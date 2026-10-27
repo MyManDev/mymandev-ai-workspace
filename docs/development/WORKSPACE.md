@@ -28,20 +28,21 @@ npm run check
 
 ## Root scripts
 
-| Script                 | Runs                                | Purpose                                            |
-| ---------------------- | ----------------------------------- | -------------------------------------------------- |
-| `npm run format`       | `prettier --write .`                | Format every file that Prettier supports.          |
-| `npm run format:check` | `prettier --check .`                | Fail if any file is not formatted.                 |
-| `npm run lint`         | `eslint .`                          | Lint JavaScript and TypeScript files.              |
-| `npm run lint:fix`     | `eslint . --fix`                    | Lint and apply automatic fixes.                    |
-| `npm run typecheck`    | `tsc -p tsconfig.json`              | Type-check the root tooling files.                 |
-| `npm run check`        | `format:check`, `lint`, `typecheck` | Run all three in order; stop at the first failure. |
+| Script                 | Runs                                                        | Purpose                                                |
+| ---------------------- | ----------------------------------------------------------- | ------------------------------------------------------ |
+| `npm run format`       | `prettier --write .`                                        | Format every file that Prettier supports.              |
+| `npm run format:check` | `prettier --check .`                                        | Fail if any file is not formatted.                     |
+| `npm run lint`         | `eslint .`                                                  | Lint JavaScript and TypeScript files.                  |
+| `npm run lint:fix`     | `eslint . --fix`                                            | Lint and apply automatic fixes.                        |
+| `npm run typecheck`    | `tsc -p tsconfig.json`, then `typecheck` in every workspace | Type-check the root tooling files and every workspace. |
+| `npm test`             | `test` in every workspace                                   | Run the tests of every workspace.                      |
+| `npm run check`        | `format:check`, `lint`, `typecheck`, `test`                 | Run all four in order; stop at the first failure.      |
 
 npm runs scripts with `cmd.exe` on Windows and `sh` on other systems. Keep root scripts portable: chain commands with `&&`, quote arguments with double quotes, and do not use single quotes, `VAR=value` prefixes, `rm`, or `cp`.
 
 `npm run lint` lints the whole repository, including every workspace. Files inside a workspace that has its own `eslint.config.mjs` are linted with that config. Do not add workspace lint delegation to the root scripts; it would lint workspaces twice.
 
-`npm run typecheck` checks only the root tooling files: `tsconfig.json` includes the root-level `*.mjs` files. Workspace type checks are added together with the first workspace; see [Root typecheck delegation](#root-typecheck-delegation).
+`npm run typecheck` first checks the root tooling files (`tsconfig.json` includes the root-level `*.mjs` files) and then runs the `typecheck` script of every workspace; see [Root typecheck delegation](#root-typecheck-delegation). `npm test` runs the `test` script of every workspace; see [Root test delegation](#root-test-delegation).
 
 ## Editor setup
 
@@ -69,7 +70,7 @@ packages/   libraries shared by applications and other packages
 docs/       project documentation
 ```
 
-The root `package.json` declares the workspace globs `apps/*` and `packages/*`. A directory becomes a workspace when it contains a `package.json`. No workspace exists yet; each one is created by the task that needs it.
+The root `package.json` declares the workspace globs `apps/*` and `packages/*`. A directory becomes a workspace when it contains a `package.json`. The first workspace is `packages/protocol` (`@mymandev/protocol`); each further workspace is created by the task that needs it.
 
 The repository has a single `package-lock.json`, at the root. Shared tooling configuration also lives at the root:
 
@@ -92,12 +93,84 @@ These rules apply to every workspace. They are enforced in review; lint does not
 - Every workspace is named `@mymandev/<directory-name>` and sets `"private": true` by default. Publishing a package is a separate decision.
 - Shared contracts, such as the protocol, event schemas, permission and capability contracts, and shared TypeScript types, require explicit coordination as described in [OWNERSHIP.md](../process/OWNERSHIP.md).
 
+## Internal packages
+
+Internal workspace packages export their TypeScript source. There is no build step, no `dist` directory, and no TypeScript project references; see [ADR 0001](../architecture/decisions/0001-internal-packages-export-typescript-source.md). Node.js 24 runs `.ts` files through built-in type stripping. Node.js, `tsc`, `node --test`, and bundlers load a package from its source through the npm workspace link, so a clean checkout type-checks, tests, and runs directly after `npm ci`.
+
+Every `packages/*` workspace follows these rules:
+
+- `package.json` sets `"type": "module"`, `"private": true`, and `"exports": { ".": "./src/index.ts" }`. Further subpaths are added only as deliberate public API when a consumer needs them. A package without side effects also sets `"sideEffects": false`.
+- The version stays `0.0.0`, and every dependent records exactly `"0.0.0"`. If the two differ, npm looks the package up on the public npm registry instead of linking the workspace.
+- Relative imports include the `.ts` extension, for example `./envelope.ts`. An import of `./envelope.js` fails at runtime with `ERR_MODULE_NOT_FOUND`.
+- Type-only imports use `import type`. `verbatimModuleSyntax` enforces this.
+- Only erasable TypeScript syntax: no `enum`, no runtime `namespace`, no parameter properties, and no decorators. `erasableSyntaxOnly` enforces this.
+- No `paths` in `tsconfig.json`. Workspaces import each other only by package name.
+- A workspace package never becomes a real directory under `node_modules`: it is not published, not packed, not copied with dereferenced links, and not run with `--preserve-symlinks`. Node.js does not strip types under `node_modules` and fails with `ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`. A deployment keeps the workspace layout or bundles the application.
+
+Every Node-side workspace uses these compiler options in its `tsconfig.json`:
+
+```json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "target": "es2025",
+    "lib": ["es2025"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  },
+  "include": ["src"]
+}
+```
+
+A package that the desktop renderer imports, such as `packages/protocol`, must not depend on Node.js. It adds a `tsconfig.src.json` that extends its `tsconfig.json`, sets `"types": []` and `lib` to the agreed renderer language level (proposed: `["es2024"]`), and excludes the tests. Its `typecheck` script runs both configurations, `"tsc -p tsconfig.json && tsc -p tsconfig.src.json"`, so a Node.js global such as `process`, or a language feature newer than the renderer level, fails in the package's own check.
+
+Consumers of an internal package:
+
+- A Node.js application runs its source directly, for example `node src/server.ts`.
+- A bundled consumer, such as the desktop renderer, sets `moduleResolution` to `bundler` together with `allowImportingTsExtensions` and `noEmit`. Its `target` and `lib` stay at or above the level in the package's `tsconfig.src.json`. Electron main and preload code that imports a workspace package is bundled too. Package source is never compiled with an emitting `tsc` build.
+
+A bundled consumer's `tsconfig.json` can start from this example; `jsx` and `types` are the consumer's choice:
+
+```json
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "target": "es2024",
+    "lib": ["es2024", "dom"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": ["vite/client"],
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["src"]
+}
+```
+
+## Tests
+
+Node-side workspaces use the built-in Node.js test runner, `node:test`; see [ADR 0002](../architecture/decisions/0002-node-test-runner.md).
+
+- Tests sit next to the code as `src/**/*.test.ts`.
+- The workspace script is `"test": "node --test \"src/**/*.test.ts\""`. Node.js runs the TypeScript tests directly, and the quoted glob also works through `cmd.exe`.
+- Tests use dependency injection instead of module mocks.
+- `node --test` exits with 0 when its pattern matches no file. When you add or remove tests, check the `tests` count in the summary.
+- A workspace `test` script runs once and exits. A bundled workspace, such as `apps/desktop`, may use Vitest in its own `devDependencies`, matched to its Vite version. With Vitest, use `"test": "vitest run"`: plain `vitest` starts watch mode in an interactive terminal and would block `npm run check`.
+- Vitest is never added to the root `package.json`, and nobody runs `node --test` at the root.
+- Coverage (`--experimental-test-coverage`) is optional and not a gate.
+
 ## Adding a workspace
 
-1. Create `apps/<name>/` or `packages/<name>/` with a `package.json` that sets `"name": "@mymandev/<name>"` and `"private": true`.
-2. Install dependencies from the repository root: `npm install <package>@<version> -w @mymandev/<name>`. Do not create a nested `package-lock.json` or a workspace `.npmrc`; npm ignores workspace `.npmrc` files.
+1. Create `apps/<name>/` or `packages/<name>/` with a `package.json` that sets `"name": "@mymandev/<name>"` and `"private": true`. A package also follows [Internal packages](#internal-packages).
+2. Install dependencies from the repository root. Run a plain `npm install` once after creating the new `package.json`, then `npm install <package>@<version> -w @mymandev/<name>`. Without the plain `npm install`, the first `-w` install links the workspace but does not save the dependency; check the workspace `package.json` after every install. Do not create a nested `package-lock.json` or a workspace `.npmrc`; npm ignores workspace `.npmrc` files.
 3. Add a `tsconfig.json` that extends `../../tsconfig.base.json` and sets the options for the workspace runtime, following [TypeScript](#typescript).
-4. Add a `typecheck` script that type-checks the workspace without emitting files.
+4. Add a `typecheck` script that type-checks the workspace without emitting files. If the workspace has tests, add a `test` script that runs them once; see [Tests](#tests).
 5. If the workspace needs its own lint rules, add an `eslint.config.mjs` that imports the root config, as shown in [ESLint](#eslint). Otherwise the root config applies.
 6. Make sure Git, Prettier, and ESLint ignore the workspace build output. The root `.gitignore` ignores `node_modules/`, `dist/`, `out/`, and `coverage/` at any depth, and the root ESLint config ignores `**/dist/`, `**/out/`, and `**/coverage/`. Any other output directory is added in two places: the root `.gitignore`, because root Prettier reads only the root `.gitignore` and `.prettierignore`, not nested ignore files; and the ESLint ignores, with `globalIgnores([...])` in the workspace `eslint.config.mjs` or in the root config with a `**/` prefix, because ESLint does not read `.gitignore`.
 7. If this is the first workspace, apply the [root typecheck delegation](#root-typecheck-delegation).
@@ -105,7 +178,7 @@ These rules apply to every workspace. They are enforced in review; lint does not
 
 ### Root typecheck delegation
 
-While no workspace exists, the root `typecheck` script checks only the root tooling files, because `npm run <script> --workspaces` fails with `No workspaces found!` when there are no workspaces. The pull request that adds the first workspace changes the root script to:
+The delegation is applied. The pull request that added the first workspace, `packages/protocol`, changed the root `typecheck` script to:
 
 ```json
 {
@@ -115,7 +188,22 @@ While no workspace exists, the root `typecheck` script checks only the root tool
 }
 ```
 
-`--if-present` skips workspaces that have no `typecheck` script.
+It could not exist earlier, because `npm run <script> --workspaces` fails with `No workspaces found!` when there are no workspaces. `--if-present` skips workspaces that have no `typecheck` script. npm runs workspace scripts in directory order (`apps/*` before `packages/*`), not in dependency order. No build order is needed, because internal packages export their source; see [Internal packages](#internal-packages).
+
+### Root test delegation
+
+The root `test` script runs the `test` script of every workspace, and `npm run check` runs the tests last:
+
+```json
+{
+  "scripts": {
+    "test": "npm run test --workspaces --if-present",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm test"
+  }
+}
+```
+
+`--if-present` skips workspaces that have no `test` script. Every workspace `test` script runs once and exits; see [Tests](#tests).
 
 ### TypeScript
 
@@ -166,7 +254,7 @@ The desktop application shell (issue #3) builds on this baseline. This section i
 
 ## Planned workspaces
 
-This list records the expected direction and is not binding. None of these workspaces exist yet. Each one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
+This list records the expected direction and is not binding. Only `packages/protocol` exists so far. Each other one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
 
 - `apps/desktop`
 - `apps/api`
