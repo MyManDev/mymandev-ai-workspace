@@ -16,6 +16,8 @@ A record starts with Status: Proposed. The Project Manager accepts it; the statu
 | [0006](0006-event-envelope-v0.md)                          | Event envelope v0, decoding and versioning           | Proposed |
 | [0007](0007-agent-run-lifecycle-v0.md)                     | Agent run lifecycle v0                               | Proposed |
 | [0008](0008-capability-vocabulary-v0.md)                   | Capability vocabulary v0                             | Proposed |
+| [0009](0009-fastify-cloud-api.md)                          | Fastify 5 for the cloud API, with hardened defaults  | Proposed |
+| [0010](0010-api-configuration-and-runtime.md)              | API configuration, runtime and shutdown              | Proposed |
 
 ## Numbering
 
