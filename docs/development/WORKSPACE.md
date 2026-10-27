@@ -254,7 +254,7 @@ The desktop application shell (issue #3) builds on this baseline. This section i
 
 ## Planned workspaces
 
-This list records the expected direction and is not binding. Only `packages/protocol` exists so far. Each other one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
+This list records the expected direction and is not binding. `packages/protocol`, `apps/api`, and `packages/database` exist so far. Each other one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
 
 - `apps/desktop`
 - `apps/api`

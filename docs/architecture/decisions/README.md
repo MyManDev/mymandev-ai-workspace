@@ -24,7 +24,7 @@ A record starts with Status: Proposed. The Project Manager accepts it; the statu
 
 ## Numbering
 
-Records are numbered in sequence and never renumbered. Numbers 0009 to 0013 are reserved for the remaining M1 decisions (the cloud API skeleton and the PostgreSQL baseline). Any other record takes the next free number when it is merged. New records are appended to the index; existing lines are not reordered.
+Records are numbered in sequence and never renumbered. A new record takes the next free number when it is merged. New records are appended to the index; existing lines are not reordered.
 
 ## Writing a record
 
