@@ -46,6 +46,37 @@ test("checkDatabaseUrl accepts only safe TLS modes and never repeats the URL", (
   }
   assert.equal(check(`no scheme ${password}`, false), "is not a valid URL");
 
+  // pg takes the last value of a repeated parameter, so a URL could pass with
+  // its first sslmode and connect with a weaker one.
+  for (const [url, production] of [
+    [`${base}?sslmode=disable&sslmode=no-verify`, false],
+    [
+      `${base}?sslmode=verify-full&application_name=a&application_name=b`,
+      false,
+    ],
+    [`${base}?sslmode=verify-full&sslmode=no-verify`, true],
+    [`${base}?sslmode=verify-full&sslmode=disable`, true],
+  ] as const) {
+    assert.equal(
+      check(url, production),
+      "must not repeat a query parameter",
+      url,
+    );
+  }
+
+  // pg re-encodes a URL with a space or a stray "%" before parsing it, and then
+  // reads "ssl%6Dode" as an unknown parameter instead of sslmode.
+  for (const [url, production] of [
+    [`${base}?application_name=100%`, false],
+    [`${base}?ssl%6Dode=verify-full&application_name=a b`, true],
+  ] as const) {
+    assert.equal(
+      check(url, production),
+      "must be percent-encoded, without spaces or stray % signs",
+      url,
+    );
+  }
+
   // Production requires verify-full.
   for (const url of [base, `${base}?sslmode=disable`]) {
     assert.equal(
@@ -53,9 +84,14 @@ test("checkDatabaseUrl accepts only safe TLS modes and never repeats the URL", (
       "sslmode=verify-full is required in production",
     );
   }
-  assert.equal(check(`${base}?sslmode=verify-full`, true), undefined);
+  for (const url of [
+    `${base}?sslmode=verify-full`,
+    `${base}?sslmode=verify-full&application_name=a%20b`,
+  ]) {
+    assert.equal(check(url, true), undefined, url);
+  }
 
-  assert.equal(messages.length, 11);
+  assert.equal(messages.length, 17);
   for (const message of messages) {
     assert.equal(message.includes(password), false);
     assert.equal(message.includes("db.internal.example"), false);

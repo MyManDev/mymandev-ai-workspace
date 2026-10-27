@@ -798,6 +798,8 @@ test("the application role can insert and update but not delete or change the sc
       create role mymandev_migrator;
       create role mymandev_app;
       alter database postgres owner to mymandev_migrator;
+      revoke all on database postgres from public;
+      grant connect on database postgres to mymandev_app;
       revoke create on schema public from public;
       alter default privileges for role mymandev_migrator in schema public
         grant select, insert, update on tables to mymandev_app;
@@ -824,6 +826,7 @@ test("the application role can insert and update but not delete or change the sc
       sql`delete from users`,
       sql`truncate users`,
       sql`create table app_owned (id integer)`,
+      sql`create temporary table app_temporary (id integer)`,
       sql`drop table users`,
       sql`select * from drizzle.__drizzle_migrations`,
     ];

@@ -16,6 +16,10 @@ const ALLOWED_SSL_MODES = new Set(["disable", "verify-full"]);
  * Returns a problem description, or undefined when the URL is acceptable.
  * pg treats prefer, require and verify-ca differently from libpq, and no-verify
  * disables certificate checks, so only disable and verify-full are accepted.
+ * pg parses the URL again on its own: it takes the last value of a repeated
+ * parameter, and it re-encodes a URL that contains a space or a stray "%"
+ * before parsing it. Such URLs are rejected, so that pg reads the same values
+ * that this check accepted.
  */
 export function checkDatabaseUrl(
   url: string,
@@ -29,6 +33,13 @@ export function checkDatabaseUrl(
   }
   if (parsed.protocol !== "postgres:" && parsed.protocol !== "postgresql:") {
     return "must use the postgres: or postgresql: scheme";
+  }
+  if (/\s|%(?![0-9a-f]{2})/iu.test(url)) {
+    return "must be percent-encoded, without spaces or stray % signs";
+  }
+  const keys = [...parsed.searchParams.keys()];
+  if (new Set(keys).size !== keys.length) {
+    return "must not repeat a query parameter";
   }
   if (parsed.searchParams.has("uselibpqcompat")) {
     return "must not set uselibpqcompat";

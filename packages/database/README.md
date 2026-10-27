@@ -25,14 +25,25 @@ Development and production use PostgreSQL 18. Install it natively, for example w
 The database uses two roles:
 
 - `mymandev_migrator` owns the database and the schema. Only `npm run db:migrate` connects as this role, through `DATABASE_MIGRATION_URL`.
-- `mymandev_app` is the role of the application (from M2, through `DATABASE_URL`). It gets `SELECT`, `INSERT`, and `UPDATE` on tables and nothing else: no `DELETE` or `TRUNCATE`, because nothing is hard-deleted; no `CREATE`; and no access to the `drizzle` schema that records the applied migrations.
+- `mymandev_app` is the role of the application (from M2, through `DATABASE_URL`). It gets `CONNECT` on the database and `SELECT`, `INSERT`, and `UPDATE` on tables, and nothing else: no `DELETE` or `TRUNCATE`, because nothing is hard-deleted; no `CREATE` and no temporary tables; and no access to the `drizzle` schema that records the applied migrations.
 
-Run this once per server as a superuser, for example with `psql -U postgres`. Use real passwords from a password manager or secret store instead of `change-me`:
+PostgreSQL lets every role connect to a new database and create temporary tables in it. The script below removes these defaults, so apart from superusers only the two roles can connect.
+
+Run this once per server in `psql` as a superuser. How to start `psql` as a superuser depends on the installation:
+
+- Windows installer: `psql -U postgres`, with `C:\Program Files\PostgreSQL\18\bin` on `PATH`, or with the full path to `psql.exe` in that folder.
+- macOS with Homebrew: `psql -d postgres`. Homebrew makes your macOS user the superuser; it creates no `postgres` role.
+- macOS with Postgres.app: the bundled `/Applications/Postgres.app/Contents/Versions/latest/bin/psql -d postgres`, which connects as your macOS user.
+- Linux distribution packages: `sudo -u postgres psql`. The default `pg_hba.conf` lets only the `postgres` operating system user connect as `postgres`.
+
+Use real passwords from a password manager or secret store instead of `change-me`:
 
 ```sql
 CREATE ROLE mymandev_migrator LOGIN PASSWORD 'change-me';
 CREATE ROLE mymandev_app LOGIN PASSWORD 'change-me';
 CREATE DATABASE mymandev OWNER mymandev_migrator;
+REVOKE ALL ON DATABASE mymandev FROM PUBLIC;
+GRANT CONNECT ON DATABASE mymandev TO mymandev_app;
 \c mymandev
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 ALTER DEFAULT PRIVILEGES FOR ROLE mymandev_migrator IN SCHEMA public
@@ -64,6 +75,10 @@ The command prints "Migrations applied." and exits with 0. A second run applies 
 - The scheme is `postgres:` or `postgresql:`.
 - `sslmode` is absent, `disable`, or `verify-full`. The pg driver treats `prefer`, `require`, and `verify-ca` differently from libpq, and `no-verify` skips certificate checks, so these values are rejected, and so is `uselibpqcompat`.
 - With `NODE_ENV=production`, `sslmode=verify-full` is required.
+- The URL is percent-encoded: no spaces, and every `%` starts an escape such as `%40`. Encode special characters in the password this way.
+- No query parameter appears twice.
+
+pg parses the URL again on its own. It takes the last value of a repeated parameter, and it re-encodes a URL with a space or a stray `%` before parsing it, so without the last two rules it could connect with other settings than the ones that were checked, for example `sslmode=verify-full&sslmode=disable`.
 
 `createDatabase` creates a pg connection pool with a connection timeout of 5 seconds (pg waits forever by default), a statement timeout of 30 seconds (configurable per connection), and an idle-in-transaction timeout of 60 seconds. The two server timeouts are sent as session parameters; PGlite ignores them, so their effect is verified only on a real server.
 
@@ -71,13 +86,13 @@ The command prints "Migrations applied." and exits with 0. A second run applies 
 
 The production path (pg pool, advisory lock, node-postgres migrator) can be tried without installing PostgreSQL, with `pglite-server` from `@electric-sql/pglite-socket` run through `npx`. Use two terminals.
 
-Terminal 1, from the repository root. npx lists the packages it would install and asks first; answer only after checking the list. Stop the server with Ctrl+C afterwards; on Windows, check that no `node` process still listens on the port.
+Terminal 1, from the repository root. npx lists the packages it would install and asks first; answer only after checking the list. Stop the server with Ctrl+C before you close the terminal; on Windows, the `node` process can otherwise keep listening. `netstat -ano | findstr 54329` (Windows) or `lsof -i :54329` (macOS, Linux) prints nothing once the port is free.
 
 ```sh
 npx -p @electric-sql/pglite-socket@0.2.12 -p @electric-sql/pglite@0.5.9 pglite-server --port 54329
 ```
 
-Terminal 2: put this line into `packages/database/.env`, then run the migration twice. Both runs print "Migrations applied." and exit with 0. Delete the `.env` file afterwards.
+Terminal 2: set `DATABASE_MIGRATION_URL` in `packages/database/.env` to this line, then run the migration twice. If the file already holds the URL of your local PostgreSQL, keep a copy of that line first. Both runs print "Migrations applied." and exit with 0. Afterwards, put your previous line back, or delete the file if you created it only for this test.
 
 ```text
 DATABASE_MIGRATION_URL=postgresql://postgres:postgres@127.0.0.1:54329/postgres?sslmode=disable
