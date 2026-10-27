@@ -11,3 +11,10 @@ indent_size = 2
 
 [*.md]
 trim_trailing_whitespace = false
+
+# drizzle-kit writes migrations with tabs and no final newline; never reformat them.
+[packages/database/migrations/**]
+insert_final_newline = unset
+trim_trailing_whitespace = unset
+indent_style = unset
+indent_size = unset
