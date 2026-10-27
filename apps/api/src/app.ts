@@ -3,7 +3,12 @@ import Fastify, { type FastifyInstance } from "fastify";
 import { STATUS_CODES } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Config } from "./config.ts";
-import { CloseCode, registerGateway, type EventHandler } from "./gateway.ts";
+import {
+  CloseCode,
+  GATEWAY_PATH,
+  registerGateway,
+  type EventHandler,
+} from "./gateway.ts";
 import { serializeError, serializeRequest } from "./log.ts";
 
 export type BuildAppOptions = Readonly<{
@@ -27,6 +32,12 @@ const MAX_FRAME_BYTES = 64 * 1024;
 const REQUEST_TIMEOUT_MS = 30_000;
 
 const DEFAULT_SHUTDOWN_GRACE_MS = 2_000;
+
+const NOT_FOUND = {
+  statusCode: 404,
+  error: "Not Found",
+  message: "Not Found",
+} as const;
 
 const healthResponse = {
   type: "object",
@@ -105,11 +116,7 @@ export async function buildApp(
   });
 
   // The default handler logs and echoes the method and the full URL.
-  app.setNotFoundHandler((_request, reply) =>
-    reply
-      .code(404)
-      .send({ statusCode: 404, error: "Not Found", message: "Not Found" }),
-  );
+  app.setNotFoundHandler((_request, reply) => reply.code(404).send(NOT_FOUND));
 
   await app.register(websocket, {
     options: { maxPayload: MAX_FRAME_BYTES },
@@ -130,6 +137,14 @@ export async function buildApp(
         client.terminate();
       }
     },
+  });
+
+  // The plugin upgrades a handshake on every GET route, skipping the Origin
+  // check of /ws, and logs the full URL when the route has no WebSocket handler.
+  app.addHook("onRequest", async (request, reply) => {
+    if (request.ws && request.routeOptions.url !== GATEWAY_PATH) {
+      return reply.code(404).send(NOT_FOUND);
+    }
   });
 
   app.get(

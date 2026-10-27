@@ -26,6 +26,9 @@ export const CloseCode = {
   messageTooBig: 1009,
 } as const;
 
+/** The only path that accepts a WebSocket upgrade. */
+export const GATEWAY_PATH = "/ws";
+
 /** The authenticated user and device of a connection. */
 export type ConnectionIdentity = Readonly<{
   userId: UserId;
@@ -90,8 +93,14 @@ export function registerGateway(
   }>,
 ): void {
   app.get(
-    "/ws",
-    { websocket: true, preValidation: originGuard(options.allowedOrigins) },
+    GATEWAY_PATH,
+    {
+      websocket: true,
+      // The HEAD route that Fastify adds for every GET route would call this
+      // handler with (request, reply) and fail with a 500.
+      exposeHeadRoute: false,
+      preValidation: originGuard(options.allowedOrigins),
+    },
     (socket: WebSocket, request) => {
       const context: ConnectionContext = Object.freeze({
         connectionId: newUuidV7(),

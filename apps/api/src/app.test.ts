@@ -78,8 +78,9 @@ test("a thrown error never sends its message, whatever statusCode it carries", a
   }
 });
 
-test("a schema validation failure returns 400 with Fastify's message, without coercion", async (t) => {
+test("a schema validation failure returns 400 with Fastify's message, without coercion or property removal", async (t) => {
   const app = await appFor(t);
+  let handled = false;
   app.post(
     "/numbers",
     {
@@ -88,22 +89,34 @@ test("a schema validation failure returns 400 with Fastify's message, without co
           type: "object",
           properties: { n: { type: "integer" } },
           required: ["n"],
+          additionalProperties: false,
         },
       },
     },
-    async () => ({ accepted: true }),
+    async () => {
+      handled = true;
+      return { accepted: true };
+    },
   );
-  const response = await app.inject({
-    method: "POST",
-    url: "/numbers",
-    payload: { n: "1" },
-  });
-  assert.equal(response.statusCode, 400);
-  assert.deepEqual(response.json(), {
-    statusCode: 400,
-    error: "Bad Request",
-    message: "body/n must be integer",
-  });
+  const cases: Array<[Record<string, unknown>, string]> = [
+    [{ n: "1" }, "body/n must be integer"],
+    // Fastify's default strips the unknown property and runs the handler.
+    [{ n: 1, extra: true }, "body must NOT have additional properties"],
+  ];
+  for (const [payload, message] of cases) {
+    const response = await app.inject({
+      method: "POST",
+      url: "/numbers",
+      payload,
+    });
+    assert.equal(response.statusCode, 400, message);
+    assert.deepEqual(response.json(), {
+      statusCode: 400,
+      error: "Bad Request",
+      message,
+    });
+  }
+  assert.equal(handled, false);
 });
 
 test("a body over the limit returns 413, and requests have a timeout", async (t) => {
@@ -149,8 +162,14 @@ test("logs never contain query strings, and errors with query data are redacted"
     logger: { stream: { write: (line) => void lines.push(line) } },
   });
   app.get("/fails", async () => {
-    throw new Error("failing route");
+    // Like a database error: the message and the params carry query values.
+    throw Object.assign(new Error(`insert failed with params ${token}`), {
+      query: "insert into messages ...",
+      params: [token],
+    });
   });
+  // injectWS never settles unless the app is ready.
+  await app.ready();
   for (const url of ["/health", "/nope", "/fails"]) {
     await app.inject({
       method: "GET",
@@ -159,6 +178,19 @@ test("logs never contain query strings, and errors with query data are redacted"
       headers: { "x-forwarded-for": "203.0.113.9" },
     });
   }
+  // Only /ws upgrades. Otherwise a handshake on /health would skip the Origin
+  // check, and the WebSocket plugin would log its full URL.
+  for (const headers of [{}, { origin: "https://evil.example" }]) {
+    await assert.rejects(
+      app.injectWS(`/health?token=${token}`, { headers }),
+      /404/u,
+    );
+  }
+  // HEAD /ws is not a route, so the WebSocket handler never runs for it.
+  const head = await app.inject({ method: "HEAD", url: `/ws?token=${token}` });
+  assert.equal(head.statusCode, 404);
+  const ws = await app.injectWS(`/ws?token=${token}`);
+  ws.terminate();
 
   const entries = lines.map(
     (line) => JSON.parse(line) as Record<string, unknown>,
@@ -171,12 +203,21 @@ test("logs never contain query strings, and errors with query data are redacted"
     );
   assert.deepEqual(
     requests.map((request) => request?.url),
-    ["/health", "/nope", "/fails"],
+    ["/health", "/nope", "/fails", "/health", "/health", "/ws", "/ws"],
   );
-  for (const request of requests) {
+  for (const request of requests.slice(0, 3)) {
     assert.equal(request?.remoteAddress, "127.0.0.1");
   }
-  assert.ok(entries.some((entry) => entry.msg === "request failed"));
+  // Only the failing route logs at error level, through the redacting serializer.
+  const failures = entries.filter((entry) => Number(entry.level) >= 50);
+  assert.deepEqual(
+    failures.map((entry) => entry.msg),
+    ["request failed"],
+  );
+  assert.deepEqual(
+    failures.map((entry) => (entry.err as { message?: string }).message),
+    ["[redacted: may contain query data]"],
+  );
   for (const line of lines) {
     assert.equal(line.includes(token), false, line);
   }

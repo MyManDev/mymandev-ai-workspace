@@ -18,7 +18,7 @@ curl http://127.0.0.1:3000/health
 
 Stop it with Ctrl+C. The API logs "shutting down", closes every WebSocket connection with code 1001, and exits with code 0. On Windows, SIGTERM is never delivered; Ctrl+C sends SIGINT, which runs the same shutdown. When npm runs through `npm.cmd` on Windows, `cmd.exe` may then ask "Terminate batch job (Y/N)?"; the API has already stopped at that point.
 
-For development, `npm run dev -w @mymandev/api` restarts the API when a source file changes, including a file in `packages/protocol`, and reads `apps/api/.env` if it exists. A restart by `--watch` stops the process without running the shutdown handler.
+For development, `npm run dev -w @mymandev/api` restarts the API when a source file changes, including a file in `packages/protocol`, and reads `apps/api/.env` if it exists. On Windows, a restart by `--watch` stops the process without running the shutdown handler; on Linux and macOS, `--watch` sends SIGTERM, which runs it.
 
 Node.js runs the TypeScript source directly. There is no build step.
 
@@ -58,7 +58,7 @@ Errors use one body shape, `{"statusCode":<code>,"error":"<status text>","messag
 
 ### `GET /ws` (WebSocket)
 
-The gateway accepts WebSocket connections and validates every frame as a protocol event that a device sent:
+`/ws` is the only path that accepts a WebSocket handshake; a handshake on any other path gets `404` before the upgrade. The gateway accepts WebSocket connections and validates every frame as a protocol event that a device sent:
 
 1. A handshake with an `Origin` header that is not listed in `API_ALLOWED_ORIGINS` gets `403` before the upgrade. A handshake without `Origin` (Node.js, the Electron main process) is accepted. Browsers send `Origin` on every WebSocket handshake and apply no same-origin rule to WebSocket, so every browser origin that may connect must be listed. A renderer loaded from `file://` or a custom scheme sends the origin `null`, which cannot be listed.
 2. Each text frame must contain one JSON event. The gateway decodes it with `decodeClientEvent` from `@mymandev/protocol`.
