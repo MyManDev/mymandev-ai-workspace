@@ -28,7 +28,8 @@ Tests must run on every developer machine and in CI on Windows, macOS, and Linux
 - PGlite is a single connection: locking, concurrency, and pooling behave differently from a server.
 - The PGlite release in use inherits the host time zone; later releases default to UTC. Typed timestamp columns return `Date` objects, so tests are not affected.
 - Constraint errors carry the SQLSTATE on the cause of the Drizzle error: `23505` unique, `23514` check, `23503` missing parent on insert, `23001` restrict on delete.
-- `pglite-server` keeps listening after its command finishes on Windows, and it ignores the pg session parameters `statement_timeout` and `idle_in_transaction_session_timeout`. Stop it with Ctrl+C and check that no `node` process still listens on the port.
+- On Windows, the `pglite-server` node process can keep listening after the shell that started it has ended. Stop it with Ctrl+C before closing the terminal, and check that the port is free, for example with `netstat -ano | findstr 54329`, which then prints nothing.
+- `pglite-server` ignores the pg session parameters `statement_timeout` and `idle_in_transaction_session_timeout`.
 
 ## Dependency policy
 
