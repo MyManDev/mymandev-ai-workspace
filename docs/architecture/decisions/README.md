@@ -18,6 +18,9 @@ A record starts with Status: Proposed. The Project Manager accepts it; the statu
 | [0008](0008-capability-vocabulary-v0.md)                   | Capability vocabulary v0                             | Proposed |
 | [0009](0009-fastify-cloud-api.md)                          | Fastify 5 for the cloud API, with hardened defaults  | Proposed |
 | [0010](0010-api-configuration-and-runtime.md)              | API configuration, runtime and shutdown              | Proposed |
+| [0011](0011-drizzle-sql-migrations.md)                     | Drizzle ORM with generated SQL migrations            | Proposed |
+| [0012](0012-pglite-database-tests.md)                      | Database tests run on in-process PGlite              | Proposed |
+| [0013](0013-m1-data-model.md)                              | M1 data model conventions and the M1-03 tables       | Proposed |
 
 ## Numbering
 
