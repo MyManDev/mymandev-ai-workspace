@@ -13,10 +13,17 @@ const VersionProbeSchema = z.object({
   protocolVersion: z.int().nonnegative(),
 });
 
-/** Stage 3: every header field, with a well-formed but not yet known `type`. */
+/**
+ * Stage 3: every header field, with a well-formed but not yet known `type`.
+ * A `type` over the limit stops validation before the pattern runs (see
+ * `displayText`).
+ */
 const EnvelopeHeaderSchema = z.object({
   ...envelopeHeaderShape,
-  type: z.string().max(LIMITS.eventType).regex(EVENT_TYPE_PATTERN),
+  type: z
+    .string()
+    .max(LIMITS.eventType, { abort: true })
+    .regex(EVENT_TYPE_PATTERN),
 });
 
 const knownTypes: ReadonlySet<string> = new Set(EVENT_TYPES);
@@ -98,10 +105,14 @@ export function decodeClientEvent(input: unknown): ClientDecodeResult {
 }
 
 /**
- * Switches zod to validation without code generation, for a renderer under a
- * strict Content Security Policy. Call it once at startup, before the first
- * decode. It goes through this package so that it configures the same zod
- * instance that the protocol schemas use.
+ * Sets zod's `jitless` option. It does not affect the protocol schemas: zod
+ * reads the option when a schema is created, not when it parses, and this
+ * package creates all of its schemas when it is evaluated, before a consumer
+ * can call this function. To validate the protocol schemas without code
+ * generation, for example in a renderer under a strict Content Security
+ * Policy, set `z.config({ jitless: true })` before this package is evaluated,
+ * as the package README describes. Whether this function stays is open
+ * (ADR 0003).
  */
 export function enableJitlessValidation(): void {
   z.config({ jitless: true });

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import * as z from "zod";
 import { decodeClientEvent, decodeEvent } from "./decode.ts";
@@ -202,6 +203,25 @@ test("hostile inputs are classified by decoding stage", () => {
   for (const [label, input, code] of cases) {
     assert.deepEqual(decodeEvent(input), { ok: false, code }, label);
   }
+
+  // Over the limit, a pattern must not run: on ten million characters it
+  // overflows the stack instead of returning a result.
+  const oversized: [label: string, input: unknown, code: string][] = [
+    [
+      "a ten-million-character reason ending in U+202E",
+      withPayload({ reason: `${"r".repeat(10_000_000)}\u202E` }),
+      "invalid_payload",
+    ],
+    [
+      "a ten-million-character type",
+      withHeader({ type: `a${"_a".repeat(5_000_000)}` }),
+      "malformed",
+    ],
+  ];
+  for (const [label, input, code] of oversized) {
+    assert.deepEqual(decodeEvent(input), { ok: false, code }, label);
+    assert.deepEqual(decodeClientEvent(input), { ok: false, code }, label);
+  }
 });
 
 test("every allowed transition decodes", () => {
@@ -267,7 +287,43 @@ test("the input is not mutated", () => {
   assert.equal(Object.hasOwn(input, "extra"), true);
 });
 
-test("the JSON Schema export works and every exported pattern compiles with the u flag", () => {
+/**
+ * Counts, in a fresh process, how often a function is created from a string
+ * while this package is evaluated and decodes one event.
+ */
+function codeGenerations(jitlessFirst: boolean): {
+  ok: boolean;
+  calls: number;
+} {
+  const zod = JSON.stringify(import.meta.resolve("zod"));
+  const protocol = JSON.stringify(new URL("./index.ts", import.meta.url).href);
+  const script = `
+let calls = 0;
+globalThis.Function = new Proxy(Function, {
+  construct(target, args, newTarget) {
+    calls += 1;
+    return Reflect.construct(target, args, newTarget);
+  },
+  apply(target, thisArg, args) {
+    calls += 1;
+    return Reflect.apply(target, thisArg, args);
+  },
+});
+const z = await import(${zod});
+if (${String(jitlessFirst)}) z.config({ jitless: true });
+const { decodeEvent } = await import(${protocol});
+const { ok } = decodeEvent(${JSON.stringify(baseEvent())});
+process.stdout.write(JSON.stringify({ ok, calls }));
+`;
+  const output = execFileSync(
+    process.execPath,
+    ["--input-type=module", "--eval", script],
+    { encoding: "utf8" },
+  );
+  return JSON.parse(output) as { ok: boolean; calls: number };
+}
+
+test("the JSON Schema export works, every exported pattern compiles with the u flag, and jitless set before loading generates no code", () => {
   const schema = z.toJSONSchema(ProtocolEventSchema, {
     target: "draft-2020-12",
     io: "input",
@@ -293,6 +349,14 @@ test("the JSON Schema export works and every exported pattern compiles with the 
   ]) {
     assert.equal(pattern.flags, "u", pattern.source);
   }
+
+  // zod reads `jitless` when a schema is created, so a consumer sets it before
+  // this package is evaluated (README). The first count shows that the
+  // counter sees zod's code generation.
+  const withCodeGeneration = codeGenerations(false);
+  assert.equal(withCodeGeneration.ok, true);
+  assert.ok(withCodeGeneration.calls > 0, "zod generated no code");
+  assert.deepEqual(codeGenerations(true), { ok: true, calls: 0 });
 });
 
 test("the actor must fit the event type", () => {

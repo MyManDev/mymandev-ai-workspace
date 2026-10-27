@@ -21,12 +21,14 @@ import {
 /**
  * Human-entered text that other devices render, from 1 to `maxLength`
  * characters. Always render it as text, never as markup.
+ * Text over the limit stops validation before the patterns run, because a
+ * pattern over a very long string can overflow the stack.
  */
 export function displayText(maxLength: number) {
   return z
     .string()
     .min(1)
-    .max(maxLength)
+    .max(maxLength, { abort: true })
     .regex(
       SAFE_TEXT_PATTERN,
       "Contains control, format or invisible characters",

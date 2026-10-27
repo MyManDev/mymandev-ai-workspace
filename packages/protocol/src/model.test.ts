@@ -42,6 +42,15 @@ test("the capability vocabulary is exactly the six names and matches exactly", (
 });
 
 test("every state pair follows RUN_TRANSITIONS, and a new run starts in queued", () => {
+  // The literal table from ADR 0007, so that RUN_TRANSITIONS cannot drift from it.
+  assert.deepEqual(RUN_TRANSITIONS, {
+    queued: ["running", "failed", "cancelled"],
+    running: ["awaiting_input", "completed", "failed", "cancelled"],
+    awaiting_input: ["running", "failed", "cancelled"],
+    completed: [],
+    failed: [],
+    cancelled: [],
+  });
   assert.equal(INITIAL_RUN_STATE, "queued");
   for (const to of RUN_STATES) {
     assert.equal(canTransition(null, to), to === "queued", `null -> ${to}`);

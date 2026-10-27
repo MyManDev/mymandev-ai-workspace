@@ -36,6 +36,10 @@ test("displayText rejects blank, too long, control, format and invisible charact
     ["ideographic space only", "\u3000\u3000"],
     ["over the limit", "a".repeat(65)],
     [
+      "ten million characters ending in U+202E",
+      `${"a".repeat(10_000_000)}\u202E`,
+    ],
+    [
       "England subdivision flag (trade-off)",
       "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}",
     ],
