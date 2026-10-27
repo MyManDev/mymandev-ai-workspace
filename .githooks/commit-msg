@@ -1,0 +1,17 @@
+#!/bin/sh
+
+set -eu
+
+message_file="$1"
+
+if grep -Eiq "Co-Authored-By:.*(Claude|Anthropic|ChatGPT|OpenAI|Codex)" "$message_file"; then
+  echo "ERROR: AI Co-Authored-By trailers are not allowed."
+  exit 1
+fi
+
+if grep -Eiq "Generated (with|by) (Claude|Anthropic|ChatGPT|OpenAI|Codex|AI)" "$message_file"; then
+  echo "ERROR: AI generation attribution is not allowed."
+  exit 1
+fi
+
+exit 0
