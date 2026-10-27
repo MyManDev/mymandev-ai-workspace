@@ -53,6 +53,17 @@ Examples:
 
 Never add AI attribution or AI co-author trailers.
 
+## Git hooks
+
+The hooks in `.githooks/` reject AI Git identities and AI attribution in commit messages.
+Enable them once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+The Identity Guard workflow runs the same checks on pull requests and on pushes to develop and main.
+
 ## Ownership
 
 Ownership means default implementation responsibility and review authority.
