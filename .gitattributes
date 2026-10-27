@@ -1,0 +1,21 @@
+# Store and check out text files with LF line endings on every platform.
+# These attributes take precedence over core.autocrlf.
+* text=auto eol=lf
+
+# Git hooks and shell scripts are always text with LF line endings.
+.githooks/* text eol=lf
+*.sh text eol=lf
+
+# Binary files are never converted.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.icns binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.zip binary

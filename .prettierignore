@@ -1,0 +1,14 @@
+# npm writes this file; keep the format npm produces.
+/package-lock.json
+
+# Existing governance files are not reformatted by the tooling baseline.
+# Formatting them is a separate follow-up task. Entries are exact files, not
+# directories, so new files in these directories are still checked.
+/CLAUDE.md
+/CONTRIBUTING.md
+/docs/process/OWNERSHIP.md
+/docs/process/ROADMAP.md
+/docs/process/WORKFLOW.md
+/.github/ISSUE_TEMPLATE/task.yml
+/.github/pull_request_template.md
+/.github/workflows/identity-guard.yml
