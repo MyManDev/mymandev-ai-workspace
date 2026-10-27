@@ -43,6 +43,10 @@ npm runs scripts with `cmd.exe` on Windows and `sh` on other systems. Keep root 
 
 `npm run typecheck` checks only the root tooling files: `tsconfig.json` includes the root-level `*.mjs` files. Workspace type checks are added together with the first workspace; see [Root typecheck delegation](#root-typecheck-delegation).
 
+## Continuous integration
+
+`.github/workflows/check.yml` runs `npm ci` and `npm run check` on Linux, Windows, and macOS for every pull request and push to `develop` and `main`. It installs the latest Node.js release that matches `.nvmrc` and does not use a dependency cache. A pull request is ready for review only when all three jobs pass.
+
 ## Editor setup
 
 Editors that support EditorConfig follow the basic rules in `.editorconfig`.
