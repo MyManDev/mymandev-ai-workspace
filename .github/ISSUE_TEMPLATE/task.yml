@@ -1,0 +1,44 @@
+﻿name: Task
+description: A focused implementation or design task
+title: '[Task] '
+labels:
+  - task
+body:
+  - type: textarea
+    id: why
+    attributes:
+      label: Why
+      description: Why does this work need to exist?
+    validations:
+      required: true
+
+  - type: textarea
+    id: change
+    attributes:
+      label: What to change
+      description: Define the intended scope.
+    validations:
+      required: true
+
+  - type: textarea
+    id: finished
+    attributes:
+      label: Finished when
+      description: Use concrete acceptance criteria.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: not_scope
+    attributes:
+      label: Not in scope
+      description: Name adjacent work this task must not absorb.
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Link blocking issues or shared contracts.

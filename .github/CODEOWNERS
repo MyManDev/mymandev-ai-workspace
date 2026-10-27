@@ -1,0 +1,11 @@
+﻿# Project Manager has final repository review authority.
+* @SpeedyV5
+
+# Desktop and local runtime default implementation area.
+/apps/desktop/ @ErtugrulS32175 @SpeedyV5
+/packages/local-runtime/ @ErtugrulS32175 @SpeedyV5
+
+# Shared boundaries.
+/packages/protocol/ @SpeedyV5 @ErtugrulS32175
+/packages/permissions/ @SpeedyV5 @ErtugrulS32175
+/docs/architecture/ @SpeedyV5 @ErtugrulS32175

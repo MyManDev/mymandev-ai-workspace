@@ -1,0 +1,88 @@
+name: Identity Guard
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  push:
+    branches:
+      - develop
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  identity-guard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Reject AI commit authors and attribution
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+            RANGE="${BASE}..${HEAD}"
+          else
+            BEFORE="${{ github.event.before }}"
+            AFTER="${{ github.sha }}"
+
+            if [[ "$BEFORE" == "0000000000000000000000000000000000000000" ]]; then
+              RANGE="$AFTER"
+            else
+              RANGE="${BEFORE}..${AFTER}"
+            fi
+          fi
+
+          echo "Checking commits in: $RANGE"
+
+          git log "$RANGE" --format="%H%x09%an%x09%ae%x09%cn%x09%ce" |
+          while IFS=$'\t' read -r sha author_name author_email committer_name committer_email; do
+            identity="$author_name $author_email $committer_name $committer_email"
+
+            if echo "$identity" | grep -Eiq "(claude|anthropic|chatgpt|openai|codex)"; then
+              echo "::error::AI identity detected in commit $sha"
+              echo "$identity"
+              exit 1
+            fi
+          done
+
+          if git log "$RANGE" --format="%B" | grep -Eiq "Co-Authored-By:.*(Claude|Anthropic|ChatGPT|OpenAI|Codex)"; then
+            echo "::error::AI Co-Authored-By trailer detected."
+            exit 1
+          fi
+
+          if git log "$RANGE" --format="%B" | grep -Eiq "Generated (with|by) (Claude|Anthropic|ChatGPT|OpenAI|Codex|AI)"; then
+            echo "::error::AI generation attribution detected."
+            exit 1
+          fi
+
+      - name: Check PR attribution
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          text="$PR_TITLE"$'\n'"$PR_BODY"
+
+          if echo "$text" | grep -Eiq "Co-Authored-By:.*(Claude|Anthropic|ChatGPT|OpenAI|Codex)"; then
+            echo "::error::AI Co-Authored-By attribution detected in PR text."
+            exit 1
+          fi
+
+          if echo "$text" | grep -Eiq "Generated (with|by) (Claude|Anthropic|ChatGPT|OpenAI|Codex|AI)"; then
+            echo "::error::AI generation attribution detected in PR text."
+            exit 1
+          fi
