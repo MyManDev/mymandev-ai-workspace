@@ -4,6 +4,8 @@ This directory records architecture decisions for MyManDev AI Workspace. Each re
 
 A record starts with Status: Proposed. The Project Manager accepts it; the status then becomes Accepted with the date, and "Needs Project Manager decision" records the answers. A later record can supersede an accepted one.
 
+ADRs 0001 to 0013 were reviewed together. Their research, experiments, and review points are kept in the [M1 Technical Decision Set](../research/m1-technical-decision-set.md).
+
 ## Index
 
 | ADR                                                        | Title                                                | Status   |

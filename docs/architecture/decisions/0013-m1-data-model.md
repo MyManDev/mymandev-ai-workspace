@@ -65,7 +65,7 @@ No dependency beyond [ADR 0011](0011-drizzle-sql-migrations.md) and [ADR 0012](0
 
 - Schema: [`packages/database/src/schema/`](../../../packages/database/src/schema/) (`identity.ts`, `workspaces.ts`, `agents.ts`, `conversations.ts`, and the shared columns in `columns.ts`) and the generated migration [`migrations/0000_init.sql`](../../../packages/database/migrations/0000_init.sql).
 - [`packages/database/src/schema.test.ts`](../../../packages/database/src/schema.test.ts), on PGlite: the CHECK vocabularies equal `CAPABILITIES`, `RUN_STATES`, `TERMINAL_RUN_STATES`, and `DEVICE_PLATFORMS`; per-conversation sequence numbers (1, 2 and 1) and a duplicate (`conversation_id`, `seq`) with 23505; a repeated client event ID with 23505, two authors and an empty or too long body with 23514; one grant per capability, a duplicate active grant with 23505, wrong scoping and unknown capabilities such as `repo.*` with 23514, a grant again after revocation, and `expires_at` not after `created_at` with 23514; the 8 inconsistent rows above, each with 23503 and the name of the composite foreign key, and consistent rows with null optional columns; run state and `finished_at` consistency with 23514; 23503 for a missing parent and 23001 for deleting a referenced user; `updated_at` increases on update; and a `// @ts-expect-error` line that proves a `DeviceId` cannot be written into a `UserId` column.
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0013, Section 2.5), linked from the M1-03 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0013, Section 2.5).
 
 ## Needs Project Manager decision
 

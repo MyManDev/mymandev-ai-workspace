@@ -66,7 +66,7 @@ Data access lives in `packages/database`. `apps/api` does not use drizzle-orm di
 - [`src/schema.test.ts`](../../../packages/database/src/schema.test.ts): a duplicate insert whose row contains a secret (the raw error contains it; the `DatabaseError` message, stack, and JSON do not), and the two roles (the application role can insert and update; delete, truncate, create table, create temporary table, drop table, and reading the migration journal fail with 42501).
 - M1-03 acceptance checks: `db:check` and a second `db:generate` report no drift; `db:migrate` against `pglite-server` applies the migration and a second run applies nothing; without a URL it exits with 1; `npm query` lists exactly the three esbuild copies on Windows, and the lockfile lists them and fsevents (macOS only).
 - Usage: [`packages/database/README.md`](../../../packages/database/README.md).
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0011, Sections 2.2, 2.3, and 2.5), linked from the M1-03 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0011, Sections 2.2, 2.3, and 2.5).
 
 ## Needs Project Manager decision
 

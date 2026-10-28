@@ -52,7 +52,7 @@ Research measurements on 20,000 decodes of the same envelope:
 
 - Schemas: [`packages/protocol/src/ids.ts`](../../../packages/protocol/src/ids.ts), [`entities.ts`](../../../packages/protocol/src/entities.ts), [`envelope.ts`](../../../packages/protocol/src/envelope.ts), and [`decode.ts`](../../../packages/protocol/src/decode.ts) (including `enableJitlessValidation`).
 - Tests: [`decode.test.ts`](../../../packages/protocol/src/decode.test.ts) (hostile inputs, stripping of unknown, `__proto__`, and `constructor` keys, no mutation, JSON Schema export with `io: "input"`, and no code generation when `jitless` is set before the protocol is evaluated) and [`entities.test.ts`](../../../packages/protocol/src/entities.test.ts).
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0003, Sections 2.2 and 2.5), linked from the M1-01 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0003, Sections 2.2 and 2.5).
 
 ## Needs Project Manager decision
 
