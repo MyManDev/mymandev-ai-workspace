@@ -1,8 +1,8 @@
 # ADR 0009: Fastify 5 for the cloud API, with hardened defaults
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -85,8 +85,15 @@ Not in M1-02: authentication, sessions, tokens, rate limits, CORS, OpenAPI, TLS,
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - Fastify 5 with @fastify/websocket (P-22, recommended: accept).
+  - Accepted.
 - A follow-up for dependency update tracking (for example Dependabot) because of the Fastify release rate (P-23, recommended: a separate follow-up task).
+  - A separate follow-up task.
 - The WebSocket close codes are provisional until M2-01 (P-24, recommended: accept).
+  - Accepted.
 - `/health` returns the application version. Remove it if the version should not be public (P-25, recommended: keep; it is the application version, not the Fastify version).
+  - Keep.
 - Credentials never in URLs; WebSocket authentication through the first message or `Sec-WebSocket-Protocol` (P-48, recommended: accept; M2-01 designs the handshake under this rule).
+  - Accepted. M2-01 designs the handshake under this rule.

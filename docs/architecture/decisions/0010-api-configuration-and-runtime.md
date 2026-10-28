@@ -1,8 +1,8 @@
 # ADR 0010: API configuration, runtime and shutdown
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -53,5 +53,9 @@ Issue #20 requires that configuration is loaded at startup, that no secrets are 
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - The variable names and the `API_` prefix, loopback-only `API_HOST` in M1, and `API_ALLOWED_ORIGINS` empty by default (P-26, recommended: accept).
+  - Accepted.
 - No build step in M1-02; the deployment artifact is decided later; production installs use `npm ci --omit=dev` (P-27, recommended: accept).
+  - Accepted.

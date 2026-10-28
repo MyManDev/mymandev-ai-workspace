@@ -1,8 +1,8 @@
 # ADR 0003: zod 4 is the runtime validation library
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -56,6 +56,11 @@ Research measurements on 20,000 decodes of the same envelope:
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - zod 4 classic (recommended), zod/mini, or valibot (P-05).
+  - zod 4 classic.
 - Defer the Fastify type provider choice to the first REST route with a body in M2 (P-06).
+  - Deferred to the first REST route with a body in M2.
 - How the renderer enables jitless validation, agreed with the desktop owner (P-02): a renderer module that sets `z.config({ jitless: true })` before the protocol is evaluated (documented in usage rule 4), a side-effect subpath of the protocol (an exception to the ADR 0001 rule that M1 adds no subpaths), or protocol schemas that are created lazily. With the first option, `enableJitlessValidation()` has no use left and can be removed.
+  - Open until the desktop owner answers in pull request #48 (P-02). Until then, usage rule 4 applies.

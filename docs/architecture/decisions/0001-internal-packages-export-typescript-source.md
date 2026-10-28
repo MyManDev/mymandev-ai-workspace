@@ -1,8 +1,8 @@
 # ADR 0001: Internal workspace packages export TypeScript source
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -59,6 +59,11 @@ Option 1 for every `packages/*` workspace:
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - Accept source exports for every internal package (P-01).
+  - Accepted.
 - Agree with the desktop owner on the consumer rules: the renderer tsconfig flags, one renderer language level (proposed: ES2024) written into the protocol's `tsconfig.src.json`, bundling the Electron main and preload code, never compiling package source with an emitting `tsc` build, and whether the desktop opens the WebSocket from the main process (no Origin header) or from the renderer (P-02).
+  - Accepted by the Project Manager. The desktop owner's agreement was requested in pull request #48, and the merge did not wait for it. Changes that the desktop owner asks for are made before the desktop imports the protocol.
 - Claim the npm organization `mymandev` and keep internal versions at `0.0.0` (P-46).
+  - Accepted. Claiming the organization is a Project Manager action.

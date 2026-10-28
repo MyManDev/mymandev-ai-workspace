@@ -1,8 +1,8 @@
 # ADR 0005: Workspaces contain projects
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -59,6 +59,11 @@ No new dependency.
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - Two levels, workspace and project (recommended), or one level (P-11).
+  - Two levels.
 - Add `workspaces` and `workspace_members` to M1-03 (P-12).
+  - Yes.
 - Confirm that a workspace ID is not a join secret and that joining needs an invitation token plus a membership check (P-13; detailed design in #14).
+  - Confirmed. The join flow is decided in issue #14.

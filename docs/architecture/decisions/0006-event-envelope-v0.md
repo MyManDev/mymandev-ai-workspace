@@ -1,8 +1,8 @@
 # ADR 0006: Event envelope v0, decoding and versioning
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -90,8 +90,15 @@ zod 4 ([ADR 0003](0003-zod-runtime-validation.md)). No new dependency.
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - `protocolVersion: 0` with the same-version-only rule, and when version 1 is declared (P-14).
+  - Version 0 now. Version 1 is declared when the M2 two-device test passes.
 - Actor or device mismatch: reject and audit (recommended) or overwrite; `decodeClientEvent` and `UnverifiedEvent` in M1, `bindIdentity` with reference binding in M2 (P-15).
+  - Reject and audit. The M1 part is accepted now.
 - Unknown fields: strip (recommended) or reject (P-16).
+  - Strip.
 - The v0 event set is only `agent.run.state_changed` (P-17).
+  - Accepted.
 - Text limits and the character rule for human-entered text, including the rejected subdivision flags (P-18).
+  - Accepted.

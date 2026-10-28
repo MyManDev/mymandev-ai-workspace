@@ -1,8 +1,8 @@
 # ADR 0002: node:test is the test runner; the root delegates
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -47,5 +47,9 @@ No test runner exists. The three M1 workspaces run on Node.js. The desktop may l
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - Accept `node:test` and the root `test` delegation in M1-01 (P-03).
+  - Accepted.
 - Decide whether `check` runs the tests, which makes CI run them (P-04, recommended: yes; implemented in M1-01).
+  - Yes, as implemented in M1-01.

@@ -1,8 +1,8 @@
 # ADR 0007: Agent run lifecycle v0
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -49,4 +49,7 @@ No new dependency.
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - The six state names, one `awaiting_input` state, retry as a new run, and run creation as a server command (P-19).
+  - Accepted.
