@@ -23,6 +23,7 @@ ADRs 0001 to 0013 were reviewed together. Their research, experiments, and revie
 | [0011](0011-drizzle-sql-migrations.md)                     | Drizzle ORM with generated SQL migrations            | Accepted |
 | [0012](0012-pglite-database-tests.md)                      | Database tests run on in-process PGlite              | Accepted |
 | [0013](0013-m1-data-model.md)                              | M1 data model conventions and the M1-03 tables       | Accepted |
+| [0014](0014-accounts-devices-and-invitations.md)           | Accounts, device credentials and invitations         | Proposed |
 
 ## Numbering
 
