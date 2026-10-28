@@ -4,8 +4,10 @@ import { CapabilitySchema } from "./entities.ts";
 import {
   CAPABILITIES,
   canTransition,
+  DEVICE_PLATFORMS,
   INITIAL_RUN_STATE,
   isTerminalRunState,
+  LIMITS,
   RUN_STATES,
   RUN_TRANSITIONS,
   TERMINAL_RUN_STATES,
@@ -82,5 +84,75 @@ test("terminal states have no outgoing transition", () => {
         assert.equal(canTransition(from, to), false, `${from} -> ${to}`);
       }
     }
+  }
+});
+
+test("the exported constants are frozen, nested values included", () => {
+  const arrays: [label: string, value: readonly unknown[]][] = [
+    ["CAPABILITIES", CAPABILITIES],
+    ["RUN_STATES", RUN_STATES],
+    ["TERMINAL_RUN_STATES", TERMINAL_RUN_STATES],
+    ["DEVICE_PLATFORMS", DEVICE_PLATFORMS],
+    ...RUN_STATES.map((state): [string, readonly unknown[]] => [
+      `RUN_TRANSITIONS.${state}`,
+      RUN_TRANSITIONS[state],
+    ]),
+  ];
+  const objects: [label: string, value: object][] = [
+    ["RUN_TRANSITIONS", RUN_TRANSITIONS],
+    ["LIMITS", LIMITS],
+  ];
+  assert.equal(arrays.length, 10);
+  assert.equal(objects.length, 2);
+
+  // Modules run in strict mode, so a write to a frozen value throws.
+  for (const [label, value] of arrays) {
+    const before = JSON.stringify(value);
+    const mutable = value as unknown[];
+    assert.equal(Object.isFrozen(value), true, label);
+    assert.throws(() => mutable.push("added"), TypeError, `${label}: push`);
+    assert.throws(
+      () => {
+        mutable[0] = "changed";
+      },
+      TypeError,
+      `${label}: index`,
+    );
+    assert.throws(
+      () => {
+        mutable.length = 0;
+      },
+      TypeError,
+      `${label}: length`,
+    );
+    assert.equal(JSON.stringify(value), before, label);
+  }
+  for (const [label, value] of objects) {
+    const before = JSON.stringify(value);
+    const mutable = value as Record<string, unknown>;
+    const key = Object.keys(value)[0] ?? "";
+    assert.equal(Object.isFrozen(value), true, label);
+    assert.throws(
+      () => {
+        mutable[key] = 1;
+      },
+      TypeError,
+      `${label}: change`,
+    );
+    assert.throws(
+      () => {
+        mutable.added = 1;
+      },
+      TypeError,
+      `${label}: add`,
+    );
+    assert.throws(
+      () => {
+        delete mutable[key];
+      },
+      TypeError,
+      `${label}: delete`,
+    );
+    assert.equal(JSON.stringify(value), before, label);
   }
 });
