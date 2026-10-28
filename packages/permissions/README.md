@@ -25,10 +25,10 @@ The permission contract is a shared boundary. It changes only by agreement betwe
   - The grant fields are the Drizzle property names of `permission_grants`, unchanged.
   - Timestamps are mapped with `toISOString()`. A value that is not a valid `Date` (for example from a database `infinity`) cannot be mapped; leave that row out, which denies.
   - `grantorMembership` is the granting user's membership in the workspace of the grant's project: the row that is not removed if there is one, otherwise a removed row or null. A removed row and null both deny.
-  - Until the database follow-up adds `provider_connection_id`, a `provider.use` row cannot be mapped and is denied.
+  - Until the provider connection entity adds `provider_connection_id` with its foreign key (ADR 0015, P-79 and P-82), a `provider.use` row cannot be mapped and is denied.
   - Obtain a typed `GrantRecord` with `GrantRecordSchema.safeParse` and leave out a row that fails. Never cast a row to `GrantRecord`.
-- Records and requests are plain data: only their own enumerable data properties are read, each once. An accessor, or a field that is only inherited from a prototype, makes the input malformed.
-- The checks never throw. Malformed data or a malformed request returns false. Treat false as a denial, and never retry with a looser request.
+- Records and requests are plain data: only their own enumerable data properties are read, each once. An accessor, a cycle through objects, or a field that is only inherited from a prototype makes the input malformed. Arrays inside them are not traversed; the schemas accept no array. `hasGrant` reads the length of the list once from its own data, and each element once through its own descriptor.
+- The checks never throw. `isGrantActive` returns false for a malformed record or an invalid `now`. `hasGrant` returns false for a malformed request, an invalid `now`, a list that is not an array, or a list whose length or elements cannot be read. It skips a malformed record, a hole, or an accessor in the list, which never grants and does not stop another record from granting. Treat false as a denial, and never retry with a looser request.
 - `CAPABILITY_RISK` is for presentation only. The permission screen presents `terminal.execute` as the highest-risk capability ([ADR 0015](../../docs/architecture/decisions/0015-capability-and-permission-contract-v0.md)).
 - A grant never carries a credential. A `ProviderConnectionId` names connection metadata only.
 - Under a strict Content Security Policy, the desktop renderer sets `z.config({ jitless: true })` before this package is evaluated, exactly as for `@mymandev/protocol` (see its README). This package creates its schemas when it is evaluated.
@@ -38,7 +38,7 @@ The permission contract is a shared boundary. It changes only by agreement betwe
 - Enforcement: the enforcement point in the local runtime (#55).
 - The provider connection entity and its binding to the agent's host device (ADR 0015, P-82), and local credential storage (#33).
 - Grant commands and grant events.
-- The database migration that adds the provider connection column (follow-up after ADR 0015 is accepted).
+- The database migration that adds the provider connection column; it comes with the provider connection entity (ADR 0015, P-79).
 - The permission screen.
 
 ## Scripts
