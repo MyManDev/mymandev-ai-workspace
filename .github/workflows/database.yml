@@ -1,8 +1,8 @@
 name: Database
 
 # Applies the migrations to a real PostgreSQL 18 server with the roles from
-# packages/database/README.md, compares the schema with PGlite, where the
-# tests run, and checks the privileges of the application role.
+# packages/database/README.md, compares the schema with PGlite, runs the
+# database tests on the server, and checks the privileges of the application role.
 on:
   pull_request:
     paths:
@@ -92,6 +92,12 @@ jobs:
 
       - name: Compare the schema with PGlite
         run: npm run db:compare -w @mymandev/database
+
+      - name: Run the database tests on the server
+        # Each test file creates and drops its own database, so the URL uses the superuser.
+        env:
+          DATABASE_TEST_URL: postgres://postgres:ci-superuser@127.0.0.1:5432/postgres?sslmode=disable
+        run: npm test -w @mymandev/database
 
       - name: Check the tables and their owner
         run: |

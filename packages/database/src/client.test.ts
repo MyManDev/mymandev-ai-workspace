@@ -1,6 +1,50 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { checkDatabaseUrl } from "./client.ts";
+import { sql } from "drizzle-orm";
+import { checkDatabaseUrl, createDatabase } from "./client.ts";
+import { DatabaseError, withDatabaseErrors } from "./errors.ts";
+import { createTestDatabase } from "./testing.ts";
+
+test(
+  "createDatabase sends the session timeouts to the server",
+  {
+    skip:
+      process.env["DATABASE_TEST_URL"] === undefined &&
+      "needs DATABASE_TEST_URL; PGlite ignores session timeouts",
+  },
+  async () => {
+    const testDatabase = await createTestDatabase();
+    assert.ok(testDatabase.url, "the test database is on a server");
+    const connection = createDatabase(testDatabase.url, {
+      max: 1,
+      statementTimeoutMs: 200,
+    });
+    try {
+      const settings = await connection.db.execute<{
+        statement: string;
+        idle: string;
+      }>(
+        sql`select current_setting('statement_timeout') as statement, current_setting('idle_in_transaction_session_timeout') as idle`,
+      );
+      assert.deepEqual(
+        { ...settings.rows[0] },
+        { statement: "200ms", idle: "1min" },
+      );
+
+      // 57014: query_canceled, raised when the statement timeout expires.
+      await assert.rejects(
+        withDatabaseErrors(() =>
+          connection.db.execute(sql`select pg_sleep(2)`),
+        ),
+        (error: unknown) =>
+          error instanceof DatabaseError && error.code === "57014",
+      );
+    } finally {
+      await connection.close();
+      await testDatabase.close();
+    }
+  },
+);
 
 test("checkDatabaseUrl accepts only safe TLS modes and never repeats the URL", () => {
   const password = "Sup3r-Secret-Passw0rd";
