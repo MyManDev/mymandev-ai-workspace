@@ -81,7 +81,7 @@ Not in M1-02: authentication, sessions, tokens, rate limits, CORS, OpenAPI, TLS,
 - [`apps/api/src/app.test.ts`](../../../apps/api/src/app.test.ts): `/health` body, generic 404, thrown errors with `statusCode` 200, 302, 0, 404, and 500 never send their message, validation 400 without coercion or property removal, 413 and the request timeout, `__proto__` 400, and logs without query strings or a client-chosen forwarded address (also for a WebSocket handshake on `/health`, which gets 404 with or without a foreign Origin, and for `HEAD /ws`, which gets 404), with the redacting error serializer wired into the logger and tested on its own.
 - [`apps/api/src/gateway.test.ts`](../../../apps/api/src/gateway.test.ts): a valid event reaches `onEvent` stripped with `identity: null`, close codes 1003, 1007, 1008 (every decode code and `not_allowed_from_device`), and 1009, no event after an invalid frame, the Origin check, and close 1001 `server_shutdown` on shutdown.
 - Usage and close codes: [`apps/api/README.md`](../../../apps/api/README.md).
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0009, Sections 2.3 and 2.5), linked from the M1-02 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0009, Sections 2.3 and 2.5).
 
 ## Needs Project Manager decision
 

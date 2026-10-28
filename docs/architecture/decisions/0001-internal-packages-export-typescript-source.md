@@ -55,7 +55,7 @@ Option 1 for every `packages/*` workspace:
 - [`packages/protocol/package.json`](../../../packages/protocol/package.json), [`packages/protocol/tsconfig.json`](../../../packages/protocol/tsconfig.json), and [`packages/protocol/tsconfig.src.json`](../../../packages/protocol/tsconfig.src.json).
 - The rules for every workspace: [WORKSPACE.md, Internal packages](../../development/WORKSPACE.md#internal-packages).
 - M1-01 acceptance checks: temporary probes in `packages/protocol/src` (`process.env`, an `enum`, an import without `.ts`, `Set.prototype.union`) fail `tsconfig.src.json` with TS2591, TS1294, TS2835, and TS2550.
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0001, Sections 2.2 and 2.5), linked from the M1-01 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0001, Sections 2.2 and 2.5).
 
 ## Needs Project Manager decision
 

@@ -43,7 +43,7 @@ IDs cross devices, the API, and PostgreSQL. They must not collide, must sort wel
 
 - [`packages/protocol/src/model.ts`](../../../packages/protocol/src/model.ts) (`UUIDV7_PATTERN`) and [`packages/protocol/src/ids.ts`](../../../packages/protocol/src/ids.ts).
 - [`packages/protocol/src/ids.test.ts`](../../../packages/protocol/src/ids.test.ts): generated IDs match the pattern and sort in creation order; uppercase and version 4 UUIDs are rejected; a `@ts-expect-error` line proves that a `UserId` is not assignable to a `DeviceId`.
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0004, Section 2.5), linked from the M1-01 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0004, Section 2.5).
 
 ## Needs Project Manager decision
 

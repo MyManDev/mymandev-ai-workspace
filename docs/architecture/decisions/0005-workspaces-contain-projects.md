@@ -55,7 +55,7 @@ No new dependency.
 
 - [`packages/protocol/src/entities.ts`](../../../packages/protocol/src/entities.ts) and the text rule `SAFE_TEXT_PATTERN` with `LIMITS` in [`packages/protocol/src/model.ts`](../../../packages/protocol/src/model.ts).
 - [`packages/protocol/src/entities.test.ts`](../../../packages/protocol/src/entities.test.ts): accepted scripts and emoji sequences, and every rejected character class, all written as escapes.
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0005, Section 2.5), linked from the M1-01 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0005, Section 2.5).
 
 ## Needs Project Manager decision
 

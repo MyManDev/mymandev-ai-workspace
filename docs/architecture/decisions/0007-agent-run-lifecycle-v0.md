@@ -45,7 +45,7 @@ No new dependency.
 - [`packages/protocol/src/model.ts`](../../../packages/protocol/src/model.ts): `RUN_STATES`, `INITIAL_RUN_STATE`, `TERMINAL_RUN_STATES`, `RUN_TRANSITIONS`, `canTransition`, and `isTerminalRunState`.
 - The payload rule in [`packages/protocol/src/envelope.ts`](../../../packages/protocol/src/envelope.ts) and the device rule in [`packages/protocol/src/decode.ts`](../../../packages/protocol/src/decode.ts).
 - Tests: [`model.test.ts`](../../../packages/protocol/src/model.test.ts) (every state pair, terminal states) and [`decode.test.ts`](../../../packages/protocol/src/decode.test.ts) (every allowed transition decodes, an illegal transition is `invalid_payload`, a run creation from a device is `not_allowed_from_device`).
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0007), linked from the M1-01 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0007).
 
 ## Needs Project Manager decision
 

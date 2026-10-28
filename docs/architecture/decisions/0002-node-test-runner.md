@@ -43,7 +43,7 @@ No test runner exists. The three M1 workspaces run on Node.js. The desktop may l
 
 - Root scripts: [`package.json`](../../../package.json); documented in [WORKSPACE.md, Root test delegation](../../development/WORKSPACE.md#root-test-delegation) and [Tests](../../development/WORKSPACE.md#tests).
 - First workspace with tests: [`packages/protocol/package.json`](../../../packages/protocol/package.json) and `packages/protocol/src/*.test.ts` (15 tests).
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0002), linked from the M1-01 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0002).
 
 ## Needs Project Manager decision
 

@@ -39,7 +39,7 @@ No new dependency.
 
 - [`packages/protocol/src/model.ts`](../../../packages/protocol/src/model.ts) (`CAPABILITIES`, `Capability`) and [`packages/protocol/src/entities.ts`](../../../packages/protocol/src/entities.ts) (`CapabilitySchema`).
 - [`packages/protocol/src/model.test.ts`](../../../packages/protocol/src/model.test.ts): the exact list in order, and `CapabilitySchema` rejects `repo.*`, `REPO.READ`, and unknown strings.
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0008), linked from the M1-01 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0008).
 
 ## Needs Project Manager decision
 

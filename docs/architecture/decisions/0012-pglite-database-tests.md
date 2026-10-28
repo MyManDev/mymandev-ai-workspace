@@ -43,7 +43,7 @@ Tests must run on every developer machine and in CI on Windows, macOS, and Linux
 - [`src/schema.test.ts`](../../../packages/database/src/schema.test.ts): one PGlite instance for the file; the test database reports PostgreSQL 18; the role test uses its own instance.
 - M1-03 acceptance check: the two-terminal `pglite-server` smoke test applied the migration ("Migrations applied.", exit 0) and a second run applied nothing; the server reported PostgreSQL 18.6 and 11 tables.
 - Usage: [`packages/database/README.md`](../../../packages/database/README.md).
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0012, Sections 2.2, 2.4, and 2.5), linked from the M1-03 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0012, Sections 2.2, 2.4, and 2.5).
 
 ## Needs Project Manager decision
 

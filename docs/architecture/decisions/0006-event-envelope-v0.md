@@ -86,7 +86,7 @@ zod 4 ([ADR 0003](0003-zod-runtime-validation.md)). No new dependency.
 
 - [`packages/protocol/src/envelope.ts`](../../../packages/protocol/src/envelope.ts) and [`packages/protocol/src/decode.ts`](../../../packages/protocol/src/decode.ts).
 - [`packages/protocol/src/decode.test.ts`](../../../packages/protocol/src/decode.test.ts): 19 hostile inputs classified by stage, every allowed transition, stripping of unknown, `__proto__`, and `constructor` keys at every level, no mutation, the JSON Schema export, the actor rule, and `decodeClientEvent`.
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0006, Sections 2.3 and 2.5), linked from the M1-01 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0006, Sections 2.3 and 2.5).
 
 ## Needs Project Manager decision
 

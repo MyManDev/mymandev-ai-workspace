@@ -49,7 +49,7 @@ Issue #20 requires that configuration is loaded at startup, that no secrets are 
 - [`apps/api/src/config.test.ts`](../../../apps/api/src/config.test.ts): defaults, only known variables, empty strings as unset, a frozen result, rejection of `80.5`, `0x50`, `8e1`, `" 80"`, `true`, `-1`, `65536`, `080`, `1_000`, a zero body limit, an unknown `NODE_ENV` and log level, the loopback-only `API_HOST`, the origin list rules, and errors that name every variable without its value.
 - M1-02 acceptance checks: `API_PORT=0x50` and `API_HOST=0.0.0.0` exit with 1 and name the variable without its value; `npm run start -w @mymandev/api` serves `/health`; Ctrl+C logs "shutting down" and exits with 0.
 - Usage: [`apps/api/README.md`](../../../apps/api/README.md).
-- Review record: M1 Technical Decision Set, revision 2 of 2026-10-27 (ADR 0010, Sections 2.2 and 2.5), linked from the M1-02 pull request.
+- Review record: [M1 Technical Decision Set](../research/m1-technical-decision-set.md), revision 2 of 2026-10-27 (ADR 0010, Sections 2.2 and 2.5).
 
 ## Needs Project Manager decision
 
