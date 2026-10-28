@@ -156,29 +156,35 @@ No implementation may infer one capability from another.
 ## M2 - Realtime collaboration
 
 ### M2-01 WebSocket protocol
+
 Default owner: Project Manager
 
 ### M2-02 Desktop WebSocket client
+
 Default owner: Ertugrul
 
 ### M2-03 Project chat
 
 Project Manager:
+
 - backend
 - persistence
 - authorization
 
 Ertugrul:
+
 - desktop UI
 - realtime rendering
 
 ### M2-04 Agent activity stream
 
 Project Manager:
+
 - event contract
 - server routing
 
 Ertugrul:
+
 - desktop visualization
 
 ### M2-05 Two-device integration test
