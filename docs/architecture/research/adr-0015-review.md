@@ -1,6 +1,6 @@
 # ADR 0015 review record
 
-- Status: Review record for [ADR 0015](../decisions/0015-capability-and-permission-contract-v0.md), which is Proposed.
+- Status: Review record for [ADR 0015](../decisions/0015-capability-and-permission-contract-v0.md), which is Accepted.
 - Date: 2026-10-28
 
 This record keeps the experiments and the review behind ADR 0015. The ADR is authoritative; where this record and the ADR differ, the ADR applies.

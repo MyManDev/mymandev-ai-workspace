@@ -23,11 +23,11 @@ ADRs 0001 to 0013 were reviewed together. Their research, experiments, and revie
 | [0011](0011-drizzle-sql-migrations.md)                     | Drizzle ORM with generated SQL migrations            | Accepted |
 | [0012](0012-pglite-database-tests.md)                      | Database tests run on in-process PGlite              | Accepted |
 | [0013](0013-m1-data-model.md)                              | M1 data model conventions and the M1-03 tables       | Accepted |
-| [0015](0015-capability-and-permission-contract-v0.md)      | Capability and permission contract v0                | Proposed |
+| [0015](0015-capability-and-permission-contract-v0.md)      | Capability and permission contract v0                | Accepted |
 
 ## Numbering
 
-Records are numbered in sequence and never renumbered. A new record takes the next free number when it is merged. New records are appended to the index; existing lines are not reordered.
+Records are numbered in sequence and never renumbered. A new record takes the next free number when it is merged. A number that a record in an open pull request already uses is not free, so records can be merged in a different order than their numbers (ADR 0015, P-81). New records are appended to the index; existing lines are not reordered.
 
 ## Writing a record
 
