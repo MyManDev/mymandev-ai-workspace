@@ -6,13 +6,13 @@ The protocol is a shared boundary. It changes only by agreement between the Proj
 
 ## Contents
 
-| Module            | Contents                                                                                                                                                                |
-| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/model.ts`    | `PROTOCOL_VERSION`, the capability, run state, and device platform vocabularies, the run transition table with `canTransition`, the text and ID patterns, and `LIMITS`. |
-| `src/ids.ts`      | Branded ID schemas and types (`UserId`, `DeviceId`, `WorkspaceId`, `ProjectId`, `RepositoryId`, `AgentId`, `RunId`, `EventId`, `CorrelationId`), `newId`, `newUuidV7`.  |
-| `src/entities.ts` | `displayText`, the vocabulary schemas, and the User, Device, Workspace, Project, Repository, Agent, and AgentRun schemas.                                               |
-| `src/envelope.ts` | The event envelope, the `agent.run.state_changed` event, `ProtocolEventSchema`, `EVENT_TYPES`, and `actorAllowed`.                                                      |
-| `src/decode.ts`   | `decodeEvent`, `decodeClientEvent`, `UnverifiedEvent`, and `enableJitlessValidation`.                                                                                   |
+| Module            | Contents                                                                                                                                                                                                            |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/model.ts`    | `PROTOCOL_VERSION`, the capability, run state, and device platform vocabularies, the run transition table with `canTransition`, the text and ID patterns, and `LIMITS`.                                             |
+| `src/ids.ts`      | Branded ID schemas and types (`UserId`, `DeviceId`, `WorkspaceId`, `ProjectId`, `RepositoryId`, `AgentId`, `RunId`, `EventId`, `CorrelationId`, `PermissionGrantId`, `ProviderConnectionId`), `newId`, `newUuidV7`. |
+| `src/entities.ts` | `displayText`, the vocabulary schemas, and the User, Device, Workspace, Project, Repository, Agent, and AgentRun schemas.                                                                                           |
+| `src/envelope.ts` | The event envelope, the `agent.run.state_changed` event, `ProtocolEventSchema`, `EVENT_TYPES`, and `actorAllowed`.                                                                                                  |
+| `src/decode.ts`   | `decodeEvent`, `decodeClientEvent`, `UnverifiedEvent`, and `enableJitlessValidation`.                                                                                                                               |
 
 ## Consumer rules
 
@@ -24,7 +24,7 @@ The protocol is a shared boundary. It changes only by agreement between the Proj
 - Human-entered text (`displayName`, `label`, `name`, run `reason`) is always rendered as text, never as markup.
 - `newId` and `newUuidV7` generate identifiers, never secrets. An ID is not a capability, and a UUIDv7 reveals its creation time. A secret, such as an invitation token, a device credential, or a session ID, is 32 bytes from `crypto.randomBytes`, encoded as base64url, and stored only as a SHA-256 hash.
 - The server generates every entity ID, including run IDs. A device generates only event IDs.
-- The capability names are defined here and nowhere else. This package exports no capability check; grant checks belong to the permissions package (M1-06).
+- The capability names are defined here and nowhere else. This package exports no capability check; grant checks belong to `@mymandev/permissions`.
 - Change the protocol only by agreement. Protocol version 0 is pre-stable: peers must run the same version, and any other version is rejected as `unsupported_version`.
 
 ## Scripts
