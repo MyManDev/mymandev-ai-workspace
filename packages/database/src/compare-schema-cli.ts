@@ -55,7 +55,7 @@ let serverVersion: string;
 try {
   onServer = (await server.query<CatalogRow>(CATALOG)).rows;
   const version = await server.query<{ version: string }>(
-    "show server_version",
+    "select current_setting('server_version') as version",
   );
   serverVersion = version.rows[0]?.version ?? "unknown";
 } finally {
