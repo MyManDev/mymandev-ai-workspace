@@ -167,7 +167,10 @@ function throwingProxy<T extends object>(target: T): T {
   });
 }
 
-/** An array proxy whose length works and whose elements throw when read. */
+/**
+ * An array proxy whose length works and whose elements throw when read, by
+ * value or by descriptor.
+ */
 function throwingIndexProxy<T>(items: T[]): T[] {
   return new Proxy(items, {
     get(target, key, receiver) {
@@ -176,7 +179,35 @@ function throwingIndexProxy<T>(items: T[]): T[] {
       }
       throw new Error("hostile index access");
     },
+    getOwnPropertyDescriptor(target, key) {
+      if (key === "length") {
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      }
+      throw new Error("hostile index access");
+    },
   });
+}
+
+/**
+ * A Proxy whose own data stays as it is, while reading `key` returns `value`.
+ * A check that compares a later read instead of the validated copy is fooled.
+ */
+function lying<T extends object>(target: T, key: string, value: unknown): T {
+  return new Proxy(target, {
+    get(inner, property, receiver) {
+      return property === key ? value : Reflect.get(inner, property, receiver);
+    },
+  });
+}
+
+/** `input` with a grant whose reads of `key` return `value`. */
+function lyingGrant(
+  input: RecordInput,
+  key: string,
+  value: unknown,
+): GrantRecord {
+  input.grant = lying(input.grant, key, value);
+  return input as unknown as GrantRecord;
 }
 
 function deepFreeze<T>(value: T): T {
@@ -638,8 +669,21 @@ test("malformed records are inactive and never throw", () => {
         );
       }),
     ],
+    [
+      "revocation fields that are not enumerable",
+      changed((input) => {
+        for (const key of ["revokedAt", "revokedByUserId"]) {
+          Object.defineProperty(input.grant, key, {
+            value: null,
+            enumerable: false,
+            configurable: true,
+            writable: true,
+          });
+        }
+      }),
+    ],
   ];
-  assert.equal(cases.length, 25);
+  assert.equal(cases.length, 26);
   for (const [label, value] of cases) {
     const malformed = value as GrantRecord;
     assertDenied(
@@ -887,6 +931,387 @@ test("a polluted Object.prototype neither fills a missing field nor widens a sco
     assert.equal(results.length, checks.length, pollution);
     for (const [index, [label, , expected]] of checks.entries()) {
       assert.equal(results[index], expected, `${pollution}: ${label}`);
+    }
+  }
+});
+
+test("a hole or an accessor in the list is skipped and never read through a prototype", () => {
+  const active = record("repo.read");
+  const wanted = request("repo.read");
+  const deleted = (): GrantRecord[] => {
+    const list = [record("repo.read", { change: revoke })];
+    delete list[0];
+    return list;
+  };
+  const accessor = (): GrantRecord[] =>
+    Object.defineProperty([] as GrantRecord[], 0, {
+      enumerable: true,
+      configurable: true,
+      get: () => active,
+    });
+  const holeBeforeActive = (): GrantRecord[] => {
+    const list = new Array<GrantRecord>(2);
+    list[1] = active;
+    return list;
+  };
+  const checks: [
+    label: string,
+    list: () => GrantRecord[],
+    expected: boolean,
+  ][] = [
+    ["one active record", () => [active], true],
+    ["a hole before an active record", holeBeforeActive, true],
+    [
+      "an empty list with a length of 1",
+      () => new Array<GrantRecord>(1),
+      false,
+    ],
+    ["a list whose revoked record was deleted", deleted, false],
+    ["an element that is an accessor", accessor, false],
+  ];
+  const prototypes: [label: string, target: object][] = [
+    ["Array.prototype", Array.prototype],
+    ["Object.prototype", Object.prototype],
+  ];
+  assert.equal(checks.length, 5);
+  for (const [label, list, expected] of checks) {
+    assert.equal(
+      hasGrant(list(), wanted, NOW),
+      expected,
+      `without pollution: ${label}`,
+    );
+  }
+
+  const arrayPrototypeLength = Array.prototype.length;
+  for (const [pollution, target] of prototypes) {
+    const results: boolean[] = [];
+    try {
+      // As a polluting assignment such as target[0] = record would.
+      Object.defineProperty(target, 0, {
+        value: active,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+      for (const [, list] of checks) {
+        results.push(hasGrant(list(), wanted, NOW));
+      }
+    } finally {
+      delete (target as Record<number, unknown>)[0];
+      // Array.prototype is itself an array, so index 0 raised its length.
+      Array.prototype.length = arrayPrototypeLength;
+    }
+    assert.equal(Array.prototype.length, arrayPrototypeLength, pollution);
+    assert.equal(results.length, checks.length, pollution);
+    for (const [index, [label, , expected]] of checks.entries()) {
+      assert.equal(results[index], expected, `${pollution}: ${label}`);
+    }
+  }
+});
+
+test("the decision uses the validated copies, not later reads of the input", () => {
+  const cases: [
+    label: string,
+    records: GrantRecord[],
+    wanted: PermissionRequest,
+  ][] = [
+    [
+      "a request for another agent that reads as the grantee",
+      [record("repo.read")],
+      lying(
+        request("repo.read", { agentId: OTHER_AGENT_ID }),
+        "agentId",
+        AGENT_ID,
+      ),
+    ],
+    [
+      "a repo.write request that reads as repo.read",
+      [record("repo.read")],
+      lying(request("repo.write"), "capability", "repo.read"),
+    ],
+    [
+      "a grant to another agent that reads as the requester",
+      [
+        lyingGrant(
+          recordInput("repo.read", { agentId: OTHER_AGENT_ID }),
+          "granteeAgentId",
+          AGENT_ID,
+        ),
+      ],
+      request("repo.read"),
+    ],
+    [
+      "a repo.write grant that reads as repo.read",
+      [lyingGrant(recordInput("repo.write"), "capability", "repo.read")],
+      request("repo.read"),
+    ],
+    [
+      "a grant on another repository that reads as the requested one",
+      [
+        lyingGrant(
+          recordInput("repo.read", { scopeId: OTHER_REPOSITORY_ID }),
+          "repositoryId",
+          REPOSITORY_ID,
+        ),
+      ],
+      request("repo.read"),
+    ],
+    [
+      "a grant on another provider connection that reads as the requested one",
+      [
+        lyingGrant(
+          recordInput("provider.use", {
+            scopeId: OTHER_PROVIDER_CONNECTION_ID,
+          }),
+          "providerConnectionId",
+          PROVIDER_CONNECTION_ID,
+        ),
+      ],
+      request("provider.use"),
+    ],
+  ];
+  // Controls: what each Proxy reads as is granted when it is the real data.
+  assert.equal(
+    hasGrant([record("repo.read")], request("repo.read"), NOW),
+    true,
+  );
+  assert.equal(
+    hasGrant([record("provider.use")], request("provider.use"), NOW),
+    true,
+  );
+  assert.equal(cases.length, 6);
+  for (const [label, records, wanted] of cases) {
+    assertDenied(() => hasGrant(records, wanted, NOW), label);
+  }
+});
+
+test("an object referenced more than once is read once", () => {
+  // Every node is referenced twice by its parent, so a copy that followed
+  // every path would read the deepest node 2 ** DEPTH times.
+  const DEPTH = 20;
+  let reads = 0;
+  const counted = (target: Json): Json =>
+    new Proxy(target, {
+      ownKeys(inner) {
+        reads += 1;
+        return Reflect.ownKeys(inner);
+      },
+    });
+  let shared: Json = counted({});
+  for (let level = 0; level < DEPTH; level += 1) {
+    shared = counted({ a: shared, b: shared });
+  }
+  const sharedRecord = record("repo.read", {
+    change: (input) => {
+      input.grant.extra = shared;
+    },
+  });
+  const sharedRequest = {
+    ...request("repo.read"),
+    extra: shared,
+  } as unknown as PermissionRequest;
+
+  reads = 0;
+  assert.equal(isGrantActive(sharedRecord, NOW), true);
+  assert.equal(reads, DEPTH + 1, "isGrantActive");
+  reads = 0;
+  assert.equal(hasGrant([sharedRecord], sharedRequest, NOW), true);
+  // The request and the record are separate inputs, each read once.
+  assert.equal(reads, 2 * (DEPTH + 1), "hasGrant");
+});
+
+test("an object referenced again is judged on its copy", () => {
+  const withShared = (grant: Json): GrantRecord =>
+    ({
+      meta: grant,
+      grant,
+      facts: recordInput("repo.read").facts,
+    }) as unknown as GrantRecord;
+  const inherited = (): Json => {
+    const own = { ...recordInput("repo.read").grant };
+    delete own.revokedAt;
+    delete own.revokedByUserId;
+    return Object.assign(
+      Object.create({ revokedAt: null, revokedByUserId: null }) as Json,
+      own,
+    );
+  };
+  const hidden = (): Json =>
+    new Proxy(recordInput("repo.read", { change: revoke }).grant, {
+      get(target, key, receiver) {
+        return key === "revokedAt" || key === "revokedByUserId"
+          ? null
+          : Reflect.get(target, key, receiver);
+      },
+    });
+  const cases: [label: string, value: GrantRecord][] = [
+    ["a grant whose revocation is only inherited", withShared(inherited())],
+    [
+      "a revoked grant behind a Proxy whose reads hide the revocation",
+      withShared(hidden()),
+    ],
+  ];
+  // Control: the same object referenced twice is granted when it is active.
+  const plain = withShared(recordInput("repo.read").grant);
+  assert.equal(isGrantActive(plain, NOW), true);
+  assert.equal(hasGrant([plain], request("repo.read"), NOW), true);
+  assert.equal(cases.length, 2);
+  for (const [label, value] of cases) {
+    assertDenied(() => isGrantActive(value, NOW), `isGrantActive: ${label}`);
+    assertDenied(
+      () => hasGrant([value], request("repo.read"), NOW),
+      `hasGrant: ${label}`,
+    );
+  }
+});
+
+test("a cycle is detected when it is reached again, not by running out of stack", () => {
+  let reads = 0;
+  const cycle = new Proxy<Json>(
+    {},
+    {
+      ownKeys(inner) {
+        reads += 1;
+        return Reflect.ownKeys(inner);
+      },
+    },
+  );
+  cycle.self = cycle;
+  const cyclic = record("repo.read", {
+    change: (input) => {
+      input.grant.extra = cycle;
+    },
+  });
+  reads = 0;
+  assertDenied(() => isGrantActive(cyclic, NOW), "isGrantActive");
+  assert.equal(reads, 1, "isGrantActive reads");
+  reads = 0;
+  assertDenied(() => hasGrant([cyclic], request("repo.read"), NOW), "hasGrant");
+  assert.equal(reads, 1, "hasGrant reads");
+});
+
+test("the checks keep no state between calls", () => {
+  const input = recordInput("repo.read");
+  const value = input as unknown as GrantRecord;
+  Object.defineProperty(input.grant, "extra", {
+    enumerable: true,
+    configurable: true,
+    get: () => "unknown",
+  });
+  assert.equal(isGrantActive(value, NOW), false);
+  assert.equal(hasGrant([value], request("repo.read"), NOW), false);
+  Object.defineProperty(input.grant, "extra", {
+    value: "unknown",
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
+  assert.equal(isGrantActive(value, NOW), true);
+  assert.equal(hasGrant([value], request("repo.read"), NOW), true);
+});
+
+test("the length of the list is read once from its own data", () => {
+  let lengthReads = 0;
+  const counted = new Proxy([record("repo.read")], {
+    get(target, key, receiver) {
+      if (key === "length") {
+        lengthReads += 1;
+      }
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  assert.equal(hasGrant(counted, request("repo.read"), NOW), true);
+  assert.equal(lengthReads, 0);
+
+  const lengths: [label: string, value: unknown][] = [
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["2 ** 32", 2 ** 32],
+    ["-1", -1],
+    ["1.5", 1.5],
+    ["a string", "1"],
+  ];
+  assert.equal(lengths.length, 5);
+  for (const [label, value] of lengths) {
+    // The descriptor of the length reports `value`, while reads of it report 1.
+    const lyingList = new Proxy([record("repo.read")], {
+      getOwnPropertyDescriptor(target, key) {
+        const descriptor = Reflect.getOwnPropertyDescriptor(target, key);
+        return key === "length" && descriptor !== undefined
+          ? { ...descriptor, value }
+          : descriptor;
+      },
+    });
+    assertDenied(
+      () => hasGrant(lyingList, request("repo.read"), NOW),
+      `length: ${label}`,
+    );
+  }
+});
+
+test("an accessor stays malformed when Object.prototype.value is polluted", () => {
+  const active = record("repo.read");
+  const revoked = record("repo.read", { change: revoke });
+  const wanted = request("repo.read");
+  // Built before the pollution, because defining an accessor reads `value`
+  // through the prototype of its descriptor.
+  const accessorList = Object.defineProperty([] as GrantRecord[], 0, {
+    enumerable: true,
+    configurable: true,
+    get: () => revoked,
+  });
+  const accessorInput = recordInput("repo.read", { change: revoke });
+  const revokedGrant = accessorInput.grant;
+  Object.defineProperty(accessorInput, "grant", {
+    enumerable: true,
+    configurable: true,
+    get: () => revokedGrant,
+  });
+  const accessorRecord = accessorInput as unknown as GrantRecord;
+  const checks: [label: string, check: () => boolean][] = [
+    [
+      "a list whose element is an accessor",
+      () => hasGrant(accessorList, wanted, NOW),
+    ],
+    [
+      "hasGrant on a record whose grant is an accessor",
+      () => hasGrant([accessorRecord], wanted, NOW),
+    ],
+    [
+      "isGrantActive on a record whose grant is an accessor",
+      () => isGrantActive(accessorRecord, NOW),
+    ],
+  ];
+  const pollutions: [label: string, value: unknown][] = [
+    ["an active record", active],
+    ["an active grant", (active as unknown as RecordInput).grant],
+  ];
+  assert.equal(checks.length, 3);
+  assert.equal(pollutions.length, 2);
+  // Controls without pollution; they also create the schemas' internal state
+  // before the pollution.
+  assert.equal(hasGrant([active], wanted, NOW), true);
+  for (const [label, check] of checks) {
+    assert.equal(check(), false, `without pollution: ${label}`);
+  }
+
+  for (const [pollution, value] of pollutions) {
+    const results: boolean[] = [];
+    try {
+      Object.defineProperty(Object.prototype, "value", {
+        value,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+      for (const [, check] of checks) {
+        results.push(check());
+      }
+    } finally {
+      delete (Object.prototype as Json).value;
+    }
+    assert.equal(results.length, checks.length, pollution);
+    for (const [index, [label]] of checks.entries()) {
+      assert.equal(results[index], false, `${pollution}: ${label}`);
     }
   }
 });

@@ -12,32 +12,58 @@ import {
 /** Marks input that is not plain data. */
 const NOT_PLAIN_DATA: unique symbol = Symbol("not plain data");
 
+/** The largest length of a JavaScript array. */
+const MAX_ARRAY_LENGTH = 2 ** 32 - 1;
+
 /**
  * A copy of `value` that holds only its own enumerable data properties, each
  * read once, in objects without a prototype. Parsing this copy means that a
  * missing field is never filled from a prototype, and that the value that is
- * validated is the value that is compared. An accessor anywhere in `value`
- * makes the whole value not plain data. Primitives and arrays are returned as
- * they are: the schemas accept no array, so an array is rejected where a
- * field is expected and stripped where it is unknown. A cycle exhausts the
- * stack, which the callers catch.
+ * validated is the value that is compared. An accessor, or a cycle through
+ * objects, makes the whole value not plain data. An object that is referenced
+ * more than once in `value` is copied once, so the copy grows with the number
+ * of objects, not with the number of paths. Primitives and arrays are returned
+ * as they are and arrays are not traversed: the schemas accept no array, so
+ * an array is rejected where a field is expected and stripped where it is
+ * unknown.
  */
 function plainData(value: unknown): unknown {
+  return copyPlainData(value, new Map(), new Set());
+}
+
+/**
+ * `copies` holds the objects that are already copied, and `open` the objects
+ * whose copy is not finished, so that reaching one of them again is a cycle.
+ */
+function copyPlainData(
+  value: unknown,
+  copies: Map<object, unknown>,
+  open: Set<object>,
+): unknown {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return value;
   }
+  if (open.has(value)) {
+    return NOT_PLAIN_DATA;
+  }
+  if (copies.has(value)) {
+    return copies.get(value);
+  }
+  open.add(value);
   const copy: Record<string, unknown> = Object.create(null);
   for (const key of Object.keys(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !("value" in descriptor)) {
+    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
       return NOT_PLAIN_DATA;
     }
-    const child = plainData(descriptor.value);
+    const child = copyPlainData(descriptor.value, copies, open);
     if (child === NOT_PLAIN_DATA) {
       return NOT_PLAIN_DATA;
     }
     copy[key] = child;
   }
+  open.delete(value);
+  copies.set(value, copy);
   return copy;
 }
 
@@ -54,6 +80,24 @@ function validNow(now: unknown): number | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * The length of the list, read once from its own data property, or null
+ * unless it is a valid array length.
+ */
+function listLength(list: readonly unknown[]): number | null {
+  const descriptor = Object.getOwnPropertyDescriptor(list, "length");
+  if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+    return null;
+  }
+  const length: unknown = descriptor.value;
+  return typeof length === "number" &&
+    Number.isSafeInteger(length) &&
+    length >= 0 &&
+    length <= MAX_ARRAY_LENGTH
+    ? length
+    : null;
 }
 
 /**
@@ -130,8 +174,9 @@ function sameScope(
  * other code combines these columns.
  *
  * Use it for display and listing; authorize with `hasGrant`. It never throws.
- * Malformed data, data that is not plain (an accessor or a field inherited
- * from a prototype), and an invalid `now` are inactive.
+ * Malformed data, data that is not plain (an accessor, a cycle through
+ * objects, or a field inherited from a prototype), and an invalid `now` are
+ * inactive.
  */
 export function isGrantActive(record: GrantRecord, now: Date): boolean {
   const nowMs = validNow(now);
@@ -150,9 +195,13 @@ export function isGrantActive(record: GrantRecord, now: Date): boolean {
  * any other capability: there is no wildcard, hierarchy or implication.
  *
  * The records come from one consistent read (ADR 0015, P-76). It never throws
- * and never mutates its inputs. A malformed request, an invalid `now` or a
- * list that is not an array is denied, and a malformed record is skipped. The
- * request and the records are read as plain data, and the decision uses the
+ * and never mutates its inputs. A malformed request, an invalid `now`, a list
+ * that is not an array, and a list whose length or elements cannot be read
+ * are denied. A malformed record is skipped: it never grants, and it does not
+ * stop another record from granting. The request and the records are read as
+ * plain data. The list's length is read once from its own data, and each
+ * element once through its own descriptor, so a hole or an accessor in the
+ * list is skipped and never read through a prototype. The decision uses the
  * validated copies.
  */
 export function hasGrant(
@@ -165,13 +214,21 @@ export function hasGrant(
     if (nowMs === null || !Array.isArray(records)) {
       return false;
     }
+    const length = listLength(records);
+    if (length === null) {
+      return false;
+    }
     const parsedRequest = PermissionRequestSchema.safeParse(plainData(request));
     if (!parsedRequest.success) {
       return false;
     }
     const wanted = parsedRequest.data;
-    for (let index = 0; index < records.length; index += 1) {
-      const parsed = parseRecord(records[index]);
+    for (let index = 0; index < length; index += 1) {
+      const element = Object.getOwnPropertyDescriptor(records, index);
+      if (element === undefined || !Object.hasOwn(element, "value")) {
+        continue;
+      }
+      const parsed = parseRecord(element.value);
       if (
         parsed !== null &&
         parsed.grant.granteeAgentId === wanted.agentId &&

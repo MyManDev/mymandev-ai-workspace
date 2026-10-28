@@ -245,7 +245,7 @@ test("a grant with the other kind's scope or with no scope is rejected", () => {
   );
 });
 
-test("a grant that names both scopes keeps only the scope of its capability", () => {
+test("a grant or a request that names both scopes keeps only the scope of its capability", () => {
   const cases: [label: string, value: Json][] = CAPABILITIES.map(
     (capability) => [
       capability,
@@ -261,6 +261,23 @@ test("a grant that names both scopes keeps only the scope of its capability", ()
     const result = PermissionGrantSchema.safeParse(value);
     assert.ok(result.success, label);
     assert.deepEqual(result.data, grant(capability), label);
+    assert.equal(
+      Object.hasOwn(result.data, otherScopeKey(capability)),
+      false,
+      label,
+    );
+  }
+
+  for (const capability of CAPABILITIES) {
+    const label = `${capability} request`;
+    const result = PermissionRequestSchema.safeParse({
+      ...request(capability),
+      repositoryId: REPOSITORY_ID,
+      providerConnectionId: PROVIDER_CONNECTION_ID,
+      extra: "unknown",
+    });
+    assert.ok(result.success, label);
+    assert.deepEqual(result.data, request(capability), label);
     assert.equal(
       Object.hasOwn(result.data, otherScopeKey(capability)),
       false,
@@ -623,7 +640,7 @@ test("unknown, __proto__ and constructor keys are stripped, and the input is not
   assert.equal((Object.prototype as Json)["polluted"], undefined);
 });
 
-test("the JSON Schema export in input mode does not contain additionalProperties false", () => {
+test("the JSON Schema export in input mode allows unknown keys and requires the lifecycle timestamps", () => {
   const schemas: [label: string, schema: z.ZodType][] = [
     ["PermissionGrantSchema", PermissionGrantSchema],
     ["GrantRecordSchema", GrantRecordSchema],
@@ -642,6 +659,19 @@ test("the JSON Schema export in input mode does not contain additionalProperties
       label,
     );
     assert.doesNotThrow(() => z.toJSONSchema(schema), `${label} output mode`);
+  }
+
+  // Lifecycle timestamps can be null, but they are never optional.
+  const grantSchema = z.toJSONSchema(PermissionGrantSchema, {
+    target: "draft-2020-12",
+    io: "input",
+  });
+  const options = (grantSchema.oneOf ?? []) as { required?: string[] }[];
+  assert.equal(options.length, 2);
+  for (const option of options) {
+    for (const key of ["expiresAt", "revokedAt", "revokedByUserId"]) {
+      assert.equal(option.required?.includes(key), true, key);
+    }
   }
 });
 
