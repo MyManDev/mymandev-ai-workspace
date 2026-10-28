@@ -1,6 +1,7 @@
 // Protocol v0 vocabulary: plain constants and functions without a zod import,
 // so that other packages (for example the database CHECK constraints) can use
-// them directly.
+// them directly. The array and object constants are frozen, so that no code
+// can change a vocabulary at runtime and widen a schema built from it later.
 
 /**
  * The protocol version of this package. Version 0 is pre-stable: peers must
@@ -13,47 +14,52 @@ export const PROTOCOL_VERSION = 0;
  * hierarchy and no implication between capabilities. This package defines
  * the names only; every grant check lives in the permissions package (M1-06).
  */
-export const CAPABILITIES = [
+export const CAPABILITIES = Object.freeze([
   "repo.read",
   "repo.write",
   "terminal.execute",
   "git.commit",
   "git.push",
   "provider.use",
-] as const;
+] as const);
 export type Capability = (typeof CAPABILITIES)[number];
 
 /** The six agent run states. */
-export const RUN_STATES = [
+export const RUN_STATES = Object.freeze([
   "queued",
   "running",
   "awaiting_input",
   "completed",
   "failed",
   "cancelled",
-] as const;
+] as const);
 export type RunState = (typeof RUN_STATES)[number];
 
 /** The state of a newly created run. Only the server creates runs. */
 export const INITIAL_RUN_STATE = "queued" satisfies RunState;
 
 /** States without an outgoing transition. A retry is a new run. */
-export const TERMINAL_RUN_STATES = [
+export const TERMINAL_RUN_STATES = Object.freeze([
   "completed",
   "failed",
   "cancelled",
-] as const satisfies readonly RunState[];
+] as const satisfies readonly RunState[]);
 export type TerminalRunState = (typeof TERMINAL_RUN_STATES)[number];
 
 /** Allowed next states for every run state. */
-export const RUN_TRANSITIONS = {
-  queued: ["running", "failed", "cancelled"],
-  running: ["awaiting_input", "completed", "failed", "cancelled"],
-  awaiting_input: ["running", "failed", "cancelled"],
-  completed: [],
-  failed: [],
-  cancelled: [],
-} as const satisfies Record<RunState, readonly RunState[]>;
+export const RUN_TRANSITIONS = Object.freeze({
+  queued: Object.freeze(["running", "failed", "cancelled"] as const),
+  running: Object.freeze([
+    "awaiting_input",
+    "completed",
+    "failed",
+    "cancelled",
+  ] as const),
+  awaiting_input: Object.freeze(["running", "failed", "cancelled"] as const),
+  completed: Object.freeze([] as const),
+  failed: Object.freeze([] as const),
+  cancelled: Object.freeze([] as const),
+} satisfies Record<RunState, readonly RunState[]>);
 
 /** Whether a run may move from `from` to `to`. `from` is null when the run is created. */
 export function canTransition(from: RunState | null, to: RunState): boolean {
@@ -71,7 +77,11 @@ export function isTerminalRunState(state: RunState): state is TerminalRunState {
 }
 
 /** Operating systems of a desktop device. */
-export const DEVICE_PLATFORMS = ["windows", "macos", "linux"] as const;
+export const DEVICE_PLATFORMS = Object.freeze([
+  "windows",
+  "macos",
+  "linux",
+] as const);
 export type DevicePlatform = (typeof DEVICE_PLATFORMS)[number];
 
 /** A UUIDv7 in canonical lowercase form. Uppercase is rejected on purpose. */
@@ -100,7 +110,7 @@ export const SAFE_TEXT_PATTERN =
 export const NOT_BLANK_PATTERN = /\S/u;
 
 /** Maximum lengths, in UTF-16 code units, of strings on the wire. */
-export const LIMITS = {
+export const LIMITS = Object.freeze({
   /** User display name. */
   displayName: 64,
   /** Device label. */
@@ -113,4 +123,4 @@ export const LIMITS = {
   runReason: 500,
   /** Event type name. */
   eventType: 100,
-} as const;
+} as const);

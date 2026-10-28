@@ -1,0 +1,88 @@
+# Dependency update pull requests. See "Dependency updates" in
+# docs/development/WORKSPACE.md for the rules behind these settings.
+version: 2
+
+updates:
+  # The root package.json, every workspace, and the single root lockfile.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    # Keep exact versions: replace the pinned version with the new one.
+    versioning-strategy: increase
+    # Adopt a release only when it is at least 14 days old. Security updates
+    # do not wait; the cooldown applies to version updates only.
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: chore
+      include: scope
+    ignore:
+      # Workspaces are private and never come from the registry. Ignoring them
+      # also prevents a public package with the same name from being proposed.
+      - dependency-name: "@mymandev/*"
+      # @types/node follows the Node.js major version in .nvmrc and engines.
+      - dependency-name: "@types/node"
+        update-types:
+          - version-update:semver-major
+      # typescript-eslint supports TypeScript below 6.1 only (its peer range).
+      # Remove this rule when a typescript-eslint release supports newer versions.
+      - dependency-name: typescript
+        versions:
+          - ">= 6.1.0"
+    # Minor and patch updates that belong together arrive in one pull request.
+    # Major updates arrive one per pull request.
+    groups:
+      tooling:
+        patterns:
+          - "@eslint/js"
+          - eslint
+          - eslint-config-prettier
+          - prettier
+          - typescript
+          - typescript-eslint
+        update-types:
+          - minor
+          - patch
+      types:
+        patterns:
+          - "@types/*"
+        update-types:
+          - minor
+          - patch
+      fastify:
+        patterns:
+          - fastify
+          - "@fastify/*"
+        update-types:
+          - minor
+          - patch
+      drizzle:
+        patterns:
+          - drizzle-orm
+          - drizzle-kit
+        update-types:
+          - minor
+          - patch
+      # protocol, api, and permissions declare the same exact zod version (ADR 0003).
+      zod:
+        patterns:
+          - zod
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 14
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"

@@ -1,10 +1,13 @@
 import { v7 as uuidv7 } from "uuid";
 import * as z from "zod";
 import { UUIDV7_PATTERN } from "./model.ts";
+import { privatePattern } from "./private-pattern.ts";
+
+const uuidV7Pattern = privatePattern(UUIDV7_PATTERN);
 
 // z.uuidv7() is case-insensitive, so IDs use the strict lowercase pattern.
 function uuidV7String() {
-  return z.string().regex(UUIDV7_PATTERN, "Expected a lowercase UUIDv7");
+  return z.string().regex(uuidV7Pattern, "Expected a lowercase UUIDv7");
 }
 
 export const UserIdSchema = uuidV7String().brand<"UserId">();
@@ -34,6 +37,20 @@ export type EventId = z.infer<typeof EventIdSchema>;
 export const CorrelationIdSchema = uuidV7String().brand<"CorrelationId">();
 export type CorrelationId = z.infer<typeof CorrelationIdSchema>;
 
+/** One permission grant. The server generates it (ADR 0004). */
+export const PermissionGrantIdSchema =
+  uuidV7String().brand<"PermissionGrantId">();
+export type PermissionGrantId = z.infer<typeof PermissionGrantIdSchema>;
+
+/**
+ * One provider connection registered by a host device. It names connection
+ * metadata only, never a credential. The server generates it. The connection
+ * entity is added by a later task (ADR 0015).
+ */
+export const ProviderConnectionIdSchema =
+  uuidV7String().brand<"ProviderConnectionId">();
+export type ProviderConnectionId = z.infer<typeof ProviderConnectionIdSchema>;
+
 /** Every branded ID kind. */
 export type AnyId =
   | UserId
@@ -44,7 +61,9 @@ export type AnyId =
   | AgentId
   | RunId
   | EventId
-  | CorrelationId;
+  | CorrelationId
+  | PermissionGrantId
+  | ProviderConnectionId;
 
 /**
  * Generates a new lowercase UUIDv7 string, for IDs that have no branded kind

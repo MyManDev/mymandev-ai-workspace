@@ -46,7 +46,8 @@ import {
 } from "./schema/index.ts";
 import { createTestDatabase } from "./testing.ts";
 
-// One PGlite instance for this file; the role test creates its own.
+// One test database for this file: PGlite, or a database on the server in
+// DATABASE_TEST_URL. The role test always creates its own PGlite instance.
 let testDatabase: Awaited<ReturnType<typeof createTestDatabase>> | undefined;
 
 function database(): Database {
