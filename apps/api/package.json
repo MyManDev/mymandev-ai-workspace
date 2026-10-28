@@ -2,6 +2,7 @@
   "name": "@mymandev/api",
   "version": "0.0.0",
   "private": true,
+  "license": "AGPL-3.0-only",
   "type": "module",
   "scripts": {
     "dev": "node --watch --env-file-if-exists=.env src/server.ts",

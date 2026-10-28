@@ -24,3 +24,11 @@ See [docs/development/WORKSPACE.md](docs/development/WORKSPACE.md) for setup det
 ## Team
 
 MyManDev.
+
+## License
+
+MyManDev AI Workspace is licensed under the GNU Affero General Public License, version 3 only (`AGPL-3.0-only`). See [LICENSE](LICENSE) for the terms.
+
+In short: you may use, change, and share the code. If you distribute a changed version, or let people use a changed version over a network, you must offer them its source code under the same license.
+
+Contributions will require a contributor license agreement. The details are added to the contribution guide before outside contributions are accepted.
