@@ -12,3 +12,6 @@
 /.github/ISSUE_TEMPLATE/task.yml
 /.github/pull_request_template.md
 /.github/workflows/identity-guard.yml
+
+# drizzle-kit writes these files; keep the format it produces.
+/packages/database/migrations/meta/

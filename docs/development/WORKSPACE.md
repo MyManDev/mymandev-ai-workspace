@@ -48,6 +48,8 @@ npm runs scripts with `cmd.exe` on Windows and `sh` on other systems. Keep root 
 
 `.github/workflows/check.yml` runs `npm ci` and `npm run check` on Linux, Windows, and macOS for every pull request and push to `develop` and `main`. It installs the latest Node.js release that matches `.nvmrc` and does not use a dependency cache. A pull request is ready for review only when all three jobs pass.
 
+`.github/workflows/database.yml` runs when a pull request or a push changes `packages/database`, `packages/protocol`, or the lockfile. It applies the migrations to a PostgreSQL 18 service container on Linux and compares the schema with PGlite; see [packages/database/README.md](../../packages/database/README.md). It also runs for pull requests whose base is another task branch.
+
 ## Editor setup
 
 Editors that support EditorConfig follow the basic rules in `.editorconfig`.
@@ -258,7 +260,7 @@ The desktop application shell (issue #3) builds on this baseline. This section i
 
 ## Planned workspaces
 
-This list records the expected direction and is not binding. Only `packages/protocol` exists so far. Each other one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
+This list records the expected direction and is not binding. `packages/protocol`, `apps/api`, and `packages/database` exist so far. Each other one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
 
 - `apps/desktop`
 - `apps/api`

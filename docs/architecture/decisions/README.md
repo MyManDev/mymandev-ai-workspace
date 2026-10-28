@@ -18,10 +18,13 @@ A record starts with Status: Proposed. The Project Manager accepts it; the statu
 | [0008](0008-capability-vocabulary-v0.md)                   | Capability vocabulary v0                             | Accepted |
 | [0009](0009-fastify-cloud-api.md)                          | Fastify 5 for the cloud API, with hardened defaults  | Accepted |
 | [0010](0010-api-configuration-and-runtime.md)              | API configuration, runtime and shutdown              | Accepted |
+| [0011](0011-drizzle-sql-migrations.md)                     | Drizzle ORM with generated SQL migrations            | Accepted |
+| [0012](0012-pglite-database-tests.md)                      | Database tests run on in-process PGlite              | Accepted |
+| [0013](0013-m1-data-model.md)                              | M1 data model conventions and the M1-03 tables       | Accepted |
 
 ## Numbering
 
-Records are numbered in sequence and never renumbered. Numbers 0009 to 0013 are reserved for the remaining M1 decisions (the cloud API skeleton and the PostgreSQL baseline). Any other record takes the next free number when it is merged. New records are appended to the index; existing lines are not reordered.
+Records are numbered in sequence and never renumbered. A new record takes the next free number when it is merged. New records are appended to the index; existing lines are not reordered.
 
 ## Writing a record
 

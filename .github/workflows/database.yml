@@ -1,0 +1,135 @@
+name: Database
+
+# Applies the migrations to a real PostgreSQL 18 server with the roles from
+# packages/database/README.md, compares the schema with PGlite, where the
+# tests run, and checks the privileges of the application role.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/database.yml
+      - package-lock.json
+      - packages/database/**
+      - packages/protocol/**
+  push:
+    branches:
+      - develop
+      - main
+    paths:
+      - .github/workflows/database.yml
+      - package-lock.json
+      - packages/database/**
+      - packages/protocol/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  postgres:
+    name: migrations on PostgreSQL 18
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          # Throwaway credentials of a service container that exists only during this job.
+          POSTGRES_PASSWORD: ci-superuser
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGUSER: postgres
+      PGPASSWORD: ci-superuser
+      DATABASE_MIGRATION_URL: postgres://mymandev_migrator:ci-migrator@127.0.0.1:5432/mymandev?sslmode=disable
+      APP_URL: postgres://mymandev_app:ci-app@127.0.0.1:5432/mymandev?sslmode=disable
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          check-latest: true
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create the roles and the database
+        # The script from packages/database/README.md, with throwaway passwords.
+        run: |
+          psql -v ON_ERROR_STOP=1 -d postgres -c "select version()"
+          psql -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+          CREATE ROLE mymandev_migrator LOGIN PASSWORD 'ci-migrator';
+          CREATE ROLE mymandev_app LOGIN PASSWORD 'ci-app';
+          CREATE DATABASE mymandev OWNER mymandev_migrator;
+          REVOKE ALL ON DATABASE mymandev FROM PUBLIC;
+          GRANT CONNECT ON DATABASE mymandev TO mymandev_app;
+          \c mymandev
+          REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+          ALTER DEFAULT PRIVILEGES FOR ROLE mymandev_migrator IN SCHEMA public
+            GRANT SELECT, INSERT, UPDATE ON TABLES TO mymandev_app;
+          SQL
+
+      - name: Apply the migrations twice
+        run: |
+          npm run db:migrate -w @mymandev/database
+          npm run db:migrate -w @mymandev/database
+
+      - name: Compare the schema with PGlite
+        run: npm run db:compare -w @mymandev/database
+
+      - name: Check the tables and their owner
+        run: |
+          psql -v ON_ERROR_STOP=1 -d mymandev <<'SQL'
+          DO $$
+          DECLARE
+            other_owners integer;
+          BEGIN
+            SELECT count(*) INTO other_owners FROM pg_tables
+            WHERE schemaname IN ('public', 'drizzle') AND tableowner <> 'mymandev_migrator';
+            IF other_owners > 0 THEN
+              RAISE EXCEPTION '% tables are not owned by mymandev_migrator', other_owners;
+            END IF;
+          END
+          $$;
+          SQL
+
+      - name: Check the privileges of the application role
+        run: |
+          psql -v ON_ERROR_STOP=1 "$APP_URL" <<'SQL'
+          INSERT INTO users (id, display_name) VALUES ('019a2b3c-4d5e-7f00-8a00-000000000001', 'App');
+          UPDATE users SET display_name = 'App user' WHERE id = '019a2b3c-4d5e-7f00-8a00-000000000001';
+          SQL
+          for statement in \
+            "DELETE FROM users" \
+            "TRUNCATE users" \
+            "CREATE TABLE app_owned (id integer)" \
+            "CREATE TEMPORARY TABLE app_temporary (id integer)" \
+            "DROP TABLE users" \
+            "SELECT * FROM drizzle.__drizzle_migrations"
+          do
+            if psql -v ON_ERROR_STOP=1 "$APP_URL" -c "$statement" 2> error.txt; then
+              echo "::error::The application role was allowed to run: $statement"
+              exit 1
+            fi
+            if ! grep -Eq "permission denied|must be owner" error.txt; then
+              cat error.txt
+              exit 1
+            fi
+            echo "rejected as expected: $statement"
+          done
