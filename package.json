@@ -1,6 +1,7 @@
 {
   "name": "mymandev-ai-workspace",
   "private": true,
+  "license": "AGPL-3.0-only",
   "packageManager": "npm@11.12.1",
   "engines": {
     "node": "^24.15.0",
