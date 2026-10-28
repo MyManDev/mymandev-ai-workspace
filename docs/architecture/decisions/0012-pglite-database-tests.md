@@ -30,6 +30,7 @@ Tests must run on every developer machine and in CI on Windows, macOS, and Linux
 - Constraint errors carry the SQLSTATE on the cause of the Drizzle error: `23505` unique, `23514` check, `23503` missing parent on insert, `23001` restrict on delete.
 - On Windows, the `pglite-server` node process can keep listening after the shell that started it has ended. Stop it with Ctrl+C before closing the terminal, and check that the port is free, for example with `netstat -ano | findstr 54329`, which then prints nothing.
 - `pglite-server` ignores the pg session parameters `statement_timeout` and `idle_in_transaction_session_timeout`.
+- Update of 2026-10-28 (#59): PGlite stays the default for local runs. With `DATABASE_TEST_URL` set, `createTestDatabase()` creates a database on that server instead, and the Database workflow runs the same tests on PostgreSQL 18 that way. Server-only behavior, such as the session timeouts, is tested there.
 
 ## Dependency policy
 
