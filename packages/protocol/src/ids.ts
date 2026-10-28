@@ -1,10 +1,13 @@
 import { v7 as uuidv7 } from "uuid";
 import * as z from "zod";
 import { UUIDV7_PATTERN } from "./model.ts";
+import { privatePattern } from "./private-pattern.ts";
+
+const uuidV7Pattern = privatePattern(UUIDV7_PATTERN);
 
 // z.uuidv7() is case-insensitive, so IDs use the strict lowercase pattern.
 function uuidV7String() {
-  return z.string().regex(UUIDV7_PATTERN, "Expected a lowercase UUIDv7");
+  return z.string().regex(uuidV7Pattern, "Expected a lowercase UUIDv7");
 }
 
 export const UserIdSchema = uuidV7String().brand<"UserId">();

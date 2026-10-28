@@ -3,7 +3,9 @@ import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import * as z from "zod";
 import { decodeClientEvent, decodeEvent } from "./decode.ts";
-import { ProtocolEventSchema } from "./envelope.ts";
+import { displayText } from "./entities.ts";
+import { envelopeHeaderShape, ProtocolEventSchema } from "./envelope.ts";
+import { UserIdSchema } from "./ids.ts";
 import {
   EVENT_TYPE_PATTERN,
   NOT_BLANK_PATTERN,
@@ -357,6 +359,54 @@ test("the JSON Schema export works, every exported pattern compiles with the u f
   assert.equal(withCodeGeneration.ok, true);
   assert.ok(withCodeGeneration.calls > 0, "zod generated no code");
   assert.deepEqual(codeGenerations(true), { ok: true, calls: 0 });
+});
+
+test("changing an exported pattern or the header shape does not change any schema", () => {
+  const nul = String.fromCharCode(0);
+  const cases: [label: string, pattern: RegExp, result: () => unknown][] = [
+    [
+      "UUIDV7_PATTERN",
+      UUIDV7_PATTERN,
+      () => UserIdSchema.safeParse("not-a-uuid").success,
+    ],
+    [
+      "EVENT_TYPE_PATTERN",
+      EVENT_TYPE_PATTERN,
+      () => decodeEvent(withHeader({ type: "Not A Type" })),
+    ],
+    // displayText creates its schema when it is called, here after the change.
+    [
+      "SAFE_TEXT_PATTERN",
+      SAFE_TEXT_PATTERN,
+      () => displayText(100).safeParse(`a${nul}b`).success,
+    ],
+    [
+      "NOT_BLANK_PATTERN",
+      NOT_BLANK_PATTERN,
+      () => displayText(100).safeParse("   ").success,
+    ],
+  ];
+  assert.equal(cases.length, 4);
+  for (const [label, pattern, result] of cases) {
+    const { source, flags } = pattern;
+    const before = result();
+    let after: unknown;
+    try {
+      // The legacy compile replaces the pattern of the exported object.
+      pattern.compile("[^]*", "u");
+      assert.equal(pattern.source, "[^]*", `${label} was replaced`);
+      after = result();
+    } finally {
+      pattern.compile(source, flags);
+    }
+    assert.equal(pattern.source, source, `${label} restored`);
+    assert.deepEqual(after, before, label);
+  }
+
+  assert.equal(Object.isFrozen(envelopeHeaderShape), true);
+  assert.throws(() => {
+    (envelopeHeaderShape as Record<string, unknown>).id = z.string();
+  }, TypeError);
 });
 
 test("the actor must fit the event type", () => {
