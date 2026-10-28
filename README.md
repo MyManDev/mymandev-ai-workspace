@@ -31,4 +31,4 @@ MyManDev AI Workspace is licensed under the GNU Affero General Public License, v
 
 In short: you may use, change, and share the code. If you distribute a changed version, or let people use a changed version over a network, you must offer them its source code under the same license.
 
-Contributions will require a contributor license agreement. The details are added to the contribution guide before outside contributions are accepted.
+Contributions require the [contributor license agreement](CLA.md). It lets the project offer the code under other licenses as well, including commercial and proprietary licenses, while each contribution also stays licensed to the public under `AGPL-3.0-only`, or under another open source license if the project uses one when the contribution is submitted. See [CONTRIBUTING.md](CONTRIBUTING.md#contributor-license-agreement) for why it exists and how to sign it.
