@@ -17,6 +17,10 @@ import {
   RUN_STATES,
   SAFE_TEXT_PATTERN,
 } from "./model.ts";
+import { privatePattern } from "./private-pattern.ts";
+
+const safeTextPattern = privatePattern(SAFE_TEXT_PATTERN);
+const notBlankPattern = privatePattern(NOT_BLANK_PATTERN);
 
 /**
  * Human-entered text that other devices render, from 1 to `maxLength`
@@ -29,11 +33,8 @@ export function displayText(maxLength: number) {
     .string()
     .min(1)
     .max(maxLength, { abort: true })
-    .regex(
-      SAFE_TEXT_PATTERN,
-      "Contains control, format or invisible characters",
-    )
-    .regex(NOT_BLANK_PATTERN, "Must not be blank");
+    .regex(safeTextPattern, "Contains control, format or invisible characters")
+    .regex(notBlankPattern, "Must not be blank");
 }
 
 /** One capability name, matched exactly. An unknown name rejects the message. */
