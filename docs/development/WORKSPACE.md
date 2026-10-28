@@ -226,7 +226,7 @@ The root `test` script runs the `test` script of every workspace, and `npm run c
 {
   "scripts": {
     "test": "npm run test --workspaces --if-present",
-    "check": "npm run format:check && npm run lint && npm run typecheck && npm test"
+    "check": "npm run format:check && npm run text:check && npm run lint && npm run typecheck && npm test"
   }
 }
 ```

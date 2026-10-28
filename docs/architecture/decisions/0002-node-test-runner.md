@@ -26,6 +26,7 @@ No test runner exists. The three M1 workspaces run on Node.js. The desktop may l
 - `node --test` exits with 0 when its pattern matches no file. Every acceptance check therefore states the expected number of tests, and the reviewer compares it with the `tests` count in the output.
 - Coverage (`--experimental-test-coverage`) is optional and not a gate.
 - The root `check` script also runs the tests, so the CI workflow proposed in PR #46 runs them on all three operating systems for every pull request that the workflow covers: `"check": "npm run format:check && npm run lint && npm run typecheck && npm test"`.
+- Update of 2026-10-28 (#63, #71): the root `check` script also runs the check for invisible characters, and the tests still run last: `"check": "npm run format:check && npm run text:check && npm run lint && npm run typecheck && npm test"`.
 
 ## Consequences
 
