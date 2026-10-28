@@ -7,13 +7,19 @@ import {
   EventIdSchema,
   newId,
   newUuidV7,
+  PermissionGrantIdSchema,
   ProjectIdSchema,
+  ProviderConnectionIdSchema,
   RepositoryIdSchema,
   RunIdSchema,
   UserIdSchema,
   WorkspaceIdSchema,
+  type AgentId,
   type DeviceId,
   type EventId,
+  type PermissionGrantId,
+  type ProviderConnectionId,
+  type RepositoryId,
   type UserId,
 } from "./ids.ts";
 import { UUIDV7_PATTERN } from "./model.ts";
@@ -28,6 +34,8 @@ const ID_SCHEMAS = [
   RunIdSchema,
   EventIdSchema,
   CorrelationIdSchema,
+  PermissionGrantIdSchema,
+  ProviderConnectionIdSchema,
 ];
 
 test("generated IDs are lowercase UUIDv7 and sort in creation order", () => {
@@ -75,4 +83,14 @@ test("ID kinds are not interchangeable (checked by tsc)", () => {
   // @ts-expect-error A UserId is not a DeviceId.
   const deviceId: DeviceId = userId;
   assert.equal(deviceId, userId);
+
+  const repositoryId = newId<RepositoryId>();
+  // @ts-expect-error A RepositoryId is not a ProviderConnectionId.
+  const providerConnectionId: ProviderConnectionId = repositoryId;
+  assert.equal(providerConnectionId, repositoryId);
+
+  const agentId = newId<AgentId>();
+  // @ts-expect-error An AgentId is not a PermissionGrantId.
+  const permissionGrantId: PermissionGrantId = agentId;
+  assert.equal(permissionGrantId, agentId);
 });

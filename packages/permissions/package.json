@@ -1,0 +1,22 @@
+{
+  "name": "@mymandev/permissions",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.src.json",
+    "test": "node --test \"src/**/*.test.ts\""
+  },
+  "dependencies": {
+    "@mymandev/protocol": "0.0.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2"
+  }
+}
