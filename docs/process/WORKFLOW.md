@@ -7,24 +7,30 @@ main is the release branch.
 
 Normal development flow:
 
+```text
 origin/develop
   -> task branch/worktree
   -> pull request
   -> develop
   -> release review
   -> main
+```
 
 ## Start a task
 
 Update the main checkout first:
 
+```sh
 git switch develop
 git fetch origin
 git pull --ff-only origin develop
+```
 
 Then create a dedicated worktree:
 
+```sh
 git worktree add -b feature/example-task ../mymandev-ai-workspace-example-task origin/develop
+```
 
 Implementation happens inside the worktree.
 The main checkout stays clean and remains the integration checkout.
@@ -58,8 +64,10 @@ Do not rebase a pushed task branch.
 
 Use:
 
+```sh
 git fetch origin
 git merge origin/develop
+```
 
 ## Task handoff
 
