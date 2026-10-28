@@ -196,8 +196,11 @@ Finished when two physical devices can:
 
 Add provider adapters only after permission enforcement exists.
 
+Permission enforcement is a separate item that lands before the Claude adapter and the Codex adapter. It is one enforcement point in the local runtime, and the context builder, tool execution, and the provider adapters all use it. Cloud-side authorization stays with the cloud API tasks, such as M2-03.
+
 Planned areas:
 
+- permission enforcement
 - Claude adapter
 - Codex adapter
 - provider connection status
