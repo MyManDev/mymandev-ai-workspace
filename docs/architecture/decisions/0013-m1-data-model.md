@@ -1,8 +1,8 @@
 # ADR 0013: M1 data model conventions and the M1-03 tables
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -69,9 +69,17 @@ No dependency beyond [ADR 0011](0011-drizzle-sql-migrations.md) and [ADR 0012](0
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - Include `permission_grants` in M1-03 as provisional and hold the M1-03 merge until the M1-06 grant shape is agreed, or ship M1-03 without it and add the table in a follow-up migration after M1-06 (P-34, recommended: include, and hold the merge). Open in the shape: the provider connection column for `provider.use`, and how an expired grant is replaced.
+  - Include `permission_grants` as provisional, and do not hold the M1-03 merge. No production database exists yet, so if M1-06 needs a different shape, a follow-up migration changes it. This differs from the recommendation, which was to hold the merge.
 - Grantee model: agents only in v0, or a subject type and subject ID pair (P-35, recommended: agents only).
+  - Agents only.
 - Only the agent's owner may grant it a capability in v0, enforced by a composite foreign key (P-44, recommended: yes; M1-06 can relax it later with a migration).
+  - Yes.
 - Message body limit of 16,000 characters, `client_event_id` idempotency, and a per-conversation `seq` (P-36, recommended: accept).
+  - Accepted.
 - PostgreSQL 18 as the production target (P-37, recommended: accept).
+  - Accepted.
 - No `handle` or credentials on `users` until #15 is decided (P-38, recommended: accept).
+  - Accepted. Issue #15 is decided: GitHub sign-in with a credential per device. The columns are added with its implementation.

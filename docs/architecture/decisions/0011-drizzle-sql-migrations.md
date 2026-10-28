@@ -1,8 +1,8 @@
 # ADR 0011: Drizzle ORM with generated SQL migrations
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -70,8 +70,15 @@ Data access lives in `packages/database`. `apps/api` does not use drizzle-orm di
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - Drizzle 0.45 stable with the guardrails, or start on the 1.0 release candidate (P-28, recommended: 0.45).
+  - 0.45 stable with the guardrails.
 - Migrations as a separate deployment step, not on API startup (P-29, recommended: deployment step).
+  - A separate deployment step.
 - Accept the 4 moderate development-only audit findings from drizzle-kit, and the install scripts of its three esbuild copies and of fsevents on macOS (P-30, recommended: accept; never run `npm audit fix --force`; check the install-script inventory in every M1-03 update).
+  - Accepted. `npm audit fix --force` is never run, and the install-script inventory is checked in every update of this package.
 - `updated_at` in the data layer or by a trigger (P-31, recommended: data layer).
+  - Data layer.
 - Two database roles, `DATABASE_MIGRATION_URL` for migrations, `sslmode=verify-full` required in production, and the pool timeouts (P-47, recommended: accept).
+  - Accepted.

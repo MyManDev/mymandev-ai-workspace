@@ -1,8 +1,8 @@
 # ADR 0012: Database tests run on in-process PGlite
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -47,5 +47,9 @@ Tests must run on every developer machine and in CI on Windows, macOS, and Linux
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - Accept PGlite (PostgreSQL 18) as the M1-03 evidence that migrations create the full schema on an empty PostgreSQL database, or require one run against a real PostgreSQL 18 server before merge (P-32, recommended: one real PostgreSQL 18 run before merge if anyone has it; otherwise accept PGlite and add the CI job).
+  - A real PostgreSQL 18 run before merge, in CI: the Database workflow applies the migrations to a PostgreSQL 18 service container with the roles from the package README and compares the schema with PGlite. The tests keep running on PGlite.
 - Add a CI job with a real PostgreSQL 18 service container once CI exists (P-33, recommended: a follow-up after PR #46).
+  - Done in M1-03 with the Database workflow. Running the tests themselves on a real server is a follow-up.
