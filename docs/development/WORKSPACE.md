@@ -28,17 +28,20 @@ npm run check
 
 ## Root scripts
 
-| Script                 | Runs                                                        | Purpose                                                |
-| ---------------------- | ----------------------------------------------------------- | ------------------------------------------------------ |
-| `npm run format`       | `prettier --write .`                                        | Format every file that Prettier supports.              |
-| `npm run format:check` | `prettier --check .`                                        | Fail if any file is not formatted.                     |
-| `npm run lint`         | `eslint .`                                                  | Lint JavaScript and TypeScript files.                  |
-| `npm run lint:fix`     | `eslint . --fix`                                            | Lint and apply automatic fixes.                        |
-| `npm run typecheck`    | `tsc -p tsconfig.json`, then `typecheck` in every workspace | Type-check the root tooling files and every workspace. |
-| `npm test`             | `test` in every workspace                                   | Run the tests of every workspace.                      |
-| `npm run check`        | `format:check`, `lint`, `typecheck`, `test`                 | Run all four in order; stop at the first failure.      |
+| Script                 | Runs                                                        | Purpose                                                                       |
+| ---------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `npm run format`       | `prettier --write .`                                        | Format every file that Prettier supports.                                     |
+| `npm run format:check` | `prettier --check .`                                        | Fail if any file is not formatted.                                            |
+| `npm run text:check`   | `node scripts/check-text.mjs`                               | Fail if a text file contains invisible, bidirectional, or control characters. |
+| `npm run lint`         | `eslint .`                                                  | Lint JavaScript and TypeScript files.                                         |
+| `npm run lint:fix`     | `eslint . --fix`                                            | Lint and apply automatic fixes.                                               |
+| `npm run typecheck`    | `tsc -p tsconfig.json`, then `typecheck` in every workspace | Type-check the root tooling files and every workspace.                        |
+| `npm test`             | `test` in every workspace                                   | Run the tests of every workspace.                                             |
+| `npm run check`        | `format:check`, `text:check`, `lint`, `typecheck`, `test`   | Run all five in order; stop at the first failure.                             |
 
 npm runs scripts with `cmd.exe` on Windows and `sh` on other systems. Keep root scripts portable: chain commands with `&&`, quote arguments with double quotes, and do not use single quotes, `VAR=value` prefixes, `rm`, or `cp`.
+
+`npm run text:check` reads every file that Git tracks or would add, skips binary files, and reports format characters such as bidirectional controls and zero-width characters, control characters other than tab, line feed, and carriage return, the Unicode line and paragraph separators, and invalid UTF-8. These characters can make code look different from what runs, and Prettier, ESLint, and `tsc` do not report them. Write such a character as an escape (for example `\u202e`) in source code and tests. Only the files listed in `scripts/check-text.mjs` may start with a UTF-8 byte order mark. The script is linted, but not type-checked, because the root type check has no Node.js types.
 
 `npm run lint` lints the whole repository, including every workspace. Files inside a workspace that has its own `eslint.config.mjs` are linted with that config. Do not add workspace lint delegation to the root scripts; it would lint workspaces twice.
 
