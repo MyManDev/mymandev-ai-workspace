@@ -6,13 +6,14 @@ No application uses this package yet. The cloud API imports its query functions 
 
 ## Scripts
 
-| Script        | Runs                                                |
-| ------------- | --------------------------------------------------- |
-| `db:generate` | `drizzle-kit generate`                              |
-| `db:check`    | `drizzle-kit check`                                 |
-| `db:migrate`  | `node --env-file-if-exists=.env src/migrate-cli.ts` |
-| `typecheck`   | `tsc -p tsconfig.json`                              |
-| `test`        | `node --test "src/**/*.test.ts"`                    |
+| Script        | Runs                                                       |
+| ------------- | ---------------------------------------------------------- |
+| `db:generate` | `drizzle-kit generate`                                     |
+| `db:check`    | `drizzle-kit check`                                        |
+| `db:migrate`  | `node --env-file-if-exists=.env src/migrate-cli.ts`        |
+| `db:compare`  | `node --env-file-if-exists=.env src/compare-schema-cli.ts` |
+| `typecheck`   | `tsc -p tsconfig.json`                                     |
+| `test`        | `node --test "src/**/*.test.ts"`                           |
 
 Run them from the repository root with `-w @mymandev/database`, or from `packages/database`. The tests need no server: they run on PGlite, PostgreSQL 18 compiled to WebAssembly, inside the test process.
 
@@ -50,7 +51,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE mymandev_migrator IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE ON TABLES TO mymandev_app;
 ```
 
-The same privileges are tested on PGlite (`src/schema.test.ts`), where `ALTER DATABASE ... OWNER TO` replaces `CREATE DATABASE` and the roles have no passwords. This script has not yet been run on a real PostgreSQL 18 server.
+The same privileges are tested on PGlite (`src/schema.test.ts`), where `ALTER DATABASE ... OWNER TO` replaces `CREATE DATABASE` and the roles have no passwords. The Database workflow (`.github/workflows/database.yml`) runs this script on a PostgreSQL 18 server in CI, applies the migrations twice, runs `db:compare`, and checks that the application role is refused everything listed above.
 
 ### Apply the migrations
 
@@ -136,6 +137,8 @@ npm run db:migrate -w @mymandev/database
 `src/testing.ts` provides `createTestDatabase()`: a fresh in-memory PGlite with every migration applied. It is not exported from the package yet; the export is added when another workspace first needs a test database (M2), and that workspace then declares `@electric-sql/pglite` with the identical exact version.
 
 Each test file that needs a database creates one PGlite instance in `before` and closes it in `after`. Starting PGlite and applying the migrations takes a few seconds, and each instance uses a few hundred megabytes of memory. `node --test` runs test files in parallel processes, so keep database tests in few files.
+
+`db:compare` checks that the migrations create the same columns, constraints, indexes, and triggers on a PostgreSQL server as on PGlite. Run it after `db:migrate`; it reads `DATABASE_MIGRATION_URL` and needs the devDependencies. The tests themselves run only on PGlite, so behavior that depends on the server, such as the session timeouts above, is not covered by a test yet.
 
 ## Not included
 
