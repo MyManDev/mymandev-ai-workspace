@@ -46,9 +46,13 @@ npm runs scripts with `cmd.exe` on Windows and `sh` on other systems. Keep root 
 
 ## Continuous integration
 
-`.github/workflows/check.yml` runs `npm ci` and `npm run check` on Linux, Windows, and macOS for every pull request and push to `develop` and `main`. It installs the latest Node.js release that matches `.nvmrc` and does not use a dependency cache. A pull request is ready for review only when all three jobs pass.
+`.github/workflows/check.yml` runs `npm ci` and `npm run check` on Linux, Windows, and macOS for every pull request and for every push to `develop` and `main`. It installs the latest Node.js release that matches `.nvmrc` and does not use a dependency cache. A pull request is ready for review only when all three jobs pass.
 
-`.github/workflows/database.yml` runs when a pull request or a push changes `packages/database`, `packages/protocol`, or the lockfile. It applies the migrations to a PostgreSQL 18 service container on Linux and compares the schema with PGlite; see [packages/database/README.md](../../packages/database/README.md). It also runs for pull requests whose base is another task branch.
+`.github/workflows/database.yml` runs when a pull request or a push changes `packages/database`, `packages/protocol`, or the lockfile. It applies the migrations to a PostgreSQL 18 service container on Linux and compares the schema with PGlite; see [packages/database/README.md](../../packages/database/README.md).
+
+The workflows also run for pull requests whose base is another task branch (stacked pull requests), and so does `.github/workflows/identity-guard.yml`. Changing the base branch of an open pull request does not start them again; push a commit, for example a merge of `origin/develop`, to get checks for the new base.
+
+A ruleset on `develop` requires the three `check` jobs and `identity-guard` to pass before a pull request is merged.
 
 ## Editor setup
 
