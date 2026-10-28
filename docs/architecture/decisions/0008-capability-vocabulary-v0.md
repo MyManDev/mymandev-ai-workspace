@@ -1,8 +1,8 @@
 # ADR 0008: Capability vocabulary v0
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -43,5 +43,9 @@ No new dependency.
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - Capability names live in `@mymandev/protocol`, which exports no capability check; `@mymandev/permissions` imports the names and owns `isGrantActive` and `hasGrant` (P-20). This also needs the desktop owner's agreement, because M1-06 is shared.
+  - Accepted by the Project Manager. The desktop owner's agreement was requested in pull request #48, and the merge did not wait for it.
 - The `provider.use` scope and the risk treatment of `terminal.execute` are settled in M1-06 (P-21).
+  - Settled in M1-06.

@@ -1,8 +1,8 @@
 # ADR 0004: Identifiers are lowercase UUIDv7
 
-- Status: Proposed
+- Status: Accepted (2026-10-28)
 - Date: 2026-10-27
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -47,7 +47,13 @@ IDs cross devices, the API, and PostgreSQL. They must not collide, must sort wel
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-28.
+
 - UUIDv7, lowercase, PostgreSQL `uuid`, branded types (P-07).
+  - Accepted.
 - Whether user IDs are also UUIDv7, which reveals the sign-up time to the millisecond (P-08, recommended: yes).
+  - Yes.
 - The protocol package generates IDs and depends on uuid (P-09, recommended: yes).
+  - Yes.
 - The server generates entity IDs, including run IDs; devices generate only event IDs; de-duplication uses the authenticated device ID; secrets are random bytes stored as hashes, never UUIDs (P-10).
+  - Accepted.
