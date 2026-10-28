@@ -26,6 +26,11 @@ updates:
       - dependency-name: "@types/node"
         update-types:
           - version-update:semver-major
+      # typescript-eslint supports TypeScript below 6.1 only (its peer range).
+      # Remove this rule when a typescript-eslint release supports newer versions.
+      - dependency-name: typescript
+        versions:
+          - ">= 6.1.0"
     # Minor and patch updates that belong together arrive in one pull request.
     # Major updates arrive one per pull request.
     groups:
