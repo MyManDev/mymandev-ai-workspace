@@ -12,12 +12,12 @@
 
 ## Checks
 
-| Check | Result |
-| --- | --- |
-| Relevant tests | |
-| Type check | |
-| Lint | |
-| Build | |
+| Check          | Result |
+| -------------- | ------ |
+| Relevant tests |        |
+| Type check     |        |
+| Lint           |        |
+| Build          |        |
 
 ## Related issue
 
