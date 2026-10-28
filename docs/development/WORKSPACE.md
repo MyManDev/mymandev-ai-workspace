@@ -57,6 +57,20 @@ The workflows also run for pull requests whose base is another task branch (stac
 
 A ruleset on `develop` requires the three `check` jobs and `identity-guard` to pass before a pull request is merged.
 
+## Dependency updates
+
+Dependabot opens pull requests against `develop` every Monday for the npm dependencies of the root and every workspace (one root lockfile) and for the GitHub Actions in `.github/workflows/`. `.github/dependabot.yml` holds the settings:
+
+- Versions stay exact: an update replaces the pinned version.
+- A release is adopted only when it is at least 14 days old. Security updates do not wait, because the cooldown applies to version updates only.
+- Minor and patch updates of packages that belong together arrive in one pull request: the shared tooling, the `@types` packages, Fastify, Drizzle, and zod (the same exact version in every workspace, [ADR 0003](../architecture/decisions/0003-zod-runtime-validation.md)). Major updates arrive one per pull request.
+- `@types/node` gets no major updates; it follows the Node.js major version in `.nvmrc`.
+- `@mymandev/*` packages are ignored. Workspaces are private and never come from the registry, and this keeps a public package with the same name from being proposed.
+
+Review a Dependabot pull request like any other: the checks must pass, read the release notes, and for a major update check the ADR of the dependency. For updates of drizzle-kit, also check the install-script inventory ([ADR 0011](../architecture/decisions/0011-drizzle-sql-migrations.md)). Never run `npm audit fix --force`.
+
+Dependabot branches start with `dependabot/`, an exception to the branch prefixes in `CLAUDE.md`, and its commits are made by the Dependabot bot, which the Identity Guard allows. Pull requests for security updates also need the repository setting "Dependabot security updates"; Dependabot alerts are already enabled.
+
 ## Editor setup
 
 Editors that support EditorConfig follow the basic rules in `.editorconfig`.
