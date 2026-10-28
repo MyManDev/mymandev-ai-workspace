@@ -8,14 +8,14 @@ A record starts with Status: Proposed. The Project Manager accepts it; the statu
 
 | ADR                                                        | Title                                                | Status   |
 | ---------------------------------------------------------- | ---------------------------------------------------- | -------- |
-| [0001](0001-internal-packages-export-typescript-source.md) | Internal workspace packages export TypeScript source | Proposed |
-| [0002](0002-node-test-runner.md)                           | node:test is the test runner; the root delegates     | Proposed |
-| [0003](0003-zod-runtime-validation.md)                     | zod 4 is the runtime validation library              | Proposed |
-| [0004](0004-uuidv7-identifiers.md)                         | Identifiers are lowercase UUIDv7                     | Proposed |
-| [0005](0005-workspaces-contain-projects.md)                | Workspaces contain projects                          | Proposed |
-| [0006](0006-event-envelope-v0.md)                          | Event envelope v0, decoding and versioning           | Proposed |
-| [0007](0007-agent-run-lifecycle-v0.md)                     | Agent run lifecycle v0                               | Proposed |
-| [0008](0008-capability-vocabulary-v0.md)                   | Capability vocabulary v0                             | Proposed |
+| [0001](0001-internal-packages-export-typescript-source.md) | Internal workspace packages export TypeScript source | Accepted |
+| [0002](0002-node-test-runner.md)                           | node:test is the test runner; the root delegates     | Accepted |
+| [0003](0003-zod-runtime-validation.md)                     | zod 4 is the runtime validation library              | Accepted |
+| [0004](0004-uuidv7-identifiers.md)                         | Identifiers are lowercase UUIDv7                     | Accepted |
+| [0005](0005-workspaces-contain-projects.md)                | Workspaces contain projects                          | Accepted |
+| [0006](0006-event-envelope-v0.md)                          | Event envelope v0, decoding and versioning           | Accepted |
+| [0007](0007-agent-run-lifecycle-v0.md)                     | Agent run lifecycle v0                               | Accepted |
+| [0008](0008-capability-vocabulary-v0.md)                   | Capability vocabulary v0                             | Accepted |
 | [0009](0009-fastify-cloud-api.md)                          | Fastify 5 for the cloud API, with hardened defaults  | Proposed |
 | [0010](0010-api-configuration-and-runtime.md)              | API configuration, runtime and shutdown              | Proposed |
 
