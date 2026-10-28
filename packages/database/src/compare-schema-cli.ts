@@ -3,7 +3,7 @@
 // Run it after db:migrate. Development and CI only: PGlite is a devDependency.
 import pg from "pg";
 import { checkDatabaseUrl } from "./client.ts";
-import { createTestDatabase } from "./testing.ts";
+import { createPgliteDatabase } from "./testing.ts";
 
 type CatalogRow = { kind: string; name: string; definition: string | null };
 
@@ -62,7 +62,7 @@ try {
   await server.end();
 }
 
-const pglite = await createTestDatabase();
+const pglite = await createPgliteDatabase();
 let onPglite: CatalogRow[];
 try {
   onPglite = (await pglite.client.query<CatalogRow>(CATALOG)).rows;

@@ -134,11 +134,19 @@ npm run db:migrate -w @mymandev/database
 
 ## Tests
 
-`src/testing.ts` provides `createTestDatabase()`: a fresh in-memory PGlite with every migration applied. It is not exported from the package yet; the export is added when another workspace first needs a test database (M2), and that workspace then declares `@electric-sql/pglite` with the identical exact version.
+`src/testing.ts` provides `createTestDatabase()`: a fresh database with every migration applied. By default it is an in-memory PGlite. It is not exported from the package yet; the export is added when another workspace first needs a test database (M2), and that workspace then declares `@electric-sql/pglite` with the identical exact version.
 
-Each test file that needs a database creates one PGlite instance in `before` and closes it in `after`. Starting PGlite and applying the migrations takes a few seconds, and each instance uses a few hundred megabytes of memory. `node --test` runs test files in parallel processes, so keep database tests in few files.
+Each test file that needs a database creates one test database in `before` and closes it in `after`. Starting PGlite and applying the migrations takes a few seconds, and each instance uses a few hundred megabytes of memory. `node --test` runs test files in parallel processes, so keep database tests in few files.
 
-`db:compare` checks that the migrations create the same columns, constraints, indexes, and triggers on a PostgreSQL server as on PGlite. Run it after `db:migrate`; it reads `DATABASE_MIGRATION_URL` and needs the devDependencies. The tests themselves run only on PGlite, so behavior that depends on the server, such as the session timeouts above, is not covered by a test yet.
+With `DATABASE_TEST_URL` set, the same tests run on a PostgreSQL server: `createTestDatabase()` creates a database with a random name on that server, applies the migrations with the production migrator, connects through `createDatabase`, and drops the database again in `close()`. The URL's role must be allowed to create databases, so use a local or throwaway server, never a shared one. The Database workflow runs the tests this way on PostgreSQL 18. A test that runs only on a server checks the session timeouts of `createDatabase`; on PGlite it is skipped. The role test always uses its own PGlite instance; the Database workflow checks the same privileges on the server.
+
+```sh
+DATABASE_TEST_URL="postgres://postgres:<password>@127.0.0.1:5432/postgres?sslmode=disable" npm test -w @mymandev/database
+```
+
+The command above needs Git Bash on Windows; in PowerShell, set `$env:DATABASE_TEST_URL` first.
+
+`db:compare` checks that the migrations create the same columns, constraints, indexes, and triggers on a PostgreSQL server as on PGlite. Run it after `db:migrate`; it reads `DATABASE_MIGRATION_URL` and needs the devDependencies. It always compares with PGlite, also when `DATABASE_TEST_URL` is set.
 
 ## Not included
 

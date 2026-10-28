@@ -34,6 +34,7 @@ Do not implement directly on develop or main.
 Use task branches from fresh origin/develop.
 
 Allowed prefixes:
+
 - feature/
 - fix/
 - docs/
@@ -72,6 +73,7 @@ If both tasks depend on a shared contract, define that contract first.
 Escalate decisions affecting architecture, security, permissions, public contracts, persistence, authentication, deployment, destructive migrations, or major scope.
 
 When escalating provide:
+
 - the decision
 - realistic options
 - tradeoffs

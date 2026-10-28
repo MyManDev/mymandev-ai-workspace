@@ -1,6 +1,6 @@
 ﻿name: Task
 description: A focused implementation or design task
-title: '[Task] '
+title: "[Task] "
 labels:
   - task
 body:

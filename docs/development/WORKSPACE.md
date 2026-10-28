@@ -28,17 +28,20 @@ npm run check
 
 ## Root scripts
 
-| Script                 | Runs                                                        | Purpose                                                |
-| ---------------------- | ----------------------------------------------------------- | ------------------------------------------------------ |
-| `npm run format`       | `prettier --write .`                                        | Format every file that Prettier supports.              |
-| `npm run format:check` | `prettier --check .`                                        | Fail if any file is not formatted.                     |
-| `npm run lint`         | `eslint .`                                                  | Lint JavaScript and TypeScript files.                  |
-| `npm run lint:fix`     | `eslint . --fix`                                            | Lint and apply automatic fixes.                        |
-| `npm run typecheck`    | `tsc -p tsconfig.json`, then `typecheck` in every workspace | Type-check the root tooling files and every workspace. |
-| `npm test`             | `test` in every workspace                                   | Run the tests of every workspace.                      |
-| `npm run check`        | `format:check`, `lint`, `typecheck`, `test`                 | Run all four in order; stop at the first failure.      |
+| Script                 | Runs                                                        | Purpose                                                                       |
+| ---------------------- | ----------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `npm run format`       | `prettier --write .`                                        | Format every file that Prettier supports.                                     |
+| `npm run format:check` | `prettier --check .`                                        | Fail if any file is not formatted.                                            |
+| `npm run text:check`   | `node scripts/check-text.mjs`                               | Fail if a text file contains invisible, bidirectional, or control characters. |
+| `npm run lint`         | `eslint .`                                                  | Lint JavaScript and TypeScript files.                                         |
+| `npm run lint:fix`     | `eslint . --fix`                                            | Lint and apply automatic fixes.                                               |
+| `npm run typecheck`    | `tsc -p tsconfig.json`, then `typecheck` in every workspace | Type-check the root tooling files and every workspace.                        |
+| `npm test`             | `test` in every workspace                                   | Run the tests of every workspace.                                             |
+| `npm run check`        | `format:check`, `text:check`, `lint`, `typecheck`, `test`   | Run all five in order; stop at the first failure.                             |
 
 npm runs scripts with `cmd.exe` on Windows and `sh` on other systems. Keep root scripts portable: chain commands with `&&`, quote arguments with double quotes, and do not use single quotes, `VAR=value` prefixes, `rm`, or `cp`.
+
+`npm run text:check` reads every file that Git tracks or would add, skips binary files, and reports format characters such as bidirectional controls and zero-width characters, control characters other than tab, line feed, and carriage return, the Unicode line and paragraph separators, and invalid UTF-8. These characters can make code look different from what runs, and Prettier, ESLint, and `tsc` do not report them. Write such a character as an escape (for example `\u202e`) in source code and tests. Only the files listed in `scripts/check-text.mjs` may start with a UTF-8 byte order mark. The script is linted, but not type-checked, because the root type check has no Node.js types.
 
 `npm run lint` lints the whole repository, including every workspace. Files inside a workspace that has its own `eslint.config.mjs` are linted with that config. Do not add workspace lint delegation to the root scripts; it would lint workspaces twice.
 
@@ -53,6 +56,21 @@ npm runs scripts with `cmd.exe` on Windows and `sh` on other systems. Keep root 
 The workflows also run for pull requests whose base is another task branch (stacked pull requests), and so does `.github/workflows/identity-guard.yml`. Changing the base branch of an open pull request does not start them again; push a commit, for example a merge of `origin/develop`, to get checks for the new base.
 
 A ruleset on `develop` requires the three `check` jobs and `identity-guard` to pass before a pull request is merged.
+
+## Dependency updates
+
+Dependabot opens pull requests against `develop` every Monday for the npm dependencies of the root and every workspace (one root lockfile) and for the GitHub Actions in `.github/workflows/`. `.github/dependabot.yml` holds the settings:
+
+- Versions stay exact: an update replaces the pinned version.
+- A release is adopted only when it is at least 14 days old. Security updates do not wait, because the cooldown applies to version updates only.
+- Minor and patch updates of packages that belong together arrive in one pull request: the shared tooling, the `@types` packages, Fastify, Drizzle, and zod (the same exact version in every workspace, [ADR 0003](../architecture/decisions/0003-zod-runtime-validation.md)). Major updates arrive one per pull request.
+- `@types/node` gets no major updates; it follows the Node.js major version in `.nvmrc`.
+- `typescript` stays below 6.1 while typescript-eslint supports only that range. Remove the rule from `dependabot.yml` when a typescript-eslint release supports newer versions.
+- `@mymandev/*` packages are ignored. Workspaces are private and never come from the registry, and this keeps a public package with the same name from being proposed.
+
+Review a Dependabot pull request like any other: the checks must pass, read the release notes, and for a major update check the ADR of the dependency. For updates of drizzle-kit, also check the install-script inventory ([ADR 0011](../architecture/decisions/0011-drizzle-sql-migrations.md)). Never run `npm audit fix --force`.
+
+Dependabot branches start with `dependabot/`, an exception to the branch prefixes in `CLAUDE.md`, and its commits are made by the Dependabot bot, which the Identity Guard allows. Pull requests for security updates also need the repository setting "Dependabot security updates"; Dependabot alerts are already enabled.
 
 ## Editor setup
 
@@ -264,7 +282,7 @@ The desktop application shell (issue #3) builds on this baseline. This section i
 
 ## Planned workspaces
 
-This list records the expected direction and is not binding. `packages/protocol`, `apps/api`, and `packages/database` exist so far. Each other one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
+This list records the expected direction and is not binding. `packages/protocol`, `apps/api`, `packages/database`, and `packages/permissions` exist so far. Each other one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
 
 - `apps/desktop`
 - `apps/api`
