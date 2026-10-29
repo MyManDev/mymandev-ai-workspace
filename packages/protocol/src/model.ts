@@ -84,6 +84,144 @@ export const DEVICE_PLATFORMS = Object.freeze([
 ] as const);
 export type DevicePlatform = (typeof DEVICE_PLATFORMS)[number];
 
+/**
+ * Workspace roles (ADR 0014, P-58). Roles are administration rights. They
+ * are not capabilities and never imply one. An unclaimed person is always a
+ * `member`, and a workspace has exactly one `owner`.
+ */
+export const MEMBER_ROLES = Object.freeze([
+  "owner",
+  "admin",
+  "member",
+] as const);
+export type MemberRole = (typeof MEMBER_ROLES)[number];
+
+/** Device key algorithms. Version 0 accepts Ed25519 only (P-52). */
+export const DEVICE_KEY_ALGORITHMS = Object.freeze(["ed25519"] as const);
+export type DeviceKeyAlgorithm = (typeof DEVICE_KEY_ALGORITHMS)[number];
+
+/** Why a device was revoked. A revoked device never comes back. */
+export const DEVICE_REVOCATION_REASONS = Object.freeze([
+  "removed",
+  "lost",
+  "replaced",
+  "account_erased",
+] as const);
+export type DeviceRevocationReason = (typeof DEVICE_REVOCATION_REASONS)[number];
+
+/** How a join request ended. A request without a decision is pending. */
+export const JOIN_REQUEST_DECISIONS = Object.freeze([
+  "approved",
+  "denied",
+  "blocked",
+  "withdrawn",
+  "expired",
+] as const);
+export type JoinRequestDecision = (typeof JOIN_REQUEST_DECISIONS)[number];
+
+/** Sign-in methods that identify an account. */
+export const IDENTITY_PROVIDERS = Object.freeze(["github"] as const);
+export type IdentityProvider = (typeof IDENTITY_PROVIDERS)[number];
+
+/**
+ * Reason codes in `reason` when the server cancels a run with a `system`
+ * actor (P-60). The desktop shows a known code as its own text.
+ */
+export const RUN_CANCEL_REASONS = Object.freeze([
+  "member_removed",
+  "device_revoked",
+] as const);
+export type RunCancelReason = (typeof RUN_CANCEL_REASONS)[number];
+
+/**
+ * The `code` of every HTTP error answer (P-66), with its HTTP status. The
+ * list is closed: the API never sends another code.
+ */
+export const API_ERROR_STATUS = Object.freeze({
+  /** The request is malformed. */
+  bad_request: 400,
+  /** An access token is missing, unknown, or expired, or no longer valid for its device or account. */
+  unauthorized: 401,
+  /** Minting an access token or signing in failed: unknown device, bad signature, or disabled account. */
+  auth_failed: 401,
+  /** A valid signature from a revoked device. */
+  device_revoked: 401,
+  /** A valid signature, but the device must sign in with GitHub again. */
+  sign_in_required: 401,
+  /** The caller's role does not allow the action. */
+  forbidden: 403,
+  /** A new device while the account's registration lock is active. */
+  device_registration_locked: 403,
+  /** A device younger than 72 hours cannot offer ownership or promote admins. */
+  device_too_new: 403,
+  /** A GitHub login that does not match the login rule. */
+  unsupported_account: 403,
+  /** Join requests of the workspace are paused, or the account is blocked. */
+  join_requests_closed: 403,
+  /** No such route or resource, or a workspace that the caller is not an active member of. */
+  not_found: 404,
+  /** A join request names a workspace that does not exist. */
+  workspace_not_found: 404,
+  /** An unknown, used, expired, or revoked invitation code, or a removed person. */
+  invitation_invalid: 404,
+  /** The installation holds another account. The body carries no login. */
+  device_account_mismatch: 409,
+  /** The account is already an active member of the workspace. */
+  already_member: 409,
+  /** The action conflicts with the current state, for example a second ownership offer. */
+  conflict: 409,
+  /** A limit was reached; the answer carries `Retry-After`. */
+  rate_limited: 429,
+  /** An unexpected server error. */
+  internal_error: 500,
+  /** GitHub sign-in is unavailable for now; the answer carries `Retry-After`. */
+  sign_in_unavailable: 503,
+} as const);
+export type ApiErrorCode = keyof typeof API_ERROR_STATUS;
+
+/** Every HTTP error code, in the order of `API_ERROR_STATUS`. */
+export const API_ERROR_CODES: readonly ApiErrorCode[] = Object.freeze(
+  Object.keys(API_ERROR_STATUS) as ApiErrorCode[],
+);
+
+/**
+ * The code for an error that the API did not raise with its own code, such
+ * as a framework error or an unexpected exception, by its HTTP status.
+ */
+export function genericApiErrorCode(status: number): ApiErrorCode {
+  if (status >= 500) {
+    return "internal_error";
+  }
+  switch (status) {
+    case 401:
+      return "unauthorized";
+    case 403:
+      return "forbidden";
+    case 404:
+      return "not_found";
+    case 409:
+      return "conflict";
+    case 429:
+      return "rate_limited";
+    default:
+      return "bad_request";
+  }
+}
+
+/**
+ * A GitHub login, including managed user accounts (`handle_shortcode`). The
+ * API and the database CHECK use this pattern. A login is display data and
+ * never identifies an account.
+ */
+export const GITHUB_LOGIN_PATTERN = /^[A-Za-z0-9_-]{1,39}$/u;
+
+/** Invitation lifetimes in seconds: 7 days by default, from 1 hour to 7 days. */
+export const INVITATION_LIFETIME_SECONDS = Object.freeze({
+  min: 3_600,
+  max: 604_800,
+  default: 604_800,
+} as const);
+
 /** A UUIDv7 in canonical lowercase form. Uppercase is rejected on purpose. */
 export const UUIDV7_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;

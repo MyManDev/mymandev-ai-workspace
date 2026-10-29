@@ -5,6 +5,9 @@ import {
   CorrelationIdSchema,
   DeviceIdSchema,
   EventIdSchema,
+  InvitationIdSchema,
+  JoinRequestIdSchema,
+  MemberIdSchema,
   newId,
   newUuidV7,
   PermissionGrantIdSchema,
@@ -17,6 +20,9 @@ import {
   type AgentId,
   type DeviceId,
   type EventId,
+  type InvitationId,
+  type JoinRequestId,
+  type MemberId,
   type PermissionGrantId,
   type ProviderConnectionId,
   type RepositoryId,
@@ -36,6 +42,9 @@ const ID_SCHEMAS = [
   CorrelationIdSchema,
   PermissionGrantIdSchema,
   ProviderConnectionIdSchema,
+  MemberIdSchema,
+  InvitationIdSchema,
+  JoinRequestIdSchema,
 ];
 
 test("generated IDs are lowercase UUIDv7 and sort in creation order", () => {
@@ -93,4 +102,14 @@ test("ID kinds are not interchangeable (checked by tsc)", () => {
   // @ts-expect-error An AgentId is not a PermissionGrantId.
   const permissionGrantId: PermissionGrantId = agentId;
   assert.equal(permissionGrantId, agentId);
+
+  const memberId = newId<MemberId>();
+  // @ts-expect-error A MemberId is not a UserId.
+  const memberAsUser: UserId = memberId;
+  assert.equal(memberAsUser, memberId);
+
+  const invitationId = newId<InvitationId>();
+  // @ts-expect-error An InvitationId is not a JoinRequestId.
+  const joinRequestId: JoinRequestId = invitationId;
+  assert.equal(joinRequestId, invitationId);
 });
