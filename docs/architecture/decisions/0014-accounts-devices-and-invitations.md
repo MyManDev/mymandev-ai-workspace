@@ -139,7 +139,7 @@ Error codes on HTTP:
 
 - Three kinds of GitHub App, each with exactly one callback URL (P-49):
   - one production app and one staging app, owned by the MyManDev organization and operated by the Project Manager, whose secrets exist only in the secret store of the hosting environment. GitHub's consent screen names the account that owns the app ("by <owner>"), so a person sees the organization, not a personal account (checked in #67);
-  - one development app per contributor, registered by that contributor, whose secrets stay in that contributor's local `.env`.
+  - one development app per contributor, registered by that contributor, whose secrets stay in that contributor's local `.env`. The registration steps are in [`docs/development/GITHUB-APP.md`](../../development/GITHUB-APP.md).
 - Settings of every app:
   - public ("Any account"), because a private app can be authorized only by members of the organization that owns it;
   - no repository, organization, or account permissions; the email permission is not requested;
