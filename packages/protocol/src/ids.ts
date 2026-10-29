@@ -51,6 +51,21 @@ export const ProviderConnectionIdSchema =
   uuidV7String().brand<"ProviderConnectionId">();
 export type ProviderConnectionId = z.infer<typeof ProviderConnectionIdSchema>;
 
+/**
+ * One person of a workspace (ADR 0014). A person exists before an account
+ * claims it. The server generates it.
+ */
+export const MemberIdSchema = uuidV7String().brand<"MemberId">();
+export type MemberId = z.infer<typeof MemberIdSchema>;
+
+/** One invitation for an unclaimed person. The server generates it. */
+export const InvitationIdSchema = uuidV7String().brand<"InvitationId">();
+export type InvitationId = z.infer<typeof InvitationIdSchema>;
+
+/** One request to join a workspace. The server generates it. */
+export const JoinRequestIdSchema = uuidV7String().brand<"JoinRequestId">();
+export type JoinRequestId = z.infer<typeof JoinRequestIdSchema>;
+
 /** Every branded ID kind. */
 export type AnyId =
   | UserId
@@ -63,7 +78,10 @@ export type AnyId =
   | EventId
   | CorrelationId
   | PermissionGrantId
-  | ProviderConnectionId;
+  | ProviderConnectionId
+  | MemberId
+  | InvitationId
+  | JoinRequestId;
 
 /**
  * Generates a new lowercase UUIDv7 string, for IDs that have no branded kind

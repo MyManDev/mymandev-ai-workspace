@@ -2,12 +2,36 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { test } from "node:test";
 import * as z from "zod";
+import {
+  AccessTokenSchema,
+  Base64Url32BytesSchema,
+  DeviceSignatureSchema,
+  GitHubLoginSchema,
+  InvitationCodeSchema,
+  SignInCodeSchema,
+} from "./account.ts";
+import {
+  LOOPBACK_REDIRECT_URI_PATTERN,
+  LoopbackRedirectUriSchema,
+} from "./auth-api.ts";
 import { decodeClientEvent, decodeEvent } from "./decode.ts";
+import {
+  ACCESS_TOKEN_PATTERN,
+  BASE64URL_32_BYTES_PATTERN,
+  DEVICE_AUTH_AUDIENCE_PATTERN,
+  DEVICE_PUBLIC_KEY_PATTERN,
+  DEVICE_SIGNATURE_PATTERN,
+  INVITATION_CODE_PATTERN,
+  isDeviceAuthAudience,
+  isDevicePublicKey,
+  SIGN_IN_CODE_PATTERN,
+} from "./device-auth.ts";
 import { displayText } from "./entities.ts";
 import { envelopeHeaderShape, ProtocolEventSchema } from "./envelope.ts";
 import { UserIdSchema } from "./ids.ts";
 import {
   EVENT_TYPE_PATTERN,
+  GITHUB_LOGIN_PATTERN,
   NOT_BLANK_PATTERN,
   RUN_STATES,
   RUN_TRANSITIONS,
@@ -348,6 +372,15 @@ test("the JSON Schema export works, every exported pattern compiles with the u f
     EVENT_TYPE_PATTERN,
     SAFE_TEXT_PATTERN,
     NOT_BLANK_PATTERN,
+    GITHUB_LOGIN_PATTERN,
+    BASE64URL_32_BYTES_PATTERN,
+    DEVICE_SIGNATURE_PATTERN,
+    DEVICE_PUBLIC_KEY_PATTERN,
+    SIGN_IN_CODE_PATTERN,
+    ACCESS_TOKEN_PATTERN,
+    INVITATION_CODE_PATTERN,
+    DEVICE_AUTH_AUDIENCE_PATTERN,
+    LOOPBACK_REDIRECT_URI_PATTERN,
   ]) {
     assert.equal(pattern.flags, "u", pattern.source);
   }
@@ -386,7 +419,59 @@ test("changing an exported pattern or the header shape does not change any schem
       () => displayText(100).safeParse("   ").success,
     ],
   ];
-  assert.equal(cases.length, 4);
+  const accountCases: [
+    label: string,
+    pattern: RegExp,
+    result: () => unknown,
+  ][] = [
+    [
+      "GITHUB_LOGIN_PATTERN",
+      GITHUB_LOGIN_PATTERN,
+      () => GitHubLoginSchema.safeParse("a b").success,
+    ],
+    [
+      "BASE64URL_32_BYTES_PATTERN",
+      BASE64URL_32_BYTES_PATTERN,
+      () => Base64Url32BytesSchema.safeParse("x").success,
+    ],
+    [
+      "DEVICE_SIGNATURE_PATTERN",
+      DEVICE_SIGNATURE_PATTERN,
+      () => DeviceSignatureSchema.safeParse("x").success,
+    ],
+    [
+      "DEVICE_PUBLIC_KEY_PATTERN",
+      DEVICE_PUBLIC_KEY_PATTERN,
+      () => isDevicePublicKey("x"),
+    ],
+    [
+      "SIGN_IN_CODE_PATTERN",
+      SIGN_IN_CODE_PATTERN,
+      () => SignInCodeSchema.safeParse("x").success,
+    ],
+    [
+      "ACCESS_TOKEN_PATTERN",
+      ACCESS_TOKEN_PATTERN,
+      () => AccessTokenSchema.safeParse("x").success,
+    ],
+    [
+      "INVITATION_CODE_PATTERN",
+      INVITATION_CODE_PATTERN,
+      () => InvitationCodeSchema.safeParse("x").success,
+    ],
+    [
+      "DEVICE_AUTH_AUDIENCE_PATTERN",
+      DEVICE_AUTH_AUDIENCE_PATTERN,
+      () => isDeviceAuthAudience("x y"),
+    ],
+    [
+      "LOOPBACK_REDIRECT_URI_PATTERN",
+      LOOPBACK_REDIRECT_URI_PATTERN,
+      () => LoopbackRedirectUriSchema.safeParse("x").success,
+    ],
+  ];
+  cases.push(...accountCases);
+  assert.equal(cases.length, 13);
   for (const [label, pattern, result] of cases) {
     const { source, flags } = pattern;
     const before = result();
