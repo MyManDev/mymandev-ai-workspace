@@ -1,6 +1,7 @@
 # ADR 0007: Agent run lifecycle v0
 
 - Status: Accepted (2026-10-28)
+- Amended by [ADR 0014](0014-accounts-devices-and-invitations.md)
 - Date: 2026-10-27
 - Decided by: Project Manager
 

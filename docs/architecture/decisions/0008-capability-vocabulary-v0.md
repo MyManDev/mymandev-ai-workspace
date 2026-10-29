@@ -1,6 +1,8 @@
 # ADR 0008: Capability vocabulary v0
 
 - Status: Accepted (2026-10-28)
+- Amended by [ADR 0014](0014-accounts-devices-and-invitations.md)
+- Amended by [ADR 0015](0015-capability-and-permission-contract-v0.md)
 - Date: 2026-10-27
 - Decided by: Project Manager
 
