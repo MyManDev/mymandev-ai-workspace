@@ -15,6 +15,27 @@
       "when": 1793256654866,
       "tag": "0001_provider_connections",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1793291264726,
+      "tag": "0002_account_tables_guard",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1793291671538,
+      "tag": "0003_account_tables",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1793291671897,
+      "tag": "0004_account_tables_member_keys",
+      "breakpoints": true
     }
   ]
 }
