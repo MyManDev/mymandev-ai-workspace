@@ -9,6 +9,7 @@ Read first:
 - docs/process/WORKFLOW.md
 - docs/process/ROADMAP.md
 - CLA.md
+- CLA-ENTITY.md
 
 ## Branches
 
@@ -49,21 +50,23 @@ That is only possible with permission from everyone who contributed.
 The contributor license agreement in CLA.md gives that permission.
 
 CLA.md is the Harmony Individual Contributor License Agreement (HA-CLA-I) v1.0 with outbound license Option Five.
-Only the fill-ins and options of the template are completed; the rest of the text is unchanged.
-CLA.md links to the headings "Contributor license agreement" and "Third-party work" in this file, so do not rename them.
+CLA-ENTITY.md, the entity version for employers and other organizations, is the Harmony Entity Contributor License Agreement (HA-CLA-E) v1.0 with outbound license Option Five.
+In both, only the fill-ins and options of the template are completed; the rest of the text is unchanged.
+Both link to the headings "Contributor license agreement" and "Third-party work" in this file, so do not rename them.
 
 The agreement is not in effect yet, and nobody can sign it yet.
 It takes effect only when all of these are done:
 
 - [LEGAL ENTITY NAME], the company that will offer the commercial licenses, has been founded
-- Every placeholder in square brackets, in CLA.md and in this section, is filled in, including the version details below
-- The draft notice at the top of CLA.md is removed
+- Every placeholder in square brackets, in CLA.md, in CLA-ENTITY.md and in this section, is filled in, including the version details below
+- The links in CLA.md and CLA-ENTITY.md point to the commit of the version instead of `develop`, so that the instructions a contributor agrees to cannot change afterwards
+- The draft notices at the top of CLA.md and CLA-ENTITY.md are removed
 
 Text in square brackets, such as [LEGAL ENTITY NAME], is a placeholder.
 
-Current version: 1.0, in effect from [DATE THIS VERSION TAKES EFFECT], published in commit [COMMIT], SHA-256 [SHA-256 OF CLA.md].
-Permanent link: https://github.com/MyManDev/mymandev-ai-workspace/blob/[COMMIT]/CLA.md
-The version number counts the versions of CLA.md in this repository, not the versions of the Harmony template.
+Current version: 1.0, in effect from [DATE THIS VERSION TAKES EFFECT], published in commit [COMMIT], SHA-256 [SHA-256 OF CLA.md] for CLA.md and [SHA-256 OF CLA-ENTITY.md] for CLA-ENTITY.md.
+Permanent links: https://github.com/MyManDev/mymandev-ai-workspace/blob/[COMMIT]/CLA.md and https://github.com/MyManDev/mymandev-ai-workspace/blob/[COMMIT]/CLA-ENTITY.md
+The version number counts the versions of CLA.md and CLA-ENTITY.md in this repository, not the versions of the Harmony templates.
 
 What the agreement means for you:
 
@@ -88,8 +91,8 @@ If a tool helped you with a change, the change is still your contribution and yo
 
 Your contribution must not conflict with rights you have granted to anyone else, including your employer or a client.
 If you are an employee, your employer must approve the agreement before you sign, or sign the entity version of the agreement.
-Ask at [CONTACT EMAIL ADDRESS] how your employer can approve the agreement.
-The entity version is [LINK TO THE ENTITY VERSION, BASED ON THE HARMONY ENTITY CONTRIBUTOR LICENSE AGREEMENT (HA-CLA-E), TO BE ADDED].
+Your employer does this by signing CLA-ENTITY.md, as described in [How to sign](#how-to-sign).
+You still sign CLA.md yourself.
 
 If you are under eighteen, your parents or guardian must sign the agreement too.
 Sign a copy of CLA.md together with them, as described in [How to sign](#how-to-sign), instead of posting the comment.
@@ -112,6 +115,9 @@ By signed document: sign a copy of the current version of CLA.md by hand or with
 If you are under eighteen, your parents or guardian add their names, addresses and signatures below yours.
 Send it to [CONTACT EMAIL ADDRESS], with the numeric ID of your GitHub account.
 Members of the core team sign this way.
+
+An employer or another organization signs the entity version only by signed document: a person who may sign for it signs a copy of the current version of CLA-ENTITY.md by hand or with a qualified electronic signature, with their name, title and address under "You".
+The organization sends it to [CONTACT EMAIL ADDRESS], with the numeric GitHub IDs of the people who contribute on its behalf, and tells [CONTACT EMAIL ADDRESS] when that list changes.
 
 Your signature is recorded with your numeric GitHub user ID, your GitHub user name at that time, the version you signed, the date and time, and a link to your comment or a copy of your signed document.
 [Signature records](#signature-records) says which parts of the record are public.
