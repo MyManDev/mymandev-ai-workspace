@@ -475,17 +475,16 @@ test("the weak key list is exactly the small-order points and their negative-zer
   }
 });
 
-test("node:crypto accepts a forged signature for the identity key, so it is refused", () => {
+test("the identity key is refused although its format matches", () => {
+  // Node.js 24.15 (OpenSSL 3.5.5) accepts the signature R = identity, S = 0
+  // for this key on any message; later builds refuse it. The check must not
+  // depend on the library, so it refuses the key itself.
   const identity = "01" + "00".repeat(31);
-  const forged = Buffer.from(identity + "00".repeat(32), "hex").toString(
-    "base64url",
-  );
   assert.match(
     identity,
     DEVICE_PUBLIC_KEY_PATTERN,
     "the format alone accepts it",
   );
-  assert.equal(verifies("any input at all", identity, forged), true);
   assert.equal(isDevicePublicKey(identity), false);
   assert.throws(
     () =>

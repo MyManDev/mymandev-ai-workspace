@@ -27,7 +27,7 @@ export const DEVICE_PUBLIC_KEY_PATTERN = /^[0-9a-f]{64}$/u;
 /**
  * Ed25519 public keys that a device may never register: the eight points of
  * small order, for which a signature can be forged without the private key
- * (node:crypto accepts such a forgery), and the two encodings of a point with
+ * (some node:crypto builds accept such a forgery), and the two encodings of a point with
  * x = 0 and the sign bit set. Non-canonical encodings (y >= p) are refused
  * separately by `isDevicePublicKey`.
  */
