@@ -159,9 +159,13 @@ No implementation may infer one capability from another.
 
 Default owner: Project Manager
 
+Includes the frame layer above the event envelope, with the authentication frames and the account frames of ADR 0014.
+
 ### M2-02 Desktop WebSocket client
 
 Default owner: Ertugrul
+
+The connection runs in the Electron main process and authenticates with the device key (ADR 0014).
 
 ### M2-03 Project chat
 
@@ -197,6 +201,34 @@ Finished when two physical devices can:
 - see each other's presence
 - receive the same project events
 - exchange project chat messages
+
+The two devices sign in with two GitHub accounts, and the second person joins by invitation or by an approved join request. Two physical devices need the API on a public HTTPS address, which a separate decision chooses (#96).
+
+### M2-06 Accounts and devices
+
+Sign-in with GitHub through the system browser, one key pair per device, access tokens, device management, and the GitHub revocation webhook ([ADR 0014](../architecture/decisions/0014-accounts-devices-and-invitations.md)).
+
+Project Manager:
+
+- protocol contract (#84)
+- account, device, membership, and audit tables (#86, shared)
+- API sign-in, access tokens, devices, WebSocket authentication, and the revocation webhook (#87 to #90)
+
+Ertugrul:
+
+- desktop sign-in and device key storage (#94)
+
+### M2-07 Workspace membership
+
+Workspaces, people, invitations, join requests with approval, removal, roles, and ownership transfer ([ADR 0014](../architecture/decisions/0014-accounts-devices-and-invitations.md)).
+
+Project Manager:
+
+- workspace, people, invitation, join request, removal, role, and ownership routes in the API (#91 to #93)
+
+Ertugrul:
+
+- desktop screens for joining, people, and devices (#95)
 
 ## M3 - Agent execution
 
