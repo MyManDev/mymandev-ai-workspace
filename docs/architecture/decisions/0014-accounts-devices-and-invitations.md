@@ -25,7 +25,7 @@ Accepted decisions that constrain it:
 - [ADR 0005](0005-workspaces-contain-projects.md): membership grants visibility only. Joining requires an invitation token and a server-side membership check (P-13).
 - [ADR 0006](0006-event-envelope-v0.md): `decodeClientEvent` returns `UnverifiedEvent`. From M2, `bindIdentity` binds every event to the authenticated connection, rejects and audits a mismatch, and checks device revocation and workspace membership for every event (P-15). Every event carries a `workspaceId`.
 - [ADR 0007](0007-agent-run-lifecycle-v0.md): every run transition after creation comes from the agent's host device. Commands are out of scope for v0.
-- [ADR 0008](0008-capability-vocabulary-v0.md) defines `isGrantActive` (M1-06, #24, not implemented yet) to treat a grant as inactive when the host device is revoked or the granting user is no longer a member of the workspace.
+- [ADR 0008](0008-capability-vocabulary-v0.md) and [ADR 0015](0015-capability-and-permission-contract-v0.md): `@mymandev/permissions` implements `isGrantActive`, which judges a grant together with facts about its agent, host device, project, and the granting user's membership; a grant is inactive when the host device is revoked or the granting user is no longer a member of the workspace. The writer rules of ADR 0015 (P-77) revoke the affected grants in the same transaction when an agent is disabled, a device is revoked, or a member is removed; the transactions below follow them.
 - [ADR 0009](0009-fastify-cloud-api.md): credentials never appear in URLs, and WebSocket authentication uses the first message or `Sec-WebSocket-Protocol` (P-48). `/ws` checks the Origin. Request logs drop the query string. `trustProxy` is off. `API_HOST` is loopback only until authentication exists. The close codes are provisional until M2-01 (P-24). The error handler sends the status text instead of the message for every 4xx that is not a Fastify error, and its body has no machine-readable code.
 - [ADR 0010](0010-api-configuration-and-runtime.md): configuration reads only known `API_` variables and never prints a value; today every variable has a default. The API has no secret yet; `DATABASE_URL` arrives with the first API feature that stores data.
 - [ADR 0011](0011-drizzle-sql-migrations.md), [ADR 0012](0012-pglite-database-tests.md), and [ADR 0013](0013-m1-data-model.md): generated migrations that run in one transaction, `text` vocabularies with CHECK constraints that equal a constant, composite foreign keys, `ON DELETE RESTRICT`, and an application role without `DELETE`. PGlite is a single connection. The `./testing` export arrives when the API first needs a test database. The account columns arrive with this implementation (P-38).
@@ -35,7 +35,6 @@ Gaps in the current code:
 - `workspace_members` has the primary key (`workspace_id`, `user_id`), and `user_id` is required. It cannot hold a person who has no account yet, a role, or a second membership period after a removal.
 - The gateway treats every text frame as an event and creates its context with `identity: null`. An authentication frame would close the connection today.
 - No audit table exists, although ADR 0006 requires an audit record on a mismatch from M2. The audit trail (#37) is planned for M3.
-- `packages/permissions` does not exist yet.
 - The API is not reachable from the internet. GitHub's webhook, two physical devices (M2-05), and production need a public HTTPS address. GitHub's callback does not: the person's browser follows it, so sign-in also works with an API on a loopback address during development.
 
 ## Options considered
@@ -176,12 +175,12 @@ Rules:
 
 ### Accounts
 
-- Accounts are keyed on GitHub's numeric user ID, which GitHub never changes or reuses. The login and the name are display data. They are refreshed at each sign-in and never used for lookup or authorization. A login can pass to another person after a rename, so nothing in the system is resolved by login.
+- Accounts are keyed on GitHub's numeric user ID, which GitHub never changes or reuses. The login is display data: it is refreshed at each sign-in and never used for lookup or authorization. The GitHub name only sets the first `users.display_name` (below). A login can pass to another person after a rename, so nothing in the system is resolved by login.
 - The first sign-in creates the user. `users.display_name` starts as the GitHub name if it passes the text rule and the length limit of ADR 0005, and as the login otherwise.
 - The login must match `^[A-Za-z0-9_-]{1,39}$`, which includes managed user accounts (`handle_shortcode`). The API and the database CHECK use the same pattern. A sign-in whose login does not match is refused with `unsupported_account`.
 - No email address and no avatar are stored. The creation time of the GitHub account is stored, and approvers see it.
 - The device label is chosen by the person. The desktop suggests one from the platform, never from the host name, because host names often contain a person's name.
-- An installation holds one account at a time. A sign-in with another GitHub account on an installation whose device is not revoked is refused with `device_account_mismatch`, which names the expected login. The desktop offers to sign in as that login, or to remove this device first.
+- An installation holds one account at a time. A sign-in with another GitHub account on an installation whose device is not revoked is refused with `device_account_mismatch`. The error body carries no login (P-66); the desktop shows the login of the account it holds and offers to sign in as that login, after which the device can be removed so that another account can sign in.
 - A repeated sign-in on a device that is not revoked keeps the device ID and replaces its key. Agents and messages that reference the device stay valid.
 - An account has at most 20 active devices and registers at most 10 new devices per 24 hours.
 
@@ -277,7 +276,7 @@ The 30-day rule covers what the API cannot observe. GitHub sends no signal when 
 - The per-event checks of ADR 0006 stay as a backstop. With one API instance, the server keeps a registry of open connections by device. Every 60 seconds one batched query re-checks the devices in the registry for a revocation, a disabled account, a sign-out, `users.sign_in_required_at`, and a connection past the 24-hour grace of the 30-day sign-in. A shared notification, for example PostgreSQL `LISTEN` and `NOTIFY`, is added before the API runs more than one instance.
 - GitHub authorization revoked (P-54): the webhook is verified with `X-Hub-Signature-256` against the current secret, or the previous one during a rotation, and matched by the numeric sender ID. The server sets `users.sign_in_required_at`, closes the person's sockets with `sign_in_required`, and stores the `X-GitHub-Delivery` ID with the audit record; a delivery ID that was already processed changes nothing, and a redelivery keeps the ID of the original delivery (checked in #67). The event also arrives for a person who authorized the app without installing it (checked in #67). The devices stay registered.
 - GitHub does not redeliver a failed webhook delivery on its own, and its delivery API needs the app's private key, which the API does not hold. A delivery lost during downtime is accepted in v0; the 30-day sign-in bounds it. After downtime or a secret rotation, the operator checks the app's recent deliveries and redelivers by hand.
-- An operator can disable an account (`users.disabled_at`), for example after abuse, and enable it again. Every authentication of a disabled account fails. Both actions write an audit record.
+- An operator can disable an account (`users.disabled_at`), for example after abuse, and enable it again. Every authentication of a disabled account fails. Disabling also revokes, in the same transaction, the active grants of the agents that the account owns (ADR 0015, P-77 and P-78); enabling it again restores none. Both actions write an audit record.
 - The person's other devices are notified when a new device registers.
 - The desktop stops local execution when it receives `device_revoked`, when its account is removed from a workspace (for that workspace's agents), and when the server cancels a run that it hosts. A stolen or hostile device cannot be stopped from the cloud; revocation only cuts it off.
 
@@ -303,16 +302,17 @@ These rules are part of the authentication contract. They are reviewed with the 
 - Inside a workspace, the desktop always shows a user through their person row: the person's display name and the GitHub login, also for removed people, who are shown as former members. The login is shown in a monospace font with the date it was last verified, so that a display name cannot impersonate someone. `users.display_name` appears only on the account's own screens and is the default name when the account creates a workspace or asks to join one.
 - Roles (P-58): `owner` (exactly one per workspace, always claimed), `admin`, and `member`. An unclaimed person is always a `member`. Roles are workspace administration rights. They are not capabilities and never imply one (ADR 0008). An owner or admin cannot grant a capability on another person's agent (P-44).
 
-| Action                                                                                                    | Owner | Admin                              | Member     |
-| --------------------------------------------------------------------------------------------------------- | ----- | ---------------------------------- | ---------- |
-| See the workspace and its people; edit own display name                                                   | yes   | yes                                | yes        |
-| Leave the workspace                                                                                       | no    | yes                                | yes        |
-| Define, rename, and remove unclaimed people                                                               | yes   | yes                                | no         |
-| Create and revoke invitations; list live invitations with their creators                                  | yes   | yes                                | no         |
-| Approve, deny, and block join requests; pause join requests                                               | yes   | yes                                | no         |
-| Remove a claimed person                                                                                   | yes   | only people with the role `member` | no         |
-| Promote a claimed member to admin, or offer ownership, from a device older than 72 hours; demote an admin | yes   | no                                 | no         |
-| Accept an ownership offer                                                                                 | no    | the target                         | the target |
+| Action                                                                                   | Owner | Admin                              | Member     |
+| ---------------------------------------------------------------------------------------- | ----- | ---------------------------------- | ---------- |
+| See the workspace and its people; edit own display name                                  | yes   | yes                                | yes        |
+| Leave the workspace                                                                      | no    | yes                                | yes        |
+| Define, rename, and remove unclaimed people                                              | yes   | yes                                | no         |
+| Create and revoke invitations; list live invitations with their creators                 | yes   | yes                                | no         |
+| Approve, deny, and block join requests; pause join requests                              | yes   | yes                                | no         |
+| Remove a claimed person                                                                  | yes   | only people with the role `member` | no         |
+| Promote a claimed member to admin, or offer ownership, from a device older than 72 hours | yes   | no                                 | no         |
+| Demote an admin                                                                          | yes   | no                                 | no         |
+| Accept an ownership offer                                                                | no    | the target                         | the target |
 
 - Creating a workspace creates the creator's person as the claimed `owner`. `workspaces.created_by_user_id` stays a historical fact; ownership lives in the role.
 - Demoting an admin revokes, in the same transaction, the live invitations that the admin created.
@@ -346,7 +346,7 @@ Limits are tuned with use (P-64).
 - GitHub allows 2,000 token requests per hour per app. The API counts its token exchanges per hour and logs a warning above 1,500. When GitHub answers with its limit, the API answers `sign_in_unavailable` with `Retry-After`.
 - Devices: at most 20 active devices per account and 10 new devices per account per 24 hours.
 - Workspaces: at most 10 new workspaces per user per 24 hours.
-- Join requests: one pending request per person and workspace; at most 5 pending requests per person in total, and 10 new requests per person per 24 hours; at most 50 pending requests per workspace; a denied person can ask the same workspace again after 24 hours; a paused workspace or a blocked person gets `join_requests_closed`.
+- Join requests: one pending request per person and workspace, and a second request while one is pending returns the pending request instead of creating another; at most 5 pending requests per person in total, and 10 new requests per person per 24 hours; at most 50 pending requests per workspace; a denied person can ask the same workspace again after 24 hours; a paused workspace or a blocked person gets `join_requests_closed`.
 - Invitations: at most 50 live invitations and 100 new invitations per workspace per 24 hours; at most 10 failed invitation previews or accepts per person per 15 minutes.
 - A limit answers `429` with the code `rate_limited` and `Retry-After`.
 
@@ -359,7 +359,7 @@ Limits are tuned with use (P-64).
   - it cancels the unfinished runs of those agents, and every unfinished run in the workspace that the person requested on another member's agent (P-60).
 - The server then drops the removed account's subscriptions to the workspace on open connections and tells that account's devices with an account frame. The per-event membership check is the backstop.
 - Nothing is deleted. Messages, runs, grants, and the person row stay and keep their attribution. The desktop shows a removed person as a former member.
-- The owner cannot be removed and cannot leave. Ownership changes only by transfer: the owner offers it to an active, claimed member from a device older than 72 hours; the target accepts within 7 days; the owner can withdraw the offer until then. Acceptance is one transaction that demotes the owner to `admin` before it promotes the target, so the unique index never sees two owners. Every device of both people is notified.
+- The owner cannot be removed and cannot leave. Ownership changes only by transfer: the owner offers it to another active, claimed person, an admin or a member, from a device older than 72 hours; the target accepts within 7 days; the owner can withdraw the offer until then. Acceptance is one transaction that demotes the owner to `admin` before it promotes the target, so the unique index never sees two owners. Every device of both people is notified.
 - At most one owner is guaranteed by a partial unique index; exactly one by the transfer transaction.
 - Revoking a device never removes a person from a workspace.
 - Cancelling runs: the server moves each affected run in `queued`, `running`, or `awaiting_input` to `cancelled`, with a `system` actor, `deviceId: null`, and a fixed reason code (`member_removed` or `device_revoked`) in `reason`. The protocol already allows a `system` actor for this event type. The desktop shows a known code from a `system` actor as its own text. Without this, such runs would stay unfinished forever, because their host device can no longer send events.
@@ -462,7 +462,7 @@ Changes to `@mymandev/protocol`, a shared boundary, reviewed with the desktop ow
   - ADR 0005: a user has a GitHub identity; people belong to a workspace and have a display name there; a person also joins through an approved join request, without a token; roles are administration rights, beyond visibility.
   - ADR 0006: the definition of an active member; `AuthenticatedConnectionContext`; the frame layer above the envelope and the account frames, which never use the envelope.
   - ADR 0007: the server may cancel runs (P-60).
-  - ADR 0008 and M1-06 (#24): `isGrantActive` uses the definition of an active member above.
+  - ADR 0008 and ADR 0015 (P-74): the membership fact of `isGrantActive` is the person row of the granting user, by the definition of an active member above.
   - ADR 0009: what counts as a credential under P-48 (P-50); the context type and the non-event frames; the error body with a code (P-66); HTML pages under `/auth/github/*`.
   - ADR 0010: the new variables, the first secrets, and `DATABASE_URL`.
   - ADR 0013: the `workspace_members` change, the new tables, hexadecimal `text` for 32-byte values, and server-only vocabularies in `packages/database`.
@@ -482,6 +482,16 @@ Changes to `@mymandev/protocol`, a shared boundary, reviewed with the desktop ow
   - a GitHub App accepts an `http://127.0.0.1` callback for development;
   - GitHub accepts the code exchange parameters in a form-encoded body, enforces the PKCE verifier (`invalid_grant`), consumes the code on a failed exchange, and can return an exchange error with HTTP status 200;
   - the consent screen of an app without permissions names the owning account and asks only to verify the identity; a returning person passes GitHub without a prompt, and `prompt=select_account` shows an account chooser.
+- Details this record leaves open. The first change that needs each one decides it and records it in the README of the protocol or the API package:
+  - the wire encoding of public keys, nonces, and signatures, and the exact input that is signed;
+  - the HTTP status of each error code, and the codes for a denied role and for a conflict;
+  - a cancel route for the confirmation page and its effect on the listener, and the response headers of the API's HTML pages;
+  - whether a new sign-in clears `signed_out_at`, and how an ownership offer that nobody answered within 7 days is cleared;
+  - which notices carry the creation date of a GitHub account, and how a requester learns the decision on a join request;
+  - the actor recorded when an operator disables or erases an account;
+  - how a pause of join requests ends, and whether expired requests that are not yet marked count as pending;
+  - the close reasons before authentication and above the connection cap, and when `devices.last_seen_at` is updated;
+  - the answer to a revocation webhook whose sender has no account, and the values of `AUDIT_REASONS`.
 - Behavior still to verify:
   - the form POST from the API's HTTPS page to `http://127.0.0.1` in current Chrome (including its Local Network Access prompt), Edge, Firefox, and Safari, and a `__Host-` cookie on a loopback HTTP origin in development;
   - which Electron API reports the Linux `safeStorage` fallback under the asynchronous API.
