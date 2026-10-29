@@ -196,7 +196,9 @@ Rules:
   5. the device ID, or empty for a new device;
   6. the connection ID (`ws`), the challenge ID (`http`), or the new public key (`sign-in`).
 
-  Every line has a fixed character set without a line break, so the input is unambiguous. A signature for one purpose, server, or connection is never accepted for another. The desktop's audience is the origin of its API base URL and must equal `API_PUBLIC_ORIGIN` exactly. The protocol package builds the input. Signing and verification use `node:crypto` in the desktop main process and in the API.
+  Every line has a fixed character set without a line break, so the input is unambiguous. The lines are joined with a single line feed, without a final line feed; the fifth line of a new device is empty. A signature for one purpose, server, or connection is never accepted for another.
+
+- Encodings on the wire and in the signed input: a public key is the raw 32-byte Ed25519 key of RFC 8032, not its SPKI form, written as 64 lowercase hexadecimal characters, the form in which the server stores it; a server nonce is 32 random bytes written as 43 base64url characters without padding; a signature is the 64-byte Ed25519 signature written as 86 base64url characters without padding. Any other length or alphabet is refused before verification. The desktop's audience is the origin of its API base URL and must equal `API_PUBLIC_ORIGIN` exactly. The protocol package builds the input. Signing and verification use `node:crypto` in the desktop main process and in the API.
 
 - WebSocket (M2-01 designs the frames under these rules):
   1. After the upgrade, which keeps the Origin check, the server sends `auth.challenge` with a nonce (32 random bytes), the connection ID, and the protocol version. It starts a 10-second timer.
@@ -483,7 +485,6 @@ Changes to `@mymandev/protocol`, a shared boundary, reviewed with the desktop ow
   - GitHub accepts the code exchange parameters in a form-encoded body, enforces the PKCE verifier (`invalid_grant`), consumes the code on a failed exchange, and can return an exchange error with HTTP status 200;
   - the consent screen of an app without permissions names the owning account and asks only to verify the identity; a returning person passes GitHub without a prompt, and `prompt=select_account` shows an account chooser.
 - Details this record leaves open. The first change that needs each one decides it and records it in the README of the protocol or the API package:
-  - the wire encoding of public keys, nonces, and signatures, and the exact input that is signed;
   - the HTTP status of each error code, and the codes for a denied role and for a conflict;
   - a cancel route for the confirmation page and its effect on the listener, and the response headers of the API's HTML pages;
   - whether a new sign-in clears `signed_out_at`, and how an ownership offer that nobody answered within 7 days is cleared;
