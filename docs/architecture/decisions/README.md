@@ -2,7 +2,7 @@
 
 This directory records architecture decisions for MyManDev AI Workspace. Each record explains one decision, the options that were considered, and the consequences. Architecture documents are a shared boundary; see [OWNERSHIP.md](../../process/OWNERSHIP.md).
 
-A record starts with Status: Proposed. The Project Manager accepts it; the status then becomes Accepted with the date, and "Needs Project Manager decision" records the answers. A later record can supersede an accepted one.
+A record starts with Status: Proposed. The Project Manager accepts it; the status then becomes Accepted with the date, and "Needs Project Manager decision" records the answers. A later record can supersede an accepted one. An accepted record that a later record changes in part gets an "Amended by ADR NNNN" line under its status, one line for each such record; its own text is not changed (ADR 0014, P-68).
 
 ADRs 0001 to 0013 were reviewed together. Their research, experiments, and review points are kept in the [M1 Technical Decision Set](../research/m1-technical-decision-set.md).
 
@@ -24,7 +24,7 @@ ADRs 0001 to 0013 were reviewed together. Their research, experiments, and revie
 | [0012](0012-pglite-database-tests.md)                      | Database tests run on in-process PGlite              | Accepted |
 | [0013](0013-m1-data-model.md)                              | M1 data model conventions and the M1-03 tables       | Accepted |
 | [0015](0015-capability-and-permission-contract-v0.md)      | Capability and permission contract v0                | Accepted |
-| [0014](0014-accounts-devices-and-invitations.md)           | Accounts, device credentials and invitations         | Proposed |
+| [0014](0014-accounts-devices-and-invitations.md)           | Accounts, device credentials and invitations         | Accepted |
 
 ## Numbering
 

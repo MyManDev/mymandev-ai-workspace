@@ -1,8 +1,8 @@
 # ADR 0014: Accounts, device credentials and invitations
 
-- Status: Proposed
+- Status: Accepted (2026-10-29)
 - Date: 2026-10-28
-- Decided by: (filled in by the Project Manager on acceptance)
+- Decided by: Project Manager
 
 ## Context
 
@@ -485,6 +485,10 @@ Changes to `@mymandev/protocol`, a shared boundary, reviewed with the desktop ow
   - a GitHub App accepts an `http://127.0.0.1` callback for development;
   - GitHub accepts the code exchange parameters in a form-encoded body, enforces the PKCE verifier (`invalid_grant`), consumes the code on a failed exchange, and can return an exchange error with HTTP status 200;
   - the consent screen of an app without permissions names the owning account and asks only to verify the identity; a returning person passes GitHub without a prompt, and `prompt=select_account` shows an account chooser.
+- Behavior verified in browsers on Windows 11 on 2026-10-29 (#67), on which P-50 rests:
+  - a page served over HTTPS from a public origin submitted a top-level form POST to `http://127.0.0.1:<port>/callback` in Chrome 156, Edge 156, and Opera 138, by its button, and in Chrome also by a script on load; the listener received the code and the state, and Chrome and Edge showed no prompt;
+  - the request arrived with `Origin: null`, because the page sends `Referrer-Policy: no-referrer`, and with `Sec-Fetch-Site: cross-site`; the listener therefore checks the state and never the origin;
+  - Chrome 156 kept a `__Host-` cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`) set by `http://127.0.0.1` and sent it back, so the attempt's cookie works in development against an API on a loopback address.
 - Details this record leaves open. The first change that needs each one decides it and records it in the README of the protocol or the API package:
   - the HTTP status of each error code, and the codes for a denied role and for a conflict;
   - a cancel route for the confirmation page and its effect on the listener, and the response headers of the API's HTML pages;
@@ -495,7 +499,7 @@ Changes to `@mymandev/protocol`, a shared boundary, reviewed with the desktop ow
   - the close reasons before authentication and above the connection cap, and when `devices.last_seen_at` is updated;
   - the answer to a revocation webhook whose sender has no account, and the values of `AUDIT_REASONS`.
 - Behavior still to verify:
-  - the form POST from the API's HTTPS page to `http://127.0.0.1` in current Chrome (including its Local Network Access prompt), Edge, Firefox, and Safari, and a `__Host-` cookie on a loopback HTTP origin in development;
+  - the form POST from the API's HTTPS page to `http://127.0.0.1`, and the `__Host-` cookie on a loopback HTTP origin, in Safari on macOS; Firefox is not checked, by the Project Manager's decision of 2026-10-29;
   - which Electron API reports the Linux `safeStorage` fallback under the asynchronous API.
 
 ## Dependency policy
@@ -538,23 +542,45 @@ This record comes before the code. The implementation issues link their pull req
 
 ## Needs Project Manager decision
 
+Answered by the Project Manager on 2026-10-29. Every recommendation was accepted.
+
 - A public GitHub App with no permissions, no email, no authorization during installation, expiring user tokens, the device flow off, one exact callback (HTTPS in production and staging), and the authorization webhook on; one production app, one staging app, and one development app per contributor (P-49, recommended: accept; an OAuth app would later need coarse scopes such as `repo` for repository access, and no revocation webhook for OAuth apps was found).
+  - Accepted.
 - The sign-in flow brokered by the API with PKCE on both legs: the attempt is bound to the browser by a cookie, the API shows a confirmation page with the GitHub login and a pairing code, and the sign-in code reaches the loopback listener only in a form POST. Under P-48, GitHub's code on the API callback is not a credential and is the only value of the flow in a URL. The attempt and the API's GitHub PKCE verifier live only in API memory, the verifier readable, as an exception to the hashing rule of ADR 0004 (P-50, recommended: accept; the alternative, a redirect with the sign-in code in the query string, works with fewer browser checks but lets a phishing page ask the victim to paste the code from the address bar).
+  - Accepted, after the browser checks of 2026-10-29 (#67).
 - The device credential is a key pair that each GitHub sign-in replaces. A WebSocket connection authenticates by signing a server nonce, and HTTP uses 15-minute access tokens minted by a signed challenge. This changes the wording of ADR 0004 (P-10) and of the protocol README (P-51, recommended: accept; the alternative is a 32-byte bearer secret with rotation, which fits ADR 0004 unchanged but logs people out when a rotation response is lost).
+  - Accepted.
 - The key algorithm: Ed25519 only in v0, with an algorithm column, or ES256 from the start so that hardware-backed keys need no new algorithm later (P-52, recommended: Ed25519).
+  - Accepted.
 - The lifetimes in the table: sign-in attempt 10 minutes, sign-in code 60 seconds, challenge 60 seconds, access token 15 minutes, WebSocket authentication 10 seconds, device sign-in 30 days with up to 24 hours more for an open connection, registration lock 7 days, a device too new for ownership actions 72 hours, invitation from 1 hour to 7 days with 7 days by default, join request 7 days, ownership offer 7 days (P-53, recommended: accept).
+  - Accepted.
 - When a person revokes the app's authorization on GitHub, every device of that person must sign in again and stays registered. GitHub sends the event also for a person who authorized the app without installing it (checked in #67). A lost delivery is accepted in v0 and redelivered by hand (P-54, recommended: sign in again; the alternatives are to revoke every device, or only to record the event).
+  - Accepted.
 - A new device needs no approval from an existing device of the same person, and the other devices are notified. For 7 days after a device is revoked as lost, new devices are refused until the person lifts the lock from another active device. An account has at most 20 active devices and 10 new devices per 24 hours (P-55, recommended: accept; approval for every new device would make recovery impossible when the only device is lost).
+  - Accepted.
 - The desktop contract: the device key, the sign-in flow, and the cloud connection live in the Electron main process; one instance per installation; API calls through `net.fetch`; the key stored with the asynchronous `safeStorage` API in the local, non-roaming data folder and decrypted once at startup; on Linux without a confirmed secret service, a passphrase-encrypted key or, by explicit choice, an unprotected file; the close-reason behavior in the table; no browser opened without the person's action. It is reviewed with the desktop owner when they start work (P-67), and the Linux rule is final only after the check that names the fallback API (P-56, recommended: accept).
+  - Accepted.
 - `workspace_members` becomes the person table, with `MemberId`, a `user_id` that is empty until claimed, a display name per workspace, and a role. Inside a workspace, users are shown through their person row with the GitHub login. This replaces the primary key of an M1-03 table, a destructive migration under OWNERSHIP.md; the migration refuses to run on a database with rows (P-57, recommended: accept and keep the name `workspace_members`).
+  - Accepted; the table keeps the name `workspace_members`.
 - "Another approved person" in #14 means an `admin`: the roles are `owner`, `admin`, and `member`; only the owner and admins approve, invite, and remove; an unclaimed person is always a member; only the owner promotes, and only a claimed person; demotion revokes the admin's invitations; an ownership transfer needs the target's acceptance and a device older than 72 hours; archiving is left for a later decision (P-58, recommended: accept; the alternative lets every active member approve).
+  - Accepted.
 - Invitations are delivered only as a code pasted into the application in v0. An HTTPS link with the code in the fragment comes later with the website (#16), as a documented exception to P-48. A custom-scheme link never carries the code. No binding to a GitHub account in v0 (P-59, recommended: accept).
+  - Accepted.
 - When a device is revoked or a person is removed, the server cancels the unfinished runs of the disabled agents, and of the runs that the removed person requested on other agents, with a `system` actor and a fixed reason code in `reason`. This changes ADR 0007, which lets only the host device make later transitions (P-60, recommended: yes; otherwise those runs never finish).
+  - Accepted.
 - A minimal `audit_events` table in M2 with closed action and reason vocabularies, which the M3 audit trail (#37) extends (P-61, recommended: yes; ADR 0006 already requires audit records from M2).
+  - Accepted.
 - Rows of used or expired invitations and join requests, and audit records, stay in v0, because the application role has no `DELETE`; sign-in attempts and tokens are never stored. A request to erase personal data is handled by `erased_at`, cleared identity columns, placeholder names, revoked devices, and ended memberships, never by a synthetic subject. A purge job with its own role is decided when the volume needs it (P-62, recommended: accept for v0).
+  - Accepted.
 - Hosting the API on a public HTTPS address is a separate decision in M2: TLS termination, `trustProxy` set to the exact proxy, a proxy that never logs query strings, cookies, or the `Authorization` header, widening `API_HOST`, the production and staging secrets, and how deliveries are checked after downtime. It blocks the webhook, M2-05, and limits by address in production, but not building sign-in (P-63, recommended: a separate decision issue in M2).
+  - Accepted: a separate decision issue in M2.
 - The limits in this record, with global caps before authentication, and @fastify/rate-limit 10 with its in-memory store while the API runs as one instance (P-64, recommended: accept).
+  - Accepted.
 - Signing out keeps the device and its agents and requires a GitHub sign-in before the key works again; removing a device revokes it and is required before another GitHub account signs in on the installation (P-65, recommended: accept; the alternative, signing out by revocation, disables every agent hosted on the installation for good).
+  - Accepted.
 - Every HTTP error has a `code` from `API_ERROR_CODES`, sent by the error handler from a typed `ApiError` and by the rate-limit plugin. This changes the error body of ADR 0009, whose message rule stays (P-66, recommended: accept).
+  - Accepted.
 - The desktop owner's review: under the Project Manager decision of 2026-10-28, the desktop owner's agreement is not required while the desktop owner has not started work. The Project Manager accepts the whole record, and the desktop-facing rules (the loopback listener, the storage and transport contract, one account per installation, sign-out and removal, the close-reason behavior, and the protocol changes) are reviewed with the desktop owner when they start, as for ADR 0015 (#76); a change goes through a later record (P-67, recommended: accept).
+  - Accepted.
 - The ADR README gains one rule: an accepted record that a later record changes in part gets an "Amended by ADR NNNN" line under its status. It is used for ADRs 0004 to 0010, 0013, and 0015, and for the records that ADR 0015 refines (P-68, recommended: accept).
+  - Accepted.

@@ -1,6 +1,7 @@
 # ADR 0009: Fastify 5 for the cloud API, with hardened defaults
 
 - Status: Accepted (2026-10-28)
+- Amended by [ADR 0014](0014-accounts-devices-and-invitations.md)
 - Date: 2026-10-27
 - Decided by: Project Manager
 
