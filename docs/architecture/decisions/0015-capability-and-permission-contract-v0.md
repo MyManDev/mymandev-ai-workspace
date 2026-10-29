@@ -169,6 +169,7 @@
 - The permission screen and the enforcement point (#55) inherit the presentation and enforcement rules above.
 - Offline behavior of the desktop application is bounded only after #55 decides freshness.
 - Adding a capability needs a protocol change, a scope entry, a risk entry, and a database migration.
+- Update of 2026-10-29 (#74): the provider connection entity exists. The `provider_connections` table and the `provider_connection_id` column of `permission_grants`, with its foreign key, came in one migration (P-79, P-82). The database also requires that a `provider.use` grant names a connection of its agent's host device, through a `host_device_id` column and two composite foreign keys. The facts gained `providerConnection` (`id`, `hostDeviceId`, `removedAt`), null for a grant on a repository; `isGrantActive` requires for `provider.use` that it describes the grant's connection, that the connection is on the agent's host device, and that it is not removed, and for a repository grant that it is null. `permission_grants.id` is typed as `PermissionGrantId` in the same change. Enforcement is still #55, and the writer that removes a connection revokes its grants (P-77). The text above is unchanged.
 
 ## Dependency policy
 

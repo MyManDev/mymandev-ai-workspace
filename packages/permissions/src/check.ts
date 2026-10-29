@@ -133,8 +133,33 @@ function active(record: GrantRecord, nowMs: number): boolean {
     membership !== null &&
     membership.workspaceId === facts.project.workspaceId &&
     membership.userId === grant.grantedByUserId &&
-    membership.removedAt === null
+    membership.removedAt === null &&
+    connectionFits(record)
   );
+}
+
+/**
+ * Whether the provider connection fact fits the grant (ADR 0015, P-82). For a
+ * grant on a provider connection, the fact describes that connection, the
+ * connection is on the agent's host device, and it is not removed. For a grant
+ * on a repository, the fact is null. Only own properties count, as in
+ * `sameScope`.
+ */
+function connectionFits(record: GrantRecord): boolean {
+  const { grant, facts } = record;
+  const connection = facts.providerConnection;
+  if (
+    "providerConnectionId" in grant &&
+    Object.hasOwn(grant, "providerConnectionId")
+  ) {
+    return (
+      connection !== null &&
+      connection.id === grant.providerConnectionId &&
+      connection.hostDeviceId === facts.agent.hostDeviceId &&
+      connection.removedAt === null
+    );
+  }
+  return connection === null;
 }
 
 /**
@@ -169,9 +194,10 @@ function sameScope(
  * The single definition of an active grant (ADR 0008, ADR 0015). A grant is
  * active at `now` when it is not revoked, it has not expired (`now` is before
  * `expiresAt`), its agent is not disabled, the agent's host device is not
- * revoked, and the granting user is still a member of the workspace of the
- * grant's project. Each fact must describe the entity the grant names. No
- * other code combines these columns.
+ * revoked, the granting user is still a member of the workspace of the
+ * grant's project, and, for `provider.use`, the provider connection is on the
+ * agent's host device and not removed. Each fact must describe the entity the
+ * grant names. No other code combines these columns.
  *
  * Use it for display and listing; authorize with `hasGrant`. It never throws.
  * Malformed data, data that is not plain (an accessor, a cycle through

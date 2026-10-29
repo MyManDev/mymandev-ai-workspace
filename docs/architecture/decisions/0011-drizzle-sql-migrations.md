@@ -41,6 +41,8 @@ Drizzle ORM, drizzle-kit, and the pg driver, with these guardrails:
 
 Data access lives in `packages/database`. `apps/api` does not use drizzle-orm directly; it will import query functions and types from `@mymandev/database` in M2.
 
+Update of 2026-10-29 (#50, #65): the roles of item 13 are also verified on a real PostgreSQL 18 server. On every pull request, the Database workflow creates both roles on a PostgreSQL 18 service container, applies the migrations twice as `mymandev_migrator`, checks that every table belongs to that role, checks that `mymandev_app` can insert and update but cannot delete, truncate, create tables, or read the migration schema, and runs the database tests on that server. The text above is unchanged.
+
 ## Consequences
 
 - `npm audit` reports 4 moderate findings, all from deprecated `@esbuild-kit/*` dependencies of drizzle-kit, which pull in an old esbuild (GHSA-67mh-4wv8-2f99, which concerns the esbuild development server). They are development-only; `npm audit --omit=dev` reports 0. `npm audit fix --force` would downgrade drizzle-kit to a much older release and must not be run. A future audit gate needs an exception or Drizzle 1.0 (P-30).

@@ -13,7 +13,9 @@ import {
   type Capability,
   type DeviceId,
   type EventId,
+  type PermissionGrantId,
   type ProjectId,
+  type ProviderConnectionId,
   type RepositoryId,
   type RunId,
   type RunState,
@@ -39,6 +41,7 @@ import {
   messages,
   permissionGrants,
   projects,
+  providerConnections,
   repositories,
   users,
   workspaceMembers,
@@ -85,6 +88,10 @@ type World = {
   bob: UserId;
   aliceDevice: DeviceId;
   bobDevice: DeviceId;
+  /** On Alice's device. */
+  aliceConnection: ProviderConnectionId;
+  /** On Bob's device. */
+  bobConnection: ProviderConnectionId;
   workspace: WorkspaceId;
   project: ProjectId;
   otherProject: ProjectId;
@@ -113,6 +120,12 @@ async function seed(): Promise<World> {
   await db.insert(devices).values([
     { id: aliceDevice, userId: alice, label: "Laptop", platform: "windows" },
     { id: bobDevice, userId: bob, label: "Desktop", platform: "linux" },
+  ]);
+  const aliceConnection = newId<ProviderConnectionId>();
+  const bobConnection = newId<ProviderConnectionId>();
+  await db.insert(providerConnections).values([
+    { id: aliceConnection, hostDeviceId: aliceDevice },
+    { id: bobConnection, hostDeviceId: bobDevice },
   ]);
   const workspace = newId<WorkspaceId>();
   await db
@@ -173,6 +186,8 @@ async function seed(): Promise<World> {
     bob,
     aliceDevice,
     bobDevice,
+    aliceConnection,
+    bobConnection,
     workspace,
     project,
     otherProject,
@@ -219,8 +234,8 @@ async function insertMessage(values: NewMessage): Promise<number> {
 
 type NewGrant = Omit<typeof permissionGrants.$inferInsert, "id">;
 
-async function insertGrant(values: NewGrant): Promise<string> {
-  const id = newUuidV7();
+async function insertGrant(values: NewGrant): Promise<PermissionGrantId> {
+  const id = newId<PermissionGrantId>();
   await database()
     .insert(permissionGrants)
     .values({ ...values, id });
@@ -405,15 +420,18 @@ test("permission grants: one capability per row, scoped, unique while active", a
   const byAlice = {
     projectId: world.project,
     granteeAgentId: world.aliceAgent,
+    hostDeviceId: world.aliceDevice,
     grantedByUserId: world.alice,
   };
-  const grantIds = new Map<Capability, string>();
+  const grantIds = new Map<Capability, PermissionGrantId>();
   for (const capability of CAPABILITIES) {
-    const repositoryId =
-      capability === "provider.use" ? undefined : world.repository;
+    const scope =
+      capability === "provider.use"
+        ? { providerConnectionId: world.aliceConnection }
+        : { repositoryId: world.repository };
     grantIds.set(
       capability,
-      await insertGrant({ ...byAlice, capability, repositoryId }),
+      await insertGrant({ ...byAlice, capability, ...scope }),
     );
   }
 
@@ -428,25 +446,65 @@ test("permission grants: one capability per row, scoped, unique while active", a
     "permission_grants_active_repository_key",
   );
   await rejectsWith(
-    () => insertGrant({ ...byAlice, capability: "provider.use" }),
-    "23505",
-    "permission_grants_active_unscoped_key",
-  );
-  await rejectsWith(
-    () => insertGrant({ ...byAlice, capability: "repo.read" }),
-    "23514",
-    "permission_grants_scope_check",
-  );
-  await rejectsWith(
     () =>
       insertGrant({
         ...byAlice,
         capability: "provider.use",
-        repositoryId: world.repository,
+        providerConnectionId: world.aliceConnection,
       }),
-    "23514",
-    "permission_grants_scope_check",
+    "23505",
+    "permission_grants_active_provider_connection_key",
   );
+  // Another connection on the same device is a separate scope.
+  const secondConnection = newId<ProviderConnectionId>();
+  await db
+    .insert(providerConnections)
+    .values({ id: secondConnection, hostDeviceId: world.aliceDevice });
+  await insertGrant({
+    ...byAlice,
+    capability: "provider.use",
+    providerConnectionId: secondConnection,
+  });
+
+  // Exactly one scope, and the provider connection exactly for provider.use.
+  const scopeCases: [string, Partial<NewGrant>][] = [
+    ["repo.read without a scope", { capability: "repo.read" }],
+    ["provider.use without a scope", { capability: "provider.use" }],
+    [
+      "provider.use on a repository",
+      { capability: "provider.use", repositoryId: world.repository },
+    ],
+    [
+      "repo.read on a provider connection",
+      { capability: "repo.read", providerConnectionId: world.aliceConnection },
+    ],
+    [
+      "provider.use with both scopes",
+      {
+        capability: "provider.use",
+        repositoryId: world.repository,
+        providerConnectionId: world.aliceConnection,
+      },
+    ],
+    [
+      "repo.read with both scopes",
+      {
+        capability: "repo.read",
+        repositoryId: world.repository,
+        providerConnectionId: world.aliceConnection,
+      },
+    ],
+  ];
+  assert.equal(scopeCases.length, 6);
+  for (const [label, values] of scopeCases) {
+    await rejectsWith(
+      () => insertGrant({ ...byAlice, capability: "repo.read", ...values }),
+      "23514",
+      "permission_grants_scope_check",
+    ).catch((error: unknown) => {
+      throw new Error(label, { cause: error });
+    });
+  }
   for (const capability of ["repo.*", "REPO.READ", "repo.admin"]) {
     await rejectsWith(
       () =>
@@ -487,6 +545,7 @@ test("permission grants: one capability per row, scoped, unique while active", a
   const byBob = {
     projectId: world.project,
     granteeAgentId: world.bobAgent,
+    hostDeviceId: world.bobDevice,
     grantedByUserId: world.bob,
     capability: "repo.read" as const,
     repositoryId: world.repository,
@@ -528,6 +587,7 @@ test("composite foreign keys reject rows that mix owners, devices and projects",
         insertGrant({
           projectId: world.project,
           granteeAgentId: world.aliceAgent,
+          hostDeviceId: world.aliceDevice,
           grantedByUserId: world.alice,
           capability: "repo.read",
           repositoryId: world.otherRepository,
@@ -540,8 +600,10 @@ test("composite foreign keys reject rows that mix owners, devices and projects",
         insertGrant({
           projectId: world.otherProject,
           granteeAgentId: world.aliceAgent,
+          hostDeviceId: world.aliceDevice,
           grantedByUserId: world.alice,
           capability: "provider.use",
+          providerConnectionId: world.aliceConnection,
         }),
     ],
     [
@@ -551,8 +613,36 @@ test("composite foreign keys reject rows that mix owners, devices and projects",
         insertGrant({
           projectId: world.project,
           granteeAgentId: world.bobAgent,
+          hostDeviceId: world.bobDevice,
           grantedByUserId: world.alice,
           capability: "provider.use",
+          providerConnectionId: world.bobConnection,
+        }),
+    ],
+    [
+      "permission_grants_agent_host_device_fk",
+      // A grant that names another host device than the agent's.
+      () =>
+        insertGrant({
+          projectId: world.project,
+          granteeAgentId: world.aliceAgent,
+          hostDeviceId: world.bobDevice,
+          grantedByUserId: world.alice,
+          capability: "repo.read",
+          repositoryId: world.repository,
+        }),
+    ],
+    [
+      "permission_grants_provider_connection_device_fk",
+      // provider.use for Alice's agent on a connection of Bob's device (P-82).
+      () =>
+        insertGrant({
+          projectId: world.project,
+          granteeAgentId: world.aliceAgent,
+          hostDeviceId: world.aliceDevice,
+          grantedByUserId: world.alice,
+          capability: "provider.use",
+          providerConnectionId: world.bobConnection,
         }),
     ],
     [
@@ -601,7 +691,7 @@ test("composite foreign keys reject rows that mix owners, devices and projects",
         }),
     ],
   ];
-  assert.equal(cases.length, 8);
+  assert.equal(cases.length, 10);
   for (const [constraint, operation] of cases) {
     await rejectsWith(operation, "23503", constraint);
   }
@@ -623,8 +713,10 @@ test("composite foreign keys reject rows that mix owners, devices and projects",
   await insertGrant({
     projectId: world.project,
     granteeAgentId: world.bobAgent,
+    hostDeviceId: world.bobDevice,
     grantedByUserId: world.bob,
     capability: "provider.use",
+    providerConnectionId: world.bobConnection,
   });
   await insertMessage({
     conversationId: world.conversation,

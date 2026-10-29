@@ -3,7 +3,9 @@ import type {
   Capability,
   CorrelationId,
   DeviceId,
+  PermissionGrantId,
   ProjectId,
+  ProviderConnectionId,
   RepositoryId,
   RunId,
   RunState,
@@ -22,6 +24,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { createdAt, nullableTimestamp, updatedAt } from "./columns.ts";
 import { devices, users } from "./identity.ts";
+import { providerConnections } from "./providers.ts";
 import { projects, repositories } from "./workspaces.ts";
 
 /**
@@ -129,15 +132,14 @@ export const agentRuns = pgTable(
 );
 
 /**
- * One row grants exactly one capability to one agent, matched exactly. This
- * table is provisional until the capability and permission contract (M1-06)
- * is agreed (P-34). The single definition of an active grant belongs to the
- * permissions package (M1-06), not to this table.
+ * One row grants exactly one capability to one agent on exactly one scope,
+ * matched exactly (ADR 0015). The single definition of an active grant
+ * belongs to the permissions package, not to this table.
  */
 export const permissionGrants = pgTable(
   "permission_grants",
   {
-    id: uuid("id").primaryKey(),
+    id: uuid("id").primaryKey().$type<PermissionGrantId>(),
     projectId: uuid("project_id")
       .notNull()
       .$type<ProjectId>()
@@ -146,10 +148,15 @@ export const permissionGrants = pgTable(
       .notNull()
       .$type<AgentId>()
       .references(() => agents.id, { onDelete: "restrict" }),
+    /** The host device of the grantee agent, recorded for composite foreign keys. */
+    hostDeviceId: uuid("host_device_id").notNull().$type<DeviceId>(),
     capability: text("capability").notNull().$type<Capability>(),
     repositoryId: uuid("repository_id")
       .$type<RepositoryId>()
       .references(() => repositories.id, { onDelete: "restrict" }),
+    providerConnectionId: uuid("provider_connection_id")
+      .$type<ProviderConnectionId>()
+      .references(() => providerConnections.id, { onDelete: "restrict" }),
     grantedByUserId: uuid("granted_by_user_id")
       .notNull()
       .$type<UserId>()
@@ -167,10 +174,11 @@ export const permissionGrants = pgTable(
       "permission_grants_capability_check",
       sql`${t.capability} in ('repo.read', 'repo.write', 'terminal.execute', 'git.commit', 'git.push', 'provider.use')`,
     ),
-    // provider.use is scoped to a provider connection (M1-06), every other capability to a repository.
+    // Exactly one scope: provider.use is scoped to a provider connection, every
+    // other capability to a repository (ADR 0015).
     check(
       "permission_grants_scope_check",
-      sql`(${t.capability} = 'provider.use') = (${t.repositoryId} is null)`,
+      sql`num_nonnulls(${t.repositoryId}, ${t.providerConnectionId}) = 1 and (${t.capability} = 'provider.use') = (${t.providerConnectionId} is not null)`,
     ),
     check(
       "permission_grants_revocation_check",
@@ -186,14 +194,31 @@ export const permissionGrants = pgTable(
     uniqueIndex("permission_grants_active_repository_key")
       .on(t.granteeAgentId, t.capability, t.repositoryId)
       .where(sql`${t.revokedAt} is null and ${t.repositoryId} is not null`),
-    uniqueIndex("permission_grants_active_unscoped_key")
-      .on(t.granteeAgentId, t.capability)
-      .where(sql`${t.revokedAt} is null and ${t.repositoryId} is null`),
+    uniqueIndex("permission_grants_active_provider_connection_key")
+      .on(t.granteeAgentId, t.capability, t.providerConnectionId)
+      .where(
+        sql`${t.revokedAt} is null and ${t.providerConnectionId} is not null`,
+      ),
     // The grant is recorded in the project of its agent.
     foreignKey({
       name: "permission_grants_agent_project_fk",
       columns: [t.granteeAgentId, t.projectId],
       foreignColumns: [agents.id, agents.projectId],
+    }).onDelete("restrict"),
+    // host_device_id is the host device of the grantee agent.
+    foreignKey({
+      name: "permission_grants_agent_host_device_fk",
+      columns: [t.granteeAgentId, t.hostDeviceId],
+      foreignColumns: [agents.id, agents.hostDeviceId],
+    }).onDelete("restrict"),
+    // The provider connection, when set, is on the agent's host device (P-82).
+    foreignKey({
+      name: "permission_grants_provider_connection_device_fk",
+      columns: [t.providerConnectionId, t.hostDeviceId],
+      foreignColumns: [
+        providerConnections.id,
+        providerConnections.hostDeviceId,
+      ],
     }).onDelete("restrict"),
     // The repository, when set, belongs to the project of the grant.
     foreignKey({

@@ -109,6 +109,9 @@ export type PermissionGrant = z.infer<typeof PermissionGrantSchema>;
  * - `project`: the grant's project and its workspace.
  * - `grantorMembership`: the granting user's current membership in the
  *   workspace of the grant's project, or null when there is none.
+ * - `providerConnection`: for a grant on a provider connection, that
+ *   connection and its host device (ADR 0015, P-82); null for a grant on a
+ *   repository.
  */
 export const GrantFactsSchema = z.object({
   agent: z.object({
@@ -128,6 +131,13 @@ export const GrantFactsSchema = z.object({
     .object({
       workspaceId: WorkspaceIdSchema,
       userId: UserIdSchema,
+      removedAt: UtcTimestampSchema.nullable(),
+    })
+    .nullable(),
+  providerConnection: z
+    .object({
+      id: ProviderConnectionIdSchema,
+      hostDeviceId: DeviceIdSchema,
       removedAt: UtcTimestampSchema.nullable(),
     })
     .nullable(),
