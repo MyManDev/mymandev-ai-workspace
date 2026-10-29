@@ -7,6 +7,7 @@ import {
   type ProtocolEvent,
 } from "./envelope.ts";
 import { EVENT_TYPE_PATTERN, LIMITS, PROTOCOL_VERSION } from "./model.ts";
+import { privatePattern } from "./private-pattern.ts";
 
 /** Stage 1: an object whose `protocolVersion` is a non-negative integer. */
 const VersionProbeSchema = z.object({
@@ -23,7 +24,7 @@ const EnvelopeHeaderSchema = z.object({
   type: z
     .string()
     .max(LIMITS.eventType, { abort: true })
-    .regex(EVENT_TYPE_PATTERN),
+    .regex(privatePattern(EVENT_TYPE_PATTERN)),
 });
 
 const knownTypes: ReadonlySet<string> = new Set(EVENT_TYPES);
