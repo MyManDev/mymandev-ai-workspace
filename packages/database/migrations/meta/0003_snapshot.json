@@ -1,5 +1,5 @@
 {
-  "id": "cada6572-b137-48ea-aa20-e4932760c93e",
+  "id": "92dc79f3-4766-42f6-bb08-86fd92de9e3f",
   "prevId": "bfe96bfb-69e5-4e94-8637-a6e4a11f34c5",
   "version": "7",
   "dialect": "postgresql",
@@ -862,7 +862,7 @@
         },
         "workspace_invitations_expiry_check": {
           "name": "workspace_invitations_expiry_check",
-          "value": "\"workspace_invitations\".\"expires_at\" >= \"workspace_invitations\".\"created_at\" + interval '1 hour' and \"workspace_invitations\".\"expires_at\" <= \"workspace_invitations\".\"created_at\" + interval '7 days'"
+          "value": "\"workspace_invitations\".\"expires_at\" >= \"workspace_invitations\".\"created_at\" + interval '1 hour' and \"workspace_invitations\".\"expires_at\" <= \"workspace_invitations\".\"created_at\" + interval '168 hours'"
         },
         "workspace_invitations_acceptance_check": {
           "name": "workspace_invitations_acceptance_check",
@@ -1182,6 +1182,21 @@
         }
       },
       "indexes": {
+        "workspace_members_workspace_id_idx": {
+          "name": "workspace_members_workspace_id_idx",
+          "columns": [
+            {
+              "expression": "workspace_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "workspace_members_user_id_idx": {
           "name": "workspace_members_user_id_idx",
           "columns": [

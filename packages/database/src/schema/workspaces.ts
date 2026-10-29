@@ -86,6 +86,7 @@ export const workspaceMembers = pgTable(
       .references(() => users.id, { onDelete: "restrict" }),
   },
   (t) => [
+    index("workspace_members_workspace_id_idx").on(t.workspaceId),
     index("workspace_members_user_id_idx").on(t.userId),
     // Target of composite foreign keys that require a person of a given workspace.
     unique("workspace_members_id_workspace_id_key").on(t.id, t.workspaceId),
@@ -132,6 +133,8 @@ export const workspaceMembers = pgTable(
 /**
  * An invitation to claim one person. Only the SHA-256 hash of the code is
  * stored. Used and expired invitations stay, because nothing is deleted (P-62).
+ * The writer sets `created_at` and `expires_at` from the same instant: the
+ * default `now()` is the start of the transaction, not the application's clock.
  */
 export const workspaceInvitations = pgTable(
   "workspace_invitations",
@@ -171,9 +174,11 @@ export const workspaceInvitations = pgTable(
       "workspace_invitations_token_hash_check",
       sql`${t.tokenHash} ~ '^[0-9a-f]{64}$'`,
     ),
+    // 1 hour to 7 days. '168 hours', not '7 days': adding days follows the
+    // session time zone, which makes a day across a daylight saving change 23 hours.
     check(
       "workspace_invitations_expiry_check",
-      sql`${t.expiresAt} >= ${t.createdAt} + interval '1 hour' and ${t.expiresAt} <= ${t.createdAt} + interval '7 days'`,
+      sql`${t.expiresAt} >= ${t.createdAt} + interval '1 hour' and ${t.expiresAt} <= ${t.createdAt} + interval '168 hours'`,
     ),
     check(
       "workspace_invitations_acceptance_check",

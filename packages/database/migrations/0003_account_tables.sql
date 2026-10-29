@@ -31,7 +31,7 @@ CREATE TABLE "workspace_invitations" (
 	"revoked_by_user_id" uuid,
 	CONSTRAINT "workspace_invitations_token_hash_key" UNIQUE("token_hash"),
 	CONSTRAINT "workspace_invitations_token_hash_check" CHECK ("workspace_invitations"."token_hash" ~ '^[0-9a-f]{64}$'),
-	CONSTRAINT "workspace_invitations_expiry_check" CHECK ("workspace_invitations"."expires_at" >= "workspace_invitations"."created_at" + interval '1 hour' and "workspace_invitations"."expires_at" <= "workspace_invitations"."created_at" + interval '7 days'),
+	CONSTRAINT "workspace_invitations_expiry_check" CHECK ("workspace_invitations"."expires_at" >= "workspace_invitations"."created_at" + interval '1 hour' and "workspace_invitations"."expires_at" <= "workspace_invitations"."created_at" + interval '168 hours'),
 	CONSTRAINT "workspace_invitations_acceptance_check" CHECK (num_nonnulls("workspace_invitations"."accepted_at", "workspace_invitations"."accepted_by_user_id", "workspace_invitations"."accepted_device_id") in (0, 3)),
 	CONSTRAINT "workspace_invitations_revocation_check" CHECK (("workspace_invitations"."revoked_at" is null) = ("workspace_invitations"."revoked_by_user_id" is null)),
 	CONSTRAINT "workspace_invitations_accepted_or_revoked_check" CHECK ("workspace_invitations"."accepted_at" is null or "workspace_invitations"."revoked_at" is null)
@@ -115,6 +115,7 @@ CREATE UNIQUE INDEX "workspace_join_requests_pending_key" ON "workspace_join_req
 CREATE INDEX "audit_events_workspace_id_idx" ON "audit_events" USING btree ("workspace_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "audit_events_github_delivery_id_key" ON "audit_events" USING btree ("github_delivery_id") WHERE "audit_events"."github_delivery_id" is not null;--> statement-breakpoint
 ALTER TABLE "workspace_members" ADD CONSTRAINT "workspace_members_removed_by_user_id_users_id_fk" FOREIGN KEY ("removed_by_user_id") REFERENCES "public"."users"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+CREATE INDEX "workspace_members_workspace_id_idx" ON "workspace_members" USING btree ("workspace_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "workspace_members_active_user_key" ON "workspace_members" USING btree ("workspace_id","user_id") WHERE "workspace_members"."user_id" is not null and "workspace_members"."removed_at" is null;--> statement-breakpoint
 CREATE UNIQUE INDEX "workspace_members_active_owner_key" ON "workspace_members" USING btree ("workspace_id") WHERE "workspace_members"."role" = 'owner' and "workspace_members"."removed_at" is null;--> statement-breakpoint
 CREATE UNIQUE INDEX "workspace_members_ownership_offer_key" ON "workspace_members" USING btree ("workspace_id") WHERE "workspace_members"."ownership_offered_at" is not null;--> statement-breakpoint

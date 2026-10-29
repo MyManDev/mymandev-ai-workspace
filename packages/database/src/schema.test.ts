@@ -17,6 +17,7 @@ import {
   CAPABILITIES,
   DEVICE_KEY_ALGORITHMS,
   DEVICE_PLATFORMS,
+  DEVICE_PUBLIC_KEY_PATTERN,
   DEVICE_REVOCATION_REASONS,
   GITHUB_LOGIN_PATTERN,
   IDENTITY_PROVIDERS,
@@ -421,10 +422,14 @@ test("the CHECK vocabularies equal the protocol constants", async () => {
   for (const reason of DEVICE_REVOCATION_REASONS) {
     assert.ok(AUDIT_REASONS.includes(reason), reason);
   }
-  // The GitHub login CHECK uses the protocol's pattern.
+  // The GitHub login and the public key CHECKs use the protocol's patterns.
   assert.deepEqual(await checkValues("user_identities_github_login_check"), [
     "github",
     GITHUB_LOGIN_PATTERN.source,
+  ]);
+  assert.deepEqual(await checkValues("devices_public_key_check"), [
+    "ed25519",
+    DEVICE_PUBLIC_KEY_PATTERN.source,
   ]);
 });
 
@@ -1480,29 +1485,40 @@ test("workspace members: claimed people, one active owner, one ownership offer",
     ],
   ]);
 
-  // After removal, the account can be claimed again, and the workspace can
-  // have a new owner once the old one is no longer active.
+  // Ownership moves only by transfer (the owner is never removed). The owner
+  // is demoted in a statement of its own first, because the partial unique
+  // index is checked row by row; then the offered person becomes the owner and
+  // the offer is cleared.
+  await db.transaction(async (tx) => {
+    await tx
+      .update(workspaceMembers)
+      .set({ role: "admin" })
+      .where(eq(workspaceMembers.id, world.aliceMember));
+    await tx
+      .update(workspaceMembers)
+      .set({ role: "owner", ownershipOfferedAt: null })
+      .where(ofBob);
+  });
+  await rejectsWith(
+    () =>
+      db
+        .update(workspaceMembers)
+        .set({ role: "owner" })
+        .where(eq(workspaceMembers.id, carolMember)),
+    "23505",
+    "workspace_members_active_owner_key",
+  );
+
+  // After removal, the account can be claimed again.
   await db
     .update(workspaceMembers)
-    .set({
-      ownershipOfferedAt: null,
-      removedAt: new Date(),
-      removedByUserId: world.alice,
-    })
-    .where(ofBob);
+    .set({ removedAt: new Date(), removedByUserId: world.bob })
+    .where(eq(workspaceMembers.id, carolMember));
   await db
     .insert(workspaceMembers)
     .values(
-      claimedMember(world.workspace, world.bob, { addedByUserId: world.alice }),
+      claimedMember(world.workspace, carol.user, { addedByUserId: world.bob }),
     );
-  await db
-    .update(workspaceMembers)
-    .set({ removedAt: new Date(), removedByUserId: world.alice })
-    .where(eq(workspaceMembers.id, world.aliceMember));
-  await db
-    .update(workspaceMembers)
-    .set({ role: "owner" })
-    .where(eq(workspaceMembers.id, carolMember));
 });
 
 test("workspace invitations: 1 hour to 7 days, one live invitation per person, accepted or revoked", async () => {
@@ -1649,6 +1665,46 @@ test("workspace invitations: 1 hour to 7 days, one live invitation per person, a
       expiresAt: new Date(createdAt.getTime() + 7 * DAY),
     }),
   );
+
+  // An accepted invitation frees the person too.
+  const accepted = invitation(world.workspace, otherGuest, world.alice);
+  await db.insert(workspaceInvitations).values(accepted);
+  await db
+    .update(workspaceInvitations)
+    .set({
+      acceptedAt: new Date(),
+      acceptedByUserId: world.bob,
+      acceptedDeviceId: world.bobDevice,
+    })
+    .where(eq(workspaceInvitations.id, accepted.id));
+  await db
+    .insert(workspaceInvitations)
+    .values(invitation(world.workspace, otherGuest, world.alice));
+});
+
+test("an invitation of exactly 7 days is valid across a daylight saving change", async () => {
+  const world = await seed();
+  const guest = newId<MemberId>();
+  await database()
+    .insert(workspaceMembers)
+    .values(unclaimedMember(world.workspace, world.alice, { id: guest }));
+  // New York moves its clocks forward on 2027-03-14, so 7 calendar days from
+  // 2027-03-10 are 167 hours there. The CHECK counts 168 hours in every zone.
+  const createdAt = new Date("2027-03-10T12:00:00Z");
+  await database().transaction(async (tx) => {
+    await tx.execute(sql`set local timezone = 'America/New_York'`);
+    // node-postgres and PGlite both return the rows in `rows`.
+    const days = (await tx.execute(
+      sql`select extract(epoch from (${createdAt.toISOString()}::timestamptz + interval '7 days') - ${createdAt.toISOString()}::timestamptz) / 3600 as hours`,
+    )) as unknown as { rows: { hours: string | number }[] };
+    assert.equal(Number(days.rows[0]?.hours), 167);
+    await tx.insert(workspaceInvitations).values(
+      invitation(world.workspace, guest, world.alice, {
+        createdAt,
+        expiresAt: new Date(createdAt.getTime() + 7 * DAY),
+      }),
+    );
+  });
 });
 
 test("workspace join requests: one pending request, decisions, approval and unblocking", async () => {
@@ -1680,6 +1736,14 @@ test("workspace join requests: one pending request, decisions, approval and unbl
         db
           .insert(workspaceJoinRequests)
           .values(fromCarol({ requestedDisplayName: "" })),
+    ],
+    [
+      "23514",
+      "workspace_join_requests_requested_display_name_length",
+      () =>
+        db
+          .insert(workspaceJoinRequests)
+          .values(fromCarol({ requestedDisplayName: "x".repeat(65) })),
     ],
     [
       "23514",
@@ -1874,15 +1938,21 @@ test("audit events: closed vocabularies, the actor's own device, one record per 
   ]);
 });
 
-/** The messages of an error and of its causes, for errors that wrap the database's. */
-function messageChain(error: unknown): string {
-  const messages: string[] = [];
+/**
+ * The innermost cause of an error: the database's own error. The outer Drizzle
+ * error repeats the SQL text, which would match any sentence of the migration.
+ */
+function rootCause(error: unknown): { code?: unknown; message?: unknown } {
   let current: unknown = error;
-  while (current instanceof Error) {
-    messages.push(current.message);
+  while (
+    typeof current === "object" &&
+    current !== null &&
+    "cause" in current &&
+    current.cause !== undefined
+  ) {
     current = current.cause;
   }
-  return messages.join(" | ");
+  return typeof current === "object" && current !== null ? current : {};
 }
 
 /** A copy of the migrations folder with only the first `count` migrations. */
@@ -1939,28 +2009,47 @@ async function tableExists(client: PGlite, name: string): Promise<boolean> {
   return result.rows[0]?.exists ?? false;
 }
 
-test("the account tables migration stops on a database that holds a user", async () => {
-  await upgradeFromProviderConnections(
-    async (client) => {
-      await client.query(
-        "insert into users (id, display_name) values ($1, 'Existing')",
-        [newUuidV7()],
-      );
-    },
-    async (upgrade, client) => {
-      await assert.rejects(upgrade, (error: unknown) => {
-        assert.match(
-          messageChain(error),
-          /need a database without users, devices, or workspace members/,
-        );
-        return true;
-      });
-      // The guard and the account tables migration ran in one transaction.
-      assert.equal(await appliedMigrations(client), 2);
-      assert.equal(await tableExists(client, "user_identities"), false);
-    },
-  );
-});
+// One row in the table, in the shape of migration 0001.
+const guardedRows: [table: string, insert: string][] = [
+  ["users", "insert into users (id, display_name) values ($1, 'Existing')"],
+  [
+    "devices",
+    "insert into devices (id, user_id, label, platform) values ($1, $1, 'Laptop', 'macos')",
+  ],
+  [
+    "workspace_members",
+    "insert into workspace_members (workspace_id, user_id, added_by_user_id) values ($1, $1, $1)",
+  ],
+];
+
+for (const [table, insert] of guardedRows) {
+  test(`the account tables migrations stop on a database with a row in ${table}`, async () => {
+    await upgradeFromProviderConnections(
+      async (client) => {
+        // A device or a person always comes with a user. The foreign keys are
+        // switched off for this row, so each condition of the guard is tested alone.
+        await client.exec("set session_replication_role = replica");
+        await client.query(insert, [newUuidV7()]);
+        await client.exec("set session_replication_role = default");
+      },
+      async (upgrade, client) => {
+        await assert.rejects(upgrade, (error: unknown) => {
+          const cause = rootCause(error);
+          // P0001: raise_exception, raised by the guard itself.
+          assert.equal(cause.code, "P0001");
+          assert.match(
+            String(cause.message),
+            /need a database without users, devices, or workspace members/,
+          );
+          return true;
+        });
+        // The guard and the account tables migrations ran in one transaction.
+        assert.equal(await appliedMigrations(client), 2);
+        assert.equal(await tableExists(client, "user_identities"), false);
+      },
+    );
+  });
+}
 
 test("the account tables migration upgrades an empty database", async () => {
   await upgradeFromProviderConnections(
