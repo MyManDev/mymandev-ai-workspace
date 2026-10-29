@@ -68,7 +68,7 @@ function grant(capability: Capability, fields: Json = {}): Json {
   };
 }
 
-function facts(): Json {
+function facts(capability: Capability = "repo.read"): Json {
   return {
     agent: { id: AGENT_ID, hostDeviceId: DEVICE_ID, disabledAt: null },
     hostDevice: { id: DEVICE_ID, revokedAt: null },
@@ -78,11 +78,19 @@ function facts(): Json {
       userId: USER_ID,
       removedAt: null,
     },
+    providerConnection:
+      CAPABILITY_SCOPE[capability] === "provider_connection"
+        ? {
+            id: PROVIDER_CONNECTION_ID,
+            hostDeviceId: DEVICE_ID,
+            removedAt: null,
+          }
+        : null,
   };
 }
 
 function record(capability: Capability, fields: Json = {}): Json {
-  return { grant: grant(capability, fields), facts: facts() };
+  return { grant: grant(capability, fields), facts: facts(capability) };
 }
 
 function request(capability: Capability): Json {
@@ -441,6 +449,18 @@ test("malformed IDs are rejected in every ID field", () => {
       ["facts", "grantorMembership", "userId"],
     ],
     [
+      "facts.providerConnection.id",
+      GrantRecordSchema,
+      record("provider.use"),
+      ["facts", "providerConnection", "id"],
+    ],
+    [
+      "facts.providerConnection.hostDeviceId",
+      GrantRecordSchema,
+      record("provider.use"),
+      ["facts", "providerConnection", "hostDeviceId"],
+    ],
+    [
       "request.agentId",
       PermissionRequestSchema,
       request("repo.read"),
@@ -459,7 +479,7 @@ test("malformed IDs are rejected in every ID field", () => {
       ["providerConnectionId"],
     ],
   ];
-  assert.equal(fields.length, 17);
+  assert.equal(fields.length, 19);
   for (const [field, schema, base, path] of fields) {
     assert.equal(schema.safeParse(base).success, true, field);
     for (const [label, value] of values) {
@@ -510,8 +530,13 @@ test("timestamps are UTC ISO 8601 strings with milliseconds", () => {
       record("repo.read"),
       ["facts", "grantorMembership", "removedAt"],
     ],
+    [
+      "facts.providerConnection.removedAt",
+      record("provider.use"),
+      ["facts", "providerConnection", "removedAt"],
+    ],
   ];
-  assert.equal(fields.length, 6);
+  assert.equal(fields.length, 7);
   for (const [field, base, path] of fields) {
     assert.equal(
       GrantRecordSchema.safeParse(withValue(base, path, accepted)).success,
@@ -572,8 +597,8 @@ test("revokedAt and revokedByUserId are set together, and expiresAt is after cre
 });
 
 test("unknown, __proto__ and constructor keys are stripped, and the input is not mutated", () => {
-  const plainGrant = grant("repo.read");
-  const plainFacts = facts();
+  const plainGrant = grant("provider.use");
+  const plainFacts = facts("provider.use");
   const plainRecord = { grant: plainGrant, facts: plainFacts };
   const plainRequest = request("provider.use");
   const factsInput = plainFacts as {
@@ -581,6 +606,7 @@ test("unknown, __proto__ and constructor keys are stripped, and the input is not
     hostDevice: Json;
     project: Json;
     grantorMembership: Json;
+    providerConnection: Json;
   };
   const hostileRecord = deepFreeze(
     hostile({
@@ -590,6 +616,7 @@ test("unknown, __proto__ and constructor keys are stripped, and the input is not
         hostDevice: hostile(factsInput.hostDevice),
         project: hostile(factsInput.project),
         grantorMembership: hostile(factsInput.grantorMembership),
+        providerConnection: hostile(factsInput.providerConnection),
       }),
     }),
   );

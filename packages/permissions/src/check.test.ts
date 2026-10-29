@@ -46,6 +46,7 @@ interface RecordInput {
     hostDevice: Json;
     project: Json;
     grantorMembership: Json | null;
+    providerConnection: Json | null;
   };
 }
 
@@ -90,13 +91,14 @@ function recordInput(
   options: RecordOptions = {},
 ): RecordInput {
   const agentId = options.agentId ?? AGENT_ID;
+  const scope = options.scopeId ?? scopeId(capability);
   const input: RecordInput = {
     grant: {
       id: GRANT_ID,
       projectId: PROJECT_ID,
       granteeAgentId: agentId,
       capability,
-      [scopeKey(capability)]: options.scopeId ?? scopeId(capability),
+      [scopeKey(capability)]: scope,
       grantedByUserId: USER_ID,
       createdAt: CREATED_AT,
       expiresAt: null,
@@ -112,10 +114,21 @@ function recordInput(
         userId: USER_ID,
         removedAt: null,
       },
+      providerConnection:
+        CAPABILITY_SCOPE[capability] === "provider_connection"
+          ? { id: scope, hostDeviceId: DEVICE_ID, removedAt: null }
+          : null,
     },
   };
   options.change?.(input);
   return input;
+}
+
+/** The provider connection fact of a `provider.use` record. */
+function connection(input: RecordInput): Json {
+  const value = input.facts.providerConnection;
+  assert.ok(value !== null);
+  return value;
 }
 
 function record(
@@ -519,6 +532,89 @@ test("a grant is active strictly before expiresAt", () => {
   }
 });
 
+test("the provider connection fact must fit the grant", () => {
+  const providerCases: [label: string, change: (input: RecordInput) => void][] =
+    [
+      [
+        "the connection is removed",
+        (input) => {
+          connection(input).removedAt = PAST;
+        },
+      ],
+      [
+        "the connection is removed with a future removedAt",
+        (input) => {
+          connection(input).removedAt = FUTURE;
+        },
+      ],
+      [
+        "the fact describes another connection",
+        (input) => {
+          connection(input).id = OTHER_PROVIDER_CONNECTION_ID;
+        },
+      ],
+      [
+        "the connection is on another device",
+        (input) => {
+          connection(input).hostDeviceId = OTHER_DEVICE_ID;
+        },
+      ],
+      [
+        "the fact is null",
+        (input) => {
+          input.facts.providerConnection = null;
+        },
+      ],
+    ];
+  const repositoryCases: [
+    label: string,
+    change: (input: RecordInput) => void,
+  ][] = [
+    [
+      "a repository grant with a connection fact",
+      (input) => {
+        input.facts.providerConnection = {
+          id: PROVIDER_CONNECTION_ID,
+          hostDeviceId: DEVICE_ID,
+          removedAt: null,
+        };
+      },
+    ],
+  ];
+  assert.equal(providerCases.length, 5);
+  assert.equal(repositoryCases.length, 1);
+
+  // Controls: the consistent records are active.
+  for (const capability of CAPABILITIES) {
+    assert.equal(isGrantActive(record(capability), NOW), true, capability);
+  }
+  const cases: [label: string, capability: Capability, value: GrantRecord][] = [
+    ...providerCases.map(
+      ([label, change]): [string, Capability, GrantRecord] => [
+        label,
+        "provider.use",
+        record("provider.use", { change }),
+      ],
+    ),
+    ...repositoryCases.flatMap(([label, change]) =>
+      CAPABILITIES.filter(
+        (capability) => CAPABILITY_SCOPE[capability] === "repository",
+      ).map((capability): [string, Capability, GrantRecord] => [
+        `${capability}: ${label}`,
+        capability,
+        record(capability, { change }),
+      ]),
+    ),
+  ];
+  assert.equal(cases.length, 10);
+  for (const [label, capability, value] of cases) {
+    // Well formed, so the denial comes from the fact and not from parsing.
+    assert.equal(GrantRecordSchema.safeParse(value).success, true, label);
+    assert.equal(isGrantActive(value, NOW), false, label);
+    assert.equal(hasGrant([value], request(capability), NOW), false, label);
+  }
+});
+
 test("malformed records are inactive and never throw", () => {
   const changed = (change: (input: RecordInput) => void): RecordInput =>
     recordInput("repo.read", { change });
@@ -670,6 +766,13 @@ test("malformed records are inactive and never throw", () => {
       }),
     ],
     [
+      "facts without a providerConnection",
+      changed((input) => {
+        delete (input.facts as Partial<RecordInput["facts"]>)
+          .providerConnection;
+      }),
+    ],
+    [
       "revocation fields that are not enumerable",
       changed((input) => {
         for (const key of ["revokedAt", "revokedByUserId"]) {
@@ -683,7 +786,7 @@ test("malformed records are inactive and never throw", () => {
       }),
     ],
   ];
-  assert.equal(cases.length, 26);
+  assert.equal(cases.length, 27);
   for (const [label, value] of cases) {
     const malformed = value as GrantRecord;
     assertDenied(
@@ -838,6 +941,12 @@ test("a polluted Object.prototype neither fills a missing field nor widens a sco
       delete (input.facts as Partial<RecordInput["facts"]>).grantorMembership;
     },
   });
+  const connectionFact = connection(recordInput("provider.use"));
+  const withoutConnection = record("provider.use", {
+    change: (input) => {
+      delete (input.facts as Partial<RecordInput["facts"]>).providerConnection;
+    },
+  });
   const checks: [label: string, check: () => boolean, expected: boolean][] = [
     [
       "provider.use on its own connection",
@@ -883,6 +992,13 @@ test("a polluted Object.prototype neither fills a missing field nor widens a sco
         hasGrant([withoutMembership], request("repo.read"), NOW),
       false,
     ],
+    [
+      "provider.use facts without a providerConnection",
+      () =>
+        isGrantActive(withoutConnection, NOW) ||
+        hasGrant([withoutConnection], request("provider.use"), NOW),
+      false,
+    ],
   ];
   const pollutions: [label: string, keys: Json, enumerable: boolean][] = [
     [
@@ -902,9 +1018,10 @@ test("a polluted Object.prototype neither fills a missing field nor widens a sco
       true,
     ],
     ["a grantorMembership", { grantorMembership: membershipFact }, true],
+    ["a providerConnection", { providerConnection: connectionFact }, true],
   ];
-  assert.equal(checks.length, 6);
-  assert.equal(pollutions.length, 5);
+  assert.equal(checks.length, 7);
+  assert.equal(pollutions.length, 6);
   for (const [label, check, expected] of checks) {
     assert.equal(check(), expected, `without pollution: ${label}`);
   }
