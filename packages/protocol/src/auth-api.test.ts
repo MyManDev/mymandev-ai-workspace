@@ -341,3 +341,46 @@ test("the request and response schemas export to JSON Schema for documentation",
     assert.equal(typeof json, "object");
   }
 });
+
+test("the access token and device list answers parse", () => {
+  assert.equal(
+    AccessTokenResponseSchema.safeParse({
+      accessToken: `mmda_${b64(32)}`,
+      expiresAt: "2026-10-29T12:15:00.000Z",
+    }).success,
+    true,
+  );
+  assert.equal(
+    AccessTokenResponseSchema.safeParse({
+      accessToken: `mmdc_${b64(32)}`,
+      expiresAt: "2026-10-29T12:15:00.000Z",
+    }).success,
+    false,
+  );
+  const device = {
+    id: DEVICE_ID,
+    label: "Work laptop",
+    platform: "macos",
+    createdAt: "2026-10-29T12:00:00.000Z",
+    lastSeenAt: null,
+    lastSignInAt: "2026-10-29T12:00:00.000Z",
+    signInExpiresAt: "2026-11-28T12:00:00.000Z",
+    revokedAt: null,
+    current: true,
+  };
+  assert.equal(
+    DeviceListResponseSchema.safeParse({ devices: [device] }).success,
+    true,
+  );
+  assert.equal(
+    DeviceListResponseSchema.safeParse({ devices: [] }).success,
+    true,
+  );
+  assert.equal(
+    DeviceListResponseSchema.safeParse({
+      devices: [{ ...device, platform: "ios" }],
+    }).success,
+    false,
+  );
+  assert.equal(DeviceListResponseSchema.safeParse({}).success, false);
+});

@@ -17,9 +17,12 @@ import {
   DEVICE_AUTH_PURPOSES,
   DEVICE_PUBLIC_KEY_PATTERN,
   DEVICE_SIGNATURE_PATTERN,
+  ED25519_WEAK_PUBLIC_KEYS,
   deviceAuthInput,
   type DeviceAuthInput,
   INVITATION_CODE_PATTERN,
+  isDeviceAuthAudience,
+  isDevicePublicKey,
   pairingCode,
   SIGN_IN_CODE_PATTERN,
 } from "./device-auth.ts";
@@ -401,4 +404,170 @@ test("the audience accepts the origins that a URL parser writes", () => {
     "https://-api.mymandev.example",
     DEVICE_AUTH_AUDIENCE_PATTERN,
   );
+});
+
+// Edwards25519 arithmetic with BigInt, only to compute the small-order points.
+const P = 2n ** 255n - 19n;
+const modP = (value: bigint) => ((value % P) + P) % P;
+const powP = (base: bigint, exponent: bigint) => {
+  let result = 1n;
+  let factor = modP(base);
+  for (let rest = exponent; rest > 0n; rest >>= 1n) {
+    if (rest & 1n) result = modP(result * factor);
+    factor = modP(factor * factor);
+  }
+  return result;
+};
+const invP = (value: bigint) => powP(value, P - 2n);
+const D = modP(-121665n * invP(121666n));
+type Point = readonly [x: bigint, y: bigint];
+const addPoints = ([x1, y1]: Point, [x2, y2]: Point): Point => {
+  const t = modP(D * x1 * x2 * y1 * y2);
+  return [
+    modP((x1 * y2 + x2 * y1) * invP(1n + t)),
+    modP((y1 * y2 + x1 * x2) * invP(1n - t)),
+  ];
+};
+const encodePoint = ([x, y]: Point): string => {
+  const bytes = Buffer.from(y.toString(16).padStart(64, "0"), "hex").reverse();
+  if (x & 1n) bytes[31] = (bytes[31] ?? 0) | 0x80;
+  return bytes.toString("hex");
+};
+const decodePoint = (hex: string): Point => {
+  const bytes = Buffer.from(hex, "hex");
+  const sign = (bytes[31] ?? 0) >> 7;
+  bytes[31] = (bytes[31] ?? 0) & 0x7f;
+  const y = BigInt(`0x${Buffer.from(bytes).reverse().toString("hex")}`);
+  const u = modP(y * y - 1n);
+  const v = modP(D * y * y + 1n);
+  let x = modP(u * powP(v, 3n) * powP(u * powP(v, 7n), (P - 5n) / 8n));
+  if (modP(v * x * x) !== u) x = modP(x * powP(2n, (P - 1n) / 4n));
+  assert.equal(modP(v * x * x), u, "on the curve");
+  if (Number(x & 1n) !== sign) x = modP(-x);
+  return [x, y];
+};
+
+test("the weak key list is exactly the small-order points and their negative-zero encodings", () => {
+  // Any point of order 8 generates the torsion subgroup.
+  const generator = decodePoint(
+    "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  );
+  const torsion = new Set<string>();
+  let point: Point = [0n, 1n];
+  for (let index = 0; index < 8; index += 1) {
+    torsion.add(encodePoint(point));
+    point = addPoints(point, generator);
+  }
+  assert.equal(encodePoint(point), encodePoint([0n, 1n]), "order 8");
+  assert.equal(torsion.size, 8);
+  // x = 0 with the sign bit set: the identity and the point of order 2.
+  const negativeZero = [
+    "0100000000000000000000000000000000000000000000000000000000000080",
+    "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  ];
+  assert.deepEqual(
+    [...ED25519_WEAK_PUBLIC_KEYS].sort(),
+    [...torsion, ...negativeZero].sort(),
+  );
+  assert.equal(Object.isFrozen(ED25519_WEAK_PUBLIC_KEYS), true);
+  for (const key of ED25519_WEAK_PUBLIC_KEYS) {
+    assert.equal(isDevicePublicKey(key), false, key);
+  }
+});
+
+test("node:crypto accepts a forged signature for the identity key, so it is refused", () => {
+  const identity = "01" + "00".repeat(31);
+  const forged = Buffer.from(identity + "00".repeat(32), "hex").toString(
+    "base64url",
+  );
+  assert.match(
+    identity,
+    DEVICE_PUBLIC_KEY_PATTERN,
+    "the format alone accepts it",
+  );
+  assert.equal(verifies("any input at all", identity, forged), true);
+  assert.equal(isDevicePublicKey(identity), false);
+  assert.throws(
+    () =>
+      deviceAuthInput({
+        purpose: "sign-in",
+        audience: AUDIENCE,
+        signInCode: SIGN_IN_CODE,
+        deviceId: null,
+        newPublicKey: identity,
+      }),
+    TypeError,
+  );
+});
+
+test("a public key needs a canonical encoding, and generated keys are accepted", () => {
+  const ones = "ff".repeat(30);
+  for (const nonCanonical of [
+    `ed${ones}7f`,
+    `ee${ones}7f`,
+    `ff${ones}7f`,
+    `ed${ones}ff`,
+    `f0${ones}ff`,
+  ]) {
+    assert.equal(isDevicePublicKey(nonCanonical), false, nonCanonical);
+  }
+  // The largest canonical y, p - 1, is the point of order 2 and is weak; p - 2 is not on the list.
+  assert.equal(isDevicePublicKey(`eb${ones}7f`), true);
+  assert.equal(isDevicePublicKey(RFC8032_PUBLIC), true);
+  for (let index = 0; index < 200; index += 1) {
+    const { privateKey } = generateKeyPairSync("ed25519");
+    assert.equal(isDevicePublicKey(rawPublicKey(privateKey)), true);
+  }
+  for (const value of [
+    42,
+    null,
+    RFC8032_PUBLIC.toUpperCase(),
+    Object(RFC8032_PUBLIC),
+  ]) {
+    assert.equal(isDevicePublicKey(value), false, String(value));
+  }
+});
+
+test("the audience writes an IPv4 host as a URL parser does", () => {
+  for (const origin of [
+    "http://127.0.0.1:3000",
+    "https://10.0.0.1",
+    "https://255.255.255.255:8443",
+  ]) {
+    assert.equal(isDeviceAuthAudience(origin), true, origin);
+    assert.equal(new URL(origin).origin, origin);
+  }
+  for (const origin of [
+    "http://127.1:3000",
+    "http://0x7f.0.0.1:3000",
+    "http://0177.0.0.1:3000",
+    "http://2130706433:3000",
+    "https://0",
+    "http://999.0.0.1:3000",
+    "https://example.123",
+    "http://127.0.0.01:3000",
+  ]) {
+    assert.equal(isDeviceAuthAudience(origin), false, origin);
+    assert.throws(
+      () =>
+        deviceAuthInput({
+          purpose: "ws",
+          audience: origin,
+          nonce: NONCE,
+          deviceId: DEVICE_ID,
+          connectionId: OTHER_ID,
+        }),
+      TypeError,
+      origin,
+    );
+  }
+});
+
+test("the audience host is at most 253 characters", () => {
+  const label = "a".repeat(63);
+  const host253 = [label, label, label, "a".repeat(61)].join(".");
+  assert.equal(host253.length, 253);
+  assert.equal(isDeviceAuthAudience(`https://${host253}`), true);
+  assert.equal(isDeviceAuthAudience(`https://${host253}:8443`), true);
+  assert.equal(isDeviceAuthAudience(`https://a${host253}`), false);
 });

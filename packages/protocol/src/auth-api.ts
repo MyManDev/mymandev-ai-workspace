@@ -67,16 +67,19 @@ export function routePath(
   params: Readonly<Record<string, string>> = {},
 ): string {
   const used = new Set<string>();
-  const filled = path.replace(/:([A-Za-z]+)/gu, (_match, name: string) => {
-    const value: unknown = Object.hasOwn(params, name)
-      ? params[name]
-      : undefined;
-    if (typeof value !== "string" || !uuidV7Pattern.test(value)) {
-      throw new TypeError(`Invalid path parameter ${name}`);
-    }
-    used.add(name);
-    return value;
-  });
+  const filled = path.replace(
+    /:([A-Za-z][A-Za-z0-9]*)/gu,
+    (_match, name: string) => {
+      const value: unknown = Object.hasOwn(params, name)
+        ? params[name]
+        : undefined;
+      if (typeof value !== "string" || !uuidV7Pattern.test(value)) {
+        throw new TypeError(`Invalid path parameter ${name}`);
+      }
+      used.add(name);
+      return value;
+    },
+  );
   for (const name of Object.keys(params)) {
     if (!used.has(name)) {
       throw new TypeError(`Unknown path parameter ${name}`);

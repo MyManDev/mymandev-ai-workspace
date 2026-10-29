@@ -24,6 +24,26 @@ export const DEVICE_SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{85}[AQgw]$/u;
  */
 export const DEVICE_PUBLIC_KEY_PATTERN = /^[0-9a-f]{64}$/u;
 
+/**
+ * Ed25519 public keys that a device may never register: the eight points of
+ * small order, for which a signature can be forged without the private key
+ * (node:crypto accepts such a forgery), and the two encodings of a point with
+ * x = 0 and the sign bit set. Non-canonical encodings (y >= p) are refused
+ * separately by `isDevicePublicKey`.
+ */
+export const ED25519_WEAK_PUBLIC_KEYS = Object.freeze([
+  "0100000000000000000000000000000000000000000000000000000000000000",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+  "0000000000000000000000000000000000000000000000000000000000000000",
+  "0000000000000000000000000000000000000000000000000000000000000080",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+  "0100000000000000000000000000000000000000000000000000000000000080",
+  "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+] as const);
+
 /** A sign-in code: `mmdc_` and 32 random bytes as canonical base64url. */
 export const SIGN_IN_CODE_PATTERN =
   /^mmdc_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
@@ -100,16 +120,60 @@ function checked(field: string, value: unknown, pattern: RegExp): string {
   return value;
 }
 
-/** A URL parser drops the default port, so an origin that names it never equals the API's origin. */
+const weakPublicKeys: ReadonlySet<string> = new Set(ED25519_WEAK_PUBLIC_KEYS);
+
+/**
+ * Whether a value is a public key that a device may register: 64 lowercase
+ * hexadecimal characters, a canonical encoding (y < p), and not one of
+ * `ED25519_WEAK_PUBLIC_KEYS`.
+ */
+export function isDevicePublicKey(value: unknown): boolean {
+  if (typeof value !== "string" || !publicKeyPattern.test(value)) {
+    return false;
+  }
+  // The key is little-endian; y >= p = 2^255 - 19 only when the top 31 bytes
+  // are all ones (the sign bit aside) and the lowest byte is at least 0xed.
+  const nonCanonical =
+    (Number.parseInt(value.slice(62, 64), 16) & 0x7f) === 0x7f &&
+    /^(?:ff){30}$/u.test(value.slice(2, 62)) &&
+    Number.parseInt(value.slice(0, 2), 16) >= 0xed;
+  return !nonCanonical && !weakPublicKeys.has(value);
+}
+
+const dottedQuad =
+  /^(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$/u;
+const numericLabel = /(?:^|\.)(?:[0-9]+|0x[0-9a-f]*)$/u;
+
+/**
+ * Whether a value can be the audience of a signature: it matches
+ * `DEVICE_AUTH_AUDIENCE_PATTERN`, names no default port, and writes an IPv4
+ * host as four decimal numbers, as a URL parser does (it rewrites `127.1` or
+ * `0x7f.0.0.1`). The API's configuration refuses an `API_PUBLIC_ORIGIN` that
+ * fails this check, so that both sides build the same input.
+ */
+export function isDeviceAuthAudience(value: unknown): boolean {
+  if (typeof value !== "string" || !audiencePattern.test(value)) {
+    return false;
+  }
+  const authority = value.slice(value.indexOf("//") + 2);
+  const colon = authority.indexOf(":");
+  const host = colon < 0 ? authority : authority.slice(0, colon);
+  if (numericLabel.test(host) && !dottedQuad.test(host)) {
+    return false;
+  }
+  // A URL parser drops the default port, so an origin that names it never
+  // equals the API's origin.
+  return !(
+    (value.startsWith("https:") && value.endsWith(":443")) ||
+    (value.startsWith("http:") && value.endsWith(":80"))
+  );
+}
+
 function checkedAudience(value: unknown): string {
-  const audience = checked("audience", value, audiencePattern);
-  if (
-    (audience.startsWith("https:") && audience.endsWith(":443")) ||
-    (audience.startsWith("http:") && audience.endsWith(":80"))
-  ) {
+  if (!isDeviceAuthAudience(value)) {
     throw new TypeError("Invalid audience");
   }
-  return audience;
+  return value as string;
 }
 
 /**
@@ -174,11 +238,10 @@ export function deviceAuthInput(input: DeviceAuthInput): string {
         rawDeviceId === null
           ? ""
           : checked("device ID", rawDeviceId, uuidV7Pattern);
-      const newPublicKey = checked(
-        "new public key",
-        values.newPublicKey,
-        publicKeyPattern,
-      );
+      const newPublicKey: unknown = values.newPublicKey;
+      if (!isDevicePublicKey(newPublicKey)) {
+        throw new TypeError("Invalid new public key");
+      }
       return [
         DEVICE_AUTH_CONTEXT,
         purpose,

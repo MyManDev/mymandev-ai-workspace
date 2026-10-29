@@ -5,6 +5,7 @@ import {
   DEVICE_PUBLIC_KEY_PATTERN,
   DEVICE_SIGNATURE_PATTERN,
   INVITATION_CODE_PATTERN,
+  isDevicePublicKey,
   SIGN_IN_CODE_PATTERN,
 } from "./device-auth.ts";
 import { DevicePlatformSchema, displayText } from "./entities.ts";
@@ -17,6 +18,7 @@ import {
 } from "./ids.ts";
 import {
   API_ERROR_CODES,
+  API_ERROR_STATUS,
   DEVICE_KEY_ALGORITHMS,
   DEVICE_REVOCATION_REASONS,
   GITHUB_LOGIN_PATTERN,
@@ -49,13 +51,17 @@ export const Base64Url32BytesSchema = z
     "Expected 32 bytes as 43 base64url characters",
   );
 
-/** A raw Ed25519 public key as 64 lowercase hexadecimal characters. */
+/**
+ * A raw Ed25519 public key as 64 lowercase hexadecimal characters, in its
+ * canonical encoding and not a key of small order (`isDevicePublicKey`).
+ */
 export const DevicePublicKeySchema = z
   .string()
   .regex(
     privatePattern(DEVICE_PUBLIC_KEY_PATTERN),
     "Expected a raw Ed25519 public key in hexadecimal",
-  );
+  )
+  .refine(isDevicePublicKey, "Expected a usable Ed25519 public key");
 
 /** An Ed25519 signature as 86 base64url characters. */
 export const DeviceSignatureSchema = z
@@ -123,6 +129,19 @@ export const WorkspaceMemberSchema = z
         path: ["identity"],
       });
     }
+    // Erasure removes the account's active memberships, so an active claimed
+    // person always shows a login next to its display name.
+    if (
+      member.userId !== null &&
+      member.identity === null &&
+      member.removedAt === null
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "An active claimed person has an identity",
+        path: ["identity"],
+      });
+    }
   });
 export type WorkspaceMember = z.infer<typeof WorkspaceMemberSchema>;
 
@@ -146,12 +165,31 @@ export type DeviceListItem = z.infer<typeof DeviceListItemSchema>;
 /**
  * The body of every HTTP error answer (P-66). `error` and `message` are the
  * status text; `message` never contains an input value. Show the person the
- * text for `code`, never `message`.
+ * text for `code`, never `message`. A code that the API raises itself comes
+ * with its status from `API_ERROR_STATUS`; the generic codes `bad_request`
+ * and `internal_error` also come with another 4xx or 5xx status, for example
+ * `413` with `bad_request` (`genericApiErrorCode`).
  */
-export const ApiErrorBodySchema = z.object({
-  statusCode: z.int().min(400).max(599),
-  error: z.string().max(100),
-  message: z.string().max(100),
-  code: ApiErrorCodeSchema,
-});
+export const ApiErrorBodySchema = z
+  .object({
+    statusCode: z.int().min(400).max(599),
+    error: z.string().max(100),
+    message: z.string().max(100),
+    code: ApiErrorCodeSchema,
+  })
+  .superRefine((body, ctx) => {
+    const fits =
+      body.code === "bad_request"
+        ? body.statusCode < 500
+        : body.code === "internal_error"
+          ? body.statusCode >= 500
+          : body.statusCode === API_ERROR_STATUS[body.code];
+    if (!fits) {
+      ctx.addIssue({
+        code: "custom",
+        message: "The status does not fit the code",
+        path: ["statusCode"],
+      });
+    }
+  });
 export type ApiErrorBody = z.infer<typeof ApiErrorBodySchema>;

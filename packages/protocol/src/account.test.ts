@@ -4,17 +4,32 @@ import { test } from "node:test";
 import {
   AccessTokenSchema,
   ApiErrorBodySchema,
+  ApiErrorCodeSchema,
   Base64Url32BytesSchema,
+  DeviceKeyAlgorithmSchema,
   DeviceListItemSchema,
   DevicePublicKeySchema,
+  DeviceRevocationReasonSchema,
   DeviceSignatureSchema,
   GitHubLoginSchema,
+  IdentityProviderSchema,
   InvitationCodeSchema,
+  JoinRequestDecisionSchema,
   MemberRoleSchema,
   RunCancelReasonSchema,
   SignInCodeSchema,
   WorkspaceMemberSchema,
 } from "./account.ts";
+import {
+  API_ERROR_CODES,
+  DEVICE_KEY_ALGORITHMS,
+  DEVICE_REVOCATION_REASONS,
+  genericApiErrorCode,
+  IDENTITY_PROVIDERS,
+  JOIN_REQUEST_DECISIONS,
+  MEMBER_ROLES,
+  RUN_CANCEL_REASONS,
+} from "./model.ts";
 
 const WORKSPACE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3";
 const MEMBER_ID = "0192f2a0-7c3e-7d2e-9f10-112233445566";
@@ -234,4 +249,110 @@ test("the vocabulary schemas match exactly", () => {
   assert.equal(MemberRoleSchema.safeParse("Owner").success, false);
   assert.equal(RunCancelReasonSchema.safeParse("device_revoked").success, true);
   assert.equal(RunCancelReasonSchema.safeParse("removed").success, false);
+});
+
+test("an active claimed person always has an identity", () => {
+  assert.equal(
+    WorkspaceMemberSchema.safeParse({
+      ...claimed,
+      role: "owner",
+      identity: null,
+    }).success,
+    false,
+  );
+  assert.equal(
+    WorkspaceMemberSchema.safeParse({
+      ...claimed,
+      identity: null,
+      removedAt: NOW,
+    }).success,
+    true,
+  );
+});
+
+test("the status of an error body fits its code", () => {
+  const body = (statusCode: number, code: string) => ({
+    statusCode,
+    error: "Status",
+    message: "Status",
+    code,
+  });
+  for (const [status, code] of [
+    [401, "unauthorized"],
+    [401, "device_revoked"],
+    [403, "device_too_new"],
+    [404, "invitation_invalid"],
+    [409, "conflict"],
+    [429, "rate_limited"],
+    [503, "sign_in_unavailable"],
+    [400, "bad_request"],
+    [413, "bad_request"],
+    [415, "bad_request"],
+    [500, "internal_error"],
+    [502, "internal_error"],
+  ] as const) {
+    assert.equal(
+      ApiErrorBodySchema.safeParse(body(status, code)).success,
+      true,
+      `${status} ${code}`,
+    );
+  }
+  for (const [status, code] of [
+    [404, "unauthorized"],
+    [400, "forbidden"],
+    [503, "rate_limited"],
+    [500, "sign_in_unavailable"],
+    [500, "bad_request"],
+    [404, "internal_error"],
+  ] as const) {
+    assert.equal(
+      ApiErrorBodySchema.safeParse(body(status, code)).success,
+      false,
+      `${status} ${code}`,
+    );
+  }
+  // Every generic code fits the status it is generated for.
+  for (let status = 400; status <= 599; status += 1) {
+    assert.equal(
+      ApiErrorBodySchema.safeParse(body(status, genericApiErrorCode(status)))
+        .success,
+      true,
+      String(status),
+    );
+  }
+});
+
+test("the public key schema refuses weak keys", () => {
+  assert.equal(
+    DevicePublicKeySchema.safeParse("01" + "00".repeat(31)).success,
+    false,
+  );
+  assert.equal(
+    DevicePublicKeySchema.safeParse("ec" + "ff".repeat(30) + "7f").success,
+    false,
+  );
+});
+
+test("every account vocabulary schema matches its constant exactly", () => {
+  const cases: [
+    schema: { safeParse(value: unknown): { success: boolean } },
+    values: readonly string[],
+  ][] = [
+    [MemberRoleSchema, MEMBER_ROLES],
+    [DeviceKeyAlgorithmSchema, DEVICE_KEY_ALGORITHMS],
+    [DeviceRevocationReasonSchema, DEVICE_REVOCATION_REASONS],
+    [JoinRequestDecisionSchema, JOIN_REQUEST_DECISIONS],
+    [IdentityProviderSchema, IDENTITY_PROVIDERS],
+    [RunCancelReasonSchema, RUN_CANCEL_REASONS],
+    [ApiErrorCodeSchema, API_ERROR_CODES],
+  ];
+  for (const [schema, values] of cases) {
+    for (const value of values) {
+      assert.equal(schema.safeParse(value).success, true, value);
+      assert.equal(schema.safeParse(value.toUpperCase()).success, false, value);
+      assert.equal(schema.safeParse(` ${value}`).success, false, value);
+    }
+    assert.equal(schema.safeParse("").success, false);
+    assert.equal(schema.safeParse(null).success, false);
+  }
 });
