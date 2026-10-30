@@ -11,6 +11,7 @@ export type RecordedRequest = Readonly<{
   url: string;
   headers: Readonly<Record<string, string>>;
   body: string;
+  redirect: string | undefined;
 }>;
 
 export type FakeGitHubScenario = {
@@ -61,6 +62,7 @@ export function fakeGitHub(scenario: Partial<FakeGitHubScenario> = {}) {
       url,
       headers,
       body: typeof init?.body === "string" ? init.body : "",
+      redirect: init?.redirect,
     });
     const path = new URL(url).pathname;
     if (method === "POST" && path === "/login/oauth/access_token") {

@@ -201,3 +201,71 @@ test("a sign-in code is used once and expires after its lifetime", () => {
   clock = 60_000;
   assert.equal(codes.take(late), null, "expired");
 });
+
+test("every GitHub call refuses redirects", async () => {
+  const fake = fakeGitHub();
+  const api = apiWith(fake.fetch);
+  await api.exchangeCode(exchangeInput);
+  await api.getUser(FAKE_TOKEN);
+  await api.deleteToken(FAKE_TOKEN);
+  assert.deepEqual(
+    fake.requests.map((request) => request.redirect),
+    ["error", "error", "error"],
+  );
+});
+
+test("a token in a failed exchange answer is deleted at once", async () => {
+  for (const [status, body] of [
+    [200, { error: "bad_verification_code", access_token: FAKE_TOKEN }],
+    [500, { access_token: FAKE_TOKEN }],
+  ] as const) {
+    const deleted: string[] = [];
+    const fetchImpl: typeof fetch = async (input, init) => {
+      if (init?.method === "DELETE") {
+        deleted.push(JSON.parse(String(init.body)).access_token);
+        return new Response(null, { status: 204 });
+      }
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const result = await apiWith(fetchImpl).exchangeCode(exchangeInput);
+    assert.equal(result.ok, false, String(status));
+    assert.deepEqual(deleted, [FAKE_TOKEN], String(status));
+  }
+});
+
+test("sweeping drops expired attempts and codes without a new request", () => {
+  let clock = 0;
+  const options = { max: 10, lifetimeMs: 1_000, now: () => clock };
+  const attempts = new SignInAttempts(options);
+  const codes = new SignInCodes(options);
+  const desktop = {
+    codeChallenge: s256("v"),
+    state: randomToken(),
+    redirectUri: "http://127.0.0.1:49152/callback",
+  };
+  const created = attempts.create(desktop);
+  assert.ok(created !== null);
+  const code = codes.issue({
+    identity: {
+      githubId: "1",
+      login: "a",
+      name: null,
+      accountCreatedAt: "2020-01-01T00:00:00Z",
+    },
+    desktopCodeChallenge: desktop.codeChallenge,
+    redirectUri: desktop.redirectUri,
+  });
+  assert.ok(code !== null);
+  clock = 1_000;
+  attempts.sweep();
+  codes.sweep();
+  clock = 0;
+  assert.equal(
+    attempts.find(created.attempt.apiState, created.cookieValue),
+    null,
+  );
+  assert.equal(codes.take(code), null);
+});

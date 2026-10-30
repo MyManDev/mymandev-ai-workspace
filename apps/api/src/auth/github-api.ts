@@ -49,10 +49,10 @@ export interface GitHubApi {
 
 const GITHUB_API_VERSION = "2022-11-28";
 
-const TokenResponseSchema = z.union([
-  z.object({ error: z.string() }),
-  z.object({ access_token: z.string().min(1).max(1024) }),
-]);
+const TokenResponseSchema = z.object({
+  error: z.string().optional(),
+  access_token: z.string().min(1).max(1024).optional(),
+});
 
 const UserResponseSchema = z.object({
   id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
@@ -107,6 +107,42 @@ export function createGitHubApi(options: GitHubApiOptions): GitHubApi {
     accept: "application/vnd.github+json",
     "x-github-api-version": GITHUB_API_VERSION,
   };
+  // A redirect would carry the client secret, the verifier, or the token in
+  // its body to another address, so every call refuses to follow one.
+  const request = (url: string, init: RequestInit) =>
+    send(url, {
+      ...init,
+      redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  /** Releases a body that is not read, so the connection is not held. */
+  const discard = async (response: Response) => {
+    await response.body?.cancel().catch(() => undefined);
+  };
+
+  async function deleteToken(accessToken: string): Promise<boolean> {
+    const basic = Buffer.from(
+      `${options.clientId}:${options.clientSecret.reveal()}`,
+    ).toString("base64");
+    try {
+      const response = await request(
+        `${apiBase}/applications/${encodeURIComponent(options.clientId)}/token`,
+        {
+          method: "DELETE",
+          headers: {
+            ...apiHeaders,
+            authorization: `Basic ${basic}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ access_token: accessToken }),
+        },
+      );
+      await discard(response);
+      return response.status === 204;
+    } catch {
+      return false;
+    }
+  }
 
   return {
     authorizeUrl(input) {
@@ -129,7 +165,7 @@ export function createGitHubApi(options: GitHubApiOptions): GitHubApi {
     async exchangeCode(input) {
       let response: Response;
       try {
-        response = await send(`${webBase}/login/oauth/access_token`, {
+        response = await request(`${webBase}/login/oauth/access_token`, {
           method: "POST",
           headers: {
             accept: "application/json",
@@ -142,12 +178,12 @@ export function createGitHubApi(options: GitHubApiOptions): GitHubApi {
             redirect_uri: input.redirectUri,
             code_verifier: input.codeVerifier,
           }).toString(),
-          signal: AbortSignal.timeout(timeoutMs),
         });
       } catch {
         return { ok: false, reason: "unavailable" };
       }
       if (isRateLimited(response)) {
+        await discard(response);
         return {
           ok: false,
           reason: "rate_limited",
@@ -164,23 +200,32 @@ export function createGitHubApi(options: GitHubApiOptions): GitHubApi {
       if (!parsed.success) {
         return { ok: false, reason: "unavailable" };
       }
-      // GitHub can answer an exchange error with HTTP 200 (#67).
-      if ("error" in parsed.data) {
-        return { ok: false, reason: "rejected" };
+      const token = parsed.data.access_token;
+      // GitHub can answer an exchange error with HTTP 200 (#67), so any
+      // error field fails; a token in a failed answer is deleted at once.
+      if (
+        parsed.data.error !== undefined ||
+        !response.ok ||
+        token === undefined
+      ) {
+        if (token !== undefined) {
+          await deleteToken(token);
+        }
+        return {
+          ok: false,
+          reason: parsed.data.error !== undefined ? "rejected" : "unavailable",
+        };
       }
-      if (!response.ok) {
-        return { ok: false, reason: "unavailable" };
-      }
-      return { ok: true, accessToken: parsed.data.access_token };
+      return { ok: true, accessToken: token };
     },
 
     async getUser(accessToken) {
       try {
-        const response = await send(`${apiBase}/user`, {
+        const response = await request(`${apiBase}/user`, {
           headers: { ...apiHeaders, authorization: `Bearer ${accessToken}` },
-          signal: AbortSignal.timeout(timeoutMs),
         });
         if (!response.ok) {
+          await discard(response);
           return null;
         }
         const parsed = UserResponseSchema.safeParse(await response.json());
@@ -198,28 +243,6 @@ export function createGitHubApi(options: GitHubApiOptions): GitHubApi {
       }
     },
 
-    async deleteToken(accessToken) {
-      const basic = Buffer.from(
-        `${options.clientId}:${options.clientSecret.reveal()}`,
-      ).toString("base64");
-      try {
-        const response = await send(
-          `${apiBase}/applications/${encodeURIComponent(options.clientId)}/token`,
-          {
-            method: "DELETE",
-            headers: {
-              ...apiHeaders,
-              authorization: `Basic ${basic}`,
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({ access_token: accessToken }),
-            signal: AbortSignal.timeout(timeoutMs),
-          },
-        );
-        return response.status === 204;
-      } catch {
-        return false;
-      }
-    },
+    deleteToken,
   };
 }

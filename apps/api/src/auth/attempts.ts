@@ -62,7 +62,7 @@ export class SignInAttempts {
   }
 
   get size(): number {
-    this.#sweep();
+    this.sweep();
     return this.#byState.size;
   }
 
@@ -70,7 +70,7 @@ export class SignInAttempts {
   create(
     desktop: DesktopRequest,
   ): { attempt: SignInAttempt; cookieValue: string } | null {
-    this.#sweep();
+    this.sweep();
     if (this.#byState.size >= this.#options.max) {
       return null;
     }
@@ -88,29 +88,38 @@ export class SignInAttempts {
     return { attempt, cookieValue };
   }
 
-  /** The live attempt for this state, only when the cookie belongs to it. */
+  /**
+   * The live attempt for this state, only when the cookie belongs to it. A
+   * request that names a live attempt without its cookie ends the attempt:
+   * only GitHub and the browser that started it see the state, so such a
+   * request is another browser carrying GitHub's code, as in the phishing
+   * scenario of ADR 0014 ("Threats"), and the code must never be exchanged.
+   */
   find(
     apiState: string,
     cookieValue: string | undefined,
   ): SignInAttempt | null {
     const attempt = this.#byState.get(apiState);
-    if (attempt === undefined || cookieValue === undefined) {
+    if (attempt === undefined) {
       return null;
     }
-    if (attempt.expiresAt <= this.#options.now()) {
+    if (
+      attempt.expiresAt <= this.#options.now() ||
+      cookieValue === undefined ||
+      !sameHash(attempt.cookieHash, sha256Hex(cookieValue))
+    ) {
       this.#byState.delete(apiState);
       return null;
     }
-    return sameHash(attempt.cookieHash, sha256Hex(cookieValue))
-      ? attempt
-      : null;
+    return attempt;
   }
 
   delete(attempt: SignInAttempt): void {
     this.#byState.delete(attempt.apiState);
   }
 
-  #sweep(): void {
+  /** Drops expired entries; the API also runs it on a timer, so nothing outlives its lifetime by much. */
+  sweep(): void {
     const now = this.#options.now();
     for (const [state, attempt] of this.#byState) {
       if (attempt.expiresAt <= now) {
@@ -141,7 +150,7 @@ export class SignInCodes {
 
   /** Issues a code bound to the record; null when the cap is reached. */
   issue(binding: Omit<SignInCodeRecord, "expiresAt">): string | null {
-    this.#sweep();
+    this.sweep();
     if (this.#byHash.size >= this.#options.max) {
       return null;
     }
@@ -167,7 +176,8 @@ export class SignInCodes {
     return record;
   }
 
-  #sweep(): void {
+  /** Drops expired entries; the API also runs it on a timer, so nothing outlives its lifetime by much. */
+  sweep(): void {
     const now = this.#options.now();
     for (const [hash, record] of this.#byHash) {
       if (record.expiresAt <= now) {

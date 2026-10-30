@@ -264,26 +264,41 @@ test("a full sign-in: callback, confirmation page, Continue, and a code posted t
   assert.equal(github.requests.length, 3);
 });
 
-test("a callback without the cookie, with another cookie, an unknown state, or a second time fails before GitHub", async (t) => {
+test("a callback that names an attempt without its cookie ends it, so a replayed GitHub code is never exchanged", async (t) => {
+  // The phishing scenario of ADR 0014 ("Threats"): an attacker starts an
+  // attempt, the victim's browser brings GitHub's code back without the
+  // attacker's cookie, and the attacker replays the URL with the cookie.
+  const { app, github } = await flowApp(t);
+  for (const victimCookie of [null, "mmd_other=x"]) {
+    const attacker = await startAttempt(app);
+    const other = await startAttempt(app);
+    const cookie = victimCookie === null ? null : other.cookie;
+    const victim = await callback(
+      app,
+      attacker,
+      { code: "victim-code", state: attacker.apiState },
+      cookie,
+    );
+    assert.equal(victim.statusCode, 400);
+    assert.equal(listenerForm(victim.body), null);
+    assert.match(victim.body, /Do not copy this page/u);
+    const replay = await callback(app, attacker, {
+      code: "victim-code",
+      state: attacker.apiState,
+    });
+    assert.equal(replay.statusCode, 400, "the attacker's replay fails");
+    assert.equal(listenerForm(replay.body), null);
+  }
+  assert.equal(github.requests.length, 0, "GitHub's code was never exchanged");
+});
+
+test("an unknown state, or a second callback, fails before another exchange", async (t) => {
   const { app, github } = await flowApp(t);
   const attempt = await startAttempt(app);
-  const other = await startAttempt(app);
-  const failures = [
-    await callback(app, attempt, { code: "c", state: attempt.apiState }, null),
-    await callback(
-      app,
-      attempt,
-      { code: "c", state: attempt.apiState },
-      other.cookie,
-    ),
-    await callback(app, attempt, { code: "c", state: other.apiState }),
-    await callback(app, attempt, { code: "c", state: "unknown" }),
-  ];
-  for (const response of failures) {
-    assert.equal(response.statusCode, 400);
-    assert.equal(listenerForm(response.body), null);
-  }
-  assert.equal(github.requests.length, 0);
+  assert.equal(
+    (await callback(app, attempt, { code: "c", state: "unknown" })).statusCode,
+    400,
+  );
   assert.equal(
     (await callback(app, attempt, { code: "c", state: attempt.apiState }))
       .statusCode,
@@ -299,7 +314,6 @@ test("a callback without the cookie, with another cookie, an unknown state, or a
     1,
   );
 });
-
 test("an exchange error with HTTP 200 fails after exactly one exchange and tells the listener", async (t) => {
   const { app, github } = await flowApp(t, {
     scenario: { exchange: "error_with_200" },
@@ -390,7 +404,7 @@ test("Cancel tells the listener access_denied, and the attempt is gone", async (
   assert.equal((await confirm(app, attempt, "continue")).statusCode, 400);
 });
 
-test("a confirmation needs the attempt's cookie, a same-origin request, and a shown confirmation page", async (t) => {
+test("a confirmation needs a form, a same-origin request, and a shown confirmation page", async (t) => {
   const { app } = await flowApp(t);
   const early = await startAttempt(app);
   assert.equal(
@@ -401,15 +415,6 @@ test("a confirmation needs the attempt's cookie, a same-origin request, and a sh
 
   const attempt = await startAttempt(app);
   await callback(app, attempt, { code: "c", state: attempt.apiState });
-  assert.equal(
-    (await confirm(app, attempt, "continue", { cookie: null })).statusCode,
-    400,
-  );
-  assert.equal(
-    (await confirm(app, attempt, "continue", { cookie: early.cookie }))
-      .statusCode,
-    400,
-  );
   assert.equal(
     (await confirm(app, attempt, "continue", { fetchSite: "cross-site" }))
       .statusCode,
@@ -426,13 +431,34 @@ test("a confirmation needs the attempt's cookie, a same-origin request, and a sh
     payload: `state=${attempt.apiState}&decision=cancel&decision=continue`,
   });
   assert.equal(duplicate.statusCode, 400);
-  // The attempt survived the refused requests.
+  const json = await app.inject({
+    method: "POST",
+    url: "/auth/github/confirm",
+    headers: { cookie: attempt.cookie },
+    payload: { state: attempt.apiState, decision: "continue" },
+  });
+  assert.equal(json.statusCode, 415);
+  assert.equal(json.json().code, "bad_request");
+  // None of the refused requests ended the attempt.
   assert.equal(
     listenerForm((await confirm(app, attempt, "continue")).body)?.fields.state,
     attempt.desktopState,
   );
 });
 
+test("a confirmation without the attempt's cookie ends the attempt", async (t) => {
+  const { app } = await flowApp(t);
+  for (const cookie of [null, "foreign"]) {
+    const attempt = await startAttempt(app);
+    const other = await startAttempt(app);
+    await callback(app, attempt, { code: "c", state: attempt.apiState });
+    const refused = await confirm(app, attempt, "continue", {
+      cookie: cookie === null ? null : other.cookie,
+    });
+    assert.equal(refused.statusCode, 400);
+    assert.equal((await confirm(app, attempt, "continue")).statusCode, 400);
+  }
+});
 test("an attempt expires after 10 minutes", async (t) => {
   let clock = Date.parse("2026-10-30T12:00:00.000Z");
   const { app, github } = await flowApp(t, { now: () => clock });

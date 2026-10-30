@@ -85,7 +85,7 @@ function readCookie(request: FastifyRequest, name: string): string | undefined {
 
 const INVALID_ATTEMPT = errorPage(
   "This sign-in is no longer valid",
-  "The sign-in expired, was already used, or was started in another browser.",
+  "The sign-in expired, was already used, or was started in another browser. Do not copy this page's address or send it to anyone.",
 );
 
 /**
@@ -100,6 +100,16 @@ export async function registerGitHubSignIn(
   const { publicOrigin, github, attempts, codes } = options;
   const callbackUrl = `${publicOrigin}${AUTH_ROUTES.githubCallback.path}`;
   const cookie = attemptCookie(publicOrigin);
+
+  // Expired attempts and codes leave memory within seconds of their lifetime.
+  const sweeper = setInterval(() => {
+    attempts.sweep();
+    codes.sweep();
+  }, 15_000);
+  sweeper.unref();
+  app.addHook("onClose", async () => {
+    clearInterval(sweeper);
+  });
 
   let exchangeHour = -1;
   let exchangeCount = 0;
@@ -142,7 +152,8 @@ export async function registerGitHubSignIn(
   }
 
   await app.register(async (scope) => {
-    // The confirmation page posts an HTML form.
+    // The confirmation page posts an HTML form, and nothing else is accepted.
+    scope.removeAllContentTypeParsers();
     scope.addContentTypeParser(
       "application/x-www-form-urlencoded",
       { parseAs: "string", bodyLimit: 4096 },
