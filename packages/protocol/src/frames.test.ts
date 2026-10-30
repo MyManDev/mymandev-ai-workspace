@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decodeClientEvent, decodeEvent } from "./decode.ts";
-import { EVENT_TYPES } from "./envelope.ts";
+import { EVENT_TYPES, SERVER_ONLY_EVENT_TYPES } from "./envelope.ts";
 import {
   CLIENT_FRAME_TYPES,
   decodeClientFrame,
@@ -262,6 +262,14 @@ test("a device refuses auth.response and malformed frames from the server", () =
       "invalid_payload",
     ],
     [
+      "a revoked device as a new device",
+      {
+        ...registered,
+        device: { ...(registered?.["device"] as Json), revokedAt: NOW },
+      },
+      "invalid_payload",
+    ],
+    [
       "another version",
       { ...challenge, protocolVersion: 1 },
       "unsupported_version",
@@ -291,7 +299,23 @@ test("membership events come only from the server, with a system actor and no de
       { ok: false, code: "not_allowed_from_device" },
       `${label} sent by a device`,
     );
+    // The forgery a device would try: its own user and device.
+    assert.equal(
+      decodeClientEvent({
+        ...event,
+        actor: { kind: "user", userId: USER_ID },
+        deviceId: DEVICE_ID,
+      }).ok,
+      false,
+      `${label} forged by a device`,
+    );
   }
+  assert.deepEqual(
+    [...SERVER_ONLY_EVENT_TYPES].sort(),
+    membershipEvents()
+      .map((event) => String(event["type"]))
+      .sort(),
+  );
 });
 
 test("membership events check the person and the roles", () => {
@@ -314,6 +338,12 @@ test("membership events check the person and the roles", () => {
       "a person of another workspace",
       membershipEvent("workspace.member.defined", {
         member: { ...unclaimed, workspaceId: OTHER_WORKSPACE_ID },
+      }),
+    ],
+    [
+      "an owner claimed",
+      membershipEvent("workspace.member.claimed", {
+        member: { ...claimed, role: "owner" },
       }),
     ],
     [

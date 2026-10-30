@@ -132,8 +132,11 @@ export const WorkspaceMemberClaimedEventSchema = z
   })
   .superRefine(
     memberInWorkspace(
-      (member) => member.userId !== null && member.removedAt === null,
-      "A claimed person has an account and is active",
+      (member) =>
+        member.userId !== null &&
+        member.removedAt === null &&
+        member.role === "member",
+      "A claimed person has an account, is active, and is a member",
     ),
   );
 
@@ -206,6 +209,17 @@ export const ProtocolEventSchema = z.discriminatedUnion("type", [
 export type ProtocolEvent = z.infer<typeof ProtocolEventSchema>;
 
 export type EventType = ProtocolEvent["type"];
+
+/** Event types that only the server originates. A device never sends them. */
+export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
+  "workspace.member.defined",
+  "workspace.member.claimed",
+  "workspace.member.renamed",
+  "workspace.member.removed",
+  "workspace.member.role_changed",
+  "workspace.ownership.transferred",
+] as const satisfies readonly EventType[]);
+export type ServerOnlyEventType = (typeof SERVER_ONLY_EVENT_TYPES)[number];
 
 /** The event types of this protocol version, taken from `ProtocolEventSchema`. */
 export const EVENT_TYPES: readonly EventType[] = Object.freeze(

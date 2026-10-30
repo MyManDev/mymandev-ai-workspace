@@ -28,7 +28,12 @@ import { privatePattern } from "./private-pattern.ts";
 // field tells them apart. Frames are never stored or relayed to other
 // accounts.
 
-/** Before authentication succeeds, a frame over this size closes the connection. */
+/**
+ * Before authentication succeeds, a frame over this size closes the
+ * connection. The server measures the raw frame, before it parses the JSON;
+ * the decoders below see parsed values and cannot check it. Which close code
+ * a refused frame gets is decided with the gateway (#89).
+ */
 export const MAX_AUTH_FRAME_BYTES = 1024;
 
 const frameHeaderShape = Object.freeze({
@@ -69,14 +74,19 @@ export type AuthOkFrame = z.infer<typeof AuthOkFrameSchema>;
 
 // Account frames go only to the connections of the account they concern. A
 // device belongs to an account, not to a workspace, so they never use the
-// event envelope and never reach other members.
+// event envelope and never reach other members. They reach only open
+// connections, so after `auth.ok` the desktop reads its devices and
+// workspaces over HTTP and never relies on a frame it may have missed.
 
 /** Another device of the account registered. */
 export const AccountDeviceRegisteredFrameSchema = z.object({
   ...frameHeaderShape,
   type: z.literal("account.device_registered"),
   /** Never the receiving device. */
-  device: DeviceListItemSchema.extend({ current: z.literal(false) }),
+  device: DeviceListItemSchema.extend({
+    revokedAt: z.null(),
+    current: z.literal(false),
+  }),
 });
 export type AccountDeviceRegisteredFrame = z.infer<
   typeof AccountDeviceRegisteredFrameSchema
