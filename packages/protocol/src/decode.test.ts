@@ -260,6 +260,7 @@ test("every allowed transition decodes", () => {
         withPayload({ previousState: from, state: to }),
       );
       assert.ok(result.ok, `${from} -> ${to}`);
+      assert.ok(result.event.type === "agent.run.state_changed");
       assert.equal(result.event.payload.previousState, from);
       assert.equal(result.event.payload.state, to);
       transitions += 1;
@@ -510,6 +511,7 @@ test("the actor must fit the event type", () => {
   assert.ok(created.ok);
   assert.deepEqual(created.event.actor, { kind: "system" });
   assert.equal(created.event.deviceId, null);
+  assert.ok(created.event.type === "agent.run.state_changed");
   assert.equal(created.event.payload.previousState, null);
   assert.equal(created.event.payload.state, "queued");
 });

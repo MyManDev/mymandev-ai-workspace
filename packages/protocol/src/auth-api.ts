@@ -11,7 +11,7 @@ import {
   SignInCodeSchema,
 } from "./account.ts";
 import { DevicePlatformSchema, displayText } from "./entities.ts";
-import { UtcTimestampSchema } from "./envelope.ts";
+import { UtcTimestampSchema } from "./entities.ts";
 import { DeviceIdSchema, UserIdSchema } from "./ids.ts";
 import { LIMITS, MAX_ANSWER_LIST_ITEMS, UUIDV7_PATTERN } from "./model.ts";
 import { privatePattern } from "./private-pattern.ts";

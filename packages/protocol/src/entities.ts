@@ -38,6 +38,9 @@ export function displayText(maxLength: number) {
 }
 
 /** One capability name, matched exactly. An unknown name rejects the message. */
+/** ISO 8601 in UTC with a Z suffix and exactly three fractional digits. */
+export const UtcTimestampSchema = z.iso.datetime({ precision: 3 });
+
 export const CapabilitySchema = z.enum(CAPABILITIES);
 
 export const RunStateSchema = z.enum(RUN_STATES);

@@ -241,6 +241,32 @@ export const EVENT_TYPE_PATTERN =
   /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*\.[a-z][a-z0-9]*(?:_[a-z0-9]+)*\.[a-z][a-z0-9]*(?:_[a-z0-9]+)*$/u;
 
 /**
+ * A frame type: lowercase snake_case `<domain>.<name>`. It has two parts and
+ * an event type has three, so a frame and an event never share a `type`.
+ */
+export const FRAME_TYPE_PATTERN =
+  /^[a-z][a-z0-9]*(?:_[a-z0-9]+)*[.][a-z][a-z0-9]*(?:_[a-z0-9]+)*$/u;
+
+/**
+ * WebSocket close codes from the private range 4000 to 4999 (ADR 0014,
+ * "Device key and authentication"; P-24). The close reason is the key. New
+ * codes follow in order and a number is never reused.
+ */
+export const WS_CLOSE_CODES = Object.freeze({
+  /** Unknown device, bad signature, or disabled account. */
+  auth_failed: 4000,
+  /** No `auth.response` within 10 seconds. */
+  auth_timeout: 4001,
+  /** A valid signature from a revoked device. */
+  device_revoked: 4002,
+  /** A valid signature, but the device must sign in with GitHub again. */
+  sign_in_required: 4003,
+  /** A newer connection of the same device authenticated. */
+  connection_replaced: 4004,
+} as const);
+export type WsCloseReason = keyof typeof WS_CLOSE_CODES;
+
+/**
  * Human-entered text: rejects control, format (including bidirectional and tag
  * characters), surrogate, private-use, line and paragraph separator, and
  * default-ignorable characters. ZWNJ, ZWJ and the two emoji variation

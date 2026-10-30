@@ -66,6 +66,14 @@ export type InvitationId = z.infer<typeof InvitationIdSchema>;
 export const JoinRequestIdSchema = uuidV7String().brand<"JoinRequestId">();
 export type JoinRequestId = z.infer<typeof JoinRequestIdSchema>;
 
+/**
+ * One WebSocket connection. The server generates it and sends it in
+ * `auth.challenge`; the device signs it, so a signature never fits another
+ * connection.
+ */
+export const ConnectionIdSchema = uuidV7String().brand<"ConnectionId">();
+export type ConnectionId = z.infer<typeof ConnectionIdSchema>;
+
 /** Every branded ID kind. */
 export type AnyId =
   | UserId
@@ -81,7 +89,8 @@ export type AnyId =
   | ProviderConnectionId
   | MemberId
   | InvitationId
-  | JoinRequestId;
+  | JoinRequestId
+  | ConnectionId;
 
 /**
  * Generates a new lowercase UUIDv7 string, for IDs that have no branded kind

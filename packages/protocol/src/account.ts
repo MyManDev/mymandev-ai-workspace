@@ -8,8 +8,11 @@ import {
   isDevicePublicKey,
   SIGN_IN_CODE_PATTERN,
 } from "./device-auth.ts";
-import { DevicePlatformSchema, displayText } from "./entities.ts";
-import { UtcTimestampSchema } from "./envelope.ts";
+import {
+  DevicePlatformSchema,
+  displayText,
+  UtcTimestampSchema,
+} from "./entities.ts";
 import {
   DeviceIdSchema,
   MemberIdSchema,
