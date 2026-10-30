@@ -340,10 +340,16 @@ export async function buildApp(
     });
     // Registering the device needs the database too.
     if (database !== null) {
+      const tokens = new AccessTokens({
+        max: MAX_ACCESS_TOKENS,
+        lifetimeMs: ACCESS_TOKEN_LIFETIME_MS,
+        now,
+      });
       await registerSignIn(app, {
         publicOrigin: config.githubSignIn.publicOrigin,
         database,
         codes,
+        tokens,
         now,
       });
       await registerDeviceRoutes(app, {
@@ -354,11 +360,7 @@ export async function buildApp(
           lifetimeMs: CHALLENGE_LIFETIME_MS,
           now,
         }),
-        tokens: new AccessTokens({
-          max: MAX_ACCESS_TOKENS,
-          lifetimeMs: ACCESS_TOKEN_LIFETIME_MS,
-          now,
-        }),
+        tokens,
         now,
       });
     }

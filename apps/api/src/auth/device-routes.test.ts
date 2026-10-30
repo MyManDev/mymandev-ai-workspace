@@ -44,7 +44,9 @@ import { connect } from "node:net";
 import { after, before, test, type TestContext } from "node:test";
 import { buildApp } from "../app.ts";
 import { loadConfig } from "../config.ts";
+import { ApiError } from "../errors.ts";
 import { Secret } from "../secret.ts";
+import { lockActor } from "./device-routes.ts";
 import { createGitHubApi } from "./github-api.ts";
 import {
   callback,
@@ -149,8 +151,15 @@ async function signInCode(app: App) {
   return { code, codeVerifier: attempt.codeVerifier };
 }
 
-/** Signs in a new device through the browser flow and POST /auth/sign-in. */
-async function signInDevice(app: App, key: Key = newKey()) {
+/**
+ * Signs in a new device through the browser flow and POST /auth/sign-in;
+ * with `previousDeviceId`, the new device replaces that one.
+ */
+async function signInDevice(
+  app: App,
+  key: Key = newKey(),
+  previousDeviceId?: string,
+) {
   const { code, codeVerifier } = await signInCode(app);
   const response = await app.inject({
     method: "POST",
@@ -172,6 +181,7 @@ async function signInDevice(app: App, key: Key = newKey()) {
           deviceId: null,
           newPublicKey: key.publicKey,
         }),
+        ...(previousDeviceId === undefined ? {} : { previousDeviceId }),
       },
     },
   });
@@ -1030,9 +1040,7 @@ test("a token is refused once its device's sign-in is 30 days old", async (t) =>
 test("a request whose body arrives after its device was revoked is refused", async (t) => {
   const app = await tokenApp(t, { githubId: 2022 });
   const stolen = await signInDevice(app);
-  const owner = await signInDevice(app);
   const stolenToken = await token(app, stolen);
-  const ownerToken = await token(app, owner);
   await app.listen({ host: "127.0.0.1", port: 0 });
   const address = app.server.address();
   assert.ok(address !== null && typeof address === "object");
@@ -1043,6 +1051,9 @@ test("a request whose body arrives after its device was revoked is refused", asy
   socket.setEncoding("utf8");
   socket.on("data", (chunk) => {
     raw += chunk;
+  });
+  socket.on("error", () => {
+    // An early answer may close the connection before the rest of the body.
   });
   const closed = once(socket, "close");
   // The headers and half of the body, while the token is still valid.
@@ -1059,24 +1070,118 @@ test("a request whose body arrives after its device was revoked is refused", asy
     ].join(crlf),
   );
   await new Promise((resolve) => setTimeout(resolve, 50));
-  // The owner revokes the stolen device as lost, which locks new devices.
-  const revoked = await post(
-    app,
-    `/devices/${stolen.deviceId}/revoke`,
-    ownerToken,
-    {
-      reason: "lost",
-    },
-  );
-  assert.equal(revoked.statusCode, 204);
+  // The device is revoked as lost, which locks new devices. The change goes
+  // straight to the database, so the token stays in the API's memory and the
+  // refusal must come from the checks after the body.
+  const lockedUntil = new Date(Date.now() + 7 * 24 * 60 * 60_000);
+  await database()
+    .update(devices)
+    .set({ revokedAt: new Date(), revocationReason: "lost" })
+    .where(eq(devices.id, stolen.deviceId));
+  await database()
+    .update(users)
+    .set({ deviceRegistrationLockedUntil: lockedUntil })
+    .where(eq(users.id, stolen.userId));
   socket.write("}");
   await closed;
   assert.ok(raw.startsWith("HTTP/1.1 401 "), raw);
   const [user] = await database()
     .select()
     .from(users)
-    .where(eq(users.id, owner.userId));
-  assert.notEqual(user?.deviceRegistrationLockedUntil, null, "the lock stays");
+    .where(eq(users.id, stolen.userId));
+  assert.equal(
+    user?.deviceRegistrationLockedUntil?.getTime(),
+    lockedUntil.getTime(),
+    "the lock stays",
+  );
+});
+
+test("inside a transaction, lockActor refuses a device or an account that changed after authentication", async (t) => {
+  let clock = Date.now();
+  const app = await tokenApp(t, { githubId: 2026, now: () => clock });
+  const unauthorized = (error: unknown) =>
+    error instanceof ApiError && error.code === "unauthorized";
+  const changes: [
+    label: string,
+    change: (device: SignedInDevice) => Promise<unknown>,
+  ][] = [
+    [
+      "a new sign-in",
+      async (d) => {
+        clock += 1_000;
+        await signInAgain(app, d);
+      },
+    ],
+    [
+      "revoked",
+      (d) =>
+        database()
+          .update(devices)
+          .set({ revokedAt: new Date(clock), revocationReason: "removed" })
+          .where(eq(devices.id, d.deviceId)),
+    ],
+    [
+      "signed out",
+      (d) =>
+        database()
+          .update(devices)
+          .set({ signedOutAt: new Date(clock) })
+          .where(eq(devices.id, d.deviceId)),
+    ],
+    [
+      "disabled",
+      (d) =>
+        database()
+          .update(users)
+          .set({ disabledAt: new Date(clock) })
+          .where(eq(users.id, d.userId)),
+    ],
+  ];
+  for (const [label, change] of changes) {
+    const device = await signInDevice(app);
+    const [row] = await database()
+      .select({ lastSignInAt: devices.lastSignInAt })
+      .from(devices)
+      .where(eq(devices.id, device.deviceId));
+    assert.ok(row !== undefined);
+    const auth = {
+      userId: device.userId,
+      deviceId: device.deviceId,
+      signedInAt: row.lastSignInAt.getTime(),
+    };
+    await database().transaction((tx) => lockActor(tx, auth, clock));
+    await change(device);
+    await assert.rejects(
+      database().transaction((tx) => lockActor(tx, auth, clock)),
+      unauthorized,
+      label,
+    );
+  }
+});
+
+test("tokens ended by a new sign-in or a replacement do not use up the account's request limit", async (t) => {
+  let clock = Date.now();
+  const app = await tokenApp(t, { githubId: 2027, now: () => clock });
+  const device = await signInDevice(app);
+  const beforeSignIn = await token(app, device);
+  const replaced = await signInDevice(app);
+  const ofReplaced = await token(app, replaced);
+  clock += 1_000;
+  const again = await signInAgain(app, device);
+  await signInDevice(app, newKey(), replaced.deviceId);
+  for (let index = 0; index < 301; index += 1) {
+    for (const stale of [beforeSignIn, ofReplaced]) {
+      assert.equal(
+        (await get(app, "/devices", stale)).statusCode,
+        401,
+        String(index),
+      );
+    }
+  }
+  assert.equal(
+    (await get(app, "/devices", await token(app, again))).statusCode,
+    200,
+  );
 });
 
 test("forged signatures do not use the device's token budget", async (t) => {

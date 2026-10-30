@@ -27,6 +27,7 @@ import { zodValidatorCompiler } from "../validation.ts";
 import { s256, type SignInCodes } from "./attempts.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
 import type { GitHubIdentity } from "./github-api.ts";
+import type { AccessTokens } from "./tokens.ts";
 
 /** ADR 0014, "Accounts" and "Limits". */
 const MAX_ACTIVE_DEVICES = 20;
@@ -44,7 +45,14 @@ export type SignInRouteOptions = Readonly<{
   publicOrigin: string;
   database: Database;
   codes: SignInCodes;
+  tokens: AccessTokens;
   now: () => number;
+}>;
+
+type SignInResult = Readonly<{
+  response: SignInResponse;
+  /** The previous device that this sign-in revoked as replaced, if any. */
+  replacedDeviceId: DeviceId | null;
 }>;
 
 /** The first display name: the GitHub name if it passes the text rule and the length limit, else the login. */
@@ -93,7 +101,7 @@ export async function registerSignIn(
   app: FastifyInstance,
   options: SignInRouteOptions,
 ): Promise<void> {
-  const { database, codes, publicOrigin } = options;
+  const { database, codes, tokens, publicOrigin } = options;
 
   await app.register(async (scope) => {
     scope.setValidatorCompiler(zodValidatorCompiler);
@@ -134,8 +142,9 @@ export async function registerSignIn(
           throw new ApiError("auth_failed");
         }
 
+        let result: SignInResult;
         try {
-          return await database.transaction((tx) =>
+          result = await database.transaction((tx) =>
             signIn(tx, binding.identity, body.device, currentKey, now),
           );
         } catch (error) {
@@ -146,6 +155,13 @@ export async function registerSignIn(
           // A concurrent sign-in of the same account or the same key.
           throw failure.code === "23505" ? new ApiError("conflict") : failure;
         }
+        // The earlier tokens of the device would be refused anyway; dropping
+        // them keeps them from using up the account's request limit.
+        tokens.dropDevice(result.response.deviceId);
+        if (result.replacedDeviceId !== null) {
+          tokens.dropDevice(result.replacedDeviceId);
+        }
+        return result.response;
       },
     );
   });
@@ -158,24 +174,27 @@ async function signIn(
   device: DeviceRegistration,
   verifiedCurrentKey: string | null,
   now: Date,
-): Promise<SignInResponse> {
+): Promise<SignInResult> {
   const userId = await upsertAccount(tx, identity, now);
+  // "No key update" still serializes with every other change of the row, but
+  // not with the key-share locks of foreign-key checks.
   const [user] = await tx
     .select()
     .from(users)
     .where(eq(users.id, userId))
-    .for("update");
+    .for("no key update");
   if (user === undefined || user.disabledAt !== null) {
     throw new ApiError("auth_failed");
   }
 
   let deviceId: DeviceId;
+  let replacedDeviceId: DeviceId | null = null;
   if (device.kind === "existing") {
     const [row] = await tx
       .select()
       .from(devices)
       .where(eq(devices.id, device.deviceId))
-      .for("update");
+      .for("no key update");
     if (row === undefined) {
       throw new ApiError("auth_failed");
     }
@@ -260,7 +279,7 @@ async function signIn(
       // Revoked only if it belongs to the same account (ADR 0014, step 8).
       // Closing its socket and sending the run events for the result waits
       // for the gateway's connection registry (#89).
-      await revokeDevice(tx, {
+      const replaced = await revokeDevice(tx, {
         deviceId: device.previousDeviceId,
         userId,
         reason: "replaced",
@@ -268,18 +287,24 @@ async function signIn(
         actorUserId: userId,
         actorDeviceId: deviceId,
       });
+      if (replaced.revoked) {
+        replacedDeviceId = device.previousDeviceId;
+      }
     }
   }
   await audit(tx, "account.signed_in", userId, deviceId, userId, now);
 
   return {
-    userId,
-    deviceId,
-    displayName: user.displayName,
-    login: identity.login,
-    signInExpiresAt: new Date(
-      now.getTime() + SIGN_IN_LIFETIME_MS,
-    ).toISOString(),
+    response: {
+      userId,
+      deviceId,
+      displayName: user.displayName,
+      login: identity.login,
+      signInExpiresAt: new Date(
+        now.getTime() + SIGN_IN_LIFETIME_MS,
+      ).toISOString(),
+    },
+    replacedDeviceId,
   };
 }
 

@@ -122,9 +122,11 @@ function tokenUsable(
  * Locks the account and the acting device until the transaction ends and
  * checks them again, so that a request authenticated before a revocation, a
  * sign-out, a new sign-in, or a disable cannot change anything after it. The
- * account is locked before the device, in the order the sign-in uses.
+ * account is locked before the device, in the order the sign-in uses. "No key
+ * update" still waits for every other change of these rows, but not for the
+ * key-share locks of foreign-key checks, so that it cannot deadlock with them.
  */
-async function lockActor(
+export async function lockActor(
   tx: Database,
   auth: AuthContext,
   now: number,
@@ -136,7 +138,7 @@ async function lockActor(
     })
     .from(users)
     .where(eq(users.id, auth.userId))
-    .for("update");
+    .for("no key update");
   const [device] = await tx
     .select({
       userId: devices.userId,
@@ -146,7 +148,7 @@ async function lockActor(
     })
     .from(devices)
     .where(eq(devices.id, auth.deviceId))
-    .for("update");
+    .for("no key update");
   const row =
     user === undefined || device === undefined
       ? undefined
