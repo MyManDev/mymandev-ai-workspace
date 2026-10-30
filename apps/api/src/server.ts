@@ -21,6 +21,16 @@ try {
 
 const app = await buildApp({ config, version: packageJson.version });
 
+// Only development and test can start without these (ADR 0014, "Configuration").
+if (config.githubSignIn === null) {
+  app.log.warn(
+    "GitHub sign-in is disabled: API_PUBLIC_ORIGIN, API_GITHUB_CLIENT_ID, and API_GITHUB_CLIENT_SECRET are not set",
+  );
+}
+if (config.databaseUrl === null) {
+  app.log.warn("the database is disabled: DATABASE_URL is not set");
+}
+
 let shuttingDown = false;
 async function shutdown(signal: NodeJS.Signals): Promise<void> {
   if (shuttingDown) {

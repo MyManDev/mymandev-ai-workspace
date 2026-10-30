@@ -62,5 +62,6 @@ Answered by the Project Manager on 2026-10-28.
   - zod 4 classic.
 - Defer the Fastify type provider choice to the first REST route with a body in M2 (P-06).
   - Deferred to the first REST route with a body in M2.
+  - Update of 2026-10-30 (#87): the Project Manager chose the small `validatorCompiler`, with no Fastify type provider and no new dependency. Routes whose schemas are zod schemas of `@mymandev/protocol` register `zodValidatorCompiler` ([`apps/api/src/validation.ts`](../../../apps/api/src/validation.ts)) in their plugin scope; it calls `safeParse`, keeps the parsed value, so unknown keys are stripped, and turns a failure into a `400` with `bad_request` whose message names the part, the path, and the issue, never an input value. Routes with JSON Schema keep Fastify's default compiler. The text above is unchanged.
 - How the renderer enables jitless validation, agreed with the desktop owner (P-02): a renderer module that sets `z.config({ jitless: true })` before the protocol is evaluated (documented in usage rule 4), a side-effect subpath of the protocol (an exception to the ADR 0001 rule that M1 adds no subpaths), or protocol schemas that are created lazily. With the first option, `enableJitlessValidation()` has no use left and can be removed.
   - Open until the desktop owner answers in pull request #48 (P-02). Until then, usage rule 4 applies.
