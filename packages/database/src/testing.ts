@@ -22,9 +22,10 @@ export type TestDatabase = {
 };
 
 /**
- * A fresh database with every migration applied. Tests only. Not exported from
- * the package yet; the export "./testing" is added when another workspace
- * first needs a test database (M2).
+ * A fresh database with every migration applied. Tests only, exported as
+ * "@mymandev/database/testing" (ADR 0012). A workspace that imports it
+ * declares @electric-sql/pglite as a devDependency at the identical exact
+ * version, because a nested PGlite breaks drizzle-orm/pglite.
  *
  * With DATABASE_TEST_URL set, the database is created on that PostgreSQL
  * server and dropped by close(); the URL's role must be allowed to create

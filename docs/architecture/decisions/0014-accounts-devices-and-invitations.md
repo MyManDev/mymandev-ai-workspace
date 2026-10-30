@@ -501,6 +501,7 @@ Changes to `@mymandev/protocol`, a shared boundary, reviewed with the desktop ow
 - Behavior still to verify:
   - the form POST from the API's HTTPS page to `http://127.0.0.1`, and the `__Host-` cookie on a loopback HTTP origin, in Safari on macOS; Firefox is not checked, by the Project Manager's decision of 2026-10-29;
   - which Electron API reports the Linux `safeStorage` fallback under the asynchronous API.
+- Update of 2026-10-29 (#67): Safari 26.6.2 on macOS 26.6.2 submitted the form POST from a page served over HTTPS from a public origin to `http://127.0.0.1:<port>/callback`, by its button and by a script on load, without a prompt; the listener received the code and the state, with `Origin: null` and `Sec-Fetch-Site: cross-site`, so P-50 holds in Safari too. Safari kept no cookie with `Secure` on `http://127.0.0.1` or on `http://localhost`, with or without the `__Host-` prefix, and kept a cookie without `Secure`. The attempt's cookie therefore fails in Safari during development against an API on a loopback address; production uses HTTPS and is not affected. How development handles the cookie is decided in #99. The text above is unchanged.
 
 ## Dependency policy
 

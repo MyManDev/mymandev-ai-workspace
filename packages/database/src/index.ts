@@ -11,3 +11,9 @@ export {
   toDatabaseError,
   withDatabaseErrors,
 } from "./errors.ts";
+export {
+  AUDIT_ACTIONS,
+  AUDIT_REASONS,
+  type AuditAction,
+  type AuditReason,
+} from "./audit-vocabulary.ts";
