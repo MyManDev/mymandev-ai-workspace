@@ -4,7 +4,9 @@ import {
   envelopeHeaderShape,
   EVENT_TYPES,
   ProtocolEventSchema,
+  SERVER_ONLY_EVENT_TYPES,
   type ProtocolEvent,
+  type ServerOnlyEventType,
 } from "./envelope.ts";
 import { EVENT_TYPE_PATTERN, LIMITS, PROTOCOL_VERSION } from "./model.ts";
 import { privatePattern } from "./private-pattern.ts";
@@ -75,9 +77,15 @@ declare const unverified: unique symbol;
  * An event that a device sent. It is well-formed, but its actor, device and
  * referenced IDs are not yet bound to the authenticated connection. Only the
  * server's identity binding (M2) produces an event that may be relayed or
- * stored. Never cast it to `ProtocolEvent` or to a verified type.
+ * stored. Never cast it to `ProtocolEvent` or to a verified type. It is
+ * never one of `SERVER_ONLY_EVENT_TYPES`.
  */
-export type UnverifiedEvent = ProtocolEvent & { readonly [unverified]: true };
+export type UnverifiedEvent = Exclude<
+  ProtocolEvent,
+  { type: ServerOnlyEventType }
+> & { readonly [unverified]: true };
+
+const serverOnlyTypes: ReadonlySet<string> = new Set(SERVER_ONLY_EVENT_TYPES);
 
 export type ClientDecodeErrorCode = DecodeErrorCode | "not_allowed_from_device";
 
@@ -92,7 +100,11 @@ export function decodeClientEvent(input: unknown): ClientDecodeResult {
     return result;
   }
   const { event } = result;
-  if (event.actor.kind === "system" || event.deviceId === null) {
+  if (
+    serverOnlyTypes.has(event.type) ||
+    event.actor.kind === "system" ||
+    event.deviceId === null
+  ) {
     return { ok: false, code: "not_allowed_from_device" };
   }
   // Creating a run is a server command (M2); a device never sends null -> queued.

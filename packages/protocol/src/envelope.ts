@@ -1,10 +1,12 @@
 import * as z from "zod";
-import { displayText, RunStateSchema } from "./entities.ts";
+import { MemberRoleSchema, WorkspaceMemberSchema } from "./account.ts";
+import { displayText, RunStateSchema, UtcTimestampSchema } from "./entities.ts";
 import {
   AgentIdSchema,
   CorrelationIdSchema,
   DeviceIdSchema,
   EventIdSchema,
+  MemberIdSchema,
   RepositoryIdSchema,
   RunIdSchema,
   UserIdSchema,
@@ -23,9 +25,6 @@ export const ActorSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("system") }),
 ]);
 export type Actor = z.infer<typeof ActorSchema>;
-
-/** ISO 8601 in UTC with a Z suffix and exactly three fractional digits. */
-export const UtcTimestampSchema = z.iso.datetime({ precision: 3 });
 
 /**
  * The header fields that every event carries, except `type`. Frozen, so that
@@ -81,16 +80,146 @@ export type AgentRunStateChangedEvent = z.infer<
   typeof AgentRunStateChangedEventSchema
 >;
 
+// Membership events (ADR 0014, "Protocol"): the changes that every member of
+// a workspace must see. Only the server originates them, with a `system`
+// actor and `deviceId: null` (see `actorAllowed`).
+
+/** Checks that the event's person belongs to its workspace and passes `check`. */
+function memberInWorkspace(
+  check: (member: z.infer<typeof WorkspaceMemberSchema>) => boolean,
+  message: string,
+) {
+  return (
+    event: {
+      workspaceId: string;
+      payload: { member: z.infer<typeof WorkspaceMemberSchema> };
+    },
+    ctx: z.RefinementCtx,
+  ) => {
+    if (event.payload.member.workspaceId !== event.workspaceId) {
+      ctx.addIssue({
+        code: "custom",
+        message: "The person belongs to another workspace",
+        path: ["payload", "member", "workspaceId"],
+      });
+    }
+    if (!check(event.payload.member)) {
+      ctx.addIssue({ code: "custom", message, path: ["payload", "member"] });
+    }
+  };
+}
+
+/** The owner or an admin defined a person, who is unclaimed. */
+export const WorkspaceMemberDefinedEventSchema = z
+  .object({
+    ...envelopeHeaderShape,
+    type: z.literal("workspace.member.defined"),
+    payload: z.object({ member: WorkspaceMemberSchema }),
+  })
+  .superRefine(
+    memberInWorkspace(
+      (member) => member.userId === null && member.removedAt === null,
+      "A defined person is unclaimed and active",
+    ),
+  );
+
+/** An account claimed a person, through an invitation or an approved join request. */
+export const WorkspaceMemberClaimedEventSchema = z
+  .object({
+    ...envelopeHeaderShape,
+    type: z.literal("workspace.member.claimed"),
+    payload: z.object({ member: WorkspaceMemberSchema }),
+  })
+  .superRefine(
+    memberInWorkspace(
+      (member) =>
+        member.userId !== null &&
+        member.removedAt === null &&
+        member.role === "member",
+      "A claimed person has an account, is active, and is a member",
+    ),
+  );
+
+/** A person's display name changed. */
+export const WorkspaceMemberRenamedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.member.renamed"),
+  payload: z.object({
+    memberId: MemberIdSchema,
+    displayName: displayText(LIMITS.displayName),
+  }),
+});
+
+/** A person was removed or left. Nothing is deleted; the person stays as a former member. */
+export const WorkspaceMemberRemovedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.member.removed"),
+  payload: z.object({
+    memberId: MemberIdSchema,
+    removedAt: UtcTimestampSchema,
+  }),
+});
+
+/** A person became an admin, or a member again. The owner changes only by transfer. */
+export const WorkspaceMemberRoleChangedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.member.role_changed"),
+  payload: z.object({
+    memberId: MemberIdSchema,
+    role: MemberRoleSchema.exclude(["owner"]),
+  }),
+});
+
+/**
+ * Ownership moved in one transaction: the previous owner is now an admin,
+ * and the target is the owner.
+ */
+export const WorkspaceOwnershipTransferredEventSchema = z
+  .object({
+    ...envelopeHeaderShape,
+    type: z.literal("workspace.ownership.transferred"),
+    payload: z.object({
+      previousOwnerMemberId: MemberIdSchema,
+      ownerMemberId: MemberIdSchema,
+    }),
+  })
+  .superRefine((event, ctx) => {
+    if (event.payload.previousOwnerMemberId === event.payload.ownerMemberId) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Ownership moves to another person",
+        path: ["payload", "ownerMemberId"],
+      });
+    }
+  });
+
 /**
  * Every protocol v0 event. Named `ProtocolEvent`, not `Event`, so that it
  * does not shadow the DOM `Event` type in the desktop renderer.
  */
 export const ProtocolEventSchema = z.discriminatedUnion("type", [
   AgentRunStateChangedEventSchema,
+  WorkspaceMemberDefinedEventSchema,
+  WorkspaceMemberClaimedEventSchema,
+  WorkspaceMemberRenamedEventSchema,
+  WorkspaceMemberRemovedEventSchema,
+  WorkspaceMemberRoleChangedEventSchema,
+  WorkspaceOwnershipTransferredEventSchema,
 ]);
 export type ProtocolEvent = z.infer<typeof ProtocolEventSchema>;
 
 export type EventType = ProtocolEvent["type"];
+
+/** Event types that only the server originates. A device never sends them. */
+export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
+  "workspace.member.defined",
+  "workspace.member.claimed",
+  "workspace.member.renamed",
+  "workspace.member.removed",
+  "workspace.member.role_changed",
+  "workspace.ownership.transferred",
+] as const satisfies readonly EventType[]);
+export type ServerOnlyEventType = (typeof SERVER_ONLY_EVENT_TYPES)[number];
 
 /** The event types of this protocol version, taken from `ProtocolEventSchema`. */
 export const EVENT_TYPES: readonly EventType[] = Object.freeze(
@@ -107,5 +236,13 @@ export function actorAllowed(event: ProtocolEvent): boolean {
         (event.actor.kind === "agent" &&
           event.actor.agentId === event.payload.agentId)
       );
+    case "workspace.member.defined":
+    case "workspace.member.claimed":
+    case "workspace.member.renamed":
+    case "workspace.member.removed":
+    case "workspace.member.role_changed":
+    case "workspace.ownership.transferred":
+      // Only the server reports membership changes.
+      return event.actor.kind === "system" && event.deviceId === null;
   }
 }

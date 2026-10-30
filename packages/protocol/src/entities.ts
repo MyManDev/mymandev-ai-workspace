@@ -37,6 +37,9 @@ export function displayText(maxLength: number) {
     .regex(notBlankPattern, "Must not be blank");
 }
 
+/** ISO 8601 in UTC with a Z suffix and exactly three fractional digits. */
+export const UtcTimestampSchema = z.iso.datetime({ precision: 3 });
+
 /** One capability name, matched exactly. An unknown name rejects the message. */
 export const CapabilitySchema = z.enum(CAPABILITIES);
 

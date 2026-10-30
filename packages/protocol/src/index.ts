@@ -3,6 +3,7 @@ export * from "./ids.ts";
 export * from "./entities.ts";
 export * from "./envelope.ts";
 export * from "./decode.ts";
+export * from "./frames.ts";
 export * from "./device-auth.ts";
 export * from "./account.ts";
 export * from "./auth-api.ts";

@@ -15,7 +15,7 @@ import {
 } from "./account.ts";
 import type { ApiRoute } from "./auth-api.ts";
 import { displayText, WorkspaceSchema } from "./entities.ts";
-import { UtcTimestampSchema } from "./envelope.ts";
+import { UtcTimestampSchema } from "./entities.ts";
 import {
   InvitationIdSchema,
   JoinRequestIdSchema,

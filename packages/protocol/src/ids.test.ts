@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   AgentIdSchema,
+  ConnectionIdSchema,
   CorrelationIdSchema,
   DeviceIdSchema,
   EventIdSchema,
@@ -45,6 +46,7 @@ const ID_SCHEMAS = [
   MemberIdSchema,
   InvitationIdSchema,
   JoinRequestIdSchema,
+  ConnectionIdSchema,
 ];
 
 test("generated IDs are lowercase UUIDv7 and sort in creation order", () => {
