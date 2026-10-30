@@ -7,6 +7,12 @@ export {
 } from "./client.ts";
 export { migrationsFolder, runMigrations } from "./migrate.ts";
 export {
+  type AccountStatusInput,
+  disableAccount,
+  type DisableAccountResult,
+  enableAccount,
+} from "./account-status.ts";
+export {
   revokeDevice,
   type RevokeDeviceInput,
   type RevokeDeviceResult,

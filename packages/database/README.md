@@ -12,6 +12,7 @@ No application uses this package yet. The cloud API imports its query functions 
 | `db:check`    | `drizzle-kit check`                                        |
 | `db:migrate`  | `node --env-file-if-exists=.env src/migrate-cli.ts`        |
 | `db:compare`  | `node --env-file-if-exists=.env src/compare-schema-cli.ts` |
+| `db:account`  | `node --env-file-if-exists=.env src/account-cli.ts`        |
 | `typecheck`   | `tsc -p tsconfig.json`                                     |
 | `test`        | `node --test "src/**/*.test.ts"`                           |
 
@@ -163,6 +164,19 @@ PGlite test databases and `pglite-server` keep their data in memory, so they nee
 ## Transactions
 
 - `revokeDevice(db, input)` revokes a device in one transaction (ADR 0014, "Revocation, sign-out, and recovery"): it sets `revoked_at` and `revocation_reason`, disables the agents that the device hosts, revokes the active grants on the device with the account as `revoked_by_user_id` (ADR 0015, P-77), moves the unfinished runs of those agents to `cancelled` with the reason `device_revoked` (P-60), and writes a `device.revoked` audit record. Inside another transaction it runs as a savepoint, so a sign-in can revoke the replaced device in its own transaction. A device that does not exist, belongs to another account, or is already revoked is left unchanged and the result says `revoked: false`. The result lists the disabled agents, the revoked grants, and the cancelled runs, so that the caller can close the device's socket and send the run events after the commit.
+
+## Operator commands
+
+An operator disables or enables an account with the application role in `DATABASE_URL`:
+
+```sh
+npm run db:account -w @mymandev/database -- disable <user ID>
+npm run db:account -w @mymandev/database -- enable <user ID>
+```
+
+- `disableAccount` sets `users.disabled_at`, so every authentication of the account fails, and revokes in the same transaction the active grants of the agents that the account owns, with the account as `revoked_by_user_id` (ADR 0014; ADR 0015, P-77 and P-78).
+- `enableAccount` clears it. No grant is restored; the person grants again what their agents need.
+- Both write an audit record (`account.disabled`, `account.enabled`) without an actor, and change nothing when the account does not exist or is already in that state.
 
 ## Tests
 
