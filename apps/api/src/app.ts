@@ -5,6 +5,9 @@ import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { STATUS_CODES } from "node:http";
 import type { Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
+import { SignInAttempts, SignInCodes } from "./auth/attempts.ts";
+import { createGitHubApi, type GitHubApi } from "./auth/github-api.ts";
+import { registerGitHubSignIn } from "./auth/github-routes.ts";
 import type { Config } from "./config.ts";
 import { ApiError } from "./errors.ts";
 import {
@@ -28,7 +31,16 @@ export type BuildAppOptions = Readonly<{
    * of standard output. Default: standard output.
    */
   logger?: false | Readonly<{ stream: { write(line: string): void } }>;
+  /** The GitHub calls of sign-in. The default calls GitHub; tests pass a stub. */
+  github?: GitHubApi;
+  /** The clock, in milliseconds since the epoch. Default: Date.now. */
+  now?: () => number;
 }>;
+
+/** In-memory sign-in state (ADR 0014, "Lifetimes" and "Limits"). */
+const MAX_OPEN_ATTEMPTS = 1_000;
+const ATTEMPT_LIFETIME_MS = 10 * 60_000;
+const SIGN_IN_CODE_LIFETIME_MS = 60_000;
 
 /** The ws default (100 MiB) is far above what one event needs. Larger frames close with 1009. */
 const MAX_FRAME_BYTES = 64 * 1024;
@@ -274,6 +286,31 @@ export async function buildApp(
     });
 
   registerGateway(app, { allowedOrigins: config.allowedOrigins, onEvent });
+
+  // Without GitHub sign-in configured, its routes answer the generic 404.
+  if (config.githubSignIn !== null) {
+    const now = options.now ?? Date.now;
+    await registerGitHubSignIn(app, {
+      publicOrigin: config.githubSignIn.publicOrigin,
+      github:
+        options.github ??
+        createGitHubApi({
+          clientId: config.githubSignIn.clientId,
+          clientSecret: config.githubSignIn.clientSecret,
+        }),
+      attempts: new SignInAttempts({
+        max: MAX_OPEN_ATTEMPTS,
+        lifetimeMs: ATTEMPT_LIFETIME_MS,
+        now,
+      }),
+      codes: new SignInCodes({
+        max: MAX_OPEN_ATTEMPTS,
+        lifetimeMs: SIGN_IN_CODE_LIFETIME_MS,
+        now,
+      }),
+      now,
+    });
+  }
 
   return app;
 }
