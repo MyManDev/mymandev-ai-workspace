@@ -1,0 +1,2 @@
+ALTER TABLE "workspace_invitations" ADD CONSTRAINT "workspace_invitations_member_workspace_fk" FOREIGN KEY ("member_id","workspace_id") REFERENCES "public"."workspace_members"("id","workspace_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "workspace_join_requests" ADD CONSTRAINT "workspace_join_requests_member_workspace_fk" FOREIGN KEY ("member_id","workspace_id") REFERENCES "public"."workspace_members"("id","workspace_id") ON DELETE restrict ON UPDATE no action;
