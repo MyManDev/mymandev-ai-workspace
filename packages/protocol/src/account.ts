@@ -29,6 +29,7 @@ import {
   JOIN_REQUEST_DECISIONS,
   LIMITS,
   MEMBER_ROLES,
+  OWNERSHIP_OFFER_END_REASONS,
   RUN_CANCEL_REASONS,
 } from "./model.ts";
 import { privatePattern } from "./private-pattern.ts";
@@ -39,6 +40,9 @@ export const DeviceRevocationReasonSchema = z.enum(DEVICE_REVOCATION_REASONS);
 export const JoinRequestDecisionSchema = z.enum(JOIN_REQUEST_DECISIONS);
 export const IdentityProviderSchema = z.enum(IDENTITY_PROVIDERS);
 export const RunCancelReasonSchema = z.enum(RUN_CANCEL_REASONS);
+export const OwnershipOfferEndReasonSchema = z.enum(
+  OWNERSHIP_OFFER_END_REASONS,
+);
 export const ApiErrorCodeSchema = z.enum(API_ERROR_CODES);
 
 /** A GitHub login. Display data only; nothing is resolved by login. */

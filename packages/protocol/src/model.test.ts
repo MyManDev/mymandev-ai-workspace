@@ -18,11 +18,13 @@ import {
   JOIN_REQUEST_DECISIONS,
   LIMITS,
   MEMBER_ROLES,
+  OWNERSHIP_OFFER_END_REASONS,
   RUN_CANCEL_REASONS,
   RUN_STATES,
   RUN_TRANSITIONS,
   TERMINAL_RUN_STATES,
   type RunState,
+  WS_CLOSE_CODES,
 } from "./model.ts";
 
 test("the capability vocabulary is exactly the six names and matches exactly", () => {
@@ -116,6 +118,7 @@ test("the account vocabularies are exactly the values of ADR 0014", () => {
   ]);
   assert.deepEqual(IDENTITY_PROVIDERS, ["github"]);
   assert.deepEqual(RUN_CANCEL_REASONS, ["member_removed", "device_revoked"]);
+  assert.deepEqual(OWNERSHIP_OFFER_END_REASONS, ["withdrawn", "expired"]);
   assert.deepEqual(INVITATION_LIFETIME_SECONDS, {
     min: 3_600,
     max: 604_800,
@@ -237,6 +240,7 @@ test("the exported constants are frozen, nested values included", () => {
     ["JOIN_REQUEST_DECISIONS", JOIN_REQUEST_DECISIONS],
     ["IDENTITY_PROVIDERS", IDENTITY_PROVIDERS],
     ["RUN_CANCEL_REASONS", RUN_CANCEL_REASONS],
+    ["OWNERSHIP_OFFER_END_REASONS", OWNERSHIP_OFFER_END_REASONS],
     ["API_ERROR_CODES", API_ERROR_CODES],
     ...RUN_STATES.map((state): [string, readonly unknown[]] => [
       `RUN_TRANSITIONS.${state}`,
@@ -248,9 +252,10 @@ test("the exported constants are frozen, nested values included", () => {
     ["LIMITS", LIMITS],
     ["API_ERROR_STATUS", API_ERROR_STATUS],
     ["INVITATION_LIFETIME_SECONDS", INVITATION_LIFETIME_SECONDS],
+    ["WS_CLOSE_CODES", WS_CLOSE_CODES],
   ];
-  assert.equal(arrays.length, 17);
-  assert.equal(objects.length, 4);
+  assert.equal(arrays.length, 18);
+  assert.equal(objects.length, 5);
 
   // Modules run in strict mode, so a write to a frozen value throws.
   for (const [label, value] of arrays) {
