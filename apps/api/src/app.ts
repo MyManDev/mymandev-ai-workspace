@@ -9,7 +9,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import { SignInAttempts, SignInCodes } from "./auth/attempts.ts";
 import { createGitHubApi, type GitHubApi } from "./auth/github-api.ts";
 import { registerGitHubSignIn } from "./auth/github-routes.ts";
+import { registerDeviceRoutes } from "./auth/device-routes.ts";
 import { registerSignIn } from "./auth/sign-in.ts";
+import { AccessTokens, Challenges } from "./auth/tokens.ts";
 import type { Config } from "./config.ts";
 import { ApiError } from "./errors.ts";
 import {
@@ -49,6 +51,11 @@ export type BuildAppOptions = Readonly<{
 const MAX_OPEN_ATTEMPTS = 1_000;
 const ATTEMPT_LIFETIME_MS = 10 * 60_000;
 const SIGN_IN_CODE_LIFETIME_MS = 60_000;
+const MAX_OPEN_CHALLENGES = 1_000;
+const CHALLENGE_LIFETIME_MS = 60_000;
+/** Far above 20 devices per account with one token each 15 minutes. */
+const MAX_ACCESS_TOKENS = 100_000;
+const ACCESS_TOKEN_LIFETIME_MS = 15 * 60_000;
 
 /** The ws default (100 MiB) is far above what one event needs. Larger frames close with 1009. */
 const MAX_FRAME_BYTES = 64 * 1024;
@@ -333,10 +340,27 @@ export async function buildApp(
     });
     // Registering the device needs the database too.
     if (database !== null) {
+      const tokens = new AccessTokens({
+        max: MAX_ACCESS_TOKENS,
+        lifetimeMs: ACCESS_TOKEN_LIFETIME_MS,
+        now,
+      });
       await registerSignIn(app, {
         publicOrigin: config.githubSignIn.publicOrigin,
         database,
         codes,
+        tokens,
+        now,
+      });
+      await registerDeviceRoutes(app, {
+        publicOrigin: config.githubSignIn.publicOrigin,
+        database,
+        challenges: new Challenges({
+          max: MAX_OPEN_CHALLENGES,
+          lifetimeMs: CHALLENGE_LIFETIME_MS,
+          now,
+        }),
+        tokens,
         now,
       });
     }
