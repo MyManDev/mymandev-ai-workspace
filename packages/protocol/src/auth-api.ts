@@ -13,7 +13,7 @@ import {
 import { DevicePlatformSchema, displayText } from "./entities.ts";
 import { UtcTimestampSchema } from "./envelope.ts";
 import { DeviceIdSchema, UserIdSchema } from "./ids.ts";
-import { LIMITS, UUIDV7_PATTERN } from "./model.ts";
+import { LIMITS, MAX_ANSWER_LIST_ITEMS, UUIDV7_PATTERN } from "./model.ts";
 import { privatePattern } from "./private-pattern.ts";
 
 /** One HTTP route of the API. Path parameters are written as `:name`. */
@@ -210,7 +210,7 @@ export type AccessTokenResponse = z.infer<typeof AccessTokenResponseSchema>;
 
 /** The answer of `GET /devices`. */
 export const DeviceListResponseSchema = z.object({
-  devices: z.array(DeviceListItemSchema),
+  devices: z.array(DeviceListItemSchema).max(MAX_ANSWER_LIST_ITEMS),
 });
 export type DeviceListResponse = z.infer<typeof DeviceListResponseSchema>;
 

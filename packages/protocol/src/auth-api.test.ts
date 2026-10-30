@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { test } from "node:test";
+import { MAX_ANSWER_LIST_ITEMS } from "./model.ts";
 import * as z from "zod";
 import {
   AccessTokenRequestSchema,
@@ -383,4 +384,30 @@ test("the access token and device list answers parse", () => {
     false,
   );
   assert.equal(DeviceListResponseSchema.safeParse({}).success, false);
+});
+
+test("the device list holds at most MAX_ANSWER_LIST_ITEMS devices", () => {
+  const device = {
+    id: DEVICE_ID,
+    label: "Work laptop",
+    platform: "windows",
+    createdAt: "2026-10-29T12:00:00.000Z",
+    lastSeenAt: null,
+    lastSignInAt: "2026-10-29T12:00:00.000Z",
+    signInExpiresAt: "2026-11-28T12:00:00.000Z",
+    revokedAt: "2026-10-29T13:00:00.000Z",
+    current: false,
+  };
+  assert.equal(
+    DeviceListResponseSchema.safeParse({
+      devices: Array(MAX_ANSWER_LIST_ITEMS).fill(device),
+    }).success,
+    true,
+  );
+  assert.equal(
+    DeviceListResponseSchema.safeParse({
+      devices: Array(MAX_ANSWER_LIST_ITEMS + 1).fill(device),
+    }).success,
+    false,
+  );
 });

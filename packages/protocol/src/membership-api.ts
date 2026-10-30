@@ -23,7 +23,11 @@ import {
   WorkspaceIdSchema,
 } from "./ids.ts";
 import type { ApiErrorCode } from "./model.ts";
-import { INVITATION_LIFETIME_SECONDS, LIMITS } from "./model.ts";
+import {
+  INVITATION_LIFETIME_SECONDS,
+  LIMITS,
+  MAX_ANSWER_LIST_ITEMS,
+} from "./model.ts";
 
 function route(method: ApiRoute["method"], path: string): ApiRoute {
   return Object.freeze({ method, path });
@@ -303,7 +307,7 @@ export type WorkspaceMembership = z.infer<typeof WorkspaceMembershipSchema>;
 
 /** The answer of `GET /workspaces`: only workspaces the account is an active member of. */
 export const WorkspaceListResponseSchema = z.object({
-  workspaces: z.array(WorkspaceMembershipSchema),
+  workspaces: z.array(WorkspaceMembershipSchema).max(MAX_ANSWER_LIST_ITEMS),
 });
 export type WorkspaceListResponse = z.infer<typeof WorkspaceListResponseSchema>;
 
@@ -343,7 +347,7 @@ export type OwnershipOffer = z.infer<typeof OwnershipOfferSchema>;
 export const WorkspaceViewResponseSchema = z
   .object({
     workspace: WorkspaceSchema,
-    members: z.array(WorkspaceMemberSchema),
+    members: z.array(WorkspaceMemberSchema).max(MAX_ANSWER_LIST_ITEMS),
     /** When new join requests were paused; null while they are accepted. */
     joinRequestsPausedAt: UtcTimestampSchema.nullable(),
     ownershipOffer: OwnershipOfferSchema.nullable(),
@@ -433,7 +437,7 @@ export type Invitation = z.infer<typeof InvitationSchema>;
 
 /** The answer of `GET /workspaces/:workspaceId/invitations`. */
 export const InvitationListResponseSchema = z.object({
-  invitations: z.array(InvitationSchema),
+  invitations: z.array(InvitationSchema).max(MAX_ANSWER_LIST_ITEMS),
 });
 export type InvitationListResponse = z.infer<
   typeof InvitationListResponseSchema
@@ -593,7 +597,7 @@ export type JoinRequest = z.infer<typeof JoinRequestSchema>;
  * requests, and the blocked requests whose block is in force.
  */
 export const JoinRequestListResponseSchema = z.object({
-  joinRequests: z.array(JoinRequestSchema),
+  joinRequests: z.array(JoinRequestSchema).max(MAX_ANSWER_LIST_ITEMS),
 });
 export type JoinRequestListResponse = z.infer<
   typeof JoinRequestListResponseSchema

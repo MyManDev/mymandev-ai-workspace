@@ -35,7 +35,11 @@ import {
   WorkspaceListResponseSchema,
   WorkspaceViewResponseSchema,
 } from "./membership-api.ts";
-import { API_ERROR_CODES, type ApiErrorCode } from "./model.ts";
+import {
+  API_ERROR_CODES,
+  type ApiErrorCode,
+  MAX_ANSWER_LIST_ITEMS,
+} from "./model.ts";
 
 type Schema = { safeParse(value: unknown): { success: boolean } };
 
@@ -1136,5 +1140,77 @@ test("every route with a body has its schemas, and they export to JSON Schema", 
         assert.equal(typeof json, "object", name);
       }
     }
+  }
+});
+
+test("every answer list holds at most MAX_ANSWER_LIST_ITEMS items", () => {
+  const invitation = {
+    id: INVITATION_ID,
+    workspaceId: WORKSPACE_ID,
+    memberId: UNCLAIMED_ID,
+    createdByMemberId: OWNER_ID,
+    createdAt: NOW,
+    expiresAt: LATER,
+  };
+  const joinRequest = {
+    id: JOIN_REQUEST_ID,
+    workspaceId: WORKSPACE_ID,
+    requestedDisplayName: "Ada",
+    requester: {
+      provider: "github",
+      login: "ada-l",
+      verifiedAt: NOW,
+      accountCreatedAt: GITHUB_CREATED,
+    },
+    createdAt: NOW,
+    expiresAt: LATER,
+    decision: null,
+    decidedAt: null,
+  };
+  const lists: [
+    label: string,
+    build: (count: number) => unknown,
+    schema: { safeParse(value: unknown): { success: boolean } },
+  ][] = [
+    [
+      "workspaces",
+      (count) => ({
+        workspaces: Array(count).fill({ workspace, member: owner }),
+      }),
+      WorkspaceListResponseSchema,
+    ],
+    [
+      "people",
+      (count) => ({
+        workspace,
+        members: [owner, ...Array(count - 1).fill(former)],
+        joinRequestsPausedAt: null,
+        ownershipOffer: null,
+      }),
+      WorkspaceViewResponseSchema,
+    ],
+    [
+      "invitations",
+      (count) => ({ invitations: Array(count).fill(invitation) }),
+      InvitationListResponseSchema,
+    ],
+    [
+      "join requests",
+      (count) => ({ joinRequests: Array(count).fill(joinRequest) }),
+      JoinRequestListResponseSchema,
+    ],
+  ];
+  assert.equal(MAX_ANSWER_LIST_ITEMS, 1_000);
+  for (const [label, build, schema] of lists) {
+    assert.equal(
+      schema.safeParse(build(MAX_ANSWER_LIST_ITEMS)).success,
+      true,
+      `${label} at the maximum`,
+    );
+    assert.equal(
+      schema.safeParse(build(MAX_ANSWER_LIST_ITEMS + 1)).success,
+      false,
+      `${label} over the maximum`,
+    );
   }
 });
