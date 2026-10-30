@@ -1,8 +1,11 @@
+import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
+import { genericApiErrorCode } from "@mymandev/protocol";
 import Fastify, { type FastifyInstance } from "fastify";
 import { STATUS_CODES } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Config } from "./config.ts";
+import { ApiError } from "./errors.ts";
 import {
   CloseCode,
   GATEWAY_PATH,
@@ -37,6 +40,7 @@ const NOT_FOUND = {
   statusCode: 404,
   error: "Not Found",
   message: "Not Found",
+  code: "not_found",
 } as const;
 
 const healthResponse = {
@@ -100,8 +104,21 @@ export async function buildApp(
   });
 
   // The default handler sends err.message in every environment, also for errors
-  // whose statusCode is below 500 or not an HTTP error status at all.
+  // whose statusCode is below 500 or not an HTTP error status at all. Every
+  // answer carries a code from API_ERROR_CODES (ADR 0014, P-66).
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof ApiError) {
+      if (error.statusCode >= 500) {
+        request.log.error({ err: error }, "request failed");
+      }
+      const reason = STATUS_CODES[error.statusCode] ?? "Error";
+      return reply.status(error.statusCode).send({
+        statusCode: error.statusCode,
+        error: reason,
+        message: reason,
+        code: error.code,
+      });
+    }
     const received = statusCodeOf(error);
     const statusCode = received >= 400 && received <= 599 ? received : 500;
     if (statusCode >= 500) {
@@ -110,13 +127,23 @@ export async function buildApp(
     const reason = STATUS_CODES[statusCode] ?? "Error";
     const message =
       statusCode < 500 && isFastifyError(error) ? error.message : reason;
-    return reply
-      .status(statusCode)
-      .send({ statusCode, error: reason, message });
+    return reply.status(statusCode).send({
+      statusCode,
+      error: reason,
+      message,
+      code: genericApiErrorCode(statusCode),
+    });
   });
 
   // The default handler logs and echoes the method and the full URL.
   app.setNotFoundHandler((_request, reply) => reply.code(404).send(NOT_FOUND));
+
+  // Limits are set per route; a limit answers 429 with rate_limited and
+  // Retry-After (P-64). The in-memory store fits one API instance.
+  await app.register(rateLimit, {
+    global: false,
+    errorResponseBuilder: () => new ApiError("rate_limited"),
+  });
 
   await app.register(websocket, {
     options: { maxPayload: MAX_FRAME_BYTES },

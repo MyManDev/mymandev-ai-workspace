@@ -1,8 +1,16 @@
+import {
+  API_ERROR_STATUS,
+  ApiErrorBodySchema,
+  RevokeDeviceRequestSchema,
+} from "@mymandev/protocol";
 import assert from "node:assert/strict";
+import { STATUS_CODES } from "node:http";
 import { test, type TestContext } from "node:test";
 import { buildApp, type BuildAppOptions } from "./app.ts";
 import { loadConfig } from "./config.ts";
+import { ApiError } from "./errors.ts";
 import { serializeError } from "./log.ts";
+import { zodValidatorCompiler } from "./validation.ts";
 
 const SECRET = "SECRET db password=hunter2";
 
@@ -41,6 +49,7 @@ test("an unknown route gets a generic 404 that echoes neither method nor path", 
     statusCode: 404,
     error: "Not Found",
     message: "Not Found",
+    code: "not_found",
   });
   assert.equal(response.body.includes("DELETE"), false);
   assert.equal(response.body.includes("secret-path"), false);
@@ -66,6 +75,7 @@ test("a thrown error never sends its message, whatever statusCode it carries", a
         statusCode: 404,
         error: "Not Found",
         message: "Not Found",
+        code: "not_found",
       });
     } else {
       assert.equal(response.statusCode, 500, String(status));
@@ -73,6 +83,7 @@ test("a thrown error never sends its message, whatever statusCode it carries", a
         statusCode: 500,
         error: "Internal Server Error",
         message: "Internal Server Error",
+        code: "internal_error",
       });
     }
   }
@@ -114,6 +125,7 @@ test("a schema validation failure returns 400 with Fastify's message, without co
       statusCode: 400,
       error: "Bad Request",
       message,
+      code: "bad_request",
     });
   }
   assert.equal(handled, false);
@@ -135,6 +147,7 @@ test("a body over the limit returns 413, and requests have a timeout", async (t)
   });
   assert.equal(response.statusCode, 413);
   assert.equal(response.json().message, "Request body is too large");
+  assert.equal(response.json().code, "bad_request");
 });
 
 test("a JSON body with __proto__ returns 400", async (t) => {
@@ -242,4 +255,108 @@ test("logs never contain query strings, and errors with query data are redacted"
   assert.equal(plain.message, "plain");
   assert.equal(plain.code, "E_PLAIN");
   assert.equal(plain.statusCode, 500);
+});
+
+test("an ApiError answers with its code's fixed status, the status text, and the code", async (t) => {
+  const app = await appFor(t);
+  const codes = [
+    "device_too_new",
+    "invitation_invalid",
+    "conflict",
+    "sign_in_unavailable",
+  ] as const;
+  for (const code of codes) {
+    app.get(`/api-error/${code}`, async () => {
+      throw new ApiError(code);
+    });
+  }
+  for (const code of codes) {
+    const response = await app.inject({
+      method: "GET",
+      url: `/api-error/${code}`,
+    });
+    const status = API_ERROR_STATUS[code];
+    assert.equal(response.statusCode, status, code);
+    const body = response.json();
+    assert.deepEqual(body, {
+      statusCode: status,
+      error: STATUS_CODES[status],
+      message: STATUS_CODES[status],
+      code,
+    });
+    assert.equal(ApiErrorBodySchema.safeParse(body).success, true, code);
+  }
+});
+
+test("a rate-limited route answers 429 with rate_limited and Retry-After", async (t) => {
+  const app = await appFor(t);
+  app.get(
+    "/limited",
+    { config: { rateLimit: { max: 1, timeWindow: 60_000 } } },
+    async () => ({ ok: true }),
+  );
+  app.get("/unlimited", async () => ({ ok: true }));
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/limited" })).statusCode,
+    200,
+  );
+  const limited = await app.inject({ method: "GET", url: "/limited" });
+  assert.equal(limited.statusCode, 429);
+  assert.deepEqual(limited.json(), {
+    statusCode: 429,
+    error: "Too Many Requests",
+    message: "Too Many Requests",
+    code: "rate_limited",
+  });
+  assert.match(String(limited.headers["retry-after"]), /^[0-9]+$/u);
+  for (let index = 0; index < 3; index += 1) {
+    assert.equal(
+      (await app.inject({ method: "GET", url: "/unlimited" })).statusCode,
+      200,
+    );
+  }
+});
+
+test("zod schemas validate in their scope: unknown keys are stripped, and a failure names the path without the value", async (t) => {
+  const app = await appFor(t);
+  const received: unknown[] = [];
+  await app.register(async (scope) => {
+    scope.setValidatorCompiler(zodValidatorCompiler);
+    scope.post(
+      "/devices/revoke-test",
+      { schema: { body: RevokeDeviceRequestSchema } },
+      async (request) => {
+        received.push(request.body);
+        return { ok: true };
+      },
+    );
+  });
+  const ok = await app.inject({
+    method: "POST",
+    url: "/devices/revoke-test",
+    payload: { reason: "lost", role: "owner" },
+  });
+  assert.equal(ok.statusCode, 200);
+  assert.deepEqual(received, [{ reason: "lost" }]);
+
+  const secret = "SECRET-reason-value";
+  const bad = await app.inject({
+    method: "POST",
+    url: "/devices/revoke-test",
+    payload: { reason: secret },
+  });
+  assert.equal(bad.statusCode, 400);
+  const body = bad.json();
+  assert.equal(body.code, "bad_request");
+  assert.match(body.message, /^body\/reason: /u);
+  assert.equal(bad.body.includes(secret), false);
+  assert.equal(received.length, 1);
+
+  const missing = await app.inject({
+    method: "POST",
+    url: "/devices/revoke-test",
+    payload: {},
+  });
+  assert.equal(missing.statusCode, 400);
+  assert.match(missing.json().message, /^body\/reason: /u);
 });
