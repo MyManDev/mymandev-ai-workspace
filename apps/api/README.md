@@ -78,6 +78,20 @@ When an attempt ends without a code, the page posts `error` and `state` to the l
 
 The pages load nothing from outside and send `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, and a Content Security Policy with `default-src 'none'`, a hash for the one style and the one script, `frame-ancestors 'none'`, and a `form-action` that allows only the API itself or this attempt's listener. Each route allows 30 requests per address in 10 minutes. The API logs a warning above 1,500 token exchanges in an hour, below GitHub's limit of 2,000. No code, state, cookie, token, verifier, or GitHub response body is logged.
 
+### Access tokens and devices
+
+These routes need GitHub sign-in and the database (ADR 0014, "Device key and authentication" and "Revocation, sign-out, and recovery"). Challenges and access tokens live only in API memory, the tokens as SHA-256 hashes; a restart drops them, and the desktop fetches a new token.
+
+- `POST /auth/challenge` returns a challenge ID and a nonce. The challenge is single use and valid for 60 seconds; at most 1,000 are open (`429` with `rate_limited` and `Retry-After`).
+- `POST /auth/access-token` takes the device ID, the challenge ID, and a signature over the `http` input. The signature is checked first with the device's current key; an unknown device, a used or expired challenge, or a bad signature answers `auth_failed`. Only then does the device answer: `device_revoked`, `sign_in_required` (signed out, last sign-in 30 days ago or more, or a GitHub revocation after the last sign-in), or `auth_failed` for a disabled account. It returns an access token (`mmda_`, 15 minutes, never extended). A device may mint 30 tokens in 15 minutes.
+- Every other route below needs `Authorization: Bearer <access token>`. The token, the device, and the account are checked in each request, before the body is validated; every failure is `401` with `unauthorized`. An account may send 300 authenticated requests a minute.
+- `POST /auth/sign-out` signs the current device out: the device, its agents, and their grants stay, its tokens stop working, and the next token needs a GitHub sign-in (P-65).
+- `GET /devices` lists the account's own devices, newest first, with the sign-in expiry and the current device.
+- `POST /devices/:deviceId/revoke` with `reason` `removed` or `lost` revokes one of the account's own devices in one transaction: its agents are disabled, their grants revoked, and their unfinished runs cancelled (`revokeDevice`). Another account's device answers `404` with `not_found`, also for the owner of a shared workspace; a revoked device answers `409` with `conflict`. `lost` also refuses new device registrations for 7 days.
+- `POST /account/registration-lock/lift` lifts that lock from an active device.
+
+Sign-out, revocations, and the lock write audit records. No `Authorization` header, token, nonce, or signature is logged.
+
 ### `GET /ws` (WebSocket)
 
 `/ws` is the only path that accepts a WebSocket handshake; a handshake on any other path gets `404` before the upgrade. The gateway accepts WebSocket connections and validates every frame as a protocol event that a device sent:
