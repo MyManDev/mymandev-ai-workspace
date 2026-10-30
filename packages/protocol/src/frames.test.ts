@@ -87,6 +87,13 @@ function serverFrames(): Json[] {
       workspaceId: WORKSPACE_ID,
       offer: { memberId: MEMBER_ID, offeredAt: NOW, expiresAt: NOW },
     },
+    {
+      protocolVersion: 0,
+      type: "account.ownership_offer_ended",
+      workspaceId: WORKSPACE_ID,
+      reason: "withdrawn",
+      endedAt: NOW,
+    },
   ];
 }
 
@@ -245,9 +252,14 @@ test("a device decodes every server frame and every membership event", () => {
 });
 
 test("a device refuses auth.response and malformed frames from the server", () => {
-  const [challenge, , registered] = serverFrames();
+  const [challenge, , registered, , , , offerEnded] = serverFrames();
   const cases: [label: string, input: unknown, code: string][] = [
     ["auth.response", authResponse(), "unknown_type"],
+    [
+      "an offer that ended by acceptance",
+      { ...offerEnded, reason: "accepted" },
+      "invalid_payload",
+    ],
     [
       "a short nonce",
       { ...challenge, nonce: "A".repeat(42) },

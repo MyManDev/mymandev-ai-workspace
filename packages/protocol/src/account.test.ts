@@ -16,6 +16,7 @@ import {
   InvitationCodeSchema,
   JoinRequestDecisionSchema,
   MemberRoleSchema,
+  OwnershipOfferEndReasonSchema,
   RunCancelReasonSchema,
   SignInCodeSchema,
   WorkspaceMemberSchema,
@@ -28,6 +29,7 @@ import {
   IDENTITY_PROVIDERS,
   JOIN_REQUEST_DECISIONS,
   MEMBER_ROLES,
+  OWNERSHIP_OFFER_END_REASONS,
   RUN_CANCEL_REASONS,
 } from "./model.ts";
 
@@ -344,6 +346,7 @@ test("every account vocabulary schema matches its constant exactly", () => {
     [JoinRequestDecisionSchema, JOIN_REQUEST_DECISIONS],
     [IdentityProviderSchema, IDENTITY_PROVIDERS],
     [RunCancelReasonSchema, RUN_CANCEL_REASONS],
+    [OwnershipOfferEndReasonSchema, OWNERSHIP_OFFER_END_REASONS],
     [ApiErrorCodeSchema, API_ERROR_CODES],
   ];
   for (const [schema, values] of cases) {

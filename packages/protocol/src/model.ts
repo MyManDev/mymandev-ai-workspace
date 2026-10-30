@@ -134,6 +134,18 @@ export const RUN_CANCEL_REASONS = Object.freeze([
 export type RunCancelReason = (typeof RUN_CANCEL_REASONS)[number];
 
 /**
+ * Why an ownership offer ended without a transfer: the owner withdrew it, or
+ * nobody answered it within 7 days. The desktop already hides an offer past
+ * its `expiresAt`; `expired` reaches it when the server clears the offer.
+ */
+export const OWNERSHIP_OFFER_END_REASONS = Object.freeze([
+  "withdrawn",
+  "expired",
+] as const);
+export type OwnershipOfferEndReason =
+  (typeof OWNERSHIP_OFFER_END_REASONS)[number];
+
+/**
  * The `code` of every HTTP error answer (P-66), with its HTTP status. The
  * list is closed: the API never sends another code.
  */

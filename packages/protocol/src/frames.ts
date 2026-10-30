@@ -4,6 +4,7 @@ import {
   DeviceListItemSchema,
   DeviceRevocationReasonSchema,
   DeviceSignatureSchema,
+  OwnershipOfferEndReasonSchema,
 } from "./account.ts";
 import { decodeEvent, type DecodeErrorCode } from "./decode.ts";
 import { UtcTimestampSchema } from "./entities.ts";
@@ -132,6 +133,22 @@ export type AccountOwnershipOfferedFrame = z.infer<
   typeof AccountOwnershipOfferedFrameSchema
 >;
 
+/**
+ * The ownership offer to the account's person ended without a transfer, so
+ * the desktop stops showing it. A transfer is reported by the
+ * `workspace.ownership.transferred` event instead.
+ */
+export const AccountOwnershipOfferEndedFrameSchema = z.object({
+  ...frameHeaderShape,
+  type: z.literal("account.ownership_offer_ended"),
+  workspaceId: WorkspaceIdSchema,
+  reason: OwnershipOfferEndReasonSchema,
+  endedAt: UtcTimestampSchema,
+});
+export type AccountOwnershipOfferEndedFrame = z.infer<
+  typeof AccountOwnershipOfferEndedFrameSchema
+>;
+
 /** Every frame that the server sends. */
 export const ServerFrameSchema = z.discriminatedUnion("type", [
   AuthChallengeFrameSchema,
@@ -140,6 +157,7 @@ export const ServerFrameSchema = z.discriminatedUnion("type", [
   AccountDeviceRevokedFrameSchema,
   AccountRemovedFromWorkspaceFrameSchema,
   AccountOwnershipOfferedFrameSchema,
+  AccountOwnershipOfferEndedFrameSchema,
 ]);
 export type ServerFrame = z.infer<typeof ServerFrameSchema>;
 
