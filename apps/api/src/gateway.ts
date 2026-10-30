@@ -62,9 +62,12 @@ export function originGuard(allowedOrigins: readonly string[]) {
   return async (request: FastifyRequest, reply: FastifyReply) => {
     const origin = request.headers.origin;
     if (origin !== undefined && !allowed.has(origin)) {
-      return reply
-        .code(403)
-        .send({ statusCode: 403, error: "Forbidden", message: "Forbidden" });
+      return reply.code(403).send({
+        statusCode: 403,
+        error: "Forbidden",
+        message: "Forbidden",
+        code: "forbidden",
+      });
     }
   };
 }

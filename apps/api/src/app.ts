@@ -1,8 +1,9 @@
 import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
 import { genericApiErrorCode } from "@mymandev/protocol";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { STATUS_CODES } from "node:http";
+import type { Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import type { Config } from "./config.ts";
 import { ApiError } from "./errors.ts";
@@ -52,6 +53,53 @@ const healthResponse = {
   required: ["status", "version"],
 } as const;
 
+/** ApiErrorBodySchema allows at most this many characters in `message`. */
+const MAX_MESSAGE_LENGTH = 100;
+
+const CRLF = String.fromCharCode(13, 10);
+
+/** The error body for a status, with the status text as the message and a generic code. */
+function genericBody(statusCode: number) {
+  const reason = STATUS_CODES[statusCode] ?? "Error";
+  return {
+    statusCode,
+    error: reason,
+    message: reason,
+    code: genericApiErrorCode(statusCode),
+  };
+}
+
+/**
+ * Answers errors that Node.js reports on the connection before Fastify sees a
+ * request (a malformed request line, headers over the limit, a timeout), like
+ * Fastify's default handler but with a code.
+ */
+function clientErrorHandler(error: Error & { code?: string }, socket: Socket) {
+  if (error.code === "ECONNRESET" || socket.destroyed) {
+    return;
+  }
+  const statusCode =
+    error.code === "ERR_HTTP_REQUEST_TIMEOUT"
+      ? 408
+      : error.code === "HPE_HEADER_OVERFLOW"
+        ? 431
+        : 400;
+  const body = JSON.stringify(genericBody(statusCode));
+  if (socket.writable) {
+    socket.write(
+      [
+        `HTTP/1.1 ${statusCode} ${STATUS_CODES[statusCode] ?? "Error"}`,
+        `Content-Length: ${Buffer.byteLength(body)}`,
+        "Content-Type: application/json; charset=utf-8",
+        "Connection: close",
+        "",
+        body,
+      ].join(CRLF),
+    );
+  }
+  socket.destroy(error);
+}
+
 // Fastify types the error handler's `error` as unknown, so narrow it.
 function statusCodeOf(error: unknown): number {
   if (
@@ -99,6 +147,22 @@ export async function buildApp(
     bodyLimit: config.bodyLimitBytes,
     trustProxy: false,
     requestTimeout: REQUEST_TIMEOUT_MS,
+    // A HEAD route per GET route would get its own rate-limit budget and run
+    // the GET handler, which doubles every limit.
+    exposeHeadRoutes: false,
+    // The default answers to a bad URL and to an over-long path parameter
+    // echo the path and carry a Fastify code instead of an API error code.
+    frameworkErrors: (error, _request, reply) => {
+      const received = statusCodeOf(error);
+      const statusCode = received >= 400 && received <= 499 ? received : 400;
+      void (reply as FastifyReply)
+        .code(statusCode)
+        .send(genericBody(statusCode));
+    },
+    clientErrorHandler,
+    // Fastify's own 503 while closing has no code; the onRequest hook below
+    // sends it with one.
+    return503OnClosing: false,
     // Reject instead of silently stripping unknown properties or coercing types.
     ajv: { customOptions: { removeAdditional: false, coerceTypes: false } },
   });
@@ -126,7 +190,9 @@ export async function buildApp(
     }
     const reason = STATUS_CODES[statusCode] ?? "Error";
     const message =
-      statusCode < 500 && isFastifyError(error) ? error.message : reason;
+      statusCode < 500 && isFastifyError(error)
+        ? error.message.slice(0, MAX_MESSAGE_LENGTH)
+        : reason;
     return reply.status(statusCode).send({
       statusCode,
       error: reason,
@@ -137,6 +203,20 @@ export async function buildApp(
 
   // The default handler logs and echoes the method and the full URL.
   app.setNotFoundHandler((_request, reply) => reply.code(404).send(NOT_FOUND));
+
+  // While the API closes, a request on a kept-alive connection gets a 503.
+  let closing = false;
+  app.addHook("preClose", async () => {
+    closing = true;
+  });
+  app.addHook("onRequest", async (_request, reply) => {
+    if (closing) {
+      return reply
+        .code(503)
+        .header("connection", "close")
+        .send(genericBody(503));
+    }
+  });
 
   // Limits are set per route; a limit answers 429 with rate_limited and
   // Retry-After (P-64). The in-memory store fits one API instance.

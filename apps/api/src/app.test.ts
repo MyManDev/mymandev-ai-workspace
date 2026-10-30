@@ -5,10 +5,12 @@ import {
 } from "@mymandev/protocol";
 import assert from "node:assert/strict";
 import { STATUS_CODES } from "node:http";
+import { connect } from "node:net";
 import { test, type TestContext } from "node:test";
 import { buildApp, type BuildAppOptions } from "./app.ts";
 import { loadConfig } from "./config.ts";
 import { ApiError } from "./errors.ts";
+import { originGuard } from "./gateway.ts";
 import { serializeError } from "./log.ts";
 import { zodValidatorCompiler } from "./validation.ts";
 
@@ -359,4 +361,156 @@ test("zod schemas validate in their scope: unknown keys are stripped, and a fail
   });
   assert.equal(missing.statusCode, 400);
   assert.match(missing.json().message, /^body\/reason: /u);
+});
+
+test("GET routes get no automatic HEAD route, so a limit is never doubled", async (t) => {
+  const app = await appFor(t);
+  let calls = 0;
+  app.get(
+    "/limited-get",
+    { config: { rateLimit: { max: 1, timeWindow: 60_000 } } },
+    async () => {
+      calls += 1;
+      return { ok: true };
+    },
+  );
+  const head = await app.inject({ method: "HEAD", url: "/limited-get" });
+  assert.equal(head.statusCode, 404);
+  assert.equal(calls, 0);
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/limited-get" })).statusCode,
+    200,
+  );
+  assert.equal(
+    (await app.inject({ method: "GET", url: "/limited-get" })).statusCode,
+    429,
+  );
+});
+
+test("a bad URL and an over-long path parameter get the generic body without the path", async (t) => {
+  const app = await appFor(t);
+  app.get("/items/:id", async () => ({ ok: true }));
+  const cases: [url: string, status: number][] = [
+    ["/%zz-SECRET-path", 400],
+    ["/%c0-SECRET-path", 400],
+    [`/items/${"SECRET".repeat(40)}`, 414],
+  ];
+  for (const [url, status] of cases) {
+    const response = await app.inject({ method: "GET", url });
+    assert.equal(response.statusCode, status, url);
+    const body = response.json();
+    assert.deepEqual(body, {
+      statusCode: status,
+      error: STATUS_CODES[status],
+      message: STATUS_CODES[status],
+      code: "bad_request",
+    });
+    assert.equal(ApiErrorBodySchema.safeParse(body).success, true, url);
+    assert.equal(response.body.includes("SECRET"), false, url);
+  }
+});
+
+test("the origin guard's 403 carries forbidden", async (t) => {
+  const app = await appFor(t);
+  app.get("/guarded", { onRequest: originGuard([]) }, async () => ({
+    ok: true,
+  }));
+  const response = await app.inject({
+    method: "GET",
+    url: "/guarded",
+    headers: { origin: "https://evil.example" },
+  });
+  assert.equal(response.statusCode, 403);
+  assert.deepEqual(response.json(), {
+    statusCode: 403,
+    error: "Forbidden",
+    message: "Forbidden",
+    code: "forbidden",
+  });
+});
+
+test("a validation message is cut to the length that the error body schema allows", async (t) => {
+  const app = await appFor(t);
+  const name = "p".repeat(150);
+  app.post(
+    "/long-name",
+    {
+      schema: {
+        body: {
+          type: "object",
+          properties: { [name]: { type: "integer" } },
+          required: [name],
+        },
+      },
+    },
+    async () => ({ ok: true }),
+  );
+  const response = await app.inject({
+    method: "POST",
+    url: "/long-name",
+    payload: { [name]: "x" },
+  });
+  assert.equal(response.statusCode, 400);
+  const body = response.json();
+  assert.equal(body.message.length <= 100, true);
+  assert.equal(ApiErrorBodySchema.safeParse(body).success, true);
+});
+
+test("an error on the connection itself is answered with a code", async (t) => {
+  const app = await appFor(t);
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const crlf = String.fromCharCode(13, 10);
+  const raw = await new Promise<string>((resolve, reject) => {
+    const socket = connect(address.port, "127.0.0.1", () => {
+      socket.write(`NOT A REQUEST LINE${crlf}${crlf}`);
+    });
+    let data = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => {
+      data += chunk;
+    });
+    socket.on("close", () => resolve(data));
+    socket.on("error", reject);
+  });
+  assert.match(raw, /^HTTP\/1\.1 400 Bad Request/u);
+  const body = JSON.parse(raw.slice(raw.indexOf(`${crlf}${crlf}`) + 4));
+  assert.deepEqual(body, {
+    statusCode: 400,
+    error: "Bad Request",
+    message: "Bad Request",
+    code: "bad_request",
+  });
+});
+
+test("a request while the API closes gets 503 with a code", async (t) => {
+  const app = await appFor(t);
+  app.get("/during-close", async () => ({ ok: true }));
+  let release: () => void = () => {};
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  // Runs after the API's own preClose hook, so the API is already closing.
+  app.addHook("preClose", () => blocked);
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const closed = app.close();
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${address.port}/during-close`,
+    );
+    assert.equal(response.status, 503);
+    assert.equal(response.headers.get("connection"), "close");
+    assert.deepEqual(await response.json(), {
+      statusCode: 503,
+      error: "Service Unavailable",
+      message: "Service Unavailable",
+      code: "internal_error",
+    });
+  } finally {
+    release();
+    await closed;
+  }
 });
