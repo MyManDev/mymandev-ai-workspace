@@ -1,5 +1,6 @@
 import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
+import { createDatabase, type Database } from "@mymandev/database";
 import { genericApiErrorCode } from "@mymandev/protocol";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { STATUS_CODES } from "node:http";
@@ -8,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { SignInAttempts, SignInCodes } from "./auth/attempts.ts";
 import { createGitHubApi, type GitHubApi } from "./auth/github-api.ts";
 import { registerGitHubSignIn } from "./auth/github-routes.ts";
+import { registerSignIn } from "./auth/sign-in.ts";
 import type { Config } from "./config.ts";
 import { ApiError } from "./errors.ts";
 import {
@@ -35,6 +37,12 @@ export type BuildAppOptions = Readonly<{
   github?: GitHubApi;
   /** The clock, in milliseconds since the epoch. Default: Date.now. */
   now?: () => number;
+  /**
+   * The database. The default connects to DATABASE_URL and closes the pool
+   * when the API closes; tests pass a test database. Without either, the
+   * routes that need the database answer the generic 404.
+   */
+  database?: Database;
 }>;
 
 /** In-memory sign-in state (ADR 0014, "Lifetimes" and "Limits"). */
@@ -188,6 +196,9 @@ export async function buildApp(
         request.log.error({ err: error }, "request failed");
       }
       const reason = STATUS_CODES[error.statusCode] ?? "Error";
+      if (error.retryAfterSeconds !== undefined) {
+        reply.header("retry-after", String(error.retryAfterSeconds));
+      }
       return reply.status(error.statusCode).send({
         statusCode: error.statusCode,
         error: reason,
@@ -287,9 +298,23 @@ export async function buildApp(
 
   registerGateway(app, { allowedOrigins: config.allowedOrigins, onEvent });
 
+  let database: Database | null = options.database ?? null;
+  if (database === null && config.databaseUrl !== null) {
+    const connection = createDatabase(config.databaseUrl.reveal());
+    database = connection.db;
+    app.addHook("onClose", async () => {
+      await connection.close();
+    });
+  }
+
   // Without GitHub sign-in configured, its routes answer the generic 404.
   if (config.githubSignIn !== null) {
     const now = options.now ?? Date.now;
+    const codes = new SignInCodes({
+      max: MAX_OPEN_ATTEMPTS,
+      lifetimeMs: SIGN_IN_CODE_LIFETIME_MS,
+      now,
+    });
     await registerGitHubSignIn(app, {
       publicOrigin: config.githubSignIn.publicOrigin,
       github:
@@ -303,13 +328,18 @@ export async function buildApp(
         lifetimeMs: ATTEMPT_LIFETIME_MS,
         now,
       }),
-      codes: new SignInCodes({
-        max: MAX_OPEN_ATTEMPTS,
-        lifetimeMs: SIGN_IN_CODE_LIFETIME_MS,
-        now,
-      }),
+      codes,
       now,
     });
+    // Registering the device needs the database too.
+    if (database !== null) {
+      await registerSignIn(app, {
+        publicOrigin: config.githubSignIn.publicOrigin,
+        database,
+        codes,
+        now,
+      });
+    }
   }
 
   return app;

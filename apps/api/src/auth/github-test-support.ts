@@ -104,6 +104,8 @@ export type StartedAttempt = Readonly<{
   cookie: string;
   desktopState: string;
   codeChallenge: string;
+  /** The desktop's PKCE verifier for this attempt. */
+  codeVerifier: string;
 }>;
 
 /** Opens `/auth/github/authorize` the way the desktop does. */
@@ -112,7 +114,8 @@ export async function startAttempt(
   extra: Readonly<Record<string, string>> = {},
 ): Promise<StartedAttempt> {
   const desktopState = randomToken();
-  const codeChallenge = s256(randomToken());
+  const codeVerifier = randomToken();
+  const codeChallenge = s256(codeVerifier);
   const query = new URLSearchParams({
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
@@ -135,6 +138,7 @@ export async function startAttempt(
     cookie: String(response.headers["set-cookie"]).split(";")[0] ?? "",
     desktopState,
     codeChallenge,
+    codeVerifier,
   };
 }
 
