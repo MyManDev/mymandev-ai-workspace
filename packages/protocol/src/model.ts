@@ -216,6 +216,16 @@ export function genericApiErrorCode(status: number): ApiErrorCode {
 export const GITHUB_LOGIN_PATTERN = /^[A-Za-z0-9_-]{1,39}$/u;
 
 /** Invitation lifetimes in seconds: 7 days by default, from 1 hour to 7 days. */
+/**
+ * The maximum number of items in a list in an API answer (ADR 0003, usage
+ * rule 3). It lies far above every count limit of ADR 0014, which are tuned
+ * with use (P-64), so raising such a limit never breaks an older client. A
+ * list that can grow without a limit, such as the people of a workspace with
+ * its former members or the devices with the revoked ones, is cut by the API
+ * to its most recent items until pagination exists.
+ */
+export const MAX_ANSWER_LIST_ITEMS = 1_000;
+
 export const INVITATION_LIFETIME_SECONDS = Object.freeze({
   min: 3_600,
   max: 604_800,
