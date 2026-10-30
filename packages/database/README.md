@@ -160,6 +160,10 @@ PGlite test databases and `pglite-server` keep their data in memory, so they nee
 - Foreign keys use `ON DELETE RESTRICT`; nothing is hard-deleted. Ownership rules that span tables are composite foreign keys, listed in [ADR 0013](../../docs/architecture/decisions/0013-m1-data-model.md) and [ADR 0014](../../docs/architecture/decisions/0014-accounts-devices-and-invitations.md).
 - Constraint errors carry the SQLSTATE: `23505` unique, `23514` check, `23503` missing parent, `23001` delete of a referenced row.
 
+## Transactions
+
+- `revokeDevice(db, input)` revokes a device in one transaction (ADR 0014, "Revocation, sign-out, and recovery"): it sets `revoked_at` and `revocation_reason`, disables the agents that the device hosts, revokes the active grants on the device with the account as `revoked_by_user_id` (ADR 0015, P-77), moves the unfinished runs of those agents to `cancelled` with the reason `device_revoked` (P-60), and writes a `device.revoked` audit record. Inside another transaction it runs as a savepoint, so a sign-in can revoke the replaced device in its own transaction. A device that does not exist, belongs to another account, or is already revoked is left unchanged and the result says `revoked: false`. The result lists the disabled agents, the revoked grants, and the cancelled runs, so that the caller can close the device's socket and send the run events after the commit.
+
 ## Tests
 
 `src/testing.ts` provides `createTestDatabase()`: a fresh database with every migration applied. By default it is an in-memory PGlite. Other workspaces import it from `@mymandev/database/testing`, in tests only. A workspace that does so declares `@electric-sql/pglite` as a `devDependency` with the identical exact version as this package, because a nested PGlite copy breaks `drizzle-orm/pglite`.
