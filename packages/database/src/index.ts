@@ -7,6 +7,11 @@ export {
 } from "./client.ts";
 export { migrationsFolder, runMigrations } from "./migrate.ts";
 export {
+  revokeDevice,
+  type RevokeDeviceInput,
+  type RevokeDeviceResult,
+} from "./device-revocation.ts";
+export {
   DatabaseError,
   toDatabaseError,
   withDatabaseErrors,
