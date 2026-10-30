@@ -196,6 +196,9 @@ export async function buildApp(
         request.log.error({ err: error }, "request failed");
       }
       const reason = STATUS_CODES[error.statusCode] ?? "Error";
+      if (error.retryAfterSeconds !== undefined) {
+        reply.header("retry-after", String(error.retryAfterSeconds));
+      }
       return reply.status(error.statusCode).send({
         statusCode: error.statusCode,
         error: reason,

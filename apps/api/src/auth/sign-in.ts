@@ -20,7 +20,7 @@ import {
   type SignInResponse,
   type UserId,
 } from "@mymandev/protocol";
-import { and, count, eq, gt, isNull } from "drizzle-orm";
+import { and, count, eq, gt, isNull, min, ne } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { ApiError } from "../errors.ts";
 import { zodValidatorCompiler } from "../validation.ts";
@@ -123,6 +123,10 @@ export async function registerSignIn(
             .from(devices)
             .where(eq(devices.id, body.device.deviceId));
           currentKey = row?.publicKey ?? null;
+          // Each sign-in replaces the key; keeping it would keep a copied key valid.
+          if (currentKey === body.device.publicKey) {
+            throw new ApiError("auth_failed");
+          }
         }
         if (
           !signaturesValid(publicOrigin, body.code, body.device, currentKey)
@@ -135,7 +139,7 @@ export async function registerSignIn(
             signIn(tx, binding.identity, body.device, currentKey, now),
           );
         } catch (error) {
-          if (error instanceof ApiError) {
+          if (error instanceof ApiError || !fromDatabase(error)) {
             throw error;
           }
           const failure = toDatabaseError(error);
@@ -175,11 +179,13 @@ async function signIn(
     if (row === undefined) {
       throw new ApiError("auth_failed");
     }
-    if (row.userId !== userId) {
-      throw new ApiError("device_account_mismatch");
-    }
+    // A revoked device answers device_revoked whatever account signs in, so
+    // that the desktop deletes the key (ADR 0014, "Accounts").
     if (row.revokedAt !== null) {
       throw new ApiError("device_revoked");
+    }
+    if (row.userId !== userId) {
+      throw new ApiError("device_account_mismatch");
     }
     // The key that signed must still be the device's key.
     if (row.publicKey !== verifiedCurrentKey) {
@@ -196,7 +202,7 @@ async function signIn(
       })
       .where(eq(devices.id, row.id));
     deviceId = row.id;
-    await audit(tx, "device.key_replaced", userId, deviceId, now);
+    await audit(tx, "device.key_replaced", userId, deviceId, deviceId, now);
   } else {
     if (
       user.deviceRegistrationLockedUntil !== null &&
@@ -204,12 +210,26 @@ async function signIn(
     ) {
       throw new ApiError("device_registration_locked");
     }
+    // The previous device that this sign-in replaces does not count: the
+    // recovery path keeps the number of active devices.
     const [active] = await tx
       .select({ n: count() })
       .from(devices)
-      .where(and(eq(devices.userId, userId), isNull(devices.revokedAt)));
+      .where(
+        and(
+          eq(devices.userId, userId),
+          isNull(devices.revokedAt),
+          device.previousDeviceId === undefined
+            ? undefined
+            : ne(devices.id, device.previousDeviceId),
+        ),
+      );
+    if ((active?.n ?? 0) >= MAX_ACTIVE_DEVICES) {
+      // Only removing a device frees a place; ask again in a day.
+      throw new ApiError("rate_limited", { retryAfterSeconds: DAY_MS / 1000 });
+    }
     const [recent] = await tx
-      .select({ n: count() })
+      .select({ n: count(), oldest: min(devices.createdAt) })
       .from(devices)
       .where(
         and(
@@ -217,11 +237,11 @@ async function signIn(
           gt(devices.createdAt, new Date(now.getTime() - DAY_MS)),
         ),
       );
-    if (
-      (active?.n ?? 0) >= MAX_ACTIVE_DEVICES ||
-      (recent?.n ?? 0) >= MAX_NEW_DEVICES_PER_DAY
-    ) {
-      throw new ApiError("rate_limited");
+    if ((recent?.n ?? 0) >= MAX_NEW_DEVICES_PER_DAY) {
+      const oldest = recent?.oldest ?? now;
+      throw new ApiError("rate_limited", {
+        retryAfterSeconds: (oldest.getTime() + DAY_MS - now.getTime()) / 1000,
+      });
     }
     deviceId = newId<DeviceId>();
     await tx.insert(devices).values({
@@ -235,9 +255,11 @@ async function signIn(
       updatedAt: now,
       lastSignInAt: now,
     });
-    await audit(tx, "device.registered", userId, deviceId, now);
+    await audit(tx, "device.registered", userId, deviceId, deviceId, now);
     if (device.previousDeviceId !== undefined) {
       // Revoked only if it belongs to the same account (ADR 0014, step 8).
+      // Closing its socket and sending the run events for the result waits
+      // for the gateway's connection registry (#89).
       await revokeDevice(tx, {
         deviceId: device.previousDeviceId,
         userId,
@@ -248,7 +270,7 @@ async function signIn(
       });
     }
   }
-  await audit(tx, "account.signed_in", userId, deviceId, now);
+  await audit(tx, "account.signed_in", userId, deviceId, userId, now);
 
   return {
     userId,
@@ -313,6 +335,7 @@ async function audit(
   action: "account.signed_in" | "device.registered" | "device.key_replaced",
   userId: UserId,
   deviceId: DeviceId,
+  subjectId: UserId | DeviceId,
   now: Date,
 ): Promise<void> {
   await tx.insert(auditEvents).values({
@@ -321,6 +344,19 @@ async function audit(
     action,
     actorUserId: userId,
     actorDeviceId: deviceId,
-    subjectId: deviceId,
+    subjectId,
   });
+}
+
+/**
+ * Whether an error came from the database driver or Drizzle, whose message
+ * carries SQL and parameters. Any other error, such as a programming error,
+ * keeps its type and stack for the log.
+ */
+function fromDatabase(error: unknown): boolean {
+  const carries = (value: unknown) =>
+    typeof value === "object" &&
+    value !== null &&
+    ("code" in value || "query" in value || "params" in value);
+  return carries(error) || (error instanceof Error && carries(error.cause));
 }

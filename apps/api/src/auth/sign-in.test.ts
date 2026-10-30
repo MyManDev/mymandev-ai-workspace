@@ -10,12 +10,12 @@ import {
 } from "@mymandev/database/testing";
 import {
   deviceAuthInput,
+  type DeviceAuthInput,
   type DeviceId,
   newId,
   SignInResponseSchema,
-  type UserId,
 } from "@mymandev/protocol";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import assert from "node:assert/strict";
 import {
   createPublicKey,
@@ -84,6 +84,14 @@ function signFor(
   return sign(null, Buffer.from(input, "utf8"), key.privateKey).toString(
     "base64url",
   );
+}
+
+function signInput(key: Key, input: DeviceAuthInput): string {
+  return sign(
+    null,
+    Buffer.from(deviceAuthInput(input), "utf8"),
+    key.privateKey,
+  ).toString("base64url");
 }
 
 async function signInApp(
@@ -352,7 +360,7 @@ test("a sign-in code expires after 60 seconds", async (t) => {
   assert.equal(codeOf(response), "auth_failed");
 });
 
-test("bad signatures are refused, and an existing device needs its current key", async (t) => {
+test("bad signatures are refused, and an existing device needs its current key and a new one", async (t) => {
   const app = await signInApp(t, { user: githubUser(1005, "margaret") });
   const key = newKey();
   const created = SignInResponseSchema.parse(
@@ -368,16 +376,55 @@ test("bad signatures are refused, and an existing device needs its current key",
     null,
     forged.device.publicKey,
   );
-  assert.equal(codeOf(await postSignIn(app, forged)), "auth_failed");
-
-  const wrongAudience = newDeviceRequest(await signInCode(app), key);
-  const otherKey = newKey();
-  wrongAudience.device.publicKey = otherKey.publicKey;
   assert.equal(
-    codeOf(await postSignIn(app, wrongAudience)),
+    codeOf(await postSignIn(app, forged)),
+    "auth_failed",
+    "another key signed",
+  );
+
+  const swapped = newDeviceRequest(await signInCode(app), key);
+  swapped.device.publicKey = newKey().publicKey;
+  assert.equal(
+    codeOf(await postSignIn(app, swapped)),
     "auth_failed",
     "the signature covers the new key",
   );
+
+  // A signature over a different line of the input never counts.
+  const variants: [
+    label: string,
+    input: (code: string, publicKey: string) => DeviceAuthInput,
+  ][] = [
+    [
+      "audience",
+      (code, publicKey) => ({
+        purpose: "sign-in",
+        audience: "https://other.example",
+        signInCode: code,
+        deviceId: null,
+        newPublicKey: publicKey,
+      }),
+    ],
+    [
+      "device line",
+      (code, publicKey) => ({
+        purpose: "sign-in",
+        audience: ORIGIN,
+        signInCode: code,
+        deviceId: created.deviceId,
+        newPublicKey: publicKey,
+      }),
+    ],
+  ];
+  for (const [label, input] of variants) {
+    const fresh = newKey();
+    const request = newDeviceRequest(await signInCode(app), fresh);
+    request.device.newKeySignature = signInput(
+      fresh,
+      input(request.code, fresh.publicKey),
+    );
+    assert.equal(codeOf(await postSignIn(app, request)), "auth_failed", label);
+  }
 
   const stranger = newKey();
   const noCurrentKey = existingDeviceRequest(
@@ -386,7 +433,24 @@ test("bad signatures are refused, and an existing device needs its current key",
     stranger,
     newKey(),
   );
-  assert.equal(codeOf(await postSignIn(app, noCurrentKey)), "auth_failed");
+  assert.equal(
+    codeOf(await postSignIn(app, noCurrentKey)),
+    "auth_failed",
+    "a stranger's key",
+  );
+
+  const sameKey = existingDeviceRequest(
+    await signInCode(app),
+    created.deviceId,
+    key,
+    key,
+  );
+  assert.equal(
+    codeOf(await postSignIn(app, sameKey)),
+    "auth_failed",
+    "the key is never kept",
+  );
+
   const [device] = await database()
     .select()
     .from(devices)
@@ -425,16 +489,22 @@ test("another account, a revoked device, and a disabled account are refused with
     .update(devices)
     .set({ revokedAt: new Date(), revocationReason: "removed" })
     .where(eq(devices.id, created.deviceId));
-  const revoked = await postSignIn(
-    owner,
-    existingDeviceRequest(
-      await signInCode(owner),
-      created.deviceId,
-      key,
-      newKey(),
-    ),
-  );
-  assert.equal(codeOf(revoked), "device_revoked");
+  for (const app of [owner, other]) {
+    const revoked = await postSignIn(
+      app,
+      existingDeviceRequest(
+        await signInCode(app),
+        created.deviceId,
+        key,
+        newKey(),
+      ),
+    );
+    assert.equal(
+      codeOf(revoked),
+      "device_revoked",
+      "whatever account signs in",
+    );
+  }
 
   await database()
     .update(users)
@@ -482,53 +552,85 @@ test("the registration lock refuses a new device but not a repeated sign-in", as
   assert.equal(repeated.statusCode, 200);
 });
 
-test("an account has at most 20 active devices and 10 new devices in 24 hours", async (t) => {
+test("an account has at most 20 active devices and 10 new devices in 24 hours, with Retry-After", async (t) => {
   const app = await signInApp(t, { user: githubUser(1009, "many-devices") });
-  const created = SignInResponseSchema.parse(
+  const firstKey = newKey();
+  const first = SignInResponseSchema.parse(
     (
-      await postSignIn(app, newDeviceRequest(await signInCode(app), newKey()))
+      await postSignIn(app, newDeviceRequest(await signInCode(app), firstKey))
     ).json(),
   );
-  const old = new Date(Date.now() - 3 * 24 * 60 * 60_000);
+  const userId = first.userId;
   const add = async (n: number, createdAt: Date) => {
     for (let index = 0; index < n; index += 1) {
-      await database()
-        .insert(devices)
-        .values({
-          id: newId<DeviceId>(),
-          userId: created.userId as UserId,
-          label: "Extra",
-          platform: "linux",
-          publicKey: newKey().publicKey,
-          keyAlgorithm: "ed25519",
-          createdAt,
-          lastSignInAt: createdAt,
-        });
+      await database().insert(devices).values({
+        id: newId<DeviceId>(),
+        userId,
+        label: "Extra",
+        platform: "linux",
+        publicKey: newKey().publicKey,
+        keyAlgorithm: "ed25519",
+        createdAt,
+        lastSignInAt: createdAt,
+      });
     }
   };
-  // 1 recent + 9 recent = 10 new devices in 24 hours.
-  await add(9, new Date());
-  const tooManyNew = await postSignIn(
-    app,
-    newDeviceRequest(await signInCode(app), newKey()),
-  );
-  assert.equal(tooManyNew.statusCode, 429);
-  assert.equal(codeOf(tooManyNew), "rate_limited");
+  const signInNew = async () =>
+    postSignIn(app, newDeviceRequest(await signInCode(app), newKey()));
 
-  // Older devices up to 20 active.
+  // 1 + 8 new devices: the 10th in 24 hours is allowed, the 11th is not.
+  await add(8, new Date());
+  assert.equal((await signInNew()).statusCode, 200, "the 10th new device");
+  const eleventh = await signInNew();
+  assert.equal(eleventh.statusCode, 429);
+  assert.equal(codeOf(eleventh), "rate_limited");
+  const wait = Number(eleventh.headers["retry-after"]);
+  assert.ok(wait > 23 * 3600 && wait <= 24 * 3600, String(wait));
+
+  // Make every device old: 10 active, 0 new in 24 hours. Up to 20 active.
+  const old = new Date(Date.now() - 3 * 24 * 60 * 60_000);
   await database()
     .update(devices)
     .set({ createdAt: old })
-    .where(eq(devices.userId, created.userId as UserId));
-  await add(10, old);
-  const tooManyActive = await postSignIn(
+    .where(eq(devices.userId, userId));
+  await add(9, old);
+  assert.equal((await signInNew()).statusCode, 200, "the 20th active device");
+  await database()
+    .update(devices)
+    .set({ createdAt: old })
+    .where(eq(devices.userId, userId));
+  const twentyFirst = await signInNew();
+  assert.equal(codeOf(twentyFirst), "rate_limited");
+  assert.equal(twentyFirst.headers["retry-after"], String(24 * 3600));
+
+  // A repeated sign-in is not limited, and a revoked device frees a place.
+  const repeated = await postSignIn(
     app,
-    newDeviceRequest(await signInCode(app), newKey()),
+    existingDeviceRequest(
+      await signInCode(app),
+      first.deviceId,
+      firstKey,
+      newKey(),
+    ),
   );
-  assert.equal(codeOf(tooManyActive), "rate_limited");
+  assert.equal(repeated.statusCode, 200, "a repeated sign-in at the limit");
+  const [extra] = await database()
+    .select({ id: devices.id })
+    .from(devices)
+    .where(and(eq(devices.userId, userId), eq(devices.label, "Extra")));
+  assert.ok(extra !== undefined);
+  await database()
+    .update(devices)
+    .set({ revokedAt: new Date(), revocationReason: "removed" })
+    .where(eq(devices.id, extra.id));
+  assert.equal(
+    (await signInNew()).statusCode,
+    200,
+    "a revoked device does not count",
+  );
 });
 
-test("naming a previous device of the same account revokes it as replaced; another account's device stays", async (t) => {
+test("naming a previous device of the same account revokes it as replaced, also at the device limit; another account's device stays", async (t) => {
   const app = await signInApp(t, { user: githubUser(1010, "replacing") });
   const lost = SignInResponseSchema.parse(
     (
@@ -544,17 +646,37 @@ test("naming a previous device of the same account revokes it as replaced; anoth
       )
     ).json(),
   );
+  // Fill the account to 20 active devices, created long ago.
+  const old = new Date(Date.now() - 3 * 24 * 60 * 60_000);
+  await database()
+    .update(devices)
+    .set({ createdAt: old })
+    .where(eq(devices.userId, lost.userId));
+  for (let index = 0; index < 19; index += 1) {
+    await database().insert(devices).values({
+      id: newId<DeviceId>(),
+      userId: lost.userId,
+      label: "Extra",
+      platform: "linux",
+      publicKey: newKey().publicKey,
+      keyAlgorithm: "ed25519",
+      createdAt: old,
+      lastSignInAt: old,
+    });
+  }
 
-  const replacement = SignInResponseSchema.parse(
-    (
-      await postSignIn(
-        app,
-        newDeviceRequest(await signInCode(app), newKey(), {
-          previousDeviceId: lost.deviceId,
-        }),
-      )
-    ).json(),
+  const response = await postSignIn(
+    app,
+    newDeviceRequest(await signInCode(app), newKey(), {
+      previousDeviceId: lost.deviceId,
+    }),
   );
+  assert.equal(
+    response.statusCode,
+    200,
+    "recovery keeps the number of active devices",
+  );
+  const replacement = SignInResponseSchema.parse(response.json());
   const [revoked] = await database()
     .select()
     .from(devices)
@@ -563,22 +685,47 @@ test("naming a previous device of the same account revokes it as replaced; anoth
   const [audit] = await database()
     .select()
     .from(auditEvents)
-    .where(eq(auditEvents.subjectId, lost.deviceId))
-    .orderBy(auditEvents.createdAt);
-  assert.ok(audit !== undefined);
+    .where(
+      and(
+        eq(auditEvents.subjectId, lost.deviceId),
+        eq(auditEvents.action, "device.revoked"),
+      ),
+    );
+  assert.equal(audit?.reason, "replaced");
+  assert.equal(audit?.actorUserId, lost.userId);
+  assert.equal(audit?.actorDeviceId, replacement.deviceId);
 
-  await postSignIn(
+  await database()
+    .update(devices)
+    .set({ createdAt: old })
+    .where(eq(devices.userId, lost.userId));
+  const withForeign = await postSignIn(
     app,
     newDeviceRequest(await signInCode(app), newKey(), {
       previousDeviceId: foreign.deviceId,
     }),
   );
+  assert.equal(withForeign.statusCode, 429, "a foreign device frees no place");
+  await database()
+    .update(devices)
+    .set({ revokedAt: new Date(), revocationReason: "removed" })
+    .where(and(eq(devices.userId, lost.userId), eq(devices.label, "Extra")));
+  const allowed = await postSignIn(
+    app,
+    newDeviceRequest(await signInCode(app), newKey(), {
+      previousDeviceId: foreign.deviceId,
+    }),
+  );
+  assert.equal(allowed.statusCode, 200);
   const [kept] = await database()
     .select()
     .from(devices)
     .where(eq(devices.id, foreign.deviceId));
-  assert.equal(kept?.revokedAt, null);
-  assert.notEqual(replacement.deviceId, lost.deviceId);
+  assert.equal(
+    kept?.revokedAt,
+    null,
+    "another account's device is never revoked",
+  );
 });
 
 test("the first display name falls back to the login when the GitHub name is not usable", async (t) => {
