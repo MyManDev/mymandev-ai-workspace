@@ -54,34 +54,52 @@ export class Challenges {
 export type AccessTokenRecord = Readonly<{
   userId: UserId;
   deviceId: DeviceId;
+  /** The device's last sign-in when the token was minted; a newer sign-in ends the token. */
+  signedInAt: number;
   expiresAt: number;
 }>;
 
 export const ACCESS_TOKEN_PREFIX = "mmda_";
 
-/** Access tokens, kept only as hashes in API memory and never extended. */
+/** A device needs one token at a time; a few cover overlapping requests. */
+const MAX_TOKENS_PER_DEVICE = 3;
+
+/**
+ * Access tokens, kept only as hashes in API memory and never extended. A
+ * device keeps at most three live tokens: minting a fourth drops the oldest.
+ */
 export class AccessTokens {
   readonly #byHash = new Map<string, AccessTokenRecord>();
+  readonly #byDevice = new Map<DeviceId, string[]>();
   readonly #options: StoreOptions;
 
   constructor(options: StoreOptions) {
     this.#options = options;
   }
 
-  /** Issues a token; null when the cap is reached. */
+  /** Issues a token; null when the global cap is reached. */
   issue(
-    owner: Readonly<{ userId: UserId; deviceId: DeviceId }>,
+    owner: Omit<AccessTokenRecord, "expiresAt">,
   ): { accessToken: string; expiresAt: number } | null {
-    this.sweep();
+    const hashes = (this.#byDevice.get(owner.deviceId) ?? []).filter((hash) =>
+      this.#byHash.has(hash),
+    );
+    while (hashes.length >= MAX_TOKENS_PER_DEVICE) {
+      const oldest = hashes.shift();
+      if (oldest !== undefined) {
+        this.#byHash.delete(oldest);
+      }
+    }
     if (this.#byHash.size >= this.#options.max) {
+      this.#byDevice.set(owner.deviceId, hashes);
       return null;
     }
     const accessToken = `${ACCESS_TOKEN_PREFIX}${randomToken()}`;
     const expiresAt = this.#options.now() + this.#options.lifetimeMs;
-    this.#byHash.set(
-      sha256Hex(accessToken),
-      Object.freeze({ ...owner, expiresAt }),
-    );
+    const hash = sha256Hex(accessToken);
+    this.#byHash.set(hash, Object.freeze({ ...owner, expiresAt }));
+    hashes.push(hash);
+    this.#byDevice.set(owner.deviceId, hashes);
     return { accessToken, expiresAt };
   }
 
@@ -101,18 +119,26 @@ export class AccessTokens {
 
   /** Drops every token of a device, after a sign-out or a revocation. */
   dropDevice(deviceId: DeviceId): void {
-    for (const [hash, record] of this.#byHash) {
-      if (record.deviceId === deviceId) {
-        this.#byHash.delete(hash);
-      }
+    for (const hash of this.#byDevice.get(deviceId) ?? []) {
+      this.#byHash.delete(hash);
     }
+    this.#byDevice.delete(deviceId);
   }
 
+  /** Drops expired tokens; the API runs it on a timer, never on the request path. */
   sweep(): void {
     const now = this.#options.now();
     for (const [hash, record] of this.#byHash) {
       if (record.expiresAt <= now) {
         this.#byHash.delete(hash);
+      }
+    }
+    for (const [deviceId, hashes] of this.#byDevice) {
+      const live = hashes.filter((hash) => this.#byHash.has(hash));
+      if (live.length === 0) {
+        this.#byDevice.delete(deviceId);
+      } else {
+        this.#byDevice.set(deviceId, live);
       }
     }
   }

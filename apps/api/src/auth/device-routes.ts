@@ -46,8 +46,14 @@ const accessTokenPattern = new RegExp(
   ACCESS_TOKEN_PATTERN.flags,
 );
 
-/** Who an authenticated request comes from. */
-export type AuthContext = Readonly<{ userId: UserId; deviceId: DeviceId }>;
+/** Who an authenticated request comes from, and the sign-in its token belongs to. */
+export type AuthContext = Readonly<{
+  userId: UserId;
+  deviceId: DeviceId;
+  signedInAt: number;
+}>;
+
+const BEARER = "bearer ";
 
 declare module "fastify" {
   interface FastifyRequest {
@@ -97,6 +103,57 @@ function stateOf(row: DeviceRow, now: number): DeviceState {
     return { state: "sign_in_required" };
   }
   return { state: "ok", userId: row.userId };
+}
+
+/** Whether a token may act now: its device is usable and has not signed in again since. */
+function tokenUsable(
+  row: DeviceRow | undefined,
+  auth: AuthContext,
+  now: number,
+): boolean {
+  if (row === undefined || row.lastSignInAt.getTime() !== auth.signedInAt) {
+    return false;
+  }
+  const state = stateOf(row, now);
+  return state.state === "ok" && state.userId === auth.userId;
+}
+
+/**
+ * Locks the account and the acting device until the transaction ends and
+ * checks them again, so that a request authenticated before a revocation, a
+ * sign-out, a new sign-in, or a disable cannot change anything after it. The
+ * account is locked before the device, in the order the sign-in uses.
+ */
+async function lockActor(
+  tx: Database,
+  auth: AuthContext,
+  now: number,
+): Promise<void> {
+  const [user] = await tx
+    .select({
+      disabledAt: users.disabledAt,
+      signInRequiredAt: users.signInRequiredAt,
+    })
+    .from(users)
+    .where(eq(users.id, auth.userId))
+    .for("update");
+  const [device] = await tx
+    .select({
+      userId: devices.userId,
+      revokedAt: devices.revokedAt,
+      signedOutAt: devices.signedOutAt,
+      lastSignInAt: devices.lastSignInAt,
+    })
+    .from(devices)
+    .where(eq(devices.id, auth.deviceId))
+    .for("update");
+  const row =
+    user === undefined || device === undefined
+      ? undefined
+      : { ...device, ...user };
+  if (!tokenUsable(row, auth, now)) {
+    throw new ApiError("unauthorized");
+  }
 }
 
 async function deviceRow(
@@ -183,7 +240,8 @@ export async function registerDeviceRoutes(
     scope.post(
       AUTH_ROUTES.challenge.path,
       { config: { rateLimit: ADDRESS_LIMIT } },
-      async (): Promise<ChallengeResponse> => {
+      async (_request, reply): Promise<ChallengeResponse> => {
+        reply.header("cache-control", "no-store");
         const challenge = challenges.issue();
         if (challenge === null) {
           throw new ApiError("rate_limited", { retryAfterSeconds: 60 });
@@ -198,7 +256,8 @@ export async function registerDeviceRoutes(
         schema: { body: AccessTokenRequestSchema },
         config: { rateLimit: ADDRESS_LIMIT },
       },
-      async (request): Promise<AccessTokenResponse> => {
+      async (request, reply): Promise<AccessTokenResponse> => {
+        reply.header("cache-control", "no-store");
         const body = request.body as AccessTokenRequest;
         const nonce = challenges.take(body.challengeId);
         const row =
@@ -236,9 +295,11 @@ export async function registerDeviceRoutes(
           case "ok":
             break;
         }
+        // The token belongs to the sign-in whose key signed; a newer sign-in ends it.
         const issued = tokens.issue({
           userId: state.userId,
           deviceId: body.deviceId,
+          signedInAt: row.lastSignInAt.getTime(),
         });
         if (issued === null) {
           throw new ApiError("rate_limited", { retryAfterSeconds: 60 });
@@ -251,40 +312,53 @@ export async function registerDeviceRoutes(
     );
   });
 
-  /**
-   * Every other route needs `Authorization: Bearer <access token>`. The
-   * token, the device, and the account are checked in each request; every
-   * failure is 401 with unauthorized.
-   */
-  async function authenticate(request: FastifyRequest): Promise<void> {
-    const header = request.headers.authorization;
+  /** The live token in `Authorization: Bearer <access token>`; the scheme ignores case. */
+  function tokenOf(request: FastifyRequest): AuthContext {
+    const header = request.headers.authorization ?? "";
     const token =
-      typeof header === "string" && header.startsWith("Bearer ")
-        ? header.slice("Bearer ".length)
+      header.slice(0, BEARER.length).toLowerCase() === BEARER
+        ? header.slice(BEARER.length)
         : "";
     const record = accessTokenPattern.test(token) ? tokens.find(token) : null;
     if (record === null) {
       throw new ApiError("unauthorized");
     }
-    const row = await deviceRow(database, record.deviceId);
-    const state = row === undefined ? null : stateOf(row, options.now());
-    if (
-      state === null ||
-      state.state !== "ok" ||
-      state.userId !== record.userId
-    ) {
-      throw new ApiError("unauthorized");
-    }
-    const wait = requestsPerUser.hit(record.userId);
+    return {
+      userId: record.userId,
+      deviceId: record.deviceId,
+      signedInAt: record.signedInAt,
+    };
+  }
+
+  /**
+   * Every other route needs an access token. The token and the account's
+   * request limit are checked when the headers arrive.
+   */
+  async function admit(request: FastifyRequest): Promise<void> {
+    const wait = requestsPerUser.hit(tokenOf(request).userId);
     if (wait > 0) {
       throw new ApiError("rate_limited", { retryAfterSeconds: wait });
     }
-    request.auth = { userId: record.userId, deviceId: record.deviceId };
+  }
+
+  /**
+   * The token, the device, and the account are checked again after the body
+   * arrived, so that a slow body cannot carry a request past a revocation.
+   * Every failure is 401 with unauthorized.
+   */
+  async function authenticate(request: FastifyRequest): Promise<void> {
+    const auth = tokenOf(request);
+    const row = await deviceRow(database, auth.deviceId);
+    if (!tokenUsable(row, auth, options.now())) {
+      throw new ApiError("unauthorized");
+    }
+    request.auth = auth;
   }
 
   await app.register(async (scope) => {
     scope.setValidatorCompiler(zodValidatorCompiler);
-    scope.addHook("onRequest", authenticate);
+    scope.addHook("onRequest", admit);
+    scope.addHook("preValidation", authenticate);
     const authOf = (request: FastifyRequest): AuthContext => {
       if (request.auth === null) {
         throw new ApiError("unauthorized");
@@ -296,6 +370,7 @@ export async function registerDeviceRoutes(
       const auth = authOf(request);
       const now = new Date(options.now());
       await database.transaction(async (tx) => {
+        await lockActor(tx, auth, now.getTime());
         await tx
           .update(devices)
           .set({ signedOutAt: now, updatedAt: now })
@@ -351,6 +426,11 @@ export async function registerDeviceRoutes(
         const auth = authOf(request);
         const { deviceId } = request.params as { deviceId: DeviceId };
         const { reason } = request.body as RevokeDeviceRequest;
+        // A device cannot report itself lost: whoever holds it could otherwise
+        // lock the account's new devices (P-55).
+        if (reason === "lost" && deviceId === auth.deviceId) {
+          throw new ApiError("conflict");
+        }
         const now = new Date(options.now());
         const [target] = await database
           .select({ userId: devices.userId, revokedAt: devices.revokedAt })
@@ -364,6 +444,7 @@ export async function registerDeviceRoutes(
           throw new ApiError("conflict");
         }
         await database.transaction(async (tx) => {
+          await lockActor(tx, auth, now.getTime());
           const result = await revokeDevice(tx, {
             deviceId,
             userId: auth.userId,
@@ -406,6 +487,7 @@ export async function registerDeviceRoutes(
         const auth = authOf(request);
         const now = new Date(options.now());
         await database.transaction(async (tx) => {
+          await lockActor(tx, auth, now.getTime());
           const lifted = await tx
             .update(users)
             .set({ deviceRegistrationLockedUntil: null, updatedAt: now })

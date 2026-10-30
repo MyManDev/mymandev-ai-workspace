@@ -39,6 +39,8 @@ import {
   type KeyObject,
   sign,
 } from "node:crypto";
+import { once } from "node:events";
+import { connect } from "node:net";
 import { after, before, test, type TestContext } from "node:test";
 import { buildApp } from "../app.ts";
 import { loadConfig } from "../config.ts";
@@ -134,8 +136,8 @@ async function tokenApp(
   return app;
 }
 
-/** Signs in a new device through the browser flow and POST /auth/sign-in. */
-async function signInDevice(app: App, key: Key = newKey()) {
+/** A sign-in code and its verifier from the browser flow. */
+async function signInCode(app: App) {
   const attempt = await startAttempt(app);
   await callback(app, attempt, {
     code: "github-code",
@@ -144,12 +146,18 @@ async function signInDevice(app: App, key: Key = newKey()) {
   const code =
     listenerForm((await confirm(app, attempt, "continue")).body)?.fields.code ??
     "";
+  return { code, codeVerifier: attempt.codeVerifier };
+}
+
+/** Signs in a new device through the browser flow and POST /auth/sign-in. */
+async function signInDevice(app: App, key: Key = newKey()) {
+  const { code, codeVerifier } = await signInCode(app);
   const response = await app.inject({
     method: "POST",
     url: "/auth/sign-in",
     payload: {
       code,
-      codeVerifier: attempt.codeVerifier,
+      codeVerifier,
       redirectUri: REDIRECT_URI,
       device: {
         kind: "new",
@@ -170,6 +178,43 @@ async function signInDevice(app: App, key: Key = newKey()) {
   assert.equal(response.statusCode, 200, response.body);
   const answer = SignInResponseSchema.parse(response.json());
   return { userId: answer.userId, deviceId: answer.deviceId, key };
+}
+
+type SignedInDevice = Awaited<ReturnType<typeof signInDevice>>;
+
+/** Signs an existing device in again with a new key, as the desktop does to replace its key. */
+async function signInAgain(
+  app: App,
+  device: SignedInDevice,
+  next: Key = newKey(),
+): Promise<SignedInDevice> {
+  const { code, codeVerifier } = await signInCode(app);
+  const input = {
+    purpose: "sign-in",
+    audience: ORIGIN,
+    signInCode: code,
+    deviceId: device.deviceId,
+    newPublicKey: next.publicKey,
+  } as const;
+  const response = await app.inject({
+    method: "POST",
+    url: "/auth/sign-in",
+    payload: {
+      code,
+      codeVerifier,
+      redirectUri: REDIRECT_URI,
+      device: {
+        kind: "existing",
+        deviceId: device.deviceId,
+        publicKey: next.publicKey,
+        keyAlgorithm: "ed25519",
+        currentKeySignature: signInput(device.key, input),
+        newKeySignature: signInput(next, input),
+      },
+    },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  return { ...device, key: next };
 }
 
 async function challenge(app: App) {
@@ -247,8 +292,14 @@ test("an access token works for 15 minutes and is then refused with unauthorized
   let clock = Date.now();
   const app = await tokenApp(t, { githubId: 2001, now: () => clock });
   const device = await signInDevice(app);
+  const challenged = await app.inject({
+    method: "POST",
+    url: "/auth/challenge",
+  });
+  assert.equal(challenged.headers["cache-control"], "no-store");
   const minted = await requestToken(app, device);
   assert.equal(minted.statusCode, 200);
+  assert.equal(minted.headers["cache-control"], "no-store");
   const body = minted.json() as { accessToken: string; expiresAt: string };
   assert.match(body.accessToken, /^mmda_[A-Za-z0-9_-]{43}$/u);
   assert.equal(Date.parse(body.expiresAt) - clock, 15 * 60_000);
@@ -734,7 +785,7 @@ test("revoking a device disables its agents, revokes their grants, cancels their
   assert.equal(codeOf(badReason), "bad_request");
 });
 
-test("a lost device locks new registrations for 7 days, a repeated sign-in still works, and lifting ends the lock", async (t) => {
+test("a lost device locks new registrations for 7 days, existing devices keep working, and lifting ends the lock", async (t) => {
   const app = await tokenApp(t, { githubId: 2014 });
   const lost = await signInDevice(app);
   const current = await signInDevice(app);
@@ -759,18 +810,14 @@ test("a lost device locks new registrations for 7 days, a repeated sign-in still
     String(lockedFor),
   );
 
-  const attempt = await startAttempt(app);
-  await callback(app, attempt, { code: "c", state: attempt.apiState });
-  const code =
-    listenerForm((await confirm(app, attempt, "continue")).body)?.fields.code ??
-    "";
+  const { code, codeVerifier } = await signInCode(app);
   const key = newKey();
   const refused = await app.inject({
     method: "POST",
     url: "/auth/sign-in",
     payload: {
       code,
-      codeVerifier: attempt.codeVerifier,
+      codeVerifier,
       redirectUri: REDIRECT_URI,
       device: {
         kind: "new",
@@ -789,12 +836,19 @@ test("a lost device locks new registrations for 7 days, a repeated sign-in still
     },
   });
   assert.equal(codeOf(refused), "device_registration_locked");
-  // A token of an existing device still works during the lock.
+  // A token of an existing device still works during the lock, and so does
+  // a repeated sign-in of that device.
   assert.equal((await get(app, "/devices", accessToken)).statusCode, 200);
+  const signedInAgain = await signInAgain(app, current);
 
   assert.equal(
-    (await post(app, "/account/registration-lock/lift", accessToken))
-      .statusCode,
+    (
+      await post(
+        app,
+        "/account/registration-lock/lift",
+        await token(app, signedInAgain),
+      )
+    ).statusCode,
     204,
   );
   await signInDevice(app);
@@ -906,4 +960,202 @@ test("authenticated requests are limited per account", async (t) => {
   assert.equal(limited.statusCode, 429);
   assert.equal(codeOf(limited), "rate_limited");
   assert.match(String(limited.headers["retry-after"]), /^[0-9]+$/u);
+});
+
+test("the Bearer scheme ignores case", async (t) => {
+  const app = await tokenApp(t, { githubId: 2019 });
+  const accessToken = await token(app, await signInDevice(app));
+  for (const scheme of ["Bearer", "bearer", "BEARER"]) {
+    const response = await app.inject({
+      method: "GET",
+      url: "/devices",
+      headers: { authorization: `${scheme} ${accessToken}` },
+    });
+    assert.equal(response.statusCode, 200, scheme);
+  }
+});
+
+test("a new sign-in of a device ends the tokens of its earlier sign-in", async (t) => {
+  let clock = Date.now();
+  const app = await tokenApp(t, { githubId: 2020, now: () => clock });
+  const device = await signInDevice(app);
+  const first = await token(app, device);
+  clock += 1_000;
+  const replaced = await signInAgain(app, device);
+  assert.deepEqual(
+    (await get(app, "/devices", first)).json(),
+    UNAUTHORIZED,
+    "after the key was replaced",
+  );
+  assert.equal(
+    codeOf(await requestToken(app, device)),
+    "auth_failed",
+    "the old key no longer signs",
+  );
+
+  // A GitHub revocation, then a new sign-in: the earlier token stays refused.
+  const second = await token(app, replaced);
+  await database()
+    .update(users)
+    .set({ signInRequiredAt: new Date(clock + 500) })
+    .where(eq(users.id, device.userId));
+  assert.deepEqual((await get(app, "/devices", second)).json(), UNAUTHORIZED);
+  clock += 1_000;
+  const again = await signInAgain(app, replaced);
+  assert.deepEqual(
+    (await get(app, "/devices", second)).json(),
+    UNAUTHORIZED,
+    "after the new sign-in",
+  );
+  assert.equal(
+    (await get(app, "/devices", await token(app, again))).statusCode,
+    200,
+  );
+});
+
+test("a token is refused once its device's sign-in is 30 days old", async (t) => {
+  let clock = Date.now();
+  const app = await tokenApp(t, { githubId: 2021, now: () => clock });
+  const device = await signInDevice(app);
+  clock += 30 * 24 * 60 * 60_000 - 60_000;
+  const accessToken = await token(app, device);
+  assert.equal((await get(app, "/devices", accessToken)).statusCode, 200);
+  clock += 60_000;
+  assert.deepEqual(
+    (await get(app, "/devices", accessToken)).json(),
+    UNAUTHORIZED,
+  );
+});
+
+test("a request whose body arrives after its device was revoked is refused", async (t) => {
+  const app = await tokenApp(t, { githubId: 2022 });
+  const stolen = await signInDevice(app);
+  const owner = await signInDevice(app);
+  const stolenToken = await token(app, stolen);
+  const ownerToken = await token(app, owner);
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  assert.ok(address !== null && typeof address === "object");
+  const crlf = String.fromCharCode(13, 10);
+  const socket = connect(address.port, "127.0.0.1");
+  await once(socket, "connect");
+  let raw = "";
+  socket.setEncoding("utf8");
+  socket.on("data", (chunk) => {
+    raw += chunk;
+  });
+  const closed = once(socket, "close");
+  // The headers and half of the body, while the token is still valid.
+  socket.write(
+    [
+      "POST /account/registration-lock/lift HTTP/1.1",
+      "Host: 127.0.0.1",
+      `Authorization: Bearer ${stolenToken}`,
+      "Content-Type: application/json",
+      "Content-Length: 2",
+      "Connection: close",
+      "",
+      "{",
+    ].join(crlf),
+  );
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  // The owner revokes the stolen device as lost, which locks new devices.
+  const revoked = await post(
+    app,
+    `/devices/${stolen.deviceId}/revoke`,
+    ownerToken,
+    {
+      reason: "lost",
+    },
+  );
+  assert.equal(revoked.statusCode, 204);
+  socket.write("}");
+  await closed;
+  assert.ok(raw.startsWith("HTTP/1.1 401 "), raw);
+  const [user] = await database()
+    .select()
+    .from(users)
+    .where(eq(users.id, owner.userId));
+  assert.notEqual(user?.deviceRegistrationLockedUntil, null, "the lock stays");
+});
+
+test("forged signatures do not use the device's token budget", async (t) => {
+  const app = await tokenApp(t, { githubId: 2023 });
+  const device = await signInDevice(app);
+  for (let index = 0; index < 31; index += 1) {
+    const remoteAddress = `10.1.0.${index}`;
+    const { challengeId, nonce } = ChallengeResponseSchema.parse(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/auth/challenge",
+          remoteAddress,
+        })
+      ).json(),
+    );
+    const forged = await app.inject({
+      method: "POST",
+      url: "/auth/access-token",
+      remoteAddress,
+      payload: {
+        deviceId: device.deviceId,
+        challengeId,
+        signature: signInput(newKey(), {
+          purpose: "http",
+          audience: ORIGIN,
+          nonce,
+          deviceId: device.deviceId,
+          challengeId,
+        }),
+      },
+    });
+    assert.equal(codeOf(forged), "auth_failed", String(index));
+  }
+  assert.equal((await requestToken(app, device)).statusCode, 200);
+});
+
+test("a device keeps at most three live tokens; a fourth ends the oldest", async (t) => {
+  const app = await tokenApp(t, { githubId: 2024 });
+  const device = await signInDevice(app);
+  const [oldest, ...live] = [
+    await token(app, device),
+    await token(app, device),
+    await token(app, device),
+    await token(app, device),
+  ];
+  assert.ok(oldest !== undefined);
+  assert.deepEqual((await get(app, "/devices", oldest)).json(), UNAUTHORIZED);
+  for (const accessToken of live) {
+    assert.equal((await get(app, "/devices", accessToken)).statusCode, 200);
+  }
+});
+
+test("a device cannot revoke itself as lost, but can remove itself", async (t) => {
+  const app = await tokenApp(t, { githubId: 2025 });
+  const device = await signInDevice(app);
+  const accessToken = await token(app, device);
+  const lost = await post(
+    app,
+    `/devices/${device.deviceId}/revoke`,
+    accessToken,
+    { reason: "lost" },
+  );
+  assert.equal(lost.statusCode, 409);
+  assert.equal(codeOf(lost), "conflict");
+  const [user] = await database()
+    .select()
+    .from(users)
+    .where(eq(users.id, device.userId));
+  assert.equal(user?.deviceRegistrationLockedUntil, null);
+  const removed = await post(
+    app,
+    `/devices/${device.deviceId}/revoke`,
+    accessToken,
+    { reason: "removed" },
+  );
+  assert.equal(removed.statusCode, 204);
+  assert.deepEqual(
+    (await get(app, "/devices", accessToken)).json(),
+    UNAUTHORIZED,
+  );
 });
