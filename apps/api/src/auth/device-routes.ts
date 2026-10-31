@@ -19,7 +19,7 @@ import {
   newUuidV7,
   type RevokeDeviceRequest,
   RevokeDeviceRequestSchema,
-  type UserId,
+  SIGN_IN_LIFETIME_MS,
 } from "@mymandev/protocol";
 import { and, desc, eq, gt } from "drizzle-orm";
 import type { FastifyInstance, FastifyRequest } from "fastify";
@@ -27,15 +27,26 @@ import * as z from "zod";
 import { ApiError } from "../errors.ts";
 import { zodValidatorCompiler } from "../validation.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
+import {
+  type AuthContext,
+  deviceRow,
+  stateOf,
+  tokenUsable,
+} from "./device-state.ts";
 import { type AccessTokens, type Challenges, WindowLimiter } from "./tokens.ts";
 
 const DAY_MS = 24 * 60 * 60_000;
 /** ADR 0014, "Lifetimes". */
-const SIGN_IN_LIFETIME_MS = 30 * DAY_MS;
 const REGISTRATION_LOCK_MS = 7 * DAY_MS;
 
-/** Per remote address, before any signature is verified (P-63). */
-const ADDRESS_LIMIT = { max: 60, timeWindow: 10 * 60_000 };
+/**
+ * Per remote address, before any signature is verified (P-63): the
+ * challenge, the access token, and the WebSocket handshake.
+ */
+export const ADDRESS_LIMIT = Object.freeze({
+  max: 60,
+  timeWindow: 10 * 60_000,
+});
 /** Access tokens per device after a verified signature; one is needed every 15 minutes. */
 const TOKENS_PER_DEVICE = { max: 30, windowMs: 15 * 60_000 };
 /** Authenticated requests per account. */
@@ -45,13 +56,6 @@ const accessTokenPattern = new RegExp(
   ACCESS_TOKEN_PATTERN.source,
   ACCESS_TOKEN_PATTERN.flags,
 );
-
-/** Who an authenticated request comes from, and the sign-in its token belongs to. */
-export type AuthContext = Readonly<{
-  userId: UserId;
-  deviceId: DeviceId;
-  signedInAt: number;
-}>;
 
 const BEARER = "bearer ";
 
@@ -69,54 +73,6 @@ export type DeviceRouteOptions = Readonly<{
   tokens: AccessTokens;
   now: () => number;
 }>;
-
-type DeviceState =
-  | Readonly<{ state: "ok"; userId: UserId }>
-  | Readonly<{ state: "revoked" | "disabled" | "sign_in_required" }>;
-
-type DeviceRow = Readonly<{
-  userId: UserId;
-  revokedAt: Date | null;
-  signedOutAt: Date | null;
-  lastSignInAt: Date;
-  disabledAt: Date | null;
-  signInRequiredAt: Date | null;
-}>;
-
-/**
- * What a device may do now (ADR 0014): a revoked device never comes back; a
- * signed-out device, a sign-in older than 30 days, or a GitHub revocation
- * after the last sign-in requires a new sign-in; a disabled account fails.
- */
-function stateOf(row: DeviceRow, now: number): DeviceState {
-  if (row.revokedAt !== null) {
-    return { state: "revoked" };
-  }
-  if (row.disabledAt !== null) {
-    return { state: "disabled" };
-  }
-  if (
-    row.signedOutAt !== null ||
-    row.lastSignInAt.getTime() + SIGN_IN_LIFETIME_MS <= now ||
-    (row.signInRequiredAt !== null && row.signInRequiredAt > row.lastSignInAt)
-  ) {
-    return { state: "sign_in_required" };
-  }
-  return { state: "ok", userId: row.userId };
-}
-
-/** Whether a token may act now: its device is usable and has not signed in again since. */
-function tokenUsable(
-  row: DeviceRow | undefined,
-  auth: AuthContext,
-  now: number,
-): boolean {
-  if (row === undefined || row.lastSignInAt.getTime() !== auth.signedInAt) {
-    return false;
-  }
-  const state = stateOf(row, now);
-  return state.state === "ok" && state.userId === auth.userId;
-}
 
 /**
  * Locks the account and the acting device until the transaction ends and
@@ -156,26 +112,6 @@ export async function lockActor(
   if (!tokenUsable(row, auth, now)) {
     throw new ApiError("unauthorized");
   }
-}
-
-async function deviceRow(
-  database: Database,
-  deviceId: DeviceId,
-): Promise<(DeviceRow & { publicKey: string }) | undefined> {
-  const [row] = await database
-    .select({
-      userId: devices.userId,
-      publicKey: devices.publicKey,
-      revokedAt: devices.revokedAt,
-      signedOutAt: devices.signedOutAt,
-      lastSignInAt: devices.lastSignInAt,
-      disabledAt: users.disabledAt,
-      signInRequiredAt: users.signInRequiredAt,
-    })
-    .from(devices)
-    .innerJoin(users, eq(users.id, devices.userId))
-    .where(eq(devices.id, deviceId));
-  return row;
 }
 
 async function audit(

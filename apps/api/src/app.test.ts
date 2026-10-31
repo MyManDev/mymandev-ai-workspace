@@ -204,8 +204,9 @@ test("logs never contain query strings, and errors with query data are redacted"
   // HEAD /ws is not a route, so the WebSocket handler never runs for it.
   const head = await app.inject({ method: "HEAD", url: `/ws?token=${token}` });
   assert.equal(head.statusCode, 404);
-  const ws = await app.injectWS(`/ws?token=${token}`);
-  ws.terminate();
+  // Without GitHub sign-in and a database, /ws is not available either. The
+  // gateway test checks the logs of a handshake that opens.
+  await assert.rejects(app.injectWS(`/ws?token=${token}`), /404/u);
 
   const entries = lines.map(
     (line) => JSON.parse(line) as Record<string, unknown>,

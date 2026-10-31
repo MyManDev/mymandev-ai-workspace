@@ -14,7 +14,7 @@ No application uses this package yet. The cloud API imports its query functions 
 | `db:compare`  | `node --env-file-if-exists=.env src/compare-schema-cli.ts` |
 | `db:account`  | `node --env-file-if-exists=.env src/account-cli.ts`        |
 | `typecheck`   | `tsc -p tsconfig.json`                                     |
-| `test`        | `node --test "src/**/*.test.ts"`                           |
+| `test`        | `node --test --test-timeout=120000 "src/**/*.test.ts"`     |
 
 Run them from the repository root with `-w @mymandev/database`, or from `packages/database`. The tests need no server: they run on PGlite, PostgreSQL 18 compiled to WebAssembly, inside the test process.
 
@@ -164,6 +164,14 @@ PGlite test databases and `pglite-server` keep their data in memory, so they nee
 ## Transactions
 
 - `revokeDevice(db, input)` revokes a device in one transaction (ADR 0014, "Revocation, sign-out, and recovery"): it sets `revoked_at` and `revocation_reason`, disables the agents that the device hosts, revokes the active grants on the device with the account as `revoked_by_user_id` (ADR 0015, P-77), moves the unfinished runs of those agents to `cancelled` with the reason `device_revoked` (P-60), and writes a `device.revoked` audit record. Inside another transaction it runs as a savepoint, so a sign-in can revoke the replaced device in its own transaction. A device that does not exist, belongs to another account, or is already revoked is left unchanged and the result says `revoked: false`. The result lists the disabled agents, the revoked grants, and the cancelled runs, so that the caller can close the device's socket and send the run events after the commit.
+
+## Queries
+
+The WebSocket gateway of the API uses these (ADR 0014, "Device key and authentication"; ADR 0006, identity binding):
+
+- `isActiveMember(db, { workspaceId, userId })` says whether the account is an active member of the workspace: a claimed person whose `removed_at` is empty. A workspace that does not exist gives `false`.
+- `markDeviceSeen(db, { deviceId, now })` sets `devices.last_seen_at`, when a connection authenticates.
+- `writeConnectionAudit(db, { action, userId, deviceId, subjectId, now })` writes a `connection.replaced` or `event.identity_mismatch` audit record with the connection's account and device as the actor. It never writes `workspace_id`, which is a foreign key, because the workspace of a refused event is unverified; the event ID goes into `subject_id`.
 
 ## Operator commands
 

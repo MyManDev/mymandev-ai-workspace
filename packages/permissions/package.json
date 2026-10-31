@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.src.json",
-    "test": "node --test \"src/**/*.test.ts\""
+    "test": "node --test --test-timeout=120000 \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@mymandev/protocol": "0.0.0",
