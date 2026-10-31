@@ -16,6 +16,7 @@ import type { Config } from "./config.ts";
 import { ApiError } from "./errors.ts";
 import {
   CloseCode,
+  ConnectionRegistry,
   GATEWAY_PATH,
   registerGateway,
   type EventHandler,
@@ -26,8 +27,16 @@ export type BuildAppOptions = Readonly<{
   config: Config;
   /** The application version that `/health` reports. */
   version: string;
-  /** Receives every valid event. The default logs it at debug level. */
+  /**
+   * Receives every event that passed identity binding, with its
+   * authenticated connection. The default logs it at debug level.
+   */
   onEvent?: EventHandler;
+  /**
+   * The open WebSocket connections. The default is a new registry; tests
+   * pass one to count or close connections.
+   */
+  connections?: ConnectionRegistry;
   /** How long shutdown waits for WebSocket clients to close. Default: 2000 ms. */
   shutdownGraceMs?: number;
   /**
@@ -303,8 +312,6 @@ export async function buildApp(
       );
     });
 
-  registerGateway(app, { allowedOrigins: config.allowedOrigins, onEvent });
-
   let database: Database | null = options.database ?? null;
   if (database === null && config.databaseUrl !== null) {
     const connection = createDatabase(config.databaseUrl.reveal());
@@ -314,7 +321,8 @@ export async function buildApp(
     });
   }
 
-  // Without GitHub sign-in configured, its routes answer the generic 404.
+  // Without GitHub sign-in configured, its routes and /ws answer the generic
+  // 404; the routes that need the database and /ws also need the database.
   if (config.githubSignIn !== null) {
     const now = options.now ?? Date.now;
     const codes = new SignInCodes({
@@ -362,6 +370,15 @@ export async function buildApp(
         }),
         tokens,
         now,
+      });
+      // A connection authenticates with its device key (ADR 0014).
+      registerGateway(app, {
+        allowedOrigins: config.allowedOrigins,
+        publicOrigin: config.githubSignIn.publicOrigin,
+        database,
+        now,
+        connections: options.connections ?? new ConnectionRegistry(),
+        onEvent,
       });
     }
   }

@@ -18,6 +18,15 @@ export {
   type RevokeDeviceResult,
 } from "./device-revocation.ts";
 export {
+  type ActiveMemberInput,
+  type ConnectionAuditAction,
+  type ConnectionAuditInput,
+  type DeviceSeenInput,
+  isActiveMember,
+  markDeviceSeen,
+  writeConnectionAudit,
+} from "./connections.ts";
+export {
   DatabaseError,
   toDatabaseError,
   withDatabaseErrors,

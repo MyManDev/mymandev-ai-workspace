@@ -11,13 +11,8 @@ import {
   workspaces,
 } from "@mymandev/database";
 import {
-  createTestDatabase,
-  type TestDatabase,
-} from "@mymandev/database/testing";
-import {
   type AgentId,
   ChallengeResponseSchema,
-  deviceAuthInput,
   type DeviceAuthInput,
   type DeviceId,
   DeviceListResponseSchema,
@@ -27,77 +22,37 @@ import {
   type ProjectId,
   type RepositoryId,
   type RunId,
-  SignInResponseSchema,
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { eq } from "drizzle-orm";
+import type { FastifyInstance } from "fastify";
 import assert from "node:assert/strict";
-import {
-  createPublicKey,
-  generateKeyPairSync,
-  type KeyObject,
-  sign,
-} from "node:crypto";
 import { once } from "node:events";
 import { connect } from "node:net";
-import { after, before, test, type TestContext } from "node:test";
-import { buildApp } from "../app.ts";
-import { loadConfig } from "../config.ts";
+import { test, type TestContext } from "node:test";
 import { ApiError } from "../errors.ts";
-import { Secret } from "../secret.ts";
 import { lockActor } from "./device-routes.ts";
-import { createGitHubApi } from "./github-api.ts";
 import {
-  callback,
-  confirm,
-  fakeGitHub,
-  listenerForm,
-  REDIRECT_URI,
-  startAttempt,
-} from "./github-test-support.ts";
+  deviceApp,
+  fakeClock,
+  type Key,
+  newKey,
+  ORIGIN,
+  signInAgain,
+  signInCode,
+  signInDevice,
+  type SignedInDevice,
+  signInput,
+  useTestDatabase,
+} from "./device-test-support.ts";
+import { REDIRECT_URI } from "./github-test-support.ts";
 
-const ORIGIN = "https://api.example";
-const CLIENT_ID = "Iv23liExampleClient1";
-const CLIENT_SECRET = "0123456789abcdef0123456789abcdef01234567";
+const database = useTestDatabase();
 
-let testDatabase: TestDatabase | undefined;
+type App = FastifyInstance;
 
-before(async () => {
-  testDatabase = await createTestDatabase();
-});
-
-after(async () => {
-  await testDatabase?.close();
-});
-
-function database() {
-  assert.ok(testDatabase, "the test database is created in before()");
-  return testDatabase.db;
-}
-
-type Key = Readonly<{ privateKey: KeyObject; publicKey: string }>;
-
-function newKey(): Key {
-  const { privateKey } = generateKeyPairSync("ed25519");
-  const publicKey = createPublicKey(privateKey)
-    .export({ type: "spki", format: "der" })
-    .subarray(12)
-    .toString("hex");
-  return { privateKey, publicKey };
-}
-
-function signInput(key: Key, input: DeviceAuthInput): string {
-  return sign(
-    null,
-    Buffer.from(deviceAuthInput(input), "utf8"),
-    key.privateKey,
-  ).toString("base64url");
-}
-
-type App = Awaited<ReturnType<typeof buildApp>>;
-
-async function tokenApp(
+function tokenApp(
   t: TestContext,
   options: Readonly<{
     githubId: number;
@@ -105,126 +60,7 @@ async function tokenApp(
     logLines?: string[];
   }>,
 ): Promise<App> {
-  const github = fakeGitHub({
-    user: {
-      id: options.githubId,
-      login: `user-${options.githubId}`,
-      name: null,
-      created_at: "2015-06-01T10:00:00Z",
-    },
-  });
-  const app = await buildApp({
-    config: loadConfig({
-      NODE_ENV: "test",
-      API_PUBLIC_ORIGIN: ORIGIN,
-      API_GITHUB_CLIENT_ID: CLIENT_ID,
-      API_GITHUB_CLIENT_SECRET: CLIENT_SECRET,
-    }),
-    version: "1.2.3",
-    logger:
-      options.logLines === undefined
-        ? false
-        : { stream: { write: (line: string) => options.logLines?.push(line) } },
-    shutdownGraceMs: 50,
-    github: createGitHubApi({
-      clientId: CLIENT_ID,
-      clientSecret: new Secret(CLIENT_SECRET),
-      fetch: github.fetch,
-    }),
-    database: database(),
-    ...(options.now === undefined ? {} : { now: options.now }),
-  });
-  t.after(() => app.close());
-  return app;
-}
-
-/** A sign-in code and its verifier from the browser flow. */
-async function signInCode(app: App) {
-  const attempt = await startAttempt(app);
-  await callback(app, attempt, {
-    code: "github-code",
-    state: attempt.apiState,
-  });
-  const code =
-    listenerForm((await confirm(app, attempt, "continue")).body)?.fields.code ??
-    "";
-  return { code, codeVerifier: attempt.codeVerifier };
-}
-
-/**
- * Signs in a new device through the browser flow and POST /auth/sign-in;
- * with `previousDeviceId`, the new device replaces that one.
- */
-async function signInDevice(
-  app: App,
-  key: Key = newKey(),
-  previousDeviceId?: string,
-) {
-  const { code, codeVerifier } = await signInCode(app);
-  const response = await app.inject({
-    method: "POST",
-    url: "/auth/sign-in",
-    payload: {
-      code,
-      codeVerifier,
-      redirectUri: REDIRECT_URI,
-      device: {
-        kind: "new",
-        publicKey: key.publicKey,
-        keyAlgorithm: "ed25519",
-        label: "Laptop",
-        platform: "macos",
-        newKeySignature: signInput(key, {
-          purpose: "sign-in",
-          audience: ORIGIN,
-          signInCode: code,
-          deviceId: null,
-          newPublicKey: key.publicKey,
-        }),
-        ...(previousDeviceId === undefined ? {} : { previousDeviceId }),
-      },
-    },
-  });
-  assert.equal(response.statusCode, 200, response.body);
-  const answer = SignInResponseSchema.parse(response.json());
-  return { userId: answer.userId, deviceId: answer.deviceId, key };
-}
-
-type SignedInDevice = Awaited<ReturnType<typeof signInDevice>>;
-
-/** Signs an existing device in again with a new key, as the desktop does to replace its key. */
-async function signInAgain(
-  app: App,
-  device: SignedInDevice,
-  next: Key = newKey(),
-): Promise<SignedInDevice> {
-  const { code, codeVerifier } = await signInCode(app);
-  const input = {
-    purpose: "sign-in",
-    audience: ORIGIN,
-    signInCode: code,
-    deviceId: device.deviceId,
-    newPublicKey: next.publicKey,
-  } as const;
-  const response = await app.inject({
-    method: "POST",
-    url: "/auth/sign-in",
-    payload: {
-      code,
-      codeVerifier,
-      redirectUri: REDIRECT_URI,
-      device: {
-        kind: "existing",
-        deviceId: device.deviceId,
-        publicKey: next.publicKey,
-        keyAlgorithm: "ed25519",
-        currentKeySignature: signInput(device.key, input),
-        newKeySignature: signInput(next, input),
-      },
-    },
-  });
-  assert.equal(response.statusCode, 200, response.body);
-  return { ...device, key: next };
+  return deviceApp(t, { database: database(), ...options });
 }
 
 async function challenge(app: App) {
@@ -299,8 +135,8 @@ function codeOf(response: { json(): unknown }): string {
 }
 
 test("an access token works for 15 minutes and is then refused with unauthorized", async (t) => {
-  let clock = Date.now();
-  const app = await tokenApp(t, { githubId: 2001, now: () => clock });
+  const clock = fakeClock();
+  const app = await tokenApp(t, { githubId: 2001, now: clock.now });
   const device = await signInDevice(app);
   const challenged = await app.inject({
     method: "POST",
@@ -312,13 +148,13 @@ test("an access token works for 15 minutes and is then refused with unauthorized
   assert.equal(minted.headers["cache-control"], "no-store");
   const body = minted.json() as { accessToken: string; expiresAt: string };
   assert.match(body.accessToken, /^mmda_[A-Za-z0-9_-]{43}$/u);
-  assert.equal(Date.parse(body.expiresAt) - clock, 15 * 60_000);
+  assert.equal(Date.parse(body.expiresAt) - clock.now(), 15 * 60_000);
 
   const list = await get(app, "/devices", body.accessToken);
   assert.equal(list.statusCode, 200);
-  clock += 15 * 60_000 - 1;
+  clock.advance(15 * 60_000 - 1);
   assert.equal((await get(app, "/devices", body.accessToken)).statusCode, 200);
-  clock += 1;
+  clock.advance(1);
   const expired = await get(app, "/devices", body.accessToken);
   assert.equal(expired.statusCode, 401);
   assert.deepEqual(expired.json(), UNAUTHORIZED);
@@ -414,8 +250,8 @@ test("a token stops working when its device is revoked or signed out, or its acc
 });
 
 test("a reused or expired challenge, the ws purpose, and another audience fail with auth_failed", async (t) => {
-  let clock = Date.now();
-  const app = await tokenApp(t, { githubId: 2004, now: () => clock });
+  const clock = fakeClock();
+  const app = await tokenApp(t, { githubId: 2004, now: clock.now });
   const device = await signInDevice(app);
 
   const { challengeId, nonce } = await challenge(app);
@@ -441,7 +277,7 @@ test("a reused or expired challenge, the ws purpose, and another audience fail w
   );
 
   const late = await challenge(app);
-  clock += 60_000;
+  clock.advance(60_000);
   const lateSignature = signInput(device.key, {
     purpose: "http",
     audience: ORIGIN,
@@ -491,8 +327,8 @@ test("a reused or expired challenge, the ws purpose, and another audience fail w
 });
 
 test("device_revoked and sign_in_required come only after a valid signature", async (t) => {
-  const clock = Date.now();
-  const app = await tokenApp(t, { githubId: 2005, now: () => clock });
+  const clock = fakeClock();
+  const app = await tokenApp(t, { githubId: 2005, now: clock.now });
   const states: [
     label: string,
     expected: string,
@@ -524,7 +360,7 @@ test("device_revoked and sign_in_required come only after a valid signature", as
       (d) =>
         database()
           .update(devices)
-          .set({ lastSignInAt: new Date(clock - 30 * 24 * 60 * 60_000) })
+          .set({ lastSignInAt: new Date(clock.now() - 30 * 24 * 60 * 60_000) })
           .where(eq(devices.id, d.deviceId)),
     ],
     [
@@ -533,7 +369,7 @@ test("device_revoked and sign_in_required come only after a valid signature", as
       (d) =>
         database()
           .update(users)
-          .set({ signInRequiredAt: new Date(clock + 1_000) })
+          .set({ signInRequiredAt: new Date(clock.now() + 1_000) })
           .where(eq(users.id, d.userId)),
     ],
     [
@@ -986,11 +822,11 @@ test("the Bearer scheme ignores case", async (t) => {
 });
 
 test("a new sign-in of a device ends the tokens of its earlier sign-in", async (t) => {
-  let clock = Date.now();
-  const app = await tokenApp(t, { githubId: 2020, now: () => clock });
+  const clock = fakeClock();
+  const app = await tokenApp(t, { githubId: 2020, now: clock.now });
   const device = await signInDevice(app);
   const first = await token(app, device);
-  clock += 1_000;
+  clock.advance(1_000);
   const replaced = await signInAgain(app, device);
   assert.deepEqual(
     (await get(app, "/devices", first)).json(),
@@ -1007,10 +843,10 @@ test("a new sign-in of a device ends the tokens of its earlier sign-in", async (
   const second = await token(app, replaced);
   await database()
     .update(users)
-    .set({ signInRequiredAt: new Date(clock + 500) })
+    .set({ signInRequiredAt: new Date(clock.now() + 500) })
     .where(eq(users.id, device.userId));
   assert.deepEqual((await get(app, "/devices", second)).json(), UNAUTHORIZED);
-  clock += 1_000;
+  clock.advance(1_000);
   const again = await signInAgain(app, replaced);
   assert.deepEqual(
     (await get(app, "/devices", second)).json(),
@@ -1024,13 +860,13 @@ test("a new sign-in of a device ends the tokens of its earlier sign-in", async (
 });
 
 test("a token is refused once its device's sign-in is 30 days old", async (t) => {
-  let clock = Date.now();
-  const app = await tokenApp(t, { githubId: 2021, now: () => clock });
+  const clock = fakeClock();
+  const app = await tokenApp(t, { githubId: 2021, now: clock.now });
   const device = await signInDevice(app);
-  clock += 30 * 24 * 60 * 60_000 - 60_000;
+  clock.advance(30 * 24 * 60 * 60_000 - 60_000);
   const accessToken = await token(app, device);
   assert.equal((await get(app, "/devices", accessToken)).statusCode, 200);
-  clock += 60_000;
+  clock.advance(60_000);
   assert.deepEqual(
     (await get(app, "/devices", accessToken)).json(),
     UNAUTHORIZED,
@@ -1097,8 +933,8 @@ test("a request whose body arrives after its device was revoked is refused", asy
 });
 
 test("inside a transaction, lockActor refuses a device or an account that changed after authentication", async (t) => {
-  let clock = Date.now();
-  const app = await tokenApp(t, { githubId: 2026, now: () => clock });
+  const clock = fakeClock();
+  const app = await tokenApp(t, { githubId: 2026, now: clock.now });
   const unauthorized = (error: unknown) =>
     error instanceof ApiError && error.code === "unauthorized";
   const changes: [
@@ -1108,7 +944,7 @@ test("inside a transaction, lockActor refuses a device or an account that change
     [
       "a new sign-in",
       async (d) => {
-        clock += 1_000;
+        clock.advance(1_000);
         await signInAgain(app, d);
       },
     ],
@@ -1117,7 +953,10 @@ test("inside a transaction, lockActor refuses a device or an account that change
       (d) =>
         database()
           .update(devices)
-          .set({ revokedAt: new Date(clock), revocationReason: "removed" })
+          .set({
+            revokedAt: new Date(clock.now()),
+            revocationReason: "removed",
+          })
           .where(eq(devices.id, d.deviceId)),
     ],
     [
@@ -1125,7 +964,7 @@ test("inside a transaction, lockActor refuses a device or an account that change
       (d) =>
         database()
           .update(devices)
-          .set({ signedOutAt: new Date(clock) })
+          .set({ signedOutAt: new Date(clock.now()) })
           .where(eq(devices.id, d.deviceId)),
     ],
     [
@@ -1133,7 +972,7 @@ test("inside a transaction, lockActor refuses a device or an account that change
       (d) =>
         database()
           .update(users)
-          .set({ disabledAt: new Date(clock) })
+          .set({ disabledAt: new Date(clock.now()) })
           .where(eq(users.id, d.userId)),
     ],
   ];
@@ -1149,10 +988,10 @@ test("inside a transaction, lockActor refuses a device or an account that change
       deviceId: device.deviceId,
       signedInAt: row.lastSignInAt.getTime(),
     };
-    await database().transaction((tx) => lockActor(tx, auth, clock));
+    await database().transaction((tx) => lockActor(tx, auth, clock.now()));
     await change(device);
     await assert.rejects(
-      database().transaction((tx) => lockActor(tx, auth, clock)),
+      database().transaction((tx) => lockActor(tx, auth, clock.now())),
       unauthorized,
       label,
     );
@@ -1160,13 +999,13 @@ test("inside a transaction, lockActor refuses a device or an account that change
 });
 
 test("tokens ended by a new sign-in or a replacement do not use up the account's request limit", async (t) => {
-  let clock = Date.now();
-  const app = await tokenApp(t, { githubId: 2027, now: () => clock });
+  const clock = fakeClock();
+  const app = await tokenApp(t, { githubId: 2027, now: clock.now });
   const device = await signInDevice(app);
   const beforeSignIn = await token(app, device);
   const replaced = await signInDevice(app);
   const ofReplaced = await token(app, replaced);
-  clock += 1_000;
+  clock.advance(1_000);
   const again = await signInAgain(app, device);
   await signInDevice(app, newKey(), replaced.deviceId);
   for (let index = 0; index < 301; index += 1) {

@@ -275,8 +275,23 @@ export const WS_CLOSE_CODES = Object.freeze({
   sign_in_required: 4003,
   /** A newer connection of the same device authenticated. */
   connection_replaced: 4004,
+  /**
+   * Before authentication succeeded: a binary frame, a frame over
+   * `MAX_AUTH_FRAME_BYTES`, a frame that is not JSON or that
+   * `decodeClientFrame` refuses, any frame other than `auth.response`, or a
+   * second frame. The desktop does not reconnect on its own and shows an
+   * error; it asks the person to update when the protocol versions differ.
+   */
+  protocol_violation: 4005,
 } as const);
 export type WsCloseReason = keyof typeof WS_CLOSE_CODES;
+
+/**
+ * How long a device's sign-in lasts (ADR 0014, "Lifetimes"): 30 days after
+ * its last GitHub sign-in, the device must sign in again. `auth.ok` and the
+ * device list report the expiry.
+ */
+export const SIGN_IN_LIFETIME_MS = 30 * 24 * 60 * 60_000;
 
 /**
  * Human-entered text: rejects control, format (including bidirectional and tag

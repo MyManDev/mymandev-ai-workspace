@@ -31,11 +31,17 @@ import { privatePattern } from "./private-pattern.ts";
 
 /**
  * Before authentication succeeds, a frame over this size closes the
- * connection. The server measures the raw frame, before it parses the JSON;
- * the decoders below see parsed values and cannot check it. Which close code
- * a refused frame gets is decided with the gateway (#89).
+ * connection with `protocol_violation`. The server measures the raw frame,
+ * before it parses the JSON; the decoders below see parsed values and cannot
+ * check it.
  */
 export const MAX_AUTH_FRAME_BYTES = 1024;
+
+/**
+ * The time from the upgrade to `auth.response` (ADR 0014, "Lifetimes"). A
+ * connection that has not authenticated by then closes with `auth_timeout`.
+ */
+export const WS_AUTH_TIMEOUT_MS = 10_000;
 
 const frameHeaderShape = Object.freeze({
   protocolVersion: z.literal(PROTOCOL_VERSION),

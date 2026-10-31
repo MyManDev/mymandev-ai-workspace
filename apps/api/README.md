@@ -1,6 +1,6 @@
 # @mymandev/api
 
-The cloud API skeleton: a Fastify application with a health endpoint and a WebSocket gateway that validates protocol events from [`@mymandev/protocol`](../../packages/protocol/README.md). It has no authentication and no persistence yet. The decisions behind it are recorded in [ADR 0009](../../docs/architecture/decisions/0009-fastify-cloud-api.md) and [ADR 0010](../../docs/architecture/decisions/0010-api-configuration-and-runtime.md).
+The cloud API: a Fastify application with a health endpoint, GitHub sign-in, device keys and access tokens, and a WebSocket gateway that authenticates each connection with its device key and validates protocol events from [`@mymandev/protocol`](../../packages/protocol/README.md). The decisions behind it are recorded in [ADR 0009](../../docs/architecture/decisions/0009-fastify-cloud-api.md), [ADR 0010](../../docs/architecture/decisions/0010-api-configuration-and-runtime.md), and [ADR 0014](../../docs/architecture/decisions/0014-accounts-devices-and-invitations.md).
 
 ## Start locally
 
@@ -96,30 +96,77 @@ The operator command (`db:account`) runs outside the API and cannot drop tokens 
 
 ### `GET /ws` (WebSocket)
 
-`/ws` is the only path that accepts a WebSocket handshake; a handshake on any other path gets `404` before the upgrade. The gateway accepts WebSocket connections and validates every frame as a protocol event that a device sent:
+`/ws` is the only path that accepts a WebSocket handshake; a handshake on any other path gets `404` before the upgrade. `/ws` exists only with GitHub sign-in and the database, like the routes that need them (ADR 0014, "Configuration"); without them it answers the generic `404` as well, and no unauthenticated mode exists.
 
-1. A handshake with an `Origin` header that is not listed in `API_ALLOWED_ORIGINS` gets `403` before the upgrade. A handshake without `Origin` (Node.js, the Electron main process) is accepted. Browsers send `Origin` on every WebSocket handshake and apply no same-origin rule to WebSocket, so every browser origin that may connect must be listed. A renderer loaded from `file://` or a custom scheme sends the origin `null`, which cannot be listed.
-2. Each text frame must contain one JSON event. The gateway decodes it with `decodeClientEvent` from `@mymandev/protocol`.
-3. A valid event goes, typed as `UnverifiedEvent`, to the event handler together with the connection context (`connectionId` and `identity`, which is always `null` until authentication exists). The default handler logs the event ID, the event type, and the connection ID at `debug` level. Nothing is routed, relayed, stored, or answered.
-4. Anything else closes the connection. Frames that arrive after the gateway has decided to close are ignored.
+Before the upgrade:
 
-| Close code | Reason                                                                                                            | When                                          |
-| ---------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| 1001       | `server_shutdown`                                                                                                 | The API shuts down.                           |
-| 1003       | `binary_not_supported`                                                                                            | A binary frame.                               |
-| 1007       | `invalid_json`                                                                                                    | A text frame that is not JSON.                |
-| 1008       | `malformed`, `unsupported_version`, `unknown_type`, `invalid_payload`, `invalid_actor`, `not_allowed_from_device` | The event is rejected by `decodeClientEvent`. |
-| 1009       | (set by the WebSocket library)                                                                                    | A frame larger than 64 KiB.                   |
+1. A handshake with an `Origin` header that is not listed in `API_ALLOWED_ORIGINS` gets `403`. A handshake without `Origin` (Node.js, the Electron main process) is accepted. Browsers send `Origin` on every WebSocket handshake and apply no same-origin rule to WebSocket, so every browser origin that may connect must be listed. A renderer loaded from `file://` or a custom scheme sends the origin `null`, which cannot be listed.
+2. At most 200 connections may wait for authentication at once (ADR 0014, "Limits"). Above that, the handshake gets `429` with `rate_limited` and `Retry-After: 10`, the longest time until a waiting connection authenticates or times out. No socket, timer, or nonce is created for it. Limits per remote address wait for the hosting decision on `trustProxy` (P-63).
 
-These close codes and reasons are provisional. The WebSocket message protocol (M2-01) owns them and may change them.
+Authentication (ADR 0014, "Device key and authentication"):
+
+1. After the upgrade the server sends `auth.challenge` with a nonce (32 random bytes), a new connection ID, and the protocol version, and starts a 10-second timer (`WS_AUTH_TIMEOUT_MS`). The nonce lives only in API memory and only for this connection.
+2. The device answers with exactly one `auth.response`: its device ID and a signature over `deviceAuthInput` with the purpose `ws`, `API_PUBLIC_ORIGIN` as the audience, the nonce, the device ID, and the connection ID. The nonce is used once: the connection accepts no second response.
+3. The server verifies the signature with the device's current key first and checks the device state second, like `POST /auth/access-token`: an unknown device, a bad signature, and a disabled account get `auth_failed`; a revoked device gets `device_revoked`; a signed-out device, a last sign-in 30 days ago or more, and a GitHub revocation after the last sign-in get `sign_in_required`.
+4. On success the server writes `devices.last_seen_at`, sends `auth.ok` with the user ID, the device ID, and the sign-in expiry (30 days after the last sign-in), and builds a frozen `AuthenticatedConnectionContext`: the connection ID, the identity (user and device), which is never null, and the time of the device's last sign-in.
+5. A device has one live connection. A newer authenticated connection closes the older one with `connection_replaced`. The server writes at most one `connection.replaced` audit record per device per hour and logs the other replacements with a count.
+
+Before `auth.ok`, no frame reaches `decodeClientEvent` or the event handler: a binary frame, a frame over 1 KiB (`MAX_AUTH_FRAME_BYTES`, measured on the raw frame before the JSON is parsed), a frame that is not JSON or that `decodeClientFrame` refuses, any frame other than `auth.response`, and a second frame close the connection with `protocol_violation`. A frame over 64 KiB closes with 1009 at any time, because the WebSocket library refuses it first.
+
+Events after `auth.ok`:
+
+1. Each text frame must contain one JSON event, which the gateway decodes with `decodeClientEvent`.
+2. `bindIdentity` then binds the event to the connection (ADR 0006, identity binding). The event's `deviceId`, and for a `user` actor its `actor.userId`, must be the connection's; a mismatch is refused and audited as `event.identity_mismatch`, with the event ID as the subject and no workspace, because the event's workspace is unverified. It is never overwritten. Every event also needs a device that is not revoked and a user who is an active member of `event.workspaceId` at this moment: a claimed person whose `removed_at` is empty. A workspace that does not exist is refused like one without the user.
+3. Only the result, a `VerifiedEvent` (a second brand next to `UnverifiedEvent`, defined in `src/gateway.ts`), reaches the event handler, together with the `AuthenticatedConnectionContext`. The handler's type accepts nothing else. The default handler logs the event ID, the event type, and the connection ID at `debug` level. Nothing is routed, relayed, stored, or answered yet: the reference binding of runs, agents, projects, and repositories comes with the first event types that carry those references (#27, #28).
+4. Events are handled one after another, in the order they arrived. While events wait for their checks, the gateway stops reading from the socket, so a fast sender cannot queue without bound.
+5. Anything else closes the connection. Frames that arrive after the gateway has decided to close are ignored.
+
+| Close code | Reason                                                                                                            | When                                                                                                                              |
+| ---------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| 1001       | `server_shutdown`                                                                                                 | The API shuts down.                                                                                                               |
+| 1003       | `binary_not_supported`                                                                                            | After authentication: a binary frame.                                                                                             |
+| 1007       | `invalid_json`                                                                                                    | After authentication: a text frame that is not JSON.                                                                              |
+| 1008       | `malformed`, `unsupported_version`, `unknown_type`, `invalid_payload`, `invalid_actor`, `not_allowed_from_device` | After authentication: `decodeClientEvent` refuses the event.                                                                      |
+| 1008       | `identity_mismatch`, `not_a_member`                                                                               | After authentication: `bindIdentity` refuses the event.                                                                           |
+| 1009       | (set by the WebSocket library)                                                                                    | A frame larger than 64 KiB.                                                                                                       |
+| 1011       | `internal_error`                                                                                                  | The server failed, for example its database.                                                                                      |
+| 4000       | `auth_failed`                                                                                                     | An unknown device, a bad signature, or a disabled account.                                                                        |
+| 4001       | `auth_timeout`                                                                                                    | No `auth.response` within 10 seconds.                                                                                             |
+| 4002       | `device_revoked`                                                                                                  | A valid signature from a revoked device, or after authentication an event from a device that was revoked since.                   |
+| 4003       | `sign_in_required`                                                                                                | A valid signature, but the device signed out, its last sign-in is 30 days old or older, or GitHub reported a revocation after it. |
+| 4004       | `connection_replaced`                                                                                             | A newer connection of the same device authenticated.                                                                              |
+| 4005       | `protocol_violation`                                                                                              | Before authentication: a frame that breaks the rules above.                                                                       |
+
+The codes 4000 to 4005 and their reasons are `WS_CLOSE_CODES` of `@mymandev/protocol`, whose README lists what the desktop does for each. The codes from 1003 to 1011 stay provisional (P-24).
+
+No authentication frame, nonce, or signature is logged. A refused connection is logged with its connection ID and the close reason only (`protocol_violation` at `debug` level, with what broke the rule, and the others at `info`), and an authenticated connection with its connection ID, user ID, and device ID.
+
+`ConnectionRegistry` (`src/gateway.ts`) holds the open connections of the instance: the unauthenticated ones, for their cap, and the live connection of each device. `closeDevice(deviceId, reason)` and `closeUser(userId, reason)` close live connections with a close reason of the protocol. `buildApp` takes a registry as an option, so tests can count and close connections.
+
+Decisions that ADR 0014 leaves open, settled by the Project Manager on 2026-10-31 (#89):
+
+- A frame that breaks the rules before authentication closes with the new code `protocol_violation` (4005). The desktop does not reconnect on its own and shows an error; when the protocol versions differ, it asks the person to update.
+- Above the cap of 200 unauthenticated connections, the handshake gets `429` with `rate_limited` and `Retry-After` before the upgrade.
+- `devices.last_seen_at` is written when a connection authenticates.
+- Without the sign-in configuration or without the database, `/ws` answers `404`; the unauthenticated mode of M1-02 is gone.
+
+Still to come in #89, part B:
+
+- every 60 seconds, one batched query re-checks the devices in the registry for a revocation, a disabled account, a sign-out, `users.sign_in_required_at`, and a connection past the 24-hour grace after the 30-day sign-in, and closes those connections with the matching reason;
+- closing a device's socket after its revocation commits (`device_revoked`), after a sign-out (`sign_in_required`), and after a sign-in that replaces the device (#87, #88);
+- sending each run that a revocation cancelled as `agent.run.state_changed` with a `system` actor, `deviceId: null`, and the reason `device_revoked` to the workspace's connections;
+- the account frames for a registered and a revoked device, sent only to the account's own connections;
+- updating `devices.last_seen_at` every 5 minutes for an open connection, in the 60-second sweep.
+
+Until then, an authenticated connection stays open after a sign-out, a disabled account, or the end of its sign-in; the per-event checks still refuse events from a revoked device and from a person who is not an active member.
 
 ## Rules
 
-- Credentials never appear in URLs, including the WebSocket URL. A browser `WebSocket` cannot set headers, which invites `/ws?token=...`; the query string would then reach proxies and browser history. WebSocket authentication (M2) uses the first message or the `Sec-WebSocket-Protocol` header.
+- Credentials never appear in URLs, including the WebSocket URL. A browser `WebSocket` cannot set headers, which invites `/ws?token=...`; the query string would then reach proxies and browser history. WebSocket authentication uses the first message, `auth.response`.
 - Logs contain the request method, the path without the query string, and the remote address. Errors are logged with their type, codes, message, and stack; an error that may carry query data (an own `query`, `params`, or `detail` property) is logged without message and stack.
-- An event from a device stays `UnverifiedEvent` until the server's identity binding (M2) has bound it to the authenticated connection. Never cast it to `ProtocolEvent` or to a verified type.
+- An event from a device stays `UnverifiedEvent` until `bindIdentity` has bound it to the authenticated connection. Never cast it to `ProtocolEvent` or to `VerifiedEvent`; only `bindIdentity` creates a `VerifiedEvent`, and the event handler accepts only that type with an `AuthenticatedConnectionContext`.
 - `src/server.ts` is the only module with side effects. Tests build the application with `buildApp` from `src/app.ts` and use `inject` and `injectWS` without a network.
 
 ## Not included
 
-Authentication, sessions, tokens, identity binding, rate limits, CORS, OpenAPI, TLS, database access, permission enforcement, event routing and relay, the WebSocket message protocol (M2-01), Docker, deployment configuration, clustering, a build step, pretty-printed logs, and a Fastify type provider.
+Sessions, CORS, OpenAPI, TLS, permission enforcement, the reference binding of events (#27, #28), event routing, relay, and storage, the parts of #89 listed above as still to come, Docker, deployment configuration, clustering, a build step, pretty-printed logs, and a Fastify type provider.

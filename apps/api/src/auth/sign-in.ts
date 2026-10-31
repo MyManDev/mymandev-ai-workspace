@@ -15,6 +15,7 @@ import {
   LIMITS,
   newId,
   newUuidV7,
+  SIGN_IN_LIFETIME_MS,
   type SignInRequest,
   SignInRequestSchema,
   type SignInResponse,
@@ -33,8 +34,6 @@ import type { AccessTokens } from "./tokens.ts";
 const MAX_ACTIVE_DEVICES = 20;
 const MAX_NEW_DEVICES_PER_DAY = 10;
 const DAY_MS = 24 * 60 * 60_000;
-/** A device must sign in with GitHub again 30 days after its last sign-in. */
-const SIGN_IN_LIFETIME_MS = 30 * DAY_MS;
 
 /** Per remote address, while the API is reached directly (P-63). */
 const ROUTE_LIMIT = { max: 30, timeWindow: 10 * 60_000 };

@@ -8,6 +8,7 @@ import {
   decodeServerMessage,
   MAX_AUTH_FRAME_BYTES,
   SERVER_FRAME_TYPES,
+  WS_AUTH_TIMEOUT_MS,
 } from "./frames.ts";
 import {
   EVENT_TYPE_PATTERN,
@@ -149,15 +150,26 @@ function membershipEvents(): Json[] {
   ];
 }
 
-test("the close codes are 4000 to 4004, in the order of ADR 0014, and frozen", () => {
+test("the close codes are 4000 to 4005, in the order of ADR 0014 and #89, and frozen", () => {
   assert.deepEqual(WS_CLOSE_CODES, {
     auth_failed: 4000,
     auth_timeout: 4001,
     device_revoked: 4002,
     sign_in_required: 4003,
     connection_replaced: 4004,
+    protocol_violation: 4005,
   });
+  // Numbers are never reused and follow in order.
+  assert.deepEqual(
+    Object.values(WS_CLOSE_CODES),
+    Object.values(WS_CLOSE_CODES).map((_, index) => 4000 + index),
+  );
   assert.ok(Object.isFrozen(WS_CLOSE_CODES));
+});
+
+test("authentication has 10 seconds and a frame limit of 1 KiB", () => {
+  assert.equal(WS_AUTH_TIMEOUT_MS, 10_000);
+  assert.equal(MAX_AUTH_FRAME_BYTES, 1024);
 });
 
 test("a frame type has two parts and an event type three, so they never overlap", () => {
