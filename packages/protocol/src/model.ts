@@ -283,6 +283,12 @@ export const WS_CLOSE_CODES = Object.freeze({
    * error; it asks the person to update when the protocol versions differ.
    */
   protocol_violation: 4005,
+  /**
+   * The connection authenticated with a key that a newer sign-in of the same
+   * device has replaced. The desktop reconnects at once with its new key; a
+   * copy of the old key then fails with `auth_failed`.
+   */
+  key_replaced: 4006,
 } as const);
 export type WsCloseReason = keyof typeof WS_CLOSE_CODES;
 

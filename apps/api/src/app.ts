@@ -19,6 +19,7 @@ import {
   ConnectionRegistry,
   GATEWAY_PATH,
   registerGateway,
+  socketErrorHandler,
   type EventHandler,
 } from "./gateway.ts";
 import { serializeError, serializeRequest } from "./log.ts";
@@ -264,8 +265,11 @@ export async function buildApp(
     errorResponseBuilder: () => new ApiError("rate_limited"),
   });
 
+  const connections = options.connections ?? new ConnectionRegistry();
   await app.register(websocket, {
     options: { maxPayload: MAX_FRAME_BYTES },
+    // What a client sent wrong is logged at debug level, with the connection ID.
+    errorHandler: socketErrorHandler(connections),
     // Close every client with 1001, wait up to the grace period, then terminate.
     preClose: async () => {
       const server = app.websocketServer;
@@ -377,7 +381,7 @@ export async function buildApp(
         publicOrigin: config.githubSignIn.publicOrigin,
         database,
         now,
-        connections: options.connections ?? new ConnectionRegistry(),
+        connections,
         onEvent,
       });
     }

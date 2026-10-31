@@ -39,8 +39,14 @@ const DAY_MS = 24 * 60 * 60_000;
 /** ADR 0014, "Lifetimes". */
 const REGISTRATION_LOCK_MS = 7 * DAY_MS;
 
-/** Per remote address, before any signature is verified (P-63). */
-const ADDRESS_LIMIT = { max: 60, timeWindow: 10 * 60_000 };
+/**
+ * Per remote address, before any signature is verified (P-63): the
+ * challenge, the access token, and the WebSocket handshake.
+ */
+export const ADDRESS_LIMIT = Object.freeze({
+  max: 60,
+  timeWindow: 10 * 60_000,
+});
 /** Access tokens per device after a verified signature; one is needed every 15 minutes. */
 const TOKENS_PER_DEVICE = { max: 30, windowMs: 15 * 60_000 };
 /** Authenticated requests per account. */

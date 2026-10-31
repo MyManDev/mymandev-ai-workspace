@@ -14,7 +14,7 @@ No application uses this package yet. The cloud API imports its query functions 
 | `db:compare`  | `node --env-file-if-exists=.env src/compare-schema-cli.ts` |
 | `db:account`  | `node --env-file-if-exists=.env src/account-cli.ts`        |
 | `typecheck`   | `tsc -p tsconfig.json`                                     |
-| `test`        | `node --test "src/**/*.test.ts"`                           |
+| `test`        | `node --test --test-timeout=120000 "src/**/*.test.ts"`     |
 
 Run them from the repository root with `-w @mymandev/database`, or from `packages/database`. The tests need no server: they run on PGlite, PostgreSQL 18 compiled to WebAssembly, inside the test process.
 

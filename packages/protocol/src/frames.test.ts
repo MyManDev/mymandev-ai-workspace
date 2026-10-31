@@ -150,7 +150,7 @@ function membershipEvents(): Json[] {
   ];
 }
 
-test("the close codes are 4000 to 4005, in the order of ADR 0014 and #89, and frozen", () => {
+test("the close codes are 4000 to 4006, in the order of ADR 0014 and #89, and frozen", () => {
   assert.deepEqual(WS_CLOSE_CODES, {
     auth_failed: 4000,
     auth_timeout: 4001,
@@ -158,6 +158,7 @@ test("the close codes are 4000 to 4005, in the order of ADR 0014 and #89, and fr
     sign_in_required: 4003,
     connection_replaced: 4004,
     protocol_violation: 4005,
+    key_replaced: 4006,
   });
   // Numbers are never reused and follow in order.
   assert.deepEqual(

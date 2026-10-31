@@ -186,7 +186,7 @@ A bundled consumer's `tsconfig.json` can start from this example; `jsx` and `typ
 Node-side workspaces use the built-in Node.js test runner, `node:test`; see [ADR 0002](../architecture/decisions/0002-node-test-runner.md).
 
 - Tests sit next to the code as `src/**/*.test.ts`.
-- The workspace script is `"test": "node --test \"src/**/*.test.ts\""`. Node.js runs the TypeScript tests directly, and the quoted glob also works through `cmd.exe`.
+- The workspace script is `"test": "node --test --test-timeout=120000 \"src/**/*.test.ts\""`. Node.js runs the TypeScript tests directly, and the quoted glob also works through `cmd.exe`. The timeout of 120 seconds per test makes a test that hangs, for example on a promise that never settles, fail instead of blocking `npm run check`; the runner has no timeout by default.
 - Tests use dependency injection instead of module mocks.
 - `node --test` exits with 0 when its pattern matches no file. When you add or remove tests, check the `tests` count in the summary.
 - A workspace `test` script runs once and exits. A bundled workspace, such as `apps/desktop`, may use Vitest in its own `devDependencies`, matched to its Vite version. With Vitest, use `"test": "vitest run"`: plain `vitest` starts watch mode in an interactive terminal and would block `npm run check`.

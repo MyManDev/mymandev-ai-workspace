@@ -34,7 +34,8 @@ import type {
 import type { RawData, WebSocket } from "ws";
 import { randomToken } from "./auth/attempts.ts";
 import { verifyDeviceSignature } from "./auth/device-keys.ts";
-import { deviceRow, stateOf } from "./auth/device-state.ts";
+import { ADDRESS_LIMIT } from "./auth/device-routes.ts";
+import { type DeviceRow, deviceRow, stateOf } from "./auth/device-state.ts";
 import { WindowLimiter } from "./auth/tokens.ts";
 import { ApiError } from "./errors.ts";
 
@@ -67,8 +68,25 @@ export const GATEWAY_PATH = "/ws";
 /** At most this many connections wait for authentication at once (ADR 0014, "Limits"). */
 export const MAX_UNAUTHENTICATED_CONNECTIONS = 200;
 
-/** At most one `connection.replaced` audit record per device in this time (ADR 0014). */
-const REPLACEMENT_AUDIT_WINDOW_MS = 60 * 60_000;
+/**
+ * How long a connection that is refused before authentication, or that timed
+ * out, may take for the closing handshake before its socket is terminated.
+ * Without it, the WebSocket library waits up to 30 seconds and the
+ * connection keeps its place among the unauthenticated ones.
+ */
+export const REFUSED_CLOSE_GRACE_MS = 1_000;
+
+/**
+ * The longest time an unauthenticated connection holds its place: the
+ * authentication timeout and the closing grace. The 429 above the cap sends
+ * it as `Retry-After`.
+ */
+export const UNAUTHENTICATED_PLACE_SECONDS = Math.ceil(
+  (WS_AUTH_TIMEOUT_MS + REFUSED_CLOSE_GRACE_MS) / 1000,
+);
+
+/** At most one audit record of each kind per device in this time (ADR 0014). */
+export const CONNECTION_AUDIT_WINDOW_MS = 60 * 60_000;
 
 /** The user and the device that a connection's key proved. */
 export type ConnectionIdentity = Readonly<{
@@ -87,7 +105,8 @@ export type AuthenticatedConnectionContext = Readonly<{
   identity: ConnectionIdentity;
   /**
    * The device's last GitHub sign-in when the connection authenticated, in
-   * milliseconds since the epoch. A newer sign-in replaces the device's key.
+   * milliseconds since the epoch. A newer sign-in replaces the key that
+   * signed, and the connection stops being accepted.
    */
   signedInAt: number;
 }>;
@@ -96,32 +115,136 @@ declare const verified: unique symbol;
 
 /**
  * An event that `bindIdentity` bound to its authenticated connection: its
- * device and its user are the connection's, the device is not revoked, and
- * the user is an active member of the event's workspace. A second brand next
- * to `UnverifiedEvent`, defined here and never in the protocol (ADR 0006).
- * Only `bindIdentity` creates it; never cast to it anywhere else. The
- * reference binding of runs, agents, projects, and repositories (#27, #28) is
- * not part of it yet, so nothing relays or stores it until then.
+ * device and its user are the connection's, the device and the account may
+ * still act, and the user is an active member of the event's workspace. A
+ * second brand next to `UnverifiedEvent`, defined here and never in the
+ * protocol (ADR 0006). Only `bindIdentity` creates it; never cast to it
+ * anywhere else.
+ * The reference binding of an agent actor, its run, and its project (ADR
+ * 0006) arrives with #27 and #28, before anything relays a VerifiedEvent.
  */
 export type VerifiedEvent = Exclude<
   ProtocolEvent,
   { type: ServerOnlyEventType }
 > & { readonly [verified]: true };
 
-/** Receives every event that passed identity binding, with its authenticated connection. */
+/**
+ * Receives every event that passed identity binding, with its authenticated
+ * connection. The gateway awaits it before the connection's next event; a
+ * failure closes the connection with 1011.
+ */
 export type EventHandler = (
   event: VerifiedEvent,
   context: AuthenticatedConnectionContext,
-) => void;
+) => void | Promise<void>;
+
+/**
+ * Why a device row no longer accepts a connection, as its close reason: a
+ * revoked device; a newer sign-in, whose new key replaced the key that
+ * signed; a disabled account; a sign-out or a GitHub revocation after the
+ * sign-in.
+ */
+export type ConnectionRefusal = Extract<
+  WsCloseReason,
+  "device_revoked" | "key_replaced" | "auth_failed" | "sign_in_required"
+>;
+
+/**
+ * Why the device's current row refuses a connection that authenticated with
+ * the key of the sign-in at `signedInAt`, or null when it may act. The
+ * server rejects the previous key from the commit of a new sign-in on (ADR
+ * 0014). With `now`, the 30-day sign-in counts too, as at authentication.
+ * Without it, as for every event, the expiry is left to the sweep, which
+ * allows an open connection 24 hours more: `stateOf` is then evaluated at
+ * the sign-in itself, where the sign-in has not expired.
+ */
+export function refusalOf(
+  row: DeviceRow | undefined,
+  signedInAt: number,
+  now: number | null,
+): ConnectionRefusal | null {
+  if (row === undefined || row.revokedAt !== null) {
+    return "device_revoked";
+  }
+  if (row.lastSignInAt.getTime() !== signedInAt) {
+    return "key_replaced";
+  }
+  const state = stateOf(row, now ?? signedInAt);
+  switch (state.state) {
+    case "revoked":
+      return "device_revoked";
+    case "disabled":
+      return "auth_failed";
+    case "sign_in_required":
+      return "sign_in_required";
+    case "ok":
+      return null;
+  }
+}
+
+/**
+ * Allows one audit record per device per window and counts the occurrences
+ * in the same window that are only logged (ADR 0014: a replaced connection
+ * is audited at most once per device per hour). A device's count is dropped
+ * when its window ends.
+ */
+export class AuditThrottle {
+  readonly #limiter: WindowLimiter;
+  readonly #windows = new Map<DeviceId, { start: number; unaudited: number }>();
+  readonly #windowMs: number;
+  readonly #now: () => number;
+
+  constructor(windowMs: number, now: () => number) {
+    this.#limiter = new WindowLimiter(1, windowMs, now);
+    this.#windowMs = windowMs;
+    this.#now = now;
+  }
+
+  /** Devices whose window is open. */
+  get size(): number {
+    return this.#windows.size;
+  }
+
+  /**
+   * Counts one occurrence. Returns 0 when it is the first of its window and
+   * is audited; otherwise the number of occurrences in this window that were
+   * not audited, this one included.
+   */
+  take(deviceId: DeviceId): number {
+    this.sweep();
+    if (this.#limiter.hit(deviceId) === 0) {
+      this.#windows.set(deviceId, { start: this.#now(), unaudited: 0 });
+      return 0;
+    }
+    const window = this.#windows.get(deviceId) ?? {
+      start: this.#now(),
+      unaudited: 0,
+    };
+    window.unaudited += 1;
+    this.#windows.set(deviceId, window);
+    return window.unaudited;
+  }
+
+  /** Drops the windows that ended, with their counts. */
+  sweep(): void {
+    const now = this.#now();
+    this.#limiter.sweep();
+    for (const [deviceId, window] of this.#windows) {
+      if (now - window.start >= this.#windowMs) {
+        this.#windows.delete(deviceId);
+      }
+    }
+  }
+}
 
 /** Why `bindIdentity` refused an event. */
 export type IdentityRejectionCode =
   /** The event names another device, or a `user` actor names another user. Audited. */
   | "identity_mismatch"
-  /** The connection's device was revoked. */
-  | "device_revoked"
   /** The connection's user is not an active member of the event's workspace. */
-  | "not_a_member";
+  | "not_a_member"
+  /** The device or the account may no longer act; the code is the close reason. */
+  | ConnectionRefusal;
 
 export type BindIdentityResult =
   | { ok: true; event: VerifiedEvent }
@@ -130,16 +253,21 @@ export type BindIdentityResult =
 export type BindIdentityDependencies = Readonly<{
   database: Database;
   now: () => number;
+  /** Limits the `event.identity_mismatch` audit records per device. */
+  mismatchAudits: AuditThrottle;
+  log: FastifyBaseLogger;
 }>;
 
 /**
  * Binds an event that a device sent to its authenticated connection (ADR
  * 0006, identity binding; ADR 0014). `deviceId`, and for a `user` actor
  * `actor.userId`, must be the connection's: a mismatch is refused and
- * audited as `event.identity_mismatch`, never overwritten. Every event also
- * needs a device that is not revoked and a user who is an active member of
- * `event.workspaceId` at this moment. The audit record names the event ID as
- * its subject and no workspace, because the event's workspace is unverified.
+ * audited as `event.identity_mismatch`, at most once per device per hour,
+ * and never overwritten. Every event also needs a device row that still
+ * accepts the connection (`refusalOf`, without the 30-day expiry) and a user
+ * who is an active member of `event.workspaceId` at this moment. The audit
+ * record names the event ID as its subject and no workspace, because the
+ * event's workspace is unverified.
  */
 export async function bindIdentity(
   event: UnverifiedEvent,
@@ -151,18 +279,26 @@ export async function bindIdentity(
     event.deviceId !== deviceId ||
     (event.actor.kind === "user" && event.actor.userId !== userId)
   ) {
-    await writeConnectionAudit(dependencies.database, {
-      action: "event.identity_mismatch",
-      userId,
-      deviceId,
-      subjectId: event.id,
-      now: new Date(dependencies.now()),
-    });
+    const unaudited = dependencies.mismatchAudits.take(deviceId);
+    dependencies.log.info(
+      unaudited === 0 ? {} : { unauditedMismatches: unaudited },
+      "identity mismatch",
+    );
+    if (unaudited === 0) {
+      await writeConnectionAudit(dependencies.database, {
+        action: "event.identity_mismatch",
+        userId,
+        deviceId,
+        subjectId: event.id,
+        now: new Date(dependencies.now()),
+      });
+    }
     return { ok: false, code: "identity_mismatch" };
   }
   const device = await deviceRow(dependencies.database, deviceId);
-  if (device === undefined || device.revokedAt !== null) {
-    return { ok: false, code: "device_revoked" };
+  const refusal = refusalOf(device, context.signedInAt, null);
+  if (refusal !== null) {
+    return { ok: false, code: refusal };
   }
   const member = await isActiveMember(dependencies.database, {
     workspaceId: event.workspaceId,
@@ -193,6 +329,7 @@ type LiveConnection = Readonly<{
 export class ConnectionRegistry {
   readonly #pending = new Set<WebSocket>();
   readonly #live = new Map<DeviceId, LiveConnection>();
+  readonly #ids = new WeakMap<WebSocket, ConnectionId>();
 
   /** Connections that have not authenticated yet. */
   get pendingCount(): number {
@@ -205,8 +342,14 @@ export class ConnectionRegistry {
   }
 
   /** Counts a new connection until it authenticates or closes. */
-  addPending(socket: WebSocket): void {
+  addPending(socket: WebSocket, connectionId: ConnectionId): void {
     this.#pending.add(socket);
+    this.#ids.set(socket, connectionId);
+  }
+
+  /** The connection ID of a socket of the gateway, for its logs. */
+  connectionIdOf(socket: WebSocket): ConnectionId | null {
+    return this.#ids.get(socket) ?? null;
   }
 
   /**
@@ -229,7 +372,10 @@ export class ConnectionRegistry {
     return previous.context;
   }
 
-  /** Forgets a connection that closed. A replaced connection is already gone. */
+  /**
+   * Forgets a connection that closed or was refused. A connection that a
+   * newer one replaced is already gone, so the newer one stays.
+   */
   remove(
     socket: WebSocket,
     context: AuthenticatedConnectionContext | null,
@@ -281,6 +427,32 @@ export class ConnectionRegistry {
   }
 }
 
+/** Error codes of what a client did on its socket, not failures of the server. */
+const CLIENT_SOCKET_ERROR = /^(?:WS_ERR_[A-Z_]+|ECONNRESET|EPIPE)$/u;
+
+/**
+ * The error handler of the WebSocket plugin. The WebSocket library reports
+ * what a client sent wrong, for example a frame over the size limit, as an
+ * error after it has sent its close frame; that is logged at debug level,
+ * anything else at error level, both with the connection ID. The socket is
+ * terminated, as the plugin's default does.
+ */
+export function socketErrorHandler(connections: ConnectionRegistry) {
+  return (error: Error, socket: WebSocket, request: FastifyRequest): void => {
+    const code = (error as Error & { code?: unknown }).code;
+    const fields = {
+      err: error,
+      connectionId: connections.connectionIdOf(socket) ?? undefined,
+    };
+    if (typeof code === "string" && CLIENT_SOCKET_ERROR.test(code)) {
+      request.log.debug(fields, "connection error");
+    } else {
+      request.log.error(fields, "connection error");
+    }
+    socket.terminate();
+  };
+}
+
 /**
  * Refuses a WebSocket handshake from a browser origin that is not listed.
  * Browsers send Origin on every WebSocket handshake and apply no same-origin
@@ -304,11 +476,13 @@ export function originGuard(allowedOrigins: readonly string[]) {
 /**
  * Refuses a handshake with 429 `rate_limited` while the cap of
  * unauthenticated connections is reached, before the upgrade: no socket,
- * timer, or nonce is created. A place frees up at most 10 seconds later, when
- * a waiting connection authenticates or times out. This is a callback hook,
- * not an async one: after `done()`, Fastify runs the upgrade and the handler
- * that counts the new connection in the same synchronous step, so two
- * handshakes can never both take the last place.
+ * timer, or nonce is created. A place frees up at most 11 seconds later
+ * (`UNAUTHENTICATED_PLACE_SECONDS`): a waiting connection authenticates, or
+ * times out after 10 seconds and is terminated 1 second after its close
+ * frame. This is a callback hook, not an async one: after `done()`, Fastify
+ * runs the upgrade and the handler that counts the new connection in the
+ * same synchronous step, so two handshakes can never both take the last
+ * place.
  */
 function capGuard(connections: ConnectionRegistry): preValidationHookHandler {
   return (request, _reply, done) => {
@@ -318,7 +492,7 @@ function capGuard(connections: ConnectionRegistry): preValidationHookHandler {
     ) {
       done(
         new ApiError("rate_limited", {
-          retryAfterSeconds: WS_AUTH_TIMEOUT_MS / 1000,
+          retryAfterSeconds: UNAUTHENTICATED_PLACE_SECONDS,
         }),
       );
       return;
@@ -365,22 +539,17 @@ export type GatewayOptions = Readonly<{
  * the server sends `auth.ok`. Before that, no frame reaches the event
  * decoder or `onEvent`. Afterwards every text frame must be one JSON event
  * that `decodeClientEvent` accepts and `bindIdentity` binds to the
- * connection; events go to `onEvent` in the order they arrived. Anything else
- * closes the connection. No authentication frame, nonce, or signature is
- * logged.
+ * connection; events go to `onEvent` one after another, in the order they
+ * arrived. Anything else closes the connection. No authentication frame,
+ * nonce, or signature is logged.
  */
 export function registerGateway(
   app: FastifyInstance,
   options: GatewayOptions,
 ): void {
   const { connections, database, now, publicOrigin } = options;
-  const replacementAudits = new WindowLimiter(
-    1,
-    REPLACEMENT_AUDIT_WINDOW_MS,
-    now,
-  );
-  /** Replacements per device since its last audit record; they are only logged. */
-  const unaudited = new Map<DeviceId, number>();
+  const replacementAudits = new AuditThrottle(CONNECTION_AUDIT_WINDOW_MS, now);
+  const mismatchAudits = new AuditThrottle(CONNECTION_AUDIT_WINDOW_MS, now);
 
   /** Audits a replacement at most once per device per hour and logs the rest with a count. */
   async function recordReplacement(
@@ -389,24 +558,17 @@ export function registerGateway(
     log: FastifyBaseLogger,
   ): Promise<void> {
     const { userId, deviceId } = context.identity;
-    replacementAudits.sweep();
-    if (replacementAudits.hit(deviceId) > 0) {
-      const count = (unaudited.get(deviceId) ?? 0) + 1;
-      unaudited.set(deviceId, count);
-      log.info(
-        {
-          replacedConnectionId: replaced.connectionId,
-          unauditedReplacements: count,
-        },
-        "connection replaced",
-      );
-      return;
-    }
-    unaudited.delete(deviceId);
+    const unaudited = replacementAudits.take(deviceId);
     log.info(
-      { replacedConnectionId: replaced.connectionId },
+      {
+        replacedConnectionId: replaced.connectionId,
+        ...(unaudited === 0 ? {} : { unauditedReplacements: unaudited }),
+      },
       "connection replaced",
     );
+    if (unaudited > 0) {
+      return;
+    }
     try {
       await writeConnectionAudit(database, {
         action: "connection.replaced",
@@ -427,6 +589,9 @@ export function registerGateway(
       // The HEAD route that Fastify adds for every GET route would call this
       // handler with (request, reply) and fail with a 500.
       exposeHeadRoute: false,
+      // The same per-address limit as the other routes before a verified
+      // signature (P-63).
+      config: { rateLimit: ADDRESS_LIMIT },
       preValidation: [
         originGuard(options.allowedOrigins),
         capGuard(connections),
@@ -444,12 +609,29 @@ export function registerGateway(
       const challengeNonce = randomToken();
       /** The challenge's nonce, until `auth.response` takes it: it is used once. */
       let nonce: string | null = challengeNonce;
+      /** Set when the connection registers, just before `auth.ok`. */
       let context: AuthenticatedConnectionContext | null = null;
       /** Events are handled one after another, in the order they arrived. */
       let queue: Promise<void> = Promise.resolve();
       let queued = 0;
+      let terminateTimer: ReturnType<typeof setTimeout> | undefined;
 
       const open = () => socket.readyState === socket.OPEN;
+
+      /**
+       * Ends the closing handshake of an unauthenticated connection after a
+       * short grace, so that it frees its place among the unauthenticated
+       * ones within seconds instead of the library's 30.
+       */
+      function terminateSoon(): void {
+        if (terminateTimer === undefined) {
+          terminateTimer = setTimeout(
+            () => socket.terminate(),
+            REFUSED_CLOSE_GRACE_MS,
+          );
+          terminateTimer.unref();
+        }
+      }
 
       /** Closes before authentication succeeded and logs only the code. */
       function refuse(reason: WsCloseReason, detail?: string): void {
@@ -459,37 +641,46 @@ export function registerGateway(
           log.info({ code: reason }, "connection refused");
         }
         closeWith(socket, reason);
+        terminateSoon();
       }
 
-      /** A failure of the server, for example of the database. */
+      /** A failure of the server, for example of the database or the event handler. */
       function fail(error: unknown): void {
         log.error({ err: error }, "connection failed");
         if (open()) {
           socket.close(CloseCode.internalError, "internal_error");
+          if (phase !== "authenticated") {
+            terminateSoon();
+          }
         }
       }
 
-      connections.addPending(socket);
+      connections.addPending(socket, connectionId);
       const timer = setTimeout(() => {
-        if (open()) {
+        if (context === null && open()) {
           refuse("auth_timeout");
         }
       }, WS_AUTH_TIMEOUT_MS);
 
       socket.on("close", () => {
         clearTimeout(timer);
+        clearTimeout(terminateTimer);
         nonce = null;
         connections.remove(socket, context);
       });
 
-      /** Verifies the signature first and the device state second. */
+      /**
+       * Verifies the signature first and the device state second, registers
+       * the connection, and checks the device again before `auth.ok`.
+       */
       async function authenticate(frame: AuthResponseFrame): Promise<void> {
         const challenge = nonce;
         nonce = null;
         if (challenge === null) {
           return;
         }
-        const row = await deviceRow(database, frame.deviceId);
+        const deviceId = frame.deviceId;
+        const row = await deviceRow(database, deviceId);
         if (!open()) {
           return;
         }
@@ -501,7 +692,7 @@ export function registerGateway(
               purpose: "ws",
               audience: publicOrigin,
               nonce: challenge,
-              deviceId: frame.deviceId,
+              deviceId,
               connectionId,
             },
             frame.signature,
@@ -510,61 +701,54 @@ export function registerGateway(
           refuse("auth_failed");
           return;
         }
+        const signedInAt = row.lastSignInAt.getTime();
         const at = now();
-        const state = stateOf(row, at);
-        switch (state.state) {
-          case "revoked":
-            refuse("device_revoked");
-            return;
-          case "disabled":
-            refuse("auth_failed");
-            return;
-          case "sign_in_required":
-            refuse("sign_in_required");
-            return;
-          case "ok":
-            break;
+        const refusal = refusalOf(row, signedInAt, at);
+        if (refusal !== null) {
+          refuse(refusal);
+          return;
         }
-        await markDeviceSeen(database, {
-          deviceId: frame.deviceId,
-          now: new Date(at),
-        });
+        await markDeviceSeen(database, { deviceId, now: new Date(at) });
         if (!open()) {
           return;
         }
         clearTimeout(timer);
         const authenticated: AuthenticatedConnectionContext = Object.freeze({
           connectionId,
-          identity: Object.freeze({
-            userId: state.userId,
-            deviceId: frame.deviceId,
-          }),
-          signedInAt: row.lastSignInAt.getTime(),
+          identity: Object.freeze({ userId: row.userId, deviceId }),
+          signedInAt,
         });
         context = authenticated;
         const replaced = connections.register(socket, authenticated);
         if (replaced !== null) {
           await recordReplacement(authenticated, replaced, log);
         }
-        // A newer connection of the device may have replaced this one meanwhile.
+        // A revocation, sign-out, new sign-in, or disable that committed
+        // before the registration shows here; one that commits later finds
+        // the connection in the registry.
+        const current = await deviceRow(database, deviceId);
         if (!open()) {
+          return;
+        }
+        const late = refusalOf(current, signedInAt, now());
+        if (late !== null) {
+          connections.remove(socket, authenticated);
+          context = null;
+          refuse(late);
           return;
         }
         phase = "authenticated";
         const ok: AuthOkFrame = {
           protocolVersion: PROTOCOL_VERSION,
           type: "auth.ok",
-          userId: state.userId,
-          deviceId: frame.deviceId,
+          userId: row.userId,
+          deviceId,
           signInExpiresAt: new Date(
-            authenticated.signedInAt + SIGN_IN_LIFETIME_MS,
+            signedInAt + SIGN_IN_LIFETIME_MS,
           ).toISOString(),
         };
         socket.send(JSON.stringify(ok));
-        log.info(
-          { userId: state.userId, deviceId: frame.deviceId },
-          "connection authenticated",
-        );
+        log.info({ userId: row.userId, deviceId }, "connection authenticated");
       }
 
       /** The one frame before authentication: exactly one `auth.response`. */
@@ -627,20 +811,26 @@ export function registerGateway(
         const bound = await bindIdentity(decoded.event, current, {
           database,
           now,
+          mismatchAudits,
+          log,
         });
+        // A connection that closed or was replaced meanwhile delivers nothing.
         if (!open()) {
           return;
         }
         if (!bound.ok) {
           log.debug({ code: bound.code }, "event rejected");
-          if (bound.code === "device_revoked") {
-            closeWith(socket, "device_revoked");
-          } else {
-            socket.close(CloseCode.policyViolation, bound.code);
+          switch (bound.code) {
+            case "identity_mismatch":
+            case "not_a_member":
+              socket.close(CloseCode.policyViolation, bound.code);
+              return;
+            default:
+              closeWith(socket, bound.code);
+              return;
           }
-          return;
         }
-        options.onEvent(bound.event, current);
+        await options.onEvent(bound.event, current);
       }
 
       socket.on("message", (data, isBinary) => {
