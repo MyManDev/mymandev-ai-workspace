@@ -436,10 +436,11 @@ export async function buildApp(
         requireAccessToken,
         now,
         onWorkspaceEvent,
-        // Account frames go to the requester's open connections at once.
+        // Account frames go to the account's open connections at once.
         onAccountFrame: (userId, frame) => {
           connections.sendToUser(userId, frame);
         },
+        connections,
       });
       // A connection authenticates with its device key (ADR 0014).
       registerGateway(app, {

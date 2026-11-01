@@ -5,7 +5,6 @@ import {
   newId,
   PROTOCOL_VERSION,
   type ProtocolEvent,
-  type RunCancelReason,
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
@@ -57,14 +56,12 @@ export function deliverWorkspaceEvent(
   );
 }
 
-/** The reason code of a run that a device revocation cancelled (ADR 0014, P-60). */
-const DEVICE_REVOKED: RunCancelReason = "device_revoked";
-
 /**
- * The event that tells a workspace's members that a device revocation
- * cancelled a run (ADR 0014, "Removal and ownership"; P-60): a `system`
- * actor, `deviceId: null`, and the reason code `device_revoked`, with the
- * run's correlation ID and repository when it has them.
+ * The event that tells a workspace's members that a device revocation or a
+ * removal cancelled a run (ADR 0014, "Removal and ownership"; P-60): a
+ * `system` actor, `deviceId: null`, and the reason code stored with the run,
+ * `device_revoked` or `member_removed`, with the run's correlation ID and
+ * repository when it has them.
  */
 export function cancelledRunEvent(
   run: CancelledRun,
@@ -80,16 +77,17 @@ export function cancelledRunEvent(
       ...(run.repositoryId === null ? {} : { repositoryId: run.repositoryId }),
       previousState: run.previousState,
       state: "cancelled",
-      reason: DEVICE_REVOKED,
+      reason: run.reason,
     },
   };
 }
 
 /**
- * Sends each run that a committed device revocation cancelled as
+ * Sends each run that a committed device revocation or removal cancelled as
  * `agent.run.state_changed` to the connections subscribed to the run's
- * workspace, and to no one else. The caller closes the revoked device's
- * connection first.
+ * workspace, and to no one else. After a revocation, the caller closes the
+ * revoked device's connection first; after a removal, the removed person's
+ * subscriptions end first.
  */
 export function sendCancelledRuns(
   connections: ConnectionRegistry,

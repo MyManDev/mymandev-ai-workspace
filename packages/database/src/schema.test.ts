@@ -1448,6 +1448,16 @@ test("workspace members: claimed people, one active owner, one ownership offer",
       () =>
         db.update(workspaceMembers).set({ removedAt: new Date() }).where(ofBob),
     ],
+    // The owner is never removed; ownership moves only by transfer (#93).
+    [
+      "23514",
+      "workspace_members_owner_removal_check",
+      () =>
+        db
+          .update(workspaceMembers)
+          .set({ removedAt: new Date(), removedByUserId: world.alice })
+          .where(eq(workspaceMembers.id, world.aliceMember)),
+    ],
   ]);
 
   // One offer per workspace.

@@ -616,11 +616,12 @@ test("an account removed from a workspace rejoins with a new invitation as a new
     ).statusCode,
     200,
   );
-  // Until #93 removes claimed people.
-  await database()
-    .update(workspaceMembers)
-    .set({ removedAt: new Date(), removedByUserId: owner.device.userId })
-    .where(eq(workspaceMembers.id, earlier));
+  const removal = await request(
+    owner,
+    "POST",
+    `/workspaces/${workspace.id}/members/${earlier}/remove`,
+  );
+  assert.equal(removal.statusCode, 204, removal.body);
 
   const again = await defined(owner, workspace.id, "Grace");
   const { code } = await invited(owner, workspace.id, again);
