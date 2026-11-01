@@ -29,7 +29,9 @@ import {
 // (`users`), then the device (`devices`), as `lockActor` in the API does; then
 // the people (`workspace_members`) in the order of their IDs; then the
 // invitations. Creating and accepting an invitation lock the person before
-// the invitation too.
+// the invitation too. The invitations of `src/invitations.ts` use the
+// helpers below; creating one locks the workspace row (`workspaces`) after
+// the people and before the invitations, for the counts of the workspace.
 
 /**
  * Why an action on a person was refused. Nothing was written.
@@ -45,7 +47,7 @@ export type PersonRefusal =
   "not_member" | "not_found" | "forbidden" | "conflict";
 
 /** Who acts, as the audit record shows it. */
-type Actor = Readonly<{
+export type Actor = Readonly<{
   workspaceId: WorkspaceId;
   /** The acting account; its active person in the workspace acts. */
   userId: UserId;
@@ -61,8 +63,8 @@ type LockedPerson = Readonly<{
   removedAt: Date | null;
 }>;
 
-/** The owner and admins define, rename, and remove unclaimed people. */
-function administers(role: MemberRole): boolean {
+/** The owner and admins define, rename, and remove unclaimed people, and invite them. */
+export function administers(role: MemberRole): boolean {
   return role === "owner" || role === "admin";
 }
 
@@ -75,7 +77,7 @@ function administers(role: MemberRole): boolean {
  * while the statement waited again, so an acting person removed in the
  * meantime is not found.
  */
-async function lockPeople(
+export async function lockPeople(
   tx: Database,
   input: Readonly<{
     workspaceId: WorkspaceId;
@@ -118,7 +120,8 @@ async function lockPeople(
   };
 }
 
-async function audit(
+/** Writes an audit record of the acting account and device, at `now`, in the actor's workspace. */
+export async function audit(
   tx: Database,
   actor: Actor,
   action: AuditAction,

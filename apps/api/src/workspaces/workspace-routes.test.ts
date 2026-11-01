@@ -323,7 +323,17 @@ test("on every route under /workspaces/:workspaceId, a non-member gets the answe
       name,
     );
   }
-  assert.ok(covered.includes("getWorkspace"), covered.join(", "));
+  for (const name of [
+    "getWorkspace",
+    "defineMember",
+    "renameMember",
+    "removeMember",
+    "listInvitations",
+    "createInvitation",
+    "revokeInvitation",
+  ]) {
+    assert.ok(covered.includes(name), `${name}: ${covered.join(", ")}`);
+  }
 });
 
 test("former members are shown as former, and a removed member gets the same 404 as an outsider", async (t) => {
