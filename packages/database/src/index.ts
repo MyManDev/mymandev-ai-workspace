@@ -61,6 +61,17 @@ export {
   type RenameMemberResult,
 } from "./people.ts";
 export {
+  createInvitation,
+  type CreateInvitationInput,
+  type CreateInvitationResult,
+  listInvitations,
+  type ListInvitationsInput,
+  type ListInvitationsResult,
+  revokeInvitation,
+  type RevokeInvitationInput,
+  type RevokeInvitationResult,
+} from "./invitations.ts";
+export {
   DatabaseError,
   toDatabaseError,
   withDatabaseErrors,

@@ -23,6 +23,7 @@ import { ApiError } from "../errors.ts";
 import { zodValidatorCompiler } from "../validation.ts";
 import { requireActiveMember, WorkspaceParamsSchema } from "./access.ts";
 import type { WorkspaceEventHandler } from "./events.ts";
+import { registerInvitationRoutes } from "./invitation-routes.ts";
 import { registerPeopleRoutes } from "./people-routes.ts";
 
 export type WorkspaceRouteOptions = Readonly<{
@@ -36,7 +37,7 @@ export type WorkspaceRouteOptions = Readonly<{
 /**
  * Workspaces and the people in them (ADR 0014, "People and roles" and "What
  * a workspace ID allows"): the account's workspaces, creating one, the view
- * of one, and its people.
+ * of one, its people, and their invitations.
  */
 export async function registerWorkspaceRoutes(
   app: FastifyInstance,
@@ -111,6 +112,8 @@ export async function registerWorkspaceRoutes(
         now: options.now,
         onWorkspaceEvent: options.onWorkspaceEvent,
       });
+
+      registerInvitationRoutes(workspace, { database, now: options.now });
     });
   });
 }
