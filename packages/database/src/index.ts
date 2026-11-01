@@ -11,7 +11,15 @@ export {
   disableAccount,
   type DisableAccountResult,
   enableAccount,
+  type EnableAccountResult,
 } from "./account-status.ts";
+export {
+  ERASED_DISPLAY_NAME,
+  eraseAccount,
+  type EraseAccountInput,
+  type EraseAccountResult,
+  type ErasedDevice,
+} from "./account-erasure.ts";
 export {
   type GitHubRevocationInput,
   type GitHubRevocationResult,

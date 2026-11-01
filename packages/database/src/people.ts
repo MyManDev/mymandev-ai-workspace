@@ -88,7 +88,7 @@ export type Actor = Readonly<{
   now: Date;
 }>;
 
-type LockedPerson = Readonly<{
+export type LockedPerson = Readonly<{
   id: MemberId;
   userId: UserId | null;
   role: MemberRole;
@@ -405,6 +405,47 @@ const NO_AGENTS = Object.freeze({
 });
 
 /**
+ * An operator's removal of an account's person (`src/account-erasure.ts`):
+ * the erased account itself is the remover, recorded as `removed_by_user_id`
+ * and `revoked_by_user_id`, because the request comes from that person (the
+ * Project Manager's decision in the #93 issue comment of 2026-10-30). There
+ * is no acting device, and the audit records have no actor, as an
+ * operator's have none (decision of 2026-11-01).
+ */
+export type OperatorRemoval = Readonly<{
+  workspaceId: WorkspaceId;
+  userId: UserId;
+  now: Date;
+  /** Why the operator removes the person; the reason of the removal's audit record. */
+  operatorReason: "account_erased";
+}>;
+
+/** Who removes a person in `removePerson`: an acting account and its device, or an operator. */
+export type Remover = Actor | OperatorRemoval;
+
+/** Writes an audit record of a removal: of the acting account, or without an actor for an operator. */
+async function auditRemoval(
+  tx: Database,
+  remover: Remover,
+  action: AuditAction,
+  subjectId: string,
+  reason?: AuditReason,
+): Promise<void> {
+  if (!("operatorReason" in remover)) {
+    await audit(tx, remover, action, subjectId, reason);
+    return;
+  }
+  await tx.insert(auditEvents).values({
+    id: newUuidV7(),
+    createdAt: remover.now,
+    action,
+    workspaceId: remover.workspaceId,
+    subjectId,
+    reason,
+  });
+}
+
+/**
  * Removes an active person that the caller locked, with the acting account
  * as the remover (ADR 0014, "Removal and ownership"; P-60; ADR 0015, P-77):
  *
@@ -425,11 +466,13 @@ const NO_AGENTS = Object.freeze({
  *
  * After the people, it locks the invitations, the agents, the grants, and
  * the runs, each `FOR NO KEY UPDATE` and in the order of their IDs. Nothing
- * outside the workspace changes, and nothing is deleted.
+ * outside the workspace changes, and nothing is deleted. An operator's
+ * removal (`OperatorRemoval`) writes its records without an actor, and the
+ * removal's record with the operator's reason.
  */
-async function removePerson(
+export async function removePerson(
   tx: Database,
-  actor: Actor,
+  actor: Remover,
   person: LockedPerson,
   action: "member.removed" | "member.left",
 ): Promise<MembershipEnd> {
@@ -443,7 +486,13 @@ async function removePerson(
       updatedAt: now,
     })
     .where(eq(workspaceMembers.id, person.id));
-  await audit(tx, actor, action, person.id);
+  await auditRemoval(
+    tx,
+    actor,
+    action,
+    person.id,
+    "operatorReason" in actor ? actor.operatorReason : undefined,
+  );
 
   const ownOrCreated = or(
     eq(workspaceInvitations.memberId, person.id),
@@ -510,14 +559,14 @@ async function removePerson(
  * that are neither accepted nor revoked, also an expired one, as in the
  * unique index of one live invitation per person, with the acting account as
  * `revoked_by_user_id` and an `invitation.revoked` audit record with `reason`
- * for each. It locks them `FOR NO KEY UPDATE` in the order of their IDs,
- * after the people, and returns their IDs in that order. `which` is
- * required, so that no caller revokes every open invitation of the
- * workspace by leaving it out.
+ * for each, without an actor for an operator (`Remover`). It locks them
+ * `FOR NO KEY UPDATE` in the order of their IDs, after the people, and
+ * returns their IDs in that order. `which` is required, so that no caller
+ * revokes every open invitation of the workspace by leaving it out.
  */
 async function revokeOpenInvitations(
   tx: Database,
-  actor: Actor,
+  actor: Remover,
   which: SQL,
   reason: "member_removed" | "creator_demoted",
 ): Promise<readonly InvitationId[]> {
@@ -541,7 +590,7 @@ async function revokeOpenInvitations(
       .set({ revokedAt: actor.now, revokedByUserId: actor.userId })
       .where(idIn(workspaceInvitations.id, ids));
     for (const id of ids) {
-      await audit(tx, actor, "invitation.revoked", id, reason);
+      await auditRemoval(tx, actor, "invitation.revoked", id, reason);
     }
   }
   return Object.freeze(ids);

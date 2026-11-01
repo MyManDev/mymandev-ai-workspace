@@ -11,6 +11,7 @@ import {
   agents,
   auditEvents,
   permissionGrants,
+  userIdentities,
   users,
 } from "./schema/index.ts";
 
@@ -66,24 +67,43 @@ export async function disableAccount(
   );
 }
 
+export type EnableAccountResult = Readonly<{
+  /** False when the account does not exist, is not disabled, or is erased. */
+  changed: boolean;
+  /** True when the account's identity is erased: an erased account stays disabled. */
+  erased: boolean;
+}>;
+
 /**
  * An operator enables a disabled account again. No grant is restored: the
  * person grants again what their agents need (ADR 0015, P-78). Writes an
- * `account.enabled` audit record without an actor.
+ * `account.enabled` audit record without an actor. An erased account
+ * (`src/account-erasure.ts`) is refused and changes nothing: it locks the
+ * account's identity `FOR SHARE` first, in the order of the sign-in and the
+ * erasure, so it waits for an erasure that runs and then sees it.
  */
 export async function enableAccount(
   db: Database,
   input: AccountStatusInput,
-): Promise<{ changed: boolean }> {
+): Promise<EnableAccountResult> {
   return withDatabaseErrors(() =>
-    db.transaction(async (tx) => {
+    db.transaction(async (tx): Promise<EnableAccountResult> => {
+      const identities = await tx
+        .select({ erasedAt: userIdentities.erasedAt })
+        .from(userIdentities)
+        .where(eq(userIdentities.userId, input.userId))
+        .orderBy(userIdentities.id)
+        .for("share");
+      if (identities.some((identity) => identity.erasedAt !== null)) {
+        return { changed: false, erased: true };
+      }
       const enabled = await tx
         .update(users)
         .set({ disabledAt: null, updatedAt: input.now })
         .where(and(eq(users.id, input.userId), isNotNull(users.disabledAt)))
         .returning({ id: users.id });
       if (enabled.length === 0) {
-        return { changed: false };
+        return { changed: false, erased: false };
       }
       await tx.insert(auditEvents).values({
         id: newUuidV7(),
@@ -91,7 +111,7 @@ export async function enableAccount(
         action: "account.enabled",
         subjectId: input.userId,
       });
-      return { changed: true };
+      return { changed: true, erased: false };
     }),
   );
 }
