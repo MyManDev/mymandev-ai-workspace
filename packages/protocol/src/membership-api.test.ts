@@ -29,6 +29,7 @@ import {
   MEMBERSHIP_ROUTES,
   type MembershipRouteName,
   OfferOwnershipRequestSchema,
+  OwnJoinRequestListResponseSchema,
   PreviewInvitationRequestSchema,
   PreviewInvitationResponseSchema,
   RenameMemberRequestSchema,
@@ -183,6 +184,7 @@ test("the membership routes are fixed, frozen, and apart from the authentication
     "POST /invitations/preview",
     "POST /invitations/accept",
     "POST /join-requests",
+    "GET /join-requests",
     "POST /join-requests/:joinRequestId/withdraw",
     "GET /workspaces/:workspaceId/join-requests",
     "POST /workspaces/:workspaceId/join-requests/:joinRequestId/approve",
@@ -319,6 +321,7 @@ test("each route answers only known error codes, the common ones included", () =
       "join_requests_closed",
       "already_member",
     ],
+    listOwnJoinRequests: [],
     withdrawJoinRequest: ["not_found", "conflict"],
     listJoinRequests: ["not_found", "forbidden"],
     approveJoinRequest: [
@@ -371,6 +374,7 @@ test("each route answers only known error codes, the common ones included", () =
     "previewInvitation",
     "acceptInvitation",
     "createJoinRequest",
+    "listOwnJoinRequests",
     "withdrawJoinRequest",
   ] as const) {
     assert.equal(
@@ -1050,6 +1054,71 @@ test("approvers see the requester's GitHub login and account creation date", () 
   );
 });
 
+test("the requester's own list shows how each request ended, a block as a denial, and nothing about the workspace", () => {
+  const pending = {
+    id: JOIN_REQUEST_ID,
+    workspaceId: WORKSPACE_ID,
+    requestedDisplayName: "Ada",
+    createdAt: NOW,
+    expiresAt: LATER,
+    decision: null,
+    decidedAt: null,
+  };
+  const ended = ["approved", "denied", "withdrawn", "expired"].map(
+    (decision) => ({ ...pending, decision, decidedAt: LATER }),
+  );
+  assert.equal(
+    OwnJoinRequestListResponseSchema.safeParse({
+      joinRequests: [pending, ...ended],
+    }).success,
+    true,
+  );
+  assert.equal(
+    OwnJoinRequestListResponseSchema.safeParse({ joinRequests: [] }).success,
+    true,
+  );
+  const one = (request: unknown) => ({ joinRequests: [request] });
+  assertRejects(OwnJoinRequestListResponseSchema, [
+    ...withoutEach(one(pending)),
+    ...withoutEach(pending, one, "joinRequest."),
+    ["a block", one({ ...pending, decision: "blocked", decidedAt: NOW })],
+    ["decision without a time", one({ ...pending, decision: "denied" })],
+    ["time without a decision", one({ ...pending, decidedAt: NOW })],
+    [
+      "unknown decision",
+      one({ ...pending, decision: "ignored", decidedAt: NOW }),
+    ],
+    ["invalid ID", one({ ...pending, id: "x" })],
+    [
+      "requested name over 64",
+      one({ ...pending, requestedDisplayName: "a".repeat(65) }),
+    ],
+  ]);
+  const parsed = OwnJoinRequestListResponseSchema.parse(
+    one({
+      ...pending,
+      workspaceName: "MyManDev",
+      memberCount: 3,
+      requester: { provider: "github", login: "ada-l" },
+      decidedBy: OWNER_USER_ID,
+      memberId: MEMBER_ID,
+    }),
+  );
+  assert.deepEqual(
+    Object.keys(parsed.joinRequests[0] ?? {}).sort(),
+    [
+      "createdAt",
+      "decidedAt",
+      "decision",
+      "expiresAt",
+      "id",
+      "requestedDisplayName",
+      "workspaceId",
+    ],
+    "the requester sees nothing about the workspace or the approver",
+  );
+});
+
 test("an approval may change the display name and answers with the new person", () => {
   assert.equal(ApproveJoinRequestRequestSchema.safeParse({}).success, true);
   assert.equal(
@@ -1111,6 +1180,7 @@ test("every route with a body has its schemas, and they export to JSON Schema", 
       CreateJoinRequestRequestSchema,
       CreateJoinRequestResponseSchema,
     ],
+    listOwnJoinRequests: [null, OwnJoinRequestListResponseSchema],
     withdrawJoinRequest: [null, null],
     listJoinRequests: [null, JoinRequestListResponseSchema],
     approveJoinRequest: [
@@ -1198,6 +1268,21 @@ test("every answer list holds at most MAX_ANSWER_LIST_ITEMS items", () => {
       "join requests",
       (count) => ({ joinRequests: Array(count).fill(joinRequest) }),
       JoinRequestListResponseSchema,
+    ],
+    [
+      "own join requests",
+      (count) => ({
+        joinRequests: Array(count).fill({
+          id: JOIN_REQUEST_ID,
+          workspaceId: WORKSPACE_ID,
+          requestedDisplayName: "Ada",
+          createdAt: NOW,
+          expiresAt: LATER,
+          decision: null,
+          decidedAt: null,
+        }),
+      }),
+      OwnJoinRequestListResponseSchema,
     ],
   ];
   assert.equal(MAX_ANSWER_LIST_ITEMS, 1_000);

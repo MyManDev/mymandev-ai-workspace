@@ -22,9 +22,13 @@ import {
 import { ApiError } from "../errors.ts";
 import { zodValidatorCompiler } from "../validation.ts";
 import { requireActiveMember, WorkspaceParamsSchema } from "./access.ts";
-import type { WorkspaceEventHandler } from "./events.ts";
+import type { AccountFrameHandler, WorkspaceEventHandler } from "./events.ts";
 import { registerInvitationCodeRoutes } from "./invitation-code-routes.ts";
 import { registerInvitationRoutes } from "./invitation-routes.ts";
+import {
+  registerJoinRequestRoutes,
+  registerOwnJoinRequestRoutes,
+} from "./join-request-routes.ts";
 import { registerPeopleRoutes } from "./people-routes.ts";
 
 export type WorkspaceRouteOptions = Readonly<{
@@ -32,17 +36,23 @@ export type WorkspaceRouteOptions = Readonly<{
   requireAccessToken: RequireAccessToken;
   now: () => number;
   /**
-   * Receives the membership events of the people routes and of accepting an
-   * invitation after the commit.
+   * Receives the membership events of the people routes, of accepting an
+   * invitation, and of approving a join request after the commit.
    */
   onWorkspaceEvent: WorkspaceEventHandler;
+  /**
+   * Receives the account frames of the join request decisions after the
+   * commit, for the requester's open connections.
+   */
+  onAccountFrame: AccountFrameHandler;
 }>;
 
 /**
- * Workspaces and the people in them (ADR 0014, "People and roles" and "What
- * a workspace ID allows"): the account's workspaces, creating one, the view
- * of one, its people, and their invitations, and previewing and accepting
- * an invitation code.
+ * Workspaces and the people in them (ADR 0014, "People and roles", "Join
+ * requests", and "What a workspace ID allows"): the account's workspaces,
+ * creating one, the view of one, its people, their invitations, and its join
+ * requests; previewing and accepting an invitation code; and the account's
+ * own join requests.
  */
 export async function registerWorkspaceRoutes(
   app: FastifyInstance,
@@ -98,6 +108,16 @@ export async function registerWorkspaceRoutes(
       onWorkspaceEvent: options.onWorkspaceEvent,
     });
 
+    // A join request is the only action that a workspace ID allows a
+    // non-member, so these routes are not under `/workspaces/:workspaceId`.
+    const joinRequests = {
+      database,
+      now: options.now,
+      onWorkspaceEvent: options.onWorkspaceEvent,
+      onAccountFrame: options.onAccountFrame,
+    };
+    registerOwnJoinRequestRoutes(scope, joinRequests);
+
     await scope.register(async (workspace) => {
       requireActiveMember(workspace, database);
 
@@ -127,6 +147,8 @@ export async function registerWorkspaceRoutes(
       });
 
       registerInvitationRoutes(workspace, { database, now: options.now });
+
+      registerJoinRequestRoutes(workspace, joinRequests);
     });
   });
 }

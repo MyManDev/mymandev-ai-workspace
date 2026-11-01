@@ -42,6 +42,7 @@ const OTHER_MEMBER_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000d";
 const OTHER_EVENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000002";
 const PROJECT_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000e";
 const MESSAGE_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000f";
+const JOIN_REQUEST_ID = "0192f0a0-7b3c-7d4e-8f50-000000000010";
 const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000005";
 const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000000007";
 const NOW = "2026-10-30T17:00:00.000Z";
@@ -114,6 +115,14 @@ function serverFrames(): Json[] {
       workspaceId: WORKSPACE_ID,
       reason: "withdrawn",
       endedAt: NOW,
+    },
+    {
+      protocolVersion: 0,
+      type: "account.join_request_decided",
+      joinRequestId: JOIN_REQUEST_ID,
+      workspaceId: WORKSPACE_ID,
+      decision: "approved",
+      decidedAt: NOW,
     },
     ...workspaceServerFrames(),
   ];
@@ -448,6 +457,58 @@ test("a device refuses auth.response and malformed frames from the server", () =
   for (const [label, input, code] of cases) {
     assert.deepEqual(decodeServerMessage(input), { ok: false, code }, label);
   }
+});
+
+test("a join request decision reaches the requester as approved or denied, never as a block, a withdrawal, or an expiry", () => {
+  const decided = serverFrames().find(
+    (frame) => frame["type"] === "account.join_request_decided",
+  );
+  assert.ok(decided);
+  for (const decision of ["approved", "denied"]) {
+    const input: Json = { ...decided, decision };
+    assert.deepEqual(
+      decodeServerMessage(input),
+      { ok: true, kind: "frame", frame: input },
+      decision,
+    );
+  }
+  const cases: [label: string, input: unknown][] = [
+    // The requester never learns of a block, and makes a withdrawal itself.
+    ...["blocked", "withdrawn", "expired", "ignored"].map(
+      (decision): [string, unknown] => [decision, { ...decided, decision }],
+    ),
+    ["no request", { ...decided, joinRequestId: undefined }],
+    ["an invalid request ID", { ...decided, joinRequestId: "x" }],
+    ["no workspace", { ...decided, workspaceId: undefined }],
+    ["no time", { ...decided, decidedAt: undefined }],
+    [
+      "a time without milliseconds",
+      { ...decided, decidedAt: "2026-10-30T17:00:00Z" },
+    ],
+  ];
+  for (const [label, input] of cases) {
+    assert.deepEqual(
+      decodeServerMessage(input),
+      { ok: false, code: "invalid_payload" },
+      label,
+    );
+  }
+  // Nothing about the workspace or the approver reaches the requester.
+  const decoded = decodeServerMessage({
+    ...decided,
+    workspaceName: "MyManDev",
+    memberId: MEMBER_ID,
+    decidedByUserId: USER_ID,
+  });
+  assert.ok(decoded.ok && decoded.kind === "frame");
+  assert.deepEqual(Object.keys(decoded.frame).sort(), [
+    "decidedAt",
+    "decision",
+    "joinRequestId",
+    "protocolVersion",
+    "type",
+    "workspaceId",
+  ]);
 });
 
 test("membership events come only from the server, with a system actor and no device", () => {

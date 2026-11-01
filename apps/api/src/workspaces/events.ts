@@ -6,10 +6,11 @@ import {
   PROTOCOL_VERSION,
   type ProtocolEvent,
   type RunCancelReason,
+  type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
 import type { FastifyBaseLogger, FastifyRequest } from "fastify";
-import type { ConnectionRegistry } from "../gateway.ts";
+import type { AccountFrame, ConnectionRegistry } from "../gateway.ts";
 
 /**
  * A membership event: a change of the people that every member of the
@@ -156,5 +157,37 @@ export function sendWorkspaceEvent(
     Promise.resolve(handler(copy)).catch(failed);
   } catch (error) {
     failed(error);
+  }
+}
+
+/**
+ * Receives an account frame for the open connections of one account, after
+ * the transaction that made the change committed. `buildApp` connects it to
+ * the gateway's `ConnectionRegistry.sendToUser`, which sends the frame at
+ * once and never waits.
+ */
+export type AccountFrameHandler = (userId: UserId, frame: AccountFrame) => void;
+
+/**
+ * Hands an account frame to `handler`. The change is already committed, so a
+ * failure is only logged, with the frame type and the error's type and never
+ * the error's message.
+ */
+export function sendAccountFrame(
+  request: FastifyRequest,
+  handler: AccountFrameHandler,
+  userId: UserId,
+  frame: AccountFrame,
+): void {
+  try {
+    handler(userId, frame);
+  } catch (error) {
+    request.log.error(
+      {
+        frameType: frame.type,
+        errorType: error instanceof Error ? error.name : typeof error,
+      },
+      "account frame failed",
+    );
   }
 }

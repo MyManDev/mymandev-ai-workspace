@@ -5,6 +5,7 @@ import {
   DeviceRevocationReasonSchema,
   DeviceSignatureSchema,
   OwnershipOfferEndReasonSchema,
+  OwnJoinRequestDecisionSchema,
 } from "./account.ts";
 import {
   decodeClientEvent,
@@ -22,6 +23,7 @@ import {
 import {
   ConnectionIdSchema,
   DeviceIdSchema,
+  JoinRequestIdSchema,
   MemberIdSchema,
   UserIdSchema,
   WorkspaceIdSchema,
@@ -178,6 +180,26 @@ export type AccountOwnershipOfferEndedFrame = z.infer<
   typeof AccountOwnershipOfferEndedFrameSchema
 >;
 
+/**
+ * An owner or admin decided on one of the account's join requests (#92).
+ * After `approved` the account is an active member, and the desktop reloads
+ * its workspaces over HTTP. A block arrives as `denied`, as the list shows
+ * it; a new request after a block answers `join_requests_closed`, as for a
+ * pause. A withdrawal, which the requester makes, and an expiry send no
+ * frame; `GET /join-requests` shows every outcome.
+ */
+export const AccountJoinRequestDecidedFrameSchema = z.object({
+  ...frameHeaderShape,
+  type: z.literal("account.join_request_decided"),
+  joinRequestId: JoinRequestIdSchema,
+  workspaceId: WorkspaceIdSchema,
+  decision: OwnJoinRequestDecisionSchema.extract(["approved", "denied"]),
+  decidedAt: UtcTimestampSchema,
+});
+export type AccountJoinRequestDecidedFrame = z.infer<
+  typeof AccountJoinRequestDecidedFrameSchema
+>;
+
 // Workspace subscriptions and presence (#110). After `auth.ok` a connection
 // receives a workspace's events and presence only while it is subscribed to
 // that workspace, and only while its account is an active member of it. The
@@ -304,6 +326,7 @@ export const ServerFrameSchema = z.discriminatedUnion("type", [
   AccountRemovedFromWorkspaceFrameSchema,
   AccountOwnershipOfferedFrameSchema,
   AccountOwnershipOfferEndedFrameSchema,
+  AccountJoinRequestDecidedFrameSchema,
   WorkspaceSubscribedFrameSchema,
   WorkspaceSubscribeRefusedFrameSchema,
   WorkspaceUnsubscribedFrameSchema,
