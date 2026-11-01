@@ -44,6 +44,12 @@ export type SignInAttempt = {
   readonly expiresAt: number;
   phase: "started" | "callback" | "identified";
   identity: GitHubIdentity | null;
+  /**
+   * When GitHub's callback started the code exchange that read the identity,
+   * in milliseconds since the epoch: a GitHub revocation recorded later
+   * refuses the sign-in.
+   */
+  identityReadAt: number | null;
 };
 
 export type AttemptStoreOptions = Readonly<{
@@ -83,6 +89,7 @@ export class SignInAttempts {
       expiresAt: this.#options.now() + this.#options.lifetimeMs,
       phase: "started",
       identity: null,
+      identityReadAt: null,
     };
     this.#byState.set(attempt.apiState, attempt);
     return { attempt, cookieValue };
@@ -132,6 +139,8 @@ export class SignInAttempts {
 /** What a sign-in code is bound to (ADR 0014, step 5). */
 export type SignInCodeRecord = Readonly<{
   identity: GitHubIdentity;
+  /** The attempt's `identityReadAt`. */
+  identityReadAt: number;
   desktopCodeChallenge: string;
   redirectUri: string;
   expiresAt: number;
@@ -182,6 +191,65 @@ export class SignInCodes {
     for (const [hash, record] of this.#byHash) {
       if (record.expiresAt <= now) {
         this.#byHash.delete(hash);
+      }
+    }
+  }
+}
+
+/**
+ * GitHub revocations of the last minutes, by GitHub's numeric ID, kept only
+ * in API memory (#115). The webhook records every verified revocation here
+ * before its transaction, also of a sender without an account, so that a
+ * sign-in whose identity the API read earlier is refused even when it
+ * creates the account. The lifetime covers an attempt and its sign-in code,
+ * with a margin; at the cap the oldest entry leaves, and a restart drops
+ * them all, like the attempts themselves.
+ */
+export class RecentRevocations {
+  readonly #bySubject = new Map<string, number>();
+  readonly #options: AttemptStoreOptions;
+
+  constructor(options: AttemptStoreOptions) {
+    this.#options = options;
+  }
+
+  get size(): number {
+    this.sweep();
+    return this.#bySubject.size;
+  }
+
+  /** Records a revocation at `at`, in milliseconds since the epoch; a later one of the same ID replaces it. */
+  record(subject: string, at: number): void {
+    this.sweep();
+    const previous = this.#bySubject.get(subject);
+    this.#bySubject.delete(subject);
+    for (const oldest of this.#bySubject.keys()) {
+      if (this.#bySubject.size < this.#options.max) {
+        break;
+      }
+      this.#bySubject.delete(oldest);
+    }
+    this.#bySubject.set(subject, Math.max(previous ?? at, at));
+  }
+
+  /** The time of the latest recorded revocation of this GitHub ID; null when there is none or it expired. */
+  latest(subject: string): number | null {
+    const at = this.#bySubject.get(subject);
+    if (
+      at === undefined ||
+      at + this.#options.lifetimeMs <= this.#options.now()
+    ) {
+      return null;
+    }
+    return at;
+  }
+
+  /** Drops expired entries; the API also runs it on a timer, so nothing outlives its lifetime by much. */
+  sweep(): void {
+    const now = this.#options.now();
+    for (const [subject, at] of this.#bySubject) {
+      if (at + this.#options.lifetimeMs <= now) {
+        this.#bySubject.delete(subject);
       }
     }
   }

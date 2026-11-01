@@ -1,6 +1,7 @@
 import {
   type Database,
   devices,
+  requireSignIn,
   revokeDevice,
   toDatabaseError,
   userIdentities,
@@ -30,7 +31,7 @@ import type { FastifyInstance } from "fastify";
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
-import { s256, type SignInCodes } from "./attempts.ts";
+import { type RecentRevocations, s256, type SignInCodes } from "./attempts.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
 import { deviceListItem } from "./device-state.ts";
 import type { GitHubIdentity } from "./github-api.ts";
@@ -50,6 +51,8 @@ export type SignInRouteOptions = Readonly<{
   publicOrigin: string;
   database: Database;
   codes: SignInCodes;
+  /** The GitHub revocations that the webhook recorded in the last minutes. */
+  revocations: RecentRevocations;
   tokens: AccessTokens;
   /**
    * The open WebSocket connections: after a sign-in commits, a connection
@@ -114,7 +117,17 @@ export async function registerSignIn(
   app: FastifyInstance,
   options: SignInRouteOptions,
 ): Promise<void> {
-  const { database, codes, tokens, connections, publicOrigin } = options;
+  const { database, codes, revocations, tokens, connections, publicOrigin } =
+    options;
+
+  // Expired revocations leave memory within seconds of their lifetime.
+  const sweeper = setInterval(() => {
+    revocations.sweep();
+  }, 15_000);
+  sweeper.unref();
+  app.addHook("onClose", async () => {
+    clearInterval(sweeper);
+  });
 
   await app.register(async (scope) => {
     scope.setValidatorCompiler(zodValidatorCompiler);
@@ -154,11 +167,26 @@ export async function registerSignIn(
         ) {
           throw new ApiError("auth_failed");
         }
+        // GitHub reported a revocation of this identity after the API read
+        // it, also of a person without an account yet (#115).
+        const revokedSinceRead = () =>
+          (revocations.latest(binding.identity.githubId) ??
+            Number.NEGATIVE_INFINITY) > binding.identityReadAt;
+        if (revokedSinceRead()) {
+          throw new ApiError("sign_in_required");
+        }
 
         let result: SignInResult;
         try {
           result = await database.transaction((tx) =>
-            signIn(tx, binding.identity, body.device, currentKey, now),
+            signIn(
+              tx,
+              binding.identity,
+              new Date(binding.identityReadAt),
+              body.device,
+              currentKey,
+              now,
+            ),
           );
         } catch (error) {
           if (error instanceof ApiError || !fromDatabase(error)) {
@@ -202,6 +230,21 @@ export async function registerSignIn(
             connections.sendToUser(userId, revoked, replaced);
           }
         }
+        // The webhook records a revocation in memory before its transaction
+        // looks up the account. If it recorded it before the check above,
+        // this sign-in was refused there. If it recorded it before this line,
+        // its lookup may have run before this commit and missed an account
+        // that this sign-in created, so the account is marked here. If it
+        // records it after this line, its lookup runs after this commit,
+        // finds the account, and marks it past this device's last sign-in.
+        // The device is registered and its key replaced, so the answer still
+        // says so; the device's next authentication answers sign_in_required.
+        if (revokedSinceRead()) {
+          await requireSignIn(database, {
+            userId,
+            now: new Date(options.now()),
+          });
+        }
         return result.response;
       },
     );
@@ -212,13 +255,16 @@ export async function registerSignIn(
 async function signIn(
   tx: Database,
   identity: GitHubIdentity,
+  identityReadAt: Date,
   device: DeviceRegistration,
   verifiedCurrentKey: string | null,
   now: Date,
 ): Promise<SignInResult> {
   const userId = await upsertAccount(tx, identity, now);
   // "No key update" still serializes with every other change of the row, but
-  // not with the key-share locks of foreign-key checks.
+  // not with the key-share locks of foreign-key checks. A GitHub revocation
+  // takes the same lock: it either committed before this read, or it waits
+  // for this transaction and then requires this device to sign in again.
   const [user] = await tx
     .select()
     .from(users)
@@ -226,6 +272,15 @@ async function signIn(
     .for("no key update");
   if (user === undefined || user.disabledAt !== null) {
     throw new ApiError("auth_failed");
+  }
+  // GitHub reported a revocation after the API read this identity, so the
+  // sign-in may rest on the authorization that the person revoked; nothing
+  // is registered or replaced (#115). Strictly later, as in stateOf.
+  if (
+    user.signInRequiredAt !== null &&
+    user.signInRequiredAt > identityReadAt
+  ) {
+    throw new ApiError("sign_in_required");
   }
 
   let deviceId: DeviceId;

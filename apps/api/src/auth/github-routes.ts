@@ -247,6 +247,9 @@ export async function registerGitHubSignIn(
           );
         }
 
+        // The earliest moment at which GitHub can confirm the account: a
+        // revocation recorded later refuses the sign-in (#115).
+        const identityReadAt = options.now();
         countExchange(request);
         const exchanged = await github.exchangeCode({
           code,
@@ -304,6 +307,7 @@ export async function registerGitHubSignIn(
           );
         }
         attempt.identity = identity;
+        attempt.identityReadAt = identityReadAt;
         attempt.phase = "identified";
         return sendPage(
           reply,
@@ -337,7 +341,8 @@ export async function registerGitHubSignIn(
           !form.success ||
           attempt === null ||
           attempt.phase !== "identified" ||
-          attempt.identity === null
+          attempt.identity === null ||
+          attempt.identityReadAt === null
         ) {
           return sendPage(reply, 400, INVALID_ATTEMPT);
         }
@@ -352,6 +357,7 @@ export async function registerGitHubSignIn(
         }
         const code = codes.issue({
           identity: attempt.identity,
+          identityReadAt: attempt.identityReadAt,
           desktopCodeChallenge: attempt.desktop.codeChallenge,
           redirectUri: attempt.desktop.redirectUri,
         });

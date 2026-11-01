@@ -16,6 +16,8 @@ export {
   type GitHubRevocationInput,
   type GitHubRevocationResult,
   recordGitHubRevocation,
+  requireSignIn,
+  type RequireSignInInput,
 } from "./github-revocation.ts";
 export {
   revokeDevice,

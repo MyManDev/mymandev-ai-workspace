@@ -6,6 +6,7 @@ import * as z from "zod";
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import type { Secret } from "../secret.ts";
+import type { RecentRevocations } from "./attempts.ts";
 import type { AccessTokens } from "./tokens.ts";
 
 export type GitHubWebhookOptions = Readonly<{
@@ -15,6 +16,8 @@ export type GitHubWebhookOptions = Readonly<{
   connections: ConnectionRegistry;
   /** The access tokens of the device routes; null when they are not registered. */
   tokens: AccessTokens | null;
+  /** The revocations that `POST /auth/sign-in` checks; null when it is not registered. */
+  revocations: RecentRevocations | null;
   now: () => number;
 }>;
 
@@ -85,7 +88,7 @@ export async function registerGitHubWebhook(
   app: FastifyInstance,
   options: GitHubWebhookOptions,
 ): Promise<void> {
-  const { secrets, database, connections, tokens } = options;
+  const { secrets, database, connections, tokens, revocations } = options;
 
   await app.register(async (scope) => {
     // The signature covers the exact bytes, so the body stays a buffer.
@@ -135,10 +138,15 @@ export async function registerGitHubWebhook(
       ) {
         throw new ApiError("bad_request");
       }
+      const subject = String(sender.data.id);
+      const now = options.now();
+      // Before the transaction, also for a sender without an account: a
+      // sign-in that commits after this line checks it (#115).
+      revocations?.record(subject, now);
       const result = await recordGitHubRevocation(database, {
-        subject: String(sender.data.id),
+        subject,
         deliveryId,
-        now: new Date(options.now()),
+        now: new Date(now),
       });
       if (result.changed && result.userId !== null) {
         // Every later request reads the account's sign_in_required_at; this

@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Secret } from "../secret.ts";
-import { randomToken, s256, SignInAttempts, SignInCodes } from "./attempts.ts";
+import {
+  randomToken,
+  RecentRevocations,
+  s256,
+  SignInAttempts,
+  SignInCodes,
+} from "./attempts.ts";
 import { createGitHubApi } from "./github-api.ts";
 import { FAKE_TOKEN, fakeGitHub } from "./github-test-support.ts";
 
@@ -188,6 +194,7 @@ test("a sign-in code is used once and expires after its lifetime", () => {
       name: null,
       accountCreatedAt: "2020-01-01T00:00:00Z",
     },
+    identityReadAt: 0,
     desktopCodeChallenge: s256("v"),
     redirectUri: "http://127.0.0.1:49152/callback",
   };
@@ -200,6 +207,37 @@ test("a sign-in code is used once and expires after its lifetime", () => {
   assert.ok(late !== null);
   clock = 60_000;
   assert.equal(codes.take(late), null, "expired");
+});
+
+test("recent revocations keep the latest time per GitHub ID, expire after their lifetime, and drop the oldest at the cap", () => {
+  let clock = 0;
+  const revocations = new RecentRevocations({
+    max: 2,
+    lifetimeMs: 1_000,
+    now: () => clock,
+  });
+  revocations.record("1", 0);
+  assert.equal(revocations.latest("1"), 0);
+  assert.equal(revocations.latest("2"), null);
+  clock = 500;
+  revocations.record("1", 500);
+  revocations.record("1", 400);
+  assert.equal(revocations.latest("1"), 500, "never an earlier time");
+
+  revocations.record("2", 500);
+  revocations.record("3", 600);
+  assert.equal(revocations.size, 2, "the cap");
+  assert.equal(revocations.latest("1"), null, "the oldest left");
+  assert.equal(revocations.latest("2"), 500);
+  assert.equal(revocations.latest("3"), 600);
+
+  clock = 1_500;
+  assert.equal(revocations.latest("2"), null, "expired");
+  assert.equal(revocations.latest("3"), 600);
+  revocations.sweep();
+  assert.equal(revocations.size, 1);
+  clock = 1_600;
+  assert.equal(revocations.size, 0);
 });
 
 test("every GitHub call refuses redirects", async () => {
@@ -255,6 +293,7 @@ test("sweeping drops expired attempts and codes without a new request", () => {
       name: null,
       accountCreatedAt: "2020-01-01T00:00:00Z",
     },
+    identityReadAt: 0,
     desktopCodeChallenge: desktop.codeChallenge,
     redirectUri: desktop.redirectUri,
   });
