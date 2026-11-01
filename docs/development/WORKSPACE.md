@@ -49,7 +49,7 @@ npm runs scripts with `cmd.exe` on Windows and `sh` on other systems. Keep root 
 
 ## Continuous integration
 
-`.github/workflows/check.yml` runs `npm ci` and `npm run check` on Linux, Windows, and macOS for every pull request and for every push to `develop` and `main`. It installs the latest Node.js release that matches `.nvmrc` and does not use a dependency cache. A pull request is ready for review only when all three jobs pass.
+`.github/workflows/check.yml` runs `npm ci` and `npm run check` on Linux, Windows, and macOS for every pull request and for every push to `develop` and `main`, and then builds the desktop application with `npm run build -w @mymandev/desktop`. It installs the latest Node.js release that matches `.nvmrc` and does not use a dependency cache. CI never downloads the Electron binary and never launches Electron ([ADR 0016](../architecture/decisions/0016-desktop-toolchain.md)). A pull request is ready for review only when all three jobs pass.
 
 `.github/workflows/database.yml` runs when a pull request or a push changes `packages/database`, `packages/protocol`, or the lockfile. It applies the migrations to a PostgreSQL 18 service container on Linux and compares the schema with PGlite; see [packages/database/README.md](../../packages/database/README.md).
 
@@ -68,7 +68,7 @@ Dependabot opens pull requests against `develop` every Monday for the npm depend
 - `typescript` stays below 6.1 while typescript-eslint supports only that range. Remove the rule from `dependabot.yml` when a typescript-eslint release supports newer versions.
 - `@mymandev/*` packages are ignored. Workspaces are private and never come from the registry, and this keeps a public package with the same name from being proposed.
 
-Review a Dependabot pull request like any other: the checks must pass, read the release notes, and for a major update check the ADR of the dependency. For updates of drizzle-kit, also check the install-script inventory ([ADR 0011](../architecture/decisions/0011-drizzle-sql-migrations.md)). Never run `npm audit fix --force`.
+Review a Dependabot pull request like any other: the checks must pass, read the release notes, and for a major update check the ADR of the dependency. For updates of drizzle-kit, Electron, or the desktop build tools, also check the install-script inventory ([ADR 0011](../architecture/decisions/0011-drizzle-sql-migrations.md), [ADR 0016](../architecture/decisions/0016-desktop-toolchain.md)). Never run `npm audit fix --force`.
 
 Dependabot branches start with `dependabot/`, an exception to the branch prefixes in `CLAUDE.md`, and its commits are made by the Dependabot bot, which the Identity Guard allows. Pull requests for security updates also need the repository setting "Dependabot security updates"; Dependabot alerts are already enabled.
 
@@ -270,19 +270,21 @@ export default defineConfig(
 
 ## Desktop workspace contract
 
-The desktop application shell (issue #3) builds on this baseline. This section is a shared boundary: it changes only by agreement, as described in [OWNERSHIP.md](../process/OWNERSHIP.md).
+The desktop application shell (issue #3) builds on this baseline; the toolchain is recorded in [ADR 0016](../architecture/decisions/0016-desktop-toolchain.md), and [apps/desktop/README.md](../../apps/desktop/README.md) describes how to run it. This section is a shared boundary: it changes only by agreement, as described in [OWNERSHIP.md](../process/OWNERSHIP.md).
 
-- Directory `apps/desktop`, package name `@mymandev/desktop`, `"private": true`.
+- Directory `apps/desktop`, package name `@mymandev/desktop`, `"private": true`, `"type": "module"`.
 - Dependencies are installed from the repository root with `-w @mymandev/desktop` and recorded in the root `package-lock.json`.
-- Electron, React, the bundler, and their plugins and type packages are declared in `apps/desktop/package.json`. Shared tooling versions stay in the root `package.json`.
-- Scripts: `dev`, `build`, and `typecheck`.
-- The same pull request applies the [root typecheck delegation](#root-typecheck-delegation).
-- The [TypeScript](#typescript) and [ESLint](#eslint) rules above apply.
-- No Prettier configuration in `apps/desktop`. A build output directory that the root ignores do not cover is added to the root `.gitignore` and to the ESLint ignores, as described in [Adding a workspace](#adding-a-workspace).
+- Electron, React, electron-vite, Vite, the React plugin, Vitest, and their type packages are declared in `apps/desktop/package.json`. Shared tooling versions stay in the root `package.json`.
+- Every package that the bundles contain, including workspace packages, is a `devDependency`. electron-vite loads packages listed in `dependencies` from `node_modules` at runtime instead of bundling them into the main process and the preload script.
+- Scripts: `dev` (`install-electron`, then `electron-vite dev`), `build` (`electron-vite build`), `typecheck`, and `test` (`vitest run`).
+- The root `typecheck` and `test` delegation already exists; do not change the root scripts.
+- The [TypeScript](#typescript) and [ESLint](#eslint) rules above apply. `apps/desktop/tsconfig.json` covers the main process, the preload script, the shared code, and the configuration files with the Node-side options. `apps/desktop/src/renderer/tsconfig.json` covers the renderer and its tests: `target` and `lib` at ES2024 with `dom`, `moduleResolution` `bundler`, `jsx` `react-jsx`, and `types: ["vite/client"]`. The desktop has no own `eslint.config.mjs`; the root config applies.
+- No Prettier configuration in `apps/desktop`. The build output goes to `apps/desktop/out/`, which the root `.gitignore` and the root ESLint ignores already cover. A further output directory is added to both, as described in [Adding a workspace](#adding-a-workspace).
+- Electron 42 and later have no install script; the Electron binary is downloaded on first use. A clean `npm ci` downloads nothing, and the type check, the tests, and the build need no binary.
 
 ## Planned workspaces
 
-This list records the expected direction and is not binding. `packages/protocol`, `apps/api`, `packages/database`, and `packages/permissions` exist so far. Each other one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
+This list records the expected direction and is not binding. `packages/protocol`, `apps/api`, `packages/database`, `packages/permissions`, and `apps/desktop` exist so far. Each other one is created by the task that needs it, as decided by the project manager; see [ROADMAP.md](../process/ROADMAP.md).
 
 - `apps/desktop`
 - `apps/api`

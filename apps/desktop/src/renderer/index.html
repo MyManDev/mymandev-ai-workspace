@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      The Content Security Policy is written in at build time by
+      config/csp.ts from src/shared/content-security-policy.ts, which the main
+      process also sends as a header with every app:// response. The value
+      here only keeps the page blocked if that step is missing.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MyManDev AI Workspace</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
+</html>
