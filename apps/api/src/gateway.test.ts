@@ -652,10 +652,16 @@ test("bindIdentity refuses an event with another device ID or user ID and audits
     event: ownUser,
   });
 
-  // A removed member and a workspace that does not exist.
+  // A removed member and a workspace that does not exist. The database
+  // never lets the owner be removed (#93), so the person stops being the
+  // owner in the same statement.
   await database()
     .update(workspaceMembers)
-    .set({ removedAt: new Date(clock.now()), removedByUserId: device.userId })
+    .set({
+      role: "member",
+      removedAt: new Date(clock.now()),
+      removedByUserId: device.userId,
+    })
     .where(eq(workspaceMembers.workspaceId, workspaceId));
   for (const [label, target] of [
     ["a removed member", workspaceId],

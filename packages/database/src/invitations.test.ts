@@ -1319,7 +1319,8 @@ test("the inviter of a preview is the creator's active person, or else its most 
 
   assert.deepEqual(await inviter(), { displayName: "Grace", identity });
 
-  // Until #93 revokes the invitations of a removed person.
+  // As only data written outside these functions can be: removing a person
+  // revokes the invitations that the person created.
   await database()
     .update(workspaceMembers)
     .set({ removedAt: at(30 * MINUTE_MS), removedByUserId: owner.userId })
@@ -1639,11 +1640,13 @@ test("an account removed from a workspace rejoins as a new person, and its earli
     claimedBy: returning,
     displayName: "Ada",
   });
-  // Until #93 removes claimed people.
-  await database()
-    .update(workspaceMembers)
-    .set({ removedAt: NOW, removedByUserId: owner.userId })
-    .where(eq(workspaceMembers.id, earlier));
+  const removal = await removeMember(database(), {
+    workspaceId,
+    ...owner,
+    memberId: earlier,
+    now: NOW,
+  });
+  assert.ok(removal.removed);
   const earlierRow = await personRow(earlier);
   const again = await addPerson(workspaceId, owner, { displayName: "Ada" });
   const tokenHash = hash();

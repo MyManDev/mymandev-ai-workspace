@@ -82,6 +82,10 @@ function remove(session: Session, workspaceId: string, memberId: string) {
   return post(session, `/workspaces/${workspaceId}/members/${memberId}/remove`);
 }
 
+function leave(session: Session, workspaceId: string) {
+  return post(session, `/workspaces/${workspaceId}/leave`);
+}
+
 async function view(session: Session, workspaceId: WorkspaceId) {
   const response = await session.app.inject({
     method: "GET",
@@ -350,17 +354,24 @@ test("every member renames their own person, and nobody renames another claimed 
   }
 });
 
-test("a removed person answers conflict, and so does removing a claimed person", async (t) => {
+test("a removed person answers conflict, and nobody removes the owner, another admin as an admin, or their own person", async (t) => {
   const recorded = recorder();
   const owner = await signedIn(
     await workspaceApp(t, { githubId: 3109, ...recorded }),
   );
   const admin = await signedIn(await workspaceApp(t, { githubId: 3110 }));
   const member = await signedIn(await workspaceApp(t, { githubId: 3111 }));
+  const otherAdmin = await signedIn(await workspaceApp(t, { githubId: 3131 }));
   const { workspace, member: ownerPerson } = await createWorkspace(owner);
   const adminPerson = await addClaimed(
     workspace.id,
     admin.device,
+    owner.device,
+    "admin",
+  );
+  const otherAdminPerson = await addClaimed(
+    workspace.id,
+    otherAdmin.device,
     owner.device,
     "admin",
   );
@@ -384,20 +395,41 @@ test("a removed person answers conflict, and so does removing a claimed person",
       "renaming it as an admin",
       await rename(admin, workspace.id, unclaimed, { displayName: "Back" }),
     ],
-    // Removing claimed people comes with #93.
-    ["removing a member", await remove(owner, workspace.id, memberPerson)],
-    ["removing an admin", await remove(owner, workspace.id, adminPerson)],
+  ] as const) {
+    assert.equal(response.statusCode, 409, label);
+    assert.deepEqual(response.json(), CONFLICT, label);
+  }
+  // The roles table of ADR 0014: a person leaves instead of removing their
+  // own person.
+  for (const [label, response] of [
     [
-      "an admin removing a member",
-      await remove(admin, workspace.id, memberPerson),
+      "an admin removing the owner",
+      await remove(admin, workspace.id, ownerPerson.id),
+    ],
+    [
+      "an admin removing another admin",
+      await remove(admin, workspace.id, otherAdminPerson),
+    ],
+    [
+      "an admin removing themselves",
+      await remove(admin, workspace.id, adminPerson),
     ],
     [
       "the owner removing themselves",
       await remove(owner, workspace.id, ownerPerson.id),
     ],
+    [
+      "a member removing themselves",
+      await remove(member, workspace.id, memberPerson),
+    ],
+    [
+      "a member removing the owner",
+      await remove(member, workspace.id, ownerPerson.id),
+    ],
+    ["the owner leaving", await leave(owner, workspace.id)],
   ] as const) {
-    assert.equal(response.statusCode, 409, label);
-    assert.deepEqual(response.json(), CONFLICT, label);
+    assert.equal(response.statusCode, 403, label);
+    assert.deepEqual(response.json(), FORBIDDEN, label);
   }
   const people = (await view(owner, workspace.id)).members;
   assert.deepEqual(
@@ -418,6 +450,173 @@ test("a removed person answers conflict, and so does removing a claimed person",
     assert.equal(response.statusCode, 404);
     assert.equal(errorCode(response), "not_found");
   }
+});
+
+/** The `member.removed` and `member.left` audit records of the workspace, in order. */
+async function departures(workspaceId: WorkspaceId) {
+  const rows = await database()
+    .select({
+      action: auditEvents.action,
+      actorUserId: auditEvents.actorUserId,
+      actorDeviceId: auditEvents.actorDeviceId,
+      subjectId: auditEvents.subjectId,
+    })
+    .from(auditEvents)
+    .where(eq(auditEvents.workspaceId, workspaceId))
+    .orderBy(auditEvents.id);
+  return rows.filter(
+    (row) => row.action === "member.removed" || row.action === "member.left",
+  );
+}
+
+/** The person IDs of the `workspace.member.removed` events that were sent. */
+function removedIds(events: readonly WorkspaceEvent[]): MemberId[] {
+  return events.flatMap((event) =>
+    event.type === "workspace.member.removed" ? [event.payload.memberId] : [],
+  );
+}
+
+test("the owner removes an admin and a member, and an admin removes a member: each answers 204, is audited, and sends workspace.member.removed", async (t) => {
+  const recorded = recorder();
+  const owner = await signedIn(
+    await workspaceApp(t, { githubId: 3132, ...recorded }),
+  );
+  const admin = await signedIn(
+    await workspaceApp(t, { githubId: 3133, ...recorded }),
+  );
+  const removedAdmin = await signedIn(
+    await workspaceApp(t, { githubId: 3134 }),
+  );
+  const first = await signedIn(await workspaceApp(t, { githubId: 3135 }));
+  const second = await signedIn(await workspaceApp(t, { githubId: 3136 }));
+  const { workspace } = await createWorkspace(owner);
+  await addClaimed(workspace.id, admin.device, owner.device, "admin");
+  const removedAdminPerson = await addClaimed(
+    workspace.id,
+    removedAdmin.device,
+    owner.device,
+    "admin",
+  );
+  const firstPerson = await addClaimed(
+    workspace.id,
+    first.device,
+    owner.device,
+  );
+  const secondPerson = await addClaimed(
+    workspace.id,
+    second.device,
+    owner.device,
+  );
+
+  const removals = [
+    [owner, removedAdmin, removedAdminPerson],
+    [owner, first, firstPerson],
+    [admin, second, secondPerson],
+  ] as const;
+  for (const [by, , memberId] of removals) {
+    const response = await remove(by, workspace.id, memberId);
+    assert.equal(response.statusCode, 204, response.body);
+    assert.equal(response.body, "");
+  }
+  assert.deepEqual(removedIds(recorded.events), [
+    removedAdminPerson,
+    firstPerson,
+    secondPerson,
+  ]);
+  const people = (await view(owner, workspace.id)).members;
+  for (const [, removed, memberId] of removals) {
+    const person = people.find((candidate) => candidate.id === memberId);
+    assert.ok(person?.removedAt !== null && person?.removedAt !== undefined);
+    assert.equal(person.userId, removed.device.userId, "a former member");
+    // The removed account is no member any more.
+    const gone = await removed.app.inject({
+      method: "GET",
+      url: `/workspaces/${workspace.id}`,
+      headers: { authorization: `Bearer ${removed.token}` },
+    });
+    assert.equal(gone.statusCode, 404);
+    assert.equal(errorCode(gone), "not_found");
+  }
+  assert.deepEqual(await departures(workspace.id), [
+    {
+      action: "member.removed",
+      actorUserId: owner.device.userId,
+      actorDeviceId: owner.device.deviceId,
+      subjectId: removedAdminPerson,
+    },
+    {
+      action: "member.removed",
+      actorUserId: owner.device.userId,
+      actorDeviceId: owner.device.deviceId,
+      subjectId: firstPerson,
+    },
+    {
+      action: "member.removed",
+      actorUserId: admin.device.userId,
+      actorDeviceId: admin.device.deviceId,
+      subjectId: secondPerson,
+    },
+  ]);
+});
+
+test("an admin and a member leave with 204, audited as member.left and sent as workspace.member.removed, and then get the 404 of a non-member", async (t) => {
+  const recorded = recorder();
+  const owner = await signedIn(await workspaceApp(t, { githubId: 3137 }));
+  const admin = await signedIn(
+    await workspaceApp(t, { githubId: 3138, ...recorded }),
+  );
+  const member = await signedIn(
+    await workspaceApp(t, { githubId: 3139, ...recorded }),
+  );
+  const { workspace } = await createWorkspace(owner);
+  const adminPerson = await addClaimed(
+    workspace.id,
+    admin.device,
+    owner.device,
+    "admin",
+  );
+  const memberPerson = await addClaimed(
+    workspace.id,
+    member.device,
+    owner.device,
+  );
+
+  for (const [session, memberId] of [
+    [admin, adminPerson],
+    [member, memberPerson],
+  ] as const) {
+    const response = await leave(session, workspace.id);
+    assert.equal(response.statusCode, 204, response.body);
+    assert.equal(response.body, "");
+    const again = await leave(session, workspace.id);
+    assert.equal(again.statusCode, 404);
+    assert.equal(errorCode(again), "not_found");
+    const person = (await view(owner, workspace.id)).members.find(
+      (candidate) => candidate.id === memberId,
+    );
+    assert.ok(typeof person?.removedAt === "string");
+  }
+  assert.deepEqual(removedIds(recorded.events), [adminPerson, memberPerson]);
+  for (const event of recorded.events) {
+    assert.deepEqual(decodeEvent(JSON.parse(JSON.stringify(event))), {
+      ok: true,
+      event,
+    });
+  }
+  assert.deepEqual(await departures(workspace.id), [
+    {
+      action: "member.left",
+      actorUserId: admin.device.userId,
+      actorDeviceId: admin.device.deviceId,
+      subjectId: adminPerson,
+    },
+    {
+      action: "member.left",
+      actorUserId: member.device.userId,
+      actorDeviceId: member.device.deviceId,
+      subjectId: memberPerson,
+    },
+  ]);
 });
 
 test("removing an unclaimed person revokes its live invitation with member_removed", async (t) => {
@@ -732,6 +931,7 @@ test("a removed admin gets the answer for a workspace that does not exist on the
     rename(removedAdmin, workspaceId, "not-an-id", { displayName: "Eve" }),
     remove(removedAdmin, workspaceId, unclaimed),
     remove(removedAdmin, workspaceId, "not-an-id"),
+    leave(removedAdmin, workspaceId),
   ];
   const nonMember = await Promise.all(requests(workspace.id));
   const missing = await Promise.all(requests(unknown));
@@ -821,6 +1021,7 @@ test("the people routes need a valid access token", async (t) => {
       { displayName: "Eve" },
     ],
     ["POST", `/workspaces/${workspace.id}/members/${unclaimed}/remove`, {}],
+    ["POST", `/workspaces/${workspace.id}/leave`, {}],
   ] as const) {
     const response = await owner.app.inject({ method, url, payload });
     assert.equal(response.statusCode, 401, url);

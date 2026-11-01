@@ -16,7 +16,7 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { eq, inArray } from "drizzle-orm";
+import { and, count, eq, inArray, sql } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
@@ -262,8 +262,9 @@ test("revoking a device disables its agents, revokes its grants, cancels their u
     actorDeviceId: world.aliceOtherDevice,
   });
   assert.equal(result.revoked, true);
+  // In the order of their IDs, as they were locked.
   assert.deepEqual(
-    [...result.disabledAgentIds].sort(),
+    result.disabledAgentIds,
     [world.aliceAgent, world.aliceSecondAgent].sort(),
   );
   assert.deepEqual(result.revokedGrantIds, [world.grants.onAliceDevice]);
@@ -284,6 +285,7 @@ test("revoking a device disables its agents, revokes its grants, cancels their u
     repositoryId: fields.repositoryId ?? null,
     correlationId: fields.correlationId ?? null,
     previousState,
+    reason: "device_revoked",
   });
   assert.deepEqual(
     result.cancelledRuns,
@@ -486,6 +488,50 @@ test("an operator's revocation records no actor", async () => {
   assert.equal(audit?.actorUserId, null);
   assert.equal(audit?.actorDeviceId, null);
   assert.equal(audit?.reason, "account_erased");
+});
+
+/** More rows than PostgreSQL's 65,535 parameters of one statement. */
+const MANY = 66_000;
+
+test(`a revocation disables, revokes, and cancels more than 65,535 agents, grants, and runs, because each step binds its IDs as one array`, async () => {
+  const db = database();
+  const world = await seed();
+  await db.execute(sql`
+    insert into agents (id, project_id, owner_user_id, host_device_id, name)
+    select gen_random_uuid(), ${world.project}, ${world.alice}, ${world.aliceDevice}, 'Bulk'
+    from generate_series(1, ${MANY})`);
+  await db.execute(sql`
+    insert into permission_grants (id, project_id, grantee_agent_id, host_device_id, capability, repository_id, granted_by_user_id)
+    select gen_random_uuid(), project_id, id, host_device_id, 'repo.read', ${world.repository}, owner_user_id
+    from agents where host_device_id = ${world.aliceDevice} and name = 'Bulk'`);
+  await db.execute(sql`
+    insert into agent_runs (id, agent_id, project_id, requested_by_user_id, state)
+    select gen_random_uuid(), id, project_id, owner_user_id, 'queued'
+    from agents where host_device_id = ${world.aliceDevice} and name = 'Bulk'`);
+
+  const result = await revokeDevice(db, {
+    deviceId: world.aliceDevice,
+    userId: world.alice,
+    reason: "removed",
+    now: NOW,
+    actorUserId: world.alice,
+    actorDeviceId: world.aliceOtherDevice,
+  });
+  // The seed adds two agents, one active grant, and three unfinished runs.
+  assert.equal(result.disabledAgentIds.length, MANY + 2);
+  assert.equal(result.revokedGrantIds.length, MANY + 1);
+  assert.equal(result.cancelledRuns.length, MANY + 3);
+  const hosted = db
+    .select({ id: agents.id })
+    .from(agents)
+    .where(eq(agents.hostDeviceId, world.aliceDevice));
+  const [left] = await db
+    .select({ n: count() })
+    .from(agentRuns)
+    .where(
+      and(inArray(agentRuns.agentId, hosted), eq(agentRuns.state, "queued")),
+    );
+  assert.equal(left?.n, 0);
 });
 
 const SERVER_ONLY = {

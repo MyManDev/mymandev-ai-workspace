@@ -122,6 +122,12 @@ export const workspaceMembers = pgTable(
       "workspace_members_removal_check",
       sql`(${t.removedAt} is null) = (${t.removedByUserId} is null)`,
     ),
+    // The owner is never removed: ownership moves only by transfer, so that a
+    // bug cannot leave a workspace without an owner (#93).
+    check(
+      "workspace_members_owner_removal_check",
+      sql`${t.role} <> 'owner' or ${t.removedAt} is null`,
+    ),
     // An ownership offer goes only to a claimed, active person who is not the owner.
     check(
       "workspace_members_ownership_offer_check",

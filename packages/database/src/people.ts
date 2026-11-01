@@ -1,29 +1,42 @@
 import {
+  type AgentId,
   type DeviceId,
   type InvitationId,
   type MemberId,
   type MemberRole,
   newId,
   newUuidV7,
+  type PermissionGrantId,
   type UserId,
   type WorkspaceId,
   type WorkspaceMember,
 } from "@mymandev/protocol";
-import { and, eq, isNull, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import type { AuditAction, AuditReason } from "./audit-vocabulary.ts";
+import {
+  type CancelledRun,
+  cancelRuns,
+  disableAgents,
+  idIn,
+  revokeGrants,
+} from "./cascade.ts";
 import type { Database } from "./db.ts";
 import { withDatabaseErrors } from "./errors.ts";
 import {
+  agentRuns,
+  agents,
   auditEvents,
+  permissionGrants,
+  projects,
   workspaceInvitations,
   workspaceMembers,
 } from "./schema/index.ts";
 
-// Defining, renaming, and removing the people of a workspace (ADR 0014,
-// "People and roles", "Invitations", and "Removal and ownership"). Each
-// function locks the people it decides on, the acting person included, before
-// it reads their state, so that concurrent changes of one person happen one
-// after another.
+// Defining, renaming, and removing the people of a workspace, and leaving it
+// (ADR 0014, "People and roles", "Invitations", and "Removal and
+// ownership"). Each function locks the people it decides on, the acting
+// person included, before it reads their state, so that concurrent changes
+// of one person happen one after another.
 //
 // Lock order, so that no two transactions wait for each other: the account
 // (`users`), then the device (`devices`), as `lockActor` in the API does; then
@@ -32,6 +45,23 @@ import {
 // the invitation too. The invitations of `src/invitations.ts` use the
 // helpers below; creating one locks the workspace row (`workspaces`) after
 // the people and before the invitations, for the counts of the workspace.
+// A removal also revokes the invitations that the removed person created,
+// which name other people whom it does not lock: it locks them after the
+// people and in the order of their IDs, and every other change of an
+// invitation locks its person before it touches that person's invitations,
+// of which at most one is live. A removal then locks the removed person's
+// agents, their grants, and the runs it cancels (`src/cascade.ts`), in that
+// order, as a device revocation does after its device.
+//
+// A future writer that inserts an agent, a grant, or a run (#75, M3) locks
+// the person of each account it attaches the row to first: the agent's
+// owner, and for a run also the requester, in the order of their IDs,
+// `FOR SHARE` or stronger, and it checks that each is still active. A
+// removal holds the person `FOR NO KEY UPDATE`, which `FOR SHARE` waits for
+// and `FOR KEY SHARE` does not; so either the removal commits first and the
+// writer finds the person removed, or the insert commits first and the
+// removal sees the new row. Without this a removal could miss an agent,
+// grant, or run that a concurrent insert added.
 
 /**
  * Why an action on a person was refused. Nothing was written.
@@ -242,24 +272,68 @@ export async function renameMember(
 
 export type RemoveMemberInput = Actor & Readonly<{ memberId: MemberId }>;
 
+/**
+ * What removing a person or leaving changed, for what the server sends after
+ * the commit (ADR 0014, "Removal and ownership"). Each list is in the order
+ * of its IDs.
+ */
+export type MembershipEnd = Readonly<{
+  /** The person that was removed or left. */
+  memberId: MemberId;
+  /**
+   * The account that had claimed the person, whose connections the server
+   * tells; null for an unclaimed person, which has no account, agents, or
+   * runs.
+   */
+  userId: UserId | null;
+  /**
+   * The person's own invitation and the invitations that the person's
+   * account created in the workspace, each neither accepted nor revoked.
+   */
+  revokedInvitationIds: readonly InvitationId[];
+  /** The account's agents in the workspace's projects that were not disabled yet. */
+  disabledAgentIds: readonly AgentId[];
+  /**
+   * The grants of the account's agents in the workspace's projects that were
+   * not revoked yet, the active ones and the expired ones alike.
+   */
+  revokedGrantIds: readonly PermissionGrantId[];
+  /** Each with the reason `member_removed`, in the order of the run IDs. */
+  cancelledRuns: readonly CancelledRun[];
+}>;
+
 export type RemoveMemberResult =
-  | Readonly<{
-      removed: true;
-      /** The person's live invitation that the removal revoked, if it had one. */
-      revokedInvitationId: InvitationId | null;
-    }>
+  | (Readonly<{ removed: true }> & MembershipEnd)
   | Readonly<{ removed: false; refusal: PersonRefusal }>;
 
 /**
- * Removes an unclaimed person in one transaction (ADR 0014, "Removal and
- * ownership"): only the owner or an admin; sets `removed_at` to `now` and
- * `removed_by_user_id` to the acting account, and revokes the person's live
- * invitation, the one neither accepted nor revoked, with the acting account
- * as `revoked_by_user_id`. Writes a `member.removed` audit record and, for a
- * revoked invitation, an `invitation.revoked` record with the reason
- * `member_removed`. A removed person is `conflict`, and so is a claimed
- * person until #93 removes claimed people. Nothing is deleted. Inside
- * another transaction it runs as a savepoint.
+ * Whether a person with the role `actor` may remove an active person with
+ * the role `target` (ADR 0014, "People and roles"): the owner removes anyone
+ * but the owner; an admin only people with the role `member`, which every
+ * unclaimed person has; a member nobody. So nobody removes the owner, and
+ * nobody removes their own person: an admin or a member leaves instead.
+ */
+function mayRemove(actor: MemberRole, target: MemberRole): boolean {
+  switch (actor) {
+    case "owner":
+      return target !== "owner";
+    case "admin":
+      return target === "member";
+    case "member":
+      return false;
+  }
+}
+
+/**
+ * Removes a person in one transaction (ADR 0014, "People and roles" and
+ * "Removal and ownership"): the owner removes any person but the owner, and
+ * an admin removes unclaimed people and claimed people with the role
+ * `member`. Every other combination is `forbidden`: a member's removal, an
+ * admin's removal of the owner or of an admin, and anyone's removal of their
+ * own person, who leaves with `leaveWorkspace` instead. A removed person is
+ * `conflict`. The removal itself is described at `removePerson` below; it
+ * writes a `member.removed` audit record. Inside another transaction it runs
+ * as a savepoint.
  */
 export async function removeMember(
   db: Database,
@@ -277,39 +351,167 @@ export async function removeMember(
       if (!administers(actor.role)) {
         return { removed: false, refusal: "forbidden" };
       }
-      if (target.removedAt !== null || target.userId !== null) {
+      if (target.removedAt !== null) {
         return { removed: false, refusal: "conflict" };
       }
-      await tx
-        .update(workspaceMembers)
-        .set({
-          removedAt: input.now,
-          removedByUserId: input.userId,
-          updatedAt: input.now,
-        })
-        .where(eq(workspaceMembers.id, target.id));
-      await audit(tx, input, "member.removed", target.id);
-      const [revoked] = await tx
-        .update(workspaceInvitations)
-        .set({ revokedAt: input.now, revokedByUserId: input.userId })
-        .where(
-          and(
-            eq(workspaceInvitations.memberId, target.id),
-            isNull(workspaceInvitations.acceptedAt),
-            isNull(workspaceInvitations.revokedAt),
-          ),
-        )
-        .returning({ id: workspaceInvitations.id });
-      if (revoked !== undefined) {
-        await audit(
-          tx,
-          input,
-          "invitation.revoked",
-          revoked.id,
-          "member_removed",
-        );
+      if (!mayRemove(actor.role, target.role)) {
+        return { removed: false, refusal: "forbidden" };
       }
-      return { removed: true, revokedInvitationId: revoked?.id ?? null };
+      const ended = await removePerson(tx, input, target, "member.removed");
+      return { removed: true, ...ended };
     }),
   );
+}
+
+export type LeaveWorkspaceInput = Actor;
+
+export type LeaveWorkspaceResult =
+  | (Readonly<{ left: true }> & MembershipEnd)
+  | Readonly<{ left: false; refusal: "not_member" | "forbidden" }>;
+
+/**
+ * The acting account's person leaves the workspace in one transaction (ADR
+ * 0014, "People and roles" and "Removal and ownership"): an admin or a
+ * member. The owner cannot leave and transfers ownership first
+ * (`forbidden`). Leaving is the removal of `removePerson` below, with the
+ * leaving account as the remover, and writes a `member.left` audit record.
+ * Inside another transaction it runs as a savepoint.
+ */
+export async function leaveWorkspace(
+  db: Database,
+  input: LeaveWorkspaceInput,
+): Promise<LeaveWorkspaceResult> {
+  return withDatabaseErrors(() =>
+    db.transaction(async (tx): Promise<LeaveWorkspaceResult> => {
+      const { actor } = await lockPeople(tx, input);
+      if (actor === undefined) {
+        return { left: false, refusal: "not_member" };
+      }
+      if (actor.role === "owner") {
+        return { left: false, refusal: "forbidden" };
+      }
+      const ended = await removePerson(tx, input, actor, "member.left");
+      return { left: true, ...ended };
+    }),
+  );
+}
+
+const NO_AGENTS = Object.freeze({
+  disabledAgentIds: Object.freeze([]),
+  revokedGrantIds: Object.freeze([]),
+  cancelledRuns: Object.freeze([]),
+});
+
+/**
+ * Removes an active person that the caller locked, with the acting account
+ * as the remover (ADR 0014, "Removal and ownership"; P-60; ADR 0015, P-77):
+ *
+ * - it sets `removed_at` to `now` and `removed_by_user_id` to the acting
+ *   account, clears an ownership offer to the person, which only an active
+ *   person can hold, and writes `action` as the audit record;
+ * - it revokes the person's own invitation and the invitations that the
+ *   person's account created in the workspace, each neither accepted nor
+ *   revoked, also an expired one, with the acting account as
+ *   `revoked_by_user_id` and an `invitation.revoked` audit record with the
+ *   reason `member_removed` for each;
+ * - for a claimed person, it disables the account's agents in the
+ *   workspace's projects, revokes their active grants with the acting
+ *   account as `revoked_by_user_id`, and moves to `cancelled`, with the
+ *   reason `member_removed`, the unfinished runs in the workspace's projects
+ *   that run on those agents or that the account requested on another
+ *   member's agent.
+ *
+ * After the people, it locks the invitations, the agents, the grants, and
+ * the runs, each `FOR NO KEY UPDATE` and in the order of their IDs. Nothing
+ * outside the workspace changes, and nothing is deleted.
+ */
+async function removePerson(
+  tx: Database,
+  actor: Actor,
+  person: LockedPerson,
+  action: "member.removed" | "member.left",
+): Promise<MembershipEnd> {
+  const { workspaceId, now } = actor;
+  await tx
+    .update(workspaceMembers)
+    .set({
+      removedAt: now,
+      removedByUserId: actor.userId,
+      ownershipOfferedAt: null,
+      updatedAt: now,
+    })
+    .where(eq(workspaceMembers.id, person.id));
+  await audit(tx, actor, action, person.id);
+
+  const invitations = await tx
+    .select({ id: workspaceInvitations.id })
+    .from(workspaceInvitations)
+    .where(
+      and(
+        eq(workspaceInvitations.workspaceId, workspaceId),
+        isNull(workspaceInvitations.acceptedAt),
+        isNull(workspaceInvitations.revokedAt),
+        or(
+          eq(workspaceInvitations.memberId, person.id),
+          person.userId === null
+            ? undefined
+            : eq(workspaceInvitations.createdByUserId, person.userId),
+        ),
+      ),
+    )
+    .orderBy(workspaceInvitations.id)
+    .for("no key update");
+  const revokedInvitationIds = invitations.map((row) => row.id);
+  if (revokedInvitationIds.length > 0) {
+    await tx
+      .update(workspaceInvitations)
+      .set({ revokedAt: now, revokedByUserId: actor.userId })
+      .where(idIn(workspaceInvitations.id, revokedInvitationIds));
+    for (const id of revokedInvitationIds) {
+      await audit(tx, actor, "invitation.revoked", id, "member_removed");
+    }
+  }
+  const ended = {
+    memberId: person.id,
+    userId: person.userId,
+    revokedInvitationIds: Object.freeze(revokedInvitationIds),
+  };
+  if (person.userId === null) {
+    return Object.freeze({ ...ended, ...NO_AGENTS });
+  }
+
+  const inWorkspace = tx
+    .select({ id: projects.id })
+    .from(projects)
+    .where(eq(projects.workspaceId, workspaceId));
+  const owned = and(
+    eq(agents.ownerUserId, person.userId),
+    inArray(agents.projectId, inWorkspace),
+  );
+  const disabledAgentIds = await disableAgents(tx, owned, now);
+  const ownedAgents = tx.select({ id: agents.id }).from(agents).where(owned);
+  const revokedGrantIds = await revokeGrants(
+    tx,
+    inArray(permissionGrants.granteeAgentId, ownedAgents),
+    actor.userId,
+    now,
+  );
+  const cancelledRuns = await cancelRuns(
+    tx,
+    and(
+      inArray(agentRuns.projectId, inWorkspace),
+      or(
+        inArray(agentRuns.agentId, ownedAgents),
+        eq(agentRuns.requestedByUserId, person.userId),
+      ),
+    ),
+    "member_removed",
+    now,
+  );
+  return Object.freeze({
+    ...ended,
+    disabledAgentIds: Object.freeze(disabledAgentIds),
+    revokedGrantIds: Object.freeze(revokedGrantIds),
+    cancelledRuns,
+  });
 }

@@ -4,6 +4,7 @@ import {
   type UserId,
 } from "@mymandev/protocol";
 import { and, eq, inArray, isNotNull, isNull } from "drizzle-orm";
+import { revokeGrants } from "./cascade.ts";
 import type { Database } from "./db.ts";
 import { withDatabaseErrors } from "./errors.ts";
 import {
@@ -42,27 +43,25 @@ export async function disableAccount(
       if (disabled.length === 0) {
         return { changed: false, revokedGrantIds: [] };
       }
+      // In the order of their IDs, as a removal and a device revocation
+      // lock grants (`src/cascade.ts`).
       const owned = tx
         .select({ id: agents.id })
         .from(agents)
         .where(eq(agents.ownerUserId, input.userId));
-      const grants = await tx
-        .update(permissionGrants)
-        .set({ revokedAt: input.now, revokedByUserId: input.userId })
-        .where(
-          and(
-            inArray(permissionGrants.granteeAgentId, owned),
-            isNull(permissionGrants.revokedAt),
-          ),
-        )
-        .returning({ id: permissionGrants.id });
+      const grants = await revokeGrants(
+        tx,
+        inArray(permissionGrants.granteeAgentId, owned),
+        input.userId,
+        input.now,
+      );
       await tx.insert(auditEvents).values({
         id: newUuidV7(),
         createdAt: input.now,
         action: "account.disabled",
         subjectId: input.userId,
       });
-      return { changed: true, revokedGrantIds: grants.map((row) => row.id) };
+      return { changed: true, revokedGrantIds: grants };
     }),
   );
 }

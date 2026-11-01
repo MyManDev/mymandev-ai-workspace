@@ -1,0 +1,1 @@
+ALTER TABLE "workspace_members" ADD CONSTRAINT "workspace_members_owner_removal_check" CHECK ("workspace_members"."role" <> 'owner' or "workspace_members"."removed_at" is null);

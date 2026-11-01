@@ -20,6 +20,7 @@ import {
   type RequireAccessToken,
 } from "../auth/authenticate.ts";
 import { ApiError } from "../errors.ts";
+import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
 import { requireActiveMember, WorkspaceParamsSchema } from "./access.ts";
 import type { AccountFrameHandler, WorkspaceEventHandler } from "./events.ts";
@@ -41,10 +42,16 @@ export type WorkspaceRouteOptions = Readonly<{
    */
   onWorkspaceEvent: WorkspaceEventHandler;
   /**
-   * Receives the account frames of the join request decisions after the
-   * commit, for the requester's open connections.
+   * Receives the account frames after the commit, for the account's open
+   * connections: a join request decision for the requester, and
+   * `account.removed_from_workspace` after a removal or a departure.
    */
   onAccountFrame: AccountFrameHandler;
+  /**
+   * The open connections, to which the people routes send the runs that a
+   * removal or a departure cancelled, after the commit.
+   */
+  connections: ConnectionRegistry;
 }>;
 
 /**
@@ -144,6 +151,8 @@ export async function registerWorkspaceRoutes(
         database,
         now: options.now,
         onWorkspaceEvent: options.onWorkspaceEvent,
+        onAccountFrame: options.onAccountFrame,
+        connections: options.connections,
       });
 
       registerInvitationRoutes(workspace, { database, now: options.now });
