@@ -1,6 +1,7 @@
 import {
   auditEvents,
   type Database,
+  deviceRow,
   devices,
   revokeDevice,
   users,
@@ -10,6 +11,7 @@ import {
   AccessTokenRequestSchema,
   type AccessTokenResponse,
   ACCESS_TOKEN_PATTERN,
+  type AccountDeviceRevokedFrame,
   AUTH_ROUTES,
   type ChallengeResponse,
   type DeviceId,
@@ -17,19 +19,20 @@ import {
   type DeviceListResponse,
   MAX_ANSWER_LIST_ITEMS,
   newUuidV7,
+  PROTOCOL_VERSION,
   type RevokeDeviceRequest,
   RevokeDeviceRequestSchema,
-  SIGN_IN_LIFETIME_MS,
 } from "@mymandev/protocol";
 import { and, desc, eq, gt } from "drizzle-orm";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import * as z from "zod";
 import { ApiError } from "../errors.ts";
+import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
 import {
   type AuthContext,
-  deviceRow,
+  deviceListItem,
   stateOf,
   tokenUsable,
 } from "./device-state.ts";
@@ -71,6 +74,11 @@ export type DeviceRouteOptions = Readonly<{
   database: Database;
   challenges: Challenges;
   tokens: AccessTokens;
+  /**
+   * The open WebSocket connections: after a sign-out or a revocation
+   * commits, the device's connection closes.
+   */
+  connections: ConnectionRegistry;
   now: () => number;
 }>;
 
@@ -146,7 +154,7 @@ export async function registerDeviceRoutes(
   app: FastifyInstance,
   options: DeviceRouteOptions,
 ): Promise<void> {
-  const { database, challenges, tokens, publicOrigin } = options;
+  const { database, challenges, tokens, connections, publicOrigin } = options;
   const tokensPerDevice = new WindowLimiter(
     TOKENS_PER_DEVICE.max,
     TOKENS_PER_DEVICE.windowMs,
@@ -321,6 +329,7 @@ export async function registerDeviceRoutes(
         });
       });
       tokens.dropDevice(auth.deviceId);
+      connections.closeDevice(auth.deviceId, "sign_in_required", request.log);
       return reply.code(204).send();
     });
 
@@ -335,19 +344,9 @@ export async function registerDeviceRoutes(
           .orderBy(desc(devices.createdAt))
           .limit(MAX_ANSWER_LIST_ITEMS);
         return {
-          devices: rows.map((row) => ({
-            id: row.id,
-            label: row.label,
-            platform: row.platform,
-            createdAt: row.createdAt.toISOString(),
-            lastSeenAt: row.lastSeenAt?.toISOString() ?? null,
-            lastSignInAt: row.lastSignInAt.toISOString(),
-            signInExpiresAt: new Date(
-              row.lastSignInAt.getTime() + SIGN_IN_LIFETIME_MS,
-            ).toISOString(),
-            revokedAt: row.revokedAt?.toISOString() ?? null,
-            current: row.id === auth.deviceId,
-          })),
+          devices: rows.map((row) =>
+            deviceListItem(row, row.id === auth.deviceId),
+          ),
         };
       },
     );
@@ -415,6 +414,17 @@ export async function registerDeviceRoutes(
           }
         });
         tokens.dropDevice(deviceId);
+        // The revoked device learns it from its close; the account's other
+        // connections from the frame.
+        connections.closeDevice(deviceId, "device_revoked", request.log);
+        const revoked: AccountDeviceRevokedFrame = {
+          protocolVersion: PROTOCOL_VERSION,
+          type: "account.device_revoked",
+          deviceId,
+          reason,
+          revokedAt: now.toISOString(),
+        };
+        connections.sendToUser(auth.userId, revoked, deviceId);
         return reply.code(204).send();
       },
     );

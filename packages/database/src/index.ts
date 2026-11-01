@@ -21,9 +21,14 @@ export {
   type ActiveMemberInput,
   type ConnectionAuditAction,
   type ConnectionAuditInput,
+  type DeviceAccessRow,
+  deviceRow,
+  deviceRows,
   type DeviceSeenInput,
+  type DevicesSeenInput,
   isActiveMember,
   markDeviceSeen,
+  markDevicesSeen,
   writeConnectionAudit,
 } from "./connections.ts";
 export {

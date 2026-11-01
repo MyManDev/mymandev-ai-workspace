@@ -26,7 +26,16 @@ import {
 import { after, before, test, type TestContext } from "node:test";
 import { buildApp } from "../app.ts";
 import { loadConfig } from "../config.ts";
+import {
+  closedWith,
+  connected,
+  loggedCloses,
+  nextFrame,
+  settle,
+} from "../gateway-test-support.ts";
+import { ConnectionRegistry } from "../gateway.ts";
 import { Secret } from "../secret.ts";
+import { deviceApp, signInAgain, signInDevice } from "./device-test-support.ts";
 import { createGitHubApi } from "./github-api.ts";
 import {
   callback,
@@ -725,6 +734,97 @@ test("naming a previous device of the same account revokes it as replaced, also 
     kept?.revokedAt,
     null,
     "another account's device is never revoked",
+  );
+});
+
+test("after a sign-in commits, the connection with the replaced key closes with key_replaced, a replaced device closes with device_revoked, and only the account's other connections hear of the new device", async (t) => {
+  const connections = new ConnectionRegistry();
+  const logLines: string[] = [];
+  const app = await deviceApp(t, {
+    database: database(),
+    githubId: 1017,
+    connections,
+    logLines,
+  });
+  const strangerApp = await deviceApp(t, {
+    database: database(),
+    githubId: 1018,
+    connections,
+  });
+  const laptop = await signInDevice(app);
+  const desktop = await signInDevice(app);
+  const stranger = await signInDevice(strangerApp);
+  const laptopSocket = await connected(t, app, laptop);
+  const desktopSocket = await connected(t, app, desktop);
+  const strangerSocket = await connected(t, strangerApp, stranger);
+
+  // A repeated sign-in replaces the laptop's key; it reconnects with the new one.
+  const renewed = await signInAgain(app, laptop);
+  assert.equal(
+    connections.connectionOf(laptop.deviceId),
+    null,
+    "closed before the answer",
+  );
+  assert.deepEqual(
+    await laptopSocket.client.closed,
+    closedWith("key_replaced"),
+  );
+  const laptopAgain = await connected(t, app, renewed);
+
+  // A new device registers and replaces the desktop.
+  const tablet = await signInDevice(app, undefined, desktop.deviceId);
+  assert.deepEqual(
+    await desktopSocket.client.closed,
+    closedWith("device_revoked"),
+  );
+  const [registered] = await database()
+    .select()
+    .from(devices)
+    .where(eq(devices.id, tablet.deviceId));
+  const [replaced] = await database()
+    .select({ revokedAt: devices.revokedAt })
+    .from(devices)
+    .where(eq(devices.id, desktop.deviceId));
+  assert.ok(registered && replaced?.revokedAt);
+  assert.deepEqual(await nextFrame(laptopAgain.client), {
+    protocolVersion: 0,
+    type: "account.device_registered",
+    device: {
+      id: tablet.deviceId,
+      label: "Laptop",
+      platform: "macos",
+      createdAt: registered.createdAt.toISOString(),
+      lastSeenAt: null,
+      lastSignInAt: registered.lastSignInAt.toISOString(),
+      signInExpiresAt: new Date(
+        registered.lastSignInAt.getTime() + 30 * 24 * 60 * 60_000,
+      ).toISOString(),
+      revokedAt: null,
+      current: false,
+    },
+  });
+  assert.deepEqual(await nextFrame(laptopAgain.client), {
+    protocolVersion: 0,
+    type: "account.device_revoked",
+    deviceId: desktop.deviceId,
+    reason: "replaced",
+    revokedAt: replaced.revokedAt.toISOString(),
+  });
+  assert.deepEqual(loggedCloses(logLines), [
+    { connectionId: laptopSocket.connectionId, code: "key_replaced" },
+    { connectionId: desktopSocket.connectionId, code: "device_revoked" },
+  ]);
+  await settle();
+  assert.equal(laptopAgain.client.unread(), 0);
+  assert.equal(
+    desktopSocket.client.unread(),
+    0,
+    "the replaced device, which also heard nothing of the key replacement",
+  );
+  assert.equal(strangerSocket.client.unread(), 0, "another account");
+  assert.equal(
+    strangerSocket.client.ws.readyState,
+    strangerSocket.client.ws.OPEN,
   );
 });
 

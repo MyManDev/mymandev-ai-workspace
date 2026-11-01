@@ -22,6 +22,7 @@ import {
   RUN_CANCEL_REASONS,
   RUN_STATES,
   RUN_TRANSITIONS,
+  SIGN_IN_GRACE_MS,
   SIGN_IN_LIFETIME_MS,
   TERMINAL_RUN_STATES,
   type RunState,
@@ -127,9 +128,11 @@ test("the account vocabularies are exactly the values of ADR 0014", () => {
   });
 });
 
-test("a device sign-in lasts 30 days", () => {
+test("a device sign-in lasts 30 days, and an open connection 24 hours more", () => {
   assert.equal(SIGN_IN_LIFETIME_MS, 30 * 24 * 60 * 60 * 1000);
   assert.equal(SIGN_IN_LIFETIME_MS, 2_592_000_000);
+  assert.equal(SIGN_IN_GRACE_MS, 24 * 60 * 60 * 1000);
+  assert.equal(SIGN_IN_GRACE_MS, 86_400_000);
 });
 
 test("every API error code has its fixed HTTP status", () => {

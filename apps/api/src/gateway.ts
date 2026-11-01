@@ -1,7 +1,10 @@
 import {
   type Database,
+  deviceRow,
+  deviceRows,
   isActiveMember,
   markDeviceSeen,
+  markDevicesSeen,
   writeConnectionAudit,
 } from "@mymandev/database";
 import {
@@ -16,7 +19,9 @@ import {
   newId,
   PROTOCOL_VERSION,
   type ProtocolEvent,
+  type ServerFrame,
   type ServerOnlyEventType,
+  SIGN_IN_GRACE_MS,
   SIGN_IN_LIFETIME_MS,
   type UnverifiedEvent,
   type UserId,
@@ -35,7 +40,7 @@ import type { RawData, WebSocket } from "ws";
 import { randomToken } from "./auth/attempts.ts";
 import { verifyDeviceSignature } from "./auth/device-keys.ts";
 import { ADDRESS_LIMIT } from "./auth/device-routes.ts";
-import { type DeviceRow, deviceRow, stateOf } from "./auth/device-state.ts";
+import { type DeviceRow, stateOf } from "./auth/device-state.ts";
 import { WindowLimiter } from "./auth/tokens.ts";
 import { ApiError } from "./errors.ts";
 
@@ -87,6 +92,15 @@ export const UNAUTHENTICATED_PLACE_SECONDS = Math.ceil(
 
 /** At most one audit record of each kind per device in this time (ADR 0014). */
 export const CONNECTION_AUDIT_WINDOW_MS = 60 * 60_000;
+
+/** How often the sweep re-checks the devices of the live connections (ADR 0014). */
+export const CONNECTION_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * The sweep writes `devices.last_seen_at` of an open connection's device at
+ * most this often; `auth.ok` writes it first.
+ */
+export const LAST_SEEN_INTERVAL_MS = 5 * 60_000;
 
 /** The user and the device that a connection's key proved. */
 export type ConnectionIdentity = Readonly<{
@@ -153,10 +167,11 @@ export type ConnectionRefusal = Extract<
  * Why the device's current row refuses a connection that authenticated with
  * the key of the sign-in at `signedInAt`, or null when it may act. The
  * server rejects the previous key from the commit of a new sign-in on (ADR
- * 0014). With `now`, the 30-day sign-in counts too, as at authentication.
- * Without it, as for every event, the expiry is left to the sweep, which
- * allows an open connection 24 hours more: `stateOf` is then evaluated at
- * the sign-in itself, where the sign-in has not expired.
+ * 0014). With `now`, the 30-day sign-in counts too, as at authentication;
+ * the sweep passes the time 24 hours ago (`SIGN_IN_GRACE_MS`), which allows
+ * an open connection 24 hours more. Without it, as for every event, the
+ * expiry is left to the sweep: `stateOf` is then evaluated at the sign-in
+ * itself, where the sign-in has not expired.
  */
 export function refusalOf(
   row: DeviceRow | undefined,
@@ -316,15 +331,33 @@ function closeWith(socket: WebSocket, reason: WsCloseReason): void {
   socket.close(WS_CLOSE_CODES[reason], reason);
 }
 
-type LiveConnection = Readonly<{
-  socket: WebSocket;
+/**
+ * The frames that go to an account's own connections (ADR 0014). They never
+ * use the event envelope and never reach another account.
+ */
+export type AccountFrame = Extract<ServerFrame, { type: `account.${string}` }>;
+
+type LiveConnection = {
+  readonly socket: WebSocket;
+  readonly context: AuthenticatedConnectionContext;
+  /** When `devices.last_seen_at` was last written for it: at `auth.ok`, then by the sweep. */
+  seenAt: number;
+  /** Whether it got `auth.ok`; only then does it receive account frames. */
+  confirmed: boolean;
+};
+
+/** A live connection as `ConnectionRegistry.live` lists it, without its socket. */
+export type LiveConnectionView = Readonly<{
   context: AuthenticatedConnectionContext;
+  /** When `devices.last_seen_at` was last written for it. */
+  seenAt: number;
 }>;
 
 /**
  * The open connections of this API instance (ADR 0014, "Revocation,
  * sign-out, and recovery"): the unauthenticated ones, counted for their cap,
- * and one live connection per device.
+ * and one live connection per device, which the sweep re-checks and the
+ * account frames reach.
  */
 export class ConnectionRegistry {
   readonly #pending = new Set<WebSocket>();
@@ -354,22 +387,38 @@ export class ConnectionRegistry {
 
   /**
    * Makes a connection that just authenticated the live connection of its
-   * device. An older connection of the device closes with
-   * `connection_replaced`; its context is returned.
+   * device; `seenAt` is when it wrote `devices.last_seen_at`. An older
+   * connection of the device closes with `connection_replaced`; its context
+   * is returned.
    */
   register(
     socket: WebSocket,
     context: AuthenticatedConnectionContext,
+    seenAt: number,
   ): AuthenticatedConnectionContext | null {
     this.#pending.delete(socket);
     const deviceId = context.identity.deviceId;
     const previous = this.#live.get(deviceId);
-    this.#live.set(deviceId, Object.freeze({ socket, context }));
+    this.#live.set(deviceId, { socket, context, seenAt, confirmed: false });
     if (previous === undefined) {
       return null;
     }
     closeWith(previous.socket, "connection_replaced");
     return previous.context;
+  }
+
+  /**
+   * Records that a live connection got `auth.ok`. Account frames reach it
+   * only from then on, so that none arrives before `auth.ok`.
+   */
+  confirm(context: AuthenticatedConnectionContext): void {
+    const live = this.#liveWith(
+      context.identity.deviceId,
+      context.connectionId,
+    );
+    if (live !== undefined) {
+      live.confirmed = true;
+    }
   }
 
   /**
@@ -394,18 +443,59 @@ export class ConnectionRegistry {
     return this.#live.get(deviceId)?.context ?? null;
   }
 
+  /** The live connections at this moment, without their sockets. */
+  live(): LiveConnectionView[] {
+    return Array.from(this.#live.values(), ({ context, seenAt }) =>
+      Object.freeze({ context, seenAt }),
+    );
+  }
+
+  /** Records when `devices.last_seen_at` was written for a connection that is still live. */
+  markSeen(context: AuthenticatedConnectionContext, seenAt: number): void {
+    const live = this.#liveWith(
+      context.identity.deviceId,
+      context.connectionId,
+    );
+    if (live !== undefined) {
+      live.seenAt = seenAt;
+    }
+  }
+
+  /**
+   * Closes the live connection of a device with a close reason of the
+   * protocol, but only while it is the connection with this ID: a newer
+   * connection of the device that registered meanwhile, for example while
+   * the sweep read the device, stays open. Returns whether it closed.
+   */
+  closeConnection(
+    deviceId: DeviceId,
+    connectionId: ConnectionId,
+    reason: WsCloseReason,
+    log: FastifyBaseLogger,
+  ): boolean {
+    const live = this.#liveWith(deviceId, connectionId);
+    if (live === undefined) {
+      return false;
+    }
+    this.#close(deviceId, live, reason, log);
+    return true;
+  }
+
   /**
    * Closes the live connection of a device with a close reason of the
    * protocol, for example `device_revoked` after a revocation commits or
    * `sign_in_required` after a sign-out. Returns whether one was open.
    */
-  closeDevice(deviceId: DeviceId, reason: WsCloseReason): boolean {
+  closeDevice(
+    deviceId: DeviceId,
+    reason: WsCloseReason,
+    log: FastifyBaseLogger,
+  ): boolean {
     const live = this.#live.get(deviceId);
     if (live === undefined) {
       return false;
     }
-    this.#live.delete(deviceId);
-    closeWith(live.socket, reason);
+    this.#close(deviceId, live, reason, log);
     return true;
   }
 
@@ -414,16 +504,140 @@ export class ConnectionRegistry {
    * with `sign_in_required` after GitHub reported a revocation. Returns how
    * many were open.
    */
-  closeUser(userId: UserId, reason: WsCloseReason): number {
+  closeUser(
+    userId: UserId,
+    reason: WsCloseReason,
+    log: FastifyBaseLogger,
+  ): number {
     let closed = 0;
     for (const [deviceId, live] of this.#live) {
       if (live.context.identity.userId === userId) {
-        this.#live.delete(deviceId);
-        closeWith(live.socket, reason);
+        this.#close(deviceId, live, reason, log);
         closed += 1;
       }
     }
     return closed;
+  }
+
+  /**
+   * Sends an account frame to the live connections of an account that got
+   * `auth.ok` and are still open, except the connection of `exceptDeviceId`,
+   * for example the device that the frame reports as revoked. Returns how
+   * many connections it was sent to.
+   */
+  sendToUser(
+    userId: UserId,
+    frame: AccountFrame,
+    exceptDeviceId?: DeviceId,
+  ): number {
+    const text = JSON.stringify(frame);
+    let sent = 0;
+    for (const [deviceId, live] of this.#live) {
+      if (
+        live.context.identity.userId === userId &&
+        deviceId !== exceptDeviceId &&
+        live.confirmed &&
+        live.socket.readyState === live.socket.OPEN
+      ) {
+        live.socket.send(text);
+        sent += 1;
+      }
+    }
+    return sent;
+  }
+
+  /**
+   * Ends a live connection that a change closed, by a route or by the sweep,
+   * and logs it with its connection ID and the close reason.
+   */
+  #close(
+    deviceId: DeviceId,
+    live: LiveConnection,
+    reason: WsCloseReason,
+    log: FastifyBaseLogger,
+  ): void {
+    this.#live.delete(deviceId);
+    closeWith(live.socket, reason);
+    log.info(
+      { connectionId: live.context.connectionId, code: reason },
+      "connection closed",
+    );
+  }
+
+  /** The live connection of a device while it is the connection with this ID. */
+  #liveWith(
+    deviceId: DeviceId,
+    connectionId: ConnectionId,
+  ): LiveConnection | undefined {
+    const live = this.#live.get(deviceId);
+    return live?.context.connectionId === connectionId ? live : undefined;
+  }
+}
+
+export type ConnectionSweepDependencies = Readonly<{
+  connections: ConnectionRegistry;
+  database: Database;
+  now: () => number;
+  log: FastifyBaseLogger;
+}>;
+
+/**
+ * Re-checks the devices of every live connection with one batched query
+ * (ADR 0014, "Revocation, sign-out, and recovery") and closes each
+ * connection that its device's row no longer accepts, with the reason of
+ * `refusalOf`: a revocation, a newer sign-in, a disabled account, a
+ * sign-out, or a GitHub revocation after the sign-in. The 30-day sign-in
+ * counts 24 hours late (`SIGN_IN_GRACE_MS`). A newer connection that
+ * registered meanwhile stays open. Then one update writes
+ * `devices.last_seen_at` for the open connections whose last write is 5
+ * minutes old or more. A failure of the database is logged, and the next
+ * sweep tries again.
+ */
+export async function sweepConnections(
+  dependencies: ConnectionSweepDependencies,
+): Promise<void> {
+  const { connections, database, now, log } = dependencies;
+  const live = connections.live();
+  if (live.length === 0) {
+    return;
+  }
+  try {
+    const rows = await deviceRows(
+      database,
+      live.map(({ context }) => context.identity.deviceId),
+    );
+    const at = now();
+    const seen: AuthenticatedConnectionContext[] = [];
+    for (const { context, seenAt } of live) {
+      const { deviceId } = context.identity;
+      // Only the 30-day sign-in depends on the time.
+      const refusal = refusalOf(
+        rows.get(deviceId),
+        context.signedInAt,
+        at - SIGN_IN_GRACE_MS,
+      );
+      if (refusal !== null) {
+        connections.closeConnection(
+          deviceId,
+          context.connectionId,
+          refusal,
+          log,
+        );
+      } else if (at - seenAt >= LAST_SEEN_INTERVAL_MS) {
+        seen.push(context);
+      }
+    }
+    if (seen.length > 0) {
+      await markDevicesSeen(database, {
+        deviceIds: seen.map((context) => context.identity.deviceId),
+        now: new Date(at),
+      });
+      for (const context of seen) {
+        connections.markSeen(context, at);
+      }
+    }
+  } catch (error) {
+    log.error({ err: error }, "connection sweep failed");
   }
 }
 
@@ -541,7 +755,9 @@ export type GatewayOptions = Readonly<{
  * that `decodeClientEvent` accepts and `bindIdentity` binds to the
  * connection; events go to `onEvent` one after another, in the order they
  * arrived. Anything else closes the connection. No authentication frame,
- * nonce, or signature is logged.
+ * nonce, or signature is logged. Every 60 seconds `sweepConnections`
+ * re-checks the live connections; a tick while the previous sweep still
+ * runs is skipped.
  */
 export function registerGateway(
   app: FastifyInstance,
@@ -550,6 +766,27 @@ export function registerGateway(
   const { connections, database, now, publicOrigin } = options;
   const replacementAudits = new AuditThrottle(CONNECTION_AUDIT_WINDOW_MS, now);
   const mismatchAudits = new AuditThrottle(CONNECTION_AUDIT_WINDOW_MS, now);
+
+  /** The sweep that runs, if any. */
+  let sweeping: Promise<void> | null = null;
+  const sweeper = setInterval(() => {
+    if (sweeping === null) {
+      sweeping = sweepConnections({
+        connections,
+        database,
+        now,
+        log: app.log,
+      }).finally(() => {
+        sweeping = null;
+      });
+    }
+  }, CONNECTION_SWEEP_INTERVAL_MS);
+  sweeper.unref();
+  app.addHook("onClose", async () => {
+    clearInterval(sweeper);
+    // The database closes after this hook, so a running sweep ends first.
+    await sweeping;
+  });
 
   /** Audits a replacement at most once per device per hour and logs the rest with a count. */
   async function recordReplacement(
@@ -719,7 +956,7 @@ export function registerGateway(
           signedInAt,
         });
         context = authenticated;
-        const replaced = connections.register(socket, authenticated);
+        const replaced = connections.register(socket, authenticated, at);
         if (replaced !== null) {
           await recordReplacement(authenticated, replaced, log);
         }
@@ -748,6 +985,7 @@ export function registerGateway(
           ).toISOString(),
         };
         socket.send(JSON.stringify(ok));
+        connections.confirm(authenticated);
         log.info({ userId: row.userId, deviceId }, "connection authenticated");
       }
 

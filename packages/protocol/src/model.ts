@@ -300,6 +300,15 @@ export type WsCloseReason = keyof typeof WS_CLOSE_CODES;
 export const SIGN_IN_LIFETIME_MS = 30 * 24 * 60 * 60_000;
 
 /**
+ * How long an open connection may outlive its device's sign-in (ADR 0014,
+ * "Lifetimes"). From the expiry on, a new connection is refused; one that
+ * authenticated before it stays open for this long. The server's sweep, which
+ * runs every 60 seconds, then closes it with `sign_in_required` at its first
+ * run after the grace, so up to one sweep interval later.
+ */
+export const SIGN_IN_GRACE_MS = 24 * 60 * 60_000;
+
+/**
  * Human-entered text: rejects control, format (including bidirectional and tag
  * characters), surrogate, private-use, line and paragraph separator, and
  * default-ignorable characters. ZWNJ, ZWJ and the two emoji variation

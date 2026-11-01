@@ -8,13 +8,17 @@ import {
   auditEvents,
 } from "@mymandev/database";
 import {
+  type AccountDeviceRegisteredFrame,
+  type AccountDeviceRevokedFrame,
   AUTH_ROUTES,
   type DeviceId,
+  type DeviceListItem,
   type DeviceRegistration,
   displayText,
   LIMITS,
   newId,
   newUuidV7,
+  PROTOCOL_VERSION,
   SIGN_IN_LIFETIME_MS,
   type SignInRequest,
   SignInRequestSchema,
@@ -24,9 +28,11 @@ import {
 import { and, count, eq, gt, isNull, min, ne } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import { ApiError } from "../errors.ts";
+import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
 import { s256, type SignInCodes } from "./attempts.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
+import { deviceListItem } from "./device-state.ts";
 import type { GitHubIdentity } from "./github-api.ts";
 import type { AccessTokens } from "./tokens.ts";
 
@@ -45,11 +51,19 @@ export type SignInRouteOptions = Readonly<{
   database: Database;
   codes: SignInCodes;
   tokens: AccessTokens;
+  /**
+   * The open WebSocket connections: after a sign-in commits, a connection
+   * with the replaced key or of a replaced device closes, and the account's
+   * other connections hear of a registered or a revoked device.
+   */
+  connections: ConnectionRegistry;
   now: () => number;
 }>;
 
 type SignInResult = Readonly<{
   response: SignInResponse;
+  /** The device that this sign-in registered, or null when it replaced an existing device's key. */
+  registered: DeviceListItem | null;
   /** The previous device that this sign-in revoked as replaced, if any. */
   replacedDeviceId: DeviceId | null;
 }>;
@@ -100,7 +114,7 @@ export async function registerSignIn(
   app: FastifyInstance,
   options: SignInRouteOptions,
 ): Promise<void> {
-  const { database, codes, tokens, publicOrigin } = options;
+  const { database, codes, tokens, connections, publicOrigin } = options;
 
   await app.register(async (scope) => {
     scope.setValidatorCompiler(zodValidatorCompiler);
@@ -154,11 +168,39 @@ export async function registerSignIn(
           // A concurrent sign-in of the same account or the same key.
           throw failure.code === "23505" ? new ApiError("conflict") : failure;
         }
+        const { userId, deviceId } = result.response;
+        const replaced = result.replacedDeviceId;
         // The earlier tokens of the device would be refused anyway; dropping
         // them keeps them from using up the account's request limit.
-        tokens.dropDevice(result.response.deviceId);
-        if (result.replacedDeviceId !== null) {
-          tokens.dropDevice(result.replacedDeviceId);
+        tokens.dropDevice(deviceId);
+        if (replaced !== null) {
+          tokens.dropDevice(replaced);
+          // The replaced device learns it from its close, before any frame.
+          connections.closeDevice(replaced, "device_revoked", request.log);
+        }
+        if (result.registered === null) {
+          // An existing device: its connection used the key that this
+          // sign-in replaced.
+          connections.closeDevice(deviceId, "key_replaced", request.log);
+        } else {
+          // The new device has no connection yet; the account's other
+          // connections hear of it and of the device it replaced.
+          const registered: AccountDeviceRegisteredFrame = {
+            protocolVersion: PROTOCOL_VERSION,
+            type: "account.device_registered",
+            device: { ...result.registered, revokedAt: null, current: false },
+          };
+          connections.sendToUser(userId, registered, deviceId);
+          if (replaced !== null) {
+            const revoked: AccountDeviceRevokedFrame = {
+              protocolVersion: PROTOCOL_VERSION,
+              type: "account.device_revoked",
+              deviceId: replaced,
+              reason: "replaced",
+              revokedAt: now.toISOString(),
+            };
+            connections.sendToUser(userId, revoked, replaced);
+          }
         }
         return result.response;
       },
@@ -187,6 +229,7 @@ async function signIn(
   }
 
   let deviceId: DeviceId;
+  let registered: DeviceListItem | null = null;
   let replacedDeviceId: DeviceId | null = null;
   if (device.kind === "existing") {
     const [row] = await tx
@@ -262,7 +305,7 @@ async function signIn(
       });
     }
     deviceId = newId<DeviceId>();
-    await tx.insert(devices).values({
+    const row = {
       id: deviceId,
       userId,
       label: device.label,
@@ -272,12 +315,17 @@ async function signIn(
       createdAt: now,
       updatedAt: now,
       lastSignInAt: now,
-    });
+    };
+    await tx.insert(devices).values(row);
+    registered = deviceListItem(
+      { ...row, lastSeenAt: null, revokedAt: null },
+      false,
+    );
     await audit(tx, "device.registered", userId, deviceId, deviceId, now);
     if (device.previousDeviceId !== undefined) {
       // Revoked only if it belongs to the same account (ADR 0014, step 8).
-      // Closing its socket and sending the run events for the result waits
-      // for the gateway's connection registry (#89).
+      // After the commit, the route closes its socket; sending the runs that
+      // the revocation cancelled waits for the workspace delivery (#110).
       const replaced = await revokeDevice(tx, {
         deviceId: device.previousDeviceId,
         userId,
@@ -303,6 +351,7 @@ async function signIn(
         now.getTime() + SIGN_IN_LIFETIME_MS,
       ).toISOString(),
     },
+    registered,
     replacedDeviceId,
   };
 }

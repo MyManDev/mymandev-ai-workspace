@@ -2,6 +2,7 @@ import {
   auditEvents,
   type Database,
   devices,
+  disableAccount,
   revokeDevice,
   users,
   workspaceMembers,
@@ -17,6 +18,7 @@ import {
   type MemberId,
   newId,
   type RunId,
+  SIGN_IN_GRACE_MS,
   SIGN_IN_LIFETIME_MS,
   type UnverifiedEvent,
   type UserId,
@@ -30,9 +32,8 @@ import type { FastifyInstance } from "fastify";
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
-import { connect as connectTcp, type Socket } from "node:net";
+import { connect as connectTcp } from "node:net";
 import { test, type TestContext } from "node:test";
-import type { WebSocket } from "ws";
 import { buildApp } from "./app.ts";
 import {
   CLIENT_ID,
@@ -40,7 +41,6 @@ import {
   deviceApp,
   type DeviceAppOptions,
   fakeClock,
-  type Key,
   newKey,
   ORIGIN,
   signInAgain,
@@ -51,17 +51,37 @@ import {
 } from "./auth/device-test-support.ts";
 import { loadConfig } from "./config.ts";
 import {
+  authenticate,
+  authResponse,
+  challengeOf,
+  type Client,
+  type Closed,
+  closedWith,
+  connect,
+  connected,
+  loggedCloses,
+  nextFrame,
+  settle,
+  signedResponse,
+  until,
+  wsInput,
+} from "./gateway-test-support.ts";
+import {
+  type AccountFrame,
   AuditThrottle,
   type AuthenticatedConnectionContext,
   bindIdentity,
   type BindIdentityDependencies,
   CloseCode,
   CONNECTION_AUDIT_WINDOW_MS,
+  CONNECTION_SWEEP_INTERVAL_MS,
   ConnectionRegistry,
   type ConnectionIdentity,
   type EventHandler,
+  LAST_SEEN_INTERVAL_MS,
   MAX_UNAUTHENTICATED_CONNECTIONS,
   REFUSED_CLOSE_GRACE_MS,
+  sweepConnections,
   UNAUTHENTICATED_PLACE_SECONDS,
   type VerifiedEvent,
 } from "./gateway.ts";
@@ -76,7 +96,6 @@ const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
 
 type Json = Record<string, unknown>;
-type Closed = Readonly<{ code: number; reason: string }>;
 type Received = Readonly<{
   event: VerifiedEvent;
   context: AuthenticatedConnectionContext;
@@ -106,158 +125,6 @@ async function gatewayApp(
   // injectWS never settles unless the app is ready.
   await app.ready();
   return { app, received };
-}
-
-/** Waits until the check passes; fails after two seconds. */
-async function until(check: () => boolean | Promise<boolean>, label: string) {
-  const deadline = Date.now() + 2_000;
-  while (!(await check())) {
-    assert.ok(Date.now() < deadline, `timed out waiting for ${label}`);
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
-type Client = Readonly<{
-  ws: WebSocket;
-  /** The next message from the server, parsed; rejects when the connection closes first. */
-  next: () => Promise<unknown>;
-  closed: Promise<Closed>;
-  send: (frame: unknown) => void;
-}>;
-
-/**
- * Opens a WebSocket on the app. The listeners are attached before the
- * connection opens, so the server's first frame is never missed.
- */
-async function connect(
-  t: TestContext,
-  app: FastifyInstance,
-  options: Readonly<{
-    headers?: Record<string, string>;
-    path?: string;
-    /** The remote address that the per-address limit counts; injectWS has none otherwise. */
-    remoteAddress?: string;
-  }> = {},
-): Promise<Client> {
-  const messages: unknown[] = [];
-  const waiting: Array<{
-    resolve: (message: unknown) => void;
-    reject: (error: Error) => void;
-  }> = [];
-  const closed = Promise.withResolvers<Closed>();
-  let closeResult: Closed | null = null;
-  const ws = await app.injectWS(
-    options.path ?? "/ws",
-    {
-      headers: options.headers ?? {},
-      ...(options.remoteAddress === undefined
-        ? {}
-        : { socket: { remoteAddress: options.remoteAddress } as Socket }),
-    },
-    {
-      onInit: (socket) => {
-        socket.on("message", (data) => {
-          const message: unknown = JSON.parse(String(data));
-          const waiter = waiting.shift();
-          if (waiter === undefined) {
-            messages.push(message);
-          } else {
-            waiter.resolve(message);
-          }
-        });
-        socket.on("close", (code, reason) => {
-          closeResult = { code, reason: reason.toString() };
-          closed.resolve(closeResult);
-          for (const waiter of waiting.splice(0)) {
-            waiter.reject(new Error(`closed with ${code}`));
-          }
-        });
-      },
-    },
-  );
-  t.after(() => ws.terminate());
-  return {
-    ws,
-    next: () => {
-      if (messages.length > 0) {
-        return Promise.resolve(messages.shift());
-      }
-      if (closeResult !== null) {
-        return Promise.reject(new Error(`closed with ${closeResult.code}`));
-      }
-      return new Promise((resolve, reject) => {
-        waiting.push({ resolve, reject });
-      });
-    },
-    closed: closed.promise,
-    send: (frame) => {
-      ws.send(
-        typeof frame === "string" || Buffer.isBuffer(frame)
-          ? frame
-          : JSON.stringify(frame),
-      );
-    },
-  };
-}
-
-/** Reads the server's auth.challenge, checking it with the device's decoder. */
-async function challengeOf(client: Client): Promise<AuthChallengeFrame> {
-  const decoded = decodeServerMessage(await client.next());
-  assert.ok(
-    decoded.ok &&
-      decoded.kind === "frame" &&
-      decoded.frame.type === "auth.challenge",
-    JSON.stringify(decoded),
-  );
-  return decoded.frame;
-}
-
-type DeviceKey = Readonly<{ deviceId: string; key: Key }>;
-
-/** The `ws` input that the device signs for a challenge. */
-function wsInput(deviceId: string, challenge: AuthChallengeFrame) {
-  return {
-    purpose: "ws",
-    audience: ORIGIN,
-    nonce: challenge.nonce,
-    deviceId,
-    connectionId: challenge.connectionId,
-  } as const;
-}
-
-function authResponse(deviceId: string, signature: string): Json {
-  return { protocolVersion: 0, type: "auth.response", deviceId, signature };
-}
-
-/** The correctly signed auth.response for a challenge. */
-function signedResponse(device: DeviceKey, challenge: AuthChallengeFrame) {
-  return authResponse(
-    device.deviceId,
-    signInput(device.key, wsInput(device.deviceId, challenge)),
-  );
-}
-
-/** Answers the challenge as the desktop does and returns auth.ok. */
-async function authenticate(client: Client, device: DeviceKey) {
-  const challenge = await challengeOf(client);
-  client.send(signedResponse(device, challenge));
-  const decoded = decodeServerMessage(await client.next());
-  assert.ok(
-    decoded.ok && decoded.kind === "frame" && decoded.frame.type === "auth.ok",
-    JSON.stringify(decoded),
-  );
-  return { challenge, ok: decoded.frame };
-}
-
-/** Opens a connection and authenticates it. */
-async function connected(
-  t: TestContext,
-  app: FastifyInstance,
-  device: DeviceKey,
-) {
-  const client = await connect(t, app);
-  const { challenge } = await authenticate(client, device);
-  return { client, connectionId: challenge.connectionId };
 }
 
 /** A run transition that the agent's host device reports. */
@@ -315,10 +182,6 @@ async function auditsOf(
         eq(auditEvents.actorDeviceId, deviceId as DeviceId),
       ),
     );
-}
-
-function closedWith(reason: keyof typeof WS_CLOSE_CODES): Closed {
-  return { code: WS_CLOSE_CODES[reason], reason };
 }
 
 test("auth.challenge, auth.response, and auth.ok authenticate a device; auth.ok writes last_seen_at; an event then reaches onEvent with the frozen context", async (t) => {
@@ -379,13 +242,6 @@ test("auth.challenge, auth.response, and auth.ok authenticate a device; auth.ok 
   assert.ok(Object.isFrozen(first.context.identity));
   assert.deepEqual(connections.connectionOf(device.deviceId), first.context);
 });
-
-/** Lets pending I/O between the test client and the server run. */
-async function settle() {
-  for (let round = 0; round < 10; round += 1) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-}
 
 test("without auth.response, the connection closes with auth_timeout after 10 seconds", async (t) => {
   const { app } = await gatewayApp(t, { githubId: 3002 });
@@ -1075,15 +931,26 @@ test("closeDevice and closeUser close live connections with the given reason", a
   assert.equal(connections.liveCount, 3);
 
   assert.equal(
-    connections.closeDevice(laptop.deviceId as DeviceId, "device_revoked"),
+    connections.closeDevice(
+      laptop.deviceId as DeviceId,
+      "device_revoked",
+      app.log,
+    ),
     true,
   );
   assert.deepEqual(await first.client.closed, closedWith("device_revoked"));
   assert.equal(
-    connections.closeDevice(laptop.deviceId as DeviceId, "device_revoked"),
+    connections.closeDevice(
+      laptop.deviceId as DeviceId,
+      "device_revoked",
+      app.log,
+    ),
     false,
   );
-  assert.equal(connections.closeUser(desktop.userId, "sign_in_required"), 1);
+  assert.equal(
+    connections.closeUser(desktop.userId, "sign_in_required", app.log),
+    1,
+  );
   assert.deepEqual(await second.client.closed, closedWith("sign_in_required"));
   assert.equal(third.client.ws.readyState, third.client.ws.OPEN);
   assert.equal(connections.liveCount, 1);
@@ -1217,7 +1084,8 @@ type QueryKind = "select" | "update";
  * Wraps the test database. After `interceptNext(kind, table, before)`, the
  * next query that starts with `update(table)` or `select(...).from(table)`,
  * as `kind` says, waits for `before` first: a change that commits while the
- * gateway is between two of its steps.
+ * gateway is between two of its steps. `started(kind, table)` counts the
+ * queries that started so far, subqueries included.
  */
 function interceptingDatabase(target: Database) {
   let hook: Readonly<{
@@ -1225,7 +1093,9 @@ function interceptingDatabase(target: Database) {
     table: unknown;
     before: () => Promise<unknown>;
   }> | null = null;
+  const queries: Array<Readonly<{ kind: QueryKind; table: unknown }>> = [];
   const take = (kind: QueryKind, table: unknown) => {
+    queries.push({ kind, table });
     if (hook === null || hook.kind !== kind || hook.table !== table) {
       return null;
     }
@@ -1282,6 +1152,9 @@ function interceptingDatabase(target: Database) {
     ) => {
       hook = { kind, table, before };
     },
+    started: (kind: QueryKind, table: unknown) =>
+      queries.filter((query) => query.kind === kind && query.table === table)
+        .length,
   };
 }
 
@@ -1385,13 +1258,16 @@ test("every event re-checks the device: a newer sign-in gets key_replaced, a dis
     expected: keyof typeof WS_CLOSE_CODES,
     change: (device: SignedInDevice) => Promise<unknown>,
   ][] = [
+    // The rows change directly: a sign-in or a sign-out over HTTP would
+    // close the connection before the event.
     [
       "a new sign-in replaced the key",
       "key_replaced",
-      async (d) => {
-        clock.advance(1_000);
-        await signInAgain(app, d);
-      },
+      (d) =>
+        database()
+          .update(devices)
+          .set({ lastSignInAt: new Date(clock.now() + 1_000) })
+          .where(eq(devices.id, d.deviceId)),
     ],
     [
       "disabled",
@@ -1426,6 +1302,8 @@ test("every event re-checks the device: a newer sign-in gets key_replaced, a dis
     const workspaceId = await workspaceOf(device.userId);
     const { client } = await connected(t, app, device);
     await change(device);
+    await settle();
+    assert.equal(client.ws.readyState, client.ws.OPEN, label);
     client.send(runEvent(workspaceId, device.deviceId));
     assert.deepEqual(await client.closed, closedWith(expected), label);
     await database()
@@ -1435,7 +1313,8 @@ test("every event re-checks the device: a newer sign-in gets key_replaced, a dis
   }
   assert.equal(received.length, 0);
 
-  // An open connection outlives the 30 days; the sweep of part B closes it.
+  // An open connection outlives the 30 days; the sweep closes it 24 hours
+  // later (see the sweep's test).
   const device = await signInDevice(app);
   const workspaceId = await workspaceOf(device.userId);
   const { client } = await connected(t, app, device);
@@ -1633,7 +1512,11 @@ test("an event in flight on a connection that is replaced or closed meanwhile is
   // closeDevice closes the newer one while its event checks membership.
   assert.ok(newer);
   intercepting.interceptNext("select", workspaceMembers, async () => {
-    connections.closeDevice(device.deviceId as DeviceId, "sign_in_required");
+    connections.closeDevice(
+      device.deviceId as DeviceId,
+      "sign_in_required",
+      app.log,
+    );
   });
   newer.client.send(runEvent(workspaceId, device.deviceId));
   assert.deepEqual(await newer.client.closed, closedWith("sign_in_required"));
@@ -1793,4 +1676,555 @@ test("the gateway awaits an asynchronous event handler before the next event, an
   for (const line of logLines) {
     assert.equal(line.includes(secret), false, line);
   }
+});
+
+/** Runs one sweep of the registry against the database, as the gateway's interval does. */
+function sweeper(
+  app: FastifyInstance,
+  connections: ConnectionRegistry,
+  db: Database,
+  now: () => number,
+) {
+  return () =>
+    sweepConnections({ connections, database: db, now, log: app.log });
+}
+
+test("one sweep re-checks every live device with one query and closes a revoked device, a replaced key, a disabled account, a sign-out, and a later sign_in_required_at with their codes", async (t) => {
+  const clock = fakeClock();
+  const logLines: string[] = [];
+  const connections = new ConnectionRegistry();
+  const intercepting = interceptingDatabase(database());
+  const appOf = async (githubId: number) =>
+    (
+      await gatewayApp(t, {
+        githubId,
+        now: clock.now,
+        connections,
+        database: intercepting.database,
+        logLines,
+      })
+    ).app;
+  const app = await appOf(3026);
+  const disabledApp = await appOf(3027);
+  const requiredApp = await appOf(3028);
+  const revoked = await signInDevice(app);
+  const replaced = await signInDevice(app);
+  const signedOut = await signInDevice(app);
+  const untouched = await signInDevice(app);
+  const disabled = await signInDevice(disabledApp);
+  const required = await signInDevice(requiredApp);
+  const devicesOnApps: [SignedInDevice, FastifyInstance][] = [
+    [revoked, app],
+    [replaced, app],
+    [signedOut, app],
+    [untouched, app],
+    [disabled, disabledApp],
+    [required, requiredApp],
+  ];
+  const sockets = new Map<
+    SignedInDevice,
+    Awaited<ReturnType<typeof connected>>
+  >();
+  for (const [device, deviceApp] of devicesOnApps) {
+    sockets.set(device, await connected(t, deviceApp, device));
+  }
+  const socketOf = (device: SignedInDevice) => {
+    const socket = sockets.get(device);
+    assert.ok(socket);
+    return socket;
+  };
+  const clientOf = (device: SignedInDevice): Client => socketOf(device).client;
+
+  // Changes that no close hook of this API sees: the operator command, or a
+  // change that another process committed.
+  await revokeDevice(database(), {
+    deviceId: revoked.deviceId,
+    userId: revoked.userId,
+    reason: "removed",
+    now: new Date(clock.now()),
+    actorUserId: null,
+    actorDeviceId: null,
+  });
+  await database()
+    .update(devices)
+    .set({ lastSignInAt: new Date(clock.now() + 1_000) })
+    .where(eq(devices.id, replaced.deviceId));
+  await database()
+    .update(devices)
+    .set({ signedOutAt: new Date(clock.now()) })
+    .where(eq(devices.id, signedOut.deviceId));
+  await disableAccount(database(), {
+    userId: disabled.userId,
+    now: new Date(clock.now()),
+  });
+  await database()
+    .update(users)
+    .set({ signInRequiredAt: new Date(clock.now() + 1_000) })
+    .where(eq(users.id, required.userId));
+  await settle();
+  assert.equal(connections.liveCount, 6, "nothing closes before the sweep");
+
+  const selects = intercepting.started("select", devices);
+  await sweeper(app, connections, intercepting.database, clock.now)();
+  assert.equal(
+    intercepting.started("select", devices) - selects,
+    1,
+    "one query for every live device",
+  );
+  const expected: [SignedInDevice, keyof typeof WS_CLOSE_CODES][] = [
+    [revoked, "device_revoked"],
+    [replaced, "key_replaced"],
+    [signedOut, "sign_in_required"],
+    [disabled, "auth_failed"],
+    [required, "sign_in_required"],
+  ];
+  for (const [device, reason] of expected) {
+    assert.deepEqual(await clientOf(device).closed, closedWith(reason), reason);
+  }
+  assert.deepEqual(
+    loggedCloses(logLines),
+    expected.map(([device, code]) => ({
+      connectionId: socketOf(device).connectionId,
+      code,
+    })),
+    "each close is logged with its connection ID and code",
+  );
+  await settle();
+  assert.equal(clientOf(untouched).ws.readyState, clientOf(untouched).ws.OPEN);
+  assert.equal(connections.liveCount, 1);
+  assert.equal(
+    connections.connectionOf(untouched.deviceId as DeviceId)?.identity.deviceId,
+    untouched.deviceId,
+  );
+});
+
+test("an open connection outlives the 30-day sign-in by 24 hours; then the sweep closes it with sign_in_required", async (t) => {
+  const clock = fakeClock();
+  const connections = new ConnectionRegistry();
+  const { app } = await gatewayApp(t, {
+    githubId: 3029,
+    now: clock.now,
+    connections,
+  });
+  const device = await signInDevice(app);
+  const { client } = await connected(t, app, device);
+  const sweep = sweeper(app, connections, database(), clock.now);
+
+  clock.advance(SIGN_IN_LIFETIME_MS + SIGN_IN_GRACE_MS - HOUR_MS);
+  await sweep();
+  await settle();
+  assert.equal(client.ws.readyState, client.ws.OPEN, "30 days and 23 hours");
+  clock.advance(HOUR_MS - 1);
+  await sweep();
+  await settle();
+  assert.equal(
+    client.ws.readyState,
+    client.ws.OPEN,
+    "1 ms before the grace ends",
+  );
+
+  clock.advance(1);
+  await sweep();
+  assert.deepEqual(await client.closed, closedWith("sign_in_required"));
+  assert.equal(connections.liveCount, 0);
+  assert.equal(SIGN_IN_GRACE_MS, 24 * HOUR_MS);
+});
+
+test("the sweep writes last_seen_at at most every 5 minutes per device, for every due device in one update", async (t) => {
+  const clock = fakeClock();
+  const connections = new ConnectionRegistry();
+  const intercepting = interceptingDatabase(database());
+  const { app } = await gatewayApp(t, {
+    githubId: 3030,
+    now: clock.now,
+    connections,
+    database: intercepting.database,
+  });
+  const first = await signInDevice(app);
+  const second = await signInDevice(app);
+  const start = clock.now();
+  await connected(t, app, first);
+  clock.advance(60_000);
+  await connected(t, app, second);
+  const sweep = sweeper(app, connections, intercepting.database, clock.now);
+  const lastSeen = async () => {
+    const seen: number[] = [];
+    for (const device of [first, second]) {
+      const [row] = await database()
+        .select({ lastSeenAt: devices.lastSeenAt })
+        .from(devices)
+        .where(eq(devices.id, device.deviceId));
+      seen.push(row?.lastSeenAt?.getTime() ?? 0);
+    }
+    return seen;
+  };
+  /** Sweeps and returns how many updates of devices it started. */
+  const sweepCountingUpdates = async () => {
+    const before = intercepting.started("update", devices);
+    await sweep();
+    return intercepting.started("update", devices) - before;
+  };
+  const minutes = (count: number) => start + count * 60_000;
+  assert.deepEqual(await lastSeen(), [minutes(0), minutes(1)], "auth.ok");
+
+  clock.advance(LAST_SEEN_INTERVAL_MS - 60_000 - 1);
+  assert.equal(await sweepCountingUpdates(), 0, "nothing is due yet");
+  assert.deepEqual(await lastSeen(), [minutes(0), minutes(1)]);
+
+  clock.advance(1);
+  assert.equal(await sweepCountingUpdates(), 1);
+  assert.deepEqual(await lastSeen(), [minutes(5), minutes(1)], "5 minutes");
+
+  clock.advance(60_000);
+  assert.equal(await sweepCountingUpdates(), 1);
+  assert.deepEqual(await lastSeen(), [minutes(5), minutes(6)]);
+
+  clock.advance(4 * 60_000 - 1);
+  assert.equal(await sweepCountingUpdates(), 0, "the first is 1 ms short");
+  clock.advance(60_000 + 1);
+  assert.equal(await sweepCountingUpdates(), 1, "one update for both devices");
+  assert.deepEqual(await lastSeen(), [minutes(11), minutes(11)]);
+  assert.equal(LAST_SEEN_INTERVAL_MS, 5 * 60_000);
+});
+
+test("a connection that registers while the sweep reads the devices is not closed by that sweep", async (t) => {
+  const clock = fakeClock();
+  const connections = new ConnectionRegistry();
+  const intercepting = interceptingDatabase(database());
+  const { app } = await gatewayApp(t, {
+    githubId: 3031,
+    now: clock.now,
+    connections,
+    database: intercepting.database,
+  });
+  const device = await signInDevice(app);
+  const older = await connected(t, app, device);
+  let newer: Awaited<ReturnType<typeof connected>> | undefined;
+  // A sign-in commits that the older connection's key no longer matches,
+  // and a newer connection of the device registers with the new row.
+  intercepting.interceptNext("select", devices, async () => {
+    await database()
+      .update(devices)
+      .set({ lastSignInAt: new Date(clock.now() + 1_000) })
+      .where(eq(devices.id, device.deviceId));
+    newer = await connected(t, app, device);
+  });
+  await sweeper(app, connections, intercepting.database, clock.now)();
+  assert.deepEqual(
+    await older.client.closed,
+    closedWith("connection_replaced"),
+  );
+  assert.ok(newer);
+  await settle();
+  assert.equal(newer.client.ws.readyState, newer.client.ws.OPEN);
+  assert.equal(
+    connections.connectionOf(device.deviceId as DeviceId)?.connectionId,
+    newer.connectionId,
+  );
+  // closeConnection closes only the connection that it names.
+  assert.equal(
+    connections.closeConnection(
+      device.deviceId as DeviceId,
+      older.connectionId,
+      "key_replaced",
+      app.log,
+    ),
+    false,
+  );
+  assert.equal(
+    connections.closeConnection(
+      device.deviceId as DeviceId,
+      newer.connectionId,
+      "device_revoked",
+      app.log,
+    ),
+    true,
+  );
+  assert.deepEqual(await newer.client.closed, closedWith("device_revoked"));
+});
+
+test("account frames reach only the account's other connections after auth.ok, never another account's, and decode as server frames", async (t) => {
+  const connections = new ConnectionRegistry();
+  const intercepting = interceptingDatabase(database());
+  const appOf = async (githubId: number) =>
+    (
+      await gatewayApp(t, {
+        githubId,
+        connections,
+        database: intercepting.database,
+      })
+    ).app;
+  const app = await appOf(3032);
+  const otherApp = await appOf(3033);
+  const laptop = await signInDevice(app);
+  const desktop = await signInDevice(app);
+  const tablet = await signInDevice(app);
+  const stranger = await signInDevice(otherApp);
+  const first = await connected(t, app, laptop);
+  const second = await connected(t, app, desktop);
+  const third = await connected(t, otherApp, stranger);
+  const revokedFrame = (deviceId: DeviceId): AccountFrame => ({
+    protocolVersion: 0,
+    type: "account.device_revoked",
+    deviceId,
+    reason: "removed",
+    revokedAt: "2026-11-01T12:00:00.000Z",
+  });
+
+  const toLaptop = revokedFrame(newId<DeviceId>());
+  assert.equal(
+    connections.sendToUser(
+      laptop.userId,
+      toLaptop,
+      desktop.deviceId as DeviceId,
+    ),
+    1,
+  );
+  assert.deepEqual(await nextFrame(first.client), toLaptop);
+  // The next frame of each other connection is its own, so the one above
+  // never reached it.
+  const toStranger = revokedFrame(newId<DeviceId>());
+  assert.equal(connections.sendToUser(stranger.userId, toStranger), 1);
+  assert.deepEqual(await nextFrame(third.client), toStranger);
+  const toDesktop = revokedFrame(newId<DeviceId>());
+  assert.equal(
+    connections.sendToUser(
+      laptop.userId,
+      toDesktop,
+      laptop.deviceId as DeviceId,
+    ),
+    1,
+  );
+  assert.deepEqual(await nextFrame(second.client), toDesktop);
+
+  // A connection that registered but has not got auth.ok yet gets nothing:
+  // the frame goes out while the gateway reads the device a second time.
+  const late = await connect(t, app);
+  const challenge = await challengeOf(late);
+  const during = revokedFrame(newId<DeviceId>());
+  let sentDuring = -1;
+  intercepting.interceptNext("update", devices, async () => {
+    intercepting.interceptNext("select", devices, async () => {
+      sentDuring = connections.sendToUser(laptop.userId, during);
+    });
+  });
+  late.send(signedResponse(tablet, challenge));
+  const ok = await nextFrame(late);
+  assert.equal(ok.type, "auth.ok");
+  assert.equal(sentDuring, 2, "the laptop and the desktop, not the tablet");
+  assert.deepEqual(await nextFrame(first.client), during);
+  assert.deepEqual(await nextFrame(second.client), during);
+  const after = revokedFrame(newId<DeviceId>());
+  assert.equal(connections.sendToUser(laptop.userId, after), 3);
+  for (const client of [first.client, second.client, late]) {
+    assert.deepEqual(await nextFrame(client), after);
+  }
+  await settle();
+  for (const client of [first.client, second.client, third.client, late]) {
+    assert.equal(client.unread(), 0);
+  }
+});
+
+/**
+ * Builds a gateway app while setInterval and clearInterval are spied on and
+ * returns the sweep interval that the gateway registered: its tick, and
+ * whether it was cleared. Other intervals in the process do not matter.
+ */
+async function sweepTimerApp(
+  t: TestContext,
+  options: Parameters<typeof gatewayApp>[1],
+) {
+  const setIntervalSpy = t.mock.method(globalThis, "setInterval");
+  const clearIntervalSpy = t.mock.method(globalThis, "clearInterval");
+  const built = await gatewayApp(t, options);
+  const sweeps = setIntervalSpy.mock.calls.filter(
+    (call) =>
+      call.arguments[1] === CONNECTION_SWEEP_INTERVAL_MS &&
+      /[/\\]gateway\.ts:/u.test(call.stack.stack ?? ""),
+  );
+  assert.equal(sweeps.length, 1, "the gateway registers one sweep interval");
+  const [sweep] = sweeps;
+  assert.ok(sweep);
+  return {
+    ...built,
+    tick: sweep.arguments[0] as () => void,
+    cleared: () =>
+      clearIntervalSpy.mock.calls.some(
+        (call) => call.arguments[0] === sweep.result,
+      ),
+  };
+}
+
+test("the gateway sweeps every 60 seconds, skips a tick while a sweep runs, and clears its interval when the app closes", async (t) => {
+  const connections = new ConnectionRegistry();
+  const intercepting = interceptingDatabase(database());
+  const { app, tick, cleared } = await sweepTimerApp(t, {
+    githubId: 3034,
+    connections,
+    database: intercepting.database,
+  });
+
+  const kept = await signInDevice(app);
+  const removed = await signInDevice(app);
+  await connected(t, app, kept);
+  const { client } = await connected(t, app, removed);
+  await database()
+    .update(devices)
+    .set({ revokedAt: new Date(), revocationReason: "removed" })
+    .where(eq(devices.id, removed.deviceId));
+  const release = Promise.withResolvers<void>();
+  intercepting.interceptNext("select", devices, () => release.promise);
+  const selects = intercepting.started("select", devices);
+  tick();
+  tick();
+  assert.equal(
+    intercepting.started("select", devices) - selects,
+    1,
+    "the second tick is skipped",
+  );
+  release.resolve();
+  assert.deepEqual(await client.closed, closedWith("device_revoked"));
+  await settle();
+  tick();
+  assert.equal(
+    intercepting.started("select", devices) - selects,
+    2,
+    "a tick after the sweep ended runs",
+  );
+
+  assert.equal(cleared(), false);
+  await app.close();
+  assert.ok(cleared(), "the interval is cleared");
+});
+
+test("closing the app waits for a running sweep", async (t) => {
+  const connections = new ConnectionRegistry();
+  const intercepting = interceptingDatabase(database());
+  const { app, tick, cleared } = await sweepTimerApp(t, {
+    githubId: 3035,
+    connections,
+    database: intercepting.database,
+  });
+  const device = await signInDevice(app);
+  await connected(t, app, device);
+  const release = Promise.withResolvers<void>();
+  intercepting.interceptNext("select", devices, () => release.promise);
+  tick();
+
+  let closed = false;
+  const closing = app.close().then(() => {
+    closed = true;
+  });
+  await until(cleared, "the gateway's onClose hook");
+  await settle();
+  assert.equal(closed, false, "close waits while the sweep's query runs");
+  release.resolve();
+  await closing;
+  assert.equal(closed, true);
+});
+
+test("a sweep whose query fails logs the code without SQL, closes and sends nothing, and the next tick sweeps again", async (t) => {
+  const logLines: string[] = [];
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandled);
+  t.after(() => {
+    process.off("unhandledRejection", onUnhandled);
+  });
+  const connections = new ConnectionRegistry();
+  const intercepting = interceptingDatabase(database());
+  const { app, tick } = await sweepTimerApp(t, {
+    githubId: 3036,
+    connections,
+    database: intercepting.database,
+    logLines,
+  });
+  const kept = await signInDevice(app);
+  const removed = await signInDevice(app);
+  const keptSocket = await connected(t, app, kept);
+  const removedSocket = await connected(t, app, removed);
+  await database()
+    .update(devices)
+    .set({ revokedAt: new Date(), revocationReason: "removed" })
+    .where(eq(devices.id, removed.deviceId));
+
+  // A driver error carries the SQL text and its parameters.
+  const secret = "SECRET_SWEEP_PARAMETER";
+  intercepting.interceptNext("select", devices, () =>
+    Promise.reject(
+      Object.assign(new Error(`select failed for ${secret}`), {
+        code: "57P01",
+        query: `select "id" from "devices" where "id" in ('${secret}')`,
+        params: [secret],
+      }),
+    ),
+  );
+  tick();
+  await until(
+    () => logLines.some((line) => line.includes('"connection sweep failed"')),
+    "the failure in the log",
+  );
+  const failures = logLines
+    .map((line) => JSON.parse(line) as Json)
+    .filter((entry) => entry.msg === "connection sweep failed");
+  assert.equal(failures.length, 1);
+  const err = failures[0]?.err as Json | undefined;
+  assert.deepEqual(
+    { level: failures[0]?.level, type: err?.type, code: err?.code },
+    { level: 50, type: "DatabaseError", code: "57P01" },
+  );
+  for (const line of logLines) {
+    assert.equal(line.includes(secret), false, line);
+    assert.equal(line.includes("select "), false, line);
+  }
+  await settle();
+  assert.deepEqual(unhandled, []);
+  for (const socket of [keptSocket, removedSocket]) {
+    assert.equal(socket.client.ws.readyState, socket.client.ws.OPEN);
+    assert.equal(socket.client.unread(), 0);
+  }
+  assert.deepEqual(loggedCloses(logLines), []);
+
+  tick();
+  assert.deepEqual(
+    await removedSocket.client.closed,
+    closedWith("device_revoked"),
+  );
+  assert.deepEqual(loggedCloses(logLines), [
+    { connectionId: removedSocket.connectionId, code: "device_revoked" },
+  ]);
+  assert.equal(keptSocket.client.ws.readyState, keptSocket.client.ws.OPEN);
+  assert.deepEqual(unhandled, []);
+});
+
+test("sendToUser skips and does not count a live connection whose socket the server is closing", async (t) => {
+  const connections = new ConnectionRegistry();
+  const { app } = await gatewayApp(t, { githubId: 3037, connections });
+  const laptop = await signInDevice(app);
+  const desktop = await signInDevice(app);
+  const open = await connected(t, app, laptop);
+  const closing = await connected(t, app, desktop);
+  // A binary frame makes the server close the socket. An injectWS socket
+  // never reports its close to the server, so the connection stays in the
+  // registry with a socket that is no longer open.
+  closing.client.send(Buffer.from([1]));
+  assert.equal((await closing.client.closed).code, CloseCode.unsupportedData);
+  assert.notEqual(
+    connections.connectionOf(desktop.deviceId as DeviceId),
+    null,
+    "still in the registry",
+  );
+  const frame: AccountFrame = {
+    protocolVersion: 0,
+    type: "account.device_revoked",
+    deviceId: newId<DeviceId>(),
+    reason: "removed",
+    revokedAt: "2026-11-01T12:00:00.000Z",
+  };
+  assert.equal(connections.sendToUser(laptop.userId, frame), 1);
+  assert.deepEqual(await nextFrame(open.client), frame);
+  await settle();
+  assert.equal(closing.client.unread(), 0);
 });

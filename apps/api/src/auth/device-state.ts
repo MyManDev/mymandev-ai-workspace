@@ -1,10 +1,10 @@
-import { type Database, devices, users } from "@mymandev/database";
+import type { devices } from "@mymandev/database";
 import {
   type DeviceId,
+  type DeviceListItem,
   SIGN_IN_LIFETIME_MS,
   type UserId,
 } from "@mymandev/protocol";
-import { eq } from "drizzle-orm";
 
 /** Who an authenticated request comes from, and the sign-in its token belongs to. */
 export type AuthContext = Readonly<{
@@ -61,23 +61,38 @@ export function tokenUsable(
   return state.state === "ok" && state.userId === auth.userId;
 }
 
-/** The device with its current key and its account's state; undefined when the device does not exist. */
-export async function deviceRow(
-  database: Database,
-  deviceId: DeviceId,
-): Promise<(DeviceRow & { publicKey: string }) | undefined> {
-  const [row] = await database
-    .select({
-      userId: devices.userId,
-      publicKey: devices.publicKey,
-      revokedAt: devices.revokedAt,
-      signedOutAt: devices.signedOutAt,
-      lastSignInAt: devices.lastSignInAt,
-      disabledAt: users.disabledAt,
-      signInRequiredAt: users.signInRequiredAt,
-    })
-    .from(devices)
-    .innerJoin(users, eq(users.id, devices.userId))
-    .where(eq(devices.id, deviceId));
-  return row;
+/** The columns of a device that the device list shows. */
+export type ListedDevice = Pick<
+  typeof devices.$inferSelect,
+  | "id"
+  | "label"
+  | "platform"
+  | "createdAt"
+  | "lastSeenAt"
+  | "lastSignInAt"
+  | "revokedAt"
+>;
+
+/**
+ * One of the person's own devices as the device list shows it, with its
+ * sign-in expiry; `current` marks the device that asks. The frame
+ * `account.device_registered` carries the same item.
+ */
+export function deviceListItem(
+  row: ListedDevice,
+  current: boolean,
+): DeviceListItem {
+  return {
+    id: row.id,
+    label: row.label,
+    platform: row.platform,
+    createdAt: row.createdAt.toISOString(),
+    lastSeenAt: row.lastSeenAt?.toISOString() ?? null,
+    lastSignInAt: row.lastSignInAt.toISOString(),
+    signInExpiresAt: new Date(
+      row.lastSignInAt.getTime() + SIGN_IN_LIFETIME_MS,
+    ).toISOString(),
+    revokedAt: row.revokedAt?.toISOString() ?? null,
+    current,
+  };
 }

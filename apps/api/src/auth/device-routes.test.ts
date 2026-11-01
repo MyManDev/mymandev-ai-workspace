@@ -32,6 +32,14 @@ import { once } from "node:events";
 import { connect } from "node:net";
 import { test, type TestContext } from "node:test";
 import { ApiError } from "../errors.ts";
+import {
+  closedWith,
+  connected,
+  loggedCloses,
+  nextFrame,
+  settle,
+} from "../gateway-test-support.ts";
+import { ConnectionRegistry } from "../gateway.ts";
 import { lockActor } from "./device-routes.ts";
 import {
   deviceApp,
@@ -58,6 +66,7 @@ function tokenApp(
     githubId: number;
     now?: () => number;
     logLines?: string[];
+    connections?: ConnectionRegistry;
   }>,
 ): Promise<App> {
   return deviceApp(t, { database: database(), ...options });
@@ -629,6 +638,85 @@ test("revoking a device disables its agents, revokes their grants, cancels their
     { reason: "replaced" },
   );
   assert.equal(codeOf(badReason), "bad_request");
+});
+
+test("signing out closes the device's connection with sign_in_required at once and sends no frame", async (t) => {
+  const connections = new ConnectionRegistry();
+  const logLines: string[] = [];
+  const app = await tokenApp(t, { githubId: 2028, connections, logLines });
+  const device = await signInDevice(app);
+  const other = await signInDevice(app);
+  const own = await connected(t, app, device);
+  const others = await connected(t, app, other);
+  const response = await post(app, "/auth/sign-out", await token(app, device));
+  assert.equal(response.statusCode, 204);
+  assert.equal(
+    connections.connectionOf(device.deviceId),
+    null,
+    "closed before the answer",
+  );
+  assert.deepEqual(await own.client.closed, closedWith("sign_in_required"));
+  assert.deepEqual(loggedCloses(logLines), [
+    { connectionId: own.connectionId, code: "sign_in_required" },
+  ]);
+  await settle();
+  assert.equal(others.client.ws.readyState, others.client.ws.OPEN);
+  assert.equal(others.client.unread(), 0);
+});
+
+test("revoking a device closes its connection with device_revoked at once; only the account's other connections get account.device_revoked", async (t) => {
+  const connections = new ConnectionRegistry();
+  const logLines: string[] = [];
+  const app = await tokenApp(t, { githubId: 2029, connections, logLines });
+  const strangerApp = await tokenApp(t, { githubId: 2030, connections });
+  const removed = await signInDevice(app);
+  const current = await signInDevice(app);
+  const spare = await signInDevice(app);
+  const stranger = await signInDevice(strangerApp);
+  const removedSocket = await connected(t, app, removed);
+  const currentSocket = await connected(t, app, current);
+  const spareSocket = await connected(t, app, spare);
+  const strangerSocket = await connected(t, strangerApp, stranger);
+
+  const response = await post(
+    app,
+    `/devices/${removed.deviceId}/revoke`,
+    await token(app, current),
+    { reason: "removed" },
+  );
+  assert.equal(response.statusCode, 204);
+  assert.equal(
+    connections.connectionOf(removed.deviceId),
+    null,
+    "closed before the answer",
+  );
+  assert.deepEqual(
+    await removedSocket.client.closed,
+    closedWith("device_revoked"),
+  );
+  assert.equal(removedSocket.client.unread(), 0, "the revoked device");
+  assert.deepEqual(loggedCloses(logLines), [
+    { connectionId: removedSocket.connectionId, code: "device_revoked" },
+  ]);
+  const [row] = await database()
+    .select({ revokedAt: devices.revokedAt })
+    .from(devices)
+    .where(eq(devices.id, removed.deviceId));
+  const expected = {
+    protocolVersion: 0,
+    type: "account.device_revoked",
+    deviceId: removed.deviceId,
+    reason: "removed",
+    revokedAt: row?.revokedAt?.toISOString(),
+  };
+  assert.deepEqual(await nextFrame(currentSocket.client), expected);
+  assert.deepEqual(await nextFrame(spareSocket.client), expected);
+  await settle();
+  assert.equal(strangerSocket.client.unread(), 0, "another account");
+  assert.equal(
+    strangerSocket.client.ws.readyState,
+    strangerSocket.client.ws.OPEN,
+  );
 });
 
 test("a lost device locks new registrations for 7 days, existing devices keep working, and lifting ends the lock", async (t) => {
