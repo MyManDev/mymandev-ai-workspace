@@ -48,6 +48,7 @@ export {
   type CreateWorkspaceInput,
   type CreateWorkspaceResult,
   listWorkspaces,
+  OWNERSHIP_OFFER_LIFETIME_MS,
   workspaceView,
   type WorkspaceViewInput,
 } from "./membership.ts";
@@ -74,6 +75,18 @@ export {
   type RenameMemberInput,
   type RenameMemberResult,
 } from "./people.ts";
+export {
+  acceptOwnershipOffer,
+  type AcceptOwnershipOfferInput,
+  type AcceptOwnershipOfferResult,
+  type EndedOwnershipOffer,
+  offerOwnership,
+  type OfferOwnershipInput,
+  type OfferOwnershipResult,
+  withdrawOwnershipOffer,
+  type WithdrawOwnershipOfferInput,
+  type WithdrawOwnershipOfferResult,
+} from "./ownership.ts";
 export {
   acceptInvitation,
   type AcceptInvitationInput,

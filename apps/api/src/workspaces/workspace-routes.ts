@@ -30,6 +30,7 @@ import {
   registerJoinRequestRoutes,
   registerOwnJoinRequestRoutes,
 } from "./join-request-routes.ts";
+import { registerOwnershipRoutes } from "./ownership-routes.ts";
 import { registerPeopleRoutes } from "./people-routes.ts";
 
 export type WorkspaceRouteOptions = Readonly<{
@@ -38,13 +39,16 @@ export type WorkspaceRouteOptions = Readonly<{
   now: () => number;
   /**
    * Receives the membership events of the people routes, of accepting an
-   * invitation, and of approving a join request after the commit.
+   * ownership offer, of accepting an invitation, and of approving a join
+   * request after the commit.
    */
   onWorkspaceEvent: WorkspaceEventHandler;
   /**
    * Receives the account frames after the commit, for the account's open
-   * connections: a join request decision for the requester, and
-   * `account.removed_from_workspace` after a removal or a departure.
+   * connections: a join request decision for the requester,
+   * `account.removed_from_workspace` after a removal or a departure, and
+   * `account.ownership_offered` and `account.ownership_offer_ended` for the
+   * target of an ownership offer.
    */
   onAccountFrame: AccountFrameHandler;
   /**
@@ -153,6 +157,13 @@ export async function registerWorkspaceRoutes(
         onWorkspaceEvent: options.onWorkspaceEvent,
         onAccountFrame: options.onAccountFrame,
         connections: options.connections,
+      });
+
+      registerOwnershipRoutes(workspace, {
+        database,
+        now: options.now,
+        onWorkspaceEvent: options.onWorkspaceEvent,
+        onAccountFrame: options.onAccountFrame,
       });
 
       registerInvitationRoutes(workspace, { database, now: options.now });

@@ -30,8 +30,11 @@ import {
 const DAY_MS = 24 * 60 * 60_000;
 /** ADR 0014, "Limits". */
 const MAX_NEW_WORKSPACES_PER_DAY = 10;
-/** ADR 0014, "Lifetimes". */
-const OWNERSHIP_OFFER_LIFETIME_MS = 7 * DAY_MS;
+/**
+ * How long an ownership offer lives (ADR 0014, "Lifetimes"): an offer made
+ * this long before `now` or longer is no offer.
+ */
+export const OWNERSHIP_OFFER_LIFETIME_MS = 7 * DAY_MS;
 
 /** A person with the sign-in identity of the account that claimed it. */
 const memberColumns = {
