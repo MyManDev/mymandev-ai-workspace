@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   type AgentId,
+  type CorrelationId,
   type DeviceId,
   type MemberId,
   newId,
@@ -15,6 +17,7 @@ import {
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { eq, inArray } from "drizzle-orm";
+import { createDatabase } from "./client.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
 import {
@@ -50,6 +53,10 @@ const NOW = new Date("2026-10-30T12:00:00.000Z");
 const EARLIER = new Date("2026-10-29T12:00:00.000Z");
 
 type World = Readonly<{
+  workspace: WorkspaceId;
+  project: ProjectId;
+  repository: RepositoryId;
+  correlation: CorrelationId;
   alice: UserId;
   bob: UserId;
   aliceDevice: DeviceId;
@@ -195,7 +202,12 @@ async function seed(): Promise<World> {
   });
 
   const runs: Record<string, RunId> = {};
-  const run = async (label: string, agentId: AgentId, state: RunState) => {
+  const run = async (
+    label: string,
+    agentId: AgentId,
+    state: RunState,
+    fields: Partial<typeof agentRuns.$inferInsert> = {},
+  ) => {
     const id = newId<RunId>();
     const finished =
       state === "completed" || state === "failed" || state === "cancelled";
@@ -206,16 +218,25 @@ async function seed(): Promise<World> {
       requestedByUserId: alice,
       state,
       ...(finished ? { finishedAt: EARLIER } : {}),
+      ...fields,
     });
     runs[label] = id;
   };
+  const correlation = newId<CorrelationId>();
   await run("queued", aliceAgent, "queued");
-  await run("running", aliceAgent, "running");
+  await run("running", aliceAgent, "running", {
+    repositoryId: repository,
+    correlationId: correlation,
+  });
   await run("awaiting", aliceSecondAgent, "awaiting_input");
   await run("completed", aliceAgent, "completed");
   await run("bobRunning", bobAgent, "running");
 
   return {
+    workspace,
+    project,
+    repository,
+    correlation,
     alice,
     bob,
     aliceDevice,
@@ -246,10 +267,36 @@ test("revoking a device disables its agents, revokes its grants, cancels their u
     [world.aliceAgent, world.aliceSecondAgent].sort(),
   );
   assert.deepEqual(result.revokedGrantIds, [world.grants.onAliceDevice]);
+  // Each cancelled run with what its event needs, in the order of the run IDs.
+  const cancelled = (
+    label: string,
+    agentId: AgentId,
+    previousState: string,
+    fields: Partial<{
+      repositoryId: RepositoryId;
+      correlationId: CorrelationId;
+    }> = {},
+  ) => ({
+    runId: world.runs[label],
+    agentId,
+    projectId: world.project,
+    workspaceId: world.workspace,
+    repositoryId: fields.repositoryId ?? null,
+    correlationId: fields.correlationId ?? null,
+    previousState,
+  });
   assert.deepEqual(
-    [...result.cancelledRunIds].sort(),
-    [world.runs.queued, world.runs.running, world.runs.awaiting].sort(),
+    result.cancelledRuns,
+    [
+      cancelled("queued", world.aliceAgent, "queued"),
+      cancelled("running", world.aliceAgent, "running", {
+        repositoryId: world.repository,
+        correlationId: world.correlation,
+      }),
+      cancelled("awaiting", world.aliceSecondAgent, "awaiting_input"),
+    ].sort((a, b) => String(a.runId).localeCompare(String(b.runId))),
   );
+  assert.ok(Object.isFrozen(result.cancelledRuns[0]));
 
   const [device] = await db
     .select()
@@ -343,7 +390,7 @@ test("a revoked device never comes back, and another account cannot revoke a dev
     revoked: false,
     disabledAgentIds: [],
     revokedGrantIds: [],
-    cancelledRunIds: [],
+    cancelledRuns: [],
   });
   const [device] = await db
     .select()
@@ -440,3 +487,92 @@ test("an operator's revocation records no actor", async () => {
   assert.equal(audit?.actorDeviceId, null);
   assert.equal(audit?.reason, "account_erased");
 });
+
+const SERVER_ONLY = {
+  skip:
+    process.env["DATABASE_TEST_URL"] === undefined &&
+    "needs DATABASE_TEST_URL; PGlite has a single session",
+};
+
+/** Whether a session of the test database waits for a lock. */
+async function waitsForLock(): Promise<boolean> {
+  assert.ok(testDatabase);
+  const { rows } = await testDatabase.client.query<{ waiting: number }>(
+    "select count(*)::int as waiting from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'",
+  );
+  return (rows[0]?.waiting ?? 0) > 0;
+}
+
+test(
+  "a run that another transaction finishes while the revocation waits for its lock is neither reported nor cancelled",
+  SERVER_ONLY,
+  async () => {
+    const url = testDatabase?.url;
+    assert.ok(url, "the test database is on a server");
+    const world = await seed();
+    const running = world.runs.running;
+    assert.ok(running !== undefined);
+    // A second session completes the running run and keeps its transaction
+    // open, so it holds the run's row.
+    const other = createDatabase(url, { max: 1 });
+    const holding = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const first = other.db.transaction(async (tx) => {
+      await tx
+        .update(agentRuns)
+        .set({ state: "completed", finishedAt: NOW })
+        .where(eq(agentRuns.id, running));
+      holding.resolve();
+      await release.promise;
+    });
+    try {
+      await Promise.race([
+        holding.promise,
+        first.then(() => {
+          throw new Error("the first transaction ended early");
+        }),
+      ]);
+      const revocation = revokeDevice(database(), {
+        deviceId: world.aliceDevice,
+        userId: world.alice,
+        reason: "removed",
+        now: NOW,
+        actorUserId: world.alice,
+        actorDeviceId: world.aliceOtherDevice,
+      });
+      let settled = false;
+      revocation.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      while (!settled && !(await waitsForLock())) {
+        await delay(10);
+      }
+      assert.equal(settled, false, "the revocation waits for the run");
+      release.resolve();
+      await first;
+      // PostgreSQL checks the run again after the lock: it is no longer
+      // unfinished, so the revocation neither reports nor cancels it.
+      const result = await revocation;
+      assert.deepEqual(
+        result.cancelledRuns.map((run) => run.runId).sort(),
+        [world.runs.queued, world.runs.awaiting].sort(),
+      );
+      const [row] = await database()
+        .select()
+        .from(agentRuns)
+        .where(eq(agentRuns.id, running));
+      assert.equal(row?.state, "completed");
+      assert.equal(row?.stateReason, null);
+      assert.deepEqual(row?.finishedAt, NOW);
+    } finally {
+      release.resolve();
+      await first.catch(() => undefined);
+      await other.close();
+    }
+  },
+);

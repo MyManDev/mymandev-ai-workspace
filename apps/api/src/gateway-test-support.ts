@@ -1,5 +1,7 @@
 // Test support for the WebSocket gateway: a client on injectWS that answers
-// the server's challenge with the device key, as the desktop does.
+// the server's challenge with the device key, as the desktop does, and a
+// database whose next query can wait for a change.
+import type { Database } from "@mymandev/database";
 import {
   type AuthChallengeFrame,
   decodeServerMessage,
@@ -202,4 +204,115 @@ export function loggedCloses(logLines: readonly string[]) {
     .map((line) => JSON.parse(line) as Record<string, unknown>)
     .filter((entry) => entry.msg === "connection closed")
     .map((entry) => ({ connectionId: entry.connectionId, code: entry.code }));
+}
+
+type AnyFunction = (...args: unknown[]) => unknown;
+
+/** A query builder whose result waits for `before` first. */
+function delayed<T extends object>(
+  builder: T,
+  before: () => Promise<unknown>,
+): T {
+  return new Proxy(builder, {
+    get(target, property) {
+      const value: unknown = Reflect.get(target, property, target);
+      if (typeof value !== "function") {
+        return value;
+      }
+      const method = value as AnyFunction;
+      if (property === "then") {
+        return (onFulfilled?: AnyFunction, onRejected?: AnyFunction) =>
+          before().then(
+            () => method.call(target, onFulfilled, onRejected),
+            onRejected,
+          );
+      }
+      return (...args: unknown[]) => {
+        const result = method.apply(target, args);
+        return typeof result === "object" && result !== null
+          ? delayed(result, before)
+          : result;
+      };
+    },
+  });
+}
+
+export type QueryKind = "select" | "update";
+
+/**
+ * Wraps the test database. After `interceptNext(kind, table, before)`, the
+ * next query that starts with `update(table)` or `select(...).from(table)`,
+ * as `kind` says, waits for `before` first: a change that commits while the
+ * gateway is between two of its steps. `started(kind, table)` counts the
+ * queries that started so far, subqueries included.
+ */
+export function interceptingDatabase(target: Database) {
+  let hook: Readonly<{
+    kind: QueryKind;
+    table: unknown;
+    before: () => Promise<unknown>;
+  }> | null = null;
+  const queries: Array<Readonly<{ kind: QueryKind; table: unknown }>> = [];
+  const take = (kind: QueryKind, table: unknown) => {
+    queries.push({ kind, table });
+    if (hook === null || hook.kind !== kind || hook.table !== table) {
+      return null;
+    }
+    const { before } = hook;
+    hook = null;
+    return before;
+  };
+  const wrap = <T extends object>(
+    kind: QueryKind,
+    query: T,
+    table: unknown,
+  ): T => {
+    const before = take(kind, table);
+    return before === null ? query : delayed(query, before);
+  };
+  const proxy = new Proxy(target, {
+    get(object, property) {
+      const value: unknown = Reflect.get(object, property, object);
+      if (typeof value !== "function") {
+        return value;
+      }
+      const method = value as AnyFunction;
+      if (property === "update") {
+        return (table: unknown) =>
+          wrap("update", method.call(object, table) as object, table);
+      }
+      if (property === "select") {
+        return (...args: unknown[]) => {
+          const builder = method.apply(object, args) as object;
+          return new Proxy(builder, {
+            get(inner, key) {
+              const field: unknown = Reflect.get(inner, key, inner);
+              if (typeof field !== "function") {
+                return field;
+              }
+              const call = field as AnyFunction;
+              return key === "from"
+                ? (table: unknown) =>
+                    wrap("select", call.call(inner, table) as object, table)
+                : call.bind(inner);
+            },
+          });
+        };
+      }
+      return method.bind(object);
+    },
+  });
+  return {
+    database: proxy,
+    interceptNext: (
+      kind: QueryKind,
+      table: unknown,
+      before: () => Promise<unknown>,
+    ) => {
+      hook = { kind, table, before };
+    },
+    started: (kind: QueryKind, table: unknown) =>
+      queries.filter((query) => query.kind === kind && query.table === table)
+        .length,
+  };
 }

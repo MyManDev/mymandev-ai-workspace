@@ -28,6 +28,7 @@ import * as z from "zod";
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
+import { sendCancelledRuns } from "../workspaces/events.ts";
 import { authOf, lockActor, type RequireAccessToken } from "./authenticate.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
 import { type AuthContext, deviceListItem, stateOf } from "./device-state.ts";
@@ -57,7 +58,8 @@ export type DeviceRouteOptions = Readonly<{
   requireAccessToken: RequireAccessToken;
   /**
    * The open WebSocket connections: after a sign-out or a revocation
-   * commits, the device's connection closes.
+   * commits, the device's connection closes, and the runs that a revocation
+   * cancelled reach the connections subscribed to their workspaces.
    */
   connections: ConnectionRegistry;
   now: () => number;
@@ -263,7 +265,7 @@ export async function registerDeviceRoutes(
         if (target.revokedAt !== null) {
           throw new ApiError("conflict");
         }
-        await database.transaction(async (tx) => {
+        const cancelledRuns = await database.transaction(async (tx) => {
           await lockActor(tx, auth, now.getTime());
           const result = await revokeDevice(tx, {
             deviceId,
@@ -295,6 +297,7 @@ export async function registerDeviceRoutes(
               reason: "lost",
             });
           }
+          return result.cancelledRuns;
         });
         tokens.dropDevice(deviceId);
         // The revoked device learns it from its close; the account's other
@@ -308,6 +311,9 @@ export async function registerDeviceRoutes(
           revokedAt: now.toISOString(),
         };
         connections.sendToUser(auth.userId, revoked, deviceId);
+        // Each cancelled run reaches its workspace's subscribed connections
+        // (ADR 0014, P-60; #110).
+        sendCancelledRuns(connections, cancelledRuns, now);
         return reply.code(204).send();
       },
     );

@@ -59,6 +59,7 @@ import {
   closedWith,
   connect,
   connected,
+  interceptingDatabase,
   loggedCloses,
   nextFrame,
   settle,
@@ -687,7 +688,7 @@ test("bindIdentity refuses an event with another device ID or user ID and audits
   );
 });
 
-test("after authentication, the M1-02 frame rules stay: 1003, 1007, 1008 with the decode code, 1009, and nothing after an invalid frame", async (t) => {
+test("after authentication, the M1-02 frame rules stay: 1003, 1007, 1008 with the decode code of decodeClientMessage, 1009, and nothing after an invalid frame", async (t) => {
   const { app, received } = await gatewayApp(t, { githubId: 3008 });
   const device = await signInDevice(app);
   const workspaceId = await workspaceOf(device.userId);
@@ -729,9 +730,37 @@ test("after authentication, the M1-02 frame rules stay: 1003, 1007, 1008 with th
       { code: CloseCode.policyViolation, reason: "not_allowed_from_device" },
       [{ ...valid, actor: { kind: "system" } }],
     ],
+    // A second auth.response, a frame that only the server sends, an
+    // unknown frame, and a subscription frame without a valid workspace.
     [
-      { code: CloseCode.policyViolation, reason: "malformed" },
+      { code: CloseCode.policyViolation, reason: "unexpected_frame" },
       [authResponse(device.deviceId, "A".repeat(86))],
+    ],
+    [
+      { code: CloseCode.policyViolation, reason: "not_allowed_from_device" },
+      [
+        {
+          protocolVersion: 0,
+          type: "presence.changed",
+          workspaceId,
+          memberId: newId<MemberId>(),
+          status: "online",
+        },
+      ],
+    ],
+    [
+      { code: CloseCode.policyViolation, reason: "unknown_type" },
+      [{ protocolVersion: 0, type: "workspace.join", workspaceId }],
+    ],
+    [
+      { code: CloseCode.policyViolation, reason: "invalid_payload" },
+      [
+        {
+          protocolVersion: 0,
+          type: "workspace.subscribe",
+          workspaceId: "not-an-id",
+        },
+      ],
     ],
   ];
   for (const [expected, frames] of cases) {
@@ -1046,117 +1075,6 @@ test("without GitHub sign-in or without a database, /ws answers 404", async (t) 
     await assert.rejects(app.injectWS("/ws"), /404/u);
   }
 });
-
-type AnyFunction = (...args: unknown[]) => unknown;
-
-/** A query builder whose result waits for `before` first. */
-function delayed<T extends object>(
-  builder: T,
-  before: () => Promise<unknown>,
-): T {
-  return new Proxy(builder, {
-    get(target, property) {
-      const value: unknown = Reflect.get(target, property, target);
-      if (typeof value !== "function") {
-        return value;
-      }
-      const method = value as AnyFunction;
-      if (property === "then") {
-        return (onFulfilled?: AnyFunction, onRejected?: AnyFunction) =>
-          before().then(
-            () => method.call(target, onFulfilled, onRejected),
-            onRejected,
-          );
-      }
-      return (...args: unknown[]) => {
-        const result = method.apply(target, args);
-        return typeof result === "object" && result !== null
-          ? delayed(result, before)
-          : result;
-      };
-    },
-  });
-}
-
-type QueryKind = "select" | "update";
-
-/**
- * Wraps the test database. After `interceptNext(kind, table, before)`, the
- * next query that starts with `update(table)` or `select(...).from(table)`,
- * as `kind` says, waits for `before` first: a change that commits while the
- * gateway is between two of its steps. `started(kind, table)` counts the
- * queries that started so far, subqueries included.
- */
-function interceptingDatabase(target: Database) {
-  let hook: Readonly<{
-    kind: QueryKind;
-    table: unknown;
-    before: () => Promise<unknown>;
-  }> | null = null;
-  const queries: Array<Readonly<{ kind: QueryKind; table: unknown }>> = [];
-  const take = (kind: QueryKind, table: unknown) => {
-    queries.push({ kind, table });
-    if (hook === null || hook.kind !== kind || hook.table !== table) {
-      return null;
-    }
-    const { before } = hook;
-    hook = null;
-    return before;
-  };
-  const wrap = <T extends object>(
-    kind: QueryKind,
-    query: T,
-    table: unknown,
-  ): T => {
-    const before = take(kind, table);
-    return before === null ? query : delayed(query, before);
-  };
-  const proxy = new Proxy(target, {
-    get(object, property) {
-      const value: unknown = Reflect.get(object, property, object);
-      if (typeof value !== "function") {
-        return value;
-      }
-      const method = value as AnyFunction;
-      if (property === "update") {
-        return (table: unknown) =>
-          wrap("update", method.call(object, table) as object, table);
-      }
-      if (property === "select") {
-        return (...args: unknown[]) => {
-          const builder = method.apply(object, args) as object;
-          return new Proxy(builder, {
-            get(inner, key) {
-              const field: unknown = Reflect.get(inner, key, inner);
-              if (typeof field !== "function") {
-                return field;
-              }
-              const call = field as AnyFunction;
-              return key === "from"
-                ? (table: unknown) =>
-                    wrap("select", call.call(inner, table) as object, table)
-                : call.bind(inner);
-            },
-          });
-        };
-      }
-      return method.bind(object);
-    },
-  });
-  return {
-    database: proxy,
-    interceptNext: (
-      kind: QueryKind,
-      table: unknown,
-      before: () => Promise<unknown>,
-    ) => {
-      hook = { kind, table, before };
-    },
-    started: (kind: QueryKind, table: unknown) =>
-      queries.filter((query) => query.kind === kind && query.table === table)
-        .length,
-  };
-}
 
 /** The first of the next message and the close, so that a missing close fails at once. */
 async function outcomeOf(

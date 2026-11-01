@@ -1,27 +1,34 @@
-import { type DeviceId, newUuidV7, type UserId } from "@mymandev/protocol";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import {
+  type DeviceId,
+  type MemberId,
+  newUuidV7,
+  type UserId,
+  type WorkspaceId,
+} from "@mymandev/protocol";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import type { AuditAction } from "./audit-vocabulary.ts";
 import type { Database } from "./db.ts";
 import { withDatabaseErrors } from "./errors.ts";
 import { type ActiveMemberInput, activePersonOf } from "./membership.ts";
-import { auditEvents, devices, users } from "./schema/index.ts";
+import {
+  auditEvents,
+  devices,
+  users,
+  workspaceMembers,
+} from "./schema/index.ts";
 
 // Queries of device authentication and the WebSocket gateway (ADR 0014,
 // "Device key and authentication" and "Revocation, sign-out, and recovery";
 // ADR 0006, identity binding).
 
-/** At most this many device IDs go into one statement. */
+/** At most this many device IDs, or workspace and account pairs, go into one statement. */
 const DEVICE_IDS_PER_STATEMENT = 500;
 
-/** The IDs in slices of at most `DEVICE_IDS_PER_STATEMENT`. */
-function slices(deviceIds: readonly DeviceId[]): DeviceId[][] {
-  const result: DeviceId[][] = [];
-  for (
-    let start = 0;
-    start < deviceIds.length;
-    start += DEVICE_IDS_PER_STATEMENT
-  ) {
-    result.push(deviceIds.slice(start, start + DEVICE_IDS_PER_STATEMENT));
+/** The items in slices of at most `DEVICE_IDS_PER_STATEMENT`. */
+function slices<T>(items: readonly T[]): T[][] {
+  const result: T[][] = [];
+  for (let start = 0; start < items.length; start += DEVICE_IDS_PER_STATEMENT) {
+    result.push(items.slice(start, start + DEVICE_IDS_PER_STATEMENT));
   }
   return result;
 }
@@ -101,6 +108,54 @@ export async function isActiveMember(
   input: ActiveMemberInput,
 ): Promise<boolean> {
   return (await activePersonOf(db, input)) !== undefined;
+}
+
+/**
+ * The active person of each account in each workspace, for many pairs of a
+ * workspace and an account at once, with one query per 500 pairs: the
+ * gateway's sweep re-checks the workspace subscriptions of every open
+ * connection with it. The result maps a workspace to its accounts and their
+ * person IDs; a pair whose account is not an active member is missing, also
+ * when the workspace does not exist.
+ */
+export async function activePeopleOf(
+  db: Database,
+  memberships: readonly ActiveMemberInput[],
+): Promise<ReadonlyMap<WorkspaceId, ReadonlyMap<UserId, MemberId>>> {
+  return withDatabaseErrors(async () => {
+    const people = new Map<WorkspaceId, Map<UserId, MemberId>>();
+    for (const slice of slices(memberships)) {
+      const found = await db
+        .select({
+          id: workspaceMembers.id,
+          workspaceId: workspaceMembers.workspaceId,
+          userId: workspaceMembers.userId,
+        })
+        .from(workspaceMembers)
+        .where(
+          and(
+            isNull(workspaceMembers.removedAt),
+            or(
+              ...slice.map((membership) =>
+                and(
+                  eq(workspaceMembers.workspaceId, membership.workspaceId),
+                  eq(workspaceMembers.userId, membership.userId),
+                ),
+              ),
+            ),
+          ),
+        );
+      for (const { id, workspaceId, userId } of found) {
+        if (userId === null) {
+          continue;
+        }
+        const accounts = people.get(workspaceId) ?? new Map();
+        accounts.set(userId, id);
+        people.set(workspaceId, accounts);
+      }
+    }
+    return people;
+  });
 }
 
 export type DeviceSeenInput = Readonly<{ deviceId: DeviceId; now: Date }>;
