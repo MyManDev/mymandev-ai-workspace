@@ -26,6 +26,7 @@ import {
   or,
   sql,
 } from "drizzle-orm";
+import { idIn } from "./cascade.ts";
 import type { Database } from "./db.ts";
 import { toDatabaseError, withDatabaseErrors } from "./errors.ts";
 import { activePersonOf, memberById } from "./membership.ts";
@@ -51,12 +52,15 @@ import {
 //
 // Lock order, the order of `src/people.ts` extended: the account (`users`),
 // then the device (`devices`), as `lockActor` in the API does; then the people
-// (`workspace_members`) in the order of their IDs; then the join request row;
-// then the workspace row (`workspaces`), only where the counts of the
-// workspace need it. Creating a request locks the account, then the
-// account's open row in the workspace, then the workspace row. Approving and
-// denying lock the acting person, then the request. Withdrawing locks only
-// the request after the account and the device.
+// (`workspace_members`) in the order of their IDs; then the join request
+// rows, several in the order of their IDs; then the workspace row
+// (`workspaces`), only where the counts of the workspace or its pause need
+// it. Creating a request locks the account, then the account's open row in
+// the workspace, then the workspace row. Approving, denying, blocking, and
+// unblocking lock the acting person, then the request. Denying all locks the
+// acting person, then the pending requests of the workspace in the order of
+// their IDs. Pausing and resuming lock the acting person, then the workspace
+// row. Withdrawing locks only the request after the account and the device.
 
 const HOUR_MS = 60 * 60_000;
 const DAY_MS = 24 * HOUR_MS;
@@ -239,7 +243,8 @@ async function limitWait(
  * 1. a workspace that does not exist or is archived is `workspace_not_found`;
  * 2. an active member of it is `already_member`;
  * 3. the account's pending request in the workspace is returned unchanged,
- *    with `created: false`, also while requests are paused;
+ *    with `created: false`, also while requests are paused (awaiting the
+ *    Project Manager's confirmation);
  * 4. a paused workspace, or a block of the account in force, is
  *    `join_requests_closed`;
  * 5. a limit of ADR 0014 is `rate_limited` with `retryAfterMs`.
@@ -650,7 +655,7 @@ async function lockPendingRequest(
 async function decide(
   tx: Database,
   input: DecideJoinRequestInput,
-  decision: Extract<JoinRequestDecision, "approved" | "denied">,
+  decision: Extract<JoinRequestDecision, "approved" | "denied" | "blocked">,
   memberId: MemberId | null = null,
 ): Promise<void> {
   await tx
@@ -786,6 +791,312 @@ export async function denyJoinRequest(
       await decide(tx, input, "denied");
       await audit(tx, input, "join_request.denied", locked.request.id);
       return { denied: true, requesterUserId: locked.request.requesterUserId };
+    }),
+  );
+}
+
+export type BlockJoinRequestResult =
+  | Readonly<{
+      blocked: true;
+      /** The account that asked, which the decision is sent to as `denied`. */
+      requesterUserId: UserId;
+    }>
+  | Readonly<{ blocked: false; refusal: PersonRefusal }>;
+
+/**
+ * Denies a pending request and blocks its account in one transaction (ADR
+ * 0014, "Join requests"): only the owner or an admin, with the refusals of
+ * `lockPendingRequest`. It sets `decision` to `blocked` with `decided_at`
+ * and `decided_by_user_id` and writes a `join_request.blocked` audit record.
+ * Until an owner or admin lifts the block, a new request of the account in
+ * the workspace is `join_requests_closed`. The requester sees the request
+ * as `denied`. Inside another transaction it runs as a savepoint.
+ */
+export async function blockJoinRequest(
+  db: Database,
+  input: DecideJoinRequestInput,
+): Promise<BlockJoinRequestResult> {
+  return withDatabaseErrors(() =>
+    db.transaction(async (tx): Promise<BlockJoinRequestResult> => {
+      const locked = await lockPendingRequest(tx, input);
+      if ("refusal" in locked) {
+        return { blocked: false, refusal: locked.refusal };
+      }
+      await decide(tx, input, "blocked");
+      await audit(tx, input, "join_request.blocked", locked.request.id);
+      return {
+        blocked: true,
+        requesterUserId: locked.request.requesterUserId,
+      };
+    }),
+  );
+}
+
+export type UnblockJoinRequestResult =
+  | Readonly<{ unblocked: true }>
+  | Readonly<{ unblocked: false; refusal: PersonRefusal }>;
+
+/**
+ * Lifts the block of a blocked request in one transaction (ADR 0014, "Join
+ * requests"): only the owner or an admin. It locks the acting person, then
+ * the request, and refuses with `not_member`, `not_found` (a request that
+ * the workspace does not have), `forbidden` (a member), or `conflict` (a
+ * request that is not blocked, or whose block was already lifted), in this
+ * order. It sets `unblocked_at` and `unblocked_by_user_id` and writes a
+ * `join_request.unblocked` audit record. The decision stays `blocked`, so
+ * the requester still sees `denied`, and nothing is sent to them. The
+ * account can ask again at once: only a `denied` decision starts the
+ * 24-hour wait. Inside another transaction it runs as a savepoint.
+ */
+export async function unblockJoinRequest(
+  db: Database,
+  input: DecideJoinRequestInput,
+): Promise<UnblockJoinRequestResult> {
+  return withDatabaseErrors(() =>
+    db.transaction(async (tx): Promise<UnblockJoinRequestResult> => {
+      const { actor } = await lockPeople(tx, input);
+      if (actor === undefined) {
+        return { unblocked: false, refusal: "not_member" };
+      }
+      const [request] = await tx
+        .select({
+          decision: workspaceJoinRequests.decision,
+          unblockedAt: workspaceJoinRequests.unblockedAt,
+        })
+        .from(workspaceJoinRequests)
+        .where(
+          and(
+            eq(workspaceJoinRequests.id, input.joinRequestId),
+            eq(workspaceJoinRequests.workspaceId, input.workspaceId),
+          ),
+        )
+        .for("no key update");
+      if (request === undefined) {
+        return { unblocked: false, refusal: "not_found" };
+      }
+      if (!administers(actor.role)) {
+        return { unblocked: false, refusal: "forbidden" };
+      }
+      if (request.decision !== "blocked" || request.unblockedAt !== null) {
+        return { unblocked: false, refusal: "conflict" };
+      }
+      await tx
+        .update(workspaceJoinRequests)
+        .set({ unblockedAt: input.now, unblockedByUserId: input.userId })
+        .where(eq(workspaceJoinRequests.id, input.joinRequestId));
+      await audit(tx, input, "join_request.unblocked", input.joinRequestId);
+      return { unblocked: true };
+    }),
+  );
+}
+
+/** An action of the owner or an admin on the join requests of a whole workspace. */
+export type WorkspaceJoinRequestsInput = Actor;
+
+/** Why an action on the join requests of a whole workspace was refused. Nothing was written. */
+export type WorkspaceJoinRequestsRefusal = "not_member" | "forbidden";
+
+/** A request that denying all pending requests denied. */
+export type DeniedJoinRequest = Readonly<{
+  joinRequestId: JoinRequestId;
+  /** The account that asked, which the decision is sent to. */
+  requesterUserId: UserId;
+}>;
+
+export type DenyAllJoinRequestsResult =
+  | Readonly<{
+      denied: true;
+      /** The requests that were pending, in the order of their IDs; empty when none was. */
+      joinRequests: readonly DeniedJoinRequest[];
+    }>
+  | Readonly<{ denied: false; refusal: WorkspaceJoinRequestsRefusal }>;
+
+/**
+ * Locks the acting person and decides whether the actor may act on the join
+ * requests of the whole workspace: an account without an active person is
+ * `not_member`, and a member is `forbidden`.
+ */
+async function lockAdministrator(
+  tx: Database,
+  input: WorkspaceJoinRequestsInput,
+): Promise<WorkspaceJoinRequestsRefusal | undefined> {
+  const { actor } = await lockPeople(tx, input);
+  if (actor === undefined) {
+    return "not_member";
+  }
+  return administers(actor.role) ? undefined : "forbidden";
+}
+
+/**
+ * Denies every pending request of the workspace in one transaction (ADR
+ * 0014, "Join requests"): only the owner or an admin, refused with
+ * `not_member` or `forbidden`, in this order. It locks the acting person,
+ * then the pending requests `FOR NO KEY UPDATE` in the order of their IDs,
+ * so that it never waits for a transaction that waits for it. PostgreSQL
+ * reads a request that a concurrent decision or withdrawal changed again
+ * after the lock, and leaves it out when it is no longer pending. It sets
+ * each request's `decision` to `denied` with `decided_at` and
+ * `decided_by_user_id`, as a denial of one request does, also of a requester
+ * who is an active member or whose identity was erased, and writes one
+ * `join_request.denied` audit record per request (Project Manager decision
+ * of 2026-11-01). A request past its expiry is not pending and stays as it
+ * is. It returns the denied requests with their accounts, which the API
+ * sends the decision to. Inside another transaction it runs as a savepoint.
+ */
+export async function denyAllJoinRequests(
+  db: Database,
+  input: WorkspaceJoinRequestsInput,
+): Promise<DenyAllJoinRequestsResult> {
+  return withDatabaseErrors(() =>
+    db.transaction(async (tx): Promise<DenyAllJoinRequestsResult> => {
+      const refusal = await lockAdministrator(tx, input);
+      if (refusal !== undefined) {
+        return { denied: false, refusal };
+      }
+      const rows = await tx
+        .select({
+          joinRequestId: workspaceJoinRequests.id,
+          requesterUserId: workspaceJoinRequests.requesterUserId,
+        })
+        .from(workspaceJoinRequests)
+        .where(
+          and(
+            eq(workspaceJoinRequests.workspaceId, input.workspaceId),
+            pending(input.now),
+          ),
+        )
+        .orderBy(workspaceJoinRequests.id)
+        .for("no key update");
+      if (rows.length > 0) {
+        await tx
+          .update(workspaceJoinRequests)
+          .set({
+            decision: "denied",
+            decidedAt: input.now,
+            decidedByUserId: input.userId,
+          })
+          .where(
+            idIn(
+              workspaceJoinRequests.id,
+              rows.map((row) => row.joinRequestId),
+            ),
+          );
+        for (const row of rows) {
+          await audit(tx, input, "join_request.denied", row.joinRequestId);
+        }
+      }
+      return { denied: true, joinRequests: rows };
+    }),
+  );
+}
+
+export type PauseJoinRequestsResult =
+  | Readonly<{
+      paused: true;
+      /** false when the workspace was already paused, and nothing was written. */
+      changed: boolean;
+    }>
+  | Readonly<{ paused: false; refusal: WorkspaceJoinRequestsRefusal }>;
+
+export type ResumeJoinRequestsResult =
+  | Readonly<{
+      resumed: true;
+      /** false when the workspace was not paused, and nothing was written. */
+      changed: boolean;
+    }>
+  | Readonly<{ resumed: false; refusal: WorkspaceJoinRequestsRefusal }>;
+
+/**
+ * Sets or clears `join_requests_paused_at` after the acting person, with
+ * `updated_at`, only when it changes, and audits the change with the
+ * workspace as the subject. A concurrent pause or resume waits for the
+ * workspace row and then finds it changed.
+ */
+async function setPaused(
+  tx: Database,
+  input: WorkspaceJoinRequestsInput,
+  paused: boolean,
+): Promise<
+  | Readonly<{ refusal: WorkspaceJoinRequestsRefusal }>
+  | Readonly<{ changed: boolean }>
+> {
+  const refusal = await lockAdministrator(tx, input);
+  if (refusal !== undefined) {
+    return { refusal };
+  }
+  const changed = await tx
+    .update(workspaces)
+    .set({
+      joinRequestsPausedAt: paused ? input.now : null,
+      updatedAt: input.now,
+    })
+    .where(
+      and(
+        eq(workspaces.id, input.workspaceId),
+        paused
+          ? isNull(workspaces.joinRequestsPausedAt)
+          : isNotNull(workspaces.joinRequestsPausedAt),
+      ),
+    )
+    .returning({ id: workspaces.id });
+  if (changed.length === 0) {
+    return { changed: false };
+  }
+  await audit(
+    tx,
+    input,
+    paused ? "join_requests.paused" : "join_requests.resumed",
+    input.workspaceId,
+  );
+  return { changed: true };
+}
+
+/**
+ * Pauses new join requests of the workspace in one transaction (ADR 0014,
+ * "Join requests"): only the owner or an admin, refused with `not_member` or
+ * `forbidden`, in this order. It sets `join_requests_paused_at` to `now` and
+ * writes a `join_requests.paused` audit record; pausing a paused workspace
+ * changes nothing and writes nothing. While paused, a new request is
+ * `join_requests_closed`. The pending requests stay pending and can still be
+ * approved, denied, blocked, or withdrawn, and a requester who asks again
+ * gets their pending request back (awaiting the Project Manager's
+ * confirmation). A pause has no expiry: it ends only with
+ * `resumeJoinRequests`. It locks the acting person, then the workspace row,
+ * which a new request locks too, so a request either was stored before the
+ * pause or sees it. Inside another transaction it runs as a savepoint.
+ */
+export async function pauseJoinRequests(
+  db: Database,
+  input: WorkspaceJoinRequestsInput,
+): Promise<PauseJoinRequestsResult> {
+  return withDatabaseErrors(() =>
+    db.transaction(async (tx): Promise<PauseJoinRequestsResult> => {
+      const result = await setPaused(tx, input, true);
+      return "refusal" in result
+        ? { paused: false, refusal: result.refusal }
+        : { paused: true, changed: result.changed };
+    }),
+  );
+}
+
+/**
+ * Ends a pause of join requests in one transaction: only the owner or an
+ * admin, refused with `not_member` or `forbidden`, in this order. It clears
+ * `join_requests_paused_at` and writes a `join_requests.resumed` audit
+ * record; resuming a workspace that is not paused changes nothing and writes
+ * nothing. It locks the acting person, then the workspace row. Inside
+ * another transaction it runs as a savepoint.
+ */
+export async function resumeJoinRequests(
+  db: Database,
+  input: WorkspaceJoinRequestsInput,
+): Promise<ResumeJoinRequestsResult> {
+  return withDatabaseErrors(() =>
+    db.transaction(async (tx): Promise<ResumeJoinRequestsResult> => {
+      const result = await setPaused(tx, input, false);
+      return "refusal" in result
+        ? { resumed: false, refusal: result.refusal }
+        : { resumed: true, changed: result.changed };
     }),
   );
 }

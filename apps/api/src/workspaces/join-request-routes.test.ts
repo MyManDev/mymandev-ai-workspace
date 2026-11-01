@@ -19,6 +19,7 @@ import {
   OwnJoinRequestListResponseSchema,
   type WorkspaceId,
   WorkspaceListResponseSchema,
+  WorkspaceViewResponseSchema,
 } from "@mymandev/protocol";
 import { eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
@@ -125,6 +126,43 @@ function deny(session: Session, workspaceId: string, joinRequestId: string) {
     "POST",
     `/workspaces/${workspaceId}/join-requests/${joinRequestId}/deny`,
   );
+}
+
+function block(session: Session, workspaceId: string, joinRequestId: string) {
+  return request(
+    session,
+    "POST",
+    `/workspaces/${workspaceId}/join-requests/${joinRequestId}/block`,
+  );
+}
+
+function unblock(session: Session, workspaceId: string, joinRequestId: string) {
+  return request(
+    session,
+    "POST",
+    `/workspaces/${workspaceId}/join-requests/${joinRequestId}/unblock`,
+  );
+}
+
+/** An action on the join requests of a whole workspace. */
+function onAll(
+  action: "deny-all" | "pause" | "resume",
+  session: Session,
+  workspaceId: string,
+) {
+  return request(
+    session,
+    "POST",
+    `/workspaces/${workspaceId}/join-requests/${action}`,
+  );
+}
+
+/** When the workspace view says join requests were paused, or null. */
+async function pausedAt(session: Session, workspaceId: WorkspaceId) {
+  const response = await request(session, "GET", `/workspaces/${workspaceId}`);
+  assert.equal(response.statusCode, 200, response.body);
+  return WorkspaceViewResponseSchema.parse(response.json())
+    .joinRequestsPausedAt;
 }
 
 async function createWorkspace(session: Session) {
@@ -465,7 +503,206 @@ test("an admin denies: the answer is 204, the requester's connection gets denied
   assert.notEqual(fresh.id, joinRequest.id);
 });
 
-test("a member gets forbidden for listing, approving, and denying, and nothing changes and nothing is sent", async (t) => {
+test("an owner blocks: the requester's connection gets denied, a new request answers join_requests_closed, and after an admin lifts the block the requester asks again at once", async (t) => {
+  const clock = fakeClock();
+  const connections = new ConnectionRegistry();
+  const owner = await signedIn(
+    await joinApp(t, { githubId: 3418, now: clock.now, connections }),
+  );
+  const admin = await signedIn(
+    await joinApp(t, { githubId: 3419, now: clock.now, connections }),
+  );
+  const guestApp = await joinApp(t, {
+    githubId: 3420,
+    now: clock.now,
+    connections,
+  });
+  const guest = await signedIn(guestApp);
+  const socket = await connected(t, guestApp, guest.device);
+  const { workspace } = await createWorkspace(owner);
+  await addClaimed(workspace.id, admin.device, owner.device, "admin");
+  const joinRequest = await asked(guest, workspace.id);
+
+  const response = await block(owner, workspace.id, joinRequest.id);
+  assert.equal(response.statusCode, 204, response.body);
+  assert.equal(response.body, "");
+  // The requester sees a block as a denial.
+  assert.deepEqual(await nextDecision(socket), {
+    protocolVersion: 0,
+    type: "account.join_request_decided",
+    joinRequestId: joinRequest.id,
+    workspaceId: workspace.id,
+    decision: "denied",
+    decidedAt: new Date(clock.now()).toISOString(),
+  });
+  const [own] = await ownList(guest);
+  assert.equal(own?.decision, "denied");
+  const closed = await ask(guest, workspace.id);
+  assert.equal(closed.statusCode, 403, closed.body);
+  assert.equal(
+    ApiErrorBodySchema.parse(closed.json()).code,
+    "join_requests_closed",
+  );
+  const listed = await list(admin, workspace.id);
+  assert.equal(listed.statusCode, 200, listed.body);
+  assert.deepEqual(
+    JoinRequestListResponseSchema.parse(listed.json()).joinRequests.map(
+      (shown) => [shown.id, shown.decision],
+    ),
+    [[joinRequest.id, "blocked"]],
+  );
+  const twice = await block(admin, workspace.id, joinRequest.id);
+  assert.equal(twice.statusCode, 409);
+  assert.deepEqual(twice.json(), CONFLICT);
+  assert.deepEqual((await auditActions(workspace.id)).at(-1), [
+    "join_request.blocked",
+    owner.device.userId,
+    joinRequest.id,
+  ]);
+
+  const lifted = await unblock(admin, workspace.id, joinRequest.id);
+  assert.equal(lifted.statusCode, 204, lifted.body);
+  assert.equal(lifted.body, "");
+  const row = await requestRow(joinRequest.id);
+  assert.equal(row.decision, "blocked");
+  assert.equal(row.unblockedByUserId, admin.device.userId);
+  assert.deepEqual((await auditActions(workspace.id)).at(-1), [
+    "join_request.unblocked",
+    admin.device.userId,
+    joinRequest.id,
+  ]);
+  const again = await unblock(owner, workspace.id, joinRequest.id);
+  assert.equal(again.statusCode, 409);
+  assert.deepEqual(again.json(), CONFLICT);
+  const unknown = await unblock(owner, workspace.id, newId<JoinRequestId>());
+  assert.equal(unknown.statusCode, 404);
+  assert.deepEqual(unknown.json(), NOT_FOUND);
+
+  // A lifted block starts no 24-hour wait, and lifting it sends nothing.
+  const fresh = await asked(guest, workspace.id);
+  assert.notEqual(fresh.id, joinRequest.id);
+  await settle();
+  assert.equal(socket.client.unread(), 0);
+});
+
+test("an admin denies all: every pending request is denied with one audit record each, and each requester's connection gets one denied frame", async (t) => {
+  const clock = fakeClock();
+  const connections = new ConnectionRegistry();
+  const owner = await signedIn(
+    await joinApp(t, { githubId: 3421, now: clock.now }),
+  );
+  const adminApp = await joinApp(t, {
+    githubId: 3422,
+    now: clock.now,
+    connections,
+  });
+  const admin = await signedIn(adminApp);
+  const adaApp = await joinApp(t, {
+    githubId: 3423,
+    now: clock.now,
+    connections,
+  });
+  const bobApp = await joinApp(t, {
+    githubId: 3424,
+    now: clock.now,
+    connections,
+  });
+  const ada = await signedIn(adaApp);
+  const bob = await signedIn(bobApp);
+  const adminSocket = await connected(t, adminApp, admin.device);
+  const adaSocket = await connected(t, adaApp, ada.device);
+  const bobSocket = await connected(t, bobApp, bob.device);
+  const { workspace } = await createWorkspace(owner);
+  await addClaimed(workspace.id, admin.device, owner.device, "admin");
+  const adaRequest = await asked(ada, workspace.id);
+  const bobRequest = await asked(bob, workspace.id);
+  const audited = await auditActions(workspace.id);
+
+  const response = await onAll("deny-all", admin, workspace.id);
+  assert.equal(response.statusCode, 204, response.body);
+  assert.equal(response.body, "");
+  for (const [socket, joinRequest] of [
+    [adaSocket, adaRequest],
+    [bobSocket, bobRequest],
+  ] as const) {
+    assert.deepEqual(await nextDecision(socket), {
+      protocolVersion: 0,
+      type: "account.join_request_decided",
+      joinRequestId: joinRequest.id,
+      workspaceId: workspace.id,
+      decision: "denied",
+      decidedAt: new Date(clock.now()).toISOString(),
+    });
+    const row = await requestRow(joinRequest.id);
+    assert.equal(row.decision, "denied");
+    assert.equal(row.decidedByUserId, admin.device.userId);
+  }
+  assert.deepEqual(await auditActions(workspace.id), [
+    ...audited,
+    ["join_request.denied", admin.device.userId, adaRequest.id],
+    ["join_request.denied", admin.device.userId, bobRequest.id],
+  ]);
+  const [own] = await ownList(ada);
+  assert.equal(own?.decision, "denied");
+
+  // With nothing pending, denying all answers 204 and changes nothing.
+  const again = await onAll("deny-all", owner, workspace.id);
+  assert.equal(again.statusCode, 204, again.body);
+  await settle();
+  for (const socket of [adminSocket, adaSocket, bobSocket]) {
+    assert.equal(socket.client.unread(), 0);
+  }
+  assert.equal((await auditActions(workspace.id)).length, audited.length + 2);
+});
+
+test("an owner pauses and an admin resumes: the workspace view shows the pause, pending requests stay, and a new request answers join_requests_closed until the resume", async (t) => {
+  const owner = await signedIn(await joinApp(t, { githubId: 3425 }));
+  const admin = await signedIn(await joinApp(t, { githubId: 3426 }));
+  const waiting = await signedIn(await joinApp(t, { githubId: 3427 }));
+  const late = await signedIn(await joinApp(t, { githubId: 3428 }));
+  const { workspace } = await createWorkspace(owner);
+  await addClaimed(workspace.id, admin.device, owner.device, "admin");
+  const pending = await asked(waiting, workspace.id);
+  assert.equal(await pausedAt(admin, workspace.id), null);
+
+  const paused = await onAll("pause", owner, workspace.id);
+  assert.equal(paused.statusCode, 204, paused.body);
+  assert.equal(paused.body, "");
+  const since = await pausedAt(admin, workspace.id);
+  assert.ok(since !== null);
+  // Pausing again keeps the first pause.
+  const twice = await onAll("pause", admin, workspace.id);
+  assert.equal(twice.statusCode, 204, twice.body);
+  assert.equal(await pausedAt(admin, workspace.id), since);
+
+  const closed = await ask(late, workspace.id);
+  assert.equal(closed.statusCode, 403, closed.body);
+  assert.equal(
+    ApiErrorBodySchema.parse(closed.json()).code,
+    "join_requests_closed",
+  );
+  assert.deepEqual(await asked(waiting, workspace.id), pending);
+  assert.equal((await requestRow(pending.id)).decision, null);
+
+  const resumed = await onAll("resume", admin, workspace.id);
+  assert.equal(resumed.statusCode, 204, resumed.body);
+  assert.equal(await pausedAt(owner, workspace.id), null);
+  const again = await onAll("resume", owner, workspace.id);
+  assert.equal(again.statusCode, 204, again.body);
+  await asked(late, workspace.id);
+
+  assert.deepEqual(
+    (await auditActions(workspace.id)).filter(([action]) =>
+      String(action).startsWith("join_requests."),
+    ),
+    [
+      ["join_requests.paused", owner.device.userId, workspace.id],
+      ["join_requests.resumed", admin.device.userId, workspace.id],
+    ],
+  );
+});
+
+test("a member gets forbidden for listing, approving, denying, blocking, unblocking, denying all, pausing, and resuming, and nothing changes and nothing is sent", async (t) => {
   const connections = new ConnectionRegistry();
   const events = recorder();
   const owner = await signedIn(await joinApp(t, { githubId: 3408 }));
@@ -478,21 +715,43 @@ test("a member gets forbidden for listing, approving, and denying, and nothing c
   );
   const guestApp = await joinApp(t, { githubId: 3410, connections });
   const guest = await signedIn(guestApp);
+  const blocked = await signedIn(await joinApp(t, { githubId: 3417 }));
   const socket = await connected(t, guestApp, guest.device);
   const { workspace } = await createWorkspace(owner);
   await addClaimed(workspace.id, member.device, owner.device);
   const joinRequest = await asked(guest, workspace.id);
+  const blockedRequest = await asked(blocked, workspace.id);
+  const blocking = await block(owner, workspace.id, blockedRequest.id);
+  assert.equal(blocking.statusCode, 204, blocking.body);
   const before = await requestRow(joinRequest.id);
+  const blockBefore = await requestRow(blockedRequest.id);
+  const audited = await auditActions(workspace.id);
 
-  for (const response of [
+  const refusals = [
     await list(member, workspace.id),
     await approve(member, workspace.id, joinRequest.id),
     await deny(member, workspace.id, joinRequest.id),
-  ]) {
+    await block(member, workspace.id, joinRequest.id),
+    await unblock(member, workspace.id, blockedRequest.id),
+    await onAll("deny-all", member, workspace.id),
+    await onAll("pause", member, workspace.id),
+  ];
+  // Resuming is refused too, also while the workspace is paused.
+  const pausing = await onAll("pause", owner, workspace.id);
+  assert.equal(pausing.statusCode, 204, pausing.body);
+  const paused = await pausedAt(owner, workspace.id);
+  refusals.push(await onAll("resume", member, workspace.id));
+  for (const response of refusals) {
     assert.equal(response.statusCode, 403, response.body);
     assert.deepEqual(response.json(), FORBIDDEN);
   }
   assert.deepEqual(await requestRow(joinRequest.id), before);
+  assert.deepEqual(await requestRow(blockedRequest.id), blockBefore);
+  assert.equal(await pausedAt(owner, workspace.id), paused);
+  assert.deepEqual(await auditActions(workspace.id), [
+    ...audited,
+    ["join_requests.paused", owner.device.userId, workspace.id],
+  ]);
   await settle();
   assert.deepEqual(events.events, []);
   assert.equal(socket.client.unread(), 0);
@@ -576,6 +835,8 @@ test("a body that breaks the protocol answers 400 with bad_request", async (t) =
     await approve(owner, workspace.id, joinRequest.id, { displayName: "" }),
     await approve(owner, workspace.id, "not-an-id"),
     await withdraw(guest, "not-an-id"),
+    await block(owner, workspace.id, "not-an-id"),
+    await unblock(owner, workspace.id, "not-an-id"),
   ]) {
     assert.equal(response.statusCode, 400, response.body);
     assert.equal(ApiErrorBodySchema.parse(response.json()).code, "bad_request");
@@ -623,6 +884,19 @@ test("the join request routes need a valid access token", async (t) => {
       `/workspaces/${workspace.id}/join-requests/${joinRequestId}/deny`,
       undefined,
     ],
+    [
+      "POST",
+      `/workspaces/${workspace.id}/join-requests/${joinRequestId}/block`,
+      undefined,
+    ],
+    [
+      "POST",
+      `/workspaces/${workspace.id}/join-requests/${joinRequestId}/unblock`,
+      undefined,
+    ],
+    ["POST", `/workspaces/${workspace.id}/join-requests/deny-all`, undefined],
+    ["POST", `/workspaces/${workspace.id}/join-requests/pause`, undefined],
+    ["POST", `/workspaces/${workspace.id}/join-requests/resume`, undefined],
   ] as const) {
     const response = await app.inject({
       method,
