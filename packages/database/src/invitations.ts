@@ -1,18 +1,21 @@
 import {
+  type DeviceId,
   INVITATION_LIFETIME_SECONDS,
   type Invitation,
   type InvitationId,
   MAX_ANSWER_LIST_ITEMS,
   type MemberId,
   newId,
+  type PreviewInvitationResponse,
   type UserId,
   type WorkspaceId,
+  type WorkspaceMembership,
 } from "@mymandev/protocol";
 import { and, count, desc, eq, gt, isNull, min, ne, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Database } from "./db.ts";
-import { withDatabaseErrors } from "./errors.ts";
-import { activePersonOf } from "./membership.ts";
+import { toDatabaseError, withDatabaseErrors } from "./errors.ts";
+import { activePersonOf, memberById } from "./membership.ts";
 import {
   type Actor,
   administers,
@@ -21,6 +24,7 @@ import {
   type PersonRefusal,
 } from "./people.ts";
 import {
+  userIdentities,
   workspaceInvitations,
   workspaceMembers,
   workspaces,
@@ -32,7 +36,8 @@ import {
 // order of `src/people.ts`: the acting person and the invited person first,
 // then the workspace row for the counts of the workspace, then the
 // invitations, so that every change of a person's invitations waits for
-// every other change of that person.
+// every other change of that person. Accepting an invitation locks its
+// person before it consumes the invitation, too.
 
 const DAY_MS = 24 * 60 * 60_000;
 /** ADR 0014, "Limits". */
@@ -357,4 +362,422 @@ export async function revokeInvitation(
       return { revoked: true };
     }),
   );
+}
+
+/**
+ * Why an invitation code claims nothing (ADR 0014, "Invitations"). The API
+ * answers each of them with the same `invitation_invalid` and logs only the
+ * reason and the invitation's ID, never the code.
+ *
+ * - `unknown`: no invitation has the code's hash;
+ * - `used`: the invitation was accepted;
+ * - `revoked` and `expired`: the invitation was revoked, or its expiry has
+ *   passed;
+ * - `member_removed` and `member_claimed`: the invitation is live, but its
+ *   person was removed or claimed; removing or claiming a person ends its
+ *   invitation, so this happens only to data written outside these functions;
+ * - `inviter_unknown`: a preview finds no person or no GitHub identity of the
+ *   account that created the invitation in its workspace, for example after
+ *   the account's data was erased.
+ */
+export type InvitationFailure =
+  | "unknown"
+  | "used"
+  | "revoked"
+  | "expired"
+  | "member_removed"
+  | "member_claimed"
+  | "inviter_unknown";
+
+/** Why a preview or an acceptance of an invitation code was refused. Nothing was written. */
+export type InvitationCodeRefusal =
+  /** The account is an active member of the invitation's workspace, whatever the invitation's state. */
+  | Readonly<{ refusal: "already_member"; invitationId: InvitationId }>
+  | Readonly<{
+      refusal: "invitation_invalid";
+      reason: InvitationFailure;
+      /** null when no invitation has the code's hash. */
+      invitationId: InvitationId | null;
+    }>;
+
+export type PreviewInvitationInput = Readonly<{
+  /**
+   * The SHA-256 hash of the code as 64 lowercase hexadecimal characters. The
+   * code itself never reaches the database.
+   */
+  tokenHash: string;
+  /** The account that presents the code. */
+  userId: UserId;
+  /** An invitation whose expiry is `now` or earlier is expired. */
+  now: Date;
+}>;
+
+export type PreviewInvitationResult =
+  | Readonly<{
+      previewed: true;
+      invitationId: InvitationId;
+      preview: PreviewInvitationResponse;
+    }>
+  | (Readonly<{ previewed: false }> & InvitationCodeRefusal);
+
+export type AcceptInvitationInput = PreviewInvitationInput &
+  Readonly<{
+    /** The account's device that accepts, recorded on the invitation and as the actor's device. */
+    deviceId: DeviceId;
+  }>;
+
+export type AcceptInvitationResult =
+  | Readonly<{
+      accepted: true;
+      invitationId: InvitationId;
+      /** The workspace and the person that the account claimed. */
+      membership: WorkspaceMembership;
+    }>
+  | (Readonly<{ accepted: false }> & InvitationCodeRefusal);
+
+/** The unique index that allows one active person per account and workspace. */
+const ACTIVE_PERSON_KEY = "workspace_members_active_user_key";
+
+function invalid(
+  reason: InvitationFailure,
+  invitationId: InvitationId | null,
+): Extract<InvitationCodeRefusal, { refusal: "invitation_invalid" }> {
+  return { refusal: "invitation_invalid", reason, invitationId };
+}
+
+/** Why an invitation is not live at `now`, or null when it is. */
+function invitationFailure(
+  invitation: Readonly<{
+    acceptedAt: Date | null;
+    revokedAt: Date | null;
+    expiresAt: Date;
+  }>,
+  now: Date,
+): InvitationFailure | null {
+  if (invitation.acceptedAt !== null) {
+    return "used";
+  }
+  if (invitation.revokedAt !== null) {
+    return "revoked";
+  }
+  return invitation.expiresAt <= now ? "expired" : null;
+}
+
+/** Why a person cannot be claimed, or null when it is unclaimed and active. */
+function personFailure(
+  person: Readonly<{ userId: UserId | null; removedAt: Date | null }>,
+): InvitationFailure | null {
+  if (person.removedAt !== null) {
+    return "member_removed";
+  }
+  return person.userId === null ? null : "member_claimed";
+}
+
+/**
+ * The person of the account that created an invitation, with its GitHub
+ * login, as the preview shows the inviter: the account's active person in
+ * the workspace, or else its most recently removed one, as
+ * `listInvitations` shows the creator. undefined without such a person or
+ * without a GitHub identity.
+ */
+async function inviterOf(
+  db: Database,
+  invitation: Readonly<{ workspaceId: WorkspaceId; createdByUserId: UserId }>,
+): Promise<PreviewInvitationResponse["inviter"] | undefined> {
+  const [row] = await db
+    .select({
+      displayName: workspaceMembers.displayName,
+      provider: userIdentities.identityProvider,
+      login: userIdentities.login,
+      verifiedAt: userIdentities.lastSignInAt,
+    })
+    .from(workspaceMembers)
+    .leftJoin(
+      userIdentities,
+      and(
+        eq(userIdentities.userId, workspaceMembers.userId),
+        eq(userIdentities.identityProvider, "github"),
+      ),
+    )
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, invitation.workspaceId),
+        eq(workspaceMembers.userId, invitation.createdByUserId),
+      ),
+    )
+    .orderBy(
+      sql`${workspaceMembers.removedAt} desc nulls first`,
+      desc(workspaceMembers.id),
+    )
+    .limit(1);
+  if (
+    row === undefined ||
+    row.provider === null ||
+    row.login === null ||
+    row.verifiedAt === null
+  ) {
+    return undefined;
+  }
+  return {
+    displayName: row.displayName,
+    identity: {
+      provider: row.provider,
+      login: row.login,
+      verifiedAt: row.verifiedAt.toISOString(),
+    },
+  };
+}
+
+/**
+ * What an invitation code claims, without consuming it (ADR 0014,
+ * "Invitations"): the answer of `POST /invitations/preview`. It finds the
+ * invitation by `tokenHash` in whatever state. An account that is already an
+ * active member of its workspace is `already_member`, before anything else
+ * is decided. Every other refusal is `invitation_invalid` with its reason:
+ * an unknown hash, an invitation that is accepted, revoked, or expired at
+ * `now`, a person that is removed or claimed, or an inviter without a person
+ * or an identity. The preview shows the workspace's name, the person's
+ * display name, the inviter's person in the workspace with its GitHub login,
+ * and the expiry. It writes nothing.
+ */
+export async function previewInvitation(
+  db: Database,
+  input: PreviewInvitationInput,
+): Promise<PreviewInvitationResult> {
+  return withDatabaseErrors(async () => {
+    const [found] = await db
+      .select({
+        id: workspaceInvitations.id,
+        workspaceId: workspaceInvitations.workspaceId,
+        createdByUserId: workspaceInvitations.createdByUserId,
+        expiresAt: workspaceInvitations.expiresAt,
+        acceptedAt: workspaceInvitations.acceptedAt,
+        revokedAt: workspaceInvitations.revokedAt,
+        workspaceName: workspaces.name,
+        displayName: workspaceMembers.displayName,
+        userId: workspaceMembers.userId,
+        removedAt: workspaceMembers.removedAt,
+      })
+      .from(workspaceInvitations)
+      .innerJoin(
+        workspaces,
+        eq(workspaces.id, workspaceInvitations.workspaceId),
+      )
+      .innerJoin(
+        workspaceMembers,
+        eq(workspaceMembers.id, workspaceInvitations.memberId),
+      )
+      .where(eq(workspaceInvitations.tokenHash, input.tokenHash));
+    if (found === undefined) {
+      return { previewed: false, ...invalid("unknown", null) };
+    }
+    const member = await activePersonOf(db, {
+      workspaceId: found.workspaceId,
+      userId: input.userId,
+    });
+    if (member !== undefined) {
+      return {
+        previewed: false,
+        refusal: "already_member",
+        invitationId: found.id,
+      };
+    }
+    const failure = invitationFailure(found, input.now) ?? personFailure(found);
+    if (failure !== null) {
+      return { previewed: false, ...invalid(failure, found.id) };
+    }
+    const inviter = await inviterOf(db, found);
+    if (inviter === undefined) {
+      return { previewed: false, ...invalid("inviter_unknown", found.id) };
+    }
+    return {
+      previewed: true,
+      invitationId: found.id,
+      preview: {
+        workspaceName: found.workspaceName,
+        displayName: found.displayName,
+        inviter,
+        expiresAt: found.expiresAt.toISOString(),
+      },
+    };
+  });
+}
+
+/** Ends an acceptance's transaction with a rollback and this result. */
+class AcceptanceUndone extends Error {
+  readonly result: AcceptInvitationResult;
+
+  constructor(result: AcceptInvitationResult) {
+    super("acceptance undone");
+    this.name = "AcceptanceUndone";
+    this.result = result;
+  }
+}
+
+/**
+ * Consumes an invitation code and claims its person in one transaction (ADR
+ * 0014, "Invitations"), at the isolation level of the connection, which is
+ * PostgreSQL's default, READ COMMITTED.
+ *
+ * It finds the invitation by `tokenHash` in whatever state; an unknown hash
+ * is `invitation_invalid`. An account that is already an active member of
+ * the invitation's workspace is `already_member` before anything is
+ * consumed, so the invitation stays as it was. Then it locks the
+ * invitation's person, as every change of a person's invitations does, and
+ * consumes the invitation with a conditional update: only if the hash
+ * matches and the invitation is neither accepted, nor revoked, nor expired
+ * at `now`. It records the accepting account and device and `now`. It then
+ * claims the person only if the person is still unclaimed and not removed,
+ * with `claimed_at` set to `now`. When either update changes no row, the
+ * transaction rolls back and the result is `invitation_invalid` with the
+ * reason. PostgreSQL checks a row that a concurrent transaction changed
+ * again before it updates it, so of two acceptances of one code only the
+ * first claims the person. When the account claimed another person of the
+ * workspace concurrently, the unique index of one active person per account
+ * and workspace refuses the claim, and the result is `already_member`.
+ *
+ * A claim always takes the invited person, a new person row, so an account
+ * that was removed and is invited again rejoins as a new person, and its
+ * earlier person stays in the history. It writes an `invitation.accepted`
+ * and a `member.claimed` audit record, with the account and the device as
+ * the actor, and returns the workspace with the claimed person. Inside
+ * another transaction it runs as a savepoint.
+ */
+export async function acceptInvitation(
+  db: Database,
+  input: AcceptInvitationInput,
+): Promise<AcceptInvitationResult> {
+  return withDatabaseErrors(async () => {
+    // The invitation that the hash names, for a refusal after a rollback.
+    const seen: { invitationId: InvitationId | null } = { invitationId: null };
+    try {
+      return await db.transaction(
+        async (tx): Promise<AcceptInvitationResult> => {
+          // The person of an invitation never changes, so it is read before the lock.
+          const [found] = await tx
+            .select({
+              id: workspaceInvitations.id,
+              workspaceId: workspaceInvitations.workspaceId,
+              memberId: workspaceInvitations.memberId,
+            })
+            .from(workspaceInvitations)
+            .where(eq(workspaceInvitations.tokenHash, input.tokenHash));
+          if (found === undefined) {
+            return { accepted: false, ...invalid("unknown", null) };
+          }
+          seen.invitationId = found.id;
+          const actor: Actor = {
+            workspaceId: found.workspaceId,
+            userId: input.userId,
+            deviceId: input.deviceId,
+            now: input.now,
+          };
+          if ((await activePersonOf(tx, actor)) !== undefined) {
+            return {
+              accepted: false,
+              refusal: "already_member",
+              invitationId: found.id,
+            };
+          }
+
+          const [person] = await tx
+            .select({
+              userId: workspaceMembers.userId,
+              removedAt: workspaceMembers.removedAt,
+            })
+            .from(workspaceMembers)
+            .where(eq(workspaceMembers.id, found.memberId))
+            .for("no key update");
+
+          const [consumed] = await tx
+            .update(workspaceInvitations)
+            .set({
+              acceptedAt: input.now,
+              acceptedByUserId: input.userId,
+              acceptedDeviceId: input.deviceId,
+            })
+            .where(
+              and(
+                eq(workspaceInvitations.tokenHash, input.tokenHash),
+                live(input.now),
+              ),
+            )
+            .returning({ id: workspaceInvitations.id });
+          if (consumed === undefined) {
+            const [state] = await tx
+              .select({
+                acceptedAt: workspaceInvitations.acceptedAt,
+                revokedAt: workspaceInvitations.revokedAt,
+                expiresAt: workspaceInvitations.expiresAt,
+              })
+              .from(workspaceInvitations)
+              .where(eq(workspaceInvitations.id, found.id));
+            const reason =
+              state === undefined
+                ? "unknown"
+                : (invitationFailure(state, input.now) ?? "unknown");
+            return { accepted: false, ...invalid(reason, found.id) };
+          }
+
+          const [claimed] = await tx
+            .update(workspaceMembers)
+            .set({
+              userId: input.userId,
+              claimedAt: input.now,
+              updatedAt: input.now,
+            })
+            .where(
+              and(
+                eq(workspaceMembers.id, found.memberId),
+                isNull(workspaceMembers.userId),
+                isNull(workspaceMembers.removedAt),
+              ),
+            )
+            .returning({ id: workspaceMembers.id });
+          if (claimed === undefined) {
+            const reason =
+              (person === undefined ? null : personFailure(person)) ??
+              "member_claimed";
+            throw new AcceptanceUndone({
+              accepted: false,
+              ...invalid(reason, found.id),
+            });
+          }
+
+          await audit(tx, actor, "invitation.accepted", found.id);
+          await audit(tx, actor, "member.claimed", claimed.id);
+          const [workspace] = await tx
+            .select({ id: workspaces.id, name: workspaces.name })
+            .from(workspaces)
+            .where(eq(workspaces.id, found.workspaceId));
+          const member = await memberById(tx, claimed.id);
+          if (workspace === undefined || member === undefined) {
+            throw new Error("The claimed person or its workspace is missing");
+          }
+          return {
+            accepted: true,
+            invitationId: found.id,
+            membership: { workspace, member },
+          };
+        },
+      );
+    } catch (error) {
+      if (error instanceof AcceptanceUndone) {
+        return error.result;
+      }
+      const failure = toDatabaseError(error);
+      if (
+        failure.code === "23505" &&
+        failure.constraint === ACTIVE_PERSON_KEY &&
+        seen.invitationId !== null
+      ) {
+        return {
+          accepted: false,
+          refusal: "already_member",
+          invitationId: seen.invitationId,
+        };
+      }
+      throw failure;
+    }
+  });
 }

@@ -21,7 +21,7 @@ import { authOf, lockActor } from "../auth/authenticate.ts";
 import { ApiError } from "../errors.ts";
 import { WorkspaceParamsSchema } from "./access.ts";
 import {
-  frozenCopy,
+  sendWorkspaceEvent,
   serverEventHeader,
   type WorkspaceEvent,
   type WorkspaceEventHandler,
@@ -62,30 +62,8 @@ export function registerPeopleRoutes(
 ): void {
   const { database } = options;
 
-  /**
-   * Hands a frozen copy of a membership event to `onWorkspaceEvent` without
-   * waiting for it: the change is already committed, so a handler that never
-   * returns cannot hold the answer, and a failure is only logged. The log
-   * names the error's type and never its message, which may quote a display
-   * name.
-   */
   function send(request: FastifyRequest, event: WorkspaceEvent): void {
-    const copy = frozenCopy(event);
-    const failed = (error: unknown) => {
-      request.log.error(
-        {
-          eventType: copy.type,
-          workspaceId: copy.workspaceId,
-          errorType: error instanceof Error ? error.name : typeof error,
-        },
-        "workspace event failed",
-      );
-    };
-    try {
-      Promise.resolve(options.onWorkspaceEvent(copy)).catch(failed);
-    } catch (error) {
-      failed(error);
-    }
+    sendWorkspaceEvent(request, options.onWorkspaceEvent, event);
   }
 
   // A `role` in the body is stripped by the protocol schema: an unclaimed
