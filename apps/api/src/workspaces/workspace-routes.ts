@@ -22,17 +22,21 @@ import {
 import { ApiError } from "../errors.ts";
 import { zodValidatorCompiler } from "../validation.ts";
 import { requireActiveMember, WorkspaceParamsSchema } from "./access.ts";
+import type { WorkspaceEventHandler } from "./events.ts";
+import { registerPeopleRoutes } from "./people-routes.ts";
 
 export type WorkspaceRouteOptions = Readonly<{
   database: Database;
   requireAccessToken: RequireAccessToken;
   now: () => number;
+  /** Receives the membership events of the people routes after the commit. */
+  onWorkspaceEvent: WorkspaceEventHandler;
 }>;
 
 /**
  * Workspaces and the people in them (ADR 0014, "People and roles" and "What
- * a workspace ID allows"): the account's workspaces, creating one, and the
- * view of one.
+ * a workspace ID allows"): the account's workspaces, creating one, the view
+ * of one, and its people.
  */
 export async function registerWorkspaceRoutes(
   app: FastifyInstance,
@@ -101,6 +105,12 @@ export async function registerWorkspaceRoutes(
           return view;
         },
       );
+
+      registerPeopleRoutes(workspace, {
+        database,
+        now: options.now,
+        onWorkspaceEvent: options.onWorkspaceEvent,
+      });
     });
   });
 }
