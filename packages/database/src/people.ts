@@ -11,7 +11,7 @@ import {
   type WorkspaceId,
   type WorkspaceMember,
 } from "@mymandev/protocol";
-import { and, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, type SQL } from "drizzle-orm";
 import type { AuditAction, AuditReason } from "./audit-vocabulary.ts";
 import {
   type CancelledRun,
@@ -26,17 +26,18 @@ import {
   agentRuns,
   agents,
   auditEvents,
+  devices,
   permissionGrants,
   projects,
   workspaceInvitations,
   workspaceMembers,
 } from "./schema/index.ts";
 
-// Defining, renaming, and removing the people of a workspace, and leaving it
-// (ADR 0014, "People and roles", "Invitations", and "Removal and
-// ownership"). Each function locks the people it decides on, the acting
-// person included, before it reads their state, so that concurrent changes
-// of one person happen one after another.
+// Defining, renaming, and removing the people of a workspace, leaving it,
+// and promoting and demoting admins (ADR 0014, "People and roles",
+// "Invitations", and "Removal and ownership"). Each function locks the
+// people it decides on, the acting person included, before it reads their
+// state, so that concurrent changes of one person happen one after another.
 //
 // Lock order, so that no two transactions wait for each other: the account
 // (`users`), then the device (`devices`), as `lockActor` in the API does; then
@@ -45,13 +46,14 @@ import {
 // the invitation too. The invitations of `src/invitations.ts` use the
 // helpers below; creating one locks the workspace row (`workspaces`) after
 // the people and before the invitations, for the counts of the workspace.
-// A removal also revokes the invitations that the removed person created,
-// which name other people whom it does not lock: it locks them after the
-// people and in the order of their IDs, and every other change of an
-// invitation locks its person before it touches that person's invitations,
-// of which at most one is live. A removal then locks the removed person's
-// agents, their grants, and the runs it cancels (`src/cascade.ts`), in that
-// order, as a device revocation does after its device.
+// A removal and a demotion also revoke the invitations that the removed or
+// demoted person created, which name other people whom they do not lock:
+// they lock them after the people and in the order of their IDs, and every
+// other change of an invitation locks its person before it touches that
+// person's invitations, of which at most one is live. A removal then locks
+// the removed person's agents, their grants, and the runs it cancels
+// (`src/cascade.ts`), in that order, as a device revocation does after its
+// device.
 //
 // A future writer that inserts an agent, a grant, or a run (#75, M3) locks
 // the person of each account it attaches the row to first: the agent's
@@ -443,38 +445,25 @@ async function removePerson(
     .where(eq(workspaceMembers.id, person.id));
   await audit(tx, actor, action, person.id);
 
-  const invitations = await tx
-    .select({ id: workspaceInvitations.id })
-    .from(workspaceInvitations)
-    .where(
-      and(
-        eq(workspaceInvitations.workspaceId, workspaceId),
-        isNull(workspaceInvitations.acceptedAt),
-        isNull(workspaceInvitations.revokedAt),
-        or(
-          eq(workspaceInvitations.memberId, person.id),
-          person.userId === null
-            ? undefined
-            : eq(workspaceInvitations.createdByUserId, person.userId),
-        ),
-      ),
-    )
-    .orderBy(workspaceInvitations.id)
-    .for("no key update");
-  const revokedInvitationIds = invitations.map((row) => row.id);
-  if (revokedInvitationIds.length > 0) {
-    await tx
-      .update(workspaceInvitations)
-      .set({ revokedAt: now, revokedByUserId: actor.userId })
-      .where(idIn(workspaceInvitations.id, revokedInvitationIds));
-    for (const id of revokedInvitationIds) {
-      await audit(tx, actor, "invitation.revoked", id, "member_removed");
-    }
+  const ownOrCreated = or(
+    eq(workspaceInvitations.memberId, person.id),
+    person.userId === null
+      ? undefined
+      : eq(workspaceInvitations.createdByUserId, person.userId),
+  );
+  if (ownOrCreated === undefined) {
+    throw new Error("A removal selects the person's invitations");
   }
+  const revokedInvitationIds = await revokeOpenInvitations(
+    tx,
+    actor,
+    ownOrCreated,
+    "member_removed",
+  );
   const ended = {
     memberId: person.id,
     userId: person.userId,
-    revokedInvitationIds: Object.freeze(revokedInvitationIds),
+    revokedInvitationIds,
   };
   if (person.userId === null) {
     return Object.freeze({ ...ended, ...NO_AGENTS });
@@ -514,4 +503,202 @@ async function removePerson(
     revokedGrantIds: Object.freeze(revokedGrantIds),
     cancelledRuns,
   });
+}
+
+/**
+ * Revokes the invitations of the actor's workspace that `which` selects and
+ * that are neither accepted nor revoked, also an expired one, as in the
+ * unique index of one live invitation per person, with the acting account as
+ * `revoked_by_user_id` and an `invitation.revoked` audit record with `reason`
+ * for each. It locks them `FOR NO KEY UPDATE` in the order of their IDs,
+ * after the people, and returns their IDs in that order. `which` is
+ * required, so that no caller revokes every open invitation of the
+ * workspace by leaving it out.
+ */
+async function revokeOpenInvitations(
+  tx: Database,
+  actor: Actor,
+  which: SQL,
+  reason: "member_removed" | "creator_demoted",
+): Promise<readonly InvitationId[]> {
+  const rows = await tx
+    .select({ id: workspaceInvitations.id })
+    .from(workspaceInvitations)
+    .where(
+      and(
+        eq(workspaceInvitations.workspaceId, actor.workspaceId),
+        isNull(workspaceInvitations.acceptedAt),
+        isNull(workspaceInvitations.revokedAt),
+        which,
+      ),
+    )
+    .orderBy(workspaceInvitations.id)
+    .for("no key update");
+  const ids = rows.map((row) => row.id);
+  if (ids.length > 0) {
+    await tx
+      .update(workspaceInvitations)
+      .set({ revokedAt: actor.now, revokedByUserId: actor.userId })
+      .where(idIn(workspaceInvitations.id, ids));
+    for (const id of ids) {
+      await audit(tx, actor, "invitation.revoked", id, reason);
+    }
+  }
+  return Object.freeze(ids);
+}
+
+/**
+ * A device must be older than this to promote a member to admin or to offer
+ * ownership (ADR 0014, "People and roles" and "Lifetimes"): 72 hours after
+ * its registration, `devices.created_at`. A device exactly this old is still
+ * too new. A new sign-in keeps the device and so its age.
+ */
+export const DEVICE_TOO_NEW_MS = 72 * 60 * 60_000;
+
+/**
+ * Whether the acting device is older than `DEVICE_TOO_NEW_MS` at `now`. A
+ * device that the acting account does not have is not. `created_at` never
+ * changes, so the row is read without a lock; the API's `lockActor` holds it
+ * anyway.
+ */
+async function deviceOldEnough(tx: Database, actor: Actor): Promise<boolean> {
+  const [device] = await tx
+    .select({ createdAt: devices.createdAt })
+    .from(devices)
+    .where(
+      and(eq(devices.id, actor.deviceId), eq(devices.userId, actor.userId)),
+    );
+  return (
+    device !== undefined &&
+    device.createdAt.getTime() + DEVICE_TOO_NEW_MS < actor.now.getTime()
+  );
+}
+
+/**
+ * Whether the acting person may change the role of the target at all (ADR
+ * 0014, "People and roles"): only the owner, and never the owner's own role,
+ * which changes only by an ownership transfer. So nobody changes their own
+ * role.
+ */
+function mayChangeRole(actor: LockedPerson, target: LockedPerson): boolean {
+  return actor.role === "owner" && target.role !== "owner";
+}
+
+export type PromoteMemberInput = Actor & Readonly<{ memberId: MemberId }>;
+
+export type PromoteMemberResult =
+  | Readonly<{ promoted: true }>
+  | Readonly<{
+      promoted: false;
+      /** `device_too_new`: the acting device is not older than `DEVICE_TOO_NEW_MS`. */
+      refusal: PersonRefusal | "device_too_new";
+    }>;
+
+/**
+ * Promotes an active, claimed `member` to `admin` in one transaction (ADR
+ * 0014, "People and roles"): only the owner, from a device that is older
+ * than `DEVICE_TOO_NEW_MS` at `now`. Anyone else, and a change of the owner's
+ * own role, is `forbidden`; a device that is not is `device_too_new`; a removed
+ * or unclaimed person, who is always a member, and an admin are `conflict`.
+ * Writes a `member.promoted` audit record. Inside another transaction it
+ * runs as a savepoint.
+ */
+export async function promoteMember(
+  db: Database,
+  input: PromoteMemberInput,
+): Promise<PromoteMemberResult> {
+  return withDatabaseErrors(() =>
+    db.transaction(async (tx): Promise<PromoteMemberResult> => {
+      const { actor, target } = await lockPeople(tx, input);
+      if (actor === undefined) {
+        return { promoted: false, refusal: "not_member" };
+      }
+      if (target === undefined) {
+        return { promoted: false, refusal: "not_found" };
+      }
+      if (!mayChangeRole(actor, target)) {
+        return { promoted: false, refusal: "forbidden" };
+      }
+      if (!(await deviceOldEnough(tx, input))) {
+        return { promoted: false, refusal: "device_too_new" };
+      }
+      if (
+        target.removedAt !== null ||
+        target.userId === null ||
+        target.role !== "member"
+      ) {
+        return { promoted: false, refusal: "conflict" };
+      }
+      await tx
+        .update(workspaceMembers)
+        .set({ role: "admin", updatedAt: input.now })
+        .where(eq(workspaceMembers.id, target.id));
+      await audit(tx, input, "member.promoted", target.id);
+      return { promoted: true };
+    }),
+  );
+}
+
+export type DemoteMemberInput = Actor & Readonly<{ memberId: MemberId }>;
+
+export type DemoteMemberResult =
+  | Readonly<{
+      demoted: true;
+      /**
+       * The invitations that the demoted account created in the workspace,
+       * each neither accepted nor revoked, in the order of their IDs.
+       */
+      revokedInvitationIds: readonly InvitationId[];
+    }>
+  | Readonly<{ demoted: false; refusal: PersonRefusal }>;
+
+/**
+ * Demotes an active `admin` to `member` in one transaction (ADR 0014,
+ * "People and roles"): only the owner, from any of the owner's devices.
+ * Anyone else, and a change of the owner's own role, is `forbidden`; a
+ * removed person and a member, an unclaimed one too, are `conflict`. Writes
+ * a `member.demoted` audit record, then revokes the invitations that the
+ * demoted account created in the workspace, each neither accepted nor
+ * revoked, also an expired one, with the owner as `revoked_by_user_id` and
+ * an `invitation.revoked` audit record with the reason `creator_demoted` for
+ * each. It locks the invitations after the people, in the order of their
+ * IDs, as a removal does. Inside another transaction it runs as a savepoint.
+ */
+export async function demoteMember(
+  db: Database,
+  input: DemoteMemberInput,
+): Promise<DemoteMemberResult> {
+  return withDatabaseErrors(() =>
+    db.transaction(async (tx): Promise<DemoteMemberResult> => {
+      const { actor, target } = await lockPeople(tx, input);
+      if (actor === undefined) {
+        return { demoted: false, refusal: "not_member" };
+      }
+      if (target === undefined) {
+        return { demoted: false, refusal: "not_found" };
+      }
+      if (!mayChangeRole(actor, target)) {
+        return { demoted: false, refusal: "forbidden" };
+      }
+      if (
+        target.removedAt !== null ||
+        target.userId === null ||
+        target.role !== "admin"
+      ) {
+        return { demoted: false, refusal: "conflict" };
+      }
+      await tx
+        .update(workspaceMembers)
+        .set({ role: "member", updatedAt: input.now })
+        .where(eq(workspaceMembers.id, target.id));
+      await audit(tx, input, "member.demoted", target.id);
+      const revokedInvitationIds = await revokeOpenInvitations(
+        tx,
+        input,
+        eq(workspaceInvitations.createdByUserId, target.userId),
+        "creator_demoted",
+      );
+      return { demoted: true, revokedInvitationIds };
+    }),
+  );
 }

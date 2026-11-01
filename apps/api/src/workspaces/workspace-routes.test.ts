@@ -328,6 +328,8 @@ test("on every route under /workspaces/:workspaceId, a non-member gets the answe
     "defineMember",
     "renameMember",
     "removeMember",
+    "promoteMember",
+    "demoteMember",
     "listInvitations",
     "createInvitation",
     "revokeInvitation",
