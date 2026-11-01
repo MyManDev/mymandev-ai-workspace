@@ -91,6 +91,23 @@ function toMember(row: MemberRow): WorkspaceMember {
   };
 }
 
+/**
+ * One person with the sign-in identity of its account, as the protocol shows
+ * it; undefined when the person does not exist. For the functions of this
+ * package, which run it through `withDatabaseErrors`.
+ */
+export async function memberById(
+  db: Database,
+  memberId: MemberId,
+): Promise<WorkspaceMember | undefined> {
+  const [row] = await db
+    .select(memberColumns)
+    .from(workspaceMembers)
+    .leftJoin(userIdentities, identityOfMember)
+    .where(eq(workspaceMembers.id, memberId));
+  return row === undefined ? undefined : toMember(row);
+}
+
 export type CreateWorkspaceInput = Readonly<{
   userId: UserId;
   /** The account's device that asks, recorded as the actor's device. */

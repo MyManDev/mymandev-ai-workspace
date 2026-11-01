@@ -3,12 +3,15 @@ import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import {
+  AcceptInvitationResponseSchema,
   type DeviceId,
   type InvitationId,
   InvitationListResponseSchema,
   InvitationSchema,
   type MemberId,
   newId,
+  newUuidV7,
+  PreviewInvitationResponseSchema,
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
@@ -16,16 +19,21 @@ import { and, eq, inArray, isNull } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
 import type { Database } from "./db.ts";
 import {
+  acceptInvitation,
+  type AcceptInvitationResult,
   createInvitation,
   type CreateInvitationInput,
   type CreateInvitationResult,
   listInvitations,
+  previewInvitation,
   revokeInvitation,
 } from "./invitations.ts";
 import { createWorkspace } from "./membership.ts";
+import { removeMember } from "./people.ts";
 import {
   auditEvents,
   devices,
+  userIdentities,
   users,
   workspaceInvitations,
   workspaceMembers,
@@ -1109,5 +1117,793 @@ test(
         ),
       );
     assert.equal(live.length, 50);
+  },
+);
+
+// Previewing and accepting an invitation code.
+
+let nextSubject = 7_000_000;
+
+/** Gives an account its GitHub identity, last verified at `NOW`, as a sign-in does. */
+async function identify(who: Account, login: string): Promise<void> {
+  nextSubject += 1;
+  await database()
+    .insert(userIdentities)
+    .values({
+      id: newUuidV7(),
+      userId: who.userId,
+      identityProvider: "github",
+      subject: String(nextSubject),
+      login,
+      accountCreatedAt: new Date("2015-06-01T10:00:00.000Z"),
+      lastSignInAt: NOW,
+    });
+}
+
+async function personRow(id: MemberId) {
+  const [row] = await database()
+    .select()
+    .from(workspaceMembers)
+    .where(eq(workspaceMembers.id, id));
+  assert.ok(row !== undefined);
+  return row;
+}
+
+/** Every row that a preview or an acceptance in the workspace could change. */
+async function snapshot(workspaceId: WorkspaceId) {
+  const db = database();
+  return {
+    invitations: await db
+      .select()
+      .from(workspaceInvitations)
+      .where(eq(workspaceInvitations.workspaceId, workspaceId))
+      .orderBy(workspaceInvitations.id),
+    people: await db
+      .select()
+      .from(workspaceMembers)
+      .where(eq(workspaceMembers.workspaceId, workspaceId))
+      .orderBy(workspaceMembers.id),
+    audit: await auditOf(workspaceId),
+  };
+}
+
+test("a preview shows the workspace, the person, the inviter's person with the GitHub login, and the expiry, and consumes nothing", async () => {
+  const owner = await account("Owner account");
+  const admin = await account("Admin account");
+  const guest = await account("Guest");
+  await identify(admin, "grace-h");
+  const { workspaceId } = await workspaceOf(owner);
+  await addPerson(workspaceId, owner, {
+    claimedBy: admin,
+    role: "admin",
+    displayName: "Grace",
+  });
+  const linus = await addPerson(workspaceId, owner, { displayName: "Linus" });
+  const tokenHash = hash();
+  const { invitation } = await created({
+    workspaceId,
+    ...admin,
+    memberId: linus,
+    tokenHash,
+    lifetimeSeconds: 2 * 3_600,
+    now: NOW,
+  });
+  const before = await snapshot(workspaceId);
+
+  const input = { tokenHash, userId: guest.userId, now: LATER };
+  const first = await previewInvitation(database(), input);
+  // The inviter is shown by their person in the workspace, not by the
+  // account's display name.
+  assert.deepEqual(first, {
+    previewed: true,
+    invitationId: invitation.id,
+    preview: {
+      workspaceName: "Team",
+      displayName: "Linus",
+      inviter: {
+        displayName: "Grace",
+        identity: {
+          provider: "github",
+          login: "grace-h",
+          verifiedAt: NOW.toISOString(),
+        },
+      },
+      expiresAt: at(2 * HOUR_MS).toISOString(),
+    },
+  });
+  assert.ok(first.previewed);
+  PreviewInvitationResponseSchema.parse(first.preview);
+  assert.deepEqual(await previewInvitation(database(), input), first);
+  assert.deepEqual(await snapshot(workspaceId), before, "nothing changed");
+
+  // The code still claims the person.
+  const accepted = await acceptInvitation(database(), {
+    tokenHash,
+    ...guest,
+    now: LATER,
+  });
+  assert.ok(accepted.accepted);
+  assert.equal(accepted.membership.member.id, linus);
+});
+
+test("a preview refuses an invitation whose creator has no person or no GitHub identity in the workspace as inviter_unknown", async () => {
+  const owner = await account("Owner");
+  const stranger = await account("Stranger");
+  const guest = await account("Guest");
+  await identify(stranger, "stranger-login");
+  const { workspaceId } = await workspaceOf(owner);
+  const preview = (tokenHash: string) =>
+    previewInvitation(database(), {
+      tokenHash,
+      userId: guest.userId,
+      now: LATER,
+    });
+
+  // The owner of this test never signed in with GitHub.
+  const noIdentity = hash();
+  const { invitation } = await created({
+    workspaceId,
+    ...owner,
+    memberId: await addPerson(workspaceId, owner),
+    tokenHash: noIdentity,
+    now: NOW,
+  });
+  assert.deepEqual(await preview(noIdentity), {
+    previewed: false,
+    refusal: "invitation_invalid",
+    reason: "inviter_unknown",
+    invitationId: invitation.id,
+  });
+
+  // An account with an identity but no person in the workspace, as only
+  // data written outside these functions can be.
+  const noPerson = hash();
+  const [written] = await insertInvitations(workspaceId, stranger, [
+    { memberId: await addPerson(workspaceId, owner), tokenHash: noPerson },
+  ]);
+  assert.ok(written !== undefined);
+  assert.deepEqual(await preview(noPerson), {
+    previewed: false,
+    refusal: "invitation_invalid",
+    reason: "inviter_unknown",
+    invitationId: written,
+  });
+});
+
+test("the inviter of a preview is the creator's active person, or else its most recently removed person", async () => {
+  const owner = await account("Owner");
+  const admin = await account("Admin");
+  const guest = await account("Guest");
+  await identify(admin, "grace-h");
+  const { workspaceId } = await workspaceOf(owner);
+  // The person removed last has the smaller ID, so that only the removal
+  // time can pick it.
+  const removedLast = newId<MemberId>();
+  const removedFirst = newId<MemberId>();
+  await addPerson(workspaceId, owner, {
+    id: removedFirst,
+    claimedBy: admin,
+    role: "admin",
+    displayName: "Grace before",
+    removedAt: at(-2 * HOUR_MS),
+    removedByUserId: owner.userId,
+  });
+  await addPerson(workspaceId, owner, {
+    id: removedLast,
+    claimedBy: admin,
+    role: "admin",
+    displayName: "Grace",
+  });
+  const tokenHash = hash();
+  await created({
+    workspaceId,
+    ...admin,
+    memberId: await addPerson(workspaceId, owner),
+    tokenHash,
+    now: NOW,
+  });
+  const inviter = async () => {
+    const result = await previewInvitation(database(), {
+      tokenHash,
+      userId: guest.userId,
+      now: LATER,
+    });
+    assert.ok(result.previewed, JSON.stringify(result));
+    return result.preview.inviter;
+  };
+  const identity = {
+    provider: "github",
+    login: "grace-h",
+    verifiedAt: NOW.toISOString(),
+  };
+
+  assert.deepEqual(await inviter(), { displayName: "Grace", identity });
+
+  // Until #93 revokes the invitations of a removed person.
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: at(30 * MINUTE_MS), removedByUserId: owner.userId })
+    .where(eq(workspaceMembers.id, removedLast));
+  assert.deepEqual(await inviter(), { displayName: "Grace", identity });
+});
+
+test("accepting claims the person, records the account and the device, and is audited; a second acceptance of the code claims nothing", async () => {
+  const owner = await account("Owner");
+  const first = await account("First");
+  const second = await account("Second");
+  await identify(first, "first-login");
+  const { workspaceId } = await workspaceOf(owner);
+  const linus = await addPerson(workspaceId, owner, { displayName: "Linus" });
+  const tokenHash = hash();
+  const { invitation } = await created({
+    workspaceId,
+    ...owner,
+    memberId: linus,
+    tokenHash,
+    now: NOW,
+  });
+
+  const accepted = await acceptInvitation(database(), {
+    tokenHash,
+    ...first,
+    now: LATER,
+  });
+  assert.deepEqual(accepted, {
+    accepted: true,
+    invitationId: invitation.id,
+    membership: {
+      workspace: { id: workspaceId, name: "Team" },
+      member: {
+        id: linus,
+        workspaceId,
+        displayName: "Linus",
+        role: "member",
+        userId: first.userId,
+        identity: {
+          provider: "github",
+          login: "first-login",
+          verifiedAt: NOW.toISOString(),
+        },
+        removedAt: null,
+      },
+    },
+  });
+  assert.ok(accepted.accepted);
+  AcceptInvitationResponseSchema.parse(accepted.membership);
+  const consumed = await invitationRow(invitation.id);
+  assert.deepEqual(
+    [
+      consumed.acceptedAt,
+      consumed.acceptedByUserId,
+      consumed.acceptedDeviceId,
+      consumed.revokedAt,
+    ],
+    [LATER, first.userId, first.deviceId, null],
+  );
+  const claimed = await personRow(linus);
+  assert.deepEqual(
+    [claimed.userId, claimed.claimedAt, claimed.role, claimed.removedAt],
+    [first.userId, LATER, "member", null],
+  );
+  const after = await snapshot(workspaceId);
+
+  // Only the first acceptance claims the person.
+  assert.deepEqual(
+    await acceptInvitation(database(), { tokenHash, ...second, now: LATER }),
+    {
+      accepted: false,
+      refusal: "invitation_invalid",
+      reason: "used",
+      invitationId: invitation.id,
+    },
+  );
+  // The account that claimed the person is an active member now.
+  assert.deepEqual(
+    await acceptInvitation(database(), { tokenHash, ...first, now: LATER }),
+    {
+      accepted: false,
+      refusal: "already_member",
+      invitationId: invitation.id,
+    },
+  );
+  assert.deepEqual(await snapshot(workspaceId), after, "nothing changed");
+  assert.deepEqual(
+    after.audit.map((entry) => [
+      entry.action,
+      entry.actorUserId,
+      entry.actorDeviceId,
+      entry.subjectId,
+      entry.reason,
+      entry.createdAt,
+    ]),
+    [
+      [
+        "invitation.created",
+        owner.userId,
+        owner.deviceId,
+        invitation.id,
+        null,
+        NOW,
+      ],
+      [
+        "invitation.accepted",
+        first.userId,
+        first.deviceId,
+        invitation.id,
+        null,
+        LATER,
+      ],
+      ["member.claimed", first.userId, first.deviceId, linus, null, LATER],
+    ],
+  );
+  const recorded = await database()
+    .select({ workspaceId: auditEvents.workspaceId })
+    .from(auditEvents)
+    .where(eq(auditEvents.subjectId, linus));
+  assert.ok(recorded.every((entry) => entry.workspaceId === workspaceId));
+});
+
+test("an unknown, used, expired, or revoked code and a removed or claimed person are refused as invitation_invalid with their reason, and nothing is written", async () => {
+  const owner = await account("Owner");
+  const first = await account("First");
+  const guest = await account("Guest");
+  const bystander = await account("Bystander");
+  await identify(owner, "owner-login");
+  const { workspaceId } = await workspaceOf(owner);
+  const invite = async (
+    memberId: MemberId,
+    lifetimeSeconds?: number,
+  ): Promise<{ id: InvitationId; tokenHash: string }> => {
+    const tokenHash = hash();
+    const { invitation } = await created({
+      workspaceId,
+      ...owner,
+      memberId,
+      tokenHash,
+      lifetimeSeconds,
+      now: NOW,
+    });
+    return { id: invitation.id, tokenHash };
+  };
+
+  const used = await invite(await addPerson(workspaceId, owner));
+  const usedBy = await acceptInvitation(database(), {
+    tokenHash: used.tokenHash,
+    ...first,
+    now: NOW,
+  });
+  assert.ok(usedBy.accepted);
+  // It expires at LATER, exactly.
+  const expired = await invite(await addPerson(workspaceId, owner), 3_600);
+  const revoked = await invite(await addPerson(workspaceId, owner));
+  const revocation = await revokeInvitation(database(), {
+    workspaceId,
+    ...owner,
+    invitationId: revoked.id,
+    now: NOW,
+  });
+  assert.deepEqual(revocation, { revoked: true });
+  // Removing a person revokes its invitation.
+  const removedPerson = await addPerson(workspaceId, owner);
+  const removedWithInvitation = await invite(removedPerson);
+  const removal = await removeMember(database(), {
+    workspaceId,
+    ...owner,
+    memberId: removedPerson,
+    now: NOW,
+  });
+  assert.ok(removal.removed);
+  // A person removed or claimed while its invitation stayed live, as only
+  // data written outside these functions can be.
+  const removedLive = await addPerson(workspaceId, owner);
+  const removedLiveInvitation = await invite(removedLive);
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: NOW, removedByUserId: owner.userId })
+    .where(eq(workspaceMembers.id, removedLive));
+  const claimedLive = await addPerson(workspaceId, owner);
+  const claimedLiveInvitation = await invite(claimedLive);
+  await database()
+    .update(workspaceMembers)
+    .set({ userId: bystander.userId, claimedAt: NOW })
+    .where(eq(workspaceMembers.id, claimedLive));
+  const before = await snapshot(workspaceId);
+
+  for (const [label, tokenHash, invitationId, reason] of [
+    ["an unknown code", hash(), null, "unknown"],
+    ["a used code", used.tokenHash, used.id, "used"],
+    ["an expired code", expired.tokenHash, expired.id, "expired"],
+    ["a revoked code", revoked.tokenHash, revoked.id, "revoked"],
+    [
+      "the code of a removed person",
+      removedWithInvitation.tokenHash,
+      removedWithInvitation.id,
+      "revoked",
+    ],
+    [
+      "a live code of a removed person",
+      removedLiveInvitation.tokenHash,
+      removedLiveInvitation.id,
+      "member_removed",
+    ],
+    [
+      "a live code of a claimed person",
+      claimedLiveInvitation.tokenHash,
+      claimedLiveInvitation.id,
+      "member_claimed",
+    ],
+  ] as const) {
+    const refusal = { refusal: "invitation_invalid", reason, invitationId };
+    assert.deepEqual(
+      await previewInvitation(database(), {
+        tokenHash,
+        userId: guest.userId,
+        now: LATER,
+      }),
+      { previewed: false, ...refusal },
+      label,
+    );
+    assert.deepEqual(
+      await acceptInvitation(database(), { tokenHash, ...guest, now: LATER }),
+      { accepted: false, ...refusal },
+      label,
+    );
+  }
+  // A consumed invitation whose person cannot be claimed was rolled back.
+  assert.deepEqual(await snapshot(workspaceId), before, "nothing changed");
+  const [membership] = await database()
+    .select({ id: workspaceMembers.id })
+    .from(workspaceMembers)
+    .where(eq(workspaceMembers.userId, guest.userId));
+  assert.equal(membership, undefined);
+
+  // One millisecond earlier, the expired code was still live.
+  const lastMoment = await acceptInvitation(database(), {
+    tokenHash: expired.tokenHash,
+    ...guest,
+    now: new Date(LATER.getTime() - 1),
+  });
+  assert.ok(lastMoment.accepted);
+});
+
+test("an active member of the workspace gets already_member before anything is consumed, whatever the invitation's state", async () => {
+  const owner = await account("Owner");
+  const member = await account("Member");
+  const guest = await account("Guest");
+  await identify(owner, "owner-login");
+  const { workspaceId } = await workspaceOf(owner);
+  await addPerson(workspaceId, owner, { claimedBy: member });
+  const linus = await addPerson(workspaceId, owner);
+  const live = hash();
+  const { invitation } = await created({
+    workspaceId,
+    ...owner,
+    memberId: linus,
+    tokenHash: live,
+    now: NOW,
+  });
+  const margaret = await addPerson(workspaceId, owner);
+  const revokedHash = hash();
+  const revoked = await created({
+    workspaceId,
+    ...owner,
+    memberId: margaret,
+    tokenHash: revokedHash,
+    now: NOW,
+  });
+  await revokeInvitation(database(), {
+    workspaceId,
+    ...owner,
+    invitationId: revoked.invitation.id,
+    now: NOW,
+  });
+  const before = await snapshot(workspaceId);
+
+  for (const [who, tokenHash, invitationId] of [
+    [owner, live, invitation.id],
+    [member, live, invitation.id],
+    [member, revokedHash, revoked.invitation.id],
+  ] as const) {
+    const refusal = { refusal: "already_member", invitationId };
+    assert.deepEqual(
+      await previewInvitation(database(), {
+        tokenHash,
+        userId: who.userId,
+        now: LATER,
+      }),
+      { previewed: false, ...refusal },
+    );
+    assert.deepEqual(
+      await acceptInvitation(database(), { tokenHash, ...who, now: LATER }),
+      { accepted: false, ...refusal },
+    );
+  }
+  assert.deepEqual(await snapshot(workspaceId), before, "nothing changed");
+
+  // The invitation was not consumed: the person it names can still claim it.
+  const accepted = await acceptInvitation(database(), {
+    tokenHash: live,
+    ...guest,
+    now: LATER,
+  });
+  assert.ok(accepted.accepted);
+  assert.equal(accepted.membership.member.id, linus);
+});
+
+test("an account removed from a workspace rejoins as a new person, and its earlier person stays in the history", async () => {
+  const owner = await account("Owner");
+  const returning = await account("Returning");
+  await identify(returning, "returning-login");
+  const { workspaceId } = await workspaceOf(owner);
+  const earlier = await addPerson(workspaceId, owner, {
+    claimedBy: returning,
+    displayName: "Ada",
+  });
+  // Until #93 removes claimed people.
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: NOW, removedByUserId: owner.userId })
+    .where(eq(workspaceMembers.id, earlier));
+  const earlierRow = await personRow(earlier);
+  const again = await addPerson(workspaceId, owner, { displayName: "Ada" });
+  const tokenHash = hash();
+  await created({
+    workspaceId,
+    ...owner,
+    memberId: again,
+    tokenHash,
+    now: NOW,
+  });
+
+  const accepted = await acceptInvitation(database(), {
+    tokenHash,
+    ...returning,
+    now: LATER,
+  });
+  assert.ok(accepted.accepted);
+  assert.equal(accepted.membership.member.id, again);
+  assert.notEqual(again, earlier);
+  assert.deepEqual(
+    await personRow(earlier),
+    earlierRow,
+    "the former person stays",
+  );
+  const people = await database()
+    .select({
+      id: workspaceMembers.id,
+      removedAt: workspaceMembers.removedAt,
+    })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, returning.userId),
+      ),
+    )
+    .orderBy(workspaceMembers.id);
+  assert.deepEqual(people, [
+    { id: earlier, removedAt: NOW },
+    { id: again, removedAt: null },
+  ]);
+});
+
+/**
+ * Runs `first` in a second session and keeps its transaction open, starts
+ * `action`, and once the action waits for a lock, runs `then` in that
+ * session and commits. Returns the action's result. The second session's
+ * transaction must commit; a deadlock between the two fails the test.
+ */
+async function whileHeld<T>(
+  first: (tx: Database) => Promise<unknown>,
+  then: (tx: Database) => Promise<unknown>,
+  action: () => Promise<T>,
+): Promise<T> {
+  const url = testDatabase?.url;
+  assert.ok(url, "the test database is on a server");
+  const other = createDatabase(url, { max: 1 });
+  const holding = Promise.withResolvers<void>();
+  const proceed = Promise.withResolvers<void>();
+  const changing = other.db.transaction(async (tx) => {
+    await first(tx);
+    holding.resolve();
+    await proceed.promise;
+    await then(tx);
+  });
+  try {
+    await Promise.race([
+      holding.promise,
+      changing.then(() => {
+        throw new Error("the change ended early");
+      }),
+    ]);
+    const result = action();
+    let settled = false;
+    result.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    while (!settled && !(await waitsForLock())) {
+      await delay(10);
+    }
+    proceed.resolve();
+    await changing;
+    return await result;
+  } finally {
+    proceed.resolve();
+    await changing.catch(() => undefined);
+    await other.close();
+  }
+}
+
+test(
+  "of two concurrent acceptances of one code, exactly one claims the person",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const first = await account("First");
+    const second = await account("Second");
+    const { workspaceId } = await workspaceOf(owner);
+    const linus = await addPerson(workspaceId, owner);
+    const tokenHash = hash();
+    const { invitation } = await created({
+      workspaceId,
+      ...owner,
+      memberId: linus,
+      tokenHash,
+      now: NOW,
+    });
+
+    // The first acceptance holds its transaction open while the second starts.
+    let firstResult: AcceptInvitationResult | undefined;
+    const secondResult = await whileHeld(
+      async (tx) => {
+        firstResult = await acceptInvitation(tx, {
+          tokenHash,
+          ...first,
+          now: LATER,
+        });
+      },
+      async () => undefined,
+      () => acceptInvitation(database(), { tokenHash, ...second, now: LATER }),
+    );
+    assert.equal(firstResult?.accepted, true);
+    assert.deepEqual(secondResult, {
+      accepted: false,
+      refusal: "invitation_invalid",
+      reason: "used",
+      invitationId: invitation.id,
+    });
+
+    // And both at once, without a held transaction.
+    const third = await account("Third");
+    const fourth = await account("Fourth");
+    const margaret = await addPerson(workspaceId, owner);
+    const raced = hash();
+    await created({
+      workspaceId,
+      ...owner,
+      memberId: margaret,
+      tokenHash: raced,
+      now: NOW,
+    });
+    const results = await Promise.all(
+      [third, fourth].map((who) =>
+        acceptInvitation(database(), { tokenHash: raced, ...who, now: LATER }),
+      ),
+    );
+    assert.deepEqual(results.map((result) => result.accepted).sort(), [
+      false,
+      true,
+    ]);
+
+    for (const [memberId, winner] of [
+      [linus, first],
+      [margaret, results[0]?.accepted === true ? third : fourth],
+    ] as const) {
+      assert.equal((await personRow(memberId)).userId, winner.userId);
+    }
+    const claims = (await auditOf(workspaceId)).filter(
+      (entry) =>
+        entry.action === "invitation.accepted" ||
+        entry.action === "member.claimed",
+    );
+    assert.equal(claims.length, 4);
+  },
+);
+
+test(
+  "an acceptance locks the person before it consumes the invitation, so it waits for a removal that holds the person and does not deadlock with it",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const guest = await account("Guest");
+    const { workspaceId } = await workspaceOf(owner);
+    const linus = await addPerson(workspaceId, owner);
+    const tokenHash = hash();
+    const { invitation } = await created({
+      workspaceId,
+      ...owner,
+      memberId: linus,
+      tokenHash,
+      now: NOW,
+    });
+
+    // As `removeMember`: the person first, then the person's invitation.
+    const result = await whileHeld(
+      (tx) =>
+        tx
+          .select({ id: workspaceMembers.id })
+          .from(workspaceMembers)
+          .where(eq(workspaceMembers.id, linus))
+          .for("no key update"),
+      async (tx) => {
+        await tx
+          .update(workspaceMembers)
+          .set({ removedAt: NOW, removedByUserId: owner.userId })
+          .where(eq(workspaceMembers.id, linus));
+        await tx
+          .update(workspaceInvitations)
+          .set({ revokedAt: NOW, revokedByUserId: owner.userId })
+          .where(eq(workspaceInvitations.id, invitation.id));
+      },
+      () => acceptInvitation(database(), { tokenHash, ...guest, now: LATER }),
+    );
+    assert.deepEqual(result, {
+      accepted: false,
+      refusal: "invitation_invalid",
+      reason: "revoked",
+      invitationId: invitation.id,
+    });
+    const row = await invitationRow(invitation.id);
+    assert.equal(row.acceptedAt, null);
+    assert.ok(row.revokedAt instanceof Date);
+    const person = await personRow(linus);
+    assert.equal(person.userId, null);
+    assert.ok(person.removedAt instanceof Date);
+  },
+);
+
+test(
+  "an account that claims another person of the workspace while its acceptance runs gets already_member, and the invitation stays live",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const guest = await account("Guest");
+    const { workspaceId } = await workspaceOf(owner);
+    const linus = await addPerson(workspaceId, owner);
+    const margaret = await addPerson(workspaceId, owner);
+    const tokenHash = hash();
+    const { invitation } = await created({
+      workspaceId,
+      ...owner,
+      memberId: linus,
+      tokenHash,
+      now: NOW,
+    });
+
+    // As a concurrent acceptance of Margaret's invitation by the same account.
+    const result = await whileHeld(
+      (tx) =>
+        tx
+          .update(workspaceMembers)
+          .set({ userId: guest.userId, claimedAt: NOW })
+          .where(eq(workspaceMembers.id, margaret)),
+      async () => undefined,
+      () => acceptInvitation(database(), { tokenHash, ...guest, now: LATER }),
+    );
+    assert.deepEqual(result, {
+      accepted: false,
+      refusal: "already_member",
+      invitationId: invitation.id,
+    });
+    const row = await invitationRow(invitation.id);
+    assert.equal(row.acceptedAt, null);
+    assert.equal(row.revokedAt, null);
+    assert.equal((await personRow(linus)).userId, null);
+    assert.equal((await personRow(margaret)).userId, guest.userId);
   },
 );

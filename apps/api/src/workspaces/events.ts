@@ -6,6 +6,7 @@ import {
   type ServerOnlyEventType,
   type WorkspaceId,
 } from "@mymandev/protocol";
+import type { FastifyRequest } from "fastify";
 
 /**
  * A membership event: a change of the people that every member of the
@@ -56,4 +57,33 @@ function deepFreeze<T>(value: T): T {
  */
 export function frozenCopy(event: WorkspaceEvent): WorkspaceEvent {
   return deepFreeze(structuredClone(event));
+}
+
+/**
+ * Hands a frozen copy of a membership event to `handler` without waiting for
+ * it: the change is already committed, so a handler that never returns
+ * cannot hold the answer, and a failure is only logged. The log names the
+ * error's type and never its message, which may quote a display name.
+ */
+export function sendWorkspaceEvent(
+  request: FastifyRequest,
+  handler: WorkspaceEventHandler,
+  event: WorkspaceEvent,
+): void {
+  const copy = frozenCopy(event);
+  const failed = (error: unknown) => {
+    request.log.error(
+      {
+        eventType: copy.type,
+        workspaceId: copy.workspaceId,
+        errorType: error instanceof Error ? error.name : typeof error,
+      },
+      "workspace event failed",
+    );
+  };
+  try {
+    Promise.resolve(handler(copy)).catch(failed);
+  } catch (error) {
+    failed(error);
+  }
 }
