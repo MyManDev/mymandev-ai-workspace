@@ -1,6 +1,6 @@
 # @mymandev/desktop
 
-The desktop application: an Electron shell with a React renderer. It shows the product name and a placeholder screen structure. The decisions behind it are recorded in [ADR 0016](../../docs/architecture/decisions/0016-desktop-toolchain.md).
+The desktop application: an Electron shell with a React renderer. It shows the product name, a placeholder screen structure, and the status of the local runtime in the main process, which the renderer reads through a typed IPC contract. The decisions behind it are recorded in [ADR 0016](../../docs/architecture/decisions/0016-desktop-toolchain.md).
 
 ## Start locally
 
@@ -27,16 +27,45 @@ Run them from the repository root with `-w @mymandev/desktop`, or from `apps/des
 
 ## Layout
 
-| Path                      | Contents                                                                                                                                                        |
-| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/main/`               | The main process: the single-instance lock, the application window, the `app://` scheme, the navigation rules, and the guards for web contents and the session. |
-| `src/preload/`            | The preload script. It exposes `window.desktop` to the renderer.                                                                                                |
-| `src/renderer/`           | The renderer: `index.html` with the Content Security Policy, the React entry point, the shell, and the screen state. It has its own `tsconfig.json`.            |
-| `src/shared/`             | Code and types that both sides use: the product name, the Content Security Policy, and the `window.desktop` interface.                                          |
-| `config/csp.ts`           | The Vite plugin that writes the Content Security Policy into `index.html`, with the development server's additions during `npm run dev`.                        |
-| `electron.vite.config.ts` | The electron-vite configuration for the three targets.                                                                                                          |
+| Path                      | Contents                                                                                                                                                                                             |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/main/`               | The main process: the single-instance lock, the application window, the `app://` scheme, the navigation rules, the guards for web contents and the session, the local runtime, and the IPC handlers. |
+| `src/preload/`            | The preload script. It exposes `window.desktop` to the renderer.                                                                                                                                     |
+| `src/renderer/`           | The renderer: `index.html` with the Content Security Policy, the React entry point, the shell, and the screen state. It has its own `tsconfig.json`.                                                 |
+| `src/shared/`             | Code and types that several sides use: the product name, the Content Security Policy, the `window.desktop` interface, the IPC channel names, and the IPC contract.                                   |
+| `config/csp.ts`           | The Vite plugin that writes the Content Security Policy into `index.html`, with the development server's additions during `npm run dev`.                                                             |
+| `electron.vite.config.ts` | The electron-vite configuration for the three targets.                                                                                                                                               |
 
 The screens are a typed state, not routes: `src/renderer/screens.ts` lists them, and `shellReducer` switches between them.
+
+## Local runtime
+
+The local runtime ([`src/main/runtime.ts`](src/main/runtime.ts)) is a service in the main process. It starts when the application is ready and stops before the application quits: the first `will-quit` waits until the stop has settled, and the application then quits again ([`src/main/runtime-lifecycle.ts`](src/main/runtime-lifecycle.ts)). Its state is `stopped`, `starting`, `running`, `stopping`, or `failed`, and its `revision` grows by one with every change. A start or stop hook that rejects, throws, or takes longer than 5 seconds moves it to `failed`, so a quit waits at most about two hook timeouts: a start that is still running, then the stop. `stop` also runs the stop hook of a `failed` runtime, so that a start that failed or timed out can clean up, and the application stops a `failed` runtime before it quits as well. The runtime is a placeholder: its hooks do no work, open no network connection, and touch no file. Later milestones add their work there, for example agent execution (M3). The shell header shows the state, for example "Local runtime: Running".
+
+## IPC contract
+
+The renderer reaches the main process only through the functions of `window.desktop`. There is no `ipcRenderer` in the renderer and no function that takes a channel name.
+
+| Channel                    | Direction                        | Arguments | Result or payload  | Bridge function                    |
+| -------------------------- | -------------------------------- | --------- | ------------------ | ---------------------------------- |
+| `runtime:get-status`       | renderer to main, `invoke`       | none      | the runtime status | `window.desktop.runtime.getStatus` |
+| `runtime:subscribe-status` | renderer to main, `invoke`       | none      | the runtime status | `subscribeStatus`                  |
+| `runtime:status-changed`   | main to subscribed frames, event |           | the runtime status | `subscribeStatus`                  |
+
+The runtime status is `{ state, revision }` (`RuntimeStatusSchema`). `subscribeStatus(listener, onError)` delivers the current status and every later one, drops a status older than the last one delivered, and returns a function that ends the subscription.
+
+- [`src/shared/ipc-channels.ts`](src/shared/ipc-channels.ts) names the channels. It imports nothing, so the preload script uses the names without bundling zod.
+- [`src/shared/ipc-contract.ts`](src/shared/ipc-contract.ts) holds a zod schema for the arguments and the result of every invoke channel (`INVOKE_CONTRACT`) and for the payload of every event channel (`EVENT_CONTRACT`), and the types derived from them. The preload script and the renderer import only the types, so zod is bundled into the main process alone, and the renderer needs no `jitless` setting ([ADR 0003](../../docs/architecture/decisions/0003-zod-runtime-validation.md)).
+- [`src/main/ipc.ts`](src/main/ipc.ts) registers the handlers. Each handler first checks the sender: the main frame, not a subframe, still attached, at the URL the window loaded, by the rules of the navigation guard (`isAppNavigation`): in a build only `app://renderer/index.html`, during development the development server's origin ([ADR 0014](../../docs/architecture/decisions/0014-accounts-devices-and-invitations.md)). It then validates the arguments against the contract, and parses its result with the contract, so unknown keys never reach the renderer. A refused call rejects in the renderer with a message that names the channel and the reason, never the arguments. Events go only to frames that subscribed and still show the application.
+- [`src/preload/bridge.ts`](src/preload/bridge.ts) builds the frozen `window.desktop` object. Its functions call fixed channels, pass no argument from the renderer on, and never hand the IPC event object, which holds `ipcRenderer`, to the renderer.
+
+To add a channel:
+
+1. Add its name to `INVOKE_CHANNELS` or `EVENT_CHANNELS` in `ipc-channels.ts`, with a `domain:action` name.
+2. Add its schemas to `INVOKE_CONTRACT` or `EVENT_CONTRACT` in `ipc-contract.ts`. Every string and array has a maximum length, and objects use `z.object`, which strips unknown keys (ADR 0003). Never send a secret: the device key, tokens, and sign-in codes stay in the main process (ADR 0014).
+3. Register an invoke handler with `createInvokeHandler` in `src/main/ipc.ts`, or send an event through a publisher that checks its receivers like `createStatusPublisher`.
+4. Add a function for it to `DesktopBridge` in `src/shared/desktop-bridge.ts` and to `createDesktopBridge`. Never expose `ipcRenderer`, a channel name parameter, or a generic `invoke` or `send`.
+5. Add tests: the schemas accept and refuse, the handler refuses a foreign sender and invalid arguments, and the bridge keeps its exact shape (`ipc-contract.test.ts`, `ipc.test.ts`, `bridge.test.ts`).
 
 ## Security settings
 
@@ -47,17 +76,17 @@ The screens are a typed state, not routes: `src/renderer/screens.ts` lists them,
 - The main process takes the single-instance lock before anything else ([ADR 0014](../../docs/architecture/decisions/0014-accounts-devices-and-invitations.md)). A second start brings the existing window to the front.
 - A built application loads its renderer from `app://renderer/`, a custom scheme registered as standard and secure before the application is ready, not from a `file:` URL ([`src/main/app-protocol.ts`](src/main/app-protocol.ts)). The scheme serves only files inside `out/renderer/`. It answers methods other than GET and HEAD with 405. It answers 404 for another host, credentials, a port, invalid percent-encoding, and a path segment that after decoding is empty, ends with a dot or a space (so also `.`, `..`, and `...`), is a Windows device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9`, `LPT1` to `LPT9`, with or without an extension, in any case), or contains `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`, or a control character. It also answers 404 for a missing file or a directory, and for a path whose real path, after symbolic links, is outside the real path of `out/renderer/`. Every response, errors included, carries the production Content Security Policy as a header and `X-Content-Type-Options: nosniff`; files also get their Content-Type.
 - A packaged application always loads its built files. `ELECTRON_RENDERER_URL`, which electron-vite sets during development, is used only when the application is not packaged, and only for an http URL on `localhost`, `127.0.0.1`, or `[::1]`.
-- The renderer reaches the main process only through `window.desktop`, which holds the Electron version ([`src/shared/desktop-bridge.ts`](src/shared/desktop-bridge.ts)).
+- The renderer reaches the main process only through `window.desktop`, which holds the Electron version and the runtime functions of the [IPC contract](#ipc-contract) ([`src/shared/desktop-bridge.ts`](src/shared/desktop-bridge.ts)). The main process checks the sender and the arguments of every IPC call.
 - The Content Security Policy is defined once, in [`src/shared/content-security-policy.ts`](src/shared/content-security-policy.ts). It allows scripts, styles, images, and fonts only from the page's own origin, which in a build is `app://renderer` and serves only the built renderer files, and no network connection: no inline code, no `eval`, and no remote origin. The main process sends it as a header with every `app://` response, and [`config/csp.ts`](config/csp.ts) writes it into the meta element of [`src/renderer/index.html`](src/renderer/index.html), whose own value, `default-src 'none'`, blocks everything if that step is missing. During `npm run dev`, the plugin adds what the development server needs: a nonce for the inline scripts and styles it injects (the React Refresh preamble and reloaded styles), new for each start, and `connect-src 'self'` for its hot reload WebSocket.
 
 ## Tests
 
-Vitest runs the tests in the Node.js environment, without DOM emulation. They cover the window options, the renderer URL and the navigation rules, the guards (with fake web contents and a fake session, so that a guard that allows or is missing fails a test), the path resolution and the handler of the `app://` scheme (with a fake file system, and once on the real file system with a temporary directory and a directory link that leads out of it), the screen state, the shell markup (rendered with `react-dom/server`), and the Content Security Policy. Code that calls Electron stays thin and is not tested directly; the logic it uses is in plain functions.
+Vitest runs the tests in the Node.js environment, without DOM emulation. They cover the window options, the renderer URL and the navigation rules, the guards (with fake web contents and a fake session, so that a guard that allows or is missing fails a test), the path resolution and the handler of the `app://` scheme (with a fake file system, and once on the real file system with a temporary directory and a directory link that leads out of it), the screen state, the shell markup and the runtime status indicator (rendered with `react-dom/server`), the Content Security Policy, the IPC schemas, the sender check and the handlers, the preload bridge, and the runtime lifecycle with its quit handling. Code that calls Electron stays thin and is not tested directly; the logic it uses is in plain functions that take fakes of `ipcMain`, `ipcRenderer`, `app`, and the timers.
 
 ## Not included yet
 
 - The product screens (M0-04).
-- The local runtime and the typed IPC interface between the renderer and the main process (M1-04).
+- Work for the local runtime, such as terminal and process execution and agent execution.
 - Repository mounting and Git inspection, sign-in, the device key, and the connection to the cloud API.
 - Packaging, code signing, the application name and ID, and Electron fuses (#17).
 - Tests that launch Electron.

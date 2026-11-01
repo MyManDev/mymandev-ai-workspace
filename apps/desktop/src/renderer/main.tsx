@@ -10,6 +10,9 @@ if (container === null) {
 
 createRoot(container).render(
   <StrictMode>
-    <App electronVersion={window.desktop?.electronVersion} />
+    <App
+      electronVersion={window.desktop?.electronVersion}
+      runtime={window.desktop?.runtime}
+    />
   </StrictMode>,
 );
