@@ -1,4 +1,5 @@
 import {
+  type CancelledRun,
   type Database,
   devices,
   requireSignIn,
@@ -31,6 +32,7 @@ import type { FastifyInstance } from "fastify";
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
+import { sendCancelledRuns } from "../workspaces/events.ts";
 import { type RecentRevocations, s256, type SignInCodes } from "./attempts.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
 import { deviceListItem } from "./device-state.ts";
@@ -56,8 +58,10 @@ export type SignInRouteOptions = Readonly<{
   tokens: AccessTokens;
   /**
    * The open WebSocket connections: after a sign-in commits, a connection
-   * with the replaced key or of a replaced device closes, and the account's
-   * other connections hear of a registered or a revoked device.
+   * with the replaced key or of a replaced device closes, the account's
+   * other connections hear of a registered or a revoked device, and the runs
+   * that the revocation cancelled reach their workspaces' subscribed
+   * connections.
    */
   connections: ConnectionRegistry;
   now: () => number;
@@ -69,6 +73,8 @@ type SignInResult = Readonly<{
   registered: DeviceListItem | null;
   /** The previous device that this sign-in revoked as replaced, if any. */
   replacedDeviceId: DeviceId | null;
+  /** The runs that revoking the previous device cancelled. */
+  cancelledRuns: readonly CancelledRun[];
 }>;
 
 /** The first display name: the GitHub name if it passes the text rule and the length limit, else the login. */
@@ -205,6 +211,9 @@ export async function registerSignIn(
           tokens.dropDevice(replaced);
           // The replaced device learns it from its close, before any frame.
           connections.closeDevice(replaced, "device_revoked", request.log);
+          // Each cancelled run reaches its workspace's subscribed
+          // connections (ADR 0014, P-60; #110).
+          sendCancelledRuns(connections, result.cancelledRuns, now);
         }
         if (result.registered === null) {
           // An existing device: its connection used the key that this
@@ -286,6 +295,7 @@ async function signIn(
   let deviceId: DeviceId;
   let registered: DeviceListItem | null = null;
   let replacedDeviceId: DeviceId | null = null;
+  let cancelledRuns: readonly CancelledRun[] = [];
   if (device.kind === "existing") {
     const [row] = await tx
       .select()
@@ -379,8 +389,8 @@ async function signIn(
     await audit(tx, "device.registered", userId, deviceId, deviceId, now);
     if (device.previousDeviceId !== undefined) {
       // Revoked only if it belongs to the same account (ADR 0014, step 8).
-      // After the commit, the route closes its socket; sending the runs that
-      // the revocation cancelled waits for the workspace delivery (#110).
+      // After the commit, the route closes its socket and sends the runs
+      // that the revocation cancelled.
       const replaced = await revokeDevice(tx, {
         deviceId: device.previousDeviceId,
         userId,
@@ -391,6 +401,7 @@ async function signIn(
       });
       if (replaced.revoked) {
         replacedDeviceId = device.previousDeviceId;
+        cancelledRuns = replaced.cancelledRuns;
       }
     }
   }
@@ -408,6 +419,7 @@ async function signIn(
     },
     registered,
     replacedDeviceId,
+    cancelledRuns,
   };
 }
 

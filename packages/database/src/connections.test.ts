@@ -13,6 +13,7 @@ import {
 import { eq } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
 import {
+  activePeopleOf,
   deviceRow,
   deviceRows,
   isActiveMember,
@@ -152,6 +153,69 @@ test("only a claimed person whose removed_at is empty makes an active member", a
     await isActiveMember(db, { workspaceId: workspace, userId: removed }),
     true,
   );
+});
+
+test("activePeopleOf finds the active person of each workspace and account pair, in slices of 500 pairs", async () => {
+  const db = database();
+  const owner = await user("People owner");
+  const member = await user("People member");
+  const removed = await user("People removed");
+  const workspace = newId<WorkspaceId>();
+  const other = newId<WorkspaceId>();
+  await db.insert(workspaces).values([
+    { id: workspace, name: "Team", createdByUserId: owner },
+    { id: other, name: "Other", createdByUserId: member },
+  ]);
+  const person = async (
+    workspaceId: WorkspaceId,
+    userId: UserId | null,
+    fields: Partial<typeof workspaceMembers.$inferInsert> = {},
+  ): Promise<MemberId> => {
+    const id = newId<MemberId>();
+    await db.insert(workspaceMembers).values({
+      id,
+      workspaceId,
+      userId,
+      displayName: "Person",
+      role: "member",
+      addedByUserId: owner,
+      claimedAt: userId === null ? null : NOW,
+      ...fields,
+    });
+    return id;
+  };
+  const ownerPerson = await person(workspace, owner, { role: "owner" });
+  const memberPerson = await person(workspace, member);
+  await person(workspace, removed, {
+    removedAt: LATER,
+    removedByUserId: owner,
+  });
+  await person(workspace, null);
+  const otherOwner = await person(other, member, { role: "owner" });
+
+  // Unknown pairs fill the slices; the known ones sit at the start of each.
+  const pairs = Array.from({ length: 1_001 }, () => ({
+    workspaceId: newId<WorkspaceId>(),
+    userId: newId<UserId>(),
+  }));
+  pairs[0] = { workspaceId: workspace, userId: owner };
+  pairs[500] = { workspaceId: workspace, userId: removed };
+  pairs[1_000] = { workspaceId: other, userId: member };
+  pairs.push({ workspaceId: workspace, userId: member });
+  // Another workspace's account is not this workspace's member.
+  pairs.push({ workspaceId: other, userId: owner });
+
+  const people = await activePeopleOf(db, pairs);
+  assert.deepEqual([...people.keys()].sort(), [workspace, other].sort());
+  assert.deepEqual(
+    new Map(people.get(workspace)),
+    new Map([
+      [owner, ownerPerson],
+      [member, memberPerson],
+    ]),
+  );
+  assert.deepEqual(new Map(people.get(other)), new Map([[member, otherOwner]]));
+  assert.equal((await activePeopleOf(db, [])).size, 0);
 });
 
 test("markDeviceSeen sets last_seen_at of that device only", async () => {

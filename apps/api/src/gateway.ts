@@ -1,4 +1,6 @@
 import {
+  activePeopleOf,
+  activePersonOf,
   type Database,
   deviceRow,
   deviceRows,
@@ -9,22 +11,31 @@ import {
 } from "@mymandev/database";
 import {
   type AuthChallengeFrame,
+  type AuthenticatedClientFrame,
   type AuthOkFrame,
   type AuthResponseFrame,
   type ConnectionId,
-  decodeClientEvent,
   decodeClientFrame,
+  decodeClientMessage,
   type DeviceId,
+  MAX_ANSWER_LIST_ITEMS,
   MAX_AUTH_FRAME_BYTES,
+  type MemberId,
   newId,
+  type PresenceChangedFrame,
+  type PresenceStatus,
   PROTOCOL_VERSION,
   type ProtocolEvent,
+  type ServerEvent,
   type ServerFrame,
   type ServerOnlyEventType,
   SIGN_IN_GRACE_MS,
   SIGN_IN_LIFETIME_MS,
   type UnverifiedEvent,
   type UserId,
+  type WorkspaceId,
+  type WorkspaceSubscribeRefusalCode,
+  type WorkspaceUnsubscribedFrame,
   WS_AUTH_TIMEOUT_MS,
   WS_CLOSE_CODES,
   type WsCloseReason,
@@ -57,12 +68,18 @@ export const CloseCode = {
   /** A text frame that is not JSON. Reason `invalid_json`. */
   invalidFramePayload: 1007,
   /**
-   * A frame that is not a valid event from a device, or an event that
-   * identity binding refused. The reason is the decode or rejection code.
+   * A frame that is not a valid event or frame from a device, or an event
+   * that identity binding refused. The reason is the decode or rejection
+   * code.
    */
   policyViolation: 1008,
   /** A frame over the size limit. Sent by the WebSocket library. */
   messageTooBig: 1009,
+  /**
+   * More than `MAX_BUFFERED_BYTES` wait to be sent to the connection, so it
+   * reads too slowly. Reason `backpressure`; the device reconnects later.
+   */
+  tryAgainLater: 1013,
   /** The server failed, for example the database. Reason `internal_error`. */
   internalError: 1011,
 } as const;
@@ -101,6 +118,39 @@ export const CONNECTION_SWEEP_INTERVAL_MS = 60_000;
  * most this often; `auth.ok` writes it first.
  */
 export const LAST_SEEN_INTERVAL_MS = 5 * 60_000;
+
+/**
+ * At most this many workspace subscriptions per connection (#110); the next
+ * `workspace.subscribe` gets `too_many_subscriptions`. The protocol leaves
+ * the cap to the server, which tunes it with use (P-64). An account creates
+ * at most 10 workspaces a day, and a desktop subscribes to the workspaces it
+ * shows, so 50 leaves room without letting one connection fan out without
+ * bound.
+ */
+export const MAX_SUBSCRIPTIONS_PER_CONNECTION = 50;
+
+/**
+ * How often a subscribe checks the membership again when a removal in the
+ * same workspace was processed during its check (#110). After the last
+ * check is stale too, the subscribe is refused with `not_found`; the device
+ * may subscribe again.
+ */
+export const MAX_SUBSCRIBE_RECHECKS = 3;
+
+/**
+ * The gateway pings every authenticated connection this often, and
+ * terminates one that did not answer the previous ping with a pong, so that
+ * a half-open connection ends within two intervals and its person goes
+ * offline.
+ */
+export const HEARTBEAT_INTERVAL_MS = 30_000;
+
+/**
+ * A connection with more than this many bytes waiting to be sent reads too
+ * slowly: instead of queueing more, the server closes it with 1013 and
+ * `backpressure`.
+ */
+export const MAX_BUFFERED_BYTES = 1024 * 1024;
 
 /** The user and the device that a connection's key proved. */
 export type ConnectionIdentity = Readonly<{
@@ -337,6 +387,19 @@ function closeWith(socket: WebSocket, reason: WsCloseReason): void {
  */
 export type AccountFrame = Extract<ServerFrame, { type: `account.${string}` }>;
 
+/**
+ * A connection's subscription to a workspace (#110): the connection, the
+ * workspace, and the account's active person there when it subscribed. The
+ * registry keeps one frozen record per connection and workspace and replaces
+ * it on every new subscribe, so a check that read the database before the
+ * newest subscribe ends nothing (`endSubscription`).
+ */
+export type Subscription = Readonly<{
+  context: AuthenticatedConnectionContext;
+  workspaceId: WorkspaceId;
+  memberId: MemberId;
+}>;
+
 type LiveConnection = {
   readonly socket: WebSocket;
   readonly context: AuthenticatedConnectionContext;
@@ -344,7 +407,30 @@ type LiveConnection = {
   seenAt: number;
   /** Whether it got `auth.ok`; only then does it receive account frames. */
   confirmed: boolean;
+  /** Its workspace subscriptions, at most `MAX_SUBSCRIPTIONS_PER_CONNECTION`. */
+  readonly subscriptions: Map<WorkspaceId, Subscription>;
+  /** Whether it answered the last ping with a pong, or got none yet. */
+  answered: boolean;
 };
+
+function isOpen(live: LiveConnection): boolean {
+  return live.socket.readyState === live.socket.OPEN;
+}
+
+/**
+ * A subscribe's membership check of a workspace while it runs.
+ * `endMembership` marks the checks of its own workspace stale, so that only
+ * they check again.
+ */
+export type MembershipCheck = {
+  readonly workspaceId: WorkspaceId;
+  stale: boolean;
+};
+
+export type ConnectionRegistryOptions = Readonly<{
+  /** Logs the connections that the registry closes on its own, for backpressure. */
+  log?: FastifyBaseLogger;
+}>;
 
 /** A live connection as `ConnectionRegistry.live` lists it, without its socket. */
 export type LiveConnectionView = Readonly<{
@@ -357,12 +443,29 @@ export type LiveConnectionView = Readonly<{
  * The open connections of this API instance (ADR 0014, "Revocation,
  * sign-out, and recovery"): the unauthenticated ones, counted for their cap,
  * and one live connection per device, which the sweep re-checks and the
- * account frames reach.
+ * account frames reach. It also holds the workspace subscriptions of the
+ * live connections and the presence that follows from them (#110): a person
+ * is online in a workspace while at least one live connection of the account
+ * is subscribed to it as that person. Presence is never stored. A connection
+ * that closes, is replaced, or that the gateway or a route closes loses its
+ * subscriptions at once.
  */
 export class ConnectionRegistry {
   readonly #pending = new Set<WebSocket>();
   readonly #live = new Map<DeviceId, LiveConnection>();
   readonly #ids = new WeakMap<WebSocket, ConnectionId>();
+  /** The subscribed live connections of each workspace, by the person they subscribed as. */
+  readonly #workspaces = new Map<
+    WorkspaceId,
+    Map<MemberId, Set<LiveConnection>>
+  >();
+  /** The membership checks of subscribes in flight, by workspace. */
+  readonly #checks = new Map<WorkspaceId, Set<MembershipCheck>>();
+  readonly #log: FastifyBaseLogger | null;
+
+  constructor(options: ConnectionRegistryOptions = {}) {
+    this.#log = options.log ?? null;
+  }
 
   /** Connections that have not authenticated yet. */
   get pendingCount(): number {
@@ -388,8 +491,8 @@ export class ConnectionRegistry {
   /**
    * Makes a connection that just authenticated the live connection of its
    * device; `seenAt` is when it wrote `devices.last_seen_at`. An older
-   * connection of the device closes with `connection_replaced`; its context
-   * is returned.
+   * connection of the device loses its subscriptions and closes with
+   * `connection_replaced`; its context is returned.
    */
   register(
     socket: WebSocket,
@@ -399,10 +502,18 @@ export class ConnectionRegistry {
     this.#pending.delete(socket);
     const deviceId = context.identity.deviceId;
     const previous = this.#live.get(deviceId);
-    this.#live.set(deviceId, { socket, context, seenAt, confirmed: false });
+    this.#live.set(deviceId, {
+      socket,
+      context,
+      seenAt,
+      confirmed: false,
+      subscriptions: new Map(),
+      answered: true,
+    });
     if (previous === undefined) {
       return null;
     }
+    this.#dropAll(previous);
     closeWith(previous.socket, "connection_replaced");
     return previous.context;
   }
@@ -422,19 +533,22 @@ export class ConnectionRegistry {
   }
 
   /**
-   * Forgets a connection that closed or was refused. A connection that a
-   * newer one replaced is already gone, so the newer one stays.
+   * Forgets a connection that closed or was refused, with its
+   * subscriptions. A connection that a newer one replaced is already gone,
+   * so the newer one stays.
    */
   remove(
     socket: WebSocket,
     context: AuthenticatedConnectionContext | null,
   ): void {
     this.#pending.delete(socket);
-    if (
-      context !== null &&
-      this.#live.get(context.identity.deviceId)?.socket === socket
-    ) {
+    if (context === null) {
+      return;
+    }
+    const live = this.#live.get(context.identity.deviceId);
+    if (live?.socket === socket) {
       this.#live.delete(context.identity.deviceId);
+      this.#dropAll(live);
     }
   }
 
@@ -532,14 +646,13 @@ export class ConnectionRegistry {
   ): number {
     const text = JSON.stringify(frame);
     let sent = 0;
-    for (const [deviceId, live] of this.#live) {
+    for (const [deviceId, live] of Array.from(this.#live)) {
       if (
         live.context.identity.userId === userId &&
         deviceId !== exceptDeviceId &&
         live.confirmed &&
-        live.socket.readyState === live.socket.OPEN
+        this.#send(live, text)
       ) {
-        live.socket.send(text);
         sent += 1;
       }
     }
@@ -547,8 +660,387 @@ export class ConnectionRegistry {
   }
 
   /**
+   * Sends a frame of the server to a live connection, for example the
+   * answer to a subscribe. Returns whether it was sent: not to a connection
+   * that is no longer live or open, and not to one that reads too slowly,
+   * which closes instead.
+   */
+  sendFrame(
+    context: AuthenticatedConnectionContext,
+    frame: ServerFrame,
+  ): boolean {
+    const live = this.#liveWith(
+      context.identity.deviceId,
+      context.connectionId,
+    );
+    return live !== undefined && this.#send(live, JSON.stringify(frame));
+  }
+
+  /** Records that a live connection answered a ping with a pong. */
+  answered(context: AuthenticatedConnectionContext): void {
+    const live = this.#liveWith(
+      context.identity.deviceId,
+      context.connectionId,
+    );
+    if (live !== undefined) {
+      live.answered = true;
+    }
+  }
+
+  /**
+   * One heartbeat: terminates each live connection that did not answer the
+   * previous ping with a pong, with its subscriptions, so that its person
+   * goes offline at once, and pings every other open one. A half-open
+   * connection, whose peer is gone without a close, therefore ends within
+   * two heartbeats. Returns how many connections it terminated.
+   */
+  heartbeat(log: FastifyBaseLogger): number {
+    let terminated = 0;
+    for (const [deviceId, live] of Array.from(this.#live)) {
+      if (this.#live.get(deviceId) !== live) {
+        continue;
+      }
+      if (!live.answered) {
+        this.#live.delete(deviceId);
+        this.#dropAll(live);
+        live.socket.terminate();
+        log.info(
+          { connectionId: live.context.connectionId, reason: "no_pong" },
+          "connection terminated",
+        );
+        terminated += 1;
+        continue;
+      }
+      live.answered = false;
+      if (isOpen(live) && !this.#tooSlow(live)) {
+        live.socket.ping();
+      }
+    }
+    return terminated;
+  }
+
+  /**
+   * Starts a subscribe's membership check of a workspace. Pass it to
+   * `endMembershipCheck` when the check ended.
+   */
+  beginMembershipCheck(workspaceId: WorkspaceId): MembershipCheck {
+    const check: MembershipCheck = { workspaceId, stale: false };
+    const checks = this.#checks.get(workspaceId) ?? new Set<MembershipCheck>();
+    checks.add(check);
+    this.#checks.set(workspaceId, checks);
+    return check;
+  }
+
+  /**
+   * Ends a membership check. Returns whether `endMembership` processed a
+   * removal in the check's workspace meanwhile, so that its result may be
+   * stale and the subscribe checks again. A removal in another workspace
+   * changes nothing.
+   */
+  endMembershipCheck(check: MembershipCheck): boolean {
+    const checks = this.#checks.get(check.workspaceId);
+    if (checks !== undefined && checks.delete(check) && checks.size === 0) {
+      this.#checks.delete(check.workspaceId);
+    }
+    return check.stale;
+  }
+
+  /** The subscription of a live connection to a workspace, or null. */
+  subscriptionOf(
+    context: AuthenticatedConnectionContext,
+    workspaceId: WorkspaceId,
+  ): Subscription | null {
+    return (
+      this.#liveWith(
+        context.identity.deviceId,
+        context.connectionId,
+      )?.subscriptions.get(workspaceId) ?? null
+    );
+  }
+
+  /** How many workspaces a live connection is subscribed to. */
+  subscriptionCount(context: AuthenticatedConnectionContext): number {
+    return (
+      this.#liveWith(context.identity.deviceId, context.connectionId)
+        ?.subscriptions.size ?? 0
+    );
+  }
+
+  /**
+   * Subscribes a live connection to a workspace as the account's active
+   * person there, which the caller checked; subscribing again keeps one
+   * subscription. When the person was offline, the workspace's other
+   * subscribed connections get `presence.changed` with `online`. Returns
+   * the people who are online in the workspace, the person included, for
+   * `workspace.subscribed`, or null when the connection is no longer live,
+   * for example because it closed or was replaced during the check.
+   */
+  subscribe(
+    context: AuthenticatedConnectionContext,
+    workspaceId: WorkspaceId,
+    memberId: MemberId,
+  ): MemberId[] | null {
+    const live = this.#liveWith(
+      context.identity.deviceId,
+      context.connectionId,
+    );
+    if (live === undefined) {
+      return null;
+    }
+    const previous = live.subscriptions.get(workspaceId);
+    if (previous !== undefined && previous.memberId !== memberId) {
+      // The account rejoined as another person meanwhile.
+      this.#drop(live, previous);
+    }
+    live.subscriptions.set(
+      workspaceId,
+      Object.freeze({ context, workspaceId, memberId }),
+    );
+    const people =
+      this.#workspaces.get(workspaceId) ??
+      new Map<MemberId, Set<LiveConnection>>();
+    this.#workspaces.set(workspaceId, people);
+    const connections = people.get(memberId) ?? new Set<LiveConnection>();
+    const wasOnline = connections.size > 0;
+    connections.add(live);
+    people.set(memberId, connections);
+    if (!wasOnline) {
+      this.#sendPresence(workspaceId, memberId, "online", live);
+    }
+    // The subscriber's own person first, so that a cut list keeps it.
+    return [
+      memberId,
+      ...Array.from(people.keys()).filter((id) => id !== memberId),
+    ].slice(0, MAX_ANSWER_LIST_ITEMS);
+  }
+
+  /**
+   * Ends a live connection's subscription to a workspace, because the
+   * device asked. When it was the person's last subscribed connection, the
+   * workspace's other subscribed connections get `presence.changed` with
+   * `offline`. Returns whether the connection was subscribed.
+   */
+  unsubscribe(
+    context: AuthenticatedConnectionContext,
+    workspaceId: WorkspaceId,
+  ): boolean {
+    const live = this.#liveWith(
+      context.identity.deviceId,
+      context.connectionId,
+    );
+    const subscription = live?.subscriptions.get(workspaceId);
+    if (live === undefined || subscription === undefined) {
+      return false;
+    }
+    this.#drop(live, subscription);
+    return true;
+  }
+
+  /**
+   * Drops every subscription of a live connection that the gateway is
+   * closing, with the presence changes that follow, so that a closing
+   * connection gets nothing more and its person goes offline at once.
+   */
+  dropSubscriptions(context: AuthenticatedConnectionContext): void {
+    const live = this.#liveWith(
+      context.identity.deviceId,
+      context.connectionId,
+    );
+    if (live !== undefined) {
+      this.#dropAll(live);
+    }
+  }
+
+  /** Every subscription of the live connections at this moment. */
+  subscriptions(): Subscription[] {
+    return Array.from(this.#live.values(), (live) =>
+      Array.from(live.subscriptions.values()),
+    ).flat();
+  }
+
+  /**
+   * Ends a subscription because the account is no longer an active member
+   * as that person, which the sweep or the per-event check found, but only
+   * while it is still this record: a newer subscribe of the connection keeps
+   * its own. The connection gets `workspace.unsubscribed` with
+   * `membership_ended`. Returns whether it ended.
+   */
+  endSubscription(subscription: Subscription): boolean {
+    const { context, workspaceId } = subscription;
+    const live = this.#liveWith(
+      context.identity.deviceId,
+      context.connectionId,
+    );
+    if (
+      live === undefined ||
+      live.subscriptions.get(workspaceId) !== subscription
+    ) {
+      return false;
+    }
+    this.#drop(live, subscription);
+    this.#sendUnsubscribed(live, workspaceId);
+    return true;
+  }
+
+  /**
+   * Ends every subscription to a workspace as a person who was removed or
+   * left (ADR 0014, "Removal and ownership"). Each of its connections gets
+   * `workspace.unsubscribed` with `membership_ended`, and the workspace's
+   * other subscribed connections get `presence.changed` with `offline`.
+   * Returns how many subscriptions ended.
+   */
+  endMembership(workspaceId: WorkspaceId, memberId: MemberId): number {
+    for (const check of this.#checks.get(workspaceId) ?? []) {
+      check.stale = true;
+    }
+    const connections = this.#workspaces.get(workspaceId)?.get(memberId);
+    if (connections === undefined) {
+      return 0;
+    }
+    let ended = 0;
+    for (const live of Array.from(connections)) {
+      const subscription = live.subscriptions.get(workspaceId);
+      if (subscription !== undefined) {
+        this.#drop(live, subscription);
+        this.#sendUnsubscribed(live, workspaceId);
+        ended += 1;
+      }
+    }
+    return ended;
+  }
+
+  /**
+   * Sends an event to every connection that is subscribed to the event's
+   * workspace and still open; a connection that the server is closing is
+   * skipped. A connection that is not subscribed never gets it, so neither
+   * does an account that is not an active member. A connection that reads
+   * too slowly closes instead. Returns how many connections it was sent to.
+   */
+  sendToWorkspace(event: ServerEvent): number {
+    const text = JSON.stringify(event);
+    let sent = 0;
+    for (const live of this.#subscribersOf(event.workspaceId)) {
+      if (this.#send(live, text)) {
+        sent += 1;
+      }
+    }
+    return sent;
+  }
+
+  /** The subscribed live connections of a workspace at this moment. */
+  #subscribersOf(workspaceId: WorkspaceId): LiveConnection[] {
+    const people = this.#workspaces.get(workspaceId);
+    return people === undefined
+      ? []
+      : Array.from(people.values(), (connections) =>
+          Array.from(connections),
+        ).flat();
+  }
+
+  /**
+   * Sends text to a live connection that is open. One with more than
+   * `MAX_BUFFERED_BYTES` waiting to be sent is closed instead. Returns
+   * whether it was sent.
+   */
+  #send(live: LiveConnection, text: string): boolean {
+    if (!isOpen(live) || this.#tooSlow(live)) {
+      return false;
+    }
+    live.socket.send(text);
+    return true;
+  }
+
+  /**
+   * Whether a connection reads too slowly; if so, it leaves the registry
+   * with its subscriptions and closes with 1013 and `backpressure`, so that
+   * nothing more is queued for it.
+   */
+  #tooSlow(live: LiveConnection): boolean {
+    if (live.socket.bufferedAmount <= MAX_BUFFERED_BYTES) {
+      return false;
+    }
+    const { deviceId } = live.context.identity;
+    if (this.#live.get(deviceId) === live) {
+      this.#live.delete(deviceId);
+    }
+    this.#dropAll(live);
+    live.socket.close(CloseCode.tryAgainLater, "backpressure");
+    this.#log?.info(
+      { connectionId: live.context.connectionId, code: "backpressure" },
+      "connection closed",
+    );
+    return true;
+  }
+
+  /** Drops one subscription and sends `offline` when it was the person's last one. */
+  #drop(live: LiveConnection, subscription: Subscription): void {
+    const { workspaceId, memberId } = subscription;
+    if (live.subscriptions.get(workspaceId) === subscription) {
+      live.subscriptions.delete(workspaceId);
+    }
+    const people = this.#workspaces.get(workspaceId);
+    const connections = people?.get(memberId);
+    if (
+      people === undefined ||
+      connections === undefined ||
+      !connections.delete(live) ||
+      connections.size > 0
+    ) {
+      return;
+    }
+    people.delete(memberId);
+    if (people.size === 0) {
+      this.#workspaces.delete(workspaceId);
+    }
+    this.#sendPresence(workspaceId, memberId, "offline");
+  }
+
+  #dropAll(live: LiveConnection): void {
+    for (const subscription of Array.from(live.subscriptions.values())) {
+      this.#drop(live, subscription);
+    }
+  }
+
+  /**
+   * Sends a person's new status to the workspace's subscribed connections
+   * that are open, except `except`. The frame names the person, never a
+   * device.
+   */
+  #sendPresence(
+    workspaceId: WorkspaceId,
+    memberId: MemberId,
+    status: PresenceStatus,
+    except?: LiveConnection,
+  ): void {
+    const frame: PresenceChangedFrame = {
+      protocolVersion: PROTOCOL_VERSION,
+      type: "presence.changed",
+      workspaceId,
+      memberId,
+      status,
+    };
+    const text = JSON.stringify(frame);
+    for (const live of this.#subscribersOf(workspaceId)) {
+      if (live !== except) {
+        this.#send(live, text);
+      }
+    }
+  }
+
+  #sendUnsubscribed(live: LiveConnection, workspaceId: WorkspaceId): void {
+    const frame: WorkspaceUnsubscribedFrame = {
+      protocolVersion: PROTOCOL_VERSION,
+      type: "workspace.unsubscribed",
+      workspaceId,
+      reason: "membership_ended",
+    };
+    this.#send(live, JSON.stringify(frame));
+  }
+
+  /**
    * Ends a live connection that a change closed, by a route or by the sweep,
-   * and logs it with its connection ID and the close reason.
+   * with its subscriptions, and logs it with its connection ID and the close
+   * reason.
    */
   #close(
     deviceId: DeviceId,
@@ -557,6 +1049,7 @@ export class ConnectionRegistry {
     log: FastifyBaseLogger,
   ): void {
     this.#live.delete(deviceId);
+    this.#dropAll(live);
     closeWith(live.socket, reason);
     log.info(
       { connectionId: live.context.connectionId, code: reason },
@@ -590,8 +1083,11 @@ export type ConnectionSweepDependencies = Readonly<{
  * counts 24 hours late (`SIGN_IN_GRACE_MS`). A newer connection that
  * registered meanwhile stays open. Then one update writes
  * `devices.last_seen_at` for the open connections whose last write is 5
- * minutes old or more. A failure of the database is logged, and the next
- * sweep tries again.
+ * minutes old or more. Last, one batched query re-checks the workspace
+ * subscriptions of the connections that stay open (`activePeopleOf`) and
+ * ends each one whose account is no longer an active member as that person,
+ * with `workspace.unsubscribed` and `membership_ended` (#110). A failure of
+ * the database is logged, and the next sweep tries again.
  */
 export async function sweepConnections(
   dependencies: ConnectionSweepDependencies,
@@ -634,6 +1130,28 @@ export async function sweepConnections(
       });
       for (const context of seen) {
         connections.markSeen(context, at);
+      }
+    }
+    const subscriptions = connections.subscriptions();
+    if (subscriptions.length > 0) {
+      const people = await activePeopleOf(
+        database,
+        subscriptions.map(({ context, workspaceId }) => ({
+          workspaceId,
+          userId: context.identity.userId,
+        })),
+      );
+      for (const subscription of subscriptions) {
+        const { context, workspaceId, memberId } = subscription;
+        if (
+          people.get(workspaceId)?.get(context.identity.userId) !== memberId &&
+          connections.endSubscription(subscription)
+        ) {
+          log.info(
+            { connectionId: context.connectionId, workspaceId },
+            "subscription ended",
+          );
+        }
       }
     }
   } catch (error) {
@@ -736,6 +1254,39 @@ function frameToText(data: RawData): string {
   return data.toString("utf8");
 }
 
+/** Why `subscriptionAccess` refused a subscribe. */
+export type SubscriptionRefusal =
+  | Extract<WorkspaceSubscribeRefusalCode, "not_found">
+  /** The device or the account may no longer act; the code is the close reason. */
+  | ConnectionRefusal;
+
+/**
+ * Whether a connection may subscribe to a workspace now (ADR 0014, "What a
+ * workspace ID allows"): its device row must still accept the connection,
+ * as for every event (`refusalOf`, without the 30-day expiry), and its
+ * account must have an active person in the workspace, whose ID it returns.
+ * A workspace that does not exist and one without the account give the same
+ * `not_found`.
+ */
+export async function subscriptionAccess(
+  database: Database,
+  context: AuthenticatedConnectionContext,
+  workspaceId: WorkspaceId,
+): Promise<
+  { ok: true; memberId: MemberId } | { ok: false; code: SubscriptionRefusal }
+> {
+  const { userId, deviceId } = context.identity;
+  const device = await deviceRow(database, deviceId);
+  const refusal = refusalOf(device, context.signedInAt, null);
+  if (refusal !== null) {
+    return { ok: false, code: refusal };
+  }
+  const person = await activePersonOf(database, { workspaceId, userId });
+  return person === undefined
+    ? { ok: false, code: "not_found" }
+    : { ok: true, memberId: person.id };
+}
+
 export type GatewayOptions = Readonly<{
   allowedOrigins: readonly string[];
   /** The API's public origin: the audience of the `ws` signature. */
@@ -751,13 +1302,16 @@ export type GatewayOptions = Readonly<{
  * connection first authenticates with its device key: the server sends
  * `auth.challenge`, the device answers with exactly one `auth.response`, and
  * the server sends `auth.ok`. Before that, no frame reaches the event
- * decoder or `onEvent`. Afterwards every text frame must be one JSON event
- * that `decodeClientEvent` accepts and `bindIdentity` binds to the
- * connection; events go to `onEvent` one after another, in the order they
- * arrived. Anything else closes the connection. No authentication frame,
- * nonce, or signature is logged. Every 60 seconds `sweepConnections`
- * re-checks the live connections; a tick while the previous sweep still
- * runs is skipped.
+ * decoder or `onEvent`. Afterwards every text frame must be one JSON message
+ * that `decodeClientMessage` accepts: an event, which `bindIdentity` binds to
+ * the connection and which then goes to `onEvent`, or a workspace
+ * subscription frame, which the gateway answers (#110). Messages are handled
+ * one after another, in the order they arrived. Anything else closes the
+ * connection. No authentication frame, nonce, or signature is logged. Every
+ * 60 seconds `sweepConnections` re-checks the live connections; a tick while
+ * the previous sweep still runs is skipped. Every 30 seconds the heartbeat
+ * pings the live connections and terminates one that did not answer the
+ * previous ping.
  */
 export function registerGateway(
   app: FastifyInstance,
@@ -782,8 +1336,13 @@ export function registerGateway(
     }
   }, CONNECTION_SWEEP_INTERVAL_MS);
   sweeper.unref();
+  const heartbeat = setInterval(() => {
+    connections.heartbeat(app.log);
+  }, HEARTBEAT_INTERVAL_MS);
+  heartbeat.unref();
   app.addHook("onClose", async () => {
     clearInterval(sweeper);
+    clearInterval(heartbeat);
     // The database closes after this hook, so a running sweep ends first.
     await sweeping;
   });
@@ -885,11 +1444,38 @@ export function registerGateway(
       function fail(error: unknown): void {
         log.error({ err: error }, "connection failed");
         if (open()) {
+          if (context !== null) {
+            connections.dropSubscriptions(context);
+          }
           socket.close(CloseCode.internalError, "internal_error");
           if (phase !== "authenticated") {
             terminateSoon();
           }
         }
+      }
+
+      /**
+       * Closes an authenticated connection from the gateway. Its
+       * subscriptions end first, so that it gets nothing more and its person
+       * goes offline at once.
+       */
+      function end(
+        current: AuthenticatedConnectionContext,
+        close: () => void,
+      ): void {
+        connections.dropSubscriptions(current);
+        close();
+      }
+
+      /**
+       * Sends a frame of the server to the authenticated connection while it
+       * is live and open; one that reads too slowly closes instead.
+       */
+      function sendFrame(
+        current: AuthenticatedConnectionContext,
+        frame: ServerFrame,
+      ): void {
+        connections.sendFrame(current, frame);
       }
 
       connections.addPending(socket, connectionId);
@@ -904,6 +1490,13 @@ export function registerGateway(
         clearTimeout(terminateTimer);
         nonce = null;
         connections.remove(socket, context);
+      });
+
+      // The heartbeat terminates a connection that did not answer its ping.
+      socket.on("pong", () => {
+        if (context !== null) {
+          connections.answered(context);
+        }
       });
 
       /**
@@ -1020,8 +1613,131 @@ export function registerGateway(
         void authenticate(decoded.frame).catch(fail);
       }
 
-      /** One frame after `auth.ok`: an event from the device. */
-      async function onEventFrame(
+      /**
+       * `workspace.subscribe` (#110): checks the cap, then the device and the
+       * active membership, records the subscription, and answers with the
+       * people online. A removal that `endMembership` processed during the
+       * check makes it check again.
+       */
+      async function subscribe(
+        current: AuthenticatedConnectionContext,
+        workspaceId: WorkspaceId,
+      ): Promise<void> {
+        if (
+          connections.subscriptionOf(current, workspaceId) === null &&
+          connections.subscriptionCount(current) >=
+            MAX_SUBSCRIPTIONS_PER_CONNECTION
+        ) {
+          log.debug(
+            { workspaceId, code: "too_many_subscriptions" },
+            "subscription refused",
+          );
+          sendFrame(current, {
+            protocolVersion: PROTOCOL_VERSION,
+            type: "workspace.subscribe_refused",
+            workspaceId,
+            code: "too_many_subscriptions",
+          });
+          return;
+        }
+        let access: Awaited<ReturnType<typeof subscriptionAccess>>;
+        for (let rechecks = 0; ; rechecks += 1) {
+          const check = connections.beginMembershipCheck(workspaceId);
+          let stale: boolean;
+          try {
+            access = await subscriptionAccess(database, current, workspaceId);
+          } finally {
+            stale = connections.endMembershipCheck(check);
+          }
+          // A connection that closed or was replaced meanwhile gets nothing.
+          if (!open()) {
+            return;
+          }
+          if (!access.ok || !stale) {
+            break;
+          }
+          if (rechecks >= MAX_SUBSCRIBE_RECHECKS) {
+            // Removals in this workspace keep coming: refuse rather than
+            // record a subscription that may be stale. A held subscription
+            // ends with it, so the answer stays true; the device may
+            // subscribe again.
+            connections.unsubscribe(current, workspaceId);
+            log.info(
+              { workspaceId, code: "not_found", rechecks },
+              "subscription refused",
+            );
+            sendFrame(current, {
+              protocolVersion: PROTOCOL_VERSION,
+              type: "workspace.subscribe_refused",
+              workspaceId,
+              code: "not_found",
+            });
+            return;
+          }
+        }
+        if (!access.ok) {
+          const { code } = access;
+          if (code !== "not_found") {
+            end(current, () => closeWith(socket, code));
+            return;
+          }
+          // A subscription that the connection holds ended with the membership.
+          const held = connections.subscriptionOf(current, workspaceId);
+          if (held !== null) {
+            connections.endSubscription(held);
+          }
+          log.debug({ workspaceId, code }, "subscription refused");
+          sendFrame(current, {
+            protocolVersion: PROTOCOL_VERSION,
+            type: "workspace.subscribe_refused",
+            workspaceId,
+            code,
+          });
+          return;
+        }
+        const online = connections.subscribe(
+          current,
+          workspaceId,
+          access.memberId,
+        );
+        if (online === null) {
+          return;
+        }
+        log.debug({ workspaceId }, "subscribed");
+        sendFrame(current, {
+          protocolVersion: PROTOCOL_VERSION,
+          type: "workspace.subscribed",
+          workspaceId,
+          onlineMemberIds: online,
+        });
+      }
+
+      /** A frame after `auth.ok`: a subscribe or an unsubscribe, answered in order. */
+      async function onClientFrame(
+        current: AuthenticatedConnectionContext,
+        frame: AuthenticatedClientFrame,
+      ): Promise<void> {
+        switch (frame.type) {
+          case "workspace.subscribe":
+            await subscribe(current, frame.workspaceId);
+            return;
+          case "workspace.unsubscribe":
+            // Answered also when the connection was not subscribed, so the
+            // answer says nothing about the workspace.
+            connections.unsubscribe(current, frame.workspaceId);
+            log.debug({ workspaceId: frame.workspaceId }, "unsubscribed");
+            sendFrame(current, {
+              protocolVersion: PROTOCOL_VERSION,
+              type: "workspace.unsubscribed",
+              workspaceId: frame.workspaceId,
+              reason: "requested",
+            });
+            return;
+        }
+      }
+
+      /** One message after `auth.ok`: an event or a frame from the device. */
+      async function onMessageFrame(
         data: RawData,
         isBinary: boolean,
       ): Promise<void> {
@@ -1030,23 +1746,34 @@ export function registerGateway(
           return;
         }
         if (isBinary) {
-          socket.close(CloseCode.unsupportedData, "binary_not_supported");
+          end(current, () =>
+            socket.close(CloseCode.unsupportedData, "binary_not_supported"),
+          );
           return;
         }
         let input: unknown;
         try {
           input = JSON.parse(frameToText(data));
         } catch {
-          socket.close(CloseCode.invalidFramePayload, "invalid_json");
+          end(current, () =>
+            socket.close(CloseCode.invalidFramePayload, "invalid_json"),
+          );
           return;
         }
-        const decoded = decodeClientEvent(input);
+        const decoded = decodeClientMessage(input);
         if (!decoded.ok) {
-          log.debug({ code: decoded.code }, "event rejected");
-          socket.close(CloseCode.policyViolation, decoded.code);
+          log.debug({ code: decoded.code }, "message rejected");
+          end(current, () =>
+            socket.close(CloseCode.policyViolation, decoded.code),
+          );
           return;
         }
-        const bound = await bindIdentity(decoded.event, current, {
+        if (decoded.kind === "frame") {
+          await onClientFrame(current, decoded.frame);
+          return;
+        }
+        const { event } = decoded;
+        const bound = await bindIdentity(event, current, {
           database,
           now,
           mismatchAudits,
@@ -1057,14 +1784,27 @@ export function registerGateway(
           return;
         }
         if (!bound.ok) {
-          log.debug({ code: bound.code }, "event rejected");
-          switch (bound.code) {
+          const { code } = bound;
+          log.debug({ code }, "event rejected");
+          switch (code) {
+            case "not_a_member": {
+              // The account's membership of a workspace that the connection
+              // is subscribed to ended, and the server had not seen it yet.
+              const held = connections.subscriptionOf(
+                current,
+                event.workspaceId,
+              );
+              if (held !== null) {
+                connections.endSubscription(held);
+              }
+              end(current, () => socket.close(CloseCode.policyViolation, code));
+              return;
+            }
             case "identity_mismatch":
-            case "not_a_member":
-              socket.close(CloseCode.policyViolation, bound.code);
+              end(current, () => socket.close(CloseCode.policyViolation, code));
               return;
             default:
-              closeWith(socket, bound.code);
+              end(current, () => closeWith(socket, code));
               return;
           }
         }
@@ -1089,7 +1829,7 @@ export function registerGateway(
             queued += 1;
             socket.pause();
             queue = queue
-              .then(() => onEventFrame(data, isBinary))
+              .then(() => onMessageFrame(data, isBinary))
               .catch(fail)
               .finally(() => {
                 queued -= 1;

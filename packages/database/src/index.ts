@@ -20,11 +20,14 @@ export {
   type RequireSignInInput,
 } from "./github-revocation.ts";
 export {
+  type CancelledRun,
   revokeDevice,
   type RevokeDeviceInput,
   type RevokeDeviceResult,
+  type UnfinishedRunState,
 } from "./device-revocation.ts";
 export {
+  activePeopleOf,
   type ConnectionAuditAction,
   type ConnectionAuditInput,
   type DeviceAccessRow,

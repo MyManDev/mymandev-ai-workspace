@@ -1,7 +1,7 @@
 import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
 import { createDatabase, type Database } from "@mymandev/database";
-import { genericApiErrorCode } from "@mymandev/protocol";
+import { genericApiErrorCode, MAX_FRAME_BYTES } from "@mymandev/protocol";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { STATUS_CODES } from "node:http";
 import type { Socket } from "node:net";
@@ -29,7 +29,10 @@ import {
   type EventHandler,
 } from "./gateway.ts";
 import { serializeError, serializeRequest } from "./log.ts";
-import type { WorkspaceEventHandler } from "./workspaces/events.ts";
+import {
+  deliverWorkspaceEvent,
+  type WorkspaceEventHandler,
+} from "./workspaces/events.ts";
 import { registerWorkspaceRoutes } from "./workspaces/workspace-routes.ts";
 
 export type BuildAppOptions = Readonly<{
@@ -43,9 +46,9 @@ export type BuildAppOptions = Readonly<{
   onEvent?: EventHandler;
   /**
    * Receives each membership event that the server originates, after the
-   * transaction that made the change committed, until #110 delivers them to
-   * the workspace's connections. The default logs the event type and the
-   * workspace ID at debug level.
+   * transaction that made the change committed and after the gateway
+   * delivered it to the workspace's subscribed connections. Tests use it to
+   * observe the events. Default: nothing more.
    */
   onWorkspaceEvent?: WorkspaceEventHandler;
   /**
@@ -93,9 +96,6 @@ const MAX_RECENT_REVOCATIONS = 10_000;
 const RECENT_REVOCATION_MARGIN_MS = 2 * 60_000;
 const RECENT_REVOCATION_LIFETIME_MS =
   ATTEMPT_LIFETIME_MS + SIGN_IN_CODE_LIFETIME_MS + RECENT_REVOCATION_MARGIN_MS;
-
-/** The ws default (100 MiB) is far above what one event needs. Larger frames close with 1009. */
-const MAX_FRAME_BYTES = 64 * 1024;
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -292,8 +292,18 @@ export async function buildApp(
     errorResponseBuilder: () => new ApiError("rate_limited"),
   });
 
-  const connections = options.connections ?? new ConnectionRegistry();
+  const connections =
+    options.connections ?? new ConnectionRegistry({ log: app.log });
+
+  // Every membership event goes to the workspace's subscribed connections
+  // (#110), then to the option.
+  const onWorkspaceEvent: WorkspaceEventHandler = (event) => {
+    deliverWorkspaceEvent(connections, event, app.log);
+    return options.onWorkspaceEvent?.(event);
+  };
   await app.register(websocket, {
+    // The ws default (100 MiB) is far above what one message needs. Larger
+    // frames close with 1009.
     options: { maxPayload: MAX_FRAME_BYTES },
     // What a client sent wrong is logged at debug level, with the connection ID.
     errorHandler: socketErrorHandler(connections),
@@ -340,15 +350,6 @@ export async function buildApp(
           connectionId: context.connectionId,
         },
         "event received",
-      );
-    });
-
-  const onWorkspaceEvent: WorkspaceEventHandler =
-    options.onWorkspaceEvent ??
-    ((event) => {
-      app.log.debug(
-        { eventType: event.type, workspaceId: event.workspaceId },
-        "workspace event",
       );
     });
 
