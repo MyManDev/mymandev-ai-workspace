@@ -1,6 +1,6 @@
 # @mymandev/api
 
-The cloud API: a Fastify application with a health endpoint, GitHub sign-in, device keys and access tokens, GitHub's revocation webhook, and a WebSocket gateway that authenticates each connection with its device key and validates protocol events from [`@mymandev/protocol`](../../packages/protocol/README.md). The decisions behind it are recorded in [ADR 0009](../../docs/architecture/decisions/0009-fastify-cloud-api.md), [ADR 0010](../../docs/architecture/decisions/0010-api-configuration-and-runtime.md), and [ADR 0014](../../docs/architecture/decisions/0014-accounts-devices-and-invitations.md).
+The cloud API: a Fastify application with a health endpoint, GitHub sign-in, device keys and access tokens, workspaces, GitHub's revocation webhook, and a WebSocket gateway that authenticates each connection with its device key and validates protocol events from [`@mymandev/protocol`](../../packages/protocol/README.md). The decisions behind it are recorded in [ADR 0009](../../docs/architecture/decisions/0009-fastify-cloud-api.md), [ADR 0010](../../docs/architecture/decisions/0010-api-configuration-and-runtime.md), and [ADR 0014](../../docs/architecture/decisions/0014-accounts-devices-and-invitations.md).
 
 ## Start locally
 
@@ -86,7 +86,7 @@ These routes need GitHub sign-in and the database (ADR 0014, "Device key and aut
 
 - `POST /auth/challenge` returns a challenge ID and a nonce. The challenge is single use and valid for 60 seconds; at most 1,000 are open (`429` with `rate_limited` and `Retry-After`).
 - `POST /auth/access-token` takes the device ID, the challenge ID, and a signature over the `http` input. The signature is checked first with the device's current key; an unknown device, a used or expired challenge, or a bad signature answers `auth_failed`. Only then does the device answer: `device_revoked`, `sign_in_required` (signed out, last sign-in 30 days ago or more, or a GitHub revocation after the last sign-in), or `auth_failed` for a disabled account. It returns an access token (`mmda_`, 15 minutes, never extended). A device may mint 30 tokens in 15 minutes and keeps at most 3 live tokens; a fourth ends the oldest. A token belongs to the device's sign-in: a new sign-in, which also replaces the key, ends the earlier tokens. Both routes answer with `Cache-Control: no-store`.
-- Every other route below needs `Authorization: Bearer <access token>`. The token and the account's limit of 300 authenticated requests a minute are checked when the headers arrive. The token, the device, and the account are checked again after the body arrived and before it is validated, so that a slow body cannot carry a request past a revocation; sign-out, revocation, and lifting the lock check them a third time inside their transaction. Every failure is `401` with `unauthorized`.
+- Every other route below needs `Authorization: Bearer <access token>`, and so do the workspace routes. `src/auth/authenticate.ts` checks the token and the account's limit of 300 authenticated requests a minute, which counts every authenticated route together, when the headers arrive. The token, the device, and the account are checked again after the body arrived and before it is validated, so that a slow body cannot carry a request past a revocation; sign-out, revocation, lifting the lock, and creating a workspace check them a third time inside their transaction (`lockActor`). Every failure is `401` with `unauthorized`.
 - `POST /auth/sign-out` signs the current device out: the device, its agents, and their grants stay, its tokens stop working, its WebSocket connection closes with `sign_in_required` after the commit, and the next token needs a GitHub sign-in (P-65).
 - `GET /devices` lists the account's own devices, newest first, with the sign-in expiry and the current device.
 - `POST /devices/:deviceId/revoke` with `reason` `removed` or `lost` revokes one of the account's own devices in one transaction: its agents are disabled, their grants revoked, and their unfinished runs cancelled (`revokeDevice`). After the commit, the device's WebSocket connection closes with `device_revoked`, and the account's other connections get `account.device_revoked`. Another account's device answers `404` with `not_found`, also for the owner of a shared workspace; a revoked device answers `409` with `conflict`. `lost` also refuses new device registrations for 7 days; the current device cannot report itself `lost` (`409` with `conflict`), so that whoever holds it cannot lock the account's new devices.
@@ -95,6 +95,23 @@ These routes need GitHub sign-in and the database (ADR 0014, "Device key and aut
 Sign-out, revocations, and the lock write audit records. No `Authorization` header, token, nonce, or signature is logged.
 
 The operator command (`db:account`) runs outside the API and cannot drop tokens from its memory: after disabling and enabling an account within 15 minutes, a token minted before the disable works again until it expires.
+
+### Workspaces
+
+These routes need GitHub sign-in, the database, and an access token, like the device routes (ADR 0014, "People and roles", "Limits", and "What a workspace ID allows"; #91). Their bodies and answers are the schemas of `MEMBERSHIP_ROUTES` in [`@mymandev/protocol`](../../packages/protocol/README.md).
+
+- `GET /workspaces` lists the workspaces that the account is an active member of, each with the account's own person, the most recently claimed first, at most 1,000 (`listWorkspaces`).
+- `POST /workspaces` with `name` and `displayName` creates a workspace with the creator's person as its claimed `owner`, named `displayName`, and answers `200` with both. `workspaces.created_by_user_id` stays a historical fact; ownership lives in the role. One transaction checks the account and the device again (`lockActor`), then `createWorkspace` locks the account, counts the workspaces it created in the last 24 hours, and refuses an 11th with `429`, `rate_limited`, and `Retry-After`: the seconds until the oldest of them is 24 hours old. It writes a `workspace.created` audit record. It sends no workspace event: the protocol has none for it, and the creator is the only member.
+- `GET /workspaces/:workspaceId` answers with the workspace, all its people, the time join requests were paused, and the ownership offer unless it is 7 days old (`workspaceView`). Each person has its display name and role and, once claimed, the account's GitHub login with the time it was last verified, which is the account's last GitHub sign-in. Removed people stay in the list with `removedAt`, so that the desktop shows them as former members. The list holds at most 1,000 people: the owner, the target of the offer, the other active people, the most recently created first, then the former members, the most recently removed first.
+- Every route under `/workspaces/:workspaceId` checks active membership first (`src/workspaces/access.ts`), right after the access token and before the path, the query, and the body are validated. An account without an active person in the workspace gets `404` with `not_found`, byte for byte the answer for a workspace that does not exist or a malformed workspace ID, whatever else the request holds.
+
+Decisions for #91 by the Project Manager on 2026-11-01:
+
+- The creator's person name comes from the request body (`displayName`), as the protocol defines it; the desktop fills it with `users.display_name`.
+- The creation date of the GitHub account, which the owner and admins see next to a claim, waits until after #110.
+- Membership events will go through an `onWorkspaceEvent` hook, which the next change adds, until #110 delivers workspace events. Creating a workspace has no membership event.
+
+Open, for a Project Manager decision: `workspaces` has no index on (`created_by_user_id`, `created_at`), so the 24-hour count of `POST /workspaces` reads every workspace. Adding one needs a migration.
 
 ### `POST /auth/github/webhook`
 
@@ -198,4 +215,4 @@ Sending each run that a device revocation cancelled as `agent.run.state_changed`
 
 ## Not included
 
-Sessions, CORS, OpenAPI, TLS, permission enforcement, the reference binding of events (#27, #28), event routing, relay, and storage, sending the runs that a revocation cancelled (#110), Docker, deployment configuration, clustering, a build step, pretty-printed logs, and a Fastify type provider.
+Sessions, CORS, OpenAPI, TLS, defining and renaming people and invitations (#91, in the next changes), join requests (#92), removal, roles, and ownership (#93), permission enforcement, the reference binding of events (#27, #28), event routing, relay, and storage, sending the runs that a revocation cancelled (#110), Docker, deployment configuration, clustering, a build step, pretty-printed logs, and a Fastify type provider.
