@@ -1,14 +1,15 @@
 import {
   EVENT_CHANNELS,
   INVOKE_CHANNELS,
+  type EventChannel,
   type InvokeChannel,
 } from "../shared/ipc-channels.ts";
 import {
   EVENT_CONTRACT,
   INVOKE_CONTRACT,
+  type EventPayload,
   type InvokeArgs,
   type InvokeResult,
-  type RuntimeStatus,
 } from "../shared/ipc-contract.ts";
 import { isAppNavigation } from "./navigation.ts";
 import type { LocalRuntime } from "./runtime.ts";
@@ -87,8 +88,9 @@ export class IpcRefusedError extends Error {
  * The `ipcMain.handle` listener of an invoke channel. It refuses a sender
  * that is not the application and arguments that do not match the contract,
  * before `implementation` runs, and parses the result with the contract, so
- * no unknown key reaches the renderer. Error messages never contain the
- * arguments.
+ * no unknown key reaches the renderer. An implementation may return a
+ * promise; its value is parsed the same way. Error messages never contain
+ * the arguments.
  */
 export function createInvokeHandler<C extends InvokeChannel>(
   channel: C,
@@ -96,7 +98,7 @@ export function createInvokeHandler<C extends InvokeChannel>(
   implementation: (
     event: IpcInvokeEvent,
     args: InvokeArgs<C>,
-  ) => InvokeResult<C>,
+  ) => InvokeResult<C> | Promise<InvokeResult<C>>,
 ): IpcInvokeListener {
   const contract = INVOKE_CONTRACT[channel];
   return (event, ...args) => {
@@ -107,28 +109,45 @@ export function createInvokeHandler<C extends InvokeChannel>(
     if (!parsed.success) {
       throw new IpcRefusedError(channel, "arguments");
     }
-    return contract.result.parse(
-      implementation(event, parsed.data as InvokeArgs<C>),
-    );
+    const result = implementation(event, parsed.data as InvokeArgs<C>);
+    return result instanceof Promise
+      ? result.then((value) => contract.result.parse(value))
+      : contract.result.parse(result);
   };
 }
 
-export interface StatusPublisher {
-  /** Sends later statuses to `receiver` until it is destroyed or leaves the application. */
+export interface EventPublisher<C extends EventChannel> {
+  /** Sends later payloads to `receiver` until it is destroyed or leaves the application. */
   readonly add: (receiver: StatusReceiver) => void;
-  /** Sends `status` to every receiver whose main frame still shows the application. */
-  readonly publish: (status: RuntimeStatus) => void;
+  /** Sends `payload` to every receiver whose main frame still shows the application. */
+  readonly publish: (payload: EventPayload<C>) => void;
   /** The number of receivers. */
   readonly size: () => number;
 }
 
+export type StatusPublisher = EventPublisher<
+  typeof EVENT_CHANNELS.runtimeStatusChanged
+>;
+
 export function createStatusPublisher(appUrl: string): StatusPublisher {
+  return createEventPublisher(EVENT_CHANNELS.runtimeStatusChanged, appUrl);
+}
+
+/**
+ * Sends the payloads of one event channel to the frames that subscribed.
+ * Every payload is parsed with the contract first, so unknown keys never
+ * reach the renderer.
+ */
+export function createEventPublisher<C extends EventChannel>(
+  channel: C,
+  appUrl: string,
+): EventPublisher<C> {
   const receivers = new Set<StatusReceiver>();
   // Receivers that already have a "destroyed" listener. A receiver that
   // leaves the set and subscribes again, for example after a reload or a
   // renderer crash, gets no second listener.
   const watched = new WeakSet<StatusReceiver>();
-  const schema = EVENT_CONTRACT[EVENT_CHANNELS.runtimeStatusChanged];
+  const schema = EVENT_CONTRACT[channel];
   return Object.freeze({
     add: (receiver: StatusReceiver) => {
       receivers.add(receiver);
@@ -139,8 +158,8 @@ export function createStatusPublisher(appUrl: string): StatusPublisher {
         });
       }
     },
-    publish: (status: RuntimeStatus) => {
-      const payload = schema.parse(status);
+    publish: (value: EventPayload<C>) => {
+      const payload = schema.parse(value);
       for (const receiver of receivers) {
         if (
           receiver.isDestroyed() ||
@@ -150,7 +169,7 @@ export function createStatusPublisher(appUrl: string): StatusPublisher {
           receivers.delete(receiver);
           continue;
         }
-        receiver.send(EVENT_CHANNELS.runtimeStatusChanged, payload);
+        receiver.send(channel, payload);
       }
     },
     size: () => receivers.size,
@@ -158,7 +177,7 @@ export function createStatusPublisher(appUrl: string): StatusPublisher {
 }
 
 /**
- * Registers the handlers of every invoke channel and sends each status
+ * Registers the handlers of the runtime channels and sends each status
  * change to the frames that subscribed. Call it before the first window
  * loads, so that the renderer's first call finds its handler.
  */

@@ -1,6 +1,6 @@
 import { expect, test } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
-import type { RuntimeStatus } from "../shared/ipc-contract.ts";
+import type { RepositoryList, RuntimeStatus } from "../shared/ipc-contract.ts";
 import { createDesktopBridge, type BridgeIpc } from "./bridge.ts";
 
 type Listener = (event: unknown, ...args: unknown[]) => void;
@@ -54,19 +54,34 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version and the runtime functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, and the repository functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
-  expect(Object.keys(bridge).sort()).toEqual(["electronVersion", "runtime"]);
+  expect(Object.keys(bridge).sort()).toEqual([
+    "electronVersion",
+    "repositories",
+    "runtime",
+  ]);
   expect(Object.keys(bridge.runtime).sort()).toEqual([
     "getStatus",
     "subscribeStatus",
   ]);
+  expect(Object.keys(bridge.repositories).sort()).toEqual([
+    "list",
+    "mount",
+    "subscribe",
+    "unmount",
+  ]);
   expect(bridge.electronVersion).toBe("44.9.1");
   expect(Object.isFrozen(bridge)).toBe(true);
   expect(Object.isFrozen(bridge.runtime)).toBe(true);
-  expect(typeof bridge.runtime.getStatus).toBe("function");
-  expect(typeof bridge.runtime.subscribeStatus).toBe("function");
+  expect(Object.isFrozen(bridge.repositories)).toBe(true);
+  for (const value of [
+    ...Object.values(bridge.runtime),
+    ...Object.values(bridge.repositories),
+  ]) {
+    expect(typeof value).toBe("function");
+  }
 });
 
 test("no part of the bridge is the ipc object or a generic invoke", () => {
@@ -75,6 +90,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
   const values = [
     ...Object.values(bridge),
     ...Object.values(bridge.runtime),
+    ...Object.values(bridge.repositories),
   ] as unknown[];
 
   expect(values).not.toContain(ipc);
@@ -216,4 +232,106 @@ test("an onError callback that throws is reported", async () => {
 
   expect(reported).toHaveLength(1);
   expect((reported[0] as Error).message).toBe("onError");
+});
+
+const MOUNT_ID = "0b9e2f7c-5d0a-4c8e-9f3b-2a1d6e4c8b70";
+
+const repositoryList = (revision: number): RepositoryList => ({
+  revision,
+  repositories: [],
+});
+
+test("list and mount call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+
+  const listed = (
+    bridge.repositories.list as (...args: unknown[]) => Promise<unknown>
+  )("/etc", { path: "/" });
+  const mounted = (
+    bridge.repositories.mount as (...args: unknown[]) => Promise<unknown>
+  )("/home/user/project");
+  fake.answers[0]?.resolve(repositoryList(1));
+  fake.answers[1]?.resolve({ outcome: "cancelled" });
+
+  await expect(listed).resolves.toEqual(repositoryList(1));
+  await expect(mounted).resolves.toEqual({ outcome: "cancelled" });
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.listRepositories, args: [] },
+    { channel: INVOKE_CHANNELS.mountRepository, args: [] },
+  ]);
+});
+
+test("unmount passes only the mount ID string on", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const unmount = bridge.repositories.unmount as (
+    ...args: unknown[]
+  ) => Promise<boolean>;
+
+  const answer = unmount(MOUNT_ID, "extra", { evil: true });
+  fake.answers[0]?.resolve(true);
+
+  await expect(answer).resolves.toBe(true);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.unmountRepository, args: [MOUNT_ID] },
+  ]);
+});
+
+test("unmount refuses a mount ID that is not a string without calling the main process", async () => {
+  const fake = fakeIpc();
+  const unmount = createDesktopBridge("44.9.1", fake.ipc).repositories
+    .unmount as (...args: unknown[]) => Promise<boolean>;
+
+  for (const value of [undefined, 1, { mountId: MOUNT_ID }, [MOUNT_ID]]) {
+    await expect(unmount(value)).rejects.toThrow(TypeError);
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("subscribe delivers the list and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const calls: unknown[][] = [];
+
+  const end = bridge.repositories.subscribe((...args: unknown[]) =>
+    calls.push(args),
+  );
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeRepositories, args: [] },
+  ]);
+  // A change arrives before the answer; the older answer is dropped.
+  fake.emit(EVENT_CHANNELS.repositoriesChanged, repositoryList(3));
+  fake.answers[0]?.resolve(repositoryList(2));
+  await settle();
+  fake.emit(EVENT_CHANNELS.repositoriesChanged, repositoryList(4));
+  end();
+  fake.emit(EVENT_CHANNELS.repositoriesChanged, repositoryList(5));
+
+  expect(calls).toEqual([[repositoryList(3)], [repositoryList(4)]]);
+  expect(fake.listenerCount(EVENT_CHANNELS.repositoriesChanged)).toBe(0);
+});
+
+test("a refused repository subscription calls onError, and a throwing listener is reported", async () => {
+  const fake = fakeIpc();
+  const reported: string[] = [];
+  const bridge = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  let errors = 0;
+
+  bridge.repositories.subscribe(
+    () => {
+      throw new Error("listener");
+    },
+    () => {
+      errors += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.repositoriesChanged, repositoryList(1));
+  fake.answers[0]?.reject(new Error("refused"));
+  await settle();
+
+  expect(errors).toBe(1);
+  expect(reported).toEqual(["A repository list callback failed."]);
 });
