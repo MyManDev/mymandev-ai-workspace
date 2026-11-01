@@ -27,7 +27,10 @@ import { createInvitation } from "./invitations.ts";
 import { activePersonOf, createWorkspace } from "./membership.ts";
 import {
   defineMember,
+  demoteMember,
+  DEVICE_TOO_NEW_MS,
   leaveWorkspace,
+  promoteMember,
   removeMember,
   renameMember,
 } from "./people.ts";
@@ -1260,6 +1263,368 @@ test("inside a transaction that rolls back, a removal leaves nothing behind", as
   assert.deepEqual(await auditOf(workspaceId), []);
 });
 
+/** Sets the account's device's registration to `age` before `LATER`; by default the least age that promotes. */
+async function deviceAged(owner: Account, age: number = DEVICE_TOO_NEW_MS + 1) {
+  await database()
+    .update(devices)
+    .set({ createdAt: new Date(LATER.getTime() - age) })
+    .where(eq(devices.id, owner.deviceId));
+}
+
+async function roleOf(id: MemberId) {
+  return (await person(id)).role;
+}
+
+test("the owner promotes a claimed member and demotes an admin, each audited, and only a demotion revokes the open invitations that the admin created, with creator_demoted", async () => {
+  const db = database();
+  const owner = await account("Owner");
+  const admin = await account("Admin");
+  const member = await account("Member");
+  await deviceAged(owner);
+  const { workspaceId } = await workspaceOf(owner);
+  const adminPerson = await addPerson(workspaceId, owner, {
+    claimedBy: admin,
+    role: "admin",
+  });
+  const memberPerson = await addPerson(workspaceId, owner, {
+    claimedBy: member,
+  });
+  const [first, second, third, fourth] = [
+    await addPerson(workspaceId, owner),
+    await addPerson(workspaceId, owner),
+    await addPerson(workspaceId, owner),
+    await addPerson(workspaceId, owner),
+  ];
+  assert.ok(
+    first !== undefined &&
+      second !== undefined &&
+      third !== undefined &&
+      fourth !== undefined,
+  );
+  const live = await invite(workspaceId, first, admin);
+  // Expired and never revoked, as in the unique index of one live invitation.
+  const expired = await invite(workspaceId, second, admin, {
+    createdAt: new Date(NOW.getTime() - 2 * HOUR_MS),
+    expiresAt: new Date(NOW.getTime() - HOUR_MS),
+  });
+  const revoked = await invite(workspaceId, third, admin, {
+    revokedAt: NOW,
+    revokedByUserId: owner.userId,
+  });
+  const ownersInvitation = await invite(workspaceId, fourth, owner);
+  // The admin's invitation in another workspace stays.
+  const elsewhereOwner = await account("Elsewhere");
+  const elsewhere = (await workspaceOf(elsewhereOwner)).workspaceId;
+  await addPerson(elsewhere, elsewhereOwner, {
+    claimedBy: admin,
+    role: "admin",
+  });
+  const elsewhereInvitation = await invite(
+    elsewhere,
+    await addPerson(elsewhere, elsewhereOwner),
+    admin,
+  );
+  const untouched = [live, expired, ownersInvitation, elsewhereInvitation];
+  const revokedAtOf = async (ids: readonly InvitationId[]) =>
+    Promise.all(ids.map(async (id) => (await invitationRow(id)).revokedAt));
+
+  assert.deepEqual(
+    await promoteMember(db, {
+      workspaceId,
+      ...owner,
+      memberId: memberPerson,
+      now: LATER,
+    }),
+    { promoted: true },
+  );
+  const promoted = await person(memberPerson);
+  assert.equal(promoted.role, "admin");
+  assert.deepEqual(promoted.updatedAt, LATER);
+  assert.deepEqual(
+    await revokedAtOf(untouched),
+    [null, null, null, null],
+    "a promotion revokes no invitation",
+  );
+
+  const demotion = await demoteMember(db, {
+    workspaceId,
+    ...owner,
+    memberId: adminPerson,
+    now: LATER,
+  });
+  assert.deepEqual(demotion, {
+    demoted: true,
+    revokedInvitationIds: byId([live, expired]),
+  });
+  const demoted = await person(adminPerson);
+  assert.equal(demoted.role, "member");
+  assert.deepEqual(demoted.updatedAt, LATER);
+  assert.equal(demoted.removedAt, null, "a demoted admin stays a member");
+  for (const id of [live, expired]) {
+    const row = await invitationRow(id);
+    assert.deepEqual(row.revokedAt, LATER);
+    assert.equal(row.revokedByUserId, owner.userId);
+  }
+  assert.deepEqual(
+    (await invitationRow(revoked)).revokedAt,
+    NOW,
+    "an earlier revocation stays",
+  );
+  assert.deepEqual(await revokedAtOf([ownersInvitation, elsewhereInvitation]), [
+    null,
+    null,
+  ]);
+
+  // The promoted member is demoted again and created no invitation.
+  assert.deepEqual(
+    await demoteMember(db, {
+      workspaceId,
+      ...owner,
+      memberId: memberPerson,
+      now: LATER,
+    }),
+    { demoted: true, revokedInvitationIds: [] },
+  );
+  assert.equal(await roleOf(memberPerson), "member");
+
+  const actor = {
+    actorUserId: owner.userId,
+    actorDeviceId: owner.deviceId,
+    createdAt: LATER,
+  };
+  assert.deepEqual(await auditOf(workspaceId), [
+    {
+      action: "member.promoted",
+      subjectId: memberPerson,
+      reason: null,
+      ...actor,
+    },
+    {
+      action: "member.demoted",
+      subjectId: adminPerson,
+      reason: null,
+      ...actor,
+    },
+    ...byId([live, expired]).map((subjectId) => ({
+      action: "invitation.revoked" as const,
+      subjectId,
+      reason: "creator_demoted" as const,
+      ...actor,
+    })),
+    {
+      action: "member.demoted",
+      subjectId: memberPerson,
+      reason: null,
+      ...actor,
+    },
+  ]);
+  assert.deepEqual(await auditOf(elsewhere), []);
+});
+
+test("only the owner changes a role, never their own, and only of an active, claimed person in the right role; a refusal changes nothing", async () => {
+  const db = database();
+  const owner = await account("Owner");
+  const admin = await account("Admin");
+  const otherAdmin = await account("Other admin");
+  const member = await account("Member");
+  const otherMember = await account("Other member");
+  const outsider = await account("Outsider");
+  const former = await account("Former");
+  // Old enough, so that each refusal is about the role or the person.
+  for (const each of [owner, admin, otherAdmin, member, outsider, former]) {
+    await deviceAged(each);
+  }
+  const { workspaceId, ownerPerson } = await workspaceOf(owner);
+  const adminPerson = await addPerson(workspaceId, owner, {
+    claimedBy: admin,
+    role: "admin",
+  });
+  const otherAdminPerson = await addPerson(workspaceId, owner, {
+    claimedBy: otherAdmin,
+    role: "admin",
+  });
+  const memberPerson = await addPerson(workspaceId, owner, {
+    claimedBy: member,
+  });
+  const otherMemberPerson = await addPerson(workspaceId, owner, {
+    claimedBy: otherMember,
+  });
+  const unclaimed = await addPerson(workspaceId, owner);
+  const formerPerson = await addPerson(workspaceId, owner, {
+    claimedBy: former,
+    role: "admin",
+    removedAt: NOW,
+    removedByUserId: owner.userId,
+  });
+  const formerMember = await addPerson(workspaceId, owner, {
+    claimedBy: await account("Former member"),
+    removedAt: NOW,
+    removedByUserId: owner.userId,
+  });
+  const elsewhere = await addPerson(
+    (await workspaceOf(outsider)).workspaceId,
+    outsider,
+    { claimedBy: otherMember },
+  );
+  const invitation = await invite(workspaceId, unclaimed, admin);
+
+  for (const [label, actor, memberId, refusal] of [
+    ["an admin, a member", admin, memberPerson, "forbidden"],
+    ["an admin, themselves", admin, adminPerson, "forbidden"],
+    ["a member, another member", member, otherMemberPerson, "forbidden"],
+    ["a member, themselves", member, memberPerson, "forbidden"],
+    ["the owner, themselves", owner, ownerPerson, "forbidden"],
+    ["the owner, an admin", owner, adminPerson, "conflict"],
+    ["the owner, an unclaimed person", owner, unclaimed, "conflict"],
+    ["the owner, a former member", owner, formerMember, "conflict"],
+    ["the owner, another workspace's person", owner, elsewhere, "not_found"],
+    ["the owner, an unknown person", owner, newId<MemberId>(), "not_found"],
+    ["an outsider", outsider, memberPerson, "not_member"],
+    ["a former admin", former, memberPerson, "not_member"],
+  ] as const) {
+    assert.deepEqual(
+      await promoteMember(db, { workspaceId, ...actor, memberId, now: LATER }),
+      { promoted: false, refusal },
+      `promote: ${label}`,
+    );
+  }
+  for (const [label, actor, memberId, refusal] of [
+    ["an admin, another admin", admin, otherAdminPerson, "forbidden"],
+    ["an admin, themselves", admin, adminPerson, "forbidden"],
+    ["an admin, the owner", admin, ownerPerson, "forbidden"],
+    ["a member, an admin", member, adminPerson, "forbidden"],
+    ["the owner, themselves", owner, ownerPerson, "forbidden"],
+    ["the owner, a member", owner, memberPerson, "conflict"],
+    ["the owner, an unclaimed person", owner, unclaimed, "conflict"],
+    ["the owner, a former admin", owner, formerPerson, "conflict"],
+    ["the owner, another workspace's person", owner, elsewhere, "not_found"],
+    ["the owner, an unknown person", owner, newId<MemberId>(), "not_found"],
+    ["an outsider", outsider, adminPerson, "not_member"],
+    ["a former admin", former, adminPerson, "not_member"],
+  ] as const) {
+    assert.deepEqual(
+      await demoteMember(db, { workspaceId, ...actor, memberId, now: LATER }),
+      { demoted: false, refusal },
+      `demote: ${label}`,
+    );
+  }
+  for (const [id, role] of [
+    [ownerPerson, "owner"],
+    [adminPerson, "admin"],
+    [otherAdminPerson, "admin"],
+    [memberPerson, "member"],
+    [otherMemberPerson, "member"],
+    [unclaimed, "member"],
+    [formerPerson, "admin"],
+    [formerMember, "member"],
+  ] as const) {
+    assert.equal(await roleOf(id), role, "a refusal changes no role");
+  }
+  assert.equal(
+    (await invitationRow(invitation)).revokedAt,
+    null,
+    "nor revokes an invitation",
+  );
+  assert.deepEqual(await auditOf(workspaceId), [], "and audits nothing");
+});
+
+test("a device exactly 72 hours old is too new to promote, and one a millisecond older promotes", async () => {
+  const db = database();
+  const owner = await account("Owner");
+  const member = await account("Member");
+  const { workspaceId } = await workspaceOf(owner);
+  const memberPerson = await addPerson(workspaceId, owner, {
+    claimedBy: member,
+  });
+  const promote = () =>
+    promoteMember(db, {
+      workspaceId,
+      ...owner,
+      memberId: memberPerson,
+      now: LATER,
+    });
+
+  await deviceAged(owner, DEVICE_TOO_NEW_MS);
+  assert.deepEqual(await promote(), {
+    promoted: false,
+    refusal: "device_too_new",
+  });
+  assert.equal(await roleOf(memberPerson), "member");
+  await deviceAged(owner, DEVICE_TOO_NEW_MS + 1);
+  assert.deepEqual(await promote(), { promoted: true });
+  assert.equal(await roleOf(memberPerson), "admin");
+});
+
+test("only a device older than 72 hours promotes, and any device of the owner demotes", async () => {
+  const db = database();
+  assert.equal(DEVICE_TOO_NEW_MS, 72 * HOUR_MS);
+  const owner = await account("Owner");
+  const admin = await account("Admin");
+  const member = await account("Member");
+  const { workspaceId } = await workspaceOf(owner);
+  const adminPerson = await addPerson(workspaceId, owner, {
+    claimedBy: admin,
+    role: "admin",
+  });
+  const memberPerson = await addPerson(workspaceId, owner, {
+    claimedBy: member,
+  });
+  const promote = (by: Account, memberId: MemberId) =>
+    promoteMember(db, { workspaceId, ...by, memberId, now: LATER });
+  const tooNew = { promoted: false, refusal: "device_too_new" };
+
+  await deviceAged(owner, 0);
+  assert.deepEqual(await promote(owner, memberPerson), tooNew);
+  await deviceAged(owner, DEVICE_TOO_NEW_MS - 1);
+  assert.deepEqual(await promote(owner, memberPerson), tooNew);
+  await deviceAged(owner, DEVICE_TOO_NEW_MS);
+  assert.deepEqual(await promote(owner, memberPerson), tooNew);
+  // A device that is too new is refused before the target's state is
+  // decided, and after the role: an admin is forbidden on any device.
+  assert.deepEqual(await promote(owner, adminPerson), tooNew);
+  assert.deepEqual(await promote(admin, memberPerson), {
+    promoted: false,
+    refusal: "forbidden",
+  });
+  // Another account's device is no device of the owner.
+  await deviceAged(member);
+  assert.deepEqual(
+    await promote({ ...owner, deviceId: member.deviceId }, memberPerson),
+    tooNew,
+  );
+  assert.equal(await roleOf(memberPerson), "member");
+  assert.deepEqual(await auditOf(workspaceId), []);
+
+  await deviceAged(owner);
+  assert.deepEqual(await promote(owner, memberPerson), { promoted: true });
+  assert.equal(await roleOf(memberPerson), "admin");
+
+  // A demotion needs no device age.
+  const desktop = await secondDevice(owner);
+  assert.deepEqual(
+    await demoteMember(db, {
+      workspaceId,
+      userId: owner.userId,
+      deviceId: desktop,
+      memberId: adminPerson,
+      now: LATER,
+    }),
+    { demoted: true, revokedInvitationIds: [] },
+  );
+  assert.equal(await roleOf(adminPerson), "member");
+  assert.deepEqual(
+    (await auditOf(workspaceId)).map((record) => [
+      record.action,
+      record.actorDeviceId,
+      record.subjectId,
+    ]),
+    [
+      ["member.promoted", owner.deviceId, memberPerson],
+      ["member.demoted", desktop, adminPerson],
+    ],
+  );
+});
+
 const SERVER_ONLY = {
   skip:
     process.env["DATABASE_TEST_URL"] === undefined &&
@@ -1559,5 +1924,157 @@ test(
     const invitation = await invitationRow(created.id);
     assert.deepEqual(invitation.revokedAt, LATER);
     assert.equal(invitation.revokedByUserId, owner.userId);
+  },
+);
+
+test(
+  "a demotion waits for an invitation that the admin creates meanwhile and revokes it with creator_demoted",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const admin = await account("Admin");
+    const { workspaceId } = await workspaceOf(owner);
+    const adminPerson = await addPerson(workspaceId, owner, {
+      claimedBy: admin,
+      role: "admin",
+    });
+    const unclaimed = await addPerson(workspaceId, owner);
+    const created: { id: InvitationId | null } = { id: null };
+    const demotion = await afterConcurrentChange(
+      async (tx) => {
+        const result = await createInvitation(tx, {
+          workspaceId,
+          ...admin,
+          memberId: unclaimed,
+          tokenHash: randomBytes(32).toString("hex"),
+          now: NOW,
+        });
+        assert.ok(result.created);
+        created.id = result.invitation.id;
+      },
+      () =>
+        demoteMember(database(), {
+          workspaceId,
+          ...owner,
+          memberId: adminPerson,
+          now: LATER,
+        }),
+    );
+    assert.ok(created.id !== null);
+    assert.deepEqual(demotion, {
+      demoted: true,
+      revokedInvitationIds: [created.id],
+    });
+    const invitation = await invitationRow(created.id);
+    assert.deepEqual(invitation.revokedAt, LATER);
+    assert.equal(invitation.revokedByUserId, owner.userId);
+    assert.deepEqual(
+      (await auditOf(workspaceId)).map((record) => [
+        record.action,
+        record.reason,
+      ]),
+      [
+        ["invitation.created", null],
+        ["member.demoted", null],
+        ["invitation.revoked", "creator_demoted"],
+      ],
+    );
+  },
+);
+
+test(
+  "an invitation and a removal by an admin wait for the admin's demotion and are then refused with forbidden",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const admin = await account("Admin");
+    const member = await account("Member");
+    const { workspaceId } = await workspaceOf(owner);
+    const adminPerson = await addPerson(workspaceId, owner, {
+      claimedBy: admin,
+      role: "admin",
+    });
+    const memberPerson = await addPerson(workspaceId, owner, {
+      claimedBy: member,
+    });
+    const unclaimed = await addPerson(workspaceId, owner);
+    const demote = (tx: Database) =>
+      demoteMember(tx, {
+        workspaceId,
+        ...owner,
+        memberId: adminPerson,
+        now: NOW,
+      });
+
+    const invitation = await afterConcurrentChange(demote, () =>
+      createInvitation(database(), {
+        workspaceId,
+        ...admin,
+        memberId: unclaimed,
+        tokenHash: randomBytes(32).toString("hex"),
+        now: LATER,
+      }),
+    );
+    assert.deepEqual(invitation, { created: false, refusal: "forbidden" });
+    const created = await database()
+      .select({ id: workspaceInvitations.id })
+      .from(workspaceInvitations)
+      .where(eq(workspaceInvitations.createdByUserId, admin.userId));
+    assert.deepEqual(created, []);
+
+    // Promoted again, as the owner would, and demoted while the removal waits.
+    await database()
+      .update(workspaceMembers)
+      .set({ role: "admin" })
+      .where(eq(workspaceMembers.id, adminPerson));
+    const removal = await afterConcurrentChange(demote, () =>
+      removeMember(database(), {
+        workspaceId,
+        ...admin,
+        memberId: memberPerson,
+        now: LATER,
+      }),
+    );
+    assert.deepEqual(removal, { removed: false, refusal: "forbidden" });
+    assert.equal((await person(memberPerson)).removedAt, null);
+    assert.equal(await roleOf(adminPerson), "member");
+  },
+);
+
+test(
+  "a demotion waits for a concurrent removal of the admin and is then a conflict",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const admin = await account("Admin");
+    const { workspaceId } = await workspaceOf(owner);
+    const adminPerson = await addPerson(workspaceId, owner, {
+      claimedBy: admin,
+      role: "admin",
+    });
+    const demotion = await afterConcurrentChange(
+      (tx) =>
+        removeMember(tx, {
+          workspaceId,
+          ...owner,
+          memberId: adminPerson,
+          now: NOW,
+        }),
+      () =>
+        demoteMember(database(), {
+          workspaceId,
+          ...owner,
+          memberId: adminPerson,
+          now: LATER,
+        }),
+    );
+    assert.deepEqual(demotion, { demoted: false, refusal: "conflict" });
+    const row = await person(adminPerson);
+    assert.deepEqual(row.removedAt, NOW);
+    assert.equal(row.role, "admin", "a former admin keeps the role it had");
+    assert.deepEqual(
+      (await auditOf(workspaceId)).map((record) => record.action),
+      ["member.removed"],
+    );
   },
 );

@@ -1,9 +1,11 @@
 import {
   type Database,
   defineMember,
+  demoteMember,
   leaveWorkspace,
   type MembershipEnd,
   type PersonRefusal,
+  promoteMember,
   removeMember,
   renameMember,
 } from "@mymandev/database";
@@ -56,13 +58,14 @@ type MemberParams = Readonly<{ workspaceId: WorkspaceId; memberId: MemberId }>;
  * The answer to a refused action on a person. An account that stopped being
  * an active member after the membership check gets the check's `404`.
  */
-function refused(refusal: PersonRefusal): ApiError {
+function refused(refusal: PersonRefusal | "device_too_new"): ApiError {
   return new ApiError(refusal === "not_member" ? "not_found" : refusal);
 }
 
 /**
- * Defining, renaming, and removing people, and leaving (ADR 0014, "People and
- * roles" and "Removal and ownership"). Registered on a scope that
+ * Defining, renaming, and removing people, leaving, and promoting and
+ * demoting admins (ADR 0014, "People and roles" and "Removal and
+ * ownership"). Registered on a scope that
  * `requireActiveMember` protects. Each change runs in one transaction that
  * checks the account and the device again (`lockActor`) and then decides on
  * the locked people; a frozen copy of its membership event goes to
@@ -208,6 +211,75 @@ export function registerPeopleRoutes(
         return result;
       });
       sendMembershipEnd(request, workspaceId, ended, now);
+      return reply.code(204).send();
+    },
+  );
+
+  /** Tells the workspace that a person became an admin or a member again. */
+  function sendRoleChanged(
+    request: FastifyRequest,
+    workspaceId: WorkspaceId,
+    memberId: MemberId,
+    role: "admin" | "member",
+    now: Date,
+  ): void {
+    send(request, {
+      ...serverEventHeader(workspaceId, now),
+      type: "workspace.member.role_changed",
+      payload: { memberId, role },
+    });
+  }
+
+  // Only the owner promotes, from a device older than 72 hours; the owner's
+  // own role changes only by transfer.
+  workspace.post(
+    MEMBERSHIP_ROUTES.promoteMember.path,
+    { schema: { params: MemberParamsSchema } },
+    async (request, reply) => {
+      const auth = authOf(request);
+      const { workspaceId, memberId } = request.params as MemberParams;
+      const now = new Date(options.now());
+      await database.transaction(async (tx) => {
+        await lockActor(tx, auth, now.getTime());
+        const result = await promoteMember(tx, {
+          workspaceId,
+          memberId,
+          userId: auth.userId,
+          deviceId: auth.deviceId,
+          now,
+        });
+        if (!result.promoted) {
+          throw refused(result.refusal);
+        }
+      });
+      sendRoleChanged(request, workspaceId, memberId, "admin", now);
+      return reply.code(204).send();
+    },
+  );
+
+  // Demoting revokes the invitations that the admin created in the same
+  // transaction; invitations send no membership event.
+  workspace.post(
+    MEMBERSHIP_ROUTES.demoteMember.path,
+    { schema: { params: MemberParamsSchema } },
+    async (request, reply) => {
+      const auth = authOf(request);
+      const { workspaceId, memberId } = request.params as MemberParams;
+      const now = new Date(options.now());
+      await database.transaction(async (tx) => {
+        await lockActor(tx, auth, now.getTime());
+        const result = await demoteMember(tx, {
+          workspaceId,
+          memberId,
+          userId: auth.userId,
+          deviceId: auth.deviceId,
+          now,
+        });
+        if (!result.demoted) {
+          throw refused(result.refusal);
+        }
+      });
+      sendRoleChanged(request, workspaceId, memberId, "member", now);
       return reply.code(204).send();
     },
   );
