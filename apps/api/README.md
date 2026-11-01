@@ -105,7 +105,7 @@ These routes need GitHub sign-in and the database (ADR 0014, "Device key and aut
 
 Sign-out, revocations, and the lock write audit records. No `Authorization` header, token, nonce, or signature is logged.
 
-The operator command (`db:account`) runs outside the API and cannot drop tokens from its memory: after disabling and enabling an account within 15 minutes, a token minted before the disable works again until it expires.
+The operator command (`db:account`) runs outside the API and cannot drop tokens from its memory: after disabling and enabling an account within 15 minutes, a token minted before the disable works again until it expires. Erasing an account (`db:account -- erase`, #93) revokes its devices, so its tokens stop working at once and its connections close at the next sweep; the API sends no membership or run events for an erasure, and the other members see it when they next load the workspace ([`@mymandev/database`](../../packages/database/README.md#operator-commands)).
 
 ### Workspaces
 
@@ -184,7 +184,7 @@ Decisions for #91 by the Project Manager on 2026-11-01:
 - At most 10 failed previews or accepts per account within 15 minutes, counting only `invitation_invalid` answers, in API memory.
 - Rejoining after a removal claims a new person, a new person row, so that the earlier membership stays in the history.
 
-Applied on 2026-11-01 under the Project Manager's rule: a preview refuses a code whose inviter has no person or no GitHub identity in the workspace with `invitation_invalid` (reason `inviter_unknown`), while accepting the same code still claims the person, which needs no inviter. This is deliberate: the preview shows the inviter's GitHub login, which the protocol requires. It cannot happen before account erasure exists, and the erasure of #93 will revoke the invitations that the erased account created.
+Applied on 2026-11-01 under the Project Manager's rule: a preview refuses a code whose inviter has no person or no GitHub identity in the workspace with `invitation_invalid` (reason `inviter_unknown`), while accepting the same code still claims the person, which needs no inviter. This is deliberate: the preview shows the inviter's GitHub login, which the protocol requires. Account erasure (#93) revokes the invitations that the erased account created, so an erasure does not lead to it either.
 
 Applied on 2026-11-01 under the Project Manager's rule: the workspace view lists the claimed active people before the unclaimed ones, so that an admin who defines 1,000 unclaimed people cannot push the claimed members out of its 1,000 rows. ADR 0014 sets no limit on the people that the owner and admins define; a limit per workspace stays open for the Project Manager.
 
@@ -215,7 +215,7 @@ Awaiting the Project Manager's confirmation: a second request while one is pendi
 
 Open, for a Project Manager decision: `workspace_join_requests` has no index on `requester_user_id`, so the counts per account of `POST /join-requests` and the list of `GET /join-requests` read every request. Adding one needs a migration.
 
-Open, for the erasure task: a pending request of an account whose identity is erased stays pending and can still be approved by its ID, although the approvers' list no longer shows it. Erasure should end the account's pending requests, or an approval should refuse a requester whose identity was erased.
+Settled by the erasure (#93): erasing an account withdraws its pending join requests and marks those past their expiry `expired`, so an approval of a request of an erased account answers `409` with `conflict`.
 
 ### `POST /auth/github/webhook`
 
@@ -339,4 +339,6 @@ Still open: how the server refuses a `chat.message.send` (#27); relaying the eve
 
 ## Not included
 
-Sessions, CORS, OpenAPI, TLS, the notice of a claim to the owner and admins (after #110), account erasure (#93), permission enforcement, the reference binding of events (#27, #28), relaying and storing the events of devices, chat storage (#27), Docker, deployment configuration, clustering, a build step, pretty-printed logs, and a Fastify type provider.
+Sessions, CORS, OpenAPI, TLS, the notice of a claim to the owner and admins (after #110), account erasure, permission enforcement, the reference binding of events (#27, #28), relaying and storing the events of devices, chat storage (#27), Docker, deployment configuration, clustering, a build step, pretty-printed logs, and a Fastify type provider.
+
+Account erasure (#93) is the operator command `db:account -- erase` of [`@mymandev/database`](../../packages/database/README.md#operator-commands), not a route. It runs outside the API, so the API sends no `workspace.member.removed`, account frame, or `agent.run.state_changed` for an erasure: the sweep closes the account's connections, and the other members see the change when they next load the workspace.

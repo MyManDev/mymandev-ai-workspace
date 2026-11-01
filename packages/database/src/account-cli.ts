@@ -1,17 +1,24 @@
-// Disables or enables an account (operator command):
+// Disables, enables, or erases an account (operator command):
 //   npm run db:account -w @mymandev/database -- disable <user ID>
 //   npm run db:account -w @mymandev/database -- enable <user ID>
+//   npm run db:account -w @mymandev/database -- erase <user ID> --confirm
 // It connects with DATABASE_URL, the application role, like the API.
-import { UserIdSchema } from "@mymandev/protocol";
+import {
+  disableReport,
+  enableReport,
+  erasureReport,
+  parseAccountCommand,
+} from "./account-command.ts";
+import { eraseAccount } from "./account-erasure.ts";
 import { disableAccount, enableAccount } from "./account-status.ts";
 import { checkDatabaseUrl, createDatabase } from "./client.ts";
 
-const [action, rawUserId] = process.argv.slice(2);
-const userId = UserIdSchema.safeParse(rawUserId);
-if ((action !== "disable" && action !== "enable") || !userId.success) {
-  console.error("Usage: db:account -- disable|enable <user ID (UUIDv7)>");
+const parsed = parseAccountCommand(process.argv.slice(2));
+if (!parsed.ok) {
+  console.error(parsed.message);
   process.exit(1);
 }
+const { action, userId } = parsed.command;
 
 const url = process.env["DATABASE_URL"];
 if (!url) {
@@ -27,20 +34,17 @@ if (problem !== undefined) {
 const { db, close } = createDatabase(url, { max: 1 });
 try {
   const now = new Date();
-  if (action === "disable") {
-    const result = await disableAccount(db, { userId: userId.data, now });
-    console.log(
-      result.changed
-        ? `Account disabled; ${result.revokedGrantIds.length} grants revoked.`
-        : "No change: the account does not exist or is already disabled.",
-    );
+  const report =
+    action === "disable"
+      ? disableReport(await disableAccount(db, { userId, now }))
+      : action === "enable"
+        ? enableReport(await enableAccount(db, { userId, now }))
+        : erasureReport(await eraseAccount(db, { userId, now }));
+  if (report.exitCode === 0) {
+    console.log(report.message);
   } else {
-    const result = await enableAccount(db, { userId: userId.data, now });
-    console.log(
-      result.changed
-        ? "Account enabled; no grant was restored."
-        : "No change: the account does not exist or is not disabled.",
-    );
+    console.error(report.message);
+    process.exitCode = report.exitCode;
   }
 } finally {
   await close();

@@ -197,11 +197,12 @@ test("enabling an account restores no grant and audits it", async () => {
   const world = await seed();
   assert.deepEqual(await enableAccount(db, { userId: world.alice, now: NOW }), {
     changed: false,
+    erased: false,
   });
   await disableAccount(db, { userId: world.alice, now: NOW });
   assert.deepEqual(
     await enableAccount(db, { userId: world.alice, now: LATER }),
-    { changed: true },
+    { changed: true, erased: false },
   );
   const [alice] = await db
     .select()
@@ -231,6 +232,6 @@ test("an unknown account changes nothing", async () => {
   );
   assert.deepEqual(
     await enableAccount(db, { userId: newId<UserId>(), now: NOW }),
-    { changed: false },
+    { changed: false, erased: false },
   );
 });

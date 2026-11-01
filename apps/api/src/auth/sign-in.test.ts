@@ -1,6 +1,7 @@
 import {
   auditEvents,
   devices,
+  eraseAccount,
   recordGitHubRevocation,
   userIdentities,
   users,
@@ -17,7 +18,7 @@ import {
   SignInResponseSchema,
   type UserId,
 } from "@mymandev/protocol";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import assert from "node:assert/strict";
 import {
   createPublicKey,
@@ -578,6 +579,55 @@ test("another account, a revoked device, and a disabled account are refused with
     newDeviceRequest(await signInCode(owner), newKey()),
   );
   assert.equal(codeOf(disabled), "auth_failed");
+});
+
+test("after an operator erases an account, its device answers device_revoked and a sign-in with the same GitHub ID creates a new account", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1101, "erin-e", "Erin") });
+  const key = newKey();
+  const erased = SignInResponseSchema.parse(
+    (
+      await postSignIn(app, newDeviceRequest(await signInCode(app), key))
+    ).json(),
+  );
+  const erasure = await eraseAccount(database(), {
+    userId: erased.userId,
+    now: new Date(),
+  });
+  assert.equal(erasure.erased, true);
+
+  const revoked = await postSignIn(
+    app,
+    existingDeviceRequest(
+      await signInCode(app),
+      erased.deviceId,
+      key,
+      newKey(),
+    ),
+  );
+  assert.equal(codeOf(revoked), "device_revoked");
+
+  const again = await postSignIn(
+    app,
+    newDeviceRequest(await signInCode(app), newKey()),
+  );
+  assert.equal(again.statusCode, 200);
+  const created = SignInResponseSchema.parse(again.json());
+  assert.notEqual(created.userId, erased.userId);
+  assert.equal(created.displayName, "Erin");
+  const identities = await database()
+    .select({
+      userId: userIdentities.userId,
+      subject: userIdentities.subject,
+    })
+    .from(userIdentities)
+    .where(inArray(userIdentities.userId, [erased.userId, created.userId]));
+  assert.deepEqual(
+    new Map(identities.map((row) => [row.userId, row.subject])),
+    new Map([
+      [erased.userId, null],
+      [created.userId, "1101"],
+    ]),
+  );
 });
 
 test("the registration lock refuses a new device but not a repeated sign-in", async (t) => {

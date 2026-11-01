@@ -51,7 +51,9 @@ export type AuditAction = (typeof AUDIT_ACTIONS)[number];
  * `creator_demoted`, and `member_removed` say why an invitation was revoked
  * without an explicit revoke: `replaced` is therefore both a device and an
  * invitation revocation reason, the latter when a new invitation for the same
- * person replaces it.
+ * person replaces it. `account_erased` also marks the `member.removed` and
+ * `join_request.withdrawn` records of an operator's erasure, which have no
+ * actor (`src/account-erasure.ts`).
  */
 export const AUDIT_REASONS = Object.freeze([
   "removed",
