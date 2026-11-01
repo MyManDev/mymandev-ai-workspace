@@ -23,7 +23,6 @@ export {
   type RevokeDeviceResult,
 } from "./device-revocation.ts";
 export {
-  type ActiveMemberInput,
   type ConnectionAuditAction,
   type ConnectionAuditInput,
   type DeviceAccessRow,
@@ -36,6 +35,17 @@ export {
   markDevicesSeen,
   writeConnectionAudit,
 } from "./connections.ts";
+export {
+  type ActiveMemberInput,
+  activePersonOf,
+  type ActivePerson,
+  createWorkspace,
+  type CreateWorkspaceInput,
+  type CreateWorkspaceResult,
+  listWorkspaces,
+  workspaceView,
+  type WorkspaceViewInput,
+} from "./membership.ts";
 export {
   DatabaseError,
   toDatabaseError,

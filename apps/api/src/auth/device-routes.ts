@@ -10,7 +10,6 @@ import {
   type AccessTokenRequest,
   AccessTokenRequestSchema,
   type AccessTokenResponse,
-  ACCESS_TOKEN_PATTERN,
   type AccountDeviceRevokedFrame,
   AUTH_ROUTES,
   type ChallengeResponse,
@@ -24,18 +23,14 @@ import {
   RevokeDeviceRequestSchema,
 } from "@mymandev/protocol";
 import { and, desc, eq, gt } from "drizzle-orm";
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance } from "fastify";
 import * as z from "zod";
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
+import { authOf, lockActor, type RequireAccessToken } from "./authenticate.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
-import {
-  type AuthContext,
-  deviceListItem,
-  stateOf,
-  tokenUsable,
-} from "./device-state.ts";
+import { type AuthContext, deviceListItem, stateOf } from "./device-state.ts";
 import { type AccessTokens, type Challenges, WindowLimiter } from "./tokens.ts";
 
 const DAY_MS = 24 * 60 * 60_000;
@@ -52,28 +47,14 @@ export const ADDRESS_LIMIT = Object.freeze({
 });
 /** Access tokens per device after a verified signature; one is needed every 15 minutes. */
 const TOKENS_PER_DEVICE = { max: 30, windowMs: 15 * 60_000 };
-/** Authenticated requests per account. */
-const REQUESTS_PER_USER = { max: 300, windowMs: 60_000 };
-
-const accessTokenPattern = new RegExp(
-  ACCESS_TOKEN_PATTERN.source,
-  ACCESS_TOKEN_PATTERN.flags,
-);
-
-const BEARER = "bearer ";
-
-declare module "fastify" {
-  interface FastifyRequest {
-    /** Set on authenticated routes after the access token passed every check. */
-    auth: AuthContext | null;
-  }
-}
 
 export type DeviceRouteOptions = Readonly<{
   publicOrigin: string;
   database: Database;
   challenges: Challenges;
   tokens: AccessTokens;
+  /** The access-token check of every route except the challenge and the access token. */
+  requireAccessToken: RequireAccessToken;
   /**
    * The open WebSocket connections: after a sign-out or a revocation
    * commits, the device's connection closes.
@@ -81,46 +62,6 @@ export type DeviceRouteOptions = Readonly<{
   connections: ConnectionRegistry;
   now: () => number;
 }>;
-
-/**
- * Locks the account and the acting device until the transaction ends and
- * checks them again, so that a request authenticated before a revocation, a
- * sign-out, a new sign-in, or a disable cannot change anything after it. The
- * account is locked before the device, in the order the sign-in uses. "No key
- * update" still waits for every other change of these rows, but not for the
- * key-share locks of foreign-key checks, so that it cannot deadlock with them.
- */
-export async function lockActor(
-  tx: Database,
-  auth: AuthContext,
-  now: number,
-): Promise<void> {
-  const [user] = await tx
-    .select({
-      disabledAt: users.disabledAt,
-      signInRequiredAt: users.signInRequiredAt,
-    })
-    .from(users)
-    .where(eq(users.id, auth.userId))
-    .for("no key update");
-  const [device] = await tx
-    .select({
-      userId: devices.userId,
-      revokedAt: devices.revokedAt,
-      signedOutAt: devices.signedOutAt,
-      lastSignInAt: devices.lastSignInAt,
-    })
-    .from(devices)
-    .where(eq(devices.id, auth.deviceId))
-    .for("no key update");
-  const row =
-    user === undefined || device === undefined
-      ? undefined
-      : { ...device, ...user };
-  if (!tokenUsable(row, auth, now)) {
-    throw new ApiError("unauthorized");
-  }
-}
 
 async function audit(
   database: Database,
@@ -160,24 +101,15 @@ export async function registerDeviceRoutes(
     TOKENS_PER_DEVICE.windowMs,
     options.now,
   );
-  const requestsPerUser = new WindowLimiter(
-    REQUESTS_PER_USER.max,
-    REQUESTS_PER_USER.windowMs,
-    options.now,
-  );
   const sweeper = setInterval(() => {
     challenges.sweep();
     tokens.sweep();
     tokensPerDevice.sweep();
-    requestsPerUser.sweep();
   }, 15_000);
   sweeper.unref();
   app.addHook("onClose", async () => {
     clearInterval(sweeper);
   });
-  if (!app.hasRequestDecorator("auth")) {
-    app.decorateRequest("auth", null);
-  }
 
   // Minting a token needs no token.
   await app.register(async (scope) => {
@@ -258,59 +190,10 @@ export async function registerDeviceRoutes(
     );
   });
 
-  /** The live token in `Authorization: Bearer <access token>`; the scheme ignores case. */
-  function tokenOf(request: FastifyRequest): AuthContext {
-    const header = request.headers.authorization ?? "";
-    const token =
-      header.slice(0, BEARER.length).toLowerCase() === BEARER
-        ? header.slice(BEARER.length)
-        : "";
-    const record = accessTokenPattern.test(token) ? tokens.find(token) : null;
-    if (record === null) {
-      throw new ApiError("unauthorized");
-    }
-    return {
-      userId: record.userId,
-      deviceId: record.deviceId,
-      signedInAt: record.signedInAt,
-    };
-  }
-
-  /**
-   * Every other route needs an access token. The token and the account's
-   * request limit are checked when the headers arrive.
-   */
-  async function admit(request: FastifyRequest): Promise<void> {
-    const wait = requestsPerUser.hit(tokenOf(request).userId);
-    if (wait > 0) {
-      throw new ApiError("rate_limited", { retryAfterSeconds: wait });
-    }
-  }
-
-  /**
-   * The token, the device, and the account are checked again after the body
-   * arrived, so that a slow body cannot carry a request past a revocation.
-   * Every failure is 401 with unauthorized.
-   */
-  async function authenticate(request: FastifyRequest): Promise<void> {
-    const auth = tokenOf(request);
-    const row = await deviceRow(database, auth.deviceId);
-    if (!tokenUsable(row, auth, options.now())) {
-      throw new ApiError("unauthorized");
-    }
-    request.auth = auth;
-  }
-
+  // Every other route needs an access token.
   await app.register(async (scope) => {
     scope.setValidatorCompiler(zodValidatorCompiler);
-    scope.addHook("onRequest", admit);
-    scope.addHook("preValidation", authenticate);
-    const authOf = (request: FastifyRequest): AuthContext => {
-      if (request.auth === null) {
-        throw new ApiError("unauthorized");
-      }
-      return request.auth;
-    };
+    options.requireAccessToken(scope);
 
     scope.post(AUTH_ROUTES.signOut.path, async (request, reply) => {
       const auth = authOf(request);

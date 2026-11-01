@@ -40,7 +40,7 @@ import {
   settle,
 } from "../gateway-test-support.ts";
 import { ConnectionRegistry } from "../gateway.ts";
-import { lockActor } from "./device-routes.ts";
+import { lockActor } from "./authenticate.ts";
 import {
   deviceApp,
   fakeClock,

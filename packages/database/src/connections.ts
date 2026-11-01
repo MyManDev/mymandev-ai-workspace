@@ -1,19 +1,10 @@
-import {
-  type DeviceId,
-  newUuidV7,
-  type UserId,
-  type WorkspaceId,
-} from "@mymandev/protocol";
+import { type DeviceId, newUuidV7, type UserId } from "@mymandev/protocol";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import type { AuditAction } from "./audit-vocabulary.ts";
 import type { Database } from "./db.ts";
 import { withDatabaseErrors } from "./errors.ts";
-import {
-  auditEvents,
-  devices,
-  users,
-  workspaceMembers,
-} from "./schema/index.ts";
+import { type ActiveMemberInput, activePersonOf } from "./membership.ts";
+import { auditEvents, devices, users } from "./schema/index.ts";
 
 // Queries of device authentication and the WebSocket gateway (ADR 0014,
 // "Device key and authentication" and "Revocation, sign-out, and recovery";
@@ -99,34 +90,17 @@ export async function deviceRows(
   });
 }
 
-export type ActiveMemberInput = Readonly<{
-  workspaceId: WorkspaceId;
-  userId: UserId;
-}>;
-
 /**
- * Whether the account is an active member of the workspace: it has claimed a
- * person there whose `removed_at` is empty (ADR 0014, "People and roles"). A
- * workspace that does not exist gives false, like one without the account.
+ * Whether the account is an active member of the workspace: it has an active
+ * person there (`activePersonOf`), a claimed person whose `removed_at` is
+ * empty (ADR 0014, "People and roles"). A workspace that does not exist gives
+ * false, like one without the account.
  */
 export async function isActiveMember(
   db: Database,
   input: ActiveMemberInput,
 ): Promise<boolean> {
-  return withDatabaseErrors(async () => {
-    const rows = await db
-      .select({ id: workspaceMembers.id })
-      .from(workspaceMembers)
-      .where(
-        and(
-          eq(workspaceMembers.workspaceId, input.workspaceId),
-          eq(workspaceMembers.userId, input.userId),
-          isNull(workspaceMembers.removedAt),
-        ),
-      )
-      .limit(1);
-    return rows.length > 0;
-  });
+  return (await activePersonOf(db, input)) !== undefined;
 }
 
 export type DeviceSeenInput = Readonly<{ deviceId: DeviceId; now: Date }>;

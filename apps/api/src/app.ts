@@ -7,6 +7,7 @@ import { STATUS_CODES } from "node:http";
 import type { Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { SignInAttempts, SignInCodes } from "./auth/attempts.ts";
+import { createAccessCheck } from "./auth/authenticate.ts";
 import { createGitHubApi, type GitHubApi } from "./auth/github-api.ts";
 import { registerGitHubSignIn } from "./auth/github-routes.ts";
 import { registerGitHubWebhook } from "./auth/github-webhook.ts";
@@ -24,6 +25,7 @@ import {
   type EventHandler,
 } from "./gateway.ts";
 import { serializeError, serializeRequest } from "./log.ts";
+import { registerWorkspaceRoutes } from "./workspaces/workspace-routes.ts";
 
 export type BuildAppOptions = Readonly<{
   config: Config;
@@ -360,6 +362,13 @@ export async function buildApp(
         lifetimeMs: ACCESS_TOKEN_LIFETIME_MS,
         now,
       });
+      // One check for every authenticated route, so that the account's
+      // request limit counts them together.
+      const requireAccessToken = createAccessCheck(app, {
+        database,
+        tokens,
+        now,
+      });
       await registerSignIn(app, {
         publicOrigin: config.githubSignIn.publicOrigin,
         database,
@@ -377,7 +386,13 @@ export async function buildApp(
           now,
         }),
         tokens,
+        requireAccessToken,
         connections,
+        now,
+      });
+      await registerWorkspaceRoutes(app, {
+        database,
+        requireAccessToken,
         now,
       });
       // A connection authenticates with its device key (ADR 0014).

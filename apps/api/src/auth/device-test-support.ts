@@ -7,6 +7,8 @@ import {
   type TestDatabase,
 } from "@mymandev/database/testing";
 import {
+  AccessTokenResponseSchema,
+  ChallengeResponseSchema,
   deviceAuthInput,
   type DeviceAuthInput,
   SignInResponseSchema,
@@ -242,4 +244,31 @@ export async function signInAgain(
   });
   assert.equal(response.statusCode, 200, response.body);
   return { ...device, key: next };
+}
+
+/** Mints an access token for a signed-in device with a challenge, as the desktop does. */
+export async function accessToken(
+  app: FastifyInstance,
+  device: Readonly<{ deviceId: string; key: Key }>,
+): Promise<string> {
+  const { challengeId, nonce } = ChallengeResponseSchema.parse(
+    (await app.inject({ method: "POST", url: "/auth/challenge" })).json(),
+  );
+  const response = await app.inject({
+    method: "POST",
+    url: "/auth/access-token",
+    payload: {
+      deviceId: device.deviceId,
+      challengeId,
+      signature: signInput(device.key, {
+        purpose: "http",
+        audience: ORIGIN,
+        nonce,
+        deviceId: device.deviceId,
+        challengeId,
+      }),
+    },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  return AccessTokenResponseSchema.parse(response.json()).accessToken;
 }
