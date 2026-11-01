@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   type DeviceId,
   type EventId,
@@ -10,9 +11,13 @@ import {
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { eq } from "drizzle-orm";
+import { createDatabase } from "./client.ts";
 import {
+  deviceRow,
+  deviceRows,
   isActiveMember,
   markDeviceSeen,
+  markDevicesSeen,
   writeConnectionAudit,
 } from "./connections.ts";
 import type { Database } from "./db.ts";
@@ -169,6 +174,176 @@ test("markDeviceSeen sets last_seen_at of that device only", async () => {
   // An unknown device changes nothing and does not fail.
   await markDeviceSeen(db, { deviceId: newId<DeviceId>(), now: LATER });
 });
+
+/** 1,001 IDs that do not exist, with `known` at the start of each slice of 500. */
+function idsAround(known: readonly DeviceId[]): DeviceId[] {
+  const ids = Array.from({ length: 1_001 }, () => newId<DeviceId>());
+  for (const [index, id] of known.entries()) {
+    ids[index * 500] = id;
+  }
+  return ids;
+}
+
+test("deviceRow and deviceRows read a device with its key and its account's state; deviceRows reads them in slices of 500 IDs", async () => {
+  const db = database();
+  const owner = await user("Rows");
+  const first = await device(owner);
+  const second = await device(owner);
+  const third = await device(owner);
+  const other = await user("Other");
+  const othersDevice = await device(other);
+  await db
+    .update(users)
+    .set({ disabledAt: LATER, signInRequiredAt: NOW })
+    .where(eq(users.id, owner));
+  await db
+    .update(devices)
+    .set({ revokedAt: LATER, revocationReason: "removed", signedOutAt: NOW })
+    .where(eq(devices.id, second));
+  const keyOf = async (id: DeviceId) =>
+    (
+      await db
+        .select({ publicKey: devices.publicKey })
+        .from(devices)
+        .where(eq(devices.id, id))
+    )[0]?.publicKey;
+  const expected = {
+    userId: owner,
+    publicKey: await keyOf(first),
+    revokedAt: null,
+    signedOutAt: null,
+    lastSignInAt: NOW,
+    disabledAt: LATER,
+    signInRequiredAt: NOW,
+  };
+  assert.deepEqual(await deviceRow(db, first), expected);
+  assert.deepEqual(await deviceRow(db, second), {
+    ...expected,
+    publicKey: await keyOf(second),
+    revokedAt: LATER,
+    signedOutAt: NOW,
+  });
+  assert.equal(await deviceRow(db, newId<DeviceId>()), undefined);
+
+  const rows = await deviceRows(db, idsAround([first, second, third]));
+  assert.deepEqual(
+    [...rows.keys()].sort(),
+    [first, second, third].sort(),
+    "every slice is read; unknown devices are missing",
+  );
+  for (const id of [first, second, third]) {
+    assert.deepEqual(rows.get(id), await deviceRow(db, id));
+  }
+  assert.equal(
+    (await deviceRows(db, [othersDevice])).get(othersDevice)?.userId,
+    other,
+  );
+  assert.equal((await deviceRows(db, [])).size, 0);
+});
+
+test("markDevicesSeen sets last_seen_at of the given devices that are not revoked, in slices of 500 IDs", async () => {
+  const db = database();
+  const owner = await user("Many");
+  const first = await device(owner);
+  const second = await device(owner);
+  const revoked = await device(owner);
+  const unseen = await device(owner);
+  // Revoked after the sweep read it: the write leaves it unchanged.
+  await db
+    .update(devices)
+    .set({ revokedAt: NOW, revocationReason: "removed", updatedAt: NOW })
+    .where(eq(devices.id, revoked));
+  await markDevicesSeen(db, {
+    deviceIds: idsAround([first, second, revoked]),
+    now: LATER,
+  });
+  const rows = await db
+    .select({
+      id: devices.id,
+      lastSeenAt: devices.lastSeenAt,
+      updatedAt: devices.updatedAt,
+    })
+    .from(devices)
+    .where(eq(devices.userId, owner));
+  assert.deepEqual(
+    new Map(rows.map((row) => [row.id, row.lastSeenAt?.getTime() ?? null])),
+    new Map([
+      [first, LATER.getTime()],
+      [second, LATER.getTime()],
+      [revoked, null],
+      [unseen, null],
+    ]),
+  );
+  assert.deepEqual(
+    new Map(
+      rows
+        .filter((row) => row.id !== unseen)
+        .map((row) => [row.id, row.updatedAt.getTime()]),
+    ),
+    new Map([
+      [first, LATER.getTime()],
+      [second, LATER.getTime()],
+      [revoked, NOW.getTime()],
+    ]),
+  );
+  // No IDs change nothing and do not fail.
+  await markDevicesSeen(db, { deviceIds: [], now: LATER });
+});
+
+test(
+  "markDevicesSeen does not wait for a device row that another transaction holds and leaves that row unchanged",
+  {
+    skip:
+      process.env["DATABASE_TEST_URL"] === undefined &&
+      "needs DATABASE_TEST_URL; PGlite has a single session",
+  },
+  async () => {
+    const url = testDatabase?.url;
+    assert.ok(url, "the test database is on a server");
+    const owner = await user("Locked");
+    const locked = await device(owner);
+    const free = await device(owner);
+    // A second session holds the row as a sign-in or a revocation does.
+    const other = createDatabase(url, { max: 1 });
+    const holding = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const transaction = other.db.transaction(async (tx) => {
+      await tx
+        .select({ id: devices.id })
+        .from(devices)
+        .where(eq(devices.id, locked))
+        .for("no key update");
+      holding.resolve();
+      await release.promise;
+    });
+    try {
+      await Promise.race([holding.promise, transaction]);
+      const outcome = await Promise.race([
+        markDevicesSeen(database(), {
+          deviceIds: [locked, free],
+          now: LATER,
+        }).then(() => "returned"),
+        delay(5_000, "waited", { ref: false }),
+      ]);
+      assert.equal(outcome, "returned");
+      const rows = await database()
+        .select({ id: devices.id, lastSeenAt: devices.lastSeenAt })
+        .from(devices)
+        .where(eq(devices.userId, owner));
+      assert.deepEqual(
+        new Map(rows.map((row) => [row.id, row.lastSeenAt?.getTime() ?? null])),
+        new Map([
+          [locked, null],
+          [free, LATER.getTime()],
+        ]),
+      );
+    } finally {
+      release.resolve();
+      await transaction;
+      await other.close();
+    }
+  },
+);
 
 test("writeConnectionAudit records the connection's account and device and no workspace", async () => {
   const db = database();

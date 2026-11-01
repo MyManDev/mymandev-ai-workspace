@@ -4,14 +4,100 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import type { AuditAction } from "./audit-vocabulary.ts";
 import type { Database } from "./db.ts";
 import { withDatabaseErrors } from "./errors.ts";
-import { auditEvents, devices, workspaceMembers } from "./schema/index.ts";
+import {
+  auditEvents,
+  devices,
+  users,
+  workspaceMembers,
+} from "./schema/index.ts";
 
-// Queries of the WebSocket gateway (ADR 0014, "Device key and
-// authentication"; ADR 0006, identity binding).
+// Queries of device authentication and the WebSocket gateway (ADR 0014,
+// "Device key and authentication" and "Revocation, sign-out, and recovery";
+// ADR 0006, identity binding).
+
+/** At most this many device IDs go into one statement. */
+const DEVICE_IDS_PER_STATEMENT = 500;
+
+/** The IDs in slices of at most `DEVICE_IDS_PER_STATEMENT`. */
+function slices(deviceIds: readonly DeviceId[]): DeviceId[][] {
+  const result: DeviceId[][] = [];
+  for (
+    let start = 0;
+    start < deviceIds.length;
+    start += DEVICE_IDS_PER_STATEMENT
+  ) {
+    result.push(deviceIds.slice(start, start + DEVICE_IDS_PER_STATEMENT));
+  }
+  return result;
+}
+
+/**
+ * A device with its current key and its account's state: everything that
+ * decides whether the device may act now (ADR 0014).
+ */
+export type DeviceAccessRow = Readonly<{
+  userId: UserId;
+  publicKey: string;
+  revokedAt: Date | null;
+  signedOutAt: Date | null;
+  lastSignInAt: Date;
+  disabledAt: Date | null;
+  signInRequiredAt: Date | null;
+}>;
+
+const deviceAccess = {
+  userId: devices.userId,
+  publicKey: devices.publicKey,
+  revokedAt: devices.revokedAt,
+  signedOutAt: devices.signedOutAt,
+  lastSignInAt: devices.lastSignInAt,
+  disabledAt: users.disabledAt,
+  signInRequiredAt: users.signInRequiredAt,
+};
+
+/** The device with its current key and its account's state; undefined when the device does not exist. */
+export async function deviceRow(
+  db: Database,
+  deviceId: DeviceId,
+): Promise<DeviceAccessRow | undefined> {
+  return withDatabaseErrors(async () => {
+    const [row] = await db
+      .select(deviceAccess)
+      .from(devices)
+      .innerJoin(users, eq(users.id, devices.userId))
+      .where(eq(devices.id, deviceId));
+    return row;
+  });
+}
+
+/**
+ * Several devices like `deviceRow`, by device ID, with one query per 500
+ * IDs: the gateway's sweep re-checks the devices of every open connection at
+ * once. A device that does not exist is missing from the map.
+ */
+export async function deviceRows(
+  db: Database,
+  deviceIds: readonly DeviceId[],
+): Promise<ReadonlyMap<DeviceId, DeviceAccessRow>> {
+  return withDatabaseErrors(async () => {
+    const rows = new Map<DeviceId, DeviceAccessRow>();
+    for (const slice of slices(deviceIds)) {
+      const found = await db
+        .select({ id: devices.id, ...deviceAccess })
+        .from(devices)
+        .innerJoin(users, eq(users.id, devices.userId))
+        .where(inArray(devices.id, slice));
+      for (const { id, ...row } of found) {
+        rows.set(id, row);
+      }
+    }
+    return rows;
+  });
+}
 
 export type ActiveMemberInput = Readonly<{
   workspaceId: WorkspaceId;
@@ -56,6 +142,37 @@ export async function markDeviceSeen(
       .set({ lastSeenAt: input.now, updatedAt: input.now })
       .where(eq(devices.id, input.deviceId)),
   );
+}
+
+export type DevicesSeenInput = Readonly<{
+  deviceIds: readonly DeviceId[];
+  now: Date;
+}>;
+
+/**
+ * Records that devices were seen now: their connections are still open. One
+ * update per 500 IDs. A revoked device is left unchanged, also one revoked
+ * since its connection was checked. A device row that another transaction
+ * holds, such as a sign-in or a revocation, is skipped: the update never
+ * waits for a locked row, so it cannot deadlock with such a transaction.
+ */
+export async function markDevicesSeen(
+  db: Database,
+  input: DevicesSeenInput,
+): Promise<void> {
+  await withDatabaseErrors(async () => {
+    for (const slice of slices(input.deviceIds)) {
+      const free = db
+        .select({ id: devices.id })
+        .from(devices)
+        .where(and(inArray(devices.id, slice), isNull(devices.revokedAt)))
+        .for("no key update", { skipLocked: true });
+      await db
+        .update(devices)
+        .set({ lastSeenAt: input.now, updatedAt: input.now })
+        .where(inArray(devices.id, free));
+    }
+  });
 }
 
 /** The audit actions of an authenticated WebSocket connection. */

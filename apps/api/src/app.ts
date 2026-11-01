@@ -362,6 +362,7 @@ export async function buildApp(
         database,
         codes,
         tokens,
+        connections,
         now,
       });
       await registerDeviceRoutes(app, {
@@ -373,6 +374,7 @@ export async function buildApp(
           now,
         }),
         tokens,
+        connections,
         now,
       });
       // A connection authenticates with its device key (ADR 0014).

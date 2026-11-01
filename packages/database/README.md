@@ -167,10 +167,13 @@ PGlite test databases and `pglite-server` keep their data in memory, so they nee
 
 ## Queries
 
-The WebSocket gateway of the API uses these (ADR 0014, "Device key and authentication"; ADR 0006, identity binding):
+Device authentication and the WebSocket gateway of the API use these (ADR 0014, "Device key and authentication" and "Revocation, sign-out, and recovery"; ADR 0006, identity binding):
 
+- `deviceRow(db, deviceId)` reads a device with its current key and its account's state, a `DeviceAccessRow`: the account, the public key, `revoked_at`, `signed_out_at`, `last_sign_in_at`, and the account's `disabled_at` and `sign_in_required_at`. A device that does not exist gives `undefined`.
+- `deviceRows(db, deviceIds)` reads the same rows for many devices, as a map by device ID, with one query per 500 IDs; the gateway's sweep re-checks every open connection with it. A device that does not exist is missing from the map.
 - `isActiveMember(db, { workspaceId, userId })` says whether the account is an active member of the workspace: a claimed person whose `removed_at` is empty. A workspace that does not exist gives `false`.
 - `markDeviceSeen(db, { deviceId, now })` sets `devices.last_seen_at`, when a connection authenticates.
+- `markDevicesSeen(db, { deviceIds, now })` sets `devices.last_seen_at` of many devices whose connections are still open, with one update per 500 IDs. A revoked device is left unchanged. A device row that another transaction holds is skipped (`FOR NO KEY UPDATE SKIP LOCKED`): the update never waits for a locked row, so it cannot deadlock with a sign-in or a revocation.
 - `writeConnectionAudit(db, { action, userId, deviceId, subjectId, now })` writes a `connection.replaced` or `event.identity_mismatch` audit record with the connection's account and device as the actor. It never writes `workspace_id`, which is a foreign key, because the workspace of a refused event is unverified; the event ID goes into `subject_id`.
 
 ## Operator commands
@@ -192,7 +195,7 @@ npm run db:account -w @mymandev/database -- enable <user ID>
 
 Each test file that needs a database creates one test database in `before` and closes it in `after`. Starting PGlite and applying the migrations takes a few seconds, and each instance uses a few hundred megabytes of memory. `node --test` runs test files in parallel processes, so keep database tests in few files.
 
-With `DATABASE_TEST_URL` set, the same tests run on a PostgreSQL server: `createTestDatabase()` creates a database with a random name on that server, applies the migrations with the production migrator, connects through `createDatabase`, and drops the database again in `close()`. The URL's role must be allowed to create databases, so use a local or throwaway server, never a shared one. The Database workflow runs the tests this way on PostgreSQL 18. A test that runs only on a server checks the session timeouts of `createDatabase`; on PGlite it is skipped. The role test always uses its own PGlite instance; the Database workflow checks the same privileges on the server.
+With `DATABASE_TEST_URL` set, the same tests run on a PostgreSQL server: `createTestDatabase()` creates a database with a random name on that server, applies the migrations with the production migrator, connects through `createDatabase`, and drops the database again in `close()`. The URL's role must be allowed to create databases, so use a local or throwaway server, never a shared one. The Database workflow runs the tests this way on PostgreSQL 18. Two tests run only on a server, because PGlite has a single session: one checks the session timeouts of `createDatabase`, the other that `markDevicesSeen` skips a row that another transaction holds. On PGlite they are skipped. The role test always uses its own PGlite instance; the Database workflow checks the same privileges on the server.
 
 ```sh
 DATABASE_TEST_URL="postgres://postgres:<password>@127.0.0.1:5432/postgres?sslmode=disable" npm test -w @mymandev/database
