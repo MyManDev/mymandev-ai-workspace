@@ -44,6 +44,26 @@ GITHUB_DEV_APP_SMEE_URL=https://smee.io/...
 
 The client ID is not secret. If a secret leaks, generate a new client secret on **Credentials** and delete the old one, or set a new webhook secret on **General**. To remove the app, use **Advanced**, **Delete GitHub App**.
 
+## Test the webhook locally
+
+GitHub cannot reach `127.0.0.1`, so a relay forwards each delivery to your machine: [smee.io](https://smee.io) holds a channel open to a client on your machine, which posts every delivery to the local API.
+
+1. On smee.io, select **Start a new channel**. Use the channel URL as the **Webhook URL** of your development app (**General**, **Webhook**), keep **Active** on, and keep the URL in `~/.mymandev/github-dev-app.env` as `GITHUB_DEV_APP_SMEE_URL`. Anyone who knows the channel URL can read the deliveries, so do not share it.
+2. In `apps/api/.env`, set `API_GITHUB_WEBHOOK_SECRET` to the webhook secret of the app, next to `DATABASE_URL` and the sign-in variables. The API accepts 32 to 256 printable ASCII characters without whitespace, so the 64 hexadecimal characters from the table above fit. Start the API with `npm run dev -w @mymandev/api`. Without the secret or the database, the webhook answers `404`.
+3. Run the smee client with the channel URL as the source and the API's webhook as the target:
+
+   ```sh
+   smee --url https://smee.io/<channel> --target http://127.0.0.1:3000/auth/github/webhook
+   ```
+
+   The client is the `smee-client` npm package. It is not a dependency of this repository; install a release that is at least 14 days old, as for dependencies ([WORKSPACE.md](WORKSPACE.md)). Use `127.0.0.1`, not `localhost`: the API listens on `127.0.0.1` by default, and `localhost` may resolve to `::1`.
+
+4. GitHub sends a GitHub App's deliveries as `application/json`, the only content type the API accepts, and the relay must keep it. The signature covers the exact bytes of the body: if every relayed delivery answers `401` although the secrets match, the relay changed the body.
+5. Revoke the app's authorization under **Settings**, **Applications**, **Authorized GitHub Apps**. The event arrives about a minute later (#67), and the API answers `204`. When your GitHub account has an account in the local database, the API logs `"githubEvent":"github_app_authorization"` with `"outcome":"revoked"`, closes the account's sockets with `sign_in_required`, and every device of the account must sign in again; otherwise it logs `no_account`.
+6. To send an event again, open **Advanced** in the app's settings, choose the delivery under **Recent Deliveries**, and select **Redeliver**. A redelivery keeps the delivery ID, so the API answers `204`, changes nothing, and logs `already_processed`.
+
+Never put the webhook secret or the channel URL into the repository, an issue, or a pull request. [`apps/api/README.md`](../../apps/api/README.md#post-authgithubwebhook) describes the route.
+
 ## What to expect
 
 These results come from the checks in #67:

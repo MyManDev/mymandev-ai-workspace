@@ -9,6 +9,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { SignInAttempts, SignInCodes } from "./auth/attempts.ts";
 import { createGitHubApi, type GitHubApi } from "./auth/github-api.ts";
 import { registerGitHubSignIn } from "./auth/github-routes.ts";
+import { registerGitHubWebhook } from "./auth/github-webhook.ts";
 import { registerDeviceRoutes } from "./auth/device-routes.ts";
 import { registerSignIn } from "./auth/sign-in.ts";
 import { AccessTokens, Challenges } from "./auth/tokens.ts";
@@ -325,10 +326,12 @@ export async function buildApp(
     });
   }
 
+  const now = options.now ?? Date.now;
+  let tokens: AccessTokens | null = null;
+
   // Without GitHub sign-in configured, its routes and /ws answer the generic
   // 404; the routes that need the database and /ws also need the database.
   if (config.githubSignIn !== null) {
-    const now = options.now ?? Date.now;
     const codes = new SignInCodes({
       max: MAX_OPEN_ATTEMPTS,
       lifetimeMs: SIGN_IN_CODE_LIFETIME_MS,
@@ -352,7 +355,7 @@ export async function buildApp(
     });
     // Registering the device needs the database too.
     if (database !== null) {
-      const tokens = new AccessTokens({
+      tokens = new AccessTokens({
         max: MAX_ACCESS_TOKENS,
         lifetimeMs: ACCESS_TOKEN_LIFETIME_MS,
         now,
@@ -387,6 +390,19 @@ export async function buildApp(
         onEvent,
       });
     }
+  }
+
+  // Without the webhook secret or the database, the webhook answers the
+  // generic 404 (ADR 0014, "Configuration").
+  if (config.githubWebhook !== null && database !== null) {
+    const { secret, previousSecret } = config.githubWebhook;
+    await registerGitHubWebhook(app, {
+      secrets: previousSecret === null ? [secret] : [secret, previousSecret],
+      database,
+      connections,
+      tokens,
+      now,
+    });
   }
 
   return app;

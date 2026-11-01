@@ -3,6 +3,10 @@ import { test } from "node:test";
 import { inspect } from "node:util";
 import { ConfigError, loadConfig } from "./config.ts";
 
+// Obviously fake values in the accepted format.
+const WEBHOOK_SECRET = "fake-webhook-secret-0123456789abcdef";
+const PREVIOUS_WEBHOOK_SECRET = "fake-previous-webhook-secret-0123456789";
+
 /** Returns the issues of the ConfigError that `loadConfig(env)` throws. */
 function issuesFor(env: Record<string, string>): readonly string[] {
   try {
@@ -23,6 +27,7 @@ test("defaults apply when no variable is set", () => {
     bodyLimitBytes: 65_536,
     allowedOrigins: [],
     githubSignIn: null,
+    githubWebhook: null,
     databaseUrl: null,
   });
 });
@@ -38,11 +43,13 @@ test("known variables are read, empty strings count as unset, other variables ar
     API_PUBLIC_ORIGIN: "https://api.example",
     API_GITHUB_CLIENT_ID: "Iv23liExampleClient1",
     API_GITHUB_CLIENT_SECRET: "0123456789abcdef0123456789abcdef01234567",
+    API_GITHUB_WEBHOOK_SECRET: WEBHOOK_SECRET,
+    API_GITHUB_WEBHOOK_SECRET_PREVIOUS: PREVIOUS_WEBHOOK_SECRET,
     DATABASE_URL: "postgres://api:pw@db.example/mymandev?sslmode=verify-full",
     API_UNKNOWN: "ignored",
     PATH: "/usr/bin",
   });
-  const { githubSignIn, databaseUrl, ...plain } = config;
+  const { githubSignIn, githubWebhook, databaseUrl, ...plain } = config;
   assert.deepEqual(plain, {
     nodeEnv: "production",
     host: "localhost",
@@ -57,11 +64,17 @@ test("known variables are read, empty strings count as unset, other variables ar
     githubSignIn?.clientSecret.reveal(),
     "0123456789abcdef0123456789abcdef01234567",
   );
+  assert.equal(githubWebhook?.secret.reveal(), WEBHOOK_SECRET);
+  assert.equal(
+    githubWebhook?.previousSecret?.reveal(),
+    PREVIOUS_WEBHOOK_SECRET,
+  );
   assert.equal(
     databaseUrl?.reveal(),
     "postgres://api:pw@db.example/mymandev?sslmode=verify-full",
   );
   assert.ok(Object.isFrozen(githubSignIn));
+  assert.ok(Object.isFrozen(githubWebhook));
   assert.ok(Object.isFrozen(config));
   assert.ok(Object.isFrozen(config.allowedOrigins));
   assert.equal("API_UNKNOWN" in config, false);
@@ -207,12 +220,77 @@ test("GitHub sign-in needs all three variables, and production needs every varia
       "API_PUBLIC_ORIGIN",
       "API_GITHUB_CLIENT_ID",
       "API_GITHUB_CLIENT_SECRET",
+      "API_GITHUB_WEBHOOK_SECRET",
       "DATABASE_URL",
     ],
   );
   for (const issue of production) {
     assert.match(issue, /: is required with NODE_ENV=production$/u);
   }
+});
+
+test("the webhook secret is optional outside production, the previous one needs the current one, and both are 32 to 256 printable ASCII characters", () => {
+  assert.equal(loadConfig({}).githubWebhook, null);
+  const current = loadConfig({ API_GITHUB_WEBHOOK_SECRET: WEBHOOK_SECRET });
+  assert.equal(current.githubWebhook?.secret.reveal(), WEBHOOK_SECRET);
+  assert.equal(current.githubWebhook?.previousSecret, null);
+
+  assert.deepEqual(
+    issuesFor({ API_GITHUB_WEBHOOK_SECRET_PREVIOUS: PREVIOUS_WEBHOOK_SECRET }),
+    [
+      "API_GITHUB_WEBHOOK_SECRET: is required with API_GITHUB_WEBHOOK_SECRET_PREVIOUS",
+    ],
+  );
+
+  // Production requires the current secret, never the previous one.
+  const production = {
+    ...SIGN_IN,
+    NODE_ENV: "production",
+    DATABASE_URL: "postgres://api:pw@db.example/mymandev?sslmode=verify-full",
+  };
+  assert.deepEqual(
+    issuesFor({
+      ...production,
+      API_GITHUB_WEBHOOK_SECRET_PREVIOUS: PREVIOUS_WEBHOOK_SECRET,
+    }),
+    ["API_GITHUB_WEBHOOK_SECRET: is required with NODE_ENV=production"],
+  );
+  assert.equal(
+    loadConfig({ ...production, API_GITHUB_WEBHOOK_SECRET: WEBHOOK_SECRET })
+      .githubWebhook?.previousSecret,
+    null,
+  );
+
+  for (const name of [
+    "API_GITHUB_WEBHOOK_SECRET",
+    "API_GITHUB_WEBHOOK_SECRET_PREVIOUS",
+  ]) {
+    for (const [value, label] of [
+      ["a".repeat(31), "31 characters"],
+      ["a".repeat(257), "257 characters"],
+      [`${"a".repeat(20)} ${"b".repeat(20)}`, "a space"],
+      [`${"a".repeat(20)}\t${"b".repeat(20)}`, "a tab"],
+      [`${"a".repeat(20)}\u00e9${"b".repeat(20)}`, "a character outside ASCII"],
+    ] as const) {
+      const issues = issuesFor({
+        API_GITHUB_WEBHOOK_SECRET: WEBHOOK_SECRET,
+        [name]: value,
+      });
+      assert.deepEqual(
+        issues,
+        [
+          `${name}: Expected 32 to 256 printable ASCII characters without whitespace`,
+        ],
+        `${name} with ${label}`,
+      );
+    }
+  }
+  const bounds = loadConfig({
+    API_GITHUB_WEBHOOK_SECRET: `!${"~".repeat(255)}`,
+    API_GITHUB_WEBHOOK_SECRET_PREVIOUS: "!".repeat(32),
+  }).githubWebhook;
+  assert.equal(bounds?.secret.reveal().length, 256);
+  assert.equal(bounds?.previousSecret?.reveal().length, 32);
 });
 
 test("API_PUBLIC_ORIGIN uses https, except a loopback http origin in development and test", () => {
@@ -304,17 +382,23 @@ test("secret values never appear in errors, JSON, strings, or inspection", () =>
   const config = loadConfig({
     ...SIGN_IN,
     API_GITHUB_CLIENT_SECRET: secret,
+    API_GITHUB_WEBHOOK_SECRET: WEBHOOK_SECRET,
+    API_GITHUB_WEBHOOK_SECRET_PREVIOUS: PREVIOUS_WEBHOOK_SECRET,
     DATABASE_URL: `postgres://api:${password}@127.0.0.1/mymandev`,
   });
   for (const text of [
     JSON.stringify(config),
     inspect(config, { depth: 10 }),
     String(config.githubSignIn?.clientSecret),
+    String(config.githubWebhook?.secret),
+    `${config.githubWebhook?.previousSecret}`,
     `${config.databaseUrl}`,
     inspect(config.databaseUrl),
   ]) {
     assert.equal(text.includes(secret), false, text);
     assert.equal(text.includes(password), false, text);
+    assert.equal(text.includes(WEBHOOK_SECRET), false, text);
+    assert.equal(text.includes(PREVIOUS_WEBHOOK_SECRET), false, text);
     assert.match(text, /redacted/u);
   }
 
@@ -323,6 +407,8 @@ test("secret values never appear in errors, JSON, strings, or inspection", () =>
     loadConfig({
       ...SIGN_IN,
       API_GITHUB_CLIENT_SECRET: `${secret} with a space`,
+      API_GITHUB_WEBHOOK_SECRET: `${WEBHOOK_SECRET} with a space`,
+      API_GITHUB_WEBHOOK_SECRET_PREVIOUS: `${PREVIOUS_WEBHOOK_SECRET} with a space`,
       DATABASE_URL: `postgres://api:${password}@127.0.0.1/mymandev?sslmode=prefer`,
     });
   } catch (error) {
@@ -337,7 +423,11 @@ test("secret values never appear in errors, JSON, strings, or inspection", () =>
   ]) {
     assert.equal(text.includes(secret), false, text);
     assert.equal(text.includes(password), false, text);
+    assert.equal(text.includes(WEBHOOK_SECRET), false, text);
+    assert.equal(text.includes(PREVIOUS_WEBHOOK_SECRET), false, text);
   }
   assert.match(caught.message, /API_GITHUB_CLIENT_SECRET: /u);
+  assert.match(caught.message, /API_GITHUB_WEBHOOK_SECRET: /u);
+  assert.match(caught.message, /API_GITHUB_WEBHOOK_SECRET_PREVIOUS: /u);
   assert.match(caught.message, /DATABASE_URL: /u);
 });

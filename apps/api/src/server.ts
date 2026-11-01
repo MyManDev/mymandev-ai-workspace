@@ -27,6 +27,11 @@ if (config.githubSignIn === null) {
     "GitHub sign-in is disabled: API_PUBLIC_ORIGIN, API_GITHUB_CLIENT_ID, and API_GITHUB_CLIENT_SECRET are not set",
   );
 }
+if (config.githubWebhook === null) {
+  app.log.warn(
+    "the GitHub webhook is disabled: API_GITHUB_WEBHOOK_SECRET is not set",
+  );
+}
 if (config.databaseUrl === null) {
   app.log.warn("the database is disabled: DATABASE_URL is not set");
 }

@@ -40,6 +40,14 @@ const OriginList = z
       .max(20),
   );
 
+// Printable ASCII from "!" to "~": no space, no other whitespace.
+const WebhookSecret = z
+  .string()
+  .regex(
+    /^[!-~]{32,256}$/u,
+    "Expected 32 to 256 printable ASCII characters without whitespace",
+  );
+
 const LOG_LEVELS = [
   "fatal",
   "error",
@@ -89,6 +97,9 @@ const EnvSchema = z.object({
     .string()
     .regex(/^[A-Za-z0-9_]{20,128}$/u, "Expected a GitHub App client secret")
     .optional(),
+  API_GITHUB_WEBHOOK_SECRET: WebhookSecret.optional(),
+  // Accepted too while a secret rotation is in progress.
+  API_GITHUB_WEBHOOK_SECRET_PREVIOUS: WebhookSecret.optional(),
   // Checked here without the production rule, so that its issues come with
   // the other variables' issues; production adds sslmode=verify-full below.
   DATABASE_URL: z
@@ -123,6 +134,12 @@ export type Config = Readonly<{
     publicOrigin: string;
     clientId: string;
     clientSecret: Secret;
+  }> | null;
+  /** The GitHub webhook secrets (ADR 0014); null when the webhook is disabled, which only development and test allow. */
+  githubWebhook: Readonly<{
+    secret: Secret;
+    /** The secret before a rotation, accepted too while it is configured; null otherwise. */
+    previousSecret: Secret | null;
   }> | null;
   /** The PostgreSQL connection URL; null when the database is disabled, which only development and test allow. */
   databaseUrl: Secret | null;
@@ -188,6 +205,16 @@ export function loadConfig(
             clientSecret: new Secret(values.API_GITHUB_CLIENT_SECRET),
           })
         : null,
+    githubWebhook:
+      values.API_GITHUB_WEBHOOK_SECRET === undefined
+        ? null
+        : Object.freeze({
+            secret: new Secret(values.API_GITHUB_WEBHOOK_SECRET),
+            previousSecret:
+              values.API_GITHUB_WEBHOOK_SECRET_PREVIOUS === undefined
+                ? null
+                : new Secret(values.API_GITHUB_WEBHOOK_SECRET_PREVIOUS),
+          }),
     databaseUrl:
       values.DATABASE_URL === undefined
         ? null
@@ -232,6 +259,17 @@ function crossChecks(values: Env): string[] {
     } else if (signInSet.length > 0) {
       issues.push(
         `${name}: is required with ${signInSet.join(" and ")}; set all three or none`,
+      );
+    }
+  }
+  if (values.API_GITHUB_WEBHOOK_SECRET === undefined) {
+    if (production) {
+      issues.push(
+        "API_GITHUB_WEBHOOK_SECRET: is required with NODE_ENV=production",
+      );
+    } else if (values.API_GITHUB_WEBHOOK_SECRET_PREVIOUS !== undefined) {
+      issues.push(
+        "API_GITHUB_WEBHOOK_SECRET: is required with API_GITHUB_WEBHOOK_SECRET_PREVIOUS",
       );
     }
   }
