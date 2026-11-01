@@ -13,6 +13,11 @@ export {
   enableAccount,
 } from "./account-status.ts";
 export {
+  type GitHubRevocationInput,
+  type GitHubRevocationResult,
+  recordGitHubRevocation,
+} from "./github-revocation.ts";
+export {
   revokeDevice,
   type RevokeDeviceInput,
   type RevokeDeviceResult,
