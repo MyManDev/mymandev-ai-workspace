@@ -275,6 +275,7 @@ test("the workspace view shows every person, former ones as former, with the log
   const db = database();
   const owner = await account("viewer");
   const admin = await account("admin");
+  const member = await account("member");
   const former = await account("former");
   const erased = await account("erased");
   const { workspace, member: ownerPerson } = await created(owner, NOW, "View");
@@ -290,6 +291,10 @@ test("the workspace view shows every person, former ones as former, with the log
   const adminPerson = await addClaimed(workspace.id, admin, {
     role: "admin",
     createdAt: new Date(NOW.getTime() + 1),
+  });
+  // Older than the unclaimed person, but claimed people come first.
+  const memberPerson = await addClaimed(workspace.id, member, {
+    createdAt: new Date(NOW.getTime() - 1),
   });
   const formerPerson = await addClaimed(workspace.id, former, {
     removedAt: new Date(NOW.getTime() + HOUR_MS),
@@ -333,8 +338,15 @@ test("the workspace view shows every person, former ones as former, with the log
   });
   assert.deepEqual(
     view.members.map((member) => member.id),
-    [ownerPerson.id, adminPerson, unclaimed, formerPerson, erasedPerson],
-    "the owner, the offer's target, the other active people, then former members, the most recently removed first",
+    [
+      ownerPerson.id,
+      adminPerson,
+      memberPerson,
+      unclaimed,
+      formerPerson,
+      erasedPerson,
+    ],
+    "the owner, the offer's target, the other claimed people, the unclaimed people, then former members, the most recently removed first",
   );
   const byId = new Map(view.members.map((member) => [member.id, member]));
   assert.deepEqual(byId.get(ownerPerson.id), ownerPerson);
@@ -423,7 +435,7 @@ test("the active person is only the account's claimed person whose removed_at is
   );
 });
 
-test("the list and the view keep their most recent 1,000 items and the people that the view's rules name", async () => {
+test("the list and the view keep their most recent 1,000 items, the people that the view's rules name, and the claimed people before unclaimed ones", async () => {
   const db = database();
   const many = await account("many");
   const ids = Array.from({ length: 1_001 }, () => newId<WorkspaceId>());
@@ -456,10 +468,12 @@ test("the list and the view keep their most recent 1,000 items and the people th
     "the earliest claimed is cut",
   );
 
-  // The owner and the offer's target are older than every other person, so
-  // only their place in the order keeps them.
+  // The owner, the offer's target, and a claimed member are older than every
+  // unclaimed person, so only their place in the order keeps them: 1,000
+  // unclaimed people never push a claimed one out.
   const crowded = await account("crowded");
   const target = await account("crowd-target");
+  const claimed = await account("crowd-claimed");
   const former = await account("crowd-former");
   const { workspace, member: owner } = await created(
     crowded,
@@ -470,6 +484,9 @@ test("the list and the view keep their most recent 1,000 items and the people th
     role: "admin",
     createdAt: new Date(NOW.getTime() - 2 * HOUR_MS),
     ownershipOfferedAt: NOW,
+  });
+  const claimedPerson = await addClaimed(workspace.id, claimed, {
+    createdAt: new Date(NOW.getTime() - 2 * HOUR_MS + 1),
   });
   const unclaimed = Array.from({ length: 1_000 }, () => newId<MemberId>());
   await db.insert(workspaceMembers).values(
@@ -492,13 +509,13 @@ test("the list and the view keep their most recent 1,000 items and the people th
   WorkspaceViewResponseSchema.parse(view);
   assert.equal(view.members.length, 1_000);
   assert.deepEqual(
-    view.members.slice(0, 3).map((member) => member.id),
-    [owner.id, targetPerson, unclaimed[999]],
+    view.members.slice(0, 4).map((member) => member.id),
+    [owner.id, targetPerson, claimedPerson, unclaimed[999]],
   );
-  assert.equal(view.members.at(-1)?.id, unclaimed[2]);
+  assert.equal(view.members.at(-1)?.id, unclaimed[3]);
   assert.equal(view.ownershipOffer?.memberId, targetPerson);
   const shown = new Set(view.members.map((member) => member.id));
-  for (const cut of [unclaimed[0], unclaimed[1], formerPerson]) {
+  for (const cut of [unclaimed[0], unclaimed[1], unclaimed[2], formerPerson]) {
     assert.ok(cut !== undefined && !shown.has(cut));
   }
 });

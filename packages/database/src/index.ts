@@ -49,6 +49,18 @@ export {
   type WorkspaceViewInput,
 } from "./membership.ts";
 export {
+  defineMember,
+  type DefineMemberInput,
+  type DefineMemberResult,
+  type PersonRefusal,
+  removeMember,
+  type RemoveMemberInput,
+  type RemoveMemberResult,
+  renameMember,
+  type RenameMemberInput,
+  type RenameMemberResult,
+} from "./people.ts";
+export {
   DatabaseError,
   toDatabaseError,
   withDatabaseErrors,

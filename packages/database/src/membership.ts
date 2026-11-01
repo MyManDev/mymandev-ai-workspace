@@ -282,10 +282,12 @@ export type WorkspaceViewInput = Readonly<{
  * paused; and the ownership offer that has not expired. undefined when the
  * workspace does not exist. The caller checks membership first.
  *
- * The people are cut to their most recent `MAX_ANSWER_LIST_ITEMS`, in an
- * order that never drops those whom the view's rules name: the active owner,
- * the target of the offer, the other active people, the most recently
- * created first, then former members, the most recently removed first.
+ * The people are cut to `MAX_ANSWER_LIST_ITEMS`, in an order that never
+ * drops those whom the view's rules name and in which unclaimed people never
+ * push out claimed ones: the active owner, the target of the offer, the other
+ * active claimed people, then the active unclaimed people, each the most
+ * recently created first, then former members, the most recently removed
+ * first.
  */
 export async function workspaceView(
   db: Database,
@@ -315,6 +317,7 @@ export async function workspaceView(
         sql`${workspaceMembers.removedAt} is not null`,
         sql`${workspaceMembers.role} <> 'owner'`,
         sql`${workspaceMembers.ownershipOfferedAt} is null`,
+        sql`${workspaceMembers.removedAt} is null and ${workspaceMembers.userId} is null`,
         desc(workspaceMembers.removedAt),
         desc(workspaceMembers.createdAt),
         desc(workspaceMembers.id),

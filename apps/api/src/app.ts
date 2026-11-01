@@ -29,6 +29,7 @@ import {
   type EventHandler,
 } from "./gateway.ts";
 import { serializeError, serializeRequest } from "./log.ts";
+import type { WorkspaceEventHandler } from "./workspaces/events.ts";
 import { registerWorkspaceRoutes } from "./workspaces/workspace-routes.ts";
 
 export type BuildAppOptions = Readonly<{
@@ -40,6 +41,13 @@ export type BuildAppOptions = Readonly<{
    * authenticated connection. The default logs it at debug level.
    */
   onEvent?: EventHandler;
+  /**
+   * Receives each membership event that the server originates, after the
+   * transaction that made the change committed, until #110 delivers them to
+   * the workspace's connections. The default logs the event type and the
+   * workspace ID at debug level.
+   */
+  onWorkspaceEvent?: WorkspaceEventHandler;
   /**
    * The open WebSocket connections. The default is a new registry; tests
    * pass one to count or close connections.
@@ -335,6 +343,15 @@ export async function buildApp(
       );
     });
 
+  const onWorkspaceEvent: WorkspaceEventHandler =
+    options.onWorkspaceEvent ??
+    ((event) => {
+      app.log.debug(
+        { eventType: event.type, workspaceId: event.workspaceId },
+        "workspace event",
+      );
+    });
+
   let database: Database | null = options.database ?? null;
   if (database === null && config.databaseUrl !== null) {
     const connection = createDatabase(config.databaseUrl.reveal());
@@ -417,6 +434,7 @@ export async function buildApp(
         database,
         requireAccessToken,
         now,
+        onWorkspaceEvent,
       });
       // A connection authenticates with its device key (ADR 0014).
       registerGateway(app, {
