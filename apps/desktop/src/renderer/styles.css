@@ -20,6 +20,10 @@ body {
 
 .shell-header {
   grid-area: header;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--shell-border);
 }
@@ -27,6 +31,34 @@ body {
 .shell-header h1 {
   margin: 0;
   font-size: 1rem;
+}
+
+.runtime-status {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.runtime-status-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: GrayText;
+}
+
+.runtime-status[data-state="running"] .runtime-status-dot {
+  background: #2da44e;
+}
+
+.runtime-status[data-state="starting"] .runtime-status-dot,
+.runtime-status[data-state="stopping"] .runtime-status-dot {
+  background: #d4a72c;
+}
+
+.runtime-status[data-state="failed"] .runtime-status-dot {
+  background: #cf222e;
 }
 
 .shell-nav {

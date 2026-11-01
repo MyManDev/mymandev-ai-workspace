@@ -1,4 +1,4 @@
-import { app, BrowserWindow, protocol, session } from "electron";
+import { app, BrowserWindow, ipcMain, protocol, session } from "electron";
 import { readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -10,7 +10,10 @@ import {
   createSessionGuardInstaller,
   installContentsGuards,
 } from "./guards.ts";
+import { registerRuntimeIpc } from "./ipc.ts";
 import { isAppNavigation, resolveRendererUrl } from "./navigation.ts";
+import { createLocalRuntime } from "./runtime.ts";
+import { stopRuntimeOnQuit } from "./runtime-lifecycle.ts";
 import { createMainWindowOptions } from "./window.ts";
 
 // ADR 0014: the main process takes the single-instance lock before anything
@@ -33,6 +36,18 @@ function start(): void {
   const rendererDir = join(import.meta.dirname, "../renderer");
   const preloadPath = join(import.meta.dirname, "../preload/index.cjs");
   let mainWindow: BrowserWindow | undefined;
+
+  // The local runtime starts when the application is ready and stops before
+  // it quits. The handlers are registered before the first window loads, so
+  // that the renderer's first call finds them.
+  const runtime = createLocalRuntime({
+    onError: (message, error) => console.error(message, error),
+  });
+  runtime.onStatusChange((status) => {
+    console.info(`The local runtime is ${status.state}.`);
+  });
+  registerRuntimeIpc(ipcMain, rendererUrl, runtime);
+  stopRuntimeOnQuit(app, runtime);
 
   function showMainWindow(): void {
     if (mainWindow !== undefined) {
@@ -84,6 +99,7 @@ function start(): void {
         APP_SCHEME,
         createAppProtocolHandler(rendererDir, { readFile, realpath }),
       );
+      void runtime.start();
       showMainWindow();
       app.on("activate", showMainWindow);
     })

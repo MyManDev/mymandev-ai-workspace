@@ -1,10 +1,10 @@
-import { contextBridge } from "electron";
-import type { DesktopBridge } from "../shared/desktop-bridge.ts";
+import { contextBridge, ipcRenderer } from "electron";
+import { createDesktopBridge } from "./bridge.ts";
 
 // A sandboxed preload script runs without Node.js modules; electron-vite
-// bundles it as CommonJS. Only the values below reach the renderer.
-const bridge: DesktopBridge = {
-  electronVersion: process.versions.electron,
-};
-
-contextBridge.exposeInMainWorld("desktop", bridge);
+// bundles it as CommonJS. Only the bridge reaches the renderer; ipcRenderer
+// stays in the preload script.
+contextBridge.exposeInMainWorld(
+  "desktop",
+  createDesktopBridge(process.versions.electron, ipcRenderer),
+);

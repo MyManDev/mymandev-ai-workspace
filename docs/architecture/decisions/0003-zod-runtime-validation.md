@@ -47,6 +47,7 @@ Research measurements on 20,000 decodes of the same envelope:
 
 - zod 4, classic API, exact pin, declared as a `dependency` by every workspace that imports it, always at the same version as `@mymandev/protocol`. A second zod copy would break `instanceof` checks on zod errors. (zod 4 keeps its global configuration, including `jitless`, on `globalThis`, so the setting itself reaches every copy.)
 - Every zod upgrade is reviewed. If the Project Manager prefers a release from before the 2026-09-21 incident, the fallback is the last zod 4 release before that date; it lacks the fix that checks array bounds before elements.
+- Update of 2026-11-01 (#22): `@mymandev/desktop` declares zod as a `devDependency`, at the same exact version, because packages that its bundles contain are `devDependencies` ([ADR 0016](0016-desktop-toolchain.md), Decision, item 3, and its update of 2026-11-01). The bundle carries zod, so the intent of the rule, one exact version and one hoisted copy, holds. The text above is unchanged.
 
 ## Evidence
 
