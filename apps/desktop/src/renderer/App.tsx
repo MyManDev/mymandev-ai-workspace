@@ -1,6 +1,14 @@
 import { useEffect, useReducer, useState } from "react";
 import type { RuntimeBridge } from "../shared/desktop-bridge.ts";
 import { PRODUCT_NAME } from "../shared/product.ts";
+import { ProjectNav, WorkspaceNav } from "./Navigation.tsx";
+import { ProjectPanel } from "./ProjectPanel.tsx";
+import {
+  ChatScreen,
+  DecisionsScreen,
+  PermissionsScreen,
+  TasksScreen,
+} from "./ProjectScreens.tsx";
 import {
   describeRuntimeView,
   initialRuntimeView,
@@ -8,64 +16,82 @@ import {
 } from "./runtime-status.ts";
 import {
   createShellState,
-  SCREENS,
+  HOME_VIEW,
+  openProject,
   shellReducer,
-  type ScreenId,
+  type ProjectSummary,
+  type ShellView,
 } from "./screens.ts";
+import { AboutScreen, HomeScreen } from "./WorkspaceScreens.tsx";
 
 export interface AppProps {
   /** The Electron version from the preload script; undefined outside Electron. */
   readonly electronVersion?: string | undefined;
   /** The local runtime from the preload script; undefined outside Electron. */
   readonly runtime?: RuntimeBridge | undefined;
-  /** The screen shown first. */
-  readonly initialScreen?: ScreenId;
+  /** The workspace's projects, in navigation order, read when the shell mounts. */
+  readonly projects: readonly ProjectSummary[];
+  /** The view shown first. An invalid view shows the home screen. */
+  readonly initialView?: ShellView;
 }
 
 export function App({
   electronVersion,
   runtime,
-  initialScreen = "home",
+  projects,
+  initialView = HOME_VIEW,
 }: AppProps) {
-  const [state, dispatch] = useReducer(
-    shellReducer,
-    initialScreen,
-    createShellState,
+  const [state, dispatch] = useReducer(shellReducer, initialView, (view) =>
+    createShellState(projects, view),
   );
   const runtimeView = useRuntimeView(runtime);
+  const open = openProject(state);
 
   return (
-    <div className="shell">
+    <div className={open === undefined ? "shell" : "shell shell-project"}>
       <header className="shell-header">
         <h1>{PRODUCT_NAME}</h1>
         <RuntimeStatusIndicator view={runtimeView} />
       </header>
-      <nav className="shell-nav" aria-label="Screens">
-        <ul>
-          {SCREENS.map((screen) => (
-            <li key={screen.id}>
-              <button
-                type="button"
-                aria-current={screen.id === state.screen ? "page" : undefined}
-                onClick={() =>
-                  dispatch({ type: "show-screen", screen: screen.id })
-                }
-              >
-                {screen.label}
-              </button>
-            </li>
-          ))}
-        </ul>
-      </nav>
+      <WorkspaceNav state={state} dispatch={dispatch} />
+      {open === undefined ? null : (
+        <ProjectNav
+          project={open.project}
+          screen={open.view.screen}
+          dispatch={dispatch}
+        />
+      )}
       <main className="shell-main">
-        {state.screen === "home" ? (
-          <HomeScreen />
-        ) : (
-          <AboutScreen electronVersion={electronVersion} />
-        )}
+        <ScreenContent view={state.view} electronVersion={electronVersion} />
       </main>
+      {open === undefined ? null : (
+        <ProjectPanel panel={open.view.panel} dispatch={dispatch} />
+      )}
     </div>
   );
+}
+
+function ScreenContent({
+  view,
+  electronVersion,
+}: {
+  readonly view: ShellView;
+  readonly electronVersion: string | undefined;
+}) {
+  switch (view.screen) {
+    case "home":
+      return <HomeScreen />;
+    case "about":
+      return <AboutScreen electronVersion={electronVersion} />;
+    case "chat":
+      return <ChatScreen />;
+    case "tasks":
+      return <TasksScreen />;
+    case "decisions":
+      return <DecisionsScreen />;
+    case "permissions":
+      return <PermissionsScreen />;
+  }
 }
 
 /** Follows the status of the local runtime while the shell is mounted. */
@@ -96,32 +122,5 @@ export function RuntimeStatusIndicator({
       <span className="runtime-status-dot" aria-hidden="true" />
       {label}
     </p>
-  );
-}
-
-function HomeScreen() {
-  return (
-    <section aria-labelledby="home-title">
-      <h2 id="home-title">Home</h2>
-      <p>Projects, chat, agents, and repositories will appear here.</p>
-    </section>
-  );
-}
-
-function AboutScreen({
-  electronVersion,
-}: {
-  readonly electronVersion: string | undefined;
-}) {
-  return (
-    <section aria-labelledby="about-title">
-      <h2 id="about-title">About</h2>
-      <p>{PRODUCT_NAME}</p>
-      <p>
-        {electronVersion === undefined
-          ? "Electron version unknown"
-          : `Electron ${electronVersion}`}
-      </p>
-    </section>
   );
 }

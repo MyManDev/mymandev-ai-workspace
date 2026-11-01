@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.tsx";
+import { PLACEHOLDER_PROJECTS } from "./placeholder-projects.ts";
 import "./styles.css";
 
 const container = document.getElementById("root");
@@ -13,6 +14,7 @@ createRoot(container).render(
     <App
       electronVersion={window.desktop?.electronVersion}
       runtime={window.desktop?.runtime}
+      projects={PLACEHOLDER_PROJECTS}
     />
   </StrictMode>,
 );
