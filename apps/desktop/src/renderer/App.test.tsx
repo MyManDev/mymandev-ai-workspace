@@ -1,6 +1,9 @@
 import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
-import type { RuntimeBridge } from "../shared/desktop-bridge.ts";
+import type {
+  RepositoryBridge,
+  RuntimeBridge,
+} from "../shared/desktop-bridge.ts";
 import { App, RuntimeStatusIndicator, type AppProps } from "./App.tsx";
 import { PLACEHOLDER_PROJECTS } from "./placeholder-projects.ts";
 import type { ProjectSummary, ShellView } from "./screens.ts";
@@ -195,8 +198,31 @@ test("the side panel shows the agents or the repositories, chosen with tabs of w
     '<div class="panel-tabs" role="tablist" aria-label="Side panel">' +
       tab("Agents", false) +
       tab("Repositories", true) +
-      '</div><div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2><p>No repositories yet.</p>',
+      '</div><div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2><p>Repositories are not available.</p>',
   );
+});
+
+test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {
+  const repositories: RepositoryBridge = {
+    list: () => Promise.resolve({ revision: 0, repositories: [] }),
+    subscribe: () => () => undefined,
+    mount: () => Promise.resolve({ outcome: "cancelled" }),
+    unmount: () => Promise.resolve(false),
+  };
+  const html = render({
+    repositories,
+    initialView: {
+      screen: "chat",
+      projectId: "project-a",
+      panel: "repositories",
+    },
+  });
+
+  // The repository panel is the content of the repositories tab.
+  expect(html).toContain(
+    '<div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2><button type="button" class="panel-action" disabled="">Add a repository</button><p>Reading the repositories.</p>',
+  );
+  expect(html).not.toContain("Repositories are not available.");
 });
 
 test("the permission screen shell has a placeholder section for every capability of ADR 0015", () => {

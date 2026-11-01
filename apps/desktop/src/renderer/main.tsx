@@ -14,6 +14,7 @@ createRoot(container).render(
     <App
       electronVersion={window.desktop?.electronVersion}
       runtime={window.desktop?.runtime}
+      repositories={window.desktop?.repositories}
       projects={PLACEHOLDER_PROJECTS}
     />
   </StrictMode>,

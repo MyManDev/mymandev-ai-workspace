@@ -1,4 +1,6 @@
 import type { Dispatch, KeyboardEvent } from "react";
+import type { RepositoryBridge } from "../shared/desktop-bridge.ts";
+import { RepositoryPanel } from "./RepositoryPanel.tsx";
 import {
   PANEL_IDS,
   PANELS,
@@ -42,15 +44,19 @@ export function panelForKey(
  * The side panel of the open project, beside its screens: its agents or its
  * repositories, chosen with tabs. Only the selected tab is in the tab order;
  * the arrow keys, Home, and End select another tab and move the focus to it.
- * Placeholder content only: agent execution and repository inspection come
- * in later milestones.
+ * The agents are placeholder content: agent execution comes in a later
+ * milestone. The repositories are the ones mounted on this device; until
+ * projects come from the cloud API, every project shows the same ones.
  */
 export function ProjectPanel({
   panel,
   dispatch,
+  repositories,
 }: {
   readonly panel: PanelId;
   readonly dispatch: Dispatch<ShellAction>;
+  /** The repository functions from the preload script; undefined outside Electron. */
+  readonly repositories?: RepositoryBridge | undefined;
 }) {
   const selectWithKey = (event: KeyboardEvent<HTMLElement>) => {
     const next = panelForKey(panel, event.key);
@@ -98,7 +104,11 @@ export function ProjectPanel({
         aria-labelledby={panelTabId(panel)}
         tabIndex={0}
       >
-        {panel === "agents" ? <AgentPanel /> : <RepositoryPanel />}
+        {panel === "agents" ? (
+          <AgentPanel />
+        ) : (
+          <RepositoryPanel repositories={repositories} />
+        )}
       </div>
     </aside>
   );
@@ -112,19 +122,6 @@ function AgentPanel() {
       <p className="placeholder-note">
         The agents of this project, with their owner, their device, and what
         they are working on, appear here.
-      </p>
-    </>
-  );
-}
-
-function RepositoryPanel() {
-  return (
-    <>
-      <h2 id="panel-title">Repositories</h2>
-      <p>No repositories yet.</p>
-      <p className="placeholder-note">
-        The repositories of this project, with their branch and their changes,
-        appear here.
       </p>
     </>
   );

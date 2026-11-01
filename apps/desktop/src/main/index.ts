@@ -1,4 +1,11 @@
-import { app, BrowserWindow, ipcMain, protocol, session } from "electron";
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  protocol,
+  session,
+} from "electron";
 import { readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
@@ -12,6 +19,12 @@ import {
 } from "./guards.ts";
 import { registerRuntimeIpc } from "./ipc.ts";
 import { isAppNavigation, resolveRendererUrl } from "./navigation.ts";
+import { registerRepositoryIpc } from "./repository-ipc.ts";
+import {
+  createSystemRepositoryService,
+  FOLDER_DIALOG_OPTIONS,
+  selectedFolder,
+} from "./repository-system.ts";
 import { createLocalRuntime } from "./runtime.ts";
 import { stopRuntimeOnQuit } from "./runtime-lifecycle.ts";
 import { createMainWindowOptions } from "./window.ts";
@@ -48,6 +61,25 @@ function start(): void {
   });
   registerRuntimeIpc(ipcMain, rendererUrl, runtime);
   stopRuntimeOnQuit(app, runtime);
+
+  // Mounted repositories: read with Git and watched, never written. The
+  // folder comes from the dialog of the main process, never from the
+  // renderer. Watchers stop and Git commands are cancelled at quit.
+  const repositories = createSystemRepositoryService((message, error) =>
+    console.error(message, error),
+  );
+  registerRepositoryIpc(ipcMain, rendererUrl, repositories, async () => {
+    const options = {
+      ...FOLDER_DIALOG_OPTIONS,
+      properties: [...FOLDER_DIALOG_OPTIONS.properties],
+    };
+    return selectedFolder(
+      mainWindow === undefined
+        ? await dialog.showOpenDialog(options)
+        : await dialog.showOpenDialog(mainWindow, options),
+    );
+  });
+  app.on("will-quit", () => repositories.close());
 
   function showMainWindow(): void {
     if (mainWindow !== undefined) {

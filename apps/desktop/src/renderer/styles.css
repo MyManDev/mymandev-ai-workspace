@@ -297,6 +297,86 @@ code {
   font-size: var(--font-size-heading);
 }
 
+/* Repositories */
+
+.panel-action,
+.repository-remove {
+  padding: var(--space-1) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-background);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.panel-action:hover,
+.repository-remove:hover {
+  background: var(--color-hover);
+}
+
+.panel-action:disabled {
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
+.panel-message {
+  color: var(--color-status-failed);
+  font-size: var(--font-size-small);
+}
+
+.repository-list,
+.remote-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.repository {
+  padding-block: var(--space-3);
+  border-block-end: var(--border-width) solid var(--color-border);
+}
+
+.repository-name {
+  margin: 0;
+  font-size: var(--font-size-base);
+}
+
+.repository-path,
+.repository-state {
+  margin: var(--space-1) 0;
+  font-size: var(--font-size-small);
+  overflow-wrap: anywhere;
+}
+
+.repository-path {
+  color: var(--color-text-muted);
+}
+
+.repository-facts {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-1) var(--space-3);
+  margin: var(--space-2) 0;
+  font-size: var(--font-size-small);
+}
+
+.repository-facts dt {
+  color: var(--color-text-muted);
+}
+
+.repository-facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.remote-name {
+  font-weight: var(--font-weight-strong);
+}
+
+.remote-url {
+  display: block;
+}
+
 /* Chat */
 
 .chat {

@@ -1,5 +1,8 @@
 import { useEffect, useReducer, useState } from "react";
-import type { RuntimeBridge } from "../shared/desktop-bridge.ts";
+import type {
+  RepositoryBridge,
+  RuntimeBridge,
+} from "../shared/desktop-bridge.ts";
 import { PRODUCT_NAME } from "../shared/product.ts";
 import { ProjectNav, WorkspaceNav } from "./Navigation.tsx";
 import { ProjectPanel } from "./ProjectPanel.tsx";
@@ -29,6 +32,8 @@ export interface AppProps {
   readonly electronVersion?: string | undefined;
   /** The local runtime from the preload script; undefined outside Electron. */
   readonly runtime?: RuntimeBridge | undefined;
+  /** The mounted repositories from the preload script; undefined outside Electron. */
+  readonly repositories?: RepositoryBridge | undefined;
   /** The workspace's projects, in navigation order, read when the shell mounts. */
   readonly projects: readonly ProjectSummary[];
   /** The view shown first. An invalid view shows the home screen. */
@@ -38,6 +43,7 @@ export interface AppProps {
 export function App({
   electronVersion,
   runtime,
+  repositories,
   projects,
   initialView = HOME_VIEW,
 }: AppProps) {
@@ -65,7 +71,11 @@ export function App({
         <ScreenContent view={state.view} electronVersion={electronVersion} />
       </main>
       {open === undefined ? null : (
-        <ProjectPanel panel={open.view.panel} dispatch={dispatch} />
+        <ProjectPanel
+          panel={open.view.panel}
+          dispatch={dispatch}
+          repositories={repositories}
+        />
       )}
     </div>
   );

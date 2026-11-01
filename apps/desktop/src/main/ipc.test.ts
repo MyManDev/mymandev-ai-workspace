@@ -208,6 +208,53 @@ test("a handler refuses invalid arguments without echoing them", () => {
   expect(calls).toBe(0);
 });
 
+test("a handler parses the value of a promise with the contract", async () => {
+  const handler = createInvokeHandler(
+    INVOKE_CHANNELS.getRuntimeStatus,
+    DEV_URL,
+    () =>
+      Promise.resolve({ ...RUNNING, internal: "never sent" } as RuntimeStatus),
+  );
+
+  await expect(handler(fakeEvent(fakeFrame(DEV_URL)))).resolves.toEqual(
+    RUNNING,
+  );
+});
+
+test("a handler rejects a promised result that breaks the contract", async () => {
+  const handler = createInvokeHandler(
+    INVOKE_CHANNELS.getRuntimeStatus,
+    DEV_URL,
+    () =>
+      Promise.resolve({
+        state: "paused",
+        revision: 0,
+      } as unknown as RuntimeStatus),
+  );
+
+  await expect(handler(fakeEvent(fakeFrame(DEV_URL)))).rejects.toThrow();
+});
+
+test("a handler with an asynchronous implementation still refuses before it runs", () => {
+  let calls = 0;
+  const handler = createInvokeHandler(
+    INVOKE_CHANNELS.getRuntimeStatus,
+    DEV_URL,
+    async () => {
+      calls += 1;
+      return RUNNING;
+    },
+  );
+
+  expect(() => handler(fakeEvent(fakeFrame("https://example.com/")))).toThrow(
+    /the sender is not the application/,
+  );
+  expect(() => handler(fakeEvent(fakeFrame(DEV_URL)), "extra")).toThrow(
+    /the arguments do not match the contract/,
+  );
+  expect(calls).toBe(0);
+});
+
 test("a handler never sends a result that breaks the contract", () => {
   const handler = createInvokeHandler(
     INVOKE_CHANNELS.getRuntimeStatus,
@@ -319,19 +366,22 @@ function registerWithFakeIpc(runtime: ReturnType<typeof fakeRuntime>) {
   return handlers;
 }
 
-test("registerRuntimeIpc registers a handler for every invoke channel and nothing else", () => {
+const RUNTIME_CHANNELS = Object.values(INVOKE_CHANNELS).filter((channel) =>
+  channel.startsWith("runtime:"),
+);
+
+test("registerRuntimeIpc registers a handler for every runtime channel and nothing else", () => {
   const handlers = registerWithFakeIpc(fakeRuntime(RUNNING));
 
-  expect([...handlers.keys()].sort()).toEqual(
-    Object.values(INVOKE_CHANNELS).sort(),
-  );
+  expect(RUNTIME_CHANNELS).toHaveLength(2);
+  expect([...handlers.keys()].sort()).toEqual([...RUNTIME_CHANNELS].sort());
 });
 
 test("every registered handler checks the sender and the arguments", () => {
   const handlers = registerWithFakeIpc(fakeRuntime(RUNNING));
   const subframe = fakeFrame(DEV_URL, { parent: fakeFrame(DEV_URL) });
 
-  expect(handlers.size).toBe(Object.values(INVOKE_CHANNELS).length);
+  expect(handlers.size).toBe(RUNTIME_CHANNELS.length);
   for (const [channel, handler] of handlers) {
     const receiver = fakeReceiver();
     for (const frame of [
