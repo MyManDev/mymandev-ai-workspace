@@ -561,7 +561,10 @@ export const DEVICE_TOO_NEW_MS = 72 * 60 * 60_000;
  * changes, so the row is read without a lock; the API's `lockActor` holds it
  * anyway.
  */
-async function deviceOldEnough(tx: Database, actor: Actor): Promise<boolean> {
+export async function deviceOldEnough(
+  tx: Database,
+  actor: Actor,
+): Promise<boolean> {
   const [device] = await tx
     .select({ createdAt: devices.createdAt })
     .from(devices)
