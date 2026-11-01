@@ -1,11 +1,16 @@
 import {
   approveJoinRequest,
+  blockJoinRequest,
   createJoinRequest,
   type Database,
+  denyAllJoinRequests,
   denyJoinRequest,
   listJoinRequests,
   listOwnJoinRequests,
+  pauseJoinRequests,
   type PersonRefusal,
+  resumeJoinRequests,
+  unblockJoinRequest,
   withdrawJoinRequest,
 } from "@mymandev/database";
 import {
@@ -43,7 +48,10 @@ export type JoinRequestRouteOptions = Readonly<{
   now: () => number;
   /** Receives `workspace.member.claimed` after an approval committed. */
   onWorkspaceEvent: WorkspaceEventHandler;
-  /** Receives `account.join_request_decided` for the requester after a decision committed. */
+  /**
+   * Receives `account.join_request_decided` for the requester after an
+   * approval, a denial, a block, or denying all committed.
+   */
   onAccountFrame: AccountFrameHandler;
 }>;
 
@@ -172,15 +180,18 @@ export function registerOwnJoinRequestRoutes(
 }
 
 /**
- * The approvers' join request routes (ADR 0014, "Join requests"):
- * listing, approving, and denying. Registered on a scope that
- * `requireActiveMember` protects. The owner and admins only; a member gets
- * `403` with `forbidden`. A decision runs in one transaction that checks the
- * account and the device again (`lockActor`), then locks the caller's own
- * person and the request. After the commit, an approval sends
- * `workspace.member.claimed` with the new person through `onWorkspaceEvent`,
- * and every decision sends `account.join_request_decided` to the
- * requester's open connections through `onAccountFrame`.
+ * The approvers' join request routes (ADR 0014, "Join requests"): listing,
+ * approving, denying, blocking and unblocking, denying all, and pausing and
+ * resuming. Registered on a scope that `requireActiveMember` protects. The
+ * owner and admins only; a member gets `403` with `forbidden`. A change runs
+ * in one transaction that checks the account and the device again
+ * (`lockActor`), then locks the caller's own person, then the request, the
+ * pending requests in the order of their IDs, or the workspace row. After
+ * the commit, an approval sends `workspace.member.claimed` with the new
+ * person through `onWorkspaceEvent`, and every decision sends
+ * `account.join_request_decided` to the requester's open connections
+ * through `onAccountFrame`: a block as `denied`, and denying all one frame
+ * per denied request. Unblocking, pausing, and resuming send nothing.
  */
 export function registerJoinRequestRoutes(
   workspace: FastifyInstance,
@@ -278,6 +289,142 @@ export function registerJoinRequestRoutes(
         workspaceId,
         decision: "denied",
         decidedAt: now.toISOString(),
+      });
+      return reply.code(204).send();
+    },
+  );
+
+  workspace.post(
+    MEMBERSHIP_ROUTES.blockJoinRequest.path,
+    { schema: { params: JoinRequestParamsSchema } },
+    async (request, reply) => {
+      const auth = authOf(request);
+      const { workspaceId, joinRequestId } =
+        request.params as JoinRequestParams;
+      const now = new Date(options.now());
+      const requesterUserId = await database.transaction(async (tx) => {
+        await lockActor(tx, auth, now.getTime());
+        const result = await blockJoinRequest(tx, {
+          workspaceId,
+          joinRequestId,
+          userId: auth.userId,
+          deviceId: auth.deviceId,
+          now,
+        });
+        if (!result.blocked) {
+          throw refused(result.refusal);
+        }
+        return result.requesterUserId;
+      });
+      // The requester sees a block as a denial.
+      sendDecision(request, options, requesterUserId, {
+        joinRequestId,
+        workspaceId,
+        decision: "denied",
+        decidedAt: now.toISOString(),
+      });
+      return reply.code(204).send();
+    },
+  );
+
+  workspace.post(
+    MEMBERSHIP_ROUTES.unblockJoinRequest.path,
+    { schema: { params: JoinRequestParamsSchema } },
+    async (request, reply) => {
+      const auth = authOf(request);
+      const { workspaceId, joinRequestId } =
+        request.params as JoinRequestParams;
+      const now = new Date(options.now());
+      await database.transaction(async (tx) => {
+        await lockActor(tx, auth, now.getTime());
+        const result = await unblockJoinRequest(tx, {
+          workspaceId,
+          joinRequestId,
+          userId: auth.userId,
+          deviceId: auth.deviceId,
+          now,
+        });
+        if (!result.unblocked) {
+          throw refused(result.refusal);
+        }
+      });
+      return reply.code(204).send();
+    },
+  );
+
+  workspace.post(
+    MEMBERSHIP_ROUTES.denyAllJoinRequests.path,
+    { schema: { params: WorkspaceParamsSchema } },
+    async (request, reply) => {
+      const auth = authOf(request);
+      const { workspaceId } = request.params as { workspaceId: WorkspaceId };
+      const now = new Date(options.now());
+      const denied = await database.transaction(async (tx) => {
+        await lockActor(tx, auth, now.getTime());
+        const result = await denyAllJoinRequests(tx, {
+          workspaceId,
+          userId: auth.userId,
+          deviceId: auth.deviceId,
+          now,
+        });
+        if (!result.denied) {
+          throw refused(result.refusal);
+        }
+        return result.joinRequests;
+      });
+      for (const { joinRequestId, requesterUserId } of denied) {
+        sendDecision(request, options, requesterUserId, {
+          joinRequestId,
+          workspaceId,
+          decision: "denied",
+          decidedAt: now.toISOString(),
+        });
+      }
+      return reply.code(204).send();
+    },
+  );
+
+  workspace.post(
+    MEMBERSHIP_ROUTES.pauseJoinRequests.path,
+    { schema: { params: WorkspaceParamsSchema } },
+    async (request, reply) => {
+      const auth = authOf(request);
+      const { workspaceId } = request.params as { workspaceId: WorkspaceId };
+      const now = new Date(options.now());
+      await database.transaction(async (tx) => {
+        await lockActor(tx, auth, now.getTime());
+        const result = await pauseJoinRequests(tx, {
+          workspaceId,
+          userId: auth.userId,
+          deviceId: auth.deviceId,
+          now,
+        });
+        if (!result.paused) {
+          throw refused(result.refusal);
+        }
+      });
+      return reply.code(204).send();
+    },
+  );
+
+  workspace.post(
+    MEMBERSHIP_ROUTES.resumeJoinRequests.path,
+    { schema: { params: WorkspaceParamsSchema } },
+    async (request, reply) => {
+      const auth = authOf(request);
+      const { workspaceId } = request.params as { workspaceId: WorkspaceId };
+      const now = new Date(options.now());
+      await database.transaction(async (tx) => {
+        await lockActor(tx, auth, now.getTime());
+        const result = await resumeJoinRequests(tx, {
+          workspaceId,
+          userId: auth.userId,
+          deviceId: auth.deviceId,
+          now,
+        });
+        if (!result.resumed) {
+          throw refused(result.refusal);
+        }
       });
       return reply.code(204).send();
     },
