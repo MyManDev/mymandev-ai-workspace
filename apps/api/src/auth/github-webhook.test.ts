@@ -1,9 +1,17 @@
-import { auditEvents, devices, users } from "@mymandev/database";
+import {
+  auditEvents,
+  type Database,
+  devices,
+  recordGitHubRevocation,
+  userIdentities,
+  users,
+} from "@mymandev/database";
 import {
   ChallengeResponseSchema,
   decodeServerMessage,
   type DeviceId,
   newId,
+  SignInResponseSchema,
   type UserId,
 } from "@mymandev/protocol";
 import { eq } from "drizzle-orm";
@@ -14,13 +22,17 @@ import { test, type TestContext } from "node:test";
 import { buildApp } from "../app.ts";
 import { loadConfig } from "../config.ts";
 import { ConnectionRegistry } from "../gateway.ts";
+import { RecentRevocations } from "./attempts.ts";
 import { AccessTokens } from "./tokens.ts";
 import {
   deviceApp,
   type DeviceAppOptions,
   fakeClock,
+  newKey,
   ORIGIN,
+  postNewDevice,
   signInAgain,
+  signInCode,
   type SignedInDevice,
   signInDevice,
   signInput,
@@ -138,6 +150,40 @@ async function requestToken(app: FastifyInstance, device: SignedInDevice) {
       }),
     },
   });
+}
+
+/**
+ * The test database, whose next transaction after `arm` holds its result
+ * until `release`: `paused` resolves once that transaction committed.
+ */
+function pausingDatabase(db: Database) {
+  const paused = Promise.withResolvers<void>();
+  const released = Promise.withResolvers<void>();
+  let armed = false;
+  const transaction: Database["transaction"] = async (...args) => {
+    const result = await db.transaction(...args);
+    paused.resolve();
+    await released.promise;
+    return result;
+  };
+  const database = new Proxy(db, {
+    get(target, property) {
+      if (property === "transaction" && armed) {
+        armed = false;
+        return transaction;
+      }
+      const value: unknown = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  return {
+    database,
+    arm: () => {
+      armed = true;
+    },
+    paused: paused.promise,
+    release: () => released.resolve(),
+  };
 }
 
 function codeOf(response: { json(): unknown }): string {
@@ -366,6 +412,123 @@ test("a revocation sets sign_in_required_at, closes the person's socket with sig
   const signedIn = await signInAgain(app, laptop);
   assert.equal((await requestToken(app, signedIn)).statusCode, 200);
   assert.equal(codeOf(await requestToken(app, desktop)), "sign_in_required");
+});
+
+test("a device that signed in at the moment of the revocation, before the webhook's transaction, must sign in again", async (t) => {
+  const clock = fakeClock();
+  const app = await webhookApp(t, { githubId: 4011, now: clock.now });
+  const device = await signInDevice(app);
+  // The webhook takes the same time as the sign-in; its transaction commits second.
+  const response = await deliver(app, { body: revokedBody(senderOf(4011)) });
+  assert.equal(response.statusCode, 204);
+  assert.equal(
+    (await signInRequiredAt(device.userId))?.getTime(),
+    clock.now() + 1,
+  );
+  assert.equal(codeOf(await requestToken(app, device)), "sign_in_required");
+});
+
+test("a first sign-in whose GitHub identity was read before a revocation of a sender without an account answers sign_in_required and creates no account", async (t) => {
+  const clock = fakeClock();
+  const app = await webhookApp(t, { githubId: 4015, now: clock.now });
+  const grant = await signInCode(app);
+  clock.advance(30_000);
+  // No account has the sender's ID yet, so the database keeps only the
+  // audit record without a person; the API keeps the ID in memory.
+  const response = await deliver(app, { body: revokedBody(senderOf(4015)) });
+  assert.equal(response.statusCode, 204);
+  clock.advance(1_000);
+
+  const refused = await postNewDevice(app, grant);
+  assert.equal(refused.statusCode, 401);
+  assert.equal(codeOf(refused), "sign_in_required");
+  const identities = await database()
+    .select()
+    .from(userIdentities)
+    .where(eq(userIdentities.subject, "4015"));
+  assert.deepEqual(identities, [], "no account was created");
+
+  // A sign-in whose identity is read after the revocation works.
+  const device = await signInDevice(app);
+  assert.equal((await requestToken(app, device)).statusCode, 200);
+});
+
+test("a first sign-in that commits after the webhook's lookup missed its account, and after its first check missed the revocation, leaves the new device required to sign in", async (t) => {
+  const clock = fakeClock();
+  const app = await webhookApp(t, { githubId: 4016, now: clock.now });
+  const grant = await signInCode(app);
+  clock.advance(1_000);
+  // The webhook's transaction runs before the sign-in commits and finds no
+  // account. In the webhook, the memory write comes first; here it lands
+  // right after the sign-in's first check, which reads only memory, so the
+  // two orders end in the same state.
+  await recordGitHubRevocation(database(), {
+    subject: "4016",
+    deliveryId: randomUUID(),
+    now: new Date(clock.now()),
+  });
+  const latest = RecentRevocations.prototype.latest;
+  let checks = 0;
+  t.mock.method(
+    RecentRevocations.prototype,
+    "latest",
+    function (this: RecentRevocations, subject: string) {
+      const found = latest.call(this, subject);
+      checks += 1;
+      if (checks === 1) {
+        this.record(subject, clock.now());
+      }
+      return found;
+    },
+  );
+
+  const key = newKey();
+  const response = await postNewDevice(app, grant, key);
+  assert.equal(response.statusCode, 200, "the device was registered");
+  assert.equal(checks, 2, "checked before and after the commit");
+  const answer = SignInResponseSchema.parse(response.json());
+  const device = { userId: answer.userId, deviceId: answer.deviceId, key };
+  assert.equal(codeOf(await requestToken(app, device)), "sign_in_required");
+});
+
+test("the webhook keeps the revocation in memory before its transaction, so a first sign-in that finishes before the route does is refused", async (t) => {
+  const clock = fakeClock();
+  const pausing = pausingDatabase(database());
+  const app = await deviceApp(t, {
+    githubId: 4017,
+    now: clock.now,
+    database: pausing.database,
+    env: { API_GITHUB_WEBHOOK_SECRET: WEBHOOK_SECRET },
+  });
+  const record = t.mock.method(RecentRevocations.prototype, "record");
+  const grant = await signInCode(app);
+  clock.advance(1_000);
+
+  // The webhook's transaction looks the sender up before the sign-in exists
+  // and commits, and the route waits there: its lookup missed the account,
+  // as when it runs before a concurrent first sign-in commits. The pause
+  // follows the commit because PGlite runs one transaction at a time.
+  pausing.arm();
+  const delivered = deliver(app, { body: revokedBody(senderOf(4017)) });
+  await Promise.race([pausing.paused, delivered]);
+  try {
+    assert.deepEqual(
+      record.mock.calls.map((call) => call.arguments),
+      [["4017", clock.now()]],
+      "recorded in memory before the transaction",
+    );
+    const refused = await postNewDevice(app, grant);
+    assert.equal(refused.statusCode, 401);
+    assert.equal(codeOf(refused), "sign_in_required");
+  } finally {
+    pausing.release();
+  }
+  assert.equal((await delivered).statusCode, 204);
+  const identities = await database()
+    .select()
+    .from(userIdentities)
+    .where(eq(userIdentities.subject, "4017"));
+  assert.deepEqual(identities, [], "no account was created");
 });
 
 test("a second delivery with the same ID changes nothing and writes no second audit record", async (t) => {

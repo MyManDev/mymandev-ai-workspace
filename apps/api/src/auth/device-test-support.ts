@@ -171,16 +171,17 @@ export async function signInCode(app: FastifyInstance) {
 }
 
 /**
- * Signs in a new device through the browser flow and POST /auth/sign-in;
- * with `previousDeviceId`, the new device replaces that one.
+ * Posts a new device's sign-in with a code from the browser flow and returns
+ * the answer; with `previousDeviceId`, the new device replaces that one.
  */
-export async function signInDevice(
+export function postNewDevice(
   app: FastifyInstance,
+  grant: Readonly<{ code: string; codeVerifier: string }>,
   key: Key = newKey(),
   previousDeviceId?: string,
 ) {
-  const { code, codeVerifier } = await signInCode(app);
-  const response = await app.inject({
+  const { code, codeVerifier } = grant;
+  return app.inject({
     method: "POST",
     url: "/auth/sign-in",
     payload: {
@@ -204,6 +205,23 @@ export async function signInDevice(
       },
     },
   });
+}
+
+/**
+ * Signs in a new device through the browser flow and POST /auth/sign-in;
+ * with `previousDeviceId`, the new device replaces that one.
+ */
+export async function signInDevice(
+  app: FastifyInstance,
+  key: Key = newKey(),
+  previousDeviceId?: string,
+) {
+  const response = await postNewDevice(
+    app,
+    await signInCode(app),
+    key,
+    previousDeviceId,
+  );
   assert.equal(response.statusCode, 200, response.body);
   const answer = SignInResponseSchema.parse(response.json());
   return { userId: answer.userId, deviceId: answer.deviceId, key };

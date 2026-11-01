@@ -6,7 +6,11 @@ import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { STATUS_CODES } from "node:http";
 import type { Socket } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
-import { SignInAttempts, SignInCodes } from "./auth/attempts.ts";
+import {
+  RecentRevocations,
+  SignInAttempts,
+  SignInCodes,
+} from "./auth/attempts.ts";
 import { createAccessCheck } from "./auth/authenticate.ts";
 import { createGitHubApi, type GitHubApi } from "./auth/github-api.ts";
 import { registerGitHubSignIn } from "./auth/github-routes.ts";
@@ -69,6 +73,18 @@ const CHALLENGE_LIFETIME_MS = 60_000;
 /** Far above 20 devices per account with one token each 15 minutes. */
 const MAX_ACCESS_TOKENS = 100_000;
 const ACCESS_TOKEN_LIFETIME_MS = 15 * 60_000;
+/**
+ * GitHub revocations stay in memory as long as a sign-in whose identity was
+ * read before them can finish: an attempt and its code (#115), and 2 minutes
+ * more as a margin. The sign-in checks again after its commit, which comes
+ * after it took the code by as long as its queries run, each up to the
+ * database's statement timeout of 30 seconds. The cap is far above the
+ * revocations that GitHub sends in that time.
+ */
+const MAX_RECENT_REVOCATIONS = 10_000;
+const RECENT_REVOCATION_MARGIN_MS = 2 * 60_000;
+const RECENT_REVOCATION_LIFETIME_MS =
+  ATTEMPT_LIFETIME_MS + SIGN_IN_CODE_LIFETIME_MS + RECENT_REVOCATION_MARGIN_MS;
 
 /** The ws default (100 MiB) is far above what one event needs. Larger frames close with 1009. */
 const MAX_FRAME_BYTES = 64 * 1024;
@@ -330,6 +346,7 @@ export async function buildApp(
 
   const now = options.now ?? Date.now;
   let tokens: AccessTokens | null = null;
+  let revocations: RecentRevocations | null = null;
 
   // Without GitHub sign-in configured, its routes and /ws answer the generic
   // 404; the routes that need the database and /ws also need the database.
@@ -369,10 +386,16 @@ export async function buildApp(
         tokens,
         now,
       });
+      revocations = new RecentRevocations({
+        max: MAX_RECENT_REVOCATIONS,
+        lifetimeMs: RECENT_REVOCATION_LIFETIME_MS,
+        now,
+      });
       await registerSignIn(app, {
         publicOrigin: config.githubSignIn.publicOrigin,
         database,
         codes,
+        revocations,
         tokens,
         connections,
         now,
@@ -416,6 +439,7 @@ export async function buildApp(
       database,
       connections,
       tokens,
+      revocations,
       now,
     });
   }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { after, before, test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   type DeviceId,
   newId,
@@ -8,8 +9,10 @@ import {
   type UserId,
 } from "@mymandev/protocol";
 import { eq } from "drizzle-orm";
+import { createDatabase } from "./client.ts";
+import { deviceRow } from "./connections.ts";
 import type { Database } from "./db.ts";
-import { recordGitHubRevocation } from "./github-revocation.ts";
+import { recordGitHubRevocation, requireSignIn } from "./github-revocation.ts";
 import { auditEvents, devices, userIdentities, users } from "./schema/index.ts";
 import { createTestDatabase } from "./testing.ts";
 
@@ -188,6 +191,147 @@ test("sign_in_required_at never moves backward", async () => {
   });
   assert.deepEqual((await userOf(alice.userId)).signInRequiredAt, LATER);
 });
+
+test("a device whose sign-in committed before the revocation must sign in again, also when its last sign-in is later than the revocation's time", async () => {
+  const db = database();
+  const alice = await seed("1010");
+  // The race of #115: the sign-in's request took its time 3 ms after the
+  // webhook's, but its transaction committed first. A revoked device's
+  // sign-in does not count.
+  const signedIn = new Date(NOW.getTime() + 3);
+  await db
+    .update(devices)
+    .set({ lastSignInAt: signedIn })
+    .where(eq(devices.id, alice.activeDevice));
+  await db
+    .update(devices)
+    .set({ lastSignInAt: LATER })
+    .where(eq(devices.id, alice.revokedDevice));
+
+  await recordGitHubRevocation(db, {
+    subject: "1010",
+    deliveryId: randomUUID(),
+    now: NOW,
+  });
+  const row = await deviceRow(db, alice.activeDevice);
+  assert.ok(row?.signInRequiredAt);
+  assert.ok(
+    row.signInRequiredAt > row.lastSignInAt,
+    "the device must sign in again",
+  );
+  assert.deepEqual(row.signInRequiredAt, new Date(signedIn.getTime() + 1));
+  assert.deepEqual((await userOf(alice.userId)).updatedAt, NOW);
+});
+
+test("a last sign-in in the future moves sign_in_required_at at most 60 seconds past the revocation's time", async () => {
+  const db = database();
+  const alice = await seed("1012");
+  // After a jump of the clock, a device's last sign-in lies a day ahead.
+  await db
+    .update(devices)
+    .set({ lastSignInAt: new Date(NOW.getTime() + 24 * 60 * 60_000) })
+    .where(eq(devices.id, alice.activeDevice));
+  await recordGitHubRevocation(db, {
+    subject: "1012",
+    deliveryId: randomUUID(),
+    now: NOW,
+  });
+  assert.deepEqual(
+    (await userOf(alice.userId)).signInRequiredAt,
+    new Date(NOW.getTime() + 60_000),
+  );
+});
+
+test("requireSignIn requires the account's devices to sign in again as a revocation does, without an audit record", async () => {
+  const db = database();
+  const alice = await seed("1013");
+  const signedIn = new Date(NOW.getTime() + 3);
+  await db
+    .update(devices)
+    .set({ lastSignInAt: signedIn })
+    .where(eq(devices.id, alice.activeDevice));
+
+  assert.deepEqual(
+    await requireSignIn(db, { userId: alice.userId, now: NOW }),
+    [alice.activeDevice],
+  );
+  const user = await userOf(alice.userId);
+  assert.deepEqual(user.signInRequiredAt, new Date(signedIn.getTime() + 1));
+  assert.deepEqual(user.updatedAt, NOW);
+  const audits = await db
+    .select()
+    .from(auditEvents)
+    .where(eq(auditEvents.subjectId, alice.userId));
+  assert.equal(audits.length, 0);
+
+  // Like a revocation, it never moves the time backward.
+  await requireSignIn(db, { userId: alice.userId, now: EARLIER });
+  assert.deepEqual(
+    (await userOf(alice.userId)).signInRequiredAt,
+    new Date(signedIn.getTime() + 1),
+  );
+});
+
+test(
+  "a revocation waits for a sign-in that holds the account's row, then requires that sign-in's device to sign in again",
+  {
+    skip:
+      process.env["DATABASE_TEST_URL"] === undefined &&
+      "needs DATABASE_TEST_URL; PGlite has a single session",
+  },
+  async () => {
+    const url = testDatabase?.url;
+    assert.ok(url, "the test database is on a server");
+    const alice = await seed("1011");
+    // A second session holds the row as a sign-in does, and its device's
+    // last sign-in is 3 ms later than the revocation's time.
+    const other = createDatabase(url, { max: 1 });
+    const holding = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const signIn = other.db.transaction(async (tx) => {
+      await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, alice.userId))
+        .for("no key update");
+      holding.resolve();
+      await release.promise;
+      await tx
+        .update(devices)
+        .set({ lastSignInAt: new Date(NOW.getTime() + 3) })
+        .where(eq(devices.id, alice.activeDevice));
+    });
+    let revocation: Promise<unknown> | undefined;
+    try {
+      await Promise.race([holding.promise, signIn]);
+      revocation = recordGitHubRevocation(database(), {
+        subject: "1011",
+        deliveryId: randomUUID(),
+        now: NOW,
+      });
+      const outcome = await Promise.race([
+        revocation.then(() => "returned"),
+        delay(500, "waited", { ref: false }),
+      ]);
+      assert.equal(outcome, "waited");
+      release.resolve();
+      await signIn;
+      await revocation;
+      const row = await deviceRow(database(), alice.activeDevice);
+      assert.ok(row?.signInRequiredAt);
+      assert.ok(
+        row.signInRequiredAt > row.lastSignInAt,
+        "the device must sign in again",
+      );
+    } finally {
+      // Settling quietly keeps the first failure as the test's error.
+      release.resolve();
+      await signIn.catch(() => undefined);
+      await revocation?.catch(() => undefined);
+      await other.close();
+    }
+  },
+);
 
 test("the account is matched by the GitHub ID, never by the login", async () => {
   const db = database();

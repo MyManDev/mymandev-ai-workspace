@@ -1,6 +1,7 @@
 import {
   auditEvents,
   devices,
+  recordGitHubRevocation,
   userIdentities,
   users,
 } from "@mymandev/database";
@@ -14,6 +15,7 @@ import {
   type DeviceId,
   newId,
   SignInResponseSchema,
+  type UserId,
 } from "@mymandev/protocol";
 import { and, eq } from "drizzle-orm";
 import assert from "node:assert/strict";
@@ -21,6 +23,7 @@ import {
   createPublicKey,
   generateKeyPairSync,
   type KeyObject,
+  randomUUID,
   sign,
 } from "node:crypto";
 import { after, before, test, type TestContext } from "node:test";
@@ -35,7 +38,12 @@ import {
 } from "../gateway-test-support.ts";
 import { ConnectionRegistry } from "../gateway.ts";
 import { Secret } from "../secret.ts";
-import { deviceApp, signInAgain, signInDevice } from "./device-test-support.ts";
+import {
+  deviceApp,
+  fakeClock,
+  signInAgain,
+  signInDevice,
+} from "./device-test-support.ts";
 import { createGitHubApi } from "./github-api.ts";
 import {
   callback,
@@ -44,6 +52,7 @@ import {
   type FakeGitHubScenario,
   listenerForm,
   REDIRECT_URI,
+  type StartedAttempt,
   startAttempt,
 } from "./github-test-support.ts";
 
@@ -139,17 +148,31 @@ async function signInApp(
   return app;
 }
 
-/** Runs the browser part of a sign-in and returns the code that reached the listener. */
-async function signInCode(app: Awaited<ReturnType<typeof signInApp>>) {
-  const attempt = await startAttempt(app);
+/**
+ * Runs GitHub's callback of an attempt, a new one by default, where the API
+ * reads the GitHub identity. The returned function confirms the attempt,
+ * maybe later, and returns the code that reached the listener.
+ */
+async function identified(
+  app: Awaited<ReturnType<typeof signInApp>>,
+  started?: StartedAttempt,
+) {
+  const attempt = started ?? (await startAttempt(app));
   await callback(app, attempt, {
     code: "github-code",
     state: attempt.apiState,
   });
-  const done = await confirm(app, attempt, "continue");
-  const code = listenerForm(done.body)?.fields.code;
-  assert.ok(code !== undefined);
-  return { code, codeVerifier: attempt.codeVerifier };
+  return async () => {
+    const done = await confirm(app, attempt, "continue");
+    const code = listenerForm(done.body)?.fields.code;
+    assert.ok(code !== undefined);
+    return { code, codeVerifier: attempt.codeVerifier };
+  };
+}
+
+/** Runs the browser part of a sign-in and returns the code that reached the listener. */
+async function signInCode(app: Awaited<ReturnType<typeof signInApp>>) {
+  return (await identified(app))();
 }
 
 function postSignIn(
@@ -217,6 +240,37 @@ function githubUser(id: number, login: string, name: string | null = null) {
 
 function codeOf(response: { json(): unknown }): string {
   return (response.json() as { code: string }).code;
+}
+
+/** GitHub's revocation of the account's authorization, recorded now as the webhook does. */
+async function revokeOnGitHub(githubId: number, now: number) {
+  await recordGitHubRevocation(database(), {
+    subject: String(githubId),
+    deliveryId: randomUUID(),
+    now: new Date(now),
+  });
+}
+
+/** Everything of the account that a sign-in writes, to show that a refused one wrote nothing. */
+async function accountRows(userId: UserId) {
+  const db = database();
+  return {
+    users: await db.select().from(users).where(eq(users.id, userId)),
+    identities: await db
+      .select()
+      .from(userIdentities)
+      .where(eq(userIdentities.userId, userId)),
+    devices: await db
+      .select()
+      .from(devices)
+      .where(eq(devices.userId, userId))
+      .orderBy(devices.id),
+    audit: await db
+      .select()
+      .from(auditEvents)
+      .where(eq(auditEvents.actorUserId, userId))
+      .orderBy(auditEvents.id),
+  };
 }
 
 test("a new device signs in: the account, its GitHub identity, the device, and audit records are stored", async (t) => {
@@ -559,6 +613,117 @@ test("the registration lock refuses a new device but not a repeated sign-in", as
     ),
   );
   assert.equal(repeated.statusCode, 200);
+});
+
+test("a sign-in whose GitHub identity was read before a recorded revocation answers sign_in_required and registers or replaces nothing", async (t) => {
+  const clock = fakeClock();
+  const app = await deviceApp(t, {
+    database: database(),
+    githubId: 1019,
+    now: clock.now,
+  });
+  const laptop = await signInDevice(app);
+  // Two sign-ins wait on the confirmation page while the person revokes the
+  // app's authorization on GitHub; they continue after the webhook arrived.
+  const forNewDevice = await identified(app);
+  const forLaptop = await identified(app);
+  clock.advance(5 * 60_000);
+  await revokeOnGitHub(1019, clock.now());
+  clock.advance(1_000);
+  const before = await accountRows(laptop.userId);
+
+  const requests = [
+    ["a new device", newDeviceRequest(await forNewDevice(), newKey())],
+    [
+      "an existing device",
+      existingDeviceRequest(
+        await forLaptop(),
+        laptop.deviceId,
+        laptop.key,
+        newKey(),
+      ),
+    ],
+  ] as const;
+  for (const [label, request] of requests) {
+    const response = await postSignIn(app, request);
+    assert.equal(response.statusCode, 401, label);
+    assert.equal(codeOf(response), "sign_in_required", label);
+  }
+  assert.deepEqual(
+    await accountRows(laptop.userId),
+    before,
+    "no device, key, login, or audit record changed",
+  );
+});
+
+test("a sign-in whose GitHub identity was read after a recorded revocation, or at the same moment, works", async (t) => {
+  const clock = fakeClock();
+  const app = await deviceApp(t, {
+    database: database(),
+    githubId: 1020,
+    now: clock.now,
+  });
+  const laptop = await signInDevice(app);
+  // The attempt starts before the revocation; GitHub's callback comes after.
+  const attempt = await startAttempt(app);
+  clock.advance(60_000);
+  await revokeOnGitHub(1020, clock.now());
+
+  // Only a later revocation refuses, as for a device's last sign-in.
+  const atRevocation = await postSignIn(
+    app,
+    newDeviceRequest(await signInCode(app), newKey()),
+  );
+  assert.equal(atRevocation.statusCode, 200, atRevocation.body);
+
+  clock.advance(1_000);
+  const forLaptop = await identified(app, attempt);
+  const next = newKey();
+  const afterRevocation = await postSignIn(
+    app,
+    existingDeviceRequest(await forLaptop(), laptop.deviceId, laptop.key, next),
+  );
+  assert.equal(afterRevocation.statusCode, 200, afterRevocation.body);
+  const [device] = await database()
+    .select()
+    .from(devices)
+    .where(eq(devices.id, laptop.deviceId));
+  assert.equal(device?.publicKey, next.publicKey);
+});
+
+test("without a recorded revocation, a sign-in works although its GitHub identity was read minutes before", async (t) => {
+  const clock = fakeClock();
+  const app = await deviceApp(t, {
+    database: database(),
+    githubId: 1021,
+    now: clock.now,
+  });
+  const laptop = await signInDevice(app);
+  const forNewDevice = await identified(app);
+  const forLaptop = await identified(app);
+  clock.advance(9 * 60_000);
+
+  const requests = [
+    ["a new device", newDeviceRequest(await forNewDevice(), newKey())],
+    [
+      "an existing device",
+      existingDeviceRequest(
+        await forLaptop(),
+        laptop.deviceId,
+        laptop.key,
+        newKey(),
+      ),
+    ],
+  ] as const;
+  for (const [label, request] of requests) {
+    const response = await postSignIn(app, request);
+    assert.equal(response.statusCode, 200, label);
+  }
+  const [user] = await database()
+    .select({ signInRequiredAt: users.signInRequiredAt })
+    .from(users)
+    .where(eq(users.id, laptop.userId));
+  assert.equal(user?.signInRequiredAt, null);
 });
 
 test("an account has at most 20 active devices and 10 new devices in 24 hours, with Retry-After", async (t) => {
