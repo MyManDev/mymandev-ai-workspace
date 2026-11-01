@@ -43,8 +43,9 @@ export type DecodeResult =
 
 /**
  * Decodes untrusted input in stages. Unknown fields are stripped at every
- * level; the input is never returned or mutated. A device uses it for events
- * that the server sends. The server uses `decodeClientEvent` instead.
+ * level; the input is never returned or mutated. A device decodes what the
+ * server sends with `decodeServerMessage`, which uses this function. The
+ * server uses `decodeClientEvent` instead, through `decodeClientMessage`.
  */
 export function decodeEvent(input: unknown): DecodeResult {
   const probe = VersionProbeSchema.safeParse(input);

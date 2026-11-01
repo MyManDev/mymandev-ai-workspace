@@ -104,3 +104,4 @@ Answered by the Project Manager on 2026-10-28.
   - Accepted.
 - Text limits and the character rule for human-entered text, including the rejected subdivision flags (P-18).
   - Accepted.
+- Update of 2026-11-01 (#110): `chat.message.send` is a device's command event, a request that the server may refuse, and keeps the name that the Project Manager chose, an exception to the past-tense rule for `type`; the fact that the server stored the message is `chat.message.created`. Only a device sends `chat.message.send`, with a `user` actor and its device, and the server never relays it. A device decodes what the server sends with `decodeServerMessage`, which uses `decodeEvent` and refuses the event types that only a device sends; after authentication the server decodes with `decodeClientMessage`, which uses `decodeClientEvent`. This exception awaits the Project Manager's confirmation. The text above is unchanged.

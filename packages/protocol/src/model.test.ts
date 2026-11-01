@@ -19,6 +19,7 @@ import {
   LIMITS,
   MEMBER_ROLES,
   OWNERSHIP_OFFER_END_REASONS,
+  PRESENCE_STATUSES,
   RUN_CANCEL_REASONS,
   RUN_STATES,
   RUN_TRANSITIONS,
@@ -26,6 +27,8 @@ import {
   SIGN_IN_LIFETIME_MS,
   TERMINAL_RUN_STATES,
   type RunState,
+  WORKSPACE_SUBSCRIBE_REFUSAL_CODES,
+  WORKSPACE_UNSUBSCRIBE_REASONS,
   WS_CLOSE_CODES,
 } from "./model.ts";
 
@@ -126,6 +129,21 @@ test("the account vocabularies are exactly the values of ADR 0014", () => {
     max: 604_800,
     default: 604_800,
   });
+});
+
+test("the workspace connection vocabularies and the message limit are the values of #110", () => {
+  assert.deepEqual(PRESENCE_STATUSES, ["online", "offline"]);
+  // One code for an unknown workspace and for a non-member (ADR 0014).
+  assert.deepEqual(WORKSPACE_SUBSCRIBE_REFUSAL_CODES, [
+    "not_found",
+    "too_many_subscriptions",
+  ]);
+  assert.deepEqual(WORKSPACE_UNSUBSCRIBE_REASONS, [
+    "requested",
+    "membership_ended",
+  ]);
+  // The `messages_body_length` CHECK of the database allows 1 to 16,000.
+  assert.equal(LIMITS.messageBody, 16_000);
 });
 
 test("a device sign-in lasts 30 days, and an open connection 24 hours more", () => {
@@ -250,6 +268,9 @@ test("the exported constants are frozen, nested values included", () => {
     ["IDENTITY_PROVIDERS", IDENTITY_PROVIDERS],
     ["RUN_CANCEL_REASONS", RUN_CANCEL_REASONS],
     ["OWNERSHIP_OFFER_END_REASONS", OWNERSHIP_OFFER_END_REASONS],
+    ["PRESENCE_STATUSES", PRESENCE_STATUSES],
+    ["WORKSPACE_SUBSCRIBE_REFUSAL_CODES", WORKSPACE_SUBSCRIBE_REFUSAL_CODES],
+    ["WORKSPACE_UNSUBSCRIBE_REASONS", WORKSPACE_UNSUBSCRIBE_REASONS],
     ["API_ERROR_CODES", API_ERROR_CODES],
     ...RUN_STATES.map((state): [string, readonly unknown[]] => [
       `RUN_TRANSITIONS.${state}`,
@@ -263,7 +284,7 @@ test("the exported constants are frozen, nested values included", () => {
     ["INVITATION_LIFETIME_SECONDS", INVITATION_LIFETIME_SECONDS],
     ["WS_CLOSE_CODES", WS_CLOSE_CODES],
   ];
-  assert.equal(arrays.length, 18);
+  assert.equal(arrays.length, 21);
   assert.equal(objects.length, 5);
 
   // Modules run in strict mode, so a write to a frozen value throws.

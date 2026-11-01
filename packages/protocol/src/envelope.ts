@@ -1,12 +1,19 @@
 import * as z from "zod";
 import { MemberRoleSchema, WorkspaceMemberSchema } from "./account.ts";
-import { displayText, RunStateSchema, UtcTimestampSchema } from "./entities.ts";
+import {
+  ChatMessageSchema,
+  displayText,
+  multilineText,
+  RunStateSchema,
+  UtcTimestampSchema,
+} from "./entities.ts";
 import {
   AgentIdSchema,
   CorrelationIdSchema,
   DeviceIdSchema,
   EventIdSchema,
   MemberIdSchema,
+  ProjectIdSchema,
   RepositoryIdSchema,
   RunIdSchema,
   UserIdSchema,
@@ -193,6 +200,46 @@ export const WorkspaceOwnershipTransferredEventSchema = z
     }
   });
 
+// Chat events (#110). A project's chat has one stream of messages; the
+// events name the project, and the server finds the conversation that holds
+// it. Storing messages and the history route belong to #27.
+
+/**
+ * A person asks the server to post a message to a project's chat. Only a
+ * device sends it, with the person's `user` actor and its own device; the
+ * server binds both to the connection (ADR 0006) and never relays this
+ * event. It is a request that the server may refuse, so its name is not in
+ * the past tense; the fact is `chat.message.created`. The event ID is the
+ * idempotency key: a resent event with the same ID creates no second message.
+ */
+export const ChatMessageSendEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("chat.message.send"),
+  payload: z.object({
+    projectId: ProjectIdSchema,
+    body: multilineText(LIMITS.messageBody),
+  }),
+});
+export type ChatMessageSendEvent = z.infer<typeof ChatMessageSendEventSchema>;
+
+/**
+ * The server stored a chat message and sends it to every connection
+ * subscribed to the workspace, the sender's included. Only the server
+ * originates it, with a `system` actor and `deviceId: null`; the null device
+ * keeps the sender's device ID from other members. The message is always
+ * attributed to its author, `payload.message.authorMemberId`.
+ * The server sets `causationId` to the ID of the `chat.message.send` that
+ * the message came from, so the sending device can replace its pending copy.
+ */
+export const ChatMessageCreatedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("chat.message.created"),
+  payload: z.object({ message: ChatMessageSchema }),
+});
+export type ChatMessageCreatedEvent = z.infer<
+  typeof ChatMessageCreatedEventSchema
+>;
+
 /**
  * Every protocol v0 event. Named `ProtocolEvent`, not `Event`, so that it
  * does not shadow the DOM `Event` type in the desktop renderer.
@@ -205,6 +252,8 @@ export const ProtocolEventSchema = z.discriminatedUnion("type", [
   WorkspaceMemberRemovedEventSchema,
   WorkspaceMemberRoleChangedEventSchema,
   WorkspaceOwnershipTransferredEventSchema,
+  ChatMessageSendEventSchema,
+  ChatMessageCreatedEventSchema,
 ]);
 export type ProtocolEvent = z.infer<typeof ProtocolEventSchema>;
 
@@ -218,8 +267,18 @@ export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
   "workspace.member.removed",
   "workspace.member.role_changed",
   "workspace.ownership.transferred",
+  "chat.message.created",
 ] as const satisfies readonly EventType[]);
 export type ServerOnlyEventType = (typeof SERVER_ONLY_EVENT_TYPES)[number];
+
+/**
+ * Event types that only a device sends. The server never relays them, so a
+ * device refuses them from the server (`decodeServerMessage`).
+ */
+export const CLIENT_ONLY_EVENT_TYPES = Object.freeze([
+  "chat.message.send",
+] as const satisfies readonly EventType[]);
+export type ClientOnlyEventType = (typeof CLIENT_ONLY_EVENT_TYPES)[number];
 
 /** The event types of this protocol version, taken from `ProtocolEventSchema`. */
 export const EVENT_TYPES: readonly EventType[] = Object.freeze(
@@ -242,7 +301,11 @@ export function actorAllowed(event: ProtocolEvent): boolean {
     case "workspace.member.removed":
     case "workspace.member.role_changed":
     case "workspace.ownership.transferred":
-      // Only the server reports membership changes.
+    case "chat.message.created":
+      // Only the server reports membership changes and stored messages.
       return event.actor.kind === "system" && event.deviceId === null;
+    case "chat.message.send":
+      // A person sends from one of their devices; identity binding checks both.
+      return event.actor.kind === "user" && event.deviceId !== null;
   }
 }

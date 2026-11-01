@@ -146,6 +146,43 @@ export type OwnershipOfferEndReason =
   (typeof OWNERSHIP_OFFER_END_REASONS)[number];
 
 /**
+ * A person's presence in a workspace (#110). A person is `online` while at
+ * least one connection of its account is subscribed to the workspace, and
+ * `offline` otherwise; an unclaimed person is always `offline`. Presence is
+ * never stored and never names a device.
+ */
+export const PRESENCE_STATUSES = Object.freeze(["online", "offline"] as const);
+export type PresenceStatus = (typeof PRESENCE_STATUSES)[number];
+
+/**
+ * Why the server refused `workspace.subscribe`. An unknown workspace and a
+ * workspace that the account is not an active member of both get
+ * `not_found`, as the HTTP routes answer both with the same `404` (ADR 0014,
+ * "What a workspace ID allows"). `too_many_subscriptions`: the connection
+ * already holds as many subscriptions as the server allows; the server sets
+ * the cap and tunes it with use (P-64). Subscribing again to a workspace
+ * that the connection holds is never refused with it.
+ */
+export const WORKSPACE_SUBSCRIBE_REFUSAL_CODES = Object.freeze([
+  "not_found",
+  "too_many_subscriptions",
+] as const);
+export type WorkspaceSubscribeRefusalCode =
+  (typeof WORKSPACE_SUBSCRIBE_REFUSAL_CODES)[number];
+
+/**
+ * Why a workspace subscription ended: the device asked with
+ * `workspace.unsubscribe`, or the account's person was removed from the
+ * workspace or left it.
+ */
+export const WORKSPACE_UNSUBSCRIBE_REASONS = Object.freeze([
+  "requested",
+  "membership_ended",
+] as const);
+export type WorkspaceUnsubscribeReason =
+  (typeof WORKSPACE_UNSUBSCRIBE_REASONS)[number];
+
+/**
  * The `code` of every HTTP error answer (P-66), with its HTTP status. The
  * list is closed: the API never sends another code.
  */
@@ -322,10 +359,22 @@ export const SIGN_IN_GRACE_MS = 24 * 60 * 60_000;
 export const SAFE_TEXT_PATTERN =
   /^(?:[^\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}\p{DI}]|\u200C|\u200D|\uFE0E|\uFE0F)*$/u;
 
+/**
+ * Human-entered text that may span lines, such as a chat message:
+ * `SAFE_TEXT_PATTERN` that also allows the line feed and the tab. Every
+ * other control character stays rejected, the carriage return included, so
+ * the desktop sends a line break as a single line feed.
+ */
+export const SAFE_MULTILINE_TEXT_PATTERN =
+  /^(?:[^\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}\p{DI}]|\n|\t|\u200C|\u200D|\uFE0E|\uFE0F)*$/u;
+
 /** At least one character that is not white space. */
 export const NOT_BLANK_PATTERN = /\S/u;
 
-/** Maximum lengths, in UTF-16 code units, of strings on the wire. */
+/**
+ * Maximum lengths of strings on the wire, in Unicode code points: zod
+ * measures a string in code points, as PostgreSQL's `char_length` does.
+ */
 export const LIMITS = Object.freeze({
   /** User display name. */
   displayName: 64,
@@ -339,4 +388,9 @@ export const LIMITS = Object.freeze({
   runReason: 500,
   /** Event type name. */
   eventType: 100,
+  /**
+   * Chat message body. Equal to the `messages_body_length` CHECK of the
+   * database, so a body within this limit always fits there.
+   */
+  messageBody: 16_000,
 } as const);

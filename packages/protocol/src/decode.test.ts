@@ -26,7 +26,7 @@ import {
   isDevicePublicKey,
   SIGN_IN_CODE_PATTERN,
 } from "./device-auth.ts";
-import { displayText } from "./entities.ts";
+import { displayText, multilineText } from "./entities.ts";
 import { envelopeHeaderShape, ProtocolEventSchema } from "./envelope.ts";
 import { UserIdSchema } from "./ids.ts";
 import {
@@ -35,6 +35,7 @@ import {
   NOT_BLANK_PATTERN,
   RUN_STATES,
   RUN_TRANSITIONS,
+  SAFE_MULTILINE_TEXT_PATTERN,
   SAFE_TEXT_PATTERN,
   UUIDV7_PATTERN,
 } from "./model.ts";
@@ -357,6 +358,7 @@ test("the JSON Schema export works, every exported pattern compiles with the u f
   });
   const patterns = collectPatterns(schema, []);
   assert.ok(patterns.includes(SAFE_TEXT_PATTERN.source));
+  assert.ok(patterns.includes(SAFE_MULTILINE_TEXT_PATTERN.source));
   assert.ok(patterns.includes(NOT_BLANK_PATTERN.source));
   assert.ok(patterns.includes(UUIDV7_PATTERN.source));
   for (const pattern of patterns) {
@@ -372,6 +374,7 @@ test("the JSON Schema export works, every exported pattern compiles with the u f
     UUIDV7_PATTERN,
     EVENT_TYPE_PATTERN,
     SAFE_TEXT_PATTERN,
+    SAFE_MULTILINE_TEXT_PATTERN,
     NOT_BLANK_PATTERN,
     GITHUB_LOGIN_PATTERN,
     BASE64URL_32_BYTES_PATTERN,
@@ -413,6 +416,11 @@ test("changing an exported pattern or the header shape does not change any schem
       "SAFE_TEXT_PATTERN",
       SAFE_TEXT_PATTERN,
       () => displayText(100).safeParse(`a${nul}b`).success,
+    ],
+    [
+      "SAFE_MULTILINE_TEXT_PATTERN",
+      SAFE_MULTILINE_TEXT_PATTERN,
+      () => multilineText(100).safeParse(`a${nul}b`).success,
     ],
     [
       "NOT_BLANK_PATTERN",
@@ -472,7 +480,7 @@ test("changing an exported pattern or the header shape does not change any schem
     ],
   ];
   cases.push(...accountCases);
-  assert.equal(cases.length, 13);
+  assert.equal(cases.length, 14);
   for (const [label, pattern, result] of cases) {
     const { source, flags } = pattern;
     const before = result();
