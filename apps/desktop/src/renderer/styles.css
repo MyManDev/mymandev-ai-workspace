@@ -1,21 +1,138 @@
+/*
+ * Placeholder styling for the product UI skeleton, which the visual design
+ * (#122) replaces. Colors, fonts, font sizes and weights, spacing, radii,
+ * borders, and the column widths are custom properties on :root; the rules
+ * below use no other color or size, apart from layout values such as 0, 1fr,
+ * and 100vh, and the narrow-window breakpoint, because a media query cannot
+ * read a custom property.
+ *
+ * The theme follows the system (prefers-color-scheme). A data-theme attribute
+ * of "light" or "dark" on the root element overrides it, so that a later
+ * setting can switch the theme by hand. The two dark blocks hold the same
+ * values (styles.test.ts checks this).
+ *
+ * The Content Security Policy allows no inline styles, so all styling lives
+ * in this file.
+ */
 :root {
   color-scheme: light dark;
-  font-family: system-ui, sans-serif;
-  --shell-border: color-mix(in srgb, CanvasText 15%, Canvas);
+
+  --color-background: #ffffff;
+  --color-surface: #f6f7f9;
+  --color-hover: #eceef1;
+  --color-selected: #dfe3e8;
+  --color-accent: #0a5fd0;
+  --color-border: #d0d5dc;
+  --color-text: #1c1f24;
+  --color-text-muted: #59616b;
+  --color-focus: #0a5fd0;
+  --color-status-neutral: #6b737d;
+  --color-status-running: #2da44e;
+  --color-status-transition: #9a6700;
+  --color-status-failed: #cf222e;
+
+  --font-family: system-ui, sans-serif;
+  --font-family-mono: ui-monospace, monospace;
+  --font-size-small: 0.875rem;
+  --font-size-base: 1rem;
+  --font-size-heading: 1.125rem;
+  --font-weight-strong: 600;
+
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+
+  --radius: 0.25rem;
+  --radius-round: 50%;
+  --border-width: 1px;
+  --focus-width: 2px;
+  --mark-width: 3px;
+  --size-sidebar: 14rem;
+  --size-panel: 18rem;
+
+  font-family: var(--font-family);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --color-background: #16181c;
+    --color-surface: #1d2025;
+    --color-hover: #262a30;
+    --color-selected: #30353c;
+    --color-accent: #6ea8ff;
+    --color-border: #3b4149;
+    --color-text: #e6e8eb;
+    --color-text-muted: #a3abb5;
+    --color-focus: #6ea8ff;
+    --color-status-neutral: #8b939d;
+    --color-status-running: #3fb950;
+    --color-status-transition: #d29922;
+    --color-status-failed: #f85149;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --color-background: #16181c;
+  --color-surface: #1d2025;
+  --color-hover: #262a30;
+  --color-selected: #30353c;
+  --color-accent: #6ea8ff;
+  --color-border: #3b4149;
+  --color-text: #e6e8eb;
+  --color-text-muted: #a3abb5;
+  --color-focus: #6ea8ff;
+  --color-status-neutral: #8b939d;
+  --color-status-running: #3fb950;
+  --color-status-transition: #d29922;
+  --color-status-failed: #f85149;
 }
 
 body {
   margin: 0;
+  background: var(--color-background);
+  color: var(--color-text);
 }
+
+:focus-visible {
+  outline: var(--focus-width) solid var(--color-focus);
+  outline-offset: var(--focus-width);
+}
+
+code {
+  font-family: var(--font-family-mono);
+}
+
+.placeholder-note {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+/* Shell layout */
 
 .shell {
   display: grid;
   grid-template-areas:
     "header header"
     "nav main";
-  grid-template-columns: 12rem 1fr;
+  grid-template-columns: var(--size-sidebar) minmax(0, 1fr);
   grid-template-rows: auto 1fr;
   min-height: 100vh;
+}
+
+.shell-project {
+  grid-template-areas:
+    "header header header"
+    "nav project-nav project-nav"
+    "nav main panel";
+  grid-template-columns: var(--size-sidebar) minmax(0, 1fr) var(--size-panel);
+  grid-template-rows: auto auto 1fr;
 }
 
 .shell-header {
@@ -23,73 +140,287 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
-  padding: 0.75rem 1rem;
-  border-bottom: 1px solid var(--shell-border);
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border-block-end: var(--border-width) solid var(--color-border);
 }
 
 .shell-header h1 {
   margin: 0;
-  font-size: 1rem;
+  font-size: var(--font-size-base);
 }
+
+.shell-main {
+  grid-area: main;
+  padding: var(--space-4);
+}
+
+.shell-main h2 {
+  margin-block-start: 0;
+  font-size: var(--font-size-heading);
+}
+
+/* Runtime status */
 
 .runtime-status {
   display: flex;
   align-items: center;
-  gap: 0.375rem;
+  gap: var(--space-2);
   margin: 0;
-  font-size: 0.875rem;
+  font-size: var(--font-size-small);
 }
 
 .runtime-status-dot {
-  width: 0.5rem;
-  height: 0.5rem;
-  border-radius: 50%;
-  background: GrayText;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-round);
+  background: var(--color-status-neutral);
 }
 
 .runtime-status[data-state="running"] .runtime-status-dot {
-  background: #2da44e;
+  background: var(--color-status-running);
 }
 
 .runtime-status[data-state="starting"] .runtime-status-dot,
 .runtime-status[data-state="stopping"] .runtime-status-dot {
-  background: #d4a72c;
+  background: var(--color-status-transition);
 }
 
 .runtime-status[data-state="failed"] .runtime-status-dot {
-  background: #cf222e;
+  background: var(--color-status-failed);
 }
+
+/* Navigation and tabs */
 
 .shell-nav {
   grid-area: nav;
-  padding: 0.5rem;
-  border-right: 1px solid var(--shell-border);
+  padding: var(--space-2);
+  border-inline-end: var(--border-width) solid var(--color-border);
+  background: var(--color-surface);
 }
 
-.shell-nav ul {
+.nav-list,
+.project-nav-list {
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.shell-nav button {
-  width: 100%;
-  padding: 0.375rem 0.5rem;
+.nav-heading {
+  margin: var(--space-4) var(--space-2) var(--space-1);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.nav-empty {
+  margin: var(--space-1) var(--space-2);
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.nav-item,
+.panel-tab {
+  padding: var(--space-1) var(--space-2);
   border: none;
-  border-radius: 0.25rem;
+  border-radius: var(--radius);
   background: none;
   color: inherit;
   font: inherit;
   text-align: start;
 }
 
-.shell-nav button[aria-current="page"] {
-  background: var(--shell-border);
-  font-weight: 600;
+.shell-nav .nav-item {
+  width: 100%;
 }
 
-.shell-main {
-  grid-area: main;
-  padding: 1rem;
+.nav-item:hover,
+.panel-tab:hover {
+  background: var(--color-hover);
+}
+
+/*
+ * The selected item has a background, a bold label, and a bar in the accent
+ * color: at the start of a sidebar item, below a project screen or a tab.
+ */
+.nav-item[aria-current],
+.panel-tab[aria-selected="true"] {
+  background: var(--color-selected);
+  font-weight: var(--font-weight-strong);
+}
+
+.shell-nav .nav-item[aria-current] {
+  box-shadow: inset var(--mark-width) 0 0 var(--color-accent);
+}
+
+.project-nav .nav-item[aria-current],
+.panel-tab[aria-selected="true"] {
+  box-shadow: inset 0 calc(-1 * var(--mark-width)) 0 var(--color-accent);
+}
+
+.project-nav {
+  grid-area: project-nav;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-4);
+  border-block-end: var(--border-width) solid var(--color-border);
+}
+
+.project-nav-name {
+  margin: 0;
+  font-weight: var(--font-weight-strong);
+}
+
+.project-nav-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/* Project side panel */
+
+.project-panel {
+  grid-area: panel;
+  padding: var(--space-4);
+  border-inline-start: var(--border-width) solid var(--color-border);
+  background: var(--color-surface);
+}
+
+.panel-tabs {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.project-panel h2 {
+  margin-block: var(--space-4) var(--space-2);
+  font-size: var(--font-size-heading);
+}
+
+/* Chat */
+
+.chat {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.chat h2 {
+  margin-block-end: 0;
+}
+
+.message-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.message {
+  padding: var(--space-3);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.message-author {
+  margin: 0 0 var(--space-1);
+  font-weight: var(--font-weight-strong);
+}
+
+.message-text {
+  margin: 0;
+}
+
+.composer {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.composer .placeholder-note {
+  margin: 0;
+}
+
+.composer-text {
+  padding: var(--space-2);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-background);
+  color: var(--color-text);
+  font: inherit;
+  resize: vertical;
+}
+
+.composer-send {
+  justify-self: end;
+  padding: var(--space-1) var(--space-4);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.composer-text:disabled,
+.composer-send:disabled {
+  background: var(--color-surface);
+  color: var(--color-text-muted);
+  cursor: not-allowed;
+}
+
+/* Permissions */
+
+.permission-section {
+  padding-block: var(--space-3);
+  border-block-start: var(--border-width) solid var(--color-border);
+}
+
+.permission-section h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-base);
+}
+
+.permission-section p {
+  margin: 0 0 var(--space-2);
+}
+
+.capability-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-2);
+  padding: 0;
+  list-style: none;
+}
+
+/* Narrow windows: the side panel moves below the screen. */
+@media (max-width: 64rem) {
+  .shell-project {
+    grid-template-areas:
+      "header header"
+      "nav project-nav"
+      "nav main"
+      "nav panel";
+    grid-template-columns: var(--size-sidebar) minmax(0, 1fr);
+    grid-template-rows: auto auto 1fr auto;
+  }
+
+  .project-panel {
+    border-inline-start: none;
+    border-block-start: var(--border-width) solid var(--color-border);
+  }
+}
+
+/*
+ * Forced colors (for example Windows contrast themes) replace backgrounds and
+ * remove shadows, so the selected item is underlined instead.
+ */
+@media (forced-colors: active) {
+  .nav-item[aria-current],
+  .panel-tab[aria-selected="true"] {
+    text-decoration: underline;
+    text-decoration-thickness: var(--mark-width);
+    text-underline-offset: var(--space-1);
+  }
 }
