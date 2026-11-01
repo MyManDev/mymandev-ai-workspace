@@ -18,6 +18,7 @@ import {
   JOIN_REQUEST_DECISIONS,
   LIMITS,
   MEMBER_ROLES,
+  OWN_JOIN_REQUEST_DECISIONS,
   OWNERSHIP_OFFER_END_REASONS,
   PRESENCE_STATUSES,
   RUN_CANCEL_REASONS,
@@ -121,6 +122,17 @@ test("the account vocabularies are exactly the values of ADR 0014", () => {
     "withdrawn",
     "expired",
   ]);
+  // The requester never sees `blocked` (#92).
+  assert.deepEqual(OWN_JOIN_REQUEST_DECISIONS, [
+    "approved",
+    "denied",
+    "withdrawn",
+    "expired",
+  ]);
+  assert.deepEqual(
+    OWN_JOIN_REQUEST_DECISIONS,
+    JOIN_REQUEST_DECISIONS.filter((decision) => decision !== "blocked"),
+  );
   assert.deepEqual(IDENTITY_PROVIDERS, ["github"]);
   assert.deepEqual(RUN_CANCEL_REASONS, ["member_removed", "device_revoked"]);
   assert.deepEqual(OWNERSHIP_OFFER_END_REASONS, ["withdrawn", "expired"]);
@@ -265,6 +277,7 @@ test("the exported constants are frozen, nested values included", () => {
     ["DEVICE_KEY_ALGORITHMS", DEVICE_KEY_ALGORITHMS],
     ["DEVICE_REVOCATION_REASONS", DEVICE_REVOCATION_REASONS],
     ["JOIN_REQUEST_DECISIONS", JOIN_REQUEST_DECISIONS],
+    ["OWN_JOIN_REQUEST_DECISIONS", OWN_JOIN_REQUEST_DECISIONS],
     ["IDENTITY_PROVIDERS", IDENTITY_PROVIDERS],
     ["RUN_CANCEL_REASONS", RUN_CANCEL_REASONS],
     ["OWNERSHIP_OFFER_END_REASONS", OWNERSHIP_OFFER_END_REASONS],
@@ -284,7 +297,7 @@ test("the exported constants are frozen, nested values included", () => {
     ["INVITATION_LIFETIME_SECONDS", INVITATION_LIFETIME_SECONDS],
     ["WS_CLOSE_CODES", WS_CLOSE_CODES],
   ];
-  assert.equal(arrays.length, 21);
+  assert.equal(arrays.length, 22);
   assert.equal(objects.length, 5);
 
   // Modules run in strict mode, so a write to a frozen value throws.

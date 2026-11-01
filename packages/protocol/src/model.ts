@@ -119,6 +119,21 @@ export const JOIN_REQUEST_DECISIONS = Object.freeze([
 ] as const);
 export type JoinRequestDecision = (typeof JOIN_REQUEST_DECISIONS)[number];
 
+/**
+ * How a join request ended, as its requester sees it (#92): a block appears
+ * as `denied`, and a request past its expiry as `expired`, also before the
+ * server marks it. A new request after a block answers
+ * `join_requests_closed`, as for a pause.
+ */
+export const OWN_JOIN_REQUEST_DECISIONS = Object.freeze([
+  "approved",
+  "denied",
+  "withdrawn",
+  "expired",
+] as const);
+export type OwnJoinRequestDecision =
+  (typeof OWN_JOIN_REQUEST_DECISIONS)[number];
+
 /** Sign-in methods that identify an account. */
 export const IDENTITY_PROVIDERS = Object.freeze(["github"] as const);
 export type IdentityProvider = (typeof IDENTITY_PROVIDERS)[number];

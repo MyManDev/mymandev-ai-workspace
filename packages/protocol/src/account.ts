@@ -29,6 +29,7 @@ import {
   JOIN_REQUEST_DECISIONS,
   LIMITS,
   MEMBER_ROLES,
+  OWN_JOIN_REQUEST_DECISIONS,
   OWNERSHIP_OFFER_END_REASONS,
   RUN_CANCEL_REASONS,
 } from "./model.ts";
@@ -38,6 +39,7 @@ export const MemberRoleSchema = z.enum(MEMBER_ROLES);
 export const DeviceKeyAlgorithmSchema = z.enum(DEVICE_KEY_ALGORITHMS);
 export const DeviceRevocationReasonSchema = z.enum(DEVICE_REVOCATION_REASONS);
 export const JoinRequestDecisionSchema = z.enum(JOIN_REQUEST_DECISIONS);
+export const OwnJoinRequestDecisionSchema = z.enum(OWN_JOIN_REQUEST_DECISIONS);
 export const IdentityProviderSchema = z.enum(IDENTITY_PROVIDERS);
 export const RunCancelReasonSchema = z.enum(RUN_CANCEL_REASONS);
 export const OwnershipOfferEndReasonSchema = z.enum(

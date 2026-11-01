@@ -83,6 +83,26 @@ export {
   type RevokeInvitationResult,
 } from "./invitations.ts";
 export {
+  approveJoinRequest,
+  type ApproveJoinRequestInput,
+  type ApproveJoinRequestResult,
+  createJoinRequest,
+  type CreateJoinRequestInput,
+  type CreateJoinRequestResult,
+  type DecideJoinRequestInput,
+  denyJoinRequest,
+  type DenyJoinRequestResult,
+  type JoinRequestRefusal,
+  listJoinRequests,
+  type ListJoinRequestsInput,
+  type ListJoinRequestsResult,
+  listOwnJoinRequests,
+  type ListOwnJoinRequestsInput,
+  withdrawJoinRequest,
+  type WithdrawJoinRequestInput,
+  type WithdrawJoinRequestResult,
+} from "./join-requests.ts";
+export {
   DatabaseError,
   toDatabaseError,
   withDatabaseErrors,

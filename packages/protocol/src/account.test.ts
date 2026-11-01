@@ -17,6 +17,7 @@ import {
   JoinRequestDecisionSchema,
   MemberRoleSchema,
   OwnershipOfferEndReasonSchema,
+  OwnJoinRequestDecisionSchema,
   RunCancelReasonSchema,
   SignInCodeSchema,
   WorkspaceMemberSchema,
@@ -29,6 +30,7 @@ import {
   IDENTITY_PROVIDERS,
   JOIN_REQUEST_DECISIONS,
   MEMBER_ROLES,
+  OWN_JOIN_REQUEST_DECISIONS,
   OWNERSHIP_OFFER_END_REASONS,
   RUN_CANCEL_REASONS,
 } from "./model.ts";
@@ -344,6 +346,7 @@ test("every account vocabulary schema matches its constant exactly", () => {
     [DeviceKeyAlgorithmSchema, DEVICE_KEY_ALGORITHMS],
     [DeviceRevocationReasonSchema, DEVICE_REVOCATION_REASONS],
     [JoinRequestDecisionSchema, JOIN_REQUEST_DECISIONS],
+    [OwnJoinRequestDecisionSchema, OWN_JOIN_REQUEST_DECISIONS],
     [IdentityProviderSchema, IDENTITY_PROVIDERS],
     [RunCancelReasonSchema, RUN_CANCEL_REASONS],
     [OwnershipOfferEndReasonSchema, OWNERSHIP_OFFER_END_REASONS],

@@ -331,6 +331,9 @@ test("on every route under /workspaces/:workspaceId, a non-member gets the answe
     "listInvitations",
     "createInvitation",
     "revokeInvitation",
+    "listJoinRequests",
+    "approveJoinRequest",
+    "denyJoinRequest",
   ]) {
     assert.ok(covered.includes(name), `${name}: ${covered.join(", ")}`);
   }

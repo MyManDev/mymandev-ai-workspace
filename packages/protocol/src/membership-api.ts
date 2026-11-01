@@ -11,6 +11,7 @@ import {
   InvitationCodeSchema,
   JoinRequestDecisionSchema,
   MemberIdentitySchema,
+  OwnJoinRequestDecisionSchema,
   WorkspaceMemberSchema,
 } from "./account.ts";
 import type { ApiRoute } from "./auth-api.ts";
@@ -139,6 +140,12 @@ export const MEMBERSHIP_ROUTES = Object.freeze({
    * answers with the pending request instead of creating another.
    */
   createJoinRequest: route("POST", "/join-requests"),
+  /**
+   * The account's own join requests, pending and ended, the most recent
+   * first, as the requester sees them: how each ended, with a block shown as
+   * a denial, and nothing about the workspace. Any account (#92).
+   */
+  listOwnJoinRequests: route("GET", "/join-requests"),
   /** The requester withdraws their own pending request. */
   withdrawJoinRequest: route("POST", "/join-requests/:joinRequestId/withdraw"),
   /**
@@ -258,6 +265,7 @@ export const MEMBERSHIP_ROUTE_ERRORS = Object.freeze({
     "join_requests_closed",
     "already_member",
   ),
+  listOwnJoinRequests: errors(),
   withdrawJoinRequest: errors("not_found", "conflict"),
   listJoinRequests: errors("not_found", "forbidden"),
   approveJoinRequest: errors(
@@ -546,6 +554,38 @@ export const CreateJoinRequestResponseSchema = z.object({
 });
 export type CreateJoinRequestResponse = z.infer<
   typeof CreateJoinRequestResponseSchema
+>;
+
+/**
+ * One of the account's own join requests with how it ended, as its
+ * requester sees it. `decision` is null while the request is pending. A
+ * block is `denied`; a request past its `expiresAt` is `expired` with
+ * `decidedAt` equal to `expiresAt`, whether or not the server marked it.
+ */
+export const OwnJoinRequestListItemSchema = OwnJoinRequestSchema.extend({
+  decision: OwnJoinRequestDecisionSchema.nullable(),
+  decidedAt: UtcTimestampSchema.nullable(),
+}).superRefine((request, ctx) => {
+  if ((request.decision === null) !== (request.decidedAt === null)) {
+    ctx.addIssue({
+      code: "custom",
+      message: "A decision has a time, and only a decision",
+      path: ["decidedAt"],
+    });
+  }
+});
+export type OwnJoinRequestListItem = z.infer<
+  typeof OwnJoinRequestListItemSchema
+>;
+
+/** The answer of `GET /join-requests`. */
+export const OwnJoinRequestListResponseSchema = z.object({
+  joinRequests: z
+    .array(OwnJoinRequestListItemSchema)
+    .max(MAX_ANSWER_LIST_ITEMS),
+});
+export type OwnJoinRequestListResponse = z.infer<
+  typeof OwnJoinRequestListResponseSchema
 >;
 
 /**
