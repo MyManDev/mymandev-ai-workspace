@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { displayText } from "./entities.ts";
+import { displayText, multilineText } from "./entities.ts";
+import { LIMITS } from "./model.ts";
 
 // Every non-ASCII character in this file is written as an escape, so that no
 // invisible or bidirectional character can hide in the source.
@@ -100,4 +101,52 @@ test("displayText rejects blank, too long, control, format and invisible charact
     );
     assert.equal(text.safeParse(character).success, false, `${label} alone`);
   }
+});
+
+test("multilineText also allows line feeds and tabs, and nothing else of the rejected characters", () => {
+  const body = multilineText(LIMITS.messageBody);
+  const accepted: [label: string, value: string][] = [
+    ["one line", "Hello"],
+    ["line feeds", "First line\nSecond line\n\nFourth line"],
+    ["tabs", "if (ready) {\n\treturn;\n}"],
+    ["ZWJ family emoji", "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}"],
+    ["Persian with ZWNJ", "\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645"],
+    ["at the limit", "a".repeat(LIMITS.messageBody)],
+    // zod counts code points, as the database CHECK does.
+    [
+      "at the limit in astral characters",
+      "\u{1F600}".repeat(LIMITS.messageBody),
+    ],
+  ];
+  for (const [label, value] of accepted) {
+    assert.equal(body.safeParse(value).success, true, label);
+  }
+
+  const rejected: [label: string, value: string][] = [
+    ["empty", ""],
+    ["only line feeds, tabs and spaces", "\n\t \n"],
+    ["over the limit", "a".repeat(LIMITS.messageBody + 1)],
+    [
+      "over the limit in astral characters",
+      "\u{1F600}".repeat(LIMITS.messageBody + 1),
+    ],
+    ["carriage return", "First\r\nSecond"],
+    ["NUL", "a\u0000b"],
+    ["ESC", "a\u001B[31mb"],
+    ["vertical tab", "a\u000Bb"],
+    ["form feed", "a\u000Cb"],
+    ["C1 NEL", "a\u0085b"],
+    ["RIGHT-TO-LEFT OVERRIDE", "a\u202Eb"],
+    ["LINE SEPARATOR", "a\u2028b"],
+    ["PARAGRAPH SEPARATOR", "a\u2029b"],
+    ["ZERO WIDTH SPACE", "a\u200Bb"],
+    ["TAG LATIN CAPITAL LETTER A", "a\u{E0041}b"],
+    ["lone high surrogate", "a\uD800b"],
+  ];
+  for (const [label, value] of rejected) {
+    assert.equal(body.safeParse(value).success, false, label);
+  }
+  // A single-line display text still refuses both.
+  assert.equal(displayText(64).safeParse("a\nb").success, false);
+  assert.equal(displayText(64).safeParse("a\tb").success, false);
 });

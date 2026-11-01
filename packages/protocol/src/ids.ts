@@ -74,6 +74,13 @@ export type JoinRequestId = z.infer<typeof JoinRequestIdSchema>;
 export const ConnectionIdSchema = uuidV7String().brand<"ConnectionId">();
 export type ConnectionId = z.infer<typeof ConnectionIdSchema>;
 
+/**
+ * One chat message (#110). The server generates it when it stores the
+ * message; the device's event ID is only the idempotency key of the send.
+ */
+export const MessageIdSchema = uuidV7String().brand<"MessageId">();
+export type MessageId = z.infer<typeof MessageIdSchema>;
+
 /** Every branded ID kind. */
 export type AnyId =
   | UserId
@@ -90,7 +97,8 @@ export type AnyId =
   | MemberId
   | InvitationId
   | JoinRequestId
-  | ConnectionId;
+  | ConnectionId
+  | MessageId;
 
 /**
  * Generates a new lowercase UUIDv7 string, for IDs that have no branded kind

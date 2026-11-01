@@ -68,3 +68,4 @@ Answered by the Project Manager on 2026-10-28.
   - Yes.
 - Confirm that a workspace ID is not a join secret and that joining needs an invitation token plus a membership check (P-13; detailed design in #14).
   - Confirmed. The join flow is decided in issue #14.
+- Update of 2026-11-01 (#110): chat message bodies, and only they, also allow the line feed (U+000A) and the tab (U+0009), so that a message can span lines and hold indented code. The carriage return and every other control character stay refused, so a line break is sent as a single line feed. Every other rule above applies to chat message bodies unchanged. The protocol checks it with `multilineText` and `SAFE_MULTILINE_TEXT_PATTERN`. This exception awaits the Project Manager's confirmation. The text above is unchanged.

@@ -3,6 +3,8 @@ import {
   AgentIdSchema,
   CorrelationIdSchema,
   DeviceIdSchema,
+  MemberIdSchema,
+  MessageIdSchema,
   ProjectIdSchema,
   RepositoryIdSchema,
   RunIdSchema,
@@ -15,11 +17,13 @@ import {
   LIMITS,
   NOT_BLANK_PATTERN,
   RUN_STATES,
+  SAFE_MULTILINE_TEXT_PATTERN,
   SAFE_TEXT_PATTERN,
 } from "./model.ts";
 import { privatePattern } from "./private-pattern.ts";
 
 const safeTextPattern = privatePattern(SAFE_TEXT_PATTERN);
+const safeMultilineTextPattern = privatePattern(SAFE_MULTILINE_TEXT_PATTERN);
 const notBlankPattern = privatePattern(NOT_BLANK_PATTERN);
 
 /**
@@ -34,6 +38,22 @@ export function displayText(maxLength: number) {
     .min(1)
     .max(maxLength, { abort: true })
     .regex(safeTextPattern, "Contains control, format or invisible characters")
+    .regex(notBlankPattern, "Must not be blank");
+}
+
+/**
+ * Like `displayText`, but the text may also hold line feeds and tabs, for
+ * example a chat message. Always render it as text, never as markup.
+ */
+export function multilineText(maxLength: number) {
+  return z
+    .string()
+    .min(1)
+    .max(maxLength, { abort: true })
+    .regex(
+      safeMultilineTextPattern,
+      "Contains control, format or invisible characters",
+    )
     .regex(notBlankPattern, "Must not be blank");
 }
 
@@ -113,3 +133,19 @@ export const AgentRunSchema = z.object({
   correlationId: CorrelationIdSchema.optional(),
 });
 export type AgentRun = z.infer<typeof AgentRunSchema>;
+
+/**
+ * One message of a project's chat (#110). The server generates the ID and
+ * the time when it stores the message; storing and the history route belong
+ * to #27. The author is shown through their person row, also after they
+ * were removed (ADR 0014, "People and roles").
+ */
+export const ChatMessageSchema = z.object({
+  id: MessageIdSchema,
+  projectId: ProjectIdSchema,
+  /** The person who wrote the message, in the project's workspace. */
+  authorMemberId: MemberIdSchema,
+  body: multilineText(LIMITS.messageBody),
+  createdAt: UtcTimestampSchema,
+});
+export type ChatMessage = z.infer<typeof ChatMessageSchema>;

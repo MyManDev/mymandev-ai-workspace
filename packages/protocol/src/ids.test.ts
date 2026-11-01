@@ -9,6 +9,7 @@ import {
   InvitationIdSchema,
   JoinRequestIdSchema,
   MemberIdSchema,
+  MessageIdSchema,
   newId,
   newUuidV7,
   PermissionGrantIdSchema,
@@ -24,6 +25,7 @@ import {
   type InvitationId,
   type JoinRequestId,
   type MemberId,
+  type MessageId,
   type PermissionGrantId,
   type ProviderConnectionId,
   type RepositoryId,
@@ -47,6 +49,7 @@ const ID_SCHEMAS = [
   InvitationIdSchema,
   JoinRequestIdSchema,
   ConnectionIdSchema,
+  MessageIdSchema,
 ];
 
 test("generated IDs are lowercase UUIDv7 and sort in creation order", () => {
@@ -114,4 +117,10 @@ test("ID kinds are not interchangeable (checked by tsc)", () => {
   // @ts-expect-error An InvitationId is not a JoinRequestId.
   const joinRequestId: JoinRequestId = invitationId;
   assert.equal(joinRequestId, invitationId);
+
+  // The event that sends a message and the stored message have different IDs.
+  const eventId = newId<EventId>();
+  // @ts-expect-error An EventId is not a MessageId.
+  const messageId: MessageId = eventId;
+  assert.equal(messageId, eventId);
 });
