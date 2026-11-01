@@ -1,0 +1,94 @@
+import { app, BrowserWindow, protocol, session } from "electron";
+import { readFile, realpath } from "node:fs/promises";
+import { join } from "node:path";
+import {
+  APP_SCHEME,
+  APP_SCHEME_PRIVILEGES,
+  createAppProtocolHandler,
+} from "./app-protocol.ts";
+import {
+  createSessionGuardInstaller,
+  installContentsGuards,
+} from "./guards.ts";
+import { isAppNavigation, resolveRendererUrl } from "./navigation.ts";
+import { createMainWindowOptions } from "./window.ts";
+
+// ADR 0014: the main process takes the single-instance lock before anything
+// touches the device key, so two instances never share one key. A second
+// instance quits at once and the first one shows its window.
+if (app.requestSingleInstanceLock()) {
+  start();
+} else {
+  app.quit();
+}
+
+function start(): void {
+  // Custom schemes must be registered before the "ready" event.
+  protocol.registerSchemesAsPrivileged([APP_SCHEME_PRIVILEGES]);
+
+  const rendererUrl = resolveRendererUrl({
+    isPackaged: app.isPackaged,
+    devServerUrl: process.env["ELECTRON_RENDERER_URL"],
+  });
+  const rendererDir = join(import.meta.dirname, "../renderer");
+  const preloadPath = join(import.meta.dirname, "../preload/index.cjs");
+  let mainWindow: BrowserWindow | undefined;
+
+  function showMainWindow(): void {
+    if (mainWindow !== undefined) {
+      if (mainWindow.isMinimized()) {
+        mainWindow.restore();
+      }
+      mainWindow.focus();
+      return;
+    }
+    const window = new BrowserWindow(
+      createMainWindowOptions(preloadPath, app.isPackaged),
+    );
+    mainWindow = window;
+    window.once("ready-to-show", () => window.show());
+    window.on("closed", () => {
+      mainWindow = undefined;
+    });
+    window.loadURL(rendererUrl).catch((error: unknown) => {
+      console.error("The application window failed to load.", error);
+    });
+  }
+
+  // Every session, including partitions that later code creates.
+  const guardSession = createSessionGuardInstaller();
+  app.on("session-created", guardSession);
+
+  // Every web contents, including windows that later code creates.
+  app.on("web-contents-created", (_event, contents) => {
+    installContentsGuards(contents, (url) => isAppNavigation(url, rendererUrl));
+  });
+
+  app.on("second-instance", () => {
+    if (app.isReady()) {
+      showMainWindow();
+    }
+  });
+
+  app.on("window-all-closed", () => {
+    if (process.platform !== "darwin") {
+      app.quit();
+    }
+  });
+
+  app
+    .whenReady()
+    .then(() => {
+      guardSession(session.defaultSession);
+      protocol.handle(
+        APP_SCHEME,
+        createAppProtocolHandler(rendererDir, { readFile, realpath }),
+      );
+      showMainWindow();
+      app.on("activate", showMainWindow);
+    })
+    .catch((error: unknown) => {
+      console.error("The application failed to start.", error);
+      app.exit(1);
+    });
+}

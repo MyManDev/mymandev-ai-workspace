@@ -25,6 +25,7 @@ ADRs 0001 to 0013 were reviewed together. Their research, experiments, and revie
 | [0013](0013-m1-data-model.md)                              | M1 data model conventions and the M1-03 tables       | Accepted |
 | [0015](0015-capability-and-permission-contract-v0.md)      | Capability and permission contract v0                | Accepted |
 | [0014](0014-accounts-devices-and-invitations.md)           | Accounts, device credentials and invitations         | Accepted |
+| [0016](0016-desktop-toolchain.md)                          | Desktop toolchain and Electron security baseline     | Accepted |
 
 ## Numbering
 

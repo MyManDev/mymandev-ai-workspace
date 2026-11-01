@@ -50,3 +50,8 @@ jobs:
 
       - name: Check
         run: npm run check
+
+      # Bundles the main process, the preload script, and the renderer. The
+      # build does not need the Electron binary, and CI never launches Electron.
+      - name: Build the desktop application
+        run: npm run build -w @mymandev/desktop

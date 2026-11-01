@@ -1,0 +1,63 @@
+:root {
+  color-scheme: light dark;
+  font-family: system-ui, sans-serif;
+  --shell-border: color-mix(in srgb, CanvasText 15%, Canvas);
+}
+
+body {
+  margin: 0;
+}
+
+.shell {
+  display: grid;
+  grid-template-areas:
+    "header header"
+    "nav main";
+  grid-template-columns: 12rem 1fr;
+  grid-template-rows: auto 1fr;
+  min-height: 100vh;
+}
+
+.shell-header {
+  grid-area: header;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--shell-border);
+}
+
+.shell-header h1 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.shell-nav {
+  grid-area: nav;
+  padding: 0.5rem;
+  border-right: 1px solid var(--shell-border);
+}
+
+.shell-nav ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.shell-nav button {
+  width: 100%;
+  padding: 0.375rem 0.5rem;
+  border: none;
+  border-radius: 0.25rem;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+}
+
+.shell-nav button[aria-current="page"] {
+  background: var(--shell-border);
+  font-weight: 600;
+}
+
+.shell-main {
+  grid-area: main;
+  padding: 1rem;
+}
