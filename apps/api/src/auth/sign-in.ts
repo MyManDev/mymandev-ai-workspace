@@ -33,7 +33,12 @@ import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
 import { sendCancelledRuns } from "../workspaces/events.ts";
-import { type RecentRevocations, s256, type SignInCodes } from "./attempts.ts";
+import {
+  type RecentRevocations,
+  s256,
+  type SignInCodes,
+  type UsedSignInCode,
+} from "./attempts.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
 import { deviceListItem } from "./device-state.ts";
 import type { GitHubIdentity } from "./github-api.ts";
@@ -117,7 +122,9 @@ function signaturesValid(
  * `POST /auth/sign-in` (ADR 0014, steps 7 and 8): takes the sign-in code once,
  * checks the PKCE verifier, `redirect_uri`, and the signatures, then creates
  * or updates the account and registers the device or replaces its key, in
- * one transaction. The answer carries no credential.
+ * one transaction. The answer carries no credential. A code that a request
+ * of its own attempt already took answers `sign_in_code_used` to that
+ * attempt (#152).
  */
 export async function registerSignIn(
   app: FastifyInstance,
@@ -145,116 +152,137 @@ export async function registerSignIn(
       },
       async (request): Promise<SignInResponse> => {
         const body = request.body as SignInRequest;
+        const challenge = s256(body.codeVerifier);
+        // Whether the request comes from the attempt that the code is bound to.
+        const ofAttempt = (bound: UsedSignInCode) =>
+          challenge === bound.desktopCodeChallenge &&
+          body.redirectUri === bound.redirectUri;
         // Taking the code consumes it, also when a later check fails.
         const binding = codes.take(body.code);
-        if (
-          binding === null ||
-          s256(body.codeVerifier) !== binding.desktopCodeChallenge ||
-          body.redirectUri !== binding.redirectUri
-        ) {
+        if (binding === null) {
+          // A copy of a request of the code's attempt may follow its commit,
+          // so it must not read as "nothing was committed" (#152). Only that
+          // attempt's verifier and redirect URI learn that the code was used.
+          const used = codes.used(body.code);
+          throw new ApiError(
+            used !== null && ofAttempt(used)
+              ? "sign_in_code_used"
+              : "auth_failed",
+          );
+        }
+        if (!ofAttempt(binding)) {
+          // A code burned by another request leaves no record: nothing was
+          // committed, so its attempt's own request gets auth_failed too.
           throw new ApiError("auth_failed");
         }
-
-        const now = new Date(options.now());
-        let currentKey: string | null = null;
-        if (body.device.kind === "existing") {
-          const [row] = await database
-            .select({ publicKey: devices.publicKey })
-            .from(devices)
-            .where(eq(devices.id, body.device.deviceId));
-          currentKey = row?.publicKey ?? null;
-          // Each sign-in replaces the key; keeping it would keep a copied key valid.
-          if (currentKey === body.device.publicKey) {
+        // Recorded before the first await, so that a copy that arrives while
+        // this request runs finds it, and again when the request ends, so
+        // that a slow request still leaves a copy the full code lifetime.
+        codes.markUsed(body.code, binding);
+        try {
+          const now = new Date(options.now());
+          let currentKey: string | null = null;
+          if (body.device.kind === "existing") {
+            const [row] = await database
+              .select({ publicKey: devices.publicKey })
+              .from(devices)
+              .where(eq(devices.id, body.device.deviceId));
+            currentKey = row?.publicKey ?? null;
+            // Each sign-in replaces the key; keeping it would keep a copied key valid.
+            if (currentKey === body.device.publicKey) {
+              throw new ApiError("auth_failed");
+            }
+          }
+          if (
+            !signaturesValid(publicOrigin, body.code, body.device, currentKey)
+          ) {
             throw new ApiError("auth_failed");
           }
-        }
-        if (
-          !signaturesValid(publicOrigin, body.code, body.device, currentKey)
-        ) {
-          throw new ApiError("auth_failed");
-        }
-        // GitHub reported a revocation of this identity after the API read
-        // it, also of a person without an account yet (#115).
-        const revokedSinceRead = () =>
-          (revocations.latest(binding.identity.githubId) ??
-            Number.NEGATIVE_INFINITY) > binding.identityReadAt;
-        if (revokedSinceRead()) {
-          throw new ApiError("sign_in_required");
-        }
+          // GitHub reported a revocation of this identity after the API read
+          // it, also of a person without an account yet (#115).
+          const revokedSinceRead = () =>
+            (revocations.latest(binding.identity.githubId) ??
+              Number.NEGATIVE_INFINITY) > binding.identityReadAt;
+          if (revokedSinceRead()) {
+            throw new ApiError("sign_in_required");
+          }
 
-        let result: SignInResult;
-        try {
-          result = await database.transaction((tx) =>
-            signIn(
-              tx,
-              binding.identity,
-              new Date(binding.identityReadAt),
-              body.device,
-              currentKey,
-              now,
-            ),
-          );
-        } catch (error) {
-          if (error instanceof ApiError || !fromDatabase(error)) {
-            throw error;
+          let result: SignInResult;
+          try {
+            result = await database.transaction((tx) =>
+              signIn(
+                tx,
+                binding.identity,
+                new Date(binding.identityReadAt),
+                body.device,
+                currentKey,
+                now,
+              ),
+            );
+          } catch (error) {
+            if (error instanceof ApiError || !fromDatabase(error)) {
+              throw error;
+            }
+            const failure = toDatabaseError(error);
+            // A concurrent sign-in of the same account or the same key.
+            throw failure.code === "23505" ? new ApiError("conflict") : failure;
           }
-          const failure = toDatabaseError(error);
-          // A concurrent sign-in of the same account or the same key.
-          throw failure.code === "23505" ? new ApiError("conflict") : failure;
-        }
-        const { userId, deviceId } = result.response;
-        const replaced = result.replacedDeviceId;
-        // The earlier tokens of the device would be refused anyway; dropping
-        // them keeps them from using up the account's request limit.
-        tokens.dropDevice(deviceId);
-        if (replaced !== null) {
-          tokens.dropDevice(replaced);
-          // The replaced device learns it from its close, before any frame.
-          connections.closeDevice(replaced, "device_revoked", request.log);
-          // Each cancelled run reaches its workspace's subscribed
-          // connections (ADR 0014, P-60; #110).
-          sendCancelledRuns(connections, result.cancelledRuns, now);
-        }
-        if (result.registered === null) {
-          // An existing device: its connection used the key that this
-          // sign-in replaced.
-          connections.closeDevice(deviceId, "key_replaced", request.log);
-        } else {
-          // The new device has no connection yet; the account's other
-          // connections hear of it and of the device it replaced.
-          const registered: AccountDeviceRegisteredFrame = {
-            protocolVersion: PROTOCOL_VERSION,
-            type: "account.device_registered",
-            device: { ...result.registered, revokedAt: null, current: false },
-          };
-          connections.sendToUser(userId, registered, deviceId);
+          const { userId, deviceId } = result.response;
+          const replaced = result.replacedDeviceId;
+          // The earlier tokens of the device would be refused anyway; dropping
+          // them keeps them from using up the account's request limit.
+          tokens.dropDevice(deviceId);
           if (replaced !== null) {
-            const revoked: AccountDeviceRevokedFrame = {
-              protocolVersion: PROTOCOL_VERSION,
-              type: "account.device_revoked",
-              deviceId: replaced,
-              reason: "replaced",
-              revokedAt: now.toISOString(),
-            };
-            connections.sendToUser(userId, revoked, replaced);
+            tokens.dropDevice(replaced);
+            // The replaced device learns it from its close, before any frame.
+            connections.closeDevice(replaced, "device_revoked", request.log);
+            // Each cancelled run reaches its workspace's subscribed
+            // connections (ADR 0014, P-60; #110).
+            sendCancelledRuns(connections, result.cancelledRuns, now);
           }
+          if (result.registered === null) {
+            // An existing device: its connection used the key that this
+            // sign-in replaced.
+            connections.closeDevice(deviceId, "key_replaced", request.log);
+          } else {
+            // The new device has no connection yet; the account's other
+            // connections hear of it and of the device it replaced.
+            const registered: AccountDeviceRegisteredFrame = {
+              protocolVersion: PROTOCOL_VERSION,
+              type: "account.device_registered",
+              device: { ...result.registered, revokedAt: null, current: false },
+            };
+            connections.sendToUser(userId, registered, deviceId);
+            if (replaced !== null) {
+              const revoked: AccountDeviceRevokedFrame = {
+                protocolVersion: PROTOCOL_VERSION,
+                type: "account.device_revoked",
+                deviceId: replaced,
+                reason: "replaced",
+                revokedAt: now.toISOString(),
+              };
+              connections.sendToUser(userId, revoked, replaced);
+            }
+          }
+          // The webhook records a revocation in memory before its transaction
+          // looks up the account. If it recorded it before the check above,
+          // this sign-in was refused there. If it recorded it before this line,
+          // its lookup may have run before this commit and missed an account
+          // that this sign-in created, so the account is marked here. If it
+          // records it after this line, its lookup runs after this commit,
+          // finds the account, and marks it past this device's last sign-in.
+          // The device is registered and its key replaced, so the answer still
+          // says so; the device's next authentication answers sign_in_required.
+          if (revokedSinceRead()) {
+            await requireSignIn(database, {
+              userId,
+              now: new Date(options.now()),
+            });
+          }
+          return result.response;
+        } finally {
+          codes.markUsed(body.code, binding);
         }
-        // The webhook records a revocation in memory before its transaction
-        // looks up the account. If it recorded it before the check above,
-        // this sign-in was refused there. If it recorded it before this line,
-        // its lookup may have run before this commit and missed an account
-        // that this sign-in created, so the account is marked here. If it
-        // records it after this line, its lookup runs after this commit,
-        // finds the account, and marks it past this device's last sign-in.
-        // The device is registered and its key replaced, so the answer still
-        // says so; the device's next authentication answers sign_in_required.
-        if (revokedSinceRead()) {
-          await requireSignIn(database, {
-            userId,
-            now: new Date(options.now()),
-          });
-        }
-        return result.response;
       },
     );
   });

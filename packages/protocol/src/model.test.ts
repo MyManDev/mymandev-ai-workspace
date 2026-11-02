@@ -185,6 +185,7 @@ test("every API error code has its fixed HTTP status", () => {
     device_account_mismatch: 409,
     already_member: 409,
     conflict: 409,
+    sign_in_code_used: 409,
     rate_limited: 429,
     internal_error: 500,
     sign_in_unavailable: 503,
