@@ -1028,3 +1028,54 @@ test("the people routes need a valid access token", async (t) => {
     assert.equal(errorCode(response), "unauthorized");
   }
 });
+
+test("defining a person in a workspace at its limit of unclaimed people answers 429 with rate_limited and a Retry-After of one day, and a removal frees a place", async (t) => {
+  const recorded = recorder();
+  const owner = await signedIn(
+    await workspaceApp(t, { githubId: 3140, ...recorded }),
+  );
+  const admin = await signedIn(
+    await workspaceApp(t, { githubId: 3141, ...recorded }),
+  );
+  const created = await post(owner, "/workspaces", {
+    name: "Small",
+    displayName: "Ada at work",
+    maxUnclaimedMembers: 2,
+  });
+  assert.equal(created.statusCode, 200, created.body);
+  const { workspace } = CreateWorkspaceResponseSchema.parse(created.json());
+  await addClaimed(workspace.id, admin.device, owner.device, "admin");
+  const first = await defined(owner, workspace.id, "Linus");
+  await defined(admin, workspace.id, "Margaret");
+  const before = await view(owner, workspace.id);
+
+  for (const session of [owner, admin]) {
+    const refused = await define(session, workspace.id, {
+      displayName: "Grace",
+    });
+    assert.equal(refused.statusCode, 429);
+    assert.deepEqual(refused.json(), {
+      statusCode: 429,
+      error: "Too Many Requests",
+      message: "Too Many Requests",
+      code: "rate_limited",
+    });
+    assert.equal(refused.headers["retry-after"], String(24 * 60 * 60));
+  }
+  assert.deepEqual(await view(owner, workspace.id), before, "nothing changed");
+  assert.deepEqual(
+    recorded.events.map((event) => event.type),
+    ["workspace.member.defined", "workspace.member.defined"],
+    "a refusal sends no event",
+  );
+
+  assert.equal((await remove(owner, workspace.id, first)).statusCode, 204);
+  await defined(admin, workspace.id, "Grace");
+  const unclaimed = (await view(owner, workspace.id)).members.filter(
+    (person) => person.userId === null && person.removedAt === null,
+  );
+  assert.deepEqual(
+    unclaimed.map((person) => person.displayName),
+    ["Grace", "Margaret"],
+  );
+});

@@ -82,6 +82,9 @@ export {
   renameMember,
   type RenameMemberInput,
   type RenameMemberResult,
+  setUnclaimedMemberLimit,
+  type SetUnclaimedMemberLimitInput,
+  type SetUnclaimedMemberLimitResult,
 } from "./people.ts";
 export {
   acceptOwnershipOffer,

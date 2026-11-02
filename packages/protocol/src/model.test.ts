@@ -28,6 +28,7 @@ import {
   SIGN_IN_LIFETIME_MS,
   TERMINAL_RUN_STATES,
   type RunState,
+  UNCLAIMED_MEMBER_LIMIT,
   WORKSPACE_SUBSCRIBE_REFUSAL_CODES,
   WORKSPACE_UNSUBSCRIBE_REASONS,
   WS_CLOSE_CODES,
@@ -295,10 +296,11 @@ test("the exported constants are frozen, nested values included", () => {
     ["LIMITS", LIMITS],
     ["API_ERROR_STATUS", API_ERROR_STATUS],
     ["INVITATION_LIFETIME_SECONDS", INVITATION_LIFETIME_SECONDS],
+    ["UNCLAIMED_MEMBER_LIMIT", UNCLAIMED_MEMBER_LIMIT],
     ["WS_CLOSE_CODES", WS_CLOSE_CODES],
   ];
   assert.equal(arrays.length, 22);
-  assert.equal(objects.length, 5);
+  assert.equal(objects.length, 6);
 
   // Modules run in strict mode, so a write to a frozen value throws.
   for (const [label, value] of arrays) {

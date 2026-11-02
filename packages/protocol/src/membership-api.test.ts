@@ -33,6 +33,7 @@ import {
   PreviewInvitationRequestSchema,
   PreviewInvitationResponseSchema,
   RenameMemberRequestSchema,
+  SetUnclaimedMemberLimitRequestSchema,
   WorkspaceListResponseSchema,
   WorkspaceViewResponseSchema,
 } from "./membership-api.ts";
@@ -40,6 +41,7 @@ import {
   API_ERROR_CODES,
   type ApiErrorCode,
   MAX_ANSWER_LIST_ITEMS,
+  UNCLAIMED_MEMBER_LIMIT,
 } from "./model.ts";
 
 type Schema = { safeParse(value: unknown): { success: boolean } };
@@ -169,6 +171,7 @@ test("the membership routes are fixed, frozen, and apart from the authentication
     "GET /workspaces",
     "POST /workspaces",
     "GET /workspaces/:workspaceId",
+    "POST /workspaces/:workspaceId/unclaimed-member-limit",
     "POST /workspaces/:workspaceId/members",
     "POST /workspaces/:workspaceId/members/:memberId/rename",
     "POST /workspaces/:workspaceId/members/:memberId/remove",
@@ -302,6 +305,7 @@ test("each route answers only known error codes, the common ones included", () =
     listWorkspaces: [],
     createWorkspace: [],
     getWorkspace: ["not_found"],
+    setUnclaimedMemberLimit: ["not_found", "forbidden", "conflict"],
     defineMember: ["not_found", "forbidden"],
     renameMember: ["not_found", "forbidden", "conflict"],
     removeMember: ["not_found", "forbidden", "conflict"],
@@ -512,9 +516,16 @@ test("the workspace list carries each workspace with the account's own active pe
   ]);
 });
 
-test("creating a workspace takes its name and the creator's display name", () => {
+test("creating a workspace takes its name, the creator's display name, and an optional limit of unclaimed people", () => {
   const body = { name: "MyManDev", displayName: "Grace" };
   assert.equal(CreateWorkspaceRequestSchema.safeParse(body).success, true);
+  for (const maxUnclaimedMembers of [1, 20, 500]) {
+    assert.deepEqual(
+      CreateWorkspaceRequestSchema.parse({ ...body, maxUnclaimedMembers }),
+      { ...body, maxUnclaimedMembers },
+      String(maxUnclaimedMembers),
+    );
+  }
   assert.equal(
     CreateWorkspaceRequestSchema.safeParse({
       name: "a".repeat(100),
@@ -534,6 +545,12 @@ test("creating a workspace takes its name and the creator's display name", () =>
     ],
     ...withoutEach(body),
     ["name as a number", { ...body, name: 1 }],
+    ["limit of 0", { ...body, maxUnclaimedMembers: 0 }],
+    ["limit over 500", { ...body, maxUnclaimedMembers: 501 }],
+    ["negative limit", { ...body, maxUnclaimedMembers: -1 }],
+    ["fractional limit", { ...body, maxUnclaimedMembers: 20.5 }],
+    ["limit as a string", { ...body, maxUnclaimedMembers: "500" }],
+    ["null limit", { ...body, maxUnclaimedMembers: null }],
   ]);
   const parsed = CreateWorkspaceRequestSchema.parse({
     ...body,
@@ -553,11 +570,12 @@ test("creating a workspace takes its name and the creator's display name", () =>
   );
 });
 
-test("the workspace view shows every person, the pause, and a valid ownership offer", () => {
+test("the workspace view shows every person, the pause, the limit of unclaimed people, and a valid ownership offer", () => {
   const view = {
     workspace,
     members: [owner, member, unclaimed, former],
     joinRequestsPausedAt: null,
+    maxUnclaimedMembers: 500,
     ownershipOffer: null,
   };
   const offer = { memberId: MEMBER_ID, offeredAt: NOW, expiresAt: LATER };
@@ -568,6 +586,11 @@ test("the workspace view shows every person, the pause, and a valid ownership of
       joinRequestsPausedAt: NOW,
       ownershipOffer: offer,
     }).success,
+    true,
+  );
+  assert.equal(
+    WorkspaceViewResponseSchema.safeParse({ ...view, maxUnclaimedMembers: 1 })
+      .success,
     true,
   );
   assert.equal(
@@ -627,6 +650,10 @@ test("the workspace view shows every person, the pause, and a valid ownership of
       { ...view, joinRequestsPausedAt: "2026-10-29T12:00:00Z" },
     ],
     ["pause as a boolean", { ...view, joinRequestsPausedAt: true }],
+    ["limit of 0", { ...view, maxUnclaimedMembers: 0 }],
+    ["limit over 500", { ...view, maxUnclaimedMembers: 501 }],
+    ["fractional limit", { ...view, maxUnclaimedMembers: 1.5 }],
+    ["null limit", { ...view, maxUnclaimedMembers: null }],
     ["pause as undefined", { ...view, joinRequestsPausedAt: undefined }],
     ["offer as undefined", { ...view, ownershipOffer: undefined }],
     [
@@ -644,9 +671,37 @@ test("the workspace view shows every person, the pause, and a valid ownership of
   });
   assert.deepEqual(Object.keys(parsed).sort(), [
     "joinRequestsPausedAt",
+    "maxUnclaimedMembers",
     "members",
     "ownershipOffer",
     "workspace",
+  ]);
+});
+
+test("the limit of unclaimed people lies from 1 to 500, 500 by default, below the answer list maximum", () => {
+  assert.deepEqual(UNCLAIMED_MEMBER_LIMIT, { min: 1, max: 500, default: 500 });
+  assert.equal(Object.isFrozen(UNCLAIMED_MEMBER_LIMIT), true);
+  assert.ok(UNCLAIMED_MEMBER_LIMIT.max < MAX_ANSWER_LIST_ITEMS);
+
+  for (const maxUnclaimedMembers of [1, 2, 499, 500]) {
+    assert.deepEqual(
+      SetUnclaimedMemberLimitRequestSchema.parse({
+        maxUnclaimedMembers,
+        workspaceId: WORKSPACE_ID,
+      }),
+      { maxUnclaimedMembers },
+      String(maxUnclaimedMembers),
+    );
+  }
+  assertRejects(SetUnclaimedMemberLimitRequestSchema, [
+    ["0", { maxUnclaimedMembers: 0 }],
+    ["501", { maxUnclaimedMembers: 501 }],
+    ["negative", { maxUnclaimedMembers: -500 }],
+    ["fractional", { maxUnclaimedMembers: 499.5 }],
+    ["infinite", { maxUnclaimedMembers: Number.POSITIVE_INFINITY }],
+    ["string", { maxUnclaimedMembers: "500" }],
+    ["null", { maxUnclaimedMembers: null }],
+    ["missing", {}],
   ]);
 });
 
@@ -1153,6 +1208,7 @@ test("every route with a body has its schemas, and they export to JSON Schema", 
       CreateWorkspaceResponseSchema,
     ],
     getWorkspace: [null, WorkspaceViewResponseSchema],
+    setUnclaimedMemberLimit: [SetUnclaimedMemberLimitRequestSchema, null],
     defineMember: [DefineMemberRequestSchema, DefineMemberResponseSchema],
     renameMember: [RenameMemberRequestSchema, null],
     removeMember: [null, null],
@@ -1255,6 +1311,7 @@ test("every answer list holds at most MAX_ANSWER_LIST_ITEMS items", () => {
         workspace,
         members: [owner, ...Array(count - 1).fill(former)],
         joinRequestsPausedAt: null,
+        maxUnclaimedMembers: 500,
         ownershipOffer: null,
       }),
       WorkspaceViewResponseSchema,

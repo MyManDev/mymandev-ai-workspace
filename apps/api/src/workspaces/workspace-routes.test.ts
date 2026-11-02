@@ -1,4 +1,5 @@
 import {
+  auditEvents,
   devices,
   userIdentities,
   workspaceMembers,
@@ -7,8 +8,10 @@ import {
 import {
   ApiErrorBodySchema,
   CreateWorkspaceResponseSchema,
+  DefineMemberResponseSchema,
   MEMBERSHIP_ROUTES,
   type MemberId,
+  type MemberRole,
   newId,
   newUuidV7,
   type WorkspaceId,
@@ -84,11 +87,12 @@ async function createWorkspace(
   return CreateWorkspaceResponseSchema.parse(response.json());
 }
 
-/** Adds the device's account to the workspace as a claimed member. */
+/** Adds the device's account to the workspace as a claimed person, a member by default. */
 async function addMember(
   workspaceId: WorkspaceId,
   device: SignedInDevice,
   addedBy: SignedInDevice,
+  role: MemberRole = "member",
 ): Promise<MemberId> {
   const id = newId<MemberId>();
   await database().insert(workspaceMembers).values({
@@ -96,7 +100,7 @@ async function addMember(
     workspaceId,
     userId: device.userId,
     displayName: "Grace",
-    role: "member",
+    role,
     addedByUserId: addedBy.userId,
     claimedAt: new Date(),
   });
@@ -153,6 +157,7 @@ test("creating a workspace makes the creator its claimed owner with the given na
     workspace: created.workspace,
     members: [created.member],
     joinRequestsPausedAt: null,
+    maxUnclaimedMembers: 500,
     ownershipOffer: null,
   });
 });
@@ -325,6 +330,7 @@ test("on every route under /workspaces/:workspaceId, a non-member gets the answe
   }
   for (const name of [
     "getWorkspace",
+    "setUnclaimedMemberLimit",
     "defineMember",
     "renameMember",
     "removeMember",
@@ -493,4 +499,186 @@ test("without a database, the workspace routes answer the generic 404", async (t
     assert.equal(response.statusCode, 404);
     assert.deepEqual(response.json(), NOT_FOUND);
   }
+});
+
+const FORBIDDEN = {
+  statusCode: 403,
+  error: "Forbidden",
+  message: "Forbidden",
+  code: "forbidden",
+};
+
+const CONFLICT = {
+  statusCode: 409,
+  error: "Conflict",
+  message: "Conflict",
+  code: "conflict",
+};
+
+async function viewOf(app: App, token: string, workspaceId: WorkspaceId) {
+  const response = await get(app, `/workspaces/${workspaceId}`, token);
+  assert.equal(response.statusCode, 200, response.body);
+  return WorkspaceViewResponseSchema.parse(response.json());
+}
+
+function setLimit(
+  app: App,
+  token: string,
+  workspaceId: WorkspaceId,
+  payload: object,
+) {
+  return post(
+    app,
+    `/workspaces/${workspaceId}/unclaimed-member-limit`,
+    token,
+    payload,
+  );
+}
+
+async function defineUnclaimed(
+  app: App,
+  token: string,
+  workspaceId: WorkspaceId,
+  displayName: string,
+) {
+  const response = await post(
+    app,
+    `/workspaces/${workspaceId}/members`,
+    token,
+    {
+      displayName,
+    },
+  );
+  assert.equal(response.statusCode, 200, response.body);
+  return DefineMemberResponseSchema.parse(response.json()).member.id;
+}
+
+test("a workspace gets the limit of unclaimed people that its creator sends, 500 without one, and a limit outside 1 to 500 answers 400", async (t) => {
+  const app = await workspaceApp(t, { githubId: 3014 });
+  const { device, token } = await signedIn(app);
+
+  const standard = await createWorkspace(app, token, "Standard");
+  assert.equal(
+    (await viewOf(app, token, standard.workspace.id)).maxUnclaimedMembers,
+    500,
+  );
+  for (const maxUnclaimedMembers of [1, 500]) {
+    const response = await post(app, "/workspaces", token, {
+      name: `Limit ${maxUnclaimedMembers}`,
+      displayName: "Ada",
+      maxUnclaimedMembers,
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    const { workspace } = CreateWorkspaceResponseSchema.parse(response.json());
+    assert.equal(
+      (await viewOf(app, token, workspace.id)).maxUnclaimedMembers,
+      maxUnclaimedMembers,
+    );
+  }
+
+  for (const maxUnclaimedMembers of [0, 501, 2.5, "20", null]) {
+    const response = await post(app, "/workspaces", token, {
+      name: "Out of range",
+      displayName: "Ada",
+      maxUnclaimedMembers,
+    });
+    assert.equal(response.statusCode, 400, String(maxUnclaimedMembers));
+    assert.equal((response.json() as { code: string }).code, "bad_request");
+  }
+  const created = await database()
+    .select({ id: workspaces.id })
+    .from(workspaces)
+    .where(eq(workspaces.createdByUserId, device.userId));
+  assert.equal(created.length, 3);
+});
+
+test("only the owner changes the limit of unclaimed people, never below their number, and the view shows it", async (t) => {
+  const ownerApp = await workspaceApp(t, { githubId: 3015 });
+  const owner = await signedIn(ownerApp);
+  const adminApp = await workspaceApp(t, { githubId: 3016 });
+  const admin = await signedIn(adminApp);
+  const memberApp = await workspaceApp(t, { githubId: 3017 });
+  const member = await signedIn(memberApp);
+  const { workspace } = await createWorkspace(ownerApp, owner.token);
+  await addMember(workspace.id, admin.device, owner.device, "admin");
+  await addMember(workspace.id, member.device, owner.device);
+  await defineUnclaimed(ownerApp, owner.token, workspace.id, "Linus");
+  await defineUnclaimed(adminApp, admin.token, workspace.id, "Margaret");
+
+  for (const [label, app, token] of [
+    ["an admin", adminApp, admin.token],
+    ["a member", memberApp, member.token],
+  ] as const) {
+    const refused = await setLimit(app, token, workspace.id, {
+      maxUnclaimedMembers: 10,
+    });
+    assert.equal(refused.statusCode, 403, label);
+    assert.deepEqual(refused.json(), FORBIDDEN, label);
+  }
+  const below = await setLimit(ownerApp, owner.token, workspace.id, {
+    maxUnclaimedMembers: 1,
+  });
+  assert.equal(below.statusCode, 409);
+  assert.deepEqual(below.json(), CONFLICT);
+  for (const payload of [
+    {},
+    { maxUnclaimedMembers: 0 },
+    { maxUnclaimedMembers: 501 },
+    { maxUnclaimedMembers: 1.5 },
+    { maxUnclaimedMembers: "2" },
+  ]) {
+    const malformed = await setLimit(
+      ownerApp,
+      owner.token,
+      workspace.id,
+      payload,
+    );
+    assert.equal(malformed.statusCode, 400, JSON.stringify(payload));
+    assert.equal((malformed.json() as { code: string }).code, "bad_request");
+  }
+  assert.equal(
+    (await viewOf(ownerApp, owner.token, workspace.id)).maxUnclaimedMembers,
+    500,
+    "a refusal changes nothing",
+  );
+
+  // Exactly the number of active unclaimed people is allowed.
+  for (const maxUnclaimedMembers of [2, 2]) {
+    const response = await setLimit(ownerApp, owner.token, workspace.id, {
+      maxUnclaimedMembers,
+    });
+    assert.equal(response.statusCode, 204, response.body);
+    assert.equal(response.body, "");
+  }
+  for (const [app, token] of [
+    [ownerApp, owner.token],
+    [memberApp, member.token],
+  ] as const) {
+    assert.equal(
+      (await viewOf(app, token, workspace.id)).maxUnclaimedMembers,
+      2,
+      "every member sees the limit",
+    );
+  }
+  const audited = await database()
+    .select({
+      action: auditEvents.action,
+      actorUserId: auditEvents.actorUserId,
+      actorDeviceId: auditEvents.actorDeviceId,
+      subjectId: auditEvents.subjectId,
+    })
+    .from(auditEvents)
+    .where(eq(auditEvents.action, "workspace.unclaimed_member_limit_changed"));
+  assert.deepEqual(
+    audited,
+    [
+      {
+        action: "workspace.unclaimed_member_limit_changed",
+        actorUserId: owner.device.userId,
+        actorDeviceId: owner.device.deviceId,
+        subjectId: workspace.id,
+      },
+    ],
+    "setting the limit in force again writes nothing",
+  );
 });

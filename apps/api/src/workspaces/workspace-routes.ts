@@ -2,6 +2,7 @@ import {
   createWorkspace,
   type Database,
   listWorkspaces,
+  setUnclaimedMemberLimit,
   workspaceView,
 } from "@mymandev/database";
 import {
@@ -9,6 +10,8 @@ import {
   CreateWorkspaceRequestSchema,
   type CreateWorkspaceResponse,
   MEMBERSHIP_ROUTES,
+  type SetUnclaimedMemberLimitRequest,
+  SetUnclaimedMemberLimitRequestSchema,
   type WorkspaceId,
   type WorkspaceListResponse,
   type WorkspaceViewResponse,
@@ -61,9 +64,9 @@ export type WorkspaceRouteOptions = Readonly<{
 /**
  * Workspaces and the people in them (ADR 0014, "People and roles", "Join
  * requests", and "What a workspace ID allows"): the account's workspaces,
- * creating one, the view of one, its people, their invitations, and its join
- * requests; previewing and accepting an invitation code; and the account's
- * own join requests.
+ * creating one, the view of one, its limit of unclaimed people, its people,
+ * their invitations, and its join requests; previewing and accepting an
+ * invitation code; and the account's own join requests.
  */
 export async function registerWorkspaceRoutes(
   app: FastifyInstance,
@@ -90,7 +93,8 @@ export async function registerWorkspaceRoutes(
       { schema: { body: CreateWorkspaceRequestSchema } },
       async (request): Promise<CreateWorkspaceResponse> => {
         const auth = authOf(request);
-        const { name, displayName } = request.body as CreateWorkspaceRequest;
+        const { name, displayName, maxUnclaimedMembers } =
+          request.body as CreateWorkspaceRequest;
         const now = new Date(options.now());
         const result = await database.transaction(async (tx) => {
           await lockActor(tx, auth, now.getTime());
@@ -99,6 +103,7 @@ export async function registerWorkspaceRoutes(
             deviceId: auth.deviceId,
             name,
             displayName,
+            maxUnclaimedMembers,
             now,
           });
         });
@@ -148,6 +153,46 @@ export async function registerWorkspaceRoutes(
             throw new ApiError("not_found");
           }
           return view;
+        },
+      );
+
+      // Only the owner changes the limit of unclaimed people, never below
+      // their number. No workspace event reports it, because the protocol has
+      // none; the members read it from the workspace view.
+      workspace.post(
+        MEMBERSHIP_ROUTES.setUnclaimedMemberLimit.path,
+        {
+          schema: {
+            params: WorkspaceParamsSchema,
+            body: SetUnclaimedMemberLimitRequestSchema,
+          },
+        },
+        async (request, reply) => {
+          const auth = authOf(request);
+          const { workspaceId } = request.params as {
+            workspaceId: WorkspaceId;
+          };
+          const { maxUnclaimedMembers } =
+            request.body as SetUnclaimedMemberLimitRequest;
+          const now = new Date(options.now());
+          await database.transaction(async (tx) => {
+            await lockActor(tx, auth, now.getTime());
+            const result = await setUnclaimedMemberLimit(tx, {
+              workspaceId,
+              userId: auth.userId,
+              deviceId: auth.deviceId,
+              maxUnclaimedMembers,
+              now,
+            });
+            if (!result.set) {
+              // An account that stopped being an active member after the
+              // membership check gets the check's 404.
+              throw new ApiError(
+                result.refusal === "not_member" ? "not_found" : result.refusal,
+              );
+            }
+          });
+          return reply.code(204).send();
         },
       );
 
