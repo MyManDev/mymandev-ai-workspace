@@ -534,6 +534,113 @@ describe("a new device", () => {
 });
 
 describe("an existing device", () => {
+  test("keeps the replacement pending when the record cannot be written after a 200", async () => {
+    const records = createDeviceRecordStore({ folder, platform: "win32" });
+    let failing = true;
+    const h = harness({
+      deviceRecords: {
+        read: records.read,
+        delete: records.delete,
+        write: (record) =>
+          failing
+            ? Promise.reject(new Error("locked by another program"))
+            : records.write(record),
+      },
+    });
+    const previousKey = await existingDevice(h);
+    const { outcome } = await signIn(h);
+    const newKey = h.requests[0]?.body.device.publicKey;
+
+    expect(outcome).toEqual({ kind: "failed", reason: "record_not_saved" });
+    // Not confirmed: both keys are kept, and the record names the previous one.
+    expect(h.keyStore.keys()?.current.publicKey).toBe(newKey);
+    expect(h.keyStore.keys()?.previous?.publicKey).toBe(previousKey);
+    expect(await records.read()).toEqual({
+      kind: "record",
+      record: { ...RECORD, publicKey: previousKey },
+    });
+
+    // In the same run, the next start writes the record first and then
+    // confirms the replacement.
+    failing = false;
+    const next = started(await h.flow.start());
+    expect(await records.read()).toEqual({
+      kind: "record",
+      record: { ...ANSWER, publicKey: newKey },
+    });
+    expect(h.keyStore.keys()?.previous).toBeNull();
+    expect(h.keyStore.keys()?.current.publicKey).toBe(newKey);
+    expect(authorizeParams(h.opened.at(-1) ?? "").get("login")).toBe("octocat");
+    next.cancel();
+    await next.outcome;
+  }, 20_000);
+
+  test("after a restart without the record write, keeps both keys and sends nothing", async () => {
+    const records = createDeviceRecordStore({ folder, platform: "win32" });
+    const h = harness({
+      deviceRecords: {
+        read: records.read,
+        delete: records.delete,
+        write: () => Promise.reject(new Error("locked by another program")),
+      },
+    });
+    const previousKey = await existingDevice(h);
+    await signIn(h);
+    const newKey = h.requests[0]?.body.device.publicKey;
+
+    // A restart: a new store loads the keys from disk, and the record in
+    // memory is gone.
+    const restarted = harness();
+    await restarted.keyStore.load();
+    expect(await restarted.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "replacement_pending" },
+    });
+    expect(restarted.opened).toEqual([]);
+    expect(restarted.requests).toEqual([]);
+    expect(await restarted.keyStore.hasKey()).toBe(true);
+    expect(restarted.keyStore.keys()?.current.publicKey).toBe(newKey);
+    expect(restarted.keyStore.keys()?.previous?.publicKey).toBe(previousKey);
+  }, 20_000);
+
+  test("after a stop between the record write and the confirmation, confirms and signs in as the same device", async () => {
+    const h = harness();
+    await existingDevice(h);
+    // The flow wrote the record with the new key after a 200 and stopped
+    // before it confirmed the replacement.
+    const keys = await h.keyStore.replace();
+    await h.records.write({ ...ANSWER, publicKey: keys.current.publicKey });
+
+    const restarted = harness();
+    await restarted.keyStore.load();
+    expect(restarted.keyStore.keys()?.previous).not.toBeNull();
+    const { outcome, authorizeUrl } = await signIn(restarted);
+
+    expect(authorizeParams(authorizeUrl).get("login")).toBe("octocat");
+    const device = restarted.requests[0]?.body.device;
+    if (device?.kind !== "existing") {
+      throw new Error("expected an existing device");
+    }
+    expect(device.deviceId).toBe(DEVICE_ID);
+    expect(device).not.toHaveProperty("previousDeviceId");
+    // The confirmed key signed as the device's current key.
+    expect(
+      verifies(
+        keys.current.publicKey,
+        {
+          purpose: "sign-in",
+          audience: API_ORIGIN,
+          signInCode: SIGN_IN_CODE,
+          deviceId: DEVICE_ID,
+          newPublicKey: device.publicKey,
+        },
+        device.currentKeySignature,
+      ),
+    ).toBe(true);
+    expect(outcome).toMatchObject({ kind: "signed_in", newDevice: false });
+    expect(restarted.keyStore.keys()?.previous).toBeNull();
+  }, 20_000);
+
   test("replaces the key with two signatures over the same input, and confirms it", async () => {
     const h = harness();
     const previousKey = await existingDevice(h);

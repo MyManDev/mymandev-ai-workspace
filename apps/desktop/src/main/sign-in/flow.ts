@@ -89,9 +89,10 @@ export const MAX_ANSWER_BYTES = 64 * 1024;
  * - `unexpected_response`: an answer that is not one of the API's; handled
  *   like `no_answer`.
  * - `record_not_saved`: the API registered the device, but the record could
- *   not be written, also when tried a second time. The flow keeps the record
- *   in memory, and the next attempt writes it before anything else (and
- *   answers `record_not_saved` again while it still cannot).
+ *   not be written, also when tried a second time. An existing device keeps
+ *   the replacement pending. The flow keeps the record in memory, and the
+ *   next attempt writes it before anything else (and answers
+ *   `record_not_saved` again while it still cannot).
  */
 export const SIGN_IN_FAILURE_REASONS = Object.freeze([
   "api_origin_unset",
@@ -420,13 +421,29 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
         return "key_not_loaded";
       }
       if (keys.previous !== null) {
+        if (keys.current.publicKey === read.record.publicKey) {
+          // The record names the new key, and the flow writes it only after
+          // a `200` proved that the API holds that key: the application
+          // stopped between the record write and the confirmation.
+          try {
+            await deps.keyStore.confirmReplacement();
+          } catch {
+            return "key_store_failed";
+          }
+          return { kind: "existing", record: read.record };
+        }
+        // The record still names the previous key: whether the API holds
+        // the new one is unknown, and an authentication must learn it first
+        // (part 3). Neither key is ever deleted here.
         return "replacement_pending";
       }
       if (keys.current.publicKey !== read.record.publicKey) {
-        // Not the key of the record's device: the key of a new device whose
-        // registration got no clear answer after that device's key was lost.
-        // The API offers no way to learn the new device's ID, so a new device
-        // names the record's device again, with a new key.
+        // Not the key of the record's device, and no replacement pending: a
+        // confirmed key always sits next to a record that names it, so this
+        // is the key of a new device whose registration got no clear answer
+        // after that device's key was lost. The API offers no way to learn
+        // the new device's ID, so a new device names the record's device
+        // again, with a new key.
         try {
           await deps.keyStore.delete();
         } catch {
@@ -801,17 +818,9 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     }
 
     const account = answer.body;
-    if (plan.kind === "existing") {
-      if (account.deviceId !== plan.record.deviceId) {
-        report("The sign-in answer named another device.");
-        return failed("unexpected_response");
-      }
-      try {
-        // The answer proves that the API holds the new key.
-        await deps.keyStore.confirmReplacement();
-      } catch {
-        report("The previous device key could not be deleted.");
-      }
+    if (plan.kind === "existing" && account.deviceId !== plan.record.deviceId) {
+      report("The sign-in answer named another device.");
+      return failed("unexpected_response");
     }
     afterAccountMismatch = false;
     const record: DeviceRecord = {
@@ -823,7 +832,9 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       publicKey: device.publicKey,
     };
     // The API registered the key under this ID; without the record the
-    // installation cannot use it, so a failed write is tried once more.
+    // installation cannot use it, so a failed write is tried once more. The
+    // record is written before the replacement is confirmed, so a confirmed
+    // key never sits next to a record that names the previous key.
     let saved = false;
     for (let attempt = 0; attempt < 2 && !saved; attempt += 1) {
       try {
@@ -834,8 +845,20 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       }
     }
     if (!saved) {
+      // An existing device keeps the replacement pending: the record on
+      // disk still names the previous key, which stays next to the new one.
       unsavedRecord = record;
       return failed("record_not_saved");
+    }
+    if (plan.kind === "existing") {
+      try {
+        // The answer proves that the API holds the new key, and the record
+        // now names it.
+        await deps.keyStore.confirmReplacement();
+      } catch {
+        // The next start confirms it: the record names the new key.
+        report("The previous device key could not be deleted.");
+      }
     }
     return Object.freeze({
       kind: "signed_in",
