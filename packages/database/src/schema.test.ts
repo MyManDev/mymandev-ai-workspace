@@ -371,6 +371,33 @@ test("the test database runs PostgreSQL 18", async () => {
   assert.match(result.rows[0]?.version ?? "", /^18\d{4}$/);
 });
 
+test("the per-account counts of workspaces and join requests have indexes", async () => {
+  assert.ok(testDatabase);
+  const result = await testDatabase.client.query<{
+    name: string;
+    definition: string;
+  }>(
+    `select indexname as name, indexdef as definition from pg_indexes
+     where schemaname = 'public' and indexname in (
+       'workspaces_created_by_user_id_created_at_idx',
+       'workspace_join_requests_requester_user_id_created_at_idx'
+     ) order by indexname`,
+  );
+  assert.deepEqual(
+    result.rows.map((row) => [row.name, row.definition.split(" USING ")[1]]),
+    [
+      [
+        "workspace_join_requests_requester_user_id_created_at_idx",
+        "btree (requester_user_id, created_at)",
+      ],
+      [
+        "workspaces_created_by_user_id_created_at_idx",
+        "btree (created_by_user_id, created_at)",
+      ],
+    ],
+  );
+});
+
 test("the CHECK vocabularies equal the protocol constants", async () => {
   // Sorted arrays compare both directions and catch duplicates.
   assert.deepEqual(
