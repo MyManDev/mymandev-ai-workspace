@@ -300,24 +300,45 @@ interface FakeApi {
   /** How many requests committed. */
   readonly commits: () => number;
   readonly handle: (body: SignInRequest) => Response;
+  /** Drops the records of used codes, as a restart of the API does. */
+  readonly restart: () => void;
 }
 
 /**
  * A fake of `POST /auth/sign-in` for the device of `RECORD`, in the API's
  * order: it takes the single-use code before every other check, verifies
  * both signatures against the key that it holds, and then holds the new key.
+ * Like the API (#152), it keeps the verifier and redirect URI of the request
+ * that took a code, in memory only, and answers a copy with both
+ * `sign_in_code_used`. Unlike the API, it binds no challenge: it records the
+ * verifier of whichever request took the code, which is the desktop's own in
+ * every test here.
  */
 function fakeApi(publicKey: string): FakeApi {
   const codes = new Set([SIGN_IN_CODE]);
+  const used = new Map<string, { codeVerifier: string; redirectUri: string }>();
   let held = publicKey;
   let commits = 0;
   return {
     publicKey: () => held,
     commits: () => commits,
+    restart: () => {
+      used.clear();
+    },
     handle: (body) => {
       if (!codes.delete(body.code)) {
-        return errorAnswer("auth_failed");
+        const taken = used.get(body.code);
+        return errorAnswer(
+          taken?.codeVerifier === body.codeVerifier &&
+            taken.redirectUri === body.redirectUri
+            ? "sign_in_code_used"
+            : "auth_failed",
+        );
       }
+      used.set(body.code, {
+        codeVerifier: body.codeVerifier,
+        redirectUri: body.redirectUri,
+      });
       const { device } = body;
       if (device.kind !== "existing" || device.deviceId !== DEVICE_ID) {
         return errorAnswer("auth_failed");
@@ -521,6 +542,22 @@ describe("a new device", () => {
     };
     const { outcome } = await signIn(h);
     expect(outcome).toEqual({ kind: "failed", reason: "no_answer" });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(
+      h.requests[0]?.body.device.publicKey,
+    );
+    expect(await h.records.read()).toEqual({ kind: "none" });
+  }, 20_000);
+
+  test("keeps a first sign-in's key on 409 with sign_in_code_used (#152)", async () => {
+    const h = harness();
+    expect(errorAnswer("sign_in_code_used").status).toBe(409);
+    h.answer = () => errorAnswer("sign_in_code_used");
+    const { outcome } = await signIn(h);
+    expect(outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "sign_in_code_used",
+    });
     expect(h.keyStore.keys()?.current.publicKey).toBe(
       h.requests[0]?.body.device.publicKey,
     );
@@ -858,15 +895,50 @@ describe("answers of the API", () => {
     20_000,
   );
 
+  test("keeps the key that the API holds when a resent copy of a committed request gets 409 with sign_in_code_used (#152)", async () => {
+    const h = harness();
+    const previousKey = await existingDevice(h);
+    const api = fakeApi(previousKey);
+    const statuses: number[] = [];
+    // The fetch delivers the request twice, as `net.fetch` or a proxy can
+    // after the connection failed: the first copy commits but its answer is
+    // lost, and only the answer to the second copy arrives.
+    h.answer = (body) => {
+      api.handle(body);
+      const answer = api.handle(body);
+      statuses.push(answer.status);
+      return answer;
+    };
+    const { outcome } = await signIn(h);
+
+    expect(statuses).toEqual([409]);
+    expect(api.commits()).toBe(1);
+    expect(outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "sign_in_code_used",
+    });
+    // The replacement stays pending, with the key that the API holds.
+    const keys = h.keyStore.keys();
+    expect(keys?.current.publicKey).toBe(api.publicKey());
+    expect(keys?.previous?.publicKey).toBe(previousKey);
+    expect(await h.records.read()).toEqual({
+      kind: "record",
+      record: { ...RECORD, publicKey: previousKey },
+    });
+  }, 20_000);
+
   test("keeps the key that the API holds when a resent copy of a committed request gets auth_failed", async () => {
     const h = harness();
     const previousKey = await existingDevice(h);
     const api = fakeApi(previousKey);
     // The fetch delivers the request twice, as `net.fetch` or a proxy can
     // after the connection failed: the first copy commits but its answer is
-    // lost, and only the answer to the second copy arrives.
+    // lost, and only the answer to the second copy arrives. The API
+    // restarted in between and lost its record of the code (#152).
     h.answer = (body) => {
       api.handle(body);
+      api.restart();
       return api.handle(body);
     };
     const { outcome } = await signIn(h);
@@ -1178,26 +1250,255 @@ describe("the browser and the listener", () => {
 });
 
 describe("the key store", () => {
-  test("reports the store's error code when a new key cannot be created", async () => {
+  /** A fake `safeStorage` whose system protection the test switches. */
+  function switchableSafeStorage() {
+    const state = { available: true, backend: "unknown" };
+    const systemProtection: SystemKeyProtection = {
+      ...fakeSafeStorage,
+      isAsyncEncryptionAvailable: () => Promise.resolve(state.available),
+      getSelectedStorageBackend: () => state.backend,
+    };
+    return { state, systemProtection };
+  }
+
+  test("refuses a new device before the browser opens when the system cannot protect its key", async () => {
+    const { state, systemProtection } = switchableSafeStorage();
+    state.available = false;
     const h = harness({
-      keyStore: {
-        ...createDeviceKeyStore({
-          folder,
-          platform: "win32",
-          systemProtection: {
-            ...fakeSafeStorage,
-            isAsyncEncryptionAvailable: () => Promise.resolve(false),
-          },
-        }),
-      },
+      keyStore: createDeviceKeyStore({
+        folder,
+        platform: "win32",
+        systemProtection,
+      }),
     });
-    const { outcome } = await signIn(h);
-    expect(outcome).toEqual({
+
+    expect(await h.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "system_protection_unavailable" },
+    });
+    expect(h.opened).toEqual([]);
+    expect(h.timers).toEqual([]);
+    expect(await h.keyStore.hasKey()).toBe(false);
+
+    // The flow can start once the system protects keys again.
+    state.available = true;
+    const again = started(await h.flow.start());
+    again.cancel();
+    expect(await again.outcome).toEqual({ kind: "cancelled" });
+  });
+
+  test("refuses a Linux device without a secret service early, unless the person chose a passphrase", async () => {
+    const { state, systemProtection } = switchableSafeStorage();
+    state.backend = "basic_text";
+    const h = harness({
+      platform: "linux",
+      keyStore: createDeviceKeyStore({
+        folder,
+        platform: "linux",
+        systemProtection,
+      }),
+    });
+
+    expect(await h.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "system_protection_unavailable" },
+    });
+    expect(h.opened).toEqual([]);
+
+    const chosen = started(
+      await h.flow.start({
+        newKeyProtection: { kind: "passphrase", passphrase: "correct horse" },
+      }),
+    );
+    expect(h.opened).toHaveLength(1);
+    chosen.cancel();
+    await chosen.outcome;
+  });
+
+  test("refuses to replace a key that the system protects when the system no longer can, and keeps it", async () => {
+    const { state, systemProtection } = switchableSafeStorage();
+    const keyStore = createDeviceKeyStore({
+      folder,
+      platform: "win32",
+      systemProtection,
+    });
+    const h = harness({ keyStore });
+    const previousKey = (await keyStore.create({ kind: "system" })).publicKey;
+    await h.records.write({ ...RECORD, publicKey: previousKey });
+    state.available = false;
+
+    expect(await h.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "system_protection_unavailable" },
+    });
+    expect(h.opened).toEqual([]);
+    expect(keyStore.keys()?.current.publicKey).toBe(previousKey);
+    expect(keyStore.keys()?.previous).toBeNull();
+  });
+
+  test("reports the store's error code when the key cannot be created after the code arrived", async () => {
+    const { state, systemProtection } = switchableSafeStorage();
+    const h = harness({
+      keyStore: createDeviceKeyStore({
+        folder,
+        platform: "win32",
+        systemProtection,
+      }),
+    });
+    const start = started(await h.flow.start());
+    // The system's protection went away while the browser was open.
+    state.available = false;
+    await deliverCode(h.opened.at(-1) ?? "");
+
+    expect(await start.outcome).toEqual({
       kind: "failed",
       reason: "key_store_failed",
       keyError: "system_protection_unavailable",
     });
     expect(h.requests).toEqual([]);
+  }, 20_000);
+});
+
+describe("the callback", () => {
+  test("calls onCallback once the listener accepted the code, before the request", async () => {
+    const h = harness();
+    const steps: string[] = [];
+    h.answer = () => {
+      steps.push("request");
+      return json(200, ANSWER);
+    };
+    const start = started(
+      await h.flow.start({ onCallback: () => steps.push("callback") }),
+    );
+    expect(steps).toEqual([]);
+    await deliverCode(h.opened.at(-1) ?? "");
+
+    expect(await start.outcome).toMatchObject({ kind: "signed_in" });
+    expect(steps).toEqual(["callback", "request"]);
+  }, 20_000);
+
+  test("calls onCallback for an error that the API's page posted, and never after a cancel or the timeout", async () => {
+    const h = harness();
+    let calls = 0;
+    const onCallback = () => {
+      calls += 1;
+    };
+
+    const posted = started(await h.flow.start({ onCallback }));
+    const params = authorizeParams(h.opened.at(-1) ?? "");
+    await postForm(
+      params.get("redirect_uri") ?? "",
+      new URLSearchParams({
+        error: "access_denied",
+        state: params.get("state") ?? "",
+      }).toString(),
+    );
+    expect(await posted.outcome).toMatchObject({ kind: "listener_error" });
+    expect(calls).toBe(1);
+
+    const cancelled = started(await h.flow.start({ onCallback }));
+    cancelled.cancel();
+    expect(await cancelled.outcome).toEqual({ kind: "cancelled" });
+
+    const timedOut = started(await h.flow.start({ onCallback }));
+    h.timers
+      .find((entry) => entry.delayMs === SIGN_IN_LISTENER_TIMEOUT_MS)
+      ?.callback();
+    expect(await timedOut.outcome).toEqual({ kind: "timed_out" });
+    expect(calls).toBe(1);
+  }, 20_000);
+
+  test("a callback that throws changes nothing", async () => {
+    const h = harness();
+    const start = started(
+      await h.flow.start({
+        onCallback: () => {
+          throw new Error("no window");
+        },
+      }),
+    );
+    await deliverCode(h.opened.at(-1) ?? "");
+
+    expect(await start.outcome).toMatchObject({ kind: "signed_in" });
+    expect(h.errors).toEqual([]);
+  }, 20_000);
+});
+
+describe("reset", () => {
+  test("drops the account mismatch, so the next attempt is a plain repeat", async () => {
+    const h = harness();
+    await existingDevice(h);
+    h.answer = () => errorAnswer("device_account_mismatch");
+    await signIn(h);
+
+    expect(h.flow.reset()).toBe(true);
+    const next = started(await h.flow.start());
+    const params = authorizeParams(h.opened.at(-1) ?? "");
+    expect(params.has("prompt")).toBe(false);
+    expect(params.get("login")).toBe("octocat");
+    next.cancel();
+    await next.outcome;
+  }, 20_000);
+
+  test("drops an unsaved record, so it is never written for a forgotten account", async () => {
+    const records = createDeviceRecordStore({ folder, platform: "win32" });
+    let failing = true;
+    const h = harness({
+      deviceRecords: {
+        read: records.read,
+        delete: records.delete,
+        write: (record) =>
+          failing
+            ? Promise.reject(new Error("disk full"))
+            : records.write(record),
+      },
+    });
+    const { outcome } = await signIn(h);
+    expect(outcome).toEqual({ kind: "failed", reason: "record_not_saved" });
+
+    // "This is not me" deletes the key and resets the flow.
+    await h.keyStore.delete();
+    expect(h.flow.reset()).toBe(true);
+    failing = false;
+    const next = started(await h.flow.start());
+
+    expect(await records.read()).toEqual({ kind: "none" });
+    expect(authorizeParams(h.opened.at(-1) ?? "").get("prompt")).toBe(
+      "select_account",
+    );
+    next.cancel();
+    await next.outcome;
+  }, 20_000);
+
+  test("changes nothing while an attempt runs", async () => {
+    const h = harness();
+    const start = started(await h.flow.start());
+
+    expect(h.flow.reset()).toBe(false);
+    start.cancel();
+    await start.outcome;
+    expect(h.flow.reset()).toBe(true);
+  });
+});
+
+describe("unexpected errors", () => {
+  test("an error that the flow did not expect is unexpected, not a key store failure", async () => {
+    const timers: { delayMs: number; callback: () => void }[] = [];
+    const h = harness({
+      // The clock fails when the request is about to be sent.
+      scheduleTimer: (callback, delayMs) => {
+        if (delayMs === SIGN_IN_REQUEST_TIMEOUT_MS) {
+          throw new Error("clock");
+        }
+        timers.push({ delayMs, callback });
+        return () => undefined;
+      },
+    });
+    const { outcome } = await signIn(h);
+
+    expect(outcome).toEqual({ kind: "failed", reason: "unexpected" });
+    expect(h.requests).toEqual([]);
+    expect(h.errors).toEqual(["The sign-in failed unexpectedly."]);
   }, 20_000);
 });
 

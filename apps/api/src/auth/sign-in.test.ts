@@ -1,5 +1,6 @@
 import {
   auditEvents,
+  type Database,
   devices,
   eraseAccount,
   recordGitHubRevocation,
@@ -39,6 +40,7 @@ import {
 } from "../gateway-test-support.ts";
 import { ConnectionRegistry } from "../gateway.ts";
 import { Secret } from "../secret.ts";
+import { randomToken, SIGN_IN_CODE_PREFIX } from "./attempts.ts";
 import {
   deviceApp,
   fakeClock,
@@ -119,6 +121,7 @@ async function signInApp(
     user?: FakeGitHubScenario["user"];
     now?: () => number;
     logLines?: string[];
+    database?: Database;
   }> = {},
 ) {
   const github = fakeGitHub(
@@ -142,7 +145,7 @@ async function signInApp(
       clientSecret: new Secret(CLIENT_SECRET),
       fetch: github.fetch,
     }),
-    database: database(),
+    database: options.database ?? database(),
     ...(options.now === undefined ? {} : { now: options.now }),
   });
   t.after(() => app.close());
@@ -383,9 +386,10 @@ test("the sign-in code is single use and bound to the verifier and the redirect 
     (await postSignIn(app, newDeviceRequest(grant, key))).statusCode,
     200,
   );
+  // The same verifier and redirect URI: a repeated request (#152).
   const reused = await postSignIn(app, newDeviceRequest(grant, newKey()));
-  assert.equal(reused.statusCode, 401);
-  assert.equal(codeOf(reused), "auth_failed");
+  assert.equal(reused.statusCode, 409);
+  assert.equal(codeOf(reused), "sign_in_code_used");
 
   const wrongVerifier = await signInCode(app);
   const other = await signInCode(app);
@@ -404,12 +408,14 @@ test("the sign-in code is single use and bound to the verifier and the redirect 
     assert.equal(response.statusCode, 401);
     assert.equal(codeOf(response), "auth_failed");
   }
-  // A refused request still consumed its code.
-  assert.equal(
-    (await postSignIn(app, newDeviceRequest(wrongVerifier, newKey())))
-      .statusCode,
-    401,
+  // A refused request still consumed its code, and left no record of use
+  // (#152).
+  const afterRefusal = await postSignIn(
+    app,
+    newDeviceRequest(wrongVerifier, newKey()),
   );
+  assert.equal(afterRefusal.statusCode, 401);
+  assert.equal(codeOf(afterRefusal), "auth_failed");
 });
 
 test("a sign-in code expires after 60 seconds", async (t) => {
@@ -422,6 +428,162 @@ test("a sign-in code expires after 60 seconds", async (t) => {
   clock += 60_000;
   const response = await postSignIn(app, newDeviceRequest(grant, newKey()));
   assert.equal(codeOf(response), "auth_failed");
+});
+
+test("the same sign-in request sent twice: the first commits, and the second answers 409 with sign_in_code_used and changes nothing (#152)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1017, "repeated") });
+  const key = newKey();
+  const register = newDeviceRequest(await signInCode(app), key);
+  const first = await postSignIn(app, register);
+  assert.equal(first.statusCode, 200);
+  const created = SignInResponseSchema.parse(first.json());
+  const registered = await accountRows(created.userId);
+  const second = await postSignIn(app, register);
+  assert.equal(second.statusCode, 409);
+  assert.deepEqual(second.json(), {
+    statusCode: 409,
+    error: "Conflict",
+    message: "Conflict",
+    code: "sign_in_code_used",
+  });
+  assert.deepEqual(await accountRows(created.userId), registered);
+
+  // An existing device: the first copy replaced the key, so the second must
+  // not read as "nothing was committed".
+  const next = newKey();
+  const replace = existingDeviceRequest(
+    await signInCode(app),
+    created.deviceId,
+    key,
+    next,
+  );
+  assert.equal((await postSignIn(app, replace)).statusCode, 200);
+  const replaced = await accountRows(created.userId);
+  assert.equal(replaced.devices[0]?.publicKey, next.publicKey);
+  const again = await postSignIn(app, replace);
+  assert.equal(again.statusCode, 409);
+  assert.equal(codeOf(again), "sign_in_code_used");
+  assert.deepEqual(await accountRows(created.userId), replaced);
+});
+
+test("a used code with another verifier or redirect URI, and an unknown code, still answer 401 with auth_failed (#152)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1018, "prober") });
+  const request = newDeviceRequest(await signInCode(app), newKey());
+  assert.equal((await postSignIn(app, request)).statusCode, 200);
+  const other = await signInCode(app);
+  for (const [label, probe] of [
+    ["another verifier", { ...request, codeVerifier: other.codeVerifier }],
+    [
+      "another redirect URI",
+      { ...request, redirectUri: "http://127.0.0.1:50000/callback" },
+    ],
+    [
+      "an unknown code",
+      { ...request, code: `${SIGN_IN_CODE_PREFIX}${randomToken()}` },
+    ],
+  ] as const) {
+    const response = await postSignIn(app, probe);
+    assert.equal(response.statusCode, 401, label);
+    assert.equal(codeOf(response), "auth_failed", label);
+  }
+  // The probes left the record of the used code.
+  assert.equal(codeOf(await postSignIn(app, request)), "sign_in_code_used");
+});
+
+test("a used code answers sign_in_code_used for one code lifetime after the request that took it ended, and an expired code answers auth_failed (#152)", async (t) => {
+  let clock = Date.parse("2026-11-02T12:00:00.000Z");
+  const app = await signInApp(t, {
+    user: githubUser(1019, "clocked"),
+    now: () => clock,
+  });
+  const request = newDeviceRequest(await signInCode(app), newKey());
+  // Taken just before the code itself expires.
+  clock += 59_000;
+  assert.equal((await postSignIn(app, request)).statusCode, 200);
+  clock += 59_999;
+  assert.equal(
+    codeOf(await postSignIn(app, request)),
+    "sign_in_code_used",
+    "past the code's own expiry",
+  );
+  clock += 1;
+  const late = await postSignIn(app, request);
+  assert.equal(late.statusCode, 401);
+  assert.equal(codeOf(late), "auth_failed");
+
+  // A code that expired before any request took it leaves no record.
+  const expired = newDeviceRequest(await signInCode(app), newKey());
+  clock += 60_000;
+  for (const copy of ["first", "second"]) {
+    const response = await postSignIn(app, expired);
+    assert.equal(response.statusCode, 401, copy);
+    assert.equal(codeOf(response), "auth_failed", copy);
+  }
+});
+
+test("a slow request leaves its copies the full code lifetime after it ended (#152)", async (t) => {
+  let clock = Date.parse("2026-11-02T12:00:00.000Z");
+  const db = database();
+  // The transaction takes 50 seconds of the injected clock.
+  const transaction: typeof db.transaction = (run, config) => {
+    clock += 50_000;
+    return db.transaction(run, config);
+  };
+  const slow = new Proxy(db, {
+    get: (target, property, receiver) =>
+      property === "transaction"
+        ? transaction
+        : Reflect.get(target, property, receiver),
+  });
+  const app = await signInApp(t, {
+    user: githubUser(1020, "slow"),
+    now: () => clock,
+    database: slow,
+  });
+  const request = newDeviceRequest(await signInCode(app), newKey());
+  assert.equal((await postSignIn(app, request)).statusCode, 200);
+  // The request ended 50 seconds after it took the code.
+  clock += 59_999;
+  assert.equal(codeOf(await postSignIn(app, request)), "sign_in_code_used");
+  clock += 1;
+  assert.equal(codeOf(await postSignIn(app, request)), "auth_failed");
+});
+
+test("a code that a request without the attempt's verifier or redirect URI burned answers auth_failed to the attempt's own request, which changes nothing (#152)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1021, "burned") });
+  const key = newKey();
+  const created = SignInResponseSchema.parse(
+    (
+      await postSignIn(app, newDeviceRequest(await signInCode(app), key))
+    ).json(),
+  );
+  const before = await accountRows(created.userId);
+  const other = await signInCode(app);
+  for (const [label, burn] of [
+    ["another verifier", { codeVerifier: other.codeVerifier }],
+    [
+      "another redirect URI",
+      { redirectUri: "http://127.0.0.1:50000/callback" },
+    ],
+  ] as const) {
+    const request = existingDeviceRequest(
+      await signInCode(app),
+      created.deviceId,
+      key,
+      newKey(),
+    );
+    const burned = await postSignIn(app, { ...request, ...burn });
+    assert.equal(burned.statusCode, 401, label);
+    assert.equal(codeOf(burned), "auth_failed", label);
+    // Nothing was committed, so the attempt's own request must not read as
+    // a copy of one that may have committed.
+    for (const copy of ["first", "second"]) {
+      const response = await postSignIn(app, request);
+      assert.equal(response.statusCode, 401, `${label}, ${copy}`);
+      assert.equal(codeOf(response), "auth_failed", `${label}, ${copy}`);
+    }
+  }
+  assert.deepEqual(await accountRows(created.userId), before);
 });
 
 test("bad signatures are refused, and an existing device needs its current key and a new one", async (t) => {

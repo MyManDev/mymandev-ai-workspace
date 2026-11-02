@@ -368,6 +368,7 @@ test("each route answers only known error codes, the common ones included", () =
     "device_registration_locked",
     "unsupported_account",
     "sign_in_unavailable",
+    "sign_in_code_used",
   ] as const) {
     assert.deepEqual(holders(code), [], code);
   }
@@ -391,11 +392,11 @@ test("each route answers only known error codes, the common ones included", () =
 
 test("the README's route table lists every route with its codes", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
-  // Only this section: the project routes have a table of their own.
-  const section =
-    readme
-      .split(/^## /mu)
-      .find((part) => part.startsWith("Membership routes\n")) ?? "";
+  // The section of the membership routes, up to the next section.
+  const section = readme
+    .split("\n## Membership routes\n")[1]
+    ?.split("\n## ")[0];
+  assert.ok(section);
   const rows = section
     .split("\n")
     .filter((line) => /^\| `(?:GET|POST) \//u.test(line))

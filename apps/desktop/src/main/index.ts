@@ -9,6 +9,13 @@ import {
 import { readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  FORGET_CONFIRMATION,
+  forgetConfirmationMessage,
+  forgetConfirmed,
+} from "./account.ts";
+import { registerAccountIpc } from "./account-ipc.ts";
+import { createSystemAccountService } from "./account-system.ts";
+import {
   APP_SCHEME,
   APP_SCHEME_PRIVILEGES,
   createAppProtocolHandler,
@@ -84,6 +91,36 @@ function start(): void {
   });
   app.on("will-quit", () => repositories.close());
 
+  // The account: the device key and the sign-in (ADR 0014). This instance
+  // holds the single-instance lock, so no other instance touches the key.
+  // The key store needs a ready application, so it is opened and the key is
+  // loaded once when the application is ready; until then the status says
+  // that the key is loading. The sign-in starts only on the person's action
+  // in the renderer. The messages are fixed text, and the key store's
+  // errors hold no secret.
+  const account = createSystemAccountService({
+    focusWindow: () => focusMainWindow(),
+    // "This is not me" is confirmed in a native dialog of the main process,
+    // like the folder dialog of the repositories.
+    confirmForget: async (login) => {
+      const options = {
+        ...FORGET_CONFIRMATION,
+        buttons: [...FORGET_CONFIRMATION.buttons],
+        message: forgetConfirmationMessage(login),
+      };
+      return forgetConfirmed(
+        mainWindow === undefined
+          ? await dialog.showMessageBox(options)
+          : await dialog.showMessageBox(mainWindow, options),
+      );
+    },
+    onError: (message, error) =>
+      error === undefined
+        ? console.error(message)
+        : console.error(message, error),
+  });
+  registerAccountIpc(ipcMain, rendererUrl, account);
+
   function showMainWindow(): void {
     if (mainWindow !== undefined) {
       if (mainWindow.isMinimized()) {
@@ -103,6 +140,19 @@ function start(): void {
     window.loadURL(rendererUrl).catch((error: unknown) => {
       console.error("The application window failed to load.", error);
     });
+  }
+
+  // ADR 0014, "Sign-in", step 6: after the browser posted to the sign-in
+  // listener, the window comes to the front so that the person sees the
+  // result. On macOS the application must also become the active one.
+  function focusMainWindow(): void {
+    if (!app.isReady()) {
+      return;
+    }
+    showMainWindow();
+    if (process.platform === "darwin") {
+      app.focus({ steal: true });
+    }
   }
 
   // Every session, including partitions that later code creates.
@@ -135,6 +185,9 @@ function start(): void {
         createAppProtocolHandler(rendererDir, { readFile, realpath }),
       );
       void runtime.start();
+      // The key is loaded before anything uses it; nothing connects to the
+      // API yet.
+      void account.initialize();
       showMainWindow();
       app.on("activate", showMainWindow);
     })
