@@ -11,7 +11,7 @@ import {
   type WorkspaceId,
   type WorkspaceMember,
 } from "@mymandev/protocol";
-import { and, eq, inArray, isNull, or, type SQL } from "drizzle-orm";
+import { and, count, eq, inArray, isNull, or, type SQL } from "drizzle-orm";
 import type { AuditAction, AuditReason } from "./audit-vocabulary.ts";
 import {
   type CancelledRun,
@@ -31,11 +31,13 @@ import {
   projects,
   workspaceInvitations,
   workspaceMembers,
+  workspaces,
 } from "./schema/index.ts";
 
 // Defining, renaming, and removing the people of a workspace, leaving it,
-// and promoting and demoting admins (ADR 0014, "People and roles",
-// "Invitations", and "Removal and ownership"). Each function locks the
+// promoting and demoting admins, and the workspace's limit of unclaimed
+// people (ADR 0014, "People and roles", "Invitations", and "Removal and
+// ownership"; Project Manager decision of 2026-11-02). Each function locks the
 // people it decides on, the acting person included, before it reads their
 // state, so that concurrent changes of one person happen one after another.
 //
@@ -46,6 +48,9 @@ import {
 // the invitation too. The invitations of `src/invitations.ts` use the
 // helpers below; creating one locks the workspace row (`workspaces`) after
 // the people and before the invitations, for the counts of the workspace.
+// Defining a person and changing the limit of unclaimed people lock the
+// workspace row after the acting person too, so that they count the active
+// unclaimed people one after another.
 // A removal and a demotion also revoke the invitations that the removed or
 // demoted person created, which name other people whom they do not lock:
 // they lock them after the people and in the order of their IDs, and every
@@ -172,18 +177,65 @@ export async function audit(
   });
 }
 
+/**
+ * Locks the workspace row `FOR NO KEY UPDATE`, after the people, and returns
+ * its limit of unclaimed people and how many active unclaimed people (no
+ * account, not removed) it holds. Every writer that defines a person or
+ * changes the limit holds this lock while it counts, so two of them never
+ * count the same state. The lock does not wait for the key-share locks of
+ * foreign-key checks, such as an insert of a person of this workspace.
+ * undefined when the workspace does not exist.
+ */
+async function lockUnclaimedCount(
+  tx: Database,
+  workspaceId: WorkspaceId,
+): Promise<Readonly<{ limit: number; unclaimed: number }> | undefined> {
+  const [workspace] = await tx
+    .select({ limit: workspaces.maxUnclaimedMembers })
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId))
+    .for("no key update");
+  if (workspace === undefined) {
+    return undefined;
+  }
+  const [active] = await tx
+    .select({ n: count() })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        isNull(workspaceMembers.userId),
+        isNull(workspaceMembers.removedAt),
+      ),
+    );
+  return { limit: workspace.limit, unclaimed: active?.n ?? 0 };
+}
+
 export type DefineMemberInput = Actor & Readonly<{ displayName: string }>;
 
 export type DefineMemberResult =
   | Readonly<{ defined: true; member: WorkspaceMember }>
-  | Readonly<{ defined: false; refusal: "not_member" | "forbidden" }>;
+  | Readonly<{
+      defined: false;
+      /**
+       * `rate_limited`: the workspace holds as many active unclaimed people
+       * as its limit. Only removing or claiming one of them, or a higher
+       * limit, frees a place; no time does.
+       */
+      refusal: "not_member" | "forbidden" | "rate_limited";
+    }>;
 
 /**
  * Defines an unclaimed person in one transaction (ADR 0014, "People and
- * roles"): only the owner or an admin; the person is always a `member`, gets
- * `displayName` and the time `now`, and has the acting account as
- * `added_by_user_id`. Writes a `member.defined` audit record. Inside another
- * transaction it runs as a savepoint.
+ * roles"; Project Manager decision of 2026-11-02): only the owner or an
+ * admin; the person is always a `member`, gets `displayName` and the time
+ * `now`, and has the acting account as `added_by_user_id`. After the acting
+ * person it locks the workspace row, so that concurrent definitions and
+ * changes of the limit in one workspace are counted one after another, and
+ * refuses with `rate_limited` when the workspace already holds as many active
+ * unclaimed people as its limit (`workspaces.max_unclaimed_members`). Writes
+ * a `member.defined` audit record. Inside another transaction it runs as a
+ * savepoint.
  */
 export async function defineMember(
   db: Database,
@@ -197,6 +249,14 @@ export async function defineMember(
       }
       if (!administers(actor.role)) {
         return { defined: false, refusal: "forbidden" };
+      }
+      const counted = await lockUnclaimedCount(tx, input.workspaceId);
+      if (counted === undefined) {
+        // An active person belongs to a workspace that exists.
+        throw new Error("The workspace of an active person is missing");
+      }
+      if (counted.unclaimed >= counted.limit) {
+        return { defined: false, refusal: "rate_limited" };
       }
       const id = newId<MemberId>();
       await tx.insert(workspaceMembers).values({
@@ -221,6 +281,80 @@ export async function defineMember(
           removedAt: null,
         },
       };
+    }),
+  );
+}
+
+export type SetUnclaimedMemberLimitInput = Actor &
+  Readonly<{
+    /** From 1 to 500; outside the range the CHECK fails. */
+    maxUnclaimedMembers: number;
+  }>;
+
+export type SetUnclaimedMemberLimitResult =
+  | Readonly<{
+      set: true;
+      /** false when the limit already had this value, and nothing was written. */
+      changed: boolean;
+    }>
+  | Readonly<{
+      set: false;
+      /**
+       * `conflict`: the value lies below the number of active unclaimed
+       * people.
+       */
+      refusal: "not_member" | "forbidden" | "conflict";
+    }>;
+
+/**
+ * Changes how many active unclaimed people the workspace may hold, in one
+ * transaction (Project Manager decision of 2026-11-02): only the owner; an
+ * admin or a member is `forbidden`. After the acting person it locks the
+ * workspace row, as `defineMember` does, counts the active unclaimed people
+ * (no account, not removed), and refuses a value below that count with
+ * `conflict`. It sets `workspaces.max_unclaimed_members` and `updated_at` and
+ * writes a `workspace.unclaimed_member_limit_changed` audit record with the
+ * workspace as the subject; the record holds no value. Setting the value in
+ * force changes nothing and writes nothing. Inside another transaction it
+ * runs as a savepoint.
+ */
+export async function setUnclaimedMemberLimit(
+  db: Database,
+  input: SetUnclaimedMemberLimitInput,
+): Promise<SetUnclaimedMemberLimitResult> {
+  return withDatabaseErrors(() =>
+    db.transaction(async (tx): Promise<SetUnclaimedMemberLimitResult> => {
+      const { actor } = await lockPeople(tx, input);
+      if (actor === undefined) {
+        return { set: false, refusal: "not_member" };
+      }
+      if (actor.role !== "owner") {
+        return { set: false, refusal: "forbidden" };
+      }
+      const counted = await lockUnclaimedCount(tx, input.workspaceId);
+      if (counted === undefined) {
+        throw new Error("The workspace of an active person is missing");
+      }
+      if (input.maxUnclaimedMembers < counted.unclaimed) {
+        return { set: false, refusal: "conflict" };
+      }
+      if (input.maxUnclaimedMembers === counted.limit) {
+        return { set: true, changed: false };
+      }
+      await tx
+        .update(workspaces)
+        .set({
+          maxUnclaimedMembers: input.maxUnclaimedMembers,
+          updatedAt: input.now,
+        })
+        .where(eq(workspaces.id, input.workspaceId));
+      await audit(
+        tx,
+        input,
+        "workspace.unclaimed_member_limit_changed",
+        input.workspaceId,
+      );
+      return { set: true, changed: true };
     }),
   );
 }

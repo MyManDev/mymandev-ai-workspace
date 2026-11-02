@@ -50,6 +50,13 @@
       "when": 1793605268043,
       "tag": "0006_count_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1793606953065,
+      "tag": "0007_unclaimed_member_limit",
+      "breakpoints": true
     }
   ]
 }

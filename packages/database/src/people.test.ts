@@ -15,10 +15,11 @@ import {
   type RepositoryId,
   type RunId,
   type RunState,
+  UNCLAIMED_MEMBER_LIMIT,
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, isNull } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
@@ -33,6 +34,7 @@ import {
   promoteMember,
   removeMember,
   renameMember,
+  setUnclaimedMemberLimit,
 } from "./people.ts";
 import {
   agentRuns,
@@ -45,6 +47,7 @@ import {
   users,
   workspaceInvitations,
   workspaceMembers,
+  workspaces,
 } from "./schema/index.ts";
 import { createTestDatabase } from "./testing.ts";
 
@@ -285,6 +288,200 @@ test("a member cannot define a person, and an account that is no active member i
     .where(eq(workspaceMembers.workspaceId, workspaceId));
   assert.equal(after.length, people.length, "a refusal defines nobody");
   assert.deepEqual(await auditOf(workspaceId), [], "and audits nothing");
+});
+
+/** A workspace of `owner` whose limit of unclaimed people is `limit`. */
+async function limitedWorkspaceOf(owner: Account, limit: number) {
+  const result = await createWorkspace(database(), {
+    ...owner,
+    name: "Team",
+    displayName: "Owner",
+    maxUnclaimedMembers: limit,
+    now: NOW,
+  });
+  assert.ok(result.created);
+  return result.membership.workspace.id;
+}
+
+async function limitOf(workspaceId: WorkspaceId): Promise<number> {
+  const [row] = await database()
+    .select({ limit: workspaces.maxUnclaimedMembers })
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId));
+  assert.ok(row !== undefined);
+  return row.limit;
+}
+
+async function unclaimedCount(workspaceId: WorkspaceId): Promise<number> {
+  const rows = await database()
+    .select({ id: workspaceMembers.id })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        isNull(workspaceMembers.userId),
+        isNull(workspaceMembers.removedAt),
+      ),
+    );
+  return rows.length;
+}
+
+test("defining stops at the workspace's limit of active unclaimed people, and removed or claimed people do not count", async () => {
+  const db = database();
+  const owner = await account("Owner");
+  const admin = await account("Admin");
+  const claimer = await account("Claimer");
+  const workspaceId = await limitedWorkspaceOf(owner, 2);
+  await addPerson(workspaceId, owner, { claimedBy: admin, role: "admin" });
+  const define = (actor: Account, displayName: string) =>
+    defineMember(db, { workspaceId, ...actor, displayName, now: NOW });
+
+  const first = await define(owner, "Linus");
+  assert.ok(first.defined);
+  assert.ok((await define(admin, "Margaret")).defined);
+  // The owner, the admin, and a claimed member never count.
+  await addPerson(workspaceId, owner, { claimedBy: claimer });
+  for (const actor of [owner, admin]) {
+    assert.deepEqual(await define(actor, "Grace"), {
+      defined: false,
+      refusal: "rate_limited",
+    });
+  }
+  assert.equal(
+    await unclaimedCount(workspaceId),
+    2,
+    "a refusal defines nobody",
+  );
+  assert.deepEqual(
+    (await auditOf(workspaceId)).map((record) => record.action),
+    ["member.defined", "member.defined"],
+    "and audits nothing",
+  );
+
+  // Removing an unclaimed person frees a place, and so does a claim.
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: NOW, removedByUserId: owner.userId })
+    .where(eq(workspaceMembers.id, first.member.id));
+  const third = await define(owner, "Grace");
+  assert.ok(third.defined);
+  assert.equal((await define(owner, "Edsger")).defined, false);
+  // As accepting an invitation claims the person.
+  const joiner = await account("Joiner");
+  await database()
+    .update(workspaceMembers)
+    .set({ userId: joiner.userId, claimedAt: NOW })
+    .where(eq(workspaceMembers.id, third.member.id));
+  assert.ok((await define(admin, "Edsger")).defined);
+  assert.equal(await unclaimedCount(workspaceId), 2);
+});
+
+test("a new workspace holds at most 500 active unclaimed people by default", async () => {
+  const db = database();
+  const owner = await account("Owner");
+  const { workspaceId } = await workspaceOf(owner);
+  assert.equal(await limitOf(workspaceId), UNCLAIMED_MEMBER_LIMIT.default);
+  await db.insert(workspaceMembers).values(
+    Array.from({ length: UNCLAIMED_MEMBER_LIMIT.default - 1 }, (_, index) => ({
+      id: newId<MemberId>(),
+      workspaceId,
+      displayName: `Person ${index}`,
+      role: "member" as const,
+      addedByUserId: owner.userId,
+      createdAt: NOW,
+    })),
+  );
+  const define = () =>
+    defineMember(db, { workspaceId, ...owner, displayName: "Last", now: NOW });
+  assert.ok((await define()).defined, "the 500th");
+  assert.deepEqual(await define(), { defined: false, refusal: "rate_limited" });
+  assert.equal(await unclaimedCount(workspaceId), 500);
+});
+
+test("only the owner changes the limit of unclaimed people, never below their number, and each change is audited", async () => {
+  const db = database();
+  const owner = await account("Owner");
+  const admin = await account("Admin");
+  const member = await account("Member");
+  const outsider = await account("Outsider");
+  const { workspaceId } = await workspaceOf(owner);
+  await addPerson(workspaceId, owner, { claimedBy: admin, role: "admin" });
+  await addPerson(workspaceId, owner, { claimedBy: member });
+  await addPerson(workspaceId, owner);
+  await addPerson(workspaceId, owner);
+  // A removed unclaimed person does not count.
+  await addPerson(workspaceId, owner, {
+    removedAt: NOW,
+    removedByUserId: owner.userId,
+  });
+  const set = (actor: Account, maxUnclaimedMembers: number, now = NOW) =>
+    setUnclaimedMemberLimit(db, {
+      workspaceId,
+      ...actor,
+      maxUnclaimedMembers,
+      now,
+    });
+
+  for (const [label, actor, refusal] of [
+    ["an admin", admin, "forbidden"],
+    ["a member", member, "forbidden"],
+    ["an outsider", outsider, "not_member"],
+  ] as const) {
+    assert.deepEqual(await set(actor, 10), { set: false, refusal }, label);
+  }
+  assert.deepEqual(
+    await setUnclaimedMemberLimit(db, {
+      workspaceId: newId<WorkspaceId>(),
+      ...owner,
+      maxUnclaimedMembers: 10,
+      now: NOW,
+    }),
+    { set: false, refusal: "not_member" },
+    "the owner elsewhere",
+  );
+  assert.deepEqual(await set(owner, 1), { set: false, refusal: "conflict" });
+  assert.equal(await limitOf(workspaceId), 500, "a refusal changes nothing");
+  assert.deepEqual(await auditOf(workspaceId), [], "and audits nothing");
+
+  assert.deepEqual(await set(owner, 2), { set: true, changed: true });
+  assert.equal(await limitOf(workspaceId), 2);
+  assert.deepEqual(await set(owner, 2, LATER), { set: true, changed: false });
+  assert.deepEqual(await set(owner, 500, LATER), { set: true, changed: true });
+  assert.equal(await limitOf(workspaceId), 500);
+  const [row] = await db
+    .select({ updatedAt: workspaces.updatedAt })
+    .from(workspaces)
+    .where(eq(workspaces.id, workspaceId));
+  assert.deepEqual(row?.updatedAt, LATER);
+  assert.deepEqual(await auditOf(workspaceId), [
+    {
+      action: "workspace.unclaimed_member_limit_changed",
+      actorUserId: owner.userId,
+      actorDeviceId: owner.deviceId,
+      subjectId: workspaceId,
+      reason: null,
+      createdAt: NOW,
+    },
+    {
+      action: "workspace.unclaimed_member_limit_changed",
+      actorUserId: owner.userId,
+      actorDeviceId: owner.deviceId,
+      subjectId: workspaceId,
+      reason: null,
+      createdAt: LATER,
+    },
+  ]);
+
+  // Below the count is a conflict before the CHECK is reached; above 500 the
+  // CHECK refuses. The protocol schema keeps both out of the API.
+  assert.deepEqual(await set(owner, 0), { set: false, refusal: "conflict" });
+  await assert.rejects(set(owner, 501), (error: unknown) => {
+    assert.ok(error instanceof DatabaseError);
+    assert.equal(error.code, "23514");
+    assert.equal(error.constraint, "workspaces_max_unclaimed_members_check");
+    return true;
+  });
+  assert.equal(await limitOf(workspaceId), 500);
 });
 
 test("every member renames their own person, and the owner or an admin an unclaimed one", async () => {
@@ -2076,5 +2273,111 @@ test(
       (await auditOf(workspaceId)).map((record) => record.action),
       ["member.removed"],
     );
+  },
+);
+
+test(
+  "of three concurrent definitions at the limit of unclaimed people, by three people, exactly one succeeds",
+  SERVER_ONLY,
+  async () => {
+    const db = database();
+    const owner = await account("Owner");
+    const admins = [await account("Admin 1"), await account("Admin 2")];
+    const workspaceId = await limitedWorkspaceOf(owner, 3);
+    for (const admin of admins) {
+      await addPerson(workspaceId, owner, { claimedBy: admin, role: "admin" });
+    }
+    await addPerson(workspaceId, owner);
+    await addPerson(workspaceId, owner);
+    // Each definition locks another acting person, so only the workspace row
+    // orders them.
+    const results = await Promise.all(
+      [owner, ...admins].map((actor, index) =>
+        defineMember(db, {
+          workspaceId,
+          ...actor,
+          displayName: `Person ${index}`,
+          now: NOW,
+        }),
+      ),
+    );
+    assert.deepEqual(results.map((result) => result.defined).sort(), [
+      false,
+      false,
+      true,
+    ]);
+    for (const result of results) {
+      if (!result.defined) {
+        assert.equal(result.refusal, "rate_limited");
+      }
+    }
+    assert.equal(await unclaimedCount(workspaceId), 3);
+  },
+);
+
+test(
+  "a definition waits for a concurrent lowering of the limit and then counts with the new limit",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const admin = await account("Admin");
+    const { workspaceId } = await workspaceOf(owner);
+    await addPerson(workspaceId, owner, { claimedBy: admin, role: "admin" });
+    await addPerson(workspaceId, owner);
+    // The owner's change locks the owner's person and the workspace row; the
+    // admin's definition locks the admin's person, so only the workspace row
+    // can make it wait. Without that lock it would count against 500.
+    const definition = await afterConcurrentChange(
+      (tx) =>
+        setUnclaimedMemberLimit(tx, {
+          workspaceId,
+          ...owner,
+          maxUnclaimedMembers: 1,
+          now: NOW,
+        }),
+      () =>
+        defineMember(database(), {
+          workspaceId,
+          ...admin,
+          displayName: "Linus",
+          now: LATER,
+        }),
+    );
+    assert.deepEqual(definition, { defined: false, refusal: "rate_limited" });
+    assert.equal(await limitOf(workspaceId), 1);
+    assert.equal(await unclaimedCount(workspaceId), 1);
+  },
+);
+
+test(
+  "a lowering of the limit waits for a concurrent definition and then counts it",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const admin = await account("Admin");
+    const workspaceId = await limitedWorkspaceOf(owner, 3);
+    await addPerson(workspaceId, owner, { claimedBy: admin, role: "admin" });
+    await addPerson(workspaceId, owner);
+    // Without the lock of the workspace row the change would count one
+    // unclaimed person, set the limit to 1, and leave two.
+    const change = await afterConcurrentChange(
+      (tx) =>
+        defineMember(tx, {
+          workspaceId,
+          ...admin,
+          displayName: "Linus",
+          now: NOW,
+        }),
+      () =>
+        setUnclaimedMemberLimit(database(), {
+          workspaceId,
+          ...owner,
+          maxUnclaimedMembers: 1,
+          now: LATER,
+        }),
+    );
+    assert.deepEqual(change, { set: false, refusal: "conflict" });
+    assert.equal(await limitOf(workspaceId), 3);
+    assert.equal(await unclaimedCount(workspaceId), 2);
   },
 );
