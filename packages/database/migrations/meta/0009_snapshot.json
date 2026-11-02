@@ -1,5 +1,5 @@
 {
-  "id": "afc5747c-4d62-4a84-9c72-eac81f15822e",
+  "id": "d995ad21-b580-45af-90ba-cace79f34f8e",
   "prevId": "90ec0b2e-448e-42a0-8ff8-4ab77bdb7320",
   "version": "7",
   "dialect": "postgresql",
@@ -589,6 +589,10 @@
         "projects_name_length": {
           "name": "projects_name_length",
           "value": "char_length(\"projects\".\"name\") between 1 and 100"
+        },
+        "projects_name_nfc_check": {
+          "name": "projects_name_nfc_check",
+          "value": "\"projects\".\"name\" is nfc normalized"
         }
       },
       "isRLSEnabled": false

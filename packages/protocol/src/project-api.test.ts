@@ -220,6 +220,8 @@ test("creating and renaming a project take a name of single-line text from 1 to 
       ["blank", { name: " \t " }],
       ["only white space of other kinds", { name: "\u00A0\u3000\n" }],
       ["line feed inside", { name: "App\nWeb" }],
+      ["line separator inside", { name: "App\u2028Web" }],
+      ["byte order mark inside", { name: "App\uFEFFWeb" }],
       ["control character", { name: "Ap\u0000p" }],
       ["zero-width space", { name: "Ap\u200Bp" }],
       ["right-to-left override", { name: "\u202EppA" }],
@@ -253,6 +255,7 @@ test("a project name is normalized to NFC and trimmed before it is checked, so n
       [" App ", "App"],
       ["\tApp\n", "App"],
       ["\u00A0App\u3000", "App"],
+      ["\uFEFF\r\nApp\u2028\r", "App"],
       [` ${decomposed} `, composed],
       // Too long only before trimming.
       [`  ${"a".repeat(100)}  `, "a".repeat(100)],

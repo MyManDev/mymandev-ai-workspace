@@ -212,15 +212,20 @@ const creator = alias(workspaceMembers, "creator");
  * creator: the account's active person in the workspace, which is the person
  * that created the project or, after the account left and joined again, its
  * new person, whose rights to rename the project follow the account (#155);
- * without one, the account's most recently removed person. The account was an
- * active member when it created the project, and person rows are never
- * deleted, so one is always found.
+ * without one, the account's most recently removed person.
+ *
+ * Invariant: the creating account of every project has a person in the
+ * project's workspace. `createProject` inserts a project only for the acting
+ * account's active person, and person rows are never deleted, so one is
+ * always found. A project written otherwise without one breaks the
+ * invariant, and the whole list fails rather than answering without a
+ * creator.
  */
 export async function listProjects(
   db: Database,
   workspaceId: WorkspaceId,
 ): Promise<WorkspaceProject[]> {
-  return withDatabaseErrors(async () => {
+  const rows = await withDatabaseErrors(() => {
     const creatorPerson = db
       .select({ id: creator.id })
       .from(creator)
@@ -232,7 +237,7 @@ export async function listProjects(
       )
       .orderBy(sql`${creator.removedAt} desc nulls first`, desc(creator.id))
       .limit(1);
-    const rows = await db
+    return db
       .select({
         id: projects.id,
         workspaceId: projects.workspaceId,
@@ -245,14 +250,16 @@ export async function listProjects(
       )
       .orderBy(asc(projects.createdAt), asc(projects.id))
       .limit(MAX_ANSWER_LIST_ITEMS);
-    return rows.map(({ createdByMemberId, ...row }) => {
-      if (createdByMemberId === null) {
-        throw new Error(
-          "The creator of a project has no person in its workspace",
-        );
-      }
-      return { ...row, createdByMemberId };
-    });
+  });
+  // Outside `withDatabaseErrors`, so that the message reaches the log; it
+  // holds no data of the row.
+  return rows.map(({ createdByMemberId, ...row }) => {
+    if (createdByMemberId === null) {
+      throw new Error(
+        "Invariant broken: the creating account of a project has no person in its workspace",
+      );
+    }
+    return { ...row, createdByMemberId };
   });
 }
 

@@ -360,6 +360,10 @@ export const projects = pgTable(
       "projects_name_length",
       sql`char_length(${t.name}) between 1 and 100`,
     ),
+    // The protocol normalizes a project name to NFC and trims it before it is
+    // stored (#155); the database enforces the normal form, and the writer the
+    // trimming.
+    check("projects_name_nfc_check", sql`${t.name} is nfc normalized`),
   ],
 );
 

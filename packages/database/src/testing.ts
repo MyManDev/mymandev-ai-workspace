@@ -51,7 +51,12 @@ async function createServerDatabase(serverUrl: string): Promise<TestDatabase> {
   }
   // node --test runs test files in parallel, so each file gets its own database.
   const name = `mymandev_test_${randomBytes(8).toString("hex")}`;
-  await administer(serverUrl, `create database ${name}`);
+  // UTF8 whatever the server's `template1`: migration 0009 needs the built-in
+  // `pg_c_utf8` collation, which exists only in a UTF8 database.
+  await administer(
+    serverUrl,
+    `create database ${name} template template0 encoding 'UTF8'`,
+  );
 
   const url = new URL(serverUrl);
   url.pathname = `/${name}`;

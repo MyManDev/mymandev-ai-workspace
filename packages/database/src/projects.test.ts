@@ -681,7 +681,7 @@ test("the name in force changes nothing, a change of case alone renames, a clash
   assert.deepEqual(await activeNames(workspaceId), ["APP", "old"]);
 });
 
-test("the database keeps one project conversation per project and the name keys, with an index for the count of an account's creations", async () => {
+test("the database keeps one project conversation per project, the name keys, and names in NFC, with an index for the count of an account's creations", async () => {
   const owner = await account("Owner");
   const workspaceId = await workspaceOf(owner);
   const project = await created(workspaceId, owner, "App");
@@ -708,6 +708,19 @@ test("the database keeps one project conversation per project and the name keys,
     "23505",
     "projects_active_name_key",
   );
+  // A name that is not in NFC fails the CHECK, whatever the writer.
+  await rejectsWith(
+    () =>
+      database().insert(projects).values({
+        id: newId<ProjectId>(),
+        workspaceId,
+        name: "Cafe\u0301",
+        createdByUserId: owner.userId,
+      }),
+    "23514",
+    "projects_name_nfc_check",
+  );
+  await created(workspaceId, owner, "Caf\u00E9");
 
   assert.ok(testDatabase);
   const result = await testDatabase.client.query<{
