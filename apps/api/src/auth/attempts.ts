@@ -185,8 +185,8 @@ export type SignInCodeRecord = Readonly<{
 }>;
 
 /**
- * What a consumed sign-in code was bound to, so that a repeated request can
- * prove it belongs to the same attempt (#152).
+ * What a sign-in code that a request of its own attempt took was bound to,
+ * so that a repeated request can prove it belongs to the same attempt (#152).
  */
 export type UsedSignInCode = Readonly<{
   desktopCodeChallenge: string;
@@ -200,9 +200,10 @@ export const SIGN_IN_CODE_PREFIX = "mmdc_";
 export class SignInCodes {
   readonly #byHash = new Map<string, SignInCodeRecord>();
   /**
-   * The codes that `take` consumed, by the same hash, for one code lifetime
-   * after the take: a copy of a request that committed can arrive after the
-   * first copy took the code (#152).
+   * The codes that a request of their own attempt took (`markUsed`), by the
+   * same hash, until one code lifetime after that request ended: a copy of a
+   * request that committed can arrive after the first copy took the code
+   * (#152). Memory only, like the codes: a restart drops them.
    */
   readonly #usedByHash = new Map<string, UsedSignInCode>();
   readonly #options: AttemptStoreOptions;
@@ -212,10 +213,9 @@ export class SignInCodes {
   }
 
   /**
-   * Issues a code bound to the record; null when the cap is reached. A
-   * consumed code keeps its place until its record expires, so live codes
-   * and consumed records together stay within twice the cap, and taking a
-   * code never has to drop a record.
+   * Issues a code bound to the record; null when the cap is reached. A code
+   * recorded as used keeps a place until its record expires, so live codes
+   * and records together stay within twice the cap.
    */
   issue(binding: Omit<SignInCodeRecord, "expiresAt">): string | null {
     this.sweep();
@@ -236,30 +236,45 @@ export class SignInCodes {
     return code;
   }
 
-  /**
-   * Takes the record of a code once; null when it is unknown, used, or
-   * expired. A code that it takes is recorded as used for one code lifetime.
-   */
+  /** Takes the record of a code once; null when it is unknown, used, or expired. */
   take(code: string): SignInCodeRecord | null {
     const hash = sha256Hex(code);
     const record = this.#byHash.get(hash);
     this.#byHash.delete(hash);
-    const now = this.#options.now();
-    if (record === undefined || record.expiresAt <= now) {
+    if (record === undefined || record.expiresAt <= this.#options.now()) {
       return null;
+    }
+    return record;
+  }
+
+  /**
+   * Records a code that `take` returned as used by a request of its own
+   * attempt, until one code lifetime from now; another call moves that end.
+   * Right after the take it always fits, because the take freed a place; a
+   * record that expired and left meanwhile comes back only within the cap.
+   */
+  markUsed(
+    code: string,
+    binding: Pick<SignInCodeRecord, "desktopCodeChallenge" | "redirectUri">,
+  ): void {
+    const hash = sha256Hex(code);
+    if (
+      !this.#usedByHash.has(hash) &&
+      this.#byHash.size + this.#usedByHash.size >= this.#options.max * 2
+    ) {
+      return;
     }
     this.#usedByHash.set(
       hash,
       Object.freeze({
-        desktopCodeChallenge: record.desktopCodeChallenge,
-        redirectUri: record.redirectUri,
-        expiresAt: now + this.#options.lifetimeMs,
+        desktopCodeChallenge: binding.desktopCodeChallenge,
+        redirectUri: binding.redirectUri,
+        expiresAt: this.#options.now() + this.#options.lifetimeMs,
       }),
     );
-    return record;
   }
 
-  /** What a code that `take` consumed was bound to; null when it is unknown, live, or its record expired. */
+  /** What a code that `markUsed` recorded was bound to; null when there is no record or it expired. */
   used(code: string): UsedSignInCode | null {
     const record = this.#usedByHash.get(sha256Hex(code));
     if (record === undefined || record.expiresAt <= this.#options.now()) {

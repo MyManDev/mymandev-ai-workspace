@@ -245,7 +245,7 @@ test("a sign-in code is used once and expires after its lifetime", () => {
   assert.equal(codes.take(late), null, "expired");
 });
 
-test("a taken sign-in code is recorded as used, with its challenge and redirect URI, for one code lifetime after the take (#152)", () => {
+test("only markUsed records a taken sign-in code, with its challenge and redirect URI, until one code lifetime after the last mark (#152)", () => {
   let clock = 0;
   const codes = new SignInCodes({
     max: 10,
@@ -255,28 +255,28 @@ test("a taken sign-in code is recorded as used, with its challenge and redirect 
   const code = codes.issue(CODE_BINDING);
   assert.ok(code !== null);
   assert.equal(codes.used(code), null, "a live code is not used");
-  clock = 59_000;
-  assert.ok(codes.take(code) !== null);
+  clock = 50_000;
+  const record = codes.take(code);
+  assert.ok(record !== null);
+  assert.equal(codes.used(code), null, "taking alone records nothing");
+  codes.markUsed(code, record);
   assert.deepEqual(codes.used(code), {
     desktopCodeChallenge: CODE_BINDING.desktopCodeChallenge,
     redirectUri: CODE_BINDING.redirectUri,
-    expiresAt: 119_000,
+    expiresAt: 110_000,
   });
   assert.equal(
     codes.used(`${SIGN_IN_CODE_PREFIX}${randomToken()}`),
     null,
     "unknown",
   );
-  clock = 118_999;
-  assert.ok(codes.used(code) !== null, "past the code's own expiry");
-  clock = 119_000;
+  // The request ends 40 seconds after the take and marks the code again.
+  clock = 90_000;
+  codes.markUsed(code, record);
+  clock = 149_999;
+  assert.ok(codes.used(code) !== null, "one lifetime after the last mark");
+  clock = 150_000;
   assert.equal(codes.used(code), null, "expired");
-
-  const late = codes.issue(CODE_BINDING);
-  assert.ok(late !== null);
-  clock += 60_000;
-  assert.equal(codes.take(late), null);
-  assert.equal(codes.used(late), null, "a code that expired is not recorded");
 });
 
 test("the code store writes a sign-in code only as its hash, also when it records the code as used (#152)", (t) => {
@@ -288,13 +288,18 @@ test("the code store writes a sign-in code only as its hash, also when it record
   const set = t.mock.method(Map.prototype, "set");
   const code = codes.issue(CODE_BINDING);
   const taken = code === null ? null : codes.take(code);
+  if (code !== null && taken !== null) {
+    codes.markUsed(code, taken);
+    codes.markUsed(code, taken);
+  }
   set.mock.restore();
   assert.ok(code !== null && taken !== null);
   const written = set.mock.calls.map((call) => call.arguments);
+  const hash = sha256Hex(code);
   assert.deepEqual(
     written.map(([key]) => key),
-    [sha256Hex(code), sha256Hex(code)],
-    "the live code and its record of use",
+    [hash, hash, hash],
+    "the live code, then its record of use twice",
   );
   assert.equal(JSON.stringify(written).includes(code), false);
 });
@@ -311,16 +316,21 @@ test("live sign-in codes and records of used codes share twice the cap, and expi
     assert.ok(code !== null);
     return code;
   };
+  const use = (code: string) => {
+    const record = codes.take(code);
+    assert.ok(record !== null);
+    codes.markUsed(code, record);
+  };
   const first = issue();
   const second = issue();
   assert.equal(codes.issue(CODE_BINDING), null, "two live codes");
-  codes.take(first);
-  codes.take(second);
+  use(first);
+  use(second);
   clock = 30_000;
   const third = issue();
   issue();
-  codes.take(third);
-  // One live code and three records: taking a code never drops a record.
+  use(third);
+  // One live code and three records: a mark right after the take always fits.
   assert.equal(codes.issue(CODE_BINDING), null, "four entries");
   assert.ok(codes.used(first) !== null);
   assert.ok(codes.used(third) !== null);
@@ -331,6 +341,11 @@ test("live sign-in codes and records of used codes share twice the cap, and expi
   );
   assert.equal(codes.used(first), null);
   assert.ok(codes.used(third) !== null);
+  // A record that left comes back only within the cap.
+  codes.markUsed(first, CODE_BINDING);
+  assert.ok(codes.used(first) !== null, "two codes and two records");
+  codes.markUsed(second, CODE_BINDING);
+  assert.equal(codes.used(second), null, "never a fifth entry");
 });
 
 test("recent revocations keep the latest time per GitHub ID, expire after their lifetime, and drop the oldest at the cap", () => {
@@ -423,7 +438,9 @@ test("sweeping drops expired attempts and codes without a new request", () => {
   });
   assert.ok(code !== null);
   const taken = codes.issue(CODE_BINDING);
-  assert.ok(taken !== null && codes.take(taken) !== null);
+  const record = taken === null ? null : codes.take(taken);
+  assert.ok(taken !== null && record !== null);
+  codes.markUsed(taken, record);
   clock = 1_000;
   attempts.sweep();
   codes.sweep();

@@ -235,10 +235,12 @@ export const API_ERROR_STATUS = Object.freeze({
   /** The action conflicts with the current state, for example a second ownership offer. */
   conflict: 409,
   /**
-   * A sign-in code that an earlier request of the same attempt already took;
-   * that request may have committed. Only a request with the attempt's PKCE
-   * verifier and `redirect_uri` gets it, within the code's lifetime after
-   * the earlier request.
+   * A sign-in code that an earlier request with the attempt's PKCE verifier
+   * and `redirect_uri` already took; that request may have committed. Only a
+   * request with the same verifier and `redirect_uri` gets it, within the
+   * code's lifetime after the earlier request ended. A code that a request
+   * without them consumed answers `auth_failed`, and so does every code
+   * after an API restart.
    */
   sign_in_code_used: 409,
   /** A limit was reached; the answer carries `Retry-After`. */
