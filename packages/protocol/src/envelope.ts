@@ -4,7 +4,6 @@ import {
   ChatMessageSchema,
   displayText,
   multilineText,
-  ProjectSchema,
   RunStateSchema,
   UtcTimestampSchema,
 } from "./entities.ts";
@@ -21,6 +20,7 @@ import {
   WorkspaceIdSchema,
 } from "./ids.ts";
 import { canTransition, LIMITS, PROTOCOL_VERSION } from "./model.ts";
+import { WorkspaceProjectSchema } from "./project-api.ts";
 
 /**
  * Who caused an event. A client cannot choose its identity: the server binds
@@ -223,12 +223,12 @@ export const WorkspaceOwnershipTransferredEventSchema = z
 // sees. Only the server originates them, after the commit, with a `system`
 // actor and `deviceId: null`, like the membership events (see `actorAllowed`).
 
-/** A member created a project, together with its project chat. */
+/** A member created a project, together with its project chat; the payload names the creator. */
 export const WorkspaceProjectCreatedEventSchema = z
   .object({
     ...envelopeHeaderShape,
     type: z.literal("workspace.project.created"),
-    payload: z.object({ project: ProjectSchema }),
+    payload: z.object({ project: WorkspaceProjectSchema }),
   })
   .superRefine((event, ctx) => {
     if (event.payload.project.workspaceId !== event.workspaceId) {

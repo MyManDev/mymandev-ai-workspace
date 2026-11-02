@@ -164,10 +164,19 @@ test("a member creates, lists, and renames projects, and each change sends its e
     await workspaceApp(t, { githubId: 3502, now: clock.now, ...recorded }),
   );
   const workspace = await createWorkspace(owner);
-  await addClaimed(workspace.id, member.device, owner.device);
+  const memberPerson = await addClaimed(
+    workspace.id,
+    member.device,
+    owner.device,
+  );
 
   const app = await created(member, workspace.id, "App");
-  assert.deepEqual(app, { id: app.id, workspaceId: workspace.id, name: "App" });
+  assert.deepEqual(app, {
+    id: app.id,
+    workspaceId: workspace.id,
+    name: "App",
+    createdByMemberId: memberPerson,
+  });
   // A field beyond the name is stripped.
   const response = await post(member, `/workspaces/${workspace.id}/projects`, {
     name: "Website",
@@ -190,9 +199,12 @@ test("a member creates, lists, and renames projects, and each change sends its e
   const renamed = await rename(member, workspace.id, app.id, "App 2");
   assert.equal(renamed.statusCode, 204, renamed.body);
   assert.equal(renamed.body, "");
-  // The name in force changes nothing and sends nothing.
-  const again = await rename(member, workspace.id, app.id, "App 2");
-  assert.equal(again.statusCode, 204, again.body);
+  // The name in force changes nothing and sends nothing, also when it is
+  // sent with white space around it.
+  for (const name of ["App 2", " App 2\t"]) {
+    const again = await rename(member, workspace.id, app.id, name);
+    assert.equal(again.statusCode, 204, again.body);
+  }
   assert.deepEqual(
     (await list(member, workspace.id)).map((project) => project.name),
     ["App 2", "Website"],
@@ -328,6 +340,53 @@ test("a name that a project of the workspace has, in any case, answers 409, and 
   assert.deepEqual(
     recorded.events.map((event) => event.type),
     ["workspace.project.renamed"],
+  );
+});
+
+test("a name is stored normalized to NFC and trimmed, so names that look the same clash, and white space alone is refused", async (t) => {
+  const recorded = recorder();
+  const owner = await signedIn(
+    await workspaceApp(t, { githubId: 3571, ...recorded }),
+  );
+  const workspace = await createWorkspace(owner);
+  const composed = "Caf\u00E9";
+  const decomposed = "Cafe\u0301";
+  const cafe = await created(owner, workspace.id, ` ${decomposed} `);
+  assert.equal(cafe.name, composed);
+  const [row] = await database()
+    .select({ name: projects.name })
+    .from(projects)
+    .where(eq(projects.id, cafe.id));
+  assert.equal(row?.name, composed);
+
+  for (const name of [composed, decomposed, `${composed}\n`]) {
+    const response = await create(owner, workspace.id, name);
+    assert.equal(response.statusCode, 409, JSON.stringify(name));
+  }
+  const app = await created(owner, workspace.id, "App");
+  const padded = await create(owner, workspace.id, " App ");
+  assert.equal(padded.statusCode, 409, padded.body);
+  // A name too long only before trimming is accepted.
+  const long = await created(owner, workspace.id, ` ${"a".repeat(100)} `);
+  assert.equal(long.name, "a".repeat(100));
+  for (const name of [" \t ", "\u3000"]) {
+    const response = await create(owner, workspace.id, name);
+    assert.equal(response.statusCode, 400, JSON.stringify(name));
+  }
+
+  // A rename stores and compares the normalized name too.
+  recorded.events.length = 0;
+  const same = await rename(owner, workspace.id, cafe.id, ` ${decomposed}`);
+  assert.equal(same.statusCode, 204, same.body);
+  const renamed = await rename(owner, workspace.id, app.id, " Web ");
+  assert.equal(renamed.statusCode, 204, renamed.body);
+  assert.deepEqual(
+    recorded.events.map((event) => [event.type, event.payload]),
+    [["workspace.project.renamed", { projectId: app.id, name: "Web" }]],
+  );
+  assert.deepEqual(
+    (await list(owner, workspace.id)).map((project) => project.name),
+    [composed, "Web", "a".repeat(100)],
   );
 });
 

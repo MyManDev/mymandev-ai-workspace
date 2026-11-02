@@ -8,6 +8,7 @@
 import * as z from "zod";
 import type { ApiRoute } from "./auth-api.ts";
 import { displayText, ProjectSchema } from "./entities.ts";
+import { MemberIdSchema } from "./ids.ts";
 import type { ApiErrorCode } from "./model.ts";
 import { LIMITS, MAX_ANSWER_LIST_ITEMS } from "./model.ts";
 
@@ -75,10 +76,50 @@ export const PROJECT_ROUTE_ERRORS = Object.freeze({
 } satisfies Record<ProjectRouteName, readonly ApiErrorCode[]>);
 
 /**
- * A project's name: 1 to `LIMITS.name` (100) characters of single-line text,
- * by the text rule of ADR 0005, as a workspace's name.
+ * How many characters a project name may have as sent, before it is
+ * normalized: room for a name of `LIMITS.name` characters in a decomposed
+ * form, which can take several code points per character, and for white
+ * space around it. Longer text stops validation before it is normalized.
  */
-const projectName = () => displayText(LIMITS.name);
+const MAX_SENT_PROJECT_NAME_LENGTH = 1_000;
+
+/**
+ * Normalizes a project name as sent (Project Manager decision of 2026-11-02,
+ * #155): to Unicode NFC, then without white space at the start and the end
+ * (`String.prototype.trim`), so that names that look the same are the same.
+ * Workspace and person names are not normalized.
+ */
+export function normalizeProjectName(name: string): string {
+  return name.normalize("NFC").trim();
+}
+
+/**
+ * A project's name in a request: normalized with `normalizeProjectName`,
+ * then 1 to `LIMITS.name` (100) characters of single-line text by the text
+ * rule of ADR 0005, as a workspace's name. The parsed value is the
+ * normalized name, which the server stores and compares; a name of only
+ * white space is empty after it and refused.
+ */
+const projectName = () =>
+  z
+    .string()
+    .max(MAX_SENT_PROJECT_NAME_LENGTH, { abort: true })
+    .transform(normalizeProjectName)
+    .pipe(displayText(LIMITS.name));
+
+/**
+ * A project as the members of its workspace see it: the protocol's
+ * `Project` with its creator, `createdByMemberId`. The table records the
+ * creating account, and renaming rights follow that account (#155): the
+ * creator is the account's active person in the workspace, so that a creator
+ * who left and joined again finds their own person; without one, the
+ * account's most recently removed person, so that the project still names
+ * its creator, shown through that person row as a former member.
+ */
+export const WorkspaceProjectSchema = ProjectSchema.extend({
+  createdByMemberId: MemberIdSchema,
+});
+export type WorkspaceProject = z.infer<typeof WorkspaceProjectSchema>;
 
 /** `POST /workspaces/:workspaceId/projects`. */
 export const CreateProjectRequestSchema = z.object({
@@ -88,7 +129,7 @@ export type CreateProjectRequest = z.infer<typeof CreateProjectRequestSchema>;
 
 /** The answer of `POST /workspaces/:workspaceId/projects`: the new project. */
 export const CreateProjectResponseSchema = z.object({
-  project: ProjectSchema,
+  project: WorkspaceProjectSchema,
 });
 export type CreateProjectResponse = z.infer<typeof CreateProjectResponseSchema>;
 
@@ -97,7 +138,7 @@ export type CreateProjectResponse = z.infer<typeof CreateProjectResponseSchema>;
  * are not archived, the oldest first.
  */
 export const ProjectListResponseSchema = z.object({
-  projects: z.array(ProjectSchema).max(MAX_ANSWER_LIST_ITEMS),
+  projects: z.array(WorkspaceProjectSchema).max(MAX_ANSWER_LIST_ITEMS),
 });
 export type ProjectListResponse = z.infer<typeof ProjectListResponseSchema>;
 

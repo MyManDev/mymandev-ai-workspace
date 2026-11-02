@@ -12,9 +12,9 @@ import {
   newId,
   newUuidV7,
   type ProjectId,
-  ProjectSchema,
   type UserId,
   type WorkspaceId,
+  WorkspaceProjectSchema,
 } from "@mymandev/protocol";
 import { and, eq, isNull } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
@@ -22,7 +22,7 @@ import { eraseAccount } from "./account-erasure.ts";
 import type { Database } from "./db.ts";
 import { DatabaseError, withDatabaseErrors } from "./errors.ts";
 import { migrationsFolder } from "./migrate.ts";
-import { createWorkspace } from "./membership.ts";
+import { activePersonOf, createWorkspace } from "./membership.ts";
 import { removeMember } from "./people.ts";
 import {
   createProject,
@@ -111,6 +111,19 @@ async function join(
     claimedAt: NOW,
   });
   return id;
+}
+
+/** The account's active person in the workspace. */
+async function personOf(
+  workspaceId: WorkspaceId,
+  who: Account,
+): Promise<MemberId> {
+  const person = await activePersonOf(database(), {
+    workspaceId,
+    userId: who.userId,
+  });
+  assert.ok(person !== undefined);
+  return person.id;
 }
 
 /** Creates a project that must be created, and returns its ID. */
@@ -215,7 +228,7 @@ test("any active member creates a project with its project conversation, and not
   const owner = await account("Owner");
   const member = await account("Member");
   const workspaceId = await workspaceOf(owner);
-  await join(workspaceId, member);
+  const memberPerson = await join(workspaceId, member);
 
   const byOwner = await createProject(db, {
     workspaceId,
@@ -228,9 +241,20 @@ test("any active member creates a project with its project conversation, and not
     id: byOwner.project.id,
     workspaceId,
     name: "App",
+    createdByMemberId: await personOf(workspaceId, owner),
   });
-  assert.ok(ProjectSchema.safeParse(byOwner.project).success);
+  assert.ok(WorkspaceProjectSchema.safeParse(byOwner.project).success);
   const byMember = await created(workspaceId, member, "Website", LATER);
+  assert.deepEqual(
+    (await listProjects(db, workspaceId)).map((project) => [
+      project.id,
+      project.createdByMemberId,
+    ]),
+    [
+      [byOwner.project.id, byOwner.project.createdByMemberId],
+      [byMember, memberPerson],
+    ],
+  );
 
   const row = await projectRow(byOwner.project.id);
   assert.equal(row.workspaceId, workspaceId);
@@ -288,9 +312,10 @@ test("the list holds the workspace's projects that are not archived, the oldest 
   });
   assert.deepEqual(renamed, { renamed: true, changed: true });
 
+  const createdByMemberId = await personOf(workspaceId, owner);
   assert.deepEqual(await listProjects(database(), workspaceId), [
-    { id: first, workspaceId, name: "Omega" },
-    { id: second, workspaceId, name: "Alpha" },
+    { id: first, workspaceId, name: "Omega", createdByMemberId },
+    { id: second, workspaceId, name: "Alpha", createdByMemberId },
   ]);
   assert.deepEqual(await listProjects(database(), newId<WorkspaceId>()), []);
 });
@@ -584,7 +609,7 @@ test("the creator, the owner, and an admin rename a project; another member is f
   );
 });
 
-test("the creator still renames the project after leaving the workspace and joining again as a new person", async () => {
+test("the creator still renames the project after leaving the workspace and joining again as a new person, which the project then names as its creator", async () => {
   const owner = await account("Owner");
   const creator = await account("Creator");
   const workspaceId = await workspaceOf(owner);
@@ -594,7 +619,21 @@ test("the creator still renames the project after leaving the workspace and join
     .update(workspaceMembers)
     .set({ removedAt: NOW, removedByUserId: creator.userId })
     .where(eq(workspaceMembers.id, person));
-  await join(workspaceId, creator);
+  // The project names the account's removed person while it has no other.
+  assert.deepEqual(
+    (await listProjects(database(), workspaceId)).map(
+      (item) => item.createdByMemberId,
+    ),
+    [person],
+  );
+  const rejoined = await join(workspaceId, creator);
+  // Then the account's active person, which holds the account's rights.
+  assert.deepEqual(
+    (await listProjects(database(), workspaceId)).map(
+      (item) => item.createdByMemberId,
+    ),
+    [rejoined],
+  );
   assert.deepEqual(
     await renameProject(database(), {
       workspaceId,

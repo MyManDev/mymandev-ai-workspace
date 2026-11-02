@@ -1,17 +1,25 @@
 import {
   MAX_ANSWER_LIST_ITEMS,
+  type MemberId,
   newId,
   newUuidV7,
-  type Project,
   type ProjectId,
   type UserId,
   type WorkspaceId,
+  type WorkspaceProject,
 } from "@mymandev/protocol";
-import { and, asc, count, eq, gt, isNull, min } from "drizzle-orm";
+import { and, asc, count, desc, eq, gt, isNull, min, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Database } from "./db.ts";
 import { toDatabaseError, withDatabaseErrors } from "./errors.ts";
 import { administers, lockPeople } from "./people.ts";
-import { conversations, projects, users, workspaces } from "./schema/index.ts";
+import {
+  conversations,
+  projects,
+  users,
+  workspaceMembers,
+  workspaces,
+} from "./schema/index.ts";
 
 // The projects of a workspace: creating, listing, and renaming them (#155;
 // Project Manager decision of 2026-11-02). Any active member creates a
@@ -21,6 +29,9 @@ import { conversations, projects, users, workspaces } from "./schema/index.ts";
 // it, so that concurrent writers cannot both pass. Creating and renaming a
 // project write no audit record: they are not administrative actions of ADR
 // 0014, and its audit vocabulary has no project action.
+// The API passes names that the protocol normalized (`normalizeProjectName`:
+// NFC, without white space at the start and the end); these functions store
+// and compare them as they are given.
 //
 // Lock order, the order of `src/people.ts` extended: the account (`users`),
 // then the device (`devices`), as `lockActor` in the API does; then the
@@ -60,7 +71,7 @@ export type CreateProjectInput = Readonly<{
 }>;
 
 export type CreateProjectResult =
-  | Readonly<{ created: true; project: Project }>
+  | Readonly<{ created: true; project: WorkspaceProject }>
   | Readonly<{
       created: false;
       /**
@@ -154,13 +165,16 @@ export async function createProject(
           };
         }
 
-        const project: Project = {
+        const project: WorkspaceProject = {
           id: newId<ProjectId>(),
           workspaceId: input.workspaceId,
           name: input.name,
+          createdByMemberId: actor.id,
         };
         await tx.insert(projects).values({
-          ...project,
+          id: project.id,
+          workspaceId: project.workspaceId,
+          name: project.name,
           createdByUserId: input.userId,
           createdAt: input.now,
           updatedAt: input.now,
@@ -183,32 +197,63 @@ export async function createProject(
   });
 }
 
+const creator = alias(workspaceMembers, "creator");
+
 /**
- * The workspace's projects that are not archived: the answer of
- * `GET /workspaces/:workspaceId/projects`. The oldest first, in the order in
- * which they were created, so that a project keeps its place when it is
- * renamed and a new one comes last; at most `MAX_ANSWER_LIST_ITEMS`, far
+ * The workspace's projects that are not archived, each with its creator: the
+ * answer of `GET /workspaces/:workspaceId/projects`. The oldest first, in the
+ * order in which they were created, so that a project keeps its place when it
+ * is renamed and a new one comes last; at most `MAX_ANSWER_LIST_ITEMS`, far
  * above `MAX_ACTIVE_PROJECTS_PER_WORKSPACE`. The caller checks membership
  * first.
+ *
+ * The table records the creating account; the protocol shows the creator's
+ * person, `createdByMemberId`, as `listInvitations` does for an invitation's
+ * creator: the account's active person in the workspace, which is the person
+ * that created the project or, after the account left and joined again, its
+ * new person, whose rights to rename the project follow the account (#155);
+ * without one, the account's most recently removed person. The account was an
+ * active member when it created the project, and person rows are never
+ * deleted, so one is always found.
  */
 export async function listProjects(
   db: Database,
   workspaceId: WorkspaceId,
-): Promise<Project[]> {
-  return withDatabaseErrors(() =>
-    db
+): Promise<WorkspaceProject[]> {
+  return withDatabaseErrors(async () => {
+    const creatorPerson = db
+      .select({ id: creator.id })
+      .from(creator)
+      .where(
+        and(
+          eq(creator.workspaceId, projects.workspaceId),
+          eq(creator.userId, projects.createdByUserId),
+        ),
+      )
+      .orderBy(sql`${creator.removedAt} desc nulls first`, desc(creator.id))
+      .limit(1);
+    const rows = await db
       .select({
         id: projects.id,
         workspaceId: projects.workspaceId,
         name: projects.name,
+        createdByMemberId: sql<MemberId | null>`(${creatorPerson})`,
       })
       .from(projects)
       .where(
         and(eq(projects.workspaceId, workspaceId), isNull(projects.archivedAt)),
       )
       .orderBy(asc(projects.createdAt), asc(projects.id))
-      .limit(MAX_ANSWER_LIST_ITEMS),
-  );
+      .limit(MAX_ANSWER_LIST_ITEMS);
+    return rows.map(({ createdByMemberId, ...row }) => {
+      if (createdByMemberId === null) {
+        throw new Error(
+          "The creator of a project has no person in its workspace",
+        );
+      }
+      return { ...row, createdByMemberId };
+    });
+  });
 }
 
 export type RenameProjectInput = Readonly<{

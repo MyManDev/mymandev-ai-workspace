@@ -7,7 +7,10 @@ import { decodeClientEvent, decodeEvent } from "./decode.ts";
 import { SERVER_ONLY_EVENT_TYPES } from "./envelope.ts";
 import { decodeClientMessage, decodeServerMessage } from "./frames.ts";
 import { ProjectIdSchema, WorkspaceIdSchema } from "./ids.ts";
-import { MEMBERSHIP_ROUTES } from "./membership-api.ts";
+import {
+  CreateWorkspaceRequestSchema,
+  MEMBERSHIP_ROUTES,
+} from "./membership-api.ts";
 import {
   API_ERROR_CODES,
   type ApiErrorCode,
@@ -16,6 +19,7 @@ import {
 import {
   CreateProjectRequestSchema,
   CreateProjectResponseSchema,
+  normalizeProjectName,
   PROJECT_ROUTE_ERRORS,
   PROJECT_ROUTES,
   ProjectListResponseSchema,
@@ -33,7 +37,14 @@ const DEVICE_ID = "0192f2a0-7c3e-7e00-8000-000000000007";
 const USER_ID = "0192f2a0-7c3e-7f00-a000-000000000002";
 const NOW = "2026-11-02T12:00:00.000Z";
 
-const project = { id: PROJECT_ID, workspaceId: WORKSPACE_ID, name: "App" };
+const MEMBER_ID = "0192f2a0-7c3e-7d2e-9f10-112233445502";
+
+const project = {
+  id: PROJECT_ID,
+  workspaceId: WORKSPACE_ID,
+  name: "App",
+  createdByMemberId: MEMBER_ID,
+};
 
 /** The codes that every project route can answer, as every membership route can. */
 const COMMON_CODES: readonly string[] = [
@@ -201,16 +212,18 @@ test("creating and renaming a project take a name of single-line text from 1 to 
       "\u00C4rger",
       "Team \u{1F680}",
     ]) {
-      assert.equal(schema.safeParse({ name }).success, true, name);
+      assert.deepEqual(schema.safeParse({ name }).data, { name }, name);
     }
     for (const [label, value] of [
       ["empty", { name: "" }],
       ["over 100", { name: "a".repeat(101) }],
       ["blank", { name: " \t " }],
-      ["line feed", { name: "App\nWeb" }],
+      ["only white space of other kinds", { name: "\u00A0\u3000\n" }],
+      ["line feed inside", { name: "App\nWeb" }],
       ["control character", { name: "Ap\u0000p" }],
       ["zero-width space", { name: "Ap\u200Bp" }],
       ["right-to-left override", { name: "\u202EppA" }],
+      ["over 1,000 as sent", { name: `${" ".repeat(998)}App` }],
       ["missing", {}],
       ["number", { name: 7 }],
     ] as const) {
@@ -225,6 +238,46 @@ test("creating and renaming a project take a name of single-line text from 1 to 
   }
 });
 
+test("a project name is normalized to NFC and trimmed before it is checked, so names that look the same are the same", () => {
+  const composed = "Caf\u00E9";
+  const decomposed = "Cafe\u0301";
+  assert.notEqual(composed, decomposed);
+  assert.equal(normalizeProjectName(decomposed), composed);
+  for (const schema of [
+    CreateProjectRequestSchema,
+    RenameProjectRequestSchema,
+  ]) {
+    for (const [sent, stored] of [
+      [decomposed, composed],
+      [composed, composed],
+      [" App ", "App"],
+      ["\tApp\n", "App"],
+      ["\u00A0App\u3000", "App"],
+      [` ${decomposed} `, composed],
+      // Too long only before trimming.
+      [`  ${"a".repeat(100)}  `, "a".repeat(100)],
+      // 100 characters only after composing: each "e" with its accent is one.
+      ["e\u0301".repeat(100), "\u00E9".repeat(100)],
+    ] as const) {
+      assert.deepEqual(
+        schema.parse({ name: sent }),
+        { name: stored },
+        JSON.stringify(sent),
+      );
+    }
+  }
+  // Inner white space stays as it is.
+  assert.equal(normalizeProjectName(" A  B "), "A  B");
+  // Workspace and person names stay as they are sent.
+  assert.deepEqual(
+    CreateWorkspaceRequestSchema.parse({
+      name: ` ${decomposed} `,
+      displayName: " Ada ",
+    }),
+    { name: ` ${decomposed} `, displayName: " Ada " },
+  );
+});
+
 test("the answers carry projects, at most MAX_ANSWER_LIST_ITEMS in a list, and export to JSON Schema", () => {
   assert.deepEqual(CreateProjectResponseSchema.parse({ project }), {
     project,
@@ -234,6 +287,11 @@ test("the answers carry projects, at most MAX_ANSWER_LIST_ITEMS in a list, and e
     ["blank name", { project: { ...project, name: " " } }],
     ["bad ID", { project: { ...project, id: "x" } }],
     ["missing workspace", { project: { id: PROJECT_ID, name: "App" } }],
+    [
+      "missing creator",
+      { project: { id: PROJECT_ID, workspaceId: WORKSPACE_ID, name: "App" } },
+    ],
+    ["bad creator", { project: { ...project, createdByMemberId: "x" } }],
   ] as const) {
     assert.equal(
       CreateProjectResponseSchema.safeParse(value).success,
@@ -329,6 +387,12 @@ test("project events check the project and its name", () => {
       "a project of another workspace",
       projectEvent("workspace.project.created", {
         project: { ...project, workspaceId: OTHER_WORKSPACE_ID },
+      }),
+    ],
+    [
+      "a created project without its creator",
+      projectEvent("workspace.project.created", {
+        project: { id: PROJECT_ID, workspaceId: WORKSPACE_ID, name: "App" },
       }),
     ],
     [

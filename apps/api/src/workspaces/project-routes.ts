@@ -133,7 +133,9 @@ export function registerProjectRoutes(
     },
   );
 
-  // The name in force changes nothing and sends no event.
+  // The protocol schema normalized the name, so the name in force, also sent
+  // with other white space around it or in another normal form, changes
+  // nothing and sends no event.
   workspace.post(
     PROJECT_ROUTES.renameProject.path,
     {
