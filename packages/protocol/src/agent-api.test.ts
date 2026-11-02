@@ -220,7 +220,7 @@ test("the agent list holds each agent of one project once, at most MAX_ANSWER_LI
   assert.deepEqual(parsed, { agents: [agent] });
 });
 
-test("the run list holds every unfinished run and the 50 most recently finished runs of one project", () => {
+test("the run list holds the unfinished runs and the most recently finished runs of one project, each list at most MAX_ANSWER_LIST_ITEMS", () => {
   const valid = {
     unfinishedRuns: [
       run(1, "queued"),
@@ -260,10 +260,26 @@ test("the run list holds every unfinished run and the 50 most recently finished 
       false,
     ],
     [
-      "one finished run too many",
+      "more finished runs than the server sends today",
       {
         unfinishedRuns: [],
         finishedRuns: runs(RECENT_FINISHED_RUNS + 1, "completed"),
+      },
+      true,
+    ],
+    [
+      "the most finished runs",
+      {
+        unfinishedRuns: [],
+        finishedRuns: runs(MAX_ANSWER_LIST_ITEMS, "completed"),
+      },
+      true,
+    ],
+    [
+      "one finished run too many",
+      {
+        unfinishedRuns: [],
+        finishedRuns: runs(MAX_ANSWER_LIST_ITEMS + 1, "completed"),
       },
       false,
     ],

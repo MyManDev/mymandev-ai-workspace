@@ -199,18 +199,25 @@ export type WorkspaceUnsubscribeReason =
 
 /**
  * Why the server refused an event that a device sent, in `event.refused`
- * (#27, #28). The connection stays open. `not_found`: the event names a
- * project, an agent, or a run that does not exist or is not in the event's
- * workspace; both get the same code, so that a device cannot probe which IDs
- * exist (ADR 0007, ADR 0014). `conflict`: what the event names exists in the
- * workspace, but is not in the state that the event needs, for example a run
- * whose stored state is not `previousState`, an archived project, or a
- * disabled agent. A protocol violation gets no code: it closes the
- * connection.
+ * (#27, #28). The connection stays open. The list is closed; it is complete
+ * before protocol version 1, because a new value then needs a new version.
+ *
+ * - `not_found`: the event names a project, an agent, a run, or a
+ *   repository that does not exist or is not in the event's workspace, or a
+ *   run of another agent; both get the same code, so that a device cannot
+ *   probe which IDs exist (ADR 0007, ADR 0014).
+ * - `conflict`: what the event names exists in the workspace, but is not in
+ *   the state that the event needs, for example a run whose stored state is
+ *   not `previousState`, an archived project, or a disabled agent.
+ * - `rate_limited`: the device sent more events than the server's send
+ *   limit allows. The limit's values are decided with the API part of #27.
+ *
+ * A protocol violation gets no code: it closes the connection.
  */
 export const EVENT_REFUSAL_CODES = Object.freeze([
   "not_found",
   "conflict",
+  "rate_limited",
 ] as const);
 export type EventRefusalCode = (typeof EVENT_REFUSAL_CODES)[number];
 
@@ -342,9 +349,11 @@ export const CHAT_HISTORY_PAGE = Object.freeze({
 } as const);
 
 /**
- * How many finished runs the project's run list holds (#28): its most
- * recently finished runs, the most recent first. The list also holds every
- * unfinished run, up to `MAX_ANSWER_LIST_ITEMS`.
+ * How many finished runs the server puts in the project's run list (#28):
+ * its most recently finished runs, the most recent first. The list also
+ * holds every unfinished run, up to `MAX_ANSWER_LIST_ITEMS`. The answer's
+ * schema accepts up to `MAX_ANSWER_LIST_ITEMS` finished runs, so that
+ * raising this count never breaks an older desktop.
  */
 export const RECENT_FINISHED_RUNS = 50;
 

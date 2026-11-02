@@ -985,7 +985,11 @@ test("a chat message holds up to 16,000 characters, and the largest one fits the
 });
 
 test("event.refused reaches only the sender, with the refused event's ID and a closed code", () => {
-  assert.deepEqual(EVENT_REFUSAL_CODES, ["not_found", "conflict"]);
+  assert.deepEqual(EVENT_REFUSAL_CODES, [
+    "not_found",
+    "conflict",
+    "rate_limited",
+  ]);
   assert.ok(Object.isFrozen(EVENT_REFUSAL_CODES));
   for (const code of EVENT_REFUSAL_CODES) {
     const input = eventRefused(code);
@@ -1023,7 +1027,7 @@ test("event.refused reaches only the sender, with the refused event's ID and a c
   // included, which close the connection instead.
   const cases: [label: string, input: Json][] = [
     ...[
-      "rate_limited",
+      "retry_later",
       "forbidden",
       "not_a_member",
       "identity_mismatch",
@@ -1085,12 +1089,67 @@ test("the server relays an agent's run transition with the same event ID and act
       { ...relayed, actor: { kind: "agent", agentId: OTHER_AGENT_ID } },
     ],
     ["a user", { ...relayed, actor: { kind: "user", userId: USER_ID } }],
+    // The server never forwards the host device's ID.
+    ["the host device's ID", sent],
+    [
+      "a run creation with a device",
+      {
+        ...relayed,
+        actor: { kind: "system" },
+        deviceId: DEVICE_ID,
+        payload: {
+          runId: RUN_ID,
+          agentId: AGENT_ID,
+          previousState: null,
+          state: "queued",
+        },
+      },
+    ],
+    [
+      "a cancellation by the server with a device",
+      {
+        ...relayed,
+        actor: { kind: "system" },
+        deviceId: DEVICE_ID,
+        payload: {
+          runId: RUN_ID,
+          agentId: AGENT_ID,
+          previousState: "running",
+          state: "cancelled",
+          reason: "device_revoked",
+        },
+      },
+    ],
+    [
+      "a stored message with a device",
+      { ...chatCreated(), deviceId: DEVICE_ID },
+    ],
   ];
   for (const [label, input] of cases) {
     assert.deepEqual(
       decodeServerMessage(input),
       { ok: false, code: "invalid_actor" },
       label,
+    );
+  }
+});
+
+test("every event that a device decodes from the server has no device", () => {
+  const events = [
+    ...membershipEvents(),
+    chatCreated(),
+    { ...runTransition(), deviceId: null },
+  ];
+  for (const event of events) {
+    const decoded = decodeServerMessage(event);
+    assert.ok(decoded.ok && decoded.kind === "event", String(event["type"]));
+    // The decoded type says so as well.
+    const deviceId: null = decoded.event.deviceId;
+    assert.equal(deviceId, null);
+    assert.deepEqual(
+      decodeServerMessage({ ...event, deviceId: DEVICE_ID }),
+      { ok: false, code: "invalid_actor" },
+      `${String(event["type"])} with a device`,
     );
   }
 });

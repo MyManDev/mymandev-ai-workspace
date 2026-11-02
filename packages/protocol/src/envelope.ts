@@ -63,8 +63,15 @@ export const envelopeHeaderShape = Object.freeze({
  * The server sends a run creation and its own cancellations with a `system`
  * actor and `deviceId: null`. Every other transition comes from the agent's
  * host device with the agent as the actor; the server stores it and relays
- * it to the workspace's subscribers with the same event ID, actor, and
- * payload, but with `deviceId: null` (#28).
+ * it to the workspace's subscribers, and to the sending connection also
+ * when it is not subscribed, as its acknowledgement (#28). The relayed
+ * event keeps every field (`id`, `occurredAt`, `actor`, `correlationId`,
+ * `causationId`, and `payload`) except `deviceId`, which is null. A device
+ * chooses its event IDs, so the server records each transition by device
+ * and event ID, and receivers never de-duplicate relayed run events by
+ * event ID alone. A transition whose device and event ID the server already
+ * recorded gets the relayed event again, sent only to the sending
+ * connection, and is never applied twice.
  */
 export const AgentRunStateChangedPayloadSchema = z
   .object({
@@ -241,9 +248,9 @@ export type ChatMessageSendEvent = z.infer<typeof ChatMessageSendEventSchema>;
  * attributed to its author, `payload.message.author`.
  * The server sets `causationId` to the ID of the `chat.message.send` that
  * the message came from, so the sending device can replace its pending copy.
- * A `chat.message.send` whose event ID the server already stored gets the
- * stored message again in this event, sent only to the sending connection,
- * with `causationId` set to that event ID (#27).
+ * A `chat.message.send` whose event ID the server already stored for the
+ * sending device gets the stored message again in this event, sent only to
+ * the sending connection, with `causationId` set to that event ID (#27).
  */
 export const ChatMessageCreatedEventSchema = z.object({
   ...envelopeHeaderShape,

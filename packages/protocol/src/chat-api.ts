@@ -82,13 +82,26 @@ export type ChatHistoryQuery = z.infer<typeof ChatHistoryQuerySchema>;
  * with the lowest `seq` it holds as `beforeSeq`. Chat messages are
  * deduplicated by message ID, so a page that overlaps the messages that
  * arrived over the connection changes nothing.
+ * The schema cannot see the request, so the device checks three things
+ * itself: every `seq` is lower than the `beforeSeq` it sent, the page holds
+ * at most the `limit` it sent, and every message belongs to the project of
+ * the path.
  */
 export const ChatHistoryResponseSchema = z
   .object({
     messages: z.array(ChatMessageSchema).max(CHAT_HISTORY_PAGE.max),
   })
   .superRefine((page, ctx) => {
+    const ids = new Set<string>();
     page.messages.forEach((message, index) => {
+      if (ids.has(message.id)) {
+        ctx.addIssue({
+          code: "custom",
+          message: "A message is listed once",
+          path: ["messages", index, "id"],
+        });
+      }
+      ids.add(message.id);
       const newer = page.messages[index - 1];
       if (newer === undefined) {
         return;

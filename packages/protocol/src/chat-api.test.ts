@@ -162,6 +162,10 @@ test("a history page holds up to 100 messages of one project, each once, the new
     ["the oldest first", { messages: [message(1), message(2)] }],
     ["a message twice", { messages: [message(2), message(2)] }],
     [
+      "a message ID twice",
+      { messages: [message(2), message(1, { id: message(2).id })] },
+    ],
+    [
       "two projects",
       {
         messages: [message(2), message(1, { projectId: OTHER_PROJECT_ID })],

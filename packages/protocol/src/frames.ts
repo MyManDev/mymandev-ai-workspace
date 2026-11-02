@@ -357,8 +357,8 @@ export const EventRefusalCodeSchema = z.enum(EVENT_REFUSAL_CODES);
  * The server refused an event that this connection sent (#27, #28), and the
  * connection stays open. Sent only to the sending connection, also when it
  * is not subscribed to the event's workspace; the server stored and relayed
- * nothing. `eventId` is the ID of the refused event. `not_found` and
- * `conflict` are described at `EVENT_REFUSAL_CODES`. A protocol violation is
+ * nothing. `eventId` is the ID of the refused event; the codes are
+ * described at `EVENT_REFUSAL_CODES`. A protocol violation is
  * never answered with this frame: a message that `decodeClientMessage`
  * refuses, an identity mismatch, and an account that is not an active member
  * of the event's workspace close the connection, as a device or an account
@@ -565,8 +565,20 @@ function isClientOnlyEvent(
 /** An event that the server sends: never one of `CLIENT_ONLY_EVENT_TYPES`. */
 export type ServerEvent = Exclude<ProtocolEvent, { type: ClientOnlyEventType }>;
 
+/**
+ * An event that a device received from the server and decoded: a
+ * `ServerEvent` whose `deviceId` is null. The server originates its events
+ * with a null device, and relays an agent's run transition with a null
+ * device as well (#28), so no device ID ever reaches other members.
+ */
+export type ReceivedServerEvent = ServerEvent & { deviceId: null };
+
+function hasNoDevice(event: ServerEvent): event is ReceivedServerEvent {
+  return event.deviceId === null;
+}
+
 export type ServerMessageDecodeResult =
-  | { ok: true; kind: "event"; event: ServerEvent }
+  | { ok: true; kind: "event"; event: ReceivedServerEvent }
   | { ok: true; kind: "frame"; frame: ServerFrame }
   | { ok: false; code: DecodeErrorCode };
 
@@ -575,7 +587,8 @@ export type ServerMessageDecodeResult =
  * device uses it; the server decodes with `decodeClientFrame` before
  * authentication and with `decodeClientMessage` after it. An event or a
  * frame that only a device sends, such as `chat.message.send` or
- * `auth.response`, is `unknown_type` here.
+ * `auth.response`, is `unknown_type` here. An event with a `deviceId` is
+ * `invalid_actor`: the server sends every event with a null device.
  */
 export function decodeServerMessage(input: unknown): ServerMessageDecodeResult {
   const header = probe(input);
@@ -594,6 +607,11 @@ export function decodeServerMessage(input: unknown): ServerMessageDecodeResult {
     // Never true after the check above; it narrows the type.
     if (isClientOnlyEvent(result.event)) {
       return { ok: false, code: "unknown_type" };
+    }
+    // The server never sends a device ID with an event, also not with a
+    // run transition that it relays from the agent's host device.
+    if (!hasNoDevice(result.event)) {
+      return { ok: false, code: "invalid_actor" };
     }
     return { ok: true, kind: "event", event: result.event };
   }

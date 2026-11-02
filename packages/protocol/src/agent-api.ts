@@ -18,12 +18,7 @@ import {
   RunIdSchema,
 } from "./ids.ts";
 import type { ApiErrorCode } from "./model.ts";
-import {
-  isTerminalRunState,
-  LIMITS,
-  MAX_ANSWER_LIST_ITEMS,
-  RECENT_FINISHED_RUNS,
-} from "./model.ts";
+import { isTerminalRunState, LIMITS, MAX_ANSWER_LIST_ITEMS } from "./model.ts";
 
 function route(method: ApiRoute["method"], path: string): ApiRoute {
   return Object.freeze({ method, path });
@@ -144,15 +139,18 @@ export type AgentRunListItem = z.infer<typeof AgentRunListItemSchema>;
 
 /**
  * The answer of `GET /projects/:projectId/runs`. `unfinishedRuns`: every
- * run of the project in `queued`, `running`, or `awaiting_input`, the most
- * recently created first, at most `MAX_ANSWER_LIST_ITEMS`. `finishedRuns`:
- * the project's `RECENT_FINISHED_RUNS` (50) most recently finished runs,
- * the most recently finished first. A run is listed once.
+ * unfinished run of the project (`queued`, `running`, or `awaiting_input`),
+ * up to `MAX_ANSWER_LIST_ITEMS`, the most recently created first.
+ * `finishedRuns`: the project's most recently finished runs, the most
+ * recently finished first; the server sends `RECENT_FINISHED_RUNS` (50) of
+ * them, and the schema accepts up to `MAX_ANSWER_LIST_ITEMS`, so that
+ * raising the server's count never breaks an older desktop. A run is
+ * listed once.
  */
 export const AgentRunListResponseSchema = z
   .object({
     unfinishedRuns: z.array(AgentRunListItemSchema).max(MAX_ANSWER_LIST_ITEMS),
-    finishedRuns: z.array(AgentRunListItemSchema).max(RECENT_FINISHED_RUNS),
+    finishedRuns: z.array(AgentRunListItemSchema).max(MAX_ANSWER_LIST_ITEMS),
   })
   .superRefine((list, ctx) => {
     const projectId = (list.unfinishedRuns[0] ?? list.finishedRuns[0])

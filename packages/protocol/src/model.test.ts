@@ -164,9 +164,13 @@ test("the workspace connection vocabularies and the message limit are the values
 });
 
 test("event refusals, the chat history page, and the finished runs are the values of #27 and #28", () => {
-  // One code for an unknown entity and for one of another workspace; no
-  // send limit exists, so no `rate_limited`.
-  assert.deepEqual(EVENT_REFUSAL_CODES, ["not_found", "conflict"]);
+  // One code for an unknown entity and for one of another workspace, and
+  // `rate_limited` for the send limit, before protocol version 1.
+  assert.deepEqual(EVENT_REFUSAL_CODES, [
+    "not_found",
+    "conflict",
+    "rate_limited",
+  ]);
   assert.deepEqual(CHAT_HISTORY_PAGE, { default: 50, max: 100 });
   assert.ok(CHAT_HISTORY_PAGE.default <= CHAT_HISTORY_PAGE.max);
   assert.ok(CHAT_HISTORY_PAGE.max <= MAX_ANSWER_LIST_ITEMS);
