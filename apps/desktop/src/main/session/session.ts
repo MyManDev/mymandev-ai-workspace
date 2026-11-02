@@ -35,6 +35,11 @@ import type { DeviceKeys, DeviceKeyStore } from "../device-key/store.ts";
 import type { DeviceRecord, DeviceRecordStore } from "../device-record.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 import { type ApiAnswer, type ApiFetch, callApi } from "./api-call.ts";
+import {
+  NO_SESSION_NOTES,
+  type SessionNotes,
+  type SessionNotesStore,
+} from "./session-notes.ts";
 import type { SignOutMarker, SignOutMarkerStore } from "./sign-out-marker.ts";
 import { webSocketAuthResponse } from "./websocket-auth.ts";
 
@@ -48,6 +53,21 @@ export const ACCESS_TOKEN_LIFETIME_MS = 15 * 60_000;
  * matter.
  */
 export const ACCESS_TOKEN_RENEW_MARGIN_MS = 60_000;
+
+/**
+ * After a sign-in whose outcome is unknown, the API may still commit it, so
+ * for this long the new key is not discarded although the previous key
+ * authenticates.
+ */
+export const REPLACEMENT_GRACE_MS = 10 * 60_000;
+
+/**
+ * When the API first refuses both keys of a pending replacement, they count
+ * as lost only if a round at least this much later refuses both again, so
+ * that a short outage of the API (for example its challenges lost in a
+ * deploy) never deletes a key that it holds.
+ */
+export const LOST_KEY_WAIT_MS = 10 * 60_000;
 
 /**
  * Why a call of the session failed:
@@ -73,6 +93,8 @@ export const ACCESS_TOKEN_RENEW_MARGIN_MS = 60_000;
  *   sign-in runs, because the sign-in may still register the new key.
  * - `replacement_pending`: the WebSocket challenge is not signed while a key
  *   replacement is pending; `authenticate` resolves it first.
+ * - `removal_pending`: the person removed this device, and the API has not
+ *   confirmed it yet; the key is used only for the removal.
  * - `refused`: the API answered with an error body; `code` names it. With
  *   `device_account_mismatch`, `deviceLogin` is the login of the account
  *   that this installation holds.
@@ -94,6 +116,7 @@ export const SESSION_FAILURE_REASONS = Object.freeze([
   "signed_out",
   "sign_in_running",
   "replacement_pending",
+  "removal_pending",
   "refused",
   "record_not_saved",
   "invalid_request",
@@ -148,7 +171,7 @@ export interface SessionAccount {
  * - `account_mismatch`: a sign-in with another GitHub account was refused;
  *   the person may sign in as `account.login`, and then remove this device.
  * - `removal_pending`: the person removed this device, and the API has not
- *   confirmed it yet.
+ *   confirmed it yet; it holds across a restart, and `refresh` retries it.
  * - `removed`: the API confirmed the removal; the key and the record are
  *   deleted.
  * - `revoked`: the API answered `device_revoked`. The caller stops local
@@ -205,12 +228,19 @@ export interface DeviceSessionDependencies {
   readonly keyStore: SessionKeyStore;
   readonly deviceRecords: DeviceRecordStore;
   readonly signOutMarkers: SignOutMarkerStore;
+  readonly sessionNotes: SessionNotesStore;
   /** Production passes Electron's `net.fetch`. */
   readonly fetch: ApiFetch;
   /** The clock of the request timeouts; defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
   /** A monotonic clock in milliseconds; defaults to `performance.now`. */
   readonly now?: () => number;
+  /**
+   * The wall clock in milliseconds; defaults to `Date.now`. It times the
+   * notes that survive a restart, and with `now` the token cache, because
+   * the monotonic clock may stop while the computer sleeps.
+   */
+  readonly wallClock?: () => number;
   /** Receives a fixed message for an error that the session handled. */
   readonly onError?: (message: string) => void;
 }
@@ -230,7 +260,9 @@ export interface DeviceSession {
    * the tokens and the API's last refusal (`sign_in_required`,
    * `auth_failed`) and `account_mismatch`. Call it at startup after the key
    * store's `load`, after a passphrase was entered, and when the person
-   * asks to try again. `revoked` and `removed` stay until a sign-in.
+   * asks to try again. `revoked` and `removed` stay until a sign-in. While
+   * a removal is pending, it also retries the removal, so it may take as
+   * long as a request.
    */
   readonly refresh: () => Promise<DeviceSessionState>;
   /**
@@ -243,10 +275,11 @@ export interface DeviceSession {
    * Call with every outcome of the sign-in flow, also one that did not
    * start. `signed_in` ends a sign-out; `refused` with
    * `device_account_mismatch` moves to `account_mismatch`; `refused` with
-   * `device_revoked` moves to `revoked`. Every other outcome changes no
-   * state and no file, `failed` included with `uncertain_refusal`,
-   * `key_changed`, or `record_not_saved`: whether such a sign-in committed
-   * is unknown, so a sign-out ends only when the new key authenticates.
+   * `device_revoked` moves to `revoked`. After every other outcome, for
+   * example `failed` with `uncertain_refusal`, `no_answer`, or
+   * `record_not_saved`, whether the sign-in committed is unknown: a pending
+   * replacement then starts its grace period (`REPLACEMENT_GRACE_MS`), and a
+   * sign-out ends only when the new key authenticates.
    */
   readonly signInFinished: (
     outcome: FinishedSignIn,
@@ -254,12 +287,14 @@ export interface DeviceSession {
   /**
    * Makes sure that a valid access token is held, minting one if needed,
    * which resolves a pending key replacement. Resolves with the account.
+   * Refused while a removal is pending.
    */
   readonly authenticate: () => Promise<SessionResult<SessionAccount>>;
   /**
    * Sends a request with an access token. A `401` is answered by minting
    * one new token and sending the request once more; when the new token
-   * cannot be minted, the failure names the reason.
+   * cannot be minted, the failure names the reason. Refused while a removal
+   * is pending.
    */
   readonly request: <T>(
     request: AuthorizedRequest<T>,
@@ -276,26 +311,32 @@ export interface DeviceSession {
   /** Reports a sign-out that the API has not confirmed yet. */
   readonly reportSignOut: () => Promise<SessionResult<"reported" | "pending">>;
   /**
-   * Remove this device: revokes it with the reason `removed`, and deletes
-   * the key and the record only after the API confirmed it. Without a clear
-   * answer it resolves with `pending`; call it again to retry.
+   * Remove this device: notes the removal, so that it holds across a
+   * restart, and revokes the device with the reason `removed`; the key and
+   * the record are deleted only after the API confirmed it. Without a clear
+   * answer it resolves with `pending`, and `refresh` or another call
+   * retries it.
    */
   readonly removeDevice: () => Promise<SessionResult<"removed" | "pending">>;
   /**
    * Signs the WebSocket `auth.challenge` with the purpose `ws` and the
    * current key, and returns the `auth.response` frame for #26. It sends no
-   * request. Refused while signed out, while the API's last answer refused
-   * the key, and while a key replacement is pending (`authenticate` first).
+   * request. Refused while signed out, while a removal is pending, while
+   * the API's last answer refused the key, and while a key replacement is
+   * pending (`authenticate` first).
    */
   readonly signWebSocketChallenge: (
     challenge: AuthChallengeFrame,
   ) => Promise<SessionResult<AuthResponseFrame>>;
   /**
    * Applies a refusal that arrived another way, for example the close
-   * reason of the WebSocket (#26).
+   * reason of the WebSocket (#26), for the device that the connection
+   * authenticated as. A refusal for another device, for example a late close
+   * of a connection of the device that this one replaced, is ignored.
    */
   readonly deviceRefused: (
     code: "auth_failed" | "device_revoked" | "sign_in_required",
+    deviceId: DeviceId,
   ) => Promise<DeviceSessionState>;
 }
 
@@ -338,6 +379,7 @@ type MintResult =
       readonly kind: "token";
       readonly token: string;
       readonly validUntil: number;
+      readonly validUntilWall: number;
       /** Whether the sign-out marker names the key that minted it. */
       readonly marked: boolean;
     }
@@ -418,6 +460,8 @@ export function createDeviceSession(
 ): DeviceSession {
   const scheduleTimer = deps.scheduleTimer ?? scheduleWithSetTimeout;
   const now = deps.now ?? (() => performance.now());
+  const wallClock = deps.wallClock ?? (() => Date.now());
+  const wallIso = (): string => new Date(wallClock()).toISOString();
   const report = (message: string): void => {
     try {
       deps.onError?.(message);
@@ -433,8 +477,11 @@ export function createDeviceSession(
   let publishedSequence = 0;
 
   /** The cached token; never leaves this closure. */
-  let cached: { readonly token: string; readonly validUntil: number } | null =
-    null;
+  let cached: {
+    readonly token: string;
+    readonly validUntil: number;
+    readonly validUntilWall: number;
+  } | null = null;
   /** The mint that concurrent callers share. */
   let minting: Promise<TokenResult> | null = null;
   /** Grows when tokens must be forgotten, so a mint that ends later is not cached. */
@@ -445,7 +492,12 @@ export function createDeviceSession(
   /** The API's last refusal of the key; cleared by a token, a sign-in, or `refresh`. */
   let refusal: "sign_in_required" | "auth_failed" | null = null;
   let accountMismatch = false;
-  let removalPending = false;
+  /**
+   * The session notes, read once: this process holds the single-instance
+   * lock, so only it writes them. Null until read.
+   */
+  let notes: SessionNotes | null = null;
+  let notesWrite: Promise<void> = Promise.resolve();
   /** Set after `device_revoked` or a confirmed removal, until a sign-in. */
   let gone: "revoked" | "removed" | null = null;
   let signInsRunning = 0;
@@ -461,6 +513,145 @@ export function createDeviceSession(
   function forgetTokens(): void {
     epoch += 1;
     cached = null;
+  }
+
+  /** The cached token while both clocks say that it is valid. */
+  function cachedToken(): string | null {
+    if (
+      cached !== null &&
+      now() < cached.validUntil &&
+      wallClock() < cached.validUntilWall
+    ) {
+      return cached.token;
+    }
+    cached = null;
+    return null;
+  }
+
+  // ---- Notes ---------------------------------------------------------------
+
+  async function loadNotes(): Promise<SessionNotes> {
+    if (notes !== null) {
+      return notes;
+    }
+    let loaded: SessionNotes = NO_SESSION_NOTES;
+    try {
+      const read = await deps.sessionNotes.read();
+      if (read.kind === "notes") {
+        loaded = read.notes;
+      } else if (read.kind === "corrupt") {
+        report("The session notes are corrupt and are not used.");
+      }
+    } catch {
+      report("The session notes could not be read.");
+    }
+    notes ??= loaded;
+    return notes;
+  }
+
+  /** Changes the notes in memory at once and writes them in order. */
+  function setNotes(next: SessionNotes): Promise<void> {
+    notes = next;
+    const write = notesWrite.then(async () => {
+      if (notes !== next) {
+        // A later change writes the newer notes.
+        return;
+      }
+      try {
+        await deps.sessionNotes.write(next);
+      } catch {
+        report(
+          "The session notes could not be saved; they hold until the application quits.",
+        );
+      }
+    });
+    notesWrite = write;
+    return write;
+  }
+
+  async function changeNotes(
+    change: (held: SessionNotes) => SessionNotes,
+  ): Promise<void> {
+    const held = await loadNotes();
+    const next = change(held);
+    if (JSON.stringify(next) !== JSON.stringify(held)) {
+      await setNotes(Object.freeze(next));
+    }
+  }
+
+  function removalNoted(record: DeviceRecord): boolean {
+    return notes?.removal?.deviceId === record.deviceId;
+  }
+
+  /** Whether the grace period of an uncertain sign-in protects the new key. */
+  function graceActive(facts: ReadyFacts, held: SessionNotes): boolean {
+    const note = held.uncertainSignIn;
+    return (
+      note !== null &&
+      note.publicKey === facts.keys.current.publicKey &&
+      wallClock() - Date.parse(note.at) < REPLACEMENT_GRACE_MS
+    );
+  }
+
+  /** The first refusal of both keys of the pending replacement, if noted. */
+  function keysRefusedNote(
+    facts: ReadyFacts,
+    held: SessionNotes,
+  ): SessionNotes["keysRefused"] {
+    const note = held.keysRefused;
+    return note !== null &&
+      note.publicKeys[0] === facts.keys.current.publicKey &&
+      note.publicKeys[1] === facts.keys.previous?.publicKey
+      ? note
+      : null;
+  }
+
+  /**
+   * Keeps only the notes about the device and the keys that the
+   * installation holds, and notes the grace period of a pending replacement
+   * that has none, for example after a stop before `signInFinished`.
+   */
+  async function tidyNotes(facts: Facts): Promise<void> {
+    await changeNotes((held) => {
+      switch (facts.kind) {
+        case "missing":
+          return facts.reason === "no_device" ? NO_SESSION_NOTES : held;
+        case "key_lost":
+          return NO_SESSION_NOTES;
+        case "key_not_loaded":
+          return {
+            ...held,
+            removal: removalOf(held, facts.record),
+          };
+        case "ready": {
+          const pending = replacementToResolve(facts);
+          const uncertain =
+            held.uncertainSignIn?.publicKey === facts.keys.current.publicKey
+              ? held.uncertainSignIn
+              : null;
+          return {
+            removal: removalOf(held, facts.record),
+            uncertainSignIn: !pending
+              ? null
+              : (uncertain ??
+                (signInsRunning > 0
+                  ? null
+                  : {
+                      publicKey: facts.keys.current.publicKey,
+                      at: wallIso(),
+                    })),
+            keysRefused: pending ? keysRefusedNote(facts, held) : null,
+          };
+        }
+      }
+    });
+  }
+
+  function removalOf(
+    held: SessionNotes,
+    record: DeviceRecord,
+  ): SessionNotes["removal"] {
+    return held.removal?.deviceId === record.deviceId ? held.removal : null;
   }
 
   function originOrFailure(): string | SessionFailure {
@@ -504,7 +695,7 @@ export function createDeviceSession(
     if (refusal !== null) {
       return { kind: refusal, account };
     }
-    if (removalPending) {
+    if (removalNoted(facts.record)) {
       return { kind: "removal_pending", account };
     }
     return { kind: "signed_in", account };
@@ -584,7 +775,14 @@ export function createDeviceSession(
     }
   }
 
+  /** Reads the record, the keys, the marker, and the notes. */
   async function readFacts(): Promise<Facts> {
+    const facts = await readFactsOnly();
+    await tidyNotes(facts);
+    return facts;
+  }
+
+  async function readFactsOnly(): Promise<Facts> {
     let read;
     try {
       read = await deps.deviceRecords.read();
@@ -705,6 +903,7 @@ export function createDeviceSession(
   async function keyHeld(
     facts: ReadyFacts,
     key: DeviceKey,
+    keepBoth = false,
   ): Promise<SessionFailure | null> {
     const { record, keys } = facts;
     if (key === keys.current) {
@@ -721,7 +920,7 @@ export function createDeviceSession(
           report("The previous device key could not be deleted.");
         }
       }
-    } else {
+    } else if (!keepBoth) {
       try {
         // The API holds the previous key, so it never registered the new one.
         await deps.keyStore.abandonReplacement();
@@ -745,7 +944,6 @@ export function createDeviceSession(
     forgetTokens();
     refusal = null;
     accountMismatch = false;
-    removalPending = false;
     publish();
     try {
       await deps.keyStore.delete();
@@ -754,6 +952,7 @@ export function createDeviceSession(
       report("The device key or record could not be deleted.");
     }
     await dropMarker();
+    await setNotes(NO_SESSION_NOTES);
   }
 
   // ---- Access tokens -----------------------------------------------------
@@ -829,15 +1028,17 @@ export function createDeviceSession(
     facts: ReadyFacts,
     origin: string,
     candidates: readonly DeviceKey[],
+    keepBoth: boolean,
   ): Promise<MintResult | { readonly kind: "all_refused" }> {
     for (const key of candidates) {
       const startedAt = now();
+      const startedAtWall = wallClock();
       const answer = await tokenFor(key, facts.record.deviceId, origin);
       if (answer.kind === "failure") {
         return answer;
       }
       if (answer.kind === "token") {
-        const notHeld = await keyHeld(facts, key);
+        const notHeld = await keyHeld(facts, key, keepBoth);
         if (notHeld !== null) {
           return { kind: "failure", failure: notHeld };
         }
@@ -846,6 +1047,10 @@ export function createDeviceSession(
           token: answer.token,
           validUntil:
             startedAt + ACCESS_TOKEN_LIFETIME_MS - ACCESS_TOKEN_RENEW_MARGIN_MS,
+          validUntilWall:
+            startedAtWall +
+            ACCESS_TOKEN_LIFETIME_MS -
+            ACCESS_TOKEN_RENEW_MARGIN_MS,
           marked: facts.marker !== null && markerNames(facts.marker, key),
         };
       }
@@ -864,7 +1069,7 @@ export function createDeviceSession(
           return { kind: "failure", failure: refused("device_revoked") };
         case "sign_in_required": {
           // The signature was verified first, so the API holds this key.
-          const notHeld = await keyHeld(facts, key);
+          const notHeld = await keyHeld(facts, key, keepBoth);
           if (notHeld !== null) {
             report("The device needs a sign-in, and its record was not saved.");
           }
@@ -890,15 +1095,19 @@ export function createDeviceSession(
 
   /**
    * Mints an access token. With a pending replacement the new key is tried
-   * first and the previous key only after the new key got `auth_failed`. A
-   * key is deleted only after `device_revoked`, or when both keys of a
-   * pending replacement were refused in two rounds (`keysLost`); an answer
-   * that is not certain changes nothing. Runs inside `exclusive`.
+   * first and the previous key only after the new key got `auth_failed`.
+   * During the grace period of an uncertain sign-in, a token of the previous
+   * key is used but both keys are kept. When both keys are refused, the
+   * time is noted and both are kept; only a round at least
+   * `LOST_KEY_WAIT_MS` later that refuses both again, after the grace
+   * period, treats them as lost (`keysLost`). A key is deleted otherwise
+   * only after `device_revoked`; an answer that is not certain changes
+   * nothing. Runs inside `exclusive`.
    */
   async function mint(facts: ReadyFacts, origin: string): Promise<MintResult> {
     const { keys } = facts;
     if (!replacementToResolve(facts) || keys.previous === null) {
-      const result = await tryKeys(facts, origin, [keys.current]);
+      const result = await tryKeys(facts, origin, [keys.current], false);
       if (result.kind !== "all_refused") {
         return result;
       }
@@ -906,23 +1115,43 @@ export function createDeviceSession(
       refusal = "auth_failed";
       return { kind: "failure", failure: refused("auth_failed") };
     }
-    const candidates = [keys.current, keys.previous];
-    // A resent copy of an access token request that the API answered gets
-    // `auth_failed`, because its challenge is used up, although the key is
-    // the API's. So both keys are refused only when a second round, with
-    // new challenges and the new key first, refuses both again.
-    for (let round = 0; round < 2; round += 1) {
-      const result = await tryKeys(facts, origin, candidates);
-      if (result.kind !== "all_refused") {
-        return result;
-      }
+    const held = await loadNotes();
+    const keepBoth = graceActive(facts, held);
+    const result = await tryKeys(
+      facts,
+      origin,
+      [keys.current, keys.previous],
+      keepBoth,
+    );
+    if (result.kind !== "all_refused") {
+      return result;
+    }
+    refusal = "auth_failed";
+    // The API answers `auth_failed` also for a challenge that it lost, for
+    // example in a deploy, and to a resent copy of a request that it already
+    // answered, so one round proves nothing.
+    const first = keysRefusedNote(facts, held);
+    if (first === null) {
+      const previous = keys.previous.publicKey;
+      await changeNotes((current) => ({
+        ...current,
+        keysRefused: {
+          publicKeys: [keys.current.publicKey, previous],
+          at: wallIso(),
+        },
+      }));
+      return { kind: "failure", failure: refused("auth_failed") };
+    }
+    if (keepBoth || wallClock() - Date.parse(first.at) < LOST_KEY_WAIT_MS) {
+      return { kind: "failure", failure: refused("auth_failed") };
     }
     return { kind: "failure", failure: await keysLost(facts) };
   }
 
   /**
-   * Both keys of a pending replacement were refused in two rounds: the
-   * installation treats them as lost (decided on #94). It publishes
+   * Both keys of a pending replacement were refused in two rounds, at least
+   * `LOST_KEY_WAIT_MS` apart: the installation treats them as lost (decided
+   * on #94). It publishes
    * `key_lost` first, deletes both keys, and keeps the record, so that the
    * next sign-in registers a new device that names the record's device. A
    * sign-out marker names only keys that are gone then, so it is deleted; a
@@ -943,7 +1172,6 @@ export function createDeviceSession(
     forgetTokens();
     refusal = null;
     accountMismatch = false;
-    removalPending = false;
     lastFacts = { kind: "key_lost", record: facts.record };
     publish();
     try {
@@ -986,6 +1214,17 @@ export function createDeviceSession(
       if (refusal !== null && !resolving) {
         return refused(refusal);
       }
+      if (resolving && refusal === "auth_failed") {
+        // Both keys were refused: the next round runs only after the wait,
+        // or after `refresh` when the person asks to try again.
+        const first = keysRefusedNote(facts, await loadNotes());
+        if (
+          first !== null &&
+          wallClock() - Date.parse(first.at) < LOST_KEY_WAIT_MS
+        ) {
+          return refused("auth_failed");
+        }
+      }
       const result = await mint(facts, origin);
       if (result.kind === "failure") {
         return result.failure;
@@ -1003,7 +1242,11 @@ export function createDeviceSession(
       }
       refusal = null;
       if (epoch === started) {
-        cached = { token: result.token, validUntil: result.validUntil };
+        cached = {
+          token: result.token,
+          validUntil: result.validUntil,
+          validUntilWall: result.validUntilWall,
+        };
       }
       return { ok: true, token: result.token };
     } catch {
@@ -1016,10 +1259,10 @@ export function createDeviceSession(
 
   /** A valid token: the cached one, or one new mint that concurrent callers share. */
   function sessionToken(): Promise<TokenResult> {
-    if (cached !== null && now() < cached.validUntil) {
-      return Promise.resolve({ ok: true, token: cached.token });
+    const token = cachedToken();
+    if (token !== null) {
+      return Promise.resolve({ ok: true, token });
     }
-    cached = null;
     if (minting !== null) {
       return minting;
     }
@@ -1062,7 +1305,25 @@ export function createDeviceSession(
       : failure("refused", { code, deviceLogin: login });
   }
 
+  /** A failure while a removal is pending: the key serves only the removal. */
+  async function removalBlock(): Promise<SessionFailure | null> {
+    if (lastFacts === null) {
+      await settle();
+    }
+    const held = await loadNotes();
+    return held.removal !== null && gone === null
+      ? failure("removal_pending")
+      : null;
+  }
+
   async function request<T>(
+    call: AuthorizedRequest<T>,
+  ): Promise<SessionResult<T | null>> {
+    const blocked = await removalBlock();
+    return blocked ?? sendAuthorized(call);
+  }
+
+  async function sendAuthorized<T>(
     call: AuthorizedRequest<T>,
   ): Promise<SessionResult<T | null>> {
     const origin = originOrFailure();
@@ -1118,6 +1379,8 @@ export function createDeviceSession(
       }
       case "error":
         return refusedWithLogin(answer.code);
+      case "invalid_request":
+        return failure("invalid_request");
       default:
         return uncertain(answer);
     }
@@ -1263,13 +1526,11 @@ export function createDeviceSession(
       }
       // The tokens are dropped first: from now on the key is not used for
       // anything but the report, which uses a token that is still valid.
-      validToken =
-        facts.marker === null && cached !== null && now() < cached.validUntil
-          ? cached.token
-          : null;
+      validToken = facts.marker === null ? cachedToken() : null;
       forgetTokens();
-      removalPending = false;
       accountMismatch = false;
+      // The key is not used after a sign-out, so a pending removal ends.
+      await changeNotes((held) => ({ ...held, removal: null }));
       if (facts.marker === null) {
         const marker: SignOutMarker = {
           publicKeys: markedKeys(facts),
@@ -1319,12 +1580,31 @@ export function createDeviceSession(
       // The API takes no request of a signed-out device: sign in first.
       return failure("signed_out");
     }
-    removalPending = true;
+    const deviceId = facts.record.deviceId;
+    // Noted first, so that the removal holds across a restart.
+    await changeNotes((held) => ({ ...held, removal: { deviceId } }));
     await settle();
+    return attemptRemoval(deviceId);
+  }
+
+  /**
+   * Refusals that leave a removal pending: the API did not answer the
+   * revoke itself, or it may take it later.
+   */
+  const REMOVAL_KEPT_CODES: readonly ApiErrorCode[] = Object.freeze([
+    "auth_failed",
+    "sign_in_required",
+    "rate_limited",
+    "unauthorized",
+  ]);
+
+  async function attemptRemoval(
+    deviceId: DeviceId,
+  ): Promise<SessionResult<"removed" | "pending">> {
     const body: RevokeDeviceRequest = { reason: "removed" };
-    const result = await request({
+    const result = await sendAuthorized({
       route: AUTH_ROUTES.revokeDevice,
-      params: { deviceId: facts.record.deviceId },
+      params: { deviceId },
       body,
       answer: "empty",
     });
@@ -1333,20 +1613,37 @@ export function createDeviceSession(
       await deviceGone("removed");
       return succeeded("removed");
     }
+    if (gone !== null) {
+      // `device_revoked`: the device is gone already.
+      return result;
+    }
     switch (result.reason) {
       case "no_answer":
       case "server_error":
       case "unexpected_response":
         // Whether the API revoked the device is unknown: the key stays, and
-        // the removal is shown as pending until a retry gets an answer.
+        // the removal stays pending until a retry gets an answer.
         return succeeded("pending");
-      default:
-        if (gone === null) {
-          removalPending = false;
-          await settle();
+      case "refused":
+        if (
+          result.code !== undefined &&
+          REMOVAL_KEPT_CODES.includes(result.code)
+        ) {
+          return result;
         }
+        break;
+      case "signed_out":
+      case "no_device":
+      case "key_lost":
+        break;
+      default:
+        // For example a key that is not loaded yet: retried later.
         return result;
     }
+    // The API refused the revoke, for example `conflict`: the removal ends.
+    await changeNotes((held) => ({ ...held, removal: null }));
+    await settle();
+    return result;
   }
 
   async function listDevices(): Promise<
@@ -1390,6 +1687,9 @@ export function createDeviceSession(
     if (facts.marker !== null) {
       return failure("signed_out");
     }
+    if (removalNoted(facts.record)) {
+      return failure("removal_pending");
+    }
     if (refusal !== null) {
       return refused(refusal);
     }
@@ -1414,6 +1714,10 @@ export function createDeviceSession(
   // ---- Lifecycle ---------------------------------------------------------
 
   async function authenticate(): Promise<SessionResult<SessionAccount>> {
+    const blocked = await removalBlock();
+    if (blocked !== null) {
+      return blocked;
+    }
     const token = await sessionToken();
     if (!token.ok) {
       return token;
@@ -1428,7 +1732,19 @@ export function createDeviceSession(
     forgetTokens();
     refusal = null;
     accountMismatch = false;
-    return settle();
+    const state = await settle();
+    const facts = lastFacts;
+    if (
+      gone === null &&
+      facts?.kind === "ready" &&
+      facts.marker === null &&
+      removalNoted(facts.record)
+    ) {
+      // A removal that the API has not confirmed yet is retried.
+      await attemptRemoval(facts.record.deviceId);
+      return current;
+    }
+    return state;
   }
 
   function signInStarted(): void {
@@ -1441,13 +1757,21 @@ export function createDeviceSession(
     signInsRunning = Math.max(0, signInsRunning - 1);
     forgetTokens();
     if (outcome.kind === "signed_in") {
-      // A GitHub sign-in ends a sign-out, a refusal, and a removed or
-      // revoked device.
+      // A GitHub sign-in ends a refusal, a pending removal, and a removed or
+      // revoked device. A sign-out ends by the rule that a marker naming no
+      // held key has ended, so a sign-out made while this sign-in ran
+      // holds; only a corrupt marker, which names every key, ends here.
       gone = null;
       refusal = null;
       accountMismatch = false;
-      removalPending = false;
-      await dropMarker();
+      await changeNotes((held) => ({ ...held, removal: null }));
+      try {
+        if ((await deps.signOutMarkers.read()).kind === "corrupt") {
+          await dropMarker();
+        }
+      } catch {
+        // An unreadable marker stays: it fails closed.
+      }
     } else if (outcome.kind === "refused") {
       if (outcome.code === "device_account_mismatch") {
         accountMismatch = true;
@@ -1457,14 +1781,25 @@ export function createDeviceSession(
       }
     }
     // Any other outcome, for example `failed` with `uncertain_refusal`,
-    // proves nothing: a pending replacement is resolved by authenticating,
-    // and the sign-out marker still names the previous key.
+    // proves nothing: the API may still commit the sign-in. A pending
+    // replacement gets its grace period from now (`tidyNotes`), and the
+    // sign-out marker still names the previous key.
     return settle();
   }
 
   async function deviceRefused(
     code: "auth_failed" | "device_revoked" | "sign_in_required",
+    deviceId: DeviceId,
   ): Promise<DeviceSessionState> {
+    const facts = await readFacts();
+    if (
+      (facts.kind !== "ready" && facts.kind !== "key_not_loaded") ||
+      facts.record.deviceId !== deviceId
+    ) {
+      // Not this installation's device: a late close of a connection of a
+      // device that it no longer holds.
+      return current;
+    }
     forgetTokens();
     if (code === "device_revoked") {
       await deviceGone("revoked");

@@ -34,6 +34,8 @@ export type ApiFetch = (url: string, init: RequestInit) => Promise<Response>;
  * - `unexpected_response`: any other answer, for example from a proxy, a
  *   body too large, or a body that is not JSON.
  * - `no_answer`: a network error, a refused redirect, or the timeout.
+ * - `invalid_request`: the URL of the request is not on the API origin;
+ *   nothing was sent.
  */
 export type ApiAnswer =
   | { readonly kind: "ok"; readonly status: number; readonly value: unknown }
@@ -44,7 +46,8 @@ export type ApiAnswer =
     }
   | { readonly kind: "server_error" }
   | { readonly kind: "unexpected_response" }
-  | { readonly kind: "no_answer" };
+  | { readonly kind: "no_answer" }
+  | { readonly kind: "invalid_request" };
 
 export interface ApiCall {
   readonly fetch: ApiFetch;
@@ -135,6 +138,17 @@ async function readAnswer(response: Response): Promise<ApiAnswer> {
 
 /** Sends one request and classifies the answer. Never rejects. */
 export async function callApi(call: ApiCall): Promise<ApiAnswer> {
+  let url: URL;
+  try {
+    url = new URL(call.path ?? call.route.path, call.origin);
+  } catch {
+    return { kind: "invalid_request" };
+  }
+  // The token goes only to the API: a path such as `//host/...` would name
+  // another origin.
+  if (url.origin !== call.origin) {
+    return { kind: "invalid_request" };
+  }
   const abort = new AbortController();
   const cancelTimeout = call.scheduleTimer(
     () => abort.abort(),
@@ -148,16 +162,16 @@ export async function callApi(call: ApiCall): Promise<ApiAnswer> {
     headers["content-type"] = "application/json";
   }
   try {
-    const response = await call.fetch(
-      new URL(call.path ?? call.route.path, call.origin).href,
-      {
-        method: call.route.method,
-        headers,
-        ...(call.body === undefined ? {} : { body: JSON.stringify(call.body) }),
-        redirect: "error",
-        signal: abort.signal,
-      },
-    );
+    const response = await call.fetch(url.href, {
+      method: call.route.method,
+      headers,
+      ...(call.body === undefined ? {} : { body: JSON.stringify(call.body) }),
+      redirect: "error",
+      // No cache and no cookie: every answer is for this request only.
+      cache: "no-store",
+      credentials: "omit",
+      signal: abort.signal,
+    });
     return await readAnswer(response);
   } catch {
     return { kind: "no_answer" };

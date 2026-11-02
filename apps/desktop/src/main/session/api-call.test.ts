@@ -62,10 +62,29 @@ describe("callApi", () => {
     expect(request?.init.method).toBe("POST");
     expect(request?.init.redirect).toBe("error");
     expect(request?.init.body).toBe('{"reason":"removed"}');
+    expect(request?.init.cache).toBe("no-store");
+    expect(request?.init.credentials).toBe("omit");
     const headers = new Headers(request?.init.headers);
     expect(headers.get("authorization")).toBe("Bearer mmda_token");
     expect(headers.get("content-type")).toBe("application/json");
     // The timer was cancelled after the answer.
+    expect(h.timers).toEqual([]);
+  });
+
+  test("a path that names another origin is not sent, with or without a token", async () => {
+    const h = harness(() => Promise.resolve(json(200, {})));
+    for (const path of ["//evil.example/devices", "https://evil.example/x"]) {
+      expect(
+        await callApi({
+          ...h,
+          origin: ORIGIN,
+          route: AUTH_ROUTES.listDevices,
+          path,
+          accessToken: "mmda_token",
+        }),
+      ).toEqual({ kind: "invalid_request" });
+    }
+    expect(h.sent).toEqual([]);
     expect(h.timers).toEqual([]);
   });
 

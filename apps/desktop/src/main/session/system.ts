@@ -13,6 +13,7 @@ import { deviceKeyFolder } from "../device-key/key-folder.ts";
 import type { DeviceKeyStore } from "../device-key/store.ts";
 import { createDeviceRecordStore } from "../device-record.ts";
 import { createDeviceSession, type DeviceSession } from "./session.ts";
+import { createSessionNotesStore } from "./session-notes.ts";
 import { createSignOutMarkerStore } from "./sign-out-marker.ts";
 
 export function createSystemDeviceSession(
@@ -38,6 +39,10 @@ export function createSystemDeviceSession(
       platform: process.platform,
     }),
     signOutMarkers: createSignOutMarkerStore({
+      folder,
+      platform: process.platform,
+    }),
+    sessionNotes: createSessionNotesStore({
       folder,
       platform: process.platform,
     }),

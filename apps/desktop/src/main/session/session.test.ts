@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   API_ERROR_STATUS,
   type ApiErrorCode,
+  AUTH_ROUTES,
   type AuthChallengeFrame,
   AuthResponseFrameSchema,
   type ConnectionId,
@@ -39,17 +40,24 @@ import {
   createSignInFlow,
   SIGN_IN_FAILURE_REASONS,
   type SignInOutcome,
+  UNCERTAIN_REFUSAL_CODES,
 } from "../sign-in/flow.ts";
 import { API_REQUEST_TIMEOUT_MS } from "./api-call.ts";
 import {
   ACCESS_TOKEN_LIFETIME_MS,
   ACCESS_TOKEN_RENEW_MARGIN_MS,
   createDeviceSession,
+  LOST_KEY_WAIT_MS,
+  REPLACEMENT_GRACE_MS,
   type DeviceSession,
   type DeviceSessionDependencies,
   type DeviceSessionState,
   type SessionKeyStore,
 } from "./session.ts";
+import {
+  createSessionNotesStore,
+  SESSION_NOTES_FILE,
+} from "./session-notes.ts";
 import {
   createSignOutMarkerStore,
   SIGN_OUT_MARKER_FILE,
@@ -61,6 +69,11 @@ const DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3" as DeviceId;
 const USER_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a4" as UserId;
 const OTHER_DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b7" as DeviceId;
 const SIGN_IN_CODE = "mmdc_ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8";
+const AUTH_FAILED = Object.freeze({
+  ok: false,
+  reason: "refused",
+  code: "auth_failed",
+});
 /** A public key that no store holds, so the fake API refuses every signature. */
 const FOREIGN_PUBLIC_KEY = "a".repeat(64);
 const SPKI_ED25519_PREFIX = "302a300506032b6570032100";
@@ -79,8 +92,11 @@ const DEVICE_ITEM = Object.freeze({
 
 let root: string;
 let folder: string;
+/** The wall clock of every session in a test, also across a restart. */
+const wall = { now: 0 };
 
 beforeEach(async () => {
+  wall.now = Date.parse("2026-11-02T10:00:00.000Z");
   root = await mkdtemp(path.join(tmpdir(), "mymandev-device-session-"));
   folder = path.join(root, "MyManDev");
 });
@@ -180,6 +196,8 @@ interface FakeApi {
   /** Every challenge that the API issued, by challenge ID. */
   readonly challengeLog: Map<string, string>;
   readonly requests: ApiRequest[];
+  /** Called after every request arrived. */
+  readonly arrivals: Set<() => void>;
   /** Answers in place of the API when it returns a response; may throw or hang. */
   intercept: ((request: ApiRequest) => Promise<Response> | undefined) | null;
 }
@@ -196,6 +214,7 @@ function fakeApi(): FakeApi {
     nonces: new Map(),
     challengeLog: new Map(),
     requests: [],
+    arrivals: new Set(),
     intercept: null,
   };
 }
@@ -292,6 +311,9 @@ function apiFetch(api: FakeApi): DeviceSessionDependencies["fetch"] {
     if (request.body?.signature !== undefined) {
       api.signatures.push(request.body.signature);
     }
+    for (const arrived of [...api.arrivals]) {
+      arrived();
+    }
     const intercepted = api.intercept?.(request);
     if (intercepted !== undefined) {
       return intercepted;
@@ -387,9 +409,11 @@ function harness(
     keyStore: loggedKeyStore,
     deviceRecords: loggedRecords,
     signOutMarkers: markers,
+    sessionNotes: createSessionNotesStore({ folder, platform: "win32" }),
     fetch: apiFetch(api),
     scheduleTimer,
     now: () => h.clock.now,
+    wallClock: () => wall.now,
     onError: (message) => h.errors.push(message),
     ...overrides,
   });
@@ -429,10 +453,15 @@ async function existingDevice(h: Harness): Promise<string> {
  */
 async function pendingReplacement(
   h: Harness,
+  options: { readonly inGrace?: boolean } = {},
 ): Promise<{ previous: string; current: string }> {
   const previous = await existingDevice(h);
   const keys = await h.keyStore.replace();
   await h.session.refresh();
+  if (options.inGrace !== true) {
+    // The sign-in that replaced the key ended long ago.
+    wall.now += REPLACEMENT_GRACE_MS;
+  }
   h.calls.length = 0;
   return { previous, current: keys.current.publicKey };
 }
@@ -454,6 +483,17 @@ function count(h: Harness, method: string, route: string): number {
 
 function mints(h: Harness): number {
   return count(h, "POST", "/auth/access-token");
+}
+
+/** The session notes file as JSON, or null when there is none. */
+async function notesFile(): Promise<Record<string, unknown> | null> {
+  try {
+    return JSON.parse(
+      await readFile(path.join(folder, SESSION_NOTES_FILE), "utf8"),
+    ) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
 }
 
 async function recordKey(h: Harness): Promise<string | null> {
@@ -518,20 +558,35 @@ function tokenRequests(api: FakeApi): ApiRequest[] {
   return api.requests.filter((r) => r.path === "/auth/access-token");
 }
 
-/** Waits until a request with this method and path arrived. */
-async function waitForRequest(
+/**
+ * Resolves once the fake API has received `number` requests with this
+ * method and path. It waits on the arrival of each request, bounded by real
+ * time, so a slow runner only makes it wait longer.
+ */
+function waitForRequest(
   h: Harness,
   method: string,
   route: string,
   number = 1,
 ): Promise<void> {
-  for (let round = 0; round < 500; round += 1) {
-    if (count(h, method, route) >= number) {
-      return;
-    }
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-  throw new Error(`No ${method} ${route}`);
+  return new Promise((resolve, reject) => {
+    const check = (): void => {
+      if (count(h, method, route) >= number) {
+        stop();
+        resolve();
+      }
+    };
+    const timer = setTimeout(() => {
+      stop();
+      reject(new Error(`No ${method} ${route}`));
+    }, 10_000);
+    const stop = (): void => {
+      clearTimeout(timer);
+      h.api.arrivals.delete(check);
+    };
+    h.api.arrivals.add(check);
+    check();
+  });
 }
 
 /** Posts the sign-in code to the flow's loopback listener, as the API's page does. */
@@ -881,22 +936,44 @@ describe("a pending key replacement", () => {
     expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
   });
 
-  test("both keys refused in two rounds: key_lost first, both keys deleted, the record kept, and the next sign-in registers a new device that names this one", async () => {
+  test("both keys refused, and again in a round at least 10 minutes later: key_lost first, both keys deleted, the record kept, and the next sign-in registers a new device that names this one", async () => {
     const h = harness();
     const { previous, current } = await pendingReplacement(h);
     h.api.publicKey = FOREIGN_PUBLIC_KEY;
 
+    // The first refusal of both keys only notes the time.
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(heldKeys(h)).toEqual({ current, previous });
+    expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
+    expect(h.session.state().kind).toBe("auth_failed");
+    expect(await notesFile()).toMatchObject({
+      keysRefused: { publicKeys: [current, previous] },
+    });
+    // Until the wait ends, nothing is asked again on its own.
+    const asked = h.api.requests.length;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(h.api.requests).toHaveLength(asked);
+    // A retry that the person asks for runs a round, but deletes nothing.
+    wall.now += LOST_KEY_WAIT_MS - 1;
+    await h.session.refresh();
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(mints(h)).toBe(4);
+    expect(heldKeys(h)).toEqual({ current, previous });
+
+    wall.now += 1;
+    h.calls.length = 0;
     const result = await h.session.authenticate();
 
     expect(result).toEqual({ ok: false, reason: "key_lost" });
-    // Two rounds, the new key first in each, every request with its own
+    // Three rounds, the new key first in each, every request with its own
     // challenge.
     const requests = tokenRequests(h.api);
     expect(
       requests.map((request) => signerOf(h.api, request, [current, previous])),
-    ).toEqual([current, previous, current, previous]);
-    expect(new Set(requests.map((r) => r.body?.challengeId)).size).toBe(4);
+    ).toEqual([current, previous, current, previous, current, previous]);
+    expect(new Set(requests.map((r) => r.body?.challengeId)).size).toBe(6);
     expect(h.calls).toEqual(["state:key_lost", "key.delete"]);
+    expect(await notesFile()).toBeNull();
     expect(h.session.state()).toEqual({
       kind: "key_lost",
       account: {
@@ -981,13 +1058,16 @@ describe("a pending key replacement", () => {
     const h = harness();
     await existingDevice(h);
     expect(await h.session.signOut()).toEqual({ ok: true, value: "reported" });
-    // A sign-in after the sign-out got no clear answer.
+    // A sign-in after the sign-out got no clear answer, long ago.
     await h.keyStore.replace();
     h.api.publicKey = FOREIGN_PUBLIC_KEY;
     if (corrupt) {
       await writeFile(path.join(folder, SIGN_OUT_MARKER_FILE), "{");
     }
     await h.session.refresh();
+    wall.now += REPLACEMENT_GRACE_MS;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    wall.now += LOST_KEY_WAIT_MS;
 
     expect(await h.session.authenticate()).toEqual({
       ok: false,
@@ -1003,17 +1083,40 @@ describe("a pending key replacement", () => {
     expect(marker !== null).toBe(corrupt);
   });
 
-  test("both keys refused in the first round and the new key accepted in the second: confirmed, nothing deleted", async () => {
+  test("a refusal of both keys counts across a restart, and a round before the wait ends deletes nothing", async () => {
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+
+    wall.now += LOST_KEY_WAIT_MS / 2;
+    const restarted = await restart(h);
+    expect(await restarted.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(heldKeys(restarted)).toEqual({ current, previous });
+
+    wall.now += LOST_KEY_WAIT_MS / 2;
+    const later = await restart(restarted);
+    expect(await later.session.authenticate()).toEqual({
+      ok: false,
+      reason: "key_lost",
+    });
+    expect(await keyFiles()).toEqual([DEVICE_RECORD_FILE]);
+  });
+
+  test("both keys refused once and the new key accepted in a later round: confirmed, nothing deleted, the note dropped", async () => {
     const h = harness();
     const { current } = await pendingReplacement(h);
     h.api.publicKey = current;
-    // The first round only got the answers to resent copies.
+    // The first round only got the answers of a short outage.
     h.api.intercept = (request) =>
       request.path === "/auth/access-token" &&
       count(h, "POST", "/auth/access-token") <= 2
         ? Promise.resolve(errorAnswer("auth_failed"))
         : undefined;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(heldKeys(h)?.previous).not.toBeNull();
 
+    await h.session.refresh();
     expect((await h.session.authenticate()).ok).toBe(true);
 
     expect(mints(h)).toBe(3);
@@ -1024,9 +1127,10 @@ describe("a pending key replacement", () => {
     expect(heldKeys(h)).toEqual({ current, previous: null });
     expect(await recordKey(h)).toBe(current);
     expect(h.session.state().kind).toBe("signed_in");
+    expect(await notesFile()).toBeNull();
   });
 
-  test("both keys refused in the first round and the previous key accepted in the second: abandoned, nothing deleted", async () => {
+  test("both keys refused once and the previous key accepted in a later round: abandoned, nothing deleted", async () => {
     const h = harness();
     const { previous } = await pendingReplacement(h);
     h.api.publicKey = previous;
@@ -1035,7 +1139,9 @@ describe("a pending key replacement", () => {
       count(h, "POST", "/auth/access-token") === 2
         ? Promise.resolve(errorAnswer("auth_failed"))
         : undefined;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
 
+    await h.session.refresh();
     expect((await h.session.authenticate()).ok).toBe(true);
 
     expect(mints(h)).toBe(4);
@@ -1046,10 +1152,12 @@ describe("a pending key replacement", () => {
     expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
   });
 
-  test("sign_in_required and device_revoked in the second round keep their meaning", async () => {
+  test("sign_in_required and device_revoked in the later round keep their meaning", async () => {
     const required = harness();
     const { current } = await pendingReplacement(required);
     required.api.publicKey = FOREIGN_PUBLIC_KEY;
+    expect(await required.session.authenticate()).toEqual(AUTH_FAILED);
+    wall.now += LOST_KEY_WAIT_MS;
     required.api.intercept = (request) =>
       request.path === "/auth/access-token" &&
       count(required, "POST", "/auth/access-token") === 3
@@ -1068,6 +1176,9 @@ describe("a pending key replacement", () => {
     const revoked = harness();
     await pendingReplacement(revoked);
     revoked.api.publicKey = FOREIGN_PUBLIC_KEY;
+    expect(await revoked.session.authenticate()).toEqual(AUTH_FAILED);
+    wall.now += LOST_KEY_WAIT_MS;
+    revoked.calls.length = 0;
     revoked.api.intercept = (request) =>
       request.path === "/auth/access-token" &&
       count(revoked, "POST", "/auth/access-token") === 4
@@ -1189,11 +1300,14 @@ describe("a pending key replacement", () => {
       [`${name}, to the previous key`, 4, answer] as const,
     ]),
   )(
-    "an uncertain answer in the second round changes nothing: %s",
+    "an uncertain answer in the round after the wait changes nothing: %s",
     async (_name, number, answer) => {
       const h = harness();
       const { previous, current } = await pendingReplacement(h);
       h.api.publicKey = FOREIGN_PUBLIC_KEY;
+      expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+      wall.now += LOST_KEY_WAIT_MS;
+      h.calls.length = 0;
       h.api.intercept = (request) =>
         request.path === "/auth/access-token" &&
         count(h, "POST", "/auth/access-token") === number
@@ -1213,7 +1327,7 @@ describe("a pending key replacement", () => {
         PREVIOUS_KEY_FILE,
         DEVICE_RECORD_FILE,
       ]);
-      expect(h.session.state().kind).toBe("signed_in");
+      expect(h.session.state().kind).toBe("auth_failed");
     },
   );
 
@@ -1460,13 +1574,13 @@ describe("device states", () => {
     const h = harness();
     await existingDevice(h);
 
-    expect((await h.session.deviceRefused("sign_in_required")).kind).toBe(
-      "sign_in_required",
-    );
+    expect(
+      (await h.session.deviceRefused("sign_in_required", DEVICE_ID)).kind,
+    ).toBe("sign_in_required");
     expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
-    expect((await h.session.deviceRefused("device_revoked")).kind).toBe(
-      "revoked",
-    );
+    expect(
+      (await h.session.deviceRefused("device_revoked", DEVICE_ID)).kind,
+    ).toBe("revoked");
     expect(await keyFiles()).toEqual([]);
   });
 
@@ -1706,9 +1820,11 @@ describe("sign-out", () => {
     const h = harness();
     const previous = await existingDevice(h);
     await h.session.signOut();
-    // The sign-in replaced the key, and the API did not commit it.
+    // The sign-in replaced the key, and the API did not commit it; its
+    // grace period has ended.
     const keys = await h.keyStore.replace();
     await h.session.refresh();
+    wall.now += REPLACEMENT_GRACE_MS;
 
     expect(await h.session.authenticate()).toEqual({
       ok: false,
@@ -1736,6 +1852,7 @@ describe("sign-out", () => {
     api.intercept = null;
     await h.keyStore.replace();
     await h.session.refresh();
+    wall.now += REPLACEMENT_GRACE_MS;
 
     expect(await h.session.authenticate()).toEqual({
       ok: false,
@@ -1828,12 +1945,14 @@ describe("outcomes of the sign-in flow", () => {
   // Typed as the flow's outcome, so the flow's type stays assignable to
   // `signInFinished`.
   const unchanged: SignInOutcome[] = [
-    ...SIGN_IN_FAILURE_REASONS.map((reason): SignInOutcome =>
-      reason === "uncertain_refusal"
-        ? { kind: "failed", reason, apiError: "auth_failed" }
-        : { kind: "failed", reason },
-    ),
-    { kind: "failed", reason: "uncertain_refusal", apiError: "rate_limited" },
+    ...SIGN_IN_FAILURE_REASONS.filter(
+      (reason) => reason !== "uncertain_refusal",
+    ).map((reason): SignInOutcome => ({ kind: "failed", reason })),
+    ...UNCERTAIN_REFUSAL_CODES.map((apiError): SignInOutcome => ({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError,
+    })),
     { kind: "failed", reason: "key_store_failed", keyError: "not_loaded" },
     { kind: "cancelled" },
     { kind: "timed_out" },
@@ -1900,8 +2019,22 @@ describe("outcomes of the sign-in flow", () => {
       previous,
     });
 
-    // Learning which key the API holds abandons the new key, and the
-    // device stays signed out.
+    // During the grace period the API may still commit the sign-in, so
+    // both keys stay although the previous key is the API's.
+    expect(await h.session.authenticate()).toEqual({
+      ok: false,
+      reason: "refused",
+      code: "sign_in_required",
+    });
+    expect(heldKeys(h)).toEqual({
+      current: keys.current.publicKey,
+      previous,
+    });
+
+    // After it, learning which key the API holds abandons the new key, and
+    // the device stays signed out.
+    wall.now += REPLACEMENT_GRACE_MS;
+    await h.session.refresh();
     expect(await h.session.authenticate()).toEqual({
       ok: false,
       reason: "refused",
@@ -1941,7 +2074,277 @@ describe("outcomes of the sign-in flow", () => {
   });
 });
 
+describe("the grace period of an uncertain sign-in", () => {
+  const NO_ANSWER: SignInOutcome = { kind: "failed", reason: "no_answer" };
+
+  /**
+   * What the sign-in flow leaves after an answer that may follow a commit:
+   * the new key, the previous key, and the record that names the previous
+   * key. The API has not committed (yet).
+   */
+  async function uncertainSignIn(
+    h: Harness,
+    outcome: SignInOutcome = NO_ANSWER,
+  ): Promise<{ previous: string; current: string }> {
+    const previous = await existingDevice(h);
+    h.session.signInStarted();
+    const keys = await h.keyStore.replace();
+    await h.session.signInFinished(outcome);
+    h.calls.length = 0;
+    return { previous, current: keys.current.publicKey };
+  }
+
+  test("during it the previous key's token is used and both keys stay, so a late commit of the new key is confirmed", async () => {
+    const h = harness();
+    const { previous, current } = await uncertainSignIn(h);
+    expect(await notesFile()).toMatchObject({
+      uncertainSignIn: {
+        publicKey: current,
+        at: new Date(wall.now).toISOString(),
+      },
+    });
+
+    expect((await h.session.listDevices()).ok).toBe(true);
+    expect(
+      tokenRequests(h.api).map((r) => signerOf(h.api, r, [current, previous])),
+    ).toEqual([current, previous]);
+    expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
+    expect(heldKeys(h)).toEqual({ current, previous });
+    expect(await recordKey(h)).toBe(previous);
+    expect(h.session.state().kind).toBe("signed_in");
+
+    // The API commits the sign-in late, which ends the previous key's
+    // tokens; the new key is tried first again.
+    wall.now += REPLACEMENT_GRACE_MS - 1;
+    h.api.publicKey = current;
+    h.api.tokens.clear();
+    expect((await h.session.listDevices()).ok).toBe(true);
+
+    expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([
+      "record.write",
+      "key.confirm",
+    ]);
+    expect(heldKeys(h)).toEqual({ current, previous: null });
+    expect(await recordKey(h)).toBe(current);
+    expect(await notesFile()).toBeNull();
+  });
+
+  test("after it, the previous key abandons the replacement", async () => {
+    const h = harness();
+    const { previous } = await uncertainSignIn(h);
+    wall.now += REPLACEMENT_GRACE_MS;
+
+    expect((await h.session.listDevices()).ok).toBe(true);
+
+    expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([
+      "key.abandon",
+    ]);
+    expect(heldKeys(h)).toEqual({ current: previous, previous: null });
+  });
+
+  test("it holds across a restart", async () => {
+    const h = harness();
+    const { previous, current } = await uncertainSignIn(h);
+
+    wall.now += REPLACEMENT_GRACE_MS / 2;
+    const restarted = await restart(h);
+    expect((await restarted.session.authenticate()).ok).toBe(true);
+    expect(heldKeys(restarted)).toEqual({ current, previous });
+
+    wall.now += REPLACEMENT_GRACE_MS / 2;
+    const later = await restart(restarted);
+    expect((await later.session.authenticate()).ok).toBe(true);
+    expect(heldKeys(later)).toEqual({ current: previous, previous: null });
+  });
+
+  const mayHaveCommitted: SignInOutcome[] = [
+    { kind: "failed", reason: "no_answer" },
+    { kind: "failed", reason: "server_error" },
+    { kind: "failed", reason: "unexpected_response" },
+    { kind: "failed", reason: "record_not_saved" },
+    ...UNCERTAIN_REFUSAL_CODES.map((apiError): SignInOutcome => ({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError,
+    })),
+    { kind: "cancelled" },
+    { kind: "timed_out" },
+  ];
+
+  test.each(
+    mayHaveCommitted.map((outcome) => [JSON.stringify(outcome), outcome]),
+  )("%s starts it", async (_name, outcome) => {
+    const h = harness();
+    const { previous, current } = await uncertainSignIn(h, outcome);
+
+    expect(await notesFile()).toMatchObject({
+      uncertainSignIn: {
+        publicKey: current,
+        at: new Date(wall.now).toISOString(),
+      },
+    });
+    h.api.publicKey = previous;
+    expect((await h.session.authenticate()).ok).toBe(true);
+    expect(heldKeys(h)).toEqual({ current, previous });
+  });
+
+  test("a later outcome of an attempt that sent nothing keeps the first time", async () => {
+    const h = harness();
+    await uncertainSignIn(h);
+    const first = await notesFile();
+    wall.now += REPLACEMENT_GRACE_MS / 2;
+
+    h.session.signInStarted();
+    const notStarted: SignInOutcome = {
+      kind: "failed",
+      reason: "replacement_pending",
+    };
+    await h.session.signInFinished(notStarted);
+
+    expect(await notesFile()).toEqual(first);
+  });
+
+  test("a pending replacement seen without an outcome, after a stop during the request, gets it from then", async () => {
+    const h = harness();
+    const previous = await existingDevice(h);
+    const keys = await h.keyStore.replace();
+
+    const restarted = await restart(h);
+
+    expect(await notesFile()).toMatchObject({
+      uncertainSignIn: { publicKey: keys.current.publicKey },
+    });
+    expect((await restarted.session.authenticate()).ok).toBe(true);
+    expect(heldKeys(restarted)).toEqual({
+      current: keys.current.publicKey,
+      previous,
+    });
+  });
+});
+
+describe("tokens, clocks, and late refusals", () => {
+  test("a cached token ends by the wall clock too, which runs while the computer sleeps", async () => {
+    const h = harness();
+    await existingDevice(h);
+    await h.session.listDevices();
+
+    wall.now += ACCESS_TOKEN_LIFETIME_MS - ACCESS_TOKEN_RENEW_MARGIN_MS;
+    await h.session.listDevices();
+
+    expect(mints(h)).toBe(2);
+  });
+
+  test("a refusal for another device, for example a late close of a replaced device's connection, is ignored", async () => {
+    const h = harness();
+    await existingDevice(h);
+
+    const state = await h.session.deviceRefused(
+      "device_revoked",
+      OTHER_DEVICE_ID,
+    );
+
+    expect(state.kind).toBe("signed_in");
+    expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
+    expect(
+      (await h.session.deviceRefused("sign_in_required", OTHER_DEVICE_ID)).kind,
+    ).toBe("signed_in");
+  });
+
+  test("a sign-out made while a sign-in ran holds after that sign-in succeeds", async () => {
+    const h = harness();
+    await existingDevice(h);
+    h.session.signInStarted();
+    // The flow got the code and replaced the key; the person signs out.
+    const keys = await h.keyStore.replace();
+    expect((await h.session.signOut()).ok).toBe(true);
+    // The flow's `200`: the record with the new key, then the confirmation.
+    await h.records.write(deviceRecord(keys.current.publicKey));
+    await h.keyStore.confirmReplacement();
+
+    expect((await h.session.signInFinished({ kind: "signed_in" })).kind).toBe(
+      "signed_out",
+    );
+    expect(
+      await readFile(path.join(folder, SIGN_OUT_MARKER_FILE), "utf8"),
+    ).toContain(keys.current.publicKey);
+  });
+});
+
 describe("remove this device", () => {
+  test("an offline removal is noted, blocks every other use of the key, holds across a restart, and is retried by refresh", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    await h.session.listDevices();
+    const revokePath = `/devices/${DEVICE_ID}/revoke`;
+    api.intercept = (request) =>
+      request.path === revokePath
+        ? Promise.reject(new TypeError("offline"))
+        : undefined;
+
+    expect(await h.session.removeDevice()).toEqual({
+      ok: true,
+      value: "pending",
+    });
+    expect(await notesFile()).toMatchObject({
+      removal: { deviceId: DEVICE_ID },
+    });
+    expect(h.session.state()).toMatchObject({ kind: "removal_pending" });
+
+    // The key serves only the removal: nothing else reaches the API.
+    const asked = api.requests.length;
+    const blocked = { ok: false, reason: "removal_pending" };
+    expect(await h.session.listDevices()).toEqual(blocked);
+    expect(await h.session.authenticate()).toEqual(blocked);
+    expect(
+      await h.session.request({
+        route: AUTH_ROUTES.listDevices,
+        answer: "empty",
+      }),
+    ).toEqual(blocked);
+    expect(await h.session.signWebSocketChallenge(challengeFrame())).toEqual(
+      blocked,
+    );
+    expect(api.requests).toHaveLength(asked);
+
+    // A restart keeps it pending, and its refresh retries the removal.
+    const restarted = await restart(h);
+    expect(count(restarted, "POST", revokePath)).toBe(2);
+    expect(restarted.session.state()).toMatchObject({
+      kind: "removal_pending",
+    });
+    expect(await restarted.session.listDevices()).toEqual(blocked);
+    expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
+
+    api.intercept = null;
+    expect((await restarted.session.refresh()).kind).toBe("removed");
+    expect(api.revokedReason).toBe("removed");
+    expect(await keyFiles()).toEqual([]);
+    expect(await notesFile()).toBeNull();
+  });
+
+  test("a sign-out or a sign-in ends a pending removal", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    api.intercept = (request) =>
+      request.path.endsWith("/revoke")
+        ? Promise.reject(new TypeError("offline"))
+        : undefined;
+    expect((await h.session.removeDevice()).ok).toBe(true);
+
+    expect((await h.session.signInFinished({ kind: "signed_in" })).kind).toBe(
+      "signed_in",
+    );
+    expect(await notesFile()).toBeNull();
+
+    expect((await h.session.removeDevice()).ok).toBe(true);
+    expect(await notesFile()).not.toBeNull();
+    expect((await h.session.signOut()).ok).toBe(true);
+    expect(await notesFile()).toBeNull();
+    expect(h.session.state().kind).toBe("signed_out");
+  });
+
   test("revokes the device as removed, and deletes the key and the record only after the API confirmed", async () => {
     const api = fakeApi();
     const h = harness(api);
@@ -2028,6 +2431,7 @@ describe("remove this device", () => {
       code: "conflict",
     });
     expect(h.session.state().kind).toBe("signed_in");
+    expect(await notesFile()).toBeNull();
     expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
   });
 
@@ -2158,7 +2562,7 @@ describe("secrets", () => {
     api.signedOut = false;
     outputs.push(await h.session.removeDevice());
     api.deviceState = "revoked";
-    outputs.push(await h.session.deviceRefused("device_revoked"));
+    outputs.push(await h.session.deviceRefused("device_revoked", DEVICE_ID));
     outputs.push(h.session.state());
 
     expect(api.issued.length).toBeGreaterThan(2);
@@ -2214,6 +2618,7 @@ test("no file of the session logs", () => {
     .sort();
   expect(names).toEqual([
     "api-call.ts",
+    "session-notes.ts",
     "session.ts",
     "sign-out-marker.ts",
     "system.ts",
