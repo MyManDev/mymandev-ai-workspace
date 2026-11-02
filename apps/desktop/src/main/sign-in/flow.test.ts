@@ -310,7 +310,9 @@ interface FakeApi {
  * both signatures against the key that it holds, and then holds the new key.
  * Like the API (#152), it keeps the verifier and redirect URI of the request
  * that took a code, in memory only, and answers a copy with both
- * `sign_in_code_used`.
+ * `sign_in_code_used`. Unlike the API, it binds no challenge: it records the
+ * verifier of whichever request took the code, which is the desktop's own in
+ * every test here.
  */
 function fakeApi(publicKey: string): FakeApi {
   const codes = new Set([SIGN_IN_CODE]);
