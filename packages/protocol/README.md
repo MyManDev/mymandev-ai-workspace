@@ -149,6 +149,10 @@ Decided by the Project Manager on 2026-11-01 (#92), as ADR 0014 leaves these det
 - A pending request whose `expiresAt` has passed no longer counts as pending, also before the server marks it `expired`: it is not returned as the pending request, it counts toward no limit, it is not in the approvers' list, and it can no longer be approved, denied, or withdrawn (`conflict`).
 - "Deny and invite instead" needs no route of its own: the desktop denies the request and then creates an invitation for one of the unclaimed people.
 
+Decided by the Project Manager on 2026-11-02 (#93), so that every device of both people learns of an ownership transfer (ADR 0014, "Removal and ownership"):
+
+- The account frame `account.ownership_transferred` reaches every open connection of the previous owner's account and of the new owner's account, also one that subscribed to nothing. It carries the workspace ID, the two people (`previousOwnerMemberId`, now an admin, and `ownerMemberId`, now the owner), which are never the same, and `transferredAt`. The workspace's subscribers still get the `workspace.ownership.transferred` event. Like every account frame, it reaches only open connections, so the desktop reads the workspace view after `auth.ok`.
+
 ## Workspace subscriptions, presence, and chat
 
 These rules follow #110 and the Project Manager's decisions of 2026-11-01. Storing chat messages, their authorization, and the history route belong to #27; the gateway work that applies these rules is a separate change. The protocol is a shared boundary: the desktop owner reviews this contract when they start work (ADR 0014, P-67).

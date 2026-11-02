@@ -49,9 +49,10 @@ export type WorkspaceRouteOptions = Readonly<{
   /**
    * Receives the account frames after the commit, for the account's open
    * connections: a join request decision for the requester,
-   * `account.removed_from_workspace` after a removal or a departure, and
+   * `account.removed_from_workspace` after a removal or a departure,
    * `account.ownership_offered` and `account.ownership_offer_ended` for the
-   * target of an ownership offer.
+   * target of an ownership offer, and `account.ownership_transferred` for
+   * the previous and the new owner after a transfer.
    */
   onAccountFrame: AccountFrameHandler;
   /**
