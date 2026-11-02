@@ -15,6 +15,7 @@ import {
   check,
   foreignKey,
   index,
+  integer,
   pgTable,
   text,
   unique,
@@ -43,11 +44,29 @@ export const workspaces = pgTable(
     archivedAt: nullableTimestamp("archived_at"),
     /** New join requests are refused until an admin resumes them. */
     joinRequestsPausedAt: nullableTimestamp("join_requests_paused_at"),
+    /**
+     * How many active unclaimed people (no account, not removed) the
+     * workspace may hold. Defining a person counts them after locking this
+     * row; the owner changes the value, never below that count.
+     */
+    maxUnclaimedMembers: integer("max_unclaimed_members")
+      .notNull()
+      .default(500),
   },
   (t) => [
+    // Counts the workspaces an account created in the last 24 hours.
+    index("workspaces_created_by_user_id_created_at_idx").on(
+      t.createdByUserId,
+      t.createdAt,
+    ),
     check(
       "workspaces_name_length",
       sql`char_length(${t.name}) between 1 and 100`,
+    ),
+    // UNCLAIMED_MEMBER_LIMIT of the protocol; a test compares them.
+    check(
+      "workspaces_max_unclaimed_members_check",
+      sql`${t.maxUnclaimedMembers} between 1 and 500`,
     ),
   ],
 );
@@ -248,6 +267,11 @@ export const workspaceJoinRequests = pgTable(
   },
   (t) => [
     index("workspace_join_requests_workspace_id_idx").on(t.workspaceId),
+    // Counts an account's requests: pending ones, and new ones in 24 hours.
+    index("workspace_join_requests_requester_user_id_created_at_idx").on(
+      t.requesterUserId,
+      t.createdAt,
+    ),
     // One pending request per account and workspace.
     uniqueIndex("workspace_join_requests_pending_key")
       .on(t.workspaceId, t.requesterUserId)

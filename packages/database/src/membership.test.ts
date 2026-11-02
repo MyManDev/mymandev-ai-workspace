@@ -16,6 +16,7 @@ import {
 import { and, eq } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
 import type { Database } from "./db.ts";
+import { DatabaseError } from "./errors.ts";
 import {
   activePersonOf,
   createWorkspace,
@@ -331,6 +332,7 @@ test("the workspace view shows every person, former ones as former, with the log
   assert.deepEqual(WorkspaceViewResponseSchema.parse(view), view);
   assert.deepEqual(view.workspace, { id: workspace.id, name: "View" });
   assert.equal(view.joinRequestsPausedAt, paused.toISOString());
+  assert.equal(view.maxUnclaimedMembers, 500);
   assert.deepEqual(view.ownershipOffer, {
     memberId: adminPerson,
     offeredAt: offered.toISOString(),
@@ -391,6 +393,66 @@ test("the workspace view shows every person, former ones as former, with the log
     await workspaceView(db, { workspaceId: newId<WorkspaceId>(), now: NOW }),
     undefined,
   );
+});
+
+test("a workspace gets the limit of unclaimed people that its creator chose, 500 otherwise, and the view shows it", async () => {
+  const db = database();
+  const creator = await account("limiter");
+  const limitOf = async (workspaceId: WorkspaceId) =>
+    (await workspaceView(db, { workspaceId, now: NOW }))?.maxUnclaimedMembers;
+
+  const standard = await created(creator, NOW, "Standard");
+  assert.equal(await limitOf(standard.workspace.id), 500);
+  for (const maxUnclaimedMembers of [1, 20, 500]) {
+    const result = await createWorkspace(db, {
+      userId: creator.userId,
+      deviceId: creator.deviceId,
+      name: `Limit ${maxUnclaimedMembers}`,
+      displayName: "Ada at work",
+      maxUnclaimedMembers,
+      now: NOW,
+    });
+    assert.ok(result.created);
+    assert.equal(
+      await limitOf(result.membership.workspace.id),
+      maxUnclaimedMembers,
+    );
+    const view = await workspaceView(db, {
+      workspaceId: result.membership.workspace.id,
+      now: NOW,
+    });
+    assert.deepEqual(WorkspaceViewResponseSchema.parse(view), view);
+  }
+  // Outside 1 to 500 the CHECK refuses, and nothing is created.
+  const before = await db
+    .select({ id: workspaces.id })
+    .from(workspaces)
+    .where(eq(workspaces.createdByUserId, creator.userId));
+  for (const maxUnclaimedMembers of [0, 501]) {
+    await assert.rejects(
+      createWorkspace(db, {
+        userId: creator.userId,
+        deviceId: creator.deviceId,
+        name: "Out of range",
+        displayName: "Ada at work",
+        maxUnclaimedMembers,
+        now: NOW,
+      }),
+      (error: unknown) => {
+        assert.ok(error instanceof DatabaseError);
+        assert.equal(
+          error.constraint,
+          "workspaces_max_unclaimed_members_check",
+        );
+        return true;
+      },
+    );
+  }
+  const after = await db
+    .select({ id: workspaces.id })
+    .from(workspaces)
+    .where(eq(workspaces.createdByUserId, creator.userId));
+  assert.equal(after.length, before.length);
 });
 
 test("the active person is only the account's claimed person whose removed_at is empty", async () => {

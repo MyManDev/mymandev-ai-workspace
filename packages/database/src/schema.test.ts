@@ -27,6 +27,7 @@ import {
   newUuidV7,
   RUN_STATES,
   TERMINAL_RUN_STATES,
+  UNCLAIMED_MEMBER_LIMIT,
   type AgentId,
   type Capability,
   type DeviceId,
@@ -369,6 +370,33 @@ test("the test database runs PostgreSQL 18", async () => {
     "select current_setting('server_version_num') as version",
   );
   assert.match(result.rows[0]?.version ?? "", /^18\d{4}$/);
+});
+
+test("the per-account counts of workspaces and join requests have indexes", async () => {
+  assert.ok(testDatabase);
+  const result = await testDatabase.client.query<{
+    name: string;
+    definition: string;
+  }>(
+    `select indexname as name, indexdef as definition from pg_indexes
+     where schemaname = 'public' and indexname in (
+       'workspaces_created_by_user_id_created_at_idx',
+       'workspace_join_requests_requester_user_id_created_at_idx'
+     ) order by indexname`,
+  );
+  assert.deepEqual(
+    result.rows.map((row) => [row.name, row.definition.split(" USING ")[1]]),
+    [
+      [
+        "workspace_join_requests_requester_user_id_created_at_idx",
+        "btree (requester_user_id, created_at)",
+      ],
+      [
+        "workspaces_created_by_user_id_created_at_idx",
+        "btree (created_by_user_id, created_at)",
+      ],
+    ],
+  );
 });
 
 test("the CHECK vocabularies equal the protocol constants", async () => {
@@ -1353,6 +1381,60 @@ test("devices: lowercase hexadecimal public keys, unique, and a reason for every
     .update(devices)
     .set({ revokedAt: new Date(), revocationReason: "lost" })
     .where(ofBob);
+});
+
+test("workspaces: a limit of unclaimed people from 1 to 500, 500 by default, as the protocol has it", async () => {
+  const db = database();
+  const world = await seed();
+  const workspace = newId<WorkspaceId>();
+  await db
+    .insert(workspaces)
+    .values({ id: workspace, name: "Limited", createdByUserId: world.alice });
+  const limitOf = async () => {
+    const [row] = await db
+      .select({ limit: workspaces.maxUnclaimedMembers })
+      .from(workspaces)
+      .where(eq(workspaces.id, workspace));
+    return row?.limit;
+  };
+  assert.equal(await limitOf(), UNCLAIMED_MEMBER_LIMIT.default);
+
+  const setLimit = (maxUnclaimedMembers: number) =>
+    db
+      .update(workspaces)
+      .set({ maxUnclaimedMembers })
+      .where(eq(workspaces.id, workspace));
+  for (const allowed of [
+    UNCLAIMED_MEMBER_LIMIT.min,
+    UNCLAIMED_MEMBER_LIMIT.max,
+  ]) {
+    await setLimit(allowed);
+    assert.equal(await limitOf(), allowed);
+  }
+  await rejectsAll([
+    [
+      "23514",
+      "workspaces_max_unclaimed_members_check",
+      () => setLimit(UNCLAIMED_MEMBER_LIMIT.min - 1),
+    ],
+    [
+      "23514",
+      "workspaces_max_unclaimed_members_check",
+      () => setLimit(UNCLAIMED_MEMBER_LIMIT.max + 1),
+    ],
+    [
+      "23514",
+      "workspaces_max_unclaimed_members_check",
+      () =>
+        db.insert(workspaces).values({
+          id: newId<WorkspaceId>(),
+          name: "Unlimited",
+          createdByUserId: world.alice,
+          maxUnclaimedMembers: -1,
+        }),
+    ],
+  ]);
+  assert.equal(await limitOf(), UNCLAIMED_MEMBER_LIMIT.max);
 });
 
 test("workspace members: claimed people, one active owner, one ownership offer", async () => {

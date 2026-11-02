@@ -21,6 +21,7 @@ export const AUDIT_ACTIONS = Object.freeze([
   "account.erased",
   // Workspaces and the people in them.
   "workspace.created",
+  "workspace.unclaimed_member_limit_changed",
   "member.defined",
   "member.renamed",
   "member.claimed",

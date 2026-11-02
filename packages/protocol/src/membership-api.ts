@@ -28,6 +28,7 @@ import {
   INVITATION_LIFETIME_SECONDS,
   LIMITS,
   MAX_ANSWER_LIST_ITEMS,
+  UNCLAIMED_MEMBER_LIMIT,
 } from "./model.ts";
 
 function route(method: ApiRoute["method"], path: string): ApiRoute {
@@ -49,10 +50,24 @@ export const MEMBERSHIP_ROUTES = Object.freeze({
   createWorkspace: route("POST", "/workspaces"),
   /**
    * The workspace, all its people including former members, whether join
-   * requests are paused, and the live ownership offer. Any active member.
+   * requests are paused, the limit of unclaimed people, and the live
+   * ownership offer. Any active member.
    */
   getWorkspace: route("GET", "/workspaces/:workspaceId"),
-  /** Defines an unclaimed person, who is always a `member`. Owner or admin. */
+  /**
+   * Changes how many active unclaimed people the workspace may hold, from 1
+   * to 500. A value below the number of active unclaimed people answers
+   * `conflict`; the value in force changes nothing. The owner only.
+   */
+  setUnclaimedMemberLimit: route(
+    "POST",
+    "/workspaces/:workspaceId/unclaimed-member-limit",
+  ),
+  /**
+   * Defines an unclaimed person, who is always a `member`. Owner or admin.
+   * A workspace that holds as many active unclaimed people as its limit
+   * answers `rate_limited`.
+   */
   defineMember: route("POST", "/workspaces/:workspaceId/members"),
   /**
    * Renames a person: any member renames their own person, and the owner or
@@ -229,18 +244,20 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  * - `device_too_new`: an ownership offer or a promotion from a device younger
  *   than 72 hours;
  * - `conflict`: the target is not in the state that the action needs, for
- *   example a removed person, a request that is no longer pending, or a
- *   second ownership offer;
+ *   example a removed person, a request that is no longer pending, a second
+ *   ownership offer, or a limit of unclaimed people below their number;
  * - `invitation_invalid`, `already_member`, `workspace_not_found`, and
  *   `join_requests_closed` as ADR 0014 defines them.
  *
  * Limits answer `rate_limited`, also those that count live or pending items,
- * such as 50 live invitations or 50 pending join requests per workspace.
+ * such as 50 live invitations or 50 pending join requests per workspace, and
+ * the workspace's limit of active unclaimed people.
  */
 export const MEMBERSHIP_ROUTE_ERRORS = Object.freeze({
   listWorkspaces: errors(),
   createWorkspace: errors(),
   getWorkspace: errors("not_found"),
+  setUnclaimedMemberLimit: errors("not_found", "forbidden", "conflict"),
   defineMember: errors("not_found", "forbidden"),
   renameMember: errors("not_found", "forbidden", "conflict"),
   removeMember: errors("not_found", "forbidden", "conflict"),
@@ -320,12 +337,22 @@ export const WorkspaceListResponseSchema = z.object({
 export type WorkspaceListResponse = z.infer<typeof WorkspaceListResponseSchema>;
 
 /**
+ * How many active unclaimed people a workspace may hold: an integer from 1 to
+ * 500 (`UNCLAIMED_MEMBER_LIMIT`).
+ */
+const maxUnclaimedMembers = () =>
+  z.int().min(UNCLAIMED_MEMBER_LIMIT.min).max(UNCLAIMED_MEMBER_LIMIT.max);
+
+/**
  * `POST /workspaces`. `displayName` is the creator's person in the new
  * workspace; the desktop fills it in with the account's display name.
+ * `maxUnclaimedMembers` limits the active unclaimed people of the workspace;
+ * the server applies 500 when it is omitted.
  */
 export const CreateWorkspaceRequestSchema = z.object({
   name: displayText(LIMITS.name),
   displayName: memberDisplayName(),
+  maxUnclaimedMembers: maxUnclaimedMembers().optional(),
 });
 export type CreateWorkspaceRequest = z.infer<
   typeof CreateWorkspaceRequestSchema
@@ -358,6 +385,8 @@ export const WorkspaceViewResponseSchema = z
     members: z.array(WorkspaceMemberSchema).max(MAX_ANSWER_LIST_ITEMS),
     /** When new join requests were paused; null while they are accepted. */
     joinRequestsPausedAt: UtcTimestampSchema.nullable(),
+    /** How many active unclaimed people the workspace may hold. */
+    maxUnclaimedMembers: maxUnclaimedMembers(),
     ownershipOffer: OwnershipOfferSchema.nullable(),
   })
   .superRefine((view, ctx) => {
@@ -401,6 +430,17 @@ export const WorkspaceViewResponseSchema = z
     }
   });
 export type WorkspaceViewResponse = z.infer<typeof WorkspaceViewResponseSchema>;
+
+/**
+ * `POST /workspaces/:workspaceId/unclaimed-member-limit`: the new limit of
+ * active unclaimed people, from 1 to 500 and never below their number.
+ */
+export const SetUnclaimedMemberLimitRequestSchema = z.object({
+  maxUnclaimedMembers: maxUnclaimedMembers(),
+});
+export type SetUnclaimedMemberLimitRequest = z.infer<
+  typeof SetUnclaimedMemberLimitRequestSchema
+>;
 
 /** `POST /workspaces/:workspaceId/members`: defines an unclaimed person. */
 export const DefineMemberRequestSchema = z.object({

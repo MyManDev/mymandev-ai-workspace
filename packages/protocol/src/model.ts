@@ -296,6 +296,22 @@ export const INVITATION_LIFETIME_SECONDS = Object.freeze({
   default: 604_800,
 } as const);
 
+/**
+ * How many active unclaimed people a workspace may hold (Project Manager
+ * decision of 2026-11-02): from 1 to 500, and 500 when the creator does not
+ * choose. The owner may change it later within the same range, never below
+ * the number of active unclaimed people at that moment. An active unclaimed
+ * person has no account and is not removed. The workspace view shows the
+ * active claimed people first and holds at most `MAX_ANSWER_LIST_ITEMS`
+ * people, so it shows every active unclaimed person while at most 500
+ * claimed people are active.
+ */
+export const UNCLAIMED_MEMBER_LIMIT = Object.freeze({
+  min: 1,
+  max: 500,
+  default: 500,
+} as const);
+
 /** A UUIDv7 in canonical lowercase form. Uppercase is rejected on purpose. */
 export const UUIDV7_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;

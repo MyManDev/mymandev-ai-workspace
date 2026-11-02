@@ -7,6 +7,7 @@ import {
   newId,
   newUuidV7,
   type OwnershipOffer,
+  UNCLAIMED_MEMBER_LIMIT,
   type UserId,
   type WorkspaceId,
   type WorkspaceMember,
@@ -118,6 +119,12 @@ export type CreateWorkspaceInput = Readonly<{
   name: string;
   /** The creator's person name in the new workspace. */
   displayName: string;
+  /**
+   * How many active unclaimed people the workspace may hold, from 1 to 500;
+   * `UNCLAIMED_MEMBER_LIMIT.default` (500) when omitted. Outside the range
+   * the CHECK fails.
+   */
+  maxUnclaimedMembers?: number;
   now: Date;
 }>;
 
@@ -133,11 +140,12 @@ export type CreateWorkspaceResult =
  * Creates a workspace in one transaction (ADR 0014, "People and roles" and
  * "Limits"): it locks the account's row, so that concurrent creations of one
  * account are counted one after another; refuses an 11th workspace that the
- * account created within 24 hours; inserts the workspace and the creator's
- * person as the claimed `owner` with `displayName`; and writes a
- * `workspace.created` audit record. Every row gets the time `now`.
- * `workspaces.created_by_user_id` stays a historical fact; ownership lives in
- * the role. Inside another transaction it runs as a savepoint.
+ * account created within 24 hours; inserts the workspace with its limit of
+ * unclaimed people and the creator's person as the claimed `owner` with
+ * `displayName`; and writes a `workspace.created` audit record. Every row
+ * gets the time `now`. `workspaces.created_by_user_id` stays a historical
+ * fact; ownership lives in the role. Inside another transaction it runs as a
+ * savepoint.
  */
 export async function createWorkspace(
   db: Database,
@@ -175,6 +183,8 @@ export async function createWorkspace(
         createdByUserId: input.userId,
         createdAt: input.now,
         updatedAt: input.now,
+        maxUnclaimedMembers:
+          input.maxUnclaimedMembers ?? UNCLAIMED_MEMBER_LIMIT.default,
       });
       await tx.insert(workspaceMembers).values({
         id: memberId,
@@ -299,8 +309,9 @@ export type WorkspaceViewInput = Readonly<{
  * `GET /workspaces/:workspaceId`. It holds every person, unclaimed, active,
  * and former, each with the login of its account and the time that login was
  * last verified (`user_identities.last_sign_in_at`); whether join requests are
- * paused; and the ownership offer that has not expired. undefined when the
- * workspace does not exist. The caller checks membership first.
+ * paused; how many active unclaimed people the workspace may hold; and the
+ * ownership offer that has not expired. undefined when the workspace does
+ * not exist. The caller checks membership first.
  *
  * The people are cut to `MAX_ANSWER_LIST_ITEMS`, in an order that never
  * drops those whom the view's rules name and in which unclaimed people never
@@ -319,6 +330,7 @@ export async function workspaceView(
         id: workspaces.id,
         name: workspaces.name,
         joinRequestsPausedAt: workspaces.joinRequestsPausedAt,
+        maxUnclaimedMembers: workspaces.maxUnclaimedMembers,
       })
       .from(workspaces)
       .where(eq(workspaces.id, input.workspaceId));
@@ -349,6 +361,7 @@ export async function workspaceView(
       members: rows.map(toMember),
       joinRequestsPausedAt:
         workspace.joinRequestsPausedAt?.toISOString() ?? null,
+      maxUnclaimedMembers: workspace.maxUnclaimedMembers,
       ownershipOffer: liveOffer(rows, input.now),
     };
   });
