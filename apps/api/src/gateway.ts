@@ -1188,7 +1188,9 @@ export function socketErrorHandler(connections: ConnectionRegistry) {
 /**
  * Refuses a WebSocket handshake from a browser origin that is not listed.
  * Browsers send Origin on every WebSocket handshake and apply no same-origin
- * rule to WebSocket; Node and the Electron main process send no Origin.
+ * rule to WebSocket; Node sends no Origin. Origins are compared as exact
+ * strings, in the serialized form that browsers send and that the
+ * configuration requires.
  */
 export function originGuard(allowedOrigins: readonly string[]) {
   const allowed: ReadonlySet<string> = new Set(allowedOrigins);
@@ -1289,7 +1291,10 @@ export async function subscriptionAccess(
 
 export type GatewayOptions = Readonly<{
   allowedOrigins: readonly string[];
-  /** The API's public origin: the audience of the `ws` signature. */
+  /**
+   * The API's public origin: the audience of the `ws` signature, and an
+   * origin that may open the gateway besides `allowedOrigins`.
+   */
   publicOrigin: string;
   database: Database;
   now: () => number;
@@ -1389,7 +1394,12 @@ export function registerGateway(
       // signature (P-63).
       config: { rateLimit: ADDRESS_LIMIT },
       preValidation: [
-        originGuard(options.allowedOrigins),
+        // The API's own origin may connect too: Electron's net.WebSocket, the
+        // desktop's client, sends by default the http(s) form of the
+        // WebSocket URL's origin, which is the API's origin (#154). The
+        // socket carries no cookie or other ambient credential; the device
+        // signature authenticates the connection.
+        originGuard([...options.allowedOrigins, publicOrigin]),
         capGuard(connections),
       ],
     },

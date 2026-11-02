@@ -6,9 +6,11 @@ import {
   API_ERROR_STATUS,
   CAPABILITIES,
   canTransition,
+  CHAT_HISTORY_PAGE,
   DEVICE_KEY_ALGORITHMS,
   DEVICE_PLATFORMS,
   DEVICE_REVOCATION_REASONS,
+  EVENT_REFUSAL_CODES,
   genericApiErrorCode,
   GITHUB_LOGIN_PATTERN,
   IDENTITY_PROVIDERS,
@@ -17,10 +19,12 @@ import {
   isTerminalRunState,
   JOIN_REQUEST_DECISIONS,
   LIMITS,
+  MAX_ANSWER_LIST_ITEMS,
   MEMBER_ROLES,
   OWN_JOIN_REQUEST_DECISIONS,
   OWNERSHIP_OFFER_END_REASONS,
   PRESENCE_STATUSES,
+  RECENT_FINISHED_RUNS,
   RUN_CANCEL_REASONS,
   RUN_STATES,
   RUN_TRANSITIONS,
@@ -159,6 +163,21 @@ test("the workspace connection vocabularies and the message limit are the values
   assert.equal(LIMITS.messageBody, 16_000);
 });
 
+test("event refusals, the chat history page, and the finished runs are the values of #27 and #28", () => {
+  // One code for an unknown entity and for one of another workspace, and
+  // `rate_limited` for the send limit, before protocol version 1.
+  assert.deepEqual(EVENT_REFUSAL_CODES, [
+    "not_found",
+    "conflict",
+    "rate_limited",
+  ]);
+  assert.deepEqual(CHAT_HISTORY_PAGE, { default: 50, max: 100 });
+  assert.ok(CHAT_HISTORY_PAGE.default <= CHAT_HISTORY_PAGE.max);
+  assert.ok(CHAT_HISTORY_PAGE.max <= MAX_ANSWER_LIST_ITEMS);
+  assert.equal(RECENT_FINISHED_RUNS, 50);
+  assert.ok(RECENT_FINISHED_RUNS <= MAX_ANSWER_LIST_ITEMS);
+});
+
 test("a device sign-in lasts 30 days, and an open connection 24 hours more", () => {
   assert.equal(SIGN_IN_LIFETIME_MS, 30 * 24 * 60 * 60 * 1000);
   assert.equal(SIGN_IN_LIFETIME_MS, 2_592_000_000);
@@ -286,6 +305,7 @@ test("the exported constants are frozen, nested values included", () => {
     ["PRESENCE_STATUSES", PRESENCE_STATUSES],
     ["WORKSPACE_SUBSCRIBE_REFUSAL_CODES", WORKSPACE_SUBSCRIBE_REFUSAL_CODES],
     ["WORKSPACE_UNSUBSCRIBE_REASONS", WORKSPACE_UNSUBSCRIBE_REASONS],
+    ["EVENT_REFUSAL_CODES", EVENT_REFUSAL_CODES],
     ["API_ERROR_CODES", API_ERROR_CODES],
     ...RUN_STATES.map((state): [string, readonly unknown[]] => [
       `RUN_TRANSITIONS.${state}`,
@@ -298,10 +318,11 @@ test("the exported constants are frozen, nested values included", () => {
     ["API_ERROR_STATUS", API_ERROR_STATUS],
     ["INVITATION_LIFETIME_SECONDS", INVITATION_LIFETIME_SECONDS],
     ["UNCLAIMED_MEMBER_LIMIT", UNCLAIMED_MEMBER_LIMIT],
+    ["CHAT_HISTORY_PAGE", CHAT_HISTORY_PAGE],
     ["WS_CLOSE_CODES", WS_CLOSE_CODES],
   ];
-  assert.equal(arrays.length, 22);
-  assert.equal(objects.length, 6);
+  assert.equal(arrays.length, 23);
+  assert.equal(objects.length, 7);
 
   // Modules run in strict mode, so a write to a frozen value throws.
   for (const [label, value] of arrays) {

@@ -44,6 +44,7 @@ Option 1 for every `packages/*` workspace:
 - Each consumer type-checks package source with its own options. Shared packages must compile under the strictest consumer. The `tsconfig.src.json` check covers the renderer case for Node.js globals (`types: []`) and for language features (`lib`), as long as its `lib` matches the renderer's.
 - Decorator-based frameworks and ORMs (NestJS, TypeORM) are excluded.
 - Revisit (move one package to `tsc -b`) only if a package must be published, needs non-erasable syntax, consumer type checks become slow, or the deployment task chooses a compiled artifact.
+- Update of 2026-11-02 (#154): the desktop opens the WebSocket from the main process, but unlike P-02 under "Needs Project Manager decision" says, it sends an `Origin` header: its client, Electron's `net.WebSocket`, sends by default the http(s) form of the WebSocket URL's origin, which is the API's origin (the update of 2026-11-02 (#154) in [ADR 0016](0016-desktop-toolchain.md)). The API's `/ws` origin guard therefore also accepts exactly `API_PUBLIC_ORIGIN`, as the update of 2026-11-02 (#154) in [ADR 0014](0014-accounts-devices-and-invitations.md) records. The text above is unchanged.
 
 ## Dependency policy
 

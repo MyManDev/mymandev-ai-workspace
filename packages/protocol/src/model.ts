@@ -198,6 +198,30 @@ export type WorkspaceUnsubscribeReason =
   (typeof WORKSPACE_UNSUBSCRIBE_REASONS)[number];
 
 /**
+ * Why the server refused an event that a device sent, in `event.refused`
+ * (#27, #28). The connection stays open. The list is closed; it is complete
+ * before protocol version 1, because a new value then needs a new version.
+ *
+ * - `not_found`: the event names a project, an agent, a run, or a
+ *   repository that does not exist or is not in the event's workspace, or a
+ *   run of another agent; both get the same code, so that a device cannot
+ *   probe which IDs exist (ADR 0007, ADR 0014).
+ * - `conflict`: what the event names exists in the workspace, but is not in
+ *   the state that the event needs, for example a run whose stored state is
+ *   not `previousState`, an archived project, or a disabled agent.
+ * - `rate_limited`: the device sent more events than the server's send
+ *   limit allows. The limit's values are decided with the API part of #27.
+ *
+ * A protocol violation gets no code: it closes the connection.
+ */
+export const EVENT_REFUSAL_CODES = Object.freeze([
+  "not_found",
+  "conflict",
+  "rate_limited",
+] as const);
+export type EventRefusalCode = (typeof EVENT_REFUSAL_CODES)[number];
+
+/**
  * The `code` of every HTTP error answer (P-66), with its HTTP status. The
  * list is closed: the API never sends another code.
  */
@@ -320,6 +344,27 @@ export const UNCLAIMED_MEMBER_LIMIT = Object.freeze({
   max: 500,
   default: 500,
 } as const);
+
+/**
+ * How many messages one page of a project's chat history holds (#27): 50
+ * when the request does not say, and at most 100. A page holds the newest
+ * messages first; a page with fewer messages than its `limit` is the oldest.
+ * The maximum lies far below `MAX_ANSWER_LIST_ITEMS`, because one message
+ * can take about 64 KB of JSON.
+ */
+export const CHAT_HISTORY_PAGE = Object.freeze({
+  default: 50,
+  max: 100,
+} as const);
+
+/**
+ * How many finished runs the server puts in the project's run list (#28):
+ * its most recently finished runs, the most recent first. The list also
+ * holds every unfinished run, up to `MAX_ANSWER_LIST_ITEMS`. The answer's
+ * schema accepts up to `MAX_ANSWER_LIST_ITEMS` finished runs, so that
+ * raising this count never breaks an older desktop.
+ */
+export const RECENT_FINISHED_RUNS = 50;
 
 /** A UUIDv7 in canonical lowercase form. Uppercase is rejected on purpose. */
 export const UUIDV7_PATTERN =

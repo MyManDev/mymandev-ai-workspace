@@ -1,7 +1,11 @@
 import type {
+  AccountStatus,
+  ForgetResult,
   MountResult,
   RepositoryList,
   RuntimeStatus,
+  StartSignInResult,
+  UnlockResult,
 } from "./ipc-contract.ts";
 
 /**
@@ -19,6 +23,8 @@ export interface DesktopBridge {
   readonly runtime: RuntimeBridge;
   /** The repositories mounted on this device, read-only. */
   readonly repositories: RepositoryBridge;
+  /** The sign-in of this installation. */
+  readonly account: AccountBridge;
 }
 
 export interface RuntimeBridge {
@@ -60,4 +66,44 @@ export interface RepositoryBridge {
    * Nothing in the folder changes. Resolves to false when it was not mounted.
    */
   readonly unmount: (mountId: string) => Promise<boolean>;
+}
+
+/**
+ * The sign-in of this installation. The main process runs it: the renderer
+ * gets the account, the pairing code, and fixed outcome codes, never a
+ * sign-in code, a verifier, a signature, a key, or a token (ADR 0014).
+ */
+export interface AccountBridge {
+  /** The current account status. */
+  readonly getStatus: () => Promise<AccountStatus>;
+  /**
+   * Calls `listener` with the current status and then after every change. A
+   * status older than the last one delivered is dropped. `onError` is called
+   * when the main process refuses the subscription. Returns a function that
+   * ends the subscription.
+   */
+  readonly subscribeStatus: (
+    listener: (status: AccountStatus) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Starts a GitHub sign-in in the system browser. Call it only after the
+   * person's action; it passes nothing from the renderer on. The main
+   * process refuses a start within a few seconds of the last one that
+   * opened the browser (`too_soon`).
+   */
+  readonly startSignIn: () => Promise<StartSignInResult>;
+  /** Ends the open sign-in. Resolves to false when none was open. */
+  readonly cancelSignIn: () => Promise<boolean>;
+  /**
+   * Loads a device key that a passphrase protects (Linux). The passphrase
+   * goes to the main process and is never sent back.
+   */
+  readonly unlockDeviceKey: (passphrase: string) => Promise<UnlockResult>;
+  /**
+   * "This is not me": the main process asks the person to confirm in a
+   * native dialog, then deletes the device key and the device record of
+   * this installation. Resolves to `cancelled` when the person kept them.
+   */
+  readonly forgetAccount: () => Promise<ForgetResult>;
 }

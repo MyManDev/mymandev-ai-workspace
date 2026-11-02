@@ -81,6 +81,12 @@ export const MAX_ANSWER_BYTES = 64 * 1024;
  *   must first learn which key the API holds.
  * - `key_store_failed`: the key store refused or failed to read, create,
  *   replace, or delete a key.
+ * - `system_protection_unavailable`: before the browser opens, the system
+ *   cannot protect the key that this attempt would create: a new device's
+ *   key with the system's protection, or the replacement of a key that the
+ *   system protects (see `systemProtection` of the key store). On Windows
+ *   and macOS the person must make the system's protection available; on
+ *   Linux a secret service is needed until the passphrase choice exists.
  * - `record_unreadable`: the record file cannot be read, or it is corrupt
  *   (for example another version, after a downgrade) while a key file
  *   exists. The key may still be the key of a device that the API knows, so
@@ -92,6 +98,8 @@ export const MAX_ANSWER_BYTES = 64 * 1024;
  *   failed, so it is handled like `no_answer`.
  * - `unexpected_response`: an answer that is not one of the API's; handled
  *   like `no_answer`.
+ * - `unexpected`: an error that the flow did not expect after the attempt
+ *   started, not a failure of the key store; nothing is undone.
  * - `uncertain_refusal`: the API answered with a code of
  *   `UNCERTAIN_REFUSAL_CODES`, which `apiError` carries. A resent copy of a
  *   request that committed gets that answer too, so it is handled like
@@ -114,11 +122,13 @@ export const SIGN_IN_FAILURE_REASONS = Object.freeze([
   "key_not_loaded",
   "replacement_pending",
   "key_store_failed",
+  "system_protection_unavailable",
   "record_unreadable",
   "listener_unavailable",
   "no_answer",
   "server_error",
   "unexpected_response",
+  "unexpected",
   "uncertain_refusal",
   "key_changed",
   "record_not_saved",
@@ -233,11 +243,21 @@ export interface SignInStartOptions {
   readonly replaceOptions?: ReplaceDeviceKeyOptions;
   /** A device label that the person chose; defaults to `suggestedDeviceLabel`. */
   readonly label?: string;
+  /**
+   * Called once, right after the listener accepted the valid request (the
+   * API's page posted a code or an error), before the key changes and before
+   * `POST /auth/sign-in`: ADR 0014, "Sign-in", step 6, brings the window to
+   * the front then. Not called after a cancel or the timeout. An error that
+   * it throws is ignored.
+   */
+  readonly onCallback?: () => void;
 }
 
 /** The part of the device key store that the flow uses. */
 export type SignInKeyStore = Pick<
   DeviceKeyStore,
+  | "systemProtection"
+  | "status"
   | "hasKey"
   | "keys"
   | "create"
@@ -274,6 +294,14 @@ export interface SignInFlow {
    * the listener, and opens the browser. Never rejects.
    */
   readonly start: (options?: SignInStartOptions) => Promise<SignInStart>;
+  /**
+   * Forgets what the flow keeps between attempts: a record that could not be
+   * written, and the account mismatch that adds `prompt`. Called when the
+   * installation forgets its account ("This is not me", #149), so that
+   * nothing of that account carries over to the next attempt. Returns false
+   * and changes nothing while an attempt runs.
+   */
+  readonly reset: () => boolean;
 }
 
 const DEVICE_PLATFORMS_BY_NODE: Readonly<
@@ -523,6 +551,35 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     return { kind: "new", record: null };
   }
 
+  /**
+   * Whether the key that this attempt would store cannot be stored now: a
+   * new device's key with the system's protection, or the replacement of a
+   * key that the system protects, needs the system's protection (see
+   * `replace` of the key store). Checked before the browser opens, so that
+   * the person does not finish the browser's part only for the key to fail.
+   * A key that a passphrase protects, or an unprotected one, is left to the
+   * store's own rules.
+   */
+  async function protectionProblem(
+    plan: DevicePlan,
+    options: SignInStartOptions,
+  ): Promise<SignInFailureReason | null> {
+    try {
+      const needsSystem =
+        plan.kind === "new"
+          ? (options.newKeyProtection ?? { kind: "system" }).kind === "system"
+          : (await deps.keyStore.status()).protection === "system";
+      if (!needsSystem) {
+        return null;
+      }
+      return (await deps.keyStore.systemProtection()).available
+        ? null
+        : "system_protection_unavailable";
+    } catch {
+      return "key_store_failed";
+    }
+  }
+
   function signInKind(plan: DevicePlan): AuthorizeSignInKind {
     const login = plan.record?.login;
     if (afterAccountMismatch) {
@@ -557,6 +614,10 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       const plan = await planDevice();
       if (typeof plan === "string") {
         return notStarted(plan);
+      }
+      const protection = await protectionProblem(plan, options);
+      if (protection !== null) {
+        return notStarted(protection);
       }
       const attempt = createSignInAttempt();
       let listener: SignInListener;
@@ -682,7 +743,7 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       return await register(input);
     } catch {
       report("The sign-in failed unexpectedly.");
-      return failed("key_store_failed");
+      return failed("unexpected");
     }
   }
 
@@ -722,6 +783,15 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
   async function register(input: FinishInput): Promise<SignInOutcome> {
     const { plan, listener, apiOrigin, attempt, abort } = input;
     const result = await listener.wait();
+    if (result.kind === "code" || result.kind === "error") {
+      // The valid request arrived: the window comes to the front now, not
+      // after the answer of `POST /auth/sign-in`.
+      try {
+        input.options.onCallback?.();
+      } catch {
+        // A failing callback never changes the sign-in.
+      }
+    }
     switch (result.kind) {
       case "cancelled":
         return Object.freeze({ kind: "cancelled" });
@@ -944,5 +1014,14 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     });
   }
 
-  return Object.freeze({ start });
+  function reset(): boolean {
+    if (running) {
+      return false;
+    }
+    unsavedRecord = null;
+    afterAccountMismatch = false;
+    return true;
+  }
+
+  return Object.freeze({ start, reset });
 }
