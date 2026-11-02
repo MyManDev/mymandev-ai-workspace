@@ -75,6 +75,24 @@ describe("resolveApiOrigin", () => {
     ).toEqual({ ok: false, reason: "api_origin_invalid" });
   });
 
+  test.each([
+    "http://localhost",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+  ])("a packaged build refuses the loopback http origin %s", (origin) => {
+    // Accepted in a development build, never as the production origin.
+    expect(isApiOrigin(origin)).toBe(true);
+    expect(
+      resolveApiOrigin({ isPackaged: true, env: {}, productionOrigin: origin }),
+    ).toEqual({ ok: false, reason: "api_origin_invalid" });
+    expect(
+      resolveApiOrigin({
+        isPackaged: false,
+        env: { [API_ORIGIN_VARIABLE]: origin },
+      }),
+    ).toEqual({ ok: true, origin });
+  });
+
   test("a development build reads MYMANDEV_API_ORIGIN", () => {
     expect(API_ORIGIN_VARIABLE).toBe("MYMANDEV_API_ORIGIN");
     expect(

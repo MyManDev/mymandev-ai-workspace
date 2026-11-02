@@ -88,6 +88,13 @@ export const MAX_ANSWER_BYTES = 64 * 1024;
  *   failed, so it is handled like `no_answer`.
  * - `unexpected_response`: an answer that is not one of the API's; handled
  *   like `no_answer`.
+ * - `uncertain_refusal`: the API answered with a code of
+ *   `UNCERTAIN_REFUSAL_CODES`, which `apiError` carries. A resent copy of a
+ *   request that committed gets that answer too, so it is handled like
+ *   `no_answer`.
+ * - `key_changed`: after the key replacement, the previous key is not the
+ *   key that the record names, so the key store changed during the attempt.
+ *   The replacement is abandoned, and nothing is signed or sent.
  * - `record_not_saved`: the API registered the device, but the record could
  *   not be written, also when tried a second time. An existing device keeps
  *   the replacement pending. The flow keeps the record in memory, and the
@@ -108,9 +115,32 @@ export const SIGN_IN_FAILURE_REASONS = Object.freeze([
   "no_answer",
   "server_error",
   "unexpected_response",
+  "uncertain_refusal",
+  "key_changed",
   "record_not_saved",
 ] as const);
 export type SignInFailureReason = (typeof SIGN_IN_FAILURE_REASONS)[number];
+
+/**
+ * The refusals of the API that do not prove that nothing was committed. When
+ * the connection fails after the API committed, `net.fetch` or a proxy can
+ * send the same request again, and only the answer to that copy arrives.
+ * `POST /auth/sign-in` takes the sign-in code before every other check, so
+ * the copy gets `auth_failed`, or `rate_limited` when the route's limit
+ * refuses it before that. A copy of a request that committed cannot get any
+ * other refusal: those answer a request that the API refused before its
+ * transaction committed. Once the API answers a resent request with its own
+ * error code, this list narrows to that code.
+ */
+export const UNCERTAIN_REFUSAL_CODES = Object.freeze([
+  "auth_failed",
+  "rate_limited",
+] as const satisfies readonly ApiErrorCode[]);
+export type UncertainRefusalCode = (typeof UNCERTAIN_REFUSAL_CODES)[number];
+
+function isUncertainRefusal(code: ApiErrorCode): code is UncertainRefusalCode {
+  return (UNCERTAIN_REFUSAL_CODES as readonly ApiErrorCode[]).includes(code);
+}
 
 /** The account that the device is signed in to. */
 export interface SignedInAccount {
@@ -139,6 +169,7 @@ export type SignInOutcome =
   | { readonly kind: "listener_error"; readonly error: SignInListenerError }
   | {
       readonly kind: "refused";
+      /** Never a code of `UNCERTAIN_REFUSAL_CODES`. */
       readonly code: ApiErrorCode;
       /**
        * With `device_account_mismatch`: the login of the account that this
@@ -154,6 +185,8 @@ export type SignInOutcome =
        * for example `system_protection_unavailable`, when it raised one.
        */
       readonly keyError?: DeviceKeyErrorCode;
+      /** With `uncertain_refusal`: the API's error code. */
+      readonly apiError?: UncertainRefusalCode;
     };
 
 interface StartedSignInBase {
@@ -359,7 +392,9 @@ async function readAnswer(response: Response): Promise<Answer> {
         }
       : { kind: "unexpected" };
   }
-  // Only a 4xx with the API's error body means that nothing was committed.
+  // Only a 4xx with the API's error body is a refusal of the API; whether it
+  // proves that nothing was committed depends on its code (see
+  // `UNCERTAIN_REFUSAL_CODES`).
   if (response.status >= 400 && response.status <= 499) {
     const parsed = ApiErrorBodySchema.safeParse(value);
     if (parsed.success && parsed.data.statusCode === response.status) {
@@ -642,17 +677,24 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
 
   /**
    * Undoes the key change of a request that the API refused with a `4xx`
-   * error body, so it committed nothing.
+   * error body whose code is not in `UNCERTAIN_REFUSAL_CODES`, so it
+   * committed nothing.
    *
-   * When whether the API committed is unknown (no answer, a `5xx`, or an
-   * answer that is not the API's), nothing is undone:
-   * an existing device keeps the replacement pending, and part 3 tries the
-   * new key first. A new device keeps its new key and the record of a lost
-   * key stays as it was. The next attempt finds a key without a record, or
-   * a key that is not the record's device's key, and registers a new device
-   * (naming the record's device) with a new key. If the uncertain request
-   * did commit, the device it registered has no usable key and expires
-   * after 30 days, because the API offers no way to learn its ID.
+   * When whether the API committed is unknown (no answer, a `5xx`, an answer
+   * that is not the API's, or an uncertain refusal), nothing is undone: an
+   * existing device keeps the replacement pending, and part 3 tries the new
+   * key first. A new device keeps its new key and the record of a lost key
+   * stays as it was. The next attempt finds a key without a record, or a key
+   * that is not the record's device's key, deletes it, and registers a new
+   * device (naming the record's device) with a new key. If the uncertain
+   * request did commit, the API offers no way to learn the ID of the device
+   * that it registered, and no installation holds that device's key. The
+   * device is never revoked on its own: after its sign-in expiry it only
+   * requires a new sign-in, which nothing can sign. Until the person removes
+   * it from another device, it is listed among the account's devices and
+   * counts toward the account's 20 active devices; it also counted toward
+   * the 10 new devices per 24 hours, and the account's other devices were
+   * told of it as a new device.
    */
   async function undoKey(plan: DevicePlan): Promise<void> {
     try {
@@ -688,6 +730,18 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
         const keys = await deps.keyStore.replace(input.options.replaceOptions);
         if (keys.previous === null) {
           throw new Error("No previous key after a replacement.");
+        }
+        if (keys.previous.publicKey !== plan.record.publicKey) {
+          // The key store changed since the attempt started: the previous
+          // key is not the key of the record's device, so it never signs
+          // for that device ID.
+          report("The device key changed during the sign-in.");
+          try {
+            await deps.keyStore.abandonReplacement();
+          } catch {
+            report("The new device key could not be discarded.");
+          }
+          return failed("key_changed");
         }
         const signed: DeviceAuthInput = {
           purpose: "sign-in",
@@ -789,6 +843,17 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       return failed(
         answer.kind === "server_error" ? "server_error" : "unexpected_response",
       );
+    }
+
+    if (answer.kind === "error" && isUncertainRefusal(answer.code)) {
+      // A resent copy of a request that committed gets this answer too;
+      // nothing is undone (see `undoKey`).
+      report("The sign-in request got a refusal that may follow a commit.");
+      return Object.freeze({
+        kind: "failed",
+        reason: "uncertain_refusal",
+        apiError: answer.code,
+      });
     }
 
     if (answer.kind === "error") {

@@ -37,7 +37,8 @@ export function isApiOrigin(value: unknown): value is string {
 /**
  * The API origin, or why there is none: `api_origin_unset` (a production
  * build without a fixed origin, or a development build without the
- * variable) or `api_origin_invalid` (a value that `isApiOrigin` refuses).
+ * variable) or `api_origin_invalid` (a value that `isApiOrigin` refuses, or
+ * a production origin without https).
  */
 export type ApiOrigin =
   | { readonly ok: true; readonly origin: string }
@@ -57,8 +58,9 @@ export interface ApiOriginInput {
 
 /**
  * The API origin of this build. A packaged build uses the fixed production
- * origin and never reads the environment; a development build reads
- * `MYMANDEV_API_ORIGIN`. The result never contains a refused value.
+ * origin, which must use https, and never reads the environment; a
+ * development build reads `MYMANDEV_API_ORIGIN`. The result never contains
+ * a refused value.
  */
 export function resolveApiOrigin(input: ApiOriginInput): ApiOrigin {
   const value = input.isPackaged
@@ -69,7 +71,11 @@ export function resolveApiOrigin(input: ApiOriginInput): ApiOrigin {
   if (value === null || value === undefined || value === "") {
     return Object.freeze({ ok: false, reason: "api_origin_unset" });
   }
-  if (!isApiOrigin(value)) {
+  // The loopback http origins are for development and tests only.
+  if (
+    !isApiOrigin(value) ||
+    (input.isPackaged && !value.startsWith("https://"))
+  ) {
     return Object.freeze({ ok: false, reason: "api_origin_invalid" });
   }
   return Object.freeze({ ok: true, origin: value });

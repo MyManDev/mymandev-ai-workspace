@@ -35,6 +35,7 @@ import {
   type SignInOutcome,
   type SignInStart,
   suggestedDeviceLabel,
+  UNCERTAIN_REFUSAL_CODES,
 } from "./flow.ts";
 import { SIGN_IN_LISTENER_TIMEOUT_MS } from "./listener.ts";
 
@@ -207,6 +208,16 @@ function started(start: SignInStart) {
   return start;
 }
 
+/** Delivers the code through the real listener of the attempt that opened this URL. */
+async function deliverCode(authorizeUrl: string): Promise<void> {
+  const params = authorizeParams(authorizeUrl);
+  const form = new URLSearchParams({
+    code: SIGN_IN_CODE,
+    state: params.get("state") ?? "",
+  }).toString();
+  expect(await postForm(params.get("redirect_uri") ?? "", form)).toBe(200);
+}
+
 /** Starts a sign-in, delivers the code through the real listener, and returns the outcome. */
 async function signIn(h: Harness): Promise<{
   outcome: SignInOutcome;
@@ -215,12 +226,7 @@ async function signIn(h: Harness): Promise<{
 }> {
   const start = started(await h.flow.start());
   const authorizeUrl = h.opened.at(-1) ?? "";
-  const params = authorizeParams(authorizeUrl);
-  const form = new URLSearchParams({
-    code: SIGN_IN_CODE,
-    state: params.get("state") ?? "",
-  }).toString();
-  expect(await postForm(params.get("redirect_uri") ?? "", form)).toBe(200);
+  await deliverCode(authorizeUrl);
   return { outcome: await start.outcome, start, authorizeUrl };
 }
 
@@ -287,6 +293,55 @@ const SERVER_ERROR = Object.freeze({
   message: "Internal Server Error",
   code: "internal_error",
 });
+
+interface FakeApi {
+  /** The public key that the API holds for the device of `RECORD`. */
+  readonly publicKey: () => string;
+  /** How many requests committed. */
+  readonly commits: () => number;
+  readonly handle: (body: SignInRequest) => Response;
+}
+
+/**
+ * A fake of `POST /auth/sign-in` for the device of `RECORD`, in the API's
+ * order: it takes the single-use code before every other check, verifies
+ * both signatures against the key that it holds, and then holds the new key.
+ */
+function fakeApi(publicKey: string): FakeApi {
+  const codes = new Set([SIGN_IN_CODE]);
+  let held = publicKey;
+  let commits = 0;
+  return {
+    publicKey: () => held,
+    commits: () => commits,
+    handle: (body) => {
+      if (!codes.delete(body.code)) {
+        return errorAnswer("auth_failed");
+      }
+      const { device } = body;
+      if (device.kind !== "existing" || device.deviceId !== DEVICE_ID) {
+        return errorAnswer("auth_failed");
+      }
+      const input = {
+        purpose: "sign-in",
+        audience: API_ORIGIN,
+        signInCode: body.code,
+        deviceId: device.deviceId,
+        newPublicKey: device.publicKey,
+      } as const;
+      if (
+        device.publicKey === held ||
+        !verifies(held, input, device.currentKeySignature) ||
+        !verifies(device.publicKey, input, device.newKeySignature)
+      ) {
+        return errorAnswer("auth_failed");
+      }
+      held = device.publicKey;
+      commits += 1;
+      return json(200, ANSWER);
+    },
+  };
+}
 
 describe("a new device", () => {
   test("registers a new key with a platform label and writes the record", async () => {
@@ -471,6 +526,34 @@ describe("a new device", () => {
     );
     expect(await h.records.read()).toEqual({ kind: "none" });
   }, 20_000);
+
+  test.each(UNCERTAIN_REFUSAL_CODES)(
+    "keeps a new device's key and the old record on %s",
+    async (code) => {
+      const h = harness();
+      // The key of the recorded device was lost.
+      await h.records.write(RECORD);
+      h.answer = () => errorAnswer(code);
+      const { outcome } = await signIn(h);
+
+      expect(outcome).toEqual({
+        kind: "failed",
+        reason: "uncertain_refusal",
+        apiError: code,
+      });
+      expect(h.keyStore.keys()?.current.publicKey).toBe(
+        h.requests[0]?.body.device.publicKey,
+      );
+      expect(await h.records.read()).toEqual({
+        kind: "record",
+        record: RECORD,
+      });
+      expect(h.errors).toContain(
+        "The sign-in request got a refusal that may follow a commit.",
+      );
+    },
+    20_000,
+  );
 
   test("writes the record a second time when the first write fails", async () => {
     const records = createDeviceRecordStore({ folder, platform: "win32" });
@@ -704,23 +787,117 @@ describe("an existing device", () => {
       outcome: { kind: "failed", reason: "replacement_pending" },
     });
   });
+
+  test("signs nothing when the previous key is not the record's key after the replacement", async () => {
+    const h = harness();
+    const recordKey = await existingDevice(h);
+    const start = started(await h.flow.start());
+    // The key store changes while the attempt waits for the code.
+    await h.keyStore.replace();
+    await h.keyStore.confirmReplacement();
+    const changed = h.keyStore.keys()?.current.publicKey;
+    expect(changed).not.toBe(recordKey);
+    await deliverCode(h.opened.at(-1) ?? "");
+
+    expect(await start.outcome).toEqual({
+      kind: "failed",
+      reason: "key_changed",
+    });
+    expect(h.requests).toEqual([]);
+    // The replacement is abandoned: the store holds what it held before.
+    expect(h.keyStore.keys()?.current.publicKey).toBe(changed);
+    expect(h.keyStore.keys()?.previous).toBeNull();
+    expect(h.errors).toContain("The device key changed during the sign-in.");
+  }, 20_000);
 });
 
 describe("answers of the API", () => {
-  test("abandons the replacement on a 4xx answer", async () => {
+  test.each(["sign_in_required", "conflict", "bad_request"] as const)(
+    "abandons the replacement on a 4xx answer with %s",
+    async (code) => {
+      const h = harness();
+      const previousKey = await existingDevice(h);
+      h.answer = () => errorAnswer(code);
+      const { outcome } = await signIn(h);
+
+      expect(outcome).toEqual({ kind: "refused", code });
+      const keys = h.keyStore.keys();
+      expect(keys?.current.publicKey).toBe(previousKey);
+      expect(keys?.previous).toBeNull();
+      expect(await h.records.read()).toEqual({
+        kind: "record",
+        record: { ...RECORD, publicKey: previousKey },
+      });
+    },
+    20_000,
+  );
+
+  test.each(UNCERTAIN_REFUSAL_CODES)(
+    "keeps the replacement pending on %s",
+    async (code) => {
+      const h = harness();
+      const previousKey = await existingDevice(h);
+      h.answer = () => errorAnswer(code);
+      const { outcome } = await signIn(h);
+
+      expect(outcome).toEqual({
+        kind: "failed",
+        reason: "uncertain_refusal",
+        apiError: code,
+      });
+      const keys = h.keyStore.keys();
+      expect(keys?.previous?.publicKey).toBe(previousKey);
+      expect(keys?.current.publicKey).toBe(
+        h.requests[0]?.body.device.publicKey,
+      );
+      expect(await h.records.read()).toEqual({
+        kind: "record",
+        record: { ...RECORD, publicKey: previousKey },
+      });
+    },
+    20_000,
+  );
+
+  test("keeps the key that the API holds when a resent copy of a committed request gets auth_failed", async () => {
     const h = harness();
     const previousKey = await existingDevice(h);
-    h.answer = () => errorAnswer("auth_failed");
+    const api = fakeApi(previousKey);
+    // The fetch delivers the request twice, as `net.fetch` or a proxy can
+    // after the connection failed: the first copy commits but its answer is
+    // lost, and only the answer to the second copy arrives.
+    h.answer = (body) => {
+      api.handle(body);
+      return api.handle(body);
+    };
     const { outcome } = await signIn(h);
+    const newKey = h.requests[0]?.body.device.publicKey;
 
-    expect(outcome).toEqual({ kind: "refused", code: "auth_failed" });
+    expect(api.commits()).toBe(1);
+    expect(api.publicKey()).toBe(newKey);
+    // The replacement stays pending: the key that the API holds is kept,
+    // next to the previous key, and the record still names the previous key.
     const keys = h.keyStore.keys();
-    expect(keys?.current.publicKey).toBe(previousKey);
-    expect(keys?.previous).toBeNull();
+    expect(keys?.current.publicKey).toBe(api.publicKey());
+    expect(keys?.previous?.publicKey).toBe(previousKey);
     expect(await h.records.read()).toEqual({
       kind: "record",
       record: { ...RECORD, publicKey: previousKey },
     });
+    expect(outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "auth_failed",
+    });
+
+    // Both keys are on disk, and the next start deletes neither.
+    const restarted = harness();
+    await restarted.keyStore.load();
+    expect(await restarted.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "replacement_pending" },
+    });
+    expect(restarted.keyStore.keys()?.current.publicKey).toBe(api.publicKey());
+    expect(restarted.keyStore.keys()?.previous?.publicKey).toBe(previousKey);
   }, 20_000);
 
   test("keeps the replacement pending on a 5xx answer, even with an error body", async () => {
@@ -884,9 +1061,12 @@ describe("answers of the API", () => {
 
   test("deletes a new device's key when the API refused it", async () => {
     const h = harness();
-    h.answer = () => errorAnswer("rate_limited");
+    h.answer = () => errorAnswer("device_registration_locked");
     const { outcome } = await signIn(h);
-    expect(outcome).toEqual({ kind: "refused", code: "rate_limited" });
+    expect(outcome).toEqual({
+      kind: "refused",
+      code: "device_registration_locked",
+    });
     expect(await h.keyStore.hasKey()).toBe(false);
     expect(await h.records.read()).toEqual({ kind: "none" });
   }, 20_000);
@@ -1050,6 +1230,7 @@ describe("secrets", () => {
     const results: unknown[] = [];
     const answers: (() => Response)[] = [
       () => json(200, ANSWER),
+      () => errorAnswer("sign_in_required"),
       () => errorAnswer("auth_failed"),
       () => {
         throw new TypeError("fetch failed");
