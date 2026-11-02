@@ -157,6 +157,17 @@ export {
   type WorkspaceJoinRequestsRefusal,
 } from "./join-requests.ts";
 export {
+  createProject,
+  type CreateProjectInput,
+  type CreateProjectResult,
+  listProjects,
+  MAX_ACTIVE_PROJECTS_PER_WORKSPACE,
+  MAX_NEW_PROJECTS_PER_DAY,
+  renameProject,
+  type RenameProjectInput,
+  type RenameProjectResult,
+} from "./projects.ts";
+export {
   DatabaseError,
   toDatabaseError,
   withDatabaseErrors,

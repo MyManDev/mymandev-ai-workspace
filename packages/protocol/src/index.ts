@@ -8,3 +8,4 @@ export * from "./device-auth.ts";
 export * from "./account.ts";
 export * from "./auth-api.ts";
 export * from "./membership-api.ts";
+export * from "./project-api.ts";

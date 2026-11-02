@@ -14,6 +14,7 @@ import {
   type MemberRole,
   newId,
   newUuidV7,
+  PROJECT_ROUTES,
   type WorkspaceId,
   WorkspaceListResponseSchema,
   WorkspaceViewResponseSchema,
@@ -295,7 +296,10 @@ test("on every route under /workspaces/:workspaceId, a non-member gets the answe
   // before validation, so a request without a body answers 404 too; a route
   // outside the membership scope answers something else for a non-member.
   const covered: string[] = [];
-  for (const [name, route] of Object.entries(MEMBERSHIP_ROUTES)) {
+  for (const [name, route] of Object.entries({
+    ...MEMBERSHIP_ROUTES,
+    ...PROJECT_ROUTES,
+  })) {
     const { method, path } = route;
     if (
       !path.startsWith("/workspaces/:workspaceId/") &&
@@ -342,6 +346,9 @@ test("on every route under /workspaces/:workspaceId, a non-member gets the answe
     "listJoinRequests",
     "approveJoinRequest",
     "denyJoinRequest",
+    "listProjects",
+    "createProject",
+    "renameProject",
   ]) {
     assert.ok(covered.includes(name), `${name}: ${covered.join(", ")}`);
   }

@@ -80,9 +80,12 @@ import {
 //    the erasure at the row then finds the workspace archived. A withdrawal
 //    or a decision of a request holds no workspace row.
 // 5. Their projects, then the repositories of those projects, for their
-//    names. Nothing else writes these rows yet; a future writer of them locks
-//    them after the people and the workspace row, a project before its
-//    repositories.
+//    names, and the projects also for their archive. `src/projects.ts` locks
+//    a workspace row or a project only after the acting person: the
+//    account's own person, whose account the erasure holds first, or another
+//    claimed person, whom the erasure never locks. A future writer of
+//    repositories locks them after the people and the workspace row, a
+//    project before its repositories.
 // 6. Their invitations that are neither accepted nor revoked.
 //
 // Only then does the erasure read whether another active, claimed person
@@ -302,7 +305,10 @@ function idsIn<Id extends string>(
  *   `ARCHIVED_PROJECT_NAME` and of their repositories with
  *   `ARCHIVED_REPOSITORY_NAME`, and the display names of its unclaimed
  *   people, removed ones included, with `ERASED_DISPLAY_NAME`; the rows and
- *   their links stay. It writes `workspace.archived`, `invitation.revoked`,
+ *   their links stay. It archives the workspace's projects too, keeping an
+ *   earlier `archived_at`, so that their common placeholder name does not
+ *   meet the unique index of project names (#155), which holds only for
+ *   projects that are not archived. It writes `workspace.archived`, `invitation.revoked`,
  *   and `join_request.denied` audit records with the reason
  *   `account_erased`. An archived workspace has no owner, which only an
  *   archived workspace may lack, and its unclaimed people stay;
@@ -607,7 +613,11 @@ export async function eraseAccount(
         if (projectIds.length > 0) {
           await tx
             .update(projects)
-            .set({ name: ARCHIVED_PROJECT_NAME, updatedAt: now })
+            .set({
+              name: ARCHIVED_PROJECT_NAME,
+              archivedAt: sql`coalesce(${projects.archivedAt}, ${now.toISOString()}::timestamptz)`,
+              updatedAt: now,
+            })
             .where(idIn(projects.id, projectIds));
         }
         if (repositoryIds.length > 0) {

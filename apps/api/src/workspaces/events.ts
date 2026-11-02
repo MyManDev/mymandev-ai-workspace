@@ -15,9 +15,10 @@ import type { AccountFrame, ConnectionRegistry } from "../gateway.ts";
  * A membership event: a change of the people that every member of the
  * workspace must see (`workspace.member.*` and
  * `workspace.ownership.transferred`). Only the server originates it, with a
- * `system` actor and `deviceId: null` (ADR 0014, "Protocol"). Other events
- * that only the server originates, such as `chat.message.created`, are not
- * membership events.
+ * `system` actor and `deviceId: null` (ADR 0014, "Protocol"). The project
+ * events `workspace.project.created` and `workspace.project.renamed` (#155)
+ * share the type and its delivery. Other events that only the server
+ * originates, such as `chat.message.created`, are not membership events.
  */
 export type WorkspaceEvent = Extract<
   ProtocolEvent,

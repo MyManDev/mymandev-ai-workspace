@@ -1,0 +1,3 @@
+CREATE INDEX "projects_created_by_user_id_created_at_idx" ON "projects" USING btree ("created_by_user_id","created_at");--> statement-breakpoint
+CREATE UNIQUE INDEX "projects_active_name_key" ON "projects" USING btree ("workspace_id",lower("name" collate "pg_c_utf8")) WHERE "projects"."archived_at" is null;--> statement-breakpoint
+CREATE UNIQUE INDEX "conversations_project_kind_key" ON "conversations" USING btree ("project_id") WHERE "conversations"."kind" = 'project';
