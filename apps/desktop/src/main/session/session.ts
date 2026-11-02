@@ -53,9 +53,14 @@ export const ACCESS_TOKEN_RENEW_MARGIN_MS = 60_000;
  * Why a call of the session failed:
  *
  * - `api_origin_unset`, `api_origin_invalid`: see `resolveApiOrigin`.
- * - `no_device`: no device that this installation can use: no record, no
- *   key, a key that is not the record's device's key, or a device that was
- *   revoked or removed in this session. A GitHub sign-in registers one.
+ * - `no_device`: no device that this installation can use: no record, or
+ *   a device that was revoked or removed in this session. A GitHub sign-in
+ *   registers one.
+ * - `key_lost`: a record without its device's key: the key file is gone,
+ *   the loaded key is not the record's device's key, or both keys of a
+ *   pending replacement were refused (see `mint`). The record is kept, and
+ *   the next GitHub sign-in registers a new device that names the record's
+ *   device, which the API revokes as `replaced`.
  * - `key_not_loaded`: a record and a key file, but the key is not loaded
  *   (for example its passphrase was not entered yet).
  * - `record_unreadable`: the record cannot be read, or it is corrupt while a
@@ -82,6 +87,7 @@ export const SESSION_FAILURE_REASONS = Object.freeze([
   "api_origin_unset",
   "api_origin_invalid",
   "no_device",
+  "key_lost",
   "key_not_loaded",
   "record_unreadable",
   "key_store_failed",
@@ -128,6 +134,9 @@ export interface SessionAccount {
  * - `starting`: before the first `refresh`.
  * - `no_device`: no device that this installation can use; a GitHub sign-in
  *   registers one.
+ * - `key_lost`: the record's device has no usable key on this installation
+ *   (see the failure `key_lost`). The record and its account are kept; the
+ *   next GitHub sign-in registers a new device that names this one.
  * - `unavailable`: the record cannot be read or the key store failed.
  * - `key_not_loaded`: the key needs its passphrase.
  * - `signed_in`: a record and a loaded key; the API is asked as needed.
@@ -148,6 +157,7 @@ export interface SessionAccount {
 export type DeviceSessionState =
   | { readonly kind: "starting" }
   | { readonly kind: "no_device" }
+  | { readonly kind: "key_lost"; readonly account: SessionAccount }
   | {
       readonly kind: "unavailable";
       readonly reason: "record_unreadable" | "key_store_failed";
@@ -233,7 +243,10 @@ export interface DeviceSession {
    * Call with every outcome of the sign-in flow, also one that did not
    * start. `signed_in` ends a sign-out; `refused` with
    * `device_account_mismatch` moves to `account_mismatch`; `refused` with
-   * `device_revoked` moves to `revoked`.
+   * `device_revoked` moves to `revoked`. Every other outcome changes no
+   * state and no file, `failed` included with `uncertain_refusal`,
+   * `key_changed`, or `record_not_saved`: whether such a sign-in committed
+   * is unknown, so a sign-out ends only when the new key authenticates.
    */
   readonly signInFinished: (
     outcome: FinishedSignIn,
@@ -300,6 +313,7 @@ type Facts =
       readonly keyError?: DeviceKeyErrorCode;
     }
   | { readonly kind: "key_not_loaded"; readonly record: DeviceRecord }
+  | { readonly kind: "key_lost"; readonly record: DeviceRecord }
   | {
       readonly kind: "ready";
       readonly record: DeviceRecord;
@@ -471,6 +485,8 @@ export function createDeviceSession(
           : { kind: "unavailable", reason: facts.reason };
       case "key_not_loaded":
         return { kind: "key_not_loaded", account: accountOf(facts.record) };
+      case "key_lost":
+        return { kind: "key_lost", account: accountOf(facts.record) };
       case "ready":
         break;
     }
@@ -603,9 +619,11 @@ export function createDeviceSession(
       } catch (error) {
         return { kind: "missing", ...keyFailureFacts(error) };
       }
+      // Without a key file the key is lost: the next sign-in registers a new
+      // device that names the record's device.
       return hasKey
         ? { kind: "key_not_loaded", record }
-        : { kind: "missing", reason: "no_device" };
+        : { kind: "key_lost", record };
     }
     if (
       keys.previous !== null &&
@@ -623,16 +641,16 @@ export function createDeviceSession(
       }
       keys = deps.keyStore.keys();
       if (keys === null) {
-        return { kind: "missing", reason: "no_device" };
+        return { kind: "key_lost", record };
       }
     }
     const named =
       keys.current.publicKey === record.publicKey ||
       keys.previous?.publicKey === record.publicKey;
     if (!named) {
-      // Not the key of the record's device: the next sign-in registers a
-      // new device that names the record's device.
-      return { kind: "missing", reason: "no_device" };
+      // Not the key of the record's device: a lost key too, so the next
+      // sign-in registers a new device that names the record's device.
+      return { kind: "key_lost", record };
     }
     const marker = await readMarker(keys);
     return { kind: "ready", record, keys, marker };
@@ -656,8 +674,8 @@ export function createDeviceSession(
   }
 
   function factsFailure(facts: Exclude<Facts, ReadyFacts>): SessionFailure {
-    if (facts.kind === "key_not_loaded") {
-      return failure("key_not_loaded");
+    if (facts.kind === "key_not_loaded" || facts.kind === "key_lost") {
+      return failure(facts.kind);
     }
     return facts.keyError === undefined
       ? failure(facts.reason)
@@ -799,21 +817,22 @@ export function createDeviceSession(
   }
 
   /**
-   * Mints an access token. With a pending replacement the new key is tried
-   * first and the previous key only after the new key got `auth_failed`. A
-   * key is deleted only after `device_revoked`; an answer that is not
-   * certain (no answer, a `5xx`, or an answer that is not the API's)
-   * changes nothing. Runs inside `exclusive`.
+   * Tries `candidates` in order, each with a new challenge, and applies a
+   * certain answer: a token or `sign_in_required` proves that the API holds
+   * the key that signed (`keyHeld`), `device_revoked` deletes the device,
+   * and `auth_failed` moves on to the next candidate. Resolves with
+   * `all_refused` when every candidate got `auth_failed`. An answer that is
+   * not certain (no answer, a `5xx`, an answer that is not the API's, or a
+   * refused challenge) changes nothing.
    */
-  async function mint(facts: ReadyFacts, origin: string): Promise<MintResult> {
-    const { record, keys } = facts;
-    const candidates: DeviceKey[] =
-      replacementToResolve(facts) && keys.previous !== null
-        ? [keys.current, keys.previous]
-        : [keys.current];
-    for (const [index, key] of candidates.entries()) {
+  async function tryKeys(
+    facts: ReadyFacts,
+    origin: string,
+    candidates: readonly DeviceKey[],
+  ): Promise<MintResult | { readonly kind: "all_refused" }> {
+    for (const key of candidates) {
       const startedAt = now();
-      const answer = await tokenFor(key, record.deviceId, origin);
+      const answer = await tokenFor(key, facts.record.deviceId, origin);
       if (answer.kind === "failure") {
         return answer;
       }
@@ -837,13 +856,9 @@ export function createDeviceSession(
       }
       switch (answer.code) {
         case "auth_failed":
-          if (index + 1 < candidates.length) {
-            // The API does not hold the new key; the previous key may work.
-            continue;
-          }
-          // Every key failed: nothing changes, and the state reports it.
-          refusal = "auth_failed";
-          return { kind: "failure", failure: refused("auth_failed") };
+          // The API does not hold this key, or this was the answer to a
+          // resent copy of a request that it already answered.
+          continue;
         case "device_revoked":
           await deviceGone("revoked");
           return { kind: "failure", failure: refused("device_revoked") };
@@ -870,7 +885,78 @@ export function createDeviceSession(
           return { kind: "failure", failure: refused(answer.code) };
       }
     }
-    return { kind: "failure", failure: failure("unexpected_response") };
+    return { kind: "all_refused" };
+  }
+
+  /**
+   * Mints an access token. With a pending replacement the new key is tried
+   * first and the previous key only after the new key got `auth_failed`. A
+   * key is deleted only after `device_revoked`, or when both keys of a
+   * pending replacement were refused in two rounds (`keysLost`); an answer
+   * that is not certain changes nothing. Runs inside `exclusive`.
+   */
+  async function mint(facts: ReadyFacts, origin: string): Promise<MintResult> {
+    const { keys } = facts;
+    if (!replacementToResolve(facts) || keys.previous === null) {
+      const result = await tryKeys(facts, origin, [keys.current]);
+      if (result.kind !== "all_refused") {
+        return result;
+      }
+      // The key is kept, and the state reports the refusal.
+      refusal = "auth_failed";
+      return { kind: "failure", failure: refused("auth_failed") };
+    }
+    const candidates = [keys.current, keys.previous];
+    // A resent copy of an access token request that the API answered gets
+    // `auth_failed`, because its challenge is used up, although the key is
+    // the API's. So both keys are refused only when a second round, with
+    // new challenges and the new key first, refuses both again.
+    for (let round = 0; round < 2; round += 1) {
+      const result = await tryKeys(facts, origin, candidates);
+      if (result.kind !== "all_refused") {
+        return result;
+      }
+    }
+    return { kind: "failure", failure: await keysLost(facts) };
+  }
+
+  /**
+   * Both keys of a pending replacement were refused in two rounds: the
+   * installation treats them as lost (decided on #94). It publishes
+   * `key_lost` first, deletes both keys, and keeps the record, so that the
+   * next sign-in registers a new device that names the record's device. A
+   * sign-out marker names only keys that are gone then, so it is deleted; a
+   * corrupt one stays until a sign-in.
+   */
+  async function keysLost(facts: ReadyFacts): Promise<SessionFailure> {
+    const held = deps.keyStore.keys();
+    if (
+      signInsRunning > 0 ||
+      held === null ||
+      held.current.publicKey !== facts.keys.current.publicKey ||
+      held.previous?.publicKey !== facts.keys.previous?.publicKey
+    ) {
+      // The keys changed meanwhile: nothing is deleted.
+      refusal = "auth_failed";
+      return refused("auth_failed");
+    }
+    forgetTokens();
+    refusal = null;
+    accountMismatch = false;
+    removalPending = false;
+    lastFacts = { kind: "key_lost", record: facts.record };
+    publish();
+    try {
+      await deps.keyStore.delete();
+    } catch {
+      report("The device keys could not be deleted.");
+      refusal = "auth_failed";
+      return refused("auth_failed");
+    }
+    if (facts.marker !== null && facts.marker.publicKeys !== null) {
+      await dropMarker();
+    }
+    return failure("key_lost");
   }
 
   async function mintForSession(started: number): Promise<TokenResult> {
@@ -1370,6 +1456,9 @@ export function createDeviceSession(
         await deviceGone("revoked");
       }
     }
+    // Any other outcome, for example `failed` with `uncertain_refusal`,
+    // proves nothing: a pending replacement is resolved by authenticating,
+    // and the sign-out marker still names the previous key.
     return settle();
   }
 

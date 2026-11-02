@@ -1,5 +1,6 @@
 import { createPublicKey, randomBytes, verify } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -15,6 +16,8 @@ import {
   type DeviceId,
   newUuidV7,
   PROTOCOL_VERSION,
+  type SignInRequest,
+  SignInRequestSchema,
   type UserId,
 } from "@mymandev/protocol";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -32,6 +35,11 @@ import {
   type DeviceRecordStore,
 } from "../device-record.ts";
 import type { ScheduleTimer } from "../runtime.ts";
+import {
+  createSignInFlow,
+  SIGN_IN_FAILURE_REASONS,
+  type SignInOutcome,
+} from "../sign-in/flow.ts";
 import { API_REQUEST_TIMEOUT_MS } from "./api-call.ts";
 import {
   ACCESS_TOKEN_LIFETIME_MS,
@@ -51,6 +59,10 @@ import {
 const API_ORIGIN = "https://api.mymandev.example";
 const DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3" as DeviceId;
 const USER_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a4" as UserId;
+const OTHER_DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b7" as DeviceId;
+const SIGN_IN_CODE = "mmdc_ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8";
+/** A public key that no store holds, so the fake API refuses every signature. */
+const FOREIGN_PUBLIC_KEY = "a".repeat(64);
 const SPKI_ED25519_PREFIX = "302a300506032b6570032100";
 
 const DEVICE_ITEM = Object.freeze({
@@ -522,6 +534,33 @@ async function waitForRequest(
   throw new Error(`No ${method} ${route}`);
 }
 
+/** Posts the sign-in code to the flow's loopback listener, as the API's page does. */
+function postCode(redirectUri: string, state: string): Promise<number> {
+  const url = new URL(redirectUri);
+  const form = new URLSearchParams({ code: SIGN_IN_CODE, state }).toString();
+  return new Promise((resolve, reject) => {
+    const outgoing = httpRequest(
+      {
+        host: "127.0.0.1",
+        port: Number(url.port),
+        path: url.pathname,
+        method: "POST",
+        headers: {
+          host: url.host,
+          "content-type": "application/x-www-form-urlencoded",
+          "content-length": String(Buffer.byteLength(form)),
+        },
+      },
+      (response) => {
+        response.resume();
+        response.on("end", () => resolve(response.statusCode ?? 0));
+      },
+    );
+    outgoing.on("error", reject);
+    outgoing.end(form);
+  });
+}
+
 /** A promise that never settles until the request is aborted. */
 function hang(request: ApiRequest): Promise<Response> {
   return new Promise((_resolve, reject) => {
@@ -842,23 +881,206 @@ describe("a pending key replacement", () => {
     expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
   });
 
-  test("both keys get auth_failed: nothing changes, and the state reports it", async () => {
+  test("both keys refused in two rounds: key_lost first, both keys deleted, the record kept, and the next sign-in registers a new device that names this one", async () => {
     const h = harness();
     const { previous, current } = await pendingReplacement(h);
-    h.api.publicKey = "a".repeat(64);
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
 
-    const result = await h.session.listDevices();
+    const result = await h.session.authenticate();
 
-    expect(result).toEqual({
-      ok: false,
-      reason: "refused",
-      code: "auth_failed",
+    expect(result).toEqual({ ok: false, reason: "key_lost" });
+    // Two rounds, the new key first in each, every request with its own
+    // challenge.
+    const requests = tokenRequests(h.api);
+    expect(
+      requests.map((request) => signerOf(h.api, request, [current, previous])),
+    ).toEqual([current, previous, current, previous]);
+    expect(new Set(requests.map((r) => r.body?.challengeId)).size).toBe(4);
+    expect(h.calls).toEqual(["state:key_lost", "key.delete"]);
+    expect(h.session.state()).toEqual({
+      kind: "key_lost",
+      account: {
+        deviceId: DEVICE_ID,
+        userId: USER_ID,
+        login: "octocat",
+        displayName: "The Octocat",
+        signInExpiresAt: "2026-12-01T10:00:00.000Z",
+      },
     });
-    expect(mints(h)).toBe(2);
-    expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
-    expect(heldKeys(h)).toEqual({ current, previous });
+    expect(await keyFiles()).toEqual([DEVICE_RECORD_FILE]);
+    expect(await h.keyStore.hasKey()).toBe(false);
     expect(await recordKey(h)).toBe(previous);
-    expect(h.session.state().kind).toBe("auth_failed");
+    const before = h.api.requests.length;
+    expect(await h.session.listDevices()).toEqual({
+      ok: false,
+      reason: "key_lost",
+    });
+    expect(h.api.requests).toHaveLength(before);
+    const restarted = await restart(h);
+    expect(restarted.session.state().kind).toBe("key_lost");
+
+    // The real sign-in flow now finds a record without a key: a new device
+    // that names the record's device.
+    const sent: SignInRequest[] = [];
+    const opened: string[] = [];
+    const flow = createSignInFlow({
+      apiOrigin: { ok: true, origin: API_ORIGIN },
+      keyStore: h.keyStore,
+      deviceRecords: h.records,
+      openExternal: (url) => {
+        opened.push(url);
+        return Promise.resolve(true);
+      },
+      fetch: (_url, init) => {
+        sent.push(SignInRequestSchema.parse(JSON.parse(String(init.body))));
+        return Promise.resolve(
+          json(200, {
+            userId: USER_ID,
+            deviceId: OTHER_DEVICE_ID,
+            displayName: "The Octocat",
+            login: "octocat",
+            signInExpiresAt: "2026-12-02T10:00:00.000Z",
+          }),
+        );
+      },
+      platform: "win32",
+      scheduleTimer: () => () => undefined,
+      listenerConnectionTimeoutMs: 2_000,
+    });
+    h.session.signInStarted();
+    const start = await flow.start();
+    if (!start.started) {
+      throw new Error(`Not started: ${JSON.stringify(start.outcome)}`);
+    }
+    const params = new URL(opened[0] ?? "").searchParams;
+    expect(params.get("login")).toBe("octocat");
+    expect(
+      await postCode(
+        params.get("redirect_uri") ?? "",
+        params.get("state") ?? "",
+      ),
+    ).toBe(200);
+    const outcome = await start.outcome;
+
+    expect(outcome.kind).toBe("signed_in");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.device).toMatchObject({
+      kind: "new",
+      previousDeviceId: DEVICE_ID,
+    });
+    expect(await h.session.signInFinished(outcome)).toMatchObject({
+      kind: "signed_in",
+      account: { deviceId: OTHER_DEVICE_ID },
+    });
+  });
+
+  test.each([
+    ["a sign-out marker of the lost keys is deleted", false],
+    ["a corrupt sign-out marker stays until a sign-in", true],
+  ])("%s", async (_name, corrupt) => {
+    const h = harness();
+    await existingDevice(h);
+    expect(await h.session.signOut()).toEqual({ ok: true, value: "reported" });
+    // A sign-in after the sign-out got no clear answer.
+    await h.keyStore.replace();
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    if (corrupt) {
+      await writeFile(path.join(folder, SIGN_OUT_MARKER_FILE), "{");
+    }
+    await h.session.refresh();
+
+    expect(await h.session.authenticate()).toEqual({
+      ok: false,
+      reason: "key_lost",
+    });
+
+    expect(h.session.state().kind).toBe("key_lost");
+    expect(await keyFiles()).toEqual([DEVICE_RECORD_FILE]);
+    const marker = await readFile(
+      path.join(folder, SIGN_OUT_MARKER_FILE),
+      "utf8",
+    ).catch(() => null);
+    expect(marker !== null).toBe(corrupt);
+  });
+
+  test("both keys refused in the first round and the new key accepted in the second: confirmed, nothing deleted", async () => {
+    const h = harness();
+    const { current } = await pendingReplacement(h);
+    h.api.publicKey = current;
+    // The first round only got the answers to resent copies.
+    h.api.intercept = (request) =>
+      request.path === "/auth/access-token" &&
+      count(h, "POST", "/auth/access-token") <= 2
+        ? Promise.resolve(errorAnswer("auth_failed"))
+        : undefined;
+
+    expect((await h.session.authenticate()).ok).toBe(true);
+
+    expect(mints(h)).toBe(3);
+    expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([
+      "record.write",
+      "key.confirm",
+    ]);
+    expect(heldKeys(h)).toEqual({ current, previous: null });
+    expect(await recordKey(h)).toBe(current);
+    expect(h.session.state().kind).toBe("signed_in");
+  });
+
+  test("both keys refused in the first round and the previous key accepted in the second: abandoned, nothing deleted", async () => {
+    const h = harness();
+    const { previous } = await pendingReplacement(h);
+    h.api.publicKey = previous;
+    h.api.intercept = (request) =>
+      request.path === "/auth/access-token" &&
+      count(h, "POST", "/auth/access-token") === 2
+        ? Promise.resolve(errorAnswer("auth_failed"))
+        : undefined;
+
+    expect((await h.session.authenticate()).ok).toBe(true);
+
+    expect(mints(h)).toBe(4);
+    expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([
+      "key.abandon",
+    ]);
+    expect(heldKeys(h)).toEqual({ current: previous, previous: null });
+    expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
+  });
+
+  test("sign_in_required and device_revoked in the second round keep their meaning", async () => {
+    const required = harness();
+    const { current } = await pendingReplacement(required);
+    required.api.publicKey = FOREIGN_PUBLIC_KEY;
+    required.api.intercept = (request) =>
+      request.path === "/auth/access-token" &&
+      count(required, "POST", "/auth/access-token") === 3
+        ? Promise.resolve(errorAnswer("sign_in_required"))
+        : undefined;
+    expect(await required.session.authenticate()).toMatchObject({
+      code: "sign_in_required",
+    });
+    expect(required.calls.filter((call) => !call.startsWith("state:"))).toEqual(
+      ["record.write", "key.confirm"],
+    );
+    expect(heldKeys(required)).toEqual({ current, previous: null });
+    expect(required.session.state().kind).toBe("sign_in_required");
+
+    await rm(folder, { recursive: true, force: true });
+    const revoked = harness();
+    await pendingReplacement(revoked);
+    revoked.api.publicKey = FOREIGN_PUBLIC_KEY;
+    revoked.api.intercept = (request) =>
+      request.path === "/auth/access-token" &&
+      count(revoked, "POST", "/auth/access-token") === 4
+        ? Promise.resolve(errorAnswer("device_revoked"))
+        : undefined;
+    expect(await revoked.session.authenticate()).toMatchObject({
+      code: "device_revoked",
+    });
+    expect(revoked.calls).toEqual([
+      "state:revoked",
+      "key.delete",
+      "record.delete",
+    ]);
   });
 
   const uncertainAnswers: [
@@ -958,6 +1180,40 @@ describe("a pending key replacement", () => {
       expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
       expect(heldKeys(h)).toEqual({ current, previous });
       expect(await recordKey(h)).toBe(previous);
+    },
+  );
+
+  test.each(
+    uncertainAnswers.flatMap(([name, answer]) => [
+      [`${name}, to the new key`, 3, answer] as const,
+      [`${name}, to the previous key`, 4, answer] as const,
+    ]),
+  )(
+    "an uncertain answer in the second round changes nothing: %s",
+    async (_name, number, answer) => {
+      const h = harness();
+      const { previous, current } = await pendingReplacement(h);
+      h.api.publicKey = FOREIGN_PUBLIC_KEY;
+      h.api.intercept = (request) =>
+        request.path === "/auth/access-token" &&
+        count(h, "POST", "/auth/access-token") === number
+          ? answer(request)
+          : undefined;
+
+      const result = await h.session.authenticate();
+
+      expect(result.ok).toBe(false);
+      expect(result).not.toMatchObject({ reason: "key_lost" });
+      expect(mints(h)).toBe(number);
+      expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
+      expect(heldKeys(h)).toEqual({ current, previous });
+      expect(await recordKey(h)).toBe(previous);
+      expect(await keyFiles()).toEqual([
+        CURRENT_KEY_FILE,
+        PREVIOUS_KEY_FILE,
+        DEVICE_RECORD_FILE,
+      ]);
+      expect(h.session.state().kind).toBe("signed_in");
     },
   );
 
@@ -1538,6 +1794,150 @@ describe("sign-out", () => {
       ok: false,
       reason: "signed_out",
     });
+  });
+});
+
+describe("outcomes of the sign-in flow", () => {
+  /** A device that signed out, and the API knows it. */
+  async function signedOutDevice(h: Harness): Promise<string> {
+    const previous = await existingDevice(h);
+    expect(await h.session.signOut()).toEqual({ ok: true, value: "reported" });
+    h.calls.length = 0;
+    return previous;
+  }
+
+  /** The content of every file in the key folder, by name. */
+  async function files(): Promise<Record<string, string>> {
+    const names = [
+      CURRENT_KEY_FILE,
+      PREVIOUS_KEY_FILE,
+      DEVICE_RECORD_FILE,
+      SIGN_OUT_MARKER_FILE,
+    ];
+    const contents: Record<string, string> = {};
+    for (const name of names) {
+      try {
+        contents[name] = await readFile(path.join(folder, name), "utf8");
+      } catch {
+        // missing
+      }
+    }
+    return contents;
+  }
+
+  // Typed as the flow's outcome, so the flow's type stays assignable to
+  // `signInFinished`.
+  const unchanged: SignInOutcome[] = [
+    ...SIGN_IN_FAILURE_REASONS.map((reason): SignInOutcome =>
+      reason === "uncertain_refusal"
+        ? { kind: "failed", reason, apiError: "auth_failed" }
+        : { kind: "failed", reason },
+    ),
+    { kind: "failed", reason: "uncertain_refusal", apiError: "rate_limited" },
+    { kind: "failed", reason: "key_store_failed", keyError: "not_loaded" },
+    { kind: "cancelled" },
+    { kind: "timed_out" },
+    { kind: "listener_error", error: "access_denied" },
+    { kind: "refused", code: "conflict" },
+    { kind: "refused", code: "bad_request" },
+    { kind: "refused", code: "device_registration_locked" },
+    { kind: "refused", code: "unsupported_account" },
+  ];
+
+  test.each(unchanged.map((outcome) => [JSON.stringify(outcome), outcome]))(
+    "%s keeps a sign-out and changes no file",
+    async (_name, outcome) => {
+      const h = harness();
+      await signedOutDevice(h);
+      h.session.signInStarted();
+      const before = await files();
+
+      const state = await h.session.signInFinished(outcome);
+
+      expect(state).toMatchObject({ kind: "signed_out", reportPending: false });
+      expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
+      expect(await files()).toEqual(before);
+      expect(before[SIGN_OUT_MARKER_FILE]).toBeDefined();
+    },
+  );
+
+  test.each(unchanged.map((outcome) => [JSON.stringify(outcome), outcome]))(
+    "%s leaves a signed-in device and a pending replacement as they are",
+    async (_name, outcome) => {
+      const h = harness();
+      const { previous, current } = await pendingReplacement(h);
+      h.session.signInStarted();
+
+      const state = await h.session.signInFinished(outcome);
+
+      expect(state.kind).toBe("signed_in");
+      expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
+      expect(heldKeys(h)).toEqual({ current, previous });
+      expect(await recordKey(h)).toBe(previous);
+      expect(h.api.requests).toEqual([]);
+    },
+  );
+
+  const UNCERTAIN_REFUSAL: SignInOutcome = {
+    kind: "failed",
+    reason: "uncertain_refusal",
+    apiError: "auth_failed",
+  };
+
+  test("an uncertain refusal of a sign-in that did not commit keeps the device signed out", async () => {
+    const h = harness();
+    const previous = await signedOutDevice(h);
+    h.session.signInStarted();
+    // What the flow did: it replaced the key, and the answer was a refusal
+    // that may follow a commit. The API did not commit.
+    const keys = await h.keyStore.replace();
+
+    expect(await h.session.signInFinished(UNCERTAIN_REFUSAL)).toMatchObject({
+      kind: "signed_out",
+    });
+    expect(heldKeys(h)).toEqual({
+      current: keys.current.publicKey,
+      previous,
+    });
+
+    // Learning which key the API holds abandons the new key, and the
+    // device stays signed out.
+    expect(await h.session.authenticate()).toEqual({
+      ok: false,
+      reason: "refused",
+      code: "sign_in_required",
+    });
+    expect(heldKeys(h)).toEqual({ current: previous, previous: null });
+    expect(h.session.state()).toMatchObject({
+      kind: "signed_out",
+      reportPending: false,
+    });
+    expect(await files()).toHaveProperty([SIGN_OUT_MARKER_FILE]);
+  });
+
+  test("an uncertain refusal of a sign-in that did commit ends the sign-out only when the new key authenticates", async () => {
+    const h = harness();
+    await signedOutDevice(h);
+    h.session.signInStarted();
+    // The API committed the sign-in, and only the answer to a resent copy
+    // of the request arrived.
+    const keys = await h.keyStore.replace();
+    h.api.publicKey = keys.current.publicKey;
+    h.api.signedOut = false;
+
+    expect(await h.session.signInFinished(UNCERTAIN_REFUSAL)).toMatchObject({
+      kind: "signed_out",
+    });
+    expect(await files()).toHaveProperty([SIGN_OUT_MARKER_FILE]);
+
+    expect((await h.session.authenticate()).ok).toBe(true);
+    expect(h.session.state().kind).toBe("signed_in");
+    expect(heldKeys(h)).toEqual({
+      current: keys.current.publicKey,
+      previous: null,
+    });
+    expect(await recordKey(h)).toBe(keys.current.publicKey);
+    expect(await files()).not.toHaveProperty([SIGN_OUT_MARKER_FILE]);
   });
 });
 
