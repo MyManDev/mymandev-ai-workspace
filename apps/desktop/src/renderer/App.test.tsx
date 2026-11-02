@@ -1,6 +1,7 @@
 import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type {
+  AccountBridge,
   RepositoryBridge,
   RuntimeBridge,
 } from "../shared/desktop-bridge.ts";
@@ -337,4 +338,23 @@ test("the indicator shows the state of the runtime", () => {
       />,
     ),
   ).toContain('data-state="failed"');
+});
+
+test("the home screen holds the account panel, which waits for the first status with the bridge", () => {
+  const account: AccountBridge = {
+    getStatus: () => new Promise(() => undefined),
+    subscribeStatus: () => () => undefined,
+    startSignIn: () => Promise.resolve({ outcome: "started" }),
+    cancelSignIn: () => Promise.resolve(false),
+    unlockDeviceKey: () => Promise.resolve({ outcome: "unlocked" }),
+    forgetAccount: () => Promise.resolve({ outcome: "forgotten" }),
+  };
+
+  expect(render({ account })).toContain(
+    '<section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">Account</h3><p>Checking the sign-in.</p></section></section>',
+  );
+  expect(render()).toContain("<p>Sign-in is not available.</p>");
+  expect(render({ account, initialView: { screen: "about" } })).not.toContain(
+    "account-panel",
+  );
 });

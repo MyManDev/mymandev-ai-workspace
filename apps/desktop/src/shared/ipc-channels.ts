@@ -25,6 +25,31 @@ export const INVOKE_CHANNELS = Object.freeze({
   mountRepository: "repositories:mount",
   /** Unmounts a repository by its mount ID. Nothing in the folder changes. */
   unmountRepository: "repositories:unmount",
+  /** The account status: the account, an open sign-in, and the device key. */
+  getAccountStatus: "account:get-status",
+  /**
+   * The account status. The calling frame then receives every later status
+   * on `EVENT_CHANNELS.accountStatusChanged`.
+   */
+  subscribeAccountStatus: "account:subscribe-status",
+  /**
+   * Starts a GitHub sign-in in the system browser, after the person's
+   * action. The renderer sends nothing.
+   */
+  startSignIn: "account:start-sign-in",
+  /** Ends the open sign-in. */
+  cancelSignIn: "account:cancel-sign-in",
+  /**
+   * Loads a device key that a passphrase protects (Linux). The passphrase is
+   * the only secret that crosses IPC, from the renderer to the main process,
+   * and it is never sent back.
+   */
+  unlockDeviceKey: "account:unlock-key",
+  /**
+   * "This is not me": deletes the device key and the device record of this
+   * installation. The renderer asks the person to confirm first.
+   */
+  forgetAccount: "account:forget",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */
@@ -33,6 +58,8 @@ export const EVENT_CHANNELS = Object.freeze({
   runtimeStatusChanged: "runtime:status-changed",
   /** The mounted repositories after every change, to the frames that subscribed. */
   repositoriesChanged: "repositories:changed",
+  /** The account status after every change, to the frames that subscribed. */
+  accountStatusChanged: "account:status-changed",
 } as const);
 
 export type InvokeChannel =

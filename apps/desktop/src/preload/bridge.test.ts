@@ -1,6 +1,10 @@
 import { expect, test } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
-import type { RepositoryList, RuntimeStatus } from "../shared/ipc-contract.ts";
+import type {
+  AccountStatus,
+  RepositoryList,
+  RuntimeStatus,
+} from "../shared/ipc-contract.ts";
 import { createDesktopBridge, type BridgeIpc } from "./bridge.ts";
 
 type Listener = (event: unknown, ...args: unknown[]) => void;
@@ -54,10 +58,11 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, and the repository functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, and the account functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
+    "account",
     "electronVersion",
     "repositories",
     "runtime",
@@ -72,13 +77,23 @@ test("the bridge holds the Electron version, the runtime, and the repository fun
     "subscribe",
     "unmount",
   ]);
+  expect(Object.keys(bridge.account).sort()).toEqual([
+    "cancelSignIn",
+    "forgetAccount",
+    "getStatus",
+    "startSignIn",
+    "subscribeStatus",
+    "unlockDeviceKey",
+  ]);
   expect(bridge.electronVersion).toBe("44.9.1");
   expect(Object.isFrozen(bridge)).toBe(true);
   expect(Object.isFrozen(bridge.runtime)).toBe(true);
   expect(Object.isFrozen(bridge.repositories)).toBe(true);
+  expect(Object.isFrozen(bridge.account)).toBe(true);
   for (const value of [
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
+    ...Object.values(bridge.account),
   ]) {
     expect(typeof value).toBe("function");
   }
@@ -91,6 +106,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge),
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
+    ...Object.values(bridge.account),
   ] as unknown[];
 
   expect(values).not.toContain(ipc);
@@ -334,4 +350,119 @@ test("a refused repository subscription calls onError, and a throwing listener i
 
   expect(errors).toBe(1);
   expect(reported).toEqual(["A repository list callback failed."]);
+});
+
+const accountStatus = (revision: number): AccountStatus => ({
+  revision,
+  account: { kind: "signed_out" },
+  signIn: { kind: "idle" },
+  lastOutcome: null,
+  deviceKey: "ready",
+  replacementPending: false,
+  apiOrigin: "set",
+});
+
+test("the account functions call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const account = createDesktopBridge("44.9.1", fake.ipc)
+    .account as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  const answers = [
+    account["getStatus"]?.("account:forget"),
+    account["startSignIn"]?.({ login: "octocat" }, "https://evil.example"),
+    account["cancelSignIn"]?.(true),
+    account["forgetAccount"]?.({ confirmed: false }),
+  ];
+  fake.answers[0]?.resolve(accountStatus(1));
+  fake.answers[1]?.resolve({ outcome: "started" });
+  fake.answers[2]?.resolve(true);
+  fake.answers[3]?.resolve({ outcome: "forgotten" });
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    accountStatus(1),
+    { outcome: "started" },
+    true,
+    { outcome: "forgotten" },
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getAccountStatus, args: [] },
+    { channel: INVOKE_CHANNELS.startSignIn, args: [] },
+    { channel: INVOKE_CHANNELS.cancelSignIn, args: [] },
+    { channel: INVOKE_CHANNELS.forgetAccount, args: [] },
+  ]);
+});
+
+test("unlockDeviceKey passes only the passphrase string on", async () => {
+  const fake = fakeIpc();
+  const unlock = createDesktopBridge("44.9.1", fake.ipc).account
+    .unlockDeviceKey as (...args: unknown[]) => Promise<unknown>;
+
+  const answer = unlock("correct horse", "extra", { evil: true });
+  fake.answers[0]?.resolve({ outcome: "unlocked" });
+
+  await expect(answer).resolves.toEqual({ outcome: "unlocked" });
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.unlockDeviceKey, args: ["correct horse"] },
+  ]);
+});
+
+test("unlockDeviceKey refuses a passphrase that is not a string without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const unlock = createDesktopBridge("44.9.1", fake.ipc).account
+    .unlockDeviceKey as (...args: unknown[]) => Promise<unknown>;
+
+  for (const value of [undefined, 1, { passphrase: "secret" }, ["secret"]]) {
+    const error = await unlock(value).catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(TypeError);
+    expect(String(error)).not.toContain("secret");
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("the account subscription delivers the status and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const reported: string[] = [];
+  const bridge = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  const calls: unknown[][] = [];
+  let errors = 0;
+
+  const end = bridge.account.subscribeStatus(
+    (...args: unknown[]) => calls.push(args),
+    () => {
+      errors += 1;
+    },
+  );
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeAccountStatus, args: [] },
+  ]);
+  fake.emit(EVENT_CHANNELS.accountStatusChanged, accountStatus(3));
+  fake.answers[0]?.resolve(accountStatus(2));
+  await settle();
+  fake.emit(EVENT_CHANNELS.accountStatusChanged, accountStatus(4));
+  end();
+  fake.emit(EVENT_CHANNELS.accountStatusChanged, accountStatus(5));
+
+  expect(calls).toEqual([[accountStatus(3)], [accountStatus(4)]]);
+  expect(fake.listenerCount(EVENT_CHANNELS.accountStatusChanged)).toBe(0);
+  expect(errors).toBe(0);
+
+  bridge.account.subscribeStatus(
+    () => {
+      throw new Error("listener");
+    },
+    () => {
+      errors += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.accountStatusChanged, accountStatus(1));
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+
+  expect(errors).toBe(1);
+  expect(reported).toEqual(["An account status callback failed."]);
 });

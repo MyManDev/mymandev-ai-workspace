@@ -1,4 +1,5 @@
 import type {
+  AccountBridge,
   DesktopBridge,
   RepositoryBridge,
   RuntimeBridge,
@@ -10,9 +11,13 @@ import {
   type InvokeChannel,
 } from "../shared/ipc-channels.ts";
 import type {
+  AccountStatus,
+  ForgetResult,
   MountResult,
   RepositoryList,
   RuntimeStatus,
+  StartSignInResult,
+  UnlockResult,
 } from "../shared/ipc-contract.ts";
 
 type IpcListener = (event: unknown, ...args: unknown[]) => void;
@@ -82,8 +87,9 @@ function subscribeRevisions<T extends { readonly revision: number }>(
 /**
  * The object the preload script exposes as `window.desktop`. Every function
  * calls one fixed channel of the IPC contract and passes no argument from
- * the renderer on to it, except the mount ID of `repositories.unmount`,
- * which must be a string and which the main process validates. Event
+ * the renderer on to it, except the mount ID of `repositories.unmount` and
+ * the passphrase of `account.unlockDeviceKey`, which must be strings and
+ * which the main process validates. Event
  * objects, which hold `ipcRenderer`, never reach the renderer. The object
  * and its parts are frozen. An error that a renderer callback throws goes
  * to `reportError` and stops nothing else.
@@ -139,5 +145,39 @@ export function createDesktopBridge(
         : Promise.reject(new TypeError("unmount needs a mount ID string.")),
   });
 
-  return Object.freeze({ electronVersion, runtime, repositories });
+  const account: AccountBridge = Object.freeze({
+    getStatus: () =>
+      ipc.invoke(INVOKE_CHANNELS.getAccountStatus) as Promise<AccountStatus>,
+    subscribeStatus: (
+      listener: (status: AccountStatus) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeAccountStatus,
+        EVENT_CHANNELS.accountStatusChanged,
+        "An account status callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    startSignIn: () =>
+      ipc.invoke(INVOKE_CHANNELS.startSignIn) as Promise<StartSignInResult>,
+    cancelSignIn: () =>
+      ipc.invoke(INVOKE_CHANNELS.cancelSignIn) as Promise<boolean>,
+    // The passphrase goes to the main process only; the error names no value.
+    unlockDeviceKey: (passphrase: string) =>
+      typeof passphrase === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.unlockDeviceKey,
+            passphrase,
+          ) as Promise<UnlockResult>)
+        : Promise.reject(
+            new TypeError("unlockDeviceKey needs a passphrase string."),
+          ),
+    forgetAccount: () =>
+      ipc.invoke(INVOKE_CHANNELS.forgetAccount) as Promise<ForgetResult>,
+  });
+
+  return Object.freeze({ electronVersion, runtime, repositories, account });
 }

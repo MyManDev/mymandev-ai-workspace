@@ -183,6 +183,239 @@ export const MountResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type MountResult = z.infer<typeof MountResultSchema>;
 
+/**
+ * Limits of the account messages, in UTF-16 code units: a display name as
+ * the protocol limits it, the authorize URL, the warning shown with it, and
+ * the passphrase. The device key store counts at most 1,024 characters of a
+ * passphrase after NFC normalization and refuses a longer one itself; this
+ * limit only bounds the message.
+ */
+export const ACCOUNT_LIMITS = Object.freeze({
+  displayName: 64,
+  authorizeUrl: 4096,
+  warning: 512,
+  passphrase: 4096,
+});
+
+/**
+ * A GitHub login, by the protocol's login rule (at most 39 characters).
+ * Display data only.
+ */
+const LoginSchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]{1,39}$/, "Expected a GitHub login");
+
+/** The account that this installation holds, from its device record. */
+export const AccountSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("signed_out") }),
+  z.object({
+    kind: z.literal("signed_in"),
+    login: LoginSchema,
+    displayName: z.string().min(1).max(ACCOUNT_LIMITS.displayName),
+    deviceId: z.uuid(),
+  }),
+]);
+export type Account = z.infer<typeof AccountSchema>;
+
+const PairingCodeSchema = z.string().regex(/^[0-9]{6}$/, "Expected six digits");
+
+/**
+ * The sign-in of this installation: none (`idle`), one that is starting the
+ * listener and the browser (`starting`), or one that waits for the browser
+ * (`waiting`) with the pairing code that the API's confirmation page shows
+ * too. When the browser did not open, `waiting` also holds the authorize URL
+ * to copy and the warning to show with it: the URL must not be shared (#149).
+ * No sign-in code, verifier, signature, key, or token is ever part of it.
+ */
+export const SignInStateSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("idle") }),
+  z.object({ kind: z.literal("starting") }),
+  z.discriminatedUnion("opened", [
+    z.object({
+      kind: z.literal("waiting"),
+      pairingCode: PairingCodeSchema,
+      opened: z.literal(true),
+    }),
+    z.object({
+      kind: z.literal("waiting"),
+      pairingCode: PairingCodeSchema,
+      opened: z.literal(false),
+      authorizeUrl: z
+        .url({ protocol: /^https?$/ })
+        .max(ACCOUNT_LIMITS.authorizeUrl),
+      warning: z.string().min(1).max(ACCOUNT_LIMITS.warning),
+    }),
+  ]),
+]);
+export type SignInState = z.infer<typeof SignInStateSchema>;
+
+/**
+ * How the last sign-in ended, as a fixed code. The main process maps the
+ * outcomes of the sign-in flow to these codes (account.ts); a reason that it
+ * does not know maps to `failed`, and an API error code without its own
+ * entry to `refused`.
+ */
+export const SIGN_IN_OUTCOME_CODES = Object.freeze([
+  "signed_in",
+  "cancelled",
+  "timed_out",
+  "access_denied",
+  "sign_in_failed",
+  "unsupported_account",
+  "sign_in_unavailable",
+  "auth_failed",
+  "sign_in_required",
+  "device_account_mismatch",
+  "device_revoked",
+  "device_registration_locked",
+  "rate_limited",
+  "refused",
+  "api_origin_unset",
+  "api_origin_invalid",
+  "unsupported_platform",
+  "key_not_loaded",
+  "replacement_pending",
+  "system_protection_unavailable",
+  "key_store_failed",
+  "record_unreadable",
+  "listener_unavailable",
+  "no_answer",
+  "server_error",
+  "unexpected_response",
+  "record_not_saved",
+  "failed",
+] as const);
+export type SignInOutcomeCode = (typeof SIGN_IN_OUTCOME_CODES)[number];
+
+export const SignInOutcomeSchema = z.object({
+  code: z.enum(SIGN_IN_OUTCOME_CODES),
+  /**
+   * With `device_account_mismatch`: the login of the account that this
+   * installation holds, which the API's answer does not carry.
+   */
+  deviceLogin: LoginSchema.optional(),
+});
+export type SignInOutcomeView = z.infer<typeof SignInOutcomeSchema>;
+
+/**
+ * The state of the device key in the main process: `loading` until the
+ * startup load has settled, `ready` when the key is loaded or none is
+ * stored, `passphrase_required` while a key that a passphrase protects waits
+ * for it (Linux), or why the key cannot be used: the system could not
+ * decrypt it (`unreadable`), its file is damaged (`corrupt`) or from a newer
+ * version (`newer_format`), Windows has no local data folder
+ * (`local_data_folder_missing`), or another error (`failed`).
+ */
+export const DEVICE_KEY_STATES = Object.freeze([
+  "loading",
+  "ready",
+  "passphrase_required",
+  "unreadable",
+  "corrupt",
+  "newer_format",
+  "local_data_folder_missing",
+  "failed",
+] as const);
+export type DeviceKeyState = (typeof DEVICE_KEY_STATES)[number];
+
+/** Whether this build has an API origin to sign in with (api-origin.ts). */
+export const API_ORIGIN_STATES = Object.freeze([
+  "set",
+  "unset",
+  "invalid",
+] as const);
+export type ApiOriginState = (typeof API_ORIGIN_STATES)[number];
+
+/** What the renderer may know about the sign-in of this installation. */
+export const AccountStatusSchema = z.object({
+  /**
+   * Grows by one with every change. A receiver keeps the status with the
+   * highest revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  account: AccountSchema,
+  signIn: SignInStateSchema,
+  /** How the last sign-in ended; null before the first one and after "This is not me". */
+  lastOutcome: SignInOutcomeSchema.nullable(),
+  deviceKey: z.enum(DEVICE_KEY_STATES),
+  /**
+   * Whether the key of the last sign-in is not confirmed yet: the previous
+   * key is kept until the new one authenticates once.
+   */
+  replacementPending: z.boolean(),
+  apiOrigin: z.enum(API_ORIGIN_STATES),
+});
+export type AccountStatus = z.infer<typeof AccountStatusSchema>;
+
+/**
+ * Why a sign-in was not started: `busy` while a sign-in is open or the
+ * account is being changed, `key_not_ready` while the device key is
+ * loading, waits for its passphrase, or cannot be used.
+ */
+export const START_SIGN_IN_REFUSALS = Object.freeze([
+  "busy",
+  "key_not_ready",
+] as const);
+
+export const StartSignInResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("started") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(START_SIGN_IN_REFUSALS),
+  }),
+  /** The sign-in flow did not start; the status's `lastOutcome` holds the code too. */
+  z.object({
+    outcome: z.literal("failed"),
+    code: z.enum(SIGN_IN_OUTCOME_CODES),
+  }),
+]);
+export type StartSignInResult = z.infer<typeof StartSignInResultSchema>;
+
+/** A passphrase for the device key. Only the renderer sends one. */
+export const PassphraseSchema = z
+  .string()
+  .min(1)
+  .max(ACCOUNT_LIMITS.passphrase);
+
+/**
+ * Why a passphrase did not unlock the device key: `not_required` when no
+ * key waits for one, `busy` while another unlock or a change of the account
+ * runs, `wrong_passphrase`, or `passphrase_invalid` for text that is not
+ * well-formed or longer than 1,024 characters.
+ */
+export const UNLOCK_REFUSALS = Object.freeze([
+  "not_required",
+  "busy",
+  "wrong_passphrase",
+  "passphrase_invalid",
+] as const);
+
+export const UnlockResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("unlocked") }),
+  z.object({ outcome: z.literal("refused"), reason: z.enum(UNLOCK_REFUSALS) }),
+  /** The key cannot be used; the status's `deviceKey` says why. */
+  z.object({ outcome: z.literal("failed") }),
+]);
+export type UnlockResult = z.infer<typeof UnlockResultSchema>;
+
+/**
+ * Why "This is not me" deleted nothing: `busy` while a sign-in is open or
+ * the key is loading or being unlocked, `not_signed_in` when this
+ * installation holds no account.
+ */
+export const FORGET_REFUSALS = Object.freeze([
+  "busy",
+  "not_signed_in",
+] as const);
+
+export const ForgetResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("forgotten") }),
+  z.object({ outcome: z.literal("refused"), reason: z.enum(FORGET_REFUSALS) }),
+  /** The record or the key could not be deleted. */
+  z.object({ outcome: z.literal("failed") }),
+]);
+export type ForgetResult = z.infer<typeof ForgetResultSchema>;
+
 /** The schemas of every invoke channel. */
 export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.getRuntimeStatus]: Object.freeze({
@@ -210,12 +443,38 @@ export const INVOKE_CONTRACT = Object.freeze({
     /** True when the repository was mounted. */
     result: z.boolean(),
   }),
+  [INVOKE_CHANNELS.getAccountStatus]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: AccountStatusSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeAccountStatus]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: AccountStatusSchema,
+  }),
+  [INVOKE_CHANNELS.startSignIn]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: StartSignInResultSchema,
+  }),
+  [INVOKE_CHANNELS.cancelSignIn]: Object.freeze({
+    args: NoArgumentsSchema,
+    /** True when a sign-in was open or starting. */
+    result: z.boolean(),
+  }),
+  [INVOKE_CHANNELS.unlockDeviceKey]: Object.freeze({
+    args: z.tuple([PassphraseSchema]),
+    result: UnlockResultSchema,
+  }),
+  [INVOKE_CHANNELS.forgetAccount]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ForgetResultSchema,
+  }),
 });
 
 /** The payload schema of every event channel. */
 export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.runtimeStatusChanged]: RuntimeStatusSchema,
   [EVENT_CHANNELS.repositoriesChanged]: RepositoryListSchema,
+  [EVENT_CHANNELS.accountStatusChanged]: AccountStatusSchema,
 });
 
 export type InvokeArgs<C extends InvokeChannel> = z.infer<
