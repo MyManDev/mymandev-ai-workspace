@@ -47,6 +47,7 @@ import {
   ACCESS_TOKEN_LIFETIME_MS,
   ACCESS_TOKEN_RENEW_MARGIN_MS,
   createDeviceSession,
+  KEYS_REFUSED_MAX_AGE_MS,
   LOST_KEY_WAIT_MS,
   REPLACEMENT_GRACE_MS,
   type DeviceSession,
@@ -94,9 +95,18 @@ let root: string;
 let folder: string;
 /** The wall clock of every session in a test, also across a restart. */
 const wall = { now: 0 };
+/** The monotonic clock of every session in a test. */
+const mono = { now: 0 };
+
+/** Time passes: both clocks move on. */
+function advance(ms: number): void {
+  wall.now += ms;
+  mono.now += ms;
+}
 
 beforeEach(async () => {
   wall.now = Date.parse("2026-11-02T10:00:00.000Z");
+  mono.now = 1_000;
   root = await mkdtemp(path.join(tmpdir(), "mymandev-device-session-"));
   folder = path.join(root, "MyManDev");
 });
@@ -368,7 +378,7 @@ function harness(
     markers,
     errors: [] as string[],
     timers,
-    clock: { now: 1_000 },
+    clock: mono,
     states: [] as DeviceSessionState[],
     calls,
     failRecordWrites: false,
@@ -460,7 +470,7 @@ async function pendingReplacement(
   await h.session.refresh();
   if (options.inGrace !== true) {
     // The sign-in that replaced the key ended long ago.
-    wall.now += REPLACEMENT_GRACE_MS;
+    advance(REPLACEMENT_GRACE_MS);
   }
   h.calls.length = 0;
   return { previous, current: keys.current.publicKey };
@@ -954,13 +964,13 @@ describe("a pending key replacement", () => {
     expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
     expect(h.api.requests).toHaveLength(asked);
     // A retry that the person asks for runs a round, but deletes nothing.
-    wall.now += LOST_KEY_WAIT_MS - 1;
+    advance(LOST_KEY_WAIT_MS - 1);
     await h.session.refresh();
     expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
     expect(mints(h)).toBe(4);
     expect(heldKeys(h)).toEqual({ current, previous });
 
-    wall.now += 1;
+    advance(1);
     h.calls.length = 0;
     const result = await h.session.authenticate();
 
@@ -1065,9 +1075,9 @@ describe("a pending key replacement", () => {
       await writeFile(path.join(folder, SIGN_OUT_MARKER_FILE), "{");
     }
     await h.session.refresh();
-    wall.now += REPLACEMENT_GRACE_MS;
+    advance(REPLACEMENT_GRACE_MS);
     expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
-    wall.now += LOST_KEY_WAIT_MS;
+    advance(LOST_KEY_WAIT_MS);
 
     expect(await h.session.authenticate()).toEqual({
       ok: false,
@@ -1089,12 +1099,12 @@ describe("a pending key replacement", () => {
     h.api.publicKey = FOREIGN_PUBLIC_KEY;
     expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
 
-    wall.now += LOST_KEY_WAIT_MS / 2;
+    advance(LOST_KEY_WAIT_MS / 2);
     const restarted = await restart(h);
     expect(await restarted.session.authenticate()).toEqual(AUTH_FAILED);
     expect(heldKeys(restarted)).toEqual({ current, previous });
 
-    wall.now += LOST_KEY_WAIT_MS / 2;
+    advance(LOST_KEY_WAIT_MS / 2);
     const later = await restart(restarted);
     expect(await later.session.authenticate()).toEqual({
       ok: false,
@@ -1157,7 +1167,7 @@ describe("a pending key replacement", () => {
     const { current } = await pendingReplacement(required);
     required.api.publicKey = FOREIGN_PUBLIC_KEY;
     expect(await required.session.authenticate()).toEqual(AUTH_FAILED);
-    wall.now += LOST_KEY_WAIT_MS;
+    advance(LOST_KEY_WAIT_MS);
     required.api.intercept = (request) =>
       request.path === "/auth/access-token" &&
       count(required, "POST", "/auth/access-token") === 3
@@ -1177,7 +1187,7 @@ describe("a pending key replacement", () => {
     await pendingReplacement(revoked);
     revoked.api.publicKey = FOREIGN_PUBLIC_KEY;
     expect(await revoked.session.authenticate()).toEqual(AUTH_FAILED);
-    wall.now += LOST_KEY_WAIT_MS;
+    advance(LOST_KEY_WAIT_MS);
     revoked.calls.length = 0;
     revoked.api.intercept = (request) =>
       request.path === "/auth/access-token" &&
@@ -1306,7 +1316,7 @@ describe("a pending key replacement", () => {
       const { previous, current } = await pendingReplacement(h);
       h.api.publicKey = FOREIGN_PUBLIC_KEY;
       expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
-      wall.now += LOST_KEY_WAIT_MS;
+      advance(LOST_KEY_WAIT_MS);
       h.calls.length = 0;
       h.api.intercept = (request) =>
         request.path === "/auth/access-token" &&
@@ -1824,7 +1834,7 @@ describe("sign-out", () => {
     // grace period has ended.
     const keys = await h.keyStore.replace();
     await h.session.refresh();
-    wall.now += REPLACEMENT_GRACE_MS;
+    advance(REPLACEMENT_GRACE_MS);
 
     expect(await h.session.authenticate()).toEqual({
       ok: false,
@@ -1852,7 +1862,7 @@ describe("sign-out", () => {
     api.intercept = null;
     await h.keyStore.replace();
     await h.session.refresh();
-    wall.now += REPLACEMENT_GRACE_MS;
+    advance(REPLACEMENT_GRACE_MS);
 
     expect(await h.session.authenticate()).toEqual({
       ok: false,
@@ -2033,7 +2043,7 @@ describe("outcomes of the sign-in flow", () => {
 
     // After it, learning which key the API holds abandons the new key, and
     // the device stays signed out.
-    wall.now += REPLACEMENT_GRACE_MS;
+    advance(REPLACEMENT_GRACE_MS);
     await h.session.refresh();
     expect(await h.session.authenticate()).toEqual({
       ok: false,
@@ -2115,7 +2125,7 @@ describe("the grace period of an uncertain sign-in", () => {
 
     // The API commits the sign-in late, which ends the previous key's
     // tokens; the new key is tried first again.
-    wall.now += REPLACEMENT_GRACE_MS - 1;
+    advance(REPLACEMENT_GRACE_MS - 1);
     h.api.publicKey = current;
     h.api.tokens.clear();
     expect((await h.session.listDevices()).ok).toBe(true);
@@ -2129,10 +2139,39 @@ describe("the grace period of an uncertain sign-in", () => {
     expect(await notesFile()).toBeNull();
   });
 
+  test("a key that authenticates during it ends an earlier refusal of both keys, so a later glitch deletes nothing", async () => {
+    const h = harness();
+    const { previous, current } = await uncertainSignIn(h);
+    // A glitch of the API refuses both keys.
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(await notesFile()).toMatchObject({
+      keysRefused: { publicKeys: [current, previous] },
+    });
+    // The glitch ends: the previous key authenticates, and both keys stay.
+    h.api.publicKey = previous;
+    await h.session.refresh();
+    expect((await h.session.authenticate()).ok).toBe(true);
+    expect(heldKeys(h)).toEqual({ current, previous });
+    expect(await notesFile()).toMatchObject({ keysRefused: null });
+
+    // After the grace period, one more glitch only starts a new wait.
+    advance(REPLACEMENT_GRACE_MS);
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    await h.session.refresh();
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(heldKeys(h)).toEqual({ current, previous });
+    expect(await keyFiles()).toEqual([
+      CURRENT_KEY_FILE,
+      PREVIOUS_KEY_FILE,
+      DEVICE_RECORD_FILE,
+    ]);
+  });
+
   test("after it, the previous key abandons the replacement", async () => {
     const h = harness();
     const { previous } = await uncertainSignIn(h);
-    wall.now += REPLACEMENT_GRACE_MS;
+    advance(REPLACEMENT_GRACE_MS);
 
     expect((await h.session.listDevices()).ok).toBe(true);
 
@@ -2146,12 +2185,12 @@ describe("the grace period of an uncertain sign-in", () => {
     const h = harness();
     const { previous, current } = await uncertainSignIn(h);
 
-    wall.now += REPLACEMENT_GRACE_MS / 2;
+    advance(REPLACEMENT_GRACE_MS / 2);
     const restarted = await restart(h);
     expect((await restarted.session.authenticate()).ok).toBe(true);
     expect(heldKeys(restarted)).toEqual({ current, previous });
 
-    wall.now += REPLACEMENT_GRACE_MS / 2;
+    advance(REPLACEMENT_GRACE_MS / 2);
     const later = await restart(restarted);
     expect((await later.session.authenticate()).ok).toBe(true);
     expect(heldKeys(later)).toEqual({ current: previous, previous: null });
@@ -2192,7 +2231,7 @@ describe("the grace period of an uncertain sign-in", () => {
     const h = harness();
     await uncertainSignIn(h);
     const first = await notesFile();
-    wall.now += REPLACEMENT_GRACE_MS / 2;
+    advance(REPLACEMENT_GRACE_MS / 2);
 
     h.session.signInStarted();
     const notStarted: SignInOutcome = {
@@ -2219,6 +2258,122 @@ describe("the grace period of an uncertain sign-in", () => {
       current: keys.current.publicKey,
       previous,
     });
+  });
+});
+
+describe("note times", () => {
+  const YEAR_MS = 365 * 24 * 60 * 60_000;
+
+  async function writeNotes(notes: Record<string, unknown>): Promise<void> {
+    await writeFile(
+      path.join(folder, SESSION_NOTES_FILE),
+      JSON.stringify({
+        version: 1,
+        removal: null,
+        uncertainSignIn: null,
+        keysRefused: null,
+        ...notes,
+      }),
+    );
+  }
+
+  test("a grace period dated a year ahead counts from now, and is rewritten", async () => {
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    await writeNotes({
+      uncertainSignIn: {
+        publicKey: current,
+        at: new Date(wall.now + YEAR_MS).toISOString(),
+      },
+    });
+    h.api.publicKey = previous;
+
+    const restarted = await restart(h);
+
+    expect(await notesFile()).toMatchObject({
+      uncertainSignIn: { at: new Date(wall.now).toISOString() },
+    });
+    expect((await restarted.session.authenticate()).ok).toBe(true);
+    expect(heldKeys(restarted)).toEqual({ current, previous });
+    // It ends 10 minutes from now, not in a year.
+    advance(REPLACEMENT_GRACE_MS);
+    await restarted.session.refresh();
+    expect((await restarted.session.authenticate()).ok).toBe(true);
+    expect(heldKeys(restarted)).toEqual({ current: previous, previous: null });
+    expect(
+      (await restarted.session.signWebSocketChallenge(challengeFrame())).ok,
+    ).toBe(true);
+  });
+
+  test("a first refusal dated a year ahead counts from now, and is rewritten", async () => {
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    await writeNotes({
+      keysRefused: {
+        publicKeys: [current, previous],
+        at: new Date(wall.now + YEAR_MS).toISOString(),
+      },
+    });
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+
+    const restarted = await restart(h);
+
+    expect(await notesFile()).toMatchObject({
+      keysRefused: { at: new Date(wall.now).toISOString() },
+    });
+    expect(await restarted.session.authenticate()).toEqual(AUTH_FAILED);
+    advance(LOST_KEY_WAIT_MS);
+    expect(await restarted.session.authenticate()).toEqual({
+      ok: false,
+      reason: "key_lost",
+    });
+  });
+
+  test("a first refusal older than a day no longer counts: the wait starts again", async () => {
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    await writeNotes({
+      keysRefused: {
+        publicKeys: [current, previous],
+        at: new Date(wall.now - KEYS_REFUSED_MAX_AGE_MS).toISOString(),
+      },
+    });
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    const restarted = await restart(h);
+
+    expect(await restarted.session.authenticate()).toEqual(AUTH_FAILED);
+
+    expect(heldKeys(restarted)).toEqual({ current, previous });
+    expect(await notesFile()).toMatchObject({
+      keysRefused: { at: new Date(wall.now).toISOString() },
+    });
+  });
+
+  test("while the application runs, a wall clock that jumps forward ends no wait", async () => {
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+
+    wall.now += LOST_KEY_WAIT_MS;
+    await h.session.refresh();
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(heldKeys(h)).toEqual({ current, previous });
+
+    mono.now += LOST_KEY_WAIT_MS;
+    expect(await h.session.authenticate()).toEqual({
+      ok: false,
+      reason: "key_lost",
+    });
+
+    // The same for the grace period.
+    await rm(folder, { recursive: true, force: true });
+    const graced = harness();
+    const keys = await pendingReplacement(graced, { inGrace: true });
+    graced.api.publicKey = keys.previous;
+    wall.now += REPLACEMENT_GRACE_MS;
+    expect((await graced.session.authenticate()).ok).toBe(true);
+    expect(heldKeys(graced)).toEqual(keys);
   });
 });
 

@@ -70,6 +70,14 @@ export const REPLACEMENT_GRACE_MS = 10 * 60_000;
 export const LOST_KEY_WAIT_MS = 10 * 60_000;
 
 /**
+ * A first refusal of both keys counts for this long. An older one says
+ * nothing about the API now, so the next refusal starts the wait again: the
+ * keys count as lost only after two refusals between `LOST_KEY_WAIT_MS` and
+ * a day apart, with no authentication between them.
+ */
+export const KEYS_REFUSED_MAX_AGE_MS = 24 * 60 * 60_000;
+
+/**
  * Why a call of the session failed:
  *
  * - `api_origin_unset`, `api_origin_invalid`: see `resolveApiOrigin`.
@@ -498,6 +506,11 @@ export function createDeviceSession(
    */
   let notes: SessionNotes | null = null;
   let notesWrite: Promise<void> = Promise.resolve();
+  /**
+   * For each note time, the monotonic clock and the note's wall-clock age
+   * when this process first saw it.
+   */
+  const notesSeen = new Map<string, { mono: number; wallAge: number }>();
   /** Set after `device_revoked` or a confirmed removal, until a sign-in. */
   let gone: "revoked" | "removed" | null = null;
   let signInsRunning = 0;
@@ -583,13 +596,42 @@ export function createDeviceSession(
     return notes?.removal?.deviceId === record.deviceId;
   }
 
+  /**
+   * How long ago a note's time was. Across a restart only the wall clock
+   * tells; while this process runs, the monotonic clock must have advanced
+   * too, so a wall clock that jumps forward ends no wait early. A time in
+   * the future counts as now (`tidyNotes` rewrites it).
+   */
+  function noteAge(kind: "grace" | "refused", at: string): number {
+    const wallAge = Math.max(0, wallClock() - Date.parse(at));
+    const key = `${kind}:${at}`;
+    let seen = notesSeen.get(key);
+    if (seen === undefined) {
+      seen = { mono: now(), wallAge };
+      notesSeen.set(key, seen);
+    }
+    return Math.min(wallAge, seen.wallAge + Math.max(0, now() - seen.mono));
+  }
+
+  /** The time of a new note, which this process sees from now on. */
+  function noteTime(kind: "grace" | "refused"): string {
+    const at = wallIso();
+    notesSeen.set(`${kind}:${at}`, { mono: now(), wallAge: 0 });
+    return at;
+  }
+
+  /** A note time that is later than now becomes now. */
+  function notLater(kind: "grace" | "refused", at: string): string {
+    return Date.parse(at) > wallClock() ? noteTime(kind) : at;
+  }
+
   /** Whether the grace period of an uncertain sign-in protects the new key. */
   function graceActive(facts: ReadyFacts, held: SessionNotes): boolean {
     const note = held.uncertainSignIn;
     return (
       note !== null &&
       note.publicKey === facts.keys.current.publicKey &&
-      wallClock() - Date.parse(note.at) < REPLACEMENT_GRACE_MS
+      noteAge("grace", note.at) < REPLACEMENT_GRACE_MS
     );
   }
 
@@ -627,8 +669,12 @@ export function createDeviceSession(
           const pending = replacementToResolve(facts);
           const uncertain =
             held.uncertainSignIn?.publicKey === facts.keys.current.publicKey
-              ? held.uncertainSignIn
+              ? {
+                  ...held.uncertainSignIn,
+                  at: notLater("grace", held.uncertainSignIn.at),
+                }
               : null;
+          const refused = pending ? keysRefusedNote(facts, held) : null;
           return {
             removal: removalOf(held, facts.record),
             uncertainSignIn: !pending
@@ -638,9 +684,12 @@ export function createDeviceSession(
                   ? null
                   : {
                       publicKey: facts.keys.current.publicKey,
-                      at: wallIso(),
+                      at: noteTime("grace"),
                     })),
-            keysRefused: pending ? keysRefusedNote(facts, held) : null,
+            keysRefused:
+              refused === null
+                ? null
+                : { ...refused, at: notLater("refused", refused.at) },
           };
         }
       }
@@ -906,6 +955,9 @@ export function createDeviceSession(
     keepBoth = false,
   ): Promise<SessionFailure | null> {
     const { record, keys } = facts;
+    // The API holds a key, so an earlier refusal of both keys was not about
+    // them: the wait starts again at the next refusal.
+    await changeNotes((held) => ({ ...held, keysRefused: null }));
     if (key === keys.current) {
       if (record.publicKey !== key.publicKey) {
         if (!(await writeRecord({ ...record, publicKey: key.publicKey }))) {
@@ -1099,8 +1151,10 @@ export function createDeviceSession(
    * During the grace period of an uncertain sign-in, a token of the previous
    * key is used but both keys are kept. When both keys are refused, the
    * time is noted and both are kept; only a round at least
-   * `LOST_KEY_WAIT_MS` later that refuses both again, after the grace
-   * period, treats them as lost (`keysLost`). A key is deleted otherwise
+   * `LOST_KEY_WAIT_MS` and less than `KEYS_REFUSED_MAX_AGE_MS` later that
+   * refuses both again, after the grace period and with no key
+   * authenticated in between (`keyHeld` ends the note), treats them as lost
+   * (`keysLost`). A key is deleted otherwise
    * only after `device_revoked`; an answer that is not certain changes
    * nothing. Runs inside `exclusive`.
    */
@@ -1131,18 +1185,19 @@ export function createDeviceSession(
     // example in a deploy, and to a resent copy of a request that it already
     // answered, so one round proves nothing.
     const first = keysRefusedNote(facts, held);
-    if (first === null) {
+    const firstAge = first === null ? 0 : noteAge("refused", first.at);
+    if (first === null || firstAge >= KEYS_REFUSED_MAX_AGE_MS) {
       const previous = keys.previous.publicKey;
       await changeNotes((current) => ({
         ...current,
         keysRefused: {
           publicKeys: [keys.current.publicKey, previous],
-          at: wallIso(),
+          at: noteTime("refused"),
         },
       }));
       return { kind: "failure", failure: refused("auth_failed") };
     }
-    if (keepBoth || wallClock() - Date.parse(first.at) < LOST_KEY_WAIT_MS) {
+    if (keepBoth || firstAge < LOST_KEY_WAIT_MS) {
       return { kind: "failure", failure: refused("auth_failed") };
     }
     return { kind: "failure", failure: await keysLost(facts) };
@@ -1218,10 +1273,7 @@ export function createDeviceSession(
         // Both keys were refused: the next round runs only after the wait,
         // or after `refresh` when the person asks to try again.
         const first = keysRefusedNote(facts, await loadNotes());
-        if (
-          first !== null &&
-          wallClock() - Date.parse(first.at) < LOST_KEY_WAIT_MS
-        ) {
+        if (first !== null && noteAge("refused", first.at) < LOST_KEY_WAIT_MS) {
           return refused("auth_failed");
         }
       }
