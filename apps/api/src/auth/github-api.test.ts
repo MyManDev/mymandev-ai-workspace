@@ -154,15 +154,15 @@ test("the attempt store caps open attempts, needs the cookie, and drops expired 
     lifetimeMs: 1_000,
     now: () => clock,
   });
-  const desktop = {
-    codeChallenge: s256("v"),
+  const desktop = () => ({
+    codeChallenge: s256(randomToken()),
     state: randomToken(),
     redirectUri: "http://127.0.0.1:49152/callback",
-  };
-  const first = attempts.create(desktop);
-  const second = attempts.create(desktop);
-  assert.ok(first !== null && second !== null);
-  assert.equal(attempts.create(desktop), null, "the cap");
+  });
+  const first = attempts.create(desktop());
+  const second = attempts.create(desktop());
+  assert.ok(typeof first !== "string" && typeof second !== "string");
+  assert.equal(attempts.create(desktop()), "full", "the cap");
   assert.equal(
     attempts.find(first.attempt.apiState, first.cookieValue),
     first.attempt,
@@ -173,11 +173,44 @@ test("the attempt store caps open attempts, needs the cookie, and drops expired 
   clock = 1_000;
   assert.equal(attempts.find(first.attempt.apiState, first.cookieValue), null);
   assert.equal(attempts.size, 0);
-  assert.notEqual(
-    attempts.create(desktop),
-    null,
+  assert.equal(
+    typeof attempts.create(desktop()),
+    "object",
     "expired attempts free the cap",
   );
+});
+
+test("the attempt store refuses a desktop challenge or state that started an attempt within its lifetime (#149)", () => {
+  let clock = 0;
+  const attempts = new SignInAttempts({
+    max: 10,
+    lifetimeMs: 1_000,
+    now: () => clock,
+  });
+  const desktop = {
+    codeChallenge: s256(randomToken()),
+    state: randomToken(),
+    redirectUri: "http://127.0.0.1:49152/callback",
+  };
+  const first = attempts.create(desktop);
+  assert.ok(typeof first !== "string");
+  assert.equal(attempts.create(desktop), "reused", "the same values");
+  assert.equal(
+    attempts.create({ ...desktop, codeChallenge: s256(randomToken()) }),
+    "reused",
+    "the same state",
+  );
+  assert.equal(
+    attempts.create({ ...desktop, state: randomToken() }),
+    "reused",
+    "the same challenge",
+  );
+  attempts.delete(first.attempt);
+  assert.equal(attempts.create(desktop), "reused", "after the attempt ended");
+  clock = 999;
+  assert.equal(attempts.create(desktop), "reused", "until its lifetime ends");
+  clock = 1_000;
+  assert.equal(typeof attempts.create(desktop), "object", "after the lifetime");
 });
 
 test("a sign-in code is used once and expires after its lifetime", () => {
@@ -285,7 +318,7 @@ test("sweeping drops expired attempts and codes without a new request", () => {
     redirectUri: "http://127.0.0.1:49152/callback",
   };
   const created = attempts.create(desktop);
-  assert.ok(created !== null);
+  assert.ok(typeof created !== "string");
   const code = codes.issue({
     identity: {
       githubId: "1",

@@ -58,9 +58,20 @@ export type AttemptStoreOptions = Readonly<{
   now: () => number;
 }>;
 
+/**
+ * Why an attempt could not start: the store is full, or the desktop's
+ * `code_challenge` or `state` already started an attempt (#149).
+ */
+export type AttemptRefusal = "full" | "reused";
+
 /** Open sign-in attempts by the API's state, with a global cap. */
 export class SignInAttempts {
   readonly #byState = new Map<string, SignInAttempt>();
+  /**
+   * The desktop values that started an attempt, as hashes, until that
+   * attempt's lifetime ends, also after the attempt itself ended.
+   */
+  readonly #seenDesktop = new Map<string, number>();
   readonly #options: AttemptStoreOptions;
 
   constructor(options: AttemptStoreOptions) {
@@ -72,26 +83,48 @@ export class SignInAttempts {
     return this.#byState.size;
   }
 
-  /** Starts an attempt; null when the cap is reached. The cookie value is returned once and kept only as a hash. */
+  /**
+   * Starts an attempt; the cookie value is returned once and kept only as a
+   * hash. Refuses `"full"` when the cap is reached, and `"reused"` when the
+   * desktop's `code_challenge` or `state` started an attempt within the
+   * attempt lifetime, ended or not. The authorize URL carries both, so a
+   * second start with them could let another GitHub account produce a code
+   * that the desktop's listener accepts and its verifier redeems (#149).
+   */
   create(
     desktop: DesktopRequest,
-  ): { attempt: SignInAttempt; cookieValue: string } | null {
+  ): { attempt: SignInAttempt; cookieValue: string } | AttemptRefusal {
     this.sweep();
-    if (this.#byState.size >= this.#options.max) {
-      return null;
+    const keys = [
+      `challenge:${sha256Hex(desktop.codeChallenge)}`,
+      `state:${sha256Hex(desktop.state)}`,
+    ];
+    if (keys.some((key) => this.#seenDesktop.has(key))) {
+      return "reused";
+    }
+    // Two keys per attempt, and attempts that ended early keep theirs.
+    if (
+      this.#byState.size >= this.#options.max ||
+      this.#seenDesktop.size + keys.length > this.#options.max * 4
+    ) {
+      return "full";
     }
     const cookieValue = randomToken();
+    const expiresAt = this.#options.now() + this.#options.lifetimeMs;
     const attempt: SignInAttempt = {
       apiState: randomToken(),
       cookieHash: sha256Hex(cookieValue),
       apiVerifier: randomToken(),
       desktop,
-      expiresAt: this.#options.now() + this.#options.lifetimeMs,
+      expiresAt,
       phase: "started",
       identity: null,
       identityReadAt: null,
     };
     this.#byState.set(attempt.apiState, attempt);
+    for (const key of keys) {
+      this.#seenDesktop.set(key, expiresAt);
+    }
     return { attempt, cookieValue };
   }
 
@@ -131,6 +164,11 @@ export class SignInAttempts {
     for (const [state, attempt] of this.#byState) {
       if (attempt.expiresAt <= now) {
         this.#byState.delete(state);
+      }
+    }
+    for (const [key, expiresAt] of this.#seenDesktop) {
+      if (expiresAt <= now) {
+        this.#seenDesktop.delete(key);
       }
     }
   }

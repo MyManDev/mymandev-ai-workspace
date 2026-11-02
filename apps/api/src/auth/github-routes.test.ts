@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 import { buildApp } from "../app.ts";
 import { loadConfig } from "../config.ts";
+import { randomToken, s256 } from "./attempts.ts";
 import { createGitHubApi } from "./github-api.ts";
 import { Secret } from "../secret.ts";
 import {
@@ -402,6 +403,45 @@ test("Cancel tells the listener access_denied, and the attempt is gone", async (
     state: attempt.desktopState,
   });
   assert.equal((await confirm(app, attempt, "continue")).statusCode, 400);
+});
+
+test("a second start with the desktop's challenge or state never reaches GitHub, also after the first attempt ended (#149)", async (t) => {
+  const { app } = await flowApp(t);
+  // The person's desktop starts an attempt; someone else got its link.
+  const attempt = await startAttempt(app);
+  const authorize = (values: Readonly<Record<string, string>>) =>
+    app.inject({
+      method: "GET",
+      url: `/auth/github/authorize?${new URLSearchParams({
+        code_challenge: attempt.codeChallenge,
+        code_challenge_method: "S256",
+        redirect_uri: REDIRECT_URI,
+        state: attempt.desktopState,
+        ...values,
+      }).toString()}`,
+    });
+  const cases: [label: string, values: Record<string, string>][] = [
+    ["the same link", {}],
+    ["the same state", { code_challenge: s256(randomToken()) }],
+    ["the same challenge", { state: randomToken() }],
+  ];
+  for (const [label, values] of cases) {
+    const response = await authorize(values);
+    assert.equal(response.statusCode, 400, label);
+    assert.equal(response.headers.location, undefined, label);
+    assert.equal(response.headers["set-cookie"], undefined, label);
+    assert.match(response.body, /already used/u, label);
+  }
+  // The person's attempt ends; its link still starts nothing.
+  await callback(app, attempt, { code: "c", state: attempt.apiState });
+  await confirm(app, attempt, "cancel");
+  assert.equal(
+    (await authorize({})).statusCode,
+    400,
+    "after the attempt ended",
+  );
+  // A new attempt from the desktop, with new values, works.
+  await startAttempt(app);
 });
 
 test("a confirmation needs a form, a same-origin request, and a shown confirmation page", async (t) => {
