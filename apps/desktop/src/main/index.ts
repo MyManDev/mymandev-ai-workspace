@@ -8,6 +8,11 @@ import {
 } from "electron";
 import { readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
+import {
+  FORGET_CONFIRMATION,
+  forgetConfirmationMessage,
+  forgetConfirmed,
+} from "./account.ts";
 import { registerAccountIpc } from "./account-ipc.ts";
 import { createSystemAccountService } from "./account-system.ts";
 import {
@@ -95,6 +100,20 @@ function start(): void {
   // errors hold no secret.
   const account = createSystemAccountService({
     focusWindow: () => focusMainWindow(),
+    // "This is not me" is confirmed in a native dialog of the main process,
+    // like the folder dialog of the repositories.
+    confirmForget: async (login) => {
+      const options = {
+        ...FORGET_CONFIRMATION,
+        buttons: [...FORGET_CONFIRMATION.buttons],
+        message: forgetConfirmationMessage(login),
+      };
+      return forgetConfirmed(
+        mainWindow === undefined
+          ? await dialog.showMessageBox(options)
+          : await dialog.showMessageBox(mainWindow, options),
+      );
+    },
     onError: (message, error) =>
       error === undefined
         ? console.error(message)

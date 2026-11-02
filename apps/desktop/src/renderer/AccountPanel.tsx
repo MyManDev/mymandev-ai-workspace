@@ -14,6 +14,7 @@ import type {
 import {
   ACTION_MESSAGES,
   apiOriginProblem,
+  START_REFUSAL_MESSAGES,
   DEVICE_KEY_PROBLEM_MESSAGES,
   describeOutcome,
   initialAccountView,
@@ -41,15 +42,14 @@ export interface AccountPanelContentProps {
   readonly busy: boolean;
   /** Why the last action was refused or failed. */
   readonly message: string | undefined;
-  /** True while "This is not me" asks for confirmation. */
-  readonly confirmingForget: boolean;
   readonly onStartSignIn: () => void;
   readonly onCancelSignIn: () => void;
   readonly onUnlock: (passphrase: string) => void;
-  /** "This is not me": asks for confirmation. */
+  /**
+   * "This is not me": the main process asks for confirmation in a native
+   * dialog, the only confirmation, which the renderer cannot answer.
+   */
   readonly onForget: () => void;
-  readonly onConfirmForget: () => void;
-  readonly onKeepAccount: () => void;
 }
 
 export function AccountPanelContent(props: AccountPanelContentProps) {
@@ -222,38 +222,7 @@ function SignInActions(
     );
   }
   if (status.account.kind === "signed_in") {
-    return props.confirmingForget ? (
-      <div className="account-confirm">
-        <p id="forget-question">
-          Remove the GitHub account <strong>{status.account.login}</strong> and
-          the device key from this installation? You can then sign in with your
-          own account.
-        </p>
-        <div
-          className="account-actions"
-          role="group"
-          aria-labelledby="forget-question"
-        >
-          <button
-            type="button"
-            className="panel-action"
-            disabled={busy}
-            onClick={props.onConfirmForget}
-          >
-            Remove from this installation
-          </button>
-          <button
-            type="button"
-            className="panel-action"
-            disabled={busy}
-            autoFocus
-            onClick={props.onKeepAccount}
-          >
-            Keep
-          </button>
-        </div>
-      </div>
-    ) : (
+    return (
       <div className="account-actions">
         <button
           type="button"
@@ -398,7 +367,6 @@ function useAccountPanel(
   );
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | undefined>(undefined);
-  const [confirmingForget, setConfirmingForget] = useState(false);
 
   useEffect(() => {
     if (bridge === undefined) {
@@ -437,11 +405,9 @@ function useAccountPanel(
       run(
         (account) => account.startSignIn(),
         (result) =>
-          result.outcome !== "refused"
-            ? undefined
-            : result.reason === "busy"
-              ? ACTION_MESSAGES.startBusy
-              : ACTION_MESSAGES.keyNotReady,
+          result.outcome === "refused"
+            ? START_REFUSAL_MESSAGES[result.reason]
+            : undefined,
         ACTION_MESSAGES.startFailed,
       ),
     [run],
@@ -467,13 +433,13 @@ function useAccountPanel(
     [run],
   );
 
-  const onConfirmForget = useCallback(() => {
-    setConfirmingForget(false);
+  const onForget = useCallback(() => {
     run(
       (account) => account.forgetAccount(),
       (result) => {
         switch (result.outcome) {
           case "forgotten":
+          case "cancelled":
             return undefined;
           case "refused":
             return result.reason === "busy"
@@ -491,16 +457,10 @@ function useAccountPanel(
     view,
     busy,
     message,
-    confirmingForget,
     onStartSignIn,
     onCancelSignIn,
     onUnlock,
-    onForget: () => {
-      setMessage(undefined);
-      setConfirmingForget(true);
-    },
-    onConfirmForget,
-    onKeepAccount: () => setConfirmingForget(false),
+    onForget,
   };
 }
 
@@ -518,6 +478,8 @@ export function unlockMessage(result: UnlockResult): string | undefined {
           return ACTION_MESSAGES.unlockNotRequired;
         case "busy":
           return ACTION_MESSAGES.unlockBusy;
+        case "too_soon":
+          return ACTION_MESSAGES.unlockTooSoon;
         case "wrong_passphrase":
           return ACTION_MESSAGES.wrongPassphrase;
         case "passphrase_invalid":

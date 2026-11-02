@@ -62,6 +62,15 @@ export interface AccountServiceOptions {
    * sign-in listener (ADR 0014, "Sign-in", step 6).
    */
   readonly focusWindow: () => void;
+  /**
+   * Asks the person, in a native dialog of the main process, whether to
+   * remove the account with this login from the installation ("This is not
+   * me"). Resolves to true only for the remove button
+   * (`FORGET_CONFIRMATION` and `forgetConfirmed`).
+   */
+  readonly confirmForget: (login: string) => Promise<boolean>;
+  /** A monotonic clock in milliseconds; defaults to `performance.now`. */
+  readonly now?: () => number;
   /** Receives a fixed message, never a value. An error that it throws is ignored. */
   readonly onError?: (message: string) => void;
 }
@@ -79,25 +88,83 @@ export interface AccountService {
    */
   readonly initialize: () => Promise<void>;
   /**
-   * Starts a sign-in after the person's action: one at a time, and only
-   * with a key that is ready. Resolves once the browser opened or the URL
-   * is ready to copy; the outcome arrives later in the status. Never
-   * rejects.
+   * Starts a sign-in after the person's action: one at a time, only with a
+   * key that is ready, and not within `SIGN_IN_START_COOLDOWN_MS` of the
+   * last start that opened the browser. Resolves once the browser opened or
+   * the URL is ready to copy; the outcome arrives later in the status.
+   * Never rejects.
    */
   readonly startSignIn: () => Promise<StartSignInResult>;
   /** Ends the open or starting sign-in; false when there is none. */
   readonly cancelSignIn: () => boolean;
   /**
    * Loads a key that a passphrase protects. The passphrase goes to the key
-   * store only; it is never kept, returned, or reported. Never rejects.
+   * store only; it is never kept, returned, or reported. After a wrong
+   * passphrase the next attempt waits (`unlockDelayMs`). Never rejects.
    */
   readonly unlockDeviceKey: (passphrase: string) => Promise<UnlockResult>;
   /**
-   * "This is not me": deletes the device record and the device key of this
-   * installation, and resets what the flow keeps in memory. The renderer
-   * asks the person to confirm first; this asks nothing. Never rejects.
+   * "This is not me": asks the person with `confirmForget`, then deletes the
+   * device record and the device key of this installation and resets what
+   * the flow keeps in memory. Never rejects.
    */
   readonly forgetAccount: () => Promise<ForgetResult>;
+}
+
+/**
+ * How long after a start that opened the browser the next start is refused
+ * (`too_soon`), so that even a renderer that misbehaves cannot open the
+ * browser in a loop.
+ */
+export const SIGN_IN_START_COOLDOWN_MS = 3_000;
+
+/** The delay after the first wrong passphrase; it doubles with each one after. */
+export const UNLOCK_DELAY_FIRST_MS = 1_000;
+
+/** The longest delay after wrong passphrases. */
+export const UNLOCK_DELAY_MAX_MS = 30_000;
+
+/**
+ * How long an unlock is refused (`too_soon`) after this many wrong
+ * passphrases in a row: 1 second after the first, doubling, at most 30
+ * seconds. A success starts again from none.
+ */
+export function unlockDelayMs(failures: number): number {
+  if (failures <= 0) {
+    return 0;
+  }
+  return Math.min(
+    UNLOCK_DELAY_MAX_MS,
+    UNLOCK_DELAY_FIRST_MS * 2 ** Math.min(failures - 1, 16),
+  );
+}
+
+/**
+ * The native confirmation of "This is not me" (#149): a warning with the
+ * remove button first and "Keep" as the default and the cancel button, like
+ * the folder dialog of the repositories. `forgetConfirmed` reads its answer.
+ */
+export const FORGET_CONFIRMATION = Object.freeze({
+  type: "warning",
+  buttons: Object.freeze(["Remove from this installation", "Keep"] as const),
+  defaultId: 1,
+  cancelId: 1,
+  noLink: true,
+  title: "This is not me",
+  detail:
+    "The device key and the account are deleted on this computer. You can then sign in with your own GitHub account.",
+} as const);
+
+/** The message of the confirmation, with the login of the account. */
+export function forgetConfirmationMessage(login: string): string {
+  return `Remove the GitHub account ${login} from this installation?`;
+}
+
+/** Whether the person chose the remove button of `FORGET_CONFIRMATION`. */
+export function forgetConfirmed(result: {
+  readonly response: number;
+}): boolean {
+  return result.response === 0;
 }
 
 const SIGNED_OUT: Account = Object.freeze({ kind: "signed_out" });
@@ -259,6 +326,7 @@ export function createAccountService(
     }
   };
   const apiOrigin = apiOriginState(options.apiOrigin);
+  const now = options.now ?? (() => performance.now());
   const listeners = new Set<(status: AccountStatus) => void>();
 
   let system: AccountSystem | null = null;
@@ -272,6 +340,11 @@ export function createAccountService(
   let generation = 0;
   /** Whether the browser of the current attempt posted to the listener. */
   let callbackArrived = false;
+  /** When the last start that opened the browser returned, or null. */
+  let lastBrowserStart: number | null = null;
+  /** Wrong passphrases in a row, and when the next unlock may run. */
+  let wrongPassphrases = 0;
+  let unlockAllowedAt = 0;
 
   let account: Account = SIGNED_OUT;
   let signIn: SignInState = IDLE;
@@ -407,6 +480,12 @@ export function createAccountService(
     if (opened === null || deviceKey !== "ready") {
       return Object.freeze({ outcome: "refused", reason: "key_not_ready" });
     }
+    if (
+      lastBrowserStart !== null &&
+      now() - lastBrowserStart < SIGN_IN_START_COOLDOWN_MS
+    ) {
+      return Object.freeze({ outcome: "refused", reason: "too_soon" });
+    }
     operation = "starting";
     cancelRequested = false;
     generation += 1;
@@ -438,6 +517,8 @@ export function createAccountService(
         publish();
         return Object.freeze({ outcome: "failed", code: view.code });
       }
+      // The flow opened the browser, or tried to and offers the URL.
+      lastBrowserStart = now();
       attempt = Object.freeze({ cancel: started.cancel });
       // The browser can post before `start` returns here.
       signIn = callbackArrived
@@ -493,9 +574,14 @@ export function createAccountService(
     if (opened === null || deviceKey !== "passphrase_required") {
       return Object.freeze({ outcome: "refused", reason: "not_required" });
     }
+    if (now() < unlockAllowedAt) {
+      return Object.freeze({ outcome: "refused", reason: "too_soon" });
+    }
     operation = "unlocking";
     try {
       await opened.keyStore.load({ passphrase });
+      wrongPassphrases = 0;
+      unlockAllowedAt = 0;
       deviceKey = "ready";
       replacementPending = await readReplacementPending(opened);
       publish();
@@ -504,6 +590,9 @@ export function createAccountService(
       // Nothing about the passphrase is reported: the store's errors are
       // fixed per code, and only the code is read here.
       if (isDeviceKeyError(error, "wrong_passphrase")) {
+        // Each wrong passphrase makes the next attempt wait longer.
+        wrongPassphrases += 1;
+        unlockAllowedAt = now() + unlockDelayMs(wrongPassphrases);
         return Object.freeze({
           outcome: "refused",
           reason: "wrong_passphrase",
@@ -535,8 +624,21 @@ export function createAccountService(
     if (opened === null || account.kind !== "signed_in") {
       return Object.freeze({ outcome: "refused", reason: "not_signed_in" });
     }
+    const { login } = account;
     operation = "forgetting";
     try {
+      // The confirmation runs in the main process, so that a renderer that
+      // misbehaves cannot delete the key without the person.
+      let confirmed: boolean;
+      try {
+        confirmed = await options.confirmForget(login);
+      } catch {
+        report("The confirmation could not be shown.");
+        return Object.freeze({ outcome: "failed" });
+      }
+      if (!confirmed) {
+        return Object.freeze({ outcome: "cancelled" });
+      }
       // Local only, in this part of #94. ADR 0014 removes a device at the
       // API first and deletes its key only after the server confirmed; that
       // needs an access token, which part 3 adds, and part 3 then tells the
@@ -548,10 +650,16 @@ export function createAccountService(
       // sign-in, while a record without a key would make the next sign-in
       // name this device as its previous device, for the other account.
       await opened.deviceRecords.delete();
+      // Once the record is gone, the flow keeps nothing of this account in
+      // memory: no unsaved record, which its next attempt would write back,
+      // and no account mismatch. This comes before the key, so that a key
+      // that cannot be deleted does not bring the account back. No attempt
+      // runs during "This is not me", so the reset applies; a flow that
+      // refused it anyway is dropped, and the next sign-in creates a new one.
+      if (flow !== null && !flow.reset()) {
+        flow = null;
+      }
       await opened.keyStore.delete();
-      // The flow keeps nothing of this account in memory: no unsaved record
-      // and no account mismatch. No attempt runs, so the reset applies.
-      flow?.reset();
       account = SIGNED_OUT;
       deviceKey = "ready";
       replacementPending = false;

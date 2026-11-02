@@ -88,7 +88,9 @@ export interface AccountBridge {
   ) => () => void;
   /**
    * Starts a GitHub sign-in in the system browser. Call it only after the
-   * person's action; it passes nothing from the renderer on.
+   * person's action; it passes nothing from the renderer on. The main
+   * process refuses a start within a few seconds of the last one that
+   * opened the browser (`too_soon`).
    */
   readonly startSignIn: () => Promise<StartSignInResult>;
   /** Ends the open sign-in. Resolves to false when none was open. */
@@ -99,8 +101,9 @@ export interface AccountBridge {
    */
   readonly unlockDeviceKey: (passphrase: string) => Promise<UnlockResult>;
   /**
-   * "This is not me": deletes the device key and the device record of this
-   * installation. Ask the person to confirm first.
+   * "This is not me": the main process asks the person to confirm in a
+   * native dialog, then deletes the device key and the device record of
+   * this installation. Resolves to `cancelled` when the person kept them.
    */
   readonly forgetAccount: () => Promise<ForgetResult>;
 }

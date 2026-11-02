@@ -10,14 +10,22 @@ import {
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import type { AccountStatus } from "../shared/ipc-contract.ts";
-import { createAccountService, type AccountService } from "./account.ts";
+import {
+  createAccountService,
+  SIGN_IN_START_COOLDOWN_MS,
+  type AccountService,
+} from "./account.ts";
 import { registerAccountIpc } from "./account-ipc.ts";
 import { APP_ENTRY_URL } from "./app-protocol.ts";
 import {
   createDeviceKeyStore,
+  type DeviceKeyStore,
   type SystemKeyProtection,
 } from "./device-key/store.ts";
-import { createDeviceRecordStore } from "./device-record.ts";
+import {
+  createDeviceRecordStore,
+  type DeviceRecordStore,
+} from "./device-record.ts";
 import type {
   IpcFrame,
   IpcInvokeEvent,
@@ -376,6 +384,7 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
   // The listener's 10 minutes and the request timeout never fire here.
   const scheduleTimer: ScheduleTimer = () => () => undefined;
   let focused = 0;
+  let clock = 0;
   const service = createAccountService({
     apiOrigin: { ok: true, origin: API_ORIGIN },
     openSystem: () => ({
@@ -413,6 +422,8 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
     focusWindow: () => {
       focused += 1;
     },
+    confirmForget: async () => true,
+    now: () => clock,
     onError: (message) => errors.push(message),
   });
   const { call } = register(service);
@@ -429,6 +440,7 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
   await service.initialize();
 
   for (const code of [SIGN_IN_CODE, SECOND_CODE]) {
+    clock += SIGN_IN_START_COOLDOWN_MS;
     const before = service.status().revision;
     await expect(invoke(INVOKE_CHANNELS.startSignIn)).resolves.toEqual({
       outcome: "started",
@@ -512,3 +524,126 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
   ).rejects.toThrow();
   await expect(keyStore.hasKey()).resolves.toBe(false);
 });
+
+test("a This is not me whose key delete fails after an unsaved record never brings the account back", async () => {
+  const folder = path.join(root, "MyManDev");
+  const realKeys = createDeviceKeyStore({
+    folder,
+    platform: "win32",
+    systemProtection: {
+      isAsyncEncryptionAvailable: () => Promise.resolve(true),
+      getSelectedStorageBackend: () => "unknown",
+      encryptStringAsync: (plainText) =>
+        Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8")),
+      decryptStringAsync: (ciphertext) =>
+        Promise.resolve({
+          shouldReEncrypt: false,
+          result: ciphertext.toString("utf8").slice("fake:".length),
+        }),
+    },
+  });
+  const realRecords = createDeviceRecordStore({ folder, platform: "win32" });
+  let failRecordWrites = false;
+  let failKeyDelete = false;
+  const records: DeviceRecordStore = {
+    read: realRecords.read,
+    delete: realRecords.delete,
+    write: (record) =>
+      failRecordWrites
+        ? Promise.reject(new Error("disk full"))
+        : realRecords.write(record),
+  };
+  const keyStore: DeviceKeyStore = {
+    ...realKeys,
+    delete: () =>
+      failKeyDelete ? Promise.reject(new Error("EBUSY")) : realKeys.delete(),
+  };
+  // The installation holds the account that is not the person's.
+  const key = await realKeys.create({ kind: "system" });
+  await realRecords.write({
+    deviceId: DEVICE_ID,
+    userId: USER_ID,
+    login: "octocat",
+    displayName: "The Octocat",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    publicKey: key.publicKey,
+  });
+  const opened: string[] = [];
+  let clock = 0;
+  const service = createAccountService({
+    apiOrigin: { ok: true, origin: API_ORIGIN },
+    openSystem: () => ({
+      keyStore,
+      deviceRecords: records,
+      createFlow: () =>
+        createSignInFlow({
+          apiOrigin: { ok: true, origin: API_ORIGIN },
+          keyStore,
+          deviceRecords: records,
+          openExternal: async (url) => {
+            opened.push(url);
+            return true;
+          },
+          fetch: async () =>
+            new Response(
+              JSON.stringify({
+                userId: USER_ID,
+                deviceId: DEVICE_ID,
+                displayName: "The Octocat",
+                login: "octocat",
+                signInExpiresAt: "2026-12-02T10:00:00.000Z",
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          platform: "win32",
+          scheduleTimer: () => () => undefined,
+          listenerConnectionTimeoutMs: 2_000,
+        }),
+    }),
+    focusWindow: () => undefined,
+    confirmForget: async () => true,
+    now: () => clock,
+  });
+  await service.initialize();
+  expect(service.status().account).toMatchObject({ login: "octocat" });
+
+  // A repeated sign-in gets a 200, but both record writes fail: the flow
+  // keeps the record in memory for its next attempt.
+  failRecordWrites = true;
+  const before = service.status().revision;
+  await expect(service.startSignIn()).resolves.toEqual({ outcome: "started" });
+  const repeated = new URL(opened.at(-1) ?? "").searchParams;
+  expect(repeated.get("login")).toBe("octocat");
+  const unsaved = idleWithOutcome(service, before);
+  await postForm(
+    repeated.get("redirect_uri") ?? "",
+    new URLSearchParams({
+      code: SIGN_IN_CODE,
+      state: repeated.get("state") ?? "",
+    }).toString(),
+  );
+  expect((await unsaved).lastOutcome).toEqual({ code: "record_not_saved" });
+
+  // "This is not me" deletes the record, and then the key delete fails.
+  failKeyDelete = true;
+  await expect(service.forgetAccount()).resolves.toEqual({
+    outcome: "failed",
+  });
+  expect(service.status().account).toEqual({ kind: "signed_out" });
+
+  // The next sign-in is a first sign-in: the unsaved record of the other
+  // account is not written back, and its login is not sent.
+  failRecordWrites = false;
+  failKeyDelete = false;
+  clock += SIGN_IN_START_COOLDOWN_MS;
+  await expect(service.startSignIn()).resolves.toEqual({ outcome: "started" });
+  const next = new URL(opened.at(-1) ?? "").searchParams;
+  expect(next.has("login")).toBe(false);
+  expect(next.get("prompt")).toBe("select_account");
+  expect(await realRecords.read()).toEqual({ kind: "none" });
+  expect(service.status().account).toEqual({ kind: "signed_out" });
+
+  const ended = idleWithOutcome(service, service.status().revision);
+  service.cancelSignIn();
+  expect((await ended).lastOutcome).toEqual({ code: "cancelled" });
+}, 20_000);

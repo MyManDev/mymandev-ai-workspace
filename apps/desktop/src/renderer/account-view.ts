@@ -1,6 +1,7 @@
 import type {
   AccountStatus,
   ApiOriginState,
+  StartSignInResult,
   DeviceKeyState,
   SignInOutcomeCode,
   SignInOutcomeView,
@@ -123,13 +124,13 @@ export function apiOriginProblem(state: ApiOriginState): string | undefined {
 
 /** The messages for an action of the panel that the main process refused. */
 export const ACTION_MESSAGES = Object.freeze({
-  startBusy: "A sign-in is already open.",
-  keyNotReady: "The device key is not ready.",
   startFailed: "The sign-in could not start.",
   cancelFailed: "The sign-in could not be cancelled.",
   unlockNotRequired: "The device key does not need a passphrase now.",
   unlockBusy: "The device key is busy. Try again.",
   wrongPassphrase: "The passphrase does not open the device key.",
+  unlockTooSoon:
+    "Wait a few seconds after a wrong passphrase before you try again.",
   passphraseInvalid:
     "The passphrase must be 1 to 1,024 characters of well-formed text.",
   unlockFailed: "The device key could not be unlocked.",
@@ -137,4 +138,13 @@ export const ACTION_MESSAGES = Object.freeze({
   notSignedIn: "This installation holds no account.",
   forgetFailed:
     "The account could not be removed from this installation. Try again.",
+});
+
+/** The message for a sign-in that the main process did not start. */
+export const START_REFUSAL_MESSAGES: Readonly<
+  Record<Extract<StartSignInResult, { outcome: "refused" }>["reason"], string>
+> = Object.freeze({
+  busy: "A sign-in is already open.",
+  key_not_ready: "The device key is not ready.",
+  too_soon: "Wait a few seconds before you start the sign-in again.",
 });

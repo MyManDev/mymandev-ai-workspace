@@ -353,11 +353,13 @@ export type AccountStatus = z.infer<typeof AccountStatusSchema>;
 /**
  * Why a sign-in was not started: `busy` while a sign-in is open or the
  * account is being changed, `key_not_ready` while the device key is
- * loading, waits for its passphrase, or cannot be used.
+ * loading, waits for its passphrase, or cannot be used, and `too_soon`
+ * within a few seconds of the last start that opened the browser.
  */
 export const START_SIGN_IN_REFUSALS = Object.freeze([
   "busy",
   "key_not_ready",
+  "too_soon",
 ] as const);
 
 export const StartSignInResultSchema = z.discriminatedUnion("outcome", [
@@ -383,14 +385,16 @@ export const PassphraseSchema = z
 /**
  * Why a passphrase did not unlock the device key: `not_required` when no
  * key waits for one, `busy` while another unlock or a change of the account
- * runs, `wrong_passphrase`, or `passphrase_invalid` for text that is not
- * well-formed or longer than 1,024 characters.
+ * runs, `wrong_passphrase`, `passphrase_invalid` for text that is not
+ * well-formed or longer than 1,024 characters, or `too_soon` while the delay
+ * after a wrong passphrase runs.
  */
 export const UNLOCK_REFUSALS = Object.freeze([
   "not_required",
   "busy",
   "wrong_passphrase",
   "passphrase_invalid",
+  "too_soon",
 ] as const);
 
 export const UnlockResultSchema = z.discriminatedUnion("outcome", [
@@ -402,9 +406,9 @@ export const UnlockResultSchema = z.discriminatedUnion("outcome", [
 export type UnlockResult = z.infer<typeof UnlockResultSchema>;
 
 /**
- * Why "This is not me" deleted nothing: `busy` while a sign-in is open or
- * the key is loading or being unlocked, `not_signed_in` when this
- * installation holds no account.
+ * Why "This is not me" deleted nothing: `busy` while a sign-in is open, the
+ * key is loading or being unlocked, or the confirmation is open,
+ * `not_signed_in` when this installation holds no account.
  */
 export const FORGET_REFUSALS = Object.freeze([
   "busy",
@@ -413,6 +417,8 @@ export const FORGET_REFUSALS = Object.freeze([
 
 export const ForgetResultSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("forgotten") }),
+  /** The person kept the account in the confirmation of the main process. */
+  z.object({ outcome: z.literal("cancelled") }),
   z.object({ outcome: z.literal("refused"), reason: z.enum(FORGET_REFUSALS) }),
   /** The record or the key could not be deleted. */
   z.object({ outcome: z.literal("failed") }),

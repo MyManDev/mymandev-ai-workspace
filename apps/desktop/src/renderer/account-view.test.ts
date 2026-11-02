@@ -2,12 +2,14 @@ import { expect, test } from "vitest";
 import {
   DEVICE_KEY_STATES,
   SIGN_IN_OUTCOME_CODES,
+  START_SIGN_IN_REFUSALS,
   UNLOCK_REFUSALS,
 } from "../shared/ipc-contract.ts";
 import { unlockMessage } from "./AccountPanel.tsx";
 import {
   ACTION_MESSAGES,
   apiOriginProblem,
+  START_REFUSAL_MESSAGES,
   DEVICE_KEY_PROBLEM_MESSAGES,
   describeOutcome,
   initialAccountView,
@@ -79,5 +81,14 @@ test("every unlock result has a message, or none when the status says it", () =>
     ACTION_MESSAGES.unlockBusy,
     ACTION_MESSAGES.wrongPassphrase,
     ACTION_MESSAGES.passphraseInvalid,
+    ACTION_MESSAGES.unlockTooSoon,
   ]);
+});
+
+test("every refused start has its own message", () => {
+  expect(Object.keys(START_REFUSAL_MESSAGES).sort()).toEqual(
+    [...START_SIGN_IN_REFUSALS].sort(),
+  );
+  const texts = Object.values(START_REFUSAL_MESSAGES);
+  expect(new Set(texts).size).toBe(texts.length);
 });

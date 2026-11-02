@@ -46,8 +46,9 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   unlockDeviceKey: "account:unlock-key",
   /**
-   * "This is not me": deletes the device key and the device record of this
-   * installation. The renderer asks the person to confirm first.
+   * "This is not me": the main process asks the person to confirm in a
+   * native dialog, then deletes the device key and the device record of
+   * this installation.
    */
   forgetAccount: "account:forget",
 } as const);

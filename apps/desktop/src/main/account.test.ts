@@ -16,7 +16,13 @@ import {
   type AccountServiceOptions,
   type AccountSystem,
   createAccountService,
+  FORGET_CONFIRMATION,
+  forgetConfirmationMessage,
+  forgetConfirmed,
+  SIGN_IN_START_COOLDOWN_MS,
   signInOutcomeView,
+  UNLOCK_DELAY_MAX_MS,
+  unlockDelayMs,
 } from "./account.ts";
 import {
   DeviceKeyError,
@@ -111,6 +117,10 @@ interface Harness {
   start: () => Promise<SignInStart>;
   /** The `onCallback` that the service passed to the last `start`. */
   callback: (() => void) | undefined;
+  /** The answer of the native confirmation of "This is not me". */
+  confirm: (login: string) => Promise<boolean>;
+  /** The service's clock in milliseconds. */
+  clock: number;
   recordDelete: () => Promise<void>;
   keyDelete: () => Promise<void>;
 }
@@ -136,6 +146,8 @@ function harness(
     load: async () => undefined,
     start: async (): Promise<SignInStart> => startedSignIn().start,
     callback: undefined,
+    confirm: async () => true,
+    clock: 0,
     recordDelete: async () => undefined,
     keyDelete: async () => undefined,
   } as Omit<Harness, "service">;
@@ -195,6 +207,11 @@ function harness(
       state.focused += 1;
       state.log.push("focus");
     },
+    confirmForget: (login) => {
+      state.log.push(`confirm ${login}`);
+      return state.confirm(login);
+    },
+    now: () => state.clock,
     onError: (message) => state.errors.push(message),
     ...overrides,
   });
@@ -405,6 +422,7 @@ test("a key that needs its passphrase waits for it; a wrong one is refused and t
   const wrong = await h.service.unlockDeviceKey("not the passphrase");
   expect(wrong).toEqual({ outcome: "refused", reason: "wrong_passphrase" });
   expect(h.service.status().revision).toBe(revision);
+  h.clock += unlockDelayMs(1);
 
   h.keyStatus = {
     protection: "passphrase",
@@ -583,6 +601,7 @@ test("only one sign-in runs at a time, and a new one starts after the outcome on
   attempt.settle({ kind: "timed_out" });
   await done;
   h.start = async () => startedSignIn().start;
+  h.clock += SIGN_IN_START_COOLDOWN_MS;
 
   await expect(h.service.startSignIn()).resolves.toEqual({
     outcome: "started",
@@ -605,6 +624,7 @@ test("cancel ends the open sign-in, and a cancel while it starts ends it once it
   expect((await cancelled).lastOutcome).toEqual({ code: "cancelled" });
 
   const starting = startedSignIn();
+  h.clock += SIGN_IN_START_COOLDOWN_MS;
   let open: () => void = () => undefined;
   h.start = () =>
     new Promise((resolve) => {
@@ -671,6 +691,7 @@ test("a callback before start returns shows the sign-in as completing, and a lat
   await done;
 
   h.start = async () => startedSignIn().start;
+  h.clock += SIGN_IN_START_COOLDOWN_MS;
   await h.service.startSignIn();
   oldCallback?.();
   expect(h.service.status().signIn).toMatchObject({ kind: "waiting" });
@@ -831,7 +852,7 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
   expect(view({ kind: "paused" })).toEqual({ code: "failed" });
 });
 
-test("This is not me deletes the record, then the key, signs out, and resets the flow", async () => {
+test("This is not me asks for confirmation, deletes the record, resets the flow, deletes the key, and signs out", async () => {
   const h = harness();
   await h.service.initialize();
   h.start = async () => ({
@@ -849,9 +870,10 @@ test("This is not me deletes the record, then the key, signs out, and resets the
   });
 
   expect(h.log).toEqual([
+    "confirm octocat",
     "delete record",
-    "delete key",
     "reset flow",
+    "delete key",
     "status idle",
   ]);
   expect(h.service.status()).toMatchObject({
@@ -887,21 +909,37 @@ test("This is not me also works while the key waits for its passphrase", async (
 test("a failed delete is reported and the account is read again, so This is not me can be tried again", async () => {
   const h = harness();
   await h.service.initialize();
+  // A start that does not get far still creates the flow.
+  h.start = async () => ({
+    started: false,
+    outcome: { kind: "failed", reason: "replacement_pending" },
+  });
+  await h.service.startSignIn();
   h.recordDelete = () => Promise.reject(new Error("EBUSY"));
 
   await expect(h.service.forgetAccount()).resolves.toEqual({
     outcome: "failed",
   });
+  // While the record stays, the account and what the flow keeps for it stay.
   expect(h.log).not.toContain("delete key");
+  expect(h.log).not.toContain("reset flow");
   expect(h.service.status().account.kind).toBe("signed_in");
 
   h.recordDelete = async () => {
     h.record = { kind: "none" };
   };
   h.keyDelete = () => Promise.reject(new Error("EBUSY"));
+  h.log.length = 0;
   await expect(h.service.forgetAccount()).resolves.toEqual({
     outcome: "failed",
   });
+  // The flow forgot the account before the key delete failed.
+  expect(h.log.slice(0, 4)).toEqual([
+    "confirm octocat",
+    "delete record",
+    "reset flow",
+    "delete key",
+  ]);
   // A key without a record is deleted by the next sign-in.
   expect(h.service.status().account).toEqual({ kind: "signed_out" });
   expect(h.errors).toEqual([
@@ -938,6 +976,7 @@ test("a listener that throws and a window that cannot come up are reported and c
     focusWindow: () => {
       throw new Error("no window");
     },
+    confirmForget: async () => true,
     onError: (message) => h.errors.push(message),
   });
   const attempt = startedSignIn();
@@ -961,6 +1000,153 @@ test("a listener that throws and a window that cannot come up are reported and c
     "An account status listener failed.",
     "The window could not be brought to the front.",
   ]);
+});
+
+test("This is not me deletes nothing when the person keeps the account or the confirmation fails, and waits while it is open", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.confirm = async () => false;
+
+  await expect(h.service.forgetAccount()).resolves.toEqual({
+    outcome: "cancelled",
+  });
+  expect(h.log.slice(-1)).toEqual(["confirm octocat"]);
+
+  h.confirm = () => Promise.reject(new Error("no dialog"));
+  await expect(h.service.forgetAccount()).resolves.toEqual({
+    outcome: "failed",
+  });
+  expect(h.errors).toEqual(["The confirmation could not be shown."]);
+
+  let answer: (confirmed: boolean) => void = () => undefined;
+  h.confirm = () =>
+    new Promise((resolve) => {
+      answer = resolve;
+    });
+  const forgetting = h.service.forgetAccount();
+  await expect(h.service.forgetAccount()).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  answer(false);
+  await expect(forgetting).resolves.toEqual({ outcome: "cancelled" });
+
+  expect(h.log).not.toContain("delete record");
+  expect(h.log).not.toContain("delete key");
+  expect(h.service.status().account.kind).toBe("signed_in");
+});
+
+test("the confirmation of This is not me names the login, offers Keep as the default, and only the remove button confirms", () => {
+  expect(FORGET_CONFIRMATION).toEqual({
+    type: "warning",
+    buttons: ["Remove from this installation", "Keep"],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+    title: "This is not me",
+    detail:
+      "The device key and the account are deleted on this computer. You can then sign in with your own GitHub account.",
+  });
+  expect(Object.isFrozen(FORGET_CONFIRMATION)).toBe(true);
+  expect(Object.isFrozen(FORGET_CONFIRMATION.buttons)).toBe(true);
+  expect(forgetConfirmationMessage("octocat")).toBe(
+    "Remove the GitHub account octocat from this installation?",
+  );
+  expect(forgetConfirmed({ response: 0 })).toBe(true);
+  for (const response of [1, 2, -1]) {
+    expect(forgetConfirmed({ response })).toBe(false);
+  }
+});
+
+test("a start within the cooldown after one that opened the browser is refused as too soon", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const first = startedSignIn();
+  h.start = async () => first.start;
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+  const cancelled = nextStatus(h, (status) => status.signIn.kind === "idle");
+  h.service.cancelSignIn();
+  await cancelled;
+
+  h.start = async () => startedSignIn().start;
+  h.clock += SIGN_IN_START_COOLDOWN_MS - 1;
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "refused",
+    reason: "too_soon",
+  });
+  expect(h.log.filter((step) => step === "start")).toHaveLength(1);
+
+  h.clock += 1;
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+  expect(h.log.filter((step) => step === "start")).toHaveLength(2);
+});
+
+test("a start that did not open the browser does not hold back the next one", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.start = async () => ({
+    started: false,
+    outcome: { kind: "failed", reason: "listener_unavailable" },
+  });
+  await h.service.startSignIn();
+
+  h.start = async () => startedSignIn().start;
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+});
+
+test("after a wrong passphrase the next unlock waits 1 second, doubling up to 30 seconds, also for the right passphrase", async () => {
+  expect([0, 1, 2, 3, 4, 5, 6, 100].map(unlockDelayMs)).toEqual([
+    0,
+    1_000,
+    2_000,
+    4_000,
+    8_000,
+    16_000,
+    30_000,
+    UNLOCK_DELAY_MAX_MS,
+  ]);
+
+  const h = harness();
+  h.load = async (passphrase) => {
+    if (passphrase !== PASSPHRASE) {
+      throw new DeviceKeyError(
+        passphrase === undefined ? "passphrase_required" : "wrong_passphrase",
+      );
+    }
+  };
+  await h.service.initialize();
+  const loads = () => h.log.filter((step) => step === "load with passphrase");
+
+  for (const delay of [1_000, 2_000, 4_000]) {
+    await expect(h.service.unlockDeviceKey("wrong")).resolves.toEqual({
+      outcome: "refused",
+      reason: "wrong_passphrase",
+    });
+    const tried = loads().length;
+    h.clock += delay - 1;
+    // Also the right passphrase waits; the store is not asked.
+    await expect(h.service.unlockDeviceKey(PASSPHRASE)).resolves.toEqual({
+      outcome: "refused",
+      reason: "too_soon",
+    });
+    expect(loads()).toHaveLength(tried);
+    h.clock += 1;
+  }
+
+  await expect(h.service.unlockDeviceKey(PASSPHRASE)).resolves.toEqual({
+    outcome: "unlocked",
+  });
+  expect(h.service.status().deviceKey).toBe("ready");
 });
 
 test("the contract's limits follow the protocol and the key store", () => {

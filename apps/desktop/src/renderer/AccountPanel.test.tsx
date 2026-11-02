@@ -41,12 +41,7 @@ const SIGNED_IN: AccountStatus = {
 
 type Handler = keyof Pick<
   AccountPanelContentProps,
-  | "onStartSignIn"
-  | "onCancelSignIn"
-  | "onUnlock"
-  | "onForget"
-  | "onConfirmForget"
-  | "onKeepAccount"
+  "onStartSignIn" | "onCancelSignIn" | "onUnlock" | "onForget"
 >;
 
 function props(
@@ -62,13 +57,10 @@ function props(
     view: { kind: "known", status: SIGNED_OUT },
     busy: false,
     message: undefined,
-    confirmingForget: false,
     onStartSignIn: record("onStartSignIn"),
     onCancelSignIn: record("onCancelSignIn"),
     onUnlock: record("onUnlock"),
     onForget: record("onForget"),
-    onConfirmForget: record("onConfirmForget"),
-    onKeepAccount: record("onKeepAccount"),
     ...overrides,
   };
 }
@@ -254,24 +246,18 @@ test("signed in, the panel shows the login and the name with This is not me", ()
   ).toEqual([["This is not me", ["onForget"]]]);
 });
 
-test("This is not me asks for confirmation before anything is removed, with Keep focused", () => {
-  const overrides = {
-    view: { kind: "known", status: SIGNED_IN },
-    confirmingForget: true,
-  } as const;
-  const html = render(overrides);
+test("This is not me asks the main process, which confirms in a native dialog, and waits while it is open", () => {
+  const view = { kind: "known", status: SIGNED_IN } as const;
 
-  expect(html).toContain(
-    '<p id="forget-question">Remove the GitHub account <strong>octocat</strong> and the device key from this installation? You can then sign in with your own account.</p><div class="account-actions" role="group" aria-labelledby="forget-question"><button type="button" class="panel-action">Remove from this installation</button><button type="button" class="panel-action" autofocus="">Keep</button></div>',
-  );
-  expect(html).not.toContain(">This is not me</button>");
-  expect(clickEveryButton(overrides)).toEqual([
-    ["Remove from this installation", ["onConfirmForget"]],
-    ["Keep", ["onKeepAccount"]],
+  expect(clickEveryButton({ view })).toEqual([
+    ["This is not me", ["onForget"]],
   ]);
-  expect(render({ ...overrides, busy: true })).toContain(
-    '<button type="button" class="panel-action" disabled="">Remove from this installation</button>',
+  const busy = render({ view, busy: true });
+  expect(busy).toContain(
+    '<button type="button" class="panel-action" disabled="">This is not me</button>',
   );
+  // The renderer has no confirmation of its own.
+  expect(busy).not.toContain("Remove from this installation");
 });
 
 test("after a sign-in, the panel names the login that the device is signed in to, with the way out", () => {

@@ -563,6 +563,7 @@ test("the results of start, unlock, and forget hold only fixed values", () => {
   }
   for (const value of [
     { outcome: "forgotten" },
+    { outcome: "cancelled" },
     { outcome: "failed" },
     ...FORGET_REFUSALS.map((reason) => ({ outcome: "refused", reason })),
   ]) {

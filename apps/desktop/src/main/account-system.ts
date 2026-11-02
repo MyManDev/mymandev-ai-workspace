@@ -18,6 +18,8 @@ import { createSystemSignInFlow } from "./sign-in/system.ts";
 export interface SystemAccountOptions {
   /** Brings the main window to the front after the browser's callback. */
   readonly focusWindow: () => void;
+  /** Asks the person to confirm "This is not me" in a native dialog. */
+  readonly confirmForget: (login: string) => Promise<boolean>;
   /** Receives fixed messages; the key store's errors hold no secret. */
   readonly onError: (message: string, error?: unknown) => void;
 }
@@ -51,6 +53,7 @@ export function createSystemAccountService(
       };
     },
     focusWindow: options.focusWindow,
+    confirmForget: options.confirmForget,
     onError: (message) => options.onError(message),
   });
 }
