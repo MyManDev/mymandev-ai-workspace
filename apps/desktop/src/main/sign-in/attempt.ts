@@ -11,9 +11,9 @@ import {
   Base64Url32BytesSchema,
   GitHubAuthorizeQuerySchema,
   type GitHubAuthorizeQuery,
-  isDeviceAuthAudience,
   pairingCode,
 } from "@mymandev/protocol";
+import { isApiOrigin } from "../api-origin.ts";
 
 /** One sign-in attempt of the desktop. */
 export interface SignInAttempt {
@@ -111,14 +111,6 @@ export interface AuthorizeUrlInput {
   readonly signIn: AuthorizeSignInKind;
 }
 
-/**
- * The http origins that the API accepts as `API_PUBLIC_ORIGIN`, in
- * development and test only: a loopback host. Every other origin must use
- * https. The same pattern as the API's configuration.
- */
-const LOOPBACK_HTTP_ORIGIN =
-  /^http:\/\/(?:127[.]0[.]0[.]1|localhost)(?::[0-9]+)?$/u;
-
 /** The order of the query parameters in the URL; every key of the schema. */
 const AUTHORIZE_PARAMETER_ORDER: readonly (keyof GitHubAuthorizeQuery)[] =
   Object.freeze([
@@ -138,13 +130,7 @@ const AUTHORIZE_PARAMETER_ORDER: readonly (keyof GitHubAuthorizeQuery)[] =
  * `TypeError` that names the field, never its value.
  */
 export function authorizeUrl(input: AuthorizeUrlInput): string {
-  if (
-    !isDeviceAuthAudience(input.apiOrigin) ||
-    !(
-      input.apiOrigin.startsWith("https://") ||
-      LOOPBACK_HTTP_ORIGIN.test(input.apiOrigin)
-    )
-  ) {
+  if (!isApiOrigin(input.apiOrigin)) {
     throw new TypeError("Invalid API origin");
   }
   const query: Record<string, string> = {
