@@ -5,6 +5,8 @@ import {
   randomToken,
   RecentRevocations,
   s256,
+  sha256Hex,
+  SIGN_IN_CODE_PREFIX,
   SignInAttempts,
   SignInCodes,
 } from "./attempts.ts";
@@ -213,6 +215,18 @@ test("the attempt store refuses a desktop challenge or state that started an att
   assert.equal(typeof attempts.create(desktop), "object", "after the lifetime");
 });
 
+const CODE_BINDING = {
+  identity: {
+    githubId: "1",
+    login: "a",
+    name: null,
+    accountCreatedAt: "2020-01-01T00:00:00Z",
+  },
+  identityReadAt: 0,
+  desktopCodeChallenge: s256("v"),
+  redirectUri: "http://127.0.0.1:49152/callback",
+};
+
 test("a sign-in code is used once and expires after its lifetime", () => {
   let clock = 0;
   const codes = new SignInCodes({
@@ -220,26 +234,103 @@ test("a sign-in code is used once and expires after its lifetime", () => {
     lifetimeMs: 60_000,
     now: () => clock,
   });
-  const binding = {
-    identity: {
-      githubId: "1",
-      login: "a",
-      name: null,
-      accountCreatedAt: "2020-01-01T00:00:00Z",
-    },
-    identityReadAt: 0,
-    desktopCodeChallenge: s256("v"),
-    redirectUri: "http://127.0.0.1:49152/callback",
-  };
-  const code = codes.issue(binding);
+  const code = codes.issue(CODE_BINDING);
   assert.ok(code !== null);
   assert.match(code, /^mmdc_[A-Za-z0-9_-]{43}$/u);
   assert.equal(codes.take(code)?.identity.login, "a");
   assert.equal(codes.take(code), null, "single use");
-  const late = codes.issue(binding);
+  const late = codes.issue(CODE_BINDING);
   assert.ok(late !== null);
   clock = 60_000;
   assert.equal(codes.take(late), null, "expired");
+});
+
+test("a taken sign-in code is recorded as used, with its challenge and redirect URI, for one code lifetime after the take (#152)", () => {
+  let clock = 0;
+  const codes = new SignInCodes({
+    max: 10,
+    lifetimeMs: 60_000,
+    now: () => clock,
+  });
+  const code = codes.issue(CODE_BINDING);
+  assert.ok(code !== null);
+  assert.equal(codes.used(code), null, "a live code is not used");
+  clock = 59_000;
+  assert.ok(codes.take(code) !== null);
+  assert.deepEqual(codes.used(code), {
+    desktopCodeChallenge: CODE_BINDING.desktopCodeChallenge,
+    redirectUri: CODE_BINDING.redirectUri,
+    expiresAt: 119_000,
+  });
+  assert.equal(
+    codes.used(`${SIGN_IN_CODE_PREFIX}${randomToken()}`),
+    null,
+    "unknown",
+  );
+  clock = 118_999;
+  assert.ok(codes.used(code) !== null, "past the code's own expiry");
+  clock = 119_000;
+  assert.equal(codes.used(code), null, "expired");
+
+  const late = codes.issue(CODE_BINDING);
+  assert.ok(late !== null);
+  clock += 60_000;
+  assert.equal(codes.take(late), null);
+  assert.equal(codes.used(late), null, "a code that expired is not recorded");
+});
+
+test("the code store writes a sign-in code only as its hash, also when it records the code as used (#152)", (t) => {
+  const codes = new SignInCodes({
+    max: 10,
+    lifetimeMs: 60_000,
+    now: () => 0,
+  });
+  const set = t.mock.method(Map.prototype, "set");
+  const code = codes.issue(CODE_BINDING);
+  const taken = code === null ? null : codes.take(code);
+  set.mock.restore();
+  assert.ok(code !== null && taken !== null);
+  const written = set.mock.calls.map((call) => call.arguments);
+  assert.deepEqual(
+    written.map(([key]) => key),
+    [sha256Hex(code), sha256Hex(code)],
+    "the live code and its record of use",
+  );
+  assert.equal(JSON.stringify(written).includes(code), false);
+});
+
+test("live sign-in codes and records of used codes share twice the cap, and expired records free their places (#152)", () => {
+  let clock = 0;
+  const codes = new SignInCodes({
+    max: 2,
+    lifetimeMs: 60_000,
+    now: () => clock,
+  });
+  const issue = () => {
+    const code = codes.issue(CODE_BINDING);
+    assert.ok(code !== null);
+    return code;
+  };
+  const first = issue();
+  const second = issue();
+  assert.equal(codes.issue(CODE_BINDING), null, "two live codes");
+  codes.take(first);
+  codes.take(second);
+  clock = 30_000;
+  const third = issue();
+  issue();
+  codes.take(third);
+  // One live code and three records: taking a code never drops a record.
+  assert.equal(codes.issue(CODE_BINDING), null, "four entries");
+  assert.ok(codes.used(first) !== null);
+  assert.ok(codes.used(third) !== null);
+  clock = 60_000;
+  assert.ok(
+    codes.issue(CODE_BINDING) !== null,
+    "the first two records expired",
+  );
+  assert.equal(codes.used(first), null);
+  assert.ok(codes.used(third) !== null);
 });
 
 test("recent revocations keep the latest time per GitHub ID, expire after their lifetime, and drop the oldest at the cap", () => {
@@ -331,6 +422,8 @@ test("sweeping drops expired attempts and codes without a new request", () => {
     redirectUri: desktop.redirectUri,
   });
   assert.ok(code !== null);
+  const taken = codes.issue(CODE_BINDING);
+  assert.ok(taken !== null && codes.take(taken) !== null);
   clock = 1_000;
   attempts.sweep();
   codes.sweep();
@@ -340,4 +433,5 @@ test("sweeping drops expired attempts and codes without a new request", () => {
     null,
   );
   assert.equal(codes.take(code), null);
+  assert.equal(codes.used(taken), null, "the record of a used code");
 });

@@ -287,6 +287,7 @@ test("the status of an error body fits its code", () => {
     [403, "device_too_new"],
     [404, "invitation_invalid"],
     [409, "conflict"],
+    [409, "sign_in_code_used"],
     [429, "rate_limited"],
     [503, "sign_in_unavailable"],
     [400, "bad_request"],
@@ -306,6 +307,7 @@ test("the status of an error body fits its code", () => {
     [400, "forbidden"],
     [503, "rate_limited"],
     [500, "sign_in_unavailable"],
+    [401, "sign_in_code_used"],
     [500, "bad_request"],
     [404, "internal_error"],
   ] as const) {

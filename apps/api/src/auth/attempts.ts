@@ -184,21 +184,45 @@ export type SignInCodeRecord = Readonly<{
   expiresAt: number;
 }>;
 
+/**
+ * What a consumed sign-in code was bound to, so that a repeated request can
+ * prove it belongs to the same attempt (#152).
+ */
+export type UsedSignInCode = Readonly<{
+  desktopCodeChallenge: string;
+  redirectUri: string;
+  expiresAt: number;
+}>;
+
 export const SIGN_IN_CODE_PREFIX = "mmdc_";
 
 /** Single-use sign-in codes, kept only as hashes, with a cap. */
 export class SignInCodes {
   readonly #byHash = new Map<string, SignInCodeRecord>();
+  /**
+   * The codes that `take` consumed, by the same hash, for one code lifetime
+   * after the take: a copy of a request that committed can arrive after the
+   * first copy took the code (#152).
+   */
+  readonly #usedByHash = new Map<string, UsedSignInCode>();
   readonly #options: AttemptStoreOptions;
 
   constructor(options: AttemptStoreOptions) {
     this.#options = options;
   }
 
-  /** Issues a code bound to the record; null when the cap is reached. */
+  /**
+   * Issues a code bound to the record; null when the cap is reached. A
+   * consumed code keeps its place until its record expires, so live codes
+   * and consumed records together stay within twice the cap, and taking a
+   * code never has to drop a record.
+   */
   issue(binding: Omit<SignInCodeRecord, "expiresAt">): string | null {
     this.sweep();
-    if (this.#byHash.size >= this.#options.max) {
+    if (
+      this.#byHash.size >= this.#options.max ||
+      this.#byHash.size + this.#usedByHash.size >= this.#options.max * 2
+    ) {
       return null;
     }
     const code = `${SIGN_IN_CODE_PREFIX}${randomToken()}`;
@@ -212,11 +236,32 @@ export class SignInCodes {
     return code;
   }
 
-  /** Takes the record of a code once; null when it is unknown, used, or expired. */
+  /**
+   * Takes the record of a code once; null when it is unknown, used, or
+   * expired. A code that it takes is recorded as used for one code lifetime.
+   */
   take(code: string): SignInCodeRecord | null {
     const hash = sha256Hex(code);
     const record = this.#byHash.get(hash);
     this.#byHash.delete(hash);
+    const now = this.#options.now();
+    if (record === undefined || record.expiresAt <= now) {
+      return null;
+    }
+    this.#usedByHash.set(
+      hash,
+      Object.freeze({
+        desktopCodeChallenge: record.desktopCodeChallenge,
+        redirectUri: record.redirectUri,
+        expiresAt: now + this.#options.lifetimeMs,
+      }),
+    );
+    return record;
+  }
+
+  /** What a code that `take` consumed was bound to; null when it is unknown, live, or its record expired. */
+  used(code: string): UsedSignInCode | null {
+    const record = this.#usedByHash.get(sha256Hex(code));
     if (record === undefined || record.expiresAt <= this.#options.now()) {
       return null;
     }
@@ -229,6 +274,11 @@ export class SignInCodes {
     for (const [hash, record] of this.#byHash) {
       if (record.expiresAt <= now) {
         this.#byHash.delete(hash);
+      }
+    }
+    for (const [hash, record] of this.#usedByHash) {
+      if (record.expiresAt <= now) {
+        this.#usedByHash.delete(hash);
       }
     }
   }

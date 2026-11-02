@@ -234,6 +234,13 @@ export const API_ERROR_STATUS = Object.freeze({
   already_member: 409,
   /** The action conflicts with the current state, for example a second ownership offer. */
   conflict: 409,
+  /**
+   * A sign-in code that an earlier request of the same attempt already took;
+   * that request may have committed. Only a request with the attempt's PKCE
+   * verifier and `redirect_uri` gets it, within the code's lifetime after
+   * the earlier request.
+   */
+  sign_in_code_used: 409,
   /** A limit was reached; the answer carries `Retry-After`. */
   rate_limited: 429,
   /** An unexpected server error. */

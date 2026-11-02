@@ -33,7 +33,12 @@ import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
 import { sendCancelledRuns } from "../workspaces/events.ts";
-import { type RecentRevocations, s256, type SignInCodes } from "./attempts.ts";
+import {
+  type RecentRevocations,
+  s256,
+  type SignInCodes,
+  type UsedSignInCode,
+} from "./attempts.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
 import { deviceListItem } from "./device-state.ts";
 import type { GitHubIdentity } from "./github-api.ts";
@@ -117,7 +122,8 @@ function signaturesValid(
  * `POST /auth/sign-in` (ADR 0014, steps 7 and 8): takes the sign-in code once,
  * checks the PKCE verifier, `redirect_uri`, and the signatures, then creates
  * or updates the account and registers the device or replaces its key, in
- * one transaction. The answer carries no credential.
+ * one transaction. The answer carries no credential. A code that was already
+ * taken answers `sign_in_code_used` to its own attempt (#152).
  */
 export async function registerSignIn(
   app: FastifyInstance,
@@ -145,13 +151,25 @@ export async function registerSignIn(
       },
       async (request): Promise<SignInResponse> => {
         const body = request.body as SignInRequest;
+        // Whether the request comes from the attempt that the code is bound to.
+        const ofAttempt = (bound: UsedSignInCode) =>
+          s256(body.codeVerifier) === bound.desktopCodeChallenge &&
+          body.redirectUri === bound.redirectUri;
         // Taking the code consumes it, also when a later check fails.
         const binding = codes.take(body.code);
-        if (
-          binding === null ||
-          s256(body.codeVerifier) !== binding.desktopCodeChallenge ||
-          body.redirectUri !== binding.redirectUri
-        ) {
+        if (binding === null) {
+          // A copy of a request that took the code may follow its commit, so
+          // it must not read as "nothing was committed" (#152). Only the
+          // attempt's own verifier and redirect URI learn that the code was
+          // used.
+          const used = codes.used(body.code);
+          throw new ApiError(
+            used !== null && ofAttempt(used)
+              ? "sign_in_code_used"
+              : "auth_failed",
+          );
+        }
+        if (!ofAttempt(binding)) {
           throw new ApiError("auth_failed");
         }
 
