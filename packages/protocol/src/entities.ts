@@ -135,16 +135,32 @@ export const AgentRunSchema = z.object({
 export type AgentRun = z.infer<typeof AgentRunSchema>;
 
 /**
- * One message of a project's chat (#110). The server generates the ID and
- * the time when it stores the message; storing and the history route belong
- * to #27. The author is shown through their person row, also after they
- * were removed (ADR 0014, "People and roles").
+ * Who wrote a chat message (#27): a person of the project's workspace, or an
+ * agent of the project. A person is shown through their person row, also
+ * after they were removed (ADR 0014, "People and roles"). Servers of M2 send
+ * only `member`; a device shows an `agent` author as well, so that agent
+ * messages need no new protocol version later.
+ */
+export const ChatMessageAuthorSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("member"), memberId: MemberIdSchema }),
+  z.object({ kind: z.literal("agent"), agentId: AgentIdSchema }),
+]);
+export type ChatMessageAuthor = z.infer<typeof ChatMessageAuthorSchema>;
+
+/**
+ * One message of a project's chat (#110, #27). The server generates the ID,
+ * the sequence number, and the time when it stores the message.
  */
 export const ChatMessageSchema = z.object({
   id: MessageIdSchema,
   projectId: ProjectIdSchema,
-  /** The person who wrote the message, in the project's workspace. */
-  authorMemberId: MemberIdSchema,
+  /**
+   * The message's number in its project's chat, from 1 (ADR 0013). The
+   * server allocates it when it stores the message: it orders the chat and
+   * is the cursor of the history. It reveals nothing about other chats.
+   */
+  seq: z.int().positive(),
+  author: ChatMessageAuthorSchema,
   body: multilineText(LIMITS.messageBody),
   createdAt: UtcTimestampSchema,
 });
