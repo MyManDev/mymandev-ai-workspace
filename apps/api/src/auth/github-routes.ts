@@ -189,7 +189,19 @@ export async function registerGitHubSignIn(
           state: query.data.state,
           redirectUri: query.data.redirect_uri,
         });
-        if (created === null) {
+        if (created === "reused") {
+          // A second start with the same desktop values never reaches GitHub
+          // (#149); the desktop starts a new attempt.
+          return sendPage(
+            reply,
+            400,
+            errorPage(
+              "Sign-in could not start",
+              "This sign-in link was already used. Start the sign-in again in the MyManDev application.",
+            ),
+          );
+        }
+        if (created === "full") {
           reply.header("retry-after", "60");
           return sendPage(
             reply,
