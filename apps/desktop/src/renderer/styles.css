@@ -36,6 +36,7 @@
   --font-size-small: 0.875rem;
   --font-size-base: 1rem;
   --font-size-heading: 1.125rem;
+  --font-size-display: 1.5rem;
   --font-weight-strong: 600;
 
   --space-1: 0.25rem;
@@ -352,7 +353,8 @@ code {
   color: var(--color-text-muted);
 }
 
-.repository-facts {
+.repository-facts,
+.account-facts {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   gap: var(--space-1) var(--space-3);
@@ -360,11 +362,13 @@ code {
   font-size: var(--font-size-small);
 }
 
-.repository-facts dt {
+.repository-facts dt,
+.account-facts dt {
   color: var(--color-text-muted);
 }
 
-.repository-facts dd {
+.repository-facts dd,
+.account-facts dd {
   margin: 0;
   overflow-wrap: anywhere;
 }
@@ -375,6 +379,75 @@ code {
 
 .remote-url {
   display: block;
+}
+
+/* Account */
+
+.account-panel {
+  margin-block-start: var(--space-4);
+  padding-block-start: var(--space-3);
+  border-block-start: var(--border-width) solid var(--color-border);
+}
+
+.account-panel h3 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-base);
+}
+
+.account-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-block: var(--space-2);
+}
+
+.account-message {
+  font-size: var(--font-size-small);
+}
+
+.account-form,
+.account-url {
+  display: grid;
+  gap: var(--space-2);
+  margin-block: var(--space-2);
+}
+
+.account-form p,
+.account-url p {
+  margin: 0;
+}
+
+.account-label {
+  font-weight: var(--font-weight-strong);
+}
+
+.account-input {
+  padding: var(--space-2);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-background);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.account-url-text {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-small);
+  resize: vertical;
+  overflow-wrap: anywhere;
+}
+
+.account-warning {
+  color: var(--color-status-transition);
+  font-size: var(--font-size-small);
+}
+
+.pairing-code {
+  margin: var(--space-2) 0;
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-display);
+  font-weight: var(--font-weight-strong);
+  letter-spacing: var(--space-1);
 }
 
 /* Chat */

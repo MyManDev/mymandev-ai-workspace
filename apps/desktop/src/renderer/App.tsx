@@ -1,5 +1,6 @@
 import { useEffect, useReducer, useState } from "react";
 import type {
+  AccountBridge,
   RepositoryBridge,
   RuntimeBridge,
 } from "../shared/desktop-bridge.ts";
@@ -34,6 +35,8 @@ export interface AppProps {
   readonly runtime?: RuntimeBridge | undefined;
   /** The mounted repositories from the preload script; undefined outside Electron. */
   readonly repositories?: RepositoryBridge | undefined;
+  /** The sign-in of this installation from the preload script; undefined outside Electron. */
+  readonly account?: AccountBridge | undefined;
   /** The workspace's projects, in navigation order, read when the shell mounts. */
   readonly projects: readonly ProjectSummary[];
   /** The view shown first. An invalid view shows the home screen. */
@@ -44,6 +47,7 @@ export function App({
   electronVersion,
   runtime,
   repositories,
+  account,
   projects,
   initialView = HOME_VIEW,
 }: AppProps) {
@@ -68,7 +72,11 @@ export function App({
         />
       )}
       <main className="shell-main">
-        <ScreenContent view={state.view} electronVersion={electronVersion} />
+        <ScreenContent
+          view={state.view}
+          electronVersion={electronVersion}
+          account={account}
+        />
       </main>
       {open === undefined ? null : (
         <ProjectPanel
@@ -84,13 +92,15 @@ export function App({
 function ScreenContent({
   view,
   electronVersion,
+  account,
 }: {
   readonly view: ShellView;
   readonly electronVersion: string | undefined;
+  readonly account: AccountBridge | undefined;
 }) {
   switch (view.screen) {
     case "home":
-      return <HomeScreen />;
+      return <HomeScreen account={account} />;
     case "about":
       return <AboutScreen electronVersion={electronVersion} />;
     case "chat":
