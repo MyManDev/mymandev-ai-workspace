@@ -512,7 +512,9 @@ test("an unprotected key needs the explicit choice and is stored for its owner o
 test.skipIf(process.platform === "win32")(
   "key files have mode 0600 and a new key folder mode 0700 on Linux and macOS",
   async () => {
-    const fake = fakeSafeStorage({ backend: "basic_text" });
+    // Without asynchronous encryption, an unprotected key is allowed on
+    // macOS too; with it, only on Linux without a secret service.
+    const fake = fakeSafeStorage({ available: false });
     const store = storeWith(fake, { platform: process.platform });
     await store.create({ kind: "unprotected", acceptsUnprotectedKey: true });
 
