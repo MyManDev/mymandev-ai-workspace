@@ -13,6 +13,7 @@ import {
   APP_SCHEME_PRIVILEGES,
   createAppProtocolHandler,
 } from "./app-protocol.ts";
+import { claimDataFolder } from "./data-folder.ts";
 import {
   createSessionGuardInstaller,
   installContentsGuards,
@@ -29,10 +30,12 @@ import { createLocalRuntime } from "./runtime.ts";
 import { stopRuntimeOnQuit } from "./runtime-lifecycle.ts";
 import { createMainWindowOptions } from "./window.ts";
 
-// ADR 0014: the main process takes the single-instance lock before anything
-// touches the device key, so two instances never share one key. A second
-// instance quits at once and the first one shows its window.
-if (app.requestSingleInstanceLock()) {
+// The data folder is set first, before anything reads it, and the
+// single-instance lock is then taken in it (data-folder.ts). ADR 0014: the
+// main process takes the single-instance lock before anything touches the
+// device key, so two instances never share one key. A second instance quits
+// at once and the first one shows its window.
+if (claimDataFolder(app)) {
   start();
 } else {
   app.quit();
