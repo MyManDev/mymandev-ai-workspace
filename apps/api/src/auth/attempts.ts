@@ -184,21 +184,45 @@ export type SignInCodeRecord = Readonly<{
   expiresAt: number;
 }>;
 
+/**
+ * What a sign-in code that a request of its own attempt took was bound to,
+ * so that a repeated request can prove it belongs to the same attempt (#152).
+ */
+export type UsedSignInCode = Readonly<{
+  desktopCodeChallenge: string;
+  redirectUri: string;
+  expiresAt: number;
+}>;
+
 export const SIGN_IN_CODE_PREFIX = "mmdc_";
 
 /** Single-use sign-in codes, kept only as hashes, with a cap. */
 export class SignInCodes {
   readonly #byHash = new Map<string, SignInCodeRecord>();
+  /**
+   * The codes that a request of their own attempt took (`markUsed`), by the
+   * same hash, until one code lifetime after that request ended: a copy of a
+   * request that committed can arrive after the first copy took the code
+   * (#152). Memory only, like the codes: a restart drops them.
+   */
+  readonly #usedByHash = new Map<string, UsedSignInCode>();
   readonly #options: AttemptStoreOptions;
 
   constructor(options: AttemptStoreOptions) {
     this.#options = options;
   }
 
-  /** Issues a code bound to the record; null when the cap is reached. */
+  /**
+   * Issues a code bound to the record; null when the cap is reached. A code
+   * recorded as used keeps a place until its record expires, so live codes
+   * and records together stay within twice the cap.
+   */
   issue(binding: Omit<SignInCodeRecord, "expiresAt">): string | null {
     this.sweep();
-    if (this.#byHash.size >= this.#options.max) {
+    if (
+      this.#byHash.size >= this.#options.max ||
+      this.#byHash.size + this.#usedByHash.size >= this.#options.max * 2
+    ) {
       return null;
     }
     const code = `${SIGN_IN_CODE_PREFIX}${randomToken()}`;
@@ -223,12 +247,53 @@ export class SignInCodes {
     return record;
   }
 
+  /**
+   * Records a code that `take` returned as used by a request of its own
+   * attempt, until one code lifetime from now; another call moves that end.
+   * Right after the take it always fits, because the take freed a place; a
+   * record that expired and left meanwhile comes back only within the cap.
+   */
+  markUsed(
+    code: string,
+    binding: Pick<SignInCodeRecord, "desktopCodeChallenge" | "redirectUri">,
+  ): void {
+    const hash = sha256Hex(code);
+    if (
+      !this.#usedByHash.has(hash) &&
+      this.#byHash.size + this.#usedByHash.size >= this.#options.max * 2
+    ) {
+      return;
+    }
+    this.#usedByHash.set(
+      hash,
+      Object.freeze({
+        desktopCodeChallenge: binding.desktopCodeChallenge,
+        redirectUri: binding.redirectUri,
+        expiresAt: this.#options.now() + this.#options.lifetimeMs,
+      }),
+    );
+  }
+
+  /** What a code that `markUsed` recorded was bound to; null when there is no record or it expired. */
+  used(code: string): UsedSignInCode | null {
+    const record = this.#usedByHash.get(sha256Hex(code));
+    if (record === undefined || record.expiresAt <= this.#options.now()) {
+      return null;
+    }
+    return record;
+  }
+
   /** Drops expired entries; the API also runs it on a timer, so nothing outlives its lifetime by much. */
   sweep(): void {
     const now = this.#options.now();
     for (const [hash, record] of this.#byHash) {
       if (record.expiresAt <= now) {
         this.#byHash.delete(hash);
+      }
+    }
+    for (const [hash, record] of this.#usedByHash) {
+      if (record.expiresAt <= now) {
+        this.#usedByHash.delete(hash);
       }
     }
   }

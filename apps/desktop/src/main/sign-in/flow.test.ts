@@ -300,24 +300,45 @@ interface FakeApi {
   /** How many requests committed. */
   readonly commits: () => number;
   readonly handle: (body: SignInRequest) => Response;
+  /** Drops the records of used codes, as a restart of the API does. */
+  readonly restart: () => void;
 }
 
 /**
  * A fake of `POST /auth/sign-in` for the device of `RECORD`, in the API's
  * order: it takes the single-use code before every other check, verifies
  * both signatures against the key that it holds, and then holds the new key.
+ * Like the API (#152), it keeps the verifier and redirect URI of the request
+ * that took a code, in memory only, and answers a copy with both
+ * `sign_in_code_used`. Unlike the API, it binds no challenge: it records the
+ * verifier of whichever request took the code, which is the desktop's own in
+ * every test here.
  */
 function fakeApi(publicKey: string): FakeApi {
   const codes = new Set([SIGN_IN_CODE]);
+  const used = new Map<string, { codeVerifier: string; redirectUri: string }>();
   let held = publicKey;
   let commits = 0;
   return {
     publicKey: () => held,
     commits: () => commits,
+    restart: () => {
+      used.clear();
+    },
     handle: (body) => {
       if (!codes.delete(body.code)) {
-        return errorAnswer("auth_failed");
+        const taken = used.get(body.code);
+        return errorAnswer(
+          taken?.codeVerifier === body.codeVerifier &&
+            taken.redirectUri === body.redirectUri
+            ? "sign_in_code_used"
+            : "auth_failed",
+        );
       }
+      used.set(body.code, {
+        codeVerifier: body.codeVerifier,
+        redirectUri: body.redirectUri,
+      });
       const { device } = body;
       if (device.kind !== "existing" || device.deviceId !== DEVICE_ID) {
         return errorAnswer("auth_failed");
@@ -521,6 +542,22 @@ describe("a new device", () => {
     };
     const { outcome } = await signIn(h);
     expect(outcome).toEqual({ kind: "failed", reason: "no_answer" });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(
+      h.requests[0]?.body.device.publicKey,
+    );
+    expect(await h.records.read()).toEqual({ kind: "none" });
+  }, 20_000);
+
+  test("keeps a first sign-in's key on 409 with sign_in_code_used (#152)", async () => {
+    const h = harness();
+    expect(errorAnswer("sign_in_code_used").status).toBe(409);
+    h.answer = () => errorAnswer("sign_in_code_used");
+    const { outcome } = await signIn(h);
+    expect(outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "sign_in_code_used",
+    });
     expect(h.keyStore.keys()?.current.publicKey).toBe(
       h.requests[0]?.body.device.publicKey,
     );
@@ -858,15 +895,50 @@ describe("answers of the API", () => {
     20_000,
   );
 
+  test("keeps the key that the API holds when a resent copy of a committed request gets 409 with sign_in_code_used (#152)", async () => {
+    const h = harness();
+    const previousKey = await existingDevice(h);
+    const api = fakeApi(previousKey);
+    const statuses: number[] = [];
+    // The fetch delivers the request twice, as `net.fetch` or a proxy can
+    // after the connection failed: the first copy commits but its answer is
+    // lost, and only the answer to the second copy arrives.
+    h.answer = (body) => {
+      api.handle(body);
+      const answer = api.handle(body);
+      statuses.push(answer.status);
+      return answer;
+    };
+    const { outcome } = await signIn(h);
+
+    expect(statuses).toEqual([409]);
+    expect(api.commits()).toBe(1);
+    expect(outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "sign_in_code_used",
+    });
+    // The replacement stays pending, with the key that the API holds.
+    const keys = h.keyStore.keys();
+    expect(keys?.current.publicKey).toBe(api.publicKey());
+    expect(keys?.previous?.publicKey).toBe(previousKey);
+    expect(await h.records.read()).toEqual({
+      kind: "record",
+      record: { ...RECORD, publicKey: previousKey },
+    });
+  }, 20_000);
+
   test("keeps the key that the API holds when a resent copy of a committed request gets auth_failed", async () => {
     const h = harness();
     const previousKey = await existingDevice(h);
     const api = fakeApi(previousKey);
     // The fetch delivers the request twice, as `net.fetch` or a proxy can
     // after the connection failed: the first copy commits but its answer is
-    // lost, and only the answer to the second copy arrives.
+    // lost, and only the answer to the second copy arrives. The API
+    // restarted in between and lost its record of the code (#152).
     h.answer = (body) => {
       api.handle(body);
+      api.restart();
       return api.handle(body);
     };
     const { outcome } = await signIn(h);
