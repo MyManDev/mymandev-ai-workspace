@@ -76,7 +76,7 @@ jobs:
           psql -v ON_ERROR_STOP=1 -d postgres <<'SQL'
           CREATE ROLE mymandev_migrator LOGIN PASSWORD 'ci-migrator';
           CREATE ROLE mymandev_app LOGIN PASSWORD 'ci-app';
-          CREATE DATABASE mymandev OWNER mymandev_migrator;
+          CREATE DATABASE mymandev OWNER mymandev_migrator TEMPLATE template0 ENCODING 'UTF8';
           REVOKE ALL ON DATABASE mymandev FROM PUBLIC;
           GRANT CONNECT ON DATABASE mymandev TO mymandev_app;
           \c mymandev

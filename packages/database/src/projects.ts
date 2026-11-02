@@ -24,13 +24,17 @@ import { conversations, projects, users, workspaces } from "./schema/index.ts";
 //
 // Lock order, the order of `src/people.ts` extended: the account (`users`),
 // then the device (`devices`), as `lockActor` in the API does; then the
-// acting person (`workspace_members`); then the workspace row (`workspaces`),
-// only for the counts of a creation; then the project. Creating a project
-// locks the account, so that the creations of one account are counted one
-// after another, then the acting person, then the workspace row, so that the
-// creations of one workspace are counted one after another. Renaming locks
-// the acting person, then the project. An erasure (`src/account-erasure.ts`)
-// locks the workspace rows before their projects, in the same order.
+// acting person (`workspace_members`); then the workspace row (`workspaces`);
+// then the project. Creating a project locks the account, so that the
+// creations of one account are counted one after another, then the acting
+// person, then the workspace row, so that the creations of one workspace are
+// counted one after another. Renaming locks the acting person, then the
+// workspace row, then the project. So every writer of a workspace's project
+// names holds its workspace row, and they run one after another: two renames
+// that swap two names cannot each wait for the other's entry in the unique
+// index of names, a deadlock that PostgreSQL would end with an error. An
+// erasure (`src/account-erasure.ts`) locks the workspace rows before their
+// projects, in the same order.
 
 const DAY_MS = 24 * 60 * 60_000;
 /** Project Manager decision of 2026-11-02 (#155). */
@@ -239,8 +243,9 @@ export type RenameProjectResult =
 /**
  * Renames a project in one transaction (#155): the account that created it,
  * also after it left the workspace and joined again, the owner, or an admin.
- * It locks the acting person, then the project `FOR NO KEY UPDATE`, and
- * decides in this order: `not_member`, `not_found`, `forbidden`, then
+ * It locks the acting person, then the workspace row, as a creation does, so
+ * that the name changes of one workspace happen one after another, then the
+ * project, each `FOR NO KEY UPDATE`, and decides in this order: `not_member`, `not_found`, `forbidden`, then
  * `conflict` for an archived project. The name in force, exactly as stored,
  * changes nothing and writes nothing; a change of case alone is a new name.
  * It sets `name` and `updated_at`. A name that another project of the
@@ -259,6 +264,11 @@ export async function renameProject(
         if (actor === undefined) {
           return { renamed: false, refusal: "not_member" };
         }
+        await tx
+          .select({ id: workspaces.id })
+          .from(workspaces)
+          .where(eq(workspaces.id, input.workspaceId))
+          .for("no key update");
         const [project] = await tx
           .select({
             name: projects.name,

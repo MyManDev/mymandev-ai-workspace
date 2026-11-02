@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join as joinPath } from "node:path";
 import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { PGlite } from "@electric-sql/pglite";
 import {
   type DeviceId,
   type MemberId,
@@ -15,8 +18,10 @@ import {
 } from "@mymandev/protocol";
 import { and, eq, isNull } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
+import { eraseAccount } from "./account-erasure.ts";
 import type { Database } from "./db.ts";
 import { DatabaseError, withDatabaseErrors } from "./errors.ts";
+import { migrationsFolder } from "./migrate.ts";
 import { createWorkspace } from "./membership.ts";
 import { removeMember } from "./people.ts";
 import {
@@ -31,6 +36,7 @@ import {
   conversations,
   devices,
   projects,
+  userIdentities,
   users,
   workspaceMembers,
 } from "./schema/index.ts";
@@ -695,6 +701,91 @@ test("the database keeps one project conversation per project and the name keys,
   );
 });
 
+test("migration 0009 archives the projects of a workspace that an earlier erasure archived, before it adds the unique index of names", async () => {
+  // A database migrated to 0008, with the rows that an erasure left before
+  // #155: an archived workspace whose projects all have the placeholder name
+  // and no `archived_at`.
+  const client = await PGlite.create();
+  try {
+    const journal = JSON.parse(
+      readFileSync(joinPath(migrationsFolder, "meta", "_journal.json"), "utf8"),
+    ) as { entries: { tag: string }[] };
+    const tags = journal.entries.map((entry) => entry.tag);
+    const next = tags.indexOf("0009_project_keys");
+    assert.ok(next > 0);
+    const apply = async (tag: string) => {
+      const text = readFileSync(
+        joinPath(migrationsFolder, `${tag}.sql`),
+        "utf8",
+      );
+      for (const statement of text.split("--> statement-breakpoint")) {
+        if (statement.trim() !== "") {
+          await client.exec(statement);
+        }
+      }
+    };
+    for (const tag of tags.slice(0, next)) {
+      await apply(tag);
+    }
+
+    const userId = newId<UserId>();
+    const archived = newId<WorkspaceId>();
+    const active = newId<WorkspaceId>();
+    const earlier = "2026-10-01T00:00:00.000Z";
+    const archivedAt = "2026-11-01T00:00:00.000Z";
+    await client.query(
+      "insert into users (id, display_name) values ($1, 'Former user')",
+      [userId],
+    );
+    await client.query(
+      `insert into workspaces (id, name, created_by_user_id, archived_at)
+       values ($1, 'Archived workspace', $3, $4), ($2, 'Team', $3, null)`,
+      [archived, active, userId, archivedAt],
+    );
+    const placeholders = [newId<ProjectId>(), newId<ProjectId>()];
+    const archivedBefore = newId<ProjectId>();
+    const kept = newId<ProjectId>();
+    await client.query(
+      `insert into projects (id, workspace_id, name, created_by_user_id, archived_at)
+       values ($1, $5, 'Archived project', $7, null),
+              ($2, $5, 'Archived project', $7, null),
+              ($3, $5, 'Archived project', $7, $8),
+              ($4, $6, 'App', $7, null)`,
+      [
+        ...placeholders,
+        archivedBefore,
+        kept,
+        archived,
+        active,
+        userId,
+        earlier,
+      ],
+    );
+
+    for (const tag of tags.slice(next)) {
+      await apply(tag);
+    }
+    const { rows } = await client.query<{
+      id: string;
+      archivedAt: Date | null;
+    }>('select id, archived_at as "archivedAt" from projects');
+    const archivedAtOf = new Map(
+      rows.map((row) => [row.id, row.archivedAt?.toISOString() ?? null]),
+    );
+    assert.deepEqual(
+      Object.fromEntries(archivedAtOf),
+      Object.fromEntries([
+        [placeholders[0], archivedAt],
+        [placeholders[1], archivedAt],
+        [archivedBefore, earlier],
+        [kept, null],
+      ]),
+    );
+  } finally {
+    await client.close();
+  }
+});
+
 const SERVER_ONLY = {
   skip:
     process.env["DATABASE_TEST_URL"] === undefined &&
@@ -711,35 +802,55 @@ async function waitsForLock(): Promise<boolean> {
 }
 
 /**
- * Starts `action` while a second session holds `change` uncommitted, lets the
- * change commit once the action waits for a lock, and returns the action's
- * result. An action that does not lock what the change holds decides on the
- * state before the change.
+ * What the sessions of the test database that wait for a lock wait for: the
+ * table of the row, through the tuple lock that a session holds or waits for
+ * while it waits for the transaction that holds the row, or else the kind of
+ * lock, such as `transactionid` for an entry of a unique index.
  */
-async function afterConcurrentChange<T>(
-  change: (tx: Database) => Promise<unknown>,
+async function lockWaits(): Promise<string[]> {
+  assert.ok(testDatabase);
+  const { rows } = await testDatabase.client.query<{ waitedOn: string }>(
+    `select distinct coalesce(c.relname, w.locktype) as "waitedOn"
+       from pg_locks w
+       left join pg_locks t on t.pid = w.pid and t.locktype = 'tuple'
+       left join pg_class c on c.oid = t.relation
+      where not w.granted
+        and (select oid from pg_database where datname = current_database())
+            in (w.database, t.database)`,
+  );
+  return rows.map((row) => row.waitedOn).sort();
+}
+
+/**
+ * Runs `first` in a transaction of a second session and keeps it open while
+ * `action` starts in this session. Returns the action's result after the
+ * held transaction committed, and what the action waited for (`lockWaits`),
+ * empty when it did not wait.
+ */
+async function whileHeld<T>(
+  first: (tx: Database) => Promise<unknown>,
   action: () => Promise<T>,
-): Promise<T> {
+): Promise<Readonly<{ result: T; waitedOn: readonly string[] }>> {
   const url = testDatabase?.url;
   assert.ok(url, "the test database is on a server");
   const other = createDatabase(url, { max: 1 });
   const holding = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  const changing = other.db.transaction(async (tx) => {
-    await change(tx);
+  const held = other.db.transaction(async (tx) => {
+    await first(tx);
     holding.resolve();
     await release.promise;
   });
   try {
     await Promise.race([
       holding.promise,
-      changing.then(() => {
-        throw new Error("the change ended early");
+      held.then(() => {
+        throw new Error("the held transaction ended early");
       }),
     ]);
-    const result = action();
+    const running = action();
     let settled = false;
-    result.then(
+    running.then(
       () => {
         settled = true;
       },
@@ -747,48 +858,62 @@ async function afterConcurrentChange<T>(
         settled = true;
       },
     );
-    while (!settled && !(await waitsForLock())) {
-      await delay(10);
+    let waited = false;
+    while (!settled && !waited) {
+      waited = await waitsForLock();
+      if (!waited) {
+        await delay(10);
+      }
     }
+    // The action waits until the held transaction is released.
+    const waitedOn = waited ? await lockWaits() : [];
     release.resolve();
-    await changing;
-    return await result;
+    await held;
+    return { result: await running, waitedOn };
   } finally {
     release.resolve();
-    await changing.catch(() => undefined);
+    await held.catch(() => undefined);
     await other.close();
   }
 }
 
+/** Creates a project in `tx`, which must be created. */
+async function createdIn(
+  tx: Database,
+  workspaceId: WorkspaceId,
+  by: Account,
+  name: string,
+  now: Date = NOW,
+): Promise<void> {
+  const result = await createProject(tx, {
+    workspaceId,
+    userId: by.userId,
+    name,
+    now,
+  });
+  assert.ok(result.created, JSON.stringify(result));
+}
+
 test(
-  "of two concurrent creations of the same name, in different case, by two people, exactly one succeeds and the other is a conflict",
+  "a creation waits at the workspace row for a concurrent creation of the same name, in another case, by another person, and is then a conflict",
   SERVER_ONLY,
   async () => {
     const owner = await account("Owner");
     const member = await account("Member");
     const workspaceId = await workspaceOf(owner);
     await join(workspaceId, member);
-    const results = await Promise.all(
-      (
-        [
-          [owner, "Launch"],
-          [member, "launch"],
-        ] as const
-      ).map(([by, name]) =>
+    const { result, waitedOn } = await whileHeld(
+      (tx) => createdIn(tx, workspaceId, member, "Launch"),
+      () =>
         createProject(database(), {
           workspaceId,
-          userId: by.userId,
-          name,
+          userId: owner.userId,
+          name: "launch",
           now: NOW,
         }),
-      ),
     );
-    assert.deepEqual(
-      results
-        .map((result) => (result.created ? "created" : result.refusal))
-        .sort(),
-      ["conflict", "created"],
-    );
+    assert.deepEqual(result, { created: false, refusal: "conflict" });
+    assert.deepEqual(waitedOn, ["workspaces"]);
     assert.deepEqual(await countsOf(workspaceId), {
       projects: 1,
       conversations: 1,
@@ -797,7 +922,7 @@ test(
 );
 
 test(
-  `of two concurrent creations at the workspace's limit of ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE}, by two people, exactly one succeeds`,
+  `a creation waits at the workspace row for a concurrent creation by another person that reaches the limit of ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE}, and is then rate_limited`,
   SERVER_ONLY,
   async () => {
     const owner = await account("Owner");
@@ -807,22 +932,22 @@ test(
     await fill(workspaceId, owner, MAX_ACTIVE_PROJECTS_PER_WORKSPACE - 1);
     // Each creation locks another account and person, so only the workspace
     // row orders them.
-    const results = await Promise.all(
-      [owner, member].map((by, index) =>
+    const { result, waitedOn } = await whileHeld(
+      (tx) => createdIn(tx, workspaceId, owner, "Last"),
+      () =>
         createProject(database(), {
           workspaceId,
-          userId: by.userId,
-          name: `Concurrent ${index}`,
+          userId: member.userId,
+          name: "One more",
           now: NOW,
         }),
-      ),
     );
-    assert.deepEqual(
-      results
-        .map((result) => (result.created ? "created" : result.refusal))
-        .sort(),
-      ["created", "rate_limited"],
-    );
+    assert.deepEqual(result, {
+      created: false,
+      refusal: "rate_limited",
+      retryAfterMs: null,
+    });
+    assert.deepEqual(waitedOn, ["workspaces"]);
     assert.equal(
       (await listProjects(database(), workspaceId)).length,
       MAX_ACTIVE_PROJECTS_PER_WORKSPACE,
@@ -831,7 +956,7 @@ test(
 );
 
 test(
-  `of two concurrent creations of one account at its limit of ${MAX_NEW_PROJECTS_PER_DAY} a day, in two workspaces, exactly one succeeds`,
+  `a creation waits at the account's row for a concurrent creation of the same account in another workspace that reaches its limit of ${MAX_NEW_PROJECTS_PER_DAY} a day, and is then rate_limited`,
   SERVER_ONLY,
   async () => {
     const owner = await account("Owner");
@@ -841,27 +966,28 @@ test(
       await created(first, owner, `Project ${index}`, NOW);
     }
     // The workspace rows differ, so only the account's row orders them.
-    const results = await Promise.all(
-      [first, second].map((workspaceId) =>
+    const { result, waitedOn } = await whileHeld(
+      (tx) => createdIn(tx, first, owner, "Last", LATER),
+      () =>
         createProject(database(), {
-          workspaceId,
+          workspaceId: second,
           userId: owner.userId,
-          name: "Concurrent",
+          name: "One more",
           now: LATER,
         }),
-      ),
     );
-    assert.deepEqual(
-      results
-        .map((result) => (result.created ? "created" : result.refusal))
-        .sort(),
-      ["created", "rate_limited"],
-    );
+    assert.deepEqual(result, {
+      created: false,
+      refusal: "rate_limited",
+      retryAfterMs: DAY_MS - (LATER.getTime() - NOW.getTime()),
+    });
+    assert.deepEqual(waitedOn, ["users"]);
+    assert.deepEqual(await listProjects(database(), second), []);
   },
 );
 
 test(
-  "a rename waits for a concurrent creation of the same name and is then a conflict",
+  "a rename waits at the workspace row for a concurrent creation of the same name and is then a conflict",
   SERVER_ONLY,
   async () => {
     const owner = await account("Owner");
@@ -869,16 +995,8 @@ test(
     const workspaceId = await workspaceOf(owner);
     await join(workspaceId, member);
     const project = await created(workspaceId, owner, "App");
-    // The rename locks neither the creator's person nor the workspace row,
-    // so only the unique index of names makes it wait.
-    const rename = await afterConcurrentChange(
-      (tx) =>
-        createProject(tx, {
-          workspaceId,
-          userId: member.userId,
-          name: "Web",
-          now: NOW,
-        }),
+    const { result, waitedOn } = await whileHeld(
+      (tx) => createdIn(tx, workspaceId, member, "Web"),
       () =>
         renameProject(database(), {
           workspaceId,
@@ -888,8 +1006,84 @@ test(
           now: LATER,
         }),
     );
-    assert.deepEqual(rename, { renamed: false, refusal: "conflict" });
+    assert.deepEqual(result, { renamed: false, refusal: "conflict" });
+    assert.deepEqual(waitedOn, ["workspaces"]);
     assert.deepEqual(await activeNames(workspaceId), ["App", "Web"]);
+  },
+);
+
+test(
+  "a rename waits at the workspace row for a concurrent rename in the workspace and then sees its new name",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const admin = await account("Admin");
+    const workspaceId = await workspaceOf(owner);
+    await join(workspaceId, admin, "admin");
+    const alpha = await created(workspaceId, owner, "Alpha");
+    const beta = await created(workspaceId, owner, "Beta");
+    // Without the workspace row the second rename would wait only for the
+    // first one's entry of "beta" in the unique index of names; two renames
+    // that swap two names then each wait for the other, a deadlock.
+    const { result, waitedOn } = await whileHeld(
+      (tx) =>
+        renameProject(tx, {
+          workspaceId,
+          projectId: beta,
+          userId: admin.userId,
+          name: "Gamma",
+          now: NOW,
+        }),
+      () =>
+        renameProject(database(), {
+          workspaceId,
+          projectId: alpha,
+          userId: owner.userId,
+          name: "beta",
+          now: LATER,
+        }),
+    );
+    assert.deepEqual(result, { renamed: true, changed: true });
+    assert.deepEqual(waitedOn, ["workspaces"]);
+    assert.deepEqual(await activeNames(workspaceId), ["Gamma", "beta"]);
+  },
+);
+
+test(
+  "two concurrent renames that swap two names never deadlock: each is a conflict, and the names stay",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const admin = await account("Admin");
+    const workspaceId = await workspaceOf(owner);
+    await join(workspaceId, admin, "admin");
+    const alpha = await created(workspaceId, owner, "Alpha");
+    const beta = await created(workspaceId, owner, "Beta");
+    // A swap of names by renames can never succeed, because each name is
+    // taken while the other project holds it; it must not fail with an error.
+    for (let round = 0; round < 20; round += 1) {
+      const results = await Promise.all(
+        (
+          [
+            [owner, alpha, "Beta"],
+            [admin, beta, "Alpha"],
+          ] as const
+        ).map(([by, projectId, name]) =>
+          renameProject(database(), {
+            workspaceId,
+            projectId,
+            userId: by.userId,
+            name,
+            now: LATER,
+          }),
+        ),
+      );
+      assert.deepEqual(results, [
+        { renamed: false, refusal: "conflict" },
+        { renamed: false, refusal: "conflict" },
+      ]);
+    }
+    assert.deepEqual(await activeNames(workspaceId), ["Alpha", "Beta"]);
   },
 );
 
@@ -901,7 +1095,7 @@ test(
     const member = await account("Member");
     const workspaceId = await workspaceOf(owner);
     const person = await join(workspaceId, member);
-    const creation = await afterConcurrentChange(
+    const { result, waitedOn } = await whileHeld(
       (tx) =>
         removeMember(tx, {
           workspaceId,
@@ -917,7 +1111,50 @@ test(
           now: LATER,
         }),
     );
-    assert.deepEqual(creation, { created: false, refusal: "not_member" });
+    assert.deepEqual(result, { created: false, refusal: "not_member" });
+    assert.deepEqual(waitedOn, ["workspace_members"]);
+    assert.deepEqual(await countsOf(workspaceId), {
+      projects: 0,
+      conversations: 0,
+    });
+  },
+);
+
+test(
+  "a creation by the owner waits for a concurrent erasure of the owner's account that archives the workspace, and is then refused as no member",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    await database()
+      .insert(userIdentities)
+      .values({
+        id: newUuidV7(),
+        userId: owner.userId,
+        identityProvider: "github",
+        subject: String(randomBytes(4).readUInt32BE()),
+        login: "owner-login",
+        accountCreatedAt: NOW,
+        lastSignInAt: NOW,
+      });
+    const workspaceId = await workspaceOf(owner);
+    const { result, waitedOn } = await whileHeld(
+      async (tx) => {
+        const erasure = await eraseAccount(tx, {
+          userId: owner.userId,
+          now: NOW,
+        });
+        assert.ok(erasure.erased, JSON.stringify(erasure));
+      },
+      () =>
+        createProject(database(), {
+          workspaceId,
+          userId: owner.userId,
+          name: "App",
+          now: LATER,
+        }),
+    );
+    assert.deepEqual(result, { created: false, refusal: "not_member" });
+    assert.deepEqual(waitedOn, ["users"]);
     assert.deepEqual(await countsOf(workspaceId), {
       projects: 0,
       conversations: 0,
