@@ -14,6 +14,9 @@ export {
   type EnableAccountResult,
 } from "./account-status.ts";
 export {
+  type ArchivedWorkspace,
+  ERASED_AGENT_NAME,
+  ERASED_DEVICE_LABEL,
   ERASED_DISPLAY_NAME,
   eraseAccount,
   type EraseAccountInput,

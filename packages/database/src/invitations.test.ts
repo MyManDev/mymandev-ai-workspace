@@ -37,6 +37,7 @@ import {
   users,
   workspaceInvitations,
   workspaceMembers,
+  workspaces,
 } from "./schema/index.ts";
 import { createTestDatabase } from "./testing.ts";
 
@@ -1629,6 +1630,48 @@ test("an active member of the workspace gets already_member before anything is c
   });
   assert.ok(accepted.accepted);
   assert.equal(accepted.membership.member.id, linus);
+});
+
+test("a live code of an archived workspace is refused as invitation_invalid with workspace_archived, and nothing is written", async () => {
+  const owner = await account("Owner");
+  const guest = await account("Guest");
+  await identify(owner, "owner-login");
+  const { workspaceId } = await workspaceOf(owner);
+  const person = await addPerson(workspaceId, owner);
+  const tokenHash = hash();
+  const { invitation } = await created({
+    workspaceId,
+    ...owner,
+    memberId: person,
+    tokenHash,
+    now: NOW,
+  });
+  // Archived as only data written outside these functions can be: the
+  // erasure that archives a workspace also revokes its invitations.
+  await database()
+    .update(workspaces)
+    .set({ archivedAt: NOW })
+    .where(eq(workspaces.id, workspaceId));
+  const before = await snapshot(workspaceId);
+
+  const refusal = {
+    refusal: "invitation_invalid",
+    reason: "workspace_archived",
+    invitationId: invitation.id,
+  };
+  assert.deepEqual(
+    await previewInvitation(database(), {
+      tokenHash,
+      userId: guest.userId,
+      now: LATER,
+    }),
+    { previewed: false, ...refusal },
+  );
+  assert.deepEqual(
+    await acceptInvitation(database(), { tokenHash, ...guest, now: LATER }),
+    { accepted: false, ...refusal },
+  );
+  assert.deepEqual(await snapshot(workspaceId), before, "nothing changed");
 });
 
 test("an account removed from a workspace rejoins as a new person, and its earlier person stays in the history", async () => {

@@ -22,6 +22,7 @@ export const AUDIT_ACTIONS = Object.freeze([
   // Workspaces and the people in them.
   "workspace.created",
   "workspace.unclaimed_member_limit_changed",
+  "workspace.archived",
   "member.defined",
   "member.renamed",
   "member.claimed",
@@ -54,7 +55,9 @@ export type AuditAction = (typeof AUDIT_ACTIONS)[number];
  * invitation revocation reason, the latter when a new invitation for the same
  * person replaces it. `account_erased` also marks the `member.removed` and
  * `join_request.withdrawn` records of an operator's erasure, which have no
- * actor (`src/account-erasure.ts`).
+ * actor (`src/account-erasure.ts`), and the `workspace.archived`,
+ * `invitation.revoked`, and `join_request.denied` records of a workspace that
+ * the erasure archives.
  */
 export const AUDIT_REASONS = Object.freeze([
   "removed",
