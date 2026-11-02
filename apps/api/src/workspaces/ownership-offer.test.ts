@@ -45,8 +45,9 @@ import type { WorkspaceEvent } from "./events.ts";
 // hours, to an active, claimed person; the target accepts within 7 days, or
 // the owner withdraws. The target's account gets `account.ownership_offered`
 // and `account.ownership_offer_ended`, and a transfer reaches the workspace's
-// subscribers as `workspace.ownership.transferred`. Every message is decoded
-// with the desktop's decoder.
+// subscribers as `workspace.ownership.transferred` and both accounts, the
+// previous and the new owner's, as `account.ownership_transferred`. Every
+// message is decoded with the desktop's decoder.
 
 const database = useTestDatabase();
 
@@ -259,6 +260,22 @@ function offerEnded(
   };
 }
 
+function ownershipTransferred(
+  workspaceId: WorkspaceId,
+  previousOwnerMemberId: MemberId,
+  ownerMemberId: MemberId,
+  transferredAt: number,
+): ServerFrame {
+  return {
+    protocolVersion: 0,
+    type: "account.ownership_transferred",
+    workspaceId,
+    previousOwnerMemberId,
+    ownerMemberId,
+    transferredAt: iso(transferredAt),
+  };
+}
+
 test("the owner offers ownership with 204; only the target's connections get account.ownership_offered, and the view shows the offer", async (t) => {
   const { clock, events, account } = await instance(t);
   const ada = await account(3601);
@@ -458,9 +475,10 @@ test("only the owner offers, never to themselves, to an active, claimed person, 
   assert.deepEqual(events, [], "a refusal sends no event");
 });
 
-test("the target accepts with 204: the owner becomes an admin and the target the owner, and only the workspace's subscribers get workspace.ownership.transferred from the system", async (t) => {
+test("the target accepts with 204: the owner becomes an admin and the target the owner, the workspace's subscribers get workspace.ownership.transferred from the system, and then every connection of both accounts gets account.ownership_transferred", async (t) => {
   const { clock, connections, events, account } = await instance(t);
   const ada = await account(3621);
+  const adasDesktop = await signInDevice(ada.app);
   const bob = await account(3622);
   const bobsDesktop = await signInDevice(bob.app);
   const cleo = await account(3623);
@@ -475,10 +493,19 @@ test("the target accepts with 204: the owner becomes an admin and the target the
   const other = await workspaceOf(dan.device, [[bob.device, "member"]]);
 
   const adaClient = (await connected(t, ada.app, ada.device)).client;
+  const adasDesktopClient = (await connected(t, ada.app, adasDesktop)).client;
   const laptop = (await connected(t, bob.app, bob.device)).client;
   const desktop = (await connected(t, bob.app, bobsDesktop)).client;
   const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
   const danClient = (await connected(t, dan.app, dan.device)).client;
+  const all = [
+    adaClient,
+    adasDesktopClient,
+    laptop,
+    desktop,
+    cleoClient,
+    danClient,
+  ];
   await subscribe(danClient, other.workspaceId);
   await subscribe(laptop, other.workspaceId);
   await subscribe(adaClient, team.workspaceId);
@@ -490,10 +517,12 @@ test("the target accepts with 204: the owner becomes an admin and the target the
   assert.equal(offeredResponse.statusCode, 204, offeredResponse.body);
   assert.equal((await nextFrame(laptop)).type, "account.ownership_offered");
   assert.equal((await nextFrame(desktop)).type, "account.ownership_offered");
-  await quiet(adaClient, laptop, desktop, cleoClient, danClient);
+  await quiet(...all);
 
   // From Bob's desktop, a device that is not 72 hours old: an acceptance
   // needs no device age.
+  clock.advance(SECOND_MS);
+  const acceptedAt = clock.now();
   const fromDesktop = {
     ...bob,
     device: bobsDesktop,
@@ -507,6 +536,7 @@ test("the target accepts with 204: the owner becomes an admin and the target the
     const event = await nextEvent(client);
     assert.ok(event.type === "workspace.ownership.transferred", event.type);
     assert.equal(event.workspaceId, team.workspaceId);
+    assert.equal(event.occurredAt, iso(acceptedAt));
     assert.deepEqual(event.actor, { kind: "system" });
     assert.equal(event.deviceId, null);
     assert.deepEqual(event.payload, {
@@ -514,8 +544,20 @@ test("the target accepts with 204: the owner becomes an admin and the target the
       ownerMemberId: bobInTeam,
     });
   }
-  // No offer frame after a transfer; the desktop subscribed to nothing.
-  await quiet(adaClient, laptop, desktop, cleoClient, danClient);
+  // After the event, every connection of the previous and the new owner's
+  // accounts, also the desktops that subscribed to nothing.
+  const frame = ownershipTransferred(
+    team.workspaceId,
+    team.ownerId,
+    bobInTeam,
+    acceptedAt,
+  );
+  for (const client of [adaClient, adasDesktopClient, laptop, desktop]) {
+    assert.deepEqual(await nextFrame(client), frame);
+  }
+  // No offer frame after a transfer, and nothing for Cleo's or Dan's
+  // account.
+  await quiet(...all);
   assert.equal(events.length, 1);
   const [event] = events;
   assert.ok(event !== undefined);
@@ -561,7 +603,7 @@ test("the target accepts with 204: the owner becomes an admin and the target the
   assert.equal(leave.statusCode, 403, leave.body);
   const offerBack = await offer(ada, team.workspaceId, team.ownerId);
   assert.equal(errorCode(offerBack), "forbidden");
-  await quiet(adaClient, laptop, desktop, cleoClient, danClient);
+  await quiet(...all);
 });
 
 test("only the target accepts a live offer, and nobody accepts a withdrawn one; a refusal sends nothing", async (t) => {

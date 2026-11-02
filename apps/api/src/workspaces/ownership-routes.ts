@@ -9,6 +9,7 @@ import {
 import {
   type AccountOwnershipOfferedFrame,
   type AccountOwnershipOfferEndedFrame,
+  type AccountOwnershipTransferredFrame,
   MEMBERSHIP_ROUTES,
   type OfferOwnershipRequest,
   OfferOwnershipRequestSchema,
@@ -33,7 +34,8 @@ export type OwnershipRouteOptions = Readonly<{
   onWorkspaceEvent: WorkspaceEventHandler;
   /**
    * Receives `account.ownership_offered` and `account.ownership_offer_ended`
-   * for the target's account after the commit.
+   * for the target's account, and `account.ownership_transferred` for the
+   * previous and the new owner's accounts, after the commit.
    */
   onAccountFrame: AccountFrameHandler;
 }>;
@@ -53,9 +55,13 @@ function refused(refusal: PersonRefusal | "device_too_new"): ApiError {
  * Each runs in one transaction that checks the account and the device again
  * (`lockActor`) and then decides on the locked people. After the commit, the
  * target's account gets `account.ownership_offered` or
- * `account.ownership_offer_ended` through `onAccountFrame`, and a transfer
+ * `account.ownership_offer_ended` through `onAccountFrame`. A transfer
  * reaches the workspace's subscribers as `workspace.ownership.transferred`
- * through `onWorkspaceEvent`.
+ * through `onWorkspaceEvent`, and then every connection of the previous
+ * owner's account and of the new owner's account as
+ * `account.ownership_transferred` through `onAccountFrame`, in this order.
+ * `buildApp` connects both handlers to the registry, which sends at once, so
+ * the order holds.
  */
 export function registerOwnershipRoutes(
   workspace: FastifyInstance,
@@ -154,6 +160,19 @@ export function registerOwnershipRoutes(
           ownerMemberId: result.ownerMemberId,
         },
       });
+      const frame: AccountOwnershipTransferredFrame = {
+        protocolVersion: PROTOCOL_VERSION,
+        type: "account.ownership_transferred",
+        workspaceId,
+        previousOwnerMemberId: result.previousOwnerMemberId,
+        ownerMemberId: result.ownerMemberId,
+        transferredAt: now.toISOString(),
+      };
+      // Two accounts: a person of the workspace belongs to one account, and
+      // the target is never the owner.
+      for (const userId of [result.previousOwnerUserId, auth.userId]) {
+        sendAccountFrame(request, options.onAccountFrame, userId, frame);
+      }
       return reply.code(204).send();
     },
   );

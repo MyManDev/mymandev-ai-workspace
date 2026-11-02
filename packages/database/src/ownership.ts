@@ -274,6 +274,11 @@ export type AcceptOwnershipOfferResult =
       accepted: true;
       /** The former owner, an `admin` now. */
       previousOwnerMemberId: MemberId;
+      /**
+       * The account that claimed the former owner, which the server tells
+       * with the acting account.
+       */
+      previousOwnerUserId: UserId;
       /** The acting account's person, the `owner` now. */
       ownerMemberId: MemberId;
     }>
@@ -332,6 +337,10 @@ export async function acceptOwnershipOffer(
       if (owner === undefined) {
         return { accepted: false, refusal: "conflict", ended: null };
       }
+      // The CHECK on `workspace_members` keeps an unclaimed person a `member`.
+      if (owner.userId === null) {
+        throw new Error("An owner is a claimed person");
+      }
       await tx
         .update(workspaceMembers)
         .set({ role: "admin", updatedAt: input.now })
@@ -344,6 +353,7 @@ export async function acceptOwnershipOffer(
       return {
         accepted: true,
         previousOwnerMemberId: owner.id,
+        previousOwnerUserId: owner.userId,
         ownerMemberId: actor.id,
       };
     }),

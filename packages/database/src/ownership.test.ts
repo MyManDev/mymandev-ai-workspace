@@ -592,6 +592,7 @@ test("the target accepts from any device: the owner becomes an admin and the tar
     {
       accepted: true,
       previousOwnerMemberId: ownerPerson,
+      previousOwnerUserId: owner.userId,
       ownerMemberId: memberPerson,
     },
   );
@@ -1253,6 +1254,7 @@ test(
         {
           accepted: true,
           previousOwnerMemberId: ownerPerson,
+          previousOwnerUserId: owner.userId,
           ownerMemberId: targetPerson,
         },
         change,
@@ -1341,6 +1343,7 @@ test(
     assert.deepEqual(first, {
       accepted: true,
       previousOwnerMemberId: ownerPerson,
+      previousOwnerUserId: owner.userId,
       ownerMemberId: memberPerson,
     });
     assert.deepEqual(second, {
