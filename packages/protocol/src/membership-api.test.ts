@@ -391,7 +391,12 @@ test("each route answers only known error codes, the common ones included", () =
 
 test("the README's route table lists every route with its codes", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
-  const rows = readme
+  // The section of the membership routes, up to the next section.
+  const section = readme
+    .split("\n## Membership routes\n")[1]
+    ?.split("\n## ")[0];
+  assert.ok(section);
+  const rows = section
     .split("\n")
     .filter((line) => /^\| `(?:GET|POST) \//u.test(line))
     .map((line) => line.split("|").map((cell) => cell.trim()));

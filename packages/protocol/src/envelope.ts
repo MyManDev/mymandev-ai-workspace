@@ -46,7 +46,11 @@ export const envelopeHeaderShape = Object.freeze({
   /** The routing and security boundary. */
   workspaceId: WorkspaceIdSchema,
   actor: ActorSchema,
-  /** null only for events that the server itself originates. */
+  /**
+   * null for events that the server itself originates, and for an agent's
+   * run transition that the server relays (#28), so that other members never
+   * see the host device's ID.
+   */
   deviceId: DeviceIdSchema.nullable(),
   /** Groups one flow, for example one request and all its runs. A label, never used for lookups. */
   correlationId: CorrelationIdSchema.optional(),
@@ -54,7 +58,14 @@ export const envelopeHeaderShape = Object.freeze({
   causationId: EventIdSchema.optional(),
 });
 
-/** A run changed state. The transition must be allowed by `canTransition`. */
+/**
+ * A run changed state. The transition must be allowed by `canTransition`.
+ * The server sends a run creation and its own cancellations with a `system`
+ * actor and `deviceId: null`. Every other transition comes from the agent's
+ * host device with the agent as the actor; the server stores it and relays
+ * it to the workspace's subscribers with the same event ID, actor, and
+ * payload, but with `deviceId: null` (#28).
+ */
 export const AgentRunStateChangedPayloadSchema = z
   .object({
     runId: RunIdSchema,
@@ -227,9 +238,12 @@ export type ChatMessageSendEvent = z.infer<typeof ChatMessageSendEventSchema>;
  * subscribed to the workspace, the sender's included. Only the server
  * originates it, with a `system` actor and `deviceId: null`; the null device
  * keeps the sender's device ID from other members. The message is always
- * attributed to its author, `payload.message.authorMemberId`.
+ * attributed to its author, `payload.message.author`.
  * The server sets `causationId` to the ID of the `chat.message.send` that
  * the message came from, so the sending device can replace its pending copy.
+ * A `chat.message.send` whose event ID the server already stored gets the
+ * stored message again in this event, sent only to the sending connection,
+ * with `causationId` set to that event ID (#27).
  */
 export const ChatMessageCreatedEventSchema = z.object({
   ...envelopeHeaderShape,
@@ -289,7 +303,8 @@ export const EVENT_TYPES: readonly EventType[] = Object.freeze(
 export function actorAllowed(event: ProtocolEvent): boolean {
   switch (event.type) {
     case "agent.run.state_changed":
-      // The server (system) creates runs; afterwards only the run's agent reports transitions.
+      // The server (system) creates runs; afterwards only the run's agent
+      // reports transitions. The server relays them with deviceId null.
       return (
         event.actor.kind === "system" ||
         (event.actor.kind === "agent" &&

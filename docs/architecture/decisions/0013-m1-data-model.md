@@ -51,6 +51,8 @@ Update of 2026-10-29 (#74), following ADR 0015 (P-79, P-82): a `provider_connect
 
 The message sequence is allocated per conversation in the insert transaction: the writer increments `conversations.last_seq` with an `UPDATE ... RETURNING` and inserts the message with the returned number. The number a client sees therefore reveals nothing about other conversations or workspaces. A global identity column would: the gaps between two messages would show how many messages other workspaces wrote in between. The `UPDATE` locks the conversation row until the transaction ends, so concurrent writers to one conversation are serialized; different conversations do not wait for each other. The first message writer (M2-03) adds the allocation as a database package function. Event sequences in M2 follow the same rule (per workspace or per run, never global).
 
+Update of 2026-11-02 (#27): `messages` gains `author_member_id` -> workspace_members, the author's person, set with `author_user_id` for a person's message, because a person who leaves and rejoins gets a new person row (ADR 0014) and the protocol names a message's author by person (`{ kind: "member", memberId }`) or by agent (`{ kind: "agent", agentId }`). The protocol carries each message's `seq` in `chat.message.created` and in the history, which pages by it. The migration comes with the database part of #27. The text above is unchanged.
+
 ## Consequences
 
 - One grant row grants exactly one capability. There is no wildcard, role, or level column, so the data model cannot express an inferred capability.

@@ -23,6 +23,7 @@ import {
 import {
   ConnectionIdSchema,
   DeviceIdSchema,
+  EventIdSchema,
   JoinRequestIdSchema,
   MemberIdSchema,
   UserIdSchema,
@@ -30,6 +31,7 @@ import {
 } from "./ids.ts";
 import { OwnershipOfferSchema } from "./membership-api.ts";
 import {
+  EVENT_REFUSAL_CODES,
   EVENT_TYPE_PATTERN,
   FRAME_TYPE_PATTERN,
   LIMITS,
@@ -349,6 +351,27 @@ export const PresenceChangedFrameSchema = z.object({
 });
 export type PresenceChangedFrame = z.infer<typeof PresenceChangedFrameSchema>;
 
+export const EventRefusalCodeSchema = z.enum(EVENT_REFUSAL_CODES);
+
+/**
+ * The server refused an event that this connection sent (#27, #28), and the
+ * connection stays open. Sent only to the sending connection, also when it
+ * is not subscribed to the event's workspace; the server stored and relayed
+ * nothing. `eventId` is the ID of the refused event. `not_found` and
+ * `conflict` are described at `EVENT_REFUSAL_CODES`. A protocol violation is
+ * never answered with this frame: a message that `decodeClientMessage`
+ * refuses, an identity mismatch, and an account that is not an active member
+ * of the event's workspace close the connection, as a device or an account
+ * that may no longer act does.
+ */
+export const EventRefusedFrameSchema = z.object({
+  ...frameHeaderShape,
+  type: z.literal("event.refused"),
+  eventId: EventIdSchema,
+  code: EventRefusalCodeSchema,
+});
+export type EventRefusedFrame = z.infer<typeof EventRefusedFrameSchema>;
+
 /** Every frame that the server sends. */
 export const ServerFrameSchema = z.discriminatedUnion("type", [
   AuthChallengeFrameSchema,
@@ -364,6 +387,7 @@ export const ServerFrameSchema = z.discriminatedUnion("type", [
   WorkspaceSubscribeRefusedFrameSchema,
   WorkspaceUnsubscribedFrameSchema,
   PresenceChangedFrameSchema,
+  EventRefusedFrameSchema,
 ]);
 export type ServerFrame = z.infer<typeof ServerFrameSchema>;
 

@@ -11,6 +11,7 @@ import {
   decodeClientFrame,
   decodeClientMessage,
   decodeServerMessage,
+  EventRefusedFrameSchema,
   MAX_AUTH_FRAME_BYTES,
   MAX_FRAME_BYTES,
   PresenceChangedFrameSchema,
@@ -23,6 +24,7 @@ import {
   WS_AUTH_TIMEOUT_MS,
 } from "./frames.ts";
 import {
+  EVENT_REFUSAL_CODES,
   EVENT_TYPE_PATTERN,
   FRAME_TYPE_PATTERN,
   LIMITS,
@@ -44,6 +46,7 @@ const PROJECT_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000e";
 const MESSAGE_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000f";
 const JOIN_REQUEST_ID = "0192f0a0-7b3c-7d4e-8f50-000000000010";
 const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000005";
+const OTHER_AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000006";
 const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000000007";
 const NOW = "2026-10-30T17:00:00.000Z";
 const NONCE = "A".repeat(43);
@@ -133,7 +136,18 @@ function serverFrames(): Json[] {
       decidedAt: NOW,
     },
     ...workspaceServerFrames(),
+    eventRefused(),
   ];
+}
+
+/** The server refused the event of `chatSend`. */
+function eventRefused(code = "not_found"): Json {
+  return {
+    protocolVersion: 0,
+    type: "event.refused",
+    eventId: EVENT_ID,
+    code,
+  };
 }
 
 /** The server's frames of a workspace subscription. */
@@ -198,7 +212,7 @@ function chatSend(body = "Hello"): Json {
 }
 
 /** The server stored the message of `chatSend`. */
-function chatCreated(): Json {
+function chatCreated(message: Json = {}): Json {
   return {
     protocolVersion: 0,
     id: OTHER_EVENT_ID,
@@ -212,10 +226,31 @@ function chatCreated(): Json {
       message: {
         id: MESSAGE_ID,
         projectId: PROJECT_ID,
-        authorMemberId: MEMBER_ID,
+        seq: 1,
+        author: { kind: "member", memberId: MEMBER_ID },
         body: "Hello",
         createdAt: NOW,
+        ...message,
       },
+    },
+  };
+}
+
+/** The agent's host device reports a run transition. */
+function runTransition(): Json {
+  return {
+    protocolVersion: 0,
+    id: EVENT_ID,
+    type: "agent.run.state_changed",
+    occurredAt: NOW,
+    workspaceId: WORKSPACE_ID,
+    actor: { kind: "agent", agentId: AGENT_ID },
+    deviceId: DEVICE_ID,
+    payload: {
+      runId: RUN_ID,
+      agentId: AGENT_ID,
+      previousState: "queued",
+      state: "running",
     },
   };
 }
@@ -675,7 +710,8 @@ test("after authentication, a device sends workspace frames and events, but neve
     payload: {
       projectId: PROJECT_ID,
       body: "Hello",
-      authorMemberId: MEMBER_ID,
+      author: { kind: "member", memberId: MEMBER_ID },
+      seq: 1,
     },
   });
   assert.deepEqual(sent, { ok: true, kind: "event", event: chatSend() });
@@ -804,26 +840,13 @@ test("chat.message.send comes from a person on a device, and chat.message.create
     false,
   );
 
-  const message = (chatCreated()["payload"] as Json)["message"] as Json;
   const payloadCases: [label: string, input: Json][] = [
-    [
-      "a message without an author",
-      {
-        ...chatCreated(),
-        payload: { message: { ...message, authorMemberId: undefined } },
-      },
-    ],
+    ["a message without an author", chatCreated({ author: undefined })],
     [
       "a message with a local time",
-      {
-        ...chatCreated(),
-        payload: { message: { ...message, createdAt: "2026-10-30T17:00:00" } },
-      },
+      chatCreated({ createdAt: "2026-10-30T17:00:00" }),
     ],
-    [
-      "a blank message",
-      { ...chatCreated(), payload: { message: { ...message, body: " " } } },
-    ],
+    ["a blank message", chatCreated({ body: " " })],
   ];
   for (const [label, input] of payloadCases) {
     assert.deepEqual(
@@ -832,6 +855,67 @@ test("chat.message.send comes from a person on a device, and chat.message.create
       label,
     );
   }
+});
+
+test("chat.message.created names its author as a person or an agent, and carries the message's seq", () => {
+  const authors: Json[] = [
+    { kind: "member", memberId: MEMBER_ID },
+    { kind: "agent", agentId: AGENT_ID },
+  ];
+  for (const author of authors) {
+    const input = chatCreated({ author });
+    assert.deepEqual(
+      decodeServerMessage(input),
+      { ok: true, kind: "event", event: input },
+      String(author["kind"]),
+    );
+  }
+  // The largest seq that JSON and zod's integer carry exactly.
+  const last = chatCreated({ seq: Number.MAX_SAFE_INTEGER });
+  assert.equal(decodeServerMessage(last).ok, true);
+
+  const cases: [label: string, message: Json][] = [
+    // The field that the union replaced is no author.
+    ["only authorMemberId", { author: undefined, authorMemberId: MEMBER_ID }],
+    ["a user author", { author: { kind: "user", userId: USER_ID } }],
+    ["a system author", { author: { kind: "system" } }],
+    ["a member without an ID", { author: { kind: "member" } }],
+    [
+      "a member with an agent ID",
+      { author: { kind: "member", agentId: AGENT_ID } },
+    ],
+    [
+      "an agent with a person ID",
+      { author: { kind: "agent", memberId: MEMBER_ID } },
+    ],
+    [
+      "an uppercase person ID",
+      { author: { kind: "member", memberId: MEMBER_ID.toUpperCase() } },
+    ],
+    ["an author as a string", { author: MEMBER_ID }],
+    ["no seq", { seq: undefined }],
+    ["seq 0", { seq: 0 }],
+    ["a negative seq", { seq: -1 }],
+    ["a fractional seq", { seq: 1.5 }],
+    ["a seq as a string", { seq: "1" }],
+    ["a seq beyond the safe integers", { seq: Number.MAX_SAFE_INTEGER + 1 }],
+  ];
+  for (const [label, message] of cases) {
+    assert.deepEqual(
+      decodeServerMessage(chatCreated(message)),
+      { ok: false, code: "invalid_payload" },
+      label,
+    );
+  }
+
+  // Fields beside the union's are stripped, so an author is one kind only.
+  const decoded = decodeServerMessage(
+    chatCreated({
+      author: { kind: "member", memberId: MEMBER_ID, agentId: AGENT_ID },
+      authorMemberId: OTHER_MEMBER_ID,
+    }),
+  );
+  assert.deepEqual(decoded, { ok: true, kind: "event", event: chatCreated() });
 });
 
 test("a chat message holds up to 16,000 characters, and the largest one fits the gateway's 64 KiB frame limit", () => {
@@ -876,6 +960,137 @@ test("a chat message holds up to 16,000 characters, and the largest one fits the
     assert.ok(
       bytes < MAX_FRAME_BYTES,
       `${JSON.stringify(character)}: ${bytes}`,
+    );
+
+    // The stored message, with the largest seq and the longer author kind,
+    // fits the same limit, so a device can hold its frames to it as well.
+    for (const author of [
+      { kind: "member", memberId: MEMBER_ID },
+      { kind: "agent", agentId: AGENT_ID },
+    ]) {
+      const created = {
+        ...chatCreated({ body, author, seq: Number.MAX_SAFE_INTEGER }),
+        correlationId: OTHER_EVENT_ID,
+      };
+      assert.equal(decodeServerMessage(created).ok, true, author.kind);
+      const createdBytes = new TextEncoder().encode(
+        JSON.stringify(created),
+      ).length;
+      assert.ok(
+        createdBytes < MAX_FRAME_BYTES,
+        `${JSON.stringify(character)}, ${author.kind}: ${createdBytes}`,
+      );
+    }
+  }
+});
+
+test("event.refused reaches only the sender, with the refused event's ID and a closed code", () => {
+  assert.deepEqual(EVENT_REFUSAL_CODES, ["not_found", "conflict"]);
+  assert.ok(Object.isFrozen(EVENT_REFUSAL_CODES));
+  for (const code of EVENT_REFUSAL_CODES) {
+    const input = eventRefused(code);
+    assert.deepEqual(
+      decodeServerMessage({ ...input, extra: true }),
+      { ok: true, kind: "frame", frame: input },
+      code,
+    );
+  }
+  // The frame names the event and the code, and nothing about the workspace,
+  // the project, the run, or the stored state.
+  const decoded = decodeServerMessage({
+    ...eventRefused(),
+    workspaceId: WORKSPACE_ID,
+    projectId: PROJECT_ID,
+    runId: RUN_ID,
+    state: "running",
+    deviceId: DEVICE_ID,
+  });
+  assert.ok(decoded.ok && decoded.kind === "frame");
+  assert.deepEqual(Object.keys(decoded.frame).sort(), [
+    "code",
+    "eventId",
+    "protocolVersion",
+    "type",
+  ]);
+  assert.deepEqual(Object.keys(EventRefusedFrameSchema.shape).sort(), [
+    "code",
+    "eventId",
+    "protocolVersion",
+    "type",
+  ]);
+
+  // The list is closed: no other code, the codes of a protocol violation
+  // included, which close the connection instead.
+  const cases: [label: string, input: Json][] = [
+    ...[
+      "rate_limited",
+      "forbidden",
+      "not_a_member",
+      "identity_mismatch",
+      "invalid_payload",
+      "workspace_not_found",
+      "too_many_subscriptions",
+      "NOT_FOUND",
+      "",
+    ].map((code): [string, Json] => [code, eventRefused(code)]),
+    ["no code", { ...eventRefused(), code: undefined }],
+    ["no event ID", { ...eventRefused(), eventId: undefined }],
+    [
+      "an uppercase event ID",
+      { ...eventRefused(), eventId: EVENT_ID.toUpperCase() },
+    ],
+    ["an event ID that is not a UUIDv7", { ...eventRefused(), eventId: "x" }],
+  ];
+  for (const [label, input] of cases) {
+    assert.deepEqual(
+      decodeServerMessage(input),
+      { ok: false, code: "invalid_payload" },
+      label,
+    );
+  }
+
+  // Only the server sends it: a device's message of this type is refused
+  // before and after authentication.
+  assert.deepEqual(decodeClientMessage(eventRefused()), {
+    ok: false,
+    code: "not_allowed_from_device",
+  });
+  assert.deepEqual(decodeClientFrame(eventRefused()), {
+    ok: false,
+    code: "not_allowed_from_device",
+  });
+});
+
+test("the server relays an agent's run transition with the same event ID and actor, and no device", () => {
+  const sent = runTransition();
+  const fromDevice = decodeClientMessage(sent);
+  assert.ok(fromDevice.ok && fromDevice.kind === "event");
+
+  const relayed: Json = { ...sent, deviceId: null };
+  const decoded = decodeServerMessage(relayed);
+  assert.deepEqual(decoded, { ok: true, kind: "event", event: relayed });
+  assert.ok(decoded.ok && decoded.kind === "event");
+  assert.equal(decoded.event.id, EVENT_ID);
+  assert.deepEqual(decoded.event.actor, { kind: "agent", agentId: AGENT_ID });
+
+  // A device never sends the relayed form, and the relay keeps the actor
+  // rule: only the run's own agent.
+  assert.deepEqual(decodeClientMessage(relayed), {
+    ok: false,
+    code: "not_allowed_from_device",
+  });
+  const cases: [label: string, input: Json][] = [
+    [
+      "another agent",
+      { ...relayed, actor: { kind: "agent", agentId: OTHER_AGENT_ID } },
+    ],
+    ["a user", { ...relayed, actor: { kind: "user", userId: USER_ID } }],
+  ];
+  for (const [label, input] of cases) {
+    assert.deepEqual(
+      decodeServerMessage(input),
+      { ok: false, code: "invalid_actor" },
+      label,
     );
   }
 });

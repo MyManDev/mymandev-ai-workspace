@@ -198,6 +198,23 @@ export type WorkspaceUnsubscribeReason =
   (typeof WORKSPACE_UNSUBSCRIBE_REASONS)[number];
 
 /**
+ * Why the server refused an event that a device sent, in `event.refused`
+ * (#27, #28). The connection stays open. `not_found`: the event names a
+ * project, an agent, or a run that does not exist or is not in the event's
+ * workspace; both get the same code, so that a device cannot probe which IDs
+ * exist (ADR 0007, ADR 0014). `conflict`: what the event names exists in the
+ * workspace, but is not in the state that the event needs, for example a run
+ * whose stored state is not `previousState`, an archived project, or a
+ * disabled agent. A protocol violation gets no code: it closes the
+ * connection.
+ */
+export const EVENT_REFUSAL_CODES = Object.freeze([
+  "not_found",
+  "conflict",
+] as const);
+export type EventRefusalCode = (typeof EVENT_REFUSAL_CODES)[number];
+
+/**
  * The `code` of every HTTP error answer (P-66), with its HTTP status. The
  * list is closed: the API never sends another code.
  */
@@ -311,6 +328,25 @@ export const UNCLAIMED_MEMBER_LIMIT = Object.freeze({
   max: 500,
   default: 500,
 } as const);
+
+/**
+ * How many messages one page of a project's chat history holds (#27): 50
+ * when the request does not say, and at most 100. A page holds the newest
+ * messages first; a page with fewer messages than its `limit` is the oldest.
+ * The maximum lies far below `MAX_ANSWER_LIST_ITEMS`, because one message
+ * can take about 64 KB of JSON.
+ */
+export const CHAT_HISTORY_PAGE = Object.freeze({
+  default: 50,
+  max: 100,
+} as const);
+
+/**
+ * How many finished runs the project's run list holds (#28): its most
+ * recently finished runs, the most recent first. The list also holds every
+ * unfinished run, up to `MAX_ANSWER_LIST_ITEMS`.
+ */
+export const RECENT_FINISHED_RUNS = 50;
 
 /** A UUIDv7 in canonical lowercase form. Uppercase is rejected on purpose. */
 export const UUIDV7_PATTERN =
