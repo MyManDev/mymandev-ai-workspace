@@ -1,4 +1,4 @@
-import rateLimit from "@fastify/rate-limit";
+import rateLimit, { normalizeIP } from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
 import { createDatabase, type Database } from "@mymandev/database";
 import { genericApiErrorCode, MAX_FRAME_BYTES } from "@mymandev/protocol";
@@ -76,6 +76,8 @@ export type BuildAppOptions = Readonly<{
 }>;
 
 /** In-memory sign-in state (ADR 0014, "Lifetimes" and "Limits"). */
+/** The IPv6 prefix length that one client counts as, in every address limit. */
+const IPV6_LIMIT_PREFIX = 64;
 const MAX_OPEN_ATTEMPTS = 1_000;
 const ATTEMPT_LIFETIME_MS = 10 * 60_000;
 const SIGN_IN_CODE_LIFETIME_MS = 60_000;
@@ -289,6 +291,14 @@ export async function buildApp(
   // Retry-After (P-64). The in-memory store fits one API instance.
   await app.register(rateLimit, {
     global: false,
+    // An IPv6 client counts by its /64, as the plugin does by default, so one
+    // network cannot multiply its limit (#111). A request without an address,
+    // such as one whose socket already closed, shares one key instead of
+    // failing with a 500.
+    keyGenerator: (request) =>
+      typeof request.ip === "string"
+        ? normalizeIP(request.ip, IPV6_LIMIT_PREFIX)
+        : "no-address",
     errorResponseBuilder: () => new ApiError("rate_limited"),
   });
 
