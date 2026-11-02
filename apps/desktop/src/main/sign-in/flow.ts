@@ -52,7 +52,11 @@ import {
 export const SIGN_IN_URL_WARNING =
   "Open this address in your own browser. Do not share it with anyone: while this sign-in is open, someone who has it could sign this device in to their account.";
 
-/** How long the answer of `POST /auth/sign-in` may take before the flow stops waiting. */
+/**
+ * How long the answer of `POST /auth/sign-in` may take before the flow stops
+ * waiting. It must not exceed the API's request timeout of 30 seconds (see
+ * `UNCERTAIN_REFUSAL_CODES`).
+ */
 export const SIGN_IN_REQUEST_TIMEOUT_MS = 30_000;
 
 /**
@@ -129,8 +133,11 @@ export type SignInFailureReason = (typeof SIGN_IN_FAILURE_REASONS)[number];
  * the copy gets `auth_failed`, or `rate_limited` when the route's limit
  * refuses it before that. A copy of a request that committed cannot get any
  * other refusal: those answer a request that the API refused before its
- * transaction committed. Once the API answers a resent request with its own
- * error code, this list narrows to that code.
+ * transaction committed. The API's request timeout answers `408` with
+ * `bad_request`, but only after 30 seconds, when the flow has stopped waiting
+ * (`SIGN_IN_REQUEST_TIMEOUT_MS` must not exceed the API's request timeout).
+ * Once the API answers a resent request with its own error code, this list
+ * narrows to that code.
  */
 export const UNCERTAIN_REFUSAL_CODES = Object.freeze([
   "auth_failed",
