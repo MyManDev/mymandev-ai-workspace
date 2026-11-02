@@ -158,15 +158,13 @@ describe("authorizeUrl", () => {
     );
   });
 
-  test("works with a development API on a loopback address", () => {
-    const url = authorizeUrl({
-      ...base,
-      apiOrigin: "http://127.0.0.1:3000",
-      signIn: { kind: "first" },
-    });
-    expect(url.startsWith("http://127.0.0.1:3000/auth/github/authorize?")).toBe(
-      true,
-    );
+  test.each([
+    "http://127.0.0.1:3000",
+    "http://localhost:3000",
+    "http://localhost",
+  ])("works with a development API on the loopback origin %s", (apiOrigin) => {
+    const url = authorizeUrl({ ...base, apiOrigin, signIn: { kind: "first" } });
+    expect(url.startsWith(`${apiOrigin}/auth/github/authorize?`)).toBe(true);
     expect(GitHubAuthorizeQuerySchema.safeParse(query(url)).success).toBe(true);
   });
 
@@ -183,6 +181,13 @@ describe("authorizeUrl", () => {
     ["ftp://api.mymandev.example", "Invalid API origin"],
     ["https://user@api.mymandev.example", "Invalid API origin"],
     ["api.mymandev.example", "Invalid API origin"],
+    // http only on a loopback host, as the API's configuration requires.
+    ["http://api.mymandev.example", "Invalid API origin"],
+    ["http://api.mymandev.example:3000", "Invalid API origin"],
+    ["http://192.168.1.10:3000", "Invalid API origin"],
+    ["http://127.0.0.2:3000", "Invalid API origin"],
+    ["http://localhost.example:3000", "Invalid API origin"],
+    ["http://127.1:3000", "Invalid API origin"],
   ])("refuses the API origin %j", (apiOrigin, message) => {
     expect(() =>
       authorizeUrl({ ...base, apiOrigin, signIn: { kind: "first" } }),

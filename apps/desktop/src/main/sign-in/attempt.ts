@@ -100,7 +100,8 @@ export interface AuthorizeUrlInput {
   /**
    * The origin of the API base URL, `scheme://host[:port]` as a URL parser
    * writes it. It is the audience of every signature and must equal the
-   * API's `API_PUBLIC_ORIGIN` exactly.
+   * API's `API_PUBLIC_ORIGIN` exactly: https, or http only on `127.0.0.1` or
+   * `localhost`, as the API's configuration allows in development and test.
    */
   readonly apiOrigin: string;
   readonly codeChallenge: string;
@@ -109,6 +110,14 @@ export interface AuthorizeUrlInput {
   readonly state: string;
   readonly signIn: AuthorizeSignInKind;
 }
+
+/**
+ * The http origins that the API accepts as `API_PUBLIC_ORIGIN`, in
+ * development and test only: a loopback host. Every other origin must use
+ * https. The same pattern as the API's configuration.
+ */
+const LOOPBACK_HTTP_ORIGIN =
+  /^http:\/\/(?:127[.]0[.]0[.]1|localhost)(?::[0-9]+)?$/u;
 
 /** The order of the query parameters in the URL; every key of the schema. */
 const AUTHORIZE_PARAMETER_ORDER: readonly (keyof GitHubAuthorizeQuery)[] =
@@ -129,7 +138,13 @@ const AUTHORIZE_PARAMETER_ORDER: readonly (keyof GitHubAuthorizeQuery)[] =
  * `TypeError` that names the field, never its value.
  */
 export function authorizeUrl(input: AuthorizeUrlInput): string {
-  if (!isDeviceAuthAudience(input.apiOrigin)) {
+  if (
+    !isDeviceAuthAudience(input.apiOrigin) ||
+    !(
+      input.apiOrigin.startsWith("https://") ||
+      LOOPBACK_HTTP_ORIGIN.test(input.apiOrigin)
+    )
+  ) {
     throw new TypeError("Invalid API origin");
   }
   const query: Record<string, string> = {
