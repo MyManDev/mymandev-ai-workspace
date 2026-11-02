@@ -1,9 +1,11 @@
 import {
+  lstat,
   mkdtemp,
   readdir,
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -32,22 +34,28 @@ afterEach(async () => {
 });
 
 /**
- * The real file system, recording its calls, that fails at `failAt`. A
- * failing write first writes half of the data, as a full disk would.
+ * The real file system, recording its calls, that fails at `failAt`. The
+ * steps `open`, `write`, `sync`, and `close` concern the temporary file
+ * (opened with "wx"); `folder` makes every flush after the rename fail: of
+ * the folder (opened with "r") and of the renamed file on Windows (opened
+ * again with "r+"). A failing write first writes half of the data, as a full
+ * disk would.
  */
 function fileSystemFailingAt(failAt: Step | null, calls: string[] = []) {
   const fileSystem: KeyFileSystem = {
     ...nodeKeyFileSystem,
     open: async (file, flags, mode) => {
-      const isFolder = flags === "r";
+      const kind =
+        flags === "wx" ? "" : flags === "r" ? " folder" : " renamed file";
       calls.push(
-        isFolder
-          ? `open folder ${flags}`
-          : `open ${path.basename(file)} ${flags} ${mode?.toString(8)}`,
+        flags === "wx"
+          ? `open ${path.basename(file)} ${flags} ${mode?.toString(8)}`
+          : `open${kind} ${flags}`,
       );
+      const temporary = flags === "wx";
       if (
-        (failAt === "open" && !isFolder) ||
-        (failAt === "folder" && isFolder)
+        (failAt === "open" && temporary) ||
+        (failAt === "folder" && !temporary)
       ) {
         throw new Error(`${failAt} failed`);
       }
@@ -62,16 +70,16 @@ function fileSystemFailingAt(failAt: Step | null, calls: string[] = []) {
           await handle.writeFile(data);
         },
         sync: async () => {
-          calls.push(isFolder ? "sync folder" : "sync");
-          if (failAt === "sync" && !isFolder) {
+          calls.push(`sync${kind}`);
+          if (failAt === "sync" && temporary) {
             throw new Error("sync failed");
           }
           await handle.sync();
         },
         close: async () => {
-          calls.push(isFolder ? "close folder" : "close");
+          calls.push(`close${kind}`);
           await handle.close();
-          if (failAt === "close" && !isFolder) {
+          if (failAt === "close" && temporary) {
             throw new Error("close failed");
           }
         },
@@ -86,6 +94,27 @@ function fileSystemFailingAt(failAt: Step | null, calls: string[] = []) {
     },
   };
   return fileSystem;
+}
+
+/**
+ * The real file system, where `place` puts something at the temporary path
+ * just before the exclusive open, as another program could.
+ */
+function fileSystemWithPlacedTemporary(
+  place: (temporary: string) => Promise<void>,
+) {
+  const placed: string[] = [];
+  const fileSystem: KeyFileSystem = {
+    ...nodeKeyFileSystem,
+    open: async (file, flags, mode) => {
+      if (flags === "wx") {
+        await place(file);
+        placed.push(file);
+      }
+      return nodeKeyFileSystem.open(file, flags, mode);
+    },
+  };
+  return { fileSystem, placed };
 }
 
 test("a write creates the file and leaves no temporary file", async () => {
@@ -168,8 +197,9 @@ test("the temporary file is created exclusively, for its owner, in the same fold
     "sync",
     "close",
     `rename ${temporaryName} device-key.json`,
-    // The folder is flushed, so that the rename survives a power loss. When
-    // this test runs on Windows, the flush fails and is ignored.
+    // On Linux and macOS the folder is flushed, so that the rename survives
+    // a power loss. When this test runs on Windows, the flush fails and is
+    // ignored.
     "open folder r",
     "sync folder",
     "close folder",
@@ -177,24 +207,77 @@ test("the temporary file is created exclusively, for its owner, in the same fold
   expect(await readFile(target, "utf8")).toBe("new");
 });
 
-test("the folder is not flushed on Windows, and a folder that cannot be flushed does not fail the write", async () => {
-  const windowsCalls: string[] = [];
+test("on Windows the renamed file is opened again and flushed before the write resolves, because a folder cannot be flushed there", async () => {
+  const calls: string[] = [];
+
   await writeFileAtomic(
-    fileSystemFailingAt(null, windowsCalls),
+    fileSystemFailingAt(null, calls),
     target,
     Buffer.from("one"),
     "win32",
   );
-  expect(windowsCalls.some((call) => call.includes("folder"))).toBe(false);
 
-  await writeFileAtomic(
-    fileSystemFailingAt("folder"),
-    target,
-    Buffer.from("two"),
-    "linux",
-  );
-  expect(await readFile(target, "utf8")).toBe("two");
+  expect(calls.slice(4)).toEqual([
+    expect.stringMatching(
+      /^rename device-key\.json\.[0-9a-f]{16}\.tmp device-key\.json$/,
+    ),
+    "open renamed file r+",
+    "sync renamed file",
+    "close renamed file",
+  ]);
+  expect(calls.some((call) => call.includes("folder"))).toBe(false);
+  expect(await readFile(target, "utf8")).toBe("one");
 });
+
+test("a flush after the rename that fails does not fail the write", async () => {
+  for (const platform of ["linux", "win32"] as const) {
+    await writeFileAtomic(
+      fileSystemFailingAt("folder"),
+      target,
+      Buffer.from(platform),
+      platform,
+    );
+    expect(await readFile(target, "utf8")).toBe(platform);
+  }
+});
+
+test("a file that already has the temporary name makes the write fail, and neither it nor the target is touched", async () => {
+  await writeFile(target, "old");
+  const { fileSystem, placed } = fileSystemWithPlacedTemporary((temporary) =>
+    writeFile(temporary, "someone else's"),
+  );
+
+  await expect(
+    writeFileAtomic(fileSystem, target, Buffer.from("new"), process.platform),
+  ).rejects.toMatchObject({ code: "EEXIST" });
+
+  expect(await readFile(target, "utf8")).toBe("old");
+  const [temporary] = placed as [string];
+  expect(await readFile(temporary, "utf8")).toBe("someone else's");
+  expect((await readdir(folder)).sort()).toEqual(
+    ["device-key.json", path.basename(temporary)].sort(),
+  );
+});
+
+test.skipIf(process.platform === "win32")(
+  "a symbolic link at the temporary path makes the write fail, and the file it points to is not written",
+  async () => {
+    const outside = path.join(folder, "outside.txt");
+    await writeFile(outside, "outside");
+    const { fileSystem, placed } = fileSystemWithPlacedTemporary((temporary) =>
+      symlink(outside, temporary),
+    );
+
+    await expect(
+      writeFileAtomic(fileSystem, target, Buffer.from("new"), process.platform),
+    ).rejects.toMatchObject({ code: "EEXIST" });
+
+    expect(await readFile(outside, "utf8")).toBe("outside");
+    const [temporary] = placed as [string];
+    expect((await lstat(temporary)).isSymbolicLink()).toBe(true);
+    expect(await readdir(folder)).not.toContain("device-key.json");
+  },
+);
 
 test.skipIf(process.platform === "win32")(
   "the file has mode 0600 on Linux and macOS",

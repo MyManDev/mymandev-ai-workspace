@@ -8,6 +8,8 @@ import {
 } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import {
+  copyFile,
+  mkdir,
   mkdtemp,
   readdir,
   readFile,
@@ -72,6 +74,13 @@ function fakeSafeStorage(
     reEncrypt: false,
     failDecrypt: false,
     failEncrypt: false,
+    /**
+     * The prefix of every ciphertext: Chromium writes `v11` with a secret
+     * service's key and `v10` with its fixed key on Linux.
+     */
+    prefix: "v11",
+    /** Prefixes for the next calls, before `prefix` applies again. */
+    nextPrefixes: [] as string[],
   };
   const decrypt = (encrypted: Buffer): string => {
     const nonce = encrypted.subarray(3, 15);
@@ -105,7 +114,7 @@ function fakeSafeStorage(
       ]);
       return Promise.resolve(
         Buffer.concat([
-          Buffer.from("v11"),
+          Buffer.from(state.nextPrefixes.shift() ?? state.prefix, "ascii"),
           nonce,
           ciphertext,
           cipher.getAuthTag(),
@@ -274,6 +283,7 @@ test("a new key is written as encrypted PKCS#8 only: no key in the clear and no 
     protection: "system",
     loaded: true,
     replacementPending: false,
+    passphraseRequired: false,
   });
   expect(store.keys()).toEqual({ current: key, previous: null });
 });
@@ -289,6 +299,7 @@ test("at the next start the key is decrypted once with decryptStringAsync, and n
     protection: "system",
     loaded: false,
     replacementPending: false,
+    passphraseRequired: false,
   });
   expect(store.keys()).toBeNull();
   expect(fake.calls).toEqual([]);
@@ -390,31 +401,120 @@ test("the system protects keys on Windows and macOS, and on Linux only with a se
     "kwallet5",
     "kwallet6",
   ]) {
+    const fake = fakeSafeStorage({ backend });
     expect(
-      await storeWith(fakeSafeStorage({ backend }), {
-        platform: "linux",
-      }).systemProtection(),
+      await storeWith(fake, { platform: "linux" }).systemProtection(),
     ).toEqual({ available: true });
+    // On Linux a probe shows which key the asynchronous encryptor uses.
+    expect(fake.calls).toEqual([
+      "isAsyncEncryptionAvailable",
+      "getSelectedStorageBackend",
+      "encryptStringAsync",
+    ]);
   }
   expect(
     await storeWith(fakeSafeStorage({ backend: "basic_text" }), {
       platform: "linux",
     }).systemProtection(),
-  ).toEqual({ available: false, reason: "no_secret_service" });
+  ).toEqual({
+    available: false,
+    reason: "no_secret_service",
+    fallbackAllowed: true,
+  });
   for (const backend of ["unknown", "something_new"]) {
     expect(
       await storeWith(fakeSafeStorage({ backend }), {
         platform: "linux",
       }).systemProtection(),
-    ).toEqual({ available: false, reason: "secret_service_unconfirmed" });
+    ).toEqual({
+      available: false,
+      reason: "secret_service_unconfirmed",
+      fallbackAllowed: true,
+    });
   }
   for (const platform of ["win32", "darwin", "linux"] as const) {
     expect(
       await storeWith(fakeSafeStorage({ available: false }), {
         platform,
       }).systemProtection(),
-    ).toEqual({ available: false, reason: "encryption_unavailable" });
+    ).toEqual({
+      available: false,
+      reason: "encryption_unavailable",
+      // Only Linux may fall back to a passphrase or an unprotected key.
+      fallbackAllowed: platform === "linux",
+    });
   }
+  const failing = fakeSafeStorage();
+  failing.state.failEncrypt = true;
+  expect(
+    await storeWith(failing, { platform: "linux" }).systemProtection(),
+  ).toEqual({
+    available: false,
+    reason: "encryption_unavailable",
+    fallbackAllowed: true,
+  });
+});
+
+test("on Linux a ciphertext of Chromium's fixed key (v10) does not count as a secret service, whatever the backend says", async () => {
+  const fake = fakeSafeStorage({ backend: "gnome_libsecret" });
+  fake.state.prefix = "v10";
+  const store = storeWith(fake, { platform: "linux" });
+
+  expect(await store.systemProtection()).toEqual({
+    available: false,
+    reason: "secret_service_unconfirmed",
+    fallbackAllowed: true,
+  });
+  await expectRejection(
+    () => store.create({ kind: "system" }),
+    "system_protection_unavailable",
+  );
+  expect(await readdir(root)).toEqual([]);
+
+  // The passphrase choice applies instead.
+  await store.create({ kind: "passphrase", passphrase: PASSPHRASE });
+  expect((await keyFileJson())["protection"]).toBe("passphrase");
+  // A replacement stays with the passphrase while the fixed key is in use.
+  await store.replace();
+  expect((await keyFileJson())["protection"]).toBe("passphrase");
+});
+
+test("on Linux a key is never written with a v10 ciphertext, even when the probe a moment before passed", async () => {
+  const fake = fakeSafeStorage({ backend: "kwallet6" });
+  fake.state.nextPrefixes = ["v11", "v10"];
+  const store = storeWith(fake, { platform: "linux" });
+
+  await expectRejection(
+    () => store.create({ kind: "system" }),
+    "system_protection_unavailable",
+  );
+
+  expect(fake.calls.filter((call) => call === "encryptStringAsync")).toEqual([
+    "encryptStringAsync",
+    "encryptStringAsync",
+  ]);
+  expect(await readdir(root)).toEqual([]);
+  expect(store.keys()).toBeNull();
+});
+
+test("on Linux a rewrite after shouldReEncrypt is not written with a v10 ciphertext", async () => {
+  const fake = fakeSafeStorage({ backend: "gnome_libsecret" });
+  await storeWith(fake, { platform: "linux" }).create({ kind: "system" });
+  const before = await readFile(path.join(folder, CURRENT_KEY_FILE), "utf8");
+  fake.state.reEncrypt = true;
+  fake.state.nextPrefixes = ["v11", "v10"];
+  const reported: string[] = [];
+
+  const keys = await storeWith(fake, {
+    platform: "linux",
+    onError: (message) => reported.push(message),
+  }).load();
+
+  expect(keys).not.toBeNull();
+  expect(reported).toEqual(["The device key could not be encrypted again."]);
+  expect(await readFile(path.join(folder, CURRENT_KEY_FILE), "utf8")).toBe(
+    before,
+  );
 });
 
 test("on Linux without a secret service a key is protected by a passphrase, and a wrong passphrase is refused", async () => {
@@ -450,6 +550,7 @@ test("on Linux without a secret service a key is protected by a passphrase, and 
     protection: "passphrase",
     loaded: false,
     replacementPending: false,
+    passphraseRequired: true,
   });
   await expectRejection(() => restarted.load(), "passphrase_required");
   const wrong = await rejectionOf(() =>
@@ -462,21 +563,85 @@ test("on Linux without a secret service a key is protected by a passphrase, and 
   const keys = await restarted.load({ passphrase: PASSPHRASE });
   expect(keys?.current.publicKey).toBe(created.publicKey);
   expect(fake.calls).not.toContain("decryptStringAsync");
+  expect(await restarted.status()).toMatchObject({
+    loaded: true,
+    passphraseRequired: false,
+  });
 });
 
-test("a passphrase or an unprotected key is refused while the system protects keys", async () => {
-  for (const platform of ["win32", "darwin", "linux"] as const) {
-    const store = storeWith(fakeSafeStorage(), { platform });
-    await expectRejection(
-      () => store.create({ kind: "passphrase", passphrase: PASSPHRASE }),
-      "system_protection_available",
-    );
-    await expectRejection(
-      () => store.create({ kind: "unprotected", acceptsUnprotectedKey: true }),
-      "system_protection_available",
-    );
+test("on Linux a passphrase or an unprotected key is refused while the system protects keys", async () => {
+  const store = storeWith(fakeSafeStorage(), { platform: "linux" });
+  await expectRejection(
+    () => store.create({ kind: "passphrase", passphrase: PASSPHRASE }),
+    "system_protection_available",
+  );
+  await expectRejection(
+    () => store.create({ kind: "unprotected", acceptsUnprotectedKey: true }),
+    "system_protection_available",
+  );
+  expect(await readdir(root)).toEqual([]);
+});
+
+test("on Windows and macOS only the system protects a key, also when it cannot", async () => {
+  for (const platform of ["win32", "darwin"] as const) {
+    for (const available of [true, false]) {
+      const fake = fakeSafeStorage({ available, backend: "basic_text" });
+      const store = storeWith(fake, { platform });
+      await expectRejection(
+        () => store.create({ kind: "passphrase", passphrase: PASSPHRASE }),
+        "system_protection_required",
+      );
+      await expectRejection(
+        () =>
+          store.create({ kind: "unprotected", acceptsUnprotectedKey: true }),
+        "system_protection_required",
+      );
+      if (!available) {
+        // For example a denied or locked Keychain: the screens tell the
+        // person to fix it.
+        await expectRejection(
+          () => store.create({ kind: "system" }),
+          "system_protection_unavailable",
+        );
+      }
+      expect(fake.calls).not.toContain("encryptStringAsync");
+    }
   }
   expect(await readdir(root)).toEqual([]);
+});
+
+test("on Windows and macOS a key file protected by a passphrase or unprotected is refused, and no replacement inherits it", async () => {
+  const linux = fakeSafeStorage({ backend: "basic_text" });
+  const planted = path.join(root, "planted");
+  for (const protection of ["passphrase", "unprotected"] as const) {
+    await rm(folder, { recursive: true, force: true });
+    await storeWith(linux, { platform: "linux" }).create(
+      protection === "passphrase"
+        ? { kind: "passphrase", passphrase: PASSPHRASE }
+        : { kind: "unprotected", acceptsUnprotectedKey: true },
+    );
+    await rm(planted, { force: true });
+    await rename(path.join(folder, CURRENT_KEY_FILE), planted);
+
+    for (const platform of ["win32", "darwin"] as const) {
+      for (const name of [CURRENT_KEY_FILE, PREVIOUS_KEY_FILE]) {
+        await rm(folder, { recursive: true, force: true });
+        await mkdir(folder);
+        await copyFile(planted, path.join(folder, name));
+        const fake = fakeSafeStorage();
+        const store = storeWith(fake, { platform });
+
+        await expectRejection(() => store.status(), "corrupt");
+        await expectRejection(
+          () => store.load({ passphrase: PASSPHRASE }),
+          "corrupt",
+        );
+        await expectRejection(() => store.replace(), "not_loaded");
+        expect(store.keys()).toBeNull();
+        expect(await readdir(folder)).toEqual([name]);
+      }
+    }
+  }
 });
 
 test("an unprotected key needs the explicit choice and is stored for its owner only", async () => {
@@ -512,10 +677,10 @@ test("an unprotected key needs the explicit choice and is stored for its owner o
 test.skipIf(process.platform === "win32")(
   "key files have mode 0600 and a new key folder mode 0700 on Linux and macOS",
   async () => {
-    // Without asynchronous encryption, an unprotected key is allowed on
-    // macOS too; with it, only on Linux without a secret service.
-    const fake = fakeSafeStorage({ available: false });
-    const store = storeWith(fake, { platform: process.platform });
+    // The store's rules for Linux, on the real file system of this Linux or
+    // macOS machine: an unprotected key exists on Linux only.
+    const fake = fakeSafeStorage({ backend: "basic_text" });
+    const store = storeWith(fake, { platform: "linux" });
     await store.create({ kind: "unprotected", acceptsUnprotectedKey: true });
 
     expect((await stat(folder)).mode & 0o777).toBe(0o700);
@@ -523,7 +688,7 @@ test.skipIf(process.platform === "win32")(
       0o600,
     );
 
-    await store.replace();
+    await store.replace({ acceptsUnprotectedKey: true });
     for (const name of [CURRENT_KEY_FILE, PREVIOUS_KEY_FILE]) {
       expect((await stat(path.join(folder, name))).mode & 0o777).toBe(0o600);
     }
@@ -549,6 +714,7 @@ test("a replacement keeps the previous key until one authentication with the new
     protection: "system",
     loaded: true,
     replacementPending: true,
+    passphraseRequired: false,
   });
 
   // A sign-in of an existing device signs the same input with both keys.
@@ -634,6 +800,7 @@ test("a replacement that stopped between its two renames leaves the previous key
     protection: "system",
     loaded: false,
     replacementPending: false,
+    passphraseRequired: false,
   });
   await expectRejection(() => store.create({ kind: "system" }), "key_exists");
   const keys = await store.load();
@@ -698,14 +865,165 @@ test("a passphrase key is replaced without asking for the passphrase again", asy
   expect(keys?.previous?.publicKey).toBe(first.publicKey);
 });
 
-test("an unprotected key is replaced as an unprotected key", async () => {
+test("an unprotected key is renewed as an unprotected key only with a fresh explicit choice", async () => {
+  const fake = fakeSafeStorage({ backend: "basic_text" });
+  const store = storeWith(fake, { platform: "linux" });
+  const first = await store.create({
+    kind: "unprotected",
+    acceptsUnprotectedKey: true,
+  });
+
+  for (const options of [
+    undefined,
+    {},
+    { acceptsUnprotectedKey: false as unknown as true },
+  ]) {
+    await expectRejection(
+      () => store.replace(options),
+      "unprotected_not_accepted",
+    );
+  }
+  expect(store.keys()).toEqual({ current: first, previous: null });
+  expect(await readdir(folder)).toEqual([CURRENT_KEY_FILE]);
+
+  await store.replace({ acceptsUnprotectedKey: true });
+
+  expect((await keyFileJson())["protection"]).toBe("unprotected");
+});
+
+test("on Linux a replacement moves a passphrase key up to the system once a secret service appears", async () => {
+  const fake = fakeSafeStorage({ backend: "basic_text" });
+  const store = storeWith(fake, { platform: "linux" });
+  const first = await store.create({
+    kind: "passphrase",
+    passphrase: PASSPHRASE,
+  });
+  fake.state.backend = "gnome_libsecret";
+
+  const replaced = await store.replace();
+
+  expect((await keyFileJson(CURRENT_KEY_FILE))["protection"]).toBe("system");
+  expect(await publicKeyInFile(fake)).toBe(replaced.current.publicKey);
+  // The previous key keeps its passphrase until the replacement is
+  // confirmed, so a start in between still asks for it.
+  expect((await keyFileJson(PREVIOUS_KEY_FILE))["protection"]).toBe(
+    "passphrase",
+  );
+  const restarted = storeWith(fake, { platform: "linux" });
+  expect(await restarted.status()).toEqual({
+    protection: "system",
+    loaded: false,
+    replacementPending: true,
+    passphraseRequired: true,
+  });
+  await expectRejection(() => restarted.load(), "passphrase_required");
+  const keys = await restarted.load({ passphrase: PASSPHRASE });
+  expect(keys?.current.publicKey).toBe(replaced.current.publicKey);
+  expect(keys?.previous?.publicKey).toBe(first.publicKey);
+
+  await restarted.confirmReplacement();
+
+  const final = storeWith(fake, { platform: "linux" });
+  expect(await final.status()).toMatchObject({
+    protection: "system",
+    passphraseRequired: false,
+  });
+  expect((await final.load())?.current.publicKey).toBe(
+    replaced.current.publicKey,
+  );
+});
+
+test("on Linux a replacement moves an unprotected key up to the system without a new choice", async () => {
   const fake = fakeSafeStorage({ backend: "basic_text" });
   const store = storeWith(fake, { platform: "linux" });
   await store.create({ kind: "unprotected", acceptsUnprotectedKey: true });
+  fake.state.backend = "kwallet6";
+
+  const replaced = await store.replace();
+
+  expect((await keyFileJson())["protection"]).toBe("system");
+  expect(await publicKeyInFile(fake)).toBe(replaced.current.publicKey);
+  await store.confirmReplacement();
+  expect(await readdir(folder)).toEqual([CURRENT_KEY_FILE]);
+});
+
+test("a moved-up key that is abandoned keeps its passphrase for the next replacement, also after a restart", async () => {
+  const fake = fakeSafeStorage({ backend: "basic_text" });
+  const first = await storeWith(fake, { platform: "linux" }).create({
+    kind: "passphrase",
+    passphrase: PASSPHRASE,
+  });
+  const salt = (await keyFileJson())["salt"];
+  fake.state.backend = "gnome_libsecret";
+  const mover = storeWith(fake, { platform: "linux" });
+  await mover.load({ passphrase: PASSPHRASE });
+  await mover.replace();
+
+  const restarted = storeWith(fake, { platform: "linux" });
+  await restarted.load({ passphrase: PASSPHRASE });
+  await restarted.abandonReplacement();
+  expect(restarted.keys()?.current.publicKey).toBe(first.publicKey);
+  fake.state.backend = "basic_text";
+
+  const replaced = await restarted.replace();
+
+  const current = await keyFileJson(CURRENT_KEY_FILE);
+  expect(current["protection"]).toBe("passphrase");
+  expect(current["salt"]).toBe(salt);
+  const keys = await storeWith(fake, { platform: "linux" }).load({
+    passphrase: PASSPHRASE,
+  });
+  expect(keys?.current.publicKey).toBe(replaced.current.publicKey);
+  expect(keys?.previous?.publicKey).toBe(first.publicKey);
+});
+
+test("on Windows every rename is flushed before replace and abandonReplacement resolve", async () => {
+  const fake = fakeSafeStorage();
+  const calls: string[] = [];
+  const fileSystem: KeyFileSystem = {
+    ...nodeKeyFileSystem,
+    open: async (file, flags, mode) => {
+      const handle = await nodeKeyFileSystem.open(file, flags, mode);
+      const name = path.basename(file).replace(/\.[0-9a-f]{16}\.tmp$/, ".tmp");
+      calls.push(`open ${name} ${flags}`);
+      return {
+        writeFile: (data: Uint8Array) => handle.writeFile(data),
+        sync: async () => {
+          calls.push(`sync ${name}`);
+          await handle.sync();
+        },
+        close: () => handle.close(),
+      };
+    },
+    rename: async (from, to) => {
+      calls.push(`rename ${path.basename(to)}`);
+      await nodeKeyFileSystem.rename(from, to);
+    },
+  };
+  const store = storeWith(fake, { platform: "win32", fileSystem });
+  await store.create({ kind: "system" });
+  calls.length = 0;
 
   await store.replace();
 
-  expect((await keyFileJson())["protection"]).toBe("unprotected");
+  expect(calls).toEqual([
+    `rename ${PREVIOUS_KEY_FILE}`,
+    `open ${PREVIOUS_KEY_FILE} r+`,
+    `sync ${PREVIOUS_KEY_FILE}`,
+    `open ${CURRENT_KEY_FILE}.tmp wx`,
+    `sync ${CURRENT_KEY_FILE}.tmp`,
+    `rename ${CURRENT_KEY_FILE}`,
+    `open ${CURRENT_KEY_FILE} r+`,
+    `sync ${CURRENT_KEY_FILE}`,
+  ]);
+
+  calls.length = 0;
+  await store.abandonReplacement();
+  expect(calls).toEqual([
+    `rename ${CURRENT_KEY_FILE}`,
+    `open ${CURRENT_KEY_FILE} r+`,
+    `sync ${CURRENT_KEY_FILE}`,
+  ]);
 });
 
 test("a system-protected key is not replaced once the system cannot protect keys", async () => {

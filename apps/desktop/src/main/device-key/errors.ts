@@ -7,6 +7,7 @@ export const DEVICE_KEY_ERROR_CODES = Object.freeze([
   "local_data_folder_missing",
   "system_protection_unavailable",
   "system_protection_available",
+  "system_protection_required",
   "unprotected_not_accepted",
   "passphrase_required",
   "passphrase_invalid",
@@ -28,10 +29,13 @@ const MESSAGES: Readonly<Record<DeviceKeyErrorCode, string>> = Object.freeze({
   system_protection_unavailable: "The system cannot protect the device key.",
   system_protection_available:
     "The system protects the device key, so it is stored neither with a passphrase nor unprotected.",
+  system_protection_required:
+    "On Windows and macOS only the system protects the device key.",
   unprotected_not_accepted:
     "An unprotected device key needs an explicit choice after a warning.",
   passphrase_required: "The device key is protected by a passphrase.",
-  passphrase_invalid: "The passphrase must have 1 to 1024 characters.",
+  passphrase_invalid:
+    "The passphrase must be well-formed text of 1 to 1024 characters.",
   wrong_passphrase: "The passphrase does not open the device key.",
   unreadable: "The system could not decrypt the device key.",
   corrupt: "The device key file is damaged or in an unknown format.",

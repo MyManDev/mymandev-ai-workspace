@@ -199,6 +199,30 @@ test("an empty, too long, or non-string passphrase is refused", async () => {
   });
 });
 
+test("a passphrase with a lone surrogate is refused, because UTF-8 would turn it into U+FFFD and collide", async () => {
+  const lone = ["key\ud800", "key\udbff", "\udc00key", "a\ud800\ud800b"];
+  // Without the check, these would derive the same key as each other and
+  // as the replacement character itself.
+  expect(
+    new Set(lone.slice(0, 2).map((text) => Buffer.from(text).toString("hex")))
+      .size,
+  ).toBe(1);
+  expect(Buffer.from("key\ud800").equals(Buffer.from("key\ufffd"))).toBe(true);
+
+  for (const passphrase of lone) {
+    expectCode(
+      await rejectionOf(() =>
+        derivePassphraseWrapping(passphrase, { cost: TEST_COST }),
+      ),
+      "passphrase_invalid",
+    );
+  }
+  // A surrogate pair is a well-formed character, and U+FFFD typed as itself
+  // is allowed.
+  await derivePassphraseWrapping("key\u{1f511}", { cost: TEST_COST });
+  await derivePassphraseWrapping("key\ufffd", { cost: TEST_COST });
+});
+
 test("a scrypt cost outside the allowed range is not used", async () => {
   for (const cost of [
     { n: 2 ** 13, r: 8, p: 1 },

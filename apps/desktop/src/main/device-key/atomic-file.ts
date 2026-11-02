@@ -100,38 +100,65 @@ export async function readFileIfPresent(
   }
 }
 
-/**
- * Flushes a folder, so that a rename in it survives a power loss. It is best
- * effort: the rename has already happened, and some file systems cannot
- * flush a folder, so an error is ignored. Windows cannot open a folder for
- * this; there the rename is flushed with the file system's journal.
- */
-export async function syncFolder(
+/** Opens `target`, flushes it, and closes it; an error is ignored. */
+async function flushQuietly(
   fileSystem: KeyFileSystem,
-  folder: string,
-  platform: NodeJS.Platform,
+  target: string,
+  flags: string,
 ): Promise<void> {
-  if (platform === "win32") {
-    return;
-  }
   try {
-    const handle = await fileSystem.open(folder, "r");
+    const handle = await fileSystem.open(target, flags);
     try {
       await handle.sync();
     } finally {
       await handle.close();
     }
   } catch {
-    // Best effort, see above.
+    // Best effort: the change on disk has already happened, and some file
+    // systems cannot flush a folder.
+  }
+}
+
+/**
+ * Flushes a folder after a file in it was deleted, so that the deletion
+ * survives a power loss. Best effort; an error is ignored. Windows cannot
+ * open a folder for this, so it does nothing there.
+ */
+export async function syncFolder(
+  fileSystem: KeyFileSystem,
+  folder: string,
+  platform: NodeJS.Platform,
+): Promise<void> {
+  if (platform !== "win32") {
+    await flushQuietly(fileSystem, folder, "r");
+  }
+}
+
+/**
+ * Flushes a rename that made `file`, so that it survives a power loss. On
+ * Linux and macOS the folder that holds `file` is flushed. Windows cannot
+ * flush a folder; there `file` itself is opened again for writing and
+ * flushed (`FlushFileBuffers`), which needs write access. Best effort: the
+ * rename has already happened, so an error is ignored.
+ */
+export async function flushRename(
+  fileSystem: KeyFileSystem,
+  file: string,
+  platform: NodeJS.Platform,
+): Promise<void> {
+  if (platform === "win32") {
+    await flushQuietly(fileSystem, file, "r+");
+  } else {
+    await flushQuietly(fileSystem, path.dirname(file), "r");
   }
 }
 
 /**
  * Writes `data` to `file` atomically, with mode 0600 on Linux and macOS: to a
  * new temporary file in the same folder, created exclusively, flushed and
- * closed, then renamed over `file`, and the folder is flushed. When a step
- * fails, the temporary file is deleted, `file` keeps its old content or stays
- * missing, and the error is thrown again.
+ * closed, then renamed over `file`, and the rename is flushed. When a step
+ * fails, the temporary file is deleted if this call created it, `file` keeps
+ * its old content or stays missing, and the error is thrown again.
  */
 export async function writeFileAtomic(
   fileSystem: KeyFileSystem,
@@ -141,11 +168,14 @@ export async function writeFileAtomic(
 ): Promise<void> {
   const temporary = temporaryFileFor(file);
   let handle: KeyFileHandle | undefined;
+  let created = false;
   let renamed = false;
   try {
-    // "wx" fails if the name exists, so the write never follows a link that
-    // someone placed there.
+    // "wx" fails if the name exists, also as a symbolic link, so the write
+    // never follows a link that someone placed there. A file at that name
+    // that this call did not create is left alone.
     handle = await fileSystem.open(temporary, "wx", KEY_FILE_MODE);
+    created = true;
     await handle.writeFile(data);
     await handle.sync();
     const closing = handle;
@@ -158,8 +188,10 @@ export async function writeFileAtomic(
       if (handle !== undefined) {
         await handle.close().catch(() => undefined);
       }
-      await removeFile(fileSystem, temporary).catch(() => undefined);
+      if (created) {
+        await removeFile(fileSystem, temporary).catch(() => undefined);
+      }
     }
   }
-  await syncFolder(fileSystem, path.dirname(file), platform);
+  await flushRename(fileSystem, file, platform);
 }

@@ -248,10 +248,12 @@ export interface PassphraseWrapping {
 /**
  * The passphrase as UTF-8 after NFC normalization, so that the same text
  * typed with another input method opens the key. Throws `passphrase_invalid`
- * unless it has 1 to 1024 characters.
+ * unless it has 1 to 1024 characters and is well-formed: UTF-8 turns every
+ * lone surrogate into U+FFFD, so different passphrases would derive the same
+ * key.
  */
 function passphraseBytes(passphrase: unknown): Buffer {
-  if (typeof passphrase !== "string") {
+  if (typeof passphrase !== "string" || !passphrase.isWellFormed()) {
     throw new DeviceKeyError("passphrase_invalid");
   }
   const normalized = passphrase.normalize("NFC");
