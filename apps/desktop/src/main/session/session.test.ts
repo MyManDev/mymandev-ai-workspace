@@ -2201,6 +2201,8 @@ describe("the grace period of an uncertain sign-in", () => {
     { kind: "failed", reason: "server_error" },
     { kind: "failed", reason: "unexpected_response" },
     { kind: "failed", reason: "record_not_saved" },
+    // An error that the flow did not expect may come after the request.
+    { kind: "failed", reason: "unexpected" },
     ...UNCERTAIN_REFUSAL_CODES.map((apiError): SignInOutcome => ({
       kind: "failed",
       reason: "uncertain_refusal",
