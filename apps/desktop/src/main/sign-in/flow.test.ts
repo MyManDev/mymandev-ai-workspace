@@ -495,17 +495,41 @@ describe("a new device", () => {
     expect(await records.read()).toMatchObject({ kind: "record" });
   }, 20_000);
 
-  test("reports record_not_saved when the record cannot be written twice", async () => {
+  test("keeps an unsaved record and writes it before the next attempt", async () => {
     const records = createDeviceRecordStore({ folder, platform: "win32" });
+    let failing = true;
     const h = harness({
       deviceRecords: {
         read: records.read,
         delete: records.delete,
-        write: () => Promise.reject(new Error("disk full")),
+        write: (record) =>
+          failing
+            ? Promise.reject(new Error("disk full"))
+            : records.write(record),
       },
     });
     const { outcome } = await signIn(h);
     expect(outcome).toEqual({ kind: "failed", reason: "record_not_saved" });
+    const registered = h.requests[0]?.body.device.publicKey;
+
+    // While the record still cannot be written, nothing else happens.
+    expect(await h.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "record_not_saved" },
+    });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(registered);
+
+    // Then the record is written first, and the key is the device's key.
+    failing = false;
+    const next = started(await h.flow.start());
+    expect(await records.read()).toEqual({
+      kind: "record",
+      record: { ...ANSWER, publicKey: registered },
+    });
+    expect(authorizeParams(h.opened.at(-1) ?? "").get("login")).toBe("octocat");
+    next.cancel();
+    await next.outcome;
+    expect(h.keyStore.keys()?.current.publicKey).toBe(registered);
   }, 20_000);
 });
 

@@ -89,7 +89,9 @@ export const MAX_ANSWER_BYTES = 64 * 1024;
  * - `unexpected_response`: an answer that is not one of the API's; handled
  *   like `no_answer`.
  * - `record_not_saved`: the API registered the device, but the record could
- *   not be written, also when tried a second time.
+ *   not be written, also when tried a second time. The flow keeps the record
+ *   in memory, and the next attempt writes it before anything else (and
+ *   answers `record_not_saved` again while it still cannot).
  */
 export const SIGN_IN_FAILURE_REASONS = Object.freeze([
   "api_origin_unset",
@@ -378,9 +380,24 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
   let running = false;
   /** Set by `device_account_mismatch`; the next attempt adds `prompt`. */
   let afterAccountMismatch = false;
+  /**
+   * A record that the API answered with `200` but that could not be
+   * written, kept in memory so that the next attempt writes it first and
+   * never treats the registered key as a leftover.
+   */
+  let unsavedRecord: DeviceRecord | null = null;
 
   /** Decides between a new and an existing device, and removes a leftover key. */
   async function planDevice(): Promise<DevicePlan | SignInFailureReason> {
+    if (unsavedRecord !== null) {
+      try {
+        await deps.deviceRecords.write(unsavedRecord);
+        unsavedRecord = null;
+      } catch {
+        report("The device record could not be written.");
+        return "record_not_saved";
+      }
+    }
     let read;
     try {
       read = await deps.deviceRecords.read();
@@ -817,6 +834,7 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       }
     }
     if (!saved) {
+      unsavedRecord = record;
       return failed("record_not_saved");
     }
     return Object.freeze({
