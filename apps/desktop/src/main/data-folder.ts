@@ -1,6 +1,8 @@
 // The application's data folder: Electron's `userData` path. Chromium keeps
 // the single-instance lock and the session data (cookies, caches, and local
-// storage) there, and the device key (#94) will be stored under it.
+// storage) there. The device key (#94) is stored there on macOS and Linux;
+// on Windows, where this folder roams, it is stored in the local data folder
+// instead (device-key/key-folder.ts).
 import { mkdirSync } from "node:fs";
 import path, { type PlatformPath } from "node:path";
 import { DATA_FOLDER_NAME } from "../shared/product.ts";
