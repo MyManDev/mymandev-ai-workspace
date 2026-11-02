@@ -118,6 +118,14 @@ function serverFrames(): Json[] {
     },
     {
       protocolVersion: 0,
+      type: "account.ownership_transferred",
+      workspaceId: WORKSPACE_ID,
+      previousOwnerMemberId: MEMBER_ID,
+      ownerMemberId: OTHER_MEMBER_ID,
+      transferredAt: NOW,
+    },
+    {
+      protocolVersion: 0,
       type: "account.join_request_decided",
       joinRequestId: JOIN_REQUEST_ID,
       workspaceId: WORKSPACE_ID,
@@ -506,6 +514,58 @@ test("a join request decision reaches the requester as approved or denied, never
     "decision",
     "joinRequestId",
     "protocolVersion",
+    "type",
+    "workspaceId",
+  ]);
+});
+
+test("an ownership transfer reaches both accounts with the workspace, both people, and the time, and always names two people", () => {
+  const transferred = serverFrames().find(
+    (frame) => frame["type"] === "account.ownership_transferred",
+  );
+  assert.ok(transferred);
+  assert.deepEqual(decodeServerMessage(transferred), {
+    ok: true,
+    kind: "frame",
+    frame: transferred,
+  });
+  const cases: [label: string, input: unknown][] = [
+    [
+      "ownership to the same person",
+      { ...transferred, ownerMemberId: MEMBER_ID },
+    ],
+    ["no workspace", { ...transferred, workspaceId: undefined }],
+    ["no previous owner", { ...transferred, previousOwnerMemberId: undefined }],
+    ["no new owner", { ...transferred, ownerMemberId: undefined }],
+    [
+      "an uppercase person ID",
+      { ...transferred, ownerMemberId: OTHER_MEMBER_ID.toUpperCase() },
+    ],
+    ["no time", { ...transferred, transferredAt: undefined }],
+    [
+      "a time without milliseconds",
+      { ...transferred, transferredAt: "2026-10-30T17:00:00Z" },
+    ],
+  ];
+  for (const [label, input] of cases) {
+    assert.deepEqual(
+      decodeServerMessage(input),
+      { ok: false, code: "invalid_payload" },
+      label,
+    );
+  }
+  // The frame names people, never an account or a device.
+  const decoded = decodeServerMessage({
+    ...transferred,
+    previousOwnerUserId: USER_ID,
+    deviceId: DEVICE_ID,
+  });
+  assert.ok(decoded.ok && decoded.kind === "frame");
+  assert.deepEqual(Object.keys(decoded.frame).sort(), [
+    "ownerMemberId",
+    "previousOwnerMemberId",
+    "protocolVersion",
+    "transferredAt",
     "type",
     "workspaceId",
   ]);

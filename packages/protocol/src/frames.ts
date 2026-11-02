@@ -166,8 +166,8 @@ export type AccountOwnershipOfferedFrame = z.infer<
 
 /**
  * The ownership offer to the account's person ended without a transfer, so
- * the desktop stops showing it. A transfer is reported by the
- * `workspace.ownership.transferred` event instead.
+ * the desktop stops showing it. A transfer is reported by
+ * `account.ownership_transferred` instead.
  */
 export const AccountOwnershipOfferEndedFrameSchema = z.object({
   ...frameHeaderShape,
@@ -178,6 +178,38 @@ export const AccountOwnershipOfferEndedFrameSchema = z.object({
 });
 export type AccountOwnershipOfferEndedFrame = z.infer<
   typeof AccountOwnershipOfferEndedFrameSchema
+>;
+
+/**
+ * The ownership of a workspace moved from one person to another: the target
+ * accepted the offer, the previous owner is an `admin` now, and the offer is
+ * gone. Both accounts get it, the previous owner's and the new owner's, on
+ * every open connection, also on one that subscribed to nothing (ADR 0014,
+ * "Removal and ownership"). The workspace's subscribers get the
+ * `workspace.ownership.transferred` event as well.
+ */
+export const AccountOwnershipTransferredFrameSchema = z
+  .object({
+    ...frameHeaderShape,
+    type: z.literal("account.ownership_transferred"),
+    workspaceId: WorkspaceIdSchema,
+    /** The former owner, an `admin` now. */
+    previousOwnerMemberId: MemberIdSchema,
+    /** The target of the offer, the `owner` now. */
+    ownerMemberId: MemberIdSchema,
+    transferredAt: UtcTimestampSchema,
+  })
+  .superRefine((frame, ctx) => {
+    if (frame.previousOwnerMemberId === frame.ownerMemberId) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Ownership moves to another person",
+        path: ["ownerMemberId"],
+      });
+    }
+  });
+export type AccountOwnershipTransferredFrame = z.infer<
+  typeof AccountOwnershipTransferredFrameSchema
 >;
 
 /**
@@ -326,6 +358,7 @@ export const ServerFrameSchema = z.discriminatedUnion("type", [
   AccountRemovedFromWorkspaceFrameSchema,
   AccountOwnershipOfferedFrameSchema,
   AccountOwnershipOfferEndedFrameSchema,
+  AccountOwnershipTransferredFrameSchema,
   AccountJoinRequestDecidedFrameSchema,
   WorkspaceSubscribedFrameSchema,
   WorkspaceSubscribeRefusedFrameSchema,
