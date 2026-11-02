@@ -879,6 +879,22 @@ test("the global cap of 1,000 open challenges answers 429 with Retry-After", asy
   assert.equal(capped.headers["retry-after"], "60");
 });
 
+test("the address limit counts an IPv6 client by its /64", async (t) => {
+  const app = await tokenApp(t, { githubId: 2090 });
+  const challengeFrom = (remoteAddress: string) =>
+    app.inject({ method: "POST", url: "/auth/challenge", remoteAddress });
+  // 60 challenges in 10 minutes from addresses of one /64.
+  for (let index = 0; index < 60; index += 1) {
+    const response = await challengeFrom(`2001:db8:1:1::${index + 1}`);
+    assert.equal(response.statusCode, 200, String(index));
+  }
+  const sameNetwork = await challengeFrom("2001:db8:1:1:ffff:ffff:ffff:fffe");
+  assert.equal(sameNetwork.statusCode, 429);
+  assert.equal(codeOf(sameNetwork), "rate_limited");
+  const otherNetwork = await challengeFrom("2001:db8:1:2::1");
+  assert.equal(otherNetwork.statusCode, 200);
+});
+
 test("authenticated requests are limited per account", async (t) => {
   const app = await tokenApp(t, { githubId: 2018 });
   const device = await signInDevice(app);
