@@ -77,7 +77,7 @@ const EnvSchema = z.object({
         .min(1)
         .max(10 * 1024 * 1024),
     ),
-  // Browser origins allowed to open /ws. Empty: no browser origin is allowed.
+  // Browser origins allowed to open /ws besides API_PUBLIC_ORIGIN. Empty: no other browser origin is allowed.
   API_ALLOWED_ORIGINS: OriginList.default([]),
   // The API's public origin: the GitHub callback and the audience of device signatures (ADR 0014).
   API_PUBLIC_ORIGIN: z
@@ -126,7 +126,7 @@ export type Config = Readonly<{
   port: number;
   logLevel: LogLevel;
   bodyLimitBytes: number;
-  /** Browser origins allowed to open the WebSocket gateway. */
+  /** Browser origins allowed to open the WebSocket gateway, besides the public origin. */
   allowedOrigins: readonly string[];
   /** GitHub sign-in (ADR 0014); null when it is disabled, which only development and test allow. */
   githubSignIn: Readonly<{

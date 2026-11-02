@@ -1012,6 +1012,44 @@ test("a foreign browser origin gets 403; a listed origin and no origin connect, 
   }
 });
 
+test("the API's own origin connects and authenticates without API_ALLOWED_ORIGINS; an origin that only resembles it gets 403", async (t) => {
+  const { app } = await gatewayApp(t, {
+    githubId: 3038,
+    env: { API_ALLOWED_ORIGINS: "" },
+  });
+  const device = await signInDevice(app);
+  // Electron's net.WebSocket, the desktop's client, always sends it (#154).
+  const client = await connect(t, app, { headers: { origin: ORIGIN } });
+  await authenticate(client, device);
+
+  // The variants below are written for this public origin.
+  assert.equal(ORIGIN, "https://api.example");
+  const refused = [
+    "https://api.example:8443",
+    "https://api.example:443",
+    "http://api.example",
+    "wss://api.example",
+    "https://app.api.example",
+    "https://xapi.example",
+    "https://api.example.evil.example",
+    "https://api.example/",
+    "https://api.example/ws",
+    "https://api.example.",
+    "https://API.example",
+    "HTTPS://api.example",
+    "null",
+    // Listed in the other tests, not in this app.
+    ALLOWED_ORIGIN,
+  ];
+  for (const origin of refused) {
+    await assert.rejects(
+      app.injectWS("/ws", { headers: { origin } }),
+      /403/u,
+      origin,
+    );
+  }
+});
+
 test("a connection that closes leaves the registry, before and after authentication", async (t) => {
   const connections = new ConnectionRegistry();
   const { app } = await gatewayApp(t, { githubId: 3014, connections });

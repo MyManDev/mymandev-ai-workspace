@@ -38,6 +38,7 @@ Issue #20 requires that configuration is loaded at startup, that no secrets are 
 - The deployment artifact is decided by a later deployment task: either ship the workspace layout and run with Node.js, or bundle ([ADR 0001](0001-internal-packages-export-typescript-source.md)). Either way, production installs use `npm ci --omit=dev`, so development tools and their install scripts never reach a server.
 - Running the API for another machine needs a code change (`API_HOST`) together with authentication, not only an environment variable.
 - On Windows, SIGTERM is never delivered, and `node --watch` restarts terminate the process without running the handler. Ctrl+C sends SIGINT, which runs it.
+- Update of 2026-11-02 (#154): besides the browser origins listed in `API_ALLOWED_ORIGINS`, `/ws` also accepts a handshake whose `Origin` is exactly `API_PUBLIC_ORIGIN`, the variable that [ADR 0014](0014-accounts-devices-and-invitations.md) added, so the API's own origin needs no entry in the list; the list's form and its empty default are unchanged. The reason is recorded in the update of 2026-11-02 (#154) in ADR 0014. The text above is unchanged.
 
 ## Dependency policy
 
