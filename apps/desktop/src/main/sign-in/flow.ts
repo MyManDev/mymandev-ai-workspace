@@ -55,8 +55,14 @@ export const SIGN_IN_URL_WARNING =
 /** How long the answer of `POST /auth/sign-in` may take before the flow stops waiting. */
 export const SIGN_IN_REQUEST_TIMEOUT_MS = 30_000;
 
-/** An answer body larger than this is not read as an answer of the API. */
-const MAX_ANSWER_CHARACTERS = 64 * 1024;
+/**
+ * How long opening the system browser may take. After that the attempt
+ * continues as if the browser did not open: the URL is shown for copying.
+ */
+export const OPEN_EXTERNAL_TIMEOUT_MS = 10_000;
+
+/** An answer body larger than this many bytes is not read as an answer of the API. */
+export const MAX_ANSWER_BYTES = 64 * 1024;
 
 /**
  * Why a sign-in failed without an answer of the API that names a code:
@@ -71,13 +77,19 @@ const MAX_ANSWER_CHARACTERS = 64 * 1024;
  *   must first learn which key the API holds.
  * - `key_store_failed`: the key store refused or failed to read, create,
  *   replace, or delete a key.
- * - `record_unreadable`: the record file exists but cannot be read.
+ * - `record_unreadable`: the record file cannot be read, or it is corrupt
+ *   (for example another version, after a downgrade) while a key file
+ *   exists. The key may still be the key of a device that the API knows, so
+ *   it is kept; an explicit reset is a later option.
  * - `listener_unavailable`: the loopback listener could not start.
  * - `no_answer`: no answer arrived (a network error, or the request timed
  *   out); a key replacement stays pending.
- * - `unexpected_response`: an answer that is not one of the API's.
+ * - `server_error`: a `5xx` answer. The API may have committed before it
+ *   failed, so it is handled like `no_answer`.
+ * - `unexpected_response`: an answer that is not one of the API's; handled
+ *   like `no_answer`.
  * - `record_not_saved`: the API registered the device, but the record could
- *   not be written.
+ *   not be written, also when tried a second time.
  */
 export const SIGN_IN_FAILURE_REASONS = Object.freeze([
   "api_origin_unset",
@@ -91,6 +103,7 @@ export const SIGN_IN_FAILURE_REASONS = Object.freeze([
   "record_unreadable",
   "listener_unavailable",
   "no_answer",
+  "server_error",
   "unexpected_response",
   "record_not_saved",
 ] as const);
@@ -267,15 +280,63 @@ type DevicePlan =
 type Answer =
   | { readonly kind: "signed_in"; readonly body: SignedInAccount }
   | { readonly kind: "error"; readonly code: ApiErrorCode }
+  | { readonly kind: "server_error" }
   | { readonly kind: "unexpected" };
 
+/**
+ * Reads the body as UTF-8 text, at most `MAX_ANSWER_BYTES`: a larger
+ * `Content-Length` is refused before reading, and the stream is cancelled
+ * once it passes the limit. Null for a body that is too large or not UTF-8.
+ * Rejects when the body cannot be read, like a request without an answer.
+ */
+async function readBodyText(response: Response): Promise<string | null> {
+  const declared = response.headers.get("content-length");
+  if (declared !== null && !(Number(declared) <= MAX_ANSWER_BYTES)) {
+    await response.body?.cancel().catch(() => undefined);
+    return null;
+  }
+  const body = response.body;
+  if (body === null) {
+    return "";
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    size += value.byteLength;
+    if (size > MAX_ANSWER_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    chunks.push(value);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(
+      Buffer.concat(chunks),
+    );
+  } catch {
+    return null;
+  }
+}
+
 async function readAnswer(response: Response): Promise<Answer> {
+  if (response.status >= 500 && response.status <= 599) {
+    // The API may have committed before it failed: after the transaction
+    // it still drops tokens and closes connections, and a lost commit
+    // acknowledgement ends as a 500 too.
+    await response.body?.cancel().catch(() => undefined);
+    return { kind: "server_error" };
+  }
+  const text = await readBodyText(response);
+  if (text === null) {
+    return { kind: "unexpected" };
+  }
   let value: unknown;
   try {
-    const text = await response.text();
-    if (text.length > MAX_ANSWER_CHARACTERS) {
-      return { kind: "unexpected" };
-    }
     value = JSON.parse(text) as unknown;
   } catch {
     return { kind: "unexpected" };
@@ -295,7 +356,8 @@ async function readAnswer(response: Response): Promise<Answer> {
         }
       : { kind: "unexpected" };
   }
-  if (response.status >= 400 && response.status <= 599) {
+  // Only a 4xx with the API's error body means that nothing was committed.
+  if (response.status >= 400 && response.status <= 499) {
     const parsed = ApiErrorBodySchema.safeParse(value);
     if (parsed.success && parsed.data.statusCode === response.status) {
       return { kind: "error", code: parsed.data.code };
@@ -343,11 +405,32 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       if (keys.previous !== null) {
         return "replacement_pending";
       }
+      if (keys.current.publicKey !== read.record.publicKey) {
+        // Not the key of the record's device: the key of a new device whose
+        // registration got no clear answer after that device's key was lost.
+        // The API offers no way to learn the new device's ID, so a new device
+        // names the record's device again, with a new key.
+        try {
+          await deps.keyStore.delete();
+        } catch {
+          return "key_store_failed";
+        }
+        return { kind: "new", record: read.record };
+      }
       return { kind: "existing", record: read.record };
     }
     if (read.kind === "corrupt") {
+      if (hasKey) {
+        // The key may still be the key of a device that the API knows, for
+        // example after a downgrade that cannot read a newer record. It is
+        // kept; an explicit reset is a later option.
+        report("The device record is corrupt; the device key is kept.");
+        return "record_unreadable";
+      }
       report("The device record is corrupt and is not used.");
+      return { kind: "new", record: null };
     }
+    // The key is deleted only when no record exists at all.
     if (hasKey) {
       // A key without a record belongs to no device that this installation
       // knows; a new device needs a new key.
@@ -437,7 +520,26 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
 
       let opened = false;
       try {
-        opened = await deps.openExternal(url);
+        opened = await new Promise<boolean>((resolve, reject) => {
+          // A browser launch that never returns must not hold back the
+          // attempt: after the timeout the URL is shown for copying.
+          const cancelTimer = scheduleTimer(
+            () => resolve(false),
+            OPEN_EXTERNAL_TIMEOUT_MS,
+          );
+          Promise.resolve()
+            .then(() => deps.openExternal(url))
+            .then(
+              (value) => {
+                cancelTimer();
+                resolve(value === true);
+              },
+              (error: unknown) => {
+                cancelTimer();
+                reject(error instanceof Error ? error : new Error("failed"));
+              },
+            );
+        });
       } catch {
         opened = false;
       }
@@ -504,7 +606,20 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     }
   }
 
-  /** Undoes the key change of a request that the API did not commit. */
+  /**
+   * Undoes the key change of a request that the API refused with a `4xx`
+   * error body, so it committed nothing.
+   *
+   * When whether the API committed is unknown (no answer, a `5xx`, or an
+   * answer that is not the API's), nothing is undone:
+   * an existing device keeps the replacement pending, and part 3 tries the
+   * new key first. A new device keeps its new key and the record of a lost
+   * key stays as it was. The next attempt finds a key without a record, or
+   * a key that is not the record's device's key, and registers a new device
+   * (naming the record's device) with a new key. If the uncertain request
+   * did commit, the device it registered has no usable key and expires
+   * after 30 days, because the API offers no way to learn its ID.
+   */
   async function undoKey(plan: DevicePlan): Promise<void> {
     try {
       if (plan.kind === "existing") {
@@ -619,13 +734,8 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       );
       answer = await readAnswer(response);
     } catch {
-      // No answer arrived: the API may hold the new key or not. The
-      // replacement stays pending, and the next authentication tries the new
-      // key first (part 3). A new device's key is dropped: without its ID
-      // the installation cannot use it.
-      if (plan.kind === "new") {
-        await undoKey(plan);
-      }
+      // No answer arrived: the API may hold the new key or not. Nothing is
+      // undone (see `undoKey`).
       if (input.isCancelled()) {
         return Object.freeze({ kind: "cancelled" });
       }
@@ -635,13 +745,16 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       cancelTimeout();
     }
 
-    if (answer.kind === "unexpected") {
-      // Not an answer of the API: whether it committed is unknown.
-      if (plan.kind === "new") {
-        await undoKey(plan);
-      }
-      report("The sign-in request got an unexpected answer.");
-      return failed("unexpected_response");
+    if (answer.kind === "server_error" || answer.kind === "unexpected") {
+      // Whether the API committed is unknown; nothing is undone.
+      report(
+        answer.kind === "server_error"
+          ? "The sign-in request got a server error."
+          : "The sign-in request got an unexpected answer.",
+      );
+      return failed(
+        answer.kind === "server_error" ? "server_error" : "unexpected_response",
+      );
     }
 
     if (answer.kind === "error") {
@@ -684,16 +797,26 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       }
     }
     afterAccountMismatch = false;
-    try {
-      await deps.deviceRecords.write({
-        deviceId: account.deviceId,
-        userId: account.userId,
-        login: account.login,
-        displayName: account.displayName,
-        signInExpiresAt: account.signInExpiresAt,
-      });
-    } catch {
-      report("The device record could not be written.");
+    const record: DeviceRecord = {
+      deviceId: account.deviceId,
+      userId: account.userId,
+      login: account.login,
+      displayName: account.displayName,
+      signInExpiresAt: account.signInExpiresAt,
+      publicKey: device.publicKey,
+    };
+    // The API registered the key under this ID; without the record the
+    // installation cannot use it, so a failed write is tried once more.
+    let saved = false;
+    for (let attempt = 0; attempt < 2 && !saved; attempt += 1) {
+      try {
+        await deps.deviceRecords.write(record);
+        saved = true;
+      } catch {
+        report("The device record could not be written.");
+      }
+    }
+    if (!saved) {
       return failed("record_not_saved");
     }
     return Object.freeze({

@@ -1,5 +1,5 @@
-import { createPublicKey, verify } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createPublicKey, generateKeyPairSync, verify } from "node:crypto";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -27,6 +27,8 @@ import {
 import type { ScheduleTimer } from "../runtime.ts";
 import {
   createSignInFlow,
+  MAX_ANSWER_BYTES,
+  OPEN_EXTERNAL_TIMEOUT_MS,
   SIGN_IN_REQUEST_TIMEOUT_MS,
   SIGN_IN_URL_WARNING,
   type SignInFlowDependencies,
@@ -68,11 +70,16 @@ afterEach(async () => {
  * A fake `safeStorage` with the asynchronous API: it "encrypts" by adding a
  * prefix, which is enough for the store on Windows.
  */
+/** Every plain text that the fake encrypted: the private keys as PKCS#8 in base64. */
+const encryptedPlainTexts: string[] = [];
+
 const fakeSafeStorage: SystemKeyProtection = Object.freeze({
   isAsyncEncryptionAvailable: () => Promise.resolve(true),
   getSelectedStorageBackend: () => "unknown",
-  encryptStringAsync: (plainText: string) =>
-    Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8")),
+  encryptStringAsync: (plainText: string) => {
+    encryptedPlainTexts.push(plainText);
+    return Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8"));
+  },
   decryptStringAsync: (encrypted: Buffer) =>
     Promise.resolve({
       shouldReEncrypt: false,
@@ -238,20 +245,48 @@ function verifies(
   );
 }
 
+/** A raw Ed25519 public key as 64 hexadecimal characters, held by no store. */
+function randomPublicKey(): string {
+  const { x } = generateKeyPairSync("ed25519").publicKey.export({
+    format: "jwk",
+  });
+  return Buffer.from(x ?? "", "base64url").toString("hex");
+}
+
+/** Waits until the flow scheduled a timer with this delay. */
+async function waitForTimer(h: Harness, delayMs: number) {
+  for (let round = 0; round < 500; round += 1) {
+    const timer = h.timers.find((entry) => entry.delayMs === delayMs);
+    if (timer !== undefined) {
+      return timer;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("The timer was not scheduled.");
+}
+
 const RECORD: DeviceRecord = Object.freeze({
   deviceId: DEVICE_ID,
   userId: USER_ID,
   login: "octocat",
   displayName: "The Octocat",
   signInExpiresAt: "2026-11-30T10:00:00.000Z",
+  publicKey: randomPublicKey(),
 });
 
 /** A device that signed in before: a record and a loaded key. */
 async function existingDevice(h: Harness): Promise<string> {
   const key = await h.keyStore.create({ kind: "system" });
-  await h.records.write(RECORD);
+  await h.records.write({ ...RECORD, publicKey: key.publicKey });
   return key.publicKey;
 }
+
+const SERVER_ERROR = Object.freeze({
+  statusCode: 500,
+  error: "Internal Server Error",
+  message: "Internal Server Error",
+  code: "internal_error",
+});
 
 describe("a new device", () => {
   test("registers a new key with a platform label and writes the record", async () => {
@@ -309,7 +344,7 @@ describe("a new device", () => {
     });
     expect(await h.records.read()).toEqual({
       kind: "record",
-      record: ANSWER,
+      record: { ...ANSWER, publicKey: body.device.publicKey },
     });
   }, 20_000);
 
@@ -351,9 +386,40 @@ describe("a new device", () => {
     expect(outcome).toMatchObject({ kind: "signed_in", newDevice: true });
   }, 20_000);
 
-  test("does not trust a corrupt record", async () => {
+  test("refuses to start when a corrupt record sits next to a key, and keeps the key", async () => {
     const h = harness();
-    await h.keyStore.create({ kind: "system" });
+    const key = await h.keyStore.create({ kind: "system" });
+    await h.records.write({ ...RECORD, publicKey: key.publicKey });
+    await writeFile(path.join(folder, DEVICE_RECORD_FILE), "{");
+    expect(await h.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "record_unreadable" },
+    });
+    expect(await h.keyStore.hasKey()).toBe(true);
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key.publicKey);
+    expect(h.opened).toEqual([]);
+    expect(h.errors).toContain(
+      "The device record is corrupt; the device key is kept.",
+    );
+  });
+
+  test("keeps the key next to a record of another version", async () => {
+    const h = harness();
+    const key = await h.keyStore.create({ kind: "system" });
+    await h.records.write({ ...RECORD, publicKey: key.publicKey });
+    await writeFile(
+      path.join(folder, DEVICE_RECORD_FILE),
+      JSON.stringify({ version: 2, ...RECORD, publicKey: key.publicKey }),
+    );
+    expect(await h.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "record_unreadable" },
+    });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key.publicKey);
+  });
+
+  test("registers a new device when a corrupt record has no key next to it", async () => {
+    const h = harness();
     await h.records.write(RECORD);
     await writeFile(path.join(folder, DEVICE_RECORD_FILE), "{");
     const { outcome } = await signIn(h);
@@ -362,6 +428,84 @@ describe("a new device", () => {
     expect(h.requests[0]?.body.device).not.toHaveProperty("previousDeviceId");
     expect(h.errors).toContain("The device record is corrupt and is not used.");
     expect(outcome).toMatchObject({ kind: "signed_in" });
+  }, 20_000);
+
+  test("keeps a new device's key and the old record on a 5xx answer, and registers again next time", async () => {
+    const h = harness();
+    // The key of the recorded device was lost.
+    await h.records.write(RECORD);
+    h.answer = () => json(500, SERVER_ERROR);
+    const first = await signIn(h);
+
+    expect(first.outcome).toEqual({ kind: "failed", reason: "server_error" });
+    const kept = h.requests[0]?.body.device.publicKey;
+    expect(h.keyStore.keys()?.current.publicKey).toBe(kept);
+    expect(await h.keyStore.hasKey()).toBe(true);
+    expect(await h.records.read()).toEqual({ kind: "record", record: RECORD });
+
+    // The kept key is not the record's device's key, so it is never used
+    // with that device ID: the next attempt registers a new device again.
+    h.answer = () => json(200, { ...ANSWER, deviceId: OTHER_DEVICE_ID });
+    const second = await signIn(h);
+    const device = h.requests[1]?.body.device;
+    expect(device).toMatchObject({ kind: "new", previousDeviceId: DEVICE_ID });
+    expect(device?.publicKey).not.toBe(kept);
+    expect(second.outcome).toMatchObject({
+      kind: "signed_in",
+      newDevice: true,
+    });
+    expect(await h.records.read()).toMatchObject({
+      record: { deviceId: OTHER_DEVICE_ID, publicKey: device?.publicKey },
+    });
+  }, 30_000);
+
+  test("keeps a first sign-in's key when no answer arrives", async () => {
+    const h = harness();
+    h.answer = () => {
+      throw new TypeError("fetch failed");
+    };
+    const { outcome } = await signIn(h);
+    expect(outcome).toEqual({ kind: "failed", reason: "no_answer" });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(
+      h.requests[0]?.body.device.publicKey,
+    );
+    expect(await h.records.read()).toEqual({ kind: "none" });
+  }, 20_000);
+
+  test("writes the record a second time when the first write fails", async () => {
+    const records = createDeviceRecordStore({ folder, platform: "win32" });
+    let writes = 0;
+    const h = harness({
+      deviceRecords: {
+        read: records.read,
+        delete: records.delete,
+        write: async (record) => {
+          writes += 1;
+          if (writes === 1) {
+            throw new Error("disk full");
+          }
+          await records.write(record);
+        },
+      },
+    });
+    const { outcome } = await signIn(h);
+    expect(outcome).toMatchObject({ kind: "signed_in" });
+    expect(writes).toBe(2);
+    expect(h.errors).toContain("The device record could not be written.");
+    expect(await records.read()).toMatchObject({ kind: "record" });
+  }, 20_000);
+
+  test("reports record_not_saved when the record cannot be written twice", async () => {
+    const records = createDeviceRecordStore({ folder, platform: "win32" });
+    const h = harness({
+      deviceRecords: {
+        read: records.read,
+        delete: records.delete,
+        write: () => Promise.reject(new Error("disk full")),
+      },
+    });
+    const { outcome } = await signIn(h);
+    expect(outcome).toEqual({ kind: "failed", reason: "record_not_saved" });
   }, 20_000);
 });
 
@@ -403,7 +547,10 @@ describe("an existing device", () => {
     const keys = h.keyStore.keys();
     expect(keys?.previous).toBeNull();
     expect(keys?.current.publicKey).toBe(device.publicKey);
-    expect(await h.records.read()).toEqual({ kind: "record", record: ANSWER });
+    expect(await h.records.read()).toEqual({
+      kind: "record",
+      record: { ...ANSWER, publicKey: device.publicKey },
+    });
   }, 20_000);
 
   test("refuses to start while a key is not loaded", async () => {
@@ -439,22 +586,86 @@ describe("answers of the API", () => {
     const keys = h.keyStore.keys();
     expect(keys?.current.publicKey).toBe(previousKey);
     expect(keys?.previous).toBeNull();
-    expect(await h.records.read()).toEqual({ kind: "record", record: RECORD });
+    expect(await h.records.read()).toEqual({
+      kind: "record",
+      record: { ...RECORD, publicKey: previousKey },
+    });
   }, 20_000);
 
-  test("abandons the replacement on a 5xx answer with an error body", async () => {
+  test("keeps the replacement pending on a 5xx answer, even with an error body", async () => {
     const h = harness();
     const previousKey = await existingDevice(h);
+    h.answer = () => json(500, SERVER_ERROR);
+    const { outcome } = await signIn(h);
+    expect(outcome).toEqual({ kind: "failed", reason: "server_error" });
+    const keys = h.keyStore.keys();
+    expect(keys?.previous?.publicKey).toBe(previousKey);
+    expect(keys?.current.publicKey).toBe(h.requests[0]?.body.device.publicKey);
+  }, 20_000);
+
+  test("a cancel while the request is in flight keeps the replacement pending", async () => {
+    const h = harness();
+    const previousKey = await existingDevice(h);
+    let cancel: () => void = () => undefined;
     h.answer = () =>
-      json(503, {
-        statusCode: 503,
-        error: "Service Unavailable",
-        message: "Service Unavailable",
-        code: "internal_error",
+      new Promise<Response>((_resolve, reject) => {
+        const signal = h.requests[0]?.init.signal;
+        signal?.addEventListener("abort", () =>
+          reject(new DOMException("aborted", "AbortError")),
+        );
+        cancel();
+      });
+    const start = started(await h.flow.start());
+    cancel = start.cancel;
+    const params = authorizeParams(h.opened[0] ?? "");
+    const form = new URLSearchParams({
+      code: SIGN_IN_CODE,
+      state: params.get("state") ?? "",
+    }).toString();
+    expect(await postForm(params.get("redirect_uri") ?? "", form)).toBe(200);
+    expect(await start.outcome).toEqual({ kind: "cancelled" });
+    expect(h.requests).toHaveLength(1);
+    expect(h.keyStore.keys()?.previous?.publicKey).toBe(previousKey);
+    expect(await h.records.read()).toEqual({
+      kind: "record",
+      record: { ...RECORD, publicKey: previousKey },
+    });
+  }, 20_000);
+
+  test("does not read an answer larger than the limit", async () => {
+    const h = harness();
+    const previousKey = await existingDevice(h);
+    let pulled = 0;
+    h.answer = () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          pull(controller) {
+            pulled += 1;
+            controller.enqueue(new Uint8Array(16 * 1024).fill(32));
+            if (pulled > 100) {
+              controller.close();
+            }
+          },
+        }),
+        { status: 200 },
+      );
+    const { outcome } = await signIn(h);
+    expect(outcome).toEqual({ kind: "failed", reason: "unexpected_response" });
+    expect(pulled).toBeLessThan(10);
+    expect(h.keyStore.keys()?.previous?.publicKey).toBe(previousKey);
+  }, 20_000);
+
+  test("refuses a Content-Length over the limit before reading", async () => {
+    const h = harness();
+    await existingDevice(h);
+    h.answer = () =>
+      new Response(JSON.stringify(ANSWER), {
+        status: 200,
+        headers: { "content-length": String(MAX_ANSWER_BYTES + 1) },
       });
     const { outcome } = await signIn(h);
-    expect(outcome).toEqual({ kind: "refused", code: "internal_error" });
-    expect(h.keyStore.keys()?.current.publicKey).toBe(previousKey);
+    expect(outcome).toEqual({ kind: "failed", reason: "unexpected_response" });
+    expect(h.keyStore.keys()?.previous).not.toBeNull();
   }, 20_000);
 
   test("keeps the replacement pending when no answer arrives", async () => {
@@ -469,13 +680,16 @@ describe("answers of the API", () => {
     const keys = h.keyStore.keys();
     expect(keys?.previous?.publicKey).toBe(previousKey);
     expect(keys?.current.publicKey).toBe(h.requests[0]?.body.device.publicKey);
-    expect(await h.records.read()).toEqual({ kind: "record", record: RECORD });
+    expect(await h.records.read()).toEqual({
+      kind: "record",
+      record: { ...RECORD, publicKey: previousKey },
+    });
   }, 20_000);
 
   test("keeps the replacement pending for an answer that is not the API's", async () => {
     const h = harness();
     const previousKey = await existingDevice(h);
-    h.answer = () => new Response("<html>Bad Gateway</html>", { status: 502 });
+    h.answer = () => new Response("<html>Not Found</html>", { status: 404 });
     const { outcome } = await signIn(h);
     expect(outcome).toEqual({ kind: "failed", reason: "unexpected_response" });
     expect(h.keyStore.keys()?.previous?.publicKey).toBe(previousKey);
@@ -548,12 +762,15 @@ describe("answers of the API", () => {
 
   test("does not trust a 200 answer outside the format", async () => {
     const h = harness();
-    await existingDevice(h);
+    const previousKey = await existingDevice(h);
     h.answer = () => json(200, { ...ANSWER, login: "octo cat" });
     const { outcome } = await signIn(h);
     expect(outcome).toEqual({ kind: "failed", reason: "unexpected_response" });
     expect(h.keyStore.keys()?.previous).not.toBeNull();
-    expect(await h.records.read()).toEqual({ kind: "record", record: RECORD });
+    expect(await h.records.read()).toEqual({
+      kind: "record",
+      record: { ...RECORD, publicKey: previousKey },
+    });
   }, 20_000);
 });
 
@@ -569,6 +786,22 @@ describe("the browser and the listener", () => {
     expect(start.authorizeUrl).toBe(h.opened[0]);
     expect(start.warning).toBe(SIGN_IN_URL_WARNING);
     expect(SIGN_IN_URL_WARNING).toContain("Do not share it");
+    start.cancel();
+    expect(await start.outcome).toEqual({ kind: "cancelled" });
+  });
+
+  test("shows the URL when opening the browser does not finish in time", async () => {
+    const h = harness();
+    h.openResult = () => new Promise<boolean>(() => undefined);
+    const pending = h.flow.start();
+    const timer = await waitForTimer(h, OPEN_EXTERNAL_TIMEOUT_MS);
+    timer.callback();
+    const start = started(await pending);
+    if (start.opened) {
+      throw new Error("expected opened: false");
+    }
+    expect(start.authorizeUrl).toBe(h.opened[0]);
+    expect(start.warning).toBe(SIGN_IN_URL_WARNING);
     start.cancel();
     expect(await start.outcome).toEqual({ kind: "cancelled" });
   });
@@ -716,5 +949,27 @@ describe("secrets", () => {
       expect(shown).not.toContain(secret);
     }
     expect(shown).not.toContain("mmdc_");
+
+    // The private keys, as the store handed them to safeStorage, appear
+    // neither in an outcome or a message nor in the record file.
+    expect(encryptedPlainTexts.length).toBeGreaterThan(0);
+    const recordFile = await readFile(
+      path.join(folder, DEVICE_RECORD_FILE),
+      "utf8",
+    );
+    for (const plainText of encryptedPlainTexts) {
+      const pkcs8 = Buffer.from(plainText, "base64");
+      const seed = pkcs8.subarray(pkcs8.length - 32);
+      for (const form of [
+        plainText,
+        pkcs8.toString("hex"),
+        seed.toString("hex"),
+        seed.toString("base64"),
+        seed.toString("base64url"),
+      ]) {
+        expect(shown).not.toContain(form);
+        expect(recordFile).not.toContain(form);
+      }
+    }
   }, 40_000);
 });

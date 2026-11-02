@@ -15,6 +15,7 @@ const RECORD: DeviceRecord = Object.freeze({
   login: "octocat",
   displayName: "The Octocat",
   signInExpiresAt: "2026-12-02T10:00:00.000Z",
+  publicKey: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
 });
 
 let root: string;
@@ -84,6 +85,10 @@ describe("createDeviceRecordStore", () => {
     [
       "a timestamp outside the format",
       JSON.stringify({ version: 1, ...RECORD, signInExpiresAt: "tomorrow" }),
+    ],
+    [
+      "a public key outside the format",
+      JSON.stringify({ version: 1, ...RECORD, publicKey: "00" }),
     ],
     ["a file that is too large", " ".repeat(5000)],
   ])("reads %s as corrupt", async (_name, content) => {

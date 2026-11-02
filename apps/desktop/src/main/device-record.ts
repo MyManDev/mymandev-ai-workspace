@@ -8,6 +8,7 @@ import path from "node:path";
 import {
   type DeviceId,
   DeviceIdSchema,
+  DevicePublicKeySchema,
   displayText,
   GitHubLoginSchema,
   LIMITS,
@@ -42,6 +43,7 @@ const DeviceRecordFileSchema = z.strictObject({
   login: GitHubLoginSchema,
   displayName: displayText(LIMITS.displayName),
   signInExpiresAt: UtcTimestampSchema,
+  publicKey: DevicePublicKeySchema,
 });
 
 /** The device and the account of the last successful sign-in. */
@@ -53,6 +55,13 @@ export interface DeviceRecord {
   readonly displayName: string;
   /** 30 days after the last sign-in, as the API answered it. */
   readonly signInExpiresAt: string;
+  /**
+   * The public key that the API holds for this device after that sign-in,
+   * so that a key of another, unconfirmed registration is never used with
+   * this device ID. Whoever confirms a pending replacement by authenticating
+   * (part 3) writes the record again with the new key.
+   */
+  readonly publicKey: string;
 }
 
 /**
@@ -93,6 +102,7 @@ function frozenRecord(record: DeviceRecord): DeviceRecord {
     login: record.login,
     displayName: record.displayName,
     signInExpiresAt: record.signInExpiresAt,
+    publicKey: record.publicKey,
   });
 }
 
