@@ -31,19 +31,13 @@ export const SIGN_IN_LISTENER_TIMEOUT_MS = 10 * 60_000;
 export const SIGN_IN_LISTENER_MAX_BODY_BYTES = 1024;
 
 /**
- * A connection ends after this long without activity, and a request whose
- * headers or body take longer is answered with 404 and closed. Node.js checks
- * the request limits once a second, so a slow request ends within about one
- * more second.
+ * A connection ends after this long without activity, without an answer, so
+ * a request that stalls in the middle of its headers or body usually ends
+ * this way. A request that keeps sending, but whose headers or body take
+ * longer than this in total, gets the 404 and is closed when Node.js next
+ * checks the request limits, once a second, so within about one more second.
  */
 export const SIGN_IN_LISTENER_CONNECTION_TIMEOUT_MS = 10_000;
-
-/**
- * At most this many connections are open at once; a further connection is
- * closed at once. Every connection ends within the connection timeout, so a
- * held slot frees within about 11 seconds.
- */
-export const SIGN_IN_LISTENER_MAX_CONNECTIONS = 16;
 
 /**
  * After the answer to the valid request, how long the other connections and
@@ -371,8 +365,11 @@ export async function startSignInListener(
   // reaches the handler, and the first answer closes the connection, so the
   // 503 that Node.js prepares for it is never sent.
   server.maxRequestsPerSocket = 1;
-  // A further connection is closed at once; the timeouts free a slot.
-  server.maxConnections = SIGN_IN_LISTENER_MAX_CONNECTIONS;
+  // No cap on connections (no `maxConnections`). A cap would let a local
+  // process that holds every slot, and reopens each one as soon as it
+  // closes, keep the browser's request out for the whole attempt. A process
+  // of the same user is outside the threat model, because it could stop the
+  // application anyway, and the timeouts bound how long each connection lives.
   // A connection that sends nothing, or stops sending, ends too.
   server.on("connection", (socket: Socket) => {
     socket.setTimeout(timeoutMs, () => socket.destroy());
@@ -383,8 +380,9 @@ export async function startSignInListener(
     notFound(response);
   });
   // A request that Node.js cannot parse, whose headers are too large, or
-  // that times out gets the same 404 instead of Node's bare 400, 431, or 408,
-  // unless an answer has already started on the connection.
+  // that keeps sending past the header or request timeout gets the same 404
+  // instead of Node's bare 400, 431, or 408, unless an answer has already
+  // started on the connection.
   server.on("clientError", (_error, socket: Duplex) => {
     const response = responses.get(socket);
     if (socket.writable && (response === undefined || !response.headersSent)) {

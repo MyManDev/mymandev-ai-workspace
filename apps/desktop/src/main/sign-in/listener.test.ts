@@ -12,7 +12,6 @@ import {
   SIGN_IN_LISTENER_CONNECTION_TIMEOUT_MS,
   SIGN_IN_LISTENER_ERRORS,
   SIGN_IN_LISTENER_MAX_BODY_BYTES,
-  SIGN_IN_LISTENER_MAX_CONNECTIONS,
   SIGN_IN_LISTENER_TIMEOUT_MS,
   type SignInListener,
   type SignInListenerOptions,
@@ -822,15 +821,14 @@ describe("answers that Node.js would write itself", () => {
   );
 });
 
-describe("timeouts and the connection limit", () => {
-  test("uses a connection timeout of 10 seconds, one request per connection, and 16 connections", async () => {
+describe("timeouts and connections", () => {
+  test("uses a connection timeout of 10 seconds and one request per connection, with no connection cap", async () => {
     const { server } = await start();
     expect(SIGN_IN_LISTENER_CONNECTION_TIMEOUT_MS).toBe(10_000);
-    expect(SIGN_IN_LISTENER_MAX_CONNECTIONS).toBe(16);
     expect(server.headersTimeout).toBe(10_000);
     expect(server.requestTimeout).toBe(10_000);
     expect(server.maxRequestsPerSocket).toBe(1);
-    expect(server.maxConnections).toBe(16);
+    expect(server.maxConnections).toBeUndefined();
   });
 
   test("gives every connection an idle timeout", async () => {
@@ -922,29 +920,22 @@ describe("timeouts and the connection limit", () => {
     expect(valid.status).toBe(200);
   });
 
-  test("closes connections beyond the limit, and the valid request gets through once the held ones time out", async () => {
-    const { listener, server, state } = await start({
-      connectionTimeoutMs: 1_000,
-    });
+  test("the valid request gets through while 20 other connections are held open in the middle of their headers", async () => {
+    // The default timeouts, so that none of the held connections ends first.
+    const { listener, server, state, result } = await start();
     const held = [];
-    for (let index = 0; index < SIGN_IN_LISTENER_MAX_CONNECTIONS; index += 1) {
-      held.push(await openConnection(listener.port, server));
-    }
-    // The next connection is closed at once, without an answer.
-    const dropped = await new Promise<string>((resolve) => {
-      const socket = connect({ host: "127.0.0.1", port: listener.port });
-      const chunks: Buffer[] = [];
-      socket.on("data", (chunk: Buffer) => chunks.push(chunk));
-      socket.on("error", () => undefined);
-      socket.once("close", () =>
-        resolve(Buffer.concat(chunks).toString("utf8")),
+    for (let index = 0; index < 20; index += 1) {
+      held.push(
+        await openConnection(
+          listener.port,
+          server,
+          `POST /callback HTTP/1.1\r\nHost: 127.0.0.1:${listener.port}\r\n`,
+        ),
       );
-    });
-    expect(dropped).toBe("");
-
-    for (const output of await Promise.all(held.map((item) => item.closed))) {
-      expect(isNothingOrNotFound(output)).toBe(true);
     }
+    await settle();
+    expect(result()).toBeUndefined();
+
     const code = newSignInCode();
     const valid = await exchange(
       listener.port,
@@ -953,15 +944,17 @@ describe("timeouts and the connection limit", () => {
     expect(valid.status).toBe(200);
     const value = await listener.wait();
     expect(value.kind === "code" && value.code).toBe(code);
+    // The held connections are closed with the listener, without an answer.
+    for (const output of await Promise.all(held.map((item) => item.closed))) {
+      expect(output).toBe("");
+    }
+    await listener.close();
+    expect(await reachable("127.0.0.1", listener.port)).toBe(false);
   });
 
   test("a refused request frees its connection at once", async () => {
     const { listener, server, state } = await start();
-    for (
-      let index = 0;
-      index < SIGN_IN_LISTENER_MAX_CONNECTIONS + 4;
-      index += 1
-    ) {
+    for (let index = 0; index < 20; index += 1) {
       const answer = await exchange(
         listener.port,
         rawRequest(listener.port, { method: "GET", path: "/" }),
