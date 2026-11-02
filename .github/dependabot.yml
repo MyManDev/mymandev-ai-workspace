@@ -32,7 +32,8 @@ updates:
         versions:
           - ">= 6.1.0"
     # Minor and patch updates that belong together arrive in one pull request.
-    # Major updates arrive one per pull request.
+    # Major updates arrive one per pull request, except in the react and vite
+    # groups, whose packages work only at matching versions (ADR 0016).
     groups:
       tooling:
         patterns:
@@ -70,6 +71,26 @@ updates:
         patterns:
           - zod
         update-types:
+          - minor
+          - patch
+      # react-dom requires the same version of react, also across majors.
+      react:
+        patterns:
+          - react
+          - react-dom
+        update-types:
+          - major
+          - minor
+          - patch
+      # The desktop build tools: their peer ranges tie these versions together.
+      vite:
+        patterns:
+          - vite
+          - vitest
+          - "@vitejs/plugin-react"
+          - electron-vite
+        update-types:
+          - major
           - minor
           - patch
 

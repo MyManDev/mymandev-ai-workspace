@@ -63,7 +63,7 @@ Dependabot opens pull requests against `develop` every Monday for the npm depend
 
 - Versions stay exact: an update replaces the pinned version.
 - A release is adopted only when it is at least 14 days old. Security updates do not wait, because the cooldown applies to version updates only.
-- Minor and patch updates of packages that belong together arrive in one pull request: the shared tooling, the `@types` packages, Fastify, Drizzle, and zod (the same exact version in every workspace, [ADR 0003](../architecture/decisions/0003-zod-runtime-validation.md)). Major updates arrive one per pull request.
+- Minor and patch updates of packages that belong together arrive in one pull request: the shared tooling, the `@types` packages, Fastify, Drizzle, and zod (the same exact version in every workspace, [ADR 0003](../architecture/decisions/0003-zod-runtime-validation.md)). Major updates arrive one per pull request, except for two groups whose packages work only at matching versions, which also arrive together for a major update: `react` with `react-dom`, and the desktop build tools Vite, Vitest, `@vitejs/plugin-react`, and electron-vite ([ADR 0016](../architecture/decisions/0016-desktop-toolchain.md)).
 - `@types/node` gets no major updates; it follows the Node.js major version in `.nvmrc`.
 - `typescript` stays below 6.1 while typescript-eslint supports only that range. Remove the rule from `dependabot.yml` when a typescript-eslint release supports newer versions.
 - `@mymandev/*` packages are ignored. Workspaces are private and never come from the registry, and this keeps a public package with the same name from being proposed.
