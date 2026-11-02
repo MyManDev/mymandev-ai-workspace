@@ -11,6 +11,8 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
+import type { Socket } from "node:net";
+import type { Duplex } from "node:stream";
 import {
   Base64Url32BytesSchema,
   LOOPBACK_CALLBACK_PATH,
@@ -27,6 +29,28 @@ export const SIGN_IN_LISTENER_TIMEOUT_MS = 10 * 60_000;
 
 /** The largest form body accepted. The API's form is about 100 bytes. */
 export const SIGN_IN_LISTENER_MAX_BODY_BYTES = 1024;
+
+/**
+ * A connection ends after this long without activity, and a request whose
+ * headers or body take longer is answered with 404 and closed. Node.js checks
+ * the request limits once a second, so a slow request ends within about one
+ * more second.
+ */
+export const SIGN_IN_LISTENER_CONNECTION_TIMEOUT_MS = 10_000;
+
+/**
+ * At most this many connections are open at once; a further connection is
+ * closed at once. Every connection ends within the connection timeout, so a
+ * held slot frees within about 11 seconds.
+ */
+export const SIGN_IN_LISTENER_MAX_CONNECTIONS = 16;
+
+/**
+ * After the answer to the valid request, how long the other connections and
+ * that answer get before every connection is closed, so `close` always
+ * resolves.
+ */
+const ANSWER_GRACE_MS = 1_000;
 
 /**
  * The errors that the API's page posts instead of a code: `access_denied`
@@ -72,6 +96,11 @@ export interface SignInListenerOptions {
   readonly state: string;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
+  /**
+   * Defaults to `SIGN_IN_LISTENER_CONNECTION_TIMEOUT_MS`; tests pass a
+   * shorter one.
+   */
+  readonly connectionTimeoutMs?: number;
   /**
    * Receives a fixed message when the server reports an error after it
    * started. A message never contains a request value.
@@ -131,7 +160,16 @@ function send(
   contentType: string,
   body: string,
 ): void {
-  if (response.headersSent || response.destroyed) {
+  // Nothing more is written once the connection ended, for example after the
+  // 404 that `clientError` wrote to the socket itself.
+  const socket = response.socket;
+  if (
+    response.headersSent ||
+    response.destroyed ||
+    socket === null ||
+    socket.destroyed ||
+    socket.writableEnded
+  ) {
     return;
   }
   const bytes = Buffer.from(body, "utf8");
@@ -143,9 +181,30 @@ function send(
   response.end(bytes);
 }
 
+const NOT_FOUND_TYPE = "text/plain; charset=utf-8";
+const NOT_FOUND_BODY = "Not Found";
+
 function notFound(response: ServerResponse): void {
-  send(response, 404, "text/plain; charset=utf-8", "Not Found");
+  send(response, 404, NOT_FOUND_TYPE, NOT_FOUND_BODY);
 }
+
+/**
+ * The same 404, written straight to the socket for a request that Node.js
+ * could not parse or that timed out, when there is no response object.
+ */
+const RAW_NOT_FOUND = Buffer.from(
+  [
+    "HTTP/1.1 404 Not Found",
+    ...Object.entries({
+      ...RESPONSE_HEADERS,
+      "content-type": NOT_FOUND_TYPE,
+      "content-length": String(NOT_FOUND_BODY.length),
+    }).map(([name, value]) => `${name}: ${value}`),
+    "",
+    NOT_FOUND_BODY,
+  ].join("\r\n"),
+  "latin1",
+);
 
 /** The value of a header sent exactly once; undefined when it is missing or repeated. */
 function singleHeader(
@@ -270,6 +329,11 @@ export async function startSignInListener(
     throw new TypeError("Invalid state");
   }
   const expectedStateHash = sha256(state.data);
+  const timeoutMs =
+    options.connectionTimeoutMs ?? SIGN_IN_LISTENER_CONNECTION_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError("Invalid connection timeout");
+  }
   const scheduleTimer = options.scheduleTimer ?? scheduleWithSetTimeout;
   const report = options.onError ?? (() => undefined);
 
@@ -281,20 +345,54 @@ export async function startSignInListener(
     resolveResult = resolve;
   });
 
+  // The response of the request that each connection carries, so that an
+  // answer written straight to the socket never mixes into a started one.
+  const responses = new WeakMap<Duplex, ServerResponse>();
+
   const server = createServer(
     {
       // A missing Host header gets this listener's 404, not Node's 400.
       requireHostHeader: false,
-      headersTimeout: 10_000,
-      requestTimeout: 10_000,
+      headersTimeout: timeoutMs,
+      requestTimeout: timeoutMs,
+      // Node.js checks the two limits above on this interval (30 seconds by
+      // default), so it bounds how late a slow request ends.
+      connectionsCheckingInterval: Math.min(1_000, timeoutMs),
     },
     (request, response) => {
+      responses.set(request.socket, response);
       handle(request, response).catch(() => {
         report("The sign-in listener failed to answer a request.");
         notFound(response);
       });
     },
   );
+  // One request per connection: Node.js drops a pipelined request before it
+  // reaches the handler, and the first answer closes the connection, so the
+  // 503 that Node.js prepares for it is never sent.
+  server.maxRequestsPerSocket = 1;
+  // A further connection is closed at once; the timeouts free a slot.
+  server.maxConnections = SIGN_IN_LISTENER_MAX_CONNECTIONS;
+  // A connection that sends nothing, or stops sending, ends too.
+  server.on("connection", (socket: Socket) => {
+    socket.setTimeout(timeoutMs, () => socket.destroy());
+  });
+  // An unknown `Expect` header gets the same 404 instead of Node's 417.
+  server.on("checkExpectation", (request, response) => {
+    responses.set(request.socket, response);
+    notFound(response);
+  });
+  // A request that Node.js cannot parse, whose headers are too large, or
+  // that times out gets the same 404 instead of Node's bare 400, 431, or 408,
+  // unless an answer has already started on the connection.
+  server.on("clientError", (_error, socket: Duplex) => {
+    const response = responses.get(socket);
+    if (socket.writable && (response === undefined || !response.headersSent)) {
+      socket.end(RAW_NOT_FOUND, () => socket.destroy());
+      return;
+    }
+    socket.destroy();
+  });
   const closed = new Promise<void>((resolve) => {
     server.once("close", () => resolve());
   });
@@ -314,9 +412,19 @@ export async function startSignInListener(
       server.closeAllConnections();
       return;
     }
-    // Let the answer to the valid request reach the browser first.
+    // Let the answer to the valid request reach the browser first, but never
+    // wait for it, or for another connection, longer than the grace period.
     server.closeIdleConnections();
-    answered.once("close", () => server.closeAllConnections());
+    const fallback = setTimeout(
+      () => server.closeAllConnections(),
+      ANSWER_GRACE_MS,
+    );
+    fallback.unref();
+    server.once("close", () => clearTimeout(fallback));
+    answered.once("close", () => {
+      clearTimeout(fallback);
+      server.closeAllConnections();
+    });
   }
 
   async function handle(

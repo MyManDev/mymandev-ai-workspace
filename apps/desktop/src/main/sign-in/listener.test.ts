@@ -1,13 +1,18 @@
 import { randomBytes } from "node:crypto";
 import { Server } from "node:http";
-import { connect } from "node:net";
+import { connect, type Socket } from "node:net";
 import { inspect } from "node:util";
-import { LoopbackRedirectUriSchema } from "@mymandev/protocol";
+import {
+  Base64Url32BytesSchema,
+  LoopbackRedirectUriSchema,
+} from "@mymandev/protocol";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ScheduleTimer } from "../runtime.ts";
 import {
+  SIGN_IN_LISTENER_CONNECTION_TIMEOUT_MS,
   SIGN_IN_LISTENER_ERRORS,
   SIGN_IN_LISTENER_MAX_BODY_BYTES,
+  SIGN_IN_LISTENER_MAX_CONNECTIONS,
   SIGN_IN_LISTENER_TIMEOUT_MS,
   type SignInListener,
   type SignInListenerOptions,
@@ -125,6 +130,25 @@ type Answer = Readonly<{
   body: string;
 }>;
 
+/** Reads one HTTP answer; an empty text gives status 0. */
+function parseAnswer(text: string): Answer {
+  if (text === "") {
+    return { status: 0, headers: {}, body: "" };
+  }
+  const end = text.indexOf("\r\n\r\n");
+  const [statusLine = "", ...headerLines] = text.slice(0, end).split("\r\n");
+  const headers: Record<string, string> = {};
+  for (const line of headerLines) {
+    const colon = line.indexOf(":");
+    headers[line.slice(0, colon).toLowerCase()] = line.slice(colon + 1).trim();
+  }
+  return {
+    status: Number(statusLine.split(" ")[1]),
+    headers,
+    body: text.slice(end + 4),
+  };
+}
+
 /**
  * Sends raw bytes on a new connection to 127.0.0.1 and reads the answer
  * until the listener closes the connection, which it does after every answer.
@@ -136,47 +160,42 @@ function exchange(port: number, request: string): Promise<Answer> {
     socket.on("data", (chunk: Buffer) => chunks.push(chunk));
     socket.on("error", reject);
     socket.on("close", () => {
-      const text = Buffer.concat(chunks).toString("utf8");
-      const end = text.indexOf("\r\n\r\n");
-      const [statusLine = "", ...headerLines] = text
-        .slice(0, end)
-        .split("\r\n");
-      const headers: Record<string, string> = {};
-      for (const line of headerLines) {
-        const colon = line.indexOf(":");
-        headers[line.slice(0, colon).toLowerCase()] = line
-          .slice(colon + 1)
-          .trim();
-      }
-      resolve({
-        status: Number(statusLine.split(" ")[1]),
-        headers,
-        body: text.slice(end + 4),
-      });
+      resolve(parseAnswer(Buffer.concat(chunks).toString("utf8")));
     });
     socket.write(request);
   });
 }
 
 /**
- * Opens a connection that sends nothing and waits until the listener has
- * accepted it. `closed` resolves when the listener closes it.
+ * Opens a connection, waits until the listener has accepted it, and sends
+ * the bytes, if any, without ending the connection. `closed` resolves with
+ * what the listener sent once it closes the connection.
  */
-async function idleConnection(
+async function openConnection(
   port: number,
   server: Server,
-): Promise<{ closed: Promise<void> }> {
+  bytes = "",
+): Promise<{ socket: Socket; closed: Promise<string> }> {
   const accepted = new Promise<void>((resolve) => {
     server.once("connection", () => resolve());
   });
   const socket = connect({ host: "127.0.0.1", port });
-  const closed = new Promise<void>((resolve) => {
-    socket.once("close", () => resolve());
+  const chunks: Buffer[] = [];
+  socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+  const closed = new Promise<string>((resolve) => {
+    socket.once("close", () => resolve(Buffer.concat(chunks).toString("utf8")));
   });
   socket.on("error", () => undefined);
   await accepted;
-  return { closed };
+  if (bytes !== "") {
+    socket.write(bytes);
+  }
+  return { socket, closed };
 }
+
+/** A connection that sends nothing. */
+const idleConnection = (port: number, server: Server) =>
+  openConnection(port, server);
 
 /** Whether a TCP connection to the address succeeds. */
 function reachable(host: string, port: number): Promise<boolean> {
@@ -405,12 +424,39 @@ const refused: [string, Refused][] = [
     (port, state, code) =>
       rawRequest(port, { contentType, body: form({ code, state }) }),
   ]),
-  // State.
-  [
-    "another state",
-    (port, _state, code) =>
-      rawRequest(port, { body: form({ code, state: random32() }) }),
-  ],
+  // Another state in the protocol's format, so only the constant-time
+  // comparison can refuse it.
+  ...(
+    [
+      ["another well-formed state", () => random32()],
+      [
+        "a state that differs in its first character",
+        (state: string) =>
+          `${state.startsWith("A") ? "B" : "A"}${state.slice(1)}`,
+      ],
+      [
+        "a state that differs in the case of one letter",
+        (state: string) => {
+          const index = state.slice(0, 42).search(/[A-Za-z]/u);
+          const letter = state.charAt(index);
+          const swapped =
+            letter === letter.toUpperCase()
+              ? letter.toLowerCase()
+              : letter.toUpperCase();
+          return `${state.slice(0, index)}${swapped}${state.slice(index + 1)}`;
+        },
+      ],
+    ] as const
+  ).map(([name, other]): [string, Refused] => [
+    name,
+    (port, state, code) => {
+      const sent = other(state);
+      expect(sent).not.toBe(state);
+      expect(Base64Url32BytesSchema.safeParse(sent).success).toBe(true);
+      return rawRequest(port, { body: form({ code, state: sent }) });
+    },
+  ]),
+  // A state outside the format.
   [
     "no state",
     (port, _state, code) => rawRequest(port, { body: form({ code }) }),
@@ -424,19 +470,6 @@ const refused: [string, Refused][] = [
     "a longer state",
     (port, state, code) =>
       rawRequest(port, { body: form({ code, state: `${state}A` }) }),
-  ],
-  [
-    "the state in another case",
-    (port, state, code) =>
-      rawRequest(port, {
-        body: form({
-          code,
-          state:
-            state.toUpperCase() === state
-              ? state.toLowerCase()
-              : state.toUpperCase(),
-        }),
-      }),
   ],
   // Body.
   ["an empty body", (port) => rawRequest(port, { body: "" })],
@@ -607,14 +640,17 @@ describe("closing", () => {
     expect(timers.pending()).toEqual([]);
     await idle.closed;
     await listener.close();
+    expect(await reachable("127.0.0.1", listener.port)).toBe(false);
     listener.cancel();
     expect(await listener.wait()).toEqual({ kind: "cancelled" });
   });
 
   test("close cancels and resolves once the port is released", async () => {
     const { listener, server } = await start();
+    expect(await reachable("127.0.0.1", listener.port)).toBe(true);
     await listener.close();
     expect(server.listening).toBe(false);
+    expect(await reachable("127.0.0.1", listener.port)).toBe(false);
     expect(await listener.wait()).toEqual({ kind: "cancelled" });
   });
 
@@ -627,6 +663,88 @@ describe("closing", () => {
     expect(server.listening).toBe(false);
     await idle.closed;
     await listener.close();
+    expect(await reachable("127.0.0.1", listener.port)).toBe(false);
+  });
+
+  test("the port is released after the valid request", async () => {
+    const { listener, state } = await start();
+    const code = newSignInCode();
+    const answer = await exchange(
+      listener.port,
+      rawRequest(listener.port, { body: form({ code, state }) }),
+    );
+    expect(answer.status).toBe(200);
+    await listener.close();
+    expect(await reachable("127.0.0.1", listener.port)).toBe(false);
+  });
+
+  test("closes a connection that is in the middle of a request when the valid request settles", async () => {
+    const { listener, server, state } = await start();
+    const partial = await openConnection(
+      listener.port,
+      server,
+      `POST /callback HTTP/1.1\r\nHost: 127.0.0.1:${listener.port}\r\n`,
+    );
+    const slowBody = await openConnection(
+      listener.port,
+      server,
+      rawRequest(listener.port, { body: "x".repeat(100) }).slice(0, -50),
+    );
+    const code = newSignInCode();
+    const answer = await exchange(
+      listener.port,
+      rawRequest(listener.port, { body: form({ code, state }) }),
+    );
+    expect(answer.status).toBe(200);
+    const value = await listener.wait();
+    expect(value.kind === "code" && value.code).toBe(code);
+    expect(await partial.closed).toBe("");
+    expect(await slowBody.closed).toBe("");
+    await listener.close();
+    expect(await reachable("127.0.0.1", listener.port)).toBe(false);
+  });
+
+  test("a valid request pipelined behind another request is dropped unread", async () => {
+    const { listener, server, state, result } = await start();
+    const partial = await openConnection(
+      listener.port,
+      server,
+      `POST /callback HTTP/1.1\r\nHost: 127.0.0.1:${listener.port}\r\n`,
+    );
+    const code = newSignInCode();
+    const answer = await exchange(
+      listener.port,
+      rawRequest(listener.port, { method: "GET", path: "/" }) +
+        rawRequest(listener.port, { body: form({ code, state }) }),
+    );
+    // One answer, the 404 to the first request, and the connection closes.
+    expect(answer.status).toBe(404);
+    expect(answer.body).toBe("Not Found");
+    await settle();
+    expect(result()).toBeUndefined();
+    expect(server.listening).toBe(true);
+
+    listener.cancel();
+    expect(await listener.wait()).toEqual({ kind: "cancelled" });
+    expect(await partial.closed).toBe("");
+    await listener.close();
+    expect(await reachable("127.0.0.1", listener.port)).toBe(false);
+  });
+
+  test("a request pipelined behind the valid request does not hold back close", async () => {
+    const { listener, state } = await start();
+    const code = newSignInCode();
+    const answer = await exchange(
+      listener.port,
+      rawRequest(listener.port, { body: form({ code, state }) }) +
+        rawRequest(listener.port, { method: "GET", path: "/" }),
+    );
+    expect(answer.status).toBe(200);
+    expect(answer.body).toContain("Returning to MyManDev");
+    const value = await listener.wait();
+    expect(value.kind === "code" && value.code).toBe(code);
+    await listener.close();
+    expect(await reachable("127.0.0.1", listener.port)).toBe(false);
   });
 
   test("a cancel after the valid request keeps its result", async () => {
@@ -639,6 +757,234 @@ describe("closing", () => {
     listener.cancel();
     const value = await listener.wait();
     expect(value.kind === "code" && value.code).toBe(code);
+  });
+});
+
+/** Whether a connection's output is nothing, or one 404 with the security headers. */
+function isNothingOrNotFound(text: string): boolean {
+  if (text === "") {
+    return true;
+  }
+  const answer = parseAnswer(text);
+  return (
+    answer.status === 404 &&
+    answer.body === "Not Found" &&
+    Object.entries(SECURITY_HEADERS).every(
+      ([name, value]) => answer.headers[name] === value,
+    )
+  );
+}
+
+describe("answers that Node.js would write itself", () => {
+  test.each([
+    [
+      "a malformed header",
+      (port: number) =>
+        `POST /callback HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nBad Header\r\n\r\n`,
+    ],
+    ["a malformed request line", () => "POST /callback HTTP/9\r\n\r\n"],
+    [
+      "an invalid Content-Length",
+      (port: number) =>
+        `POST /callback HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nContent-Length: x\r\n\r\n`,
+    ],
+    [
+      "an unknown Expect header",
+      (port: number) =>
+        rawRequest(port, { headers: ["Expect: something"], body: "" }),
+    ],
+  ])(
+    "%s gets the same 404 with the security headers, and the listener keeps listening",
+    async (_name, build) => {
+      const { listener, server, state, result, errors } = await start();
+      const answer = await exchange(listener.port, build(listener.port));
+      expect(answer.status).toBe(404);
+      expect(answer.headers).toMatchObject({
+        ...SECURITY_HEADERS,
+        "content-type": "text/plain; charset=utf-8",
+        "content-length": "9",
+      });
+      expect(answer.body).toBe("Not Found");
+      await settle();
+      expect(result()).toBeUndefined();
+      expect(server.listening).toBe(true);
+
+      const code = newSignInCode();
+      const valid = await exchange(
+        listener.port,
+        rawRequest(listener.port, { body: form({ code, state }) }),
+      );
+      expect(valid.status).toBe(200);
+      const value = await listener.wait();
+      expect(value.kind === "code" && value.code).toBe(code);
+      expect(errors).toEqual([]);
+    },
+  );
+});
+
+describe("timeouts and the connection limit", () => {
+  test("uses a connection timeout of 10 seconds, one request per connection, and 16 connections", async () => {
+    const { server } = await start();
+    expect(SIGN_IN_LISTENER_CONNECTION_TIMEOUT_MS).toBe(10_000);
+    expect(SIGN_IN_LISTENER_MAX_CONNECTIONS).toBe(16);
+    expect(server.headersTimeout).toBe(10_000);
+    expect(server.requestTimeout).toBe(10_000);
+    expect(server.maxRequestsPerSocket).toBe(1);
+    expect(server.maxConnections).toBe(16);
+  });
+
+  test("gives every connection an idle timeout", async () => {
+    const { listener, server } = await start({ connectionTimeoutMs: 4_321 });
+    // The listener's own connection handler runs first.
+    const timeout = new Promise<number | undefined>((resolve) => {
+      server.once("connection", (socket: Socket) => resolve(socket.timeout));
+    });
+    await openConnection(listener.port, server);
+    expect(await timeout).toBe(4_321);
+  });
+
+  test("ends a request whose body trickles in, although the connection never goes idle", async () => {
+    const timeoutMs = 300;
+    const { listener, server, result } = await start({
+      connectionTimeoutMs: timeoutMs,
+    });
+    const length = 200;
+    const connection = await openConnection(
+      listener.port,
+      server,
+      rawRequest(listener.port, { body: "x".repeat(length) }).slice(0, -length),
+    );
+    // One byte every 50 ms keeps the idle timeout from firing; only the
+    // request timeout, checked every 300 ms here, can end the request.
+    const { socket } = connection;
+    let sent = 0;
+    const trickle = setInterval(() => {
+      if (!socket.destroyed && sent < length - 1) {
+        socket.write("x");
+        sent += 1;
+      }
+    }, 50);
+    const started = Date.now();
+    const output = await connection.closed;
+    clearInterval(trickle);
+    expect(Date.now() - started).toBeLessThan(3_000);
+    expect(sent).toBeLessThan(length - 1);
+    expect(isNothingOrNotFound(output)).toBe(true);
+    expect(result()).toBeUndefined();
+  });
+
+  test.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses the connection timeout %s",
+    async (connectionTimeoutMs) => {
+      const error = await startSignInListener({
+        state: random32(),
+        connectionTimeoutMs,
+      }).catch((caught: unknown) => caught);
+      expect(error).toEqual(new TypeError("Invalid connection timeout"));
+    },
+  );
+
+  test("ends a connection that sends nothing, one in the middle of its headers, and one in the middle of its body", async () => {
+    const timeoutMs = 200;
+    const { listener, server, state, result } = await start({
+      connectionTimeoutMs: timeoutMs,
+    });
+    const started = Date.now();
+    const connections = [
+      await openConnection(listener.port, server),
+      await openConnection(
+        listener.port,
+        server,
+        `POST /callback HTTP/1.1\r\nHost: 127.0.0.1:${listener.port}\r\n`,
+      ),
+      await openConnection(
+        listener.port,
+        server,
+        rawRequest(listener.port, { body: "x".repeat(100) }).slice(0, -50),
+      ),
+    ];
+    const outputs = await Promise.all(
+      connections.map((connection) => connection.closed),
+    );
+    // Within the timeout and one check of Node.js, with a margin for CI.
+    expect(Date.now() - started).toBeLessThan(5_000);
+    for (const output of outputs) {
+      expect(isNothingOrNotFound(output)).toBe(true);
+    }
+    expect(result()).toBeUndefined();
+    expect(server.listening).toBe(true);
+
+    const code = newSignInCode();
+    const valid = await exchange(
+      listener.port,
+      rawRequest(listener.port, { body: form({ code, state }) }),
+    );
+    expect(valid.status).toBe(200);
+  });
+
+  test("closes connections beyond the limit, and the valid request gets through once the held ones time out", async () => {
+    const { listener, server, state } = await start({
+      connectionTimeoutMs: 1_000,
+    });
+    const held = [];
+    for (let index = 0; index < SIGN_IN_LISTENER_MAX_CONNECTIONS; index += 1) {
+      held.push(await openConnection(listener.port, server));
+    }
+    // The next connection is closed at once, without an answer.
+    const dropped = await new Promise<string>((resolve) => {
+      const socket = connect({ host: "127.0.0.1", port: listener.port });
+      const chunks: Buffer[] = [];
+      socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+      socket.on("error", () => undefined);
+      socket.once("close", () =>
+        resolve(Buffer.concat(chunks).toString("utf8")),
+      );
+    });
+    expect(dropped).toBe("");
+
+    for (const output of await Promise.all(held.map((item) => item.closed))) {
+      expect(isNothingOrNotFound(output)).toBe(true);
+    }
+    const code = newSignInCode();
+    const valid = await exchange(
+      listener.port,
+      rawRequest(listener.port, { body: form({ code, state }) }),
+    );
+    expect(valid.status).toBe(200);
+    const value = await listener.wait();
+    expect(value.kind === "code" && value.code).toBe(code);
+  });
+
+  test("a refused request frees its connection at once", async () => {
+    const { listener, server, state } = await start();
+    for (
+      let index = 0;
+      index < SIGN_IN_LISTENER_MAX_CONNECTIONS + 4;
+      index += 1
+    ) {
+      const answer = await exchange(
+        listener.port,
+        rawRequest(listener.port, { method: "GET", path: "/" }),
+      );
+      expect(answer.status).toBe(404);
+    }
+    const count = () =>
+      new Promise<number>((resolve, reject) => {
+        server.getConnections((error, value) =>
+          error ? reject(error) : resolve(value),
+        );
+      });
+    // The server closes its side of each connection a moment after the client sees it.
+    for (let tries = 0; tries < 50 && (await count()) > 0; tries += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(await count()).toBe(0);
+    const code = newSignInCode();
+    const valid = await exchange(
+      listener.port,
+      rawRequest(listener.port, { body: form({ code, state }) }),
+    );
+    expect(valid.status).toBe(200);
   });
 });
 
