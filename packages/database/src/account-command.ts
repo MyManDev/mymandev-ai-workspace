@@ -46,7 +46,7 @@ export function parseAccountCommand(
   if (action === "erase" && !confirmed) {
     return {
       ok: false,
-      message: `Erasing an account cannot be undone: its GitHub identity and names are erased, its devices revoked, and its memberships ended. To erase ${userId.data}, repeat the command with ${CONFIRM_FLAG}.`,
+      message: `Erasing an account cannot be undone: its GitHub identity, names, device labels, and agent names are erased, its devices revoked, its memberships ended, and the workspaces that it owns as their only active member with an account archived. To erase ${userId.data}, repeat the command with ${CONFIRM_FLAG}.`,
     };
   }
   return { ok: true, command: { action, userId: userId.data } };
@@ -87,18 +87,24 @@ export function enableReport(result: EnableAccountResult): CommandReport {
 }
 
 /**
- * An erasure that is refused, because the account owns a workspace or does
- * not exist, exits with 1; a second erasure of an erased account changes
- * nothing and exits with 0.
+ * An erasure that is refused, because the account owns a workspace with
+ * another active member who has an account, or does not exist, exits with
+ * 1; a second erasure of an erased account changes nothing and exits with 0.
  */
 export function erasureReport(result: EraseAccountResult): CommandReport {
   if (result.erased) {
     const ended = [...result.endedMemberships, ...result.revokedDevices];
+    const revokedInvitations = [
+      ...result.endedMemberships,
+      ...result.archivedWorkspaces,
+    ].map((end) => end.revokedInvitationIds);
     const summary = [
       `Account erased: ${result.endedMemberships.length} memberships ended,`,
       `${result.revokedDevices.length} devices revoked,`,
       `${result.withdrawnJoinRequestIds.length} join requests withdrawn,`,
-      `${total(result.endedMemberships.map((end) => end.revokedInvitationIds))} invitations revoked,`,
+      `${result.archivedWorkspaces.length} workspaces archived,`,
+      `${total(result.archivedWorkspaces.map((archive) => archive.deniedJoinRequestIds))} join requests denied,`,
+      `${total(revokedInvitations)} invitations revoked,`,
       `${total(ended.map((end) => end.revokedGrantIds))} grants revoked,`,
       `${total(ended.map((end) => end.cancelledRuns))} runs cancelled.`,
     ].join(" ");
@@ -113,7 +119,7 @@ export function erasureReport(result: EraseAccountResult): CommandReport {
     case "owner":
       return {
         exitCode: 1,
-        message: `Refused: the account owns ${result.ownedWorkspaceIds.length} workspaces (${result.ownedWorkspaceIds.join(", ")}). Transfer their ownership first. Nothing was changed.`,
+        message: `Refused: the account owns ${result.ownedWorkspaceIds.length} workspaces with another active member who has an account (${result.ownedWorkspaceIds.join(", ")}). Transfer their ownership first; a workspace without such a member is archived instead. Nothing was changed.`,
       };
     case "not_found":
       return {

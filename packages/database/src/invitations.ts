@@ -378,7 +378,11 @@ export async function revokeInvitation(
  *   invitation, so this happens only to data written outside these functions;
  * - `inviter_unknown`: a preview finds no person or no GitHub identity of the
  *   account that created the invitation in its workspace, for example after
- *   the account's data was erased.
+ *   the account's data was erased;
+ * - `workspace_archived`: the invitation's workspace is archived, whatever
+ *   the invitation's state. The erasure that archives a workspace revokes
+ *   its invitations too (`src/account-erasure.ts`), so this happens only to
+ *   data written outside these functions.
  */
 export type InvitationFailure =
   | "unknown"
@@ -387,7 +391,8 @@ export type InvitationFailure =
   | "expired"
   | "member_removed"
   | "member_claimed"
-  | "inviter_unknown";
+  | "inviter_unknown"
+  | "workspace_archived";
 
 /** Why a preview or an acceptance of an invitation code was refused. Nothing was written. */
 export type InvitationCodeRefusal =
@@ -534,11 +539,11 @@ async function inviterOf(
  * invitation by `tokenHash` in whatever state. An account that is already an
  * active member of its workspace is `already_member`, before anything else
  * is decided. Every other refusal is `invitation_invalid` with its reason:
- * an unknown hash, an invitation that is accepted, revoked, or expired at
- * `now`, a person that is removed or claimed, or an inviter without a person
- * or an identity. The preview shows the workspace's name, the person's
- * display name, the inviter's person in the workspace with its GitHub login,
- * and the expiry. It writes nothing.
+ * an unknown hash, an archived workspace, an invitation that is accepted,
+ * revoked, or expired at `now`, a person that is removed or claimed, or an
+ * inviter without a person or an identity. The preview shows the
+ * workspace's name, the person's display name, the inviter's person in the
+ * workspace with its GitHub login, and the expiry. It writes nothing.
  */
 export async function previewInvitation(
   db: Database,
@@ -554,6 +559,7 @@ export async function previewInvitation(
         acceptedAt: workspaceInvitations.acceptedAt,
         revokedAt: workspaceInvitations.revokedAt,
         workspaceName: workspaces.name,
+        archivedAt: workspaces.archivedAt,
         displayName: workspaceMembers.displayName,
         userId: workspaceMembers.userId,
         removedAt: workspaceMembers.removedAt,
@@ -581,6 +587,9 @@ export async function previewInvitation(
         refusal: "already_member",
         invitationId: found.id,
       };
+    }
+    if (found.archivedAt !== null) {
+      return { previewed: false, ...invalid("workspace_archived", found.id) };
     }
     const failure = invitationFailure(found, input.now) ?? personFailure(found);
     if (failure !== null) {
@@ -622,9 +631,14 @@ class AcceptanceUndone extends Error {
  * It finds the invitation by `tokenHash` in whatever state; an unknown hash
  * is `invitation_invalid`. An account that is already an active member of
  * the invitation's workspace is `already_member` before anything is
- * consumed, so the invitation stays as it was. Then it locks the
- * invitation's person, as every change of a person's invitations does, and
- * consumes the invitation with a conditional update: only if the hash
+ * consumed, so the invitation stays as it was. An archived workspace is
+ * `invitation_invalid` with `workspace_archived`; the erasure that archives
+ * a workspace locks and revokes its invitations before it decides, so an
+ * acceptance that comes later finds its invitation revoked, and one that
+ * consumed it first makes the erasure see the new person and refuse
+ * (`src/account-erasure.ts`). Then it locks the invitation's person, as
+ * every change of a person's invitations does, and consumes the invitation
+ * with a conditional update: only if the hash
  * matches and the invitation is neither accepted, nor revoked, nor expired
  * at `now`. It records the accepting account and device and `now`. It then
  * claims the person only if the person is still unclaimed and not removed,
@@ -659,8 +673,13 @@ export async function acceptInvitation(
               id: workspaceInvitations.id,
               workspaceId: workspaceInvitations.workspaceId,
               memberId: workspaceInvitations.memberId,
+              archivedAt: workspaces.archivedAt,
             })
             .from(workspaceInvitations)
+            .innerJoin(
+              workspaces,
+              eq(workspaces.id, workspaceInvitations.workspaceId),
+            )
             .where(eq(workspaceInvitations.tokenHash, input.tokenHash));
           if (found === undefined) {
             return { accepted: false, ...invalid("unknown", null) };
@@ -677,6 +696,12 @@ export async function acceptInvitation(
               accepted: false,
               refusal: "already_member",
               invitationId: found.id,
+            };
+          }
+          if (found.archivedAt !== null) {
+            return {
+              accepted: false,
+              ...invalid("workspace_archived", found.id),
             };
           }
 

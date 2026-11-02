@@ -19,11 +19,23 @@ import {
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
-import { ERASED_DISPLAY_NAME, eraseAccount } from "./account-erasure.ts";
+import {
+  ARCHIVED_PROJECT_NAME,
+  ARCHIVED_REPOSITORY_NAME,
+  ARCHIVED_WORKSPACE_NAME,
+  ERASED_AGENT_NAME,
+  ERASED_DEVICE_LABEL,
+  ERASED_DISPLAY_NAME,
+  eraseAccount,
+} from "./account-erasure.ts";
 import { enableAccount } from "./account-status.ts";
 import { createDatabase } from "./client.ts";
 import type { Database } from "./db.ts";
-import { acceptInvitation } from "./invitations.ts";
+import {
+  acceptInvitation,
+  createInvitation,
+  previewInvitation,
+} from "./invitations.ts";
 import {
   approveJoinRequest,
   blockJoinRequest,
@@ -73,6 +85,7 @@ const ROLLED_BACK_AT = new Date("2026-11-02T16:00:00.000Z");
 const DISABLED_ERASED_AT = new Date("2026-11-02T17:00:00.000Z");
 const BLOCKED_ERASED_AT = new Date("2026-11-02T18:00:00.000Z");
 const ENABLE_REFUSED_AT = new Date("2026-11-02T19:00:00.000Z");
+const ARCHIVED_AT = new Date("2026-11-02T20:00:00.000Z");
 const GITHUB_CREATED = new Date("2015-06-01T10:00:00.000Z");
 
 type Account = Readonly<{
@@ -337,6 +350,8 @@ const invitationRow = (id: InvitationId) =>
       .from(workspaceInvitations)
       .where(eq(workspaceInvitations.id, id)),
   );
+const workspaceRow = (id: WorkspaceId) =>
+  rowOf(database().select().from(workspaces).where(eq(workspaces.id, id)));
 
 /** The audit records written at `at`, as comparable tuples in a fixed order. */
 async function auditAt(at: Date) {
@@ -360,11 +375,21 @@ function byId<T extends string>(ids: readonly T[]): T[] {
   return [...ids].sort();
 }
 
-test("an account that owns a workspace is refused, also when it is a member elsewhere, and nothing changes", async () => {
+test("an account that owns a workspace with another active, claimed person is refused with that workspace only, also when it owns another alone and is a member elsewhere, and nothing changes", async () => {
   const owner = await account("Owner");
   const other = await account("Other owner");
+  const mia = await account("Mia");
   const owned = await workspaceOf(owner);
+  const alone = await workspaceOf(owner);
   const elsewhere = await workspaceOf(other);
+  await addPerson(owned.workspaceId, owner, { claimedBy: mia });
+  // Neither an unclaimed nor a removed person can take over ownership.
+  const unclaimed = await addPerson(alone.workspaceId, owner);
+  await addPerson(alone.workspaceId, owner, {
+    claimedBy: mia,
+    removedAt: NOW,
+    removedByUserId: owner.userId,
+  });
   const person = await addPerson(elsewhere.workspaceId, other, {
     claimedBy: owner,
     displayName: "Olga",
@@ -386,7 +411,18 @@ test("an account that owns a workspace is refused, also when it is a member else
   assert.equal(user.disabledAt, null);
   assert.equal((await personRow(person)).removedAt, null);
   assert.equal((await personRow(person)).displayName, "Olga");
-  assert.equal((await deviceRow(owner.deviceId)).revokedAt, null);
+  for (const { workspaceId, ownerPerson } of [owned, alone]) {
+    const row = await personRow(ownerPerson);
+    assert.equal(row.role, "owner");
+    assert.equal(row.removedAt, null);
+    const workspace = await workspaceRow(workspaceId);
+    assert.equal(workspace.archivedAt, null);
+    assert.equal(workspace.name, "Team");
+  }
+  assert.equal((await personRow(unclaimed)).displayName, "Someone");
+  const device = await deviceRow(owner.deviceId);
+  assert.equal(device.revokedAt, null);
+  assert.equal(device.label, "Laptop");
   assert.deepEqual(await auditAt(REFUSED_AT), []);
 });
 
@@ -609,6 +645,21 @@ test("an erasure ends each membership as a removal does, revokes every device wi
   assert.deepEqual(before.revokedAt, NOW);
   assert.equal(before.revocationReason, "removed");
 
+  // The labels of every device of the account, the one revoked before too,
+  // and the names of every agent that it owns, which can hold personal data,
+  // are replaced.
+  for (const id of [erased.deviceId, secondDevice, revokedBefore]) {
+    const row = await deviceRow(id);
+    assert.equal(row.label, ERASED_DEVICE_LABEL);
+    assert.deepEqual(row.updatedAt, ERASED_AT);
+  }
+  for (const id of [erasedAgent, strayAgent]) {
+    const row = await agentRow(id);
+    assert.equal(row.name, ERASED_AGENT_NAME);
+    assert.deepEqual(row.updatedAt, ERASED_AT);
+  }
+  assert.deepEqual(result.archivedWorkspaces, []);
+
   // The join requests: the pending one withdrawn by the account, the lapsed
   // one marked expired, the denied one kept; every name replaced.
   assert.deepEqual(result.withdrawnJoinRequestIds, [pending]);
@@ -710,6 +761,8 @@ test("an erasure ends each membership as a removal does, revokes every device wi
     "Erin Example",
   );
   assert.equal((await agentRow(ownerAgent)).disabledAt, null);
+  assert.equal((await agentRow(ownerAgent)).name, "Builder");
+  assert.equal((await deviceRow(owner.deviceId)).label, "Laptop");
   assert.equal((await grantRow(ownerGrant)).revokedAt, null);
   assert.equal((await runRow(ownersRun)).state, "running");
   assert.equal((await runRow(finished)).state, "completed");
@@ -723,6 +776,281 @@ test("an erasure ends each membership as a removal does, revokes every device wi
   assert.deepEqual(await auditAt(LATER), []);
   assert.deepEqual((await userRow(erased.userId)).updatedAt, ERASED_AT);
   assert.deepEqual((await identityRow(erased.userId)).erasedAt, ERASED_AT);
+});
+
+test("the owner of workspaces without another active, claimed person is erased: each is archived, its open invitations revoked, the pending requests of other accounts denied, and the owner made a member and removed, audited with account_erased", async () => {
+  const db = database();
+  const erased = await account("Ayla");
+  const guest = await account("Gus");
+  const asker = await account("Ari");
+  const lapsedAsker = await account("Lou");
+  const other = await account("Mia");
+  const team = await workspaceOf(erased);
+  const solo = await workspaceOf(erased);
+  const elsewhere = await workspaceOf(other);
+
+  // The team keeps an unclaimed person with a live invitation, another with
+  // an invitation past its expiry that nobody revoked, and a former member.
+  const unclaimed = await addPerson(team.workspaceId, erased);
+  const tokenHash = randomBytes(32).toString("hex");
+  const live = await invite(team.workspaceId, unclaimed, erased, tokenHash);
+  const lapsedPerson = await addPerson(team.workspaceId, erased);
+  const expiredInvitation = newId<InvitationId>();
+  await db.insert(workspaceInvitations).values({
+    id: expiredInvitation,
+    workspaceId: team.workspaceId,
+    memberId: lapsedPerson,
+    tokenHash: randomBytes(32).toString("hex"),
+    createdByUserId: erased.userId,
+    createdAt: new Date(NOW.getTime() - 200 * HOUR_MS),
+    expiresAt: new Date(NOW.getTime() - 32 * HOUR_MS),
+  });
+  const former = await addPerson(team.workspaceId, erased, {
+    claimedBy: other,
+    displayName: "Mia",
+    removedAt: NOW,
+    removedByUserId: erased.userId,
+  });
+  // A removed unclaimed person, named after someone by the owner.
+  const removedUnclaimed = await addPerson(team.workspaceId, erased, {
+    displayName: "Ayla's cousin",
+    removedAt: NOW,
+    removedByUserId: erased.userId,
+  });
+  // A pending request of another account, and one past its expiry.
+  const asked = await requested(asker, team.workspaceId);
+  const lapsedRequest = newId<JoinRequestId>();
+  await db.insert(workspaceJoinRequests).values({
+    id: lapsedRequest,
+    workspaceId: team.workspaceId,
+    requesterUserId: lapsedAsker.userId,
+    requesterDeviceId: lapsedAsker.deviceId,
+    requestedDisplayName: "Lou",
+    createdAt: new Date(NOW.getTime() - 170 * HOUR_MS),
+    expiresAt: new Date(NOW.getTime() - 2 * HOUR_MS),
+  });
+  // The account is a member elsewhere too.
+  const elsewherePerson = await addPerson(elsewhere.workspaceId, other, {
+    claimedBy: erased,
+  });
+  // Its agent in the team, named after the person, with a grant and a run.
+  await db
+    .update(devices)
+    .set({ label: "Ayla's work laptop" })
+    .where(eq(devices.id, erased.deviceId));
+  const project = await projectIn(team.workspaceId, erased);
+  const agent = await agentOf(project, erased);
+  await db
+    .update(agents)
+    .set({ name: "Ayla's builder" })
+    .where(eq(agents.id, agent));
+  const grant = await grantTo(project, agent, erased);
+  const run = await runOf(project, agent, "queued", erased);
+  // A second project of the team, and a project elsewhere that stays.
+  const soloProject = await projectIn(solo.workspaceId, erased);
+  const elsewhereProject = await projectIn(elsewhere.workspaceId, other);
+
+  const result = await eraseAccount(db, {
+    userId: erased.userId,
+    now: ARCHIVED_AT,
+  });
+  assert.ok(result.erased);
+  assert.deepEqual(
+    result.archivedWorkspaces,
+    [
+      {
+        workspaceId: team.workspaceId,
+        revokedInvitationIds: byId([live, expiredInvitation]),
+        deniedJoinRequestIds: [asked],
+      },
+      {
+        workspaceId: solo.workspaceId,
+        revokedInvitationIds: [],
+        deniedJoinRequestIds: [],
+      },
+    ].sort((a, b) => a.workspaceId.localeCompare(b.workspaceId)),
+  );
+
+  // The workspaces are archived, and nothing is deleted. The names that the
+  // owner wrote in them are replaced; the rows and their links stay.
+  for (const { workspaceId } of [team, solo]) {
+    const row = await workspaceRow(workspaceId);
+    assert.deepEqual(row.archivedAt, ARCHIVED_AT);
+    assert.deepEqual(row.updatedAt, ARCHIVED_AT);
+    assert.equal(row.name, ARCHIVED_WORKSPACE_NAME);
+  }
+  for (const { projectId, repositoryId } of [project, soloProject]) {
+    const projectRow = await rowOf(
+      db.select().from(projects).where(eq(projects.id, projectId)),
+    );
+    assert.equal(projectRow.name, ARCHIVED_PROJECT_NAME);
+    assert.deepEqual(projectRow.updatedAt, ARCHIVED_AT);
+    const repositoryRow = await rowOf(
+      db.select().from(repositories).where(eq(repositories.id, repositoryId)),
+    );
+    assert.equal(repositoryRow.name, ARCHIVED_REPOSITORY_NAME);
+    assert.equal(repositoryRow.projectId, projectId);
+    assert.deepEqual(repositoryRow.updatedAt, ARCHIVED_AT);
+  }
+  for (const id of [unclaimed, lapsedPerson, removedUnclaimed]) {
+    const row = await personRow(id);
+    assert.equal(row.displayName, ERASED_DISPLAY_NAME);
+    assert.equal(row.workspaceId, team.workspaceId);
+    assert.deepEqual(row.updatedAt, ARCHIVED_AT);
+  }
+  assert.deepEqual((await personRow(removedUnclaimed)).removedAt, NOW);
+  // A former member keeps the name of its own account.
+  assert.equal((await personRow(former)).displayName, "Mia");
+  const elsewhereRow = await workspaceRow(elsewhere.workspaceId);
+  assert.equal(elsewhereRow.archivedAt, null);
+  assert.equal(elsewhereRow.name, "Team");
+  const elsewhereProjectRow = await rowOf(
+    db
+      .select()
+      .from(projects)
+      .where(eq(projects.id, elsewhereProject.projectId)),
+  );
+  assert.equal(elsewhereProjectRow.name, "App");
+
+  // The owner's people are members now, removed as a removal does; an
+  // archived workspace has no owner.
+  for (const { ownerPerson } of [team, solo]) {
+    const row = await personRow(ownerPerson);
+    assert.equal(row.role, "member");
+    assert.deepEqual(row.removedAt, ARCHIVED_AT);
+    assert.equal(row.removedByUserId, erased.userId);
+    assert.equal(row.displayName, ERASED_DISPLAY_NAME);
+  }
+  const owners = await db
+    .select({ id: workspaceMembers.id })
+    .from(workspaceMembers)
+    .where(
+      and(
+        inArray(workspaceMembers.workspaceId, [
+          team.workspaceId,
+          solo.workspaceId,
+        ]),
+        eq(workspaceMembers.role, "owner"),
+      ),
+    );
+  assert.deepEqual(owners, []);
+  assert.deepEqual(
+    result.endedMemberships.map((end) => end.memberId),
+    byId([team.ownerPerson, solo.ownerPerson, elsewherePerson]),
+  );
+  const [teamEnd] = result.endedMemberships.filter(
+    (end) => end.memberId === team.ownerPerson,
+  );
+  assert.ok(teamEnd);
+  // The archive revoked the invitations before the removal.
+  assert.deepEqual(teamEnd.revokedInvitationIds, []);
+  assert.deepEqual(teamEnd.disabledAgentIds, [agent]);
+  assert.deepEqual(teamEnd.revokedGrantIds, [grant]);
+  assert.deepEqual(
+    teamEnd.cancelledRuns.map((cancelled) => [
+      cancelled.runId,
+      cancelled.reason,
+    ]),
+    [[run, "member_removed"]],
+  );
+  // The unclaimed people and the former member stay as they were.
+  for (const id of [unclaimed, lapsedPerson]) {
+    const row = await personRow(id);
+    assert.equal(row.removedAt, null);
+    assert.equal(row.userId, null);
+  }
+  assert.deepEqual((await personRow(former)).removedAt, NOW);
+
+  for (const id of [live, expiredInvitation]) {
+    const row = await invitationRow(id);
+    assert.deepEqual(row.revokedAt, ARCHIVED_AT);
+    assert.equal(row.revokedByUserId, erased.userId);
+  }
+  const denied = await requestRow(asked);
+  assert.equal(denied.decision, "denied");
+  assert.deepEqual(denied.decidedAt, ARCHIVED_AT);
+  assert.equal(denied.decidedByUserId, erased.userId);
+  assert.equal(denied.requestedDisplayName, "Erin Example");
+  const lapsed = await requestRow(lapsedRequest);
+  assert.equal(lapsed.decision, null, "a request past its expiry stays");
+
+  assert.equal((await deviceRow(erased.deviceId)).label, ERASED_DEVICE_LABEL);
+  assert.equal((await agentRow(agent)).name, ERASED_AGENT_NAME);
+
+  assert.deepEqual(
+    await auditAt(ARCHIVED_AT),
+    [
+      ["account.erased", null, null, null, erased.userId, null],
+      ["device.revoked", null, null, null, erased.deviceId, "account_erased"],
+      ...[team, solo].map(({ workspaceId }) => [
+        "workspace.archived",
+        null,
+        null,
+        workspaceId,
+        workspaceId,
+        "account_erased",
+      ]),
+      ...[live, expiredInvitation].map((id) => [
+        "invitation.revoked",
+        null,
+        null,
+        team.workspaceId,
+        id,
+        "account_erased",
+      ]),
+      [
+        "join_request.denied",
+        null,
+        null,
+        team.workspaceId,
+        asked,
+        "account_erased",
+      ],
+      ...[
+        [team.workspaceId, team.ownerPerson],
+        [solo.workspaceId, solo.ownerPerson],
+        [elsewhere.workspaceId, elsewherePerson],
+      ].map(([workspaceId, personId]) => [
+        "member.removed",
+        null,
+        null,
+        workspaceId,
+        personId,
+        "account_erased",
+      ]),
+    ].sort((a, b) => String(a).localeCompare(String(b))),
+  );
+
+  // An archived workspace refuses an invitation code as an invalid one, and
+  // a join request as an unknown workspace.
+  const refusal = {
+    refusal: "invitation_invalid",
+    reason: "workspace_archived",
+    invitationId: live,
+  };
+  assert.deepEqual(
+    await previewInvitation(db, {
+      tokenHash,
+      userId: guest.userId,
+      now: LATER,
+    }),
+    { previewed: false, ...refusal },
+  );
+  assert.deepEqual(
+    await acceptInvitation(db, { tokenHash, ...guest, now: LATER }),
+    { accepted: false, ...refusal },
+  );
+  assert.equal((await personRow(unclaimed)).userId, null);
+  assert.deepEqual(
+    await createJoinRequest(db, {
+      workspaceId: team.workspaceId,
+      userId: guest.userId,
+      deviceId: guest.deviceId,
+      displayName: "Gus",
+      now: LATER,
+    }),
+    { requested: false, refusal: "workspace_not_found" },
+  );
 });
 
 test("an earlier disable keeps its time, and the former GitHub ID matches nothing, so a sign-in with it can store a new account", async () => {
@@ -748,6 +1076,7 @@ test("an earlier disable keeps its time, and the former GitHub ID matches nothin
       },
     ],
     withdrawnJoinRequestIds: [],
+    archivedWorkspaces: [],
   });
   assert.deepEqual((await userRow(erased.userId)).disabledAt, NOW);
 
@@ -907,14 +1236,61 @@ async function waitsForLock(): Promise<boolean> {
 }
 
 /**
+ * What the sessions of the test database that wait for a lock wait for: the
+ * table of the row, through the tuple lock that a session holds or waits for
+ * while it waits for the transaction that holds the row, or else the kind of
+ * lock, such as `advisory`.
+ */
+async function lockWaits(): Promise<string[]> {
+  assert.ok(testDatabase);
+  const { rows } = await testDatabase.client.query<{ waitedOn: string }>(
+    `select distinct coalesce(c.relname, w.locktype) as "waitedOn"
+       from pg_locks w
+       left join pg_locks t on t.pid = w.pid and t.locktype = 'tuple'
+       left join pg_class c on c.oid = t.relation
+      where not w.granted
+        and (select oid from pg_database where datname = current_database())
+            in (w.database, t.database)`,
+  );
+  return rows.map((row) => row.waitedOn).sort();
+}
+
+/**
+ * Waits until a session of the test database waits for a lock, while
+ * `running` has not settled, and returns what it waits for (`lockWaits`);
+ * empty when `running` settled without waiting.
+ */
+async function untilWaiting(running: Promise<unknown>): Promise<string[]> {
+  let settled = false;
+  running.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  while (!settled) {
+    if (await waitsForLock()) {
+      return lockWaits();
+    }
+    await delay(10);
+  }
+  return [];
+}
+
+/**
  * Runs `first` in a transaction of a second session and keeps it open while
  * `action` starts in this session. Returns the action's result after the
- * held transaction committed, and whether the action waited for a lock.
+ * held transaction committed, whether the action waited for a lock, and what
+ * it waited for (`lockWaits`).
  */
 async function whileHeld<T>(
   first: (tx: Database) => Promise<unknown>,
   action: () => Promise<T>,
-): Promise<Readonly<{ result: T; waited: boolean }>> {
+): Promise<
+  Readonly<{ result: T; waited: boolean; waitedOn: readonly string[] }>
+> {
   const url = testDatabase?.url;
   assert.ok(url, "the test database is on a server");
   const other = createDatabase(url, { max: 1 });
@@ -949,9 +1325,11 @@ async function whileHeld<T>(
         await delay(10);
       }
     }
+    // The action waits until the held transaction is released.
+    const waitedOn = waited ? await lockWaits() : [];
     release.resolve();
     await held;
-    return { result: await running, waited };
+    return { result: await running, waited, waitedOn };
   } finally {
     release.resolve();
     await held.catch(() => undefined);
@@ -989,7 +1367,7 @@ test(
   async () => {
     const erased = await account("Erin");
     const registered = newId<DeviceId>();
-    const { result, waited } = await whileHeld(
+    const { result, waited, waitedOn } = await whileHeld(
       async (tx) => {
         // The sign-in's locks: the identity, then the account; then a new device.
         const [found] = await signInLookup(tx, erased.subject);
@@ -1008,6 +1386,7 @@ test(
       () => eraseAccount(database(), { userId: erased.userId, now: ERASED_AT }),
     );
     assert.equal(waited, true, "the erasure waits for the identity");
+    assert.deepEqual(waitedOn, ["user_identities"]);
     assert.ok(result.erased);
     assert.deepEqual(
       result.revokedDevices.map((device) => device.deviceId),
@@ -1025,7 +1404,7 @@ test(
   SERVER_ONLY,
   async () => {
     const erased = await account("Erin");
-    const { result, waited } = await whileHeld(
+    const { result, waited, waitedOn } = await whileHeld(
       async (tx) => {
         const erasure = await eraseAccount(tx, {
           userId: erased.userId,
@@ -1036,6 +1415,7 @@ test(
       () => database().transaction((tx) => signInLookup(tx, erased.subject)),
     );
     assert.equal(waited, true, "the sign-in waits for the identity");
+    assert.deepEqual(waitedOn, ["user_identities"]);
     assert.deepEqual(result, [], "the sign-in then creates a new account");
   },
 );
@@ -1050,7 +1430,7 @@ test(
     const invited = await addPerson(workspaceId, owner);
     const tokenHash = randomBytes(32).toString("hex");
     await invite(workspaceId, invited, owner, tokenHash);
-    const { result, waited } = await whileHeld(
+    const { result, waited, waitedOn } = await whileHeld(
       async (tx) => {
         assert.equal(await accountUsable(tx, erased.userId), true);
         const accepted = await acceptInvitation(tx, {
@@ -1064,6 +1444,7 @@ test(
       () => eraseAccount(database(), { userId: erased.userId, now: ERASED_AT }),
     );
     assert.equal(waited, true, "the erasure waits for the account");
+    assert.deepEqual(waitedOn, ["users"]);
     assert.ok(result.erased);
     assert.deepEqual(
       result.endedMemberships.map((end) => end.memberId),
@@ -1086,7 +1467,7 @@ test(
     const invited = await addPerson(workspaceId, owner);
     const tokenHash = randomBytes(32).toString("hex");
     await invite(workspaceId, invited, owner, tokenHash);
-    const { result, waited } = await whileHeld(
+    const { result, waited, waitedOn } = await whileHeld(
       async (tx) => {
         const erasure = await eraseAccount(tx, {
           userId: erased.userId,
@@ -1107,6 +1488,7 @@ test(
         ),
     );
     assert.equal(waited, true, "the accept waits for the account");
+    assert.deepEqual(waitedOn, ["users"]);
     assert.equal(result, "unauthorized");
     assert.equal((await personRow(invited)).userId, null);
   },
@@ -1136,6 +1518,7 @@ test(
       () => eraseAccount(database(), { userId: erased.userId, now: ERASED_AT }),
     );
     assert.equal(approval.waited, true, "the erasure waits for the request");
+    assert.deepEqual(approval.waitedOn, ["workspace_join_requests"]);
     assert.ok(approval.result.erased);
     assert.ok(approvedPerson);
     assert.deepEqual(
@@ -1163,6 +1546,7 @@ test(
         }),
     );
     assert.equal(erasure.waited, true, "the approval waits for the request");
+    assert.deepEqual(erasure.waitedOn, ["workspace_join_requests"]);
     assert.deepEqual(erasure.result, { approved: false, refusal: "conflict" });
     assert.equal((await requestRow(second)).decision, "withdrawn");
     const people = await database()
@@ -1179,7 +1563,7 @@ test(
   async () => {
     const first = await account("Erin");
     const second = await account("Lee");
-    const { result, waited } = await whileHeld(
+    const { result, waited, waitedOn } = await whileHeld(
       async (tx) => {
         const erasure = await eraseAccount(tx, {
           userId: first.userId,
@@ -1190,7 +1574,328 @@ test(
       () => eraseAccount(database(), { userId: second.userId, now: ERASED_AT }),
     );
     assert.equal(waited, true, "the second erasure waits for the first");
+    assert.deepEqual(waitedOn, ["advisory"]);
     assert.ok(result.erased);
     assert.equal((await identityRow(second.userId)).subject, null);
+  },
+);
+
+/** An owner's workspace whose only other person is an unclaimed one. */
+async function soleOwner(name: string) {
+  const owner = await account(name);
+  const workspace = await workspaceOf(owner);
+  const unclaimed = await addPerson(workspace.workspaceId, owner);
+  return { owner, ...workspace, unclaimed };
+}
+
+test(
+  "an erasure waits for an invitation that the owner creates in a workspace without another claimed person, then archives the workspace and revokes the invitation",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId, unclaimed } = await soleOwner("Ayla");
+    let created: InvitationId | undefined;
+    const { result, waited, waitedOn } = await whileHeld(
+      async (tx) => {
+        const invitation = await createInvitation(tx, {
+          workspaceId,
+          ...owner,
+          memberId: unclaimed,
+          tokenHash: randomBytes(32).toString("hex"),
+          now: NOW,
+        });
+        assert.ok(invitation.created);
+        created = invitation.invitation.id;
+      },
+      () => eraseAccount(database(), { userId: owner.userId, now: ERASED_AT }),
+    );
+    assert.equal(waited, true, "the erasure waits for the owner's person");
+    assert.deepEqual(waitedOn, ["workspace_members"]);
+    assert.ok(result.erased);
+    assert.ok(created);
+    assert.deepEqual(result.archivedWorkspaces, [
+      {
+        workspaceId,
+        revokedInvitationIds: [created],
+        deniedJoinRequestIds: [],
+      },
+    ]);
+    assert.deepEqual((await invitationRow(created)).revokedAt, ERASED_AT);
+  },
+);
+
+test(
+  "an invitation that the owner creates while an erasure archives the workspace waits for it and is refused as not_member",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId, unclaimed } = await soleOwner("Ayla");
+    const { result, waited, waitedOn } = await whileHeld(
+      async (tx) => {
+        const erasure = await eraseAccount(tx, {
+          userId: owner.userId,
+          now: ERASED_AT,
+        });
+        assert.ok(erasure.erased);
+        assert.equal(erasure.archivedWorkspaces.length, 1);
+      },
+      () =>
+        createInvitation(database(), {
+          workspaceId,
+          ...owner,
+          memberId: unclaimed,
+          tokenHash: randomBytes(32).toString("hex"),
+          now: LATER,
+        }),
+    );
+    assert.equal(waited, true, "the invitation waits for the owner's person");
+    assert.deepEqual(waitedOn, ["workspace_members"]);
+    assert.deepEqual(result, { created: false, refusal: "not_member" });
+    const invitations = await database()
+      .select({ id: workspaceInvitations.id })
+      .from(workspaceInvitations)
+      .where(eq(workspaceInvitations.workspaceId, workspaceId));
+    assert.deepEqual(invitations, []);
+  },
+);
+
+test(
+  "an erasure waits for an acceptance in a workspace without another claimed person and then refuses, because the new member can take over ownership",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId, ownerPerson, unclaimed } =
+      await soleOwner("Ayla");
+    const guest = await account("Gus");
+    const tokenHash = randomBytes(32).toString("hex");
+    await invite(workspaceId, unclaimed, owner, tokenHash);
+    const { result, waited, waitedOn } = await whileHeld(
+      async (tx) => {
+        const accepted = await acceptInvitation(tx, {
+          tokenHash,
+          userId: guest.userId,
+          deviceId: guest.deviceId,
+          now: NOW,
+        });
+        assert.equal(accepted.accepted, true);
+      },
+      () => eraseAccount(database(), { userId: owner.userId, now: ERASED_AT }),
+    );
+    assert.equal(
+      waited,
+      true,
+      "the erasure waits for the person that the acceptance claims",
+    );
+    assert.deepEqual(waitedOn, ["workspace_members"]);
+    assert.deepEqual(result, {
+      erased: false,
+      refusal: "owner",
+      ownedWorkspaceIds: [workspaceId],
+    });
+    assert.equal((await workspaceRow(workspaceId)).archivedAt, null);
+    const row = await personRow(ownerPerson);
+    assert.equal(row.role, "owner");
+    assert.equal(row.removedAt, null);
+    assert.equal((await identityRow(owner.userId)).erasedAt, null);
+    assert.equal((await personRow(unclaimed)).userId, guest.userId);
+  },
+);
+
+test(
+  "an acceptance that waits for an erasure that archives the workspace finds its invitation revoked",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId, unclaimed } = await soleOwner("Ayla");
+    const guest = await account("Gus");
+    const tokenHash = randomBytes(32).toString("hex");
+    const invitationId = await invite(workspaceId, unclaimed, owner, tokenHash);
+    const { result, waited, waitedOn } = await whileHeld(
+      async (tx) => {
+        const erasure = await eraseAccount(tx, {
+          userId: owner.userId,
+          now: ERASED_AT,
+        });
+        assert.ok(erasure.erased);
+      },
+      () =>
+        acceptInvitation(database(), {
+          tokenHash,
+          userId: guest.userId,
+          deviceId: guest.deviceId,
+          now: LATER,
+        }),
+    );
+    assert.equal(waited, true, "the acceptance waits for its person");
+    assert.deepEqual(waitedOn, ["workspace_members"]);
+    assert.deepEqual(result, {
+      accepted: false,
+      refusal: "invitation_invalid",
+      reason: "revoked",
+      invitationId,
+    });
+    assert.equal((await personRow(unclaimed)).userId, null);
+  },
+);
+
+test(
+  "an erasure waits for a join request that holds the workspace row and then denies it with the archive",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId } = await soleOwner("Ayla");
+    const asker = await account("Ari");
+    let asked: JoinRequestId | undefined;
+    const { result, waited, waitedOn } = await whileHeld(
+      async (tx) => {
+        const request = await createJoinRequest(tx, {
+          workspaceId,
+          userId: asker.userId,
+          deviceId: asker.deviceId,
+          displayName: "Ari",
+          now: NOW,
+        });
+        assert.ok(request.requested && request.created);
+        asked = request.joinRequest.id;
+      },
+      () => eraseAccount(database(), { userId: owner.userId, now: ERASED_AT }),
+    );
+    assert.equal(waited, true, "the erasure waits for the workspace row");
+    assert.deepEqual(waitedOn, ["workspaces"]);
+    assert.ok(result.erased);
+    assert.ok(asked);
+    assert.deepEqual(result.archivedWorkspaces, [
+      { workspaceId, revokedInvitationIds: [], deniedJoinRequestIds: [asked] },
+    ]);
+    const request = await requestRow(asked);
+    assert.equal(request.decision, "denied");
+    assert.equal(request.decidedByUserId, owner.userId);
+  },
+);
+
+test(
+  "a join request that waits for an erasure that archives the workspace finds it archived",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId } = await soleOwner("Ayla");
+    const asker = await account("Ari");
+    const { result, waited, waitedOn } = await whileHeld(
+      async (tx) => {
+        const erasure = await eraseAccount(tx, {
+          userId: owner.userId,
+          now: ERASED_AT,
+        });
+        assert.ok(erasure.erased);
+      },
+      () =>
+        createJoinRequest(database(), {
+          workspaceId,
+          userId: asker.userId,
+          deviceId: asker.deviceId,
+          displayName: "Ari",
+          now: LATER,
+        }),
+    );
+    assert.equal(waited, true, "the request waits for the workspace row");
+    assert.deepEqual(waitedOn, ["workspaces"]);
+    assert.deepEqual(result, {
+      requested: false,
+      refusal: "workspace_not_found",
+    });
+    const requests = await database()
+      .select({ id: workspaceJoinRequests.id })
+      .from(workspaceJoinRequests)
+      .where(eq(workspaceJoinRequests.workspaceId, workspaceId));
+    assert.deepEqual(requests, []);
+  },
+);
+
+test(
+  "a requester whose clock counts its request as expired holds it while an erasure with an earlier now counts it as pending; the erasure waits for it before the workspace row, so neither deadlocks",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId } = await soleOwner("Ayla");
+    const asker = await account("Ari");
+    const expiresAt = new Date("2026-11-03T12:00:00.000Z");
+    // `account-cli.ts` takes `now` before the erasure waits for its locks.
+    const erasureNow = new Date(expiresAt.getTime() - HOUR_MS);
+    const requesterNow = new Date(expiresAt.getTime() + HOUR_MS);
+    const stale = newId<JoinRequestId>();
+    await database()
+      .insert(workspaceJoinRequests)
+      .values({
+        id: stale,
+        workspaceId,
+        requesterUserId: asker.userId,
+        requesterDeviceId: asker.deviceId,
+        requestedDisplayName: "Ari",
+        createdAt: new Date(expiresAt.getTime() - 168 * HOUR_MS),
+        expiresAt,
+      });
+
+    const url = testDatabase?.url;
+    assert.ok(url, "the test database is on a server");
+    const other = createDatabase(url, { max: 1 });
+    const holding = Promise.withResolvers<void>();
+    const go = Promise.withResolvers<void>();
+    // The requester takes the first locks of `createJoinRequest`, its account
+    // and its open request, and holds them; then it runs the whole request,
+    // which locks the workspace row next.
+    const requesting = other.db.transaction(async (tx) => {
+      await tx
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.id, asker.userId))
+        .for("no key update");
+      await tx
+        .select({ id: workspaceJoinRequests.id })
+        .from(workspaceJoinRequests)
+        .where(eq(workspaceJoinRequests.id, stale))
+        .for("no key update");
+      holding.resolve();
+      await go.promise;
+      return createJoinRequest(tx, {
+        workspaceId,
+        userId: asker.userId,
+        deviceId: asker.deviceId,
+        displayName: "Ari",
+        now: requesterNow,
+      });
+    });
+    try {
+      await Promise.race([
+        holding.promise,
+        requesting.then(() => {
+          throw new Error("the requester ended early");
+        }),
+      ]);
+      const erasing = eraseAccount(database(), {
+        userId: owner.userId,
+        now: erasureNow,
+      });
+      assert.deepEqual(
+        await untilWaiting(erasing),
+        ["workspace_join_requests"],
+        "the erasure waits for the request, before the workspace row",
+      );
+      go.resolve();
+      // Neither fails with a deadlock (40P01).
+      const request = await requesting;
+      const erasure = await erasing;
+      assert.ok(request.requested && request.created);
+      assert.ok(erasure.erased);
+      assert.deepEqual(erasure.archivedWorkspaces, [
+        {
+          workspaceId,
+          revokedInvitationIds: [],
+          deniedJoinRequestIds: [request.joinRequest.id],
+        },
+      ]);
+      const marked = await requestRow(stale);
+      assert.equal(marked.decision, "expired");
+      assert.deepEqual(marked.decidedAt, expiresAt);
+      const denied = await requestRow(request.joinRequest.id);
+      assert.equal(denied.decision, "denied");
+      assert.equal(denied.decidedByUserId, owner.userId);
+    } finally {
+      go.resolve();
+      await requesting.catch(() => undefined);
+      await other.close();
+    }
   },
 );

@@ -57,6 +57,13 @@
       "when": 1793606953065,
       "tag": "0007_unclaimed_member_limit",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1793612942347,
+      "tag": "0008_workspace_archived_audit",
+      "breakpoints": true
     }
   ]
 }

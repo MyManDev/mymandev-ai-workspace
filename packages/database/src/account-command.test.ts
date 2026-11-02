@@ -2,7 +2,14 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { newId, type UserId, type WorkspaceId } from "@mymandev/protocol";
+import {
+  type InvitationId,
+  type JoinRequestId,
+  type MemberId,
+  newId,
+  type UserId,
+  type WorkspaceId,
+} from "@mymandev/protocol";
 import {
   ACCOUNT_COMMAND_USAGE,
   CONFIRM_FLAG,
@@ -98,6 +105,7 @@ test("an erasure that is refused, or of an account that does not exist, exits wi
   assert.equal(owner.exitCode, 1);
   assert.ok(owner.message.includes(workspaceId));
   assert.match(owner.message, /Transfer their ownership first/);
+  assert.match(owner.message, /archived instead/);
   const unknown = erasureReport({ erased: false, refusal: "not_found" });
   assert.equal(unknown.exitCode, 1);
   assert.match(unknown.message, /^Refused: no account/);
@@ -113,11 +121,42 @@ test("an erasure that is refused, or of an account that does not exist, exits wi
     endedMemberships: [],
     revokedDevices: [],
     withdrawnJoinRequestIds: [],
+    archivedWorkspaces: [],
   });
   assert.equal(erased.exitCode, 0);
   assert.match(
     erased.message,
-    /^Account erased: 0 memberships ended, 0 devices revoked, 0 join requests withdrawn, 0 invitations revoked, 0 grants revoked, 0 runs cancelled\.\nThe API closes/,
+    /^Account erased: 0 memberships ended, 0 devices revoked, 0 join requests withdrawn, 0 workspaces archived, 0 join requests denied, 0 invitations revoked, 0 grants revoked, 0 runs cancelled\.\nThe API closes/,
+  );
+});
+
+test("an erasure that archives a workspace counts its denied join requests, and its revoked invitations with those of the removals", () => {
+  const archived = erasureReport({
+    erased: true,
+    endedMemberships: [
+      {
+        memberId: newId<MemberId>(),
+        userId,
+        revokedInvitationIds: [newId<InvitationId>()],
+        disabledAgentIds: [],
+        revokedGrantIds: [],
+        cancelledRuns: [],
+      },
+    ],
+    revokedDevices: [],
+    withdrawnJoinRequestIds: [],
+    archivedWorkspaces: [
+      {
+        workspaceId: newId<WorkspaceId>(),
+        revokedInvitationIds: [newId<InvitationId>(), newId<InvitationId>()],
+        deniedJoinRequestIds: [newId<JoinRequestId>()],
+      },
+    ],
+  });
+  assert.equal(archived.exitCode, 0);
+  assert.match(
+    archived.message,
+    /^Account erased: 1 memberships ended, 0 devices revoked, 0 join requests withdrawn, 1 workspaces archived, 1 join requests denied, 3 invitations revoked, 0 grants revoked, 0 runs cancelled\.\n/,
   );
 });
 

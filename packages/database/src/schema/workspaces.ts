@@ -41,6 +41,11 @@ export const workspaces = pgTable(
       .references(() => users.id, { onDelete: "restrict" }),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
+    /**
+     * Set by the erasure of an owner's account when no other active, claimed
+     * person remains (#93). An archived workspace has no owner and no active
+     * claimed person, and it refuses join requests and invitation codes.
+     */
     archivedAt: nullableTimestamp("archived_at"),
     /** New join requests are refused until an admin resumes them. */
     joinRequestsPausedAt: nullableTimestamp("join_requests_paused_at"),
@@ -113,7 +118,9 @@ export const workspaceMembers = pgTable(
     uniqueIndex("workspace_members_active_user_key")
       .on(t.workspaceId, t.userId)
       .where(sql`${t.userId} is not null and ${t.removedAt} is null`),
-    // Exactly one owner among the active people; "at least one" is the writer's rule.
+    // At most one owner among the active people. "At least one" is the
+    // writer's rule, and only an archived workspace has none: an erasure that
+    // archives a workspace demotes and removes its owner (#93).
     uniqueIndex("workspace_members_active_owner_key")
       .on(t.workspaceId)
       .where(sql`${t.role} = 'owner' and ${t.removedAt} is null`),
@@ -142,7 +149,8 @@ export const workspaceMembers = pgTable(
       sql`(${t.removedAt} is null) = (${t.removedByUserId} is null)`,
     ),
     // The owner is never removed: ownership moves only by transfer, so that a
-    // bug cannot leave a workspace without an owner (#93).
+    // bug cannot leave a workspace without an owner (#93). An erasure that
+    // archives a workspace makes its owner a member first, and then removes it.
     check(
       "workspace_members_owner_removal_check",
       sql`${t.role} <> 'owner' or ${t.removedAt} is null`,
