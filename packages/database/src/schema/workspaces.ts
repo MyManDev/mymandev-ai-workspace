@@ -45,6 +45,11 @@ export const workspaces = pgTable(
     joinRequestsPausedAt: nullableTimestamp("join_requests_paused_at"),
   },
   (t) => [
+    // Counts the workspaces an account created in the last 24 hours.
+    index("workspaces_created_by_user_id_created_at_idx").on(
+      t.createdByUserId,
+      t.createdAt,
+    ),
     check(
       "workspaces_name_length",
       sql`char_length(${t.name}) between 1 and 100`,
@@ -248,6 +253,11 @@ export const workspaceJoinRequests = pgTable(
   },
   (t) => [
     index("workspace_join_requests_workspace_id_idx").on(t.workspaceId),
+    // Counts an account's requests: pending ones, and new ones in 24 hours.
+    index("workspace_join_requests_requester_user_id_created_at_idx").on(
+      t.requesterUserId,
+      t.createdAt,
+    ),
     // One pending request per account and workspace.
     uniqueIndex("workspace_join_requests_pending_key")
       .on(t.workspaceId, t.requesterUserId)
