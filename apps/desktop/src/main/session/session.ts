@@ -597,12 +597,20 @@ export function createDeviceSession(
   }
 
   /**
-   * How long ago a note's time was. Across a restart only the wall clock
-   * tells; while this process runs, the monotonic clock must have advanced
-   * too, so a wall clock that jumps forward ends no wait early. A time in
-   * the future counts as now (`tidyNotes` rewrites it).
+   * How long ago a note's time was, by two clocks: the wall clock, the only
+   * one that survives a restart, and, while this process runs, the note's
+   * wall-clock age when the process first saw it plus the monotonic time
+   * since. `least` is the smaller age: a wait ends only when both clocks
+   * say so, so a wall clock that jumps forward ends no wait early. `most` is
+   * the larger: a note is too old as soon as either clock says so, because
+   * the monotonic clock may stop while the computer sleeps. A time in the
+   * future counts as now (`tidyNotes` rewrites it).
    */
-  function noteAge(kind: "grace" | "refused", at: string): number {
+  function noteAge(
+    kind: "grace" | "refused",
+    at: string,
+    bound: "least" | "most",
+  ): number {
     const wallAge = Math.max(0, wallClock() - Date.parse(at));
     const key = `${kind}:${at}`;
     let seen = notesSeen.get(key);
@@ -610,7 +618,10 @@ export function createDeviceSession(
       seen = { mono: now(), wallAge };
       notesSeen.set(key, seen);
     }
-    return Math.min(wallAge, seen.wallAge + Math.max(0, now() - seen.mono));
+    const runningAge = seen.wallAge + Math.max(0, now() - seen.mono);
+    return bound === "least"
+      ? Math.min(wallAge, runningAge)
+      : Math.max(wallAge, runningAge);
   }
 
   /** The time of a new note, which this process sees from now on. */
@@ -631,7 +642,7 @@ export function createDeviceSession(
     return (
       note !== null &&
       note.publicKey === facts.keys.current.publicKey &&
-      noteAge("grace", note.at) < REPLACEMENT_GRACE_MS
+      noteAge("grace", note.at, "least") < REPLACEMENT_GRACE_MS
     );
   }
 
@@ -1185,8 +1196,12 @@ export function createDeviceSession(
     // example in a deploy, and to a resent copy of a request that it already
     // answered, so one round proves nothing.
     const first = keysRefusedNote(facts, held);
-    const firstAge = first === null ? 0 : noteAge("refused", first.at);
-    if (first === null || firstAge >= KEYS_REFUSED_MAX_AGE_MS) {
+    // Too old as soon as either clock says so; the wait ends only when both
+    // say so.
+    if (
+      first === null ||
+      noteAge("refused", first.at, "most") >= KEYS_REFUSED_MAX_AGE_MS
+    ) {
       const previous = keys.previous.publicKey;
       await changeNotes((current) => ({
         ...current,
@@ -1197,7 +1212,7 @@ export function createDeviceSession(
       }));
       return { kind: "failure", failure: refused("auth_failed") };
     }
-    if (keepBoth || firstAge < LOST_KEY_WAIT_MS) {
+    if (keepBoth || noteAge("refused", first.at, "least") < LOST_KEY_WAIT_MS) {
       return { kind: "failure", failure: refused("auth_failed") };
     }
     return { kind: "failure", failure: await keysLost(facts) };
@@ -1273,7 +1288,10 @@ export function createDeviceSession(
         // Both keys were refused: the next round runs only after the wait,
         // or after `refresh` when the person asks to try again.
         const first = keysRefusedNote(facts, await loadNotes());
-        if (first !== null && noteAge("refused", first.at) < LOST_KEY_WAIT_MS) {
+        if (
+          first !== null &&
+          noteAge("refused", first.at, "least") < LOST_KEY_WAIT_MS
+        ) {
           return refused("auth_failed");
         }
       }

@@ -2351,6 +2351,29 @@ describe("note times", () => {
     });
   });
 
+  test("a first refusal that the computer slept through for days is too old, also while the application runs", async () => {
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+
+    // Three days of sleep: the wall clock runs, the monotonic clock stops.
+    wall.now += 3 * 24 * 60 * 60_000;
+    // Ten minutes awake, then one glitch round.
+    advance(LOST_KEY_WAIT_MS);
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+
+    expect(heldKeys(h)).toEqual({ current, previous });
+    expect(await keyFiles()).toEqual([
+      CURRENT_KEY_FILE,
+      PREVIOUS_KEY_FILE,
+      DEVICE_RECORD_FILE,
+    ]);
+    expect(await notesFile()).toMatchObject({
+      keysRefused: { at: new Date(wall.now).toISOString() },
+    });
+  });
+
   test("while the application runs, a wall clock that jumps forward ends no wait", async () => {
     const h = harness();
     const { previous, current } = await pendingReplacement(h);
