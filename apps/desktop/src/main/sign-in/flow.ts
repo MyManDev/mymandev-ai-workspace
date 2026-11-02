@@ -129,19 +129,23 @@ export type SignInFailureReason = (typeof SIGN_IN_FAILURE_REASONS)[number];
  * The refusals of the API that do not prove that nothing was committed. When
  * the connection fails after the API committed, `net.fetch` or a proxy can
  * send the same request again, and only the answer to that copy arrives.
- * `POST /auth/sign-in` takes the sign-in code before every other check, so
- * the copy gets `auth_failed`, or `rate_limited` when the route's limit
- * refuses it before that. A copy of a request that committed cannot get any
- * other refusal: those answer a request that the API refused before its
+ * `POST /auth/sign-in` answers such a copy with `sign_in_code_used` while it
+ * keeps its record of the code, for a minute after the first copy ended
+ * (#152). That record lives in API memory only: a copy that reaches a
+ * restarted API gets `auth_failed`, because the API takes the sign-in code
+ * before every other check. The route's limit can refuse a copy with
+ * `rate_limited` before that. A copy of a request that committed cannot get
+ * any other refusal: those answer a request that the API refused before its
  * transaction committed. The API's request timeout answers `408` with
  * `bad_request`, but only after 30 seconds, when the flow has stopped waiting
  * (`SIGN_IN_REQUEST_TIMEOUT_MS` must not exceed the API's request timeout).
- * Once the API answers a resent request with its own error code, this list
- * narrows to that code.
+ * `auth_failed` stays in this list for the restarted API; whether it can
+ * leave is a separate decision.
  */
 export const UNCERTAIN_REFUSAL_CODES = Object.freeze([
   "auth_failed",
   "rate_limited",
+  "sign_in_code_used",
 ] as const satisfies readonly ApiErrorCode[]);
 export type UncertainRefusalCode = (typeof UNCERTAIN_REFUSAL_CODES)[number];
 

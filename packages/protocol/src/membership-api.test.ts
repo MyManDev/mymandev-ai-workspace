@@ -368,6 +368,7 @@ test("each route answers only known error codes, the common ones included", () =
     "device_registration_locked",
     "unsupported_account",
     "sign_in_unavailable",
+    "sign_in_code_used",
   ] as const) {
     assert.deepEqual(holders(code), [], code);
   }
