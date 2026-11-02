@@ -16,7 +16,7 @@ import { createDeviceRecordStore } from "./device-record.ts";
 import { createSystemSignInFlow } from "./sign-in/system.ts";
 
 export interface SystemAccountOptions {
-  /** Brings the main window to the front after a valid callback. */
+  /** Brings the main window to the front after the browser's callback. */
   readonly focusWindow: () => void;
   /** Receives fixed messages; the key store's errors hold no secret. */
   readonly onError: (message: string, error?: unknown) => void;
@@ -32,19 +32,20 @@ export function createSystemAccountService(
     }),
     openSystem: () => {
       const keyStore = createSystemDeviceKeyStore(options.onError);
+      // One record store, in the key's folder, for the service and the flow.
+      const deviceRecords = createDeviceRecordStore({
+        folder: deviceKeyFolder({
+          platform: process.platform,
+          env: process.env,
+          userData: app.getPath("userData"),
+        }),
+        platform: process.platform,
+      });
       return {
         keyStore,
-        // The flow keeps its own record store over the same file.
-        deviceRecords: createDeviceRecordStore({
-          folder: deviceKeyFolder({
-            platform: process.platform,
-            env: process.env,
-            userData: app.getPath("userData"),
-          }),
-          platform: process.platform,
-        }),
+        deviceRecords,
         createFlow: () =>
-          createSystemSignInFlow(keyStore, (message) =>
+          createSystemSignInFlow(keyStore, deviceRecords, (message) =>
             options.onError(message),
           ),
       };

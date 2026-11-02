@@ -370,6 +370,7 @@ test("an account status with every sign-in state, outcome, and key state is acce
     accountStatus(),
     accountStatus({ account: { kind: "signed_out" } }),
     accountStatus({ signIn: { kind: "starting" } }),
+    accountStatus({ signIn: { kind: "completing" } }),
     accountStatus({
       signIn: { kind: "waiting", pairingCode: "012345", opened: true },
     }),

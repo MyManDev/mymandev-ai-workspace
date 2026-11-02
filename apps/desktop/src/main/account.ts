@@ -41,11 +41,10 @@ export interface AccountSystem {
   /** The record store over the file that the flow writes. */
   readonly deviceRecords: Pick<DeviceRecordStore, "read" | "delete">;
   /**
-   * Creates the sign-in flow over the same key store. Called before the
-   * first sign-in, after the key is loaded, and again after "This is not
-   * me", so that nothing that the previous flow kept in memory remains.
+   * Creates the sign-in flow over the same key store and record store.
+   * Called once, before the first sign-in, after the key is loaded.
    */
-  readonly createFlow: () => Pick<SignInFlow, "start">;
+  readonly createFlow: () => Pick<SignInFlow, "start" | "reset">;
 }
 
 export interface AccountServiceOptions {
@@ -58,7 +57,10 @@ export interface AccountServiceOptions {
    * `local_data_folder_missing` on Windows.
    */
   readonly openSystem: () => AccountSystem;
-  /** Brings the main window to the front (ADR 0014, "Sign-in", step 6). */
+  /**
+   * Brings the main window to the front once the browser posted to the
+   * sign-in listener (ADR 0014, "Sign-in", step 6).
+   */
   readonly focusWindow: () => void;
   /** Receives a fixed message, never a value. An error that it throws is ignored. */
   readonly onError?: (message: string) => void;
@@ -92,8 +94,8 @@ export interface AccountService {
   readonly unlockDeviceKey: (passphrase: string) => Promise<UnlockResult>;
   /**
    * "This is not me": deletes the device record and the device key of this
-   * installation. The renderer asks the person to confirm first; this asks
-   * nothing. Never rejects.
+   * installation, and resets what the flow keeps in memory. The renderer
+   * asks the person to confirm first; this asks nothing. Never rejects.
    */
   readonly forgetAccount: () => Promise<ForgetResult>;
 }
@@ -101,6 +103,7 @@ export interface AccountService {
 const SIGNED_OUT: Account = Object.freeze({ kind: "signed_out" });
 const IDLE: SignInState = Object.freeze({ kind: "idle" });
 const STARTING: SignInState = Object.freeze({ kind: "starting" });
+const COMPLETING: SignInState = Object.freeze({ kind: "completing" });
 
 /** The outcome code of each error that the API's page posts. */
 const LISTENER_ERROR_CODES: Readonly<
@@ -114,26 +117,27 @@ const LISTENER_ERROR_CODES: Readonly<
 
 /**
  * The outcome code of each API error code that `POST /auth/sign-in`
- * answers with. Every other code is `refused`.
+ * answers with. Every other code is `refused`. The flow reports a code of
+ * `UNCERTAIN_REFUSAL_CODES` as the failure `uncertain_refusal`, never as a
+ * refusal.
  */
 const REFUSAL_CODES: Readonly<
   Partial<Record<ApiErrorCode, SignInOutcomeCode>>
 > = Object.freeze({
-  auth_failed: "auth_failed",
   sign_in_required: "sign_in_required",
   device_account_mismatch: "device_account_mismatch",
   device_revoked: "device_revoked",
   device_registration_locked: "device_registration_locked",
   unsupported_account: "unsupported_account",
-  rate_limited: "rate_limited",
   sign_in_unavailable: "sign_in_unavailable",
 });
 
 /**
- * The outcome code of each failure reason of the flow. `label_invalid` and
- * `already_running` cannot happen here (the service passes no label and
- * runs one attempt at a time), so they are `failed`, like a reason that a
- * later flow adds.
+ * The outcome code of each failure reason of the flow. `unexpected` is the
+ * generic `failed`. `label_invalid` and `already_running` cannot happen
+ * here (the service passes no label and runs one attempt at a time), so
+ * they are `failed` too, like a reason that a later flow adds. The API's
+ * code of `uncertain_refusal` is not passed on.
  */
 const FAILURE_CODES: Readonly<
   Partial<Record<SignInFailureReason, SignInOutcomeCode>>
@@ -144,11 +148,15 @@ const FAILURE_CODES: Readonly<
   key_not_loaded: "key_not_loaded",
   replacement_pending: "replacement_pending",
   key_store_failed: "key_store_failed",
+  system_protection_unavailable: "system_protection_unavailable",
   record_unreadable: "record_unreadable",
   listener_unavailable: "listener_unavailable",
   no_answer: "no_answer",
   server_error: "server_error",
   unexpected_response: "unexpected_response",
+  unexpected: "failed",
+  uncertain_refusal: "uncertain_refusal",
+  key_changed: "key_changed",
   record_not_saved: "record_not_saved",
 });
 
@@ -196,25 +204,6 @@ export function signInOutcomeView(outcome: SignInOutcome): SignInOutcomeView {
     default:
       // An outcome that a later flow adds.
       return Object.freeze({ code: "failed" });
-  }
-}
-
-/**
- * Whether the listener received the valid request before the outcome: the
- * API's page posted a code or an error. Every `failed` outcome of a started
- * attempt comes after a code. Only then does the window come to the front.
- * The flow resolves its outcome only after `POST /auth/sign-in` answered,
- * so this is the earliest moment the service learns of the request.
- */
-export function followsCallback(outcome: SignInOutcome): boolean {
-  switch (outcome.kind) {
-    case "signed_in":
-    case "refused":
-    case "failed":
-    case "listener_error":
-      return true;
-    default:
-      return false;
   }
 }
 
@@ -273,12 +262,16 @@ export function createAccountService(
   const listeners = new Set<(status: AccountStatus) => void>();
 
   let system: AccountSystem | null = null;
-  let flow: Pick<SignInFlow, "start"> | null = null;
+  let flow: Pick<SignInFlow, "start" | "reset"> | null = null;
   let initializing: Promise<void> | null = null;
   /** The action that runs; at most one at a time, besides an open attempt. */
   let operation: "starting" | "unlocking" | "forgetting" | null = null;
   let attempt: OpenAttempt | null = null;
   let cancelRequested = false;
+  /** Counts the attempts, so that a late callback of an old one changes nothing. */
+  let generation = 0;
+  /** Whether the browser of the current attempt posted to the listener. */
+  let callbackArrived = false;
 
   let account: Account = SIGNED_OUT;
   let signIn: SignInState = IDLE;
@@ -365,7 +358,28 @@ export function createAccountService(
     publish();
   }
 
-  /** Records how a started sign-in ended and brings the window up after a callback. */
+  /**
+   * The browser posted to the listener (ADR 0014, "Sign-in", step 6): the
+   * status says that the sign-in completes, and the window comes to the
+   * front before `POST /auth/sign-in` answers.
+   */
+  function callback(current: number): void {
+    if (current !== generation || callbackArrived) {
+      return;
+    }
+    callbackArrived = true;
+    if (signIn.kind === "waiting") {
+      signIn = COMPLETING;
+      publish();
+    }
+    try {
+      options.focusWindow();
+    } catch {
+      report("The window could not be brought to the front.");
+    }
+  }
+
+  /** Records how a started sign-in ended. */
   async function finish(
     opened: AccountSystem,
     outcome: SignInOutcome,
@@ -383,13 +397,6 @@ export function createAccountService(
     signIn = IDLE;
     lastOutcome = view;
     publish();
-    if (followsCallback(outcome)) {
-      try {
-        options.focusWindow();
-      } catch {
-        report("The window could not be brought to the front.");
-      }
-    }
   }
 
   async function startSignIn(): Promise<StartSignInResult> {
@@ -402,6 +409,9 @@ export function createAccountService(
     }
     operation = "starting";
     cancelRequested = false;
+    generation += 1;
+    callbackArrived = false;
+    const current = generation;
     signIn = STARTING;
     lastOutcome = null;
     publish();
@@ -409,7 +419,7 @@ export function createAccountService(
       let started: SignInStart | null = null;
       try {
         flow ??= opened.createFlow();
-        started = await flow.start();
+        started = await flow.start({ onCallback: () => callback(current) });
       } catch {
         // `start` never rejects; a flow that cannot be created ends here.
         report("The sign-in could not start.");
@@ -429,25 +439,28 @@ export function createAccountService(
         return Object.freeze({ outcome: "failed", code: view.code });
       }
       attempt = Object.freeze({ cancel: started.cancel });
-      signIn = Object.freeze(
-        started.opened
-          ? {
-              kind: "waiting",
-              pairingCode: started.pairingCode,
-              opened: true,
-            }
-          : {
-              kind: "waiting",
-              pairingCode: started.pairingCode,
-              opened: false,
-              authorizeUrl: started.authorizeUrl,
-              warning: started.warning,
-            },
-      );
+      // The browser can post before `start` returns here.
+      signIn = callbackArrived
+        ? COMPLETING
+        : Object.freeze(
+            started.opened
+              ? {
+                  kind: "waiting",
+                  pairingCode: started.pairingCode,
+                  opened: true,
+                }
+              : {
+                  kind: "waiting",
+                  pairingCode: started.pairingCode,
+                  opened: false,
+                  authorizeUrl: started.authorizeUrl,
+                  warning: started.warning,
+                },
+          );
       publish();
       const { outcome } = started;
       void outcome
-        .catch((): SignInOutcome => ({ kind: "failed", reason: "no_answer" }))
+        .catch((): SignInOutcome => ({ kind: "failed", reason: "unexpected" }))
         .then((value) => finish(opened, value))
         .catch(() => report("The sign-in outcome could not be recorded."));
       if (cancelRequested) {
@@ -536,9 +549,9 @@ export function createAccountService(
       // name this device as its previous device, for the other account.
       await opened.deviceRecords.delete();
       await opened.keyStore.delete();
-      // A new flow keeps nothing of this account in memory: no unsaved
-      // record and no account mismatch.
-      flow = null;
+      // The flow keeps nothing of this account in memory: no unsaved record
+      // and no account mismatch. No attempt runs, so the reset applies.
+      flow?.reset();
       account = SIGNED_OUT;
       deviceKey = "ready";
       replacementPending = false;

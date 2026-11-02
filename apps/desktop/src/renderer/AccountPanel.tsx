@@ -322,6 +322,11 @@ function SignInProgress({
       </>
     );
   }
+  if (signIn.kind === "completing") {
+    // The browser's part is done and the device is being registered; a
+    // cancel now would leave the server's answer unknown.
+    return <p role="status">Completing the sign-in.</p>;
+  }
   return (
     <>
       <p role="status">

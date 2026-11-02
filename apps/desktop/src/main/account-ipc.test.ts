@@ -370,6 +370,8 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
   });
   const records = createDeviceRecordStore({ folder, platform: "win32" });
   const bodies: string[] = [];
+  /** How often the window came up when each request was sent. */
+  const focusedAtRequest: number[] = [];
   const errors: string[] = [];
   // The listener's 10 minutes and the request timeout never fire here.
   const scheduleTimer: ScheduleTimer = () => () => undefined;
@@ -390,6 +392,7 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
             const body = String(init.body);
             SignInRequestSchema.parse(JSON.parse(body));
             bodies.push(body);
+            focusedAtRequest.push(focused);
             return new Response(
               JSON.stringify({
                 userId: USER_ID,
@@ -456,6 +459,12 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
   });
 
   expect(focused).toBe(2);
+  // The window came up after the browser's post, before each request.
+  expect(focusedAtRequest).toEqual([1, 2]);
+  const kinds = subscriber.sent.map(
+    ([, status]) => (status as AccountStatus).signIn.kind,
+  );
+  expect(kinds.filter((kind) => kind === "completing")).toHaveLength(2);
   expect(errors).toEqual([
     "The system browser could not be opened.",
     "The system browser could not be opened.",

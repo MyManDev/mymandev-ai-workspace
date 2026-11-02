@@ -221,15 +221,18 @@ const PairingCodeSchema = z.string().regex(/^[0-9]{6}$/, "Expected six digits");
 
 /**
  * The sign-in of this installation: none (`idle`), one that is starting the
- * listener and the browser (`starting`), or one that waits for the browser
+ * listener and the browser (`starting`), one that waits for the browser
  * (`waiting`) with the pairing code that the API's confirmation page shows
- * too. When the browser did not open, `waiting` also holds the authorize URL
- * to copy and the warning to show with it: the URL must not be shared (#149).
- * No sign-in code, verifier, signature, key, or token is ever part of it.
+ * too, or one whose browser part ended and that now registers the device
+ * (`completing`). When the browser did not open, `waiting` also holds the
+ * authorize URL to copy and the warning to show with it: the URL must not
+ * be shared (#149). No sign-in code, verifier, signature, key, or token is
+ * ever part of it.
  */
 export const SignInStateSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("idle") }),
   z.object({ kind: z.literal("starting") }),
+  z.object({ kind: z.literal("completing") }),
   z.discriminatedUnion("opened", [
     z.object({
       kind: z.literal("waiting"),
@@ -263,12 +266,10 @@ export const SIGN_IN_OUTCOME_CODES = Object.freeze([
   "sign_in_failed",
   "unsupported_account",
   "sign_in_unavailable",
-  "auth_failed",
   "sign_in_required",
   "device_account_mismatch",
   "device_revoked",
   "device_registration_locked",
-  "rate_limited",
   "refused",
   "api_origin_unset",
   "api_origin_invalid",
@@ -282,6 +283,8 @@ export const SIGN_IN_OUTCOME_CODES = Object.freeze([
   "no_answer",
   "server_error",
   "unexpected_response",
+  "uncertain_refusal",
+  "key_changed",
   "record_not_saved",
   "failed",
 ] as const);

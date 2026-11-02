@@ -16,7 +16,6 @@ import {
   type AccountServiceOptions,
   type AccountSystem,
   createAccountService,
-  followsCallback,
   signInOutcomeView,
 } from "./account.ts";
 import {
@@ -29,6 +28,7 @@ import type { DeviceRecord, DeviceRecordRead } from "./device-record.ts";
 import {
   SIGN_IN_FAILURE_REASONS,
   SIGN_IN_URL_WARNING,
+  UNCERTAIN_REFUSAL_CODES,
   type SignInOutcome,
   type SignInStart,
 } from "./sign-in/flow.ts";
@@ -109,6 +109,8 @@ interface Harness {
   load: (passphrase: string | undefined) => Promise<void>;
   /** What the flow's `start` resolves with. */
   start: () => Promise<SignInStart>;
+  /** The `onCallback` that the service passed to the last `start`. */
+  callback: (() => void) | undefined;
   recordDelete: () => Promise<void>;
   keyDelete: () => Promise<void>;
 }
@@ -133,6 +135,7 @@ function harness(
     } as DeviceKeyStatus | Error,
     load: async () => undefined,
     start: async (): Promise<SignInStart> => startedSignIn().start,
+    callback: undefined,
     recordDelete: async () => undefined,
     keyDelete: async () => undefined,
   } as Omit<Harness, "service">;
@@ -173,9 +176,14 @@ function harness(
       state.flows += 1;
       state.log.push(`create flow ${state.flows}`);
       return {
-        start: () => {
+        start: (options) => {
           state.log.push("start");
+          state.callback = options?.onCallback;
           return state.start();
+        },
+        reset: () => {
+          state.log.push("reset flow");
+          return true;
         },
       };
     },
@@ -486,6 +494,12 @@ test("a sign-in moves from starting to waiting with the pairing code, and to its
   });
   expect(h.focused).toBe(0);
 
+  // The browser posted to the listener: the window comes up at once, before
+  // the answer of the API.
+  h.callback?.();
+  expect(h.service.status().signIn).toEqual({ kind: "completing" });
+  expect(h.log.slice(-2)).toEqual(["status completing", "focus"]);
+
   // The account comes from the outcome, not from a record read.
   const done = nextStatus(h, (status) => status.signIn.kind === "idle");
   attempt.settle(SIGNED_IN_OUTCOME);
@@ -502,9 +516,15 @@ test("a sign-in moves from starting to waiting with the pairing code, and to its
     lastOutcome: { code: "signed_in" },
   });
   await settle();
-  // The window comes up after the status that shows the result.
-  expect(h.log.slice(-2)).toEqual(["status idle", "focus"]);
-  expect(h.statuses.map((status) => status.revision)).toEqual([1, 2, 3, 4]);
+  expect(h.focused).toBe(1);
+  expect(h.statuses.map((status) => status.signIn.kind)).toEqual([
+    "idle",
+    "starting",
+    "waiting",
+    "completing",
+    "idle",
+  ]);
+  expect(h.statuses.map((status) => status.revision)).toEqual([1, 2, 3, 4, 5]);
   expect(JSON.stringify(h.statuses)).not.toContain(USER_ID);
 });
 
@@ -602,17 +622,16 @@ test("cancel ends the open sign-in, and a cancel while it starts ends it once it
   expect(h.focused).toBe(0);
 });
 
-test("the window comes to the front only after the browser posted to the listener", async () => {
+test("the window comes to the front once the browser posted to the listener, never for a cancel or a timeout", async () => {
   const cases: [SignInOutcome, boolean][] = [
     [SIGNED_IN_OUTCOME, true],
-    [{ kind: "refused", code: "auth_failed" }, true],
+    [{ kind: "refused", code: "device_revoked" }, true],
     [{ kind: "failed", reason: "no_answer" }, true],
     [{ kind: "listener_error", error: "access_denied" }, true],
     [{ kind: "cancelled" }, false],
     [{ kind: "timed_out" }, false],
   ];
-  for (const [outcome, focus] of cases) {
-    expect(followsCallback(outcome)).toBe(focus);
+  for (const [outcome, posted] of cases) {
     const h = harness();
     await h.service.initialize();
     const attempt = startedSignIn();
@@ -620,13 +639,42 @@ test("the window comes to the front only after the browser posted to the listene
     await h.service.startSignIn();
     expect(h.focused).toBe(0);
 
+    if (posted) {
+      h.callback?.();
+      h.callback?.();
+      expect(h.focused).toBe(1);
+    }
     const done = nextStatus(h, (status) => status.signIn.kind === "idle");
     attempt.settle(outcome);
     await done;
     await settle();
 
-    expect(h.focused).toBe(focus ? 1 : 0);
+    expect(h.focused).toBe(posted ? 1 : 0);
   }
+});
+
+test("a callback before start returns shows the sign-in as completing, and a late callback of an old attempt changes nothing", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const first = startedSignIn();
+  h.start = async () => {
+    h.callback?.();
+    return first.start;
+  };
+
+  await h.service.startSignIn();
+  expect(h.service.status().signIn).toEqual({ kind: "completing" });
+  expect(h.focused).toBe(1);
+  const oldCallback = h.callback;
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  first.settle({ kind: "timed_out" });
+  await done;
+
+  h.start = async () => startedSignIn().start;
+  await h.service.startSignIn();
+  oldCallback?.();
+  expect(h.service.status().signIn).toMatchObject({ kind: "waiting" });
+  expect(h.focused).toBe(1);
 });
 
 test("a sign-in that does not start leaves the status idle with its code, and the window where it is", async () => {
@@ -703,13 +751,11 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
   });
 
   const refusals: Partial<Record<string, SignInOutcomeCode>> = {
-    auth_failed: "auth_failed",
     sign_in_required: "sign_in_required",
     device_account_mismatch: "device_account_mismatch",
     device_revoked: "device_revoked",
     device_registration_locked: "device_registration_locked",
     unsupported_account: "unsupported_account",
-    rate_limited: "rate_limited",
     sign_in_unavailable: "sign_in_unavailable",
   };
   for (const code of API_ERROR_CODES) {
@@ -741,13 +787,23 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
     key_not_loaded: "key_not_loaded",
     replacement_pending: "replacement_pending",
     key_store_failed: "key_store_failed",
+    system_protection_unavailable: "system_protection_unavailable",
     record_unreadable: "record_unreadable",
     listener_unavailable: "listener_unavailable",
     no_answer: "no_answer",
     server_error: "server_error",
     unexpected_response: "unexpected_response",
+    unexpected: "failed",
+    uncertain_refusal: "uncertain_refusal",
+    key_changed: "key_changed",
     record_not_saved: "record_not_saved",
   });
+  // The API's code of an uncertain refusal is not passed on.
+  for (const apiError of UNCERTAIN_REFUSAL_CODES) {
+    expect(
+      view({ kind: "failed", reason: "uncertain_refusal", apiError }),
+    ).toEqual({ code: "uncertain_refusal" });
+  }
   expect(
     view({
       kind: "failed",
@@ -775,7 +831,7 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
   expect(view({ kind: "paused" })).toEqual({ code: "failed" });
 });
 
-test("This is not me deletes the record, then the key, signs out, and the next sign-in uses a new flow", async () => {
+test("This is not me deletes the record, then the key, signs out, and resets the flow", async () => {
   const h = harness();
   await h.service.initialize();
   h.start = async () => ({
@@ -792,7 +848,12 @@ test("This is not me deletes the record, then the key, signs out, and the next s
     outcome: "forgotten",
   });
 
-  expect(h.log).toEqual(["delete record", "delete key", "status idle"]);
+  expect(h.log).toEqual([
+    "delete record",
+    "delete key",
+    "reset flow",
+    "status idle",
+  ]);
   expect(h.service.status()).toMatchObject({
     account: { kind: "signed_out" },
     deviceKey: "ready",
@@ -806,7 +867,7 @@ test("This is not me deletes the record, then the key, signs out, and the next s
 
   h.start = async () => startedSignIn().start;
   await h.service.startSignIn();
-  expect(h.flows).toBe(2);
+  expect(h.flows).toBe(1);
 });
 
 test("This is not me also works while the key waits for its passphrase", async () => {
@@ -866,7 +927,13 @@ test("a listener that throws and a window that cannot come up are reported and c
         read: async () => ({ kind: "none" }),
         delete: async () => undefined,
       },
-      createFlow: () => ({ start: async () => attempt.start }),
+      createFlow: () => ({
+        start: async (startOptions) => {
+          callback = startOptions?.onCallback;
+          return attempt.start;
+        },
+        reset: () => true,
+      }),
     }),
     focusWindow: () => {
       throw new Error("no window");
@@ -874,15 +941,18 @@ test("a listener that throws and a window that cannot come up are reported and c
     onError: (message) => h.errors.push(message),
   });
   const attempt = startedSignIn();
+  let callback: (() => void) | undefined;
 
   await h.service.initialize();
   await focusing.initialize();
   await focusing.startSignIn();
+  callback?.();
+  expect(focusing.status().signIn).toEqual({ kind: "completing" });
   const done = nextStatus(
     { ...h, service: focusing },
     (status) => status.signIn.kind === "idle",
   );
-  attempt.settle({ kind: "refused", code: "auth_failed" });
+  attempt.settle({ kind: "refused", code: "device_revoked" });
   await done;
   await settle();
 

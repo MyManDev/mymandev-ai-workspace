@@ -32,8 +32,6 @@ export const SIGN_IN_OUTCOME_MESSAGES: Readonly<
     "This GitHub account cannot be used, because its login is not supported.",
   sign_in_unavailable:
     "Sign-in with GitHub is not available right now. Try again later.",
-  auth_failed:
-    "The server did not accept the sign-in, for example because it took too long. Start it again.",
   sign_in_required:
     "GitHub reported a change to this account's access during the sign-in. Start it again.",
   device_account_mismatch:
@@ -42,8 +40,6 @@ export const SIGN_IN_OUTCOME_MESSAGES: Readonly<
     "This device was removed from its account, and its key was deleted. Sign in again to add it as a new device.",
   device_registration_locked:
     "No new device can be added to this account right now, because one of its devices was reported lost. Lift the lock from another of your devices.",
-  rate_limited:
-    "This account has too many devices or new devices. Try again later.",
   refused: "The server refused the sign-in.",
   api_origin_unset:
     "Sign-in is not available in this build, because no server address is set.",
@@ -54,7 +50,7 @@ export const SIGN_IN_OUTCOME_MESSAGES: Readonly<
   replacement_pending:
     "The device key of the last sign-in is not confirmed yet, so a new sign-in cannot start.",
   system_protection_unavailable:
-    "The system cannot protect the device key. Make the system's key storage available, for example by unlocking the keychain, and try again.",
+    "The system cannot protect the device key, so the sign-in did not start. On Windows and macOS, make the system's key storage available, for example by unlocking the keychain. On Linux, a secret service such as GNOME Keyring or KDE Wallet is needed for now.",
   key_store_failed: "The device key could not be created or changed.",
   record_unreadable:
     "The device record of this installation cannot be read, so the sign-in was stopped and the device key is kept.",
@@ -65,6 +61,10 @@ export const SIGN_IN_OUTCOME_MESSAGES: Readonly<
   server_error: "The server failed during the sign-in. Start it again.",
   unexpected_response:
     "The server's answer could not be read. Start the sign-in again.",
+  uncertain_refusal:
+    "The server's answer does not show whether the sign-in was completed. It is safe to start it again.",
+  key_changed:
+    "The device key changed during the sign-in, so it was stopped. Start it again.",
   record_not_saved:
     "The server accepted the sign-in, but this installation could not save it. Start the sign-in again.",
   failed: "The sign-in failed.",

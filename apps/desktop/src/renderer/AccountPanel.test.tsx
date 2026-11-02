@@ -190,6 +190,15 @@ test("while the sign-in starts, the panel says so and offers to cancel", () => {
   expect(clickEveryButton({ view })).toEqual([["Cancel", ["onCancelSignIn"]]]);
 });
 
+test("once the browser posted to the application, the panel says that the sign-in completes, without a cancel", () => {
+  const view = known({ signIn: { kind: "completing" } });
+  const html = render({ view });
+
+  expect(html).toContain('<p role="status">Completing the sign-in.</p>');
+  expect(html).not.toContain("pairing-code");
+  expect(clickEveryButton({ view })).toEqual([]);
+});
+
 test("while the browser is open, the pairing code is shown prominently with a cancel", () => {
   const view = known({
     signIn: { kind: "waiting", pairingCode: "042137", opened: true },
