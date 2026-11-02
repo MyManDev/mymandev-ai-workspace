@@ -1395,9 +1395,10 @@ export function registerGateway(
       config: { rateLimit: ADDRESS_LIMIT },
       preValidation: [
         // The API's own origin may connect too: Electron's net.WebSocket, the
-        // desktop's client, always sends it (#154). The socket carries no
-        // cookie or other ambient credential; the device signature
-        // authenticates the connection.
+        // desktop's client, sends by default the http(s) form of the
+        // WebSocket URL's origin, which is the API's origin (#154). The
+        // socket carries no cookie or other ambient credential; the device
+        // signature authenticates the connection.
         originGuard([...options.allowedOrigins, publicOrigin]),
         capGuard(connections),
       ],

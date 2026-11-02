@@ -68,7 +68,7 @@ Not in M1-02: authentication, sessions, tokens, rate limits, CORS, OpenAPI, TLS,
 - The API cannot be reached from another machine in M1. Widening `API_HOST` is part of the authentication work in M2.
 - The error serializer drops message and stack for database errors. The database package (M1-03) also turns every query error into an error without query data, so the serializer is a second line of defense.
 - A major Fastify release (6) is in alpha; a major upgrade will come.
-- Update of 2026-11-02 (#154): the WebSocket Origin hook on `/ws` also accepts a request whose `Origin` is exactly `API_PUBLIC_ORIGIN`, besides a request without `Origin` and an origin listed in `API_ALLOWED_ORIGINS`; every other origin still gets 403. The reason is recorded in the update of 2026-11-02 (#154) in [ADR 0014](0014-accounts-devices-and-invitations.md). The text above is unchanged.
+- Update of 2026-11-02 (#154): the WebSocket Origin hook on `/ws` also accepts a request whose `Origin` is exactly `API_PUBLIC_ORIGIN`, besides a request without `Origin` and an origin listed in `API_ALLOWED_ORIGINS`; every other origin still gets 403. Unlike the table above says, the Electron main process's WebSocket client now sends an `Origin`: Electron's `net.WebSocket` sends by default the http(s) form of the WebSocket URL's origin, which is the API's origin (the update of 2026-11-02 (#154) in [ADR 0016](0016-desktop-toolchain.md)). The reason for accepting it is recorded in the update of 2026-11-02 (#154) in [ADR 0014](0014-accounts-devices-and-invitations.md). The text above is unchanged.
 
 ## Dependency policy
 
