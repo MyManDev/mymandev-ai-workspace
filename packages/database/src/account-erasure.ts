@@ -3,8 +3,11 @@ import {
   type DeviceId,
   type InvitationId,
   type JoinRequestId,
+  type MemberId,
   newUuidV7,
   type PermissionGrantId,
+  type ProjectId,
+  type RepositoryId,
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
@@ -18,6 +21,8 @@ import {
   agents,
   auditEvents,
   devices,
+  projects,
+  repositories,
   userIdentities,
   users,
   workspaceInvitations,
@@ -48,36 +53,66 @@ import {
 // withdrawn. An approval locks no person of the requester, so the two cannot
 // wait for each other in a cycle.
 //
-// After the people come the workspaces that the account owns, which the
-// erasure archives when no other active, claimed person remains in them
-// (Project Manager decision of 2026-11-02), each step `FOR NO KEY UPDATE` and
-// in the order of the IDs. First the pending join requests of other accounts
-// in them, before the workspace rows, as `src/join-requests.ts` locks a
-// request before a workspace row (`createJoinRequest`). Then the workspace
-// rows, after the people, as the writers of `src/people.ts` and
-// `src/invitations.ts` lock a person before a workspace row. Then the pending
-// join requests once more: a new request locks the workspace row before it
-// stores the request, so this finds every request stored before the erasure
-// held the row, and a new request that waits for the erasure at the row then
-// finds the workspace archived. A withdrawal or a decision of a request holds
-// no workspace row. Then the workspaces' invitations that are neither
-// accepted nor revoked. Only then does the erasure read whether another
-// active, claimed person remains, so that no claim escapes it: an acceptance
-// that consumed its invitation first makes the erasure wait for its commit,
-// and the erasure then sees the new person and refuses; an acceptance that
-// comes later waits for the erasure at the invitation and finds it revoked.
-// An approval or a new invitation needs an active owner or admin, which is
-// the account's person, which the erasure holds, or another person, who
-// stops the archive anyway. An acceptance locks its unclaimed person, which
-// the erasure never locks, and then its invitation, so the two cannot wait
-// for each other in a cycle.
+// After the account's people come the workspaces that the account owns,
+// which the erasure archives when no other active, claimed person remains in
+// them (Project Manager decisions of 2026-11-02), each step `FOR NO KEY
+// UPDATE` and in the order of the IDs:
 //
-// After that, each removal locks its invitations, agents, grants, and runs
-// (`removePerson` in `src/people.ts`), and then each device revocation locks
-// the agents, grants, and runs of its device (`revokeDevice`), each in the
-// order of their IDs (`src/cascade.ts`); last, the agents that the account
-// owns, for their names, in the order of their IDs. Every other transaction
-// that changes these rows locks the account first (the API's requests of the
+// 1. Their unclaimed people, removed ones included, for their names. They
+//    come with the people and before the workspace rows and the invitations,
+//    as every writer of `src/people.ts` and `src/invitations.ts` locks the
+//    people before a workspace row, and an acceptance locks its person before
+//    its invitation. A writer that holds an unclaimed person waits for
+//    nothing that the erasure holds at that point: its actor could only be
+//    the account's own person, and every request of the account in the API
+//    locks the account first (`lockActor`), which the erasure holds.
+// 2. Their pending join requests of other accounts, before the workspace
+//    rows, as `createJoinRequest` locks a request before a workspace row. A
+//    requester whose clock already counts its request as expired, while the
+//    erasure's earlier `now` does not, holds that request and then waits for
+//    the workspace row; the erasure waits for it here, before it holds the
+//    row, so the two cannot wait for each other.
+// 3. The workspace rows, after the people, as the writers of `src/people.ts`
+//    and `src/invitations.ts` lock a person before a workspace row.
+// 4. Their pending join requests once more: a new request locks the
+//    workspace row before it stores the request, so this finds every request
+//    stored before the erasure held the row, and a new request that waits for
+//    the erasure at the row then finds the workspace archived. A withdrawal
+//    or a decision of a request holds no workspace row.
+// 5. Their projects, then the repositories of those projects, for their
+//    names. Nothing else writes these rows yet; a future writer of them locks
+//    them after the people and the workspace row, a project before its
+//    repositories.
+// 6. Their invitations that are neither accepted nor revoked.
+//
+// Only then does the erasure read whether another active, claimed person
+// remains, so that no claim escapes it: an acceptance that holds its person
+// first makes the erasure wait for its commit, and the erasure then sees the
+// new person and refuses; an acceptance that comes later waits for the
+// erasure at its person and then finds its invitation revoked. An approval
+// or a new invitation needs an active owner or admin, which is the account's
+// person, which the erasure holds, or another person, who stops the archive
+// anyway.
+//
+// One rare cycle remains, which PostgreSQL ends by aborting one of the two
+// transactions: a workspace that the account owns can hold a pending request
+// of the account itself, made before the account became a member there, and
+// a pending request of another account with a lower ID. The erasure holds the
+// first from the account's own join requests and waits for the second in
+// step 2, while another admin's denial of all requests
+// (`denyAllJoinRequests`) holds the second and waits for the first. That
+// admin is an active, claimed person, so the erasure would be refused anyway.
+//
+// After the decision and the archive's writes come the agents that the
+// account owns, for their names, in the order of their IDs. Then each removal
+// locks its invitations, agents, grants, and runs (`removePerson` in
+// `src/people.ts`), and each device revocation locks the agents, grants, and
+// runs of its device (`revokeDevice`), each in the order of their IDs
+// (`src/cascade.ts`). Every agent that they lock is one that the erasure
+// already holds, so the order of `src/cascade.ts`, agents, then grants, then
+// runs, holds for the erasure as a whole; only the grants and runs of one
+// removal come after the runs of the one before. Every other transaction that
+// changes these rows locks the account first (the API's requests of the
 // account, a sign-in, `disableAccount`), or a person of the account first (a
 // removal, and the future writers of agents, grants, and runs), so it waits
 // for the erasure at that row, or the erasure waits for it there and then
@@ -114,6 +149,20 @@ export const ERASED_DEVICE_LABEL = "Former device";
  * decision of 2026-11-02).
  */
 export const ERASED_AGENT_NAME = "Former agent";
+
+/**
+ * The fixed placeholder that replaces the name of a workspace that the
+ * erasure archives, which its owner wrote (Project Manager decision of
+ * 2026-11-02). The unclaimed people of such a workspace get
+ * `ERASED_DISPLAY_NAME`.
+ */
+export const ARCHIVED_WORKSPACE_NAME = "Archived workspace";
+
+/** The fixed placeholder for the names of the projects of an archived workspace. */
+export const ARCHIVED_PROJECT_NAME = "Archived project";
+
+/** The fixed placeholder for the names of the repositories of an archived workspace. */
+export const ARCHIVED_REPOSITORY_NAME = "Archived repository";
 
 export type EraseAccountInput = Readonly<{ userId: UserId; now: Date }>;
 
@@ -247,10 +296,16 @@ function idsIn<Id extends string>(
  *   account as `revoked_by_user_id`, denies the pending join requests of
  *   other accounts in it with the account as `decided_by_user_id`, and makes
  *   the owner's person a `member`, so that its removal below passes
- *   `workspace_members_owner_removal_check`. It writes `workspace.archived`,
- *   `invitation.revoked`, and `join_request.denied` audit records with the
- *   reason `account_erased`. An archived workspace has no owner, which only
- *   an archived workspace may lack, and its unclaimed people stay;
+ *   `workspace_members_owner_removal_check`. It replaces the names that the
+ *   owner wrote in it with fixed placeholders: the workspace's name with
+ *   `ARCHIVED_WORKSPACE_NAME`, the names of its projects with
+ *   `ARCHIVED_PROJECT_NAME` and of their repositories with
+ *   `ARCHIVED_REPOSITORY_NAME`, and the display names of its unclaimed
+ *   people, removed ones included, with `ERASED_DISPLAY_NAME`; the rows and
+ *   their links stay. It writes `workspace.archived`, `invitation.revoked`,
+ *   and `join_request.denied` audit records with the reason
+ *   `account_erased`. An archived workspace has no owner, which only an
+ *   archived workspace may lack, and its unclaimed people stay;
  * - it removes each active person of the account as a removal does
  *   (`removePerson`), with the account itself as `removed_by_user_id` and
  *   `revoked_by_user_id` (the Project Manager's decision in the #93 issue
@@ -335,16 +390,35 @@ export async function eraseAccount(
       const owners = active.filter((person) => person.role === "owner");
 
       // The workspaces that the account owns, archived below unless another
-      // active, claimed person remains in one of them.
+      // active, claimed person remains in one of them. The steps are numbered
+      // as in the lock order at the top of this file.
       let ownedWorkspaceIds: WorkspaceId[] = [];
+      let unclaimedIds: MemberId[] = [];
       let workspaceRequests: PendingRequest[] = [];
+      let projectIds: ProjectId[] = [];
+      let repositoryIds: RepositoryId[] = [];
       let openInvitations: Readonly<{
         id: InvitationId;
         workspaceId: WorkspaceId;
       }>[] = [];
       if (owners.length > 0) {
         const candidates = owners.map((person) => person.workspaceId);
+        // 1. The unclaimed people, removed ones included.
+        const unclaimed = await tx
+          .select({ id: workspaceMembers.id })
+          .from(workspaceMembers)
+          .where(
+            and(
+              idIn(workspaceMembers.workspaceId, candidates),
+              isNull(workspaceMembers.userId),
+            ),
+          )
+          .orderBy(workspaceMembers.id)
+          .for("no key update");
+        unclaimedIds = unclaimed.map((person) => person.id);
+        // 2. The pending join requests of other accounts.
         await lockPendingRequestsIn(tx, candidates, userId, now);
+        // 3. The workspace rows.
         const locked = await tx
           .select({ id: workspaces.id })
           .from(workspaces)
@@ -352,12 +426,31 @@ export async function eraseAccount(
           .orderBy(workspaces.id)
           .for("no key update");
         ownedWorkspaceIds = locked.map((workspace) => workspace.id);
+        // 4. The pending join requests once more.
         workspaceRequests = await lockPendingRequestsIn(
           tx,
           ownedWorkspaceIds,
           userId,
           now,
         );
+        // 5. The projects, then their repositories.
+        const lockedProjects = await tx
+          .select({ id: projects.id })
+          .from(projects)
+          .where(idIn(projects.workspaceId, ownedWorkspaceIds))
+          .orderBy(projects.id)
+          .for("no key update");
+        projectIds = lockedProjects.map((project) => project.id);
+        if (projectIds.length > 0) {
+          const lockedRepositories = await tx
+            .select({ id: repositories.id })
+            .from(repositories)
+            .where(idIn(repositories.projectId, projectIds))
+            .orderBy(repositories.id)
+            .for("no key update");
+          repositoryIds = lockedRepositories.map((repository) => repository.id);
+        }
+        // 6. The invitations that are neither accepted nor revoked.
         openInvitations = await tx
           .select({
             id: workspaceInvitations.id,
@@ -499,8 +592,30 @@ export async function eraseAccount(
       if (ownedWorkspaceIds.length > 0) {
         await tx
           .update(workspaces)
-          .set({ archivedAt: now, updatedAt: now })
+          .set({
+            name: ARCHIVED_WORKSPACE_NAME,
+            archivedAt: now,
+            updatedAt: now,
+          })
           .where(idIn(workspaces.id, ownedWorkspaceIds));
+        if (unclaimedIds.length > 0) {
+          await tx
+            .update(workspaceMembers)
+            .set({ displayName: ERASED_DISPLAY_NAME, updatedAt: now })
+            .where(idIn(workspaceMembers.id, unclaimedIds));
+        }
+        if (projectIds.length > 0) {
+          await tx
+            .update(projects)
+            .set({ name: ARCHIVED_PROJECT_NAME, updatedAt: now })
+            .where(idIn(projects.id, projectIds));
+        }
+        if (repositoryIds.length > 0) {
+          await tx
+            .update(repositories)
+            .set({ name: ARCHIVED_REPOSITORY_NAME, updatedAt: now })
+            .where(idIn(repositories.id, repositoryIds));
+        }
         if (openInvitations.length > 0) {
           await tx
             .update(workspaceInvitations)
@@ -559,6 +674,39 @@ export async function eraseAccount(
         ]);
       }
 
+      // The agents that the account owns, before the removals and the device
+      // revocations, so that every agent they lock is already held and their
+      // grants and runs come after it (`src/cascade.ts`). Every agent of the
+      // account runs on one of its devices (`agents_host_device_owner_fk`),
+      // so the index of the host device finds them all.
+      if (accountDevices.length > 0) {
+        const ownedAgents = await tx
+          .select({ id: agents.id })
+          .from(agents)
+          .where(
+            and(
+              idIn(
+                agents.hostDeviceId,
+                accountDevices.map((device) => device.id),
+              ),
+              eq(agents.ownerUserId, userId),
+            ),
+          )
+          .orderBy(agents.id)
+          .for("no key update");
+        if (ownedAgents.length > 0) {
+          await tx
+            .update(agents)
+            .set({ name: ERASED_AGENT_NAME, updatedAt: now })
+            .where(
+              idIn(
+                agents.id,
+                ownedAgents.map((agent) => agent.id),
+              ),
+            );
+        }
+      }
+
       const endedMemberships: MembershipEnd[] = [];
       for (const person of active) {
         endedMemberships.push(
@@ -598,37 +746,6 @@ export async function eraseAccount(
               cancelledRuns: revoked.cancelledRuns,
             }),
           );
-        }
-      }
-
-      // Every agent of the account runs on one of its devices
-      // (`agents_host_device_owner_fk`), so the index of the host device
-      // finds them all.
-      if (accountDevices.length > 0) {
-        const ownedAgents = await tx
-          .select({ id: agents.id })
-          .from(agents)
-          .where(
-            and(
-              idIn(
-                agents.hostDeviceId,
-                accountDevices.map((device) => device.id),
-              ),
-              eq(agents.ownerUserId, userId),
-            ),
-          )
-          .orderBy(agents.id)
-          .for("no key update");
-        if (ownedAgents.length > 0) {
-          await tx
-            .update(agents)
-            .set({ name: ERASED_AGENT_NAME, updatedAt: now })
-            .where(
-              idIn(
-                agents.id,
-                ownedAgents.map((agent) => agent.id),
-              ),
-            );
         }
       }
 

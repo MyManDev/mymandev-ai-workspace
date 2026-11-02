@@ -37,6 +37,12 @@ import {
 // cannot deadlock, whatever the plans of their queries. PostgreSQL checks a
 // row that changed while it waited for the lock again, so a row that a
 // concurrent transaction already changed is neither reported nor changed.
+// An erasure (`src/account-erasure.ts`) takes these steps once per removal
+// and per device revocation in one transaction. It locks every agent of the
+// account before all of them, so no agent comes after a grant or a run, but
+// the grants and runs of one removal come after the runs of the one before.
+// Every other transaction that changes those rows locks the erased account,
+// or one of its people, first, where it waits for the erasure.
 
 /**
  * `column = any($1::uuid[])`: the IDs travel as one array parameter, so that
