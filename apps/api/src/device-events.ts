@@ -14,7 +14,7 @@ export type VerifiedEventOf<Type extends VerifiedEvent["type"]> = Extract<
 /**
  * The handlers of the event types that a device sends, by type. A type
  * without a handler is only logged. Handling a new event type is one more
- * entry here, for example the run transitions of #28.
+ * entry here, as the run transitions of #28 are.
  */
 export type DeviceEventHandlers = Readonly<{
   [Type in VerifiedEvent["type"]]?: (

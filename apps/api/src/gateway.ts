@@ -18,6 +18,7 @@ import {
   decodeClientFrame,
   decodeClientMessage,
   type DeviceId,
+  type EventId,
   MAX_ANSWER_LIST_ITEMS,
   MAX_AUTH_FRAME_BYTES,
   type MemberId,
@@ -188,8 +189,9 @@ declare const verified: unique symbol;
  * The reference binding of what an event names (ADR 0006) belongs to the
  * handler of its type, inside the transaction that stores it: a
  * `chat.message.send` stores nothing unless its project is in the event's
- * workspace (#27, `postChatMessage`). The binding of an agent actor, its
- * run, and its project arrives with #28.
+ * workspace (#27, `postChatMessage`), and an `agent.run.state_changed`
+ * nothing unless its agent is in the event's workspace and hosted by the
+ * sending device, and its run is that agent's (#28, `recordRunTransition`).
  */
 export type VerifiedEvent = Exclude<
   ProtocolEvent,
@@ -200,12 +202,14 @@ export type VerifiedEvent = Exclude<
  * What an event handler returns when it found, inside the transaction that
  * would have stored the event, what identity binding refuses: the account is
  * no longer an active member of the event's workspace, or the device or the
- * account may no longer act. The gateway then closes the connection as it
- * does after `bindIdentity`. An identity mismatch is never found there,
- * because identity binding checks it first and audits it.
+ * account may no longer act; or an identity mismatch that only the stored
+ * data shows, such as an `agent` actor that names an agent of the workspace
+ * that another device hosts (#28). The gateway then closes the connection
+ * as it does after `bindIdentity`, and audits an identity mismatch in the
+ * same way (`auditIdentityMismatch`).
  */
 export type EventRejection = Readonly<{
-  rejected: Exclude<IdentityRejectionCode, "identity_mismatch">;
+  rejected: IdentityRejectionCode;
 }>;
 
 /**
@@ -341,6 +345,36 @@ export type BindIdentityDependencies = Readonly<{
 }>;
 
 /**
+ * Audits an identity mismatch of the event with this ID as
+ * `event.identity_mismatch`, at most once per device per hour, and logs
+ * every occurrence, with the count of those that were not audited (ADR
+ * 0006). The audit record names the event ID as its subject and no
+ * workspace. Used by `bindIdentity`, and by the gateway for an event
+ * handler's `identity_mismatch` rejection, with the same throttle.
+ */
+export async function auditIdentityMismatch(
+  eventId: EventId,
+  context: AuthenticatedConnectionContext,
+  dependencies: BindIdentityDependencies,
+): Promise<void> {
+  const { userId, deviceId } = context.identity;
+  const unaudited = dependencies.mismatchAudits.take(deviceId);
+  dependencies.log.info(
+    unaudited === 0 ? {} : { unauditedMismatches: unaudited },
+    "identity mismatch",
+  );
+  if (unaudited === 0) {
+    await writeConnectionAudit(dependencies.database, {
+      action: "event.identity_mismatch",
+      userId,
+      deviceId,
+      subjectId: eventId,
+      now: new Date(dependencies.now()),
+    });
+  }
+}
+
+/**
  * Binds an event that a device sent to its authenticated connection (ADR
  * 0006, identity binding; ADR 0014). `deviceId`, and for a `user` actor
  * `actor.userId`, must be the connection's: a mismatch is refused and
@@ -361,20 +395,7 @@ export async function bindIdentity(
     event.deviceId !== deviceId ||
     (event.actor.kind === "user" && event.actor.userId !== userId)
   ) {
-    const unaudited = dependencies.mismatchAudits.take(deviceId);
-    dependencies.log.info(
-      unaudited === 0 ? {} : { unauditedMismatches: unaudited },
-      "identity mismatch",
-    );
-    if (unaudited === 0) {
-      await writeConnectionAudit(dependencies.database, {
-        action: "event.identity_mismatch",
-        userId,
-        deviceId,
-        subjectId: event.id,
-        now: new Date(dependencies.now()),
-      });
-    }
+    await auditIdentityMismatch(event.id, context, dependencies);
     return { ok: false, code: "identity_mismatch" };
   }
   const device = await deviceRow(dependencies.database, deviceId);
@@ -1868,7 +1889,19 @@ export function registerGateway(
           return;
         }
         const outcome = await options.onEvent(bound.event, current);
-        if (outcome !== undefined && open()) {
+        if (outcome === undefined) {
+          return;
+        }
+        if (outcome.rejected === "identity_mismatch") {
+          // Audited as identity binding audits it, with the same throttle.
+          await auditIdentityMismatch(event.id, current, {
+            database,
+            now,
+            mismatchAudits,
+            log,
+          });
+        }
+        if (open()) {
           reject(current, event.workspaceId, outcome.rejected);
         }
       }
