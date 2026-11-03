@@ -1,5 +1,6 @@
 import type {
   AccountBridge,
+  ConnectionBridge,
   DesktopBridge,
   RepositoryBridge,
   RuntimeBridge,
@@ -12,9 +13,11 @@ import {
 } from "../shared/ipc-channels.ts";
 import type {
   AccountStatus,
+  ConnectionStatus,
   ForgetResult,
   ListDevicesResult,
   MountResult,
+  ReconnectResult,
   RemoveDeviceResult,
   RepositoryList,
   RuntimeStatus,
@@ -188,5 +191,33 @@ export function createDesktopBridge(
       ipc.invoke(INVOKE_CHANNELS.listDevices) as Promise<ListDevicesResult>,
   });
 
-  return Object.freeze({ electronVersion, runtime, repositories, account });
+  const connection: ConnectionBridge = Object.freeze({
+    getStatus: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.getConnectionStatus,
+      ) as Promise<ConnectionStatus>,
+    subscribeStatus: (
+      listener: (status: ConnectionStatus) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeConnectionStatus,
+        EVENT_CHANNELS.connectionStatusChanged,
+        "A connection status callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    reconnect: () =>
+      ipc.invoke(INVOKE_CHANNELS.reconnect) as Promise<ReconnectResult>,
+  });
+
+  return Object.freeze({
+    electronVersion,
+    runtime,
+    repositories,
+    account,
+    connection,
+  });
 }

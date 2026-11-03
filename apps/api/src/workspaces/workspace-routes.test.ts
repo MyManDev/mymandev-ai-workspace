@@ -539,6 +539,8 @@ test("the workspace routes, the project routes, and the device routes share the 
   for (const url of [
     `/workspaces/${newId<WorkspaceId>()}`,
     `/projects/${newId<ProjectId>()}/messages`,
+    `/projects/${newId<ProjectId>()}/agents`,
+    `/projects/${newId<ProjectId>()}/runs`,
   ]) {
     const limited = await get(app, url, token);
     assert.equal(limited.statusCode, 429, url);

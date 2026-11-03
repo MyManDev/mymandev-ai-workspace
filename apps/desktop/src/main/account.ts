@@ -5,14 +5,22 @@
 // account, creates the device session and refreshes it, starts and cancels
 // the sign-in flow on the person's action, unlocks a key that a passphrase
 // protects, signs out, removes this device, lists the account's devices, and
-// forgets the account for "This is not me" (#149).
+// forgets the account for "This is not me" (#149). It also lends the
+// device session to the connection client of #26 in the main process: the
+// signature of the WebSocket challenge and the close reasons that refuse the
+// device.
 //
 // The renderer gets a narrow status only: the account's login, display name,
 // and device ID, the pairing code, the authorize URL when the browser did not
 // open, the device list, and fixed codes. The sign-in code, the verifier,
 // signatures, keys, tokens, and the passphrase never reach the status, a
 // result, or a message.
-import type { ApiErrorCode } from "@mymandev/protocol";
+import type {
+  ApiErrorCode,
+  AuthChallengeFrame,
+  AuthResponseFrame,
+  DeviceId,
+} from "@mymandev/protocol";
 import type {
   Account,
   AccountStatus,
@@ -66,7 +74,22 @@ export type AccountSession = Pick<
   | "signOut"
   | "reportSignOut"
   | "removeDevice"
+  | "signWebSocketChallenge"
+  | "deviceRefused"
 >;
+
+/**
+ * The answer to the WebSocket `auth.challenge`: the signed `auth.response`
+ * frame, or nothing. The frame carries a signature: send it, and never log
+ * it.
+ */
+export type ChallengeAnswer =
+  | { readonly ok: true; readonly frame: AuthResponseFrame }
+  | { readonly ok: false };
+
+/** The close reasons of the WebSocket that refuse the device (ADR 0014). */
+export type DeviceRefusalCode =
+  "auth_failed" | "device_revoked" | "sign_in_required";
 
 /** What the service uses once the application is ready. */
 export interface AccountSystem {
@@ -188,6 +211,26 @@ export interface AccountService {
   readonly removeDevice: () => Promise<RemoveDeviceResult>;
   /** The account's devices, without anything secret. Never rejects. */
   readonly listDevices: () => Promise<ListDevicesResult>;
+  /**
+   * Signs the WebSocket `auth.challenge` with the device session, for the
+   * connection client of the main process (#26); never for the renderer.
+   * While a key replacement is pending, it authenticates once first, which
+   * resolves the replacement, and signs again. Never rejects.
+   */
+  readonly signWebSocketChallenge: (
+    challenge: AuthChallengeFrame,
+  ) => Promise<ChallengeAnswer>;
+  /**
+   * Applies a close reason of the WebSocket to the device session, for the
+   * device that the connection authenticated as (#26): `device_revoked`
+   * deletes the key and stops local execution, and `sign_in_required` and
+   * `auth_failed` keep the key until a sign-in. A refusal for a device that
+   * the installation no longer holds is ignored. Never rejects.
+   */
+  readonly deviceRefused: (
+    code: DeviceRefusalCode,
+    deviceId: DeviceId,
+  ) => Promise<void>;
 }
 
 /**
@@ -433,6 +476,8 @@ const ACTION_NOT_SIGNED_IN = Object.freeze({
   reason: "not_signed_in" as const,
 });
 
+const CHALLENGE_NOT_SIGNED: ChallengeAnswer = Object.freeze({ ok: false });
+
 export function createAccountService(
   options: AccountServiceOptions,
 ): AccountService {
@@ -583,6 +628,14 @@ export function createAccountService(
     publish();
   }
 
+  function stopLocalExecution(): void {
+    try {
+      options.stopLocalExecution?.();
+    } catch {
+      report("The local execution could not be stopped.");
+    }
+  }
+
   /** Follows the state of the device session. */
   function sessionChanged(state: DeviceSessionState): void {
     const next = deviceStateOf(state);
@@ -593,11 +646,7 @@ export function createAccountService(
     if (next === "revoked") {
       // ADR 0014: a revoked device stops local execution. The session
       // publishes `revoked` before it deletes the key.
-      try {
-        options.stopLocalExecution?.();
-      } catch {
-        report("The local execution could not be stopped.");
-      }
+      stopLocalExecution();
     }
     if (next === "revoked" || next === "removed") {
       // The device is gone at the API for good. The session publishes this
@@ -1243,6 +1292,67 @@ export function createAccountService(
     }
   }
 
+  async function signWebSocketChallenge(
+    challenge: AuthChallengeFrame,
+  ): Promise<ChallengeAnswer> {
+    const held = session;
+    if (held === null) {
+      return CHALLENGE_NOT_SIGNED;
+    }
+    try {
+      let signed = await held.signWebSocketChallenge(challenge);
+      // The connection is not the person's action, so it takes no
+      // `operation` lock and never makes an action answer `busy`. Signing
+      // sends no request; the authentication below does, so it is left out
+      // while an action, a sign-in, or a background refresh uses the key,
+      // and the connection backs off and tries again.
+      if (
+        !signed.ok &&
+        signed.reason === "replacement_pending" &&
+        operation === null &&
+        attempt === null &&
+        background.size === 0
+      ) {
+        // Only an authentication learns which key the API holds; a token
+        // confirms or abandons the replacement as far as the API's answers
+        // allow.
+        const authenticated = await held.authenticate();
+        void refreshAccount().catch(() => {
+          report("The account could not be read.");
+        });
+        if (authenticated.ok) {
+          signed = await held.signWebSocketChallenge(challenge);
+        }
+      }
+      return signed.ok
+        ? Object.freeze({ ok: true, frame: signed.value })
+        : CHALLENGE_NOT_SIGNED;
+    } catch {
+      report("The connection's challenge could not be signed.");
+      return CHALLENGE_NOT_SIGNED;
+    }
+  }
+
+  async function deviceRefused(
+    code: DeviceRefusalCode,
+    deviceId: DeviceId,
+  ): Promise<void> {
+    const held = session;
+    if (held === null) {
+      return;
+    }
+    try {
+      sessionChanged(await held.deviceRefused(code, deviceId));
+    } catch {
+      report("The device session could not apply the connection's refusal.");
+      // ADR 0014: a revoked device stops local execution, also when the
+      // session failed to delete the key.
+      if (code === "device_revoked" && device !== "revoked") {
+        stopLocalExecution();
+      }
+    }
+  }
+
   return Object.freeze({
     status: () => current,
     onStatusChange: (listener: (status: AccountStatus) => void) => {
@@ -1270,5 +1380,7 @@ export function createAccountService(
     signOut,
     removeDevice,
     listDevices,
+    signWebSocketChallenge,
+    deviceRefused,
   });
 }

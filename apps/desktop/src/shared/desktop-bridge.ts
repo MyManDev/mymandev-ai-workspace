@@ -1,8 +1,10 @@
 import type {
   AccountStatus,
+  ConnectionStatus,
   ForgetResult,
   ListDevicesResult,
   MountResult,
+  ReconnectResult,
   RemoveDeviceResult,
   RepositoryList,
   RuntimeStatus,
@@ -28,6 +30,8 @@ export interface DesktopBridge {
   readonly repositories: RepositoryBridge;
   /** The sign-in of this installation. */
   readonly account: AccountBridge;
+  /** The status of the connection to the cloud API. */
+  readonly connection: ConnectionBridge;
 }
 
 export interface RuntimeBridge {
@@ -124,4 +128,31 @@ export interface AccountBridge {
   readonly removeDevice: () => Promise<RemoveDeviceResult>;
   /** The devices of the account; the device of this installation is marked. */
   readonly listDevices: () => Promise<ListDevicesResult>;
+}
+
+/**
+ * The connection to the cloud API, which the main process keeps. The
+ * renderer gets its status as fixed codes and can ask to connect again; it
+ * never sees a frame, a nonce, a signature, or a key (ADR 0014).
+ */
+export interface ConnectionBridge {
+  /** The current connection status. */
+  readonly getStatus: () => Promise<ConnectionStatus>;
+  /**
+   * Calls `listener` with the current status and then after every change. A
+   * status older than the last one delivered is dropped. `onError` is called
+   * when the main process refuses the subscription. Returns a function that
+   * ends the subscription.
+   */
+  readonly subscribeStatus: (
+    listener: (status: ConnectionStatus) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Connects again at once, after the person's action: "Retry now" while
+   * the connection waits, and "Reconnect here once" after another
+   * installation took over the device's connection. It passes nothing from
+   * the renderer on.
+   */
+  readonly reconnect: () => Promise<ReconnectResult>;
 }

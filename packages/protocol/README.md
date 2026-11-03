@@ -270,6 +270,8 @@ Decided by the Project Manager on 2026-11-02 (#27, #28):
 
 Update of 2026-11-03 (#27, API part): the values of the chat send limit, applied under the Project Manager's rule of 2026-11-02 and recorded in the [API's README](../../apps/api/README.md#project-chat): at most 15 `chat.message.send` in any 10 seconds and 600 in an hour per account, all its devices and workspaces together; a send above either gets `event.refused` with `rate_limited`, the connection stays open, and the device may send the same event ID again later. 15 of the largest `chat.message.created` stay under the server's 1 MiB backpressure limit of a connection. The limit counts per account, not per device, so that more devices give an account no more room; the protocol is unchanged. Whether run transitions (#28) count too is decided with that part.
 
+Update of 2026-11-03 (#28, API part): run transitions do not count toward the chat send limit. They have their own limit per account, applied under the same rule and recorded in the [API's README](../../apps/api/README.md#agent-activity): at most 30 `agent.run.state_changed` in any 10 seconds and 1,800 in an hour, all the account's devices and workspaces together; a transition above either gets `event.refused` with `rate_limited`, the connection stays open, and the device may send the same event ID again later. 30 of the largest relayed transitions, together with 15 of the largest `chat.message.created`, stay under the server's 1 MiB backpressure limit of a connection. The protocol is unchanged.
+
 Applied as defaults unless the Project Manager decides otherwise (#27, #28):
 
 - Any active member of the project's workspace may post to the project's chat and read its history, agents, and runs.

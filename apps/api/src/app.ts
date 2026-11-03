@@ -30,6 +30,7 @@ import {
 } from "./gateway.ts";
 import { dispatchDeviceEvents } from "./device-events.ts";
 import { serializeError, serializeRequest } from "./log.ts";
+import { runTransitionHandler } from "./workspaces/agent-events.ts";
 import { chatSendHandler } from "./workspaces/chat-events.ts";
 import {
   deliverWorkspaceEvent,
@@ -45,7 +46,8 @@ export type BuildAppOptions = Readonly<{
    * Receives every event that passed identity binding, with its
    * authenticated connection. The default logs it at debug level and hands
    * it to the handler of its type (`dispatchDeviceEvents`): a
-   * `chat.message.send` is stored and delivered (#27).
+   * `chat.message.send` is stored and delivered (#27), and an
+   * `agent.run.state_changed` is recorded and relayed (#28).
    */
   onEvent?: EventHandler;
   /**
@@ -455,6 +457,12 @@ export async function buildApp(
           dispatchDeviceEvents(
             {
               "chat.message.send": chatSendHandler(app, {
+                database,
+                now,
+                connections,
+                log: app.log,
+              }),
+              "agent.run.state_changed": runTransitionHandler(app, {
                 database,
                 now,
                 connections,

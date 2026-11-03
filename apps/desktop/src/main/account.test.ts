@@ -1,5 +1,7 @@
 import {
   API_ERROR_CODES,
+  type AuthChallengeFrame,
+  type AuthResponseFrame,
   type DeviceId,
   GITHUB_LOGIN_PATTERN,
   LIMITS,
@@ -90,6 +92,20 @@ const DEVICE_ITEM = Object.freeze({
   current: true,
 } as const);
 
+const CHALLENGE: AuthChallengeFrame = Object.freeze({
+  protocolVersion: 0,
+  type: "auth.challenge",
+  nonce: "n".repeat(43),
+  connectionId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c1",
+} as AuthChallengeFrame);
+
+const AUTH_RESPONSE: AuthResponseFrame = Object.freeze({
+  protocolVersion: 0,
+  type: "auth.response",
+  deviceId: DEVICE_ID,
+  signature: "s".repeat(86),
+} as AuthResponseFrame);
+
 const SIGNED_IN_OUTCOME: SignInOutcome = Object.freeze({
   kind: "signed_in",
   account: Object.freeze({
@@ -172,6 +188,13 @@ interface Harness {
   reportSignOut: () => Promise<SessionResult<"reported" | "pending">>;
   removeDevice: () => Promise<SessionResult<"removed" | "pending">>;
   listDevices: () => Promise<SessionResult<readonly unknown[]>>;
+  /** The answers of the session's `signWebSocketChallenge`, one per call. */
+  signChallenge: () => Promise<SessionResult<AuthResponseFrame>>;
+  /** What the session's `deviceRefused` does; it moves to the state it returns. */
+  refuseDevice: (
+    code: string,
+    deviceId: DeviceId,
+  ) => Promise<DeviceSessionState>;
   createSession: () => AccountSession;
 }
 
@@ -214,6 +237,8 @@ function harness(
     reportSignOut: async () => ({ ok: true, value: "reported" }),
     removeDevice: async () => ({ ok: true, value: "removed" }),
     listDevices: async () => ({ ok: true, value: [DEVICE_ITEM] }),
+    signChallenge: async () => ({ ok: true, value: AUTH_RESPONSE }),
+    refuseDevice: async () => SESSION_SIGNED_IN,
   } as unknown as Omit<Harness, "service">;
   const sessionListeners = new Set<(state: DeviceSessionState) => void>();
   state.emit = (next) => {
@@ -266,6 +291,14 @@ function harness(
       removeDevice: async () => {
         state.log.push("session removeDevice");
         return state.removeDevice();
+      },
+      signWebSocketChallenge: async () => {
+        state.log.push("session signWebSocketChallenge");
+        return state.signChallenge();
+      },
+      deviceRefused: async (code, deviceId) => {
+        state.log.push(`session deviceRefused ${code}`);
+        return state.refuseDevice(code, deviceId);
       },
     };
   };
@@ -2317,4 +2350,172 @@ test("a sign-in between the key's load and the startup refresh waits for the ref
   expect(h.log.indexOf("start")).toBeGreaterThan(
     h.log.indexOf("session refresh"),
   );
+});
+
+// ---- Connection (#26) --------------------------------------------------
+
+test("the connection's challenge is signed by the session, and only the frame or nothing comes back", async () => {
+  const h = harness();
+  await expect(
+    h.service.signWebSocketChallenge(CHALLENGE),
+    "before the session exists",
+  ).resolves.toEqual({ ok: false });
+  await h.service.initialize();
+  h.log.length = 0;
+
+  await expect(h.service.signWebSocketChallenge(CHALLENGE)).resolves.toEqual({
+    ok: true,
+    frame: AUTH_RESPONSE,
+  });
+  expect(h.log).toEqual(["session signWebSocketChallenge"]);
+
+  // A failure keeps its reason and the API's code inside the main process.
+  h.signChallenge = async () => ({
+    ok: false,
+    reason: "refused",
+    code: "sign_in_required",
+  });
+  await expect(h.service.signWebSocketChallenge(CHALLENGE)).resolves.toEqual({
+    ok: false,
+  });
+
+  h.signChallenge = () => Promise.reject(new Error("broken"));
+  await expect(h.service.signWebSocketChallenge(CHALLENGE)).resolves.toEqual({
+    ok: false,
+  });
+  expect(h.errors).toEqual(["The connection's challenge could not be signed."]);
+});
+
+test("a pending replacement is resolved with one authentication before the challenge is signed again", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const answers: SessionResult<AuthResponseFrame>[] = [
+    { ok: false, reason: "replacement_pending" },
+    { ok: true, value: AUTH_RESPONSE },
+  ];
+  h.signChallenge = async () =>
+    answers.shift() ?? { ok: false, reason: "replacement_pending" };
+  h.log.length = 0;
+
+  await expect(h.service.signWebSocketChallenge(CHALLENGE)).resolves.toEqual({
+    ok: true,
+    frame: AUTH_RESPONSE,
+  });
+  expect(h.log.filter((line) => line.startsWith("session"))).toEqual([
+    "session signWebSocketChallenge",
+    "session authenticate",
+    "session signWebSocketChallenge",
+  ]);
+  // The key's replacement is read again for the status.
+  expect(h.log).toContain("read record");
+
+  // An authentication that fails is not followed by a second signature, and
+  // a second `replacement_pending` is not retried.
+  const cases: [SessionResult<SessionAccount>, string[]][] = [
+    [
+      { ok: false, reason: "no_answer" },
+      ["session signWebSocketChallenge", "session authenticate"],
+    ],
+    [
+      { ok: true, value: SESSION_ACCOUNT },
+      [
+        "session signWebSocketChallenge",
+        "session authenticate",
+        "session signWebSocketChallenge",
+      ],
+    ],
+  ];
+  for (const [authenticated, calls] of cases) {
+    h.authenticate = async () => authenticated;
+    h.signChallenge = async () => ({
+      ok: false,
+      reason: "replacement_pending",
+    });
+    h.log.length = 0;
+    await expect(h.service.signWebSocketChallenge(CHALLENGE)).resolves.toEqual({
+      ok: false,
+    });
+    expect(h.log.filter((line) => line.startsWith("session"))).toEqual(calls);
+  }
+});
+
+test("the authentication for a pending replacement waits for no action and runs none while an action holds the key", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.signChallenge = async () => ({ ok: false, reason: "replacement_pending" });
+  let finishSignOut: (
+    value: SessionResult<"reported" | "pending">,
+  ) => void = () => undefined;
+  h.signOut = () =>
+    new Promise((resolve) => {
+      finishSignOut = resolve;
+    });
+  const signingOut = h.service.signOut();
+  await new Promise((resolve) => setImmediate(resolve));
+  h.log.length = 0;
+
+  await expect(h.service.signWebSocketChallenge(CHALLENGE)).resolves.toEqual({
+    ok: false,
+  });
+  expect(h.log.filter((line) => line.startsWith("session"))).toEqual([
+    "session signWebSocketChallenge",
+  ]);
+
+  finishSignOut({ ok: true, value: "reported" });
+  await signingOut;
+});
+
+test("a close reason of the connection reaches the session for the connection's device, and device_revoked stops local execution once", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.refuseDevice = async (code) => {
+    const next: DeviceSessionState =
+      code === "device_revoked"
+        ? { kind: "revoked" }
+        : { kind: "sign_in_required", account: SESSION_ACCOUNT };
+    // The session publishes the state, then answers with it.
+    h.emit(next);
+    return next;
+  };
+  const seen: string[] = [];
+  const original = h.refuseDevice;
+  h.refuseDevice = async (code, deviceId) => {
+    seen.push(`${code} ${deviceId}`);
+    return original(code, deviceId);
+  };
+
+  await h.service.deviceRefused("sign_in_required", DEVICE_ID);
+  expect(h.service.status().device).toBe("sign_in_required");
+  expect(h.stopped).toBe(0);
+
+  await h.service.deviceRefused("device_revoked", DEVICE_ID);
+  expect(seen).toEqual([
+    `sign_in_required ${DEVICE_ID}`,
+    `device_revoked ${DEVICE_ID}`,
+  ]);
+  expect(h.service.status()).toMatchObject({
+    device: "revoked",
+    account: { kind: "signed_out" },
+  });
+  expect(h.stopped).toBe(1);
+});
+
+test("a refusal that the session ignores changes nothing, and one that fails still stops local execution after device_revoked", async () => {
+  const h = harness();
+  await h.service.initialize();
+  // Another device: the session keeps its state.
+  h.refuseDevice = async () => SESSION_SIGNED_IN;
+  await h.service.deviceRefused("device_revoked", OTHER_DEVICE_ID);
+  expect(h.service.status().device).toBe("signed_in");
+  expect(h.stopped).toBe(0);
+
+  h.refuseDevice = () => Promise.reject(new Error("broken"));
+  await h.service.deviceRefused("sign_in_required", DEVICE_ID);
+  expect(h.stopped).toBe(0);
+  await h.service.deviceRefused("device_revoked", DEVICE_ID);
+  expect(h.stopped).toBe(1);
+  expect(h.errors).toEqual([
+    "The device session could not apply the connection's refusal.",
+    "The device session could not apply the connection's refusal.",
+  ]);
 });

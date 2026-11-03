@@ -25,6 +25,11 @@ import {
   APP_SCHEME_PRIVILEGES,
   createAppProtocolHandler,
 } from "./app-protocol.ts";
+import {
+  createSystemConnectionClient,
+  followSystemResume,
+} from "./connection/system.ts";
+import { registerConnectionIpc } from "./connection-ipc.ts";
 import { claimDataFolder } from "./data-folder.ts";
 import {
   createSessionGuardInstaller,
@@ -146,6 +151,25 @@ function start(): void {
   });
   registerAccountIpc(ipcMain, rendererUrl, account);
 
+  // The connection to the cloud API (#26): one WebSocket in the main process
+  // while the account reports a signed-in device with a loaded key. The
+  // device session signs its challenge, and its close reasons reach the
+  // session through the account service, which stops local execution after
+  // `device_revoked`. The logs hold fixed text and close codes only, never
+  // a frame, a nonce, a signature, or a key. It closes (1000) at quit.
+  const connection = createSystemConnectionClient(account, (message) =>
+    console.info(message),
+  );
+  connection.onStatusChange((status) => {
+    console.info(
+      "reason" in status && status.reason !== undefined
+        ? `The connection to the API is ${status.state} (${status.reason}).`
+        : `The connection to the API is ${status.state}.`,
+    );
+  });
+  registerConnectionIpc(ipcMain, rendererUrl, connection);
+  app.on("will-quit", () => connection.close());
+
   function showMainWindow(): void {
     if (mainWindow !== undefined) {
       if (mainWindow.isMinimized()) {
@@ -213,6 +237,7 @@ function start(): void {
       // The key is loaded before anything uses it; the device session then
       // refreshes, which retries a pending removal or sign-out report.
       void account.initialize();
+      followSystemResume(connection);
       showMainWindow();
       app.on("activate", showMainWindow);
     })

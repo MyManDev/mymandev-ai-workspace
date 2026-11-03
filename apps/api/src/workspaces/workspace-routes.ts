@@ -30,6 +30,7 @@ import {
   requireProjectMember,
   WorkspaceParamsSchema,
 } from "./access.ts";
+import { registerAgentRoutes } from "./agent-routes.ts";
 import { registerChatRoutes } from "./chat-routes.ts";
 import type { AccountFrameHandler, WorkspaceEventHandler } from "./events.ts";
 import { registerInvitationCodeRoutes } from "./invitation-code-routes.ts";
@@ -237,6 +238,8 @@ export async function registerWorkspaceRoutes(
       requireProjectMember(project, database);
 
       registerChatRoutes(project, { database });
+
+      registerAgentRoutes(project, { database });
     });
   });
 }
