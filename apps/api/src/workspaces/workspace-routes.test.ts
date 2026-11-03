@@ -7,6 +7,8 @@ import {
 } from "@mymandev/database";
 import {
   ApiErrorBodySchema,
+  CHAT_ROUTES,
+  CreateProjectResponseSchema,
   CreateWorkspaceResponseSchema,
   DefineMemberResponseSchema,
   MEMBERSHIP_ROUTES,
@@ -15,6 +17,7 @@ import {
   newId,
   newUuidV7,
   PROJECT_ROUTES,
+  type ProjectId,
   type WorkspaceId,
   WorkspaceListResponseSchema,
   WorkspaceViewResponseSchema,
@@ -354,6 +357,59 @@ test("on every route under /workspaces/:workspaceId, a non-member gets the answe
   }
 });
 
+test("on every route under /projects/:projectId, a non-member's project, an unknown project, and a malformed project ID get the same 404", async (t) => {
+  const ownerApp = await workspaceApp(t, { githubId: 3018 });
+  const owner = await signedIn(ownerApp);
+  const { workspace } = await createWorkspace(ownerApp, owner.token);
+  const created = await post(
+    ownerApp,
+    `/workspaces/${workspace.id}/projects`,
+    owner.token,
+    { name: "App" },
+  );
+  assert.equal(created.statusCode, 200, created.body);
+  const project = CreateProjectResponseSchema.parse(created.json()).project;
+  const outsiderApp = await workspaceApp(t, { githubId: 3019 });
+  const outsider = await signedIn(outsiderApp);
+
+  // Every registered route, also those of later changes (#28). The check
+  // runs before validation, so a malformed query answers 404 too.
+  const covered: string[] = [];
+  for (const [name, route] of Object.entries(CHAT_ROUTES)) {
+    const { method, path } = route;
+    if (
+      !path.startsWith("/projects/:projectId/") ||
+      !outsiderApp.hasRoute({ method, url: path })
+    ) {
+      continue;
+    }
+    covered.push(name);
+    const ask = (app: App, token: string, projectId: string) =>
+      app.inject({
+        method,
+        url: `${path.replace(":projectId", projectId)}?limit=0`,
+        headers: { authorization: `Bearer ${token}` },
+      });
+    const nonMember = await ask(outsiderApp, outsider.token, project.id);
+    assert.equal(nonMember.statusCode, 404, name);
+    assert.deepEqual(nonMember.json(), NOT_FOUND, name);
+    for (const other of [
+      await ask(outsiderApp, outsider.token, newId<ProjectId>()),
+      await ask(outsiderApp, outsider.token, "not-an-id"),
+      await ask(ownerApp, owner.token, newId<ProjectId>()),
+      await ask(ownerApp, owner.token, "not-an-id"),
+    ]) {
+      assert.equal(other.body, nonMember.body, name);
+      assert.equal(
+        other.headers["content-type"],
+        nonMember.headers["content-type"],
+        name,
+      );
+    }
+  }
+  assert.deepEqual(covered, ["listMessages"]);
+});
+
 test("former members are shown as former, and a removed member gets the same 404 as an outsider", async (t) => {
   const ownerApp = await workspaceApp(t, { githubId: 3006 });
   const owner = await signedIn(ownerApp);
@@ -473,17 +529,22 @@ test("a body that breaks the protocol answers 400 with bad_request and creates n
   assert.equal(created.length, 0);
 });
 
-test("the workspace routes and the device routes share the account's request limit", async (t) => {
+test("the workspace routes, the project routes, and the device routes share the account's request limit", async (t) => {
   const app = await workspaceApp(t, { githubId: 3010 });
   const { token } = await signedIn(app);
   for (let index = 0; index < 150; index += 1) {
     assert.equal((await get(app, "/devices", token)).statusCode, 200);
     assert.equal((await get(app, "/workspaces", token)).statusCode, 200);
   }
-  const limited = await get(app, `/workspaces/${newId<WorkspaceId>()}`, token);
-  assert.equal(limited.statusCode, 429);
-  assert.equal((limited.json() as { code: string }).code, "rate_limited");
-  assert.match(String(limited.headers["retry-after"]), /^[0-9]+$/u);
+  for (const url of [
+    `/workspaces/${newId<WorkspaceId>()}`,
+    `/projects/${newId<ProjectId>()}/messages`,
+  ]) {
+    const limited = await get(app, url, token);
+    assert.equal(limited.statusCode, 429, url);
+    assert.equal((limited.json() as { code: string }).code, "rate_limited");
+    assert.match(String(limited.headers["retry-after"]), /^[0-9]+$/u);
+  }
 });
 
 test("without a database, the workspace routes answer the generic 404", async (t) => {
