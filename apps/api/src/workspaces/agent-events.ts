@@ -26,11 +26,16 @@ import { type SendLimitValues, sweptSendLimit } from "./send-limit.ts";
  *   500 code points of 4 bytes each and every optional field, is about
  *   2,600 bytes, so 30 are about 78,500 bytes: under the about 79,000 bytes
  *   that 15 of the largest chat messages leave below `MAX_BUFFERED_BYTES`
- *   (1 MiB). The chat messages and the run transitions of one account
- *   together can never push a subscriber that reads nothing for 10 seconds
- *   over the limit. A run moves a few times in its life, so 30 in 10
- *   seconds lets the development switch of #28 walk several runs at once,
- *   and lets real agents report every step of their runs.
+ *   (1 MiB). One account's chat burst and transition burst, as the limits
+ *   count them, fit together under the limit. The limits count an event
+ *   when it arrives, before its transaction, and the relay follows the
+ *   commit, so when transactions wait for locks, the relays of two bursts
+ *   can reach a subscriber close together; a subscriber that reads nothing
+ *   then closes with `backpressure` and reloads, the accepted worst case,
+ *   as for several accounts together. A run moves a few times in its
+ *   life, so 30 in 10 seconds lets the development switch of #28 walk
+ *   several runs at once, and lets real agents report every step of their
+ *   runs.
  * - The window bounds the sustained rate and the storage: 1,800 an hour is
  *   a transition every 2 seconds for a whole hour, at most about 4.7 MB of
  *   run events an hour for each subscriber, and 1,800 rows of the
