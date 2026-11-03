@@ -3,9 +3,11 @@
 //   MYMANDEV_DEV_SEED=1 npm run db:dev-seed -w @mymandev/database -- <device ID> <project ID> [--runs <n>]
 // It connects with DATABASE_URL, the application role, like the API, and
 // refuses a database that is not on this computer (`src/dev-seed-command.ts`).
+import { sql } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
 import {
   checkDevSeedEnvironment,
+  checkServerAddress,
   devSeedReport,
   parseDevSeedCommand,
 } from "./dev-seed-command.ts";
@@ -24,9 +26,16 @@ if (!allowed.ok) {
 
 const { db, close } = createDatabase(allowed.url, { max: 1 });
 try {
-  const report = devSeedReport(
-    await seedDevAgent(db, { ...parsed.command, now: new Date() }),
+  const { rows } = await db.execute<{ address: string | null }>(
+    sql`select host(inet_server_addr()) as address`,
   );
+  const remote = checkServerAddress(rows[0]?.address ?? null);
+  const report =
+    remote !== undefined
+      ? ({ exitCode: 1, message: remote } as const)
+      : devSeedReport(
+          await seedDevAgent(db, { ...parsed.command, now: new Date() }),
+        );
   if (report.exitCode === 0) {
     console.log(report.message);
   } else {

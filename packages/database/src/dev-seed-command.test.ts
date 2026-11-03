@@ -9,9 +9,11 @@ import {
 } from "@mymandev/protocol";
 import {
   checkDevSeedEnvironment,
+  checkServerAddress,
   DEV_SEED_FLAG,
   DEV_SEED_USAGE,
   devSeedReport,
+  isLoopbackAddress,
   parseDevSeedCommand,
 } from "./dev-seed-command.ts";
 
@@ -67,6 +69,12 @@ test("the seed command runs only with the opt-in, outside production, and on a d
     "postgres://mymandev_app:secret@10.0.0.5:5432/mymandev",
     "postgres://mymandev_app:secret@127.0.0.1.example.com/mymandev",
     "postgres://mymandev_app:secret@localhost.example.com/mymandev",
+    // Not an IPv4 address in its usual form, or outside 127.0.0.0/8.
+    "postgres://mymandev_app:secret@127.1/mymandev",
+    "postgres://mymandev_app:secret@127.0.0.256/mymandev",
+    "postgres://mymandev_app:secret@0127.0.0.1/mymandev",
+    "postgres://mymandev_app:secret@128.0.0.1/mymandev",
+    "postgres://mymandev_app:secret@[::2]/mymandev",
     // pg would connect to the host in the query instead.
     "postgres://mymandev_app:secret@127.0.0.1/mymandev?host=db.example.com",
   ]) {
@@ -124,4 +132,35 @@ test("the seed command reports the agent and its runs, and a refusal with exit c
     message:
       "Refused: the device's account is not an active member of the project's workspace. Nothing was changed.",
   });
+});
+
+test("only loopback addresses count as this computer, also for the address on which the server took the connection", () => {
+  for (const address of [
+    "127.0.0.1",
+    "127.255.255.254",
+    "::1",
+    "::ffff:127.0.0.1",
+    "::FFFF:127.1.2.3",
+  ]) {
+    assert.equal(isLoopbackAddress(address), true, address);
+    assert.equal(checkServerAddress(address), undefined, address);
+  }
+  for (const address of [
+    "",
+    "localhost",
+    "127.1",
+    "127.0.0.1/32",
+    "10.0.0.5",
+    "::2",
+    "::ffff:10.0.0.5",
+    "fe80::1",
+  ]) {
+    assert.equal(isLoopbackAddress(address), false, address);
+  }
+  // A Unix-domain socket has no address.
+  assert.equal(checkServerAddress(null), undefined);
+  assert.match(
+    checkServerAddress("10.0.0.5") ?? "",
+    /^Refused: the database server did not accept the connection on a loopback address/u,
+  );
 });

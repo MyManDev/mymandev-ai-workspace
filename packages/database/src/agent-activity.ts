@@ -58,11 +58,12 @@ import {
 // the runs `FOR NO KEY UPDATE` (`src/cascade.ts`), so either one commits
 // first and the transition finds the agent disabled, or the transition
 // commits first and the cancellation starts from its new state. The
-// transitions of one agent do not wait for each other at the agent. The
-// `UPDATE` of the run, which applies only while the run is still in
-// `previousState`, locks the run until the transaction ends, so of two
-// concurrent transitions from the same state one applies and the other finds
-// the run changed.
+// transitions of one agent do not wait for each other at the agent. It reads
+// the run `FOR NO KEY UPDATE`, the lock that its update takes, before it
+// decides on the run's state, so of two concurrent transitions of one run
+// the second waits until the first commits and then decides on the state
+// that the first left: `conflict`, or the stored event when both have the
+// same device and event ID.
 
 /** The unique index of one accepted transition per device and event ID. */
 const EVENT_KEY = "agent_run_transitions_device_event_key";
@@ -228,22 +229,24 @@ export type RecordRunTransitionResult =
  *    the device does not host, or that another account owns, is
  *    `identity_mismatch`, a protocol violation on which the API closes the
  *    connection and writes an audit record.
- * 4. A run that does not exist or is not the agent's, and a `repositoryId`
- *    that is not the run's repository, are `not_found`.
+ * 4. It locks the run `FOR NO KEY UPDATE`. A run that does not exist or is
+ *    not the agent's, and a `repositoryId` that is not the run's
+ *    repository, are `not_found`.
  * 5. A disabled agent, an archived project or workspace, a transition that
  *    `canTransition` refuses, and a run whose stored state is not
- *    `previousState` are `conflict`.
+ *    `previousState` are `conflict`; a run that a concurrent transition of
+ *    the same device and event ID moved while this one waited for its lock
+ *    is answered as in step 2.
  *
  * It then sets the run's `state`, `state_reason` (the reason, or null),
  * `started_at` (`now`, when it first becomes `running`), and `finished_at`
  * (`now` for a terminal state) with one `UPDATE ... WHERE id = runId AND
  * state = previousState`, and inserts the transition into the log with the
  * device, the event ID, and `now` as `created_at`. These two statements run
- * as a savepoint: when a concurrent transition changed the run first, the
- * update changes nothing, and when a concurrent transition of the same
- * device and event ID committed first, the result is its stored event, as
- * in step 2; otherwise a run changed concurrently is `conflict`. Inside
- * another transaction it runs as a savepoint.
+ * as a savepoint: when a concurrent transition of the same device and event
+ * ID on another run committed first, the insert fails the unique index, the
+ * savepoint rolls the run's update back, and the result is the stored event,
+ * as in step 2. Inside another transaction it runs as a savepoint.
  *
  * The device's revocation is the API's check (`lockActor`); a revocation
  * disables the device's agents in its own transaction, so a transition that
@@ -322,7 +325,8 @@ export async function recordRunTransition(
             eq(agentRuns.id, input.runId),
             eq(agentRuns.agentId, input.agentId),
           ),
-        );
+        )
+        .for("no key update");
       if (
         run === undefined ||
         (input.repositoryId !== undefined &&
@@ -335,10 +339,15 @@ export async function recordRunTransition(
         agent.disabledAt !== null ||
         agent.projectArchivedAt !== null ||
         agent.workspaceArchivedAt !== null ||
-        !canTransition(input.previousState, input.state) ||
-        run.state !== input.previousState
+        !canTransition(input.previousState, input.state)
       ) {
         return refused("conflict");
+      }
+      if (run.state !== input.previousState) {
+        // The lock may have waited for a concurrent transition of the same
+        // device and event ID, which this statement's snapshot now sees.
+        const raced = await storedTransition(tx, actor.deviceId, input.eventId);
+        return raced === undefined ? refused("conflict") : answerTo(raced);
       }
 
       const row: TransitionRow = {
@@ -355,7 +364,7 @@ export async function recordRunTransition(
         causationId: input.causationId ?? null,
       };
       try {
-        const applied = await tx.transaction(async (savepoint) => {
+        await tx.transaction(async (savepoint) => {
           const updated = await savepoint
             .update(agentRuns)
             .set({
@@ -376,7 +385,7 @@ export async function recordRunTransition(
             )
             .returning({ id: agentRuns.id });
           if (updated.length === 0) {
-            return false;
+            throw new Error("The locked run left previousState");
           }
           await savepoint.insert(agentRunTransitions).values({
             id: newUuidV7(),
@@ -393,22 +402,19 @@ export async function recordRunTransition(
             causationId: row.causationId,
             createdAt: input.now,
           });
-          return true;
         });
-        if (applied) {
-          return {
-            recorded: true,
-            duplicate: false,
-            event: toRelayedEvent(row),
-          };
-        }
+        return {
+          recorded: true,
+          duplicate: false,
+          event: toRelayedEvent(row),
+        };
       } catch (error) {
         if (!isEventClash(error)) {
           throw error;
         }
       }
-      // A concurrent transition changed the run first, or one of the same
-      // device and event ID committed first.
+      // A concurrent transition of the same device and event ID on another
+      // run committed first.
       const raced = await storedTransition(tx, actor.deviceId, input.eventId);
       return raced === undefined ? refused("conflict") : answerTo(raced);
     }),
@@ -431,6 +437,24 @@ const NOT_FOUND: NotFound = Object.freeze({
   listed: false,
   refusal: "not_found",
 });
+
+/**
+ * Runs the statements of a read in one read-only `REPEATABLE READ`
+ * transaction, so that they see one snapshot: the membership check and the
+ * rows, and both run lists. Inside another transaction they run in that
+ * transaction's isolation.
+ */
+async function inSnapshot<T>(
+  db: Database,
+  read: (tx: Database) => Promise<T>,
+): Promise<T> {
+  return withDatabaseErrors(() =>
+    db.transaction(read, {
+      isolationLevel: "repeatable read",
+      accessMode: "read only",
+    }),
+  );
+}
 
 /** Whether the project exists and the account is an active member of its workspace. */
 async function readable(
@@ -474,12 +498,14 @@ const owner = alias(workspaceMembers, "owner");
  * workspace, because a writer of agents attaches the agent to its owner's
  * active person (`src/people.ts`), and nothing deletes a person. An agent
  * written otherwise makes the whole list throw ("Invariant broken: ...").
+ * The membership check and the list are read in one read-only `REPEATABLE
+ * READ` transaction, from one snapshot, as `listProjectRuns` reads.
  */
 export async function listProjectAgents(
   db: Database,
   input: ProjectActivityInput,
 ): Promise<ListProjectAgentsResult> {
-  const rows = await withDatabaseErrors(async () => {
+  const rows = await inSnapshot(db, async (db) => {
     if (!(await readable(db, input))) {
       return undefined;
     }
@@ -579,21 +605,16 @@ function toRunListItem(row: RunRow): AgentRunListItem {
  * recently finished first. Ties go to the higher run ID, so a run is listed
  * once and in a fixed place. `reason` is the run's `state_reason`, the reason
  * given with its last state change. The same reader and the same `not_found`
- * as `listProjectAgents`. Both lists are read in one read-only `REPEATABLE
- * READ` transaction, from one snapshot, so that a run that finishes while
- * they are read is listed once, as the protocol's answer requires; inside
- * another transaction they are read in that transaction's isolation.
+ * as `listProjectAgents`. The membership check and both lists are read in
+ * one read-only `REPEATABLE READ` transaction, from one snapshot, so that a
+ * run that finishes while they are read is listed once, as the protocol's
+ * answer requires.
  */
 export async function listProjectRuns(
   db: Database,
   input: ProjectActivityInput,
 ): Promise<ListProjectRunsResult> {
-  return withDatabaseErrors(() =>
-    db.transaction(listRunsIn(input), {
-      isolationLevel: "repeatable read",
-      accessMode: "read only",
-    }),
-  );
+  return inSnapshot(db, listRunsIn(input));
 }
 
 function listRunsIn(input: ProjectActivityInput) {

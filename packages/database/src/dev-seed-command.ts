@@ -1,3 +1,4 @@
+import { isIPv4, isIPv6 } from "node:net";
 import {
   type DeviceId,
   DeviceIdSchema,
@@ -61,13 +62,33 @@ export function parseDevSeedCommand(
   };
 }
 
-/** Whether a URL's host is the computer itself: `localhost`, 127.0.0.0/8, or `::1`. */
-function isLoopback(hostname: string): boolean {
-  return (
-    hostname === "localhost" ||
-    hostname === "[::1]" ||
-    /^127\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}$/u.test(hostname)
-  );
+/**
+ * Whether an IP address is the computer itself: an IPv4 address in
+ * 127.0.0.0/8, `::1`, or an IPv4-mapped IPv6 address in 127.0.0.0/8, in
+ * their usual text forms. Anything else, also another spelling of `::1`, is
+ * not.
+ */
+export function isLoopbackAddress(address: string): boolean {
+  if (isIPv4(address)) {
+    return address.startsWith("127.");
+  }
+  if (!isIPv6(address)) {
+    return false;
+  }
+  const lower = address.toLowerCase();
+  const mapped = lower.startsWith("::ffff:")
+    ? lower.slice("::ffff:".length)
+    : "";
+  return lower === "::1" || (isIPv4(mapped) && mapped.startsWith("127."));
+}
+
+/** Whether a URL's host is the computer itself: `localhost` or a loopback address. */
+function isLoopbackHost(hostname: string): boolean {
+  const address =
+    hostname.startsWith("[") && hostname.endsWith("]")
+      ? hostname.slice(1, -1)
+      : hostname;
+  return hostname === "localhost" || isLoopbackAddress(address);
 }
 
 /**
@@ -110,7 +131,7 @@ export function checkDevSeedEnvironment(
     return { ok: false, message: `DATABASE_URL ${problem}.` };
   }
   const parsed = new URL(url);
-  if (!isLoopback(parsed.hostname) || parsed.searchParams.has("host")) {
+  if (!isLoopbackHost(parsed.hostname) || parsed.searchParams.has("host")) {
     return {
       ok: false,
       message:
@@ -118,6 +139,20 @@ export function checkDevSeedEnvironment(
     };
   }
   return { ok: true, url };
+}
+
+/**
+ * The second check, after the command connected: the address on which the
+ * server took the connection, `host(inet_server_addr())`, must be a loopback
+ * address, or null for a Unix-domain socket, so that a name that resolves
+ * elsewhere cannot pass. A tunnel to a server still passes, because its
+ * local end is the loopback address; the opt-in guards against it. Returns
+ * the message of a refusal, or undefined.
+ */
+export function checkServerAddress(address: string | null): string | undefined {
+  return address === null || isLoopbackAddress(address)
+    ? undefined
+    : "Refused: the database server did not accept the connection on a loopback address. Nothing was changed.";
 }
 
 /** What the command prints, and its exit code. */

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import {
   type AgentId,
   AgentListResponseSchema,
@@ -33,7 +32,6 @@ import {
   type RecordRunTransitionInput,
   type RecordRunTransitionResult,
 } from "./agent-activity.ts";
-import { createDatabase } from "./client.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
 import {
@@ -56,6 +54,7 @@ import {
   workspaceMembers,
   workspaces,
 } from "./schema/index.ts";
+import { SERVER_ONLY, whileHeld } from "./race-testing.ts";
 import { createTestDatabase } from "./testing.ts";
 
 let testDatabase: Awaited<ReturnType<typeof createTestDatabase>> | undefined;
@@ -1140,97 +1139,6 @@ test("the development seed refuses a missing or revoked device, a missing projec
   }
 });
 
-const SERVER_ONLY = {
-  skip:
-    process.env["DATABASE_TEST_URL"] === undefined &&
-    "needs DATABASE_TEST_URL; PGlite has a single session",
-};
-
-/** Whether a session of the test database waits for a lock. */
-async function waitsForLock(): Promise<boolean> {
-  assert.ok(testDatabase);
-  const { rows } = await testDatabase.client.query<{ waiting: number }>(
-    "select count(*)::int as waiting from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'",
-  );
-  return (rows[0]?.waiting ?? 0) > 0;
-}
-
-/**
- * What the sessions of the test database that wait for a lock wait for: the
- * table of the row, through the tuple lock that a session holds or waits for
- * while it waits for the transaction that holds the row, or else the kind of
- * lock, such as `transactionid` for an entry of a unique index.
- */
-async function lockWaits(): Promise<string[]> {
-  assert.ok(testDatabase);
-  const { rows } = await testDatabase.client.query<{ waitedOn: string }>(
-    `select distinct coalesce(c.relname, w.locktype) as "waitedOn"
-       from pg_locks w
-       left join pg_locks t on t.pid = w.pid and t.locktype = 'tuple'
-       left join pg_class c on c.oid = t.relation
-      where not w.granted
-        and (select oid from pg_database where datname = current_database())
-            in (w.database, t.database)`,
-  );
-  return rows.map((row) => row.waitedOn).sort();
-}
-
-/**
- * Runs `first` in a transaction of a second session and keeps it open while
- * `action` starts in this session. Returns the action's result after the
- * held transaction committed, and what the action waited for (`lockWaits`),
- * empty when it did not wait.
- */
-async function whileHeld<T>(
-  first: (tx: Database) => Promise<unknown>,
-  action: () => Promise<T>,
-): Promise<Readonly<{ result: T; waitedOn: readonly string[] }>> {
-  const url = testDatabase?.url;
-  assert.ok(url, "the test database is on a server");
-  const other = createDatabase(url, { max: 1 });
-  const holding = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<void>();
-  const held = other.db.transaction(async (tx) => {
-    await first(tx);
-    holding.resolve();
-    await release.promise;
-  });
-  try {
-    await Promise.race([
-      holding.promise,
-      held.then(() => {
-        throw new Error("the held transaction ended early");
-      }),
-    ]);
-    const running = action();
-    let settled = false;
-    running.then(
-      () => {
-        settled = true;
-      },
-      () => {
-        settled = true;
-      },
-    );
-    let waited = false;
-    while (!settled && !waited) {
-      waited = await waitsForLock();
-      if (!waited) {
-        await delay(10);
-      }
-    }
-    // The action waits until the held transaction is released.
-    const waitedOn = waited ? await lockWaits() : [];
-    release.resolve();
-    await held;
-    return { result: await running, waitedOn };
-  } finally {
-    release.resolve();
-    await held.catch(() => undefined);
-    await other.close();
-  }
-}
-
 test(
   "of two concurrent transitions from the same state, the second waits at the run and is a conflict",
   SERVER_ONLY,
@@ -1238,6 +1146,7 @@ test(
     const { owner, workspaceId, agentId, runId } = await setUp();
     const from = { workspaceId, who: owner, agentId };
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       (tx) => applied(from, runId, {}, tx),
       () => send(from, runId, { state: "cancelled" }),
     );
@@ -1260,6 +1169,7 @@ test(
     const eventId = newId<EventId>();
     let held: AgentRunStateChangedEvent | undefined;
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       async (tx) => {
         held = await applied(from, runId, { eventId, reason: "First" }, tx);
       },
@@ -1283,6 +1193,7 @@ test(
     const eventId = newId<EventId>();
     let held: AgentRunStateChangedEvent | undefined;
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       async (tx) => {
         held = await applied(from, runId, { eventId }, tx);
       },
@@ -1303,6 +1214,7 @@ test(
   async () => {
     const { owner, workspaceId, agentId, runId } = await setUp();
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       (tx) =>
         revokeDevice(tx, {
           ...owner,
@@ -1328,6 +1240,7 @@ test(
   async () => {
     const { owner, workspaceId, agentId, runId } = await setUp();
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       (tx) => applied({ workspaceId, who: owner, agentId }, runId, {}, tx),
       () =>
         revokeDevice(database(), {
@@ -1359,6 +1272,7 @@ test(
     const agentId = await agentOf(projectId, member);
     const runId = await runOf(agentId, projectId, member);
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       (tx) =>
         removeMember(tx, { workspaceId, ...owner, memberId: person, now: NOW }),
       () => send({ workspaceId, who: member, agentId }, runId),
