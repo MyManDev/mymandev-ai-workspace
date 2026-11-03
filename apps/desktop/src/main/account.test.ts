@@ -158,6 +158,8 @@ interface Harness {
   keyDelete: () => Promise<void>;
   /** The answer of the native confirmation of removing this device. */
   confirmRemoval: (login: string) => Promise<boolean>;
+  /** When set, every read of the record waits for it. */
+  readGate: Promise<void> | null;
   /** How often local execution was stopped. */
   stopped: number;
   /** The state of the fake device session, which `state` and `refresh` return. */
@@ -201,6 +203,7 @@ function harness(
     recordDelete: async () => undefined,
     keyDelete: async () => undefined,
     confirmRemoval: async () => true,
+    readGate: null,
     stopped: 0,
     sessionState: SESSION_SIGNED_IN,
     emit: () => undefined,
@@ -287,6 +290,7 @@ function harness(
     deviceRecords: {
       read: async () => {
         state.log.push("read record");
+        await state.readGate;
         if (state.record instanceof Error) {
           throw state.record;
         }
@@ -762,6 +766,9 @@ test("cancel ends the open sign-in, and a cancel while it starts ends it once it
       open = () => resolve(starting.start);
     });
   const result = h.service.startSignIn();
+  // The flow's start is on its way.
+  await settle();
+  expect(h.log.at(-1)).toBe("start");
   expect(h.service.cancelSignIn()).toBe(true);
   expect(starting.cancels()).toBe(0);
   const ended = nextStatus(h, (status) => status.signIn.kind === "idle");
@@ -2224,4 +2231,60 @@ test("the device list takes the lock, waits a cooldown between requests, and is 
     outcome: "refused",
     reason: "not_signed_in",
   });
+});
+
+test("a cancel while the sign-in waits for the background refresh never opens the browser", async () => {
+  const h = harness();
+  h.sessionState = SIGNED_OUT_PENDING;
+  const release = holdReport(h);
+  const initializing = h.service.initialize();
+  await settle();
+  expect(h.log.at(-1)).toBe("session reportSignOut");
+
+  const starting = h.service.startSignIn();
+  await settle();
+  expect(h.service.status().signIn).toEqual({ kind: "starting" });
+  expect(h.service.cancelSignIn()).toBe(true);
+  release();
+  await initializing;
+
+  await expect(starting).resolves.toEqual({
+    outcome: "failed",
+    code: "cancelled",
+  });
+  expect(h.log).not.toContain("start");
+  expect(h.log).not.toContain("session signInStarted");
+  expect(h.flows).toBe(0);
+  expect(h.service.status()).toMatchObject({
+    signIn: { kind: "idle" },
+    lastOutcome: { code: "cancelled" },
+  });
+  // The next start is not held back by a cooldown: no browser opened.
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+});
+
+test("a sign-in between the key's load and the startup refresh waits for the refresh", async () => {
+  const h = harness();
+  let release: () => void = () => undefined;
+  h.readGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const initializing = h.service.initialize();
+  await settle();
+  // The key is loaded, and the record read is on its way.
+  expect(h.log).toEqual(["load", "session create", "read record"]);
+
+  const starting = h.service.startSignIn();
+  await settle();
+  expect(h.log).not.toContain("start");
+  h.readGate = null;
+  release();
+  await initializing;
+
+  await expect(starting).resolves.toEqual({ outcome: "started" });
+  expect(h.log.indexOf("start")).toBeGreaterThan(
+    h.log.indexOf("session refresh"),
+  );
 });

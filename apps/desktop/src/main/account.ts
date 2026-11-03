@@ -455,12 +455,13 @@ export function createAccountService(
     | "listing"
     | null = null;
   /**
-   * The refresh of the device session that runs in the background (at
-   * startup and after an unlock), or null. It may report a sign-out or
-   * retry a removal, which use the key and may write the record, so every
-   * action of the person waits for it (`backgroundSettled`).
+   * The work that runs in the background: the startup (from the key's load
+   * until its session refresh has ended) and the refresh after an unlock.
+   * A refresh may report a sign-out or retry a removal, which use the key
+   * and may write the record, so every action of the person waits until
+   * none runs (`backgroundSettled`). Each run never rejects.
    */
-  let background: Promise<void> | null = null;
+  const background = new Set<Promise<void>>();
   /** When the last device list was asked for, or null. */
   let lastList: number | null = null;
   let attempt: OpenAttempt | null = null;
@@ -618,15 +619,16 @@ export function createAccountService(
    * API has not learned yet is then reported.
    */
   async function refreshSession(): Promise<void> {
-    const run = refreshSessionNow();
-    background = run;
-    try {
-      await run;
-    } finally {
-      if (background === run) {
-        background = null;
-      }
-    }
+    await inBackground(refreshSessionNow());
+  }
+
+  /** Counts `run` as background work until it has settled. */
+  function inBackground(run: Promise<void>): Promise<void> {
+    background.add(run);
+    void run.finally(() => {
+      background.delete(run);
+    });
+    return run;
   }
 
   /**
@@ -639,8 +641,8 @@ export function createAccountService(
    * `busy`.
    */
   async function backgroundSettled(): Promise<void> {
-    while (background !== null) {
-      await background;
+    while (background.size > 0) {
+      await Promise.all(background);
     }
   }
 
@@ -842,6 +844,13 @@ export function createAccountService(
     const held = session;
     try {
       await backgroundSettled();
+      if (cancelRequested) {
+        // Cancelled while it waited: the browser is never opened.
+        signIn = IDLE;
+        lastOutcome = Object.freeze({ code: "cancelled" });
+        publish();
+        return Object.freeze({ outcome: "failed", code: "cancelled" });
+      }
       let started = await startFlow(opened, held, current);
       // The flow does not replace a key while a replacement is pending, and
       // only an authentication learns which key the API holds. When it
@@ -1229,9 +1238,14 @@ export function createAccountService(
       };
     },
     initialize: () => {
-      initializing ??= initialize().catch(() => {
-        report("The account could not be read.");
-      });
+      // The whole startup counts as background work: from the key's load,
+      // the key is ready before the startup refresh begins, and a sign-in or
+      // another action in that gap must wait for the refresh as well.
+      initializing ??= inBackground(
+        initialize().catch(() => {
+          report("The account could not be read.");
+        }),
+      );
       return initializing;
     },
     startSignIn,
