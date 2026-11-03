@@ -85,7 +85,7 @@ The command prints "Migrations applied." and exits with 0. A second run applies 
 
 pg parses the URL again on its own. It takes the last value of a repeated parameter, and it re-encodes a URL with a space or a stray `%` before parsing it, so without the last two rules it could connect with other settings than the ones that were checked, for example `sslmode=verify-full&sslmode=disable`.
 
-`createDatabase` creates a pg connection pool with a connection timeout of 5 seconds (pg waits forever by default), a statement timeout of 30 seconds (configurable per connection), and an idle-in-transaction timeout of 60 seconds. The two server timeouts are sent as session parameters; PGlite ignores them, so their effect is verified only on a real server.
+`createDatabase` creates a pg connection pool with a connection timeout of 5 seconds (pg waits forever by default), a statement timeout of 30 seconds (configurable per connection), and an idle-in-transaction timeout of 60 seconds. The two server timeouts are sent as session parameters; PGlite ignores them, so their effect is verified only on a real server. The pool has an `error` listener, because pg emits `error` when the server ends an idle connection and Node would otherwise stop the process with an uncaught exception; pg has already discarded that connection, and the listener only calls the optional `onPoolError` hook, without the error, whose message can contain the host (the API logs a fixed message).
 
 ### Smoke test without PostgreSQL
 

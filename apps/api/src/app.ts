@@ -358,7 +358,11 @@ export async function buildApp(
 
   let database: Database | null = options.database ?? null;
   if (database === null && config.databaseUrl !== null) {
-    const connection = createDatabase(config.databaseUrl.reveal());
+    const connection = createDatabase(config.databaseUrl.reveal(), {
+      onPoolError: () => {
+        app.log.error("an idle database connection failed");
+      },
+    });
     database = connection.db;
     app.addHook("onClose", async () => {
       await connection.close();
