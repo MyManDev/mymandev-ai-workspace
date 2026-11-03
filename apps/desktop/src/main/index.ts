@@ -14,6 +14,11 @@ import {
   forgetConfirmed,
 } from "./account.ts";
 import { registerAccountIpc } from "./account-ipc.ts";
+import {
+  REMOVE_DEVICE_CONFIRMATION,
+  removeDeviceConfirmationMessage,
+  removeDeviceConfirmed,
+} from "./account-session.ts";
 import { createSystemAccountService } from "./account-system.ts";
 import {
   APP_SCHEME,
@@ -91,13 +96,14 @@ function start(): void {
   });
   app.on("will-quit", () => repositories.close());
 
-  // The account: the device key and the sign-in (ADR 0014). This instance
-  // holds the single-instance lock, so no other instance touches the key.
-  // The key store needs a ready application, so it is opened and the key is
-  // loaded once when the application is ready; until then the status says
-  // that the key is loading. The sign-in starts only on the person's action
-  // in the renderer. The messages are fixed text, and the key store's
-  // errors hold no secret.
+  // The account: the device key, the sign-in, and the device session (ADR
+  // 0014). This instance holds the single-instance lock, so no other
+  // instance touches the key. The key store needs a ready application, so
+  // it is opened and the key is loaded once when the application is ready;
+  // until then the status says that the key is loading. The device session
+  // is created and refreshed after the load. The sign-in, the sign-out, and
+  // the removal start only on the person's action in the renderer. The
+  // messages are fixed text, and the key store's errors hold no secret.
   const account = createSystemAccountService({
     focusWindow: () => focusMainWindow(),
     // "This is not me" is confirmed in a native dialog of the main process,
@@ -114,6 +120,25 @@ function start(): void {
           : await dialog.showMessageBox(mainWindow, options),
       );
     },
+    // Removing this device is confirmed the same way.
+    confirmRemoveDevice: async (login) => {
+      const options = {
+        ...REMOVE_DEVICE_CONFIRMATION,
+        buttons: [...REMOVE_DEVICE_CONFIRMATION.buttons],
+        message: removeDeviceConfirmationMessage(login),
+      };
+      return removeDeviceConfirmed(
+        mainWindow === undefined
+          ? await dialog.showMessageBox(options)
+          : await dialog.showMessageBox(mainWindow, options),
+      );
+    },
+    // ADR 0014: a revoked device stops local execution. The local runtime
+    // is a placeholder that executes nothing yet (runtime.ts), so there is
+    // nothing to stop; stopping it would only leave it stopped with no way
+    // back after the next sign-in. The local runtime tasks (terminal,
+    // process, and agent execution) stop their work here.
+    stopLocalExecution: () => undefined,
     onError: (message, error) =>
       error === undefined
         ? console.error(message)
@@ -185,8 +210,8 @@ function start(): void {
         createAppProtocolHandler(rendererDir, { readFile, realpath }),
       );
       void runtime.start();
-      // The key is loaded before anything uses it; nothing connects to the
-      // API yet.
+      // The key is loaded before anything uses it; the device session then
+      // refreshes, which retries a pending removal or sign-out report.
       void account.initialize();
       showMainWindow();
       app.on("activate", showMainWindow);

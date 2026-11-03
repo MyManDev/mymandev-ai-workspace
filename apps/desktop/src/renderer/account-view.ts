@@ -2,9 +2,16 @@ import type {
   AccountStatus,
   ApiOriginState,
   StartSignInResult,
+  DeviceActionFailure,
   DeviceKeyState,
+  DeviceState,
+  DeviceView,
+  ForgetResult,
+  ListDevicesResult,
+  RemoveDeviceResult,
   SignInOutcomeCode,
   SignInOutcomeView,
+  SignOutResult,
 } from "../shared/ipc-contract.ts";
 
 /** What the account panel knows about the sign-in of this installation. */
@@ -148,3 +155,202 @@ export const START_REFUSAL_MESSAGES: Readonly<
   key_not_ready: "The device key is not ready.",
   too_soon: "Wait a few seconds before you start the sign-in again.",
 });
+
+/**
+ * The message for each state of the device, or none where the panel shows
+ * the state otherwise (signed in, no device yet, or the passphrase form).
+ */
+export const DEVICE_STATE_MESSAGES: Readonly<
+  Record<DeviceState, string | undefined>
+> = Object.freeze({
+  starting: "Checking this device.",
+  no_device: undefined,
+  signed_in: undefined,
+  signed_out:
+    "You signed out on this device. Sign in with GitHub to use it again.",
+  sign_out_report_pending:
+    "You signed out on this device. The server learns it as soon as it can be reached.",
+  sign_in_required: "The server asks for a new GitHub sign-in on this device.",
+  auth_failed:
+    "The server did not accept this device's key. Sign in with GitHub again.",
+  account_mismatch:
+    "This installation belongs to another GitHub account. Sign in with that account, then remove this device so that another account can use it.",
+  key_lost:
+    "This device's key is missing. Sign in with GitHub to add this computer as a new device, which replaces the old one.",
+  key_not_loaded: undefined,
+  unavailable:
+    "The device record or the device key of this installation cannot be read.",
+  removal_pending:
+    "The removal of this device waits for the server. It is tried again when the application starts, or when you remove the device again.",
+  removed:
+    "This device was removed from its account, and its key was deleted. Sign in with GitHub to add it again as a new device.",
+  revoked:
+    "The server revoked this device, for example because it was removed from another device, and its key was deleted. Sign in with GitHub to add it again as a new device.",
+});
+
+/** States of the device that the panel announces at once. */
+const DEVICE_STATE_ALERTS: ReadonlySet<DeviceState> = new Set<DeviceState>([
+  "auth_failed",
+  "account_mismatch",
+  "key_lost",
+  "unavailable",
+  "revoked",
+]);
+
+/** The message for the state of the device, or none. */
+export function describeDeviceState(
+  state: DeviceState,
+): OutcomeMessage | undefined {
+  const text = DEVICE_STATE_MESSAGES[state];
+  return text === undefined
+    ? undefined
+    : { role: DEVICE_STATE_ALERTS.has(state) ? "alert" : "status", text };
+}
+
+/** The device states in which the panel offers "Sign in with GitHub". */
+const SIGN_IN_STATES: ReadonlySet<DeviceState> = new Set<DeviceState>([
+  "no_device",
+  "signed_out",
+  "sign_out_report_pending",
+  "sign_in_required",
+  "auth_failed",
+  "account_mismatch",
+  "key_lost",
+  "removed",
+  "revoked",
+]);
+
+/**
+ * Whether the panel offers a GitHub sign-in: without an account, or when
+ * the device needs one (after a sign-out, a refusal of the API, a lost key,
+ * or a removal).
+ */
+export function offersSignIn(status: AccountStatus): boolean {
+  return (
+    status.account.kind === "signed_out" || SIGN_IN_STATES.has(status.device)
+  );
+}
+
+/** The message for each failure of a sign-out, a removal, or the device list. */
+export const DEVICE_ACTION_FAILURE_MESSAGES: Readonly<
+  Record<DeviceActionFailure, string>
+> = Object.freeze({
+  api_origin_unset: SIGN_IN_OUTCOME_MESSAGES.api_origin_unset,
+  api_origin_invalid: SIGN_IN_OUTCOME_MESSAGES.api_origin_invalid,
+  no_device: "This installation holds no device that can be used.",
+  key_lost: "This device's key is missing. Sign in with GitHub first.",
+  key_not_loaded: "The device key is not loaded. Enter its passphrase first.",
+  record_unreadable: "The device record of this installation cannot be read.",
+  key_store_failed: "The device key could not be used.",
+  signed_out: "This device is signed out. Sign in with GitHub first.",
+  sign_in_running: "Wait until the sign-in is finished.",
+  replacement_pending:
+    "The device key of the last sign-in is not confirmed yet. Try again in a few minutes.",
+  removal_pending: "The removal of this device waits for the server.",
+  record_not_saved:
+    "The device record of this installation could not be saved. Try again.",
+  no_answer: "The server did not answer. Check the connection and try again.",
+  server_error: "The server failed. Try again later.",
+  unexpected_response: "The server's answer could not be read. Try again.",
+  sign_in_required: "The server asks for a new GitHub sign-in on this device.",
+  auth_failed: "The server did not accept this device's key.",
+  device_revoked: "This device was removed from its account.",
+  device_account_mismatch:
+    "This installation belongs to another GitHub account.",
+  rate_limited: "Too many requests. Wait a minute and try again.",
+  refused: "The server refused the request.",
+  failed: "The request failed.",
+});
+
+/** The messages of the device actions that the main process refused or that need a note. */
+export const DEVICE_ACTION_MESSAGES = Object.freeze({
+  busy: "Wait until the sign-in or the current change of the account is finished.",
+  notSignedIn: "This installation holds no account.",
+  signOutFailed: "The sign-out could not be completed. Try again.",
+  removeFailed: "The device could not be removed. Try again.",
+  listFailed: "The devices could not be listed. Try again.",
+  forgottenLocally:
+    "The account was removed from this installation, but the server could not remove this device from it. The device stays listed in that account, without a key, until its sign-in ends after 30 days or it is removed from another device.",
+});
+
+/** The message for a device action that did not succeed, or none. */
+function deviceActionMessage(
+  result:
+    | { readonly outcome: "refused"; readonly reason: "busy" | "not_signed_in" }
+    | { readonly outcome: "failed"; readonly reason: DeviceActionFailure },
+): string {
+  if (result.outcome === "refused") {
+    return result.reason === "busy"
+      ? DEVICE_ACTION_MESSAGES.busy
+      : DEVICE_ACTION_MESSAGES.notSignedIn;
+  }
+  return DEVICE_ACTION_FAILURE_MESSAGES[result.reason];
+}
+
+/** The message after a sign-out; the device state shows a success. */
+export function signOutMessage(result: SignOutResult): string | undefined {
+  switch (result.outcome) {
+    case "signed_out":
+    case "pending":
+      return undefined;
+    default:
+      return deviceActionMessage(result);
+  }
+}
+
+/** The message after a removal; the device state shows a removal or a pending one. */
+export function removeDeviceMessage(
+  result: RemoveDeviceResult,
+): string | undefined {
+  switch (result.outcome) {
+    case "removed":
+    case "pending":
+    case "cancelled":
+      return undefined;
+    default:
+      return deviceActionMessage(result);
+  }
+}
+
+/** The message after the device list was asked for; the list shows itself. */
+export function listDevicesMessage(
+  result: ListDevicesResult,
+): string | undefined {
+  return result.outcome === "listed" ? undefined : deviceActionMessage(result);
+}
+
+/** The message after "This is not me". */
+export function forgetMessage(result: ForgetResult): string | undefined {
+  switch (result.outcome) {
+    case "forgotten":
+      return result.removedAtServer
+        ? undefined
+        : DEVICE_ACTION_MESSAGES.forgottenLocally;
+    case "cancelled":
+      return undefined;
+    case "refused":
+      return result.reason === "busy"
+        ? ACTION_MESSAGES.forgetBusy
+        : ACTION_MESSAGES.notSignedIn;
+    case "failed":
+      return ACTION_MESSAGES.forgetFailed;
+  }
+}
+
+const PLATFORM_NAMES: Readonly<Record<DeviceView["platform"], string>> =
+  Object.freeze({
+    windows: "Windows",
+    macos: "macOS",
+    linux: "Linux",
+  });
+
+/** One line of detail for a device of the list: its platform and its state. */
+export function deviceDetail(device: DeviceView): string {
+  const platform = PLATFORM_NAMES[device.platform];
+  if (device.revokedAt !== null) {
+    return `${platform}, removed on ${device.revokedAt.slice(0, 10)}`;
+  }
+  return device.lastSeenAt === null
+    ? `${platform}, not connected yet`
+    : `${platform}, last seen on ${device.lastSeenAt.slice(0, 10)}`;
+}

@@ -442,6 +442,29 @@ code {
   font-size: var(--font-size-small);
 }
 
+.account-panel h4 {
+  margin: var(--space-3) 0 0;
+  font-size: var(--font-size-small);
+}
+
+.device-list {
+  margin: var(--space-2) 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--font-size-small);
+}
+
+.device-list li {
+  padding-block: var(--space-1);
+  border-block-end: var(--border-width) solid var(--color-border);
+  overflow-wrap: anywhere;
+}
+
+.device-detail {
+  display: block;
+  color: var(--color-text-muted);
+}
+
 .pairing-code {
   margin: var(--space-2) 0;
   font-family: var(--font-family-mono);

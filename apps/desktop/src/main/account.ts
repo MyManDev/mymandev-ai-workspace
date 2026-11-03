@@ -1,27 +1,39 @@
-// The account of this installation in the main process (ADR 0014, "Sign-in"
-// and "Storage and transport on the device"; part 2c of #94). It loads the
-// device key once at startup, reads the device record to learn whether the
-// installation holds an account, starts and cancels the sign-in flow on the
-// person's action, unlocks a key that a passphrase protects, and forgets the
-// account for "This is not me" (#149).
+// The account of this installation in the main process (ADR 0014, "Sign-in",
+// "Revocation, sign-out, and recovery", and "Storage and transport on the
+// device"; parts 2c and 3 of #94). It loads the device key once at startup,
+// reads the device record to learn whether the installation holds an
+// account, creates the device session and refreshes it, starts and cancels
+// the sign-in flow on the person's action, unlocks a key that a passphrase
+// protects, signs out, removes this device, lists the account's devices, and
+// forgets the account for "This is not me" (#149).
 //
 // The renderer gets a narrow status only: the account's login, display name,
 // and device ID, the pairing code, the authorize URL when the browser did not
-// open, and fixed codes. The sign-in code, the verifier, signatures, keys,
-// tokens, and the passphrase never reach the status, a result, or a message.
+// open, the device list, and fixed codes. The sign-in code, the verifier,
+// signatures, keys, tokens, and the passphrase never reach the status, a
+// result, or a message.
 import type { ApiErrorCode } from "@mymandev/protocol";
 import type {
   Account,
   AccountStatus,
   ApiOriginState,
   DeviceKeyState,
+  DeviceState,
   ForgetResult,
+  ListDevicesResult,
+  RemoveDeviceResult,
   SignInOutcomeCode,
   SignInOutcomeView,
   SignInState,
+  SignOutResult,
   StartSignInResult,
   UnlockResult,
 } from "../shared/ipc-contract.ts";
+import {
+  deviceActionFailure,
+  deviceStateOf,
+  deviceViewOf,
+} from "./account-session.ts";
 import type { ApiOrigin } from "./api-origin.ts";
 import { isDeviceKeyError } from "./device-key/errors.ts";
 import type { DeviceKeyStore } from "./device-key/store.ts";
@@ -34,6 +46,26 @@ import type {
   SignInStart,
 } from "./sign-in/flow.ts";
 import type { SignInListenerError } from "./sign-in/listener.ts";
+import type {
+  DeviceSession,
+  DeviceSessionState,
+  SessionFailure,
+} from "./session/session.ts";
+
+/** The part of the device session that the service uses. */
+export type AccountSession = Pick<
+  DeviceSession,
+  | "state"
+  | "onChange"
+  | "refresh"
+  | "signInStarted"
+  | "signInFinished"
+  | "authenticate"
+  | "listDevices"
+  | "signOut"
+  | "reportSignOut"
+  | "removeDevice"
+>;
 
 /** What the service uses once the application is ready. */
 export interface AccountSystem {
@@ -45,6 +77,12 @@ export interface AccountSystem {
    * Called once, before the first sign-in, after the key is loaded.
    */
   readonly createFlow: () => Pick<SignInFlow, "start" | "reset">;
+  /**
+   * Creates the device session over the same key store and record store.
+   * Called once, after the key's load settled, also when the key waits for
+   * its passphrase.
+   */
+  readonly createSession: () => AccountSession;
 }
 
 export interface AccountServiceOptions {
@@ -69,6 +107,21 @@ export interface AccountServiceOptions {
    * (`FORGET_CONFIRMATION` and `forgetConfirmed`).
    */
   readonly confirmForget: (login: string) => Promise<boolean>;
+  /**
+   * Asks the person, in a native dialog of the main process, whether to
+   * remove this device from the account with this login. Resolves to true
+   * only for the remove button (`REMOVE_DEVICE_CONFIRMATION` and
+   * `removeDeviceConfirmed`).
+   */
+  readonly confirmRemoveDevice: (login: string) => Promise<boolean>;
+  /**
+   * Stops local execution after the API revoked this device (ADR 0014:
+   * after `device_revoked` the desktop "stops local execution"). Called
+   * each time the device state moves to `revoked`, after the session
+   * published it and before it deletes the key. An error that it throws is
+   * reported.
+   */
+  readonly stopLocalExecution?: () => void;
   /** A monotonic clock in milliseconds; defaults to `performance.now`. */
   readonly now?: () => number;
   /** Receives a fixed message, never a value. An error that it throws is ignored. */
@@ -83,7 +136,9 @@ export interface AccountService {
     listener: (status: AccountStatus) => void,
   ) => () => void;
   /**
-   * Opens the key store, loads the device key, and reads the device record.
+   * Opens the key store, loads the device key, reads the device record,
+   * creates the device session, and refreshes it, which retries a pending
+   * removal; a sign-out that the API has not learned yet is then reported.
    * Runs once; a later call resolves with the first one. Never rejects.
    */
   readonly initialize: () => Promise<void>;
@@ -104,11 +159,29 @@ export interface AccountService {
    */
   readonly unlockDeviceKey: (passphrase: string) => Promise<UnlockResult>;
   /**
-   * "This is not me": asks the person with `confirmForget`, then deletes the
+   * "This is not me": asks the person with `confirmForget`, removes the
+   * device at the API through the session where it can, then deletes the
    * device record and the device key of this installation and resets what
-   * the flow keeps in memory. Never rejects.
+   * the flow keeps in memory, whatever the API answered. Never rejects.
    */
   readonly forgetAccount: () => Promise<ForgetResult>;
+  /**
+   * Signs out (P-65): the device, its key, and its record stay, and the key
+   * is not used until the next GitHub sign-in. Resolves with `pending` when
+   * the API learns it later; a second call while the report is pending
+   * retries it. Never rejects.
+   */
+  readonly signOut: () => Promise<SignOutResult>;
+  /**
+   * Removes this device: asks the person with `confirmRemoveDevice`, then
+   * revokes the device at the API with the reason `removed`. The key and the
+   * record are deleted only after the API confirmed it; without a clear
+   * answer the removal stays pending, and a later call or the next start
+   * retries it. Never rejects.
+   */
+  readonly removeDevice: () => Promise<RemoveDeviceResult>;
+  /** The account's devices, without anything secret. Never rejects. */
+  readonly listDevices: () => Promise<ListDevicesResult>;
 }
 
 /**
@@ -152,7 +225,7 @@ export const FORGET_CONFIRMATION = Object.freeze({
   noLink: true,
   title: "This is not me",
   detail:
-    "The device key and the account are deleted on this computer. You can then sign in with your own GitHub account.",
+    "This device is removed from that account when the server can be reached, and the device key and the account are deleted on this computer. You can then sign in with your own GitHub account.",
 } as const);
 
 /** The message of the confirmation, with the login of the account. */
@@ -315,6 +388,38 @@ interface OpenAttempt {
   readonly cancel: () => void;
 }
 
+/** What the session hears of a flow that could not be created or did not answer. */
+const UNEXPECTED_OUTCOME: SignInOutcome = Object.freeze({
+  kind: "failed",
+  reason: "unexpected",
+});
+
+/** Whether the flow did not start because a key replacement is pending. */
+function replacementPendingOutcome(outcome: SignInOutcome): boolean {
+  return outcome.kind === "failed" && outcome.reason === "replacement_pending";
+}
+
+/** The result of a session action that failed, as a fixed code. */
+function actionFailed(failure: SessionFailure) {
+  return Object.freeze({
+    outcome: "failed" as const,
+    reason: deviceActionFailure(failure),
+  });
+}
+
+const ACTION_FAILED = Object.freeze({
+  outcome: "failed" as const,
+  reason: "failed" as const,
+});
+const ACTION_BUSY = Object.freeze({
+  outcome: "refused" as const,
+  reason: "busy" as const,
+});
+const ACTION_NOT_SIGNED_IN = Object.freeze({
+  outcome: "refused" as const,
+  reason: "not_signed_in" as const,
+});
+
 export function createAccountService(
   options: AccountServiceOptions,
 ): AccountService {
@@ -331,9 +436,16 @@ export function createAccountService(
 
   let system: AccountSystem | null = null;
   let flow: Pick<SignInFlow, "start" | "reset"> | null = null;
+  let session: AccountSession | null = null;
   let initializing: Promise<void> | null = null;
   /** The action that runs; at most one at a time, besides an open attempt. */
-  let operation: "starting" | "unlocking" | "forgetting" | null = null;
+  let operation:
+    | "starting"
+    | "unlocking"
+    | "forgetting"
+    | "signing_out"
+    | "removing"
+    | null = null;
   let attempt: OpenAttempt | null = null;
   let cancelRequested = false;
   /** Counts the attempts, so that a late callback of an old one changes nothing. */
@@ -351,6 +463,12 @@ export function createAccountService(
   let lastOutcome: SignInOutcomeView | null = null;
   let deviceKey: DeviceKeyState = "loading";
   let replacementPending = false;
+  let device: DeviceState = "starting";
+  /**
+   * Counts the reads of the account that may publish it, so that a read
+   * that a later one overtook changes nothing.
+   */
+  let accountReads = 0;
   let revision = 0;
   let current = snapshot();
 
@@ -363,6 +481,7 @@ export function createAccountService(
       deviceKey,
       replacementPending,
       apiOrigin,
+      device,
     });
   }
 
@@ -401,6 +520,102 @@ export function createAccountService(
     }
   }
 
+  /**
+   * Forgets what the flow keeps of a device that is gone (an unsaved record
+   * and an account mismatch), so that its next attempt does not bring the
+   * device back. A flow that refuses, because an attempt runs, is dropped,
+   * and the next sign-in creates a new one.
+   */
+  function resetFlow(): void {
+    if (flow !== null && !flow.reset()) {
+      flow = null;
+    }
+  }
+
+  /**
+   * Reads the record and the key's replacement again, after the session
+   * changed them, and publishes them when they changed.
+   */
+  async function refreshAccount(): Promise<void> {
+    const opened = system;
+    if (opened === null) {
+      return;
+    }
+    accountReads += 1;
+    const read = accountReads;
+    const next = await readAccount(opened);
+    const pending = await readReplacementPending(opened);
+    if (read !== accountReads) {
+      return;
+    }
+    if (
+      JSON.stringify(next) === JSON.stringify(account) &&
+      pending === replacementPending
+    ) {
+      return;
+    }
+    account = next;
+    replacementPending = pending;
+    publish();
+  }
+
+  /** Follows the state of the device session. */
+  function sessionChanged(state: DeviceSessionState): void {
+    const next = deviceStateOf(state);
+    if (next === device) {
+      return;
+    }
+    device = next;
+    if (next === "revoked") {
+      // ADR 0014: a revoked device stops local execution. The session
+      // publishes `revoked` before it deletes the key.
+      try {
+        options.stopLocalExecution?.();
+      } catch {
+        report("The local execution could not be stopped.");
+      }
+    }
+    if (next === "revoked" || next === "removed") {
+      // The device is gone at the API for good. The session publishes this
+      // before it deletes the key and the record, so the account is not
+      // read now but signed out at once, and what the flow keeps of it is
+      // forgotten.
+      accountReads += 1;
+      account = SIGNED_OUT;
+      replacementPending = false;
+      resetFlow();
+      publish();
+      return;
+    }
+    publish();
+    // A confirmed or abandoned replacement changed the key, and a lost key
+    // deleted it.
+    void refreshAccount().catch(() => {
+      report("The account could not be read.");
+    });
+  }
+
+  /**
+   * Refreshes the device session: at startup, after a passphrase, and after
+   * "This is not me". It retries a pending removal, and a sign-out that the
+   * API has not learned yet is then reported.
+   */
+  async function refreshSession(): Promise<void> {
+    const held = session;
+    if (held === null) {
+      return;
+    }
+    try {
+      const state = await held.refresh();
+      sessionChanged(state);
+      if (state.kind === "signed_out" && state.reportPending) {
+        await held.reportSignOut();
+      }
+    } catch {
+      report("The device session could not be refreshed.");
+    }
+  }
+
   async function initialize(): Promise<void> {
     let opened: AccountSystem;
     try {
@@ -426,9 +641,22 @@ export function createAccountService(
         report("The device key could not be loaded.");
       }
     }
+    // The session needs the key's load to have settled; with a key that
+    // waits for its passphrase it reports `key_not_loaded` until then.
+    try {
+      const created = opened.createSession();
+      session = created;
+      created.onChange(sessionChanged);
+      device = deviceStateOf(created.state());
+    } catch {
+      device = "unavailable";
+      report("The device session could not be created.");
+    }
+    accountReads += 1;
     replacementPending = await readReplacementPending(opened);
     account = await readAccount(opened);
     publish();
+    await refreshSession();
   }
 
   /**
@@ -452,11 +680,82 @@ export function createAccountService(
     }
   }
 
+  /** Tells the session how a sign-in ended, also one that did not start. */
+  async function sessionSignInFinished(
+    held: AccountSession | null,
+    outcome: SignInOutcome,
+  ): Promise<void> {
+    if (held === null) {
+      return;
+    }
+    try {
+      sessionChanged(await held.signInFinished(outcome));
+    } catch {
+      report("The device session could not record the sign-in.");
+    }
+  }
+
+  /**
+   * Starts the flow, with `signInStarted` before it, so that the session
+   * does not resolve a pending replacement while the sign-in may still
+   * register the new key, and `signInFinished` when it did not start.
+   */
+  async function startFlow(
+    opened: AccountSystem,
+    held: AccountSession | null,
+    current: number,
+  ): Promise<SignInStart | null> {
+    try {
+      held?.signInStarted();
+    } catch {
+      report("The device session could not record the sign-in.");
+    }
+    let started: SignInStart | null = null;
+    try {
+      flow ??= opened.createFlow();
+      started = await flow.start({ onCallback: () => callback(current) });
+    } catch {
+      // `start` never rejects; a flow that cannot be created ends here.
+      report("The sign-in could not start.");
+    }
+    if (started === null || !started.started) {
+      await sessionSignInFinished(
+        held,
+        started === null ? UNEXPECTED_OUTCOME : started.outcome,
+      );
+    }
+    return started;
+  }
+
+  /**
+   * After the flow answered `replacement_pending`: authenticates, which
+   * resolves the pending replacement as far as the API's answers allow (the
+   * new key confirmed, the replacement abandoned after the grace period, or
+   * both keys deleted as lost), and tells whether the key store still holds
+   * a replacement. Every failure counts as unresolved.
+   */
+  async function replacementResolved(
+    opened: AccountSystem,
+    held: AccountSession,
+  ): Promise<boolean> {
+    try {
+      await held.authenticate();
+      const keyStatus = await opened.keyStore.status();
+      return keyStatus.protection === "none" || !keyStatus.replacementPending;
+    } catch {
+      report("The pending key replacement could not be resolved.");
+      return false;
+    }
+  }
+
   /** Records how a started sign-in ended. */
   async function finish(
     opened: AccountSystem,
+    held: AccountSession | null,
     outcome: SignInOutcome,
   ): Promise<void> {
+    await sessionSignInFinished(held, outcome);
+    accountReads += 1;
     const view = signInOutcomeView(outcome);
     // The flow may have written or deleted the record and the key, for
     // example after `device_revoked`.
@@ -494,14 +793,27 @@ export function createAccountService(
     signIn = STARTING;
     lastOutcome = null;
     publish();
+    const held = session;
     try {
-      let started: SignInStart | null = null;
-      try {
-        flow ??= opened.createFlow();
-        started = await flow.start({ onCallback: () => callback(current) });
-      } catch {
-        // `start` never rejects; a flow that cannot be created ends here.
-        report("The sign-in could not start.");
+      let started = await startFlow(opened, held, current);
+      // The flow does not replace a key while a replacement is pending, and
+      // only an authentication learns which key the API holds. When it
+      // resolves the replacement, the flow starts once more, at most once
+      // per action of the person: a second answer, whatever it is, is shown
+      // as it is, so the service never loops. A replacement that the
+      // authentication could not resolve (no answer, the grace period of an
+      // uncertain sign-in, a first refusal of both keys) is reported as
+      // `replacement_pending` without a second start.
+      if (
+        held !== null &&
+        started !== null &&
+        !started.started &&
+        replacementPendingOutcome(started.outcome) &&
+        !cancelRequested &&
+        (await replacementResolved(opened, held)) &&
+        !cancelRequested
+      ) {
+        started = await startFlow(opened, held, current);
       }
       if (started === null || !started.started) {
         const view =
@@ -510,6 +822,7 @@ export function createAccountService(
             : signInOutcomeView(started.outcome);
         // A start that failed may have written a record that the flow kept
         // or deleted a leftover key.
+        accountReads += 1;
         account = await readAccount(opened);
         replacementPending = await readReplacementPending(opened);
         signIn = IDLE;
@@ -542,7 +855,7 @@ export function createAccountService(
       const { outcome } = started;
       void outcome
         .catch((): SignInOutcome => ({ kind: "failed", reason: "unexpected" }))
-        .then((value) => finish(opened, value))
+        .then((value) => finish(opened, held, value))
         .catch(() => report("The sign-in outcome could not be recorded."));
       if (cancelRequested) {
         started.cancel();
@@ -585,6 +898,9 @@ export function createAccountService(
       deviceKey = "ready";
       replacementPending = await readReplacementPending(opened);
       publish();
+      // The session reads the loaded key; a pending removal or sign-out
+      // report is retried. The unlock does not wait for the API.
+      void refreshSession();
       return Object.freeze({ outcome: "unlocked" });
     } catch (error) {
       // Nothing about the passphrase is reported: the store's errors are
@@ -639,16 +955,30 @@ export function createAccountService(
       if (!confirmed) {
         return Object.freeze({ outcome: "cancelled" });
       }
-      // Local only, in this part of #94. ADR 0014 removes a device at the
-      // API first and deletes its key only after the server confirmed; that
-      // needs an access token, which part 3 adds, and part 3 then tells the
-      // API to remove the device here. Until then the device stays
-      // registered to that account at the API, without a key that can use
-      // it, until its 30-day sign-in ends or the account removes it.
-      //
+      // The device is removed at the API first, and then forgotten here
+      // whatever the API answered. The removal needs the key, which signs
+      // the access token request, and the record, which names the device,
+      // so it can only come before they are deleted. Its failure (offline,
+      // signed out, a key that waits for its passphrase, a refusal) never
+      // stops the local part, so the account never stays on the
+      // installation because the API could not be reached; the device then
+      // stays registered to that account at the API, without a key that can
+      // use it, until its 30-day sign-in ends or the account removes it
+      // from another device. The removal itself only deletes files after the
+      // API confirmed it, so it can never bring the account back either.
+      let removedAtServer = false;
+      if (session !== null) {
+        try {
+          const removal = await session.removeDevice();
+          removedAtServer = removal.ok && removal.value === "removed";
+        } catch {
+          report("The device could not be removed at the server.");
+        }
+      }
       // The record goes first: a key without a record is deleted by the next
       // sign-in, while a record without a key would make the next sign-in
       // name this device as its previous device, for the other account.
+      accountReads += 1;
       await opened.deviceRecords.delete();
       // Once the record is gone, the flow keeps nothing of this account in
       // memory: no unsaved record, which its next attempt would write back,
@@ -665,15 +995,135 @@ export function createAccountService(
       replacementPending = false;
       lastOutcome = null;
       publish();
-      return Object.freeze({ outcome: "forgotten" });
+      // The session reads the files again; a removal that it noted for the
+      // deleted device ends with them.
+      await refreshSession();
+      return Object.freeze({ outcome: "forgotten", removedAtServer });
     } catch {
       report("The account could not be forgotten on this device.");
+      accountReads += 1;
       account = await readAccount(opened);
       replacementPending = await readReplacementPending(opened);
       publish();
+      await refreshSession();
       return Object.freeze({ outcome: "failed" });
     } finally {
       operation = null;
+    }
+  }
+
+  /**
+   * The session for an action of the person, or why the action is refused:
+   * `busy` while a sign-in is open, the key is loading, or another action
+   * runs, and `not_signed_in` without an account or a session.
+   */
+  function sessionFor():
+    AccountSession | typeof ACTION_BUSY | typeof ACTION_NOT_SIGNED_IN {
+    if (operation !== null || attempt !== null || deviceKey === "loading") {
+      return ACTION_BUSY;
+    }
+    if (system === null || session === null || account.kind !== "signed_in") {
+      return ACTION_NOT_SIGNED_IN;
+    }
+    return session;
+  }
+
+  function isRefusal(
+    value: AccountSession | typeof ACTION_BUSY | typeof ACTION_NOT_SIGNED_IN,
+  ): value is typeof ACTION_BUSY | typeof ACTION_NOT_SIGNED_IN {
+    return "outcome" in value;
+  }
+
+  async function signOut(): Promise<SignOutResult> {
+    const held = sessionFor();
+    if (isRefusal(held)) {
+      return held;
+    }
+    operation = "signing_out";
+    try {
+      // P-65: the session keeps the device, its key, and its record; the
+      // sign-out holds on the device at once, and the API learns it now or
+      // later.
+      const result = await held.signOut();
+      if (!result.ok) {
+        return actionFailed(result);
+      }
+      return result.value === "reported"
+        ? Object.freeze({ outcome: "signed_out" })
+        : Object.freeze({ outcome: "pending" });
+    } catch {
+      report("The sign-out failed.");
+      return ACTION_FAILED;
+    } finally {
+      operation = null;
+    }
+  }
+
+  async function removeDevice(): Promise<RemoveDeviceResult> {
+    const held = sessionFor();
+    if (isRefusal(held)) {
+      return held;
+    }
+    if (account.kind !== "signed_in") {
+      return ACTION_NOT_SIGNED_IN;
+    }
+    if (device === "signed_out" || device === "sign_out_report_pending") {
+      // The API takes no request of a signed-out device, so the person is
+      // not asked for a removal that cannot happen: they sign in first.
+      return Object.freeze({ outcome: "failed", reason: "signed_out" });
+    }
+    const { login } = account;
+    operation = "removing";
+    try {
+      // The confirmation runs in the main process, so that a renderer that
+      // misbehaves cannot remove the device without the person.
+      let confirmed: boolean;
+      try {
+        confirmed = await options.confirmRemoveDevice(login);
+      } catch {
+        report("The confirmation could not be shown.");
+        return ACTION_FAILED;
+      }
+      if (!confirmed) {
+        return Object.freeze({ outcome: "cancelled" });
+      }
+      // The session notes the removal, so that it holds across a restart,
+      // and deletes the key and the record only after the API confirmed it.
+      const result = await held.removeDevice();
+      if (!result.ok) {
+        return actionFailed(result);
+      }
+      if (result.value === "pending") {
+        // The key stays, and the next start or another removal retries it.
+        return Object.freeze({ outcome: "pending" });
+      }
+      resetFlow();
+      return Object.freeze({ outcome: "removed" });
+    } catch {
+      report("The device could not be removed.");
+      return ACTION_FAILED;
+    } finally {
+      operation = null;
+    }
+  }
+
+  async function listDevices(): Promise<ListDevicesResult> {
+    const held = sessionFor();
+    if (isRefusal(held)) {
+      return held;
+    }
+    try {
+      const result = await held.listDevices();
+      if (!result.ok) {
+        return actionFailed(result);
+      }
+      return Object.freeze({
+        outcome: "listed",
+        devices: result.value.map(deviceViewOf),
+      });
+    } catch {
+      report("The device list could not be read.");
+      return ACTION_FAILED;
     }
   }
 
@@ -696,5 +1146,8 @@ export function createAccountService(
     cancelSignIn,
     unlockDeviceKey,
     forgetAccount,
+    signOut,
+    removeDevice,
+    listDevices,
   });
 }

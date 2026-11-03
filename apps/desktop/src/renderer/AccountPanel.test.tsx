@@ -3,6 +3,8 @@ import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import {
   type AccountStatus,
+  DEVICE_STATES,
+  type DeviceView,
   SIGN_IN_OUTCOME_CODES,
 } from "../shared/ipc-contract.ts";
 import {
@@ -11,6 +13,7 @@ import {
 } from "./AccountPanel.tsx";
 import {
   DEVICE_KEY_PROBLEM_MESSAGES,
+  DEVICE_STATE_MESSAGES,
   SIGN_IN_OUTCOME_MESSAGES,
 } from "./account-view.ts";
 
@@ -27,6 +30,7 @@ const SIGNED_OUT: AccountStatus = {
   deviceKey: "ready",
   replacementPending: false,
   apiOrigin: "set",
+  device: "no_device",
 };
 
 const SIGNED_IN: AccountStatus = {
@@ -37,11 +41,18 @@ const SIGNED_IN: AccountStatus = {
     displayName: "The Octocat",
     deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
   },
+  device: "signed_in",
 };
 
 type Handler = keyof Pick<
   AccountPanelContentProps,
-  "onStartSignIn" | "onCancelSignIn" | "onUnlock" | "onForget"
+  | "onStartSignIn"
+  | "onCancelSignIn"
+  | "onUnlock"
+  | "onForget"
+  | "onSignOut"
+  | "onRemoveDevice"
+  | "onListDevices"
 >;
 
 function props(
@@ -61,6 +72,10 @@ function props(
     onCancelSignIn: record("onCancelSignIn"),
     onUnlock: record("onUnlock"),
     onForget: record("onForget"),
+    devices: undefined,
+    onSignOut: record("onSignOut"),
+    onRemoveDevice: record("onRemoveDevice"),
+    onListDevices: record("onListDevices"),
     ...overrides,
   };
 }
@@ -233,7 +248,14 @@ test("when the browser did not open, the URL is in a read-only field with the wa
   );
 });
 
-test("signed in, the panel shows the login and the name with This is not me", () => {
+const SIGNED_IN_BUTTONS = [
+  ["Show devices", ["onListDevices"]],
+  ["Sign out", ["onSignOut"]],
+  ["Remove this device", ["onRemoveDevice"]],
+  ["This is not me", ["onForget"]],
+];
+
+test("signed in, the panel shows the login and the name with the device's actions and This is not me", () => {
   const html = render({ view: { kind: "known", status: SIGNED_IN } });
 
   expect(html).toContain(
@@ -243,14 +265,15 @@ test("signed in, the panel shows the login and the name with This is not me", ()
   expect(html).not.toContain("Sign in with GitHub");
   expect(
     clickEveryButton({ view: { kind: "known", status: SIGNED_IN } }),
-  ).toEqual([["This is not me", ["onForget"]]]);
+  ).toEqual(SIGNED_IN_BUTTONS);
 });
 
 test("This is not me asks the main process, which confirms in a native dialog, and waits while it is open", () => {
   const view = { kind: "known", status: SIGNED_IN } as const;
 
-  expect(clickEveryButton({ view })).toEqual([
-    ["This is not me", ["onForget"]],
+  expect(clickEveryButton({ view })).toContainEqual([
+    "This is not me",
+    ["onForget"],
   ]);
   const busy = render({ view, busy: true });
   expect(busy).toContain(
@@ -319,14 +342,17 @@ test("a key that needs its passphrase shows a labelled password field and an unl
     '<button type="button" class="panel-action" disabled="">Sign in with GitHub</button>',
   );
   // A signed-in account can still be removed, also without its passphrase.
-  const signedIn = render({
-    view: {
-      kind: "known",
-      status: { ...SIGNED_IN, deviceKey: "passphrase_required" },
-    },
-  });
+  const status: AccountStatus = {
+    ...SIGNED_IN,
+    deviceKey: "passphrase_required",
+    device: "key_not_loaded",
+  };
+  const signedIn = render({ view: { kind: "known", status } });
   expect(signedIn).toContain('type="password"');
   expect(signedIn).toContain(">This is not me</button>");
+  // A key that is not loaded cannot sign out or remove the device.
+  expect(signedIn).not.toContain(">Sign out</button>");
+  expect(signedIn).not.toContain(">Remove this device</button>");
 });
 
 test("a key that cannot be used shows why", () => {
@@ -379,4 +405,127 @@ test("logins, names, URLs, and warnings are rendered as text, not as markup, and
   expect(html).not.toMatch(/<(?:b|img|script)[\s>]/);
   expect(html).toContain("&lt;b&gt;name&lt;/b&gt;");
   expect(html).not.toMatch(/\sstyle=/);
+});
+
+test("every state of the device has its message, announced at once when the device cannot be used", () => {
+  for (const device of DEVICE_STATES) {
+    const html = render({
+      view: { kind: "known", status: { ...SIGNED_IN, device } },
+    });
+    const text = DEVICE_STATE_MESSAGES[device];
+    if (text === undefined) {
+      expect(["no_device", "signed_in", "key_not_loaded"]).toContain(device);
+      continue;
+    }
+    const alert = [
+      "auth_failed",
+      "account_mismatch",
+      "key_lost",
+      "unavailable",
+      "revoked",
+    ].includes(device);
+    expect(html, device).toContain(
+      `<p class="${alert ? "panel-message" : "account-message"}" role="${alert ? "alert" : "status"}">${text.replaceAll("'", "&#x27;")}</p>`,
+    );
+  }
+  // While a sign-in runs, the panel shows the sign-in instead.
+  expect(
+    render({
+      view: known({ device: "auth_failed", signIn: { kind: "starting" } }),
+    }),
+  ).not.toContain(DEVICE_STATE_MESSAGES.auth_failed?.replaceAll("'", "&#x27;"));
+});
+
+test("each state of the device offers its actions", () => {
+  const labels = (status: AccountStatus) =>
+    clickEveryButton({ view: { kind: "known", status } }).map(
+      ([label]) => label,
+    );
+
+  expect(labels(SIGNED_IN)).toEqual([
+    "Show devices",
+    "Sign out",
+    "Remove this device",
+    "This is not me",
+  ]);
+  for (const device of [
+    "signed_out",
+    "sign_out_report_pending",
+    "sign_in_required",
+    "auth_failed",
+    "account_mismatch",
+    "key_lost",
+  ] as const) {
+    expect(labels({ ...SIGNED_IN, device }), device).toEqual([
+      "Sign in with GitHub",
+      "This is not me",
+    ]);
+  }
+  expect(labels({ ...SIGNED_IN, device: "removal_pending" })).toEqual([
+    "Remove this device",
+    "This is not me",
+  ]);
+  for (const device of ["removed", "revoked", "no_device"] as const) {
+    expect(labels({ ...SIGNED_OUT, device }), device).toEqual([
+      "Sign in with GitHub",
+    ]);
+  }
+  for (const device of ["starting", "unavailable"] as const) {
+    expect(labels({ ...SIGNED_IN, device }), device).toEqual([
+      "This is not me",
+    ]);
+  }
+  // Every action waits while another one runs.
+  const busy = render({
+    view: { kind: "known", status: SIGNED_IN },
+    busy: true,
+  });
+  for (const label of ["Show devices", "Sign out", "Remove this device"]) {
+    expect(busy).toContain(
+      `<button type="button" class="panel-action" disabled="">${label}</button>`,
+    );
+  }
+});
+
+const DEVICES: DeviceView[] = [
+  {
+    id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+    label: "Mac",
+    platform: "macos",
+    lastSeenAt: "2026-11-02T09:00:00.000Z",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    revokedAt: null,
+    current: true,
+  },
+  {
+    id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b7",
+    label: "<b>Windows computer</b>",
+    platform: "windows",
+    lastSeenAt: null,
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    revokedAt: "2026-11-02T08:00:00.000Z",
+    current: false,
+  },
+];
+
+test("the device list marks the device of this installation, as text, and only while it is signed in", () => {
+  const html = render({
+    view: { kind: "known", status: SIGNED_IN },
+    devices: DEVICES,
+  });
+
+  expect(html).toContain(
+    '<section aria-labelledby="devices-title"><h4 id="devices-title">Devices</h4><ul class="device-list"><li aria-current="true">Mac<!-- --> (this device)<span class="device-detail">macOS, last seen on 2026-11-02</span></li><li>&lt;b&gt;Windows computer&lt;/b&gt;<span class="device-detail">Windows, removed on 2026-11-02</span></li></ul></section>',
+  );
+  expect(
+    render({ view: { kind: "known", status: SIGNED_IN }, devices: [] }),
+  ).toContain('<p class="placeholder-note">No devices are listed.</p>');
+  for (const status of [
+    { ...SIGNED_IN, device: "signed_out" as const },
+    { ...SIGNED_IN, signIn: { kind: "starting" as const } },
+  ]) {
+    expect(
+      render({ view: { kind: "known", status }, devices: DEVICES }),
+    ).not.toContain("devices-title");
+  }
 });

@@ -6,18 +6,20 @@
 //
 // Create the session after the device key store (device-key/system.ts) and
 // after `load`, in the instance that holds the single-instance lock, then
-// call `refresh`.
+// call `refresh`. The account service (account-system.ts) passes the record
+// store that the sign-in flow uses too.
 import { app, net } from "electron";
 import { resolveApiOrigin } from "../api-origin.ts";
 import { deviceKeyFolder } from "../device-key/key-folder.ts";
 import type { DeviceKeyStore } from "../device-key/store.ts";
-import { createDeviceRecordStore } from "../device-record.ts";
+import type { DeviceRecordStore } from "../device-record.ts";
 import { createDeviceSession, type DeviceSession } from "./session.ts";
 import { createSessionNotesStore } from "./session-notes.ts";
 import { createSignOutMarkerStore } from "./sign-out-marker.ts";
 
 export function createSystemDeviceSession(
   keyStore: DeviceKeyStore,
+  deviceRecords: DeviceRecordStore,
   onError: (message: string) => void,
 ): DeviceSession {
   if (!app.isReady()) {
@@ -34,10 +36,7 @@ export function createSystemDeviceSession(
       env: process.env,
     }),
     keyStore,
-    deviceRecords: createDeviceRecordStore({
-      folder,
-      platform: process.platform,
-    }),
+    deviceRecords,
     signOutMarkers: createSignOutMarkerStore({
       folder,
       platform: process.platform,

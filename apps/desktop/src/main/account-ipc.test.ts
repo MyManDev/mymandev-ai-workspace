@@ -1,15 +1,23 @@
+import { createPublicKey, randomBytes, verify } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { request } from "node:http";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
+  API_ERROR_STATUS,
+  type ApiErrorCode,
+  deviceAuthInput,
   type DeviceId,
+  newUuidV7,
   SignInRequestSchema,
   type UserId,
 } from "@mymandev/protocol";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
-import type { AccountStatus } from "../shared/ipc-contract.ts";
+import type {
+  AccountStatus,
+  ListDevicesResult,
+} from "../shared/ipc-contract.ts";
 import {
   createAccountService,
   SIGN_IN_START_COOLDOWN_MS,
@@ -33,6 +41,9 @@ import type {
   StatusReceiver,
 } from "./ipc.ts";
 import type { ScheduleTimer } from "./runtime.ts";
+import { createDeviceSession } from "./session/session.ts";
+import { createSessionNotesStore } from "./session/session-notes.ts";
+import { createSignOutMarkerStore } from "./session/sign-out-marker.ts";
 import { createSignInFlow } from "./sign-in/flow.ts";
 
 const DEV_URL = "http://localhost:5173/";
@@ -46,6 +57,7 @@ const STATUS: AccountStatus = Object.freeze({
   deviceKey: "passphrase_required",
   replacementPending: false,
   apiOrigin: "set",
+  device: "key_not_loaded",
 });
 
 function frame(url: string, parent: IpcFrame | null = null): IpcFrame {
@@ -102,7 +114,34 @@ function fakeService() {
     },
     forgetAccount: async () => {
       calls.push({ method: "forgetAccount", args: [] });
-      return { outcome: "forgotten" };
+      return { outcome: "forgotten", removedAtServer: true };
+    },
+    signOut: async () => {
+      calls.push({ method: "signOut", args: [] });
+      return { outcome: "pending" };
+    },
+    removeDevice: async () => {
+      calls.push({ method: "removeDevice", args: [] });
+      return { outcome: "failed", reason: "no_answer" };
+    },
+    listDevices: async () => {
+      calls.push({ method: "listDevices", args: [] });
+      return {
+        outcome: "listed",
+        devices: [
+          {
+            id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+            label: "Mac",
+            platform: "macos",
+            lastSeenAt: null,
+            signInExpiresAt: "2026-12-02T10:00:00.000Z",
+            revokedAt: null,
+            current: true,
+            // A field that the contract does not name is dropped.
+            publicKey: "ab".repeat(32),
+          } as never,
+        ],
+      };
     },
   };
   return {
@@ -151,7 +190,7 @@ const ACCOUNT_CHANNELS = Object.values(INVOKE_CHANNELS).filter((channel) =>
 test("a handler is registered for every account channel and nothing else", () => {
   const { handlers } = register(fakeService().service);
 
-  expect(ACCOUNT_CHANNELS).toHaveLength(6);
+  expect(ACCOUNT_CHANNELS).toHaveLength(9);
   expect([...handlers.keys()].sort()).toEqual([...ACCOUNT_CHANNELS].sort());
 });
 
@@ -232,6 +271,28 @@ test("the handlers answer with the service's values, and unlock passes the passp
   ) as Promise<unknown>);
   await expect(call(INVOKE_CHANNELS.forgetAccount, app)).resolves.toEqual({
     outcome: "forgotten",
+    removedAtServer: true,
+  });
+  await expect(call(INVOKE_CHANNELS.signOut, app)).resolves.toEqual({
+    outcome: "pending",
+  });
+  await expect(call(INVOKE_CHANNELS.removeDevice, app)).resolves.toEqual({
+    outcome: "failed",
+    reason: "no_answer",
+  });
+  await expect(call(INVOKE_CHANNELS.listDevices, app)).resolves.toEqual({
+    outcome: "listed",
+    devices: [
+      {
+        id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+        label: "Mac",
+        platform: "macos",
+        lastSeenAt: null,
+        signInExpiresAt: "2026-12-02T10:00:00.000Z",
+        revokedAt: null,
+        current: true,
+      },
+    ],
   });
 
   expect(unlocked).toEqual({ outcome: "refused", reason: "wrong_passphrase" });
@@ -242,6 +303,9 @@ test("the handlers answer with the service's values, and unlock passes the passp
     "cancelSignIn",
     "unlockDeviceKey",
     "forgetAccount",
+    "signOut",
+    "removeDevice",
+    "listDevices",
   ]);
   expect(fake.calls[3]?.args).toEqual([PASSPHRASE]);
 });
@@ -310,6 +374,28 @@ beforeEach(async () => {
 afterEach(async () => {
   await rm(root, { recursive: true, force: true });
 });
+
+/**
+ * The real device session over the key store and the record store of a
+ * test, with its own `fetch`; offline unless the test passes one.
+ */
+function sessionOver(
+  folder: string,
+  keyStore: DeviceKeyStore,
+  deviceRecords: DeviceRecordStore,
+  fetch: (url: string, init: RequestInit) => Promise<Response> = () =>
+    Promise.reject(new TypeError("offline")),
+) {
+  return createDeviceSession({
+    apiOrigin: { ok: true, origin: API_ORIGIN },
+    keyStore,
+    deviceRecords,
+    signOutMarkers: createSignOutMarkerStore({ folder, platform: "win32" }),
+    sessionNotes: createSessionNotesStore({ folder, platform: "win32" }),
+    fetch,
+    scheduleTimer: () => () => undefined,
+  });
+}
 
 /** Posts a form body to the listener, as the API's page does. */
 function postForm(redirectUri: string, form: string): Promise<number> {
@@ -418,11 +504,14 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
           listenerConnectionTimeoutMs: 2_000,
           onError: (message) => errors.push(message),
         }),
+      // The session is offline: "This is not me" is then local only.
+      createSession: () => sessionOver(folder, keyStore, records),
     }),
     focusWindow: () => {
       focused += 1;
     },
     confirmForget: async () => true,
+    confirmRemoveDevice: async () => true,
     now: () => clock,
     onError: (message) => errors.push(message),
   });
@@ -468,6 +557,7 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
   await invoke(INVOKE_CHANNELS.getAccountStatus);
   await expect(invoke(INVOKE_CHANNELS.forgetAccount)).resolves.toEqual({
     outcome: "forgotten",
+    removedAtServer: false,
   });
 
   expect(focused).toBe(2);
@@ -476,7 +566,13 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
   const kinds = subscriber.sent.map(
     ([, status]) => (status as AccountStatus).signIn.kind,
   );
-  expect(kinds.filter((kind) => kind === "completing")).toHaveLength(2);
+  // Each sign-in moved to completing once; the device state of the session
+  // may change while it completes.
+  expect(
+    kinds.filter(
+      (kind, index) => kind === "completing" && kinds[index - 1] !== kind,
+    ),
+  ).toHaveLength(2);
   expect(errors).toEqual([
     "The system browser could not be opened.",
     "The system browser could not be opened.",
@@ -599,9 +695,11 @@ test("a This is not me whose key delete fails after an unsaved record never brin
           scheduleTimer: () => () => undefined,
           listenerConnectionTimeoutMs: 2_000,
         }),
+      createSession: () => sessionOver(folder, keyStore, records),
     }),
     focusWindow: () => undefined,
     confirmForget: async () => true,
+    confirmRemoveDevice: async () => true,
     now: () => clock,
   });
   await service.initialize();
@@ -646,4 +744,388 @@ test("a This is not me whose key delete fails after an unsaved record never brin
   const ended = idleWithOutcome(service, service.status().revision);
   service.cancelSignIn();
   expect((await ended).lastOutcome).toEqual({ code: "cancelled" });
+}, 20_000);
+
+// The device session through IPC, with the real sign-in flow, key store,
+// record store, session, and a fake API with the rules of the API's device
+// routes: sign in, list the devices, sign out, sign in again, and remove
+// this device. Nothing that reaches the renderer holds a token, a
+// signature, or key material.
+
+const SPKI_ED25519_PREFIX = "302a300506032b6570032100";
+
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function refusal(code: ApiErrorCode): Response {
+  const statusCode = API_ERROR_STATUS[code];
+  return json(statusCode, {
+    statusCode,
+    error: "Error",
+    message: "Refused",
+    code,
+  });
+}
+
+/** Whether `signature` is the `http` signature of the key `publicKey`. */
+function signedBy(
+  publicKey: string,
+  nonce: string,
+  challengeId: string,
+  signature: string,
+): boolean {
+  try {
+    return verify(
+      null,
+      Buffer.from(
+        deviceAuthInput({
+          purpose: "http",
+          audience: API_ORIGIN,
+          nonce,
+          deviceId: DEVICE_ID,
+          challengeId,
+        }),
+        "utf8",
+      ),
+      createPublicKey({
+        key: Buffer.from(`${SPKI_ED25519_PREFIX}${publicKey}`, "hex"),
+        format: "der",
+        type: "spki",
+      }),
+      Buffer.from(signature, "base64url"),
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A fake API for one device: a sign-in registers it or replaces its key, a
+ * challenge is single use, a token needs the key that the API holds, and a
+ * sign-out or a revocation ends every token.
+ */
+function deviceApi() {
+  const api = {
+    publicKey: null as string | null,
+    signedOut: false,
+    revokedReason: null as string | null,
+    tokens: new Set<string>(),
+    issued: [] as string[],
+    signatures: [] as string[],
+    signInBodies: [] as string[],
+    routes: [] as string[],
+  };
+  const nonces = new Map<string, string>();
+  const fetch = async (url: string, init: RequestInit): Promise<Response> => {
+    const parsed = new URL(url);
+    expect(parsed.origin).toBe(API_ORIGIN);
+    const method = init.method ?? "GET";
+    const route = `${method} ${parsed.pathname}`;
+    api.routes.push(route);
+    const text = init.body === undefined ? "" : String(init.body);
+    const body =
+      text === "" ? {} : (JSON.parse(text) as Record<string, string>);
+    if (route === "POST /auth/sign-in") {
+      const request = SignInRequestSchema.parse(JSON.parse(text));
+      api.signInBodies.push(text);
+      api.signatures.push(request.device.newKeySignature);
+      if (request.device.kind === "existing") {
+        api.signatures.push(request.device.currentKeySignature);
+      }
+      if (api.revokedReason !== null) {
+        return refusal("device_revoked");
+      }
+      api.publicKey = request.device.publicKey;
+      api.signedOut = false;
+      return json(200, {
+        userId: USER_ID,
+        deviceId: DEVICE_ID,
+        displayName: "The Octocat",
+        login: "octocat",
+        signInExpiresAt: "2026-12-02T10:00:00.000Z",
+      });
+    }
+    if (route === "POST /auth/challenge") {
+      const challengeId = newUuidV7();
+      const nonce = randomBytes(32).toString("base64url");
+      nonces.set(challengeId, nonce);
+      return json(200, { challengeId, nonce });
+    }
+    if (route === "POST /auth/access-token") {
+      const challengeId = body["challengeId"] ?? "";
+      const signature = body["signature"] ?? "";
+      api.signatures.push(signature);
+      const nonce = nonces.get(challengeId);
+      nonces.delete(challengeId);
+      if (
+        nonce === undefined ||
+        body["deviceId"] !== DEVICE_ID ||
+        api.publicKey === null ||
+        !signedBy(api.publicKey, nonce, challengeId, signature)
+      ) {
+        return refusal("auth_failed");
+      }
+      if (api.revokedReason !== null) {
+        return refusal("device_revoked");
+      }
+      if (api.signedOut) {
+        return refusal("sign_in_required");
+      }
+      const accessToken = `mmda_${randomBytes(32).toString("base64url")}`;
+      api.tokens.add(accessToken);
+      api.issued.push(accessToken);
+      return json(200, {
+        accessToken,
+        expiresAt: "2026-12-02T10:00:00.000Z",
+      });
+    }
+    const token =
+      new Headers(init.headers)
+        .get("authorization")
+        ?.replace(/^Bearer /u, "") ?? "";
+    if (!api.tokens.has(token)) {
+      return refusal("unauthorized");
+    }
+    switch (route) {
+      case "POST /auth/sign-out":
+        api.signedOut = true;
+        api.tokens.clear();
+        return new Response(null, { status: 204 });
+      case "GET /devices":
+        return json(200, {
+          devices: [
+            {
+              id: DEVICE_ID,
+              label: "Windows computer",
+              platform: "windows",
+              createdAt: "2026-11-01T10:00:00.000Z",
+              lastSeenAt: null,
+              lastSignInAt: "2026-11-02T10:00:00.000Z",
+              signInExpiresAt: "2026-12-02T10:00:00.000Z",
+              revokedAt: null,
+              current: true,
+            },
+          ],
+        });
+      case `POST /devices/${DEVICE_ID}/revoke`:
+        api.revokedReason = body["reason"] ?? null;
+        api.tokens.clear();
+        return new Response(null, { status: 204 });
+      default:
+        return refusal("not_found");
+    }
+  };
+  return { api, fetch };
+}
+
+test("sign in, list the devices, sign out, sign in again, and remove this device through IPC, with no token, signature, or key sent to the renderer", async () => {
+  const folder = path.join(root, "MyManDev");
+  const encrypted: string[] = [];
+  const keyStore = createDeviceKeyStore({
+    folder,
+    platform: "win32",
+    systemProtection: {
+      isAsyncEncryptionAvailable: () => Promise.resolve(true),
+      getSelectedStorageBackend: () => "unknown",
+      encryptStringAsync: (plainText) => {
+        encrypted.push(plainText);
+        return Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8"));
+      },
+      decryptStringAsync: (ciphertext) =>
+        Promise.resolve({
+          shouldReEncrypt: false,
+          result: ciphertext.toString("utf8").slice("fake:".length),
+        }),
+    },
+  });
+  const records = createDeviceRecordStore({ folder, platform: "win32" });
+  const { api, fetch } = deviceApi();
+  const opened: string[] = [];
+  const confirmed: string[] = [];
+  const errors: string[] = [];
+  let stopped = 0;
+  let clock = 0;
+  const service = createAccountService({
+    apiOrigin: { ok: true, origin: API_ORIGIN },
+    openSystem: () => ({
+      keyStore,
+      deviceRecords: records,
+      createFlow: () =>
+        createSignInFlow({
+          apiOrigin: { ok: true, origin: API_ORIGIN },
+          keyStore,
+          deviceRecords: records,
+          openExternal: async (url) => {
+            opened.push(url);
+            return true;
+          },
+          fetch,
+          platform: "win32",
+          scheduleTimer: () => () => undefined,
+          listenerConnectionTimeoutMs: 2_000,
+          onError: (message) => errors.push(message),
+        }),
+      createSession: () => sessionOver(folder, keyStore, records, fetch),
+    }),
+    focusWindow: () => undefined,
+    confirmForget: async () => false,
+    confirmRemoveDevice: async (login) => {
+      confirmed.push(login);
+      return true;
+    },
+    stopLocalExecution: () => {
+      stopped += 1;
+    },
+    now: () => clock,
+    onError: (message) => errors.push(message),
+  });
+  const { call } = register(service);
+  const subscriber = receiver();
+  const app = () => event(frame(DEV_URL), subscriber);
+  const answers: unknown[] = [];
+  const invoke = async (channel: string): Promise<unknown> => {
+    const answer = await call(channel, app());
+    answers.push(answer);
+    return answer;
+  };
+  const signIn = async (code: string) => {
+    clock += SIGN_IN_START_COOLDOWN_MS;
+    const before = service.status().revision;
+    await expect(invoke(INVOKE_CHANNELS.startSignIn)).resolves.toEqual({
+      outcome: "started",
+    });
+    const query = new URL(opened.at(-1) ?? "").searchParams;
+    const done = idleWithOutcome(service, before);
+    expect(
+      await postForm(
+        query.get("redirect_uri") ?? "",
+        new URLSearchParams({
+          code,
+          state: query.get("state") ?? "",
+        }).toString(),
+      ),
+    ).toBe(200);
+    expect((await done).lastOutcome).toEqual({ code: "signed_in" });
+  };
+  const device = async () =>
+    ((await invoke(INVOKE_CHANNELS.getAccountStatus)) as AccountStatus).device;
+
+  answers.push(call(INVOKE_CHANNELS.subscribeAccountStatus, app()));
+  await service.initialize();
+  expect(await device()).toBe("no_device");
+  await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+  });
+
+  // Sign in: a new device.
+  await signIn(SIGN_IN_CODE);
+  expect(await device()).toBe("signed_in");
+  const listed = (await invoke(
+    INVOKE_CHANNELS.listDevices,
+  )) as ListDevicesResult;
+  expect(listed).toEqual({
+    outcome: "listed",
+    devices: [
+      {
+        id: DEVICE_ID,
+        label: "Windows computer",
+        platform: "windows",
+        lastSeenAt: null,
+        signInExpiresAt: "2026-12-02T10:00:00.000Z",
+        revokedAt: null,
+        current: true,
+      },
+    ],
+  });
+
+  // Sign out (P-65): the key and the record stay, and the API ended the
+  // tokens; the key is not used until the next sign-in.
+  await expect(invoke(INVOKE_CHANNELS.signOut)).resolves.toEqual({
+    outcome: "signed_out",
+  });
+  expect(api.signedOut).toBe(true);
+  expect(await device()).toBe("signed_out");
+  await expect(keyStore.hasKey()).resolves.toBe(true);
+  expect(await records.read()).toMatchObject({ kind: "record" });
+  const routesAfterSignOut = api.routes.length;
+  await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toEqual({
+    outcome: "failed",
+    reason: "signed_out",
+  });
+  await expect(invoke(INVOKE_CHANNELS.removeDevice)).resolves.toEqual({
+    outcome: "failed",
+    reason: "signed_out",
+  });
+  expect(api.routes.length).toBe(routesAfterSignOut);
+
+  // Sign in again: the same device with a new key, signed in once more.
+  await signIn(SECOND_CODE);
+  expect(new URL(opened.at(-1) ?? "").searchParams.get("login")).toBe(
+    "octocat",
+  );
+  expect(await device()).toBe("signed_in");
+  await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toMatchObject({
+    outcome: "listed",
+  });
+
+  // Remove this device: confirmed in the main process, revoked at the API,
+  // and only then are the key and the record deleted.
+  await expect(invoke(INVOKE_CHANNELS.removeDevice)).resolves.toEqual({
+    outcome: "removed",
+  });
+  expect(confirmed).toEqual(["octocat"]);
+  expect(api.revokedReason).toBe("removed");
+  await expect(keyStore.hasKey()).resolves.toBe(false);
+  expect(await records.read()).toEqual({ kind: "none" });
+  const last = (await invoke(
+    INVOKE_CHANNELS.getAccountStatus,
+  )) as AccountStatus;
+  expect(last).toMatchObject({
+    account: { kind: "signed_out" },
+    device: "removed",
+  });
+  // A removal is not a revocation by the API: local execution goes on.
+  expect(stopped).toBe(0);
+  expect(errors).toEqual([]);
+
+  // Nothing that reached the renderer holds a sign-in code, a verifier, a
+  // token, a signature, or key material.
+  const requests = api.signInBodies.map((body) =>
+    SignInRequestSchema.parse(JSON.parse(body)),
+  );
+  expect(requests.map((request) => request.device.kind)).toEqual([
+    "new",
+    "existing",
+  ]);
+  const secrets = [
+    SIGN_IN_CODE,
+    SECOND_CODE,
+    ...requests.map((request) => request.codeVerifier),
+    ...requests.map((request) => request.device.publicKey),
+    ...api.issued,
+    ...api.signatures,
+    ...encrypted,
+    ...encrypted.map((pkcs8) =>
+      Buffer.from(pkcs8, "base64").toString("base64url"),
+    ),
+    ...encrypted.map((pkcs8) => Buffer.from(pkcs8, "base64").toString("hex")),
+  ];
+  // A token before the sign-out and one after the second sign-in; the
+  // signatures of both sign-ins (three) and of both tokens.
+  expect(api.issued).toHaveLength(2);
+  expect(api.signatures).toHaveLength(5);
+  expect(secrets.every((secret) => secret.length >= 32)).toBe(true);
+  const sent = JSON.stringify([subscriber.sent, answers]);
+  expect(subscriber.sent.length).toBeGreaterThanOrEqual(10);
+  for (const secret of secrets) {
+    expect(sent).not.toContain(secret);
+  }
+  expect(sent).not.toMatch(
+    /mmdc_|mmda_|codeVerifier|Signature|pkcs8|publicKey|accessToken|userId/i,
+  );
 }, 20_000);

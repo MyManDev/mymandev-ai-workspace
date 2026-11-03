@@ -25,7 +25,10 @@ export const INVOKE_CHANNELS = Object.freeze({
   mountRepository: "repositories:mount",
   /** Unmounts a repository by its mount ID. Nothing in the folder changes. */
   unmountRepository: "repositories:unmount",
-  /** The account status: the account, an open sign-in, and the device key. */
+  /**
+   * The account status: the account, an open sign-in, the device key, and
+   * the state of the device.
+   */
   getAccountStatus: "account:get-status",
   /**
    * The account status. The calling frame then receives every later status
@@ -51,6 +54,19 @@ export const INVOKE_CHANNELS = Object.freeze({
    * this installation.
    */
   forgetAccount: "account:forget",
+  /**
+   * Signs out (P-65): the device and its key stay, and the next GitHub
+   * sign-in is needed before the key is used again.
+   */
+  signOut: "account:sign-out",
+  /**
+   * Removes this device from its account: the main process asks the person
+   * to confirm in a native dialog, and deletes the device key only after
+   * the API confirmed the removal.
+   */
+  removeDevice: "account:remove-device",
+  /** The devices of the account, without anything secret. */
+  listDevices: "account:list-devices",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */

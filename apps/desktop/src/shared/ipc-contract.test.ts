@@ -4,19 +4,25 @@ import {
   ACCOUNT_LIMITS,
   AccountStatusSchema,
   API_ORIGIN_STATES,
+  DEVICE_ACTION_FAILURES,
+  DEVICE_ACTION_REFUSALS,
   DEVICE_KEY_STATES,
+  DEVICE_STATES,
   EVENT_CONTRACT,
   FORGET_REFUSALS,
   ForgetResultSchema,
   INVOKE_CONTRACT,
+  ListDevicesResultSchema,
   MOUNT_REFUSALS,
   MountResultSchema,
   REPOSITORY_LIMITS,
   REPOSITORY_PROBLEMS,
+  RemoveDeviceResultSchema,
   RepositoryListSchema,
   RUNTIME_STATES,
   RuntimeStatusSchema,
   SIGN_IN_OUTCOME_CODES,
+  SignOutResultSchema,
   START_SIGN_IN_REFUSALS,
   StartSignInResultSchema,
   UNLOCK_REFUSALS,
@@ -361,6 +367,7 @@ function accountStatus(overrides: Partial<AccountStatus> = {}): AccountStatus {
     deviceKey: "ready",
     replacementPending: false,
     apiOrigin: "set",
+    device: "signed_in",
     ...overrides,
   };
 }
@@ -392,6 +399,7 @@ test("an account status with every sign-in state, outcome, and key state is acce
     ...DEVICE_KEY_STATES.map((deviceKey) => accountStatus({ deviceKey })),
     ...API_ORIGIN_STATES.map((apiOrigin) => accountStatus({ apiOrigin })),
     accountStatus({ replacementPending: true }),
+    ...DEVICE_STATES.map((device) => accountStatus({ device })),
   ];
 
   for (const value of values) {
@@ -448,6 +456,8 @@ test("an account status with a wrong value is refused", () => {
     accountStatus({ revision: -1 }),
     accountStatus({ deviceKey: "lost" as never }),
     accountStatus({ apiOrigin: "maybe" as never }),
+    accountStatus({ device: "lost" as never }),
+    accountStatus({ device: undefined as never }),
     accountStatus({ lastOutcome: { code: "fatal: no answer" as never } }),
     accountStatus({
       lastOutcome: { code: "device_account_mismatch", deviceLogin: "a b" },
@@ -562,7 +572,8 @@ test("the results of start, unlock, and forget hold only fixed values", () => {
     expect(UnlockResultSchema.parse(value)).toEqual(value);
   }
   for (const value of [
-    { outcome: "forgotten" },
+    { outcome: "forgotten", removedAtServer: true },
+    { outcome: "forgotten", removedAtServer: false },
     { outcome: "cancelled" },
     { outcome: "failed" },
     ...FORGET_REFUSALS.map((reason) => ({ outcome: "refused", reason })),
@@ -578,7 +589,144 @@ test("the results of start, unlock, and forget hold only fixed values", () => {
     [UnlockResultSchema, { outcome: "refused", reason: "other" }],
     [ForgetResultSchema, { outcome: "refused", reason: "other" }],
     [ForgetResultSchema, { outcome: "deleted" }],
+    [ForgetResultSchema, { outcome: "forgotten" }],
   ] as const) {
     expect(schema.safeParse(value).success).toBe(false);
+  }
+});
+
+const DEVICE_VIEW = Object.freeze({
+  id: DEVICE_ID,
+  label: "Mac",
+  platform: "macos",
+  lastSeenAt: "2026-11-02T09:00:00.000Z",
+  signInExpiresAt: "2026-12-02T10:00:00.000Z",
+  revokedAt: null,
+  current: true,
+});
+
+test("the results of sign-out, removal, and the device list hold only fixed values and the device fields", () => {
+  const refusals = DEVICE_ACTION_REFUSALS.map((reason) => ({
+    outcome: "refused",
+    reason,
+  }));
+  const failures = DEVICE_ACTION_FAILURES.map((reason) => ({
+    outcome: "failed",
+    reason,
+  }));
+  for (const value of [
+    { outcome: "signed_out" },
+    { outcome: "pending" },
+    ...refusals,
+    ...failures,
+  ]) {
+    expect(SignOutResultSchema.parse(value)).toEqual(value);
+  }
+  for (const value of [
+    { outcome: "removed" },
+    { outcome: "pending" },
+    { outcome: "cancelled" },
+    ...refusals,
+    ...failures,
+  ]) {
+    expect(RemoveDeviceResultSchema.parse(value)).toEqual(value);
+  }
+  for (const value of [
+    { outcome: "listed", devices: [] },
+    {
+      outcome: "listed",
+      devices: [
+        DEVICE_VIEW,
+        {
+          ...DEVICE_VIEW,
+          platform: "windows",
+          lastSeenAt: null,
+          revokedAt: "2026-11-02T10:00:00.000Z",
+          current: false,
+        },
+      ],
+    },
+    ...refusals,
+    ...failures,
+  ]) {
+    expect(ListDevicesResultSchema.parse(value)).toEqual(value);
+  }
+
+  // Unknown fields are dropped, also inside a device.
+  const parsed = ListDevicesResultSchema.parse({
+    outcome: "listed",
+    devices: [{ ...DEVICE_VIEW, publicKey: "ab".repeat(32), userId: "x" }],
+    accessToken: "mmda_secret",
+  });
+  expect(JSON.stringify(parsed)).not.toMatch(/publicKey|userId|mmda_/);
+  expect(
+    SignOutResultSchema.parse({ outcome: "pending", accessToken: "mmda_x" }),
+  ).toEqual({ outcome: "pending" });
+
+  for (const [schema, value] of [
+    [SignOutResultSchema, { outcome: "failed", reason: "other" }],
+    [SignOutResultSchema, { outcome: "refused", reason: "other" }],
+    [SignOutResultSchema, { outcome: "removed" }],
+    [RemoveDeviceResultSchema, { outcome: "signed_out" }],
+    [RemoveDeviceResultSchema, { outcome: "failed" }],
+    [ListDevicesResultSchema, { outcome: "listed" }],
+    [
+      ListDevicesResultSchema,
+      {
+        outcome: "listed",
+        devices: Array.from(
+          { length: ACCOUNT_LIMITS.devices + 1 },
+          () => DEVICE_VIEW,
+        ),
+      },
+    ],
+    [
+      ListDevicesResultSchema,
+      { outcome: "listed", devices: [{ ...DEVICE_VIEW, id: "x" }] },
+    ],
+    [
+      ListDevicesResultSchema,
+      { outcome: "listed", devices: [{ ...DEVICE_VIEW, label: "" }] },
+    ],
+    [
+      ListDevicesResultSchema,
+      {
+        outcome: "listed",
+        devices: [
+          { ...DEVICE_VIEW, label: "x".repeat(ACCOUNT_LIMITS.deviceLabel + 1) },
+        ],
+      },
+    ],
+    [
+      ListDevicesResultSchema,
+      { outcome: "listed", devices: [{ ...DEVICE_VIEW, platform: "android" }] },
+    ],
+    [
+      ListDevicesResultSchema,
+      {
+        outcome: "listed",
+        devices: [{ ...DEVICE_VIEW, lastSeenAt: "yesterday" }],
+      },
+    ],
+    [
+      ListDevicesResultSchema,
+      { outcome: "listed", devices: [{ ...DEVICE_VIEW, current: "yes" }] },
+    ],
+  ] as const) {
+    expect(schema.safeParse(value).success).toBe(false);
+  }
+});
+
+test("sign-out, removal, and the device list take no argument", () => {
+  for (const channel of [
+    INVOKE_CHANNELS.signOut,
+    INVOKE_CHANNELS.removeDevice,
+    INVOKE_CHANNELS.listDevices,
+  ]) {
+    const { args } = INVOKE_CONTRACT[channel];
+    expect(args.parse([])).toEqual([]);
+    for (const value of [[undefined], [true], [{ deviceId: DEVICE_ID }]]) {
+      expect(args.safeParse(value).success).toBe(false);
+    }
   }
 });
