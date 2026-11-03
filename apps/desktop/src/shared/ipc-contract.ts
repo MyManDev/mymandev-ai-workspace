@@ -589,6 +589,134 @@ export const ListDevicesResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type ListDevicesResult = z.infer<typeof ListDevicesResultSchema>;
 
+/**
+ * The states of the connection to the cloud API (#26):
+ *
+ * - `offline`: no connection is wanted, because no device is signed in with
+ *   a loaded key, the API origin is not set, or the application quits.
+ * - `connecting`: the opening handshake runs.
+ * - `authenticating`: the socket is open, and the device answers the
+ *   server's challenge.
+ * - `connected`: the server confirmed the device (`auth.ok`).
+ * - `waiting`: the connection ended, and the next attempt starts at
+ *   `retryAt`.
+ * - `stopped`: the connection ended for a reason that needs the person, and
+ *   it does not reconnect on its own.
+ */
+export const CONNECTION_STATES = Object.freeze([
+  "offline",
+  "connecting",
+  "authenticating",
+  "connected",
+  "waiting",
+  "stopped",
+] as const);
+export type ConnectionState = (typeof CONNECTION_STATES)[number];
+
+/** Why the connection is `offline`. */
+export const CONNECTION_OFFLINE_REASONS = Object.freeze([
+  "not_signed_in",
+  "no_api_origin",
+] as const);
+
+/**
+ * Why the connection is `waiting`: the handshake failed
+ * (`connection_failed`) or an open connection dropped (`connection_lost`);
+ * a timer of the client or the server ended (`timeout`); the server failed
+ * (`server_error`) or was busy (`server_busy`); the server refused a message
+ * after authentication (`message_refused`); the client refused a message of
+ * the server (`invalid_message`); the challenge could not be signed
+ * (`signature_failed`); or the server replaced the key again soon after the
+ * reconnect that the last replacement caused (`key_replaced`).
+ */
+export const CONNECTION_WAITING_REASONS = Object.freeze([
+  "connection_failed",
+  "connection_lost",
+  "timeout",
+  "server_error",
+  "server_busy",
+  "message_refused",
+  "invalid_message",
+  "signature_failed",
+  "key_replaced",
+] as const);
+
+/**
+ * Why the connection is `stopped`: the close reasons of the server after
+ * which the client does not reconnect on its own (ADR 0014, "Device key and
+ * authentication"), and `update_required` when the server speaks another
+ * protocol version.
+ */
+export const CONNECTION_STOP_REASONS = Object.freeze([
+  "auth_failed",
+  "device_revoked",
+  "sign_in_required",
+  "connection_replaced",
+  "protocol_violation",
+  "update_required",
+] as const);
+export type ConnectionOfflineReason =
+  (typeof CONNECTION_OFFLINE_REASONS)[number];
+export type ConnectionWaitingReason =
+  (typeof CONNECTION_WAITING_REASONS)[number];
+export type ConnectionStopReason = (typeof CONNECTION_STOP_REASONS)[number];
+
+/**
+ * The status of the connection to the cloud API: `{ state, reason?,
+ * retryAt?, revision }`, with a reason only where the state has one. It
+ * holds fixed codes and a time only, never a frame, a nonce, a signature, or
+ * a key.
+ */
+export const ConnectionStatusSchema = z.discriminatedUnion("state", [
+  z.object({
+    state: z.literal("offline"),
+    reason: z.enum(CONNECTION_OFFLINE_REASONS).optional(),
+    revision: z.int().nonnegative(),
+  }),
+  z.object({
+    state: z.enum(["connecting", "authenticating", "connected"]),
+    revision: z.int().nonnegative(),
+  }),
+  z.object({
+    state: z.literal("waiting"),
+    reason: z.enum(CONNECTION_WAITING_REASONS),
+    /** When the next attempt starts, in UTC. */
+    retryAt: TimestampSchema,
+    revision: z.int().nonnegative(),
+  }),
+  z.object({
+    state: z.literal("stopped"),
+    reason: z.enum(CONNECTION_STOP_REASONS),
+    revision: z.int().nonnegative(),
+  }),
+]);
+export type ConnectionStatus = z.infer<typeof ConnectionStatusSchema>;
+
+/**
+ * Why a reconnect was refused: `not_signed_in` without a signed-in device
+ * with a loaded key, and after the server refused the device (`auth_failed`,
+ * `device_revoked`, `sign_in_required`), which only a GitHub sign-in ends;
+ * `update_required` while the server speaks another protocol version;
+ * `already_open` while a connection is open or opening; and `too_soon`
+ * within a few seconds of the last reconnect, or after too many reconnects
+ * in 10 minutes.
+ */
+export const RECONNECT_REFUSALS = Object.freeze([
+  "not_signed_in",
+  "update_required",
+  "already_open",
+  "too_soon",
+] as const);
+
+export const ReconnectResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("reconnecting") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(RECONNECT_REFUSALS),
+  }),
+]);
+export type ReconnectResult = z.infer<typeof ReconnectResultSchema>;
+
 /** The schemas of every invoke channel. */
 export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.getRuntimeStatus]: Object.freeze({
@@ -653,6 +781,18 @@ export const INVOKE_CONTRACT = Object.freeze({
     args: NoArgumentsSchema,
     result: ListDevicesResultSchema,
   }),
+  [INVOKE_CHANNELS.getConnectionStatus]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ConnectionStatusSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeConnectionStatus]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ConnectionStatusSchema,
+  }),
+  [INVOKE_CHANNELS.reconnect]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ReconnectResultSchema,
+  }),
 });
 
 /** The payload schema of every event channel. */
@@ -660,6 +800,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.runtimeStatusChanged]: RuntimeStatusSchema,
   [EVENT_CHANNELS.repositoriesChanged]: RepositoryListSchema,
   [EVENT_CHANNELS.accountStatusChanged]: AccountStatusSchema,
+  [EVENT_CHANNELS.connectionStatusChanged]: ConnectionStatusSchema,
 });
 
 export type InvokeArgs<C extends InvokeChannel> = z.infer<

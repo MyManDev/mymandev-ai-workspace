@@ -1,11 +1,18 @@
+import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type {
   AccountBridge,
+  ConnectionBridge,
   RepositoryBridge,
   RuntimeBridge,
 } from "../shared/desktop-bridge.ts";
-import { App, RuntimeStatusIndicator, type AppProps } from "./App.tsx";
+import {
+  App,
+  ConnectionStatusIndicator,
+  RuntimeStatusIndicator,
+  type AppProps,
+} from "./App.tsx";
 import { PLACEHOLDER_PROJECTS } from "./placeholder-projects.ts";
 import type { ProjectSummary, ShellView } from "./screens.ts";
 
@@ -338,6 +345,121 @@ test("the indicator shows the state of the runtime", () => {
       />,
     ),
   ).toContain('data-state="failed"');
+});
+
+test("the header shows the connection status until the first status arrives", () => {
+  const connection: ConnectionBridge = {
+    getStatus: () => new Promise(() => undefined),
+    subscribeStatus: () => () => undefined,
+    reconnect: () => Promise.resolve({ outcome: "reconnecting" }),
+  };
+  expect(render({ connection })).toContain(
+    '<div class="connection-status" data-state="unknown"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Checking</p></div>',
+  );
+  expect(render()).toContain("Cloud: Unavailable");
+});
+
+test("the connection indicator shows the state, the reason, and the action of the status", () => {
+  expect(
+    renderToString(
+      <ConnectionStatusIndicator
+        view={{ kind: "known", status: { state: "connected", revision: 2 } }}
+        onReconnect={() => undefined}
+      />,
+    ),
+  ).toBe(
+    '<div class="connection-status" data-state="connected"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Connected</p></div>',
+  );
+  expect(
+    renderToString(
+      <ConnectionStatusIndicator
+        view={{
+          kind: "known",
+          status: {
+            state: "stopped",
+            reason: "connection_replaced",
+            revision: 3,
+          },
+        }}
+        onReconnect={() => undefined}
+      />,
+    ),
+  ).toBe(
+    '<div class="connection-status" data-state="stopped"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">Another installation connected with this device&#x27;s key. The key is in use there.</span></p><button type="button">Reconnect here once</button></div>',
+  );
+  // Without the bridge, no action is offered.
+  expect(
+    renderToString(
+      <ConnectionStatusIndicator
+        view={{
+          kind: "known",
+          status: {
+            state: "waiting",
+            reason: "connection_lost",
+            retryAt: "2026-11-03T10:00:01.000Z",
+            revision: 4,
+          },
+        }}
+      />,
+    ),
+  ).not.toContain("<button");
+});
+
+/** The element and every element below it, without rendering components. */
+function elementsOf(
+  node: ReactNode,
+): ReactElement<{ children?: ReactNode; onClick?: () => void }>[] {
+  if (Array.isArray(node)) {
+    return node.flatMap((child: ReactNode) => elementsOf(child));
+  }
+  if (!isValidElement<{ children?: ReactNode; onClick?: () => void }>(node)) {
+    return [];
+  }
+  return [node, ...elementsOf(node.props.children)];
+}
+
+test("Retry now and Reconnect here once call the reconnect, and nothing else does", () => {
+  let reconnects = 0;
+  const onReconnect = () => {
+    reconnects += 1;
+  };
+  const waiting = ConnectionStatusIndicator({
+    view: {
+      kind: "known",
+      status: {
+        state: "waiting",
+        reason: "timeout",
+        retryAt: "2026-11-03T10:00:01.000Z",
+        revision: 1,
+      },
+    },
+    onReconnect,
+  });
+  const buttons = elementsOf(waiting).filter(
+    (element) => element.type === "button",
+  );
+  expect(buttons.map((button) => button.props.children)).toEqual(["Retry now"]);
+  buttons[0]?.props.onClick?.();
+  expect(reconnects).toBe(1);
+
+  for (const reason of [
+    "auth_failed",
+    "device_revoked",
+    "sign_in_required",
+    "update_required",
+  ] as const) {
+    const stopped = ConnectionStatusIndicator({
+      view: {
+        kind: "known",
+        status: { state: "stopped", reason, revision: 1 },
+      },
+      onReconnect,
+    });
+    expect(
+      elementsOf(stopped).filter((element) => element.type === "button"),
+      reason,
+    ).toEqual([]);
+  }
 });
 
 test("the home screen holds the account panel, which waits for the first status with the bridge", () => {

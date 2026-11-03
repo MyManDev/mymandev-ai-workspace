@@ -16,6 +16,7 @@ createRoot(container).render(
       runtime={window.desktop?.runtime}
       repositories={window.desktop?.repositories}
       account={window.desktop?.account}
+      connection={window.desktop?.connection}
       projects={PLACEHOLDER_PROJECTS}
     />
   </StrictMode>,
