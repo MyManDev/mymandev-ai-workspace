@@ -4,6 +4,11 @@ import {
   ACCOUNT_LIMITS,
   AccountStatusSchema,
   API_ORIGIN_STATES,
+  CONNECTION_OFFLINE_REASONS,
+  CONNECTION_STATES,
+  CONNECTION_STOP_REASONS,
+  CONNECTION_WAITING_REASONS,
+  ConnectionStatusSchema,
   DEVICE_ACTION_FAILURES,
   DEVICE_ACTION_REFUSALS,
   DEVICE_KEY_STATES,
@@ -15,6 +20,8 @@ import {
   ListDevicesResultSchema,
   MOUNT_REFUSALS,
   MountResultSchema,
+  RECONNECT_REFUSALS,
+  ReconnectResultSchema,
   REPOSITORY_LIMITS,
   REPOSITORY_PROBLEMS,
   RemoveDeviceResultSchema,
@@ -62,6 +69,11 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     START_SIGN_IN_REFUSALS,
     UNLOCK_REFUSALS,
     FORGET_REFUSALS,
+    CONNECTION_STATES,
+    CONNECTION_OFFLINE_REASONS,
+    CONNECTION_WAITING_REASONS,
+    CONNECTION_STOP_REASONS,
+    RECONNECT_REFUSALS,
   ]) {
     expect(Object.isFrozen(list)).toBe(true);
   }
@@ -728,5 +740,92 @@ test("sign-out, removal, and the device list take no argument", () => {
     for (const value of [[undefined], [true], [{ deviceId: DEVICE_ID }]]) {
       expect(args.safeParse(value).success).toBe(false);
     }
+  }
+});
+
+test("a connection status holds a reason and a retry time only where its state has them", () => {
+  const accepted: unknown[] = [
+    { state: "offline", revision: 0 },
+    ...CONNECTION_OFFLINE_REASONS.map((reason) => ({
+      state: "offline",
+      reason,
+      revision: 1,
+    })),
+    { state: "connecting", revision: 2 },
+    { state: "authenticating", revision: 3 },
+    { state: "connected", revision: 4 },
+    ...CONNECTION_WAITING_REASONS.map((reason) => ({
+      state: "waiting",
+      reason,
+      retryAt: "2026-11-03T10:00:01.000Z",
+      revision: 5,
+    })),
+    ...CONNECTION_STOP_REASONS.map((reason) => ({
+      state: "stopped",
+      reason,
+      revision: 6,
+    })),
+  ];
+  for (const value of accepted) {
+    expect(ConnectionStatusSchema.parse(value)).toEqual(value);
+  }
+  expect(
+    new Set(accepted.map((value) => (value as { state: string }).state)),
+  ).toEqual(new Set(CONNECTION_STATES));
+
+  // Unknown keys are dropped, also a reason or a time where the state has none.
+  expect(
+    ConnectionStatusSchema.parse({
+      state: "connected",
+      reason: "connection_lost",
+      retryAt: "2026-11-03T10:00:01.000Z",
+      nonce: "secret",
+      revision: 7,
+    }),
+  ).toEqual({ state: "connected", revision: 7 });
+
+  for (const value of [
+    { state: "waiting", reason: "connection_lost", revision: 1 },
+    { state: "waiting", retryAt: "2026-11-03T10:00:01.000Z", revision: 1 },
+    {
+      state: "waiting",
+      reason: "auth_failed",
+      retryAt: "2026-11-03T10:00:01.000Z",
+      revision: 1,
+    },
+    {
+      state: "waiting",
+      reason: "timeout",
+      retryAt: "tomorrow",
+      revision: 1,
+    },
+    { state: "stopped", revision: 1 },
+    { state: "stopped", reason: "timeout", revision: 1 },
+    { state: "offline", reason: "auth_failed", revision: 1 },
+    { state: "online", revision: 1 },
+    { state: "connected", revision: -1 },
+    { state: "connected", revision: 1.5 },
+    { state: "connected" },
+  ]) {
+    expect(ConnectionStatusSchema.safeParse(value).success).toBe(false);
+  }
+});
+
+test("a reconnect result is reconnecting or refused with a known reason", () => {
+  expect(ReconnectResultSchema.parse({ outcome: "reconnecting" })).toEqual({
+    outcome: "reconnecting",
+  });
+  for (const reason of RECONNECT_REFUSALS) {
+    expect(
+      ReconnectResultSchema.parse({ outcome: "refused", reason, extra: 1 }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const value of [
+    { outcome: "refused" },
+    { outcome: "refused", reason: "busy" },
+    { outcome: "connected" },
+    true,
+  ]) {
+    expect(ReconnectResultSchema.safeParse(value).success).toBe(false);
   }
 });

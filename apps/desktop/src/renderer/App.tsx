@@ -1,10 +1,17 @@
 import { useEffect, useReducer, useState } from "react";
 import type {
   AccountBridge,
+  ConnectionBridge,
   RepositoryBridge,
   RuntimeBridge,
 } from "../shared/desktop-bridge.ts";
 import { PRODUCT_NAME } from "../shared/product.ts";
+import {
+  CONNECTION_ACTION_LABELS,
+  describeConnectionView,
+  initialConnectionView,
+  type ConnectionView,
+} from "./connection-status.ts";
 import { ProjectNav, WorkspaceNav } from "./Navigation.tsx";
 import { ProjectPanel } from "./ProjectPanel.tsx";
 import {
@@ -37,6 +44,8 @@ export interface AppProps {
   readonly repositories?: RepositoryBridge | undefined;
   /** The sign-in of this installation from the preload script; undefined outside Electron. */
   readonly account?: AccountBridge | undefined;
+  /** The connection to the cloud API from the preload script; undefined outside Electron. */
+  readonly connection?: ConnectionBridge | undefined;
   /** The workspace's projects, in navigation order, read when the shell mounts. */
   readonly projects: readonly ProjectSummary[];
   /** The view shown first. An invalid view shows the home screen. */
@@ -48,6 +57,7 @@ export function App({
   runtime,
   repositories,
   account,
+  connection,
   projects,
   initialView = HOME_VIEW,
 }: AppProps) {
@@ -55,13 +65,27 @@ export function App({
     createShellState(projects, view),
   );
   const runtimeView = useRuntimeView(runtime);
+  const connectionView = useConnectionView(connection);
   const open = openProject(state);
 
   return (
     <div className={open === undefined ? "shell" : "shell shell-project"}>
       <header className="shell-header">
         <h1>{PRODUCT_NAME}</h1>
-        <RuntimeStatusIndicator view={runtimeView} />
+        <div className="shell-status">
+          <ConnectionStatusIndicator
+            view={connectionView}
+            onReconnect={
+              connection === undefined
+                ? undefined
+                : () => {
+                    // The status shows what follows; a refusal changes nothing.
+                    connection.reconnect().catch(() => undefined);
+                  }
+            }
+          />
+          <RuntimeStatusIndicator view={runtimeView} />
+        </div>
       </header>
       <WorkspaceNav state={state} dispatch={dispatch} />
       {open === undefined ? null : (
@@ -142,5 +166,55 @@ export function RuntimeStatusIndicator({
       <span className="runtime-status-dot" aria-hidden="true" />
       {label}
     </p>
+  );
+}
+
+/** Follows the status of the connection to the cloud API while the shell is mounted. */
+function useConnectionView(
+  connection: ConnectionBridge | undefined,
+): ConnectionView {
+  const [view, setView] = useState(() =>
+    initialConnectionView(connection !== undefined),
+  );
+  useEffect(() => {
+    if (connection === undefined) {
+      return undefined;
+    }
+    return connection.subscribeStatus(
+      (status) => setView({ kind: "known", status }),
+      () => setView({ kind: "unavailable" }),
+    );
+  }, [connection]);
+  return view;
+}
+
+/**
+ * The connection status in the header: the state, a fixed sentence about
+ * the reason, and "Retry now" or "Reconnect here once" where the person can
+ * act. A sign-in starts only from the account panel, on the person's click.
+ */
+export function ConnectionStatusIndicator({
+  view,
+  onReconnect,
+}: {
+  readonly view: ConnectionView;
+  readonly onReconnect?: (() => void) | undefined;
+}) {
+  const { tone, label, detail, action } = describeConnectionView(view);
+  return (
+    <div className="connection-status" data-state={tone}>
+      <p className="connection-status-text" role="status">
+        <span className="connection-status-dot" aria-hidden="true" />
+        {label}
+        {detail === null ? null : (
+          <span className="connection-status-detail">{detail}</span>
+        )}
+      </p>
+      {action === null || onReconnect === undefined ? null : (
+        <button type="button" onClick={onReconnect}>
+          {CONNECTION_ACTION_LABELS[action]}
+        </button>
+      )}
+    </div>
   );
 }

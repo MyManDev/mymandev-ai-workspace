@@ -58,11 +58,12 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, and the account functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, and the connection functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
     "account",
+    "connection",
     "electronVersion",
     "repositories",
     "runtime",
@@ -88,15 +89,22 @@ test("the bridge holds the Electron version, the runtime, the repository, and th
     "subscribeStatus",
     "unlockDeviceKey",
   ]);
+  expect(Object.keys(bridge.connection).sort()).toEqual([
+    "getStatus",
+    "reconnect",
+    "subscribeStatus",
+  ]);
   expect(bridge.electronVersion).toBe("44.9.1");
   expect(Object.isFrozen(bridge)).toBe(true);
   expect(Object.isFrozen(bridge.runtime)).toBe(true);
   expect(Object.isFrozen(bridge.repositories)).toBe(true);
   expect(Object.isFrozen(bridge.account)).toBe(true);
+  expect(Object.isFrozen(bridge.connection)).toBe(true);
   for (const value of [
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
     ...Object.values(bridge.account),
+    ...Object.values(bridge.connection),
   ]) {
     expect(typeof value).toBe("function");
   }
@@ -110,6 +118,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
     ...Object.values(bridge.account),
+    ...Object.values(bridge.connection),
   ] as unknown[];
 
   expect(values).not.toContain(ipc);
@@ -481,4 +490,68 @@ test("the account subscription delivers the status and every newer one, without 
 
   expect(errors).toBe(1);
   expect(reported).toEqual(["An account status callback failed."]);
+});
+
+test("the connection functions call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const connection = createDesktopBridge("44.9.1", fake.ipc)
+    .connection as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const offline = { state: "offline", revision: 1 };
+
+  const answers = [
+    connection["getStatus"]?.("connection:reconnect"),
+    connection["reconnect"]?.({ here: true }, "wss://evil.example"),
+  ];
+  fake.answers[0]?.resolve(offline);
+  fake.answers[1]?.resolve({ outcome: "reconnecting" });
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    offline,
+    { outcome: "reconnecting" },
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getConnectionStatus, args: [] },
+    { channel: INVOKE_CHANNELS.reconnect, args: [] },
+  ]);
+});
+
+test("the connection subscription delivers the status and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const calls: unknown[][] = [];
+  const reported: string[] = [];
+  bridge.connection.subscribeStatus((...args) => calls.push(args));
+
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeConnectionStatus, args: [] },
+  ]);
+  fake.answers[0]?.resolve({ state: "connecting", revision: 3 });
+  await settle();
+  fake.emit(EVENT_CHANNELS.connectionStatusChanged, {
+    state: "connected",
+    revision: 4,
+  });
+  fake.emit(EVENT_CHANNELS.connectionStatusChanged, {
+    state: "connecting",
+    revision: 2,
+  });
+  expect(calls).toEqual([
+    [{ state: "connecting", revision: 3 }],
+    [{ state: "connected", revision: 4 }],
+  ]);
+
+  const failing = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  failing.connection.subscribeStatus(() => {
+    throw new Error("broken");
+  });
+  fake.emit(EVENT_CHANNELS.connectionStatusChanged, {
+    state: "connected",
+    revision: 5,
+  });
+  expect(reported).toEqual(["A connection status callback failed."]);
 });

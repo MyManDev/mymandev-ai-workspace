@@ -191,6 +191,53 @@ code {
   background: var(--color-status-failed);
 }
 
+.shell-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-4);
+}
+
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--font-size-small);
+}
+
+.connection-status-text {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+}
+
+.connection-status-detail {
+  color: var(--color-text-muted);
+}
+
+.connection-status-dot {
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-round);
+  background: var(--color-status-neutral);
+}
+
+.connection-status[data-state="connected"] .connection-status-dot {
+  background: var(--color-status-running);
+}
+
+.connection-status[data-state="connecting"] .connection-status-dot,
+.connection-status[data-state="authenticating"] .connection-status-dot,
+.connection-status[data-state="waiting"] .connection-status-dot {
+  background: var(--color-status-transition);
+}
+
+.connection-status[data-state="stopped"] .connection-status-dot {
+  background: var(--color-status-failed);
+}
+
 /* Navigation and tabs */
 
 .shell-nav {

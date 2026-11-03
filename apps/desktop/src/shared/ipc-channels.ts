@@ -67,6 +67,19 @@ export const INVOKE_CHANNELS = Object.freeze({
   removeDevice: "account:remove-device",
   /** The devices of the account, without anything secret. */
   listDevices: "account:list-devices",
+  /** The status of the connection to the cloud API. */
+  getConnectionStatus: "connection:get-status",
+  /**
+   * The status of the connection to the cloud API. The calling frame then
+   * receives every later status on `EVENT_CHANNELS.connectionStatusChanged`.
+   */
+  subscribeConnectionStatus: "connection:subscribe-status",
+  /**
+   * Connects again after the person's action: "Retry now" while the
+   * connection waits, or "Reconnect here once" after another installation
+   * took over the device's connection. The renderer sends nothing.
+   */
+  reconnect: "connection:reconnect",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */
@@ -77,6 +90,8 @@ export const EVENT_CHANNELS = Object.freeze({
   repositoriesChanged: "repositories:changed",
   /** The account status after every change, to the frames that subscribed. */
   accountStatusChanged: "account:status-changed",
+  /** The connection status after every change, to the frames that subscribed. */
+  connectionStatusChanged: "connection:status-changed",
 } as const);
 
 export type InvokeChannel =

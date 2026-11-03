@@ -167,6 +167,7 @@ test("the checks read every renderer source and no test", () => {
     "./AccountPanel.tsx",
     "./account-view.ts",
     "./App.tsx",
+    "./connection-status.ts",
     "./main.tsx",
     "./Navigation.tsx",
     "./ProjectPanel.tsx",
