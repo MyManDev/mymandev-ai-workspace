@@ -176,6 +176,17 @@ export {
   type PostChatMessageResult,
 } from "./chat.ts";
 export {
+  listProjectAgents,
+  type ListProjectAgentsResult,
+  listProjectRuns,
+  type ListProjectRunsResult,
+  type ProjectActivityInput,
+  recordRunTransition,
+  type RecordRunTransitionInput,
+  type RecordRunTransitionResult,
+  type RunTransitionRefusal,
+} from "./agent-activity.ts";
+export {
   DatabaseError,
   toDatabaseError,
   withDatabaseErrors,
