@@ -488,7 +488,41 @@ test("the send limit slides over the burst, counts a fixed hourly window, never 
   assert.ok(limit.take(ada));
 });
 
-test("a removed member's send closes the connection with not_a_member, ends its subscription, and stores nothing", async (t) => {
+test("the hourly window restarts with an accepted send only, not with a send that the burst refuses, and the sweep keeps an account whose burst is full", () => {
+  const clock = fakeClock(0);
+  const limit = new ChatSendLimit(clock.now);
+  const ada = newId<UserId>();
+  const { burst, window } = CHAT_SEND_LIMIT;
+
+  assert.ok(limit.take(ada));
+  clock.advance(window.windowMs - burst.windowMs / 2);
+  for (let index = 0; index < burst.max; index += 1) {
+    assert.ok(limit.take(ada));
+  }
+  // The window ended, but the burst is full: refused, and no window starts.
+  clock.advance(burst.windowMs / 2);
+  assert.equal(limit.take(ada), false);
+  limit.sweep();
+  assert.equal(limit.size, 1, "the full burst is kept");
+
+  clock.advance(burst.windowMs / 2);
+  const restart = clock.now();
+  let taken = 0;
+  while (taken < window.max) {
+    for (let index = 0; index < burst.max && taken < window.max; index += 1) {
+      assert.ok(limit.take(ada), `send ${taken + 1}`);
+      taken += 1;
+    }
+    clock.advance(burst.windowMs);
+  }
+  // The new window started with the accepted send at `restart`.
+  clock.advance(restart + window.windowMs - 1 - clock.now());
+  assert.equal(limit.take(ada), false);
+  clock.advance(1);
+  assert.ok(limit.take(ada));
+});
+
+test("a removed member's send, also a resent event ID of a stored message, closes the connection with not_a_member, ends its subscription, and stores nothing", async (t) => {
   const { account } = await instance(t);
   const ada = await account(3741);
   const bob = await account(3742);
@@ -504,13 +538,16 @@ test("a removed member's send closes the connection with not_a_member, ends its 
     (await nextFrame(adaConnection.client)).type,
     "presence.changed",
   );
+  const before = sendOf(bob.device, workspaceId, projectId, "Before");
+  bobConnection.client.send(before);
+  const stored = await nextCreated(bobConnection.client, before);
+  assert.deepEqual(await nextCreated(adaConnection.client, before), stored);
   const bobPerson = memberIds[0];
   assert.ok(bobPerson !== undefined);
   await removeInDatabase(bobPerson, ada.device);
 
-  bobConnection.client.send(
-    sendOf(bob.device, workspaceId, projectId, "Still here?"),
-  );
+  // The stored message is not sent again to a removed member.
+  bobConnection.client.send(before);
   assert.deepEqual(await bobConnection.client.closed, {
     code: CloseCode.policyViolation,
     reason: "not_a_member",
@@ -522,8 +559,15 @@ test("a removed member's send closes the connection with not_a_member, ends its 
     memberId: bobPerson,
     status: "offline",
   });
+  const again = await connected(t, bob.app, bob.device);
+  again.client.send(sendOf(bob.device, workspaceId, projectId, "Still here?"));
+  assert.deepEqual(await again.client.closed, {
+    code: CloseCode.policyViolation,
+    reason: "not_a_member",
+  });
   await quiet(adaConnection.client);
-  assert.deepEqual(await storedOf(projectId), []);
+  assert.equal(again.client.unread(), 0);
+  assert.deepEqual(await storedOf(projectId), [{ seq: 1, body: "Before" }]);
 });
 
 test("after identity binding, the send handler refuses a removed member and a revoked device inside its transaction, and the gateway closes for its rejection", async (t) => {
@@ -729,6 +773,10 @@ test("an unknown project, a project of another workspace, a malformed project ID
     bob.device,
   ]);
   const projectId = await projectIn(workspaceId, ada.device);
+  // The outsider is an active member of another workspace, with a project.
+  const elsewhere = await workspaceOf(outsider.device);
+  const ownProject = await projectIn(elsewhere.workspaceId, outsider.device);
+  assert.equal((await history(outsider, ownProject)).statusCode, 200);
   assert.equal((await history(bob, projectId)).statusCode, 200);
   const bobPerson = memberIds[0];
   assert.ok(bobPerson !== undefined);

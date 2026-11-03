@@ -21,8 +21,8 @@ import {
  * The chat send limit of an account (#27; values settled with the API part
  * under the Project Manager's rule of 2026-11-02): at most `burst.max`
  * messages in any `burst.windowMs`, and at most `window.max` messages in a
- * window of `window.windowMs` that starts with the account's first message
- * after the previous window ended. Every device of the account counts
+ * window of `window.windowMs` that starts with the account's first accepted
+ * message after the previous window ended. Every device of the account counts
  * together, and so does every workspace. A `chat.message.send` above it gets
  * `event.refused` with `rate_limited`, and the connection stays open.
  *
@@ -30,8 +30,8 @@ import {
  *   once. The largest `chat.message.created` is about 64,600 bytes, just
  *   under `MAX_FRAME_BYTES` (64 KiB), and a connection with more than
  *   `MAX_BUFFERED_BYTES` (1 MiB) waiting closes with `backpressure`. 15 of
- *   the largest messages are about 969,000 bytes, so one account alone can
- *   never push a subscriber that reads nothing for 10 seconds over the
+ *   the largest messages are about 969,000 bytes, so the chat messages of
+ *   one account alone can never push a subscriber that reads nothing for 10 seconds over the
  *   limit, with about 79,000 bytes left for presence and the messages of
  *   others; 16 would leave about 15,000 bytes. A person who types
  *   short messages sends far fewer than 15 in 10 seconds.
@@ -86,28 +86,43 @@ export class ChatSendLimit {
   take(userId: UserId): boolean {
     const now = this.#now();
     const { burst, window } = this.#limit;
-    let count = this.#accounts.get(userId);
-    if (count === undefined || now - count.windowStart >= window.windowMs) {
-      count = { recent: count?.recent ?? [], windowStart: now, sent: 0 };
-      this.#accounts.set(userId, count);
+    const count = this.#accounts.get(userId);
+    if (count === undefined) {
+      this.#accounts.set(userId, { recent: [now], windowStart: now, sent: 1 });
+      return true;
     }
     const { recent } = count;
     while (recent.length > 0 && now - (recent[0] ?? now) >= burst.windowMs) {
       recent.shift();
     }
-    if (recent.length >= burst.max || count.sent >= window.max) {
+    // The window ended: the next accepted send starts a new one. A send
+    // that the burst refuses starts none.
+    const ended = now - count.windowStart >= window.windowMs;
+    if (recent.length >= burst.max || (!ended && count.sent >= window.max)) {
       return false;
+    }
+    if (ended) {
+      count.windowStart = now;
+      count.sent = 0;
     }
     recent.push(now);
     count.sent += 1;
     return true;
   }
 
-  /** Forgets the accounts whose window ended. */
+  /**
+   * Forgets the accounts whose window ended and whose last accepted send
+   * left the burst.
+   */
   sweep(): void {
     const now = this.#now();
+    const { burst, window } = this.#limit;
     for (const [userId, count] of this.#accounts) {
-      if (now - count.windowStart >= this.#limit.window.windowMs) {
+      const last = count.recent.at(-1);
+      if (
+        now - count.windowStart >= window.windowMs &&
+        (last === undefined || now - last >= burst.windowMs)
+      ) {
         this.#accounts.delete(userId);
       }
     }
