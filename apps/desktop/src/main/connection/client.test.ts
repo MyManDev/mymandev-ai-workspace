@@ -24,6 +24,8 @@ import {
   HANDSHAKE_TIMEOUT_MS,
   MAX_BUFFERED_SEND_BYTES,
   RECEIVE_LIMIT_BYTES,
+  RECONNECT_BUDGET,
+  RECONNECT_BUDGET_WINDOW_MS,
   RECONNECT_COOLDOWN_MS,
   STABLE_CONNECTION_MS,
   type ClientEvent,
@@ -1036,4 +1038,113 @@ test("no file of the connection client logs with console", () => {
     const text = readFileSync(path.join(moduleFolder, name), "utf8");
     expect(text, name).not.toMatch(/\bconsole\./);
   }
+});
+
+test("a reconnect is refused after the server refused the device, also before the account status follows, and allowed after connection_replaced and protocol_violation", async () => {
+  const cases: [number, string, string][] = [
+    [4000, "auth_failed", "refused"],
+    [4002, "device_revoked", "refused"],
+    [4003, "sign_in_required", "refused"],
+    [4004, "connection_replaced", "reconnecting"],
+    [4005, "protocol_violation", "reconnecting"],
+  ];
+  for (const [code, reason, outcome] of cases) {
+    const h = harness();
+    await h.authenticate();
+    // The account status still names the signed-in device.
+    h.last().closed(code, reason);
+    const result = h.client.reconnect();
+    expect(result.outcome, reason).toBe(outcome);
+    if (result.outcome === "refused") {
+      expect(result.reason, reason).toBe("not_signed_in");
+      expect(h.sockets, reason).toHaveLength(1);
+      expect(h.client.status(), reason).toMatchObject({
+        state: "stopped",
+        reason,
+      });
+    } else {
+      expect(h.sockets, reason).toHaveLength(2);
+    }
+  }
+});
+
+test("a reconnect is refused while a socket is open, opening, or closing before the next one", async () => {
+  const h = harness();
+  expect(h.client.reconnect()).toEqual({
+    outcome: "refused",
+    reason: "already_open",
+  });
+  await h.authenticate();
+  expect(h.client.reconnect()).toEqual({
+    outcome: "refused",
+    reason: "already_open",
+  });
+  // The system resumed: the open socket closes, and the next one waits for it.
+  h.client.systemResumed();
+  expect(h.client.status().state).toBe("connecting");
+  expect(h.client.reconnect()).toEqual({
+    outcome: "refused",
+    reason: "already_open",
+  });
+  expect(h.sockets).toHaveLength(1);
+});
+
+test("at most 10 reconnects within 10 minutes are accepted, so a renderer cannot exceed the API's handshake limit", () => {
+  expect(RECONNECT_BUDGET).toBe(10);
+  expect(RECONNECT_BUDGET_WINDOW_MS).toBe(10 * 60_000);
+  const h = harness();
+  const toWaiting = () => {
+    if (h.client.status().state !== "waiting") {
+      h.last().closed(1006);
+    }
+    expect(h.client.status().state).toBe("waiting");
+  };
+  for (let index = 0; index < RECONNECT_BUDGET; index += 1) {
+    toWaiting();
+    expect(h.client.reconnect(), String(index)).toEqual({
+      outcome: "reconnecting",
+    });
+    h.advance(RECONNECT_COOLDOWN_MS);
+  }
+  toWaiting();
+  expect(h.client.reconnect()).toEqual({
+    outcome: "refused",
+    reason: "too_soon",
+  });
+  const handshakes = h.sockets.length;
+
+  // The first reconnect leaves the window at 10 minutes.
+  h.advance(
+    RECONNECT_BUDGET_WINDOW_MS - RECONNECT_BUDGET * RECONNECT_COOLDOWN_MS - 1,
+  );
+  toWaiting();
+  expect(h.client.reconnect()).toEqual({
+    outcome: "refused",
+    reason: "too_soon",
+  });
+  h.advance(1);
+  toWaiting();
+  expect(h.client.reconnect()).toEqual({ outcome: "reconnecting" });
+  // The backoff and the budget together stay below the API's 60 handshakes
+  // per address in 10 minutes.
+  expect(handshakes).toBeLessThanOrEqual(1 + RECONNECT_BUDGET + 25);
+  expect(h.sockets.length).toBeLessThan(60);
+});
+
+test("a send carries only what the protocol knows, not the caller's extra fields", async () => {
+  const h = harness();
+  await h.authenticate();
+  const event = chatSend() as unknown as Record<string, unknown>;
+  const withExtras = {
+    ...event,
+    secret: "kept local",
+    payload: {
+      ...(event["payload"] as Record<string, unknown>),
+      secret: "kept local",
+    },
+  } as unknown as ClientEvent;
+  expect(h.client.send(withExtras)).toBe("sent");
+  const sent = h.last().sent.at(-1) ?? "";
+  expect(sent).not.toContain("kept local");
+  expect(JSON.parse(sent)).toEqual(chatSend());
 });

@@ -71,6 +71,23 @@ export const STABLE_CONNECTION_MS = 60_000;
 export const RECONNECT_COOLDOWN_MS = 3_000;
 
 /**
+ * At most this many reconnects within `RECONNECT_BUDGET_WINDOW_MS`; more are
+ * refused (`too_soon`). The API allows 60 handshakes per address in 10
+ * minutes. The backoff makes at most 25 in that time, when every wait is
+ * the shortest (0.5, 1, 2, 4, 8, and 16 seconds, then 30), so with these 10
+ * the client makes at most 35 and leaves room for other devices behind the
+ * same address. A renderer that calls the reconnect in a loop gets no more.
+ */
+export const RECONNECT_BUDGET = 10;
+export const RECONNECT_BUDGET_WINDOW_MS = 10 * 60_000;
+
+/** The stop reasons after which a reconnect may be asked for. */
+const RECONNECTABLE_STOPS: ReadonlySet<ConnectionStopReason> = new Set([
+  "connection_replaced",
+  "protocol_violation",
+]);
+
+/**
  * How long the client waits for the close event of a socket that it closed
  * before it opens the next one, so that two sockets are never open at once.
  */
@@ -167,10 +184,14 @@ export interface ConnectionClient {
   ) => () => void;
   /**
    * Connects again at once after the person's action: "Retry now" while
-   * waiting, or "Reconnect here once" after `connection_replaced` (and after
-   * `protocol_violation`). Refused without a signed-in device, while an
-   * update is required, while a socket is open, and within
-   * `RECONNECT_COOLDOWN_MS` of the last reconnect.
+   * waiting, or "Reconnect here once" after `connection_replaced` (and
+   * "Retry now" after `protocol_violation`). Refused as `not_signed_in`
+   * without a signed-in device and after the server refused the device
+   * (`auth_failed`, `device_revoked`, `sign_in_required`), which only a
+   * GitHub sign-in ends; as `update_required` while an update is required;
+   * as `already_open` while a socket is open or opening; and as `too_soon`
+   * within `RECONNECT_COOLDOWN_MS` of the last reconnect or beyond
+   * `RECONNECT_BUDGET` reconnects in `RECONNECT_BUDGET_WINDOW_MS`.
    */
   readonly reconnect: () => ReconnectResult;
   /**
@@ -288,7 +309,8 @@ export function createConnectionClient(
   let attempt = 0;
   /** Whether the reconnect after `key_replaced` was used since the last stable connection. */
   let keyReplacedReconnectUsed = false;
-  let lastReconnect: number | null = null;
+  /** When the reconnects within the budget's window were accepted, oldest first. */
+  const reconnects: number[] = [];
   let closed = false;
   let revision = 0;
   let current: ConnectionStatus = Object.freeze({
@@ -758,11 +780,15 @@ export function createConnectionClient(
       return "too_large";
     }
     // Only what the server accepts after `auth.ok`: an authenticated client
-    // frame, or a client event.
+    // frame, or a client event. The decoded copy is sent, so a field that
+    // the protocol does not know never leaves.
     const checked = decodeClientMessage(JSON.parse(text) as unknown);
     if (!checked.ok || checked.kind !== kind) {
       return "invalid";
     }
+    text = JSON.stringify(
+      checked.kind === "event" ? checked.event : checked.frame,
+    );
     if (record.socket.bufferedAmount() > MAX_BUFFERED_SEND_BYTES) {
       return "backpressure";
     }
@@ -818,14 +844,34 @@ export function createConnectionClient(
     if (latch === "update_required") {
       return Object.freeze({ outcome: "refused", reason: "update_required" });
     }
-    if (live !== null) {
+    if (latch !== null && !RECONNECTABLE_STOPS.has(latch)) {
+      // The server refused the device: the same key would be refused again,
+      // and only a GitHub sign-in, which the account panel starts, ends it.
+      return Object.freeze({ outcome: "refused", reason: "not_signed_in" });
+    }
+    if (
+      live !== null ||
+      draining !== null ||
+      (latch === null && cancelRetry === null)
+    ) {
+      // A socket is open, opening, or about to open.
       return Object.freeze({ outcome: "refused", reason: "already_open" });
     }
     const at = now();
-    if (lastReconnect !== null && at - lastReconnect < RECONNECT_COOLDOWN_MS) {
+    while (
+      reconnects.length > 0 &&
+      at - (reconnects[0] ?? at) >= RECONNECT_BUDGET_WINDOW_MS
+    ) {
+      reconnects.shift();
+    }
+    const last = reconnects.at(-1);
+    if (
+      (last !== undefined && at - last < RECONNECT_COOLDOWN_MS) ||
+      reconnects.length >= RECONNECT_BUDGET
+    ) {
       return Object.freeze({ outcome: "refused", reason: "too_soon" });
     }
-    lastReconnect = at;
+    reconnects.push(at);
     latch = null;
     stopRetry();
     pump();

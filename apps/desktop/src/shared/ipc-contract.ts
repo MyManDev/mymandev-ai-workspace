@@ -694,9 +694,12 @@ export type ConnectionStatus = z.infer<typeof ConnectionStatusSchema>;
 
 /**
  * Why a reconnect was refused: `not_signed_in` without a signed-in device
- * with a loaded key, `update_required` while the server speaks another
- * protocol version, `already_open` while a connection is open or opening,
- * and `too_soon` within a few seconds of the last reconnect.
+ * with a loaded key, and after the server refused the device (`auth_failed`,
+ * `device_revoked`, `sign_in_required`), which only a GitHub sign-in ends;
+ * `update_required` while the server speaks another protocol version;
+ * `already_open` while a connection is open or opening; and `too_soon`
+ * within a few seconds of the last reconnect, or after too many reconnects
+ * in 10 minutes.
  */
 export const RECONNECT_REFUSALS = Object.freeze([
   "not_signed_in",
