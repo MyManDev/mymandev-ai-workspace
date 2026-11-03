@@ -81,6 +81,9 @@ test("the bridge holds the Electron version, the runtime, the repository, and th
     "cancelSignIn",
     "forgetAccount",
     "getStatus",
+    "listDevices",
+    "removeDevice",
+    "signOut",
     "startSignIn",
     "subscribeStatus",
     "unlockDeviceKey",
@@ -360,6 +363,7 @@ const accountStatus = (revision: number): AccountStatus => ({
   deviceKey: "ready",
   replacementPending: false,
   apiOrigin: "set",
+  device: "no_device",
 });
 
 test("the account functions call their channels and pass no argument from the renderer on", async () => {
@@ -375,23 +379,35 @@ test("the account functions call their channels and pass no argument from the re
     account["startSignIn"]?.({ login: "octocat" }, "https://evil.example"),
     account["cancelSignIn"]?.(true),
     account["forgetAccount"]?.({ confirmed: false }),
+    account["signOut"]?.({ keepKey: false }),
+    account["removeDevice"]?.({ confirmed: true }, "0192f2a0"),
+    account["listDevices"]?.({ all: true }),
   ];
   fake.answers[0]?.resolve(accountStatus(1));
   fake.answers[1]?.resolve({ outcome: "started" });
   fake.answers[2]?.resolve(true);
-  fake.answers[3]?.resolve({ outcome: "forgotten" });
+  fake.answers[3]?.resolve({ outcome: "forgotten", removedAtServer: true });
+  fake.answers[4]?.resolve({ outcome: "pending" });
+  fake.answers[5]?.resolve({ outcome: "cancelled" });
+  fake.answers[6]?.resolve({ outcome: "listed", devices: [] });
 
   await expect(Promise.all(answers)).resolves.toEqual([
     accountStatus(1),
     { outcome: "started" },
     true,
-    { outcome: "forgotten" },
+    { outcome: "forgotten", removedAtServer: true },
+    { outcome: "pending" },
+    { outcome: "cancelled" },
+    { outcome: "listed", devices: [] },
   ]);
   expect(fake.invoked).toEqual([
     { channel: INVOKE_CHANNELS.getAccountStatus, args: [] },
     { channel: INVOKE_CHANNELS.startSignIn, args: [] },
     { channel: INVOKE_CHANNELS.cancelSignIn, args: [] },
     { channel: INVOKE_CHANNELS.forgetAccount, args: [] },
+    { channel: INVOKE_CHANNELS.signOut, args: [] },
+    { channel: INVOKE_CHANNELS.removeDevice, args: [] },
+    { channel: INVOKE_CHANNELS.listDevices, args: [] },
   ]);
 });
 

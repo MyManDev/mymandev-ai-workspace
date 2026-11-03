@@ -415,6 +415,14 @@ test("the CHECK vocabularies equal the protocol constants", async () => {
     sorted(TERMINAL_RUN_STATES),
   );
   assert.deepEqual(
+    sorted(await checkValues("agent_run_transitions_previous_state_check")),
+    sorted(RUN_STATES),
+  );
+  assert.deepEqual(
+    sorted(await checkValues("agent_run_transitions_state_check")),
+    sorted(RUN_STATES),
+  );
+  assert.deepEqual(
     sorted(await checkValues("devices_platform_check")),
     sorted(DEVICE_PLATFORMS),
   );

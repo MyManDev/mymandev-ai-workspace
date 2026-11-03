@@ -13,9 +13,12 @@ import {
 import type {
   AccountStatus,
   ForgetResult,
+  ListDevicesResult,
   MountResult,
+  RemoveDeviceResult,
   RepositoryList,
   RuntimeStatus,
+  SignOutResult,
   StartSignInResult,
   UnlockResult,
 } from "../shared/ipc-contract.ts";
@@ -177,6 +180,12 @@ export function createDesktopBridge(
           ),
     forgetAccount: () =>
       ipc.invoke(INVOKE_CHANNELS.forgetAccount) as Promise<ForgetResult>,
+    signOut: () =>
+      ipc.invoke(INVOKE_CHANNELS.signOut) as Promise<SignOutResult>,
+    removeDevice: () =>
+      ipc.invoke(INVOKE_CHANNELS.removeDevice) as Promise<RemoveDeviceResult>,
+    listDevices: () =>
+      ipc.invoke(INVOKE_CHANNELS.listDevices) as Promise<ListDevicesResult>,
   });
 
   return Object.freeze({ electronVersion, runtime, repositories, account });

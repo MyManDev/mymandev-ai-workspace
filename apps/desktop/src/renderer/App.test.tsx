@@ -347,7 +347,11 @@ test("the home screen holds the account panel, which waits for the first status 
     startSignIn: () => Promise.resolve({ outcome: "started" }),
     cancelSignIn: () => Promise.resolve(false),
     unlockDeviceKey: () => Promise.resolve({ outcome: "unlocked" }),
-    forgetAccount: () => Promise.resolve({ outcome: "forgotten" }),
+    forgetAccount: () =>
+      Promise.resolve({ outcome: "forgotten", removedAtServer: true }),
+    signOut: () => Promise.resolve({ outcome: "signed_out" }),
+    removeDevice: () => Promise.resolve({ outcome: "removed" }),
+    listDevices: () => Promise.resolve({ outcome: "listed", devices: [] }),
   };
 
   expect(render({ account })).toContain(

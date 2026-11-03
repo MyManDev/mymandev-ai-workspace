@@ -49,6 +49,7 @@ import type {
 } from "fastify";
 import type { RawData, WebSocket } from "ws";
 import { randomToken } from "./auth/attempts.ts";
+import { lockDeviceRow } from "./auth/authenticate.ts";
 import { verifyDeviceSignature } from "./auth/device-keys.ts";
 import { ADDRESS_LIMIT } from "./auth/device-routes.ts";
 import { type DeviceRow, stateOf } from "./auth/device-state.ts";
@@ -184,8 +185,11 @@ declare const verified: unique symbol;
  * second brand next to `UnverifiedEvent`, defined here and never in the
  * protocol (ADR 0006). Only `bindIdentity` creates it; never cast to it
  * anywhere else.
- * The reference binding of an agent actor, its run, and its project (ADR
- * 0006) arrives with #27 and #28, before anything relays a VerifiedEvent.
+ * The reference binding of what an event names (ADR 0006) belongs to the
+ * handler of its type, inside the transaction that stores it: a
+ * `chat.message.send` stores nothing unless its project is in the event's
+ * workspace (#27, `postChatMessage`). The binding of an agent actor, its
+ * run, and its project arrives with #28.
  */
 export type VerifiedEvent = Exclude<
   ProtocolEvent,
@@ -193,14 +197,27 @@ export type VerifiedEvent = Exclude<
 > & { readonly [verified]: true };
 
 /**
+ * What an event handler returns when it found, inside the transaction that
+ * would have stored the event, what identity binding refuses: the account is
+ * no longer an active member of the event's workspace, or the device or the
+ * account may no longer act. The gateway then closes the connection as it
+ * does after `bindIdentity`. An identity mismatch is never found there,
+ * because identity binding checks it first and audits it.
+ */
+export type EventRejection = Readonly<{
+  rejected: Exclude<IdentityRejectionCode, "identity_mismatch">;
+}>;
+
+/**
  * Receives every event that passed identity binding, with its authenticated
  * connection. The gateway awaits it before the connection's next event; a
- * failure closes the connection with 1011.
+ * returned `EventRejection` closes the connection, and a failure closes it
+ * with 1011.
  */
 export type EventHandler = (
   event: VerifiedEvent,
   context: AuthenticatedConnectionContext,
-) => void | Promise<void>;
+) => void | EventRejection | Promise<void | EventRejection>;
 
 /**
  * Why a device row no longer accepts a connection, as its close reason: a
@@ -374,6 +391,26 @@ export async function bindIdentity(
   }
   // The one place that turns an event into a VerifiedEvent (ADR 0006).
   return { ok: true, event: event as unknown as VerifiedEvent };
+}
+
+/**
+ * Locks the account and the device of a connection until the transaction
+ * ends (`lockDeviceRow`, in the order of `lockActor`) and returns why they
+ * no longer accept the connection, or null, as `bindIdentity` checks them:
+ * without the 30-day expiry, which the sweep checks. A handler that stores
+ * an event calls it first in its transaction, so that a revocation, a
+ * sign-out, a new sign-in, or a disable that commits after identity binding
+ * stores nothing.
+ */
+export async function lockConnection(
+  tx: Database,
+  context: AuthenticatedConnectionContext,
+): Promise<ConnectionRefusal | null> {
+  return refusalOf(
+    await lockDeviceRow(tx, context.identity),
+    context.signedInAt,
+    null,
+  );
 }
 
 /** Closes a socket with a close code of the protocol; the reason is the code's key. */
@@ -913,18 +950,51 @@ export class ConnectionRegistry {
    * Sends an event to every connection that is subscribed to the event's
    * workspace and still open; a connection that the server is closing is
    * skipped. A connection that is not subscribed never gets it, so neither
-   * does an account that is not an active member. A connection that reads
-   * too slowly closes instead. Returns how many connections it was sent to.
+   * does an account that is not an active member. The one exception is
+   * `sender`: the live connection whose event the server just accepted, as
+   * an active member of the workspace, gets it too, once, also when it is not
+   * subscribed (#27, #28). A connection that reads too slowly closes
+   * instead. Returns how many connections it was sent to.
    */
-  sendToWorkspace(event: ServerEvent): number {
+  sendToWorkspace(
+    event: ServerEvent,
+    sender?: AuthenticatedConnectionContext,
+  ): number {
     const text = JSON.stringify(event);
+    const targets = new Set(this.#subscribersOf(event.workspaceId));
+    if (sender !== undefined) {
+      const live = this.#liveWith(
+        sender.identity.deviceId,
+        sender.connectionId,
+      );
+      if (live !== undefined) {
+        targets.add(live);
+      }
+    }
     let sent = 0;
-    for (const live of this.#subscribersOf(event.workspaceId)) {
+    for (const live of targets) {
       if (this.#send(live, text)) {
         sent += 1;
       }
     }
     return sent;
+  }
+
+  /**
+   * Sends an event to one live connection only, whether or not it is
+   * subscribed to the event's workspace: the answer to an event that the
+   * connection sent, such as the stored `chat.message.created` for a
+   * resent `chat.message.send` (#27). Returns whether it was sent.
+   */
+  sendEvent(
+    context: AuthenticatedConnectionContext,
+    event: ServerEvent,
+  ): boolean {
+    const live = this.#liveWith(
+      context.identity.deviceId,
+      context.connectionId,
+    );
+    return live !== undefined && this.#send(live, JSON.stringify(event));
   }
 
   /** The subscribed live connections of a workspace at this moment. */
@@ -1794,31 +1864,43 @@ export function registerGateway(
           return;
         }
         if (!bound.ok) {
-          const { code } = bound;
-          log.debug({ code }, "event rejected");
-          switch (code) {
-            case "not_a_member": {
-              // The account's membership of a workspace that the connection
-              // is subscribed to ended, and the server had not seen it yet.
-              const held = connections.subscriptionOf(
-                current,
-                event.workspaceId,
-              );
-              if (held !== null) {
-                connections.endSubscription(held);
-              }
-              end(current, () => socket.close(CloseCode.policyViolation, code));
-              return;
-            }
-            case "identity_mismatch":
-              end(current, () => socket.close(CloseCode.policyViolation, code));
-              return;
-            default:
-              end(current, () => closeWith(socket, code));
-              return;
-          }
+          reject(current, event.workspaceId, bound.code);
+          return;
         }
-        await options.onEvent(bound.event, current);
+        const outcome = await options.onEvent(bound.event, current);
+        if (outcome !== undefined && open()) {
+          reject(current, event.workspaceId, outcome.rejected);
+        }
+      }
+
+      /**
+       * Closes the connection for an event that identity binding, or the
+       * event handler after it, refused.
+       */
+      function reject(
+        current: AuthenticatedConnectionContext,
+        workspaceId: WorkspaceId,
+        code: IdentityRejectionCode,
+      ): void {
+        log.debug({ code }, "event rejected");
+        switch (code) {
+          case "not_a_member": {
+            // The account's membership of a workspace that the connection
+            // is subscribed to ended, and the server had not seen it yet.
+            const held = connections.subscriptionOf(current, workspaceId);
+            if (held !== null) {
+              connections.endSubscription(held);
+            }
+            end(current, () => socket.close(CloseCode.policyViolation, code));
+            return;
+          }
+          case "identity_mismatch":
+            end(current, () => socket.close(CloseCode.policyViolation, code));
+            return;
+          default:
+            end(current, () => closeWith(socket, code));
+            return;
+        }
       }
 
       socket.on("message", (data, isBinary) => {

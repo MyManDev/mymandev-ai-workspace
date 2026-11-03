@@ -2814,3 +2814,95 @@ test("no file of the session logs", () => {
     expect(text, name).not.toMatch(/\bconsole\./);
   }
 });
+
+describe("answers that arrive after the device was forgotten", () => {
+  test("a token answer after the record and the keys were deleted writes nothing back", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    // Signed out while offline, then a sign-in replaced the key, and the API
+    // holds the new key.
+    api.intercept = () => Promise.reject(new TypeError("offline"));
+    await h.session.signOut();
+    api.intercept = null;
+    const keys = await h.keyStore.replace();
+    api.publicKey = keys.current.publicKey;
+    await h.session.refresh();
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    api.intercept = (request) =>
+      request.path === "/auth/access-token"
+        ? gate.then(() => answerApi(api, request))
+        : undefined;
+    h.calls.length = 0;
+
+    const reporting = h.session.reportSignOut();
+    await waitForRequest(h, "POST", "/auth/access-token");
+    // "This is not me" deletes the record and then the keys meanwhile.
+    await h.records.delete();
+    await h.keyStore.delete();
+    release();
+
+    expect(await reporting).toEqual({ ok: false, reason: "no_device" });
+    expect(await h.records.read()).toEqual({ kind: "none" });
+    expect(h.calls).not.toContain("record.write");
+    expect(h.calls).not.toContain("key.confirm");
+    expect(h.session.state().kind).toBe("no_device");
+  });
+
+  test("a token answer for a record that names another device writes nothing", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    const { current } = await pendingReplacement(h);
+    api.publicKey = current;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    api.intercept = (request) =>
+      request.path === "/auth/access-token"
+        ? gate.then(() => answerApi(api, request))
+        : undefined;
+
+    const authenticating = h.session.authenticate();
+    await waitForRequest(h, "POST", "/auth/access-token");
+    const other = {
+      ...deviceRecord("b".repeat(64)),
+      deviceId: OTHER_DEVICE_ID,
+    };
+    await h.records.write(other);
+    release();
+
+    expect(await authenticating).toEqual({ ok: false, reason: "no_device" });
+    expect(await h.records.read()).toEqual({ kind: "record", record: other });
+    expect(h.calls).not.toContain("key.confirm");
+  });
+
+  test("removing this device waits for a mint that runs before it notes the removal", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    api.intercept = (request) =>
+      request.path === "/auth/access-token"
+        ? gate.then(() => answerApi(api, request))
+        : undefined;
+
+    const authenticating = h.session.authenticate();
+    await waitForRequest(h, "POST", "/auth/access-token");
+    const removing = h.session.removeDevice();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(await notesFile()).toBeNull();
+    expect(h.session.state().kind).toBe("signed_in");
+    release();
+
+    expect((await authenticating).ok).toBe(true);
+    expect(await removing).toEqual({ ok: true, value: "removed" });
+    expect(api.revokedReason).toBe("removed");
+  });
+});

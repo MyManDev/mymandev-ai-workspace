@@ -1,9 +1,17 @@
 import { type Database, deviceRow, devices, users } from "@mymandev/database";
-import { ACCESS_TOKEN_PATTERN } from "@mymandev/protocol";
+import {
+  ACCESS_TOKEN_PATTERN,
+  type DeviceId,
+  type UserId,
+} from "@mymandev/protocol";
 import { eq } from "drizzle-orm";
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { ApiError } from "../errors.ts";
-import { type AuthContext, tokenUsable } from "./device-state.ts";
+import {
+  type AuthContext,
+  type DeviceRow,
+  tokenUsable,
+} from "./device-state.ts";
 import { type AccessTokens, WindowLimiter } from "./tokens.ts";
 
 /** Authenticated requests per account, across every authenticated route. */
@@ -119,25 +127,24 @@ export function authOf(request: FastifyRequest): AuthContext {
 }
 
 /**
- * Locks the account and the acting device until the transaction ends and
- * checks them again, so that a request authenticated before a revocation, a
- * sign-out, a new sign-in, or a disable cannot change anything after it. The
- * account is locked before the device, in the order the sign-in uses. "No key
- * update" still waits for every other change of these rows, but not for the
- * key-share locks of foreign-key checks, so that it cannot deadlock with them.
+ * Locks an account and one of its devices until the transaction ends and
+ * reads them as `deviceRow` does, or undefined when either is missing. The
+ * account is locked before the device, in the order the sign-in uses. "No
+ * key update" still waits for every other change of these rows, but not for
+ * the key-share locks of foreign-key checks, so that it cannot deadlock with
+ * them.
  */
-export async function lockActor(
+export async function lockDeviceRow(
   tx: Database,
-  auth: AuthContext,
-  now: number,
-): Promise<void> {
+  identity: Readonly<{ userId: UserId; deviceId: DeviceId }>,
+): Promise<DeviceRow | undefined> {
   const [user] = await tx
     .select({
       disabledAt: users.disabledAt,
       signInRequiredAt: users.signInRequiredAt,
     })
     .from(users)
-    .where(eq(users.id, auth.userId))
+    .where(eq(users.id, identity.userId))
     .for("no key update");
   const [device] = await tx
     .select({
@@ -147,13 +154,25 @@ export async function lockActor(
       lastSignInAt: devices.lastSignInAt,
     })
     .from(devices)
-    .where(eq(devices.id, auth.deviceId))
+    .where(eq(devices.id, identity.deviceId))
     .for("no key update");
-  const row =
-    user === undefined || device === undefined
-      ? undefined
-      : { ...device, ...user };
-  if (!tokenUsable(row, auth, now)) {
+  return user === undefined || device === undefined
+    ? undefined
+    : { ...device, ...user };
+}
+
+/**
+ * Locks the account and the acting device until the transaction ends and
+ * checks them again (`lockDeviceRow`), so that a request authenticated
+ * before a revocation, a sign-out, a new sign-in, or a disable cannot change
+ * anything after it.
+ */
+export async function lockActor(
+  tx: Database,
+  auth: AuthContext,
+  now: number,
+): Promise<void> {
+  if (!tokenUsable(await lockDeviceRow(tx, auth), auth, now)) {
     throw new ApiError("unauthorized");
   }
 }

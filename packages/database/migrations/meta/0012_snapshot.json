@@ -1,5 +1,5 @@
 {
-  "id": "e6e78a26-094f-4c9e-9750-ad75c08f3dc3",
+  "id": "7804ed80-a60d-4137-b56d-a285caa1d492",
   "prevId": "f5a2054f-464f-4df0-bd61-093ac916253f",
   "version": "7",
   "dialect": "postgresql",
@@ -60,12 +60,6 @@
         },
         "last_seen_at": {
           "name": "last_seen_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "first_authenticated_at": {
-          "name": "first_authenticated_at",
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
@@ -1700,6 +1694,34 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "agent_runs_project_id_finished_at_idx": {
+          "name": "agent_runs_project_id_finished_at_idx",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "finished_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"agent_runs\".\"finished_at\" is not null",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -1787,7 +1809,24 @@
         }
       },
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
+      "uniqueConstraints": {
+        "agent_runs_id_agent_id_key": {
+          "name": "agent_runs_id_agent_id_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "agent_id"
+          ]
+        },
+        "agent_runs_id_repository_id_key": {
+          "name": "agent_runs_id_repository_id_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "repository_id"
+          ]
+        }
+      },
       "policies": {},
       "checkConstraints": {
         "agent_runs_state_check": {

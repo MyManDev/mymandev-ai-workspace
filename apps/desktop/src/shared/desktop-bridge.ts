@@ -1,9 +1,12 @@
 import type {
   AccountStatus,
   ForgetResult,
+  ListDevicesResult,
   MountResult,
+  RemoveDeviceResult,
   RepositoryList,
   RuntimeStatus,
+  SignOutResult,
   StartSignInResult,
   UnlockResult,
 } from "./ipc-contract.ts";
@@ -69,9 +72,10 @@ export interface RepositoryBridge {
 }
 
 /**
- * The sign-in of this installation. The main process runs it: the renderer
- * gets the account, the pairing code, and fixed outcome codes, never a
- * sign-in code, a verifier, a signature, a key, or a token (ADR 0014).
+ * The sign-in and the device of this installation. The main process runs
+ * them: the renderer gets the account, the pairing code, the device list,
+ * and fixed codes, never a sign-in code, a verifier, a signature, a key, or
+ * a token (ADR 0014).
  */
 export interface AccountBridge {
   /** The current account status. */
@@ -102,8 +106,22 @@ export interface AccountBridge {
   readonly unlockDeviceKey: (passphrase: string) => Promise<UnlockResult>;
   /**
    * "This is not me": the main process asks the person to confirm in a
-   * native dialog, then deletes the device key and the device record of
-   * this installation. Resolves to `cancelled` when the person kept them.
+   * native dialog, removes the device at the API where it can, then deletes
+   * the device key and the device record of this installation. Resolves to
+   * `cancelled` when the person kept them.
    */
   readonly forgetAccount: () => Promise<ForgetResult>;
+  /**
+   * Signs out (P-65): the device and its key stay, and the next GitHub
+   * sign-in is needed. Resolves to `pending` when the API learns it later.
+   */
+  readonly signOut: () => Promise<SignOutResult>;
+  /**
+   * Removes this device from its account: the main process asks the person
+   * to confirm in a native dialog, and deletes the device key only after
+   * the API confirmed. Resolves to `pending` while the API has not answered.
+   */
+  readonly removeDevice: () => Promise<RemoveDeviceResult>;
+  /** The devices of the account; the device of this installation is marked. */
+  readonly listDevices: () => Promise<ListDevicesResult>;
 }
