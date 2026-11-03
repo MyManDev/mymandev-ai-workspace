@@ -191,6 +191,13 @@ export interface AccountService {
  */
 export const SIGN_IN_START_COOLDOWN_MS = 3_000;
 
+/**
+ * How long after a device list was asked for the next one is refused
+ * (`too_soon`), so that even a renderer that misbehaves cannot ask the API
+ * for the list in a loop.
+ */
+export const LIST_DEVICES_COOLDOWN_MS = 2_000;
+
 /** The delay after the first wrong passphrase; it doubles with each one after. */
 export const UNLOCK_DELAY_FIRST_MS = 1_000;
 
@@ -225,7 +232,7 @@ export const FORGET_CONFIRMATION = Object.freeze({
   noLink: true,
   title: "This is not me",
   detail:
-    "This device is removed from that account when the server can be reached, and the device key and the account are deleted on this computer. You can then sign in with your own GitHub account.",
+    "The device key and the account are deleted on this computer. When this device is signed in with a usable key and the server can be reached, it is first removed from that account; otherwise it stays listed there, without a key, until its sign-in ends or the account removes it. You can then sign in with your own GitHub account.",
 } as const);
 
 /** The message of the confirmation, with the login of the account. */
@@ -445,7 +452,17 @@ export function createAccountService(
     | "forgetting"
     | "signing_out"
     | "removing"
+    | "listing"
     | null = null;
+  /**
+   * The refresh of the device session that runs in the background (at
+   * startup and after an unlock), or null. It may report a sign-out or
+   * retry a removal, which use the key and may write the record, so every
+   * action of the person waits for it (`backgroundSettled`).
+   */
+  let background: Promise<void> | null = null;
+  /** When the last device list was asked for, or null. */
+  let lastList: number | null = null;
   let attempt: OpenAttempt | null = null;
   let cancelRequested = false;
   /** Counts the attempts, so that a late callback of an old one changes nothing. */
@@ -601,6 +618,33 @@ export function createAccountService(
    * API has not learned yet is then reported.
    */
   async function refreshSession(): Promise<void> {
+    const run = refreshSessionNow();
+    background = run;
+    try {
+      await run;
+    } finally {
+      if (background === run) {
+        background = null;
+      }
+    }
+  }
+
+  /**
+   * Waits until no background refresh runs. Every action of the person
+   * takes the `operation` lock first and then waits here, so that it never
+   * overlaps a sign-out report or a removal that the refresh retries: the
+   * action is delayed, not refused, because the refresh is not the person's
+   * doing and the first click after a start would otherwise fail for as
+   * long as an offline request takes. While it waits, other actions answer
+   * `busy`.
+   */
+  async function backgroundSettled(): Promise<void> {
+    while (background !== null) {
+      await background;
+    }
+  }
+
+  async function refreshSessionNow(): Promise<void> {
     const held = session;
     if (held === null) {
       return;
@@ -624,6 +668,8 @@ export function createAccountService(
       deviceKey = isDeviceKeyError(error, "local_data_folder_missing")
         ? "local_data_folder_missing"
         : "failed";
+      // Without the key store there is no device session either.
+      device = "unavailable";
       report("The device key store could not be opened.");
       publish();
       return;
@@ -795,6 +841,7 @@ export function createAccountService(
     publish();
     const held = session;
     try {
+      await backgroundSettled();
       let started = await startFlow(opened, held, current);
       // The flow does not replace a key while a replacement is pending, and
       // only an authentication learns which key the API holds. When it
@@ -940,9 +987,16 @@ export function createAccountService(
     if (opened === null || account.kind !== "signed_in") {
       return Object.freeze({ outcome: "refused", reason: "not_signed_in" });
     }
-    const { login } = account;
     operation = "forgetting";
     try {
+      // A background refresh may still use the key, for example to report a
+      // sign-out, and write the record once the API answers: the forget
+      // waits for it, so that nothing writes the account back afterwards.
+      await backgroundSettled();
+      if (account.kind !== "signed_in") {
+        return Object.freeze({ outcome: "refused", reason: "not_signed_in" });
+      }
+      const { login } = account;
       // The confirmation runs in the main process, so that a renderer that
       // misbehaves cannot delete the key without the person.
       let confirmed: boolean;
@@ -1012,16 +1066,24 @@ export function createAccountService(
     }
   }
 
+  type ActionRefusal = typeof ACTION_BUSY | typeof ACTION_NOT_SIGNED_IN;
+
   /**
-   * The session for an action of the person, or why the action is refused:
-   * `busy` while a sign-in is open, the key is loading, or another action
-   * runs, and `not_signed_in` without an account or a session.
+   * Starts an action of the device session: refuses it as `busy` while a
+   * sign-in is open, the key is loading, or another action runs; takes the
+   * `operation` lock; waits for a background refresh (`backgroundSettled`);
+   * and then refuses it as `not_signed_in` without an account or a session.
+   * The caller releases the lock with `endAction` in `finally`, also after a
+   * refusal here.
    */
-  function sessionFor():
-    AccountSession | typeof ACTION_BUSY | typeof ACTION_NOT_SIGNED_IN {
+  async function beginAction(
+    kind: "signing_out" | "removing" | "listing",
+  ): Promise<AccountSession | ActionRefusal> {
     if (operation !== null || attempt !== null || deviceKey === "loading") {
       return ACTION_BUSY;
     }
+    operation = kind;
+    await backgroundSettled();
     if (system === null || session === null || account.kind !== "signed_in") {
       return ACTION_NOT_SIGNED_IN;
     }
@@ -1029,18 +1091,29 @@ export function createAccountService(
   }
 
   function isRefusal(
-    value: AccountSession | typeof ACTION_BUSY | typeof ACTION_NOT_SIGNED_IN,
-  ): value is typeof ACTION_BUSY | typeof ACTION_NOT_SIGNED_IN {
+    value: AccountSession | ActionRefusal,
+  ): value is ActionRefusal {
     return "outcome" in value;
   }
 
-  async function signOut(): Promise<SignOutResult> {
-    const held = sessionFor();
-    if (isRefusal(held)) {
-      return held;
+  /** Releases the lock that `beginAction` took; `busy` took none. */
+  function endAction(value: AccountSession | ActionRefusal): void {
+    if (value !== ACTION_BUSY) {
+      operation = null;
     }
-    operation = "signing_out";
+  }
+
+  async function signOut(): Promise<SignOutResult> {
+    const held = await beginAction("signing_out");
     try {
+      if (isRefusal(held)) {
+        return held;
+      }
+      if (device === "removal_pending") {
+        // A sign-out would end the removal that the person confirmed; it is
+        // retried at the next start or by removing the device again.
+        return Object.freeze({ outcome: "failed", reason: "removal_pending" });
+      }
       // P-65: the session keeps the device, its key, and its record; the
       // sign-out holds on the device at once, and the API learns it now or
       // later.
@@ -1055,26 +1128,29 @@ export function createAccountService(
       report("The sign-out failed.");
       return ACTION_FAILED;
     } finally {
-      operation = null;
+      endAction(held);
     }
   }
 
   async function removeDevice(): Promise<RemoveDeviceResult> {
-    const held = sessionFor();
-    if (isRefusal(held)) {
-      return held;
-    }
-    if (account.kind !== "signed_in") {
-      return ACTION_NOT_SIGNED_IN;
-    }
-    if (device === "signed_out" || device === "sign_out_report_pending") {
-      // The API takes no request of a signed-out device, so the person is
-      // not asked for a removal that cannot happen: they sign in first.
-      return Object.freeze({ outcome: "failed", reason: "signed_out" });
-    }
-    const { login } = account;
-    operation = "removing";
+    const held = await beginAction("removing");
     try {
+      if (isRefusal(held)) {
+        return held;
+      }
+      if (account.kind !== "signed_in") {
+        return ACTION_NOT_SIGNED_IN;
+      }
+      // The person is not asked for a removal that cannot happen: the API
+      // takes no request of a signed-out device (they sign in first), and a
+      // key that waits for its passphrase cannot sign.
+      if (device === "signed_out" || device === "sign_out_report_pending") {
+        return Object.freeze({ outcome: "failed", reason: "signed_out" });
+      }
+      if (device === "key_not_loaded" || deviceKey !== "ready") {
+        return Object.freeze({ outcome: "failed", reason: "key_not_loaded" });
+      }
+      const { login } = account;
       // The confirmation runs in the main process, so that a renderer that
       // misbehaves cannot remove the device without the person.
       let confirmed: boolean;
@@ -1103,17 +1179,31 @@ export function createAccountService(
       report("The device could not be removed.");
       return ACTION_FAILED;
     } finally {
-      operation = null;
+      endAction(held);
     }
   }
 
   async function listDevices(): Promise<ListDevicesResult> {
-    const held = sessionFor();
-    if (isRefusal(held)) {
-      return held;
-    }
+    const held = await beginAction("listing");
     try {
+      if (isRefusal(held)) {
+        return held;
+      }
+      if (account.kind !== "signed_in") {
+        return ACTION_NOT_SIGNED_IN;
+      }
+      if (lastList !== null && now() - lastList < LIST_DEVICES_COOLDOWN_MS) {
+        return Object.freeze({ outcome: "refused", reason: "too_soon" });
+      }
+      const deviceId = account.deviceId;
+      lastList = now();
       const result = await held.listDevices();
+      // The list belongs to the device that asked: when the account changed
+      // meanwhile (for example the session found the device revoked), it is
+      // dropped.
+      if (account.kind !== "signed_in" || account.deviceId !== deviceId) {
+        return ACTION_NOT_SIGNED_IN;
+      }
       if (!result.ok) {
         return actionFailed(result);
       }
@@ -1124,6 +1214,8 @@ export function createAccountService(
     } catch {
       report("The device list could not be read.");
       return ACTION_FAILED;
+    } finally {
+      endAction(held);
     }
   }
 

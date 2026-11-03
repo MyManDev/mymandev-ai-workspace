@@ -266,6 +266,7 @@ export const DEVICE_ACTION_FAILURE_MESSAGES: Readonly<
 export const DEVICE_ACTION_MESSAGES = Object.freeze({
   busy: "Wait until the sign-in or the current change of the account is finished.",
   notSignedIn: "This installation holds no account.",
+  tooSoon: "Wait a few seconds before you ask for the devices again.",
   signOutFailed: "The sign-out could not be completed. Try again.",
   removeFailed: "The device could not be removed. Try again.",
   listFailed: "The devices could not be listed. Try again.",
@@ -276,13 +277,21 @@ export const DEVICE_ACTION_MESSAGES = Object.freeze({
 /** The message for a device action that did not succeed, or none. */
 function deviceActionMessage(
   result:
-    | { readonly outcome: "refused"; readonly reason: "busy" | "not_signed_in" }
+    | {
+        readonly outcome: "refused";
+        readonly reason: "busy" | "not_signed_in" | "too_soon";
+      }
     | { readonly outcome: "failed"; readonly reason: DeviceActionFailure },
 ): string {
   if (result.outcome === "refused") {
-    return result.reason === "busy"
-      ? DEVICE_ACTION_MESSAGES.busy
-      : DEVICE_ACTION_MESSAGES.notSignedIn;
+    switch (result.reason) {
+      case "busy":
+        return DEVICE_ACTION_MESSAGES.busy;
+      case "not_signed_in":
+        return DEVICE_ACTION_MESSAGES.notSignedIn;
+      case "too_soon":
+        return DEVICE_ACTION_MESSAGES.tooSoon;
+    }
   }
   return DEVICE_ACTION_FAILURE_MESSAGES[result.reason];
 }

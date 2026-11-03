@@ -20,6 +20,7 @@ import type {
 } from "../shared/ipc-contract.ts";
 import {
   createAccountService,
+  LIST_DEVICES_COOLDOWN_MS,
   SIGN_IN_START_COOLDOWN_MS,
   type AccountService,
 } from "./account.ts";
@@ -818,6 +819,10 @@ function deviceApi() {
     signatures: [] as string[],
     signInBodies: [] as string[],
     routes: [] as string[],
+    /** Holds every answer to `POST /auth/access-token` until it resolves. */
+    tokenGate: null as Promise<void> | null,
+    /** Called when a request arrives. */
+    onRequest: null as ((route: string) => void) | null,
   };
   const nonces = new Map<string, string>();
   const fetch = async (url: string, init: RequestInit): Promise<Response> => {
@@ -826,6 +831,7 @@ function deviceApi() {
     const method = init.method ?? "GET";
     const route = `${method} ${parsed.pathname}`;
     api.routes.push(route);
+    api.onRequest?.(route);
     const text = init.body === undefined ? "" : String(init.body);
     const body =
       text === "" ? {} : (JSON.parse(text) as Record<string, string>);
@@ -856,6 +862,7 @@ function deviceApi() {
       return json(200, { challengeId, nonce });
     }
     if (route === "POST /auth/access-token") {
+      await api.tokenGate;
       const challengeId = body["challengeId"] ?? "";
       const signature = body["signature"] ?? "";
       api.signatures.push(signature);
@@ -1053,6 +1060,7 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   await expect(keyStore.hasKey()).resolves.toBe(true);
   expect(await records.read()).toMatchObject({ kind: "record" });
   const routesAfterSignOut = api.routes.length;
+  clock += LIST_DEVICES_COOLDOWN_MS;
   await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toEqual({
     outcome: "failed",
     reason: "signed_out",
@@ -1069,6 +1077,7 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     "octocat",
   );
   expect(await device()).toBe("signed_in");
+  clock += LIST_DEVICES_COOLDOWN_MS;
   await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toMatchObject({
     outcome: "listed",
   });
@@ -1128,4 +1137,102 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   expect(sent).not.toMatch(
     /mmdc_|mmda_|codeVerifier|Signature|pkcs8|publicKey|accessToken|userId/i,
   );
+}, 20_000);
+
+test("This is not me during a sign-out report of the startup refresh never writes the other account back", async () => {
+  const folder = path.join(root, "MyManDev");
+  const keyStore = createDeviceKeyStore({
+    folder,
+    platform: "win32",
+    systemProtection: {
+      isAsyncEncryptionAvailable: () => Promise.resolve(true),
+      getSelectedStorageBackend: () => "unknown",
+      encryptStringAsync: (plainText) =>
+        Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8")),
+      decryptStringAsync: (ciphertext) =>
+        Promise.resolve({
+          shouldReEncrypt: false,
+          result: ciphertext.toString("utf8").slice("fake:".length),
+        }),
+    },
+  });
+  const records = createDeviceRecordStore({ folder, platform: "win32" });
+  // The installation holds the other account: a sign-in replaced its key
+  // without a clear answer (the record names the previous key), and the
+  // person signed out while offline, so the report is pending. The API
+  // holds the new key.
+  const previous = await keyStore.create({ kind: "system" });
+  await records.write({
+    deviceId: DEVICE_ID,
+    userId: USER_ID,
+    login: "octocat",
+    displayName: "The Octocat",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    publicKey: previous.publicKey,
+  });
+  const replaced = await keyStore.replace();
+  await createSignOutMarkerStore({ folder, platform: "win32" }).write({
+    publicKeys: [replaced.current.publicKey, previous.publicKey],
+    reported: false,
+  });
+  const { api, fetch } = deviceApi();
+  api.publicKey = replaced.current.publicKey;
+  // The answer to the token request of the report is held back.
+  let release: () => void = () => undefined;
+  api.tokenGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const tokenAsked = new Promise<void>((resolve) => {
+    api.onRequest = (route) => {
+      if (route === "POST /auth/access-token") {
+        resolve();
+      }
+    };
+  });
+  const service = createAccountService({
+    apiOrigin: { ok: true, origin: API_ORIGIN },
+    openSystem: () => ({
+      keyStore,
+      deviceRecords: records,
+      createFlow: () =>
+        createSignInFlow({
+          apiOrigin: { ok: true, origin: API_ORIGIN },
+          keyStore,
+          deviceRecords: records,
+          openExternal: async () => true,
+          fetch,
+          platform: "win32",
+          scheduleTimer: () => () => undefined,
+        }),
+      createSession: () => sessionOver(folder, keyStore, records, fetch),
+    }),
+    focusWindow: () => undefined,
+    confirmForget: async () => true,
+    confirmRemoveDevice: async () => true,
+  });
+
+  // The startup refresh finds the pending report and sends it.
+  const initializing = service.initialize();
+  await tokenAsked;
+  expect(service.status().device).toBe("sign_out_report_pending");
+
+  // "This is not me" while the token answer is on its way.
+  const forgetting = service.forgetAccount();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  release();
+  await initializing;
+
+  await expect(forgetting).resolves.toEqual({
+    outcome: "forgotten",
+    removedAtServer: false,
+  });
+  // Nothing wrote the other account back.
+  expect(await records.read()).toEqual({ kind: "none" });
+  await expect(keyStore.hasKey()).resolves.toBe(false);
+  expect(service.status()).toMatchObject({
+    account: { kind: "signed_out" },
+    device: "no_device",
+  });
+  // The report reached the API before the forget.
+  expect(api.signedOut).toBe(true);
 }, 20_000);

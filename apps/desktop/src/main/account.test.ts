@@ -20,6 +20,7 @@ import {
   createAccountService,
   FORGET_CONFIRMATION,
   forgetConfirmationMessage,
+  LIST_DEVICES_COOLDOWN_MS,
   forgetConfirmed,
   SIGN_IN_START_COOLDOWN_MS,
   signInOutcomeView,
@@ -508,6 +509,7 @@ test("a key store that cannot be opened shows why", async () => {
     expect(h.service.status()).toMatchObject({
       account: { kind: "signed_out" },
       deviceKey,
+      device: "unavailable",
     });
     expect(h.errors).toEqual(["The device key store could not be opened."]);
     await expect(h.service.startSignIn()).resolves.toEqual({
@@ -1187,7 +1189,7 @@ test("the confirmation of This is not me names the login, offers Keep as the def
     noLink: true,
     title: "This is not me",
     detail:
-      "This device is removed from that account when the server can be reached, and the device key and the account are deleted on this computer. You can then sign in with your own GitHub account.",
+      "The device key and the account are deleted on this computer. When this device is signed in with a usable key and the server can be reached, it is first removed from that account; otherwise it stays listed there, without a key, until its sign-in ends or the account removes it. You can then sign in with your own GitHub account.",
   });
   expect(Object.isFrozen(FORGET_CONFIRMATION)).toBe(true);
   expect(Object.isFrozen(FORGET_CONFIRMATION.buttons)).toBe(true);
@@ -2000,11 +2002,13 @@ test("the device list holds only the fields that the renderer may see, with the 
   );
 
   h.listDevices = async () => ({ ok: false, reason: "no_answer" });
+  h.clock += LIST_DEVICES_COOLDOWN_MS;
   await expect(h.service.listDevices()).resolves.toEqual({
     outcome: "failed",
     reason: "no_answer",
   });
   h.listDevices = () => Promise.reject(new Error("broken"));
+  h.clock += LIST_DEVICES_COOLDOWN_MS;
   await expect(h.service.listDevices()).resolves.toEqual({
     outcome: "failed",
     reason: "failed",
@@ -2052,4 +2056,172 @@ test("This is not me forgets the account on this installation also when the API 
     expect(h.errors).toEqual(errors);
     expect(h.service.status().account).toEqual({ kind: "signed_out" });
   }
+});
+
+// ---- Review fixes: background refresh, removal, list --------------------
+
+/** Holds the fake session's next `reportSignOut` until `release`. */
+function holdReport(h: Harness): () => void {
+  let release: () => void = () => undefined;
+  const answer = h.reportSignOut;
+  h.reportSignOut = () => {
+    h.reportSignOut = answer;
+    return new Promise((resolve) => {
+      release = () => resolve({ ok: true, value: "reported" });
+    });
+  };
+  return () => release();
+}
+
+const SIGNED_OUT_PENDING: DeviceSessionState = Object.freeze({
+  kind: "signed_out",
+  account: SESSION_ACCOUNT,
+  reportPending: true,
+});
+
+test("This is not me waits for the background refresh before it asks, removes, or deletes anything", async () => {
+  const h = harness();
+  h.sessionState = SIGNED_OUT_PENDING;
+  const release = holdReport(h);
+
+  const initializing = h.service.initialize();
+  await settle();
+  expect(h.log.at(-1)).toBe("session reportSignOut");
+  const forgetting = h.service.forgetAccount();
+  // The forget holds the lock while it waits: other actions are busy.
+  for (const action of [
+    h.service.forgetAccount,
+    h.service.signOut,
+    h.service.removeDevice,
+    h.service.listDevices,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+  await settle();
+  expect(h.log.at(-1)).toBe("session reportSignOut");
+
+  release();
+  await initializing;
+  await expect(forgetting).resolves.toEqual({
+    outcome: "forgotten",
+    removedAtServer: true,
+  });
+  const reported = h.log.indexOf("session reportSignOut");
+  expect(h.log.slice(reported + 1, reported + 4)).toEqual([
+    "confirm octocat",
+    "session removeDevice",
+    "delete record",
+  ]);
+});
+
+test("every action of the session waits for the background refresh, also the one after an unlock", async () => {
+  const actions: [string, (h: Harness) => Promise<unknown>, string][] = [
+    ["sign-out", (h) => h.service.signOut(), "session signOut"],
+    ["removal", (h) => h.service.removeDevice(), "confirm removal octocat"],
+    ["list", (h) => h.service.listDevices(), "session listDevices"],
+    ["sign-in", (h) => h.service.startSignIn(), "session signInStarted"],
+  ];
+  for (const [name, act, step] of actions) {
+    const h = harness();
+    h.load = async (passphrase) => {
+      if (passphrase === undefined) {
+        throw new DeviceKeyError("passphrase_required");
+      }
+    };
+    await h.service.initialize();
+    // After the unlock the session finds the sign-out to report.
+    h.sessionState = SIGNED_OUT_PENDING;
+    const release = holdReport(h);
+    await h.service.unlockDeviceKey(PASSPHRASE);
+    await settle();
+    expect(h.log.at(-1), name).toBe("session reportSignOut");
+    h.emit(SESSION_SIGNED_IN);
+
+    const acting = act(h);
+    await settle();
+    expect(h.log, name).not.toContain(step);
+    release();
+    await acting;
+    expect(h.log.indexOf(step), name).toBeGreaterThan(
+      h.log.indexOf("session reportSignOut"),
+    );
+  }
+});
+
+test("sign-out is refused while a removal is pending, so a confirmed removal is never dropped", async () => {
+  const h = harness();
+  h.sessionState = { kind: "removal_pending", account: SESSION_ACCOUNT };
+  await h.service.initialize();
+
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "failed",
+    reason: "removal_pending",
+  });
+  expect(h.log).not.toContain("session signOut");
+  // The removal can be retried.
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "removed",
+  });
+});
+
+test("removing this device is refused before the confirmation while the key waits for its passphrase", async () => {
+  const h = harness();
+  h.load = () => Promise.reject(new DeviceKeyError("passphrase_required"));
+  h.sessionState = { kind: "key_not_loaded", account: SESSION_ACCOUNT };
+  await h.service.initialize();
+
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "failed",
+    reason: "key_not_loaded",
+  });
+  expect(h.log.filter((step) => step.startsWith("confirm"))).toEqual([]);
+  expect(h.log).not.toContain("session removeDevice");
+});
+
+test("the device list takes the lock, waits a cooldown between requests, and is dropped when the account changed meanwhile", async () => {
+  const h = harness();
+  await h.service.initialize();
+  let answer: () => void = () => undefined;
+  h.listDevices = () =>
+    new Promise((resolve) => {
+      answer = () => resolve({ ok: true, value: [DEVICE_ITEM] });
+    });
+
+  const listing = h.service.listDevices();
+  await settle();
+  for (const action of [
+    h.service.signOut,
+    h.service.removeDevice,
+    h.service.forgetAccount,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+  answer();
+  await expect(listing).resolves.toMatchObject({ outcome: "listed" });
+
+  h.clock += LIST_DEVICES_COOLDOWN_MS - 1;
+  await expect(h.service.listDevices()).resolves.toEqual({
+    outcome: "refused",
+    reason: "too_soon",
+  });
+  expect(h.log.filter((step) => step === "session listDevices")).toHaveLength(
+    1,
+  );
+
+  // The session finds the device revoked while the list is on its way.
+  h.clock += 1;
+  h.listDevices = async () => {
+    h.emit({ kind: "revoked" });
+    return { ok: true, value: [DEVICE_ITEM] };
+  };
+  await expect(h.service.listDevices()).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+  });
 });

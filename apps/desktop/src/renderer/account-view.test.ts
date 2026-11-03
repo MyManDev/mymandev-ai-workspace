@@ -174,6 +174,7 @@ test("every failure of a device action has its own message, and a success none",
   for (const [reason, text] of [
     ["busy", DEVICE_ACTION_MESSAGES.busy],
     ["not_signed_in", DEVICE_ACTION_MESSAGES.notSignedIn],
+    ["too_soon", DEVICE_ACTION_MESSAGES.tooSoon],
   ] as const) {
     const refused = { outcome: "refused", reason } as const;
     expect(signOutMessage(refused)).toBe(text);

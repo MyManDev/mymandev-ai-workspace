@@ -480,12 +480,14 @@ export type ForgetResult = z.infer<typeof ForgetResultSchema>;
 /**
  * Why an action of the device session (sign-out, removing this device, the
  * device list) was not taken: `busy` while a sign-in is open, the key is
- * loading or being unlocked, or another change of the account runs, and
- * `not_signed_in` when this installation holds no account.
+ * loading or being unlocked, or another change of the account runs,
+ * `not_signed_in` when this installation holds no account, and `too_soon`
+ * for a device list within a few seconds of the last one.
  */
 export const DEVICE_ACTION_REFUSALS = Object.freeze([
   "busy",
   "not_signed_in",
+  "too_soon",
 ] as const);
 
 /**
