@@ -99,6 +99,13 @@
       "when": 1793666497586,
       "tag": "0013_agent_run_transitions",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1793668564965,
+      "tag": "0014_device_first_authenticated",
+      "breakpoints": true
     }
   ]
 }

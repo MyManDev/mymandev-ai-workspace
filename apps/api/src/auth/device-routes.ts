@@ -3,6 +3,7 @@ import {
   type Database,
   deviceRow,
   devices,
+  markDeviceAuthenticated,
   revokeDevice,
   users,
 } from "@mymandev/database";
@@ -175,6 +176,12 @@ export async function registerDeviceRoutes(
           case "ok":
             break;
         }
+        // The device proved its key under its ID, so it no longer repeats
+        // its registration (#153); recorded before the token exists.
+        await markDeviceAuthenticated(database, {
+          deviceId: body.deviceId,
+          now: new Date(options.now()),
+        });
         // The token belongs to the sign-in whose key signed; a newer sign-in ends it.
         const issued = tokens.issue({
           userId: state.userId,

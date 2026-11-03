@@ -1,6 +1,6 @@
 // Connects the account service to Electron: the device key store
-// (device-key/system.ts), the device record in the key's folder, the
-// sign-in flow (sign-in/system.ts), the device session (session/system.ts),
+// (device-key/system.ts), the device record and the registration marker in
+// the key's folder, the sign-in flow (sign-in/system.ts), the device session (session/system.ts),
 // and the API origin of this build. It
 // stays thin and is not tested directly; the type check proves that the
 // parts fit the service.
@@ -15,6 +15,7 @@ import { deviceKeyFolder } from "./device-key/key-folder.ts";
 import { createSystemDeviceKeyStore } from "./device-key/system.ts";
 import { createDeviceRecordStore } from "./device-record.ts";
 import { createSystemDeviceSession } from "./session/system.ts";
+import { createRegistrationMarkerStore } from "./sign-in/registration-marker.ts";
 import { createSystemSignInFlow } from "./sign-in/system.ts";
 
 export interface SystemAccountOptions {
@@ -40,22 +41,33 @@ export function createSystemAccountService(
     }),
     openSystem: () => {
       const keyStore = createSystemDeviceKeyStore(options.onError);
+      const folder = deviceKeyFolder({
+        platform: process.platform,
+        env: process.env,
+        userData: app.getPath("userData"),
+      });
       // One record store, in the key's folder, for the service, the flow,
       // and the session.
       const deviceRecords = createDeviceRecordStore({
-        folder: deviceKeyFolder({
-          platform: process.platform,
-          env: process.env,
-          userData: app.getPath("userData"),
-        }),
+        folder,
+        platform: process.platform,
+      });
+      // One registration marker store, in the same folder, for the service
+      // and the flow (#153).
+      const registrationMarkers = createRegistrationMarkerStore({
+        folder,
         platform: process.platform,
       });
       return {
         keyStore,
         deviceRecords,
+        registrationMarkers,
         createFlow: () =>
-          createSystemSignInFlow(keyStore, deviceRecords, (message) =>
-            options.onError(message),
+          createSystemSignInFlow(
+            keyStore,
+            deviceRecords,
+            registrationMarkers,
+            (message) => options.onError(message),
           ),
         createSession: () =>
           createSystemDeviceSession(keyStore, deviceRecords, (message) =>

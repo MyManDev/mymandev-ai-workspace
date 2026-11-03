@@ -4,7 +4,9 @@
 // with the device registration to `POST /auth/sign-in`.
 //
 // It decides between a new device (no record, or no key) and an existing
-// device (a record and a loaded key). It never logs or returns the code, the
+// device (a record and a loaded key). A new device whose registration got no
+// clear answer sends the same key again at the next attempt
+// (`registration-marker.ts`, #153). It never logs or returns the code, the
 // verifier, a signature, or a key; a message for `onError` is fixed text.
 import {
   type ApiErrorCode,
@@ -25,12 +27,17 @@ import {
   type DeviceKeyErrorCode,
   isDeviceKeyError,
 } from "../device-key/errors.ts";
+import type { DeviceKey } from "../device-key/signing-key.ts";
 import type {
   DeviceKeyStore,
   NewDeviceKeyProtection,
   ReplaceDeviceKeyOptions,
 } from "../device-key/store.ts";
-import type { DeviceRecord, DeviceRecordStore } from "../device-record.ts";
+import type {
+  DeviceRecord,
+  DeviceRecordRead,
+  DeviceRecordStore,
+} from "../device-record.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 import {
   type AuthorizeSignInKind,
@@ -43,6 +50,10 @@ import {
   type SignInListenerOptions,
   startSignInListener,
 } from "./listener.ts";
+import type {
+  RegistrationMarker,
+  RegistrationMarkerStore,
+} from "./registration-marker.ts";
 
 /**
  * Shown with the authorize URL when the browser could not be opened (#149):
@@ -69,6 +80,18 @@ export const OPEN_EXTERNAL_TIMEOUT_MS = 10_000;
 export const MAX_ANSWER_BYTES = 64 * 1024;
 
 /**
+ * How long after its first attempt the key of a new device's uncertain
+ * registration is sent again (#153). The next attempt that the person
+ * starts settles it, usually within minutes; seven days also cover an
+ * outage of the API or a person who comes back after a week away. After
+ * that, a key that never had a clear answer is not kept: it is deleted, and
+ * a new device registers with a new key, as before #153. A key that the API
+ * registered then stays a device that nobody can use, until the person
+ * removes it from another device.
+ */
+export const REGISTRATION_RESEND_MS = 7 * 24 * 60 * 60_000;
+
+/**
  * Why a sign-in failed without an answer of the API that names a code:
  *
  * - `api_origin_unset`, `api_origin_invalid`: see `resolveApiOrigin`.
@@ -89,15 +112,18 @@ export const MAX_ANSWER_BYTES = 64 * 1024;
  *   Linux a secret service is needed until the passphrase choice exists.
  * - `record_unreadable`: the record file cannot be read, or it is corrupt
  *   (for example another version, after a downgrade) while a key file
- *   exists. The key may still be the key of a device that the API knows, so
- *   it is kept; an explicit reset is a later option.
+ *   exists, or the registration marker cannot be read while a key that no
+ *   record names would be deleted (#153). The key may still be the key of a
+ *   device that the API knows, so it is kept; an explicit reset is a later
+ *   option.
  * - `listener_unavailable`: the loopback listener could not start.
  * - `no_answer`: no answer arrived (a network error, or the request timed
  *   out); a key replacement stays pending.
  * - `server_error`: a `5xx` answer. The API may have committed before it
  *   failed, so it is handled like `no_answer`.
- * - `unexpected_response`: an answer that is not one of the API's; handled
- *   like `no_answer`.
+ * - `unexpected_response`: an answer that is not one of the API's, or a new
+ *   device's `200` that names the device whose key was lost; handled like
+ *   `no_answer`.
  * - `unexpected`: an error that the flow did not expect after the attempt
  *   started, not a failure of the key store; nothing is undone.
  * - `uncertain_refusal`: the API answered with a code of
@@ -105,8 +131,9 @@ export const MAX_ANSWER_BYTES = 64 * 1024;
  *   request that committed gets that answer too, so it is handled like
  *   `no_answer`.
  * - `key_changed`: after the key replacement, the previous key is not the
- *   key that the record names, so the key store changed during the attempt.
- *   The replacement is abandoned, and nothing is signed or sent.
+ *   key that the record names, or the key that a new device sends again is
+ *   no longer the key held, so the key store changed during the attempt. A
+ *   replacement is abandoned, and nothing is signed or sent.
  * - `record_not_saved`: the API registered the device, but the record could
  *   not be written, also when tried a second time. An existing device keeps
  *   the replacement pending. The flow keeps the record in memory, and the
@@ -275,6 +302,8 @@ export interface SignInFlowDependencies {
   readonly apiOrigin: ApiOrigin;
   readonly keyStore: SignInKeyStore;
   readonly deviceRecords: DeviceRecordStore;
+  /** The marker of a new device's key whose registration got no clear answer. */
+  readonly registrationMarkers: RegistrationMarkerStore;
   /** Opens the URL in the system browser; resolves false when it could not. */
   readonly openExternal: (url: string) => Promise<boolean>;
   readonly fetch: SignInFetch;
@@ -282,6 +311,11 @@ export interface SignInFlowDependencies {
   readonly platform: NodeJS.Platform;
   /** The clock of the listener's 10 minutes and of the request; defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
+  /**
+   * The wall clock of the registration marker, in milliseconds since the
+   * epoch; defaults to `Date.now`.
+   */
+  readonly wallClock?: () => number;
   /** Passed to the listener; tests pass a shorter one. */
   readonly listenerConnectionTimeoutMs?: number;
   /** Receives a fixed message for an error that the flow handled. */
@@ -345,10 +379,16 @@ function notStarted(reason: SignInFailureReason): SignInStart {
 /**
  * The device as the flow found it at the start of an attempt. A new device
  * keeps the record of a device whose key was lost: it names that device and
- * signs in as its account.
+ * signs in as its account. `resend` is the key of an earlier registration
+ * that got no clear answer, which this attempt sends again instead of a new
+ * key (#153).
  */
 type DevicePlan =
-  | { readonly kind: "new"; readonly record: DeviceRecord | null }
+  | {
+      readonly kind: "new";
+      readonly record: DeviceRecord | null;
+      readonly resend: DeviceKey | null;
+    }
   | { readonly kind: "existing"; readonly record: DeviceRecord };
 
 /** What the API answered, read without trusting it. */
@@ -445,6 +485,7 @@ async function readAnswer(response: Response): Promise<Answer> {
 
 export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
   const scheduleTimer = deps.scheduleTimer ?? scheduleWithSetTimeout;
+  const wallClock = deps.wallClock ?? (() => Date.now());
   const report = (message: string): void => {
     try {
       deps.onError?.(message);
@@ -462,7 +503,72 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
    */
   let unsavedRecord: DeviceRecord | null = null;
 
-  /** Decides between a new and an existing device, and removes a leftover key. */
+  /**
+   * Reads the registration marker; a corrupt one names no key and is
+   * dropped. `unreadable` when the file exists but cannot be read: whether
+   * it names the key is then unknown.
+   */
+  async function readRegistrationMarker(): Promise<
+    RegistrationMarker | "unreadable" | null
+  > {
+    let read;
+    try {
+      read = await deps.registrationMarkers.read();
+    } catch {
+      report("The registration marker could not be read.");
+      return "unreadable";
+    }
+    if (read.kind === "corrupt") {
+      report("The registration marker is corrupt and is not used.");
+      await dropRegistrationMarker();
+      return null;
+    }
+    return read.kind === "marker" ? read.marker : null;
+  }
+
+  async function dropRegistrationMarker(): Promise<void> {
+    try {
+      await deps.registrationMarkers.delete();
+    } catch {
+      report("The registration marker could not be deleted.");
+    }
+  }
+
+  /**
+   * The key that this attempt sends again (#153): the loaded key that the
+   * marker names, when no record names it, no replacement is pending, and
+   * the marker's first attempt is less than `REGISTRATION_RESEND_MS` ago. A
+   * time in the future means that the clock went back, so the age is
+   * unknown and the key is not sent again. A key that is not loaded cannot
+   * sign, so it is not sent again either.
+   */
+  function resendOf(
+    marker: RegistrationMarker | null,
+    recordKey: string | null,
+  ): DeviceKey | null {
+    // The callers ask only when no record names the loaded key and no
+    // replacement is pending, so the record's key and `previous` cannot
+    // match here; both checks stay as defense in depth, so that the key
+    // of a record's device is never sent as a new device.
+    if (marker === null || marker.publicKey === recordKey) {
+      return null;
+    }
+    const keys = deps.keyStore.keys();
+    if (
+      keys === null ||
+      keys.previous !== null ||
+      keys.current.publicKey !== marker.publicKey
+    ) {
+      return null;
+    }
+    const age = wallClock() - Date.parse(marker.at);
+    return age >= 0 && age < REGISTRATION_RESEND_MS ? keys.current : null;
+  }
+
+  /**
+   * Decides between a new and an existing device, and removes a leftover
+   * key. A marker that this attempt does not send again is dropped.
+   */
   async function planDevice(): Promise<DevicePlan | SignInFailureReason> {
     if (unsavedRecord !== null) {
       try {
@@ -485,10 +591,44 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     } catch {
       return "key_store_failed";
     }
+    const marker = await readRegistrationMarker();
+    const plan = await planFrom(read, hasKey, marker);
+    if (
+      marker !== null &&
+      marker !== "unreadable" &&
+      typeof plan !== "string" &&
+      (plan.kind === "existing" || plan.resend === null)
+    ) {
+      // An expired marker, or one whose key a record names or that is gone.
+      await dropRegistrationMarker();
+    }
+    return plan;
+  }
+
+  async function planFrom(
+    read: DeviceRecordRead,
+    hasKey: boolean,
+    marker: RegistrationMarker | "unreadable" | null,
+  ): Promise<DevicePlan | SignInFailureReason> {
+    /**
+     * The key to send again, or `record_unreadable` when the marker cannot
+     * be read: the key may be one that the API holds, so it is kept.
+     */
+    const resendOrStop = (
+      recordKey: string | null,
+    ): DeviceKey | null | "record_unreadable" => {
+      if (marker === "unreadable") {
+        report(
+          "The registration marker could not be read; the device key is kept.",
+        );
+        return "record_unreadable";
+      }
+      return resendOf(marker, recordKey);
+    };
     if (read.kind === "record") {
       if (!hasKey) {
         // The key was lost: a new device that names the previous one.
-        return { kind: "new", record: read.record };
+        return { kind: "new", record: read.record, resend: null };
       }
       const keys = deps.keyStore.keys();
       if (keys === null) {
@@ -515,15 +655,24 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
         // Not the key of the record's device, and no replacement pending: a
         // confirmed key always sits next to a record that names it, so this
         // is the key of a new device whose registration got no clear answer
-        // after that device's key was lost. The API offers no way to learn
-        // the new device's ID, so a new device names the record's device
-        // again, with a new key.
+        // after that device's key was lost. Within the marker's time it is
+        // sent again, as a new device that names the record's device again
+        // (#153); it is never used with the record's device ID.
+        const resend = resendOrStop(read.record.publicKey);
+        if (resend === "record_unreadable") {
+          return resend;
+        }
+        if (resend !== null) {
+          return { kind: "new", record: read.record, resend };
+        }
+        // Otherwise the API offers no way to learn the new device's ID, so
+        // a new device names the record's device again, with a new key.
         try {
           await deps.keyStore.delete();
         } catch {
           return "key_store_failed";
         }
-        return { kind: "new", record: read.record };
+        return { kind: "new", record: read.record, resend: null };
       }
       return { kind: "existing", record: read.record };
     }
@@ -536,19 +685,28 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
         return "record_unreadable";
       }
       report("The device record is corrupt and is not used.");
-      return { kind: "new", record: null };
+      return { kind: "new", record: null, resend: null };
     }
     // The key is deleted only when no record exists at all.
     if (hasKey) {
-      // A key without a record belongs to no device that this installation
-      // knows; a new device needs a new key.
+      // The key of a first registration that got no clear answer is sent
+      // again within the marker's time (#153).
+      const resend = resendOrStop(null);
+      if (resend === "record_unreadable") {
+        return resend;
+      }
+      if (resend !== null) {
+        return { kind: "new", record: null, resend };
+      }
+      // Any other key without a record belongs to no device that this
+      // installation knows; a new device needs a new key.
       try {
         await deps.keyStore.delete();
       } catch {
         return "key_store_failed";
       }
     }
-    return { kind: "new", record: null };
+    return { kind: "new", record: null, resend: null };
   }
 
   /**
@@ -750,23 +908,30 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
   /**
    * Undoes the key change of a request that the API refused with a `4xx`
    * error body whose code is not in `UNCERTAIN_REFUSAL_CODES`, so it
-   * committed nothing.
+   * committed nothing. A new device's key is deleted, also a key sent again,
+   * and so is its registration marker: the refusal is certain, so the next
+   * attempt registers a new device with a new key, as before #153.
    *
    * When whether the API committed is unknown (no answer, a `5xx`, an answer
    * that is not the API's, or an uncertain refusal), nothing is undone: an
    * existing device keeps the replacement pending, and part 3 tries the new
-   * key first. A new device keeps its new key and the record of a lost key
-   * stays as it was. The next attempt finds a key without a record, or a key
-   * that is not the record's device's key, deletes it, and registers a new
-   * device (naming the record's device) with a new key. If the uncertain
-   * request did commit, the API offers no way to learn the ID of the device
-   * that it registered, and no installation holds that device's key. The
-   * device is never revoked on its own: after its sign-in expiry it only
-   * requires a new sign-in, which nothing can sign. Until the person removes
-   * it from another device, it is listed among the account's devices and
-   * counts toward the account's 20 active devices; it also counted toward
-   * the 10 new devices per 24 hours, and the account's other devices were
-   * told of it as a new device.
+   * key first. A new device keeps its new key and its registration marker,
+   * and the record of a lost key stays as it was. The next attempt, within
+   * `REGISTRATION_RESEND_MS` of the first, sends the same key again, as a
+   * new device that names the record's device if there is one (#153). If
+   * the earlier request committed, the API answers with the device that it
+   * registered then, without a second device and without a second alert to
+   * the account's other devices; otherwise it registers the key now.
+   *
+   * Without the marker, after that time, or when the key is not loaded, the
+   * next attempt deletes the key and registers a new device with a new key.
+   * If an uncertain request did commit, that device stays: it is never
+   * revoked on its own, and after its sign-in expiry it only requires a new
+   * sign-in, which nothing can sign. Until the person removes it from
+   * another device, it is listed among the account's devices and counts
+   * toward the account's 20 active devices; it also counted toward the 10
+   * new devices per 24 hours, and the account's other devices were told of
+   * it as a new device.
    */
   async function undoKey(plan: DevicePlan): Promise<void> {
     try {
@@ -777,6 +942,9 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       }
     } catch {
       report("The new device key could not be discarded.");
+    }
+    if (plan.kind === "new") {
+      await dropRegistrationMarker();
     }
   }
 
@@ -840,9 +1008,25 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
           newKeySignature: keys.current.sign(signed),
         };
       } else {
-        const key = await deps.keyStore.create(
-          input.options.newKeyProtection ?? { kind: "system" },
-        );
+        let key: DeviceKey;
+        if (plan.resend === null) {
+          key = await deps.keyStore.create(
+            input.options.newKeyProtection ?? { kind: "system" },
+          );
+        } else {
+          const keys = deps.keyStore.keys();
+          if (
+            keys === null ||
+            keys.previous !== null ||
+            keys.current.publicKey !== plan.resend.publicKey
+          ) {
+            // The key store changed since the attempt started: the key to
+            // send again is no longer the key held. Nothing is deleted.
+            report("The device key changed during the sign-in.");
+            return failed("key_changed");
+          }
+          key = keys.current;
+        }
         const signed: DeviceAuthInput = {
           purpose: "sign-in",
           audience: apiOrigin,
@@ -872,8 +1056,26 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     }
 
     if (input.isCancelled()) {
-      await undoKey(plan);
+      // Nothing was sent. A key sent before stays for the next attempt,
+      // because the API may hold it (#153).
+      if (plan.kind === "existing" || plan.resend === null) {
+        await undoKey(plan);
+      }
       return Object.freeze({ kind: "cancelled" });
+    }
+
+    if (plan.kind === "new" && plan.resend === null) {
+      // Written before the request, so that a stop of the application while
+      // it runs keeps the key too (#153). Without the marker, the next
+      // attempt deletes the key, as before #153.
+      try {
+        await deps.registrationMarkers.write({
+          publicKey: device.publicKey,
+          at: new Date(wallClock()).toISOString(),
+        });
+      } catch {
+        report("The registration marker could not be saved.");
+      }
     }
 
     const request: SignInRequest = {
@@ -968,6 +1170,12 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
       report("The sign-in answer named another device.");
       return failed("unexpected_response");
     }
+    if (plan.kind === "new" && account.deviceId === plan.record?.deviceId) {
+      // The new key never belongs to the device whose key was lost, which
+      // the API revokes; nothing is written with that device ID.
+      report("The sign-in answer named the replaced device.");
+      return failed("unexpected_response");
+    }
     afterAccountMismatch = false;
     const record: DeviceRecord = {
       deviceId: account.deviceId,
@@ -993,8 +1201,14 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     if (!saved) {
       // An existing device keeps the replacement pending: the record on
       // disk still names the previous key, which stays next to the new one.
+      // A new device keeps its registration marker, so that after a restart
+      // the next attempt sends the key again and gets this device (#153).
       unsavedRecord = record;
       return failed("record_not_saved");
+    }
+    if (plan.kind === "new") {
+      // The record names the key now.
+      await dropRegistrationMarker();
     }
     if (plan.kind === "existing") {
       try {

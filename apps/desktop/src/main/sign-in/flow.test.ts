@@ -29,6 +29,7 @@ import {
   createSignInFlow,
   MAX_ANSWER_BYTES,
   OPEN_EXTERNAL_TIMEOUT_MS,
+  REGISTRATION_RESEND_MS,
   SIGN_IN_REQUEST_TIMEOUT_MS,
   SIGN_IN_URL_WARNING,
   type SignInFlowDependencies,
@@ -38,6 +39,11 @@ import {
   UNCERTAIN_REFUSAL_CODES,
 } from "./flow.ts";
 import { SIGN_IN_LISTENER_TIMEOUT_MS } from "./listener.ts";
+import {
+  createRegistrationMarkerStore,
+  REGISTRATION_MARKER_FILE,
+  type RegistrationMarkerStore,
+} from "./registration-marker.ts";
 
 const API_ORIGIN = "https://api.mymandev.example";
 const SIGN_IN_URL = `${API_ORIGIN}/auth/sign-in`;
@@ -110,6 +116,7 @@ function errorAnswer(code: ApiErrorCode): Response {
 interface Harness {
   readonly keyStore: DeviceKeyStore;
   readonly records: DeviceRecordStore;
+  readonly markers: RegistrationMarkerStore;
   readonly opened: string[];
   readonly requests: { url: string; init: RequestInit; body: SignInRequest }[];
   readonly errors: string[];
@@ -126,6 +133,7 @@ function harness(overrides: Partial<SignInFlowDependencies> = {}): Harness {
     systemProtection: fakeSafeStorage,
   });
   const records = createDeviceRecordStore({ folder, platform: "win32" });
+  const markers = createRegistrationMarkerStore({ folder, platform: "win32" });
   const timers: Harness["timers"] = [];
   const scheduleTimer: ScheduleTimer = (callback, delayMs) => {
     const timer = { delayMs, callback };
@@ -140,6 +148,7 @@ function harness(overrides: Partial<SignInFlowDependencies> = {}): Harness {
   const state: Harness = {
     keyStore,
     records,
+    markers,
     opened: [],
     requests: [],
     errors: [],
@@ -152,6 +161,7 @@ function harness(overrides: Partial<SignInFlowDependencies> = {}): Harness {
     apiOrigin: { ok: true, origin: API_ORIGIN },
     keyStore,
     deviceRecords: records,
+    registrationMarkers: markers,
     openExternal: (url) => {
       state.opened.push(url);
       return state.openResult();
@@ -506,7 +516,7 @@ describe("a new device", () => {
     expect(outcome).toMatchObject({ kind: "signed_in" });
   }, 20_000);
 
-  test("keeps a new device's key and the old record on a 5xx answer, and registers again next time", async () => {
+  test("keeps a new device's key and the old record on a 5xx answer, and sends the same key again next time (#153)", async () => {
     const h = harness();
     // The key of the recorded device was lost.
     await h.records.write(RECORD);
@@ -518,21 +528,48 @@ describe("a new device", () => {
     expect(h.keyStore.keys()?.current.publicKey).toBe(kept);
     expect(await h.keyStore.hasKey()).toBe(true);
     expect(await h.records.read()).toEqual({ kind: "record", record: RECORD });
+    expect(await h.markers.read()).toMatchObject({
+      kind: "marker",
+      marker: { publicKey: kept },
+    });
 
     // The kept key is not the record's device's key, so it is never used
-    // with that device ID: the next attempt registers a new device again.
+    // with that device ID: the next attempt sends it again as a new device
+    // that names the record's device, and the API answers with the device
+    // that it registered.
     h.answer = () => json(200, { ...ANSWER, deviceId: OTHER_DEVICE_ID });
     const second = await signIn(h);
     const device = h.requests[1]?.body.device;
-    expect(device).toMatchObject({ kind: "new", previousDeviceId: DEVICE_ID });
-    expect(device?.publicKey).not.toBe(kept);
+    expect(device).toMatchObject({
+      kind: "new",
+      publicKey: kept,
+      previousDeviceId: DEVICE_ID,
+    });
+    if (device?.kind !== "new") {
+      throw new Error("expected a new device");
+    }
+    expect(
+      verifies(
+        device.publicKey,
+        {
+          purpose: "sign-in",
+          audience: API_ORIGIN,
+          signInCode: SIGN_IN_CODE,
+          deviceId: null,
+          newPublicKey: device.publicKey,
+        },
+        device.newKeySignature,
+      ),
+    ).toBe(true);
     expect(second.outcome).toMatchObject({
       kind: "signed_in",
       newDevice: true,
     });
     expect(await h.records.read()).toMatchObject({
-      record: { deviceId: OTHER_DEVICE_ID, publicKey: device?.publicKey },
+      record: { deviceId: OTHER_DEVICE_ID, publicKey: kept },
     });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(kept);
+    expect(await h.markers.read()).toEqual({ kind: "none" });
   }, 30_000);
 
   test("keeps a first sign-in's key when no answer arrives", async () => {
@@ -651,6 +688,388 @@ describe("a new device", () => {
     await next.outcome;
     expect(h.keyStore.keys()?.current.publicKey).toBe(registered);
   }, 20_000);
+});
+
+describe("a new device's registration without a clear answer (#153)", () => {
+  const FIRST = Date.parse("2026-11-03T10:00:00.000Z");
+
+  /** A first sign-in whose request got no answer; returns the key it sent. */
+  async function unanswered(h: Harness): Promise<string> {
+    h.answer = () => {
+      throw new TypeError("fetch failed");
+    };
+    const { outcome } = await signIn(h);
+    expect(outcome).toEqual({ kind: "failed", reason: "no_answer" });
+    const key = h.requests.at(-1)?.body.device.publicKey;
+    if (key === undefined) {
+      throw new Error("nothing was sent");
+    }
+    return key;
+  }
+
+  /** The new device's request of the latest attempt. */
+  function lastNewDevice(h: Harness) {
+    const device = h.requests.at(-1)?.body.device;
+    if (device?.kind !== "new") {
+      throw new Error("expected a new device");
+    }
+    return device;
+  }
+
+  test("writes the marker with the key and the time before the request", async () => {
+    const h = harness({ wallClock: () => FIRST });
+    let during: unknown;
+    h.answer = async () => {
+      during = await h.markers.read();
+      throw new TypeError("fetch failed");
+    };
+    await signIn(h);
+    const key = h.requests[0]?.body.device.publicKey;
+    const marker = { publicKey: key, at: new Date(FIRST).toISOString() };
+    expect(during).toEqual({ kind: "marker", marker });
+    expect(
+      JSON.parse(
+        await readFile(path.join(folder, REGISTRATION_MARKER_FILE), "utf8"),
+      ),
+    ).toEqual({ version: 1, ...marker });
+  }, 20_000);
+
+  test("a first sign-in sends the same key again, without a previous device, keeps the first time, and writes the record with the device that the API answers", async () => {
+    let clock = FIRST;
+    const h = harness({ wallClock: () => clock });
+    const key = await unanswered(h);
+
+    clock += 60 * 60_000;
+    let during: unknown;
+    h.answer = async () => {
+      during = await h.markers.read();
+      return json(200, ANSWER);
+    };
+    const { outcome } = await signIn(h);
+    const device = lastNewDevice(h);
+    expect(device.publicKey).toBe(key);
+    expect(device).not.toHaveProperty("previousDeviceId");
+    expect(
+      verifies(
+        key,
+        {
+          purpose: "sign-in",
+          audience: API_ORIGIN,
+          signInCode: SIGN_IN_CODE,
+          deviceId: null,
+          newPublicKey: key,
+        },
+        device.newKeySignature,
+      ),
+    ).toBe(true);
+    expect(during).toEqual({
+      kind: "marker",
+      marker: { publicKey: key, at: new Date(FIRST).toISOString() },
+    });
+    expect(outcome).toMatchObject({ kind: "signed_in", newDevice: true });
+    expect(await h.records.read()).toEqual({
+      kind: "record",
+      record: { ...ANSWER, publicKey: key },
+    });
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+  }, 30_000);
+
+  test("keeps the key, the marker, and its first time when the resend gets no clear answer again", async () => {
+    let clock = FIRST;
+    const h = harness({ wallClock: () => clock });
+    const key = await unanswered(h);
+    clock += 60 * 60_000;
+    h.answer = () => json(500, SERVER_ERROR);
+    expect((await signIn(h)).outcome).toEqual({
+      kind: "failed",
+      reason: "server_error",
+    });
+    expect(lastNewDevice(h).publicKey).toBe(key);
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key);
+    expect(await h.markers.read()).toEqual({
+      kind: "marker",
+      marker: { publicKey: key, at: new Date(FIRST).toISOString() },
+    });
+  }, 30_000);
+
+  test("a certain refusal of the resend deletes the key and the marker, and the next attempt registers a new key", async () => {
+    const h = harness({ wallClock: () => FIRST });
+    const key = await unanswered(h);
+    h.answer = () => errorAnswer("conflict");
+    expect((await signIn(h)).outcome).toEqual({
+      kind: "refused",
+      code: "conflict",
+    });
+    expect(lastNewDevice(h).publicKey).toBe(key);
+    expect(await h.keyStore.hasKey()).toBe(false);
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+
+    h.answer = () => json(200, ANSWER);
+    await signIn(h);
+    expect(lastNewDevice(h).publicKey).not.toBe(key);
+  }, 30_000);
+
+  test("sends the key again until 7 days after the first attempt, then deletes it and registers a new key", async () => {
+    let clock = FIRST;
+    const h = harness({ wallClock: () => clock });
+    const key = await unanswered(h);
+    expect(REGISTRATION_RESEND_MS).toBe(7 * 24 * 60 * 60_000);
+
+    clock = FIRST + REGISTRATION_RESEND_MS - 1;
+    h.answer = () => json(500, SERVER_ERROR);
+    await signIn(h);
+    expect(lastNewDevice(h).publicKey).toBe(key);
+
+    clock = FIRST + REGISTRATION_RESEND_MS;
+    await signIn(h);
+    const fresh = lastNewDevice(h).publicKey;
+    expect(fresh).not.toBe(key);
+    expect(h.keyStore.keys()?.current.publicKey).toBe(fresh);
+    // The new key's own registration got no clear answer either.
+    expect(await h.markers.read()).toEqual({
+      kind: "marker",
+      marker: { publicKey: fresh, at: new Date(clock).toISOString() },
+    });
+  }, 30_000);
+
+  test("does not send the key again when the marker's time is in the future", async () => {
+    let clock = FIRST;
+    const h = harness({ wallClock: () => clock });
+    const key = await unanswered(h);
+    clock = FIRST - 1;
+    h.answer = () => json(200, ANSWER);
+    await signIn(h);
+    expect(lastNewDevice(h).publicKey).not.toBe(key);
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+  }, 30_000);
+
+  test("a marker that names another key, or a corrupt one, is dropped, and a leftover key is deleted as before", async () => {
+    const h = harness({ wallClock: () => FIRST });
+    h.answer = () => json(200, ANSWER);
+    const leftover = await h.keyStore.create({ kind: "system" });
+    await h.markers.write({
+      publicKey: randomPublicKey(),
+      at: new Date(FIRST).toISOString(),
+    });
+    await signIn(h);
+    expect(lastNewDevice(h).publicKey).not.toBe(leftover.publicKey);
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+
+    await h.records.delete();
+    const corruptLeftover = h.keyStore.keys()?.current.publicKey;
+    await writeFile(path.join(folder, REGISTRATION_MARKER_FILE), "{");
+    await signIn(h);
+    expect(lastNewDevice(h).publicKey).not.toBe(corruptLeftover);
+    expect(h.errors).toContain(
+      "The registration marker is corrupt and is not used.",
+    );
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+  }, 30_000);
+
+  test("a marker whose key the record names is dropped, and the device signs in as an existing device", async () => {
+    const h = harness({ wallClock: () => FIRST });
+    const key = await existingDevice(h);
+    await h.markers.write({
+      publicKey: key,
+      at: new Date(FIRST).toISOString(),
+    });
+    await signIn(h);
+    expect(h.requests[0]?.body.device).toMatchObject({
+      kind: "existing",
+      deviceId: DEVICE_ID,
+    });
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+  }, 20_000);
+
+  test("after a restart, the loaded key is sent again; a key that is not loaded is deleted as before", async () => {
+    const h = harness({ wallClock: () => FIRST });
+    const key = await unanswered(h);
+
+    const restarted = harness({ wallClock: () => FIRST });
+    await restarted.keyStore.load();
+    restarted.answer = () => json(500, SERVER_ERROR);
+    await signIn(restarted);
+    expect(lastNewDevice(restarted).publicKey).toBe(key);
+
+    // A store that never loaded the key cannot sign with it.
+    const notLoaded = harness({ wallClock: () => FIRST });
+    notLoaded.answer = () => json(200, ANSWER);
+    await signIn(notLoaded);
+    expect(lastNewDevice(notLoaded).publicKey).not.toBe(key);
+    expect(await notLoaded.markers.read()).toEqual({ kind: "none" });
+  }, 30_000);
+
+  test("after a 200 whose record could not be written and a restart, sends the same key again and writes the record", async () => {
+    const records = createDeviceRecordStore({ folder, platform: "win32" });
+    const h = harness({
+      wallClock: () => FIRST,
+      deviceRecords: {
+        read: records.read,
+        delete: records.delete,
+        write: () => Promise.reject(new Error("disk full")),
+      },
+    });
+    expect((await signIn(h)).outcome).toEqual({
+      kind: "failed",
+      reason: "record_not_saved",
+    });
+    const key = lastNewDevice(h).publicKey;
+    expect(await h.markers.read()).toMatchObject({
+      marker: { publicKey: key },
+    });
+
+    // The application quit before the record could be written.
+    const restarted = harness({ wallClock: () => FIRST });
+    await restarted.keyStore.load();
+    const { outcome } = await signIn(restarted);
+    expect(lastNewDevice(restarted).publicKey).toBe(key);
+    expect(outcome).toMatchObject({ kind: "signed_in" });
+    expect(await restarted.records.read()).toEqual({
+      kind: "record",
+      record: { ...ANSWER, publicKey: key },
+    });
+    expect(await restarted.markers.read()).toEqual({ kind: "none" });
+  }, 30_000);
+
+  test("a cancelled attempt keeps the key and the marker for the next one, also after the code arrived", async () => {
+    const h = harness({ wallClock: () => FIRST });
+    const key = await unanswered(h);
+    const start = started(await h.flow.start());
+    start.cancel();
+    expect(await start.outcome).toEqual({ kind: "cancelled" });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key);
+    expect(await h.markers.read()).toMatchObject({
+      marker: { publicKey: key },
+    });
+
+    // Cancelled once the code arrived, before the request: nothing is sent,
+    // and the key that the API may hold stays.
+    let cancel = (): void => undefined;
+    const late = started(await h.flow.start({ onCallback: () => cancel() }));
+    cancel = late.cancel;
+    await deliverCode(h.opened.at(-1) ?? "");
+    expect(await late.outcome).toEqual({ kind: "cancelled" });
+    expect(h.requests).toHaveLength(1);
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key);
+    expect(await h.markers.read()).toMatchObject({
+      marker: { publicKey: key },
+    });
+
+    h.answer = () => json(200, ANSWER);
+    await signIn(h);
+    expect(lastNewDevice(h).publicKey).toBe(key);
+  }, 30_000);
+
+  test("a fresh key cancelled once the code arrived is deleted without a marker", async () => {
+    const h = harness({ wallClock: () => FIRST });
+    let cancel = (): void => undefined;
+    const start = started(await h.flow.start({ onCallback: () => cancel() }));
+    cancel = start.cancel;
+    await deliverCode(h.opened.at(-1) ?? "");
+    expect(await start.outcome).toEqual({ kind: "cancelled" });
+    expect(h.requests).toEqual([]);
+    expect(await h.keyStore.hasKey()).toBe(false);
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+  }, 20_000);
+
+  test("signs nothing when the key to send again changed during the attempt", async () => {
+    const h = harness({ wallClock: () => FIRST });
+    await unanswered(h);
+    const start = started(await h.flow.start());
+    await h.keyStore.delete();
+    const other = await h.keyStore.create({ kind: "system" });
+    await deliverCode(h.opened.at(-1) ?? "");
+    expect(await start.outcome).toEqual({
+      kind: "failed",
+      reason: "key_changed",
+    });
+    expect(h.requests).toHaveLength(1);
+    expect(h.keyStore.keys()?.current.publicKey).toBe(other.publicKey);
+    expect(h.errors).toContain("The device key changed during the sign-in.");
+  }, 30_000);
+
+  test("never writes the record with the device whose key was lost", async () => {
+    const h = harness({ wallClock: () => FIRST });
+    await h.records.write(RECORD);
+    const key = await unanswered(h);
+    expect(lastNewDevice(h).previousDeviceId).toBe(DEVICE_ID);
+
+    h.answer = () => json(200, ANSWER);
+    expect((await signIn(h)).outcome).toEqual({
+      kind: "failed",
+      reason: "unexpected_response",
+    });
+    expect(lastNewDevice(h)).toMatchObject({
+      publicKey: key,
+      previousDeviceId: DEVICE_ID,
+    });
+    expect(await h.records.read()).toEqual({ kind: "record", record: RECORD });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key);
+    expect(await h.markers.read()).toMatchObject({
+      marker: { publicKey: key },
+    });
+    expect(h.errors).toContain("The sign-in answer named the replaced device.");
+  }, 30_000);
+
+  test("a marker that cannot be read stops an attempt that would delete a key, and keeps the key", async () => {
+    const markers = createRegistrationMarkerStore({
+      folder,
+      platform: "win32",
+    });
+    let unreadable = false;
+    const h = harness({
+      wallClock: () => FIRST,
+      registrationMarkers: {
+        read: () =>
+          unreadable ? Promise.reject(new Error("EACCES")) : markers.read(),
+        write: markers.write,
+        delete: markers.delete,
+      },
+    });
+    const key = await unanswered(h);
+    unreadable = true;
+    expect(await h.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "record_unreadable" },
+    });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key);
+    expect(h.opened).toHaveLength(1);
+    expect(h.errors).toContain(
+      "The registration marker could not be read; the device key is kept.",
+    );
+    // With a record and a key that is not the record's, too.
+    await h.records.write(RECORD);
+    expect(await h.flow.start()).toMatchObject({
+      outcome: { reason: "record_unreadable" },
+    });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key);
+
+    // An attempt that deletes no key does not need the marker.
+    await h.records.write({ ...RECORD, publicKey: key });
+    h.answer = () => json(200, ANSWER);
+    expect((await signIn(h)).outcome).toMatchObject({ kind: "signed_in" });
+    expect(h.requests.at(-1)?.body.device.kind).toBe("existing");
+  }, 30_000);
+
+  test("without a marker that could be written, the next attempt deletes the key as before", async () => {
+    const markers = createRegistrationMarkerStore({
+      folder,
+      platform: "win32",
+    });
+    const h = harness({
+      wallClock: () => FIRST,
+      registrationMarkers: {
+        read: markers.read,
+        delete: markers.delete,
+        write: () => Promise.reject(new Error("disk full")),
+      },
+    });
+    const key = await unanswered(h);
+    expect(h.errors).toContain("The registration marker could not be saved.");
+    h.answer = () => json(200, ANSWER);
+    await signIn(h);
+    expect(lastNewDevice(h).publicKey).not.toBe(key);
+  }, 30_000);
 });
 
 describe("an existing device", () => {

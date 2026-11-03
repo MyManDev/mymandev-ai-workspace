@@ -5,7 +5,7 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { and, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import type { AuditAction } from "./audit-vocabulary.ts";
 import type { Database } from "./db.ts";
 import { withDatabaseErrors } from "./errors.ts";
@@ -160,7 +160,11 @@ export async function activePeopleOf(
 
 export type DeviceSeenInput = Readonly<{ deviceId: DeviceId; now: Date }>;
 
-/** Records that a device was seen now: it authenticated a WebSocket connection. */
+/**
+ * Records that a device was seen now: it authenticated a WebSocket
+ * connection. The first authentication also sets `first_authenticated_at`,
+ * which ends the repeat of its registration (#153).
+ */
 export async function markDeviceSeen(
   db: Database,
   input: DeviceSeenInput,
@@ -168,8 +172,35 @@ export async function markDeviceSeen(
   await withDatabaseErrors(() =>
     db
       .update(devices)
-      .set({ lastSeenAt: input.now, updatedAt: input.now })
+      .set({
+        lastSeenAt: input.now,
+        firstAuthenticatedAt: sql`coalesce(${devices.firstAuthenticatedAt}, ${input.now})`,
+        updatedAt: input.now,
+      })
       .where(eq(devices.id, input.deviceId)),
+  );
+}
+
+/**
+ * Records that a device proved its key under its device ID for an access
+ * token: sets `first_authenticated_at` the first time and changes nothing
+ * after that (#153). It waits for a sign-in that holds the device's row, so
+ * that a repeat of the registration either commits first or sees the time.
+ */
+export async function markDeviceAuthenticated(
+  db: Database,
+  input: DeviceSeenInput,
+): Promise<void> {
+  await withDatabaseErrors(() =>
+    db
+      .update(devices)
+      .set({ firstAuthenticatedAt: input.now, updatedAt: input.now })
+      .where(
+        and(
+          eq(devices.id, input.deviceId),
+          isNull(devices.firstAuthenticatedAt),
+        ),
+      ),
   );
 }
 

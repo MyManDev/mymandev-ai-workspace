@@ -42,6 +42,7 @@ import {
   type SignInOutcome,
   UNCERTAIN_REFUSAL_CODES,
 } from "../sign-in/flow.ts";
+import { createRegistrationMarkerStore } from "../sign-in/registration-marker.ts";
 import { API_REQUEST_TIMEOUT_MS } from "./api-call.ts";
 import {
   ACCESS_TOKEN_LIFETIME_MS,
@@ -1014,6 +1015,10 @@ describe("a pending key replacement", () => {
       apiOrigin: { ok: true, origin: API_ORIGIN },
       keyStore: h.keyStore,
       deviceRecords: h.records,
+      registrationMarkers: createRegistrationMarkerStore({
+        folder,
+        platform: "win32",
+      }),
       openExternal: (url) => {
         opened.push(url);
         return Promise.resolve(true);

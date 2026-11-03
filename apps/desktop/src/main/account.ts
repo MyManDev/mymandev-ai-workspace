@@ -54,6 +54,7 @@ import type {
   SignInStart,
 } from "./sign-in/flow.ts";
 import type { SignInListenerError } from "./sign-in/listener.ts";
+import type { RegistrationMarkerStore } from "./sign-in/registration-marker.ts";
 import type {
   DeviceSession,
   DeviceSessionState,
@@ -95,6 +96,11 @@ export interface AccountSystem {
   readonly keyStore: Pick<DeviceKeyStore, "load" | "status" | "delete">;
   /** The record store over the file that the flow writes. */
   readonly deviceRecords: Pick<DeviceRecordStore, "read" | "delete">;
+  /**
+   * The registration marker store over the file that the flow writes
+   * (#153); "This is not me" deletes the marker.
+   */
+  readonly registrationMarkers: Pick<RegistrationMarkerStore, "delete">;
   /**
    * Creates the sign-in flow over the same key store and record store.
    * Called once, before the first sign-in, after the key is loaded.
@@ -1087,11 +1093,20 @@ export function createAccountService(
           report("The device could not be removed at the server.");
         }
       }
-      // The record goes first: a key without a record is deleted by the next
-      // sign-in, while a record without a key would make the next sign-in
-      // name this device as its previous device, for the other account.
+      // The record goes first: a record without a key would make the next
+      // sign-in name this device as its previous device, for the other
+      // account. A key without a record is deleted by the next sign-in
+      // unless the registration marker names it, so the marker goes right
+      // after the record: otherwise the next sign-in would send this
+      // account's key again (#153). A marker that cannot be deleted does not
+      // stop the rest; once the key is gone, it names no key.
       accountReads += 1;
       await opened.deviceRecords.delete();
+      try {
+        await opened.registrationMarkers.delete();
+      } catch {
+        report("The registration marker could not be deleted.");
+      }
       // Once the record is gone, the flow keeps nothing of this account in
       // memory: no unsaved record, which its next attempt would write back,
       // and no account mismatch. This comes before the key, so that a key

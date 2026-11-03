@@ -7,16 +7,19 @@
 // Create the flow after the device key store (device-key/system.ts) and
 // after `load`, in the instance that holds the single-instance lock. The
 // caller passes the device record store over the key's folder, so that the
-// flow and the caller read and write the same record through one store.
+// flow and the caller read and write the same record through one store, and
+// the registration marker store over the same folder.
 import { app, net, shell } from "electron";
 import { resolveApiOrigin } from "../api-origin.ts";
 import type { DeviceKeyStore } from "../device-key/store.ts";
 import type { DeviceRecordStore } from "../device-record.ts";
 import { createSignInFlow, type SignInFlow } from "./flow.ts";
+import type { RegistrationMarkerStore } from "./registration-marker.ts";
 
 export function createSystemSignInFlow(
   keyStore: DeviceKeyStore,
   deviceRecords: DeviceRecordStore,
+  registrationMarkers: RegistrationMarkerStore,
   onError: (message: string) => void,
 ): SignInFlow {
   if (!app.isReady()) {
@@ -29,6 +32,7 @@ export function createSystemSignInFlow(
     }),
     keyStore,
     deviceRecords,
+    registrationMarkers,
     openExternal: async (url) => {
       try {
         await shell.openExternal(url);

@@ -1,5 +1,6 @@
 import {
   auditEvents,
+  createDatabase,
   type Database,
   devices,
   eraseAccount,
@@ -29,6 +30,7 @@ import {
   sign,
 } from "node:crypto";
 import { after, before, test, type TestContext } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { buildApp } from "../app.ts";
 import { loadConfig } from "../config.ts";
 import {
@@ -42,8 +44,10 @@ import { ConnectionRegistry } from "../gateway.ts";
 import { Secret } from "../secret.ts";
 import { randomToken, SIGN_IN_CODE_PREFIX } from "./attempts.ts";
 import {
+  accessToken,
   deviceApp,
   fakeClock,
+  postNewDevice,
   signInAgain,
   signInDevice,
 } from "./device-test-support.ts";
@@ -1204,6 +1208,539 @@ test("after a sign-in commits, the connection with the replaced key closes with 
     strangerSocket.client.ws.OPEN,
   );
 });
+
+test("a new device sent again with the same key after a lost answer gets the same device and a renewed sign-in, and adds no device (#153)", async (t) => {
+  let clock = Date.parse("2026-11-03T09:00:00.000Z");
+  const app = await signInApp(t, {
+    user: githubUser(1201, "lost-answer"),
+    now: () => clock,
+  });
+  const key = newKey();
+  const first = await postSignIn(
+    app,
+    newDeviceRequest(await signInCode(app), key),
+  );
+  assert.equal(first.statusCode, 200);
+  // The desktop never read this answer.
+  const lost = SignInResponseSchema.parse(first.json());
+  await database()
+    .update(devices)
+    .set({ signedOutAt: new Date(clock) })
+    .where(eq(devices.id, lost.deviceId));
+
+  clock += 60 * 60_000;
+  const repeat = newDeviceRequest(await signInCode(app), key, {
+    label: "Another label",
+    platform: "linux",
+  });
+  const response = await postSignIn(app, repeat);
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(SignInResponseSchema.parse(response.json()), {
+    ...lost,
+    signInExpiresAt: new Date(clock + 30 * 24 * 60 * 60_000).toISOString(),
+  });
+
+  const rows = await accountRows(lost.userId);
+  assert.equal(rows.devices.length, 1, "no second device");
+  const [device] = rows.devices;
+  assert.equal(device?.id, lost.deviceId);
+  assert.equal(device?.publicKey, key.publicKey);
+  assert.equal(device?.label, "Work laptop", "the label stays");
+  assert.equal(device?.platform, "windows", "the platform stays");
+  assert.equal(device?.lastSignInAt.getTime(), clock, "a sign-in like any");
+  assert.equal(device?.signedOutAt, null);
+  assert.equal(device?.revokedAt, null);
+  assert.deepEqual(
+    rows.audit.map((row) => row.action).sort(),
+    ["account.signed_in", "account.signed_in", "device.registered"],
+    "registered once, signed in twice",
+  );
+
+  // The repeat consumed its code as usual.
+  const copy = await postSignIn(app, repeat);
+  assert.equal(copy.statusCode, 409);
+  assert.equal(codeOf(copy), "sign_in_code_used");
+  assert.deepEqual(await accountRows(lost.userId), rows);
+});
+
+test("the registration lock and the device limits do not refuse a repeated registration, which adds no device (#153)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1202, "full-account") });
+  const key = newKey();
+  const lost = SignInResponseSchema.parse(
+    (
+      await postSignIn(app, newDeviceRequest(await signInCode(app), key))
+    ).json(),
+  );
+  // 20 active devices, all of them new in the last 24 hours, and the lock.
+  const now = new Date();
+  for (let index = 0; index < 19; index += 1) {
+    await database().insert(devices).values({
+      id: newId<DeviceId>(),
+      userId: lost.userId,
+      label: "Extra",
+      platform: "linux",
+      publicKey: newKey().publicKey,
+      keyAlgorithm: "ed25519",
+      createdAt: now,
+      lastSignInAt: now,
+    });
+  }
+  await database()
+    .update(users)
+    .set({
+      deviceRegistrationLockedUntil: new Date(
+        Date.now() + 7 * 24 * 60 * 60_000,
+      ),
+    })
+    .where(eq(users.id, lost.userId));
+
+  const fresh = await postSignIn(
+    app,
+    newDeviceRequest(await signInCode(app), newKey()),
+  );
+  assert.equal(codeOf(fresh), "device_registration_locked");
+  const repeated = await postSignIn(
+    app,
+    newDeviceRequest(await signInCode(app), key),
+  );
+  assert.equal(repeated.statusCode, 200);
+  assert.equal(
+    SignInResponseSchema.parse(repeated.json()).deviceId,
+    lost.deviceId,
+  );
+  assert.equal((await accountRows(lost.userId)).devices.length, 20);
+});
+
+test("a key of a revoked device or of another account's device still answers 409 with conflict, and a device never replaces itself (#153)", async (t) => {
+  const owner = await signInApp(t, { user: githubUser(1203, "key-owner") });
+  const key = newKey();
+  const created = SignInResponseSchema.parse(
+    (
+      await postSignIn(owner, newDeviceRequest(await signInCode(owner), key))
+    ).json(),
+  );
+  const other = await signInApp(t, { user: githubUser(1204, "key-stranger") });
+  const otherAccount = SignInResponseSchema.parse(
+    (
+      await postSignIn(
+        other,
+        newDeviceRequest(await signInCode(other), newKey()),
+      )
+    ).json(),
+  );
+  const before = {
+    owner: await accountRows(created.userId),
+    other: await accountRows(otherAccount.userId),
+  };
+
+  const foreign = await postSignIn(
+    other,
+    newDeviceRequest(await signInCode(other), key),
+  );
+  assert.equal(foreign.statusCode, 409);
+  assert.deepEqual(foreign.json(), {
+    statusCode: 409,
+    error: "Conflict",
+    message: "Conflict",
+    code: "conflict",
+  });
+
+  const itself = await postSignIn(
+    owner,
+    newDeviceRequest(await signInCode(owner), key, {
+      previousDeviceId: created.deviceId,
+    }),
+  );
+  assert.equal(codeOf(itself), "conflict", "a device never replaces itself");
+  assert.deepEqual(
+    {
+      owner: await accountRows(created.userId),
+      other: await accountRows(otherAccount.userId),
+    },
+    before,
+    "nothing changed",
+  );
+
+  await database()
+    .update(devices)
+    .set({ revokedAt: new Date(), revocationReason: "removed" })
+    .where(eq(devices.id, created.deviceId));
+  const revoked = await accountRows(created.userId);
+  for (const app of [owner, other]) {
+    const response = await postSignIn(
+      app,
+      newDeviceRequest(await signInCode(app), key),
+    );
+    assert.equal(response.statusCode, 409);
+    assert.equal(codeOf(response), "conflict", "a revoked device's key");
+  }
+  assert.deepEqual(await accountRows(created.userId), revoked);
+  assert.deepEqual(await accountRows(otherAccount.userId), before.other);
+});
+
+test("a repeated registration that names the previous device leaves it as the first commit revoked it (#153)", async (t) => {
+  const connections = new ConnectionRegistry();
+  const app = await deviceApp(t, {
+    database: database(),
+    githubId: 1205,
+    connections,
+  });
+  const watcher = await signInDevice(app);
+  const previous = await signInDevice(app);
+  const watching = await connected(t, app, watcher);
+
+  // The key of the previous device was lost: a new device names it.
+  const key = newKey();
+  const grant = await signInCode(app);
+  const first = await postNewDevice(app, grant, key, previous.deviceId);
+  assert.equal(first.statusCode, 200);
+  const lost = SignInResponseSchema.parse(first.json());
+  assert.equal(
+    ((await nextFrame(watching.client)) as { type: string }).type,
+    "account.device_registered",
+  );
+  assert.equal(
+    ((await nextFrame(watching.client)) as { type: string }).type,
+    "account.device_revoked",
+  );
+  const committed = await accountRows(lost.userId);
+  const [revoked] = committed.devices.filter(
+    (row) => row.id === previous.deviceId,
+  );
+  assert.equal(revoked?.revocationReason, "replaced");
+
+  const response = await postNewDevice(
+    app,
+    await signInCode(app),
+    key,
+    previous.deviceId,
+  );
+  assert.equal(response.statusCode, 200);
+  assert.equal(
+    SignInResponseSchema.parse(response.json()).deviceId,
+    lost.deviceId,
+  );
+  const repeated = await accountRows(lost.userId);
+  assert.deepEqual(
+    repeated.devices.find((row) => row.id === previous.deviceId),
+    revoked,
+    "the previous device is unchanged",
+  );
+  assert.equal(repeated.devices.length, committed.devices.length);
+  assert.deepEqual(
+    repeated.audit.slice(committed.audit.length).map((row) => row.action),
+    ["account.signed_in"],
+    "no second registration and no second revocation",
+  );
+  await settle();
+  assert.equal(watching.client.unread(), 0, "no alert and no revocation");
+});
+
+test("a repeated registration ignores the previous device that it names, also another active device of the account (#153)", async (t) => {
+  const connections = new ConnectionRegistry();
+  const app = await deviceApp(t, {
+    database: database(),
+    githubId: 1206,
+    connections,
+  });
+  const watcher = await signInDevice(app);
+  const key = newKey();
+  const lost = await signInDevice(app, key);
+  const other = await signInDevice(app);
+  const watching = await connected(t, app, watcher);
+  const otherSocket = await connected(t, app, other);
+  const before = await accountRows(lost.userId);
+
+  const response = await postNewDevice(
+    app,
+    await signInCode(app),
+    key,
+    other.deviceId,
+  );
+  assert.equal(response.statusCode, 200);
+  assert.equal(
+    SignInResponseSchema.parse(response.json()).deviceId,
+    lost.deviceId,
+  );
+  const after = await accountRows(lost.userId);
+  assert.deepEqual(
+    after.devices.find((row) => row.id === other.deviceId),
+    before.devices.find((row) => row.id === other.deviceId),
+    "the named device is unchanged",
+  );
+  assert.deepEqual(
+    after.audit.slice(before.audit.length).map((row) => row.action),
+    ["account.signed_in"],
+    "no revocation",
+  );
+  await settle();
+  assert.equal(watching.client.unread(), 0, "no alert and no revocation");
+  assert.equal(otherSocket.client.ws.readyState, otherSocket.client.ws.OPEN);
+});
+
+test("a device that minted an access token, authenticated a WebSocket, replaced its key, or is 7 days old does not repeat its registration: a copied key cannot renew itself (#153)", async (t) => {
+  const clock = fakeClock(Date.parse("2026-11-03T09:00:00.000Z"));
+  const connections = new ConnectionRegistry();
+  const app = await deviceApp(t, {
+    database: database(),
+    githubId: 1210,
+    connections,
+    now: clock.now,
+  });
+  const repeat = async (key: Key) =>
+    postNewDevice(app, await signInCode(app), key);
+  const rowOf = async (deviceId: string) =>
+    (
+      await database()
+        .select()
+        .from(devices)
+        .where(eq(devices.id, deviceId as DeviceId))
+    )[0];
+
+  // An access token: the desktop knew the device ID. A copied key of it
+  // stays refused at every later sign-in, also each 29 days later.
+  const tokened = await signInDevice(app);
+  await accessToken(app, tokened);
+  const used = await rowOf(tokened.deviceId);
+  assert.equal(used?.firstAuthenticatedAt?.getTime(), clock.now());
+  for (let round = 0; round < 6; round += 1) {
+    const response = await repeat(tokened.key);
+    assert.equal(response.statusCode, 409, `round ${round}`);
+    assert.equal(codeOf(response), "conflict");
+    clock.advance(29 * 24 * 60 * 60_000);
+  }
+  assert.deepEqual(
+    await rowOf(tokened.deviceId),
+    used,
+    "neither the key nor the sign-in was renewed",
+  );
+
+  // A WebSocket authentication.
+  const socketed = await signInDevice(app);
+  await connected(t, app, socketed);
+  assert.equal(codeOf(await repeat(socketed.key)), "conflict");
+
+  // A sign-in that replaced the key: the new key was never registered.
+  const replaced = await signInAgain(app, await signInDevice(app));
+  assert.equal(codeOf(await repeat(replaced.key)), "conflict");
+
+  // A device that never authenticated repeats until 7 days after its
+  // registration, and not from then on.
+  const fresh = await signInDevice(app);
+  clock.advance(7 * 24 * 60 * 60_000 - 1);
+  const inTime = await repeat(fresh.key);
+  assert.equal(inTime.statusCode, 200);
+  assert.equal(
+    SignInResponseSchema.parse(inTime.json()).deviceId,
+    fresh.deviceId,
+  );
+  clock.advance(1);
+  const late = await repeat(fresh.key);
+  assert.equal(late.statusCode, 409);
+  assert.equal(codeOf(late), "conflict");
+  assert.equal((await rowOf(fresh.deviceId))?.firstAuthenticatedAt, null);
+});
+
+/** The test database, whose first `failures` transactions fail with a unique violation before they start. */
+function databaseFailingWithUniqueViolation(failures: number) {
+  const db = database();
+  let calls = 0;
+  const failing = Object.create(db) as Database;
+  Object.defineProperty(failing, "transaction", {
+    value: (...args: Parameters<Database["transaction"]>) => {
+      calls += 1;
+      if (calls <= failures) {
+        // The answer of a concurrent sign-in that created the account first.
+        return Promise.reject(
+          Object.assign(new Error("duplicate key"), {
+            code: "23505",
+            constraint: "user_identities_provider_subject_key",
+          }),
+        );
+      }
+      return db.transaction(...args);
+    },
+  });
+  return { failing, calls: () => calls };
+}
+
+test("a sign-in that lost the creation of its account to a concurrent one runs once more and gets the account and the device; a second unique violation answers conflict (#153)", async (t) => {
+  const key = newKey();
+  const once = databaseFailingWithUniqueViolation(1);
+  const app = await signInApp(t, {
+    user: githubUser(1211, "retried"),
+    database: once.failing,
+  });
+  const response = await postSignIn(
+    app,
+    newDeviceRequest(await signInCode(app), key),
+  );
+  assert.equal(response.statusCode, 200);
+  assert.equal(once.calls(), 2);
+  const answer = SignInResponseSchema.parse(response.json());
+  assert.equal((await accountRows(answer.userId)).devices.length, 1);
+
+  const twice = databaseFailingWithUniqueViolation(2);
+  const other = await signInApp(t, {
+    user: githubUser(1212, "twice"),
+    database: twice.failing,
+  });
+  const refused = await postSignIn(
+    other,
+    newDeviceRequest(await signInCode(other), newKey()),
+  );
+  assert.equal(refused.statusCode, 409);
+  assert.equal(codeOf(refused), "conflict");
+  assert.equal(twice.calls(), 2, "one retry only");
+});
+
+test("two registrations with the same key at once leave one device: the identity row orders them, so the later one finds the device (#153)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1207, "both-at-once") });
+  // The account exists, so both sign-ins lock its identity row.
+  await postSignIn(app, newDeviceRequest(await signInCode(app), newKey()));
+  const key = newKey();
+  const grants = [await signInCode(app), await signInCode(app)];
+  const responses = await Promise.all(
+    grants.map((grant) => postSignIn(app, newDeviceRequest(grant, key))),
+  );
+  assert.deepEqual(
+    responses.map((response) => response.statusCode),
+    [200, 200],
+  );
+  const [one, two] = responses.map((response) =>
+    SignInResponseSchema.parse(response.json()),
+  );
+  assert.equal(one?.deviceId, two?.deviceId);
+  const held = await database()
+    .select()
+    .from(devices)
+    .where(eq(devices.publicKey, key.publicKey));
+  assert.equal(held.length, 1);
+  const registered = await database()
+    .select()
+    .from(auditEvents)
+    .where(
+      and(
+        eq(auditEvents.subjectId, one?.deviceId ?? ""),
+        eq(auditEvents.action, "device.registered"),
+      ),
+    );
+  assert.equal(registered.length, 1);
+});
+
+test("two first sign-ins of a new account with the same key at once leave one account and one device, and both answer with it (#153)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1208, "brand-new") });
+  const key = newKey();
+  const grants = [await signInCode(app), await signInCode(app)];
+  const responses = await Promise.all(
+    grants.map((grant) => postSignIn(app, newDeviceRequest(grant, key))),
+  );
+  // PGlite runs one transaction at a time, so the later one finds the
+  // device. On a server the later one fails on the account's identity,
+  // which the earlier one created, and runs once more.
+  assert.deepEqual(
+    responses.map((response) => response.statusCode),
+    [200, 200],
+  );
+  const held = await database()
+    .select()
+    .from(devices)
+    .where(eq(devices.publicKey, key.publicKey));
+  assert.equal(held.length, 1);
+  assert.deepEqual(
+    responses.map(
+      (response) => SignInResponseSchema.parse(response.json()).deviceId,
+    ),
+    [held[0]?.id, held[0]?.id],
+  );
+  const identities = await database()
+    .select()
+    .from(userIdentities)
+    .where(eq(userIdentities.subject, "1208"));
+  assert.equal(identities.length, 1);
+});
+
+const SERVER_ONLY = {
+  skip:
+    process.env["DATABASE_TEST_URL"] === undefined &&
+    "needs DATABASE_TEST_URL; PGlite has a single session",
+};
+
+/** How many sessions of the test database wait for a lock. */
+async function lockWaiters(): Promise<number> {
+  assert.ok(testDatabase);
+  const { rows } = await testDatabase.client.query<{ waiting: number }>(
+    "select count(*)::int as waiting from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'",
+  );
+  return rows[0]?.waiting ?? 0;
+}
+
+test(
+  "two registrations with the same key that run at the same time: the later one waits at the identity row, then answers with the device that the earlier one committed (#153)",
+  SERVER_ONLY,
+  async (t) => {
+    const url = testDatabase?.url;
+    assert.ok(url, "the test database is on a server");
+    const app = await signInApp(t, { user: githubUser(1209, "racing") });
+    const existing = SignInResponseSchema.parse(
+      (
+        await postSignIn(app, newDeviceRequest(await signInCode(app), newKey()))
+      ).json(),
+    );
+    const key = newKey();
+    const grants = [await signInCode(app), await signInCode(app)];
+    // A second session holds the account's identity row, so both sign-ins
+    // are inside their transactions before either can register the key.
+    const other = createDatabase(url, { max: 1 });
+    const holding = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const held = other.db.transaction(async (tx) => {
+      await tx
+        .select()
+        .from(userIdentities)
+        .where(eq(userIdentities.userId, existing.userId))
+        .for("update");
+      holding.resolve();
+      await release.promise;
+    });
+    try {
+      await Promise.race([
+        holding.promise,
+        held.then(() => {
+          throw new Error("the holding transaction ended early");
+        }),
+      ]);
+      const racing = grants.map((grant) =>
+        postSignIn(app, newDeviceRequest(grant, key)),
+      );
+      while ((await lockWaiters()) < 2) {
+        await delay(10);
+      }
+      release.resolve();
+      await held;
+      const responses = await Promise.all(racing);
+      assert.deepEqual(
+        responses.map((response) => response.statusCode),
+        [200, 200],
+      );
+      const [one, two] = responses.map((response) =>
+        SignInResponseSchema.parse(response.json()),
+      );
+      assert.equal(one?.deviceId, two?.deviceId);
+      const rows = await accountRows(existing.userId);
+      assert.equal(rows.devices.length, 2);
+      assert.equal(
+        rows.audit.filter((row) => row.action === "device.registered").length,
+        2,
+        "the first device and the raced one, once",
+      );
+    } finally {
+      release.resolve();
+      await held.catch(() => undefined);
+      await other.close();
+    }
+  },
+);
 
 test("the first display name falls back to the login when the GitHub name is not usable", async (t) => {
   for (const [id, name] of [

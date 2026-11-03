@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { join as joinPath } from "node:path";
 import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { PGlite } from "@electric-sql/pglite";
 import {
   type DeviceId,
   type EventId,
@@ -12,11 +15,13 @@ import {
 } from "@mymandev/protocol";
 import { eq } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
+import { migrationsFolder } from "./migrate.ts";
 import {
   activePeopleOf,
   deviceRow,
   deviceRows,
   isActiveMember,
+  markDeviceAuthenticated,
   markDeviceSeen,
   markDevicesSeen,
   writeConnectionAudit,
@@ -237,6 +242,106 @@ test("markDeviceSeen sets last_seen_at of that device only", async () => {
   );
   // An unknown device changes nothing and does not fail.
   await markDeviceSeen(db, { deviceId: newId<DeviceId>(), now: LATER });
+});
+
+test("the first WebSocket authentication or access token sets first_authenticated_at once (#153)", async () => {
+  const db = database();
+  const owner = await user("First authenticated");
+  const viaSocket = await device(owner);
+  const viaToken = await device(owner);
+  const never = await device(owner);
+  const first = async () =>
+    new Map(
+      (
+        await db
+          .select({
+            id: devices.id,
+            at: devices.firstAuthenticatedAt,
+          })
+          .from(devices)
+          .where(eq(devices.userId, owner))
+      ).map((row) => [row.id, row.at?.getTime() ?? null]),
+    );
+  assert.deepEqual(
+    await first(),
+    new Map([
+      [viaSocket, null],
+      [viaToken, null],
+      [never, null],
+    ]),
+    "a new device never authenticated",
+  );
+  await markDeviceSeen(db, { deviceId: viaSocket, now: NOW });
+  await markDeviceAuthenticated(db, { deviceId: viaToken, now: NOW });
+  // Later authentications keep the first time.
+  await markDeviceSeen(db, { deviceId: viaSocket, now: LATER });
+  await markDeviceAuthenticated(db, { deviceId: viaToken, now: LATER });
+  await markDeviceSeen(db, { deviceId: viaToken, now: LATER });
+  assert.deepEqual(
+    await first(),
+    new Map([
+      [viaSocket, NOW.getTime()],
+      [viaToken, NOW.getTime()],
+      [never, null],
+    ]),
+  );
+  await markDeviceAuthenticated(db, {
+    deviceId: newId<DeviceId>(),
+    now: LATER,
+  });
+});
+
+test("the migration device_first_authenticated counts every device that existed before it as authenticated at its creation (#153)", async () => {
+  const client = await PGlite.create();
+  try {
+    const journal = JSON.parse(
+      readFileSync(joinPath(migrationsFolder, "meta", "_journal.json"), "utf8"),
+    ) as { entries: { tag: string }[] };
+    const tags = journal.entries.map((entry) => entry.tag);
+    // Found by its name, so that a new number does not change the test.
+    const next = tags.findIndex((tag) =>
+      /^\d{4}_device_first_authenticated$/u.test(tag),
+    );
+    assert.ok(next > 0);
+    const apply = async (tag: string) => {
+      const text = readFileSync(
+        joinPath(migrationsFolder, `${tag}.sql`),
+        "utf8",
+      );
+      for (const statement of text.split("--> statement-breakpoint")) {
+        if (statement.trim() !== "") {
+          await client.exec(statement);
+        }
+      }
+    };
+    for (const tag of tags.slice(0, next)) {
+      await apply(tag);
+    }
+    const userId = newId<UserId>();
+    const deviceId = newId<DeviceId>();
+    const createdAt = "2026-10-01T00:00:00.000Z";
+    await client.query(
+      "insert into users (id, display_name) values ($1, 'Before')",
+      [userId],
+    );
+    await client.query(
+      `insert into devices (id, user_id, label, platform, public_key, key_algorithm, created_at, last_sign_in_at)
+       values ($1, $2, 'Laptop', 'linux', $3, 'ed25519', $4, $4)`,
+      [deviceId, userId, randomBytes(32).toString("hex"), createdAt],
+    );
+    for (const tag of tags.slice(next)) {
+      await apply(tag);
+    }
+    const { rows } = await client.query<{ at: Date | null }>(
+      'select first_authenticated_at as "at" from devices where id = $1',
+      [deviceId],
+    );
+    // No record says whether it was used, so it never repeats its
+    // registration.
+    assert.equal(rows[0]?.at?.toISOString(), createdAt);
+  } finally {
+    await client.close();
+  }
 });
 
 /** 1,001 IDs that do not exist, with `known` at the start of each slice of 500. */
