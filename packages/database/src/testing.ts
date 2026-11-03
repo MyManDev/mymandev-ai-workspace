@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { PGlite } from "@electric-sql/pglite";
 import { drizzle } from "drizzle-orm/pglite";
 import { migrate } from "drizzle-orm/pglite/migrator";
@@ -84,9 +85,46 @@ async function createServerDatabase(serverUrl: string): Promise<TestDatabase> {
     url: url.href,
     close: async () => {
       await Promise.all([connection.close(), raw.end()]);
+      // A pool's `end` resolves before its clients' sockets are closed. A
+      // forced drop that reaches a session before it read its client's
+      // goodbye terminates it, and the client emits that error to a pool
+      // that no longer listens: an uncaught exception in the test file. So
+      // the drop waits until the database has no session; `with (force)`
+      // only ends a session that a test left open.
+      await sessionsEnded(serverUrl, name);
       await administer(serverUrl, `drop database ${name} with (force)`);
     },
   };
+}
+
+/** How long `close` waits for the sessions of the test database to end. */
+const SESSIONS_END_TIMEOUT_MS = 10_000;
+
+/**
+ * Waits until no session is connected to the database `name`, at most
+ * `SESSIONS_END_TIMEOUT_MS`, through the server's maintenance connection.
+ */
+async function sessionsEnded(serverUrl: string, name: string): Promise<void> {
+  const client = new pg.Client({
+    connectionString: serverUrl,
+    connectionTimeoutMillis: 5_000,
+  });
+  await client.connect();
+  try {
+    const deadline = Date.now() + SESSIONS_END_TIMEOUT_MS;
+    for (;;) {
+      const { rows } = await client.query<{ sessions: number }>(
+        "select count(*)::int as sessions from pg_stat_activity where datname = $1",
+        [name],
+      );
+      if ((rows[0]?.sessions ?? 0) === 0 || Date.now() >= deadline) {
+        return;
+      }
+      await delay(10);
+    }
+  } finally {
+    await client.end();
+  }
 }
 
 /** Runs one statement on the server's maintenance connection. */
