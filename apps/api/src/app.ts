@@ -28,7 +28,9 @@ import {
   socketErrorHandler,
   type EventHandler,
 } from "./gateway.ts";
+import { dispatchDeviceEvents } from "./device-events.ts";
 import { serializeError, serializeRequest } from "./log.ts";
+import { chatSendHandler } from "./workspaces/chat-events.ts";
 import {
   deliverWorkspaceEvent,
   type WorkspaceEventHandler,
@@ -41,7 +43,9 @@ export type BuildAppOptions = Readonly<{
   version: string;
   /**
    * Receives every event that passed identity binding, with its
-   * authenticated connection. The default logs it at debug level.
+   * authenticated connection. The default logs it at debug level and hands
+   * it to the handler of its type (`dispatchDeviceEvents`): a
+   * `chat.message.send` is stored and delivered (#27).
    */
   onEvent?: EventHandler;
   /**
@@ -350,19 +354,6 @@ export async function buildApp(
     async () => ({ status: "ok", version: options.version }),
   );
 
-  const onEvent: EventHandler =
-    options.onEvent ??
-    ((event, context) => {
-      app.log.debug(
-        {
-          eventId: event.id,
-          eventType: event.type,
-          connectionId: context.connectionId,
-        },
-        "event received",
-      );
-    });
-
   let database: Database | null = options.database ?? null;
   if (database === null && config.databaseUrl !== null) {
     const connection = createDatabase(config.databaseUrl.reveal());
@@ -459,7 +450,19 @@ export async function buildApp(
         database,
         now,
         connections,
-        onEvent,
+        onEvent:
+          options.onEvent ??
+          dispatchDeviceEvents(
+            {
+              "chat.message.send": chatSendHandler(app, {
+                database,
+                now,
+                connections,
+                log: app.log,
+              }),
+            },
+            app.log,
+          ),
       });
     }
   }

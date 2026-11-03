@@ -25,7 +25,12 @@ import {
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
-import { requireActiveMember, WorkspaceParamsSchema } from "./access.ts";
+import {
+  requireActiveMember,
+  requireProjectMember,
+  WorkspaceParamsSchema,
+} from "./access.ts";
+import { registerChatRoutes } from "./chat-routes.ts";
 import type { AccountFrameHandler, WorkspaceEventHandler } from "./events.ts";
 import { registerInvitationCodeRoutes } from "./invitation-code-routes.ts";
 import { registerInvitationRoutes } from "./invitation-routes.ts";
@@ -68,7 +73,9 @@ export type WorkspaceRouteOptions = Readonly<{
  * requests", and "What a workspace ID allows"): the account's workspaces,
  * creating one, the view of one, its limit of unclaimed people, its people,
  * their invitations, its join requests, and its projects (#155); previewing
- * and accepting an invitation code; and the account's own join requests.
+ * and accepting an invitation code; the account's own join requests; and
+ * the routes under `/projects/:projectId`, such as a project's chat history
+ * (#27).
  */
 export async function registerWorkspaceRoutes(
   app: FastifyInstance,
@@ -222,6 +229,14 @@ export async function registerWorkspaceRoutes(
         now: options.now,
         onWorkspaceEvent: options.onWorkspaceEvent,
       });
+    });
+
+    // A project ID names its workspace, so these routes check the
+    // membership of the project's workspace (#27, #28).
+    await scope.register(async (project) => {
+      requireProjectMember(project, database);
+
+      registerChatRoutes(project, { database });
     });
   });
 }

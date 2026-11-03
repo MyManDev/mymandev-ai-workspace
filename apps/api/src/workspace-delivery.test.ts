@@ -1070,7 +1070,7 @@ test(`a connection holds at most ${MAX_SUBSCRIPTIONS_PER_CONNECTION} subscriptio
   await quiet(client);
 });
 
-test("chat.message.send passes identity binding to the event handler and is neither relayed to the workspace's subscribers nor answered", async (t) => {
+test("chat.message.send passes identity binding to a custom event handler, and the gateway itself neither relays nor answers it", async (t) => {
   const received: VerifiedEvent[] = [];
   const { account } = await instance(t, {
     onEvent: (event) => {
