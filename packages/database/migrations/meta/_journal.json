@@ -75,8 +75,22 @@
     {
       "idx": 10,
       "version": "7",
-      "when": 1793667031315,
-      "tag": "0010_device_first_authenticated",
+      "when": 1793665643078,
+      "tag": "0010_chat_author_member",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1793665643432,
+      "tag": "0011_chat_author_member_keys",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1793667615223,
+      "tag": "0012_device_first_authenticated",
       "breakpoints": true
     }
   ]

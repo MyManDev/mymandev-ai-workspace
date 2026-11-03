@@ -1,5 +1,5 @@
 {
-  "id": "abdade1b-1a98-410d-938e-139e451feaba",
+  "id": "88c007d7-0ed0-4ab2-9b31-42826c2d9fd2",
   "prevId": "d995ad21-b580-45af-90ba-cace79f34f8e",
   "version": "7",
   "dialect": "postgresql",
@@ -60,12 +60,6 @@
         },
         "last_seen_at": {
           "name": "last_seen_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": false
-        },
-        "first_authenticated_at": {
-          "name": "first_authenticated_at",
           "type": "timestamp with time zone",
           "primaryKey": false,
           "notNull": false
@@ -1434,6 +1428,14 @@
             "id",
             "workspace_id"
           ]
+        },
+        "workspace_members_id_user_id_key": {
+          "name": "workspace_members_id_user_id_key",
+          "nullsNotDistinct": false,
+          "columns": [
+            "id",
+            "user_id"
+          ]
         }
       },
       "policies": {},
@@ -2458,6 +2460,12 @@
         },
         "author_user_id": {
           "name": "author_user_id",
+          "type": "uuid",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "author_member_id": {
+          "name": "author_member_id",
           "type": "uuid",
           "primaryKey": false,
           "notNull": false

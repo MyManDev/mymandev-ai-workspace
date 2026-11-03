@@ -291,14 +291,17 @@ test("the first WebSocket authentication or access token sets first_authenticate
   });
 });
 
-test("migration 0010 counts every device that existed before it as authenticated at its creation (#153)", async () => {
+test("the migration device_first_authenticated counts every device that existed before it as authenticated at its creation (#153)", async () => {
   const client = await PGlite.create();
   try {
     const journal = JSON.parse(
       readFileSync(joinPath(migrationsFolder, "meta", "_journal.json"), "utf8"),
     ) as { entries: { tag: string }[] };
     const tags = journal.entries.map((entry) => entry.tag);
-    const next = tags.indexOf("0010_device_first_authenticated");
+    // Found by its name, so that a new number does not change the test.
+    const next = tags.findIndex((tag) =>
+      /^\d{4}_device_first_authenticated$/u.test(tag),
+    );
     assert.ok(next > 0);
     const apply = async (tag: string) => {
       const text = readFileSync(

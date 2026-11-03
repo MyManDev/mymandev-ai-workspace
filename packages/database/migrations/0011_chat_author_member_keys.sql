@@ -1,0 +1,2 @@
+ALTER TABLE "messages" ADD CONSTRAINT "messages_author_member_user_fk" FOREIGN KEY ("author_member_id","author_user_id") REFERENCES "public"."workspace_members"("id","user_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "messages" ADD CONSTRAINT "messages_author_member_check" CHECK (("messages"."author_user_id" is null) = ("messages"."author_member_id" is null));
