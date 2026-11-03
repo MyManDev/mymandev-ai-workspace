@@ -59,10 +59,18 @@ export function checkDatabaseUrl(
  * pg waits forever for a connection by default, so the pool sets a connection
  * timeout; the statement and idle-in-transaction timeouts are sent to the
  * server as session parameters.
+ * When the server ends an idle connection, the pool emits "error", and Node
+ * throws an "error" event without a listener as an uncaught exception. The
+ * pool has already discarded the broken client, so the listener only calls
+ * onPoolError, without the error, whose message can contain the host.
  */
 export function createDatabase(
   connectionString: string,
-  options: { readonly max?: number; readonly statementTimeoutMs?: number } = {},
+  options: {
+    readonly max?: number;
+    readonly statementTimeoutMs?: number;
+    readonly onPoolError?: () => void;
+  } = {},
 ): DatabaseConnection {
   const pool = new pg.Pool({
     connectionString,
@@ -70,6 +78,10 @@ export function createDatabase(
     connectionTimeoutMillis: 5_000,
     statement_timeout: options.statementTimeoutMs ?? 30_000,
     idle_in_transaction_session_timeout: 60_000,
+  });
+  const { onPoolError } = options;
+  pool.on("error", () => {
+    onPoolError?.();
   });
   return { db: drizzle({ client: pool, schema }), close: () => pool.end() };
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { sql } from "drizzle-orm";
+import pg from "pg";
 import { checkDatabaseUrl, createDatabase } from "./client.ts";
 import { DatabaseError, withDatabaseErrors } from "./errors.ts";
 import { createTestDatabase } from "./testing.ts";
@@ -45,6 +46,37 @@ test(
     }
   },
 );
+
+test("an error on the pool of createDatabase calls onPoolError and is not thrown", async () => {
+  // The pool connects only on the first query, so no server is needed.
+  const url = "postgresql://127.0.0.1:1/unused";
+  let calls = 0;
+  const connection = createDatabase(url, {
+    max: 1,
+    onPoolError: () => {
+      calls += 1;
+    },
+  });
+  const silent = createDatabase(url, { max: 1 });
+  try {
+    // pg-pool emits "error" this way when the server ends an idle connection;
+    // without a listener, emit throws, and on a socket event that throw is an
+    // uncaught exception.
+    const error = new Error(
+      "terminating connection due to administrator command",
+    );
+    // DatabaseConnection hides the pool; Drizzle keeps it as $client.
+    const pool: unknown = Reflect.get(connection.db, "$client");
+    const silentPool: unknown = Reflect.get(silent.db, "$client");
+    assert.ok(pool instanceof pg.Pool && silentPool instanceof pg.Pool);
+    assert.doesNotThrow(() => pool.emit("error", error));
+    assert.equal(calls, 1);
+    assert.doesNotThrow(() => silentPool.emit("error", error));
+  } finally {
+    await connection.close();
+    await silent.close();
+  }
+});
 
 test("checkDatabaseUrl accepts only safe TLS modes and never repeats the URL", () => {
   const password = "Sup3r-Secret-Passw0rd";
