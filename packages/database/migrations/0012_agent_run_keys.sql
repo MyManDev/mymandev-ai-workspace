@@ -1,0 +1,3 @@
+CREATE INDEX "agent_runs_project_id_finished_at_idx" ON "agent_runs" USING btree ("project_id","finished_at","id") WHERE "agent_runs"."finished_at" is not null;--> statement-breakpoint
+ALTER TABLE "agent_runs" ADD CONSTRAINT "agent_runs_id_agent_id_key" UNIQUE("id","agent_id");--> statement-breakpoint
+ALTER TABLE "agent_runs" ADD CONSTRAINT "agent_runs_id_repository_id_key" UNIQUE("id","repository_id");

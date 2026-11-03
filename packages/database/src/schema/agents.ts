@@ -3,6 +3,7 @@ import type {
   Capability,
   CorrelationId,
   DeviceId,
+  EventId,
   PermissionGrantId,
   ProjectId,
   ProviderConnectionId,
@@ -102,6 +103,13 @@ export const agentRuns = pgTable(
   (t) => [
     index("agent_runs_agent_id_created_at_idx").on(t.agentId, t.createdAt),
     index("agent_runs_project_id_state_idx").on(t.projectId, t.state),
+    // The most recently finished runs of a project (#28).
+    index("agent_runs_project_id_finished_at_idx")
+      .on(t.projectId, t.finishedAt, t.id)
+      .where(sql`${t.finishedAt} is not null`),
+    // Targets of composite foreign keys from the transition log (#28).
+    unique("agent_runs_id_agent_id_key").on(t.id, t.agentId),
+    unique("agent_runs_id_repository_id_key").on(t.id, t.repositoryId),
     check(
       "agent_runs_state_check",
       sql`${t.state} in ('queued', 'running', 'awaiting_input', 'completed', 'failed', 'cancelled')`,
@@ -127,6 +135,92 @@ export const agentRuns = pgTable(
       name: "agent_runs_repository_project_fk",
       columns: [t.repositoryId, t.projectId],
       foreignColumns: [repositories.id, repositories.projectId],
+    }).onDelete("restrict"),
+  ],
+);
+
+/**
+ * The log of accepted run transitions (#28): one row for each
+ * `agent.run.state_changed` that an agent's host device sent and the server
+ * applied, written in the transaction of the run's update. It holds what the
+ * relayed event carries besides the run's workspace, which the run's project
+ * names, so that a transition sent again with the same device and event ID
+ * gets exactly the event that was relayed, and is never applied twice. The
+ * server's own transitions (a run's creation, its cancellations) have no row.
+ */
+export const agentRunTransitions = pgTable(
+  "agent_run_transitions",
+  {
+    id: uuid("id").primaryKey(),
+    runId: uuid("run_id")
+      .notNull()
+      .$type<RunId>()
+      .references(() => agentRuns.id, { onDelete: "restrict" }),
+    agentId: uuid("agent_id")
+      .notNull()
+      .$type<AgentId>()
+      .references(() => agents.id, { onDelete: "restrict" }),
+    /** The sending device: the authenticated connection's, never the event's `deviceId` field. */
+    deviceId: uuid("device_id")
+      .notNull()
+      .$type<DeviceId>()
+      .references(() => devices.id, { onDelete: "restrict" }),
+    /** The event's ID, chosen by the device; unique per device only. */
+    eventId: uuid("event_id").notNull().$type<EventId>(),
+    /** The payload's `repositoryId` as sent: null when the event had none. */
+    repositoryId: uuid("repository_id").$type<RepositoryId>(),
+    previousState: text("previous_state").notNull().$type<RunState>(),
+    state: text("state").notNull().$type<RunState>(),
+    /** The payload's `reason` as sent: null when the event had none. */
+    reason: text("reason"),
+    /** The event's `occurredAt`, informational, with millisecond precision as the protocol has it. */
+    occurredAt: nullableTimestamp("occurred_at").notNull(),
+    /** Labels chosen by the device, relayed as sent and never used for lookups. */
+    correlationId: uuid("correlation_id").$type<CorrelationId>(),
+    causationId: uuid("causation_id").$type<EventId>(),
+    /** When the server applied the transition. */
+    createdAt: createdAt(),
+  },
+  (t) => [
+    // The idempotency key: one accepted transition per device and event ID.
+    unique("agent_run_transitions_device_event_key").on(t.deviceId, t.eventId),
+    index("agent_run_transitions_run_id_idx").on(t.runId),
+    check(
+      "agent_run_transitions_previous_state_check",
+      sql`${t.previousState} in ('queued', 'running', 'awaiting_input', 'completed', 'failed', 'cancelled')`,
+    ),
+    check(
+      "agent_run_transitions_state_check",
+      sql`${t.state} in ('queued', 'running', 'awaiting_input', 'completed', 'failed', 'cancelled')`,
+    ),
+    // Only the transitions that the protocol allows (ADR 0007); a device
+    // never sends a run's creation.
+    check(
+      "agent_run_transitions_transition_check",
+      sql`(${t.previousState}, ${t.state}) in (('queued', 'running'), ('queued', 'failed'), ('queued', 'cancelled'), ('running', 'awaiting_input'), ('running', 'completed'), ('running', 'failed'), ('running', 'cancelled'), ('awaiting_input', 'running'), ('awaiting_input', 'failed'), ('awaiting_input', 'cancelled'))`,
+    ),
+    // A null reason passes the check; a reason that is set has 1 to 500 characters.
+    check(
+      "agent_run_transitions_reason_length",
+      sql`char_length(${t.reason}) between 1 and 500`,
+    ),
+    // The run is a run of the agent.
+    foreignKey({
+      name: "agent_run_transitions_run_agent_fk",
+      columns: [t.runId, t.agentId],
+      foreignColumns: [agentRuns.id, agentRuns.agentId],
+    }).onDelete("restrict"),
+    // The sending device hosts the agent.
+    foreignKey({
+      name: "agent_run_transitions_agent_host_device_fk",
+      columns: [t.agentId, t.deviceId],
+      foreignColumns: [agents.id, agents.hostDeviceId],
+    }).onDelete("restrict"),
+    // The repository, when sent, is the run's repository.
+    foreignKey({
+      name: "agent_run_transitions_run_repository_fk",
+      columns: [t.runId, t.repositoryId],
+      foreignColumns: [agentRuns.id, agentRuns.repositoryId],
     }).onDelete("restrict"),
   ],
 );

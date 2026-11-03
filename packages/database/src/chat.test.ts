@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
-import { setTimeout as delay } from "node:timers/promises";
 import {
   type AgentId,
   CHAT_HISTORY_PAGE,
@@ -23,7 +22,6 @@ import {
   postChatMessage,
   type PostChatMessageResult,
 } from "./chat.ts";
-import { createDatabase } from "./client.ts";
 import type { Database } from "./db.ts";
 import { activePersonOf, createWorkspace } from "./membership.ts";
 import { leaveWorkspace, removeMember } from "./people.ts";
@@ -38,6 +36,7 @@ import {
   workspaceMembers,
   workspaces,
 } from "./schema/index.ts";
+import { SERVER_ONLY, whileHeld } from "./race-testing.ts";
 import { createTestDatabase } from "./testing.ts";
 
 let testDatabase: Awaited<ReturnType<typeof createTestDatabase>> | undefined;
@@ -662,98 +661,6 @@ test("inside another transaction, a post rolls back with it", async () => {
   assert.equal((await posted(workspaceId, owner, app, "Again")).seq, 1);
 });
 
-const SERVER_ONLY = {
-  skip:
-    process.env["DATABASE_TEST_URL"] === undefined &&
-    "needs DATABASE_TEST_URL; PGlite has a single session",
-};
-
-/** Whether a session of the test database waits for a lock. */
-async function waitsForLock(): Promise<boolean> {
-  assert.ok(testDatabase);
-  const { rows } = await testDatabase.client.query<{ waiting: number }>(
-    "select count(*)::int as waiting from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'",
-  );
-  return (rows[0]?.waiting ?? 0) > 0;
-}
-
-/**
- * What the sessions of the test database that wait for a lock wait for: the
- * table of the row, through the tuple lock that a session holds or waits for
- * while it waits for the transaction that holds the row, or else the kind of
- * lock, such as `transactionid` for an entry of a unique index.
- */
-async function lockWaits(): Promise<string[]> {
-  assert.ok(testDatabase);
-  const { rows } = await testDatabase.client.query<{ waitedOn: string }>(
-    `select distinct coalesce(c.relname, w.locktype) as "waitedOn"
-       from pg_locks w
-       left join pg_locks t on t.pid = w.pid and t.locktype = 'tuple'
-       left join pg_class c on c.oid = t.relation
-      where not w.granted
-        and w.pid in (
-          select pid from pg_stat_activity where datname = current_database()
-        )`,
-  );
-  return rows.map((row) => row.waitedOn).sort();
-}
-
-/**
- * Runs `first` in a transaction of a second session and keeps it open while
- * `action` starts in this session. Returns the action's result after the
- * held transaction committed, and what the action waited for (`lockWaits`),
- * empty when it did not wait.
- */
-async function whileHeld<T>(
-  first: (tx: Database) => Promise<unknown>,
-  action: () => Promise<T>,
-): Promise<Readonly<{ result: T; waitedOn: readonly string[] }>> {
-  const url = testDatabase?.url;
-  assert.ok(url, "the test database is on a server");
-  const other = createDatabase(url, { max: 1 });
-  const holding = Promise.withResolvers<void>();
-  const release = Promise.withResolvers<void>();
-  const held = other.db.transaction(async (tx) => {
-    await first(tx);
-    holding.resolve();
-    await release.promise;
-  });
-  try {
-    await Promise.race([
-      holding.promise,
-      held.then(() => {
-        throw new Error("the held transaction ended early");
-      }),
-    ]);
-    const running = action();
-    let settled = false;
-    running.then(
-      () => {
-        settled = true;
-      },
-      () => {
-        settled = true;
-      },
-    );
-    let waited = false;
-    while (!settled && !waited) {
-      waited = await waitsForLock();
-      if (!waited) {
-        await delay(10);
-      }
-    }
-    // The action waits until the held transaction is released.
-    const waitedOn = waited ? await lockWaits() : [];
-    release.resolve();
-    await held;
-    return { result: await running, waitedOn };
-  } finally {
-    release.resolve();
-    await held.catch(() => undefined);
-    await other.close();
-  }
-}
-
 /** Posts in `tx` a message that must be stored as a new one, and returns it. */
 async function postedIn(
   tx: Database,
@@ -781,6 +688,7 @@ test(
     await posted(workspaceId, owner, app, "Two");
     let held: ChatMessage | undefined;
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       async (tx) => {
         held = await postedIn(tx, workspaceId, owner, app, "Three");
       },
@@ -844,6 +752,7 @@ test(
     const eventId = newId<EventId>();
     let held: ChatMessage | undefined;
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       async (tx) => {
         held = await postedIn(tx, workspaceId, owner, app, "First", eventId);
       },
@@ -873,6 +782,7 @@ test(
     const eventId = newId<EventId>();
     let held: ChatMessage | undefined;
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       async (tx) => {
         held = await postedIn(tx, workspaceId, owner, app, "First", eventId);
       },
@@ -896,6 +806,7 @@ test(
     const person = await join(workspaceId, member);
     const app = await projectOf(workspaceId, owner);
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       (tx) =>
         removeMember(tx, {
           workspaceId,
@@ -923,6 +834,7 @@ test(
     const person = await join(workspaceId, member);
     const app = await projectOf(workspaceId, owner);
     const { result, waitedOn } = await whileHeld(
+      testDatabase,
       (tx) => postedIn(tx, workspaceId, member, app, "Hello"),
       () =>
         removeMember(database(), {
