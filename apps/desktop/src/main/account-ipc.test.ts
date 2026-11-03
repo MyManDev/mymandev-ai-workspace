@@ -391,6 +391,10 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
     openSystem: () => ({
       keyStore,
       deviceRecords: records,
+      registrationMarkers: createRegistrationMarkerStore({
+        folder,
+        platform: "win32",
+      }),
       createFlow: () =>
         createSignInFlow({
           apiOrigin: { ok: true, origin: API_ORIGIN },
@@ -580,6 +584,10 @@ test("a This is not me whose key delete fails after an unsaved record never brin
     openSystem: () => ({
       keyStore,
       deviceRecords: records,
+      registrationMarkers: createRegistrationMarkerStore({
+        folder,
+        platform: "win32",
+      }),
       createFlow: () =>
         createSignInFlow({
           apiOrigin: { ok: true, origin: API_ORIGIN },
@@ -655,4 +663,118 @@ test("a This is not me whose key delete fails after an unsaved record never brin
   const ended = idleWithOutcome(service, service.status().revision);
   service.cancelSignIn();
   expect((await ended).lastOutcome).toEqual({ code: "cancelled" });
+}, 20_000);
+
+test("This is not me deletes the registration marker, so a key whose delete fails is never sent again for the forgotten account (#153)", async () => {
+  const folder = path.join(root, "MyManDev");
+  const realKeys = createDeviceKeyStore({
+    folder,
+    platform: "win32",
+    systemProtection: {
+      isAsyncEncryptionAvailable: () => Promise.resolve(true),
+      getSelectedStorageBackend: () => "unknown",
+      encryptStringAsync: (plainText) =>
+        Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8")),
+      decryptStringAsync: (ciphertext) =>
+        Promise.resolve({
+          shouldReEncrypt: false,
+          result: ciphertext.toString("utf8").slice("fake:".length),
+        }),
+    },
+  });
+  const records = createDeviceRecordStore({ folder, platform: "win32" });
+  const markers = createRegistrationMarkerStore({ folder, platform: "win32" });
+  let failKeyDelete = false;
+  const keyStore: DeviceKeyStore = {
+    ...realKeys,
+    delete: () =>
+      failKeyDelete ? Promise.reject(new Error("EBUSY")) : realKeys.delete(),
+  };
+  // The installation holds an account whose device key was lost.
+  const lost = await realKeys.create({ kind: "system" });
+  await records.write({
+    deviceId: DEVICE_ID,
+    userId: USER_ID,
+    login: "octocat",
+    displayName: "The Octocat",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    publicKey: lost.publicKey,
+  });
+  await realKeys.delete();
+  const sent: string[] = [];
+  const opened: string[] = [];
+  let clock = 0;
+  const service = createAccountService({
+    apiOrigin: { ok: true, origin: API_ORIGIN },
+    openSystem: () => ({
+      keyStore,
+      deviceRecords: records,
+      registrationMarkers: markers,
+      createFlow: () =>
+        createSignInFlow({
+          apiOrigin: { ok: true, origin: API_ORIGIN },
+          keyStore,
+          deviceRecords: records,
+          registrationMarkers: markers,
+          openExternal: async (url) => {
+            opened.push(url);
+            return true;
+          },
+          fetch: async (_url, init) => {
+            sent.push(
+              SignInRequestSchema.parse(JSON.parse(String(init.body))).device
+                .publicKey,
+            );
+            return new Response("{}", { status: 503 });
+          },
+          platform: "win32",
+          scheduleTimer: () => () => undefined,
+          listenerConnectionTimeoutMs: 2_000,
+        }),
+    }),
+    focusWindow: () => undefined,
+    confirmForget: async () => true,
+    now: () => clock,
+  });
+  await service.initialize();
+  const signIn = async () => {
+    const before = service.status().revision;
+    await expect(service.startSignIn()).resolves.toEqual({
+      outcome: "started",
+    });
+    const query = new URL(opened.at(-1) ?? "").searchParams;
+    const done = idleWithOutcome(service, before);
+    await postForm(
+      query.get("redirect_uri") ?? "",
+      new URLSearchParams({
+        code: SIGN_IN_CODE,
+        state: query.get("state") ?? "",
+      }).toString(),
+    );
+    return (await done).lastOutcome;
+  };
+
+  // The new device's registration gets no clear answer: its key and the
+  // marker stay.
+  expect(await signIn()).toEqual({ code: "server_error" });
+  const uncertain = sent[0];
+  expect(await markers.read()).toMatchObject({
+    marker: { publicKey: uncertain },
+  });
+
+  // "This is not me" deletes the record and the marker; the key delete fails.
+  failKeyDelete = true;
+  await expect(service.forgetAccount()).resolves.toEqual({
+    outcome: "failed",
+  });
+  expect(await records.read()).toEqual({ kind: "none" });
+  expect(await markers.read()).toEqual({ kind: "none" });
+  expect(realKeys.keys()?.current.publicKey).toBe(uncertain);
+
+  // The next sign-in deletes the leftover key and sends a new one.
+  failKeyDelete = false;
+  clock += SIGN_IN_START_COOLDOWN_MS;
+  await signIn();
+  expect(sent).toHaveLength(2);
+  expect(sent[1]).not.toBe(uncertain);
 }, 20_000);

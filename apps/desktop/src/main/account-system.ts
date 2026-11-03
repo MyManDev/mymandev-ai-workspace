@@ -53,6 +53,7 @@ export function createSystemAccountService(
       return {
         keyStore,
         deviceRecords,
+        registrationMarkers,
         createFlow: () =>
           createSystemSignInFlow(
             keyStore,

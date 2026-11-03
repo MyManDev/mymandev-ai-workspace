@@ -1011,6 +1011,46 @@ describe("a new device's registration without a clear answer (#153)", () => {
     expect(h.errors).toContain("The sign-in answer named the replaced device.");
   }, 30_000);
 
+  test("a marker that cannot be read stops an attempt that would delete a key, and keeps the key", async () => {
+    const markers = createRegistrationMarkerStore({
+      folder,
+      platform: "win32",
+    });
+    let unreadable = false;
+    const h = harness({
+      wallClock: () => FIRST,
+      registrationMarkers: {
+        read: () =>
+          unreadable ? Promise.reject(new Error("EACCES")) : markers.read(),
+        write: markers.write,
+        delete: markers.delete,
+      },
+    });
+    const key = await unanswered(h);
+    unreadable = true;
+    expect(await h.flow.start()).toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "record_unreadable" },
+    });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key);
+    expect(h.opened).toHaveLength(1);
+    expect(h.errors).toContain(
+      "The registration marker could not be read; the device key is kept.",
+    );
+    // With a record and a key that is not the record's, too.
+    await h.records.write(RECORD);
+    expect(await h.flow.start()).toMatchObject({
+      outcome: { reason: "record_unreadable" },
+    });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(key);
+
+    // An attempt that deletes no key does not need the marker.
+    await h.records.write({ ...RECORD, publicKey: key });
+    h.answer = () => json(200, ANSWER);
+    expect((await signIn(h)).outcome).toMatchObject({ kind: "signed_in" });
+    expect(h.requests.at(-1)?.body.device.kind).toBe("existing");
+  }, 30_000);
+
   test("without a marker that could be written, the next attempt deletes the key as before", async () => {
     const markers = createRegistrationMarkerStore({
       folder,

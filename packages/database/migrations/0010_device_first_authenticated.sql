@@ -1,0 +1,2 @@
+ALTER TABLE "devices" ADD COLUMN "first_authenticated_at" timestamp with time zone;--> statement-breakpoint
+UPDATE "devices" SET "first_authenticated_at" = "created_at" WHERE "first_authenticated_at" IS NULL;

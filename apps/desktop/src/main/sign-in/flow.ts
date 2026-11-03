@@ -112,8 +112,10 @@ export const REGISTRATION_RESEND_MS = 7 * 24 * 60 * 60_000;
  *   Linux a secret service is needed until the passphrase choice exists.
  * - `record_unreadable`: the record file cannot be read, or it is corrupt
  *   (for example another version, after a downgrade) while a key file
- *   exists. The key may still be the key of a device that the API knows, so
- *   it is kept; an explicit reset is a later option.
+ *   exists, or the registration marker cannot be read while a key that no
+ *   record names would be deleted (#153). The key may still be the key of a
+ *   device that the API knows, so it is kept; an explicit reset is a later
+ *   option.
  * - `listener_unavailable`: the loopback listener could not start.
  * - `no_answer`: no answer arrived (a network error, or the request timed
  *   out); a key replacement stays pending.
@@ -501,14 +503,20 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
    */
   let unsavedRecord: DeviceRecord | null = null;
 
-  /** Reads the registration marker; a corrupt one names no key and is dropped. */
-  async function readRegistrationMarker(): Promise<RegistrationMarker | null> {
+  /**
+   * Reads the registration marker; a corrupt one names no key and is
+   * dropped. `unreadable` when the file exists but cannot be read: whether
+   * it names the key is then unknown.
+   */
+  async function readRegistrationMarker(): Promise<
+    RegistrationMarker | "unreadable" | null
+  > {
     let read;
     try {
       read = await deps.registrationMarkers.read();
     } catch {
       report("The registration marker could not be read.");
-      return null;
+      return "unreadable";
     }
     if (read.kind === "corrupt") {
       report("The registration marker is corrupt and is not used.");
@@ -538,6 +546,10 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     marker: RegistrationMarker | null,
     recordKey: string | null,
   ): DeviceKey | null {
+    // The callers ask only when no record names the loaded key and no
+    // replacement is pending, so the record's key and `previous` cannot
+    // match here; both checks stay as defense in depth, so that the key
+    // of a record's device is never sent as a new device.
     if (marker === null || marker.publicKey === recordKey) {
       return null;
     }
@@ -583,6 +595,7 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     const plan = await planFrom(read, hasKey, marker);
     if (
       marker !== null &&
+      marker !== "unreadable" &&
       typeof plan !== "string" &&
       (plan.kind === "existing" || plan.resend === null)
     ) {
@@ -595,8 +608,23 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
   async function planFrom(
     read: DeviceRecordRead,
     hasKey: boolean,
-    marker: RegistrationMarker | null,
+    marker: RegistrationMarker | "unreadable" | null,
   ): Promise<DevicePlan | SignInFailureReason> {
+    /**
+     * The key to send again, or `record_unreadable` when the marker cannot
+     * be read: the key may be one that the API holds, so it is kept.
+     */
+    const resendOrStop = (
+      recordKey: string | null,
+    ): DeviceKey | null | "record_unreadable" => {
+      if (marker === "unreadable") {
+        report(
+          "The registration marker could not be read; the device key is kept.",
+        );
+        return "record_unreadable";
+      }
+      return resendOf(marker, recordKey);
+    };
     if (read.kind === "record") {
       if (!hasKey) {
         // The key was lost: a new device that names the previous one.
@@ -630,7 +658,10 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
         // after that device's key was lost. Within the marker's time it is
         // sent again, as a new device that names the record's device again
         // (#153); it is never used with the record's device ID.
-        const resend = resendOf(marker, read.record.publicKey);
+        const resend = resendOrStop(read.record.publicKey);
+        if (resend === "record_unreadable") {
+          return resend;
+        }
         if (resend !== null) {
           return { kind: "new", record: read.record, resend };
         }
@@ -660,7 +691,10 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
     if (hasKey) {
       // The key of a first registration that got no clear answer is sent
       // again within the marker's time (#153).
-      const resend = resendOf(marker, null);
+      const resend = resendOrStop(null);
+      if (resend === "record_unreadable") {
+        return resend;
+      }
       if (resend !== null) {
         return { kind: "new", record: null, resend };
       }

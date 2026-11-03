@@ -122,6 +122,7 @@ interface Harness {
   /** The service's clock in milliseconds. */
   clock: number;
   recordDelete: () => Promise<void>;
+  markerDelete: () => Promise<void>;
   keyDelete: () => Promise<void>;
 }
 
@@ -149,6 +150,7 @@ function harness(
     confirm: async () => true,
     clock: 0,
     recordDelete: async () => undefined,
+    markerDelete: async () => undefined,
     keyDelete: async () => undefined,
   } as Omit<Harness, "service">;
   const system: AccountSystem = {
@@ -182,6 +184,12 @@ function harness(
       delete: async () => {
         state.log.push("delete record");
         await state.recordDelete();
+      },
+    },
+    registrationMarkers: {
+      delete: async () => {
+        state.log.push("delete registration marker");
+        await state.markerDelete();
       },
     },
     createFlow: () => {
@@ -852,7 +860,7 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
   expect(view({ kind: "paused" })).toEqual({ code: "failed" });
 });
 
-test("This is not me asks for confirmation, deletes the record, resets the flow, deletes the key, and signs out", async () => {
+test("This is not me asks for confirmation, deletes the record and the registration marker, resets the flow, deletes the key, and signs out", async () => {
   const h = harness();
   await h.service.initialize();
   h.start = async () => ({
@@ -872,6 +880,7 @@ test("This is not me asks for confirmation, deletes the record, resets the flow,
   expect(h.log).toEqual([
     "confirm octocat",
     "delete record",
+    "delete registration marker",
     "reset flow",
     "delete key",
     "status idle",
@@ -890,6 +899,23 @@ test("This is not me asks for confirmation, deletes the record, resets the flow,
   h.start = async () => startedSignIn().start;
   await h.service.startSignIn();
   expect(h.flows).toBe(1);
+});
+
+test("This is not me goes on when the registration marker cannot be deleted, so the key is deleted and names no marker", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.markerDelete = () => Promise.reject(new Error("EBUSY"));
+  h.log.length = 0;
+  await expect(h.service.forgetAccount()).resolves.toEqual({
+    outcome: "forgotten",
+  });
+  expect(h.log.slice(0, 4)).toEqual([
+    "confirm octocat",
+    "delete record",
+    "delete registration marker",
+    "delete key",
+  ]);
+  expect(h.errors).toEqual(["The registration marker could not be deleted."]);
 });
 
 test("This is not me also works while the key waits for its passphrase", async () => {
@@ -934,13 +960,15 @@ test("a failed delete is reported and the account is read again, so This is not 
     outcome: "failed",
   });
   // The flow forgot the account before the key delete failed.
-  expect(h.log.slice(0, 4)).toEqual([
+  expect(h.log.slice(0, 5)).toEqual([
     "confirm octocat",
     "delete record",
+    "delete registration marker",
     "reset flow",
     "delete key",
   ]);
-  // A key without a record is deleted by the next sign-in.
+  // A key without a record or a registration marker is deleted by the next
+  // sign-in.
   expect(h.service.status().account).toEqual({ kind: "signed_out" });
   expect(h.errors).toEqual([
     "The account could not be forgotten on this device.",
@@ -965,6 +993,7 @@ test("a listener that throws and a window that cannot come up are reported and c
         read: async () => ({ kind: "none" }),
         delete: async () => undefined,
       },
+      registrationMarkers: { delete: async () => undefined },
       createFlow: () => ({
         start: async (startOptions) => {
           callback = startOptions?.onCallback;

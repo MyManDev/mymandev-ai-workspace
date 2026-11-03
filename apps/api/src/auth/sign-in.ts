@@ -49,6 +49,14 @@ const MAX_ACTIVE_DEVICES = 20;
 const MAX_NEW_DEVICES_PER_DAY = 10;
 const DAY_MS = 24 * 60 * 60_000;
 
+/**
+ * How long after its registration a device that never authenticated may
+ * repeat it with the same key (#153): the desktop sends the key of an
+ * uncertain registration again for at most 7 days (its
+ * `REGISTRATION_RESEND_MS`).
+ */
+const REPEATABLE_REGISTRATION_MS = 7 * DAY_MS;
+
 /** Per remote address, while the API is reached directly (P-63). */
 const ROUTE_LIMIT = { max: 30, timeWindow: 10 * 60_000 };
 
@@ -212,9 +220,8 @@ export async function registerSignIn(
             throw new ApiError("sign_in_required");
           }
 
-          let result: SignInResult;
-          try {
-            result = await database.transaction((tx) =>
+          const run = () =>
+            database.transaction((tx) =>
               signIn(
                 tx,
                 binding.identity,
@@ -224,15 +231,31 @@ export async function registerSignIn(
                 now,
               ),
             );
+          let result: SignInResult;
+          try {
+            try {
+              result = await run();
+            } catch (error) {
+              // A concurrent sign-in created the same account first: its
+              // identity's unique key refused this one, which committed
+              // nothing. Run once more, which finds the account and, for a
+              // registration with the same key, the device (#153). A second
+              // unique violation, such as the same key registered for another
+              // account at the same time, answers conflict.
+              if (
+                error instanceof ApiError ||
+                !fromDatabase(error) ||
+                toDatabaseError(error).code !== "23505"
+              ) {
+                throw error;
+              }
+              result = await run();
+            }
           } catch (error) {
             if (error instanceof ApiError || !fromDatabase(error)) {
               throw error;
             }
             const failure = toDatabaseError(error);
-            // A concurrent sign-in that created the same account, or that
-            // registered the same key for another account. A concurrent
-            // sign-in of an existing account with the same key waits at the
-            // identity row instead, and then finds the device (#153).
             throw failure.code === "23505" ? new ApiError("conflict") : failure;
           }
           const { userId, deviceId } = result.response;
@@ -249,31 +272,29 @@ export async function registerSignIn(
             sendCancelledRuns(connections, result.cancelledRuns, now);
           }
           if (result.registered === null) {
-            // An existing device: its connection used the sign-in that this
-            // one followed, with the key that it replaced or, for a repeated
-            // registration (#153), with the same key.
+            // An existing device: its connection used the key that this
+            // sign-in replaced. The device of a repeated registration never
+            // authenticated, so it has no connection (#153).
             connections.closeDevice(deviceId, "key_replaced", request.log);
           } else {
             // The new device has no connection yet; the account's other
-            // connections hear of it.
+            // connections hear of it and of the device it replaced.
             const registered: AccountDeviceRegisteredFrame = {
               protocolVersion: PROTOCOL_VERSION,
               type: "account.device_registered",
               device: { ...result.registered, revokedAt: null, current: false },
             };
             connections.sendToUser(userId, registered, deviceId);
-          }
-          if (replaced !== null) {
-            // The account's other connections hear of the device that a new
-            // or a repeated registration replaced.
-            const revoked: AccountDeviceRevokedFrame = {
-              protocolVersion: PROTOCOL_VERSION,
-              type: "account.device_revoked",
-              deviceId: replaced,
-              reason: "replaced",
-              revokedAt: now.toISOString(),
-            };
-            connections.sendToUser(userId, revoked, replaced);
+            if (replaced !== null) {
+              const revoked: AccountDeviceRevokedFrame = {
+                protocolVersion: PROTOCOL_VERSION,
+                type: "account.device_revoked",
+                deviceId: replaced,
+                reason: "replaced",
+                revokedAt: now.toISOString(),
+              };
+              connections.sendToUser(userId, revoked, replaced);
+            }
           }
           // The webhook records a revocation in memory before its transaction
           // looks up the account. If it recorded it before the check above,
@@ -363,6 +384,10 @@ async function signIn(
         keyAlgorithm: device.keyAlgorithm,
         lastSignInAt: now,
         signedOutAt: null,
+        // Signing with the device's current key under its ID proves that
+        // the desktop knows the device, so it no longer repeats its
+        // registration (#153).
+        firstAuthenticatedAt: row.firstAuthenticatedAt ?? now,
         updatedAt: now,
       })
       .where(eq(devices.id, row.id));
@@ -382,13 +407,22 @@ async function signIn(
       .for("no key update");
     if (holder !== undefined) {
       // The signature proved the private key, so an active device of this
-      // account signs in again: no new device, no limit, no registration
-      // lock, and no alert. A revoked device's key and another account's
-      // key stay refused, and a device never replaces itself.
+      // account that cannot have been used yet signs in again: no new
+      // device, no limit, no registration lock, and no alert. It must be
+      // younger than the desktop's 7 days and must never have proved its
+      // key under its device ID: no access token, no WebSocket
+      // authentication, and no sign-in that replaced its key, so its key is
+      // still the one it was registered with. Otherwise a copied key of a
+      // device in use could renew itself without ever being replaced
+      // (ADR 0014, "Device key and authentication"). A revoked device's
+      // key, another account's key, and a used or older device stay
+      // refused, and a device never replaces itself.
       if (
         holder.revokedAt !== null ||
         holder.userId !== userId ||
-        holder.id === device.previousDeviceId
+        holder.id === device.previousDeviceId ||
+        holder.firstAuthenticatedAt !== null ||
+        now.getTime() - holder.createdAt.getTime() >= REPEATABLE_REGISTRATION_MS
       ) {
         throw new ApiError("conflict");
       }
@@ -457,23 +491,24 @@ async function signIn(
         false,
       );
       await audit(tx, "device.registered", userId, deviceId, deviceId, now);
-    }
-    if (device.previousDeviceId !== undefined) {
-      // Revoked only if it belongs to the same account (ADR 0014, step 8).
-      // The first commit of a repeated registration revoked it already, so
-      // the repeat changes nothing about it. After the commit, the route
-      // closes its socket and sends the runs that the revocation cancelled.
-      const replaced = await revokeDevice(tx, {
-        deviceId: device.previousDeviceId,
-        userId,
-        reason: "replaced",
-        now,
-        actorUserId: userId,
-        actorDeviceId: deviceId,
-      });
-      if (replaced.revoked) {
-        replacedDeviceId = device.previousDeviceId;
-        cancelledRuns = replaced.cancelledRuns;
+      if (device.previousDeviceId !== undefined) {
+        // Revoked only if it belongs to the same account (ADR 0014, step 8).
+        // After the commit, the route closes its socket and sends the runs
+        // that the revocation cancelled. A repeated registration ignores
+        // the previous device: its first commit revoked it already, and the
+        // repeat changes nothing about it (#153).
+        const replaced = await revokeDevice(tx, {
+          deviceId: device.previousDeviceId,
+          userId,
+          reason: "replaced",
+          now,
+          actorUserId: userId,
+          actorDeviceId: deviceId,
+        });
+        if (replaced.revoked) {
+          replacedDeviceId = device.previousDeviceId;
+          cancelledRuns = replaced.cancelledRuns;
+        }
       }
     }
   }

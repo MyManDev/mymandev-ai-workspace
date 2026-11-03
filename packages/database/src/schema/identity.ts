@@ -122,6 +122,14 @@ export const devices = pgTable(
     createdAt: createdAt(),
     updatedAt: updatedAt(),
     lastSeenAt: nullableTimestamp("last_seen_at"),
+    /**
+     * When the device first proved its key under its device ID: its first
+     * access token, its first WebSocket authentication, or the first sign-in
+     * that replaced its key. Null while the desktop may never have learned
+     * the device ID, so that only then may a new-device sign-in with the
+     * same key repeat the registration (#153).
+     */
+    firstAuthenticatedAt: nullableTimestamp("first_authenticated_at"),
     lastSignInAt: nullableTimestamp("last_sign_in_at").notNull(),
     signedOutAt: nullableTimestamp("signed_out_at"),
     revokedAt: nullableTimestamp("revoked_at"),

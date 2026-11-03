@@ -50,6 +50,7 @@ export {
   type DeviceSeenInput,
   type DevicesSeenInput,
   isActiveMember,
+  markDeviceAuthenticated,
   markDeviceSeen,
   markDevicesSeen,
   writeConnectionAudit,
