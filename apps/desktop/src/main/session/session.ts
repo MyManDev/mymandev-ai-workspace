@@ -32,7 +32,11 @@ import {
 } from "../device-key/errors.ts";
 import type { DeviceKey } from "../device-key/signing-key.ts";
 import type { DeviceKeys, DeviceKeyStore } from "../device-key/store.ts";
-import type { DeviceRecord, DeviceRecordStore } from "../device-record.ts";
+import type {
+  DeviceRecord,
+  DeviceRecordRead,
+  DeviceRecordStore,
+} from "../device-record.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 import { type ApiAnswer, type ApiFetch, callApi } from "./api-call.ts";
 import {
@@ -959,16 +963,39 @@ export function createDeviceSession(
    * names it, so a confirmed key never sits next to a record that names the
    * previous key; if the record cannot be written, the replacement stays
    * pending. A sign-out marker that does not name the key has ended.
+   *
+   * The answer may arrive long after `facts` were read: the record is read
+   * again, and nothing is written or changed when it is gone, names another
+   * device, or the key store no longer holds these keys, for example after
+   * "This is not me" deleted the record and the key meanwhile. Writing the
+   * record from `facts` then would bring that account back.
    */
   async function keyHeld(
     facts: ReadyFacts,
     key: DeviceKey,
     keepBoth = false,
   ): Promise<SessionFailure | null> {
-    const { record, keys } = facts;
+    const { keys } = facts;
+    let read: DeviceRecordRead;
+    try {
+      read = await deps.deviceRecords.read();
+    } catch {
+      return failure("record_unreadable");
+    }
+    const held = deps.keyStore.keys();
+    if (
+      read.kind !== "record" ||
+      read.record.deviceId !== facts.record.deviceId ||
+      held === null ||
+      held.current.publicKey !== keys.current.publicKey ||
+      held.previous?.publicKey !== keys.previous?.publicKey
+    ) {
+      return failure("no_device");
+    }
+    const record = read.record;
     // The API holds a key, so an earlier refusal of both keys was not about
     // them: the wait starts again at the next refusal.
-    await changeNotes((held) => ({ ...held, keysRefused: null }));
+    await changeNotes((notes) => ({ ...notes, keysRefused: null }));
     if (key === keys.current) {
       if (record.publicKey !== key.publicKey) {
         if (!(await writeRecord({ ...record, publicKey: key.publicKey }))) {
@@ -1634,27 +1661,38 @@ export function createDeviceSession(
   // ---- Removal and the device list ---------------------------------------
 
   async function removeDevice(): Promise<SessionResult<"removed" | "pending">> {
-    if (gone !== null) {
-      return failure("no_device");
+    // In the key queue, so that the removal starts only after a mint or a
+    // sign-out report that runs, and reads what that left behind.
+    const noted = await exclusive(
+      async (): Promise<DeviceId | SessionFailure> => {
+        if (gone !== null) {
+          return failure("no_device");
+        }
+        let facts: Facts;
+        try {
+          facts = await readFacts();
+        } catch {
+          return failure("key_store_failed");
+        }
+        if (facts.kind !== "ready") {
+          return factsFailure(facts);
+        }
+        if (facts.marker !== null) {
+          // The API takes no request of a signed-out device: sign in first.
+          return failure("signed_out");
+        }
+        const deviceId = facts.record.deviceId;
+        // Noted first, so that the removal holds across a restart.
+        await changeNotes((held) => ({ ...held, removal: { deviceId } }));
+        await settle();
+        return deviceId;
+      },
+    );
+    if (typeof noted !== "string") {
+      return noted;
     }
-    let facts: Facts;
-    try {
-      facts = await readFacts();
-    } catch {
-      return failure("key_store_failed");
-    }
-    if (facts.kind !== "ready") {
-      return factsFailure(facts);
-    }
-    if (facts.marker !== null) {
-      // The API takes no request of a signed-out device: sign in first.
-      return failure("signed_out");
-    }
-    const deviceId = facts.record.deviceId;
-    // Noted first, so that the removal holds across a restart.
-    await changeNotes((held) => ({ ...held, removal: { deviceId } }));
-    await settle();
-    return attemptRemoval(deviceId);
+    // Outside the queue: the request mints its token in the queue itself.
+    return attemptRemoval(noted);
   }
 
   /**

@@ -3,6 +3,7 @@ import {
   type DeviceId,
   GITHUB_LOGIN_PATTERN,
   LIMITS,
+  MAX_ANSWER_LIST_ITEMS,
   type UserId,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
@@ -14,10 +15,12 @@ import {
 } from "../shared/ipc-contract.ts";
 import {
   type AccountServiceOptions,
+  type AccountSession,
   type AccountSystem,
   createAccountService,
   FORGET_CONFIRMATION,
   forgetConfirmationMessage,
+  LIST_DEVICES_COOLDOWN_MS,
   forgetConfirmed,
   SIGN_IN_START_COOLDOWN_MS,
   signInOutcomeView,
@@ -31,6 +34,11 @@ import {
 import { PASSPHRASE_MAX_CHARACTERS } from "./device-key/key-file.ts";
 import type { DeviceKeyStatus } from "./device-key/store.ts";
 import type { DeviceRecord, DeviceRecordRead } from "./device-record.ts";
+import type {
+  DeviceSessionState,
+  SessionAccount,
+  SessionResult,
+} from "./session/session.ts";
 import {
   SIGN_IN_FAILURE_REASONS,
   SIGN_IN_URL_WARNING,
@@ -56,6 +64,31 @@ const RECORD: DeviceRecord = Object.freeze({
   signInExpiresAt: "2026-12-02T10:00:00.000Z",
   publicKey: PUBLIC_KEY,
 });
+
+const SESSION_ACCOUNT: SessionAccount = Object.freeze({
+  deviceId: DEVICE_ID,
+  userId: USER_ID,
+  login: "octocat",
+  displayName: "The Octocat",
+  signInExpiresAt: "2026-12-02T10:00:00.000Z",
+});
+
+const SESSION_SIGNED_IN: DeviceSessionState = Object.freeze({
+  kind: "signed_in",
+  account: SESSION_ACCOUNT,
+});
+
+const DEVICE_ITEM = Object.freeze({
+  id: DEVICE_ID,
+  label: "Mac",
+  platform: "macos",
+  createdAt: "2026-10-01T10:00:00.000Z",
+  lastSeenAt: "2026-11-02T09:00:00.000Z",
+  lastSignInAt: "2026-11-01T10:00:00.000Z",
+  signInExpiresAt: "2026-12-01T10:00:00.000Z",
+  revokedAt: null,
+  current: true,
+} as const);
 
 const SIGNED_IN_OUTCOME: SignInOutcome = Object.freeze({
   kind: "signed_in",
@@ -123,11 +156,30 @@ interface Harness {
   clock: number;
   recordDelete: () => Promise<void>;
   keyDelete: () => Promise<void>;
+  /** The answer of the native confirmation of removing this device. */
+  confirmRemoval: (login: string) => Promise<boolean>;
+  /** When set, every read of the record waits for it. */
+  readGate: Promise<void> | null;
+  /** How often local execution was stopped. */
+  stopped: number;
+  /** The state of the fake device session, which `state` and `refresh` return. */
+  sessionState: DeviceSessionState;
+  /** Sets the session's state and calls its listeners, as the session does. */
+  emit: (state: DeviceSessionState) => void;
+  authenticate: () => Promise<SessionResult<SessionAccount>>;
+  signOut: () => Promise<SessionResult<"reported" | "pending">>;
+  reportSignOut: () => Promise<SessionResult<"reported" | "pending">>;
+  removeDevice: () => Promise<SessionResult<"removed" | "pending">>;
+  listDevices: () => Promise<SessionResult<readonly unknown[]>>;
+  createSession: () => AccountSession;
 }
 
 function harness(
   overrides: Partial<
-    Pick<AccountServiceOptions, "apiOrigin" | "openSystem">
+    Pick<
+      AccountServiceOptions,
+      "apiOrigin" | "openSystem" | "stopLocalExecution"
+    >
   > = {},
 ): Harness {
   const state = {
@@ -150,7 +202,71 @@ function harness(
     clock: 0,
     recordDelete: async () => undefined,
     keyDelete: async () => undefined,
-  } as Omit<Harness, "service">;
+    confirmRemoval: async () => true,
+    readGate: null,
+    stopped: 0,
+    sessionState: SESSION_SIGNED_IN,
+    emit: () => undefined,
+    authenticate: async () => ({ ok: true, value: SESSION_ACCOUNT }),
+    signOut: async () => ({ ok: true, value: "reported" }),
+    reportSignOut: async () => ({ ok: true, value: "reported" }),
+    removeDevice: async () => ({ ok: true, value: "removed" }),
+    listDevices: async () => ({ ok: true, value: [DEVICE_ITEM] }),
+  } as unknown as Omit<Harness, "service">;
+  const sessionListeners = new Set<(state: DeviceSessionState) => void>();
+  state.emit = (next) => {
+    state.sessionState = next;
+    for (const listener of [...sessionListeners]) {
+      listener(next);
+    }
+  };
+  // A fake of the device session that logs every call.
+  state.createSession = () => {
+    state.log.push("session create");
+    return {
+      state: () => state.sessionState,
+      onChange: (listener) => {
+        sessionListeners.add(listener);
+        return () => {
+          sessionListeners.delete(listener);
+        };
+      },
+      refresh: async () => {
+        state.log.push("session refresh");
+        return state.sessionState;
+      },
+      signInStarted: () => {
+        state.log.push("session signInStarted");
+      },
+      signInFinished: async (outcome) => {
+        const detail = (outcome as { reason?: string }).reason ?? outcome.code;
+        state.log.push(
+          `session signInFinished ${outcome.kind}${detail === undefined ? "" : ` ${detail}`}`,
+        );
+        return state.sessionState;
+      },
+      authenticate: async () => {
+        state.log.push("session authenticate");
+        return state.authenticate();
+      },
+      listDevices: async () => {
+        state.log.push("session listDevices");
+        return (await state.listDevices()) as never;
+      },
+      signOut: async () => {
+        state.log.push("session signOut");
+        return state.signOut();
+      },
+      reportSignOut: async () => {
+        state.log.push("session reportSignOut");
+        return state.reportSignOut();
+      },
+      removeDevice: async () => {
+        state.log.push("session removeDevice");
+        return state.removeDevice();
+      },
+    };
+  };
   const system: AccountSystem = {
     keyStore: {
       load: async (options) => {
@@ -174,6 +290,7 @@ function harness(
     deviceRecords: {
       read: async () => {
         state.log.push("read record");
+        await state.readGate;
         if (state.record instanceof Error) {
           throw state.record;
         }
@@ -199,6 +316,7 @@ function harness(
         },
       };
     },
+    createSession: () => state.createSession(),
   };
   const service = createAccountService({
     apiOrigin: { ok: true, origin: "https://api.mymandev.example" },
@@ -210,6 +328,14 @@ function harness(
     confirmForget: (login) => {
       state.log.push(`confirm ${login}`);
       return state.confirm(login);
+    },
+    confirmRemoveDevice: (login) => {
+      state.log.push(`confirm removal ${login}`);
+      return state.confirmRemoval(login);
+    },
+    stopLocalExecution: () => {
+      state.stopped += 1;
+      state.log.push("stop local execution");
     },
     now: () => state.clock,
     onError: (message) => state.errors.push(message),
@@ -254,6 +380,7 @@ test("before the key is loaded, the status says so and every action waits", asyn
     deviceKey: "loading",
     replacementPending: false,
     apiOrigin: "set",
+    device: "starting",
   });
   await expect(h.service.startSignIn()).resolves.toEqual({
     outcome: "refused",
@@ -277,7 +404,13 @@ test("initialize loads the key once, then reads the record, and shows only the l
   await Promise.all([h.service.initialize(), h.service.initialize()]);
   await h.service.initialize();
 
-  expect(h.log).toEqual(["load", "read record", "status idle"]);
+  expect(h.log).toEqual([
+    "load",
+    "session create",
+    "read record",
+    "status idle",
+    "session refresh",
+  ]);
   expect(h.service.status()).toEqual({
     revision: 1,
     account: {
@@ -291,6 +424,7 @@ test("initialize loads the key once, then reads the record, and shows only the l
     deviceKey: "ready",
     replacementPending: false,
     apiOrigin: "set",
+    device: "signed_in",
   });
   expect(JSON.stringify(h.service.status())).not.toMatch(
     new RegExp(`${USER_ID}|${PUBLIC_KEY}|signInExpiresAt`),
@@ -379,6 +513,7 @@ test("a key store that cannot be opened shows why", async () => {
     expect(h.service.status()).toMatchObject({
       account: { kind: "signed_out" },
       deviceKey,
+      device: "unavailable",
     });
     expect(h.errors).toEqual(["The device key store could not be opened."]);
     await expect(h.service.startSignIn()).resolves.toEqual({
@@ -631,6 +766,9 @@ test("cancel ends the open sign-in, and a cancel while it starts ends it once it
       open = () => resolve(starting.start);
     });
   const result = h.service.startSignIn();
+  // The flow's start is on its way.
+  await settle();
+  expect(h.log.at(-1)).toBe("start");
   expect(h.service.cancelSignIn()).toBe(true);
   expect(starting.cancels()).toBe(0);
   const ended = nextStatus(h, (status) => status.signIn.kind === "idle");
@@ -852,29 +990,32 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
   expect(view({ kind: "paused" })).toEqual({ code: "failed" });
 });
 
-test("This is not me asks for confirmation, deletes the record, resets the flow, deletes the key, and signs out", async () => {
+test("This is not me asks for confirmation, removes the device at the API, deletes the record, resets the flow, deletes the key, and signs out", async () => {
   const h = harness();
   await h.service.initialize();
   h.start = async () => ({
     started: false,
-    outcome: { kind: "failed", reason: "replacement_pending" },
+    outcome: { kind: "failed", reason: "listener_unavailable" },
   });
   await h.service.startSignIn();
   expect(h.service.status().lastOutcome).toEqual({
-    code: "replacement_pending",
+    code: "listener_unavailable",
   });
   h.log.length = 0;
 
   await expect(h.service.forgetAccount()).resolves.toEqual({
     outcome: "forgotten",
+    removedAtServer: true,
   });
 
   expect(h.log).toEqual([
     "confirm octocat",
+    "session removeDevice",
     "delete record",
     "reset flow",
     "delete key",
     "status idle",
+    "session refresh",
   ]);
   expect(h.service.status()).toMatchObject({
     account: { kind: "signed_out" },
@@ -897,8 +1038,11 @@ test("This is not me also works while the key waits for its passphrase", async (
   h.load = () => Promise.reject(new DeviceKeyError("passphrase_required"));
   await h.service.initialize();
 
+  h.removeDevice = async () => ({ ok: false, reason: "key_not_loaded" });
+
   await expect(h.service.forgetAccount()).resolves.toEqual({
     outcome: "forgotten",
+    removedAtServer: false,
   });
   expect(h.service.status()).toMatchObject({
     account: { kind: "signed_out" },
@@ -912,7 +1056,7 @@ test("a failed delete is reported and the account is read again, so This is not 
   // A start that does not get far still creates the flow.
   h.start = async () => ({
     started: false,
-    outcome: { kind: "failed", reason: "replacement_pending" },
+    outcome: { kind: "failed", reason: "listener_unavailable" },
   });
   await h.service.startSignIn();
   h.recordDelete = () => Promise.reject(new Error("EBUSY"));
@@ -934,8 +1078,9 @@ test("a failed delete is reported and the account is read again, so This is not 
     outcome: "failed",
   });
   // The flow forgot the account before the key delete failed.
-  expect(h.log.slice(0, 4)).toEqual([
+  expect(h.log.slice(0, 5)).toEqual([
     "confirm octocat",
+    "session removeDevice",
     "delete record",
     "reset flow",
     "delete key",
@@ -972,11 +1117,13 @@ test("a listener that throws and a window that cannot come up are reported and c
         },
         reset: () => true,
       }),
+      createSession: () => h.createSession(),
     }),
     focusWindow: () => {
       throw new Error("no window");
     },
     confirmForget: async () => true,
+    confirmRemoveDevice: async () => true,
     onError: (message) => h.errors.push(message),
   });
   const attempt = startedSignIn();
@@ -1049,7 +1196,7 @@ test("the confirmation of This is not me names the login, offers Keep as the def
     noLink: true,
     title: "This is not me",
     detail:
-      "The device key and the account are deleted on this computer. You can then sign in with your own GitHub account.",
+      "The device key and the account are deleted on this computer. When this device is signed in with a usable key and the server can be reached, it is first removed from that account; otherwise it stays listed there, without a key, until its sign-in ends or the account removes it. You can then sign in with your own GitHub account.",
   });
   expect(Object.isFrozen(FORGET_CONFIRMATION)).toBe(true);
   expect(Object.isFrozen(FORGET_CONFIRMATION.buttons)).toBe(true);
@@ -1151,6 +1298,8 @@ test("after a wrong passphrase the next unlock waits 1 second, doubling up to 30
 
 test("the contract's limits follow the protocol and the key store", () => {
   expect(ACCOUNT_LIMITS.displayName).toBe(LIMITS.displayName);
+  expect(ACCOUNT_LIMITS.deviceLabel).toBe(LIMITS.deviceLabel);
+  expect(ACCOUNT_LIMITS.devices).toBe(MAX_ANSWER_LIST_ITEMS);
   // NFC can join up to four UTF-16 code units into one character, and the
   // store counts characters after normalization.
   expect(ACCOUNT_LIMITS.passphrase).toBeGreaterThanOrEqual(
@@ -1171,4 +1320,971 @@ test("the contract's limits follow the protocol and the key store", () => {
       GITHUB_LOGIN_PATTERN.test(value),
     );
   }
+});
+
+// ---- The device session (part 3 of #94) ---------------------------------
+
+test("the session is created after the key's load, also for a key that waits for its passphrase, and refreshed at startup", async () => {
+  const h = harness();
+  h.load = () => Promise.reject(new DeviceKeyError("passphrase_required"));
+  h.sessionState = { kind: "key_not_loaded", account: SESSION_ACCOUNT };
+
+  await h.service.initialize();
+
+  expect(h.log).toEqual([
+    "load",
+    "session create",
+    "read record",
+    "status idle",
+    "session refresh",
+  ]);
+  expect(h.service.status().device).toBe("key_not_loaded");
+
+  // The unlock refreshes the session, which reads the loaded key.
+  h.sessionState = SESSION_SIGNED_IN;
+  h.load = async () => undefined;
+  await expect(h.service.unlockDeviceKey(PASSPHRASE)).resolves.toEqual({
+    outcome: "unlocked",
+  });
+  await settle();
+  // The new state reaches the status, and the account is read again.
+  expect(h.log.slice(-5)).toEqual([
+    "load with passphrase",
+    "status idle",
+    "session refresh",
+    "status idle",
+    "read record",
+  ]);
+  expect(h.service.status().device).toBe("signed_in");
+});
+
+test("a sign-out that the API has not learned is reported at startup", async () => {
+  const h = harness();
+  h.sessionState = {
+    kind: "signed_out",
+    account: SESSION_ACCOUNT,
+    reportPending: true,
+  };
+
+  await h.service.initialize();
+
+  expect(h.log.slice(-2)).toEqual(["session refresh", "session reportSignOut"]);
+  expect(h.service.status().device).toBe("sign_out_report_pending");
+  h.emit({
+    kind: "signed_out",
+    account: SESSION_ACCOUNT,
+    reportPending: false,
+  });
+  expect(h.service.status().device).toBe("signed_out");
+});
+
+test("a session that cannot be created is reported, and its actions are refused", async () => {
+  const h = harness();
+  h.createSession = () => {
+    throw new Error("The device session needs a ready application.");
+  };
+
+  await h.service.initialize();
+
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "signed_in" },
+    deviceKey: "ready",
+    device: "unavailable",
+  });
+  expect(h.errors).toEqual(["The device session could not be created."]);
+  for (const action of [
+    h.service.signOut,
+    h.service.removeDevice,
+    h.service.listDevices,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "not_signed_in",
+    });
+  }
+  // A sign-in and "This is not me" still work without the session.
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+});
+
+test("every state of the session reaches the status as its code, without the account's user ID or sign-in expiry", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const states: [DeviceSessionState, string][] = [
+    [{ kind: "starting" }, "starting"],
+    [{ kind: "no_device" }, "no_device"],
+    [{ kind: "key_lost", account: SESSION_ACCOUNT }, "key_lost"],
+    [{ kind: "unavailable", reason: "record_unreadable" }, "unavailable"],
+    [{ kind: "key_not_loaded", account: SESSION_ACCOUNT }, "key_not_loaded"],
+    [SESSION_SIGNED_IN, "signed_in"],
+    [
+      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: false },
+      "signed_out",
+    ],
+    [
+      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: true },
+      "sign_out_report_pending",
+    ],
+    [
+      { kind: "sign_in_required", account: SESSION_ACCOUNT },
+      "sign_in_required",
+    ],
+    [{ kind: "auth_failed", account: SESSION_ACCOUNT }, "auth_failed"],
+    [
+      { kind: "account_mismatch", account: SESSION_ACCOUNT },
+      "account_mismatch",
+    ],
+    [{ kind: "removal_pending", account: SESSION_ACCOUNT }, "removal_pending"],
+    [{ kind: "removed" }, "removed"],
+    [{ kind: "revoked" }, "revoked"],
+  ];
+  for (const [state, code] of states) {
+    h.emit(state);
+    expect(h.service.status().device).toBe(code);
+    expect(AccountStatusSchema.parse(h.service.status())).toEqual(
+      h.service.status(),
+    );
+  }
+  await settle();
+  const sent = JSON.stringify(h.statuses);
+  expect(sent).not.toContain(USER_ID);
+  expect(sent).not.toContain("2026-12-02T10:00:00.000Z");
+  expect(sent).not.toContain(PUBLIC_KEY);
+});
+
+test("a revoked device stops local execution once, resets the flow, and reads the account again", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.start = async () => ({
+    started: false,
+    outcome: { kind: "failed", reason: "listener_unavailable" },
+  });
+  await h.service.startSignIn();
+  h.log.length = 0;
+
+  // The session deleted the key and then the record.
+  h.record = { kind: "none" };
+  h.emit({ kind: "revoked" });
+  expect(h.log.slice(0, 3)).toEqual([
+    "stop local execution",
+    "reset flow",
+    "status idle",
+  ]);
+  await settle();
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "signed_out" },
+    device: "revoked",
+  });
+  h.emit({ kind: "revoked" });
+  expect(h.stopped).toBe(1);
+
+  // A device that is revoked again later stops again.
+  h.emit({ kind: "no_device" });
+  h.emit({ kind: "revoked" });
+  expect(h.stopped).toBe(2);
+
+  // A local execution that cannot be stopped is reported.
+  const failing = harness({
+    stopLocalExecution: () => {
+      throw new Error("busy");
+    },
+  });
+  await failing.service.initialize();
+  failing.emit({ kind: "revoked" });
+  expect(failing.errors).toEqual(["The local execution could not be stopped."]);
+  expect(failing.service.status().device).toBe("revoked");
+});
+
+test("a sign-in tells the session when it starts and how it ended, also when it did not start", async () => {
+  const outcomes: SignInOutcome[] = [
+    SIGNED_IN_OUTCOME,
+    {
+      kind: "refused",
+      code: "device_account_mismatch",
+      deviceLogin: "octocat",
+    },
+    { kind: "failed", reason: "uncertain_refusal", apiError: "auth_failed" },
+    { kind: "cancelled" },
+  ];
+  for (const outcome of outcomes) {
+    const h = harness();
+    await h.service.initialize();
+    const attempt = startedSignIn();
+    h.start = async () => attempt.start;
+    h.log.length = 0;
+
+    await h.service.startSignIn();
+    const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+    attempt.settle(outcome);
+    await done;
+
+    const detail =
+      outcome.kind === "refused"
+        ? ` ${outcome.code}`
+        : outcome.kind === "failed"
+          ? ` ${outcome.reason}`
+          : "";
+    expect(h.log.filter((step) => step.startsWith("session"))).toEqual([
+      "session signInStarted",
+      `session signInFinished ${outcome.kind}${detail}`,
+    ]);
+    expect(h.log.indexOf("session signInStarted")).toBeLessThan(
+      h.log.indexOf("start"),
+    );
+  }
+
+  const h = harness();
+  await h.service.initialize();
+  h.log.length = 0;
+  h.start = async () => ({
+    started: false,
+    outcome: { kind: "failed", reason: "api_origin_unset" },
+  });
+  await h.service.startSignIn();
+  h.clock += SIGN_IN_START_COOLDOWN_MS;
+  h.start = () => Promise.reject(new Error("broken"));
+  await h.service.startSignIn();
+  expect(h.log.filter((step) => step.startsWith("session"))).toEqual([
+    "session signInStarted",
+    "session signInFinished failed api_origin_unset",
+    "session signInStarted",
+    "session signInFinished failed unexpected",
+  ]);
+});
+
+test("the session's state after a sign-in reaches the status", async () => {
+  const h = harness();
+  h.sessionState = { kind: "no_device" };
+  h.record = { kind: "none" };
+  await h.service.initialize();
+  expect(h.service.status().device).toBe("no_device");
+  const attempt = startedSignIn();
+  h.start = async () => attempt.start;
+  await h.service.startSignIn();
+
+  h.sessionState = SESSION_SIGNED_IN;
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  attempt.settle(SIGNED_IN_OUTCOME);
+
+  expect(await done).toMatchObject({
+    device: "signed_in",
+    lastOutcome: { code: "signed_in" },
+  });
+});
+
+const REPLACEMENT_PENDING: SignInStart = Object.freeze({
+  started: false,
+  outcome: Object.freeze({ kind: "failed", reason: "replacement_pending" }),
+});
+
+test("a pending replacement that an authentication resolves starts the flow once more", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const attempt = startedSignIn();
+  const starts = [REPLACEMENT_PENDING, attempt.start];
+  h.start = async () => starts.shift() ?? REPLACEMENT_PENDING;
+  h.keyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: true,
+    passphraseRequired: false,
+  };
+  h.authenticate = async () => {
+    // The new key authenticated: the session confirmed the replacement.
+    h.keyStatus = {
+      protection: "system",
+      loaded: true,
+      replacementPending: false,
+      passphraseRequired: false,
+    };
+    return { ok: true, value: SESSION_ACCOUNT };
+  };
+  h.log.length = 0;
+
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+
+  expect(h.log.filter((step) => step !== "status starting")).toEqual([
+    "session signInStarted",
+    "create flow 1",
+    "start",
+    "session signInFinished failed replacement_pending",
+    "session authenticate",
+    "session signInStarted",
+    "start",
+    "status waiting",
+  ]);
+  expect(h.flows).toBe(1);
+});
+
+test("both keys lost in the authentication also start the flow once more, which then registers a new device", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const starts = [REPLACEMENT_PENDING, startedSignIn().start];
+  h.start = async () => starts.shift() ?? REPLACEMENT_PENDING;
+  h.keyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: true,
+    passphraseRequired: false,
+  };
+  h.authenticate = async () => {
+    // A second round refused both keys: the session deleted them.
+    h.keyStatus = { protection: "none" };
+    return { ok: false, reason: "key_lost" };
+  };
+
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+  expect(h.log.filter((step) => step === "start")).toHaveLength(2);
+});
+
+test("a pending replacement that the authentication does not resolve is reported without a second start, and the flow never loops", async () => {
+  {
+    // No answer: the store still holds the replacement.
+    const h = harness();
+    await h.service.initialize();
+    h.start = async () => REPLACEMENT_PENDING;
+    h.keyStatus = {
+      protection: "system",
+      loaded: true,
+      replacementPending: true,
+      passphraseRequired: false,
+    };
+    h.authenticate = async () => ({ ok: false, reason: "no_answer" });
+
+    await expect(h.service.startSignIn()).resolves.toEqual({
+      outcome: "failed",
+      code: "replacement_pending",
+    });
+    expect(h.log.filter((step) => step === "start")).toHaveLength(1);
+    expect(
+      h.log.filter((step) => step === "session authenticate"),
+    ).toHaveLength(1);
+  }
+
+  // The store says the replacement is resolved, but the flow answers
+  // `replacement_pending` again: the second answer is shown as it is.
+  const h = harness();
+  await h.service.initialize();
+  h.start = async () => REPLACEMENT_PENDING;
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "failed",
+    code: "replacement_pending",
+  });
+  expect(h.log.filter((step) => step === "start")).toHaveLength(2);
+  expect(h.log.filter((step) => step === "session authenticate")).toHaveLength(
+    1,
+  );
+  expect(h.log.filter((step) => step === "session signInStarted")).toHaveLength(
+    2,
+  );
+  expect(h.service.status().lastOutcome).toEqual({
+    code: "replacement_pending",
+  });
+
+  // An authentication or a key store that throws counts as unresolved.
+  for (const broken of ["authenticate", "status"] as const) {
+    const b = harness();
+    await b.service.initialize();
+    b.start = async () => REPLACEMENT_PENDING;
+    if (broken === "authenticate") {
+      b.authenticate = () => Promise.reject(new Error("broken"));
+    } else {
+      b.keyStatus = new Error("EIO");
+    }
+    await expect(b.service.startSignIn()).resolves.toEqual({
+      outcome: "failed",
+      code: "replacement_pending",
+    });
+    expect(b.log.filter((step) => step === "start")).toHaveLength(1);
+    expect(b.errors).toEqual([
+      "The pending key replacement could not be resolved.",
+    ]);
+  }
+});
+
+test("a cancel while the pending replacement is resolved starts nothing more", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.start = async () => REPLACEMENT_PENDING;
+  let answer: () => void = () => undefined;
+  h.authenticate = () =>
+    new Promise((resolve) => {
+      answer = () => resolve({ ok: true, value: SESSION_ACCOUNT });
+    });
+
+  const result = h.service.startSignIn();
+  await settle();
+  expect(h.log.at(-1)).toBe("session authenticate");
+  expect(h.service.status().signIn).toEqual({ kind: "starting" });
+  expect(h.service.cancelSignIn()).toBe(true);
+  answer();
+
+  await expect(result).resolves.toEqual({
+    outcome: "failed",
+    code: "replacement_pending",
+  });
+  expect(h.log.filter((step) => step === "start")).toHaveLength(1);
+});
+
+test("sign-out asks the session, which keeps the key, and maps its answer", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.signOut = async () => {
+    h.emit({
+      kind: "signed_out",
+      account: SESSION_ACCOUNT,
+      reportPending: false,
+    });
+    return { ok: true, value: "reported" };
+  };
+
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "signed_out",
+  });
+  expect(h.log).not.toContain("delete key");
+  expect(h.log).not.toContain("delete record");
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "signed_in", login: "octocat" },
+    device: "signed_out",
+  });
+
+  h.signOut = async () => ({ ok: true, value: "pending" });
+  await expect(h.service.signOut()).resolves.toEqual({ outcome: "pending" });
+
+  for (const [failure, reason] of [
+    [{ ok: false, reason: "key_not_loaded" }, "key_not_loaded"],
+    [{ ok: false, reason: "no_device" }, "no_device"],
+    [
+      { ok: false, reason: "refused", code: "device_revoked" },
+      "device_revoked",
+    ],
+    [{ ok: false, reason: "refused", code: "conflict" }, "refused"],
+    [{ ok: false, reason: "invalid_request" }, "failed"],
+  ] as const) {
+    h.signOut = async () => failure;
+    await expect(h.service.signOut()).resolves.toEqual({
+      outcome: "failed",
+      reason,
+    });
+  }
+
+  h.signOut = () => Promise.reject(new Error("broken"));
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "failed",
+    reason: "failed",
+  });
+  expect(h.errors).toEqual(["The sign-out failed."]);
+});
+
+test("sign-out, removal, and the device list are refused while busy and without an account", async () => {
+  const before = harness();
+  for (const action of [
+    before.service.signOut,
+    before.service.removeDevice,
+    before.service.listDevices,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+
+  const h = harness();
+  await h.service.initialize();
+  const attempt = startedSignIn();
+  h.start = async () => attempt.start;
+  await h.service.startSignIn();
+  for (const action of [
+    h.service.signOut,
+    h.service.removeDevice,
+    h.service.listDevices,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  attempt.settle({ kind: "cancelled" });
+  await done;
+
+  let release: () => void = () => undefined;
+  h.signOut = () =>
+    new Promise((resolve) => {
+      release = () => resolve({ ok: true, value: "reported" });
+    });
+  const signingOut = h.service.signOut();
+  for (const action of [
+    h.service.signOut,
+    h.service.removeDevice,
+    h.service.listDevices,
+    h.service.forgetAccount,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  release();
+  await expect(signingOut).resolves.toEqual({ outcome: "signed_out" });
+
+  const signedOut = harness();
+  signedOut.record = { kind: "none" };
+  await signedOut.service.initialize();
+  for (const action of [
+    signedOut.service.signOut,
+    signedOut.service.removeDevice,
+    signedOut.service.listDevices,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "not_signed_in",
+    });
+  }
+  expect(signedOut.log.filter((step) => step.startsWith("session"))).toEqual([
+    "session create",
+    "session refresh",
+  ]);
+});
+
+test("removing this device asks for confirmation, then the session, and resets the flow once the API confirmed", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.start = async () => ({
+    started: false,
+    outcome: { kind: "failed", reason: "listener_unavailable" },
+  });
+  await h.service.startSignIn();
+  h.log.length = 0;
+  h.removeDevice = async () => {
+    h.record = { kind: "none" };
+    h.emit({ kind: "removed" });
+    return { ok: true, value: "removed" };
+  };
+
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "removed",
+  });
+  expect(h.log.slice(0, 2)).toEqual([
+    "confirm removal octocat",
+    "session removeDevice",
+  ]);
+  expect(h.log).toContain("reset flow");
+  expect(h.log).not.toContain("stop local execution");
+  await settle();
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "signed_out" },
+    device: "removed",
+  });
+});
+
+test("a removal without a clear answer stays pending, and a refusal or a failure is mapped", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.removeDevice = async () => {
+    h.emit({ kind: "removal_pending", account: SESSION_ACCOUNT });
+    return { ok: true, value: "pending" };
+  };
+
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "pending",
+  });
+  expect(h.service.status().device).toBe("removal_pending");
+  expect(h.log).not.toContain("reset flow");
+
+  for (const [failure, reason] of [
+    [{ ok: false, reason: "signed_out" }, "signed_out"],
+    [{ ok: false, reason: "refused", code: "rate_limited" }, "rate_limited"],
+    [
+      { ok: false, reason: "refused", code: "sign_in_required" },
+      "sign_in_required",
+    ],
+    [{ ok: false, reason: "refused", code: "conflict" }, "refused"],
+  ] as const) {
+    h.removeDevice = async () => failure;
+    await expect(h.service.removeDevice()).resolves.toEqual({
+      outcome: "failed",
+      reason,
+    });
+  }
+  h.removeDevice = () => Promise.reject(new Error("broken"));
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "failed",
+    reason: "failed",
+  });
+  expect(h.errors).toEqual(["The device could not be removed."]);
+});
+
+test("removing this device asks nothing of the session when the person keeps it or the confirmation fails, and waits while it is open", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.confirmRemoval = async () => false;
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "cancelled",
+  });
+
+  h.confirmRemoval = () => Promise.reject(new Error("no dialog"));
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "failed",
+    reason: "failed",
+  });
+  expect(h.errors).toEqual(["The confirmation could not be shown."]);
+
+  let answer: (confirmed: boolean) => void = () => undefined;
+  h.confirmRemoval = () =>
+    new Promise((resolve) => {
+      answer = resolve;
+    });
+  const removing = h.service.removeDevice();
+  for (const action of [
+    h.service.removeDevice,
+    h.service.signOut,
+    h.service.forgetAccount,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+  answer(false);
+  await expect(removing).resolves.toEqual({ outcome: "cancelled" });
+  expect(h.log).not.toContain("session removeDevice");
+});
+
+test("the device list holds only the fields that the renderer may see, with the current device marked", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.listDevices = async () => ({
+    ok: true,
+    value: [
+      { ...DEVICE_ITEM, publicKey: PUBLIC_KEY, userId: USER_ID },
+      {
+        ...DEVICE_ITEM,
+        id: OTHER_DEVICE_ID,
+        label: "Windows computer",
+        platform: "windows",
+        lastSeenAt: null,
+        revokedAt: "2026-11-02T08:00:00.000Z",
+        current: false,
+      },
+    ],
+  });
+
+  const listed = await h.service.listDevices();
+
+  expect(listed).toEqual({
+    outcome: "listed",
+    devices: [
+      {
+        id: DEVICE_ID,
+        label: "Mac",
+        platform: "macos",
+        lastSeenAt: "2026-11-02T09:00:00.000Z",
+        signInExpiresAt: "2026-12-01T10:00:00.000Z",
+        revokedAt: null,
+        current: true,
+      },
+      {
+        id: OTHER_DEVICE_ID,
+        label: "Windows computer",
+        platform: "windows",
+        lastSeenAt: null,
+        signInExpiresAt: "2026-12-01T10:00:00.000Z",
+        revokedAt: "2026-11-02T08:00:00.000Z",
+        current: false,
+      },
+    ],
+  });
+  expect(JSON.stringify(listed)).not.toMatch(
+    new RegExp(`${PUBLIC_KEY}|${USER_ID}|createdAt|lastSignInAt`),
+  );
+
+  h.listDevices = async () => ({ ok: false, reason: "no_answer" });
+  h.clock += LIST_DEVICES_COOLDOWN_MS;
+  await expect(h.service.listDevices()).resolves.toEqual({
+    outcome: "failed",
+    reason: "no_answer",
+  });
+  h.listDevices = () => Promise.reject(new Error("broken"));
+  h.clock += LIST_DEVICES_COOLDOWN_MS;
+  await expect(h.service.listDevices()).resolves.toEqual({
+    outcome: "failed",
+    reason: "failed",
+  });
+  expect(h.errors).toEqual(["The device list could not be read."]);
+});
+
+test("This is not me forgets the account on this installation also when the API removal is pending, refused, or fails", async () => {
+  const answers: [
+    string,
+    () => Promise<SessionResult<"removed" | "pending">>,
+    string[],
+  ][] = [
+    ["pending", async () => ({ ok: true, value: "pending" }), []],
+    ["signed out", async () => ({ ok: false, reason: "signed_out" }), []],
+    [
+      "refused",
+      async () => ({ ok: false, reason: "refused", code: "conflict" }),
+      [],
+    ],
+    [
+      "broken",
+      () => Promise.reject(new Error("broken")),
+      ["The device could not be removed at the server."],
+    ],
+  ];
+  for (const [name, removeDevice, errors] of answers) {
+    const h = harness();
+    await h.service.initialize();
+    h.removeDevice = removeDevice;
+    h.log.length = 0;
+
+    await expect(h.service.forgetAccount(), name).resolves.toEqual({
+      outcome: "forgotten",
+      removedAtServer: false,
+    });
+    expect(h.log).toEqual([
+      "confirm octocat",
+      "session removeDevice",
+      "delete record",
+      "delete key",
+      "status idle",
+      "session refresh",
+    ]);
+    expect(h.errors).toEqual(errors);
+    expect(h.service.status().account).toEqual({ kind: "signed_out" });
+  }
+});
+
+// ---- Review fixes: background refresh, removal, list --------------------
+
+/** Holds the fake session's next `reportSignOut` until `release`. */
+function holdReport(h: Harness): () => void {
+  let release: () => void = () => undefined;
+  const answer = h.reportSignOut;
+  h.reportSignOut = () => {
+    h.reportSignOut = answer;
+    return new Promise((resolve) => {
+      release = () => resolve({ ok: true, value: "reported" });
+    });
+  };
+  return () => release();
+}
+
+const SIGNED_OUT_PENDING: DeviceSessionState = Object.freeze({
+  kind: "signed_out",
+  account: SESSION_ACCOUNT,
+  reportPending: true,
+});
+
+test("This is not me waits for the background refresh before it asks, removes, or deletes anything", async () => {
+  const h = harness();
+  h.sessionState = SIGNED_OUT_PENDING;
+  const release = holdReport(h);
+
+  const initializing = h.service.initialize();
+  await settle();
+  expect(h.log.at(-1)).toBe("session reportSignOut");
+  const forgetting = h.service.forgetAccount();
+  // The forget holds the lock while it waits: other actions are busy.
+  for (const action of [
+    h.service.forgetAccount,
+    h.service.signOut,
+    h.service.removeDevice,
+    h.service.listDevices,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+  await settle();
+  expect(h.log.at(-1)).toBe("session reportSignOut");
+
+  release();
+  await initializing;
+  await expect(forgetting).resolves.toEqual({
+    outcome: "forgotten",
+    removedAtServer: true,
+  });
+  const reported = h.log.indexOf("session reportSignOut");
+  expect(h.log.slice(reported + 1, reported + 4)).toEqual([
+    "confirm octocat",
+    "session removeDevice",
+    "delete record",
+  ]);
+});
+
+test("every action of the session waits for the background refresh, also the one after an unlock", async () => {
+  const actions: [string, (h: Harness) => Promise<unknown>, string][] = [
+    ["sign-out", (h) => h.service.signOut(), "session signOut"],
+    ["removal", (h) => h.service.removeDevice(), "confirm removal octocat"],
+    ["list", (h) => h.service.listDevices(), "session listDevices"],
+    ["sign-in", (h) => h.service.startSignIn(), "session signInStarted"],
+  ];
+  for (const [name, act, step] of actions) {
+    const h = harness();
+    h.load = async (passphrase) => {
+      if (passphrase === undefined) {
+        throw new DeviceKeyError("passphrase_required");
+      }
+    };
+    await h.service.initialize();
+    // After the unlock the session finds the sign-out to report.
+    h.sessionState = SIGNED_OUT_PENDING;
+    const release = holdReport(h);
+    await h.service.unlockDeviceKey(PASSPHRASE);
+    await settle();
+    expect(h.log.at(-1), name).toBe("session reportSignOut");
+    h.emit(SESSION_SIGNED_IN);
+
+    const acting = act(h);
+    await settle();
+    expect(h.log, name).not.toContain(step);
+    release();
+    await acting;
+    expect(h.log.indexOf(step), name).toBeGreaterThan(
+      h.log.indexOf("session reportSignOut"),
+    );
+  }
+});
+
+test("sign-out is refused while a removal is pending, so a confirmed removal is never dropped", async () => {
+  const h = harness();
+  h.sessionState = { kind: "removal_pending", account: SESSION_ACCOUNT };
+  await h.service.initialize();
+
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "failed",
+    reason: "removal_pending",
+  });
+  expect(h.log).not.toContain("session signOut");
+  // The removal can be retried.
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "removed",
+  });
+});
+
+test("removing this device is refused before the confirmation while the key waits for its passphrase", async () => {
+  const h = harness();
+  h.load = () => Promise.reject(new DeviceKeyError("passphrase_required"));
+  h.sessionState = { kind: "key_not_loaded", account: SESSION_ACCOUNT };
+  await h.service.initialize();
+
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "failed",
+    reason: "key_not_loaded",
+  });
+  expect(h.log.filter((step) => step.startsWith("confirm"))).toEqual([]);
+  expect(h.log).not.toContain("session removeDevice");
+});
+
+test("the device list takes the lock, waits a cooldown between requests, and is dropped when the account changed meanwhile", async () => {
+  const h = harness();
+  await h.service.initialize();
+  let answer: () => void = () => undefined;
+  h.listDevices = () =>
+    new Promise((resolve) => {
+      answer = () => resolve({ ok: true, value: [DEVICE_ITEM] });
+    });
+
+  const listing = h.service.listDevices();
+  await settle();
+  for (const action of [
+    h.service.signOut,
+    h.service.removeDevice,
+    h.service.forgetAccount,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+  answer();
+  await expect(listing).resolves.toMatchObject({ outcome: "listed" });
+
+  h.clock += LIST_DEVICES_COOLDOWN_MS - 1;
+  await expect(h.service.listDevices()).resolves.toEqual({
+    outcome: "refused",
+    reason: "too_soon",
+  });
+  expect(h.log.filter((step) => step === "session listDevices")).toHaveLength(
+    1,
+  );
+
+  // The session finds the device revoked while the list is on its way.
+  h.clock += 1;
+  h.listDevices = async () => {
+    h.emit({ kind: "revoked" });
+    return { ok: true, value: [DEVICE_ITEM] };
+  };
+  await expect(h.service.listDevices()).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+  });
+});
+
+test("a cancel while the sign-in waits for the background refresh never opens the browser", async () => {
+  const h = harness();
+  h.sessionState = SIGNED_OUT_PENDING;
+  const release = holdReport(h);
+  const initializing = h.service.initialize();
+  await settle();
+  expect(h.log.at(-1)).toBe("session reportSignOut");
+
+  const starting = h.service.startSignIn();
+  await settle();
+  expect(h.service.status().signIn).toEqual({ kind: "starting" });
+  expect(h.service.cancelSignIn()).toBe(true);
+  release();
+  await initializing;
+
+  await expect(starting).resolves.toEqual({
+    outcome: "failed",
+    code: "cancelled",
+  });
+  expect(h.log).not.toContain("start");
+  expect(h.log).not.toContain("session signInStarted");
+  expect(h.flows).toBe(0);
+  expect(h.service.status()).toMatchObject({
+    signIn: { kind: "idle" },
+    lastOutcome: { code: "cancelled" },
+  });
+  // The next start is not held back by a cooldown: no browser opened.
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+});
+
+test("a sign-in between the key's load and the startup refresh waits for the refresh", async () => {
+  const h = harness();
+  let release: () => void = () => undefined;
+  h.readGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const initializing = h.service.initialize();
+  await settle();
+  // The key is loaded, and the record read is on its way.
+  expect(h.log).toEqual(["load", "session create", "read record"]);
+
+  const starting = h.service.startSignIn();
+  await settle();
+  expect(h.log).not.toContain("start");
+  h.readGate = null;
+  release();
+  await initializing;
+
+  await expect(starting).resolves.toEqual({ outcome: "started" });
+  expect(h.log.indexOf("start")).toBeGreaterThan(
+    h.log.indexOf("session refresh"),
+  );
 });

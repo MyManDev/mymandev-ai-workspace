@@ -184,17 +184,20 @@ export const MountResultSchema = z.discriminatedUnion("outcome", [
 export type MountResult = z.infer<typeof MountResultSchema>;
 
 /**
- * Limits of the account messages, in UTF-16 code units: a display name as
- * the protocol limits it, the authorize URL, the warning shown with it, and
- * the passphrase. The device key store counts at most 1,024 characters of a
- * passphrase after NFC normalization and refuses a longer one itself; this
- * limit only bounds the message.
+ * Limits of the account messages, in UTF-16 code units: a display name and
+ * a device label as the protocol limits them, the authorize URL, the
+ * warning shown with it, and the passphrase; and the number of devices in
+ * the device list, the most that the API sends. The device key store counts
+ * at most 1,024 characters of a passphrase after NFC normalization and
+ * refuses a longer one itself; this limit only bounds the message.
  */
 export const ACCOUNT_LIMITS = Object.freeze({
   displayName: 64,
+  deviceLabel: 64,
   authorizeUrl: 4096,
   warning: 512,
   passphrase: 4096,
+  devices: 1_000,
 });
 
 /**
@@ -329,6 +332,47 @@ export const API_ORIGIN_STATES = Object.freeze([
 ] as const);
 export type ApiOriginState = (typeof API_ORIGIN_STATES)[number];
 
+/**
+ * The state of this installation's device in the device session (ADR 0014,
+ * "Revocation, sign-out, and recovery"), as a fixed code:
+ *
+ * - `starting`: the device session has not read the device yet.
+ * - `no_device`: no device that this installation can use; a GitHub sign-in
+ *   registers one.
+ * - `signed_in`: a device and a loaded key that the API is asked with.
+ * - `signed_out`: the person signed out (P-65); the key stays, and the next
+ *   GitHub sign-in is needed. `sign_out_report_pending` while the API has
+ *   not learned it yet.
+ * - `sign_in_required`: the API asks for a GitHub sign-in.
+ * - `auth_failed`: the API refused the device key.
+ * - `account_mismatch`: a sign-in with another GitHub account was refused.
+ * - `key_lost`: the device has no usable key on this installation; the next
+ *   sign-in registers a new device that replaces it.
+ * - `key_not_loaded`: the key waits for its passphrase.
+ * - `unavailable`: the device record or the key store cannot be read.
+ * - `removal_pending`: the person removed this device, and the API has not
+ *   confirmed it yet.
+ * - `removed`: the API confirmed the removal; the key is deleted.
+ * - `revoked`: the API revoked the device; the key is deleted.
+ */
+export const DEVICE_STATES = Object.freeze([
+  "starting",
+  "no_device",
+  "signed_in",
+  "signed_out",
+  "sign_out_report_pending",
+  "sign_in_required",
+  "auth_failed",
+  "account_mismatch",
+  "key_lost",
+  "key_not_loaded",
+  "unavailable",
+  "removal_pending",
+  "removed",
+  "revoked",
+] as const);
+export type DeviceState = (typeof DEVICE_STATES)[number];
+
 /** What the renderer may know about the sign-in of this installation. */
 export const AccountStatusSchema = z.object({
   /**
@@ -347,6 +391,8 @@ export const AccountStatusSchema = z.object({
    */
   replacementPending: z.boolean(),
   apiOrigin: z.enum(API_ORIGIN_STATES),
+  /** The state of the device in the device session. */
+  device: z.enum(DEVICE_STATES),
 });
 export type AccountStatus = z.infer<typeof AccountStatusSchema>;
 
@@ -416,7 +462,13 @@ export const FORGET_REFUSALS = Object.freeze([
 ] as const);
 
 export const ForgetResultSchema = z.discriminatedUnion("outcome", [
-  z.object({ outcome: z.literal("forgotten") }),
+  /**
+   * The record and the key are deleted on this installation.
+   * `removedAtServer` is true when the API confirmed the removal of the
+   * device first; otherwise the device stays registered to that account,
+   * without a usable key, until its sign-in ends or the account removes it.
+   */
+  z.object({ outcome: z.literal("forgotten"), removedAtServer: z.boolean() }),
   /** The person kept the account in the confirmation of the main process. */
   z.object({ outcome: z.literal("cancelled") }),
   z.object({ outcome: z.literal("refused"), reason: z.enum(FORGET_REFUSALS) }),
@@ -424,6 +476,118 @@ export const ForgetResultSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("failed") }),
 ]);
 export type ForgetResult = z.infer<typeof ForgetResultSchema>;
+
+/**
+ * Why an action of the device session (sign-out, removing this device, the
+ * device list) was not taken: `busy` while a sign-in is open, the key is
+ * loading or being unlocked, or another change of the account runs,
+ * `not_signed_in` when this installation holds no account, and `too_soon`
+ * for a device list within a few seconds of the last one.
+ */
+export const DEVICE_ACTION_REFUSALS = Object.freeze([
+  "busy",
+  "not_signed_in",
+  "too_soon",
+] as const);
+
+/**
+ * Why an action of the device session failed, as a fixed code. The main
+ * process maps the session's failures to these codes (account-session.ts):
+ * the reasons of the session one to one, the API's codes that the screens
+ * explain on their own, `refused` for another API code, and `failed` for
+ * anything else.
+ */
+export const DEVICE_ACTION_FAILURES = Object.freeze([
+  "api_origin_unset",
+  "api_origin_invalid",
+  "no_device",
+  "key_lost",
+  "key_not_loaded",
+  "record_unreadable",
+  "key_store_failed",
+  "signed_out",
+  "sign_in_running",
+  "replacement_pending",
+  "removal_pending",
+  "record_not_saved",
+  "no_answer",
+  "server_error",
+  "unexpected_response",
+  "sign_in_required",
+  "auth_failed",
+  "device_revoked",
+  "device_account_mismatch",
+  "rate_limited",
+  "refused",
+  "failed",
+] as const);
+export type DeviceActionFailure = (typeof DEVICE_ACTION_FAILURES)[number];
+
+const DeviceActionRefusedSchema = z.object({
+  outcome: z.literal("refused"),
+  reason: z.enum(DEVICE_ACTION_REFUSALS),
+});
+
+const DeviceActionFailedSchema = z.object({
+  outcome: z.literal("failed"),
+  reason: z.enum(DEVICE_ACTION_FAILURES),
+});
+
+/**
+ * The result of a sign-out: `signed_out` when the API confirmed it,
+ * `pending` when the device is signed out and the API learns it later.
+ */
+export const SignOutResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("signed_out") }),
+  z.object({ outcome: z.literal("pending") }),
+  DeviceActionRefusedSchema,
+  DeviceActionFailedSchema,
+]);
+export type SignOutResult = z.infer<typeof SignOutResultSchema>;
+
+/**
+ * The result of removing this device: `removed` when the API confirmed it
+ * and the key is deleted, `pending` while the API has not answered clearly
+ * (the key stays, and the removal is retried), or `cancelled` when the
+ * person kept the device in the native confirmation.
+ */
+export const RemoveDeviceResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("removed") }),
+  z.object({ outcome: z.literal("pending") }),
+  z.object({ outcome: z.literal("cancelled") }),
+  DeviceActionRefusedSchema,
+  DeviceActionFailedSchema,
+]);
+export type RemoveDeviceResult = z.infer<typeof RemoveDeviceResultSchema>;
+
+/** A timestamp of the API, in UTC. */
+const TimestampSchema = z.iso.datetime();
+
+/**
+ * One device of the account, as the device list shows it. `current` marks
+ * the device of this installation. Holds no key or token.
+ */
+export const DeviceViewSchema = z.object({
+  id: z.uuid(),
+  label: z.string().min(1).max(ACCOUNT_LIMITS.deviceLabel),
+  platform: z.enum(["windows", "macos", "linux"]),
+  /** null until the device first connects. */
+  lastSeenAt: TimestampSchema.nullable(),
+  signInExpiresAt: TimestampSchema,
+  revokedAt: TimestampSchema.nullable(),
+  current: z.boolean(),
+});
+export type DeviceView = z.infer<typeof DeviceViewSchema>;
+
+export const ListDevicesResultSchema = z.discriminatedUnion("outcome", [
+  z.object({
+    outcome: z.literal("listed"),
+    devices: z.array(DeviceViewSchema).max(ACCOUNT_LIMITS.devices),
+  }),
+  DeviceActionRefusedSchema,
+  DeviceActionFailedSchema,
+]);
+export type ListDevicesResult = z.infer<typeof ListDevicesResultSchema>;
 
 /** The schemas of every invoke channel. */
 export const INVOKE_CONTRACT = Object.freeze({
@@ -476,6 +640,18 @@ export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.forgetAccount]: Object.freeze({
     args: NoArgumentsSchema,
     result: ForgetResultSchema,
+  }),
+  [INVOKE_CHANNELS.signOut]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: SignOutResultSchema,
+  }),
+  [INVOKE_CHANNELS.removeDevice]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: RemoveDeviceResultSchema,
+  }),
+  [INVOKE_CHANNELS.listDevices]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ListDevicesResultSchema,
   }),
 });
 
