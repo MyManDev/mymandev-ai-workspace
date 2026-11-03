@@ -114,6 +114,9 @@ export const workspaceMembers = pgTable(
     index("workspace_members_user_id_idx").on(t.userId),
     // Target of composite foreign keys that require a person of a given workspace.
     unique("workspace_members_id_workspace_id_key").on(t.id, t.workspaceId),
+    // Target of composite foreign keys that require a person of a given
+    // account, such as a message's author (#27).
+    unique("workspace_members_id_user_id_key").on(t.id, t.userId),
     // One active person per account and workspace.
     uniqueIndex("workspace_members_active_user_key")
       .on(t.workspaceId, t.userId)

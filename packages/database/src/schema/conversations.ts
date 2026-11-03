@@ -2,6 +2,8 @@ import type {
   AgentId,
   DeviceId,
   EventId,
+  MemberId,
+  MessageId,
   ProjectId,
   UserId,
 } from "@mymandev/protocol";
@@ -20,7 +22,7 @@ import {
 import { agents } from "./agents.ts";
 import { createdAt, nullableTimestamp } from "./columns.ts";
 import { devices, users } from "./identity.ts";
-import { projects } from "./workspaces.ts";
+import { projects, workspaceMembers } from "./workspaces.ts";
 
 /** A conversation in a project. Only project chat exists in M1. */
 export const conversations = pgTable(
@@ -64,12 +66,14 @@ export const conversations = pgTable(
 
 /**
  * A chat message. Exactly one author: a user, or an agent. The server orders
- * messages by `seq` within the conversation, never by client time.
+ * messages by `seq` within the conversation, never by client time. A user's
+ * message also names the user's person in the workspace (#27), because an
+ * account that leaves and joins again gets a new person.
  */
 export const messages = pgTable(
   "messages",
   {
-    id: uuid("id").primaryKey(),
+    id: uuid("id").primaryKey().$type<MessageId>(),
     conversationId: uuid("conversation_id")
       .notNull()
       .references(() => conversations.id, { onDelete: "restrict" }),
@@ -78,6 +82,12 @@ export const messages = pgTable(
     authorUserId: uuid("author_user_id")
       .$type<UserId>()
       .references(() => users.id, { onDelete: "restrict" }),
+    /**
+     * The author's person in the project's workspace, set exactly when
+     * `author_user_id` is set: the person the protocol names as the author
+     * (`{ kind: "member", memberId }`), also after it was removed.
+     */
+    authorMemberId: uuid("author_member_id").$type<MemberId>(),
     authorAgentId: uuid("author_agent_id")
       .$type<AgentId>()
       .references(() => agents.id, { onDelete: "restrict" }),
@@ -101,6 +111,11 @@ export const messages = pgTable(
       "messages_author_check",
       sql`num_nonnulls(${t.authorUserId}, ${t.authorAgentId}) = 1`,
     ),
+    // A user's message names the user's person; an agent's message names none.
+    check(
+      "messages_author_member_check",
+      sql`(${t.authorUserId} is null) = (${t.authorMemberId} is null)`,
+    ),
     check("messages_seq_check", sql`${t.seq} >= 1`),
     check(
       "messages_body_length",
@@ -111,6 +126,14 @@ export const messages = pgTable(
       name: "messages_sender_device_user_fk",
       columns: [t.senderDeviceId, t.authorUserId],
       foreignColumns: [devices.id, devices.userId],
+    }).onDelete("restrict"),
+    // The author's person belongs to the author's account. That it is a
+    // person of the project's workspace is the writer's rule: a message
+    // records its conversation, not its workspace.
+    foreignKey({
+      name: "messages_author_member_user_fk",
+      columns: [t.authorMemberId, t.authorUserId],
+      foreignColumns: [workspaceMembers.id, workspaceMembers.userId],
     }).onDelete("restrict"),
     // A message of an agent comes from the host device of that agent.
     foreignKey({
