@@ -40,6 +40,7 @@ import {
   type JoinRequestId,
   type MemberId,
   type MemberRole,
+  type MessageId,
   type PermissionGrantId,
   type ProjectId,
   type ProviderConnectionId,
@@ -321,7 +322,7 @@ async function insertMessage(values: NewMessage): Promise<number> {
     assert.ok(row, "the conversation exists");
     await tx
       .insert(messages)
-      .values({ ...values, id: newUuidV7(), seq: row.seq });
+      .values({ ...values, id: newId<MessageId>(), seq: row.seq });
     return row.seq;
   });
 }
@@ -468,6 +469,7 @@ test("message sequence numbers are allocated per conversation", async () => {
   const second = await addConversation(world.otherProject, world.alice);
   const fromAlice = {
     authorUserId: world.alice,
+    authorMemberId: world.aliceMember,
     senderDeviceId: world.aliceDevice,
   };
   assert.equal(
@@ -505,7 +507,7 @@ test("message sequence numbers are allocated per conversation", async () => {
   );
   const duplicate = {
     ...fromAlice,
-    id: newUuidV7(),
+    id: newId<MessageId>(),
     conversationId: world.conversation,
     body: "again",
   };
@@ -527,6 +529,7 @@ test("messages are idempotent per device and have exactly one author", async () 
   const fromAlice = {
     conversationId: world.conversation,
     authorUserId: world.alice,
+    authorMemberId: world.aliceMember,
     senderDeviceId: world.aliceDevice,
   };
   await insertMessage({ ...fromAlice, clientEventId, body: "hello" });
@@ -540,6 +543,7 @@ test("messages are idempotent per device and have exactly one author", async () 
   await insertMessage({
     conversationId: world.conversation,
     authorUserId: world.bob,
+    authorMemberId: world.bobMember,
     senderDeviceId: world.bobDevice,
     clientEventId,
     body: "hello",
@@ -566,6 +570,29 @@ test("messages are idempotent per device and have exactly one author", async () 
       }),
     "23514",
     "messages_author_check",
+  );
+  // A person's message names the person, and an agent's message names none.
+  await rejectsWith(
+    () =>
+      insertMessage({
+        ...fromAlice,
+        authorMemberId: undefined,
+        body: "no person",
+      }),
+    "23514",
+    "messages_author_member_check",
+  );
+  await rejectsWith(
+    () =>
+      insertMessage({
+        conversationId: world.conversation,
+        authorAgentId: world.aliceAgent,
+        authorMemberId: world.aliceMember,
+        senderDeviceId: world.aliceDevice,
+        body: "agent with a person",
+      }),
+    "23514",
+    "messages_author_member_check",
   );
   await rejectsWith(
     () => insertMessage({ ...fromAlice, body: "" }),
@@ -818,7 +845,20 @@ test("composite foreign keys reject rows that mix owners, devices and projects",
         insertMessage({
           conversationId: world.conversation,
           authorUserId: world.alice,
+          authorMemberId: world.aliceMember,
           senderDeviceId: world.bobDevice,
+          body: "spoofed",
+        }),
+    ],
+    [
+      "messages_author_member_user_fk",
+      // A message of Alice that names Bob's person as its author.
+      () =>
+        insertMessage({
+          conversationId: world.conversation,
+          authorUserId: world.alice,
+          authorMemberId: world.bobMember,
+          senderDeviceId: world.aliceDevice,
           body: "spoofed",
         }),
     ],
@@ -857,7 +897,7 @@ test("composite foreign keys reject rows that mix owners, devices and projects",
         }),
     ],
   ];
-  assert.equal(cases.length, 10);
+  assert.equal(cases.length, 11);
   for (const [constraint, operation] of cases) {
     await rejectsWith(operation, "23503", constraint);
   }
@@ -887,6 +927,7 @@ test("composite foreign keys reject rows that mix owners, devices and projects",
   await insertMessage({
     conversationId: world.conversation,
     authorUserId: world.bob,
+    authorMemberId: world.bobMember,
     senderDeviceId: world.bobDevice,
     body: "from Bob",
   });
@@ -1006,6 +1047,7 @@ test("database errors never carry query data out of the package", async () => {
   const message = {
     conversationId: world.conversation,
     authorUserId: world.alice,
+    authorMemberId: world.aliceMember,
     senderDeviceId: world.aliceDevice,
     clientEventId,
   };

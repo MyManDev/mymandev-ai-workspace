@@ -168,6 +168,14 @@ export {
   type RenameProjectResult,
 } from "./projects.ts";
 export {
+  listChatMessages,
+  type ListChatMessagesInput,
+  type ListChatMessagesResult,
+  postChatMessage,
+  type PostChatMessageInput,
+  type PostChatMessageResult,
+} from "./chat.ts";
+export {
   DatabaseError,
   toDatabaseError,
   withDatabaseErrors,
