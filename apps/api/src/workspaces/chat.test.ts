@@ -9,7 +9,6 @@ import {
   workspaces,
 } from "@mymandev/database";
 import {
-  type AgentId,
   type ChatMessage,
   ChatHistoryResponseSchema,
   type ConnectionId,
@@ -21,7 +20,6 @@ import {
   type MemberRole,
   newId,
   type ProjectId,
-  type RunId,
   type ServerEvent,
   type UserId,
   type WorkspaceId,
@@ -55,11 +53,8 @@ import {
   nextFrame,
   settle,
 } from "../gateway-test-support.ts";
-import {
-  CHAT_SEND_LIMIT,
-  ChatSendLimit,
-  chatSendHandler,
-} from "./chat-events.ts";
+import { CHAT_SEND_LIMIT, chatSendHandler } from "./chat-events.ts";
+import { AccountSendLimit } from "./send-limit.ts";
 
 const database = useTestDatabase();
 
@@ -455,7 +450,7 @@ test(`an account's sends above ${CHAT_SEND_LIMIT.burst.max} in ${CHAT_SEND_LIMIT
 
 test("the send limit slides over the burst, counts a fixed hourly window, never counts a refused send, and forgets an account after its window", () => {
   const clock = fakeClock(0);
-  const limit = new ChatSendLimit(clock.now);
+  const limit = new AccountSendLimit(clock.now, CHAT_SEND_LIMIT);
   const ada = newId<UserId>();
   const bob = newId<UserId>();
   const { burst, window } = CHAT_SEND_LIMIT;
@@ -490,7 +485,7 @@ test("the send limit slides over the burst, counts a fixed hourly window, never 
 
 test("the hourly window restarts with an accepted send only, not with a send that the burst refuses, and the sweep keeps an account whose burst is full", () => {
   const clock = fakeClock(0);
-  const limit = new ChatSendLimit(clock.now);
+  const limit = new AccountSendLimit(clock.now, CHAT_SEND_LIMIT);
   const ada = newId<UserId>();
   const { burst, window } = CHAT_SEND_LIMIT;
 
@@ -677,34 +672,6 @@ test("after identity binding, the send handler refuses a removed member and a re
   );
 });
 
-test("the default event handler only logs an event type without a handler, such as a run transition, and the connection goes on", async (t) => {
-  const { account } = await instance(t);
-  const ada = await account(3781);
-  const { workspaceId } = await workspaceOf(ada.device);
-  const projectId = await projectIn(workspaceId, ada.device);
-  const { client } = await connected(t, ada.app, ada.device);
-  const agentId = newId<AgentId>();
-  client.send({
-    protocolVersion: 0,
-    id: newId<EventId>(),
-    type: "agent.run.state_changed",
-    occurredAt: "2026-11-03T09:00:00.000Z",
-    workspaceId,
-    actor: { kind: "agent", agentId },
-    deviceId: ada.device.deviceId,
-    payload: {
-      runId: newId<RunId>(),
-      agentId,
-      previousState: "queued",
-      state: "running",
-    },
-  });
-  await quiet(client);
-  const send = sendOf(ada.device, workspaceId, projectId, "After");
-  client.send(send);
-  assert.equal((await nextCreated(client, send)).seq, 1);
-});
-
 test("the history pages the newest messages first, also of an archived project, and a malformed query answers 400 to a member", async (t) => {
   const { account } = await instance(t);
   const ada = await account(3761);
@@ -764,7 +731,7 @@ test("the history pages the newest messages first, also of an archived project, 
   }
 });
 
-test("an unknown project, a project of another workspace, a malformed project ID, and a removed member get the same 404 from the history, whatever the query", async (t) => {
+test("an unknown project, a project of another workspace, a malformed project ID, and a removed member get the same 404 from the history, whatever the query, and from the agent and run routes", async (t) => {
   const { account } = await instance(t);
   const ada = await account(3771);
   const bob = await account(3772);
@@ -782,14 +749,30 @@ test("an unknown project, a project of another workspace, a malformed project ID
   assert.ok(bobPerson !== undefined);
   await removeInDatabase(bobPerson, ada.device);
 
+  // The agent and run routes lie in the same scope (#28).
+  const read = (account: Account, id: string, route: string) =>
+    account.app.inject({
+      method: "GET",
+      url: `/projects/${id}/${route}`,
+      headers: { authorization: `Bearer ${account.token}` },
+    });
+  for (const route of ["agents", "runs"]) {
+    assert.equal((await read(outsider, ownProject, route)).statusCode, 200);
+  }
   const answers = [];
-  for (const query of ["", "?limit=0", "?beforeSeq=x"]) {
+  for (const route of [
+    "messages",
+    "messages?limit=0",
+    "messages?beforeSeq=x",
+    "agents",
+    "runs",
+  ]) {
     answers.push(
-      await history(outsider, projectId, query),
-      await history(bob, projectId, query),
-      await history(ada, newId<ProjectId>(), query),
-      await history(ada, "not-an-id", query),
-      await history(outsider, newId<ProjectId>(), query),
+      await read(outsider, projectId, route),
+      await read(bob, projectId, route),
+      await read(ada, newId<ProjectId>(), route),
+      await read(ada, "not-an-id", route),
+      await read(outsider, newId<ProjectId>(), route),
     );
   }
   for (const response of answers) {
@@ -802,4 +785,7 @@ test("an unknown project, a project of another workspace, a malformed project ID
     );
   }
   assert.equal((await history(ada, projectId)).statusCode, 200);
+  for (const route of ["agents", "runs"]) {
+    assert.equal((await read(ada, projectId, route)).statusCode, 200);
+  }
 });

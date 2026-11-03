@@ -6,7 +6,6 @@ import {
   type EventRefusalCode,
   newId,
   PROTOCOL_VERSION,
-  type UserId,
 } from "@mymandev/protocol";
 import type { FastifyBaseLogger, FastifyInstance } from "fastify";
 import type { VerifiedEventOf } from "../device-events.ts";
@@ -16,6 +15,7 @@ import {
   type EventRejection,
   lockConnection,
 } from "../gateway.ts";
+import { type SendLimitValues, sweptSendLimit } from "./send-limit.ts";
 
 /**
  * The chat send limit of an account (#27; values settled with the API part
@@ -34,7 +34,9 @@ import {
  *   one account alone can never push a subscriber that reads nothing for 10 seconds over the
  *   limit, with about 79,000 bytes left for presence and the messages of
  *   others; 16 would leave about 15,000 bytes. A person who types
- *   short messages sends far fewer than 15 in 10 seconds.
+ *   short messages sends far fewer than 15 in 10 seconds. The account's
+ *   run transitions have their own limit, which fits in what is left
+ *   (`RUN_TRANSITION_LIMIT`, #28).
  * - The window bounds the sustained rate and the storage: 600 an hour is a
  *   message every 6 seconds for a whole hour, beyond a person who chats, and
  *   at most about 39 MB of message events an hour for each subscriber, about
@@ -43,91 +45,10 @@ import {
  * The limit lives in the memory of one API instance, as the request limits
  * do (ADR 0014 assumes one instance), and starts empty after a restart.
  */
-export const CHAT_SEND_LIMIT = Object.freeze({
+export const CHAT_SEND_LIMIT: SendLimitValues = Object.freeze({
   burst: Object.freeze({ max: 15, windowMs: 10_000 }),
   window: Object.freeze({ max: 600, windowMs: 60 * 60_000 }),
 });
-
-/** How often the send limit forgets the accounts whose counts ended. */
-export const CHAT_SEND_LIMIT_SWEEP_MS = 60_000;
-
-type SendCount = {
-  /** The times of the accepted sends of the last `burst.windowMs`, oldest first. */
-  readonly recent: number[];
-  /** When the account's current window started. */
-  windowStart: number;
-  /** The accepted sends of the current window. */
-  sent: number;
-};
-
-/**
- * Counts the accepted chat sends of each account (`CHAT_SEND_LIMIT`). The
- * burst slides, so no 10 seconds ever hold more than `burst.max` sends; the
- * longer window is fixed, which needs one counter per account. A send that
- * the limit refuses is not counted. It keeps at most `burst.max` times and a
- * counter per account that sent within the window.
- */
-export class ChatSendLimit {
-  readonly #accounts = new Map<UserId, SendCount>();
-  readonly #now: () => number;
-  readonly #limit: typeof CHAT_SEND_LIMIT;
-
-  constructor(now: () => number, limit = CHAT_SEND_LIMIT) {
-    this.#now = now;
-    this.#limit = limit;
-  }
-
-  /** Accounts that the limit holds a count for. */
-  get size(): number {
-    return this.#accounts.size;
-  }
-
-  /** Counts one send of the account and returns true, or returns false when it is over the limit. */
-  take(userId: UserId): boolean {
-    const now = this.#now();
-    const { burst, window } = this.#limit;
-    const count = this.#accounts.get(userId);
-    if (count === undefined) {
-      this.#accounts.set(userId, { recent: [now], windowStart: now, sent: 1 });
-      return true;
-    }
-    const { recent } = count;
-    while (recent.length > 0 && now - (recent[0] ?? now) >= burst.windowMs) {
-      recent.shift();
-    }
-    // The window ended: the next accepted send starts a new one. A send
-    // that the burst refuses starts none.
-    const ended = now - count.windowStart >= window.windowMs;
-    if (recent.length >= burst.max || (!ended && count.sent >= window.max)) {
-      return false;
-    }
-    if (ended) {
-      count.windowStart = now;
-      count.sent = 0;
-    }
-    recent.push(now);
-    count.sent += 1;
-    return true;
-  }
-
-  /**
-   * Forgets the accounts whose window ended and whose last accepted send
-   * left the burst.
-   */
-  sweep(): void {
-    const now = this.#now();
-    const { burst, window } = this.#limit;
-    for (const [userId, count] of this.#accounts) {
-      const last = count.recent.at(-1);
-      if (
-        now - count.windowStart >= window.windowMs &&
-        (last === undefined || now - last >= burst.windowMs)
-      ) {
-        this.#accounts.delete(userId);
-      }
-    }
-  }
-}
 
 /**
  * The `chat.message.created` of a stored message: from the server, with a
@@ -182,8 +103,8 @@ export type ChatSendOptions = Readonly<{
  *    account that may no longer act, since identity binding, close the
  *    connection as identity binding does.
  *
- * The send limit is one `ChatSendLimit` per call, swept every minute until
- * `app` closes.
+ * The send limit is one `AccountSendLimit` per call, swept every minute
+ * until `app` closes (`sweptSendLimit`).
  */
 export function chatSendHandler(
   app: FastifyInstance,
@@ -193,14 +114,7 @@ export function chatSendHandler(
   context: AuthenticatedConnectionContext,
 ) => Promise<EventRejection | undefined> {
   const { database, connections, log } = options;
-  const accounts = new ChatSendLimit(options.now);
-  const sweeper = setInterval(() => {
-    accounts.sweep();
-  }, CHAT_SEND_LIMIT_SWEEP_MS);
-  sweeper.unref();
-  app.addHook("onClose", async () => {
-    clearInterval(sweeper);
-  });
+  const accounts = sweptSendLimit(app, options.now, CHAT_SEND_LIMIT);
 
   return async (event, context) => {
     const refuse = (code: EventRefusalCode) => {
