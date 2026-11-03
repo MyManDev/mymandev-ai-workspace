@@ -45,7 +45,7 @@ export type BuildAppOptions = Readonly<{
    */
   onEvent?: EventHandler;
   /**
-   * Receives each membership event that the server originates, after the
+   * Receives each membership and project event that the server originates, after the
    * transaction that made the change committed and after the gateway
    * delivered it to the workspace's subscribed connections. Tests use it to
    * observe the events. Default: nothing more.

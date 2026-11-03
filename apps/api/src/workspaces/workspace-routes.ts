@@ -35,6 +35,7 @@ import {
 } from "./join-request-routes.ts";
 import { registerOwnershipRoutes } from "./ownership-routes.ts";
 import { registerPeopleRoutes } from "./people-routes.ts";
+import { registerProjectRoutes } from "./project-routes.ts";
 
 export type WorkspaceRouteOptions = Readonly<{
   database: Database;
@@ -43,7 +44,7 @@ export type WorkspaceRouteOptions = Readonly<{
   /**
    * Receives the membership events of the people routes, of accepting an
    * ownership offer, of accepting an invitation, and of approving a join
-   * request after the commit.
+   * request, and the project events of the project routes, after the commit.
    */
   onWorkspaceEvent: WorkspaceEventHandler;
   /**
@@ -66,8 +67,8 @@ export type WorkspaceRouteOptions = Readonly<{
  * Workspaces and the people in them (ADR 0014, "People and roles", "Join
  * requests", and "What a workspace ID allows"): the account's workspaces,
  * creating one, the view of one, its limit of unclaimed people, its people,
- * their invitations, and its join requests; previewing and accepting an
- * invitation code; and the account's own join requests.
+ * their invitations, its join requests, and its projects (#155); previewing
+ * and accepting an invitation code; and the account's own join requests.
  */
 export async function registerWorkspaceRoutes(
   app: FastifyInstance,
@@ -215,6 +216,12 @@ export async function registerWorkspaceRoutes(
       registerInvitationRoutes(workspace, { database, now: options.now });
 
       registerJoinRequestRoutes(workspace, joinRequests);
+
+      registerProjectRoutes(workspace, {
+        database,
+        now: options.now,
+        onWorkspaceEvent: options.onWorkspaceEvent,
+      });
     });
   });
 }

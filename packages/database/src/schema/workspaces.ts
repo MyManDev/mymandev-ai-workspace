@@ -344,10 +344,26 @@ export const projects = pgTable(
   },
   (t) => [
     index("projects_workspace_id_idx").on(t.workspaceId),
+    // Counts the projects an account created in the last 24 hours.
+    index("projects_created_by_user_id_created_at_idx").on(
+      t.createdByUserId,
+      t.createdAt,
+    ),
+    // One name per workspace among the projects that are not archived,
+    // compared without regard to case (#155): `lower` with the built-in
+    // `pg_c_utf8` collation, Unicode's simple lowercase mapping, the same on
+    // every server whatever its locale.
+    uniqueIndex("projects_active_name_key")
+      .on(t.workspaceId, sql`lower(${t.name} collate "pg_c_utf8")`)
+      .where(sql`${t.archivedAt} is null`),
     check(
       "projects_name_length",
       sql`char_length(${t.name}) between 1 and 100`,
     ),
+    // The protocol normalizes a project name to NFC and trims it before it is
+    // stored (#155); the database enforces the normal form, and the writer the
+    // trimming.
+    check("projects_name_nfc_check", sql`${t.name} is nfc normalized`),
   ],
 );
 

@@ -47,6 +47,11 @@ export const conversations = pgTable(
   },
   (t) => [
     index("conversations_project_id_idx").on(t.projectId),
+    // One `project` conversation per project: the project's chat, which
+    // creating the project creates (#155).
+    uniqueIndex("conversations_project_kind_key")
+      .on(t.projectId)
+      .where(sql`${t.kind} = 'project'`),
     check("conversations_kind_check", sql`${t.kind} in ('project')`),
     // A null title passes the check; a title that is set has 1 to 200 characters.
     check(

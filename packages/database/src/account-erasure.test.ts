@@ -218,16 +218,20 @@ async function requested(
 
 type Project = Readonly<{ projectId: ProjectId; repositoryId: RepositoryId }>;
 
-/** A project of the workspace with one repository. */
+/**
+ * A project of the workspace with one repository. Project names are unique
+ * in a workspace, so a second project there needs another `name`.
+ */
 async function projectIn(
   workspaceId: WorkspaceId,
   by: Account,
+  name = "App",
 ): Promise<Project> {
   const projectId = newId<ProjectId>();
   await database().insert(projects).values({
     id: projectId,
     workspaceId,
-    name: "App",
+    name,
     createdByUserId: by.userId,
   });
   const repositoryId = newId<RepositoryId>();
@@ -849,6 +853,14 @@ test("the owner of workspaces without another active, claimed person is erased: 
   // A second project of the team, and a project elsewhere that stays.
   const soloProject = await projectIn(solo.workspaceId, erased);
   const elsewhereProject = await projectIn(elsewhere.workspaceId, other);
+  // Two more projects of the team, one archived before: every project of an
+  // archived workspace gets the same placeholder name (#155).
+  const teamProject = await projectIn(team.workspaceId, erased, "Website");
+  const archivedProject = await projectIn(team.workspaceId, erased, "Old");
+  await db
+    .update(projects)
+    .set({ archivedAt: NOW })
+    .where(eq(projects.id, archivedProject.projectId));
 
   const result = await eraseAccount(db, {
     userId: erased.userId,
@@ -879,12 +891,22 @@ test("the owner of workspaces without another active, claimed person is erased: 
     assert.deepEqual(row.updatedAt, ARCHIVED_AT);
     assert.equal(row.name, ARCHIVED_WORKSPACE_NAME);
   }
-  for (const { projectId, repositoryId } of [project, soloProject]) {
+  for (const { projectId, repositoryId } of [
+    project,
+    soloProject,
+    teamProject,
+    archivedProject,
+  ]) {
     const projectRow = await rowOf(
       db.select().from(projects).where(eq(projects.id, projectId)),
     );
     assert.equal(projectRow.name, ARCHIVED_PROJECT_NAME);
     assert.deepEqual(projectRow.updatedAt, ARCHIVED_AT);
+    // The projects are archived with their workspace, an earlier archive kept.
+    assert.deepEqual(
+      projectRow.archivedAt,
+      projectId === archivedProject.projectId ? NOW : ARCHIVED_AT,
+    );
     const repositoryRow = await rowOf(
       db.select().from(repositories).where(eq(repositories.id, repositoryId)),
     );
@@ -911,6 +933,7 @@ test("the owner of workspaces without another active, claimed person is erased: 
       .where(eq(projects.id, elsewhereProject.projectId)),
   );
   assert.equal(elsewhereProjectRow.name, "App");
+  assert.equal(elsewhereProjectRow.archivedAt, null);
 
   // The owner's people are members now, removed as a removal does; an
   // archived workspace has no owner.

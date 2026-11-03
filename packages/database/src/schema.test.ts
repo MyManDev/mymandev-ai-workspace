@@ -49,7 +49,7 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { eq, sql, type SQL } from "drizzle-orm";
+import { eq, inArray, sql, type SQL } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/pglite";
 import { migrate } from "drizzle-orm/pglite/migrator";
 import {
@@ -464,7 +464,8 @@ test("the CHECK vocabularies equal the protocol constants", async () => {
 test("message sequence numbers are allocated per conversation", async () => {
   const db = database();
   const world = await seed();
-  const second = await addConversation(world.project, world.alice);
+  // A project has one `project` conversation, so the second is another project's.
+  const second = await addConversation(world.otherProject, world.alice);
   const fromAlice = {
     authorUserId: world.alice,
     senderDeviceId: world.aliceDevice,
@@ -492,7 +493,9 @@ test("message sequence numbers are allocated per conversation", async () => {
   const lastSeqs = await db
     .select({ id: conversations.id, lastSeq: conversations.lastSeq })
     .from(conversations)
-    .where(eq(conversations.projectId, world.project));
+    .where(
+      inArray(conversations.projectId, [world.project, world.otherProject]),
+    );
   assert.deepEqual(
     new Map(lastSeqs.map((row) => [row.id, row.lastSeq])),
     new Map([

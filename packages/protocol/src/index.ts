@@ -10,3 +10,4 @@ export * from "./auth-api.ts";
 export * from "./membership-api.ts";
 export * from "./chat-api.ts";
 export * from "./agent-api.ts";
+export * from "./project-api.ts";

@@ -20,6 +20,7 @@ import {
   WorkspaceIdSchema,
 } from "./ids.ts";
 import { canTransition, LIMITS, PROTOCOL_VERSION } from "./model.ts";
+import { WorkspaceProjectSchema } from "./project-api.ts";
 
 /**
  * Who caused an event. A client cannot choose its identity: the server binds
@@ -218,6 +219,37 @@ export const WorkspaceOwnershipTransferredEventSchema = z
     }
   });
 
+// Project events (#155): the projects of a workspace, which every member
+// sees. Only the server originates them, after the commit, with a `system`
+// actor and `deviceId: null`, like the membership events (see `actorAllowed`).
+
+/** A member created a project, together with its project chat; the payload names the creator. */
+export const WorkspaceProjectCreatedEventSchema = z
+  .object({
+    ...envelopeHeaderShape,
+    type: z.literal("workspace.project.created"),
+    payload: z.object({ project: WorkspaceProjectSchema }),
+  })
+  .superRefine((event, ctx) => {
+    if (event.payload.project.workspaceId !== event.workspaceId) {
+      ctx.addIssue({
+        code: "custom",
+        message: "The project belongs to another workspace",
+        path: ["payload", "project", "workspaceId"],
+      });
+    }
+  });
+
+/** A project's name changed. */
+export const WorkspaceProjectRenamedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.project.renamed"),
+  payload: z.object({
+    projectId: ProjectIdSchema,
+    name: displayText(LIMITS.name),
+  }),
+});
+
 // Chat events (#110). A project's chat has one stream of messages; the
 // events name the project, and the server finds the conversation that holds
 // it. Storing messages and the history route belong to #27.
@@ -273,6 +305,8 @@ export const ProtocolEventSchema = z.discriminatedUnion("type", [
   WorkspaceMemberRemovedEventSchema,
   WorkspaceMemberRoleChangedEventSchema,
   WorkspaceOwnershipTransferredEventSchema,
+  WorkspaceProjectCreatedEventSchema,
+  WorkspaceProjectRenamedEventSchema,
   ChatMessageSendEventSchema,
   ChatMessageCreatedEventSchema,
 ]);
@@ -288,6 +322,8 @@ export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
   "workspace.member.removed",
   "workspace.member.role_changed",
   "workspace.ownership.transferred",
+  "workspace.project.created",
+  "workspace.project.renamed",
   "chat.message.created",
 ] as const satisfies readonly EventType[]);
 export type ServerOnlyEventType = (typeof SERVER_ONLY_EVENT_TYPES)[number];
@@ -323,8 +359,10 @@ export function actorAllowed(event: ProtocolEvent): boolean {
     case "workspace.member.removed":
     case "workspace.member.role_changed":
     case "workspace.ownership.transferred":
+    case "workspace.project.created":
+    case "workspace.project.renamed":
     case "chat.message.created":
-      // Only the server reports membership changes and stored messages.
+      // Only the server reports membership and project changes and stored messages.
       return event.actor.kind === "system" && event.deviceId === null;
     case "chat.message.send":
       // A person sends from one of their devices; identity binding checks both.

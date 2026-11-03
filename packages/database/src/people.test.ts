@@ -974,16 +974,20 @@ test("the database refuses to remove the owner, whatever the application checks"
 
 type Project = Readonly<{ projectId: ProjectId; repositoryId: RepositoryId }>;
 
-/** A project of the workspace with one repository. */
+/**
+ * A project of the workspace with one repository. Project names are unique
+ * in a workspace, so a second project there needs another `name`.
+ */
 async function projectIn(
   workspaceId: WorkspaceId,
   by: Account,
+  name = "App",
 ): Promise<Project> {
   const projectId = newId<ProjectId>();
   await database().insert(projects).values({
     id: projectId,
     workspaceId,
-    name: "App",
+    name,
     createdByUserId: by.userId,
   });
   const repositoryId = newId<RepositoryId>();
@@ -1134,7 +1138,7 @@ test("a removal disables the person's agents in the workspace, revokes their gra
   });
   await addPerson(workspaceId, owner, { claimedBy: bob });
   const first = await projectIn(workspaceId, owner);
-  const second = await projectIn(workspaceId, owner);
+  const second = await projectIn(workspaceId, owner, "Website");
   const desktop = await secondDevice(removed);
 
   // The removed admin's agents: one per project and device, and one that
