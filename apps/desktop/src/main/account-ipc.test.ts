@@ -34,6 +34,7 @@ import type {
 } from "./ipc.ts";
 import type { ScheduleTimer } from "./runtime.ts";
 import { createSignInFlow } from "./sign-in/flow.ts";
+import { createRegistrationMarkerStore } from "./sign-in/registration-marker.ts";
 
 const DEV_URL = "http://localhost:5173/";
 const PASSPHRASE = "correct horse battery staple";
@@ -395,6 +396,10 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
           apiOrigin: { ok: true, origin: API_ORIGIN },
           keyStore,
           deviceRecords: records,
+          registrationMarkers: createRegistrationMarkerStore({
+            folder,
+            platform: "win32",
+          }),
           // The browser does not open, so the URL to copy is sent too.
           openExternal: async () => false,
           fetch: async (_url, init) => {
@@ -580,6 +585,10 @@ test("a This is not me whose key delete fails after an unsaved record never brin
           apiOrigin: { ok: true, origin: API_ORIGIN },
           keyStore,
           deviceRecords: records,
+          registrationMarkers: createRegistrationMarkerStore({
+            folder,
+            platform: "win32",
+          }),
           openExternal: async (url) => {
             opened.push(url);
             return true;

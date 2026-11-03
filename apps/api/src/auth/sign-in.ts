@@ -74,7 +74,11 @@ export type SignInRouteOptions = Readonly<{
 
 type SignInResult = Readonly<{
   response: SignInResponse;
-  /** The device that this sign-in registered, or null when it replaced an existing device's key. */
+  /**
+   * The device that this sign-in registered, or null when it signed in an
+   * existing device: it replaced the device's key, or it repeated the
+   * device's registration with the same key (#153).
+   */
   registered: DeviceListItem | null;
   /** The previous device that this sign-in revoked as replaced, if any. */
   replacedDeviceId: DeviceId | null;
@@ -124,7 +128,8 @@ function signaturesValid(
  * or updates the account and registers the device or replaces its key, in
  * one transaction. The answer carries no credential. A code that a request
  * of its own attempt already took answers `sign_in_code_used` to that
- * attempt (#152).
+ * attempt (#152). A new device whose key already belongs to an active
+ * device of the same account gets that device (#153).
  */
 export async function registerSignIn(
   app: FastifyInstance,
@@ -224,7 +229,10 @@ export async function registerSignIn(
               throw error;
             }
             const failure = toDatabaseError(error);
-            // A concurrent sign-in of the same account or the same key.
+            // A concurrent sign-in that created the same account, or that
+            // registered the same key for another account. A concurrent
+            // sign-in of an existing account with the same key waits at the
+            // identity row instead, and then finds the device (#153).
             throw failure.code === "23505" ? new ApiError("conflict") : failure;
           }
           const { userId, deviceId } = result.response;
@@ -241,28 +249,31 @@ export async function registerSignIn(
             sendCancelledRuns(connections, result.cancelledRuns, now);
           }
           if (result.registered === null) {
-            // An existing device: its connection used the key that this
-            // sign-in replaced.
+            // An existing device: its connection used the sign-in that this
+            // one followed, with the key that it replaced or, for a repeated
+            // registration (#153), with the same key.
             connections.closeDevice(deviceId, "key_replaced", request.log);
           } else {
             // The new device has no connection yet; the account's other
-            // connections hear of it and of the device it replaced.
+            // connections hear of it.
             const registered: AccountDeviceRegisteredFrame = {
               protocolVersion: PROTOCOL_VERSION,
               type: "account.device_registered",
               device: { ...result.registered, revokedAt: null, current: false },
             };
             connections.sendToUser(userId, registered, deviceId);
-            if (replaced !== null) {
-              const revoked: AccountDeviceRevokedFrame = {
-                protocolVersion: PROTOCOL_VERSION,
-                type: "account.device_revoked",
-                deviceId: replaced,
-                reason: "replaced",
-                revokedAt: now.toISOString(),
-              };
-              connections.sendToUser(userId, revoked, replaced);
-            }
+          }
+          if (replaced !== null) {
+            // The account's other connections hear of the device that a new
+            // or a repeated registration replaced.
+            const revoked: AccountDeviceRevokedFrame = {
+              protocolVersion: PROTOCOL_VERSION,
+              type: "account.device_revoked",
+              deviceId: replaced,
+              reason: "replaced",
+              revokedAt: now.toISOString(),
+            };
+            connections.sendToUser(userId, revoked, replaced);
           }
           // The webhook records a revocation in memory before its transaction
           // looks up the account. If it recorded it before the check above,
@@ -358,67 +369,100 @@ async function signIn(
     deviceId = row.id;
     await audit(tx, "device.key_replaced", userId, deviceId, deviceId, now);
   } else {
-    if (
-      user.deviceRegistrationLockedUntil !== null &&
-      user.deviceRegistrationLockedUntil > now
-    ) {
-      throw new ApiError("device_registration_locked");
-    }
-    // The previous device that this sign-in replaces does not count: the
-    // recovery path keeps the number of active devices.
-    const [active] = await tx
-      .select({ n: count() })
+    // A new device whose answer was lost comes again with the same key
+    // (#153). The key is unique among all devices, revoked ones included,
+    // so at most one row holds it. It is locked like an existing device's
+    // row, so a revocation that commits first is seen here. Two sign-ins of
+    // one account wait for each other at its identity row, so the later
+    // one finds the device that the earlier one committed.
+    const [holder] = await tx
+      .select()
       .from(devices)
-      .where(
-        and(
-          eq(devices.userId, userId),
-          isNull(devices.revokedAt),
-          device.previousDeviceId === undefined
-            ? undefined
-            : ne(devices.id, device.previousDeviceId),
-        ),
+      .where(eq(devices.publicKey, device.publicKey))
+      .for("no key update");
+    if (holder !== undefined) {
+      // The signature proved the private key, so an active device of this
+      // account signs in again: no new device, no limit, no registration
+      // lock, and no alert. A revoked device's key and another account's
+      // key stay refused, and a device never replaces itself.
+      if (
+        holder.revokedAt !== null ||
+        holder.userId !== userId ||
+        holder.id === device.previousDeviceId
+      ) {
+        throw new ApiError("conflict");
+      }
+      await tx
+        .update(devices)
+        .set({ lastSignInAt: now, signedOutAt: null, updatedAt: now })
+        .where(eq(devices.id, holder.id));
+      deviceId = holder.id;
+    } else {
+      if (
+        user.deviceRegistrationLockedUntil !== null &&
+        user.deviceRegistrationLockedUntil > now
+      ) {
+        throw new ApiError("device_registration_locked");
+      }
+      // The previous device that this sign-in replaces does not count: the
+      // recovery path keeps the number of active devices.
+      const [active] = await tx
+        .select({ n: count() })
+        .from(devices)
+        .where(
+          and(
+            eq(devices.userId, userId),
+            isNull(devices.revokedAt),
+            device.previousDeviceId === undefined
+              ? undefined
+              : ne(devices.id, device.previousDeviceId),
+          ),
+        );
+      if ((active?.n ?? 0) >= MAX_ACTIVE_DEVICES) {
+        // Only removing a device frees a place; ask again in a day.
+        throw new ApiError("rate_limited", {
+          retryAfterSeconds: DAY_MS / 1000,
+        });
+      }
+      const [recent] = await tx
+        .select({ n: count(), oldest: min(devices.createdAt) })
+        .from(devices)
+        .where(
+          and(
+            eq(devices.userId, userId),
+            gt(devices.createdAt, new Date(now.getTime() - DAY_MS)),
+          ),
+        );
+      if ((recent?.n ?? 0) >= MAX_NEW_DEVICES_PER_DAY) {
+        const oldest = recent?.oldest ?? now;
+        throw new ApiError("rate_limited", {
+          retryAfterSeconds: (oldest.getTime() + DAY_MS - now.getTime()) / 1000,
+        });
+      }
+      deviceId = newId<DeviceId>();
+      const row = {
+        id: deviceId,
+        userId,
+        label: device.label,
+        platform: device.platform,
+        publicKey: device.publicKey,
+        keyAlgorithm: device.keyAlgorithm,
+        createdAt: now,
+        updatedAt: now,
+        lastSignInAt: now,
+      };
+      await tx.insert(devices).values(row);
+      registered = deviceListItem(
+        { ...row, lastSeenAt: null, revokedAt: null },
+        false,
       );
-    if ((active?.n ?? 0) >= MAX_ACTIVE_DEVICES) {
-      // Only removing a device frees a place; ask again in a day.
-      throw new ApiError("rate_limited", { retryAfterSeconds: DAY_MS / 1000 });
+      await audit(tx, "device.registered", userId, deviceId, deviceId, now);
     }
-    const [recent] = await tx
-      .select({ n: count(), oldest: min(devices.createdAt) })
-      .from(devices)
-      .where(
-        and(
-          eq(devices.userId, userId),
-          gt(devices.createdAt, new Date(now.getTime() - DAY_MS)),
-        ),
-      );
-    if ((recent?.n ?? 0) >= MAX_NEW_DEVICES_PER_DAY) {
-      const oldest = recent?.oldest ?? now;
-      throw new ApiError("rate_limited", {
-        retryAfterSeconds: (oldest.getTime() + DAY_MS - now.getTime()) / 1000,
-      });
-    }
-    deviceId = newId<DeviceId>();
-    const row = {
-      id: deviceId,
-      userId,
-      label: device.label,
-      platform: device.platform,
-      publicKey: device.publicKey,
-      keyAlgorithm: device.keyAlgorithm,
-      createdAt: now,
-      updatedAt: now,
-      lastSignInAt: now,
-    };
-    await tx.insert(devices).values(row);
-    registered = deviceListItem(
-      { ...row, lastSeenAt: null, revokedAt: null },
-      false,
-    );
-    await audit(tx, "device.registered", userId, deviceId, deviceId, now);
     if (device.previousDeviceId !== undefined) {
       // Revoked only if it belongs to the same account (ADR 0014, step 8).
-      // After the commit, the route closes its socket and sends the runs
-      // that the revocation cancelled.
+      // The first commit of a repeated registration revoked it already, so
+      // the repeat changes nothing about it. After the commit, the route
+      // closes its socket and sends the runs that the revocation cancelled.
       const replaced = await revokeDevice(tx, {
         deviceId: device.previousDeviceId,
         userId,
