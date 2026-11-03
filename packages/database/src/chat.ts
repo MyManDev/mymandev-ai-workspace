@@ -100,14 +100,18 @@ function toChatMessage(row: MessageRow): ChatMessage {
   };
 }
 
-/** The message that the device stored with this event ID, with its workspace. */
+/**
+ * The message that the device stored with this event ID, with its workspace
+ * and its author's account. The key is unique per device, whoever the
+ * author: a device also sends its agents' messages (M4).
+ */
 async function storedMessage(
   tx: Database,
   deviceId: DeviceId,
   eventId: EventId,
 ) {
   const [row] = await tx
-    .select(messageColumns)
+    .select({ ...messageColumns, authorUserId: messages.authorUserId })
     .from(messages)
     .innerJoin(conversations, eq(conversations.id, messages.conversationId))
     .innerJoin(projects, eq(projects.id, conversations.projectId))
@@ -157,7 +161,7 @@ export type PostChatMessageResult =
        * workspace has no project with this ID, also when it is a project of
        * another workspace; `conflict`: the project or the workspace is
        * archived, or the device stored a message with this event ID in
-       * another workspace.
+       * another workspace or as an agent's message.
        */
       refusal: "not_member" | "not_found" | "conflict";
     }>;
@@ -166,10 +170,11 @@ export type PostChatMessageResult =
  * Posts a message to a project's chat in one transaction (#27). It locks the
  * account's active person in the actor's workspace `FOR SHARE`, and without
  * one refuses with `not_member`. Then, before any state of the project, it
- * looks for a message that the device already stored with this event ID: one
- * in the workspace is returned as it is stored, with `duplicate: true`, even
- * when its body differs or its project was archived since, and one in another
- * workspace is a `conflict`. Then it locks the project `FOR SHARE` and
+ * looks for a message that the device already stored with this event ID: the
+ * account's own message in the workspace is returned as it is stored, with
+ * `duplicate: true`, even when its body differs or its project was archived
+ * since; one in another workspace, or an agent's message of the device, is a
+ * `conflict`. Then it locks the project `FOR SHARE` and
  * refuses a project that the workspace does not have with `not_found`, and
  * an archived project or workspace with `conflict`. It numbers the message
  * with `UPDATE conversations SET last_seq = last_seq + 1 ... RETURNING` and
@@ -189,11 +194,17 @@ export async function postChatMessage(
   const refused = (
     refusal: "not_member" | "not_found" | "conflict",
   ): PostChatMessageResult => ({ posted: false, refusal });
-  // A message that the device already stored with this event ID.
+  // A message that the device already stored with this event ID. Only a
+  // message of the account's person in the actor's workspace is its
+  // duplicate; an agent's message with the same key, or one in another
+  // workspace, is a conflict.
   const answerTo = (
-    stored: MessageRow & Readonly<{ workspaceId: WorkspaceId }>,
+    stored: MessageRow &
+      Readonly<{ workspaceId: WorkspaceId; authorUserId: UserId | null }>,
   ): PostChatMessageResult =>
-    stored.workspaceId === actor.workspaceId
+    stored.workspaceId === actor.workspaceId &&
+    stored.authorUserId === actor.userId &&
+    stored.authorMemberId !== null
       ? { posted: true, duplicate: true, message: toChatMessage(stored) }
       : refused("conflict");
   return withDatabaseErrors(() =>
@@ -333,7 +344,10 @@ export type ListChatMessagesResult =
  * `GET /projects/:projectId/messages`. The newest first, by `seq`; with
  * `beforeSeq`, only messages with a lower `seq`; at most `limit`. Any active
  * member of the project's workspace reads it, also the history of an
- * archived project. A message keeps its author's person after the person
+ * archived project. It checks membership and reads the page in one
+ * read-only transaction at `REPEATABLE READ`, so both see one snapshot;
+ * inside another transaction it runs as a savepoint, at that transaction's
+ * isolation level. A message keeps its author's person after the person
  * was removed. It does not filter on `deleted_at`: no writer sets it yet,
  * and the writer that does decides how the history shows a deleted message,
  * so that a page still holds `limit` messages unless it is the oldest.
@@ -357,49 +371,59 @@ export async function listChatMessages(
   ) {
     throw new RangeError("beforeSeq is a positive integer");
   }
-  const rows = await withDatabaseErrors(async () => {
-    const [chat] = await db
-      .select({ id: conversations.id })
-      .from(projects)
-      .innerJoin(
-        workspaceMembers,
-        and(
-          eq(workspaceMembers.workspaceId, projects.workspaceId),
-          eq(workspaceMembers.userId, input.actorUserId),
-          isNull(workspaceMembers.removedAt),
-        ),
-      )
-      .leftJoin(
-        conversations,
-        and(
-          eq(conversations.projectId, projects.id),
-          eq(conversations.kind, "project"),
-        ),
-      )
-      .where(eq(projects.id, input.projectId));
-    if (chat === undefined) {
-      return undefined;
-    }
-    const chatId = chat.id;
-    if (chatId === null) {
-      return null;
-    }
-    return db
-      .select(messageColumns)
-      .from(messages)
-      .innerJoin(conversations, eq(conversations.id, messages.conversationId))
-      .innerJoin(projects, eq(projects.id, conversations.projectId))
-      .where(
-        and(
-          eq(messages.conversationId, chatId),
-          input.beforeSeq === undefined
-            ? undefined
-            : lt(messages.seq, input.beforeSeq),
-        ),
-      )
-      .orderBy(desc(messages.seq))
-      .limit(input.limit);
-  });
+  // One snapshot for the membership check and the page: a removal that
+  // commits in between is seen by both statements or by neither.
+  const rows = await withDatabaseErrors(() =>
+    db.transaction(
+      async (tx) => {
+        const [chat] = await tx
+          .select({ id: conversations.id })
+          .from(projects)
+          .innerJoin(
+            workspaceMembers,
+            and(
+              eq(workspaceMembers.workspaceId, projects.workspaceId),
+              eq(workspaceMembers.userId, input.actorUserId),
+              isNull(workspaceMembers.removedAt),
+            ),
+          )
+          .leftJoin(
+            conversations,
+            and(
+              eq(conversations.projectId, projects.id),
+              eq(conversations.kind, "project"),
+            ),
+          )
+          .where(eq(projects.id, input.projectId));
+        if (chat === undefined) {
+          return undefined;
+        }
+        const chatId = chat.id;
+        if (chatId === null) {
+          return null;
+        }
+        return tx
+          .select(messageColumns)
+          .from(messages)
+          .innerJoin(
+            conversations,
+            eq(conversations.id, messages.conversationId),
+          )
+          .innerJoin(projects, eq(projects.id, conversations.projectId))
+          .where(
+            and(
+              eq(messages.conversationId, chatId),
+              input.beforeSeq === undefined
+                ? undefined
+                : lt(messages.seq, input.beforeSeq),
+            ),
+          )
+          .orderBy(desc(messages.seq))
+          .limit(input.limit);
+      },
+      { isolationLevel: "repeatable read", accessMode: "read only" },
+    ),
+  );
   if (rows === undefined) {
     return { listed: false, refusal: "not_found" };
   }

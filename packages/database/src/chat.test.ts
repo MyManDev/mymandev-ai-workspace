@@ -440,6 +440,23 @@ test("an event ID that the device stored in another workspace is a conflict, and
   assert.equal(again.message.projectId, app);
 });
 
+test("an agent's message of the device with the same event ID is never answered as the person's duplicate: a conflict, and nothing is written", async () => {
+  const owner = await account("Owner");
+  const workspaceId = await workspaceOf(owner);
+  const app = await projectOf(workspaceId, owner);
+  const eventId = newId<EventId>();
+  const { id } = await agentMessage(app, owner, "Done", eventId);
+  assert.deepEqual(
+    await post(database(), workspaceId, owner, app, "Hello", eventId),
+    { posted: false, refusal: "conflict" },
+  );
+  assert.equal((await chatOf(app)).lastSeq, 1);
+  assert.deepEqual(
+    (await rowsOf(app)).map((row) => [row.id, row.authorUserId]),
+    [[id, null]],
+  );
+});
+
 test("an account that leaves and joins again posts as its new person, and its earlier messages keep the earlier person", async () => {
   const owner = await account("Owner");
   const member = await account("Member");
@@ -569,21 +586,25 @@ test("an unknown project, a project of another workspace, and a removed member a
   });
 });
 
-test("the history shows an agent's message with the agent as its author", async () => {
-  const owner = await account("Owner");
-  const workspaceId = await workspaceOf(owner);
-  const app = await projectOf(workspaceId, owner);
-  await posted(workspaceId, owner, app, "Hello");
+/**
+ * Stores a message of a new agent of `owner`, hosted on the owner's device,
+ * numbered as a post numbers it. No writer stores agent messages yet (M4).
+ */
+async function agentMessage(
+  projectId: ProjectId,
+  owner: Account,
+  body: string,
+  clientEventId?: EventId,
+): Promise<Readonly<{ id: MessageId; agentId: AgentId }>> {
   const agentId = newId<AgentId>();
   await database().insert(agents).values({
     id: agentId,
-    projectId: app,
+    projectId,
     ownerUserId: owner.userId,
     hostDeviceId: owner.deviceId,
     name: "Builder",
   });
-  // No writer stores agent messages yet (M4); numbered as a post does.
-  const chat = await chatOf(app);
+  const chat = await chatOf(projectId);
   const id = newId<MessageId>();
   await database().transaction(async (tx) => {
     const [row] = await tx
@@ -598,10 +619,20 @@ test("the history shows an agent's message with the agent as its author", async 
       seq: row.seq,
       authorAgentId: agentId,
       senderDeviceId: owner.deviceId,
-      body: "Done",
+      clientEventId,
+      body,
       createdAt: LATER,
     });
   });
+  return { id, agentId };
+}
+
+test("the history shows an agent's message with the agent as its author", async () => {
+  const owner = await account("Owner");
+  const workspaceId = await workspaceOf(owner);
+  const app = await projectOf(workspaceId, owner);
+  await posted(workspaceId, owner, app, "Hello");
+  const { id, agentId } = await agentMessage(app, owner, "Done");
   const [newest] = await historyOf(owner, app);
   assert.deepEqual(newest, {
     id,
@@ -660,8 +691,9 @@ async function lockWaits(): Promise<string[]> {
        left join pg_locks t on t.pid = w.pid and t.locktype = 'tuple'
        left join pg_class c on c.oid = t.relation
       where not w.granted
-        and (select oid from pg_database where datname = current_database())
-            in (w.database, t.database)`,
+        and w.pid in (
+          select pid from pg_stat_activity where datname = current_database()
+        )`,
   );
   return rows.map((row) => row.waitedOn).sort();
 }
