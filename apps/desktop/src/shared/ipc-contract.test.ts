@@ -3,6 +3,11 @@ import { EVENT_CHANNELS, INVOKE_CHANNELS } from "./ipc-channels.ts";
 import {
   ACCOUNT_LIMITS,
   AccountStatusSchema,
+  AGENT_ACTIVITY_PROBLEMS,
+  AGENT_ACTIVITY_STATUSES,
+  AGENT_LIMITS,
+  AGENT_RUN_STATES,
+  AgentActivityViewSchema,
   API_ORIGIN_STATES,
   CONNECTION_OFFLINE_REASONS,
   CONNECTION_STATES,
@@ -20,6 +25,7 @@ import {
   ListDevicesResultSchema,
   MOUNT_REFUSALS,
   MountResultSchema,
+  ProtocolIdSchema,
   RECONNECT_REFUSALS,
   ReconnectResultSchema,
   REPOSITORY_LIMITS,
@@ -86,6 +92,10 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     WORKSPACE_STATUSES,
     WORKSPACE_PROBLEMS,
     WORKSPACE_ACTION_REFUSALS,
+    AGENT_LIMITS,
+    AGENT_ACTIVITY_STATUSES,
+    AGENT_ACTIVITY_PROBLEMS,
+    AGENT_RUN_STATES,
   ]) {
     expect(Object.isFrozen(list)).toBe(true);
   }
@@ -1135,4 +1145,186 @@ test("a workspace action result is ok or refused with a known reason, without an
   ]) {
     expect(WorkspaceActionResultSchema.safeParse(value).success).toBe(false);
   }
+});
+
+const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000f1";
+const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000001001";
+const AGENT_PROJECT_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000e1";
+const AGENT_WORKSPACE_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000a1";
+const MEMBER_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000c1";
+const AGENT_DEVICE_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000d1";
+const RUN_AT = "2026-11-05T10:00:00.000Z";
+
+function agentRun(overrides: Record<string, unknown> = {}) {
+  return {
+    id: RUN_ID,
+    agentId: AGENT_ID,
+    state: "running",
+    reason: null,
+    createdAt: RUN_AT,
+    finishedAt: null,
+    ...overrides,
+  };
+}
+
+function agentActivity(overrides: Record<string, unknown> = {}) {
+  return {
+    status: "ready",
+    revision: 3,
+    workspaceId: AGENT_WORKSPACE_ID,
+    projectId: AGENT_PROJECT_ID,
+    agents: [
+      {
+        id: AGENT_ID,
+        name: "Agent Alpha",
+        ownerName: "Ada Lovelace",
+        disabledAt: null,
+      },
+    ],
+    unfinishedRuns: [agentRun()],
+    moreUnfinishedRuns: 0,
+    finishedRuns: [
+      agentRun({
+        state: "failed",
+        reason: "Out of memory",
+        finishedAt: RUN_AT,
+      }),
+    ],
+    ...overrides,
+  };
+}
+
+test("a protocol ID that is too long is refused with one issue, before the pattern runs", () => {
+  const result = ProtocolIdSchema.safeParse("x".repeat(10_000));
+
+  expect(result.success).toBe(false);
+  expect(result.error?.issues).toHaveLength(1);
+  expect(result.error?.issues[0]?.code).toBe("too_big");
+});
+
+test("an agent activity with every status, problem, and run state is accepted and frozen", () => {
+  for (const status of AGENT_ACTIVITY_STATUSES) {
+    if (status === "unavailable") {
+      for (const problem of AGENT_ACTIVITY_PROBLEMS) {
+        const value = agentActivity({ status, problem });
+        expect(AgentActivityViewSchema.parse(value)).toEqual(value);
+      }
+      continue;
+    }
+    const value = agentActivity({ status });
+    expect(AgentActivityViewSchema.parse(value)).toEqual(value);
+  }
+  const value = agentActivity({
+    workspaceId: null,
+    projectId: null,
+    unfinishedRuns: AGENT_RUN_STATES.map((state) => agentRun({ state })),
+    moreUnfinishedRuns: 12,
+  });
+  const parsed = AgentActivityViewSchema.parse(value);
+  expect(parsed).toEqual(value);
+  expect(Object.isFrozen(parsed.agents)).toBe(true);
+  expect(Object.isFrozen(parsed.unfinishedRuns)).toBe(true);
+  expect(Object.isFrozen(parsed.finishedRuns)).toBe(true);
+});
+
+test("an agent activity drops unknown keys at every level, so no member ID or device ID crosses", () => {
+  const parsed = AgentActivityViewSchema.parse(
+    agentActivity({
+      problem: "failed",
+      hostDeviceId: AGENT_DEVICE_ID,
+      agents: [
+        {
+          id: AGENT_ID,
+          name: "Agent Alpha",
+          ownerName: "Ada Lovelace",
+          ownerMemberId: MEMBER_ID,
+          hostDeviceId: AGENT_DEVICE_ID,
+          disabledAt: null,
+        },
+      ],
+      unfinishedRuns: [
+        agentRun({ projectId: AGENT_PROJECT_ID, repositoryId: MEMBER_ID }),
+      ],
+    }),
+  );
+
+  expect(parsed).toEqual(agentActivity());
+  expect(JSON.stringify(parsed)).not.toContain(MEMBER_ID);
+  expect(JSON.stringify(parsed)).not.toContain(AGENT_DEVICE_ID);
+});
+
+test("an agent activity over the limits or with wrong values is refused", () => {
+  const agent = (overrides: Record<string, unknown>) => ({
+    id: AGENT_ID,
+    name: "Agent Alpha",
+    ownerName: "Ada Lovelace",
+    disabledAt: null,
+    ...overrides,
+  });
+  const many = <T>(item: T, count: number) =>
+    Array.from({ length: count }, () => item);
+  for (const value of [
+    agentActivity({ status: "unavailable" }),
+    agentActivity({ status: "unavailable", problem: "busy" }),
+    agentActivity({ status: "paused" }),
+    agentActivity({ revision: -1 }),
+    agentActivity({ revision: 1.5 }),
+    agentActivity({ moreUnfinishedRuns: -1 }),
+    agentActivity({ moreUnfinishedRuns: 0.5 }),
+    agentActivity({ moreUnfinishedRuns: undefined }),
+    agentActivity({ workspaceId: "workspace" }),
+    agentActivity({ projectId: AGENT_PROJECT_ID.toUpperCase() }),
+    agentActivity({
+      agents: many(agent({}), AGENT_LIMITS.agents + 1),
+    }),
+    agentActivity({
+      unfinishedRuns: many(agentRun(), AGENT_LIMITS.unfinishedRuns + 1),
+    }),
+    agentActivity({
+      finishedRuns: many(
+        agentRun({ state: "completed", finishedAt: RUN_AT }),
+        AGENT_LIMITS.finishedRuns + 1,
+      ),
+    }),
+    agentActivity({ agents: [agent({ name: "" })] }),
+    agentActivity({
+      agents: [agent({ name: "a".repeat(AGENT_LIMITS.agentName + 1) })],
+    }),
+    agentActivity({ agents: [agent({ ownerName: "" })] }),
+    agentActivity({
+      agents: [agent({ ownerName: "a".repeat(AGENT_LIMITS.ownerName + 1) })],
+    }),
+    agentActivity({ agents: [agent({ ownerName: undefined })] }),
+    agentActivity({ agents: [agent({ disabledAt: "yesterday" })] }),
+    agentActivity({ agents: [agent({ id: MOUNT_ID })] }),
+    agentActivity({ unfinishedRuns: [agentRun({ state: "paused" })] }),
+    agentActivity({ unfinishedRuns: [agentRun({ reason: "" })] }),
+    agentActivity({
+      unfinishedRuns: [
+        agentRun({ reason: "a".repeat(AGENT_LIMITS.runReason + 1) }),
+      ],
+    }),
+    agentActivity({ unfinishedRuns: [agentRun({ agentId: null })] }),
+    agentActivity({ unfinishedRuns: [agentRun({ createdAt: "now" })] }),
+  ]) {
+    expect(AgentActivityViewSchema.safeParse(value).success).toBe(false);
+  }
+
+  // At the limits, everything is accepted.
+  expect(
+    AgentActivityViewSchema.safeParse(
+      agentActivity({
+        agents: [
+          agent({
+            name: "\u{1F600}".repeat(AGENT_LIMITS.agentName),
+            ownerName: "a".repeat(AGENT_LIMITS.ownerName),
+          }),
+        ],
+        unfinishedRuns: many(
+          agentRun({ reason: "a".repeat(AGENT_LIMITS.runReason) }),
+          AGENT_LIMITS.unfinishedRuns,
+        ),
+      }),
+    ).success,
+  ).toBe(true);
 });

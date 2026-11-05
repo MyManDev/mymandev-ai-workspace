@@ -58,11 +58,12 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, and the workspace functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, and the agent functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
     "account",
+    "agents",
     "connection",
     "electronVersion",
     "repositories",
@@ -101,6 +102,10 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "select",
     "subscribeState",
   ]);
+  expect(Object.keys(bridge.agents).sort()).toEqual([
+    "getState",
+    "subscribeState",
+  ]);
   expect(bridge.electronVersion).toBe("44.9.1");
   expect(Object.isFrozen(bridge)).toBe(true);
   expect(Object.isFrozen(bridge.runtime)).toBe(true);
@@ -108,12 +113,14 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   expect(Object.isFrozen(bridge.account)).toBe(true);
   expect(Object.isFrozen(bridge.connection)).toBe(true);
   expect(Object.isFrozen(bridge.workspaces)).toBe(true);
+  expect(Object.isFrozen(bridge.agents)).toBe(true);
   for (const value of [
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
     ...Object.values(bridge.account),
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
+    ...Object.values(bridge.agents),
   ]) {
     expect(typeof value).toBe("function");
   }
@@ -129,6 +136,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.account),
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
+    ...Object.values(bridge.agents),
   ] as unknown[];
 
   expect(values).not.toContain(ipc);
@@ -716,4 +724,69 @@ test("the workspace subscription delivers the state and every newer one, without
 
   expect(errors).toBe(1);
   expect(reported).toEqual(["A workspace state callback failed."]);
+});
+
+test("the agent functions call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const agents = createDesktopBridge("44.9.1", fake.ipc)
+    .agents as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const empty = { status: "no_project", revision: 0 };
+
+  const answer = agents["getState"]?.("agents:subscribe-state", {
+    projectId: "other",
+  });
+  fake.answers[0]?.resolve(empty);
+
+  await expect(answer).resolves.toEqual(empty);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getAgentState, args: [] },
+  ]);
+});
+
+test("the agent subscription delivers the activity and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const calls: unknown[][] = [];
+  const reported: string[] = [];
+  const unsubscribe = bridge.agents.subscribeState((...args) =>
+    calls.push(args),
+  );
+
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeAgentState, args: [] },
+  ]);
+  fake.answers[0]?.resolve({ status: "loading", revision: 3 });
+  await settle();
+  fake.emit(EVENT_CHANNELS.agentStateChanged, { status: "ready", revision: 4 });
+  fake.emit(EVENT_CHANNELS.agentStateChanged, {
+    status: "loading",
+    revision: 2,
+  });
+  expect(calls).toEqual([
+    [{ status: "loading", revision: 3 }],
+    [{ status: "ready", revision: 4 }],
+  ]);
+  unsubscribe();
+  expect(fake.listenerCount(EVENT_CHANNELS.agentStateChanged)).toBe(0);
+
+  const failing = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  let refused = 0;
+  failing.agents.subscribeState(
+    () => {
+      throw new Error("broken");
+    },
+    () => {
+      refused += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.agentStateChanged, { status: "ready", revision: 5 });
+  expect(reported).toEqual(["An agent activity callback failed."]);
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+  expect(refused).toBe(1);
 });
