@@ -12,6 +12,8 @@ import type {
   StartSignInOptions,
   StartSignInResult,
   UnlockResult,
+  WorkspaceActionResult,
+  WorkspaceView,
 } from "./ipc-contract.ts";
 
 /**
@@ -33,6 +35,8 @@ export interface DesktopBridge {
   readonly account: AccountBridge;
   /** The status of the connection to the cloud API. */
   readonly connection: ConnectionBridge;
+  /** The account's workspaces, the selected one's projects, and the open project. */
+  readonly workspaces: WorkspaceBridge;
 }
 
 export interface RuntimeBridge {
@@ -161,4 +165,40 @@ export interface ConnectionBridge {
    * the renderer on.
    */
   readonly reconnect: () => Promise<ReconnectResult>;
+}
+
+/**
+ * The workspaces of the account, which the workspace service in the main
+ * process holds. The renderer gets IDs, names, and fixed codes, and can
+ * select a workspace or open a project; it never sees a member ID, a user
+ * ID, or anything secret.
+ */
+export interface WorkspaceBridge {
+  /** The current workspace state. */
+  readonly getState: () => Promise<WorkspaceView>;
+  /**
+   * Calls `listener` with the current state and then after every change. A
+   * state older than the last one delivered is dropped. `onError` is called
+   * when the main process refuses the subscription. Returns a function that
+   * ends the subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: WorkspaceView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Selects a workspace of the list; the open project closes. Resolves to
+   * `refused` for a workspace that the list does not hold. The main process
+   * accepts only a lowercase UUIDv7.
+   */
+  readonly select: (workspaceId: string) => Promise<WorkspaceActionResult>;
+  /**
+   * Opens a project of the selected workspace, or closes the open one with
+   * null. Resolves to `refused` for a project that the selected workspace
+   * does not hold. The main process closes the open project itself when the
+   * page reloads or the window closes.
+   */
+  readonly openProject: (
+    projectId: string | null,
+  ) => Promise<WorkspaceActionResult>;
 }

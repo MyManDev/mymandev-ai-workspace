@@ -58,7 +58,7 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, and the connection functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, and the workspace functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
@@ -67,6 +67,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "electronVersion",
     "repositories",
     "runtime",
+    "workspaces",
   ]);
   expect(Object.keys(bridge.runtime).sort()).toEqual([
     "getStatus",
@@ -94,17 +95,25 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "reconnect",
     "subscribeStatus",
   ]);
+  expect(Object.keys(bridge.workspaces).sort()).toEqual([
+    "getState",
+    "openProject",
+    "select",
+    "subscribeState",
+  ]);
   expect(bridge.electronVersion).toBe("44.9.1");
   expect(Object.isFrozen(bridge)).toBe(true);
   expect(Object.isFrozen(bridge.runtime)).toBe(true);
   expect(Object.isFrozen(bridge.repositories)).toBe(true);
   expect(Object.isFrozen(bridge.account)).toBe(true);
   expect(Object.isFrozen(bridge.connection)).toBe(true);
+  expect(Object.isFrozen(bridge.workspaces)).toBe(true);
   for (const value of [
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
     ...Object.values(bridge.account),
     ...Object.values(bridge.connection),
+    ...Object.values(bridge.workspaces),
   ]) {
     expect(typeof value).toBe("function");
   }
@@ -119,6 +128,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.repositories),
     ...Object.values(bridge.account),
     ...Object.values(bridge.connection),
+    ...Object.values(bridge.workspaces),
   ] as unknown[];
 
   expect(values).not.toContain(ipc);
@@ -584,4 +594,126 @@ test("the connection subscription delivers the status and every newer one, witho
     revision: 5,
   });
   expect(reported).toEqual(["A connection status callback failed."]);
+});
+
+const WORKSPACE_ID = "019a5b2c-3d4e-7f60-8a1b-2c3d4e5f6a7b";
+const PROJECT_ID = "019a5b2c-3d4e-7f60-9a1b-2c3d4e5f6a7c";
+
+const workspaceState = (revision: number) => ({
+  revision,
+  status: "ready",
+  workspaces: [{ id: WORKSPACE_ID, name: "Team" }],
+  selectedWorkspaceId: WORKSPACE_ID,
+  projects: [{ id: PROJECT_ID, name: "Desktop" }],
+  openProjectId: null,
+});
+
+test("getState calls its channel and passes no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const getState = createDesktopBridge("44.9.1", fake.ipc).workspaces
+    .getState as (...args: unknown[]) => Promise<unknown>;
+
+  const answer = getState("workspaces:select", WORKSPACE_ID);
+  fake.answers[0]?.resolve(workspaceState(1));
+
+  await expect(answer).resolves.toEqual(workspaceState(1));
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getWorkspaceState, args: [] },
+  ]);
+});
+
+test("select passes only the workspace ID string on", async () => {
+  const fake = fakeIpc();
+  const select = createDesktopBridge("44.9.1", fake.ipc).workspaces.select as (
+    ...args: unknown[]
+  ) => Promise<unknown>;
+
+  const answer = select(WORKSPACE_ID, "extra", { force: true });
+  fake.answers[0]?.resolve({ outcome: "ok" });
+
+  await expect(answer).resolves.toEqual({ outcome: "ok" });
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.selectWorkspace, args: [WORKSPACE_ID] },
+  ]);
+});
+
+test("openProject passes only the project ID string or null on", async () => {
+  const fake = fakeIpc();
+  const openProject = createDesktopBridge("44.9.1", fake.ipc).workspaces
+    .openProject as (...args: unknown[]) => Promise<unknown>;
+
+  const answers = [openProject(PROJECT_ID, "extra"), openProject(null, 1)];
+  fake.answers[0]?.resolve({ outcome: "ok" });
+  fake.answers[1]?.resolve({ outcome: "refused" });
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    { outcome: "ok" },
+    { outcome: "refused" },
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.openProject, args: [PROJECT_ID] },
+    { channel: INVOKE_CHANNELS.openProject, args: [null] },
+  ]);
+});
+
+test("select and openProject refuse a value of another type without calling the main process", async () => {
+  const fake = fakeIpc();
+  const workspaces = createDesktopBridge("44.9.1", fake.ipc)
+    .workspaces as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  for (const value of [undefined, 1, { id: WORKSPACE_ID }, [WORKSPACE_ID]]) {
+    await expect(workspaces["select"]?.(value)).rejects.toThrow(TypeError);
+    await expect(workspaces["openProject"]?.(value)).rejects.toThrow(TypeError);
+  }
+  await expect(workspaces["select"]?.(null)).rejects.toThrow(TypeError);
+  await expect(workspaces["openProject"]?.()).rejects.toThrow(TypeError);
+  expect(fake.invoked).toEqual([]);
+});
+
+test("the workspace subscription delivers the state and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const reported: string[] = [];
+  const bridge = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  const calls: unknown[][] = [];
+  let errors = 0;
+
+  const end = bridge.workspaces.subscribeState(
+    (...args: unknown[]) => calls.push(args),
+    () => {
+      errors += 1;
+    },
+  );
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeWorkspaceState, args: [] },
+  ]);
+  fake.emit(EVENT_CHANNELS.workspaceStateChanged, workspaceState(3));
+  fake.answers[0]?.resolve(workspaceState(2));
+  await settle();
+  fake.emit(EVENT_CHANNELS.workspaceStateChanged, workspaceState(4));
+  end();
+  fake.emit(EVENT_CHANNELS.workspaceStateChanged, workspaceState(5));
+
+  expect(calls).toEqual([[workspaceState(3)], [workspaceState(4)]]);
+  expect(fake.listenerCount(EVENT_CHANNELS.workspaceStateChanged)).toBe(0);
+  expect(errors).toBe(0);
+
+  bridge.workspaces.subscribeState(
+    () => {
+      throw new Error("listener");
+    },
+    () => {
+      errors += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.workspaceStateChanged, workspaceState(1));
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+
+  expect(errors).toBe(1);
+  expect(reported).toEqual(["A workspace state callback failed."]);
 });

@@ -739,6 +739,125 @@ export const ReconnectResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type ReconnectResult = z.infer<typeof ReconnectResultSchema>;
 
+/**
+ * Limits of the workspace messages: the number of workspaces and of
+ * projects, the most that one answer of the API holds (the protocol's
+ * `MAX_ANSWER_LIST_ITEMS`), and the length of a name in characters (the
+ * protocol's `LIMITS.name`; zod counts code points, like the protocol). The
+ * main process sends at most this many workspaces and projects and shortens
+ * a longer name. The shared contract does not import the protocol package,
+ * so the main process's tests check that the values match.
+ */
+export const WORKSPACE_LIMITS = Object.freeze({
+  workspaces: 1_000,
+  projects: 1_000,
+  name: 100,
+});
+
+/** A UUIDv7 in canonical lowercase form, like the protocol's `UUIDV7_PATTERN`. */
+const UUIDV7_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/**
+ * A protocol ID, such as a workspace or a project ID, that crosses IPC
+ * (Project Manager decision of 2026-11-05): a lowercase UUIDv7. A longer
+ * string is refused before the pattern runs. The main process checks every
+ * ID from the renderer with the protocol's own ID schema as well.
+ */
+export const ProtocolIdSchema = z
+  .string()
+  .max(36, { abort: true })
+  .regex(UUIDV7_PATTERN, "Expected a lowercase UUIDv7");
+
+const WorkspaceNameSchema = z.string().min(1).max(WORKSPACE_LIMITS.name);
+
+/** A workspace of the account. */
+export const WorkspaceSummarySchema = z.object({
+  id: ProtocolIdSchema,
+  name: WorkspaceNameSchema,
+});
+export type WorkspaceSummaryView = z.infer<typeof WorkspaceSummarySchema>;
+
+/** A project of the selected workspace. Its creator does not cross IPC. */
+export const ProjectSummarySchema = z.object({
+  id: ProtocolIdSchema,
+  name: WorkspaceNameSchema,
+});
+export type ProjectSummaryView = z.infer<typeof ProjectSummarySchema>;
+
+/**
+ * The states of the workspace service: `signed_out` without a signed-in
+ * device with a ready key, `loading` until the list and the selected
+ * workspace loaded once, `ready`, and `unavailable` while a retry of a
+ * failed load waits.
+ */
+export const WORKSPACE_STATUSES = Object.freeze([
+  "signed_out",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+
+/** Why the workspaces are `unavailable`: the failure of the last read. */
+export const WORKSPACE_PROBLEMS = Object.freeze([
+  "not_signed_in",
+  "not_found",
+  "rate_limited",
+  "unavailable",
+  "failed",
+] as const);
+export type WorkspaceProblem = (typeof WORKSPACE_PROBLEMS)[number];
+
+const WorkspaceViewFields = {
+  /**
+   * Grows by one with every change. A receiver keeps the state with the
+   * highest revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /** In the server's order, the most recently claimed first. */
+  workspaces: z
+    .array(WorkspaceSummarySchema)
+    .max(WORKSPACE_LIMITS.workspaces)
+    .readonly(),
+  selectedWorkspaceId: ProtocolIdSchema.nullable(),
+  /** The selected workspace's projects, the oldest first. */
+  projects: z
+    .array(ProjectSummarySchema)
+    .max(WORKSPACE_LIMITS.projects)
+    .readonly(),
+  openProjectId: ProtocolIdSchema.nullable(),
+};
+
+/**
+ * What the renderer may know of the workspace service's state: `{ revision,
+ * status, problem?, workspaces, selectedWorkspaceId, projects,
+ * openProjectId }`, with a problem only while `unavailable`. It holds IDs
+ * and names only, no member ID, user ID, or anything secret.
+ */
+export const WorkspaceViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum(["signed_out", "loading", "ready"]),
+    ...WorkspaceViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(WORKSPACE_PROBLEMS),
+    ...WorkspaceViewFields,
+  }),
+]);
+export type WorkspaceView = z.infer<typeof WorkspaceViewSchema>;
+
+/**
+ * The result of selecting a workspace or opening a project: `ok`, or
+ * `refused` for a workspace that the list does not hold, a project that the
+ * selected workspace does not hold, or no signed-in device.
+ */
+export const WorkspaceActionResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  z.object({ outcome: z.literal("refused") }),
+]);
+export type WorkspaceActionResult = z.infer<typeof WorkspaceActionResultSchema>;
+
 /** The schemas of every invoke channel. */
 export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.getRuntimeStatus]: Object.freeze({
@@ -816,6 +935,23 @@ export const INVOKE_CONTRACT = Object.freeze({
     args: NoArgumentsSchema,
     result: ReconnectResultSchema,
   }),
+  [INVOKE_CHANNELS.getWorkspaceState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: WorkspaceViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeWorkspaceState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: WorkspaceViewSchema,
+  }),
+  [INVOKE_CHANNELS.selectWorkspace]: Object.freeze({
+    args: z.tuple([ProtocolIdSchema]),
+    result: WorkspaceActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.openProject]: Object.freeze({
+    /** A project ID, or null to close the open project. */
+    args: z.tuple([ProtocolIdSchema.nullable()]),
+    result: WorkspaceActionResultSchema,
+  }),
 });
 
 /** The payload schema of every event channel. */
@@ -824,6 +960,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.repositoriesChanged]: RepositoryListSchema,
   [EVENT_CHANNELS.accountStatusChanged]: AccountStatusSchema,
   [EVENT_CHANNELS.connectionStatusChanged]: ConnectionStatusSchema,
+  [EVENT_CHANNELS.workspaceStateChanged]: WorkspaceViewSchema,
 });
 
 export type InvokeArgs<C extends InvokeChannel> = z.infer<
