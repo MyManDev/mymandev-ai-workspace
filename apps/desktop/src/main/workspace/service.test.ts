@@ -626,11 +626,13 @@ test("project and member events apply while live", async () => {
   );
   expect(h.state.projects.map((p) => p.id)).toEqual([PROJECT_1, PROJECT_2]);
   expect(h.state.revision).toBeGreaterThan(before);
-  // The same event again changes nothing but the revision.
+  // The same event again changes nothing, not even the revision.
+  const afterCreated = h.state.revision;
   h.receive(
     event("workspace.project.created", { project: project(PROJECT_2) }),
   );
   expect(h.state.projects.map((p) => p.id)).toEqual([PROJECT_1, PROJECT_2]);
+  expect(h.state.revision).toBe(afterCreated);
   h.receive(
     event("workspace.project.renamed", {
       projectId: PROJECT_1,
@@ -658,6 +660,22 @@ test("project and member events apply while live", async () => {
     }),
   );
   expect(h.service.memberName(MEMBER)).toBe("Grace Renamed");
+  // A role, an owner, or a removal changes nothing that the service keeps,
+  // and neither does a name or a project name that is already held.
+  const afterNames = h.state.revision;
+  const published = h.states.length;
+  h.receive(
+    event("workspace.member.renamed", {
+      memberId: MEMBER,
+      displayName: "Grace Renamed",
+    }),
+  );
+  h.receive(
+    event("workspace.project.renamed", {
+      projectId: PROJECT_1,
+      name: "Project One Renamed",
+    }),
+  );
   h.receive(
     event("workspace.member.role_changed", { memberId: MEMBER, role: "admin" }),
   );
@@ -673,6 +691,8 @@ test("project and member events apply while live", async () => {
   );
   expect(h.service.memberName(MEMBER)).toBe("Grace Renamed");
   expect(h.service.memberName(UNKNOWN_MEMBER)).toBe(UNKNOWN_MEMBER_NAME);
+  expect(h.state.revision).toBe(afterNames);
+  expect(h.states).toHaveLength(published);
   expect(h.reads).toEqual([]);
 
   // Events of another workspace, chat messages, runs, and presence change

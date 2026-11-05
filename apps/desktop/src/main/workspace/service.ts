@@ -79,7 +79,8 @@ export function workspaceRetryDelayMs(
  * - `ready`: the list loaded, and so did the selected workspace, if any.
  *   It stays `ready` during later reloads, which `gateLive` reports.
  * - `unavailable`: the last load of the list or of the selected workspace
- *   failed, and a retry waits; `problem` holds the failure. What was loaded
+ *   failed; a retry waits, or, after a failure while offline, the next
+ *   connection loads again. `problem` holds the failure. What was loaded
  *   before stays.
  */
 export type WorkspaceServiceStatus =
@@ -617,19 +618,28 @@ export function createWorkspaceService(
    * an ownership transfer change nothing that the service keeps: a former
    * member keeps their name.
    */
+  /** Keeps a person's name, and touches the state only when it changes. */
+  function setMemberName(memberId: MemberId, displayName: string): void {
+    if (members.get(memberId) !== displayName) {
+      members.set(memberId, displayName);
+      touch();
+    }
+  }
+
   function applyEvent(event: WorkspaceEvent): boolean {
     switch (event.type) {
       case "workspace.member.defined":
       case "workspace.member.claimed":
-        members.set(event.payload.member.id, event.payload.member.displayName);
-        touch();
+        setMemberName(
+          event.payload.member.id,
+          event.payload.member.displayName,
+        );
         return true;
       case "workspace.member.renamed":
         if (!members.has(event.payload.memberId)) {
           return false;
         }
-        members.set(event.payload.memberId, event.payload.displayName);
-        touch();
+        setMemberName(event.payload.memberId, event.payload.displayName);
         return true;
       case "workspace.member.removed":
       case "workspace.member.role_changed":
@@ -641,6 +651,13 @@ export function createWorkspaceService(
         );
       case "workspace.project.created": {
         const project = projectSummary(event.payload.project);
+        const held = projects.find((entry) => entry.id === project.id);
+        if (
+          held?.name === project.name &&
+          held.createdByMemberId === project.createdByMemberId
+        ) {
+          return true;
+        }
         touch();
         projects = Object.freeze(
           projects.some((held) => held.id === project.id)
@@ -651,8 +668,12 @@ export function createWorkspaceService(
       }
       case "workspace.project.renamed": {
         const { projectId, name } = event.payload;
-        if (!projects.some((held) => held.id === projectId)) {
+        const held = projects.find((entry) => entry.id === projectId);
+        if (held === undefined) {
           return false;
+        }
+        if (held.name === name) {
+          return true;
         }
         projects = Object.freeze(
           projects.map((held) =>
