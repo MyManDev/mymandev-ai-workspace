@@ -14,6 +14,7 @@ import {
   forgetConfirmed,
 } from "./account.ts";
 import { registerAccountIpc } from "./account-ipc.ts";
+import { registerAgentIpc } from "./agent-ipc.ts";
 import {
   REMOVE_DEVICE_CONFIRMATION,
   removeDeviceConfirmationMessage,
@@ -190,10 +191,9 @@ function start(): void {
 
   // The agents and runs of the open project (#28), read over HTTP and kept
   // current with the selected workspace's run events through its own resync
-  // gate. It never sends an event and has no IPC yet. It is created right
-  // after the workspace service, so that it sees the first
-  // `workspace.subscribed`. The logs are fixed text with a failure code at
-  // most, never a name or an ID.
+  // gate. It never sends an event. It is created right after the workspace
+  // service, so that it sees the first `workspace.subscribed`. The logs are
+  // fixed text with a failure code at most, never a name or an ID.
   const agents = createAgentActivityService({
     account,
     connection,
@@ -201,6 +201,15 @@ function start(): void {
     log: (message) => console.info(message),
   });
   app.on("will-quit", () => agents.close());
+
+  // The agent activity reaches the renderer read-only, with the owners'
+  // names resolved in the main process and the newest runs only, at most
+  // one publish every 50 ms. Its waiting publish is cancelled at quit.
+  const agentIpc = registerAgentIpc(ipcMain, rendererUrl, {
+    agents,
+    workspaces,
+  });
+  app.on("will-quit", () => agentIpc.close());
 
   // The open project's chat (#27): its history, read over HTTP, its
   // `chat.message.created` events, and the person's messages, sent with the

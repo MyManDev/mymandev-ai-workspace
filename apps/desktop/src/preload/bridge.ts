@@ -1,5 +1,6 @@
 import type {
   AccountBridge,
+  AgentBridge,
   ConnectionBridge,
   DesktopBridge,
   RepositoryBridge,
@@ -14,6 +15,7 @@ import {
 } from "../shared/ipc-channels.ts";
 import type {
   AccountStatus,
+  AgentActivityView,
   ConnectionStatus,
   ForgetResult,
   ListDevicesResult,
@@ -276,6 +278,24 @@ export function createDesktopBridge(
           ),
   });
 
+  const agents: AgentBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
+    subscribeState: (
+      listener: (state: AgentActivityView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeAgentState,
+        EVENT_CHANNELS.agentStateChanged,
+        "An agent activity callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+  });
+
   return Object.freeze({
     electronVersion,
     runtime,
@@ -283,5 +303,6 @@ export function createDesktopBridge(
     account,
     connection,
     workspaces,
+    agents,
   });
 }
