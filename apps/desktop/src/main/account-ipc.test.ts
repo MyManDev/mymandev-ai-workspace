@@ -1403,3 +1403,78 @@ test("This is not me during a sign-out report of the startup refresh never write
   // The report reached the API before the forget.
   expect(api.signedOut).toBe(true);
 }, 20_000);
+
+test("a workspace read refused by its own token request answers not_signed_in, although the real session moved the device meanwhile", async () => {
+  const cases: ["sign_in_required" | "auth_failed", string][] = [
+    ["sign_in_required", "sign-in-required"],
+    ["auth_failed", "auth-failed"],
+  ];
+  for (const [refusalCode, name] of cases) {
+    const folder = path.join(root, name);
+    const keyStore = createDeviceKeyStore({
+      folder,
+      platform: "win32",
+      systemProtection: {
+        isAsyncEncryptionAvailable: () => Promise.resolve(true),
+        getSelectedStorageBackend: () => "unknown",
+        encryptStringAsync: (plainText) =>
+          Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8")),
+        decryptStringAsync: (ciphertext) =>
+          Promise.resolve({
+            shouldReEncrypt: false,
+            result: ciphertext.toString("utf8").slice("fake:".length),
+          }),
+      },
+    });
+    const records = createDeviceRecordStore({ folder, platform: "win32" });
+    const key = await keyStore.create({ kind: "system" });
+    await records.write({
+      deviceId: DEVICE_ID,
+      userId: USER_ID,
+      login: "octocat",
+      displayName: "The Octocat",
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
+      publicKey: key.publicKey,
+    });
+    const { api, fetch } = deviceApi();
+    if (refusalCode === "sign_in_required") {
+      // The device's sign-in ended at the API.
+      api.publicKey = key.publicKey;
+      api.signedOut = true;
+    } else {
+      // The API holds another key.
+      api.publicKey = "a".repeat(64);
+    }
+    const service = createAccountService({
+      apiOrigin: { ok: true, origin: API_ORIGIN },
+      openSystem: () => ({
+        keyStore,
+        deviceRecords: records,
+        registrationMarkers: createRegistrationMarkerStore({
+          folder,
+          platform: "win32",
+        }),
+        createFlow: () => {
+          throw new Error("no sign-in here");
+        },
+        createSession: () => sessionOver(folder, keyStore, records, fetch),
+      }),
+      focusWindow: () => undefined,
+      confirmForget: async () => false,
+      confirmRemoveDevice: async () => false,
+    });
+    await service.initialize();
+    expect(service.status().device, name).toBe("signed_in");
+
+    await expect(
+      service.readWorkspaceData("listWorkspaces", {}),
+      name,
+    ).resolves.toEqual({ ok: false, reason: "not_signed_in" });
+    // The session published the refusal while the read was on its way.
+    expect(service.status().device, name).toBe(refusalCode);
+    expect(api.routes, name).toEqual([
+      "POST /auth/challenge",
+      "POST /auth/access-token",
+    ]);
+  }
+}, 20_000);

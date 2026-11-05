@@ -8,7 +8,8 @@
 // forgets the account for "This is not me" (#149). It also lends the
 // device session to the connection client of #26 in the main process: the
 // signature of the WebSocket challenge and the close reasons that refuse the
-// device.
+// device. And it sends the six reads of workspace, chat, and agent data of
+// #27 and #28 (`api-reads.ts`) for the main process only.
 //
 // The renderer gets a narrow status only: the account's login, display name,
 // and device ID, the pairing code, the authorize URL when the browser did not
@@ -45,6 +46,16 @@ import {
 } from "./account-session.ts";
 import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
 import type { ApiOrigin } from "./api-origin.ts";
+import {
+  type WorkspaceReadAnswer,
+  type WorkspaceReadName,
+  type WorkspaceReadParams,
+  type WorkspaceReadQuery,
+  type WorkspaceReadResult,
+  workspaceReadFailed,
+  workspaceReadFailureOf,
+  workspaceReadRequest,
+} from "./api-reads.ts";
 import { isDeviceKeyError } from "./device-key/errors.ts";
 import type { DeviceKeyStore } from "./device-key/store.ts";
 import type { DeviceRecordStore } from "./device-record.ts";
@@ -78,6 +89,7 @@ export type AccountSession = Pick<
   | "removeDevice"
   | "signWebSocketChallenge"
   | "deviceRefused"
+  | "request"
 >;
 
 /**
@@ -237,6 +249,27 @@ export interface AccountService {
     code: DeviceRefusalCode,
     deviceId: DeviceId,
   ) => Promise<void>;
+  /**
+   * Sends one read of the allowlist in `api-reads.ts` with the device
+   * session, for the main process only (#27, #28); never for the renderer.
+   * The answer is parsed with the protocol's response schema and its size
+   * is capped. It takes no `operation` lock: while a sign-in, a sign-out,
+   * "This is not me", a device removal, or an unlock runs, it answers
+   * `unavailable`, and the caller tries again later. It waits for the
+   * startup refresh and a background refresh to end, like an action, but
+   * actions do not wait for a read on its way. Its answer is dropped as
+   * `not_signed_in` when no device is signed in any more, and as
+   * `unavailable` when another device is. Data is also dropped as
+   * `unavailable` when such an action began while it was on its way, also
+   * one that has ended since, or when the account or the device changed
+   * meanwhile; a failure carries no data and is answered as it is, also when
+   * its own refusal changed the device. Never rejects.
+   */
+  readonly readWorkspaceData: <N extends WorkspaceReadName>(
+    name: N,
+    params: WorkspaceReadParams[N],
+    query?: WorkspaceReadQuery[N],
+  ) => Promise<WorkspaceReadResult<WorkspaceReadAnswer[N]>>;
 }
 
 // The cooldown lives in a shared module, so that the renderer's delay for
@@ -544,6 +577,16 @@ export function createAccountService(
    * that a later one overtook changes nothing.
    */
   let accountReads = 0;
+  /**
+   * Counts the changes that may end what a workspace read is for: every
+   * action of the person that may change the account or the device (a
+   * sign-in, a sign-out, "This is not me", a device removal, an unlock)
+   * when it begins, and every published change of the account, the key's
+   * state, or the device, except a device that becomes signed in. A read
+   * takes it before its request and drops the answer when it changed, also
+   * when the action that changed it has ended meanwhile.
+   */
+  let accountChanges = 0;
   let revision = 0;
   let current = snapshot();
 
@@ -561,8 +604,16 @@ export function createAccountService(
   }
 
   function publish(): void {
+    const previous = current;
     revision += 1;
     current = snapshot();
+    if (
+      JSON.stringify(previous.account) !== JSON.stringify(current.account) ||
+      previous.deviceKey !== current.deviceKey ||
+      (previous.device !== current.device && current.device !== "signed_in")
+    ) {
+      accountChanges += 1;
+    }
     for (const listener of listeners) {
       try {
         listener(current);
@@ -903,6 +954,7 @@ export function createAccountService(
       return Object.freeze({ outcome: "refused", reason: "too_soon" });
     }
     operation = "starting";
+    accountChanges += 1;
     cancelRequested = false;
     generation += 1;
     callbackArrived = false;
@@ -1020,6 +1072,7 @@ export function createAccountService(
       return Object.freeze({ outcome: "refused", reason: "too_soon" });
     }
     operation = "unlocking";
+    accountChanges += 1;
     try {
       await opened.keyStore.load({ passphrase });
       wrongPassphrases = 0;
@@ -1070,6 +1123,7 @@ export function createAccountService(
       return Object.freeze({ outcome: "refused", reason: "not_signed_in" });
     }
     operation = "forgetting";
+    accountChanges += 1;
     try {
       // A background refresh may still use the key, for example to report a
       // sign-out, and write the record once the API answers: the forget
@@ -1174,6 +1228,9 @@ export function createAccountService(
       return ACTION_BUSY;
     }
     operation = kind;
+    if (kind !== "listing") {
+      accountChanges += 1;
+    }
     await backgroundSettled();
     if (system === null || session === null || account.kind !== "signed_in") {
       return ACTION_NOT_SIGNED_IN;
@@ -1351,6 +1408,80 @@ export function createAccountService(
     }
   }
 
+  /**
+   * Whether an action of the person or a sign-in runs that may change or end
+   * the account: a read is then left out. The device list changes nothing.
+   */
+  function readsPaused(): boolean {
+    return (operation !== null && operation !== "listing") || attempt !== null;
+  }
+
+  async function readWorkspaceData<N extends WorkspaceReadName>(
+    name: N,
+    params: WorkspaceReadParams[N],
+    query?: WorkspaceReadQuery[N],
+  ): Promise<WorkspaceReadResult<WorkspaceReadAnswer[N]>> {
+    try {
+      const call = workspaceReadRequest(name, params, query);
+      if (call === null) {
+        return workspaceReadFailed("failed");
+      }
+      // Reads are not the person's actions: they take no `operation` lock
+      // and never make an action answer `busy`. They wait for a background
+      // refresh, which may report a sign-out or retry a removal with the
+      // key, so that they never overlap it.
+      if (readsPaused()) {
+        return workspaceReadFailed("unavailable");
+      }
+      await backgroundSettled();
+      if (readsPaused() || deviceKey === "loading") {
+        return workspaceReadFailed("unavailable");
+      }
+      const held = session;
+      if (system === null || held === null || account.kind !== "signed_in") {
+        return workspaceReadFailed("not_signed_in");
+      }
+      const deviceId = account.deviceId;
+      const changes = accountChanges;
+      const replacementWasPending = replacementPending;
+      const result = await held.request(call);
+      if (replacementWasPending) {
+        // A token may have confirmed or abandoned the key's replacement.
+        void refreshAccount().catch(() => {
+          report("The account could not be read.");
+        });
+      }
+      // The answer belongs to the device that asked: when no device or
+      // another one is signed in now, it is dropped.
+      if (account.kind !== "signed_in") {
+        return workspaceReadFailed("not_signed_in");
+      }
+      if (account.deviceId !== deviceId) {
+        return workspaceReadFailed("unavailable");
+      }
+      // A failure carries no data, so it is answered as it is, also when
+      // the request's own refusal (for example `sign_in_required`) changed
+      // the device meanwhile.
+      if (!result.ok) {
+        return workspaceReadFailed(workspaceReadFailureOf(result));
+      }
+      // Data is dropped when the account or the device changed meanwhile,
+      // or an action that may change them began, also one that has ended
+      // since (`accountChanges`). Actions do not wait for a read on its
+      // way; this check makes its answer harmless instead.
+      if (accountChanges !== changes) {
+        return workspaceReadFailed("unavailable");
+      }
+      if (result.value === null) {
+        return workspaceReadFailed("failed");
+      }
+      return Object.freeze({ ok: true, value: result.value });
+    } catch {
+      report("The workspace data could not be read.");
+      return workspaceReadFailed("unavailable");
+    }
+  }
+
   async function deviceRefused(
     code: DeviceRefusalCode,
     deviceId: DeviceId,
@@ -1400,5 +1531,6 @@ export function createAccountService(
     listDevices,
     signWebSocketChallenge,
     deviceRefused,
+    readWorkspaceData,
   });
 }

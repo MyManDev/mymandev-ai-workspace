@@ -14,9 +14,10 @@ import type { ScheduleTimer } from "../runtime.ts";
 export const API_REQUEST_TIMEOUT_MS = 30_000;
 
 /**
- * An answer body larger than this many bytes is not read as an answer of the
- * API. The device list may hold up to 1,000 devices, so this is larger than
- * the limit of the sign-in flow.
+ * By default, an answer body larger than this many bytes is not read as an
+ * answer of the API. The device list may hold up to 1,000 devices, so this is
+ * larger than the limit of the sign-in flow. A read whose answer can be
+ * larger names its own cap (`maxAnswerBytes`).
  */
 export const MAX_API_ANSWER_BYTES = 512 * 1024;
 
@@ -62,17 +63,22 @@ export interface ApiCall {
   /** Sent as JSON. Without it the request has no body. */
   readonly body?: unknown;
   readonly timeoutMs?: number;
+  /** The cap of the answer body in bytes; defaults to `MAX_API_ANSWER_BYTES`. */
+  readonly maxAnswerBytes?: number;
 }
 
 /**
- * Reads the body as UTF-8 text, at most `MAX_API_ANSWER_BYTES`: a larger
+ * Reads the body as UTF-8 text, at most `maxBytes`: a larger
  * `Content-Length` is refused before reading, and the stream is cancelled
  * once it passes the limit. Null for a body that is too large or not UTF-8.
  * Rejects when the body cannot be read, like a request without an answer.
  */
-async function readBodyText(response: Response): Promise<string | null> {
+async function readBodyText(
+  response: Response,
+  maxBytes: number,
+): Promise<string | null> {
   const declared = response.headers.get("content-length");
-  if (declared !== null && !(Number(declared) <= MAX_API_ANSWER_BYTES)) {
+  if (declared !== null && !(Number(declared) <= maxBytes)) {
     await response.body?.cancel().catch(() => undefined);
     return null;
   }
@@ -89,7 +95,7 @@ async function readBodyText(response: Response): Promise<string | null> {
       break;
     }
     size += value.byteLength;
-    if (size > MAX_API_ANSWER_BYTES) {
+    if (size > maxBytes) {
       await reader.cancel().catch(() => undefined);
       return null;
     }
@@ -104,13 +110,16 @@ async function readBodyText(response: Response): Promise<string | null> {
   }
 }
 
-async function readAnswer(response: Response): Promise<ApiAnswer> {
+async function readAnswer(
+  response: Response,
+  maxBytes: number,
+): Promise<ApiAnswer> {
   const status = response.status;
   if (status >= 500 && status <= 599) {
     await response.body?.cancel().catch(() => undefined);
     return { kind: "server_error" };
   }
-  const text = await readBodyText(response);
+  const text = await readBodyText(response, maxBytes);
   if (text === null) {
     return { kind: "unexpected_response" };
   }
@@ -172,7 +181,10 @@ export async function callApi(call: ApiCall): Promise<ApiAnswer> {
       credentials: "omit",
       signal: abort.signal,
     });
-    return await readAnswer(response);
+    return await readAnswer(
+      response,
+      call.maxAnswerBytes ?? MAX_API_ANSWER_BYTES,
+    );
   } catch {
     return { kind: "no_answer" };
   } finally {

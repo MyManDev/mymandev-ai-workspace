@@ -197,6 +197,37 @@ describe("callApi", () => {
     expect(pulled).toBeLessThan(MAX_API_ANSWER_BYTES / (64 * 1024) + 3);
   });
 
+  test("a call's own cap replaces the default, at its exact size", async () => {
+    // A JSON string body of exactly `size` bytes.
+    const body = (size: number) => `"${" ".repeat(size - 2)}"`;
+    const cap = 2 * MAX_API_ANSWER_BYTES;
+    const cases: [number, number | undefined, string][] = [
+      [MAX_API_ANSWER_BYTES, undefined, "ok"],
+      [MAX_API_ANSWER_BYTES + 1, undefined, "unexpected_response"],
+      [cap, cap, "ok"],
+      [cap + 1, cap, "unexpected_response"],
+    ];
+    for (const [size, maxAnswerBytes, kind] of cases) {
+      for (const declare of [true, false]) {
+        const h = harness(() =>
+          Promise.resolve(
+            new Response(body(size), {
+              status: 200,
+              headers: declare ? { "content-length": String(size) } : {},
+            }),
+          ),
+        );
+        const answer = await callApi({
+          ...h,
+          origin: ORIGIN,
+          route: AUTH_ROUTES.listDevices,
+          ...(maxAnswerBytes === undefined ? {} : { maxAnswerBytes }),
+        });
+        expect(answer.kind, `${size} bytes, cap ${maxAnswerBytes}`).toBe(kind);
+      }
+    }
+  });
+
   test("the timeout aborts the request", async () => {
     const h = harness(
       (sent) =>

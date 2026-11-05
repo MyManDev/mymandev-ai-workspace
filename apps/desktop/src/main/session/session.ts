@@ -216,8 +216,19 @@ export interface AuthorizedRequest<T> {
   readonly route: ApiRoute;
   /** The `:name` parameters of the route path; every one is an ID. */
   readonly params?: Readonly<Record<string, string>>;
+  /**
+   * The query, encoded with `URLSearchParams` after the filled path, which
+   * stays on the API origin. Without it, or when it is empty, the URL has no
+   * query.
+   */
+  readonly query?: Readonly<Record<string, string>>;
   /** Sent as JSON. */
   readonly body?: unknown;
+  /**
+   * The cap of the answer body in bytes, for a read whose answer can be
+   * larger than `MAX_API_ANSWER_BYTES`, the default.
+   */
+  readonly maxAnswerBytes?: number;
   /** The schema of a `2xx` answer's body, or `empty` for an answer without one (`204`). */
   readonly answer: z.ZodType<T> | "empty";
 }
@@ -1417,11 +1428,18 @@ export function createDeviceSession(
     call: AuthorizedRequest<T>,
   ): Promise<SessionResult<T | null>> {
     const blocked = await removalBlock();
-    return blocked ?? sendAuthorized(call);
+    return blocked ?? sendAuthorized(call, removalBlock);
   }
 
+  /**
+   * Sends `call` with a token, and once more with a new token after a `401`.
+   * `blockedBeforeRetry`, when given, is asked again before that new token is
+   * minted: a removal noted while the first request was on its way then
+   * stops the retry, as it stops every other use of the key.
+   */
   async function sendAuthorized<T>(
     call: AuthorizedRequest<T>,
+    blockedBeforeRetry?: () => Promise<SessionFailure | null>,
   ): Promise<SessionResult<T | null>> {
     const origin = originOrFailure();
     if (typeof origin !== "string") {
@@ -1433,6 +1451,10 @@ export function createDeviceSession(
     } catch {
       return failure("invalid_request");
     }
+    const query = new URLSearchParams(call.query).toString();
+    if (query !== "") {
+      path = `${path}?${query}`;
+    }
     const send = (token: string): Promise<ApiAnswer> =>
       callApi({
         fetch: deps.fetch,
@@ -1442,6 +1464,9 @@ export function createDeviceSession(
         path,
         accessToken: token,
         ...(call.body === undefined ? {} : { body: call.body }),
+        ...(call.maxAnswerBytes === undefined
+          ? {}
+          : { maxAnswerBytes: call.maxAnswerBytes }),
       });
     const first = await sessionToken();
     if (!first.ok) {
@@ -1452,6 +1477,10 @@ export function createDeviceSession(
       // The token ended (expired, a sign-out, a new sign-in, or a revoked
       // device): one new token, which reports the reason if it fails.
       dropToken(first.token);
+      const blocked = (await blockedBeforeRetry?.()) ?? null;
+      if (blocked !== null) {
+        return blocked;
+      }
       const second = await sessionToken();
       if (!second.ok) {
         return second;

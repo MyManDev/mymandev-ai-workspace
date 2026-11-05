@@ -6,7 +6,9 @@ import {
   GITHUB_LOGIN_PATTERN,
   LIMITS,
   MAX_ANSWER_LIST_ITEMS,
+  type ProjectId,
   type UserId,
+  type WorkspaceId,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
 import {
@@ -36,7 +38,9 @@ import {
 import { PASSPHRASE_MAX_CHARACTERS } from "./device-key/key-file.ts";
 import type { DeviceKeyStatus } from "./device-key/store.ts";
 import type { DeviceRecord, DeviceRecordRead } from "./device-record.ts";
+import { WORKSPACE_READS } from "./api-reads.ts";
 import type {
+  AuthorizedRequest,
   DeviceSessionState,
   SessionAccount,
   SessionResult,
@@ -105,6 +109,10 @@ const AUTH_RESPONSE: AuthResponseFrame = Object.freeze({
   deviceId: DEVICE_ID,
   signature: "s".repeat(86),
 } as AuthResponseFrame);
+
+const WORKSPACE_LIST = Object.freeze({ workspaces: [] });
+const WORKSPACE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1" as WorkspaceId;
+const PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192e1" as ProjectId;
 
 const SIGNED_IN_OUTCOME: SignInOutcome = Object.freeze({
   kind: "signed_in",
@@ -192,6 +200,12 @@ interface Harness {
   listDevices: () => Promise<SessionResult<readonly unknown[]>>;
   /** The answers of the session's `signWebSocketChallenge`, one per call. */
   signChallenge: () => Promise<SessionResult<AuthResponseFrame>>;
+  /** What the session's `request` answers. */
+  request: (
+    call: AuthorizedRequest<unknown>,
+  ) => Promise<SessionResult<unknown>>;
+  /** Every request that reached the session's `request`, in order. */
+  readonly requests: AuthorizedRequest<unknown>[];
   /** What the session's `deviceRefused` does; it moves to the state it returns. */
   refuseDevice: (
     code: string,
@@ -241,6 +255,8 @@ function harness(
     removeDevice: async () => ({ ok: true, value: "removed" }),
     listDevices: async () => ({ ok: true, value: [DEVICE_ITEM] }),
     signChallenge: async () => ({ ok: true, value: AUTH_RESPONSE }),
+    request: async () => ({ ok: true, value: WORKSPACE_LIST }),
+    requests: [] as AuthorizedRequest<unknown>[],
     refuseDevice: async () => SESSION_SIGNED_IN,
   } as unknown as Omit<Harness, "service">;
   const sessionListeners = new Set<(state: DeviceSessionState) => void>();
@@ -302,6 +318,13 @@ function harness(
       deviceRefused: async (code, deviceId) => {
         state.log.push(`session deviceRefused ${code}`);
         return state.refuseDevice(code, deviceId);
+      },
+      request: async (call) => {
+        state.log.push(`session request ${call.route.path}`);
+        state.requests.push(call as AuthorizedRequest<unknown>);
+        return (await state.request(
+          call as AuthorizedRequest<unknown>,
+        )) as never;
       },
     };
   };
@@ -2648,4 +2671,622 @@ test("a refusal that the session ignores changes nothing, and one that fails sti
     "The device session could not apply the connection's refusal.",
     "The device session could not apply the connection's refusal.",
   ]);
+});
+
+// ---- Workspace reads (#27, #28) ----------------------------------------
+
+/** Waits until the pending promise callbacks and I/O callbacks have run. */
+function tick(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/** Makes the session's next answers wait; the result settles them. */
+function heldAnswer(h: Harness) {
+  let finish: (result: SessionResult<unknown>) => void = () => undefined;
+  h.request = () =>
+    new Promise((resolve) => {
+      finish = resolve;
+    });
+  return (result: SessionResult<unknown>) => finish(result);
+}
+
+test("a workspace read goes to the session with the allowlist's route, parameters, query, and cap, and only the parsed answer comes back", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.log.length = 0;
+
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  await expect(
+    h.service.readWorkspaceData(
+      "listMessages",
+      { projectId: PROJECT_ID },
+      { beforeSeq: 120 },
+    ),
+  ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  expect(h.log).toEqual([
+    "session request /workspaces",
+    "session request /projects/:projectId/messages",
+  ]);
+  expect(h.requests).toEqual([
+    {
+      route: WORKSPACE_READS.listWorkspaces.route,
+      params: {},
+      answer: WORKSPACE_READS.listWorkspaces.answer,
+      maxAnswerBytes: 2 * 1024 * 1024,
+    },
+    {
+      route: WORKSPACE_READS.listMessages.route,
+      params: { projectId: PROJECT_ID },
+      query: { beforeSeq: "120", limit: "50" },
+      answer: WORKSPACE_READS.listMessages.answer,
+      maxAnswerBytes: 4 * 1024 * 1024,
+    },
+  ]);
+});
+
+test("only the allowlist's reads are sent, checked by type and at runtime", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const read = h.service.readWorkspaceData;
+  const refused: (() => Promise<unknown>)[] = [
+    // @ts-expect-error A route that is not on the allowlist.
+    () => read("listDevices", {}),
+    // @ts-expect-error A POST route of the protocol.
+    () => read("createWorkspace", {}),
+    () => read("toString" as "listWorkspaces", {}),
+    // @ts-expect-error A query for a read that takes none.
+    () => read("listAgents", { projectId: PROJECT_ID }, { limit: 5 }),
+    // @ts-expect-error A missing path parameter.
+    () => read("getWorkspace", {}),
+    () =>
+      read("getWorkspace", {
+        workspaceId: WORKSPACE_ID,
+        extra: WORKSPACE_ID,
+      } as never),
+    // A page larger than the cap holds.
+    () => read("listMessages", { projectId: PROJECT_ID }, { limit: 51 }),
+    () => read("listMessages", { projectId: PROJECT_ID }, { beforeSeq: 0 }),
+  ];
+  for (const call of refused) {
+    await expect(call()).resolves.toEqual({ ok: false, reason: "failed" });
+  }
+  expect(h.requests).toEqual([]);
+});
+
+test("a read is not signed in without an account, and maps the session's failures to a closed set", async () => {
+  const none = harness();
+  none.record = { kind: "none" };
+  await none.service.initialize();
+  await expect(
+    none.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: false, reason: "not_signed_in" });
+  expect(none.requests).toEqual([]);
+
+  const h = harness();
+  await h.service.initialize();
+  const cases: [SessionResult<unknown>, string][] = [
+    [{ ok: false, reason: "refused", code: "not_found" }, "not_found"],
+    [{ ok: false, reason: "refused", code: "rate_limited" }, "rate_limited"],
+    [{ ok: false, reason: "refused", code: "unauthorized" }, "not_signed_in"],
+    [{ ok: false, reason: "refused", code: "forbidden" }, "failed"],
+    [{ ok: false, reason: "signed_out" }, "not_signed_in"],
+    [{ ok: false, reason: "removal_pending" }, "not_signed_in"],
+    [{ ok: false, reason: "sign_in_running" }, "unavailable"],
+    [{ ok: false, reason: "no_answer" }, "unavailable"],
+    [{ ok: false, reason: "server_error" }, "unavailable"],
+    // An answer too large or outside the response schema.
+    [{ ok: false, reason: "unexpected_response" }, "failed"],
+  ];
+  for (const [result, reason] of cases) {
+    h.request = async () => result;
+    await expect(
+      h.service.readWorkspaceData("listRuns", { projectId: PROJECT_ID }),
+      JSON.stringify(result),
+    ).resolves.toEqual({ ok: false, reason });
+  }
+
+  h.request = () => Promise.reject(new Error("broken"));
+  await expect(
+    h.service.readWorkspaceData("listAgents", { projectId: PROJECT_ID }),
+  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  expect(h.errors).toEqual(["The workspace data could not be read."]);
+});
+
+test("a read takes no lock: an action runs while a read is on its way", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const finish = heldAnswer(h);
+  const reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  expect(h.requests).toHaveLength(1);
+
+  await expect(h.service.listDevices()).resolves.toMatchObject({
+    outcome: "listed",
+  });
+
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+});
+
+test("a read is unavailable during This is not me, a sign-out, and a device removal", async () => {
+  const h = harness();
+  await h.service.initialize();
+
+  let confirm: (value: boolean) => void = () => undefined;
+  h.confirm = () =>
+    new Promise((resolve) => {
+      confirm = resolve;
+    });
+  const forgetting = h.service.forgetAccount();
+  await tick();
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  confirm(false);
+  await forgetting;
+
+  let signedOut: (value: SessionResult<"reported" | "pending">) => void = () =>
+    undefined;
+  h.signOut = () =>
+    new Promise((resolve) => {
+      signedOut = resolve;
+    });
+  const signingOut = h.service.signOut();
+  await tick();
+  await expect(
+    h.service.readWorkspaceData("getWorkspace", { workspaceId: WORKSPACE_ID }),
+  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  signedOut({ ok: true, value: "reported" });
+  await signingOut;
+
+  h.confirmRemoval = () =>
+    new Promise((resolve) => {
+      confirm = resolve;
+    });
+  const removing = h.service.removeDevice();
+  await tick();
+  await expect(
+    h.service.readWorkspaceData("listProjects", { workspaceId: WORKSPACE_ID }),
+  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  confirm(false);
+  await removing;
+
+  expect(h.requests).toEqual([]);
+});
+
+test("a read is unavailable during a sign-in, also with a pending key replacement, and the answer of a read that a sign-in overtook is dropped", async () => {
+  const h = harness();
+  h.keyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: true,
+    passphraseRequired: false,
+  };
+  await h.service.initialize();
+  expect(h.service.status().replacementPending).toBe(true);
+
+  // A read that is on its way when the sign-in starts.
+  const finish = heldAnswer(h);
+  const overtaken = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+
+  const signIn = startedSignIn();
+  h.start = async () => signIn.start;
+  await expect(h.service.startSignIn()).resolves.toMatchObject({
+    outcome: "started",
+  });
+  await expect(
+    h.service.readWorkspaceData("listAgents", { projectId: PROJECT_ID }),
+  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  expect(h.requests).toHaveLength(1);
+
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(overtaken).resolves.toEqual({
+    ok: false,
+    reason: "unavailable",
+  });
+  signIn.settle({ kind: "cancelled" });
+});
+
+test("a read during the startup waits for the startup refresh and is sent after it", async () => {
+  const h = harness();
+  let release: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const createSession = h.createSession;
+  h.createSession = () => {
+    const session = createSession();
+    return {
+      ...session,
+      refresh: async () => {
+        await gate;
+        return session.refresh();
+      },
+    };
+  };
+  const initializing = h.service.initialize();
+  // Before the key is loaded, and then while the refresh runs.
+  const early = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  const reading = h.service.readWorkspaceData("listProjects", {
+    workspaceId: WORKSPACE_ID,
+  });
+  await tick();
+  expect(h.log).not.toContain("session refresh");
+  expect(h.requests).toEqual([]);
+
+  release();
+  await initializing;
+  await expect(early).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  expect(h.log.indexOf("session request /workspaces")).toBeGreaterThan(
+    h.log.indexOf("session refresh"),
+  );
+});
+
+test("an answer is dropped when the signed-in device changed while the read was on its way", async () => {
+  const h = harness();
+  await h.service.initialize();
+
+  // The device is revoked meanwhile: no device is signed in.
+  let finish = heldAnswer(h);
+  let reading = h.service.readWorkspaceData("listRuns", {
+    projectId: PROJECT_ID,
+  });
+  await tick();
+  h.emit({ kind: "revoked" });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({
+    ok: false,
+    reason: "not_signed_in",
+  });
+
+  // Another device signed in meanwhile: the caller reads again for it.
+  const other = harness();
+  await other.service.initialize();
+  finish = heldAnswer(other);
+  reading = other.service.readWorkspaceData("listRuns", {
+    projectId: PROJECT_ID,
+  });
+  await tick();
+  other.record = {
+    kind: "record",
+    record: { ...RECORD, deviceId: OTHER_DEVICE_ID },
+  };
+  // The session moves through another state, so that the service reads the
+  // record again.
+  other.emit({ kind: "no_device" });
+  other.emit({
+    kind: "signed_in",
+    account: { ...SESSION_ACCOUNT, deviceId: OTHER_DEVICE_ID },
+  });
+  await tick();
+  expect(other.service.status().account).toMatchObject({
+    deviceId: OTHER_DEVICE_ID,
+  });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+});
+
+test("an answer is dropped when an action began and ended while the read was on its way", async () => {
+  const h = harness();
+  await h.service.initialize();
+
+  // A sign-out that starts and ends: the record is kept, the same device
+  // stays in the account, and no action runs when the answer arrives.
+  let finish = heldAnswer(h);
+  let reading: Promise<unknown> = h.service.readWorkspaceData("listMessages", {
+    projectId: PROJECT_ID,
+  });
+  await tick();
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "signed_out",
+  });
+  expect(h.service.status().account).toMatchObject({
+    kind: "signed_in",
+    deviceId: DEVICE_ID,
+  });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // A removal that ends as pending.
+  finish = heldAnswer(h);
+  reading = h.service.readWorkspaceData("listAgents", {
+    projectId: PROJECT_ID,
+  });
+  await tick();
+  h.removeDevice = async () => ({ ok: true, value: "pending" });
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "pending",
+  });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // A sign-in attempt that starts and is cancelled.
+  finish = heldAnswer(h);
+  reading = h.service.readWorkspaceData("listRuns", { projectId: PROJECT_ID });
+  await tick();
+  const signIn = startedSignIn();
+  h.start = async () => signIn.start;
+  await expect(h.service.startSignIn()).resolves.toMatchObject({
+    outcome: "started",
+  });
+  expect(h.service.cancelSignIn()).toBe(true);
+  await tick();
+  expect(h.service.status().signIn).toEqual({ kind: "idle" });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // Without a change, the next answer comes back.
+  h.request = async () => ({ ok: true, value: WORKSPACE_LIST });
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+});
+
+test("an answer is dropped when the device signed out without an action while the read was on its way, and kept when it only became signed in", async () => {
+  const h = harness();
+  await h.service.initialize();
+
+  // For example a close reason of the connection.
+  let finish = heldAnswer(h);
+  let reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  h.emit({
+    kind: "signed_out",
+    account: SESSION_ACCOUNT,
+    reportPending: false,
+  });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // Signed in again, for example after `refresh`: nothing ended.
+  h.emit({ kind: "auth_failed", account: SESSION_ACCOUNT });
+  finish = heldAnswer(h);
+  reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  h.emit(SESSION_SIGNED_IN);
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+});
+
+test("a read refused by its own token request answers the refusal, also when the session published the refused state meanwhile", async () => {
+  const cases: [DeviceSessionState, SessionResult<unknown>][] = [
+    [
+      { kind: "sign_in_required", account: SESSION_ACCOUNT },
+      { ok: false, reason: "refused", code: "sign_in_required" },
+    ],
+    [
+      { kind: "auth_failed", account: SESSION_ACCOUNT },
+      { ok: false, reason: "refused", code: "auth_failed" },
+    ],
+    [
+      { kind: "account_mismatch", account: SESSION_ACCOUNT },
+      { ok: false, reason: "refused", code: "device_account_mismatch" },
+    ],
+    [
+      { kind: "key_lost", account: SESSION_ACCOUNT },
+      { ok: false, reason: "key_lost" },
+    ],
+  ];
+  for (const [state, failure] of cases) {
+    const h = harness();
+    await h.service.initialize();
+    // As the session does: the state is published before the request's
+    // failure resolves.
+    h.request = async () => {
+      h.emit(state);
+      return failure;
+    };
+    await expect(
+      h.service.readWorkspaceData("listWorkspaces", {}),
+      state.kind,
+    ).resolves.toEqual({ ok: false, reason: "not_signed_in" });
+    expect(h.service.status().device, state.kind).toBe(state.kind);
+  }
+});
+
+test("a successful answer without a value fails", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.request = async () => ({ ok: true, value: null });
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: false, reason: "failed" });
+});
+
+/** A harness whose session refresh waits for `gate` while one is set. */
+function gatedRefresh(h: Harness) {
+  let gate: Promise<void> | null = null;
+  let release: () => void = () => undefined;
+  const createSession = h.createSession;
+  h.createSession = () => {
+    const session = createSession();
+    return {
+      ...session,
+      refresh: async () => {
+        await gate;
+        return session.refresh();
+      },
+    };
+  };
+  return {
+    hold: () => {
+      gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    },
+    release: () => release(),
+  };
+}
+
+test("an action that starts while a read waits for the startup refresh makes the read unavailable without a request", async () => {
+  // A sign-out.
+  const h = harness();
+  const refresh = gatedRefresh(h);
+  refresh.hold();
+  const initializing = h.service.initialize();
+  await tick();
+  const reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  const signingOut = h.service.signOut();
+  await tick();
+  refresh.release();
+  await initializing;
+  await expect(reading).resolves.toEqual({
+    ok: false,
+    reason: "unavailable",
+  });
+  await expect(signingOut).resolves.toEqual({ outcome: "signed_out" });
+  expect(h.requests).toEqual([]);
+
+  // The start of a sign-in.
+  const s = harness();
+  const startRefresh = gatedRefresh(s);
+  startRefresh.hold();
+  const starting = s.service.initialize();
+  await tick();
+  const read = s.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  const signIn = startedSignIn();
+  s.start = async () => signIn.start;
+  const started = s.service.startSignIn();
+  await tick();
+  startRefresh.release();
+  await starting;
+  await expect(read).resolves.toEqual({ ok: false, reason: "unavailable" });
+  await expect(started).resolves.toEqual({ outcome: "started" });
+  expect(s.requests).toEqual([]);
+  signIn.settle({ kind: "cancelled" });
+});
+
+test("a read during the refresh after an unlock waits for it and is sent after it", async () => {
+  const h = harness();
+  h.load = async (passphrase) => {
+    if (passphrase === undefined) {
+      throw new DeviceKeyError("passphrase_required");
+    }
+  };
+  const refresh = gatedRefresh(h);
+  await h.service.initialize();
+  refresh.hold();
+  h.log.length = 0;
+
+  await expect(h.service.unlockDeviceKey(PASSPHRASE)).resolves.toEqual({
+    outcome: "unlocked",
+  });
+  const reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  expect(h.requests).toEqual([]);
+
+  refresh.release();
+  await expect(reading).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  expect(h.log.indexOf("session request /workspaces")).toBeGreaterThan(
+    h.log.indexOf("session refresh"),
+  );
+  expect(h.log).toContain("session refresh");
+});
+
+test("a read is unavailable during an unlock, an unlock or This is not me that began meanwhile drops its answer, and a device list does not stop it", async () => {
+  const h = harness();
+  let release: () => void = () => undefined;
+  h.load = (passphrase) => {
+    if (passphrase === undefined) {
+      return Promise.reject(new DeviceKeyError("passphrase_required"));
+    }
+    return new Promise((_resolve, reject) => {
+      release = () => reject(new DeviceKeyError("wrong_passphrase"));
+    });
+  };
+  await h.service.initialize();
+
+  // During an unlock.
+  const unlocking = h.service.unlockDeviceKey("not the passphrase");
+  await tick();
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  expect(h.requests).toEqual([]);
+  release();
+  await expect(unlocking).resolves.toEqual({
+    outcome: "refused",
+    reason: "wrong_passphrase",
+  });
+
+  // An unlock that began and ended, refused, while the read was on its way.
+  h.clock += unlockDelayMs(1);
+  let finish = heldAnswer(h);
+  let reading: Promise<unknown> = h.service.readWorkspaceData(
+    "listWorkspaces",
+    {},
+  );
+  await tick();
+  const revision = h.service.status().revision;
+  const unlock = h.service.unlockDeviceKey("not the passphrase");
+  await tick();
+  release();
+  await expect(unlock).resolves.toMatchObject({ reason: "wrong_passphrase" });
+  expect(h.service.status().revision).toBe(revision);
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // This is not me, cancelled, while the read was on its way.
+  h.confirm = async () => false;
+  finish = heldAnswer(h);
+  reading = h.service.readWorkspaceData("listProjects", {
+    workspaceId: WORKSPACE_ID,
+  });
+  await tick();
+  await expect(h.service.forgetAccount()).resolves.toEqual({
+    outcome: "cancelled",
+  });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // A device list that runs does not stop a read.
+  let listed: (value: SessionResult<readonly unknown[]>) => void = () =>
+    undefined;
+  h.listDevices = () =>
+    new Promise((resolve) => {
+      listed = resolve;
+    });
+  const listing = h.service.listDevices();
+  await tick();
+  h.request = async () => ({ ok: true, value: WORKSPACE_LIST });
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  listed({ ok: true, value: [DEVICE_ITEM] });
+  await expect(listing).resolves.toMatchObject({ outcome: "listed" });
+});
+
+test("after a read made while a key replacement was pending, the account and the key are read again", async () => {
+  const h = harness();
+  h.keyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: true,
+    passphraseRequired: false,
+  };
+  await h.service.initialize();
+  expect(h.service.status().replacementPending).toBe(true);
+
+  // The read's token confirmed the replacement.
+  h.request = async () => {
+    h.keyStatus = {
+      protection: "system",
+      loaded: true,
+      replacementPending: false,
+      passphraseRequired: false,
+    };
+    return { ok: true, value: WORKSPACE_LIST };
+  };
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  await tick();
+  expect(h.service.status().replacementPending).toBe(false);
 });
