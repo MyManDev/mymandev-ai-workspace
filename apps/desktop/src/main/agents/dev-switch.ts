@@ -20,7 +20,10 @@
 //   the activity and from the acknowledgements, never from what was sent.
 //   Without an acknowledgement within `DEV_SWITCH_ACK_TIMEOUT_MS`, it sends
 //   the same event once more, which the server never applies twice, and then
-//   stops. It stops at the first refusal, and on close.
+//   stops. It stops at the first refusal, and on close. A connection that the
+//   server closed for a refused message while a transition waits, such as
+//   1008 `identity_mismatch` for an agent that another device hosts, also
+//   stops it, because the resend would be refused again.
 // - At most one send every `DEV_SWITCH_STEP_MS`, resends included, and at
 //   most `DEV_SWITCH_HOURLY_SENDS` in any hour, well below the account's
 //   transition limit (D5).
@@ -42,7 +45,10 @@ import {
   type RunState,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import type { AccountStatus } from "../../shared/ipc-contract.ts";
+import type {
+  AccountStatus,
+  ConnectionStatus,
+} from "../../shared/ipc-contract.ts";
 import type { AccountService } from "../account.ts";
 import type { ConnectionClient, ServerMessage } from "../connection/client.ts";
 import type { ScheduleTimer } from "../runtime.ts";
@@ -116,7 +122,7 @@ export type DevSwitchAccount = Pick<
 /** The part of the connection client that the switch uses. */
 export type DevSwitchConnection = Pick<
   ConnectionClient,
-  "sendAs" | "onMessage"
+  "sendAs" | "onMessage" | "onStatusChange"
 >;
 /** The part of the workspace service that the switch uses. */
 export type DevSwitchWorkspaces = Pick<
@@ -495,8 +501,29 @@ export function createDevAgentSwitch(
     evaluate();
   }
 
+  /**
+   * The server closed the connection for a message that it refused
+   * (`message_refused`, such as 1008 `identity_mismatch`) while a transition
+   * waits for its acknowledgement: most likely for that transition, so it is
+   * not sent again. Any other loss keeps the one resend.
+   */
+  function connectionChanged(status: ConnectionStatus): void {
+    if (
+      !closed &&
+      !stopped &&
+      pending !== null &&
+      status.state === "waiting" &&
+      status.reason === "message_refused"
+    ) {
+      stop(
+        "The development agent switch stopped: the server closed the connection after a transition (message_refused).",
+      );
+    }
+  }
+
   const removers = [
     account.onStatusChange(() => evaluate()),
+    connection.onStatusChange((status) => connectionChanged(status)),
     workspaces.onChange(() => evaluate()),
     agents.onChange(() => evaluate()),
     connection.onMessage((message) => messageReceived(message)),

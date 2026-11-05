@@ -12,12 +12,16 @@ import {
   type EventId,
   type MemberId,
   type ProjectId,
+  type ReceivedServerEvent,
   type RunState,
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
-import type { AccountStatus } from "../../shared/ipc-contract.ts";
+import type {
+  AccountStatus,
+  ConnectionStatus,
+} from "../../shared/ipc-contract.ts";
 import type {
   BuildClientEvent,
   SendOutcome,
@@ -43,6 +47,7 @@ const DEVICE_ID = "0192f0a0-7b3c-7d4e-8f50-000000000004" as DeviceId;
 const OTHER_DEVICE_ID = "0192f0a0-7b3c-7d4e-8f50-000000000014" as DeviceId;
 const USER_ID = "0192f0a0-7b3c-7d4e-8f50-000000000009" as UserId;
 const WS_A = "0192f0a0-7b3c-7d4e-8f50-0000000000a1" as WorkspaceId;
+const WS_B = "0192f0a0-7b3c-7d4e-8f50-0000000000a2" as WorkspaceId;
 const OWNER = "0192f0a0-7b3c-7d4e-8f50-0000000000c1" as MemberId;
 const MEMBER = "0192f0a0-7b3c-7d4e-8f50-0000000000c2" as MemberId;
 const PROJECT_1 = "0192f0a0-7b3c-7d4e-8f50-0000000000e1" as ProjectId;
@@ -180,7 +185,23 @@ interface HarnessOptions {
   readonly agentsLive?: boolean;
   readonly workspaceLive?: boolean;
   readonly ownMember?: MemberId | null;
+  /** Replaces the harness's log, which keeps the lines. */
+  readonly log?: (message: string) => void;
 }
+
+/** The client backs off: the server closed the connection. */
+function waiting(
+  reason: "message_refused" | "connection_lost",
+): ConnectionStatus {
+  return {
+    state: "waiting",
+    reason,
+    retryAt: "2026-11-05T12:00:30.000Z",
+    revision: 2,
+  };
+}
+
+const CONNECTED: ConnectionStatus = { state: "connected", revision: 3 };
 
 class Harness {
   /** The monotonic time in milliseconds. */
@@ -203,6 +224,7 @@ class Harness {
   readonly logs: string[] = [];
   readonly accountListeners = new Set<(status: AccountStatus) => void>();
   readonly messageListeners = new Set<(message: ServerMessage) => void>();
+  readonly connectionListeners = new Set<(status: ConnectionStatus) => void>();
   readonly workspaceListeners = new Set<(state: WorkspaceState) => void>();
   readonly agentListeners = new Set<(state: AgentActivityState) => void>();
   readonly devSwitch: DevAgentSwitch;
@@ -227,6 +249,10 @@ class Harness {
       onMessage: (listener) => {
         this.messageListeners.add(listener);
         return () => this.messageListeners.delete(listener);
+      },
+      onStatusChange: (listener) => {
+        this.connectionListeners.add(listener);
+        return () => this.connectionListeners.delete(listener);
       },
     };
     const workspaces: DevSwitchWorkspaces = {
@@ -273,10 +299,12 @@ class Harness {
         this.#nextEvent += 1;
         return eventId(this.#nextEvent);
       },
-      log: (message) => {
-        this.logs.push(message);
-        allLogs.push(message);
-      },
+      log:
+        options.log ??
+        ((message) => {
+          this.logs.push(message);
+          allLogs.push(message);
+        }),
     });
   }
 
@@ -376,6 +404,12 @@ class Harness {
   workspaceChanged(): void {
     for (const listener of [...this.workspaceListeners]) {
       listener({} as WorkspaceState);
+    }
+  }
+
+  setConnection(status: ConnectionStatus): void {
+    for (const listener of [...this.connectionListeners]) {
+      listener(status);
     }
   }
 
@@ -688,6 +722,17 @@ test("it waits for each acknowledgement", () => {
     },
   );
   h.ack(h.last, { runId: runId(2) });
+  h.ack({ ...h.last, workspaceId: WS_B });
+  // Built without the decoder, because no other event type carries an
+  // agent actor.
+  h.receive({
+    kind: "event",
+    event: {
+      ...h.last,
+      deviceId: null,
+      type: "workspace.project.renamed",
+    } as unknown as ReceivedServerEvent,
+  });
   h.refuse("conflict", eventId(77));
   expect(h.sent).toHaveLength(1);
   expect(h.logs).not.toContain(
@@ -865,6 +910,125 @@ test("it never sends more than the account's transition limit allows", () => {
   expect(times[DEV_SWITCH_HOURLY_SENDS]).toBe(3_600_000);
 });
 
+test("a connection that the server closed for a refused message stops the switch without a resend", () => {
+  // As after 1008 identity_mismatch: the database names another host device.
+  const h = new Harness();
+  h.setConnection(waiting("message_refused"));
+  expect(h.logs.at(-1)).toBe(
+    "The development agent switch stopped: the server closed the connection after a transition (message_refused).",
+  );
+  h.setConnection(CONNECTED);
+  h.setActivity(activity());
+  h.advance(60_000);
+  expect(h.sent).toHaveLength(1);
+  expect(h.openTimers()).toEqual([]);
+  expect(h.connectionListeners.size).toBe(0);
+
+  // Without a transition that waits, it changes nothing.
+  const g = new Harness();
+  g.ack();
+  g.setConnection(waiting("message_refused"));
+  g.setConnection(CONNECTED);
+  g.advance(DEV_SWITCH_STEP_MS);
+  expect(g.walk()).toEqual(["01 queued>running", "01 running>awaiting_input"]);
+});
+
+test("an ordinary loss of the connection keeps the one resend", () => {
+  const h = new Harness();
+  h.agentsLive = false;
+  h.workspaceLive = false;
+  h.setConnection(waiting("connection_lost"));
+  h.advance(DEV_SWITCH_ACK_TIMEOUT_MS);
+  expect(h.sent).toHaveLength(1);
+  h.setConnection(CONNECTED);
+  h.agentsLive = true;
+  h.workspaceLive = true;
+  h.setActivity(activity());
+  expect(h.sent).toHaveLength(2);
+  expect(h.sent[1]).toEqual(h.sent[0]);
+  h.ack();
+  h.advance(DEV_SWITCH_STEP_MS);
+  expect(h.walk()).toEqual([
+    "01 queued>running",
+    "01 queued>running",
+    "01 running>awaiting_input",
+  ]);
+});
+
+test("a resend waits for the hourly budget too", () => {
+  const runs = Array.from(
+    { length: Math.ceil(DEV_SWITCH_HOURLY_SENDS / 4) + 1 },
+    (_, index) => [index + 1, "queued"] as const,
+  );
+  const h = new Harness({ activity: activity({ runs }) });
+  while (h.sent.length < DEV_SWITCH_HOURLY_SENDS) {
+    h.ack();
+    h.advance(DEV_SWITCH_STEP_MS);
+  }
+  // The last send waits for its acknowledgement, which does not come.
+  const last = h.last;
+  expect(h.sentAt.at(-1)).toBe(
+    (DEV_SWITCH_HOURLY_SENDS - 1) * DEV_SWITCH_STEP_MS,
+  );
+  h.advance(DEV_SWITCH_ACK_TIMEOUT_MS);
+  expect(h.sent).toHaveLength(DEV_SWITCH_HOURLY_SENDS);
+  h.advance(3_600_000 - h.time - 1);
+  expect(h.sent).toHaveLength(DEV_SWITCH_HOURLY_SENDS);
+  h.advance(1);
+  expect(h.sent).toHaveLength(DEV_SWITCH_HOURLY_SENDS + 1);
+  expect(h.last).toEqual(last);
+  expect(h.sentAt.at(-1)).toBe(3_600_000);
+});
+
+test("a key that is not ready, no API origin, or a device that is not signed in holds the walk", () => {
+  const h = new Harness();
+  for (const status of [
+    { ...accountStatus(), deviceKey: "loading" },
+    { ...accountStatus(), apiOrigin: "unset" },
+    { ...accountStatus(), device: "signed_out" },
+  ]) {
+    const count = h.sent.length;
+    h.setAccount(status as AccountStatus);
+    h.ack();
+    h.advance(60_000);
+    expect(h.sent).toHaveLength(count);
+    // The gates stay live; the status alone holds it back.
+    h.setAccount(accountStatus());
+    expect(h.sent).toHaveLength(count + 1);
+  }
+  expect(h.walk()).toEqual([
+    "01 queued>running",
+    "01 running>awaiting_input",
+    "01 awaiting_input>running",
+    "01 running>completed",
+  ]);
+});
+
+test("a log that throws changes nothing", () => {
+  const scenario = (h: Harness) => {
+    h.ack();
+    h.advance(DEV_SWITCH_STEP_MS);
+    h.ack();
+    h.advance(DEV_SWITCH_STEP_MS);
+    // A resend, and then a refusal.
+    h.advance(DEV_SWITCH_ACK_TIMEOUT_MS);
+    h.refuse("conflict");
+    h.advance(60_000);
+    return { walk: h.walk(), sentAt: h.sentAt, timers: h.openTimers() };
+  };
+  const quiet = scenario(new Harness());
+  const loud = scenario(
+    new Harness({
+      log: () => {
+        throw new Error("The log failed.");
+      },
+    }),
+  );
+  expect(loud).toEqual(quiet);
+  expect(loud.walk).toHaveLength(4);
+  expect(loud.timers).toEqual([]);
+});
+
 test("a send that the connection refuses stops the switch", () => {
   for (const outcome of [
     "not_connected",
@@ -895,6 +1059,7 @@ test("close stops listening and cancels the timers", () => {
   expect(h.workspaceListeners.size).toBe(0);
   expect(h.agentListeners.size).toBe(0);
   expect(h.messageListeners.size).toBe(0);
+  expect(h.connectionListeners.size).toBe(0);
   h.setActivity(activity());
   h.advance(60_000);
   expect(h.sent).toHaveLength(1);
