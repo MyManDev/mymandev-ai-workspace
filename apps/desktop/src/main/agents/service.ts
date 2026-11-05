@@ -9,8 +9,9 @@
 //   reloads the open project: first its runs, then its agents, so that the
 //   agent list is never older than the runs. The events that arrived
 //   meanwhile apply after the reload, in order.
-// - A server cancellation that disabled agents (the model's `agentsStale`)
-//   and `workspace.member.removed` reload the agent list alone. An event for
+// - A server cancellation that disabled agents (the model's `agentsStale`),
+//   `workspace.member.removed`, and `account.device_revoked` reload the
+//   agent list alone. An event for
 //   a run of a listed agent that the activity does not hold (`unknown_run`)
 //   reloads everything, at most once for each reload, so that data that
 //   stays inconsistent does not reload in a loop. Both wait a moment, so
@@ -664,6 +665,14 @@ export function createAgentActivityService(
       case "workspace.unsubscribed":
         if (frame.workspaceId === workspaceId) {
           endSubscription();
+        }
+        return;
+      case "account.device_revoked":
+        // The revocation disabled the device's agents. Only its unfinished
+        // runs are cancelled with an event, so without one, nothing else
+        // reports it.
+        if (projectId !== null) {
+          followUp("part");
         }
         return;
       default:

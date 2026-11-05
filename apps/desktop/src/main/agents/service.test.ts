@@ -473,16 +473,27 @@ test("opening a project reads its runs first and then its agents", async () => {
   expect(h.states.at(-1)).toBe(h.state);
 });
 
-test("nothing loads without a signed-in device", async () => {
-  const h = new Harness(SIGNED_OUT);
-  h.setConnection("connected");
-  h.setWorkspace(WS_A, PROJECT_1);
-  h.receive(subscribed());
-  expect(h.reads).toEqual([]);
-  expect(h.state.status).toBe("no_project");
-  // A sign-in follows the open project.
-  h.setAccount(accountStatus());
-  expect(h.readNames()).toEqual(["listRuns"]);
+test("nothing loads without a signed-in device with a ready key", async () => {
+  for (const status of [
+    SIGNED_OUT,
+    accountStatus({ deviceKey: "passphrase_required" }),
+    accountStatus({ apiOrigin: "unset" }),
+    accountStatus({ device: "starting" }),
+  ]) {
+    const h = new Harness(status);
+    h.setConnection("connected");
+    h.setWorkspace(WS_A, PROJECT_1);
+    h.receive(subscribed());
+    expect(h.reads).toEqual([]);
+    expect(h.state.status).toBe("no_project");
+    // A sign-in follows the open project.
+    h.setAccount(accountStatus());
+    expect(h.readNames()).toEqual(["listRuns"]);
+  }
+});
+
+test("a follow-up reload waits one second", () => {
+  expect(AGENT_FOLLOW_UP_DELAY_MS).toBe(1_000);
 });
 
 test("every workspace.subscribed of the selected workspace reloads the open project", async () => {
@@ -604,8 +615,14 @@ test("an answer for the previous project or workspace is dropped, and another pr
   // The subscription belonged to the previous workspace: events of the new
   // one are ignored until its workspace.subscribed.
   h.receive(runEvent(5, "running", "completed", { agentId: AGENT_2 }));
-  h.receive(runEvent(5, "running", "completed", { workspaceId: WS_B }));
+  h.receive(
+    runEvent(5, "running", "completed", {
+      agentId: AGENT_2,
+      workspaceId: WS_B,
+    }),
+  );
   expect(runStates(h.state)).toEqual(["05 running"]);
+  expect(h.openTimers()).toEqual([]);
   h.receive(subscribed(WS_B));
   await h.answerReload(
     ok(runList([run(5, "running", AGENT_2, PROJECT_2)])),
@@ -618,6 +635,23 @@ test("an answer for the previous project or workspace is dropped, and another pr
     }),
   );
   expect(runStates(h.state)).toEqual(["05 completed"]);
+});
+
+test("another workspace with no open project clears the state and tells the listeners", async () => {
+  const h = await liveHarness();
+  const count = h.states.length;
+  h.setWorkspace(WS_B);
+  expect(h.state).toEqual({
+    revision: h.state.revision,
+    status: "no_project",
+    workspaceId: null,
+    projectId: null,
+    agents: [],
+    unfinishedRuns: [],
+    finishedRuns: [],
+  });
+  expect(h.states).toHaveLength(count + 1);
+  expect(h.states.at(-1)).toBe(h.state);
 });
 
 test("a live event for an agent of another project is ignored and reloads nothing", async () => {
@@ -665,6 +699,55 @@ test("unknown_run reloads everything after a pause, at most once for each reload
   await h.answerReload();
   h.receive(runEvent(8, "running", "completed"));
   expect(h.openTimers()).toEqual([]);
+});
+
+test("an unknown_run that waited for the reload that unknown_run began reloads nothing more", async () => {
+  const h = await liveHarness();
+  h.receive(runEvent(8, "queued", "running"));
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  await h.answer("listRuns", ok(runList([run(1, "running")])));
+  // Buffered between the two reads, applied right after the reload.
+  h.receive(runEvent(8, "running", "completed"));
+  await h.answer("listAgents", ok(agentList([AGENT_1, AGENT_2])));
+  expect(h.openTimers()).toEqual([]);
+  expect(h.reads).toEqual([]);
+});
+
+test("a full follow-up stays full when a part reload is asked for within the delay", async () => {
+  const h = await liveHarness();
+  h.receive(runEvent(8, "queued", "running"));
+  h.receive(memberRemoved());
+  h.receive(
+    runEvent(1, "running", "cancelled", { cancelledFor: "member_removed" }),
+  );
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.readNames()).toEqual(["listRuns"]);
+});
+
+test("account.device_revoked reloads the agent list alone", async () => {
+  const revoked = frame({
+    type: "account.device_revoked",
+    deviceId: OTHER_DEVICE_ID,
+    reason: "removed",
+    revokedAt: LATER,
+  });
+  const idle = subscribedHarness();
+  idle.receive(revoked);
+  expect(idle.openTimers()).toEqual([]);
+
+  // No run of the revoked device was unfinished, so no cancellation reports
+  // that its agents were disabled.
+  const h = await liveHarness();
+  h.receive(revoked);
+  expect(h.reads).toEqual([]);
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.readNames()).toEqual(["listAgents"]);
+  await h.answer(
+    "listAgents",
+    ok(agentList([AGENT_1, AGENT_2], PROJECT_1, [AGENT_1])),
+  );
+  expect(h.state.agents[0]?.disabledAt).toBe(LATER);
+  expect(runStates(h.state)).toEqual(["01 running"]);
 });
 
 test("a server cancellation that disables agents reloads the agent list alone", async () => {
@@ -880,6 +963,48 @@ test("a refused or ended subscription ends the gate", async () => {
   }
 });
 
+test("an ended or refused subscription of another workspace leaves the gate alone", async () => {
+  const h = await liveHarness();
+  h.receive(
+    frame({
+      type: "workspace.unsubscribed",
+      workspaceId: WS_B,
+      reason: "requested",
+    }),
+  );
+  h.receive(
+    frame({
+      type: "workspace.subscribe_refused",
+      workspaceId: WS_B,
+      code: "not_found",
+    }),
+  );
+  h.receive(runEvent(1, "running", "completed"));
+  expect(runStates(h.state)).toEqual(["01 completed"]);
+});
+
+test("workspace.subscribed cancels a waiting retry and reloads at once", async () => {
+  const h = subscribedHarness();
+  h.setWorkspace(WS_A, PROJECT_1);
+  await h.answer("listRuns", failure("unavailable"));
+  expect(h.openTimers()).toHaveLength(1);
+  h.receive(subscribed());
+  expect(h.openTimers()).toEqual([]);
+  expect(h.readNames()).toEqual(["listRuns"]);
+});
+
+test("another project starts the backoff again", async () => {
+  const h = subscribedHarness();
+  h.setWorkspace(WS_A, PROJECT_1);
+  await h.answer("listRuns", failure("unavailable"));
+  h.fire(2_000);
+  await h.answer("listRuns", failure("unavailable"));
+  h.setWorkspace(WS_A, PROJECT_2);
+  expect(h.openTimers()).toEqual([]);
+  await h.answer("listRuns", failure("unavailable"));
+  h.fire(2_000);
+});
+
 test("a project opened before the subscription loads, and applies events only once subscribed", async () => {
   const h = new Harness();
   h.setWorkspace(WS_A, PROJECT_1);
@@ -944,13 +1069,18 @@ test("another device clears everything, and its reload does not wait for the dro
     unfinishedRuns: [],
   });
   expect(h.readNames()).toEqual(["listRuns", "listRuns"]);
-  // The first read was for the previous device: its answer is dropped.
+  // The gate ended with the device: this event is ignored, not buffered.
+  h.receive(runEvent(1, "running", "completed"));
+  // The first read was for the previous device: its answer is dropped, and
+  // it does not let a second reload go while the new device's is on its way.
+  await h.answer("listRuns", ok(runList([run(9, "running")])));
+  expect(h.readNames()).toEqual(["listRuns"]);
+  h.receive(subscribed());
+  expect(h.readNames()).toEqual(["listRuns"]);
+  // That reload is stale now and stops after its runs.
   await h.answer("listRuns", ok(runList([run(9, "running")])));
   expect(h.readNames()).toEqual(["listRuns"]);
   await h.answerReload();
-  expect(runStates(h.state)).toEqual(["01 running"]);
-  // The gate ended with the device: events wait for workspace.subscribed.
-  h.receive(runEvent(1, "running", "completed"));
   expect(runStates(h.state)).toEqual(["01 running"]);
   // A change that keeps the device changes nothing.
   const revision = h.state.revision;
@@ -973,6 +1103,23 @@ test("a listener that throws is logged, and the others still get the state", asy
   const count = seen.length;
   await h.answerReload();
   expect(seen).toHaveLength(count);
+});
+
+test("a listener that changes the state again never lets a later listener see an older state", async () => {
+  const h = await liveHarness();
+  let nested = false;
+  h.service.onChange((state) => {
+    if (!nested && state.projectId === PROJECT_2) {
+      nested = true;
+      h.setWorkspace(WS_A, PROJECT_1);
+    }
+  });
+  const seen: number[] = [];
+  h.service.onChange((state) => seen.push(state.revision));
+  h.setWorkspace(WS_A, PROJECT_2);
+  expect(nested).toBe(true);
+  expect(seen).toEqual([h.state.revision]);
+  expect(h.state.projectId).toBe(PROJECT_1);
 });
 
 test("close stops listening and cancels the timers", async () => {
