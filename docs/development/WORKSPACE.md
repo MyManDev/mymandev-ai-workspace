@@ -70,6 +70,11 @@ Dependabot opens pull requests against `develop` every Monday for the npm depend
 
 Review a Dependabot pull request like any other: the checks must pass, read the release notes, and for a major update check the ADR of the dependency. For updates of drizzle-kit, Electron, or the desktop build tools, also check the install-script inventory ([ADR 0011](../architecture/decisions/0011-drizzle-sql-migrations.md), [ADR 0016](../architecture/decisions/0016-desktop-toolchain.md)). Never run `npm audit fix --force`.
 
+`npm audit` reports moderate findings in development tools only; `npm audit --omit=dev` reports none. They are accepted until a release of the package that brings them allows the fix:
+
+- GHSA-67mh-4wv8-2f99, an old esbuild through the deprecated `@esbuild-kit/*` dependencies of drizzle-kit ([ADR 0011](../architecture/decisions/0011-drizzle-sql-migrations.md)).
+- GHSA-g3hv-75wg-m249, minimatch below 11.0.1 through ESLint, `@eslint/config-array`, and typescript-eslint (#176). Only the lint run uses it, on the glob patterns of this repository's own configuration. The fix needs minimatch 11, which those packages do not allow yet; `npm audit fix` proposes downgrades of ESLint and typescript-eslint instead, which must not be applied.
+
 Dependabot branches start with `dependabot/`, an exception to the branch prefixes in `CLAUDE.md`, and its commits are made by the Dependabot bot, which the Identity Guard allows. Pull requests for security updates also need the repository setting "Dependabot security updates"; Dependabot alerts are already enabled.
 
 ## Editor setup
