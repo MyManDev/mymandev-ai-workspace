@@ -1,7 +1,6 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App.tsx";
-import { PLACEHOLDER_PROJECTS } from "./placeholder-projects.ts";
 import "./styles.css";
 
 const container = document.getElementById("root");
@@ -17,7 +16,7 @@ createRoot(container).render(
       repositories={window.desktop?.repositories}
       account={window.desktop?.account}
       connection={window.desktop?.connection}
-      projects={PLACEHOLDER_PROJECTS}
+      workspaces={window.desktop?.workspaces}
     />
   </StrictMode>,
 );

@@ -266,6 +266,11 @@ code {
   font-size: var(--font-size-small);
 }
 
+/* The live region of the workspaces stays in place and takes no room while empty. */
+.nav-status:empty {
+  margin: 0;
+}
+
 .nav-item,
 .panel-tab {
   padding: var(--space-1) var(--space-2);
@@ -277,8 +282,10 @@ code {
   text-align: start;
 }
 
+/* A long workspace or project name wraps instead of widening the sidebar. */
 .shell-nav .nav-item {
   width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .nav-item:hover,
@@ -318,6 +325,7 @@ code {
 .project-nav-name {
   margin: 0;
   font-weight: var(--font-weight-strong);
+  overflow-wrap: anywhere;
 }
 
 .project-nav-list {

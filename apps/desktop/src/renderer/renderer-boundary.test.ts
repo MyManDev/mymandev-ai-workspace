@@ -176,11 +176,11 @@ test("the checks read every renderer source and no test", () => {
     "./ProjectPanel.tsx",
     "./ProjectScreens.tsx",
     "./WorkspaceScreens.tsx",
-    "./placeholder-projects.ts",
     "./RepositoryPanel.tsx",
     "./repository-view.ts",
     "./runtime-status.ts",
     "./screens.ts",
+    "./workspace-view.ts",
   ]) {
     expect(FILES).toContain(file);
   }

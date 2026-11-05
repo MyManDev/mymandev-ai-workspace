@@ -6,15 +6,26 @@ import type {
   ConnectionBridge,
   RepositoryBridge,
   RuntimeBridge,
+  WorkspaceBridge,
 } from "../shared/desktop-bridge.ts";
+import type { WorkspaceView } from "../shared/ipc-contract.ts";
 import {
   App,
   ConnectionStatusIndicator,
   RuntimeStatusIndicator,
   type AppProps,
 } from "./App.tsx";
-import { PLACEHOLDER_PROJECTS } from "./placeholder-projects.ts";
-import type { ProjectSummary, ShellView } from "./screens.ts";
+import { WorkspaceNav } from "./Navigation.tsx";
+import {
+  createShellState,
+  type ProjectSummary,
+  type ShellView,
+} from "./screens.ts";
+import {
+  SELECT_REFUSAL_MESSAGES,
+  WORKSPACE_MESSAGES,
+  WORKSPACE_PROBLEM_MESSAGES,
+} from "./workspace-view.ts";
 
 const runtime: RuntimeBridge = {
   getStatus: () => Promise.resolve({ state: "running", revision: 2 }),
@@ -26,8 +37,31 @@ const PROJECTS: readonly ProjectSummary[] = [
   { id: "project-b", name: "Project B" },
 ];
 
+const WORKSPACES: WorkspaceView["workspaces"] = [
+  { id: "workspace-a", name: "Workspace A" },
+  { id: "workspace-b", name: "Workspace B" },
+];
+
+/** A ready workspace state with workspace B selected and these projects. */
+function workspaceState(
+  projects: readonly ProjectSummary[],
+  overrides: Partial<WorkspaceView> = {},
+): WorkspaceView {
+  return {
+    revision: 1,
+    status: "ready",
+    workspaces: WORKSPACES,
+    selectedWorkspaceId: "workspace-b",
+    projects,
+    openProjectId: null,
+    ...overrides,
+  } as WorkspaceView;
+}
+
 function render(props: Partial<AppProps> = {}): string {
-  return renderToString(<App projects={PROJECTS} {...props} />);
+  return renderToString(
+    <App initialWorkspaceState={workspaceState(PROJECTS)} {...props} />,
+  );
 }
 
 /** The buttons marked with aria-current, as "label (value)". */
@@ -57,37 +91,37 @@ const SCREEN_CASES: readonly ScreenCase[] = [
     view: { screen: "home" },
     title: '<h2 id="home-title">Home</h2>',
     placeholder: "Open a project to see its chat",
-    current: ["Home (page)"],
+    current: ["Home (page)", "Workspace B (true)"],
   },
   {
     view: { screen: "about" },
     title: '<h2 id="about-title">About</h2>',
     placeholder: "Electron 44.9.0",
-    current: ["About (page)"],
+    current: ["About (page)", "Workspace B (true)"],
   },
   {
     view: { screen: "chat", projectId: "project-b", panel: "agents" },
     title: '<h2 id="chat-title">Chat</h2>',
     placeholder: "This is a placeholder message.",
-    current: ["Project B (true)", "Chat (page)"],
+    current: ["Workspace B (true)", "Project B (true)", "Chat (page)"],
   },
   {
     view: { screen: "tasks", projectId: "project-a", panel: "agents" },
     title: '<h2 id="tasks-title">Tasks</h2>',
     placeholder: "No tasks yet.",
-    current: ["Project A (true)", "Tasks (page)"],
+    current: ["Workspace B (true)", "Project A (true)", "Tasks (page)"],
   },
   {
     view: { screen: "decisions", projectId: "project-a", panel: "agents" },
     title: '<h2 id="decisions-title">Decisions</h2>',
     placeholder: "No decisions yet.",
-    current: ["Project A (true)", "Decisions (page)"],
+    current: ["Workspace B (true)", "Project A (true)", "Decisions (page)"],
   },
   {
     view: { screen: "permissions", projectId: "project-b", panel: "agents" },
     title: '<h2 id="permissions-title">Permissions</h2>',
     placeholder: "Not available yet.",
-    current: ["Project B (true)", "Permissions (page)"],
+    current: ["Workspace B (true)", "Project B (true)", "Permissions (page)"],
   },
 ];
 
@@ -130,11 +164,15 @@ test.each(SCREEN_CASES)(
   },
 );
 
-test("the sidebar lists the workspace screens and every project", () => {
+test("the sidebar lists the workspace screens, every workspace with the selected one marked, and every project", () => {
   const html = render();
 
   expect(html).toMatch(
     /<button type="button" class="nav-item">About<\/button>/,
+  );
+  expect(html).toContain('<h2 class="nav-heading" id="workspaces-heading">');
+  expect(html).toContain(
+    '<ul class="nav-list" aria-labelledby="workspaces-heading"><li><button type="button" class="nav-item" dir="auto">Workspace A</button></li><li><button type="button" class="nav-item" dir="auto" aria-current="true">Workspace B</button></li></ul>',
   );
   expect(html).toContain('<h2 class="nav-heading" id="projects-heading">');
   expect(html).toContain(
@@ -142,7 +180,7 @@ test("the sidebar lists the workspace screens and every project", () => {
   );
   for (const project of PROJECTS) {
     expect(html).toContain(
-      `<button type="button" class="nav-item">${project.name}</button>`,
+      `<button type="button" class="nav-item" dir="auto">${project.name}</button>`,
     );
   }
 });
@@ -152,7 +190,9 @@ test("the project navigation names the open project and reaches tasks and decisi
     initialView: { screen: "chat", projectId: "project-a", panel: "agents" },
   });
 
-  expect(html).toContain('<p class="project-nav-name">Project A</p>');
+  expect(html).toContain(
+    '<p class="project-nav-name" dir="auto">Project A</p>',
+  );
   for (const label of ["Tasks", "Decisions", "Permissions"]) {
     expect(html).toContain(
       `<button type="button" class="nav-item">${label}</button>`,
@@ -274,39 +314,251 @@ test("the permission screen shell has a placeholder section for every capability
   expect(html).toContain('<section aria-labelledby="permissions-title">');
 });
 
-test("project names are rendered as text, not as markup", () => {
+test("workspace and project names are rendered as text, not as markup", () => {
   const html = renderToString(
     <App
-      projects={[{ id: "x", name: '<img src="x">' }]}
+      initialWorkspaceState={workspaceState(
+        [{ id: "x", name: '<img src="x">' }],
+        {
+          workspaces: [{ id: "w", name: "<b>Workspace</b>" }],
+          selectedWorkspaceId: "w",
+        },
+      )}
       initialView={{ screen: "chat", projectId: "x", panel: "agents" }}
     />,
   );
 
   expect(html).not.toContain("<img");
-  expect(html).toContain("&lt;img src=&quot;x&quot;&gt;");
+  expect(html).not.toContain("<b>");
+  expect(html).toContain(
+    '<button type="button" class="nav-item" dir="auto" aria-current="true">&lt;b&gt;Workspace&lt;/b&gt;</button>',
+  );
+  expect(html).toContain(
+    '<button type="button" class="nav-item" dir="auto" aria-current="true">&lt;img src=&quot;x&quot;&gt;</button>',
+  );
+  expect(html).toContain(
+    '<p class="project-nav-name" dir="auto">&lt;img src=&quot;x&quot;&gt;</p>',
+  );
 });
 
-test("without projects, the sidebar says so and the shell shows the home screen", () => {
-  const html = renderToString(
-    <App
-      projects={[]}
-      initialView={{ screen: "chat", projectId: "project-a", panel: "agents" }}
-    />,
-  );
+test("a workspace without projects says so, and the shell shows the home screen", () => {
+  const html = render({
+    initialWorkspaceState: workspaceState([]),
+    initialView: { screen: "chat", projectId: "project-a", panel: "agents" },
+  });
 
-  expect(html).toContain('<p class="nav-empty">No projects yet.</p>');
+  expect(html).toContain(
+    `<h2 class="nav-heading" id="projects-heading">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.noProjects}</p></nav>`,
+  );
   expect(html).not.toContain('aria-labelledby="projects-heading"');
   expect(html).toContain('<h2 id="home-title">Home</h2>');
-  expect(currentItems(html)).toEqual(["Home (page)"]);
+  expect(currentItems(html)).toEqual(["Home (page)", "Workspace B (true)"]);
 });
 
-test("the shell renders the placeholder projects", () => {
-  const html = renderToString(<App projects={PLACEHOLDER_PROJECTS} />);
+/** The text as `renderToString` escapes it. */
+function escaped(text: string): string {
+  return text.replaceAll("'", "&#x27;");
+}
 
-  expect(PLACEHOLDER_PROJECTS.length).toBeGreaterThan(0);
-  for (const project of PLACEHOLDER_PROJECTS) {
-    expect(html).toContain(`>${project.name}</button>`);
+/** The sidebar after the workspace screens. */
+function workspacePart(props: Partial<AppProps>): string {
+  const html = render(props);
+  const start = html.indexOf(
+    '<h2 class="nav-heading" id="workspaces-heading">',
+  );
+  return html.slice(start, html.indexOf("</nav>", start));
+}
+
+const WORKSPACES_HEADING =
+  '<h2 class="nav-heading" id="workspaces-heading">Workspaces</h2>';
+
+const pendingBridge: WorkspaceBridge = {
+  getState: () => new Promise(() => undefined),
+  subscribeState: () => () => undefined,
+  select: () => Promise.resolve({ outcome: "ok" }),
+  openProject: () => Promise.resolve({ outcome: "ok" }),
+};
+
+/** The always present live region of the workspaces, with this text. */
+function statusParagraph(text = ""): string {
+  return `<p class="nav-empty nav-status" role="status">${escaped(text)}</p>`;
+}
+
+test("each workspace state has its own fixed text in the sidebar, and no ID is shown", () => {
+  const cases: [Partial<AppProps>, string][] = [
+    [
+      { initialWorkspaceState: undefined },
+      `<p class="nav-empty">${WORKSPACE_MESSAGES.unavailable}</p>`,
+    ],
+    [
+      { initialWorkspaceState: undefined, workspaces: pendingBridge },
+      `<p class="nav-empty">${WORKSPACE_MESSAGES.pending}</p>`,
+    ],
+    [
+      {
+        initialWorkspaceState: workspaceState([], {
+          status: "signed_out",
+          workspaces: [],
+          selectedWorkspaceId: null,
+        }),
+      },
+      `<p class="nav-empty">${WORKSPACE_MESSAGES.signedOut}</p>`,
+    ],
+    [
+      {
+        initialWorkspaceState: workspaceState([], {
+          status: "loading",
+          workspaces: [],
+          selectedWorkspaceId: null,
+        }),
+      },
+      `<p class="nav-empty">${WORKSPACE_MESSAGES.loadingWorkspaces}</p>`,
+    ],
+    [
+      {
+        initialWorkspaceState: workspaceState([], {
+          workspaces: [],
+          selectedWorkspaceId: null,
+        }),
+      },
+      `<p class="nav-empty">${WORKSPACE_MESSAGES.noWorkspaces}</p>`,
+    ],
+  ];
+  for (const [props, text] of cases) {
+    expect(workspacePart(props)).toBe(
+      `${WORKSPACES_HEADING}${text}${statusParagraph()}`,
+    );
   }
+
+  // While the selected workspace loads, on the first load or after a switch.
+  const loading = workspacePart({
+    initialWorkspaceState: workspaceState([], { status: "loading" }),
+  });
+  expect(loading).toContain('aria-current="true">Workspace B</button>');
+  expect(loading).toContain(
+    `<h2 class="nav-heading" id="projects-heading">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.loadingProjects}</p>`,
+  );
+
+  // Workspaces are listed, but none is selected.
+  const noneSelected = workspacePart({
+    initialWorkspaceState: workspaceState([], { selectedWorkspaceId: null }),
+  });
+  expect(noneSelected).toContain(
+    `</ul>${statusParagraph()}<p class="nav-empty">${WORKSPACE_MESSAGES.noneSelected}</p>`,
+  );
+  expect(noneSelected).not.toContain("aria-current");
+  expect(noneSelected).not.toContain("projects-heading");
+
+  for (const html of [loading, noneSelected, workspacePart({})]) {
+    expect(html).not.toContain("workspace-a");
+    expect(html).not.toContain("workspace-b");
+    expect(html).not.toContain("project-a");
+    expect(html.match(/role="status"/g)).toHaveLength(1);
+    expect(html).toContain(statusParagraph());
+  }
+});
+
+/** The sidebar for this workspace state with this switch message. */
+function navWith(state: WorkspaceView, message: string | undefined): string {
+  return renderToString(
+    <WorkspaceNav
+      state={createShellState(state.projects)}
+      dispatch={() => undefined}
+      workspaces={{
+        view: { kind: "known", state },
+        message,
+        onSelect: () => undefined,
+      }}
+    />,
+  );
+}
+
+test("a refused switch shows a calm fixed text below the workspaces and keeps the selection", () => {
+  const html = navWith(
+    workspaceState(PROJECTS),
+    SELECT_REFUSAL_MESSAGES.too_soon,
+  );
+
+  expect(html).toContain(
+    `aria-current="true">Workspace B</button></li></ul>${statusParagraph("Wait a moment before switching again.")}`,
+  );
+  expect(html).not.toContain('role="alert"');
+  expect(html).not.toContain("panel-message");
+});
+
+test("a switch message is not shown while the device is not ready", () => {
+  const html = navWith(
+    workspaceState([], {
+      status: "signed_out",
+      workspaces: [],
+      selectedWorkspaceId: null,
+    }),
+    SELECT_REFUSAL_MESSAGES.too_soon,
+  );
+
+  expect(html).toContain(
+    `<p class="nav-empty">${WORKSPACE_MESSAGES.signedOut}</p>${statusParagraph()}`,
+  );
+  expect(html).not.toContain(SELECT_REFUSAL_MESSAGES.too_soon);
+});
+
+test("unavailable workspaces keep what was loaded and show the problem as a fixed text", () => {
+  for (const problem of [
+    "not_signed_in",
+    "not_found",
+    "rate_limited",
+    "unavailable",
+    "failed",
+  ] as const) {
+    const kept = workspacePart({
+      initialWorkspaceState: workspaceState(PROJECTS, {
+        status: "unavailable",
+        problem,
+      }),
+    });
+    expect(kept).toContain(
+      `</ul>${statusParagraph(WORKSPACE_PROBLEM_MESSAGES[problem])}<h2 class="nav-heading" id="projects-heading">Projects</h2>`,
+    );
+    expect(kept).toContain('dir="auto">Project A</button>');
+
+    // The problem says why no project is listed, not "No projects yet."
+    const noProjects = workspacePart({
+      initialWorkspaceState: workspaceState([], {
+        status: "unavailable",
+        problem,
+      }),
+    });
+    expect(noProjects).toMatch(
+      /<h2 class="nav-heading" id="projects-heading">Projects<\/h2>$/,
+    );
+    expect(noProjects).not.toContain(WORKSPACE_MESSAGES.noProjects);
+
+    const empty = workspacePart({
+      initialWorkspaceState: workspaceState([], {
+        status: "unavailable",
+        problem,
+        workspaces: [],
+        selectedWorkspaceId: null,
+      }),
+    });
+    expect(empty).toBe(
+      `${WORKSPACES_HEADING}${statusParagraph(WORKSPACE_PROBLEM_MESSAGES[problem])}`,
+    );
+  }
+});
+
+test("the problem and a switch message share the one status paragraph", () => {
+  const html = navWith(
+    workspaceState(PROJECTS, { status: "unavailable", problem: "failed" }),
+    SELECT_REFUSAL_MESSAGES.too_soon,
+  );
+
+  expect(html.match(/role="status"/g)).toHaveLength(1);
+  expect(html).toContain(
+    statusParagraph(
+      `${WORKSPACE_PROBLEM_MESSAGES.failed} ${SELECT_REFUSAL_MESSAGES.too_soon}`,
+    ),
+  );
 });
 
 test("the about screen shows the Electron version from the preload script", () => {

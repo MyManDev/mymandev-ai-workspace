@@ -17,8 +17,10 @@
 // The renderer gets the status only: fixed codes and a time. No frame,
 // nonce, signature, key, or user ID is logged or reaches the renderer. The
 // signed frame and the events of `sendAs` go only to the socket. `sendAs`
-// passes the identity, user ID included, to the caller's `build`, so it
-// leaves this module but stays in the main process.
+// passes the identity, user ID included, to the caller's `build`, and
+// `identity()` returns it to main-process code that keys its data by the
+// account and the device, such as the chat service, so it leaves this module
+// but stays in the main process.
 import {
   decodeClientMessage,
   decodeServerMessage,
@@ -243,6 +245,13 @@ export interface ConnectionClient {
    * `SendOutcome` apply as well, and only the decoded copy is sent.
    */
   readonly sendAs: (build: BuildClientEvent) => SendOutcome;
+  /**
+   * The identity of the current socket's `auth.ok`, or null without an
+   * authenticated socket. Main process only, for code that keys its data by
+   * the account and the device, such as the chat service's waiting
+   * messages; events are still sent only through `sendAs`.
+   */
+  readonly identity: () => ConnectionIdentity | null;
   /**
    * Calls `listener` with every decoded message of the server after
    * `auth.ok`. The result removes the listener. Main process only.
@@ -1032,6 +1041,7 @@ export function createConnectionClient(
     },
     workspaces: () => Object.freeze([...workspaces]),
     sendAs,
+    identity: () => (live?.phase === "open" ? live.identity : null),
     onMessage: (listener: (message: ServerMessage) => void) => {
       const entry = (message: ServerMessage) => listener(message);
       messageListeners.add(entry);
