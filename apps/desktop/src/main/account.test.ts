@@ -164,6 +164,8 @@ interface Harness {
   load: (passphrase: string | undefined) => Promise<void>;
   /** What the flow's `start` resolves with. */
   start: () => Promise<SignInStart>;
+  /** The `openBrowser` option of every `start` of the flow, in order. */
+  readonly openBrowser: (boolean | undefined)[];
   /** The `onCallback` that the service passed to the last `start`. */
   callback: (() => void) | undefined;
   /** The answer of the native confirmation of "This is not me". */
@@ -221,6 +223,7 @@ function harness(
     } as DeviceKeyStatus | Error,
     load: async () => undefined,
     start: async (): Promise<SignInStart> => startedSignIn().start,
+    openBrowser: [] as (boolean | undefined)[],
     callback: undefined,
     confirm: async () => true,
     clock: 0,
@@ -348,6 +351,7 @@ function harness(
       return {
         start: (options) => {
           state.log.push("start");
+          state.openBrowser.push(options?.openBrowser);
           state.callback = options?.onCallback;
           return state.start();
         },
@@ -528,6 +532,10 @@ test("a key that cannot be loaded shows why, and the sign-in is refused", async 
     expect(h.service.status().deviceKey).toBe(deviceKey);
     expect(h.errors).toEqual(["The device key could not be loaded."]);
     await expect(h.service.startSignIn()).resolves.toEqual({
+      outcome: "refused",
+      reason: "key_not_ready",
+    });
+    await expect(h.service.startSignIn({ browser: "other" })).resolves.toEqual({
       outcome: "refused",
       reason: "key_not_ready",
     });
@@ -735,6 +743,7 @@ test("when the browser did not open, the status holds the URL to copy and the wa
     opened: false,
     authorizeUrl: AUTHORIZE_URL,
     warning: SIGN_IN_URL_WARNING,
+    browser: "default",
   });
   expect(AccountStatusSchema.parse(h.service.status())).toEqual(
     h.service.status(),
@@ -1298,6 +1307,94 @@ test("a start within the cooldown after one that opened the browser is refused a
   expect(h.log.filter((step) => step === "start")).toHaveLength(2);
 });
 
+test("a start in another browser opens no browser, offers the URL with the warning, and counts for the cooldown", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const attempt = startedSignIn(false);
+  h.start = async () => attempt.start;
+
+  await expect(h.service.startSignIn({ browser: "other" })).resolves.toEqual({
+    outcome: "started",
+  });
+  expect(h.openBrowser).toEqual([false]);
+  expect(h.service.status().signIn).toEqual({
+    kind: "waiting",
+    pairingCode: "042137",
+    opened: false,
+    authorizeUrl: AUTHORIZE_URL,
+    warning: SIGN_IN_URL_WARNING,
+    browser: "other",
+  });
+  for (const options of [undefined, { browser: "other" } as const]) {
+    await expect(h.service.startSignIn(options)).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+
+  const cancelled = nextStatus(h, (status) => status.signIn.kind === "idle");
+  expect(h.service.cancelSignIn()).toBe(true);
+  expect(attempt.cancels()).toBe(1);
+  expect((await cancelled).lastOutcome).toEqual({ code: "cancelled" });
+
+  h.start = async () => startedSignIn().start;
+  h.clock += SIGN_IN_START_COOLDOWN_MS - 1;
+  for (const options of [undefined, { browser: "other" } as const]) {
+    await expect(h.service.startSignIn(options)).resolves.toEqual({
+      outcome: "refused",
+      reason: "too_soon",
+    });
+  }
+  h.clock += 1;
+  await expect(h.service.startSignIn({ browser: "default" })).resolves.toEqual({
+    outcome: "started",
+  });
+  expect(h.openBrowser).toEqual([false, true]);
+});
+
+test("a sign-in that waits in the browser ends with a cancel before a start in another browser can follow", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const first = startedSignIn();
+  h.start = async () => first.start;
+  await h.service.startSignIn();
+  expect(h.service.status().signIn).toMatchObject({
+    kind: "waiting",
+    opened: true,
+  });
+  await expect(h.service.startSignIn({ browser: "other" })).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  expect(first.cancels()).toBe(0);
+
+  h.clock += SIGN_IN_START_COOLDOWN_MS;
+  const cancelled = nextStatus(h, (status) => status.signIn.kind === "idle");
+  expect(h.service.cancelSignIn()).toBe(true);
+  expect(first.cancels()).toBe(1);
+  // The attempt stays open until its outcome is recorded.
+  await expect(h.service.startSignIn({ browser: "other" })).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  expect((await cancelled).lastOutcome).toEqual({ code: "cancelled" });
+
+  const second = startedSignIn(false);
+  h.start = async () => second.start;
+  await expect(h.service.startSignIn({ browser: "other" })).resolves.toEqual({
+    outcome: "started",
+  });
+  expect(h.openBrowser).toEqual([true, false]);
+  expect(h.service.status().signIn).toEqual({
+    kind: "waiting",
+    pairingCode: "042137",
+    opened: false,
+    authorizeUrl: AUTHORIZE_URL,
+    warning: SIGN_IN_URL_WARNING,
+    browser: "other",
+  });
+});
+
 test("a start that did not open the browser does not hold back the next one", async () => {
   const h = harness();
   await h.service.initialize();
@@ -1679,6 +1776,39 @@ test("a pending replacement that an authentication resolves starts the flow once
     "status waiting",
   ]);
   expect(h.flows).toBe(1);
+});
+
+test("a start in another browser keeps its option when the flow starts once more after a resolved replacement", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const starts = [REPLACEMENT_PENDING, startedSignIn(false).start];
+  h.start = async () => starts.shift() ?? REPLACEMENT_PENDING;
+  h.keyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: true,
+    passphraseRequired: false,
+  };
+  h.authenticate = async () => {
+    h.keyStatus = {
+      protection: "system",
+      loaded: true,
+      replacementPending: false,
+      passphraseRequired: false,
+    };
+    return { ok: true, value: SESSION_ACCOUNT };
+  };
+
+  await expect(h.service.startSignIn({ browser: "other" })).resolves.toEqual({
+    outcome: "started",
+  });
+  expect(h.openBrowser).toEqual([false, false]);
+  expect(h.service.status().signIn).toMatchObject({
+    kind: "waiting",
+    opened: false,
+    warning: SIGN_IN_URL_WARNING,
+    browser: "other",
+  });
 });
 
 test("both keys lost in the authentication also start the flow once more, which then registers a new device", async () => {
