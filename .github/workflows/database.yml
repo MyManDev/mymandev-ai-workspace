@@ -2,11 +2,14 @@ name: Database
 
 # Applies the migrations to a real PostgreSQL 18 server with the roles from
 # packages/database/README.md, compares the schema with PGlite, runs the
-# database tests on the server, and checks the privileges of the application role.
+# database tests on the server, checks the privileges of the application role,
+# and runs the API tests on the server. The API depends on packages/database
+# and packages/protocol.
 on:
   pull_request:
     paths:
       - .github/workflows/database.yml
+      - apps/api/**
       - package-lock.json
       - packages/database/**
       - packages/protocol/**
@@ -16,6 +19,7 @@ on:
       - main
     paths:
       - .github/workflows/database.yml
+      - apps/api/**
       - package-lock.json
       - packages/database/**
       - packages/protocol/**
@@ -139,3 +143,11 @@ jobs:
             fi
             echo "rejected as expected: $statement"
           done
+
+      - name: Run the API tests on the server
+        # The API's test files create and drop their databases with
+        # createTestDatabase() as well, so the URL uses the superuser. The tests
+        # that need more than one session run only here, not on PGlite.
+        env:
+          DATABASE_TEST_URL: postgres://postgres:ci-superuser@127.0.0.1:5432/postgres?sslmode=disable
+        run: npm test -w @mymandev/api

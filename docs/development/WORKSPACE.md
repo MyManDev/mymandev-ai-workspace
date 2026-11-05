@@ -51,7 +51,7 @@ npm runs scripts with `cmd.exe` on Windows and `sh` on other systems. Keep root 
 
 `.github/workflows/check.yml` runs `npm ci` and `npm run check` on Linux, Windows, and macOS for every pull request and for every push to `develop` and `main`, and then builds the desktop application with `npm run build -w @mymandev/desktop`. It installs the latest Node.js release that matches `.nvmrc` and does not use a dependency cache. CI never downloads the Electron binary and never launches Electron ([ADR 0016](../architecture/decisions/0016-desktop-toolchain.md)). A pull request is ready for review only when all three jobs pass.
 
-`.github/workflows/database.yml` runs when a pull request or a push changes `packages/database`, `packages/protocol`, or the lockfile. It applies the migrations to a PostgreSQL 18 service container on Linux and compares the schema with PGlite; see [packages/database/README.md](../../packages/database/README.md).
+`.github/workflows/database.yml` runs when a pull request or a push changes `apps/api`, `packages/database`, `packages/protocol`, or the lockfile. It applies the migrations to a PostgreSQL 18 service container on Linux, compares the schema with PGlite, and runs the database and API tests on that server; see [packages/database/README.md](../../packages/database/README.md).
 
 The workflows also run for pull requests whose base is another task branch (stacked pull requests), and so does `.github/workflows/identity-guard.yml`. Changing the base branch of an open pull request does not start them again; push a commit, for example a merge of `origin/develop`, to get checks for the new base.
 
