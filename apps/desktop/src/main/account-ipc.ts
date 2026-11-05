@@ -11,9 +11,9 @@ import {
  * the account status to the frames that subscribed. Every handler checks the
  * sender and the arguments first (`createInvokeHandler`) and answers with a
  * value parsed by the contract, so only the narrow status, fixed codes,
- * and the device list reach the renderer (ADR 0014). Only
- * `unlockDeviceKey` takes an argument, the
- * passphrase, which goes to the key store and is never sent back or logged.
+ * and the device list reach the renderer (ADR 0014). `unlockDeviceKey`
+ * takes the passphrase, which goes to the key store and is never sent back
+ * or logged, and `startSignIn` an optional choice of the browser (#175).
  * Call it before the first window loads.
  */
 export function registerAccountIpc(
@@ -58,8 +58,10 @@ export function registerAccountIpc(
   );
   ipc.handle(
     INVOKE_CHANNELS.startSignIn,
-    createInvokeHandler(INVOKE_CHANNELS.startSignIn, appUrl, () =>
-      service.startSignIn(),
+    createInvokeHandler(
+      INVOKE_CHANNELS.startSignIn,
+      appUrl,
+      (_event, [options]) => service.startSignIn(options),
     ),
   );
   ipc.handle(

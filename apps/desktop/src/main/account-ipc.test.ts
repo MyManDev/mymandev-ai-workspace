@@ -102,8 +102,11 @@ function fakeService() {
       listeners.push(listener);
       return () => undefined;
     },
-    startSignIn: async () => {
-      calls.push({ method: "startSignIn", args: [] });
+    startSignIn: async (options) => {
+      calls.push({
+        method: "startSignIn",
+        args: options === undefined ? [] : [options],
+      });
       return { outcome: "started" };
     },
     cancelSignIn: () => {
@@ -240,7 +243,16 @@ test("every account handler refuses arguments that break the contract, without n
             [null],
             [{ passphrase: PASSPHRASE }],
           ]
-        : [[PASSPHRASE], [{ login: "octocat" }], [undefined], [1, 2]];
+        : [
+            [PASSPHRASE],
+            [{ login: "octocat" }],
+            [undefined],
+            [1, 2],
+            [{ browser: "chrome" }],
+            [{ browser: "other", login: "octocat" }],
+            [{ browser: "other" }, "extra"],
+            [{}],
+          ];
     for (const args of argumentLists) {
       let refusal: unknown;
       try {
@@ -265,6 +277,9 @@ test("the handlers answer with the service's values, and unlock passes the passp
   await expect(call(INVOKE_CHANNELS.startSignIn, app)).resolves.toEqual({
     outcome: "started",
   });
+  await expect(
+    call(INVOKE_CHANNELS.startSignIn, app, { browser: "other" }),
+  ).resolves.toEqual({ outcome: "started" });
   expect(call(INVOKE_CHANNELS.cancelSignIn, app)).toBe(true);
   const unlocked = await (call(
     INVOKE_CHANNELS.unlockDeviceKey,
@@ -302,6 +317,7 @@ test("the handlers answer with the service's values, and unlock passes the passp
   expect(fake.calls.map(({ method }) => method)).toEqual([
     "status",
     "startSignIn",
+    "startSignIn",
     "cancelSignIn",
     "unlockDeviceKey",
     "forgetAccount",
@@ -309,7 +325,9 @@ test("the handlers answer with the service's values, and unlock passes the passp
     "removeDevice",
     "listDevices",
   ]);
-  expect(fake.calls[3]?.args).toEqual([PASSPHRASE]);
+  expect(fake.calls[1]?.args).toEqual([]);
+  expect(fake.calls[2]?.args).toEqual([{ browser: "other" }]);
+  expect(fake.calls[4]?.args).toEqual([PASSPHRASE]);
 });
 
 test("subscribe answers with the status and sends every later one, parsed by the contract, to the subscribers only", () => {
