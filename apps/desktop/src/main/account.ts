@@ -34,6 +34,7 @@ import type {
   SignInOutcomeView,
   SignInState,
   SignOutResult,
+  StartSignInOptions,
   StartSignInResult,
   UnlockResult,
 } from "../shared/ipc-contract.ts";
@@ -42,6 +43,7 @@ import {
   deviceStateOf,
   deviceViewOf,
 } from "./account-session.ts";
+import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
 import type { ApiOrigin } from "./api-origin.ts";
 import { isDeviceKeyError } from "./device-key/errors.ts";
 import type { DeviceKeyStore } from "./device-key/store.ts";
@@ -174,11 +176,15 @@ export interface AccountService {
   /**
    * Starts a sign-in after the person's action: one at a time, only with a
    * key that is ready, and not within `SIGN_IN_START_COOLDOWN_MS` of the
-   * last start that opened the browser. Resolves once the browser opened or
-   * the URL is ready to copy; the outcome arrives later in the status.
-   * Never rejects.
+   * last start that opened the browser or offered its URL. With
+   * `{ browser: "other" }` the default browser is not opened, and the URL is
+   * offered for copying into another browser (#175). Resolves once the
+   * browser opened or the URL is ready to copy; the outcome arrives later in
+   * the status. Never rejects.
    */
-  readonly startSignIn: () => Promise<StartSignInResult>;
+  readonly startSignIn: (
+    options?: StartSignInOptions,
+  ) => Promise<StartSignInResult>;
   /** Ends the open or starting sign-in; false when there is none. */
   readonly cancelSignIn: () => boolean;
   /**
@@ -233,12 +239,9 @@ export interface AccountService {
   ) => Promise<void>;
 }
 
-/**
- * How long after a start that opened the browser the next start is refused
- * (`too_soon`), so that even a renderer that misbehaves cannot open the
- * browser in a loop.
- */
-export const SIGN_IN_START_COOLDOWN_MS = 3_000;
+// The cooldown lives in a shared module, so that the renderer's delay for
+// "Use another browser" follows it.
+export { SIGN_IN_START_COOLDOWN_MS };
 
 /**
  * How long after a device list was asked for the next one is refused
@@ -521,7 +524,10 @@ export function createAccountService(
   let generation = 0;
   /** Whether the browser of the current attempt posted to the listener. */
   let callbackArrived = false;
-  /** When the last start that opened the browser returned, or null. */
+  /**
+   * When the last start that opened the browser or offered its URL
+   * returned, or null.
+   */
   let lastBrowserStart: number | null = null;
   /** Wrong passphrases in a row, and when the next unlock may run. */
   let wrongPassphrases = 0;
@@ -807,6 +813,7 @@ export function createAccountService(
     opened: AccountSystem,
     held: AccountSession | null,
     current: number,
+    openBrowser: boolean,
   ): Promise<SignInStart | null> {
     try {
       held?.signInStarted();
@@ -816,7 +823,10 @@ export function createAccountService(
     let started: SignInStart | null = null;
     try {
       flow ??= opened.createFlow();
-      started = await flow.start({ onCallback: () => callback(current) });
+      started = await flow.start({
+        onCallback: () => callback(current),
+        openBrowser,
+      });
     } catch {
       // `start` never rejects; a flow that cannot be created ends here.
       report("The sign-in could not start.");
@@ -874,7 +884,11 @@ export function createAccountService(
     publish();
   }
 
-  async function startSignIn(): Promise<StartSignInResult> {
+  async function startSignIn(
+    options?: StartSignInOptions,
+  ): Promise<StartSignInResult> {
+    // The default browser opens unless the person asked for the address.
+    const openBrowser = options?.browser !== "other";
     if (operation !== null || attempt !== null) {
       return Object.freeze({ outcome: "refused", reason: "busy" });
     }
@@ -906,7 +920,7 @@ export function createAccountService(
         publish();
         return Object.freeze({ outcome: "failed", code: "cancelled" });
       }
-      let started = await startFlow(opened, held, current);
+      let started = await startFlow(opened, held, current, openBrowser);
       // The flow does not replace a key while a replacement is pending, and
       // only an authentication learns which key the API holds. When it
       // resolves the replacement, the flow starts once more, at most once
@@ -924,7 +938,7 @@ export function createAccountService(
         (await replacementResolved(opened, held)) &&
         !cancelRequested
       ) {
-        started = await startFlow(opened, held, current);
+        started = await startFlow(opened, held, current, openBrowser);
       }
       if (started === null || !started.started) {
         const view =
@@ -941,7 +955,8 @@ export function createAccountService(
         publish();
         return Object.freeze({ outcome: "failed", code: view.code });
       }
-      // The flow opened the browser, or tried to and offers the URL.
+      // The flow opened the browser, or offers the URL: it could not open
+      // it, or the person asked for the URL.
       lastBrowserStart = now();
       attempt = Object.freeze({ cancel: started.cancel });
       // The browser can post before `start` returns here.
@@ -960,6 +975,9 @@ export function createAccountService(
                   opened: false,
                   authorizeUrl: started.authorizeUrl,
                   warning: started.warning,
+                  // Why the URL is offered, so that the panel words it
+                  // also after it was shown again.
+                  browser: openBrowser ? "default" : "other",
                 },
           );
       publish();

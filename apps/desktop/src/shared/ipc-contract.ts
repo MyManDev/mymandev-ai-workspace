@@ -223,13 +223,24 @@ export type Account = z.infer<typeof AccountSchema>;
 const PairingCodeSchema = z.string().regex(/^[0-9]{6}$/, "Expected six digits");
 
 /**
+ * Where the person completes a sign-in (#175): `default` opens the system's
+ * default browser, and `other` opens none and offers the start address for
+ * copying into a browser of the person's choice, with the same warning as
+ * when the browser does not open. The main process decides what it opens.
+ */
+export const SIGN_IN_BROWSERS = Object.freeze(["default", "other"] as const);
+export type SignInBrowser = (typeof SIGN_IN_BROWSERS)[number];
+
+/**
  * The sign-in of this installation: none (`idle`), one that is starting the
  * listener and the browser (`starting`), one that waits for the browser
  * (`waiting`) with the pairing code that the API's confirmation page shows
  * too, or one whose browser part ended and that now registers the device
  * (`completing`). When the browser did not open, `waiting` also holds the
  * authorize URL to copy and the warning to show with it: the URL must not
- * be shared (#149). No sign-in code, verifier, signature, key, or token is
+ * be shared (#149). Its `browser` says why: `default` when the default
+ * browser could not be opened, `other` when the person asked for the
+ * address (#175). No sign-in code, verifier, signature, key, or token is
  * ever part of it.
  */
 export const SignInStateSchema = z.discriminatedUnion("kind", [
@@ -250,6 +261,7 @@ export const SignInStateSchema = z.discriminatedUnion("kind", [
         .url({ protocol: /^https?$/ })
         .max(ACCOUNT_LIMITS.authorizeUrl),
       warning: z.string().min(1).max(ACCOUNT_LIMITS.warning),
+      browser: z.enum(SIGN_IN_BROWSERS),
     }),
   ]),
 ]);
@@ -400,7 +412,8 @@ export type AccountStatus = z.infer<typeof AccountStatusSchema>;
  * Why a sign-in was not started: `busy` while a sign-in is open or the
  * account is being changed, `key_not_ready` while the device key is
  * loading, waits for its passphrase, or cannot be used, and `too_soon`
- * within a few seconds of the last start that opened the browser.
+ * within a few seconds of the last start that opened the browser or offered
+ * its address.
  */
 export const START_SIGN_IN_REFUSALS = Object.freeze([
   "busy",
@@ -421,6 +434,15 @@ export const StartSignInResultSchema = z.discriminatedUnion("outcome", [
   }),
 ]);
 export type StartSignInResult = z.infer<typeof StartSignInResultSchema>;
+
+/**
+ * The option of a sign-in start. It comes from the renderer, so an unknown
+ * key is refused rather than stripped.
+ */
+export const StartSignInOptionsSchema = z.strictObject({
+  browser: z.enum(SIGN_IN_BROWSERS),
+});
+export type StartSignInOptions = z.infer<typeof StartSignInOptionsSchema>;
 
 /** A passphrase for the device key. Only the renderer sends one. */
 export const PassphraseSchema = z
@@ -753,7 +775,8 @@ export const INVOKE_CONTRACT = Object.freeze({
     result: AccountStatusSchema,
   }),
   [INVOKE_CHANNELS.startSignIn]: Object.freeze({
-    args: NoArgumentsSchema,
+    /** None, which opens the default browser, or the option of the start. */
+    args: z.union([NoArgumentsSchema, z.tuple([StartSignInOptionsSchema])]),
     result: StartSignInResultSchema,
   }),
   [INVOKE_CHANNELS.cancelSignIn]: Object.freeze({

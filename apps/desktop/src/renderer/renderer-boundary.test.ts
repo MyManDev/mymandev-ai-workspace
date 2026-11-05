@@ -25,7 +25,10 @@ const ALLOWED_PACKAGES = new Set(["react", "react-dom/client"]);
  * module is imported with `import type`, so that zod and the IPC channel
  * names stay out of the renderer bundle.
  */
-const SHARED_VALUE_MODULES = new Set([`${SHARED_DIRECTORY}product.ts`]);
+const SHARED_VALUE_MODULES = new Set([
+  `${SHARED_DIRECTORY}product.ts`,
+  `${SHARED_DIRECTORY}sign-in-timing.ts`,
+]);
 
 /** Browser and Node.js APIs that reach the network or the machine. */
 const FORBIDDEN_APIS: readonly [string, RegExp][] = [
