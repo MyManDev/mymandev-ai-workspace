@@ -151,9 +151,12 @@ test("the session denies every permission request, permission check, and device 
   const session = new FakeSession();
   installSessionGuards(session);
 
+  // Electron 45 reports screen capture requests as "display-capture" instead
+  // of "media".
   for (const permission of [
     "notifications",
     "media",
+    "display-capture",
     "clipboard-read",
     "hid",
   ]) {
