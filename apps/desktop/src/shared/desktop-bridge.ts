@@ -22,7 +22,7 @@ import type {
  * and no function that takes a channel name. The preload script freezes it.
  */
 export interface DesktopBridge {
-  /** The Electron version the application runs on, for example "44.9.1". */
+  /** The Electron version the application runs on, for example "45.0.0". */
   readonly electronVersion: string;
   /** The local runtime in the main process. */
   readonly runtime: RuntimeBridge;
