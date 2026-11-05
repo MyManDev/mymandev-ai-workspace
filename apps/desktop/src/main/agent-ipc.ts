@@ -32,17 +32,17 @@ import type { WorkspaceService } from "./workspace/service.ts";
 export const AGENT_PUBLISH_INTERVAL_MS = 50;
 
 /**
- * Each status of the service and its status in the contract. The record
- * fails to compile when the service gains or loses a status.
+ * Each status of the service and its status in the contract. `satisfies`
+ * checks the fresh literal, so the record fails to compile when the service
+ * gains or loses a status.
  */
-const STATUS_VIEWS: Readonly<
-  Record<AgentActivityStatus, AgentActivityStatusView>
-> = Object.freeze({
+const STATUS_VIEWS = {
   no_project: "no_project",
   loading: "loading",
   ready: "ready",
   unavailable: "unavailable",
-});
+} satisfies Record<AgentActivityStatus, AgentActivityStatusView>;
+Object.freeze(STATUS_VIEWS);
 
 /** `text`, cut to `maxLength` characters (code points), as zod counts them. */
 function cut(text: string, maxLength: number): string {

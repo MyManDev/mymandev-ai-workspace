@@ -139,6 +139,7 @@ interface Timer {
   readonly callback: () => void;
   readonly delayMs: number;
   cancelled: boolean;
+  fired: boolean;
 }
 
 /** The agent and workspace services, with listeners the test calls. */
@@ -162,7 +163,7 @@ function fakeServices(initial: AgentActivityState = activity()) {
     agentListeners,
     workspaceListeners,
     /** The timers that were neither cancelled nor fired. */
-    waiting: () => timers.filter((timer) => !timer.cancelled),
+    waiting: () => timers.filter((timer) => !timer.cancelled && !timer.fired),
     setState(next: AgentActivityState) {
       state = next;
       for (const listener of [...agentListeners]) {
@@ -186,9 +187,9 @@ function fakeServices(initial: AgentActivityState = activity()) {
     },
     /** Fires every waiting timer once. */
     fire() {
-      for (const timer of timers) {
-        if (!timer.cancelled) {
-          timer.cancelled = true;
+      for (const timer of [...timers]) {
+        if (!timer.cancelled && !timer.fired) {
+          timer.fired = true;
           timer.callback();
         }
       }
@@ -217,7 +218,12 @@ function fakeServices(initial: AgentActivityState = activity()) {
         },
       },
       scheduleTimer: (callback: () => void, delayMs: number) => {
-        const timer: Timer = { callback, delayMs, cancelled: false };
+        const timer: Timer = {
+          callback,
+          delayMs,
+          cancelled: false,
+          fired: false,
+        };
         timers.push(timer);
         return () => {
           timer.cancelled = true;
@@ -516,17 +522,22 @@ test("a burst of changes publishes once, after the interval, with the last state
   expect(first.revision).toBe(0);
 
   fake.setState(activity({ status: "loading", agents: [] }));
+  expect(fake.timers).toHaveLength(1);
+  const [timer] = fake.timers;
+  expect(timer?.delayMs).toBe(AGENT_PUBLISH_INTERVAL_MS);
+  // The later changes of the burst neither cancel the timer nor add one:
+  // the first change sets when the view goes out.
   fake.setState(activity({ unfinishedRuns: runs(3) }));
   fake.rename(OWNER, "Ada King");
   fake.setState(activity({ unfinishedRuns: runs(5) }));
   expect(payloads()).toEqual([]);
-  expect(fake.waiting().map((timer) => timer.delayMs)).toEqual([
-    AGENT_PUBLISH_INTERVAL_MS,
-  ]);
+  expect(fake.timers).toEqual([timer]);
+  expect(timer?.cancelled).toBe(false);
   // A call meanwhile already answers with the latest view.
   expect(call(INVOKE_CHANNELS.getAgentState).revision).toBe(4);
 
   fake.fire();
+  expect(timer?.cancelled).toBe(false);
   expect(payloads()).toHaveLength(1);
   const [sent] = payloads();
   expect(sent?.revision).toBe(4);
@@ -593,6 +604,25 @@ test("a view that the contract refuses is reported, not sent", () => {
 
   expect(payloads()).toEqual([]);
   expect(fake.errors).toEqual(["Sending the agent activity failed."]);
+
+  // The next change is scheduled and sent again.
+  fake.setState(activity());
+  expect(fake.waiting()).toHaveLength(1);
+  fake.fire();
+  expect(payloads().map((view) => view.revision)).toEqual([2]);
+  expect(fake.errors).toHaveLength(1);
+});
+
+test("getState answers without subscribing the caller", () => {
+  const fake = fakeServices();
+  const { call } = register(fake);
+  const caller = receiver();
+
+  expect(call(INVOKE_CHANNELS.getAgentState, caller).revision).toBe(0);
+  fake.setState(activity({ unfinishedRuns: runs(2) }));
+  fake.fire();
+
+  expect(caller.sent).toEqual([]);
 });
 
 test("an unavailable activity crosses with its problem", () => {
