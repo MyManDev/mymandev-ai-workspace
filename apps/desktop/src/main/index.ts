@@ -25,6 +25,7 @@ import {
   APP_SCHEME_PRIVILEGES,
   createAppProtocolHandler,
 } from "./app-protocol.ts";
+import { createChatService } from "./chat/service.ts";
 import {
   createSystemConnectionClient,
   followSystemResume,
@@ -185,6 +186,21 @@ function start(): void {
   });
   registerWorkspaceIpc(ipcMain, rendererUrl, workspaces);
   app.on("will-quit", () => workspaces.close());
+
+  // The open project's chat (#27): its history, read over HTTP, its
+  // `chat.message.created` events, and the person's messages, sent with the
+  // connection's `sendAs`. Messages that wait for the connection stay in
+  // memory only. It has no IPC yet; a switch of the project or the workspace
+  // that the person asks for goes through its `switchProject` and
+  // `selectWorkspace`. The logs are fixed text with a failure code at most,
+  // never a name, an ID, or a message body.
+  const chat = createChatService({
+    account,
+    connection,
+    workspaces,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => chat.close());
 
   function showMainWindow(): void {
     if (mainWindow !== undefined) {

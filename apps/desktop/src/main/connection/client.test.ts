@@ -1184,6 +1184,7 @@ test("sendAs calls build only after auth.ok of the signed device, with that acco
   await flush();
   // While the client waits for auth.ok.
   expect(h.client.sendAs(build)).toBe("not_connected");
+  expect(h.client.identity()).toBeNull();
   expect(seen).toEqual([]);
   expect(socket.sentJson()).toEqual([RESPONSE]);
 
@@ -1191,6 +1192,8 @@ test("sendAs calls build only after auth.ok of the signed device, with that acco
   expect(h.client.sendAs(build)).toBe("sent");
   expect(seen).toEqual([{ userId: USER_ID, deviceId: DEVICE_ID }]);
   expect(Object.isFrozen(seen[0])).toBe(true);
+  // The getter gives the same frozen identity.
+  expect(h.client.identity()).toBe(seen[0]);
   expect(socket.sentJson()).toEqual([RESPONSE, chatSend()]);
   // The identity reaches no status and no log.
   expect(JSON.stringify([h.statuses, h.logs])).not.toContain(USER_ID);
@@ -1206,6 +1209,7 @@ test("auth.ok of another device gives sendAs no identity", async () => {
   socket.receiveJson({ ...AUTH_OK, deviceId: OTHER_DEVICE_ID });
   expect(socket.closes).toEqual([1000]);
   expect(h.client.sendAs(build)).toBe("not_connected");
+  expect(h.client.identity()).toBeNull();
   expect(seen).toEqual([]);
 });
 
@@ -1218,6 +1222,7 @@ test("the identity is cleared when the socket closes or is replaced, and the nex
   // The server closes the socket.
   h.last().closed(1006);
   expect(h.client.sendAs(build)).toBe("not_connected");
+  expect(h.client.identity()).toBeNull();
   h.advance(backoffDelayMs(0));
   expect(h.sockets).toHaveLength(2);
   expect(h.client.sendAs(build)).toBe("not_connected");
@@ -1228,6 +1233,7 @@ test("the identity is cleared when the socket closes or is replaced, and the nex
   h.client.systemResumed();
   expect(h.sockets[1]?.closes).toEqual([1000]);
   expect(h.client.sendAs(build)).toBe("not_connected");
+  expect(h.client.identity()).toBeNull();
   h.last().closed(1000);
   expect(h.sockets).toHaveLength(3);
   expect(h.client.sendAs(build)).toBe("not_connected");
@@ -1241,11 +1247,16 @@ test("the identity is cleared when the socket closes or is replaced, and the nex
   const other = await switchToOtherAccount(h, 2, () => {
     checks += 1;
     expect(h.client.sendAs(build)).toBe("not_connected");
+    expect(h.client.identity()).toBeNull();
   });
   expect(checks).toBe(3);
   expect(authenticated.closes).toEqual([1000]);
   expect(authenticated.sent).toHaveLength(2);
   expect(h.client.sendAs(build)).toBe("sent");
+  expect(h.client.identity()).toEqual({
+    userId: OTHER_USER_ID,
+    deviceId: OTHER_DEVICE_ID,
+  });
   expect(other.sentJson().at(-1)).toMatchObject({
     actor: { kind: "user", userId: OTHER_USER_ID },
     deviceId: OTHER_DEVICE_ID,
@@ -1268,6 +1279,7 @@ test("a sign-out and the quit clear the identity of an authenticated socket", as
   h.emit(SIGNED_OUT);
   expect(h.sockets[0]?.closes).toEqual([1000]);
   expect(h.client.sendAs(build)).toBe("not_connected");
+  expect(h.client.identity()).toBeNull();
   h.last().closed(1000);
   expect(h.client.sendAs(build)).toBe("not_connected");
 
@@ -1280,6 +1292,7 @@ test("a sign-out and the quit clear the identity of an authenticated socket", as
   h.client.close();
   expect(h.last().closes).toEqual([1000]);
   expect(h.client.sendAs(build)).toBe("not_connected");
+  expect(h.client.identity()).toBeNull();
   h.last().closed(1000);
   expect(h.client.sendAs(build)).toBe("not_connected");
   expect(h.sockets.map((socket) => socket.sent.length)).toEqual([2, 2]);
