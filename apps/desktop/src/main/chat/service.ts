@@ -11,12 +11,15 @@
 //   load on request.
 // - A message that cannot be sent at once waits in memory, and is sent again
 //   automatically with the same event ID while the workspace service's
-//   `gateLive` holds for its workspace, in the order the person wrote them
-//   and at most one per second. After `rate_limited` a message is tried
-//   again 10 seconds later, up to 3 times; it then shows as not sent, like
-//   a message refused with `not_found` or `conflict`, and the person can
-//   retry it (the Project Manager's decisions of 2026-11-05 on #27). The
-//   messages behind it wait for it.
+//   `gateLive` holds for its workspace, at most one per second. The waiting
+//   messages go out in the order the person wrote them: only the first one
+//   is sent. After `rate_limited` a message is tried again 10 seconds later,
+//   up to 3 times, and the waiting messages behind it wait for it; it then
+//   shows as not sent, like a message refused with `not_found` or
+//   `conflict`, and the person can retry it (the Project Manager's decisions
+//   of 2026-11-05 on #27). A message that shows as not sent, or that is
+//   being sent, does not hold the line, so the server can store a later
+//   message first; see the README.
 // - The messages that wait belong to the account, the device, the workspace,
 //   and the project. They are dropped without asking on a sign-out, on a
 //   change of the account or the device, when the membership ends, and
@@ -942,6 +945,11 @@ export function createChatService(options: ChatServiceOptions): ChatService {
       return false;
     }
     setTimeline(discardPending(timeline, eventId));
+    if (copy.state === "waiting") {
+      // It may have held the line, for example while it waited after
+      // `rate_limited`.
+      pump();
+    }
     return true;
   }
 
@@ -960,12 +968,10 @@ export function createChatService(options: ChatServiceOptions): ChatService {
     const copy = timeline.pending.find(
       (held) => held.eventId === frame.eventId,
     );
-    if (
-      frame.code === "rate_limited" &&
-      (copy?.state === "refused" || entry.notSendable)
-    ) {
-      // A late answer for a message that already shows as not sent; only
-      // `retry` sends it again.
+    if (frame.code === "rate_limited" && copy?.state !== "sending") {
+      // A late answer: the message shows as not sent, and only `retry`
+      // sends it again, or it already waits for its next try, for example
+      // the second answer for a message that an overflow had sent twice.
       return;
     }
     log(`A chat message was refused (${frame.code}).`);

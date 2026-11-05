@@ -1250,6 +1250,118 @@ test("after an overflow, only the messages whose answer may be lost go out again
   expect(h.pendingStatuses()).toEqual(["sending", "sending", "sending"]);
 });
 
+/** The event ID of an accepted send. */
+function idOf(result: ReturnType<ChatService["send"]>): EventId {
+  if (result.kind !== "accepted") {
+    throw new Error("The test message was refused");
+  }
+  return result.eventId;
+}
+
+/** Overflows the chat's gate during the reload of a `workspace.subscribed`. */
+function overflow(h: Harness): void {
+  h.receive(subscribed());
+  for (let index = 0; index <= MAX_BUFFERED_EVENTS; index += 1) {
+    h.receive(created(2));
+  }
+  expect(h.logs).toContain("Too many chat events waited; the chat reloads.");
+}
+
+test("after an overflow and a failed reload, the retry sends the message again once", async () => {
+  const h = await withChat({ seqs: [1] });
+  const x = idOf(h.service.send("First"));
+  overflow(h);
+  h.advance(WORKSPACE_RETRY_BASE_MS);
+  // The reload of `workspace.subscribed` is stale; the one after the overflow fails.
+  await h.answer(ok(page([1, 2])));
+  await h.answer(failure("unavailable"));
+  expect(h.pendingStatuses()).toEqual(["sending"]);
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([
+    WORKSPACE_RETRY_BASE_MS * 2,
+  ]);
+  h.advance(WORKSPACE_RETRY_BASE_MS * 2);
+  await h.answer(ok(page([1, 2])));
+  expect(h.sentIds()).toEqual([x, x]);
+  h.receive(created(3, { causationId: x }));
+  // The answer to the repeat.
+  h.receive(created(3, { causationId: x }));
+  h.advance(CHAT_RESEND_INTERVAL_MS * 10);
+  expect(h.state.pending).toEqual([]);
+  expect(seqsOf(h.state)).toEqual([1, 2, 3]);
+  expect(h.sentIds()).toEqual([x, x]);
+});
+
+test("a message sent while the gate stays overflowed, whose answer is dropped, is sent again after the retried reload", async () => {
+  const h = await withChat({ seqs: [1] });
+  overflow(h);
+  const y = idOf(h.service.send("Second"));
+  // Its answer arrives while events are dropped.
+  h.receive(created(3, { causationId: y }));
+  expect(h.pendingStatuses()).toEqual(["sending"]);
+  h.advance(WORKSPACE_RETRY_BASE_MS);
+  await h.answer(ok(page([1, 2])));
+  await h.answer(failure("unavailable"));
+  h.advance(WORKSPACE_RETRY_BASE_MS * 2);
+  await h.answer(ok(page([1, 2, 3])));
+  expect(h.sentIds()).toEqual([y, y]);
+  h.receive(created(3, { causationId: y }));
+  h.advance(CHAT_RESEND_INTERVAL_MS * 10);
+  expect(h.state.pending).toEqual([]);
+  expect(h.sentIds()).toEqual([y, y]);
+});
+
+test("after an overflow and a lost connection, the reconnect sends the message again once", async () => {
+  const h = await withChat({ seqs: [1] });
+  const x = idOf(h.service.send("First"));
+  overflow(h);
+  h.disconnect();
+  expect(h.pendingStatuses()).toEqual(["waiting"]);
+  // The lost connection cancels the reload after the overflow.
+  expect(h.openTimers()).toEqual([]);
+  h.advance(CHAT_RESEND_INTERVAL_MS);
+  h.setConnection("connected");
+  h.receive(subscribed());
+  h.workspaces.setLive(WS_A, true);
+  expect(h.sentIds()).toEqual([x, x]);
+  // The reload of the old subscription is stale; the new one applies, and
+  // the message sent during it is not sent a third time.
+  await h.answer(ok(page([1, 2])));
+  await h.answer(ok(page([1, 2])));
+  expect(h.pendingStatuses()).toEqual(["sending"]);
+  h.advance(CHAT_RESEND_INTERVAL_MS * 10);
+  expect(h.sentIds()).toEqual([x, x]);
+  h.receive(created(3, { causationId: x }));
+  expect(h.state.pending).toEqual([]);
+});
+
+test("discarding the first waiting message lets the next one go at once", async () => {
+  const h = await withChat();
+  const a = idOf(h.service.send("First"));
+  h.receive(refusedFrame(a, "rate_limited"));
+  h.advance(2_000);
+  const b = idOf(h.service.send("Second"));
+  expect(h.sentIds()).toEqual([a]);
+  expect(h.service.discard(a)).toBe(true);
+  expect(h.sentIds()).toEqual([a, b]);
+  expect(h.pendingStatuses()).toEqual(["sending"]);
+});
+
+test("a second rate_limited for a message that already waits does not count against its retries", async () => {
+  const h = await withChat();
+  const a = idOf(h.service.send("First"));
+  // Both answers of a message that was in flight twice.
+  h.receive(refusedFrame(a, "rate_limited"));
+  h.receive(refusedFrame(a, "rate_limited"));
+  for (const sends of [2, 3, 4]) {
+    h.advance(CHAT_RATE_LIMITED_RETRY_MS);
+    expect(h.sent).toHaveLength(sends);
+    expect(h.pendingStatuses()).toEqual(["sending"]);
+    h.receive(refusedFrame(a, "rate_limited"));
+  }
+  expect(h.pendingStatuses()).toEqual(["not_sent:rate_limited"]);
+  expect(h.logs).toHaveLength(4);
+});
+
 test("waiting messages and their key outlive a lost connection while the workspace service changes", async () => {
   const h = await withChat({ live: false });
   const result = h.service.send("Hello from the composer");
