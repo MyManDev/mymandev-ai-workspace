@@ -20,6 +20,7 @@ import {
   removeDeviceConfirmed,
 } from "./account-session.ts";
 import { createSystemAccountService } from "./account-system.ts";
+import { createAgentActivityService } from "./agents/service.ts";
 import {
   APP_SCHEME,
   APP_SCHEME_PRIVILEGES,
@@ -182,6 +183,20 @@ function start(): void {
     log: (message) => console.info(message),
   });
   app.on("will-quit", () => workspaces.close());
+
+  // The agents and runs of the open project (#28), read over HTTP and kept
+  // current with the selected workspace's run events through its own resync
+  // gate. It never sends an event and has no IPC yet. It is created right
+  // after the workspace service, so that it sees the first
+  // `workspace.subscribed`. The logs are fixed text with a failure code at
+  // most, never a name or an ID.
+  const agents = createAgentActivityService({
+    account,
+    connection,
+    workspaces,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => agents.close());
 
   function showMainWindow(): void {
     if (mainWindow !== undefined) {
