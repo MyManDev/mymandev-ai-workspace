@@ -38,7 +38,7 @@ import {
 } from "../workspace/service.ts";
 import {
   CHAT_RATE_LIMITED_RETRY_MS,
-  CHAT_RATE_LIMITED_TRIES,
+  CHAT_RATE_LIMITED_RETRIES,
   CHAT_RESEND_INTERVAL_MS,
   createChatService,
   UNKNOWN_AGENT_NAME,
@@ -898,8 +898,8 @@ test("not_found and conflict show as not sent at once, and retry sends again wit
   }
 });
 
-test("after rate_limited a message is tried 3 times, 10 seconds apart, then shows as not sent", async () => {
-  expect(CHAT_RATE_LIMITED_TRIES).toBe(3);
+test("after rate_limited a message is tried again 3 times, 10 seconds apart, then shows as not sent", async () => {
+  expect(CHAT_RATE_LIMITED_RETRIES).toBe(3);
   expect(CHAT_RATE_LIMITED_RETRY_MS).toBe(10_000);
   const h = await withChat();
   const result = h.service.send("Hello from the composer");
@@ -910,23 +910,82 @@ test("after rate_limited a message is tried 3 times, 10 seconds apart, then show
   expect(h.sent).toHaveLength(1);
   h.advance(1);
   expect(h.sent).toHaveLength(2);
-  h.receive(refusedFrame(eventId, "rate_limited"));
-  h.advance(CHAT_RATE_LIMITED_RETRY_MS);
-  expect(h.sent).toHaveLength(3);
+  for (const sends of [3, 4]) {
+    h.receive(refusedFrame(eventId, "rate_limited"));
+    expect(h.pendingStatuses()).toEqual(["waiting"]);
+    h.advance(CHAT_RATE_LIMITED_RETRY_MS);
+    expect(h.sent).toHaveLength(sends);
+  }
+  // The first send and 3 retries were refused.
   h.receive(refusedFrame(eventId, "rate_limited"));
   expect(h.pendingStatuses()).toEqual(["not_sent:rate_limited"]);
   h.advance(CHAT_RATE_LIMITED_RETRY_MS * 10);
-  expect(h.sentIds()).toEqual([eventId, eventId, eventId]);
+  expect(h.sentIds()).toEqual([eventId, eventId, eventId, eventId]);
 
-  // Retry gives three new tries.
+  // Retry gives 3 new retries.
   expect(h.service.retry(eventId)).toBe(true);
-  expect(h.sent).toHaveLength(4);
-  h.receive(refusedFrame(eventId, "rate_limited"));
-  h.advance(CHAT_RATE_LIMITED_RETRY_MS);
-  h.receive(refusedFrame(eventId, "rate_limited"));
-  h.advance(CHAT_RATE_LIMITED_RETRY_MS);
-  expect(h.sent).toHaveLength(6);
+  expect(h.sent).toHaveLength(5);
+  for (const sends of [6, 7, 8]) {
+    h.receive(refusedFrame(eventId, "rate_limited"));
+    h.advance(CHAT_RATE_LIMITED_RETRY_MS);
+    expect(h.sent).toHaveLength(sends);
+  }
   expect(h.pendingStatuses()).toEqual(["sending"]);
+});
+
+test("a late rate_limited does not bring back a message that shows as not sent", async () => {
+  const h = await withChat();
+  const result = h.service.send("Hello from the composer");
+  const eventId = (result.kind === "accepted" ? result.eventId : "") as EventId;
+  h.receive(refusedFrame(eventId, "not_found"));
+  expect(h.pendingStatuses()).toEqual(["not_sent:not_found"]);
+  h.receive(refusedFrame(eventId, "rate_limited"));
+  expect(h.pendingStatuses()).toEqual(["not_sent:not_found"]);
+  h.advance(CHAT_RATE_LIMITED_RETRY_MS * 2);
+  expect(h.sent).toHaveLength(1);
+  expect(h.logs).toEqual(["A chat message was refused (not_found)."]);
+});
+
+test("a message that waits after rate_limited keeps its place: a new one goes out only after it", async () => {
+  const h = await withChat();
+  const a = h.service.send("First");
+  const aId = (a.kind === "accepted" ? a.eventId : "") as EventId;
+  h.receive(refusedFrame(aId, "rate_limited"));
+  h.advance(2_000);
+  const b = h.service.send("Second");
+  const bId = (b.kind === "accepted" ? b.eventId : "") as EventId;
+  expect(h.pendingStatuses()).toEqual(["waiting", "waiting"]);
+  h.advance(CHAT_RATE_LIMITED_RETRY_MS - 2_000 - 1);
+  expect(h.sentIds()).toEqual([aId]);
+  h.advance(1);
+  expect(h.sentIds()).toEqual([aId, aId]);
+  h.advance(CHAT_RESEND_INTERVAL_MS);
+  expect(h.sentIds()).toEqual([aId, aId, bId]);
+  expect(h.pendingStatuses()).toEqual(["sending", "sending"]);
+});
+
+test("after a reconnect, the copies behind a message that waits after rate_limited do not pass it", async () => {
+  const h = await withChat({ live: false });
+  h.workspaces.setLive(WS_A, true);
+  const a = h.service.send("First");
+  const aId = (a.kind === "accepted" ? a.eventId : "") as EventId;
+  h.receive(refusedFrame(aId, "rate_limited"));
+  h.workspaces.setLive(WS_A, false);
+  const b = h.service.send("Second");
+  const bId = (b.kind === "accepted" ? b.eventId : "") as EventId;
+  const c = h.service.send("Third");
+  const cId = (c.kind === "accepted" ? c.eventId : "") as EventId;
+  h.disconnect();
+  h.advance(3_000);
+  h.setConnection("connected");
+  h.receive(subscribed());
+  h.workspaces.setLive(WS_A, true);
+  expect(h.sentIds()).toEqual([aId]);
+  h.advance(CHAT_RATE_LIMITED_RETRY_MS - 3_000 - 1);
+  expect(h.sentIds()).toEqual([aId]);
+  h.advance(1);
+  h.advance(CHAT_RESEND_INTERVAL_MS * 2);
+  expect(h.sentIds()).toEqual([aId, aId, bId, cId]);
 });
 
 test("a send that the connection client cannot take keeps waiting or shows as not sent", async () => {
@@ -1143,6 +1202,8 @@ test("too many waiting events reload the chat after a backoff, and a message bei
   for (let index = 0; index <= MAX_BUFFERED_EVENTS; index += 1) {
     h.receive(created(2, { projectId: PROJECT_2 }));
   }
+  expect(h.logs).toEqual([]);
+  expect(h.openTimers()).toEqual([]);
   for (let index = 0; index <= MAX_BUFFERED_EVENTS; index += 1) {
     h.receive(created(2));
   }
@@ -1161,6 +1222,141 @@ test("too many waiting events reload the chat after a backoff, and a message bei
   expect(h.sentIds()).toEqual([eventId, eventId]);
   h.receive(created(3, { causationId: eventId }));
   expect(h.state.pending).toEqual([]);
+});
+
+test("after an overflow, only the messages whose answer may be lost go out again", async () => {
+  const h = await withChat({ seqs: [1] });
+  const x = h.service.send("First");
+  const xId = (x.kind === "accepted" ? x.eventId : "") as EventId;
+  h.receive(subscribed());
+  for (let index = 0; index <= MAX_BUFFERED_EVENTS; index += 1) {
+    h.receive(created(2));
+  }
+  // Sent while the gate stays overflowed: its answer is dropped too.
+  const y = h.service.send("Second");
+  const yId = (y.kind === "accepted" ? y.eventId : "") as EventId;
+  h.advance(WORKSPACE_RETRY_BASE_MS);
+  // Sent after the reload began: its answer waits for the reload.
+  const z = h.service.send("Third");
+  const zId = (z.kind === "accepted" ? z.eventId : "") as EventId;
+  expect(h.sentIds()).toEqual([xId, yId, zId]);
+  // The reload of `workspace.subscribed` is stale; the one after the overflow applies.
+  await h.answer(ok(page([1, 2])));
+  await h.answer(ok(page([1, 2])));
+  expect(seqsOf(h.state)).toEqual([1, 2]);
+  expect(h.pendingStatuses()).toEqual(["waiting", "waiting", "sending"]);
+  h.advance(CHAT_RESEND_INTERVAL_MS * 10);
+  expect(h.sentIds()).toEqual([xId, yId, zId, xId, yId]);
+  expect(h.pendingStatuses()).toEqual(["sending", "sending", "sending"]);
+});
+
+test("waiting messages and their key outlive a lost connection while the workspace service changes", async () => {
+  const h = await withChat({ live: false });
+  const result = h.service.send("Hello from the composer");
+  const eventId = (result.kind === "accepted" ? result.eventId : "") as EventId;
+  const pending = h.state.pending;
+  h.disconnect();
+  // The workspace service notifies while offline.
+  h.workspaces.setLive(WS_A, false);
+  h.workspaces.change(WS_A, PROJECT_1);
+  // On the reconnect the workspace service hears `connected` first and
+  // notifies before the chat does.
+  h.socketIdentity = IDENTITY;
+  h.workspaces.change(WS_A, PROJECT_1);
+  expect(h.state.pending).toEqual(pending);
+  expect(h.state.projectId).toBe(PROJECT_1);
+  h.setConnection("connected");
+  h.receive(subscribed());
+  h.workspaces.setLive(WS_A, true);
+  expect(h.sentIds()).toEqual([eventId]);
+});
+
+test("the switch question also counts messages that are being sent or show as not sent", async () => {
+  const h = await withChat();
+  const result = h.service.send("Hello from the composer");
+  const eventId = (result.kind === "accepted" ? result.eventId : "") as EventId;
+  for (const statuses of [["sending"], ["not_sent:conflict"]]) {
+    if (statuses[0] !== "sending") {
+      h.receive(refusedFrame(eventId, "conflict"));
+    }
+    expect(h.pendingStatuses()).toEqual(statuses);
+    expect(
+      h.service.switchProject(PROJECT_2, { discardWaiting: false }),
+    ).toEqual({ kind: "waiting", count: 1 });
+    expect(h.service.selectWorkspace(WS_B, { discardWaiting: false })).toEqual({
+      kind: "waiting",
+      count: 1,
+    });
+    expect(h.pendingStatuses()).toEqual(statuses);
+    expect(h.workspaces.state()).toMatchObject({
+      selectedWorkspaceId: WS_A,
+      openProjectId: PROJECT_1,
+    });
+  }
+});
+
+test("a requested unsubscription keeps the waiting messages", async () => {
+  const h = await withChat({ live: false });
+  const result = h.service.send("Hello from the composer");
+  const eventId = (result.kind === "accepted" ? result.eventId : "") as EventId;
+  h.receive(
+    frame({
+      type: "workspace.unsubscribed",
+      workspaceId: WS_A,
+      reason: "requested",
+    }),
+  );
+  expect(h.pendingStatuses()).toEqual(["waiting"]);
+  h.receive(subscribed());
+  h.workspaces.setLive(WS_A, true);
+  expect(h.sentIds()).toEqual([eventId]);
+});
+
+test("a stale failed reload changes nothing", async () => {
+  const h = await withChat({ seqs: [1, 2] });
+  h.receive(subscribed());
+  h.receive(subscribed());
+  h.take().answer(failure("unavailable"));
+  await settle();
+  expect(h.state.status).toBe("ready");
+  expect(h.logs).toEqual([]);
+  expect(h.openTimers()).toEqual([]);
+  await h.answer(ok(page([1, 2, 3])));
+  expect(seqsOf(h.state)).toEqual([1, 2, 3]);
+});
+
+test("a failure after ready keeps the messages, and a success resets the backoff", async () => {
+  const h = await withChat({ seqs: [1, 2] });
+  h.receive(subscribed());
+  await h.answer(failure("unavailable"));
+  expect(h.state).toMatchObject({
+    status: "unavailable",
+    problem: "unavailable",
+  });
+  expect(seqsOf(h.state)).toEqual([1, 2]);
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([
+    WORKSPACE_RETRY_BASE_MS,
+  ]);
+  h.advance(WORKSPACE_RETRY_BASE_MS);
+  await h.answer(ok(page([1, 2])));
+  expect(h.state.status).toBe("ready");
+  h.receive(subscribed());
+  await h.answer(failure("unavailable"));
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([
+    WORKSPACE_RETRY_BASE_MS,
+  ]);
+});
+
+test("a sign-in again on the same device while offline loads nothing until the next auth.ok", async () => {
+  const h = await withChat();
+  h.setAccount(SIGNED_OUT);
+  h.setConnection("offline");
+  h.setAccount(accountStatus());
+  expect(h.state.status).toBe("no_project");
+  expect(h.reads).toEqual([]);
+  h.setConnection("connected");
+  expect(h.state).toMatchObject({ status: "loading", projectId: PROJECT_1 });
+  expect(h.reads).toHaveLength(1);
 });
 
 test("authorName gives the person's name, and a fixed text for an agent", async () => {

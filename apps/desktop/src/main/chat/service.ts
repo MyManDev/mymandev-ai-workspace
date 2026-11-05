@@ -11,11 +11,12 @@
 //   load on request.
 // - A message that cannot be sent at once waits in memory, and is sent again
 //   automatically with the same event ID while the workspace service's
-//   `gateLive` holds for its workspace, at most one per second. After
-//   `rate_limited` a message is tried again 10 seconds later, up to 3 tries
-//   in all; it then shows as not sent, like a message refused with
-//   `not_found` or `conflict`, and the person can retry it (the Project
-//   Manager's decisions of 2026-11-05 on #27).
+//   `gateLive` holds for its workspace, in the order the person wrote them
+//   and at most one per second. After `rate_limited` a message is tried
+//   again 10 seconds later, up to 3 times; it then shows as not sent, like
+//   a message refused with `not_found` or `conflict`, and the person can
+//   retry it (the Project Manager's decisions of 2026-11-05 on #27). The
+//   messages behind it wait for it.
 // - The messages that wait belong to the account, the device, the workspace,
 //   and the project. They are dropped without asking on a sign-out, on a
 //   change of the account or the device, when the membership ends, and
@@ -80,11 +81,11 @@ import {
 } from "./timeline.ts";
 
 /**
- * How many times a message is tried while the server answers
- * `rate_limited`, the first send included; after the last refusal it shows
- * as not sent.
+ * How many times a message is tried again after the server answered
+ * `rate_limited`: the first send and these retries make 4 sends in all.
+ * After the last retry's refusal it shows as not sent.
  */
-export const CHAT_RATE_LIMITED_TRIES = 3;
+export const CHAT_RATE_LIMITED_RETRIES = 3;
 /** The wait before a message is tried again after `rate_limited`. */
 export const CHAT_RATE_LIMITED_RETRY_MS = 10_000;
 /** The shortest time between two automatic sends of waiting messages. */
@@ -241,7 +242,7 @@ export interface ChatService {
   readonly send: (text: string) => ChatSendResult;
   /**
    * Tries a message that shows as not sent again, with the same event ID
-   * and three new tries after `rate_limited`. False for any other message.
+   * and new retries after `rate_limited`. False for any other message.
    */
   readonly retry: (eventId: EventId) => boolean;
   /**
@@ -288,6 +289,11 @@ interface CopyEntry {
   retryAt: number | null;
   /** The connection client refused to send it. */
   notSendable: boolean;
+  /**
+   * It was sent, and its `chat.message.created` may be among the events
+   * that an overflow of the gate dropped.
+   */
+  ackAtRisk: boolean;
 }
 
 /** An older page on its way. */
@@ -366,8 +372,6 @@ export function createChatService(options: ChatServiceOptions): ChatService {
   let problem: WorkspaceReadFailure | null = null;
   let reloadAttempt = 0;
   let cancelReloadRetry: (() => void) | null = null;
-  /** Events were dropped after an overflow, `chat.message.created` included. */
-  let eventsLost = false;
   let older: OlderRequest | null = null;
   let olderProblem: WorkspaceReadFailure | null = null;
   let lastSendAt: number | null = null;
@@ -498,7 +502,6 @@ export function createChatService(options: ChatServiceOptions): ChatService {
     copies.clear();
     problem = null;
     reloadAttempt = 0;
-    eventsLost = false;
     older = null;
     olderProblem = null;
     touch();
@@ -634,12 +637,13 @@ export function createChatService(options: ChatServiceOptions): ChatService {
     for (const event of events) {
       next = applyCreated(next, event);
     }
-    if (eventsLost) {
-      // The `chat.message.created` of a message that was sent may have been
-      // dropped: it is sent again with its event ID, and the server answers
-      // a repeat with the stored message.
-      eventsLost = false;
-      for (const copy of next.pending) {
+    for (const copy of next.pending) {
+      const entry = copies.get(copy.eventId);
+      if (entry?.ackAtRisk === true) {
+        // Its `chat.message.created` may have been dropped: it is sent again
+        // with its event ID, and the server answers a repeat with the stored
+        // message.
+        entry.ackAtRisk = false;
         if (copy.state === "sending") {
           next = markPending(next, copy.eventId, "waiting");
         }
@@ -801,6 +805,9 @@ export function createChatService(options: ChatServiceOptions): ChatService {
     switch (outcome) {
       case "sent":
         entry.retryAt = null;
+        // After an overflow, events are dropped until the next reload
+        // begins, its answer included.
+        entry.ackAtRisk = gate.state() === "overflowed";
         if (timeline !== null) {
           setTimeline(markPending(timeline, copy.eventId, "sending"));
         }
@@ -819,27 +826,25 @@ export function createChatService(options: ChatServiceOptions): ChatService {
   }
 
   /**
-   * Sends the next waiting copy whose time has come, at most one each
-   * `CHAT_RESEND_INTERVAL_MS`, and schedules the next try.
+   * Sends the first waiting copy, the head of the line, once its time has
+   * come and at most one each `CHAT_RESEND_INTERVAL_MS`, and schedules the
+   * next try. The copies behind it wait for it, also while it waits after
+   * `rate_limited`, so that the messages go out in the order the person
+   * wrote them.
    */
   function pump(): void {
     stopPump();
     if (!canSend()) {
       return;
     }
-    const ready = sendable();
-    if (ready.length === 0) {
+    const head = sendable()[0];
+    if (head === undefined) {
       return;
     }
     const at = now();
-    const due = ready.find(
-      (copy) => (copies.get(copy.eventId)?.retryAt ?? at) <= at,
-    );
-    if (due === undefined) {
-      const next = Math.min(
-        ...ready.map((copy) => copies.get(copy.eventId)?.retryAt ?? at),
-      );
-      schedulePump(next - at);
+    const retryAt = copies.get(head.eventId)?.retryAt ?? null;
+    if (retryAt !== null && retryAt > at) {
+      schedulePump(retryAt - at);
       return;
     }
     const wait =
@@ -848,7 +853,7 @@ export function createChatService(options: ChatServiceOptions): ChatService {
       schedulePump(wait);
       return;
     }
-    if (sendCopy(due)) {
+    if (sendCopy(head)) {
       scheduleNext();
     }
   }
@@ -891,6 +896,7 @@ export function createChatService(options: ChatServiceOptions): ChatService {
       rateLimited: 0,
       retryAt: null,
       notSendable: false,
+      ackAtRisk: false,
     });
     setTimeline(added.timeline);
     const copy = added.timeline.pending.at(-1);
@@ -951,10 +957,21 @@ export function createChatService(options: ChatServiceOptions): ChatService {
       // Another service's event, or a copy that is gone.
       return;
     }
+    const copy = timeline.pending.find(
+      (held) => held.eventId === frame.eventId,
+    );
+    if (
+      frame.code === "rate_limited" &&
+      (copy?.state === "refused" || entry.notSendable)
+    ) {
+      // A late answer for a message that already shows as not sent; only
+      // `retry` sends it again.
+      return;
+    }
     log(`A chat message was refused (${frame.code}).`);
     if (frame.code === "rate_limited") {
       entry.rateLimited += 1;
-      if (entry.rateLimited < CHAT_RATE_LIMITED_TRIES) {
+      if (entry.rateLimited <= CHAT_RATE_LIMITED_RETRIES) {
         entry.retryAt = now() + CHAT_RATE_LIMITED_RETRY_MS;
         setTimeline(markPending(timeline, frame.eventId, "waiting"));
         pump();
@@ -978,7 +995,13 @@ export function createChatService(options: ChatServiceOptions): ChatService {
         setTimeline(applyCreated(timeline, event));
         return;
       case "overflowed":
-        eventsLost = true;
+        // The dropped events may hold the answer to a message that was sent.
+        for (const copy of timeline.pending) {
+          const entry = copies.get(copy.eventId);
+          if (copy.state === "sending" && entry !== undefined) {
+            entry.ackAtRisk = true;
+          }
+        }
         log("Too many chat events waited; the chat reloads.");
         scheduleReload(workspaceRetryDelayMs(reloadAttempt, "unavailable"));
         reloadAttempt += 1;
