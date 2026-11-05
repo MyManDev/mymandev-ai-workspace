@@ -80,6 +80,20 @@ export const INVOKE_CHANNELS = Object.freeze({
    * took over the device's connection. The renderer sends nothing.
    */
   reconnect: "connection:reconnect",
+  /**
+   * What the renderer may know of the workspace service's state: the
+   * workspaces, the selected workspace's projects, and the open project.
+   */
+  getWorkspaceState: "workspaces:get-state",
+  /**
+   * The workspace state. The calling frame then receives every later state
+   * on `EVENT_CHANNELS.workspaceStateChanged`.
+   */
+  subscribeWorkspaceState: "workspaces:subscribe-state",
+  /** Selects a workspace of the list by its ID. */
+  selectWorkspace: "workspaces:select",
+  /** Opens a project of the selected workspace by its ID, or closes it with null. */
+  openProject: "workspaces:open-project",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */
@@ -92,6 +106,8 @@ export const EVENT_CHANNELS = Object.freeze({
   accountStatusChanged: "account:status-changed",
   /** The connection status after every change, to the frames that subscribed. */
   connectionStatusChanged: "connection:status-changed",
+  /** The workspace state after every change, to the frames that subscribed. */
+  workspaceStateChanged: "workspaces:state-changed",
 } as const);
 
 export type InvokeChannel =

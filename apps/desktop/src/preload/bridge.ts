@@ -4,6 +4,7 @@ import type {
   DesktopBridge,
   RepositoryBridge,
   RuntimeBridge,
+  WorkspaceBridge,
 } from "../shared/desktop-bridge.ts";
 import {
   EVENT_CHANNELS,
@@ -25,6 +26,8 @@ import type {
   StartSignInOptions,
   StartSignInResult,
   UnlockResult,
+  WorkspaceActionResult,
+  WorkspaceView,
 } from "../shared/ipc-contract.ts";
 
 type IpcListener = (event: unknown, ...args: unknown[]) => void;
@@ -111,9 +114,10 @@ function subscribeRevisions<T extends { readonly revision: number }>(
 /**
  * The object the preload script exposes as `window.desktop`. Every function
  * calls one fixed channel of the IPC contract and passes no argument from
- * the renderer on to it, except the mount ID of `repositories.unmount` and
- * the passphrase of `account.unlockDeviceKey`, which must be strings and
- * which the main process validates. `account.startSignIn` passes on a fixed
+ * the renderer on to it, except the mount ID of `repositories.unmount`, the
+ * passphrase of `account.unlockDeviceKey`, and the IDs of
+ * `workspaces.select` and `workspaces.openProject`, which must be strings
+ * (or null to close a project) and which the main process validates. `account.startSignIn` passes on a fixed
  * option of its own when the renderer asks for another browser. Event
  * objects, which hold `ipcRenderer`, never reach the renderer. The object
  * and its parts are frozen. An error that a renderer callback throws goes
@@ -238,11 +242,46 @@ export function createDesktopBridge(
       ipc.invoke(INVOKE_CHANNELS.reconnect) as Promise<ReconnectResult>,
   });
 
+  const workspaces: WorkspaceBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(INVOKE_CHANNELS.getWorkspaceState) as Promise<WorkspaceView>,
+    subscribeState: (
+      listener: (state: WorkspaceView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeWorkspaceState,
+        EVENT_CHANNELS.workspaceStateChanged,
+        "A workspace state callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    select: (workspaceId: string) =>
+      typeof workspaceId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.selectWorkspace,
+            workspaceId,
+          ) as Promise<WorkspaceActionResult>)
+        : Promise.reject(new TypeError("select needs a workspace ID string.")),
+    openProject: (projectId: string | null) =>
+      typeof projectId === "string" || projectId === null
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.openProject,
+            projectId,
+          ) as Promise<WorkspaceActionResult>)
+        : Promise.reject(
+            new TypeError("openProject needs a project ID string or null."),
+          ),
+  });
+
   return Object.freeze({
     electronVersion,
     runtime,
     repositories,
     account,
     connection,
+    workspaces,
   });
 }

@@ -36,6 +36,12 @@ import {
   StartSignInResultSchema,
   UNLOCK_REFUSALS,
   UnlockResultSchema,
+  WORKSPACE_ACTION_REFUSALS,
+  WORKSPACE_LIMITS,
+  WORKSPACE_PROBLEMS,
+  WORKSPACE_STATUSES,
+  WorkspaceActionResultSchema,
+  WorkspaceViewSchema,
   type AccountStatus,
   type MountedRepository,
   type RepositoryList,
@@ -76,6 +82,10 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     CONNECTION_WAITING_REASONS,
     CONNECTION_STOP_REASONS,
     RECONNECT_REFUSALS,
+    WORKSPACE_LIMITS,
+    WORKSPACE_STATUSES,
+    WORKSPACE_PROBLEMS,
+    WORKSPACE_ACTION_REFUSALS,
   ]) {
     expect(Object.isFrozen(list)).toBe(true);
   }
@@ -127,14 +137,16 @@ test("a runtime status with a wrong state or revision is refused", () => {
   }
 });
 
-test("the invoke channels except unmount, unlock, and the sign-in start take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, and open take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
       channel !== INVOKE_CHANNELS.unlockDeviceKey &&
-      channel !== INVOKE_CHANNELS.startSignIn,
+      channel !== INVOKE_CHANNELS.startSignIn &&
+      channel !== INVOKE_CHANNELS.selectWorkspace &&
+      channel !== INVOKE_CHANNELS.openProject,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 3);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 5);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -881,5 +893,246 @@ test("a reconnect result is reconnecting or refused with a known reason", () => 
     true,
   ]) {
     expect(ReconnectResultSchema.safeParse(value).success).toBe(false);
+  }
+});
+
+const WORKSPACE_ID = "019a5b2c-3d4e-7f60-8a1b-2c3d4e5f6a7b";
+const PROJECT_ID = "019a5b2c-3d4e-7f60-9a1b-2c3d4e5f6a7c";
+
+function workspaceView(overrides: Record<string, unknown> = {}) {
+  return {
+    revision: 3,
+    status: "ready",
+    workspaces: [{ id: WORKSPACE_ID, name: "Team" }],
+    selectedWorkspaceId: WORKSPACE_ID,
+    projects: [{ id: PROJECT_ID, name: "Desktop" }],
+    openProjectId: PROJECT_ID,
+    ...overrides,
+  };
+}
+
+/** IDs that are not a lowercase UUIDv7, and values that are not strings. */
+const NOT_PROTOCOL_IDS: readonly unknown[] = [
+  "",
+  "workspace",
+  // A UUID of version 4, and of version 7 with a wrong variant.
+  "0b9e2f7c-5d0a-4c8e-9f3b-2a1d6e4c8b70",
+  "019a5b2c-3d4e-7f60-ca1b-2c3d4e5f6a7b",
+  WORKSPACE_ID.toUpperCase(),
+  `${WORKSPACE_ID} `,
+  ` ${WORKSPACE_ID}`,
+  `{${WORKSPACE_ID}}`,
+  WORKSPACE_ID.replaceAll("-", ""),
+  `${WORKSPACE_ID}${"0".repeat(10_000)}`,
+  "x".repeat(1_000_000),
+  1,
+  true,
+  {},
+  { id: WORKSPACE_ID },
+  [WORKSPACE_ID],
+  undefined,
+];
+
+test("select takes exactly one lowercase UUIDv7 and refuses anything else", () => {
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.selectWorkspace];
+
+  expect(args.parse([WORKSPACE_ID])).toEqual([WORKSPACE_ID]);
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(args.safeParse([value]).success, String(value)).toBe(false);
+  }
+  for (const value of [
+    [],
+    [null],
+    [WORKSPACE_ID, WORKSPACE_ID],
+    [WORKSPACE_ID, undefined],
+    [WORKSPACE_ID, { force: true }],
+    WORKSPACE_ID,
+    undefined,
+  ]) {
+    expect(args.safeParse(value).success).toBe(false);
+  }
+});
+
+test("open takes exactly one lowercase UUIDv7 or null and refuses anything else", () => {
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.openProject];
+
+  expect(args.parse([PROJECT_ID])).toEqual([PROJECT_ID]);
+  expect(args.parse([null])).toEqual([null]);
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(args.safeParse([value]).success, String(value)).toBe(false);
+  }
+  for (const value of [
+    [],
+    [PROJECT_ID, PROJECT_ID],
+    [null, null],
+    [PROJECT_ID, "extra"],
+    PROJECT_ID,
+    null,
+  ]) {
+    expect(args.safeParse(value).success).toBe(false);
+  }
+});
+
+test("a refused ID is not repeated in the error", () => {
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.selectWorkspace];
+  const result = args.safeParse(["secret-workspace"]);
+
+  expect(result.success).toBe(false);
+  expect(JSON.stringify(result.error?.issues)).not.toContain("secret");
+});
+
+test("a workspace view with every status is accepted, with a problem only while unavailable", () => {
+  for (const status of ["signed_out", "loading", "ready"]) {
+    expect(WorkspaceViewSchema.parse(workspaceView({ status }))).toEqual(
+      workspaceView({ status }),
+    );
+  }
+  for (const problem of WORKSPACE_PROBLEMS) {
+    const value = workspaceView({ status: "unavailable", problem });
+    expect(WorkspaceViewSchema.parse(value)).toEqual(value);
+  }
+  expect(WORKSPACE_STATUSES).toEqual([
+    "signed_out",
+    "loading",
+    "ready",
+    "unavailable",
+  ]);
+  const empty = workspaceView({
+    status: "signed_out",
+    workspaces: [],
+    selectedWorkspaceId: null,
+    projects: [],
+    openProjectId: null,
+  });
+  expect(WorkspaceViewSchema.parse(empty)).toEqual(empty);
+
+  // A problem where the status has none is dropped.
+  expect(
+    WorkspaceViewSchema.parse(workspaceView({ problem: "failed" })),
+  ).toEqual(workspaceView());
+});
+
+test("a workspace view keeps only IDs and names, also of each workspace and project", () => {
+  const parsed = WorkspaceViewSchema.parse(
+    workspaceView({
+      workspaces: [{ id: WORKSPACE_ID, name: "Team", role: "owner" }],
+      projects: [
+        {
+          id: PROJECT_ID,
+          name: "Desktop",
+          createdByMemberId: WORKSPACE_ID,
+          workspaceId: WORKSPACE_ID,
+        },
+      ],
+      members: [{ displayName: "Someone" }],
+      token: "secret",
+    }),
+  );
+
+  expect(parsed).toEqual(workspaceView());
+  expect(Object.keys(parsed).sort()).toEqual([
+    "openProjectId",
+    "projects",
+    "revision",
+    "selectedWorkspaceId",
+    "status",
+    "workspaces",
+  ]);
+});
+
+test("a workspace view over the limits or with wrong values is refused", () => {
+  const workspace = { id: WORKSPACE_ID, name: "Team" };
+  const project = { id: PROJECT_ID, name: "Desktop" };
+  expect(
+    WorkspaceViewSchema.safeParse(
+      workspaceView({
+        workspaces: Array.from(
+          { length: WORKSPACE_LIMITS.workspaces },
+          () => workspace,
+        ),
+        projects: Array.from(
+          { length: WORKSPACE_LIMITS.projects },
+          () => project,
+        ),
+      }),
+    ).success,
+  ).toBe(true);
+  // At the name limit in characters, also outside the Basic Multilingual Plane.
+  expect(
+    WorkspaceViewSchema.safeParse(
+      workspaceView({
+        workspaces: [
+          { id: WORKSPACE_ID, name: "\u{1F600}".repeat(WORKSPACE_LIMITS.name) },
+        ],
+      }),
+    ).success,
+  ).toBe(true);
+
+  for (const overrides of [
+    {
+      workspaces: Array.from(
+        { length: WORKSPACE_LIMITS.workspaces + 1 },
+        () => workspace,
+      ),
+    },
+    {
+      projects: Array.from(
+        { length: WORKSPACE_LIMITS.projects + 1 },
+        () => project,
+      ),
+    },
+    {
+      workspaces: [
+        { id: WORKSPACE_ID, name: "x".repeat(WORKSPACE_LIMITS.name + 1) },
+      ],
+    },
+    {
+      projects: [
+        { id: PROJECT_ID, name: "x".repeat(WORKSPACE_LIMITS.name + 1) },
+      ],
+    },
+    { workspaces: [{ id: WORKSPACE_ID, name: "" }] },
+    { workspaces: [{ id: WORKSPACE_ID.toUpperCase(), name: "Team" }] },
+    { projects: [{ id: "0b9e2f7c-5d0a-4c8e-9f3b-2a1d6e4c8b70", name: "A" }] },
+    { workspaces: [{ id: WORKSPACE_ID }] },
+    { workspaces: {} },
+    { selectedWorkspaceId: "workspace" },
+    { selectedWorkspaceId: undefined },
+    { openProjectId: 1 },
+    { status: "unavailable" },
+    { status: "unavailable", problem: "busy" },
+    { status: "offline" },
+    { revision: -1 },
+    { revision: 1.5 },
+  ]) {
+    expect(
+      WorkspaceViewSchema.safeParse(workspaceView(overrides)).success,
+    ).toBe(false);
+  }
+});
+
+test("a workspace action result is ok or refused with a known reason, without anything else", () => {
+  expect(WorkspaceActionResultSchema.parse({ outcome: "ok", id: 1 })).toEqual({
+    outcome: "ok",
+  });
+  expect(WORKSPACE_ACTION_REFUSALS).toEqual(["not_found", "too_soon"]);
+  for (const reason of WORKSPACE_ACTION_REFUSALS) {
+    expect(
+      WorkspaceActionResultSchema.parse({
+        outcome: "refused",
+        reason,
+        workspaceId: WORKSPACE_ID,
+      }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const value of [
+    { outcome: "refused" },
+    { outcome: "refused", reason: "busy" },
+    { outcome: "cancelled" },
+    {},
+    true,
+    "ok",
+  ]) {
+    expect(WorkspaceActionResultSchema.safeParse(value).success).toBe(false);
   }
 });
