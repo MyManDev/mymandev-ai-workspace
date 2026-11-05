@@ -6,12 +6,18 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { eq } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import type { Database } from "./db.ts";
 import { toDatabaseError } from "./errors.ts";
 import { createWorkspace } from "./membership.ts";
 import { createProject } from "./projects.ts";
-import { devices, users } from "./schema/index.ts";
+import {
+  devices,
+  projects,
+  users,
+  workspaceMembers,
+  workspaces,
+} from "./schema/index.ts";
 
 // Test data for #27 and #28 (Project Manager decision of 2026-11-05): until
 // #95 adds the screens that create workspaces and projects, a
@@ -25,7 +31,10 @@ import { devices, users } from "./schema/index.ts";
 //
 // Lock order, as the API's `lockActor` and then the two functions: the
 // account (`users`), then the device (`devices`), each `FOR NO KEY UPDATE`;
-// then what `createWorkspace` and `createProject` lock.
+// then what `createWorkspace` and `createProject` lock. The lookup of an
+// existing workspace reads without locks: it runs after the account's lock,
+// which every creation of a workspace by the account takes first, so two
+// runs for one account cannot both miss a workspace that the other creates.
 
 export type CreateDevWorkspaceInput = Readonly<{
   /** The developer's device; its account owns the workspace. */
@@ -63,6 +72,20 @@ export type CreateDevWorkspaceResult =
         | "conflict";
     }>
   /**
+   * The account already owns a workspace that is not archived and has
+   * exactly this name, the most recently created one if several do; nothing
+   * is created. `projectId` is its project that is not archived and has the
+   * project name, compared as the API compares project names (ignoring
+   * case), or null if it has none.
+   */
+  | Readonly<{
+      created: false;
+      refusal: "exists";
+      userId: UserId;
+      workspaceId: WorkspaceId;
+      projectId: ProjectId | null;
+    }>
+  /**
    * A limit of `createWorkspace` (`limit: "workspaces"`) or of
    * `createProject` (`limit: "projects"`) is reached; `retryAfterMs` as
    * they return it.
@@ -96,8 +119,12 @@ class Undo extends Error {
  * (NFC, without white space at the start and the end). It refuses a device
  * that does not exist or is revoked, a disabled account, and a name that
  * the schemas refuse, and returns the limits of the two functions; nothing
- * is written then. Like the API, it sends no event: a running desktop loads
- * the workspaces only when it connects. Development only: the command that
+ * is written then. When the account already owns a workspace that is not
+ * archived with this name, it creates nothing and returns that workspace
+ * and its project of the project name, if any (`exists`), so that a second
+ * run neither adds a workspace that the desktop would select by default nor
+ * uses up the account's daily limits. Like the API, it sends no event: a
+ * running desktop loads the workspaces only when it connects. Development only: the command that
  * calls it refuses a database that is not on the developer's own computer
  * (`src/dev-seed-command.ts`).
  */
@@ -147,6 +174,46 @@ export async function createDevWorkspace(
         });
         if (!workspaceRequest.success || !projectRequest.success) {
           return { created: false, refusal: "invalid_name" };
+        }
+
+        // A second run with the same names finds what the first created.
+        const [existing] = await tx
+          .select({ id: workspaces.id })
+          .from(workspaces)
+          .innerJoin(
+            workspaceMembers,
+            eq(workspaceMembers.workspaceId, workspaces.id),
+          )
+          .where(
+            and(
+              eq(workspaceMembers.userId, owner.userId),
+              eq(workspaceMembers.role, "owner"),
+              isNull(workspaceMembers.removedAt),
+              isNull(workspaces.archivedAt),
+              eq(workspaces.name, workspaceRequest.data.name),
+            ),
+          )
+          .orderBy(desc(workspaces.createdAt), desc(workspaces.id))
+          .limit(1);
+        if (existing !== undefined) {
+          // The expression of the unique index `projects_active_name_key`.
+          const [project] = await tx
+            .select({ id: projects.id })
+            .from(projects)
+            .where(
+              and(
+                eq(projects.workspaceId, existing.id),
+                isNull(projects.archivedAt),
+                sql`lower(${projects.name} collate "pg_c_utf8") = lower(cast(${projectRequest.data.name} as text) collate "pg_c_utf8")`,
+              ),
+            );
+          return {
+            created: false,
+            refusal: "exists",
+            userId: owner.userId,
+            workspaceId: existing.id,
+            projectId: project?.id ?? null,
+          };
         }
 
         const workspace = await createWorkspace(tx, {

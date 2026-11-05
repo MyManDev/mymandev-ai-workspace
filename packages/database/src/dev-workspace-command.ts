@@ -6,8 +6,12 @@ import {
   LIMITS,
 } from "@mymandev/protocol";
 import type { CommandReport } from "./account-command.ts";
-import { DEV_SEED_FLAG } from "./dev-seed-command.ts";
-import type { CreateDevWorkspaceResult } from "./dev-workspace.ts";
+import type { Database } from "./db.ts";
+import { checkServerAddress, DEV_SEED_FLAG } from "./dev-seed-command.ts";
+import {
+  createDevWorkspace,
+  type CreateDevWorkspaceResult,
+} from "./dev-workspace.ts";
 import {
   MAX_ACTIVE_PROJECTS_PER_WORKSPACE,
   MAX_NEW_PROJECTS_PER_DAY,
@@ -126,6 +130,23 @@ export function devWorkspaceReport(
       ].join("\n"),
     };
   }
+  if (result.refusal === "exists") {
+    // A second run with the same names: the IDs of the first, or a refusal
+    // when the workspace has no project of that name.
+    return result.projectId === null
+      ? {
+          exitCode: 1,
+          message: `Refused: account ${result.userId} already owns a workspace of that name, ${result.workspaceId}, without a project of that name. Nothing was changed. Choose another workspace name with --workspace.`,
+        }
+      : {
+          exitCode: 0,
+          message: [
+            `Nothing was created: account ${result.userId} already owns a workspace of that name with a project of that name:`,
+            `Workspace ID: ${result.workspaceId}`,
+            `Project ID: ${result.projectId}`,
+          ].join("\n"),
+        };
+  }
   if (result.refusal === "rate_limited") {
     const reason =
       result.limit === "workspaces"
@@ -155,4 +176,27 @@ export function devWorkspaceReport(
     exitCode: 1,
     message: `Refused: ${reasons[result.refusal]}. Nothing was changed.`,
   };
+}
+
+/**
+ * The command's work once it is connected: it refuses a server that did not
+ * take the connection on a loopback address (`checkServerAddress`, with the
+ * `host(inet_server_addr())` that the command read) before it writes
+ * anything, and then creates the workspace and the project.
+ */
+export async function runDevWorkspaceCommand(
+  db: Database,
+  input: Readonly<{
+    command: DevWorkspaceCommand;
+    serverAddress: string | null;
+    now: Date;
+  }>,
+): Promise<CommandReport> {
+  const remote = checkServerAddress(input.serverAddress);
+  if (remote !== undefined) {
+    return { exitCode: 1, message: remote };
+  }
+  return devWorkspaceReport(
+    await createDevWorkspace(db, { ...input.command, now: input.now }),
+  );
 }

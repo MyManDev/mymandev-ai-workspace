@@ -21,6 +21,7 @@ import {
   DEV_WORKSPACE_USAGE,
   devWorkspaceReport,
   parseDevWorkspaceCommand,
+  runDevWorkspaceCommand,
 } from "./dev-workspace-command.ts";
 import { createWorkspace, listWorkspaces } from "./membership.ts";
 import {
@@ -211,7 +212,7 @@ test("the workspace command runs only with the opt-in, outside production, and o
   assert.equal(usage.stderr.trim(), DEV_WORKSPACE_USAGE);
 });
 
-test("the workspace command reports the IDs, and a refusal or a limit with exit code 1", () => {
+test("the workspace command reports the IDs, also of an existing workspace, and a refusal or a limit with exit code 1", () => {
   const userId = newId<UserId>();
   const workspaceId = newId<WorkspaceId>();
   const projectId = newId<ProjectId>();
@@ -220,6 +221,32 @@ test("the workspace command reports the IDs, and a refusal or a limit with exit 
     {
       exitCode: 0,
       message: `Workspace and project created for account ${userId}:\nWorkspace ID: ${workspaceId}\nProject ID: ${projectId}`,
+    },
+  );
+  assert.deepEqual(
+    devWorkspaceReport({
+      created: false,
+      refusal: "exists",
+      userId,
+      workspaceId,
+      projectId,
+    }),
+    {
+      exitCode: 0,
+      message: `Nothing was created: account ${userId} already owns a workspace of that name with a project of that name:\nWorkspace ID: ${workspaceId}\nProject ID: ${projectId}`,
+    },
+  );
+  assert.deepEqual(
+    devWorkspaceReport({
+      created: false,
+      refusal: "exists",
+      userId,
+      workspaceId,
+      projectId: null,
+    }),
+    {
+      exitCode: 1,
+      message: `Refused: account ${userId} already owns a workspace of that name, ${workspaceId}, without a project of that name. Nothing was changed. Choose another workspace name with --workspace.`,
     },
   );
   assert.deepEqual(
@@ -342,7 +369,7 @@ function create(
   });
 }
 
-test("the workspace command creates a workspace that the device's account owns, with one project, by the API's functions", async () => {
+test("the workspace command creates a workspace that the device's account owns, with one project, by the API's functions, and finds them on a second run", async () => {
   const owner = await account("Ayla");
   const result = await create(owner.deviceId, {
     workspaceName: "Team",
@@ -390,13 +417,87 @@ test("the workspace command creates a workspace that the device's account owns, 
     { action: "workspace.created", actorDeviceId: owner.deviceId },
   ]);
 
-  // A second run creates another workspace with the same names.
-  const again = await create(owner.deviceId, {
-    workspaceName: "Team",
+  // A second run with the same names creates nothing and finds both; the
+  // project name is compared as the API compares it, ignoring case.
+  const unchanged = await counts(owner.userId);
+  assert.deepEqual(
+    await create(owner.deviceId, {
+      workspaceName: "Team",
+      projectName: "caf\u00e9",
+    }),
+    {
+      created: false,
+      refusal: "exists",
+      userId: owner.userId,
+      workspaceId: result.workspaceId,
+      projectId: result.projectId,
+    },
+  );
+  // Another project name in that workspace is not created either.
+  assert.deepEqual(
+    await create(owner.deviceId, {
+      workspaceName: "Team",
+      projectName: "Other",
+    }),
+    {
+      created: false,
+      refusal: "exists",
+      userId: owner.userId,
+      workspaceId: result.workspaceId,
+      projectId: null,
+    },
+  );
+  assert.deepEqual(await counts(owner.userId), unchanged);
+  assert.equal((await listProjects(database(), result.workspaceId)).length, 1);
+
+  // Workspace names are compared exactly, and only among the workspaces
+  // that the account owns.
+  const renamed = await create(owner.deviceId, {
+    workspaceName: "team",
     projectName: "Caf\u00e9",
   });
-  assert.ok(again.created);
-  assert.notEqual(again.workspaceId, result.workspaceId);
+  assert.ok(renamed.created);
+  assert.notEqual(renamed.workspaceId, result.workspaceId);
+  const stranger = await account("Stranger");
+  const theirs = await create(stranger.deviceId, { workspaceName: "Team" });
+  assert.ok(theirs.created);
+  assert.notEqual(theirs.workspaceId, result.workspaceId);
+});
+
+test("the connected workspace command refuses a server that did not take the connection on a loopback address, before it writes", async () => {
+  const owner = await account("Remote");
+  const parsed = parseDevWorkspaceCommand([owner.deviceId]);
+  assert.ok(parsed.ok);
+  const run = (serverAddress: string | null) =>
+    runDevWorkspaceCommand(database(), {
+      command: parsed.command,
+      serverAddress,
+      now: NOW,
+    });
+  for (const address of ["192.168.1.10", "10.0.0.5", "2001:db8::1"]) {
+    assert.deepEqual(
+      await run(address),
+      {
+        exitCode: 1,
+        message:
+          "Refused: the database server did not accept the connection on a loopback address. Nothing was changed.",
+      },
+      address,
+    );
+  }
+  assert.deepEqual(await counts(owner.userId), {
+    workspaces: 0,
+    auditEvents: 0,
+  });
+  // A loopback address, or none for a Unix-domain socket, lets it create,
+  // and a second run finds what the first created.
+  const created = await run("127.0.0.1");
+  assert.equal(created.exitCode, 0);
+  assert.match(created.message, /^Workspace and project created for account /u);
+  const again = await run(null);
+  assert.equal(again.exitCode, 0);
+  assert.match(again.message, /^Nothing was created: account /u);
+  assert.equal((await counts(owner.userId)).workspaces, 1);
 });
 
 test("the workspace command refuses an unknown or revoked device, a disabled account, and a name that the API refuses, and writes nothing", async () => {

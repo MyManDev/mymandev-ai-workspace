@@ -7,14 +7,10 @@
 // `db:dev-seed` (`src/dev-seed-command.ts`).
 import { sql } from "drizzle-orm";
 import { createDatabase } from "./client.ts";
+import { checkDevSeedEnvironment } from "./dev-seed-command.ts";
 import {
-  checkDevSeedEnvironment,
-  checkServerAddress,
-} from "./dev-seed-command.ts";
-import { createDevWorkspace } from "./dev-workspace.ts";
-import {
-  devWorkspaceReport,
   parseDevWorkspaceCommand,
+  runDevWorkspaceCommand,
 } from "./dev-workspace-command.ts";
 
 const parsed = parseDevWorkspaceCommand(process.argv.slice(2));
@@ -33,13 +29,12 @@ try {
   const { rows } = await db.execute<{ address: string | null }>(
     sql`select host(inet_server_addr()) as address`,
   );
-  const remote = checkServerAddress(rows[0]?.address ?? null);
-  const report =
-    remote !== undefined
-      ? ({ exitCode: 1, message: remote } as const)
-      : devWorkspaceReport(
-          await createDevWorkspace(db, { ...parsed.command, now: new Date() }),
-        );
+  // runDevWorkspaceCommand refuses a remote server before it writes.
+  const report = await runDevWorkspaceCommand(db, {
+    command: parsed.command,
+    serverAddress: rows[0]?.address ?? null,
+    now: new Date(),
+  });
   if (report.exitCode === 0) {
     console.log(report.message);
   } else {
