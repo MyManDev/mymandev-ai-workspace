@@ -61,14 +61,16 @@ export type RunEventInput = Pick<
  * - `applied`: the event changed the activity; `activity` is the new one.
  * - `unchanged`: the activity already holds what the event reports, or the
  *   run is already finished, so the event is older than the snapshot.
- * - `unknown_agent`: no agent of this project has the event's agent ID. Most
- *   often the run belongs to another project of the same workspace, because
- *   the event names no project; the caller does not reload for it. It can
- *   also be an agent created after the snapshot, or one beyond the agent
- *   list's limit; the caller decides.
- * - `unknown_run`: the event changes a run that the activity does not hold,
- *   or a held run belongs to another agent. The data is inconsistent, so
- *   the caller reloads.
+ * - `unknown_agent`: the activity does not hold the event's run, and no agent
+ *   of this project has the event's agent ID. Most often the run belongs to
+ *   another project of the same workspace, because the event names no
+ *   project; the caller does not reload for it. It can also be an agent
+ *   created after the snapshot, or one beyond the agent list's limit; the
+ *   caller decides. A held run is never `unknown_agent`: the snapshot showed
+ *   that it belongs to this project.
+ * - `unknown_run`: the event changes a run of a listed agent that the
+ *   activity does not hold, or a held run belongs to another agent. The data
+ *   is inconsistent, so the caller reloads.
  */
 export type RunEventOutcome =
   | {
@@ -163,7 +165,9 @@ function cancelsAgents(event: RunEventInput): boolean {
  * terminal state moves to the front of the finished runs with the event's
  * `occurredAt` as its finish time; that time is provisional, and the next
  * reload replaces it with the server's. A `repositoryId` in the event never
- * changes the run's repository.
+ * changes the run's repository. An event for a held run applies also when
+ * the agent list does not hold the run's agent, for example an agent created
+ * between the two reads of the snapshot: the run belongs to this project.
  */
 export function applyRunEvent(
   activity: ProjectActivity,
@@ -171,9 +175,6 @@ export function applyRunEvent(
 ): RunEventOutcome {
   const { payload } = event;
   const agentsStale = cancelsAgents(event);
-  if (!activity.agents.some((agent) => agent.id === payload.agentId)) {
-    return Object.freeze({ kind: "unknown_agent", agentsStale });
-  }
   const unfinished = activity.unfinishedRuns.find(
     (run) => run.id === payload.runId,
   );
@@ -182,6 +183,12 @@ export function applyRunEvent(
       ? activity.finishedRuns.find((run) => run.id === payload.runId)
       : undefined;
   const held = unfinished ?? finished;
+  if (
+    held === undefined &&
+    !activity.agents.some((agent) => agent.id === payload.agentId)
+  ) {
+    return Object.freeze({ kind: "unknown_agent", agentsStale });
+  }
   if (held !== undefined && held.agentId !== payload.agentId) {
     return Object.freeze({ kind: "unknown_run", agentsStale });
   }

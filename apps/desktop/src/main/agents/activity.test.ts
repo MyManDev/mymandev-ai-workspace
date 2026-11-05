@@ -214,6 +214,43 @@ test("a snapshot of the path's project is accepted in the server's order and fro
   expect(isDeepFrozen(result)).toBe(true);
 });
 
+test("a snapshot and a new agent list are copied and frozen, and the answers are not changed", () => {
+  // Parsed and not frozen, as the service passes them.
+  const agents = AgentListResponseSchema.parse({ agents: [agent(AGENT_ID)] });
+  const runs = AgentRunListResponseSchema.parse({
+    unfinishedRuns: [run(1, "running")],
+    finishedRuns: [run(2, "completed")],
+  });
+  const newAgents = AgentListResponseSchema.parse({
+    agents: [agent(OTHER_AGENT_ID)],
+  });
+
+  const result = activityFromSnapshot(PROJECT_ID, agents, runs);
+  if (!result.ok) {
+    throw new Error(`The snapshot was refused: ${result.reason}`);
+  }
+  const replaced = replaceAgents(result.activity, newAgents);
+  if (!replaced.ok) {
+    throw new Error(`The agents were refused: ${replaced.reason}`);
+  }
+
+  const { activity } = result;
+  expect(isDeepFrozen(result)).toBe(true);
+  expect(isDeepFrozen(replaced)).toBe(true);
+  for (const [copy, answer] of [
+    [activity.agents, agents.agents],
+    [activity.unfinishedRuns, runs.unfinishedRuns],
+    [activity.finishedRuns, runs.finishedRuns],
+    [replaced.activity.agents, newAgents.agents],
+  ] as const) {
+    expect(copy).toEqual(answer);
+    expect(copy).not.toBe(answer);
+    expect(copy[0]).not.toBe(answer[0]);
+    expect(Object.isFrozen(answer)).toBe(false);
+    expect(Object.isFrozen(answer[0])).toBe(false);
+  }
+});
+
 test("the finished limit is the snapshot's count when the server sent more than 50", () => {
   const finished = Array.from({ length: 60 }, (_, index) =>
     run(100 + index, "completed"),
@@ -420,12 +457,15 @@ test("buffered events over a newer snapshot end in the last event's state", () =
 test("an unknown agent and an unknown run are reported", () => {
   const activity = snapshot([run(1, "running")]);
 
-  expect(
-    applyRunEvent(
-      activity,
-      runEvent(1, "running", "completed", { agentId: UNLISTED_AGENT_ID }),
-    ),
-  ).toEqual({ kind: "unknown_agent", agentsStale: false });
+  for (const event of [
+    runEvent(2, "running", "completed", { agentId: UNLISTED_AGENT_ID }),
+    runEvent(2, null, "queued", { agentId: UNLISTED_AGENT_ID }),
+  ]) {
+    expect(applyRunEvent(activity, event)).toEqual({
+      kind: "unknown_agent",
+      agentsStale: false,
+    });
+  }
   expect(applyRunEvent(activity, runEvent(2, "running", "completed"))).toEqual({
     kind: "unknown_run",
     agentsStale: false,
@@ -436,28 +476,56 @@ test("a held run of another agent is reported as unknown_run", () => {
   const activity = snapshot([run(1, "running")], [run(2, "completed")]);
 
   for (const n of [1, 2]) {
-    expect(
-      applyRunEvent(
-        activity,
-        runEvent(n, "running", "failed", { agentId: OTHER_AGENT_ID }),
-      ),
-    ).toEqual({ kind: "unknown_run", agentsStale: false });
+    for (const agentId of [OTHER_AGENT_ID, UNLISTED_AGENT_ID]) {
+      expect(
+        applyRunEvent(activity, runEvent(n, "running", "failed", { agentId })),
+      ).toEqual({ kind: "unknown_run", agentsStale: false });
+    }
   }
 });
 
-test("a run of an agent that is not in the agent list is kept, and its events are unknown_agent", () => {
-  const activity = snapshot([
-    run(1, "running", { agentId: UNLISTED_AGENT_ID }),
-    run(2, "queued"),
-  ]);
+test("a run of an agent that is not in the agent list is kept, and its events apply", () => {
+  // The agent was created between the two reads of the snapshot.
+  const activity = snapshot(
+    [run(1, "queued", { agentId: UNLISTED_AGENT_ID }), run(2, "queued")],
+    [run(3, "completed", { agentId: UNLISTED_AGENT_ID })],
+  );
+  const occurredAt = at(700);
 
   expect(ids(activity.unfinishedRuns)).toEqual([runId(1), runId(2)]);
-  expect(
+  const started = applied(
     applyRunEvent(
       activity,
-      runEvent(1, "running", "completed", { agentId: UNLISTED_AGENT_ID }),
+      runEvent(1, "queued", "running", { agentId: UNLISTED_AGENT_ID }),
     ),
-  ).toEqual({ kind: "unknown_agent", agentsStale: false });
+  );
+  expect(started.unfinishedRuns[0]).toEqual({
+    ...run(1, "queued", { agentId: UNLISTED_AGENT_ID }),
+    state: "running",
+  });
+  const done = applied(
+    applyRunEvent(
+      started,
+      runEvent(1, "running", "completed", {
+        agentId: UNLISTED_AGENT_ID,
+        occurredAt,
+      }),
+    ),
+  );
+
+  expect(ids(done.unfinishedRuns)).toEqual([runId(2)]);
+  expect(ids(done.finishedRuns)).toEqual([runId(1), runId(3)]);
+  expect(done.finishedRuns[0]).toMatchObject({
+    state: "completed",
+    finishedAt: occurredAt,
+  });
+  expect(done.agents).toBe(activity.agents);
+  expect(
+    applyRunEvent(
+      done,
+      runEvent(3, "running", "failed", { agentId: UNLISTED_AGENT_ID }),
+    ),
+  ).toEqual({ kind: "unchanged", agentsStale: false });
 });
 
 test("a system creation of an unknown run is inserted at the front", () => {
@@ -495,6 +563,21 @@ test("a created run without a repository has a null repository", () => {
   );
 
   expect(next.unfinishedRuns[0]?.repositoryId).toBeNull();
+});
+
+test("a created run carries the event's reason", () => {
+  const next = applied(
+    applyRunEvent(
+      snapshot([]),
+      runEvent(1, null, "queued", { reason: "Waiting for a device" }),
+    ),
+  );
+
+  expect(next.unfinishedRuns[0]).toMatchObject({
+    id: runId(1),
+    state: "queued",
+    reason: "Waiting for a device",
+  });
 });
 
 test("a server cancellation with a known code marks the agents stale", () => {
