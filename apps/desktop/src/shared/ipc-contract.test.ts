@@ -36,6 +36,7 @@ import {
   StartSignInResultSchema,
   UNLOCK_REFUSALS,
   UnlockResultSchema,
+  WORKSPACE_ACTION_REFUSALS,
   WORKSPACE_LIMITS,
   WORKSPACE_PROBLEMS,
   WORKSPACE_STATUSES,
@@ -84,6 +85,7 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     WORKSPACE_LIMITS,
     WORKSPACE_STATUSES,
     WORKSPACE_PROBLEMS,
+    WORKSPACE_ACTION_REFUSALS,
   ]) {
     expect(Object.isFrozen(list)).toBe(true);
   }
@@ -1109,14 +1111,28 @@ test("a workspace view over the limits or with wrong values is refused", () => {
   }
 });
 
-test("a workspace action result is ok or refused, without anything else", () => {
+test("a workspace action result is ok or refused with a known reason, without anything else", () => {
   expect(WorkspaceActionResultSchema.parse({ outcome: "ok", id: 1 })).toEqual({
     outcome: "ok",
   });
-  expect(
-    WorkspaceActionResultSchema.parse({ outcome: "refused", reason: "x" }),
-  ).toEqual({ outcome: "refused" });
-  for (const value of [{ outcome: "cancelled" }, {}, true, "ok"]) {
+  expect(WORKSPACE_ACTION_REFUSALS).toEqual(["not_found", "too_soon"]);
+  for (const reason of WORKSPACE_ACTION_REFUSALS) {
+    expect(
+      WorkspaceActionResultSchema.parse({
+        outcome: "refused",
+        reason,
+        workspaceId: WORKSPACE_ID,
+      }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const value of [
+    { outcome: "refused" },
+    { outcome: "refused", reason: "busy" },
+    { outcome: "cancelled" },
+    {},
+    true,
+    "ok",
+  ]) {
     expect(WorkspaceActionResultSchema.safeParse(value).success).toBe(false);
   }
 });

@@ -16,8 +16,12 @@ import {
   WORKSPACE_PROBLEMS,
   WORKSPACE_STATUSES,
   WorkspaceViewSchema,
+  type AccountStatus,
 } from "../shared/ipc-contract.ts";
-import { WORKSPACE_READ_FAILURES } from "./api-reads.ts";
+import {
+  WORKSPACE_READ_FAILURES,
+  type WorkspaceReadResult,
+} from "./api-reads.ts";
 import { APP_ENTRY_URL } from "./app-protocol.ts";
 import type {
   IpcFrame,
@@ -25,16 +29,22 @@ import type {
   IpcInvokeListener,
   StatusReceiver,
 } from "./ipc.ts";
-import type {
-  ProjectSummary,
-  WorkspaceServiceStatus,
-  WorkspaceState,
-  WorkspaceSummary,
+import {
+  createWorkspaceService,
+  type ProjectSummary,
+  type WorkspaceAccount,
+  type WorkspaceConnection,
+  type WorkspaceServiceStatus,
+  type WorkspaceState,
+  type WorkspaceSummary,
 } from "./workspace/service.ts";
 import {
   closeProjectWithPage,
   createWorkspaceActions,
+  NAVIGATION_ABORTED,
   registerWorkspaceIpc,
+  WORKSPACE_SWITCH_BUDGET,
+  WORKSPACE_SWITCH_WINDOW_MS,
   workspaceView,
   type WorkspacePageWindow,
 } from "./workspace-ipc.ts";
@@ -170,6 +180,7 @@ function fakeService(initial: WorkspaceState = STATE) {
         }
         return true;
       },
+      selectedWorkspaceId: () => state.selectedWorkspaceId,
       openProject: (projectId: ProjectId | null) => {
         calls.push({ method: "openProject", args: [projectId] });
         if (
@@ -188,8 +199,9 @@ function fakeService(initial: WorkspaceState = STATE) {
 }
 
 function register(
-  fake: ReturnType<typeof fakeService>,
+  fake: { readonly service: Parameters<typeof registerWorkspaceIpc>[2] },
   appUrl: string = DEV_URL,
+  now?: () => number,
 ) {
   const handlers = new Map<string, IpcInvokeListener>();
   const errors: string[] = [];
@@ -198,6 +210,7 @@ function register(
     appUrl,
     fake.service,
     (message) => errors.push(message),
+    now,
   );
   const call = (channel: string, ...args: unknown[]) => {
     const handler = handlers.get(channel);
@@ -365,9 +378,11 @@ test("select and open pass a valid ID to the service and answer ok or refused", 
   });
   expect(call(INVOKE_CHANNELS.openProject, unknown)).toEqual({
     outcome: "refused",
+    reason: "not_found",
   });
   expect(call(INVOKE_CHANNELS.selectWorkspace, unknown)).toEqual({
     outcome: "refused",
+    reason: "not_found",
   });
   expect(call(INVOKE_CHANNELS.selectWorkspace, OTHER_WORKSPACE_ID)).toEqual({
     outcome: "ok",
@@ -390,8 +405,14 @@ test("the actions check every ID with the protocol's ID schemas, also without th
   const open = actions.openProject as (value: unknown) => unknown;
 
   for (const value of NOT_PROTOCOL_IDS) {
-    expect(select(value), String(value)).toEqual({ outcome: "refused" });
-    expect(open(value), String(value)).toEqual({ outcome: "refused" });
+    expect(select(value), String(value)).toEqual({
+      outcome: "refused",
+      reason: "not_found",
+    });
+    expect(open(value), String(value)).toEqual({
+      outcome: "refused",
+      reason: "not_found",
+    });
   }
   expect(fake.calls).toEqual([]);
 
@@ -513,11 +534,157 @@ test("a subscribed frame receives every later state, parsed by the contract", ()
   expect(errors).toEqual(["Sending the workspace state failed."]);
 });
 
-/** A window whose events the test fires, like Electron's after "closed". */
+test("a refused close of the open project answers refused, through IPC and the actions", () => {
+  const calls: unknown[] = [];
+  const stub = {
+    ...fakeService().service,
+    openProject: (projectId: ProjectId | null) => {
+      calls.push(projectId);
+      return false;
+    },
+  };
+
+  expect(createWorkspaceActions(stub).openProject(null)).toEqual(NOT_FOUND);
+  const { call } = register({ service: stub });
+  expect(call(INVOKE_CHANNELS.openProject, null)).toEqual(NOT_FOUND);
+  expect(calls).toEqual([null, null]);
+});
+
+const NOT_FOUND = { outcome: "refused", reason: "not_found" };
+const TOO_SOON = { outcome: "refused", reason: "too_soon" };
+
+const SIGNED_IN = Object.freeze({
+  revision: 1,
+  account: Object.freeze({
+    kind: "signed_in",
+    login: "octocat",
+    displayName: "Octo Cat",
+    deviceId: "019a5b2c-3d4e-7f60-8a1b-2c3d4e5f6a70",
+  }),
+  signIn: Object.freeze({ kind: "idle" }),
+  lastOutcome: null,
+  deviceKey: "ready",
+  replacementPending: false,
+  apiOrigin: "set",
+  device: "signed_in",
+}) satisfies AccountStatus;
+
+/**
+ * The real workspace service with a signed-in device, a connected client
+ * that counts its subscriptions, and a list of two workspaces. The reloads
+ * of a selected workspace never answer.
+ */
+async function realService() {
+  const subscribed: WorkspaceId[] = [];
+  const unsubscribed: WorkspaceId[] = [];
+  const account: WorkspaceAccount = {
+    status: () => SIGNED_IN,
+    onStatusChange: () => () => undefined,
+    readWorkspaceData: ((name: string) =>
+      name === "listWorkspaces"
+        ? Promise.resolve({
+            ok: true,
+            value: {
+              workspaces: [WORKSPACE_ID, OTHER_WORKSPACE_ID].map((id) => ({
+                workspace: { id, name: "Team" },
+              })),
+            },
+          } as WorkspaceReadResult<unknown>)
+        : new Promise(
+            () => undefined,
+          )) as WorkspaceAccount["readWorkspaceData"],
+  };
+  const connection: WorkspaceConnection = {
+    status: () => ({ state: "connected", revision: 1 }),
+    onStatusChange: () => () => undefined,
+    onMessage: () => () => undefined,
+    subscribeWorkspace: (workspaceId) => {
+      subscribed.push(workspaceId);
+    },
+    unsubscribeWorkspace: (workspaceId) => {
+      unsubscribed.push(workspaceId);
+    },
+  } as WorkspaceConnection;
+  const service = createWorkspaceService({ account, connection });
+  for (let index = 0; index < 5; index += 1) {
+    await Promise.resolve();
+  }
+  return { service, subscribed, unsubscribed };
+}
+
+test("a loop of alternating selects reaches the connection only within the budget, and works again after the window", async () => {
+  const { service, subscribed, unsubscribed } = await realService();
+  expect(service.state().status).toBe("loading");
+  expect(subscribed).toEqual([WORKSPACE_ID]);
+  let clock = 1_000;
+  const { call } = register({ service }, DEV_URL, () => clock);
+
+  const answers: unknown[] = [];
+  for (let index = 0; index < 1_000; index += 1) {
+    clock += 1;
+    answers.push(
+      call(
+        INVOKE_CHANNELS.selectWorkspace,
+        index % 2 === 0 ? OTHER_WORKSPACE_ID : WORKSPACE_ID,
+      ),
+    );
+  }
+  expect(answers.slice(0, WORKSPACE_SWITCH_BUDGET)).toEqual(
+    Array.from({ length: WORKSPACE_SWITCH_BUDGET }, () => ({ outcome: "ok" })),
+  );
+  // Beyond the budget, every switch is refused; every other call asks for
+  // the workspace that is selected already, which stays free.
+  expect(answers.slice(WORKSPACE_SWITCH_BUDGET)).toEqual(
+    Array.from({ length: 1_000 - WORKSPACE_SWITCH_BUDGET }, (_, index) =>
+      index % 2 === 0 ? TOO_SOON : { outcome: "ok" },
+    ),
+  );
+  expect(subscribed).toHaveLength(1 + WORKSPACE_SWITCH_BUDGET);
+  expect(unsubscribed).toHaveLength(WORKSPACE_SWITCH_BUDGET);
+
+  // Selecting the selected workspace stays free and sends nothing.
+  const selected = service.selectedWorkspaceId();
+  expect(selected).not.toBeNull();
+  expect(call(INVOKE_CHANNELS.selectWorkspace, selected)).toEqual({
+    outcome: "ok",
+  });
+  expect(subscribed).toHaveLength(1 + WORKSPACE_SWITCH_BUDGET);
+
+  // Once the window has passed for the first switch, one more switch passes.
+  clock = 1_000 + 1 + WORKSPACE_SWITCH_WINDOW_MS;
+  const other = selected === WORKSPACE_ID ? OTHER_WORKSPACE_ID : WORKSPACE_ID;
+  expect(call(INVOKE_CHANNELS.selectWorkspace, other)).toEqual({
+    outcome: "ok",
+  });
+  expect(service.selectedWorkspaceId()).toBe(other);
+  expect(subscribed).toHaveLength(2 + WORKSPACE_SWITCH_BUDGET);
+  expect(call(INVOKE_CHANNELS.selectWorkspace, selected)).toEqual(TOO_SOON);
+  service.close();
+});
+
+test("a refused select of an unknown workspace does not count against the budget", () => {
+  const fake = fakeService();
+  let clock = 0;
+  const actions = createWorkspaceActions(fake.service, () => clock);
+  const unknown = "019a5b2c-3d4e-7f62-8a1b-2c3d4e5f6a7b";
+
+  for (let index = 0; index < WORKSPACE_SWITCH_BUDGET * 3; index += 1) {
+    clock += 1;
+    expect(actions.selectWorkspace(unknown)).toEqual(NOT_FOUND);
+  }
+  expect(actions.selectWorkspace(OTHER_WORKSPACE_ID)).toEqual({
+    outcome: "ok",
+  });
+});
+
+/**
+ * A window whose events the test fires with Electron's arguments, like
+ * Electron's after "closed".
+ */
 function fakeWindow() {
-  const listeners = new Map<string, (() => void)[]>();
+  const listeners = new Map<string, ((...args: never[]) => void)[]>();
   let destroyed = false;
-  const add = (event: string, listener: () => void) => {
+  const add = (event: string, listener: (...args: never[]) => void) => {
     listeners.set(event, [...(listeners.get(event) ?? []), listener]);
   };
   const contents = { on: add };
@@ -533,15 +700,35 @@ function fakeWindow() {
   return {
     window,
     events: () => [...listeners.keys()].sort(),
-    fire: (event: string) => {
+    fire: (event: string, ...args: unknown[]) => {
       if (event === "closed") {
         destroyed = true;
       }
       for (const listener of listeners.get(event) ?? []) {
-        listener();
+        (listener as (...args: unknown[]) => void)(...args);
       }
     },
   };
+}
+
+const ELECTRON_EVENT = { preventDefault: () => undefined };
+
+/** Fires `did-fail-load` with Electron's arguments. */
+function failLoad(
+  page: ReturnType<typeof fakeWindow>,
+  errorCode: number,
+  isMainFrame: boolean,
+) {
+  page.fire(
+    "did-fail-load",
+    ELECTRON_EVENT,
+    errorCode,
+    "ERR_FAILED",
+    DEV_URL,
+    isMainFrame,
+    1,
+    1,
+  );
 }
 
 test("the open project closes when the window closes, and the selection stays", () => {
@@ -551,7 +738,8 @@ test("the open project closes when the window closes, and the selection stays", 
 
   expect(page.events()).toEqual([
     "closed",
-    "did-start-loading",
+    "did-fail-load",
+    "did-navigate",
     "render-process-gone",
   ]);
   expect(fake.calls).toEqual([]);
@@ -561,20 +749,49 @@ test("the open project closes when the window closes, and the selection stays", 
   expect(fake.current().selectedWorkspaceId).toBe(WORKSPACE_ID);
 });
 
-test("the open project closes when the renderer starts loading or reloading, and the selection stays", () => {
+test("the start of a load alone keeps the open project", () => {
   const fake = fakeService();
   const page = fakeWindow();
   closeProjectWithPage(page.window, fake.service);
 
   page.fire("did-start-loading");
+  page.fire("did-start-navigation", ELECTRON_EVENT, DEV_URL, false, true);
+  expect(fake.calls).toEqual([]);
+  expect(fake.current().openProjectId).toBe(PROJECT_ID);
+});
+
+test("the open project closes when a new document commits in the main frame, also on a reload, and the selection stays", () => {
+  const fake = fakeService();
+  const page = fakeWindow();
+  closeProjectWithPage(page.window, fake.service);
+
+  page.fire("did-navigate", ELECTRON_EVENT, DEV_URL, -1, "");
   expect(fake.calls).toEqual([{ method: "openProject", args: [null] }]);
   expect(fake.current().openProjectId).toBeNull();
   expect(fake.current().selectedWorkspaceId).toBe(WORKSPACE_ID);
 
   // The new page opens a project again; the next reload closes it again.
   expect(fake.service.openProject(PROJECT_ID)).toBe(true);
-  page.fire("did-start-loading");
+  page.fire("did-navigate", ELECTRON_EVENT, DEV_URL, -1, "");
   expect(fake.current().openProjectId).toBeNull();
+});
+
+test("the open project closes when the main frame fails to load, but not on an aborted load or in a subframe", () => {
+  const fake = fakeService();
+  const page = fakeWindow();
+  closeProjectWithPage(page.window, fake.service);
+
+  failLoad(page, NAVIGATION_ABORTED, true);
+  failLoad(page, -2, false);
+  failLoad(page, NAVIGATION_ABORTED, false);
+  expect(NAVIGATION_ABORTED).toBe(-3);
+  expect(fake.calls).toEqual([]);
+  expect(fake.current().openProjectId).toBe(PROJECT_ID);
+
+  failLoad(page, -2, true);
+  expect(fake.calls).toEqual([{ method: "openProject", args: [null] }]);
+  expect(fake.current().openProjectId).toBeNull();
+  expect(fake.current().selectedWorkspaceId).toBe(WORKSPACE_ID);
 });
 
 test("the open project closes when the render process is gone, and the selection stays", () => {
@@ -582,7 +799,7 @@ test("the open project closes when the render process is gone, and the selection
   const page = fakeWindow();
   closeProjectWithPage(page.window, fake.service);
 
-  page.fire("render-process-gone");
+  page.fire("render-process-gone", ELECTRON_EVENT, { reason: "crashed" });
   expect(fake.calls).toEqual([{ method: "openProject", args: [null] }]);
   expect(fake.current().openProjectId).toBeNull();
   expect(fake.current().selectedWorkspaceId).toBe(WORKSPACE_ID);

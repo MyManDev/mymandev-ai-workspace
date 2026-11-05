@@ -848,13 +848,24 @@ export const WorkspaceViewSchema = z.discriminatedUnion("status", [
 export type WorkspaceView = z.infer<typeof WorkspaceViewSchema>;
 
 /**
- * The result of selecting a workspace or opening a project: `ok`, or
- * `refused` for a workspace that the list does not hold, a project that the
- * selected workspace does not hold, or no signed-in device.
+ * Why a workspace action was refused: `not_found` for a workspace that the
+ * list does not hold, a project that the selected workspace does not hold,
+ * or no signed-in device, and `too_soon` for a switch to another workspace
+ * beyond the budget of switches in the main process.
  */
+export const WORKSPACE_ACTION_REFUSALS = Object.freeze([
+  "not_found",
+  "too_soon",
+] as const);
+export type WorkspaceActionRefusal = (typeof WORKSPACE_ACTION_REFUSALS)[number];
+
+/** The result of selecting a workspace or opening a project. */
 export const WorkspaceActionResultSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("ok") }),
-  z.object({ outcome: z.literal("refused") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(WORKSPACE_ACTION_REFUSALS),
+  }),
 ]);
 export type WorkspaceActionResult = z.infer<typeof WorkspaceActionResultSchema>;
 

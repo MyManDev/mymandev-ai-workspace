@@ -199,8 +199,9 @@ function start(): void {
     );
     mainWindow = window;
     window.once("ready-to-show", () => window.show());
-    // The open project closes with the page that opened it: on a reload, a
-    // crash of the render process, and when the window closes.
+    // The open project closes with the page that opened it: when a new
+    // document commits, also on a reload, when the page fails to load, when
+    // the render process is gone, and when the window closes.
     closeProjectWithPage(window, workspaces);
     window.on("closed", () => {
       mainWindow = undefined;

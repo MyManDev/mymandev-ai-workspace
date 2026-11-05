@@ -644,11 +644,11 @@ test("openProject passes only the project ID string or null on", async () => {
 
   const answers = [openProject(PROJECT_ID, "extra"), openProject(null, 1)];
   fake.answers[0]?.resolve({ outcome: "ok" });
-  fake.answers[1]?.resolve({ outcome: "refused" });
+  fake.answers[1]?.resolve({ outcome: "refused", reason: "not_found" });
 
   await expect(Promise.all(answers)).resolves.toEqual([
     { outcome: "ok" },
-    { outcome: "refused" },
+    { outcome: "refused", reason: "not_found" },
   ]);
   expect(fake.invoked).toEqual([
     { channel: INVOKE_CHANNELS.openProject, args: [PROJECT_ID] },

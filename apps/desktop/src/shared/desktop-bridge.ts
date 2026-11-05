@@ -188,15 +188,20 @@ export interface WorkspaceBridge {
   ) => () => void;
   /**
    * Selects a workspace of the list; the open project closes. Resolves to
-   * `refused` for a workspace that the list does not hold. The main process
-   * accepts only a lowercase UUIDv7.
+   * `refused` with `not_found` for a workspace that the list does not hold,
+   * and with `too_soon` beyond the main process's budget of switches to
+   * another workspace (`WORKSPACE_SWITCH_BUDGET` per minute); selecting the
+   * selected workspace is not counted. The main process accepts only a
+   * lowercase UUIDv7.
    */
   readonly select: (workspaceId: string) => Promise<WorkspaceActionResult>;
   /**
    * Opens a project of the selected workspace, or closes the open one with
-   * null. Resolves to `refused` for a project that the selected workspace
-   * does not hold. The main process closes the open project itself when the
-   * page reloads or the window closes.
+   * null. Resolves to `refused` with `not_found` for a project that the
+   * selected workspace does not hold. The main process closes the open
+   * project itself when a new page commits, also on a reload, when the page
+   * fails to load, when the render process is gone, and when the window
+   * closes.
    */
   readonly openProject: (
     projectId: string | null,
