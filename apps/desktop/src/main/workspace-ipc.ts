@@ -93,7 +93,7 @@ export interface WorkspaceActions {
 export function createWorkspaceActions(
   service: Pick<
     WorkspaceService,
-    "select" | "openProject" | "selectedWorkspaceId"
+    "state" | "select" | "openProject" | "selectedWorkspaceId"
   >,
   now: () => number = () => performance.now(),
 ): WorkspaceActions {
@@ -108,6 +108,14 @@ export function createWorkspaceActions(
       }
       if (workspaceId.data === service.selectedWorkspaceId()) {
         return service.select(workspaceId.data) ? OK : NOT_FOUND;
+      }
+      // A workspace that the list does not hold is refused as not found
+      // before the budget, which counts switches only.
+      const listed = service
+        .state()
+        .workspaces.some((workspace) => workspace.id === workspaceId.data);
+      if (!listed) {
+        return NOT_FOUND;
       }
       const at = now();
       while (
@@ -238,8 +246,9 @@ export interface WorkspacePageWindow {
  * Closes the open project when the page that may have opened it is gone: a
  * new document commits in the main frame (`did-navigate`, also on a
  * reload), a load of the main frame fails other than by being aborted
- * (`did-fail-load`; an aborted or blocked navigation leaves the page, so
- * it changes nothing), the render process is gone, or the window closes. A
+ * (`did-fail-load`; a load aborted after the commit, such as by
+ * `window.stop()`, leaves the page, and a blocked navigation never reaches
+ * this event), the render process is gone, or the window closes. A
  * project then never stays open in the main process without a screen that
  * shows it. The start of a load alone changes nothing, because a dropped
  * file or a blocked link starts one that is then cancelled. The workspace

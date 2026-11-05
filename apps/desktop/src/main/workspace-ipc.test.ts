@@ -387,11 +387,11 @@ test("select and open pass a valid ID to the service and answer ok or refused", 
   expect(call(INVOKE_CHANNELS.selectWorkspace, OTHER_WORKSPACE_ID)).toEqual({
     outcome: "ok",
   });
-  expect(fake.calls).toEqual([
+  // A workspace that the list does not hold never reaches `select`.
+  expect(fake.calls.filter(({ method }) => method !== "state")).toEqual([
     { method: "openProject", args: [null] },
     { method: "openProject", args: [PROJECT_ID] },
     { method: "openProject", args: [unknown] },
-    { method: "select", args: [unknown] },
     { method: "select", args: [OTHER_WORKSPACE_ID] },
   ]);
   expect(fake.current().selectedWorkspaceId).toBe(OTHER_WORKSPACE_ID);
@@ -659,6 +659,14 @@ test("a loop of alternating selects reaches the connection only within the budge
   expect(service.selectedWorkspaceId()).toBe(other);
   expect(subscribed).toHaveLength(2 + WORKSPACE_SWITCH_BUDGET);
   expect(call(INVOKE_CHANNELS.selectWorkspace, selected)).toEqual(TOO_SOON);
+  // With the budget used up, a workspace that the list does not hold is
+  // still refused as not found.
+  expect(
+    call(
+      INVOKE_CHANNELS.selectWorkspace,
+      "019a5b2c-3d4e-7f62-8a1b-2c3d4e5f6a7b",
+    ),
+  ).toEqual(NOT_FOUND);
   service.close();
 });
 
