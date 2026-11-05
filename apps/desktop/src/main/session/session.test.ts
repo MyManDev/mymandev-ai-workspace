@@ -23,6 +23,10 @@ import {
 } from "@mymandev/protocol";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import {
+  type KeyFileSystem,
+  nodeKeyFileSystem,
+} from "../device-key/atomic-file.ts";
+import {
   createDeviceKeyStore,
   CURRENT_KEY_FILE,
   type DeviceKeyStore,
@@ -132,6 +136,26 @@ const fakeSafeStorage: SystemKeyProtection = Object.freeze({
       shouldReEncrypt: false,
       result: encrypted.toString("utf8").slice("fake:".length),
     }),
+});
+
+/**
+ * The real file system without the flush to the disk. Every file is still
+ * written to a temporary file, renamed, and read back from the folder, so a
+ * restart reads what the session wrote. Only the wait for the disk is left
+ * out: it guards against a power loss, which no test here can see, and
+ * `atomic-file.test.ts` tests it. On a busy machine one flush can wait for
+ * the disk for a long time, and a test here makes up to about ten of them.
+ */
+const unflushedFileSystem: KeyFileSystem = Object.freeze({
+  ...nodeKeyFileSystem,
+  open: async (file: string, flags: string, mode?: number) => {
+    const handle = await nodeKeyFileSystem.open(file, flags, mode);
+    return {
+      writeFile: (data: Uint8Array) => handle.writeFile(data),
+      sync: () => Promise.resolve(),
+      close: () => handle.close(),
+    };
+  },
 });
 
 function json(status: number, body: unknown): Response {
@@ -357,9 +381,18 @@ function harness(
     folder,
     platform: "win32",
     systemProtection: fakeSafeStorage,
+    fileSystem: unflushedFileSystem,
   });
-  const records = createDeviceRecordStore({ folder, platform: "win32" });
-  const markers = createSignOutMarkerStore({ folder, platform: "win32" });
+  const records = createDeviceRecordStore({
+    folder,
+    platform: "win32",
+    fileSystem: unflushedFileSystem,
+  });
+  const markers = createSignOutMarkerStore({
+    folder,
+    platform: "win32",
+    fileSystem: unflushedFileSystem,
+  });
   const timers: Harness["timers"] = [];
   const scheduleTimer: ScheduleTimer = (callback, delayMs) => {
     const timer = { delayMs, callback };
@@ -420,7 +453,11 @@ function harness(
     keyStore: loggedKeyStore,
     deviceRecords: loggedRecords,
     signOutMarkers: markers,
-    sessionNotes: createSessionNotesStore({ folder, platform: "win32" }),
+    sessionNotes: createSessionNotesStore({
+      folder,
+      platform: "win32",
+      fileSystem: unflushedFileSystem,
+    }),
     fetch: apiFetch(api),
     scheduleTimer,
     now: () => h.clock.now,
@@ -1018,6 +1055,7 @@ describe("a pending key replacement", () => {
       registrationMarkers: createRegistrationMarkerStore({
         folder,
         platform: "win32",
+        fileSystem: unflushedFileSystem,
       }),
       openExternal: (url) => {
         opened.push(url);
