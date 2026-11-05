@@ -1,0 +1,886 @@
+// The workspace service (#27, #28): the account's workspaces, the selected
+// workspace with its people and projects, and the open project, in the main
+// process. It reads them over HTTP with the account service's
+// `readWorkspaceData` and keeps them current with the workspace's events.
+// Read-only: creating workspaces and projects stays with #95.
+//
+// - The list (`GET /workspaces`) loads whenever a signed-in device's
+//   connection reaches `connected`, because account frames sent while it was
+//   offline are lost. One load at a time; a trigger during a load makes its
+//   answer stale and loads again. A failed load is retried with a backoff.
+// - The selection is kept in memory only. It defaults to the first workspace
+//   of the list, the most recently claimed (decided on #27 on 2026-11-05).
+//   Only the selected workspace is subscribed.
+// - After each `workspace.subscribed` of the selected workspace, its view and
+//   its projects are reloaded through the service's own resync gate, and
+//   the events that arrived meanwhile are applied after the reload.
+// - When the membership ends or the subscription is refused, the
+//   subscription is dropped from the connection client, which would
+//   otherwise send it again after every `auth.ok`, the list is reloaded, and
+//   the first remaining workspace is selected.
+//
+// Presence frames are ignored: no issue owns showing presence yet. Nothing
+// secret, no user ID, and no name reaches the state or a log; the logs are
+// fixed text with a failure code at most.
+import type {
+  MemberId,
+  ProjectId,
+  ProjectListResponse,
+  ReceivedServerEvent,
+  WorkspaceId,
+  WorkspaceListResponse,
+  WorkspaceViewResponse,
+} from "@mymandev/protocol";
+import type { AccountStatus } from "../../shared/ipc-contract.ts";
+import type { AccountService } from "../account.ts";
+import type {
+  WorkspaceReadFailure,
+  WorkspaceReadResult,
+} from "../api-reads.ts";
+import type { ConnectionClient, ServerMessage } from "../connection/client.ts";
+import type { ScheduleTimer } from "../runtime.ts";
+import { createResyncGate } from "./resync.ts";
+
+/** The first delay after a failed load; it doubles with each failure. */
+export const WORKSPACE_RETRY_BASE_MS = 2_000;
+/** The longest delay after a failed load. */
+export const WORKSPACE_RETRY_MAX_MS = 60_000;
+/**
+ * The delay after `rate_limited`. The reads do not read `Retry-After`, so
+ * the wait is fixed (the API reads, decided on 2026-11-05).
+ */
+export const RATE_LIMITED_RETRY_MS = 60_000;
+
+/** The name shown for a person that the selected workspace does not hold. */
+export const UNKNOWN_MEMBER_NAME = "Unknown person";
+
+/**
+ * The delay before the retry after `attempt` failures in a row (from 0):
+ * `RATE_LIMITED_RETRY_MS` after `rate_limited`, otherwise
+ * min(`WORKSPACE_RETRY_MAX_MS`, `WORKSPACE_RETRY_BASE_MS` x 2^attempt).
+ */
+export function workspaceRetryDelayMs(
+  attempt: number,
+  reason: WorkspaceReadFailure,
+): number {
+  if (reason === "rate_limited") {
+    return RATE_LIMITED_RETRY_MS;
+  }
+  return Math.min(
+    WORKSPACE_RETRY_MAX_MS,
+    WORKSPACE_RETRY_BASE_MS * 2 ** Math.min(attempt, 30),
+  );
+}
+
+/**
+ * - `signed_out`: no signed-in device with a ready key; the state is empty.
+ * - `loading`: the list, or the selected workspace's people and projects,
+ *   have not loaded yet for this device.
+ * - `ready`: the list loaded, and so did the selected workspace, if any.
+ *   It stays `ready` during later reloads, which `gateLive` reports.
+ * - `unavailable`: the last load of the list or of the selected workspace
+ *   failed; a retry waits, or, after a failure while offline, the next
+ *   connection loads again. `problem` holds the failure. What was loaded
+ *   before stays.
+ */
+export type WorkspaceServiceStatus =
+  "signed_out" | "loading" | "ready" | "unavailable";
+
+export interface WorkspaceSummary {
+  readonly id: WorkspaceId;
+  readonly name: string;
+}
+
+export interface ProjectSummary {
+  readonly id: ProjectId;
+  readonly name: string;
+  readonly createdByMemberId: MemberId;
+}
+
+/** The service's state. Every value is frozen. */
+export interface WorkspaceState {
+  /**
+   * Grows by one with every change, also when only `gateLive` or
+   * `memberName` would answer differently.
+   */
+  readonly revision: number;
+  readonly status: WorkspaceServiceStatus;
+  /** Only with `unavailable`. */
+  readonly problem?: WorkspaceReadFailure;
+  /** In the server's order, the most recently claimed first. */
+  readonly workspaces: readonly WorkspaceSummary[];
+  readonly selectedWorkspaceId: WorkspaceId | null;
+  /** The selected workspace's projects, the oldest first. */
+  readonly projects: readonly ProjectSummary[];
+  readonly openProjectId: ProjectId | null;
+}
+
+/** The part of the account service that the workspace service uses. */
+export type WorkspaceAccount = Pick<
+  AccountService,
+  "status" | "onStatusChange" | "readWorkspaceData"
+>;
+
+/** The part of the connection client that the workspace service uses. */
+export type WorkspaceConnection = Pick<
+  ConnectionClient,
+  | "status"
+  | "onStatusChange"
+  | "onMessage"
+  | "subscribeWorkspace"
+  | "unsubscribeWorkspace"
+>;
+
+export interface WorkspaceServiceOptions {
+  readonly account: WorkspaceAccount;
+  readonly connection: WorkspaceConnection;
+  /** Defaults to `setTimeout`. */
+  readonly scheduleTimer?: ScheduleTimer;
+  /**
+   * Receives fixed messages with a failure code at most, never a name or an
+   * ID. An error that it throws is ignored.
+   */
+  readonly log?: (message: string) => void;
+}
+
+export interface WorkspaceService {
+  /** The current state. */
+  readonly state: () => WorkspaceState;
+  /** Calls `listener` after every change. The result removes the listener. */
+  readonly onChange: (listener: (state: WorkspaceState) => void) => () => void;
+  /**
+   * Selects a workspace of the list and subscribes to it instead of the
+   * previous one; the open project closes. False for a workspace that the
+   * list does not hold. Selecting the selected workspace changes nothing.
+   */
+  readonly select: (workspaceId: WorkspaceId) => boolean;
+  /**
+   * Opens a project of the selected workspace, or closes the open one with
+   * null. False for a project that the selected workspace does not hold.
+   */
+  readonly openProject: (projectId: ProjectId | null) => boolean;
+  /**
+   * The display name of a person of the selected workspace, also of a former
+   * member, for a chat message's author; `UNKNOWN_MEMBER_NAME` for a person
+   * that it does not hold.
+   */
+  readonly memberName: (memberId: MemberId) => string;
+  /**
+   * Whether `workspaceId` is the selected workspace, subscribed, and
+   * reloaded since its last `workspace.subscribed`, with no reload open. The
+   * chat and agent services and the development switch send events for a
+   * workspace only while this holds.
+   */
+  readonly gateLive: (workspaceId: WorkspaceId) => boolean;
+  /** The selected workspace, or null. */
+  readonly selectedWorkspaceId: () => WorkspaceId | null;
+  /** Stops listening and cancels the timers, for the quit. */
+  readonly close: () => void;
+}
+
+const WORKSPACE_EVENT_TYPES = Object.freeze([
+  "workspace.member.defined",
+  "workspace.member.claimed",
+  "workspace.member.renamed",
+  "workspace.member.removed",
+  "workspace.member.role_changed",
+  "workspace.ownership.transferred",
+  "workspace.project.created",
+  "workspace.project.renamed",
+] as const);
+type WorkspaceEventType = (typeof WORKSPACE_EVENT_TYPES)[number];
+const workspaceEventTypes: ReadonlySet<string> = new Set(WORKSPACE_EVENT_TYPES);
+
+/** The events that this service applies. */
+export type WorkspaceEvent = Extract<
+  ReceivedServerEvent,
+  { type: WorkspaceEventType }
+>;
+
+function isWorkspaceEvent(event: ReceivedServerEvent): event is WorkspaceEvent {
+  return workspaceEventTypes.has(event.type);
+}
+
+function projectSummary(project: {
+  readonly id: ProjectId;
+  readonly name: string;
+  readonly createdByMemberId: MemberId;
+}): ProjectSummary {
+  return Object.freeze({
+    id: project.id,
+    name: project.name,
+    createdByMemberId: project.createdByMemberId,
+  });
+}
+
+/**
+ * The signed-in device, or null: the same condition under which the
+ * connection client connects. The device ID is kept only to notice a change
+ * of the device; it never reaches the state or a log.
+ */
+function signedInDevice(status: AccountStatus): string | null {
+  if (
+    status.apiOrigin === "set" &&
+    status.device === "signed_in" &&
+    status.deviceKey === "ready" &&
+    status.account.kind === "signed_in"
+  ) {
+    return status.account.deviceId;
+  }
+  return null;
+}
+
+function scheduleWithSetTimeout(
+  callback: () => void,
+  delayMs: number,
+): () => void {
+  const handle = setTimeout(callback, delayMs);
+  return () => clearTimeout(handle);
+}
+
+const NO_WORKSPACES: readonly WorkspaceSummary[] = Object.freeze([]);
+const NO_PROJECTS: readonly ProjectSummary[] = Object.freeze([]);
+
+export function createWorkspaceService(
+  options: WorkspaceServiceOptions,
+): WorkspaceService {
+  const { account, connection } = options;
+  const schedule = options.scheduleTimer ?? scheduleWithSetTimeout;
+
+  function log(message: string): void {
+    try {
+      options.log?.(message);
+    } catch {
+      // A failing log changes nothing.
+    }
+  }
+
+  let closed = false;
+  /** The signed-in device, compared only; see `signedInDevice`. */
+  let device: string | null = null;
+  /** Changes with every reset, so that an answer for an earlier device is dropped. */
+  let epoch = 0;
+  let connected = false;
+
+  let workspaces = NO_WORKSPACES;
+  let listLoaded = false;
+  let listProblem: WorkspaceReadFailure | null = null;
+  let listInFlight = false;
+  /** A trigger arrived during the load: its answer is stale. */
+  let listAgain = false;
+  let listAttempt = 0;
+  let cancelListRetry: (() => void) | null = null;
+  /**
+   * Workspaces that refused the subscription. They are never selected by
+   * default, so that a list that still holds one does not subscribe to it
+   * again and again; the person can still select it. A list without one
+   * drops it, so that a later listing, a new membership, counts again.
+   */
+  const refused = new Set<WorkspaceId>();
+
+  let selected: WorkspaceId | null = null;
+  const gate = createResyncGate<WorkspaceEvent>({
+    sizeOf: (event) => Buffer.byteLength(JSON.stringify(event), "utf8"),
+  });
+  let viewLoaded = false;
+  let viewProblem: WorkspaceReadFailure | null = null;
+  let viewAttempt = 0;
+  let cancelViewRetry: (() => void) | null = null;
+  /**
+   * The display name of each person of the selected workspace, former
+   * members included: all that `memberName` needs. Never the user ID, the
+   * identity, the role, or the removal time.
+   */
+  let members = new Map<MemberId, string>();
+  let projects = NO_PROJECTS;
+  let openProjectId: ProjectId | null = null;
+
+  let revision = 0;
+  let dirty = false;
+  let current = buildState();
+  const listeners = new Set<(state: WorkspaceState) => void>();
+
+  function buildState(): WorkspaceState {
+    const base = {
+      revision,
+      workspaces,
+      selectedWorkspaceId: selected,
+      projects,
+      openProjectId,
+    };
+    if (device === null) {
+      return Object.freeze({ ...base, status: "signed_out" });
+    }
+    const problem = listProblem ?? viewProblem;
+    if (problem !== null) {
+      return Object.freeze({ ...base, status: "unavailable", problem });
+    }
+    const loading = !listLoaded || (selected !== null && !viewLoaded);
+    return Object.freeze({ ...base, status: loading ? "loading" : "ready" });
+  }
+
+  function touch(): void {
+    dirty = true;
+  }
+
+  function flush(): void {
+    if (!dirty || closed) {
+      return;
+    }
+    dirty = false;
+    revision += 1;
+    const state = buildState();
+    current = state;
+    for (const listener of [...listeners]) {
+      // A listener that changed the state again has notified everyone of
+      // the newer state already.
+      if (current !== state) {
+        return;
+      }
+      try {
+        listener(state);
+      } catch {
+        log("A workspace state listener failed.");
+      }
+    }
+  }
+
+  /** Runs one entry point and then publishes what it changed. */
+  function run<T>(action: () => T): T {
+    try {
+      return action();
+    } finally {
+      flush();
+    }
+  }
+
+  function stopListRetry(): void {
+    cancelListRetry?.();
+    cancelListRetry = null;
+  }
+
+  function stopViewRetry(): void {
+    cancelViewRetry?.();
+    cancelViewRetry = null;
+  }
+
+  function endSubscription(): void {
+    gate.end();
+    stopViewRetry();
+    touch();
+  }
+
+  /** Forgets everything: a sign-out, or another device. */
+  function reset(): void {
+    epoch += 1;
+    stopListRetry();
+    stopViewRetry();
+    if (selected !== null) {
+      connection.unsubscribeWorkspace(selected);
+    }
+    gate.end();
+    workspaces = NO_WORKSPACES;
+    listLoaded = false;
+    listProblem = null;
+    listInFlight = false;
+    listAgain = false;
+    listAttempt = 0;
+    refused.clear();
+    selected = null;
+    clearWorkspaceData();
+    touch();
+  }
+
+  function clearWorkspaceData(): void {
+    viewLoaded = false;
+    viewProblem = null;
+    viewAttempt = 0;
+    members = new Map();
+    projects = NO_PROJECTS;
+    openProjectId = null;
+  }
+
+  function listed(workspaceId: WorkspaceId): boolean {
+    return workspaces.some((workspace) => workspace.id === workspaceId);
+  }
+
+  function defaultWorkspace(): WorkspaceId | null {
+    return (
+      workspaces.find((workspace) => !refused.has(workspace.id))?.id ?? null
+    );
+  }
+
+  /** Subscribes to `workspaceId` instead of the selected workspace. */
+  function selectWorkspace(workspaceId: WorkspaceId | null): void {
+    if (workspaceId === selected) {
+      return;
+    }
+    if (selected !== null) {
+      connection.unsubscribeWorkspace(selected);
+    }
+    gate.end();
+    stopViewRetry();
+    clearWorkspaceData();
+    selected = workspaceId;
+    if (workspaceId !== null) {
+      // Sent at once while connected, otherwise after the next `auth.ok`.
+      connection.subscribeWorkspace(workspaceId);
+    }
+    touch();
+  }
+
+  // The list.
+
+  function loadList(): void {
+    if (closed || device === null) {
+      return;
+    }
+    stopListRetry();
+    if (listInFlight) {
+      listAgain = true;
+      return;
+    }
+    listInFlight = true;
+    const at = epoch;
+    account.readWorkspaceData("listWorkspaces", {}).then(
+      (result) => run(() => listAnswered(at, result)),
+      () => run(() => listAnswered(at, { ok: false, reason: "unavailable" })),
+    );
+  }
+
+  function listAnswered(
+    at: number,
+    result: WorkspaceReadResult<WorkspaceListResponse>,
+  ): void {
+    if (closed || at !== epoch) {
+      return;
+    }
+    listInFlight = false;
+    if (listAgain) {
+      listAgain = false;
+      loadList();
+      return;
+    }
+    if (!result.ok) {
+      listProblem = result.reason;
+      touch();
+      log(`The workspace list did not load (${result.reason}).`);
+      const delay = workspaceRetryDelayMs(listAttempt, result.reason);
+      listAttempt += 1;
+      if (connected) {
+        // Offline, the next `connected` loads anyway.
+        cancelListRetry = schedule(() => {
+          run(() => {
+            cancelListRetry = null;
+            loadList();
+          });
+        }, delay);
+      }
+      return;
+    }
+    listAttempt = 0;
+    listProblem = null;
+    listLoaded = true;
+    workspaces = Object.freeze(
+      result.value.workspaces.map(({ workspace }) =>
+        Object.freeze({ id: workspace.id, name: workspace.name }),
+      ),
+    );
+    // A refused workspace that the list no longer holds is forgotten, so
+    // that a later listing, a new membership, is selected by default again.
+    // One that the list still holds stays refused, so that it is not
+    // subscribed to in a loop.
+    for (const workspaceId of [...refused]) {
+      if (!listed(workspaceId)) {
+        refused.delete(workspaceId);
+      }
+    }
+    touch();
+    if (selected === null || !listed(selected)) {
+      selectWorkspace(defaultWorkspace());
+    }
+  }
+
+  // The selected workspace's people and projects.
+
+  function startReload(generation: number): void {
+    const workspaceId = selected;
+    if (workspaceId === null) {
+      return;
+    }
+    stopViewRetry();
+    touch();
+    const at = epoch;
+    Promise.all([
+      account.readWorkspaceData("getWorkspace", { workspaceId }),
+      account.readWorkspaceData("listProjects", { workspaceId }),
+    ]).then(
+      ([view, list]) =>
+        run(() => reloadAnswered(at, workspaceId, generation, view, list)),
+      () =>
+        run(() =>
+          reloadAnswered(
+            at,
+            workspaceId,
+            generation,
+            { ok: false, reason: "unavailable" },
+            { ok: false, reason: "unavailable" },
+          ),
+        ),
+    );
+  }
+
+  function reloadAnswered(
+    at: number,
+    workspaceId: WorkspaceId,
+    generation: number,
+    view: WorkspaceReadResult<WorkspaceViewResponse>,
+    list: WorkspaceReadResult<ProjectListResponse>,
+  ): void {
+    if (closed || at !== epoch || workspaceId !== selected) {
+      return;
+    }
+    if (
+      !view.ok ||
+      !list.ok ||
+      view.value.workspace.id !== workspaceId ||
+      list.value.projects.some((project) => project.workspaceId !== workspaceId)
+    ) {
+      const reason = !view.ok ? view.reason : !list.ok ? list.reason : "failed";
+      if (!gate.reloadFailed(generation)) {
+        return;
+      }
+      viewProblem = reason;
+      touch();
+      log(`The selected workspace did not load (${reason}).`);
+      if (reason === "not_found") {
+        // Most likely the membership ended; the list tells.
+        loadList();
+      }
+      scheduleReload(workspaceRetryDelayMs(viewAttempt, reason));
+      viewAttempt += 1;
+      return;
+    }
+    const events = gate.reloaded(generation);
+    if (events === null) {
+      return;
+    }
+    members = new Map(
+      view.value.members.map((member) => [member.id, member.displayName]),
+    );
+    projects = Object.freeze(list.value.projects.map(projectSummary));
+    for (const event of events) {
+      // The reload is newer than an event that it already holds, and an
+      // event that names something unknown here cannot be resolved by
+      // another reload, so it is skipped.
+      applyEvent(event);
+    }
+    viewLoaded = true;
+    viewProblem = null;
+    viewAttempt = 0;
+    closeVanishedProject();
+    touch();
+  }
+
+  /** Begins a reload after `delayMs`, unless the workspace changed. */
+  function scheduleReload(delayMs: number): void {
+    stopViewRetry();
+    const workspaceId = selected;
+    cancelViewRetry = schedule(() => {
+      run(() => {
+        cancelViewRetry = null;
+        const state = gate.state();
+        if (
+          workspaceId === selected &&
+          (state === "failed" || state === "overflowed")
+        ) {
+          startReload(gate.begin("all").generation);
+        }
+      });
+    }, delayMs);
+  }
+
+  function closeVanishedProject(): void {
+    if (
+      openProjectId !== null &&
+      !projects.some((project) => project.id === openProjectId)
+    ) {
+      openProjectId = null;
+    }
+  }
+
+  // The events.
+
+  /**
+   * Applies one event. Every event sets the state that it reports, so
+   * applying one again changes nothing. False when it names a person or a
+   * project that the workspace does not hold. A removal, a role change, and
+   * an ownership transfer change nothing that the service keeps: a former
+   * member keeps their name.
+   */
+  /** Keeps a person's name, and touches the state only when it changes. */
+  function setMemberName(memberId: MemberId, displayName: string): void {
+    if (members.get(memberId) !== displayName) {
+      members.set(memberId, displayName);
+      touch();
+    }
+  }
+
+  function applyEvent(event: WorkspaceEvent): boolean {
+    switch (event.type) {
+      case "workspace.member.defined":
+      case "workspace.member.claimed":
+        setMemberName(
+          event.payload.member.id,
+          event.payload.member.displayName,
+        );
+        return true;
+      case "workspace.member.renamed":
+        if (!members.has(event.payload.memberId)) {
+          return false;
+        }
+        setMemberName(event.payload.memberId, event.payload.displayName);
+        return true;
+      case "workspace.member.removed":
+      case "workspace.member.role_changed":
+        return members.has(event.payload.memberId);
+      case "workspace.ownership.transferred":
+        return (
+          members.has(event.payload.previousOwnerMemberId) &&
+          members.has(event.payload.ownerMemberId)
+        );
+      case "workspace.project.created": {
+        const project = projectSummary(event.payload.project);
+        const held = projects.find((entry) => entry.id === project.id);
+        if (
+          held?.name === project.name &&
+          held.createdByMemberId === project.createdByMemberId
+        ) {
+          return true;
+        }
+        touch();
+        projects = Object.freeze(
+          projects.some((held) => held.id === project.id)
+            ? projects.map((held) => (held.id === project.id ? project : held))
+            : [...projects, project],
+        );
+        return true;
+      }
+      case "workspace.project.renamed": {
+        const { projectId, name } = event.payload;
+        const held = projects.find((entry) => entry.id === projectId);
+        if (held === undefined) {
+          return false;
+        }
+        if (held.name === name) {
+          return true;
+        }
+        projects = Object.freeze(
+          projects.map((held) =>
+            held.id === projectId ? Object.freeze({ ...held, name }) : held,
+          ),
+        );
+        touch();
+        return true;
+      }
+    }
+  }
+
+  function eventReceived(event: ReceivedServerEvent): void {
+    if (!isWorkspaceEvent(event) || event.workspaceId !== selected) {
+      return;
+    }
+    switch (gate.push(event)) {
+      case "apply":
+        if (!applyEvent(event)) {
+          // Something was missed: the workspace reloads.
+          startReload(gate.begin("all").generation);
+        }
+        return;
+      case "overflowed":
+        log("Too many workspace events waited; the workspace reloads.");
+        scheduleReload(workspaceRetryDelayMs(viewAttempt, "unavailable"));
+        viewAttempt += 1;
+        return;
+      case "buffered":
+      case "dropped":
+      case "ignored":
+        return;
+    }
+  }
+
+  // The frames.
+
+  /**
+   * The membership ended or the subscription was refused: the subscription
+   * leaves the connection client's set, so that it is not sent again after
+   * the next `auth.ok`. For the selected workspace, the first remaining one
+   * is selected. The list then reloads.
+   */
+  function membershipLost(workspaceId: WorkspaceId): void {
+    connection.unsubscribeWorkspace(workspaceId);
+    if (listed(workspaceId)) {
+      workspaces = Object.freeze(
+        workspaces.filter((workspace) => workspace.id !== workspaceId),
+      );
+      touch();
+    }
+    if (workspaceId === selected) {
+      selectWorkspace(defaultWorkspace());
+    }
+    loadList();
+  }
+
+  function messageReceived(message: ServerMessage): void {
+    if (device === null) {
+      return;
+    }
+    if (message.kind === "event") {
+      eventReceived(message.event);
+      return;
+    }
+    const frame = message.frame;
+    switch (frame.type) {
+      case "workspace.subscribed":
+        // `onlineMemberIds` is presence, which this service ignores.
+        if (frame.workspaceId === selected) {
+          startReload(gate.subscribed());
+        }
+        return;
+      case "workspace.subscribe_refused":
+        if (frame.workspaceId === selected) {
+          log(`The workspace subscription was refused (${frame.code}).`);
+          refused.add(frame.workspaceId);
+          membershipLost(frame.workspaceId);
+        } else {
+          // A late answer for an earlier selection.
+          connection.unsubscribeWorkspace(frame.workspaceId);
+        }
+        return;
+      case "workspace.unsubscribed":
+        if (frame.reason === "membership_ended") {
+          membershipLost(frame.workspaceId);
+        } else if (frame.workspaceId === selected) {
+          // The answer to an earlier unsubscribe of a workspace that was
+          // selected again; its `workspace.subscribed` follows.
+          endSubscription();
+        }
+        return;
+      case "account.removed_from_workspace":
+        membershipLost(frame.workspaceId);
+        return;
+      case "account.join_request_decided":
+        if (frame.decision === "approved") {
+          refused.delete(frame.workspaceId);
+          loadList();
+        }
+        return;
+      default:
+        // Presence (no issue owns it yet), event refusals (the chat and
+        // agent services), and the other account frames.
+        return;
+    }
+  }
+
+  // The account and the connection.
+
+  function accountChanged(status: AccountStatus): void {
+    const next = signedInDevice(status);
+    if (next === device) {
+      return;
+    }
+    if (device !== null) {
+      reset();
+    }
+    device = next;
+    touch();
+    if (device !== null && connected) {
+      loadList();
+    }
+  }
+
+  function connectionChanged(state: string): void {
+    const now = state === "connected";
+    if (now === connected) {
+      return;
+    }
+    connected = now;
+    if (!now) {
+      // A lost connection ends the subscription; the next
+      // `workspace.subscribed` reloads.
+      stopListRetry();
+      endSubscription();
+      return;
+    }
+    // Account frames sent while offline are lost: the list reloads.
+    loadList();
+  }
+
+  const removers = [
+    account.onStatusChange((status) => run(() => accountChanged(status))),
+    connection.onStatusChange((status) =>
+      run(() => connectionChanged(status.state)),
+    ),
+    connection.onMessage((message) => run(() => messageReceived(message))),
+  ];
+  accountChanged(account.status());
+  connectionChanged(connection.status().state);
+  // The first state is revision 0.
+  current = buildState();
+  dirty = false;
+
+  return Object.freeze({
+    state: () => current,
+    onChange: (listener: (state: WorkspaceState) => void) => {
+      const entry = (state: WorkspaceState) => listener(state);
+      listeners.add(entry);
+      return () => {
+        listeners.delete(entry);
+      };
+    },
+    select: (workspaceId: WorkspaceId) =>
+      run(() => {
+        if (closed || device === null || !listed(workspaceId)) {
+          return false;
+        }
+        refused.delete(workspaceId);
+        selectWorkspace(workspaceId);
+        return true;
+      }),
+    openProject: (projectId: ProjectId | null) =>
+      run(() => {
+        if (closed || device === null) {
+          return false;
+        }
+        if (
+          projectId !== null &&
+          !projects.some((project) => project.id === projectId)
+        ) {
+          return false;
+        }
+        if (projectId !== openProjectId) {
+          openProjectId = projectId;
+          touch();
+        }
+        return true;
+      }),
+    memberName: (memberId: MemberId) =>
+      members.get(memberId) ?? UNKNOWN_MEMBER_NAME,
+    gateLive: (workspaceId: WorkspaceId) =>
+      !closed && workspaceId === selected && gate.state() === "live",
+    selectedWorkspaceId: () => selected,
+    close: () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      for (const remove of removers) {
+        remove();
+      }
+      listeners.clear();
+      stopListRetry();
+      stopViewRetry();
+      gate.end();
+    },
+  });
+}

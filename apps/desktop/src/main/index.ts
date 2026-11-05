@@ -46,6 +46,7 @@ import {
 import { createLocalRuntime } from "./runtime.ts";
 import { stopRuntimeOnQuit } from "./runtime-lifecycle.ts";
 import { createMainWindowOptions } from "./window.ts";
+import { createWorkspaceService } from "./workspace/service.ts";
 
 // The data folder is set first, before anything reads it, and the
 // single-instance lock is then taken in it (data-folder.ts). ADR 0014: the
@@ -169,6 +170,18 @@ function start(): void {
   });
   registerConnectionIpc(ipcMain, rendererUrl, connection);
   app.on("will-quit", () => connection.close());
+
+  // The account's workspaces and the selected one's people and projects
+  // (#27, #28), read over HTTP and kept current with the workspace's events.
+  // It subscribes to the selected workspace only. It has no IPC yet; the
+  // chat and agent services read it in the main process. The logs are fixed
+  // text with a failure code at most, never a name or an ID.
+  const workspaces = createWorkspaceService({
+    account,
+    connection,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => workspaces.close());
 
   function showMainWindow(): void {
     if (mainWindow !== undefined) {
