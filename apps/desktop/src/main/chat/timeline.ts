@@ -114,8 +114,11 @@ export type ChatPageProblem =
   "wrong_project" | "too_many_messages" | "seq_not_below";
 
 /**
- * `stale`: an older page for a range that the timeline no longer ends with,
- * for example one that a newest-page reload overtook. The caller drops it.
+ * `stale`: the answer to a request that a later answer overtook, so that
+ * applying it would leave a gap: an older page for a range that the timeline
+ * no longer ends with, for example after a newest-page reload, or a newest
+ * page that ends below the held messages while older pages exist. The caller
+ * drops it.
  */
 export type ChatPageResult =
   | { readonly kind: "applied"; readonly timeline: ChatTimeline }
@@ -313,13 +316,46 @@ function lowestSeqOf(messages: readonly ChatMessage[]): number {
   );
 }
 
+function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
+  const sameAuthor =
+    a.author.kind === "member"
+      ? b.author.kind === "member" && a.author.memberId === b.author.memberId
+      : b.author.kind === "agent" && a.author.agentId === b.author.agentId;
+  return (
+    sameAuthor &&
+    a.id === b.id &&
+    a.projectId === b.projectId &&
+    a.seq === b.seq &&
+    a.body === b.body &&
+    a.createdAt === b.createdAt
+  );
+}
+
+function sameMessages(
+  a: readonly ChatMessage[],
+  b: readonly ChatMessage[],
+): boolean {
+  return (
+    a.length === b.length &&
+    a.every((message, index) => {
+      const other = b[index];
+      return other !== undefined && sameMessage(message, other);
+    })
+  );
+}
+
 /**
  * Applies the newest page: the page replaces the held messages, so a reload
  * never leaves a gap, also after messages were missed while the connection
  * was down. Held messages newer than the page's newest message stay, because
  * they arrived over the connection after the server read the page. The
  * pending copies stay. `hasOlder` becomes true when the page is full and does
- * not reach `seq` 1.
+ * not reach `seq` 1. A reload that changes nothing returns the same timeline.
+ *
+ * While older pages exist, a page whose newest `seq` + 1 is below the lowest
+ * held `seq` is `stale`: the server read it before the page that the
+ * timeline now ends with, for example an earlier request that a later reload
+ * overtook. Applying it would leave a gap that no older page fills.
  */
 export function applyNewestPage(
   timeline: ChatTimeline,
@@ -334,16 +370,25 @@ export function applyNewestPage(
     (newest, message) => Math.max(newest, message.seq),
     0,
   );
+  const lowest = timeline.messages[0];
+  if (timeline.hasOlder && lowest !== undefined && newestSeq + 1 < lowest.seq) {
+    return Object.freeze({ kind: "stale" });
+  }
   const newer = timeline.messages.filter((message) => message.seq > newestSeq);
+  const messages = merge(page.messages.map(heldMessage), newer);
+  const hasOlder =
+    page.messages.length > 0 &&
+    olderExist(page, query, lowestSeqOf(page.messages));
+  if (
+    timeline.loaded &&
+    timeline.hasOlder === hasOlder &&
+    sameMessages(timeline.messages, messages)
+  ) {
+    return Object.freeze({ kind: "applied", timeline });
+  }
   return Object.freeze({
     kind: "applied",
-    timeline: changed(timeline, {
-      messages: merge(page.messages.map(heldMessage), newer),
-      loaded: true,
-      hasOlder:
-        page.messages.length > 0 &&
-        olderExist(page, query, lowestSeqOf(page.messages)),
-    }),
+    timeline: changed(timeline, { messages, loaded: true, hasOlder }),
   });
 }
 

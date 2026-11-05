@@ -1,4 +1,5 @@
 import {
+  ChatHistoryResponseSchema,
   ChatMessageCreatedEventSchema,
   ChatMessageSchema,
   DeviceIdSchema,
@@ -52,21 +53,40 @@ const AT = "2026-11-05T10:00:00.000Z";
 
 function message(
   seq: number,
-  options: { readonly projectId?: string; readonly id?: string } = {},
+  options: {
+    readonly projectId?: string;
+    readonly id?: string;
+    readonly body?: string;
+  } = {},
 ): ChatMessage {
   return ChatMessageSchema.parse({
     id: options.id ?? uuid("0192f2b0", seq),
     projectId: options.projectId ?? KEY.projectId,
     seq,
     author: { kind: "member", memberId: MEMBER_ID },
-    body: `message ${seq}`,
+    body: options.body ?? `message ${seq}`,
     createdAt: AT,
   });
 }
 
-/** A page of the given `seq` numbers, the newest first, as the API sends it. */
+/**
+ * A decoded page of the given `seq` numbers of a project, the newest first,
+ * as the API sends it.
+ */
+function pageOf(
+  projectId: string,
+  ...seqs: readonly number[]
+): ChatHistoryResponse {
+  return ChatHistoryResponseSchema.parse({
+    messages: [...seqs]
+      .sort((a, b) => b - a)
+      .map((s) => message(s, { projectId })),
+  });
+}
+
+/** A decoded page of the timeline's project. */
 function page(...seqs: readonly number[]): ChatHistoryResponse {
-  return { messages: [...seqs].sort((a, b) => b - a).map((s) => message(s)) };
+  return pageOf(KEY.projectId, ...seqs);
 }
 
 function eventId(n: number): EventId {
@@ -356,6 +376,65 @@ describe("the newest page", () => {
     expect(seqs(empty)).toEqual([1]);
   });
 
+  test("drops a newest page that a later reload overtook while older pages exist", () => {
+    // The later reload answered first.
+    const timeline = applied(
+      applyNewestPage(
+        createChatTimeline(KEY),
+        { limit: 50 },
+        page(...range(61, 110)),
+      ),
+    );
+    expect(timeline.hasOlder).toBe(true);
+    // Messages 51 to 60 would be missing, and no older page would bring them.
+    for (const late of [range(1, 50), range(5, 54), []]) {
+      const result = applyNewestPage(timeline, { limit: 50 }, page(...late));
+      expect(result).toEqual({ kind: "stale" });
+      expect(Object.isFrozen(result)).toBe(true);
+    }
+    // A late page that ends right below the held messages leaves no gap.
+    const adjacent = applied(
+      applyNewestPage(timeline, { limit: 50 }, page(...range(11, 60))),
+    );
+    expect(seqs(adjacent)).toEqual(range(11, 110));
+    expect(adjacent.hasOlder).toBe(true);
+  });
+
+  test("applies a page below relays while nothing older exists", () => {
+    // The project was empty at the first load. Message 5 was relayed before
+    // message 4, and the reload read the server before both.
+    let timeline = applyCreated(loaded(), created(message(5)));
+    timeline = applied(applyNewestPage(timeline, { limit: 50 }, page(1, 2, 3)));
+    expect(seqs(timeline)).toEqual([1, 2, 3, 5]);
+    timeline = applyCreated(timeline, created(message(4)));
+    expect(seqs(timeline)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  test("a reload that changes nothing returns the same timeline", () => {
+    const timeline = applyCreated(loaded(1, 2), created(message(3)));
+    for (const answer of [page(1, 2, 3), page(1, 2)]) {
+      expect(applied(applyNewestPage(timeline, { limit: 50 }, answer))).toBe(
+        timeline,
+      );
+    }
+    const edited = ChatHistoryResponseSchema.parse({
+      messages: [message(3, { body: "edited" }), message(2), message(1)],
+    });
+    const changed = applied(applyNewestPage(timeline, { limit: 50 }, edited));
+    expect(changed).not.toBe(timeline);
+    expect(changed.messages[2]?.body).toBe("edited");
+    const full = applied(
+      applyNewestPage(createChatTimeline(KEY), { limit: 2 }, page(4, 5)),
+    );
+    const short = applied(applyNewestPage(full, { limit: 3 }, page(4, 5)));
+    expect(short).not.toBe(full);
+    expect(short.hasOlder).toBe(false);
+    const relayed = applyCreated(createChatTimeline(KEY), created(message(1)));
+    const first = applied(applyNewestPage(relayed, { limit: 50 }, page(1)));
+    expect(first).not.toBe(relayed);
+    expect(first.loaded).toBe(true);
+  });
+
   test("a reload keeps the pending copies", () => {
     let timeline = withPending(loaded(1, 2), 1, 2);
     timeline = applyRefused(timeline, {
@@ -377,15 +456,11 @@ describe("the newest page", () => {
     expect(applyCreated(timeline, created(message(2)))).toBe(timeline);
   });
 
-  test("refuses a message of another project", () => {
-    const wrong: ChatHistoryResponse = {
-      messages: [message(2), message(1, { projectId: OTHER_PROJECT })],
-    };
+  test("refuses a page of another project", () => {
     const timeline = loaded(1);
-    expect(applyNewestPage(timeline, { limit: 50 }, wrong)).toEqual({
-      kind: "invalid",
-      reason: "wrong_project",
-    });
+    expect(
+      applyNewestPage(timeline, { limit: 50 }, pageOf(OTHER_PROJECT, 1, 2)),
+    ).toEqual({ kind: "invalid", reason: "wrong_project" });
   });
 
   test("refuses more messages than the limit that was sent", () => {
@@ -399,6 +474,7 @@ describe("the newest page", () => {
   });
 
   test("copies the messages and leaves the page unchanged", () => {
+    // Not decoded on purpose: the decoder would drop the extra field.
     const answer = page(1);
     const extra = { ...answer.messages[0], extra: "not held" } as ChatMessage;
     const timeline = applied(
@@ -494,9 +570,7 @@ describe("older pages", () => {
       applyOlderPage(
         timeline,
         { beforeSeq: 4, limit: 2 },
-        {
-          messages: [message(3, { projectId: OTHER_PROJECT })],
-        },
+        pageOf(OTHER_PROJECT, 3),
       ),
     ).toEqual({ kind: "invalid", reason: "wrong_project" });
     expect(
