@@ -1,11 +1,12 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type {
-  AuthChallengeFrame,
-  AuthResponseFrame,
-  DeviceId,
-  WorkspaceId,
+import {
+  PROTOCOL_VERSION,
+  type AuthChallengeFrame,
+  type AuthResponseFrame,
+  type DeviceId,
+  type WorkspaceId,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
 import {
@@ -30,6 +31,7 @@ import {
   STABLE_CONNECTION_MS,
   type ClientEvent,
   type ConnectionClient,
+  type ConnectionIdentity,
   type ServerMessage,
   type SocketEvents,
 } from "./client.ts";
@@ -38,6 +40,7 @@ const ORIGIN = "https://api.mymandev.example";
 const DEVICE_ID = "0192f0a0-7b3c-7d4e-8f50-000000000004" as DeviceId;
 const OTHER_DEVICE_ID = "0192f0a0-7b3c-7d4e-8f50-000000000014" as DeviceId;
 const USER_ID = "0192f0a0-7b3c-7d4e-8f50-000000000009";
+const OTHER_USER_ID = "0192f0a0-7b3c-7d4e-8f50-000000000019";
 const CONNECTION_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000b";
 const WORKSPACE_ID = "0192f0a0-7b3c-7d4e-8f50-000000000003" as WorkspaceId;
 const OTHER_WORKSPACE_ID =
@@ -45,6 +48,8 @@ const OTHER_WORKSPACE_ID =
 const MEMBER_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000c";
 const EVENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000001";
 const PROJECT_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000e";
+const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000005";
+const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000000007";
 const NONCE = Buffer.alloc(32, 7).toString("base64url");
 const SIGNATURE = Buffer.alloc(64, 9).toString("base64url");
 const WALL_START = Date.parse("2026-11-03T10:00:00.000Z");
@@ -90,6 +95,15 @@ function chatSend(body = "Hello"): ClientEvent {
     actor: { kind: "user", userId: USER_ID },
     deviceId: DEVICE_ID,
     payload: { projectId: PROJECT_ID, body },
+  } as unknown as ClientEvent;
+}
+
+/** The chat message of `chatSend`, from the account and device of `identity`. */
+function chatSendAs(identity: ConnectionIdentity, body = "Hello"): ClientEvent {
+  return {
+    ...chatSend(body),
+    actor: { kind: "user", userId: identity.userId },
+    deviceId: identity.deviceId,
   } as unknown as ClientEvent;
 }
 
@@ -317,14 +331,14 @@ test("a signed-in device connects, answers the challenge with one signed frame, 
   expect(h.client.status().state).toBe("authenticating");
   // Nothing is sent before the challenge.
   expect(socket.sent).toEqual([]);
-  expect(h.client.send(chatSend())).toBe("not_connected");
+  expect(h.client.sendAs(chatSendAs)).toBe("not_connected");
 
   socket.receiveJson(CHALLENGE);
   await flush();
   expect(h.challenges).toEqual([CHALLENGE]);
   expect(socket.sentJson()).toEqual([RESPONSE]);
   expect(h.client.status().state).toBe("authenticating");
-  expect(h.client.send(chatSend())).toBe("not_connected");
+  expect(h.client.sendAs(chatSendAs)).toBe("not_connected");
 
   socket.receiveJson(AUTH_OK);
   expect(h.client.status()).toEqual({ state: "connected", revision: 3 });
@@ -332,7 +346,7 @@ test("a signed-in device connects, answers the challenge with one signed frame, 
   expect(h.states()).toEqual(["authenticating", "connected"]);
   expect(socket.sent).toHaveLength(1);
   expect(socket.closes).toEqual([]);
-  expect(h.client.send(chatSend())).toBe("sent");
+  expect(h.client.sendAs(chatSendAs)).toBe("sent");
   expect(socket.sentJson()[1]).toEqual(chatSend());
   expect(h.logs).toEqual(["The connection to the API is authenticated."]);
 });
@@ -891,30 +905,6 @@ test("a socket that cannot be opened backs off", () => {
   expect(h.sockets).toHaveLength(1);
 });
 
-test("sends are refused over 1 MiB of buffered data, over the server's frame limit, and for messages outside the protocol", async () => {
-  const h = harness();
-  await h.authenticate();
-  const socket = h.last();
-
-  socket.buffered = MAX_BUFFERED_SEND_BYTES + 1;
-  expect(h.client.send(chatSend())).toBe("backpressure");
-  socket.buffered = MAX_BUFFERED_SEND_BYTES;
-  expect(h.client.send(chatSend())).toBe("sent");
-
-  expect(h.client.send(chatSend("x".repeat(70_000)))).toBe("too_large");
-  expect(
-    h.client.send({ ...chatSend(), deviceId: null } as unknown as ClientEvent),
-  ).toBe("invalid");
-  expect(
-    h.client.send({
-      protocolVersion: 0,
-      type: "workspace.subscribe",
-      workspaceId: WORKSPACE_ID,
-    } as unknown as ClientEvent),
-  ).toBe("invalid");
-  expect(socket.sent).toHaveLength(2);
-});
-
 test("workspace subscriptions are sent after each auth.ok, and unsubscribing ends them", async () => {
   const h = harness();
   h.client.subscribeWorkspace(WORKSPACE_ID);
@@ -1131,20 +1121,344 @@ test("at most 10 reconnects within 10 minutes are accepted, so a renderer cannot
   expect(h.sockets.length).toBeLessThan(60);
 });
 
-test("a send carries only what the protocol knows, not the caller's extra fields", async () => {
+/** A build function that records each identity it is called with. */
+function recordingBuild(): {
+  readonly build: (identity: ConnectionIdentity) => ClientEvent;
+  readonly seen: ConnectionIdentity[];
+} {
+  const seen: ConnectionIdentity[] = [];
+  return {
+    seen,
+    build: (identity) => {
+      seen.push(identity);
+      return chatSendAs(identity);
+    },
+  };
+}
+
+/**
+ * Moves the harness to another device of another account, up to its auth.ok.
+ * `between` runs at each step before that auth.ok: after the account change,
+ * after the previous socket's close event, and while the client waits for
+ * auth.ok.
+ */
+async function switchToOtherAccount(
+  h: ReturnType<typeof harness>,
+  revision: number,
+  between: () => void = () => {},
+): Promise<FakeSocket> {
+  h.state.sign = async () => ({
+    ok: true,
+    frame: { ...RESPONSE, deviceId: OTHER_DEVICE_ID },
+  });
+  const previous = h.last();
+  h.emit(accountStatus({ revision }, OTHER_DEVICE_ID));
+  between();
+  previous.closed(1000);
+  between();
+  const next = h.last();
+  expect(next).not.toBe(previous);
+  next.open();
+  next.receiveJson(CHALLENGE);
+  await flush();
+  between();
+  next.receiveJson({
+    ...AUTH_OK,
+    userId: OTHER_USER_ID,
+    deviceId: OTHER_DEVICE_ID,
+  });
+  expect(h.client.status().state).toBe("connected");
+  return next;
+}
+
+test("sendAs calls build only after auth.ok of the signed device, with that account and device", async () => {
+  const h = harness();
+  const { build, seen } = recordingBuild();
+  const socket = h.last();
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  socket.open();
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  socket.receiveJson(CHALLENGE);
+  // While the session signs.
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  await flush();
+  // While the client waits for auth.ok.
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  expect(seen).toEqual([]);
+  expect(socket.sentJson()).toEqual([RESPONSE]);
+
+  socket.receiveJson(AUTH_OK);
+  expect(h.client.sendAs(build)).toBe("sent");
+  expect(seen).toEqual([{ userId: USER_ID, deviceId: DEVICE_ID }]);
+  expect(Object.isFrozen(seen[0])).toBe(true);
+  expect(socket.sentJson()).toEqual([RESPONSE, chatSend()]);
+  // The identity reaches no status and no log.
+  expect(JSON.stringify([h.statuses, h.logs])).not.toContain(USER_ID);
+});
+
+test("auth.ok of another device gives sendAs no identity", async () => {
+  const h = harness();
+  const { build, seen } = recordingBuild();
+  const socket = h.last();
+  socket.open();
+  socket.receiveJson(CHALLENGE);
+  await flush();
+  socket.receiveJson({ ...AUTH_OK, deviceId: OTHER_DEVICE_ID });
+  expect(socket.closes).toEqual([1000]);
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  expect(seen).toEqual([]);
+});
+
+test("the identity is cleared when the socket closes or is replaced, and the next auth.ok sets it again", async () => {
+  const h = harness();
+  const { build, seen } = recordingBuild();
+  await h.authenticate();
+  expect(h.client.sendAs(build)).toBe("sent");
+
+  // The server closes the socket.
+  h.last().closed(1006);
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  h.advance(backoffDelayMs(0));
+  expect(h.sockets).toHaveLength(2);
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  await h.authenticate();
+  expect(h.client.sendAs(build)).toBe("sent");
+
+  // The client replaces the socket after a resume, before and after its close event.
+  h.client.systemResumed();
+  expect(h.sockets[1]?.closes).toEqual([1000]);
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  h.last().closed(1000);
+  expect(h.sockets).toHaveLength(3);
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  await h.authenticate();
+  expect(h.client.sendAs(build)).toBe("sent");
+
+  // Another device of another account, from the authenticated socket: the
+  // identity is cleared at the change, and only the new auth.ok sets it.
+  const authenticated = h.last();
+  let checks = 0;
+  const other = await switchToOtherAccount(h, 2, () => {
+    checks += 1;
+    expect(h.client.sendAs(build)).toBe("not_connected");
+  });
+  expect(checks).toBe(3);
+  expect(authenticated.closes).toEqual([1000]);
+  expect(authenticated.sent).toHaveLength(2);
+  expect(h.client.sendAs(build)).toBe("sent");
+  expect(other.sentJson().at(-1)).toMatchObject({
+    actor: { kind: "user", userId: OTHER_USER_ID },
+    deviceId: OTHER_DEVICE_ID,
+  });
+  expect(seen).toEqual([
+    { userId: USER_ID, deviceId: DEVICE_ID },
+    { userId: USER_ID, deviceId: DEVICE_ID },
+    { userId: USER_ID, deviceId: DEVICE_ID },
+    { userId: OTHER_USER_ID, deviceId: OTHER_DEVICE_ID },
+  ]);
+});
+
+test("a sign-out and the quit clear the identity of an authenticated socket", async () => {
+  const h = harness();
+  const { build, seen } = recordingBuild();
+  await h.authenticate();
+  expect(h.client.sendAs(build)).toBe("sent");
+
+  // Sign-out, before and after the socket's close event.
+  h.emit(SIGNED_OUT);
+  expect(h.sockets[0]?.closes).toEqual([1000]);
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  h.last().closed(1000);
+  expect(h.client.sendAs(build)).toBe("not_connected");
+
+  // Signed in again, the next auth.ok sets the identity, and the quit
+  // clears it, before and after the socket's close event.
+  h.emit(accountStatus({ revision: 2 }));
+  expect(h.sockets).toHaveLength(2);
+  await h.authenticate();
+  expect(h.client.sendAs(build)).toBe("sent");
+  h.client.close();
+  expect(h.last().closes).toEqual([1000]);
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  h.last().closed(1000);
+  expect(h.client.sendAs(build)).toBe("not_connected");
+  expect(h.sockets.map((socket) => socket.sent.length)).toEqual([2, 2]);
+  expect(seen).toEqual([
+    { userId: USER_ID, deviceId: DEVICE_ID },
+    { userId: USER_ID, deviceId: DEVICE_ID },
+  ]);
+});
+
+test("a send after the socket changed uses the new identity, and an event built for the old one is refused", async () => {
   const h = harness();
   await h.authenticate();
-  const event = chatSend() as unknown as Record<string, unknown>;
-  const withExtras = {
-    ...event,
-    secret: "kept local",
-    payload: {
-      ...(event["payload"] as Record<string, unknown>),
+  const kept: ConnectionIdentity[] = [];
+  expect(
+    h.client.sendAs((identity) => {
+      kept.push(identity);
+      return chatSendAs(identity);
+    }),
+  ).toBe("sent");
+  const old = kept[0];
+  if (old === undefined) {
+    throw new Error("build was not called");
+  }
+
+  const other = await switchToOtherAccount(h, 2);
+  // A caller that kept the old identity across the change sends nothing,
+  // and the connection stays open.
+  expect(h.client.sendAs(() => chatSendAs(old))).toBe("invalid");
+  expect(other.sent).toHaveLength(1);
+  expect(h.client.status().state).toBe("connected");
+
+  // A build that replaces the socket itself sends on neither socket.
+  expect(
+    h.client.sendAs((identity) => {
+      h.client.systemResumed();
+      return chatSendAs(identity);
+    }),
+  ).toBe("not_connected");
+  expect(other.sent).toHaveLength(1);
+  expect(other.closes).toEqual([1000]);
+});
+
+test("events go only through sendAs, which refuses buffered data, oversized and unknown messages, and events that the server would not bind", async () => {
+  const h = harness();
+  await h.authenticate();
+  const socket = h.last();
+  const asIs = (identity: ConnectionIdentity) => chatSendAs(identity);
+  // No other member sends an event.
+  expect("send" in h.client).toBe(false);
+
+  socket.buffered = MAX_BUFFERED_SEND_BYTES + 1;
+  expect(h.client.sendAs(asIs)).toBe("backpressure");
+  socket.buffered = MAX_BUFFERED_SEND_BYTES;
+  expect(h.client.sendAs(asIs)).toBe("sent");
+
+  expect(
+    h.client.sendAs((identity) => chatSendAs(identity, "x".repeat(70_000))),
+  ).toBe("too_large");
+  expect(
+    h.client.sendAs(
+      (identity) =>
+        ({ ...chatSendAs(identity), deviceId: null }) as unknown as ClientEvent,
+    ),
+  ).toBe("invalid");
+  // A valid client frame is not an event.
+  expect(
+    h.client.sendAs(
+      () =>
+        ({
+          protocolVersion: PROTOCOL_VERSION,
+          type: "workspace.subscribe",
+          workspaceId: WORKSPACE_ID,
+        }) as unknown as ClientEvent,
+    ),
+  ).toBe("invalid");
+  // An event of another protocol version.
+  expect(
+    h.client.sendAs(
+      (identity) =>
+        ({
+          ...chatSendAs(identity),
+          protocolVersion: PROTOCOL_VERSION + 1,
+        }) as unknown as ClientEvent,
+    ),
+  ).toBe("invalid");
+  // Something that JSON cannot carry.
+  for (const value of [undefined, () => undefined, 1n]) {
+    expect(h.client.sendAs(() => value as unknown as ClientEvent)).toBe(
+      "invalid",
+    );
+  }
+  expect(
+    h.client.sendAs(
+      (identity) =>
+        ({
+          ...chatSendAs(identity),
+          payload: { projectId: PROJECT_ID, body: 1n },
+        }) as unknown as ClientEvent,
+    ),
+  ).toBe("invalid");
+  // Another device, or another account as the actor: the server would close
+  // the connection with identity_mismatch.
+  expect(
+    h.client.sendAs(
+      (identity) =>
+        ({
+          ...chatSendAs(identity),
+          deviceId: OTHER_DEVICE_ID,
+        }) as unknown as ClientEvent,
+    ),
+  ).toBe("invalid");
+  expect(
+    h.client.sendAs(
+      (identity) =>
+        ({
+          ...chatSendAs(identity),
+          actor: { kind: "user", userId: OTHER_USER_ID },
+        }) as unknown as ClientEvent,
+    ),
+  ).toBe("invalid");
+  expect(
+    h.client.sendAs(() => {
+      throw new Error("no event");
+    }),
+  ).toBe("invalid");
+
+  // Only what the protocol knows is sent, not the caller's extra fields.
+  expect(
+    h.client.sendAs((identity) => {
+      const event = chatSendAs(identity) as unknown as Record<string, unknown>;
+      return {
+        ...event,
+        secret: "kept local",
+        payload: {
+          ...(event["payload"] as Record<string, unknown>),
+          secret: "kept local",
+        },
+      } as unknown as ClientEvent;
+    }),
+  ).toBe("sent");
+  expect(socket.sent).toHaveLength(3);
+  expect(socket.sent.at(-1)).not.toContain("kept local");
+  expect(socket.sentJson().at(-1)).toEqual(chatSend());
+  expect(socket.closes).toEqual([]);
+  expect(h.client.status().state).toBe("connected");
+});
+
+test("sendAs sends an event of an agent actor from the identity's device, and refuses it from another device", async () => {
+  const h = harness();
+  await h.authenticate();
+  const socket = h.last();
+  /** A run transition that the agent's host device reports. */
+  const runStarted = (deviceId: DeviceId): ClientEvent =>
+    ({
+      protocolVersion: PROTOCOL_VERSION,
+      id: EVENT_ID,
+      type: "agent.run.state_changed",
+      occurredAt: "2026-11-03T10:00:00.000Z",
+      workspaceId: WORKSPACE_ID,
+      actor: { kind: "agent", agentId: AGENT_ID },
+      deviceId,
+      payload: {
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        previousState: "queued",
+        state: "running",
+      },
+    }) as unknown as ClientEvent;
+
+  // The account binds no agent actor; the device does.
+  expect(
+    h.client.sendAs((identity) => ({
+      ...runStarted(identity.deviceId),
       secret: "kept local",
-    },
-  } as unknown as ClientEvent;
-  expect(h.client.send(withExtras)).toBe("sent");
-  const sent = h.last().sent.at(-1) ?? "";
-  expect(sent).not.toContain("kept local");
-  expect(JSON.parse(sent)).toEqual(chatSend());
+    })),
+  ).toBe("sent");
+  expect(socket.sent.at(-1)).not.toContain("kept local");
+  expect(socket.sentJson().at(-1)).toEqual(runStarted(DEVICE_ID));
+  expect(h.client.sendAs(() => runStarted(OTHER_DEVICE_ID))).toBe("invalid");
+  expect(socket.sent).toHaveLength(2);
+  expect(socket.closes).toEqual([]);
 });

@@ -8,12 +8,17 @@
 // The client waits for `auth.challenge`, sends the one `auth.response` that
 // the device session signs, and waits for `auth.ok`. It then sends the
 // workspace subscriptions again, and passes decoded server messages on to
-// other code of the main process. It acts on each close reason as ADR 0014's
-// table says, and backs off between attempts.
+// other code of the main process. It keeps the account and device of that
+// `auth.ok` for the socket's lifetime, and sends events only through
+// `sendAs`, which builds each event from the identity that the server binds
+// it to. It acts on each close reason as ADR 0014's table says, and backs off
+// between attempts.
 //
 // The renderer gets the status only: fixed codes and a time. No frame,
-// nonce, signature, or key is logged or leaves this module, except the
-// signed frame, which goes to the socket.
+// nonce, signature, key, or user ID is logged or reaches the renderer. The
+// signed frame and the events of `sendAs` go only to the socket. `sendAs`
+// passes the identity, user ID included, to the caller's `build`, so it
+// leaves this module but stays in the main process.
 import {
   decodeClientMessage,
   decodeServerMessage,
@@ -26,6 +31,7 @@ import {
   type ReceivedServerEvent,
   type ServerFrame,
   type ServerOnlyEventType,
+  type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
 import type {
@@ -154,6 +160,22 @@ export type ServerMessage =
 export type SendOutcome =
   "sent" | "not_connected" | "backpressure" | "too_large" | "invalid";
 
+/**
+ * Who the current socket's `auth.ok` authenticated: the account and the
+ * device that the server binds every event of the connection to (ADR 0006,
+ * identity binding). An event with another `deviceId`, or with a `user`
+ * actor of another account, closes the connection (1008
+ * `identity_mismatch`). Main process only: it never reaches the renderer or
+ * a log.
+ */
+export interface ConnectionIdentity {
+  readonly userId: UserId;
+  readonly deviceId: DeviceId;
+}
+
+/** Builds a client event from the identity of the current socket. */
+export type BuildClientEvent = (identity: ConnectionIdentity) => ClientEvent;
+
 export interface ConnectionClientOptions {
   /** From `resolveApiOrigin`. */
   readonly apiOrigin: ApiOrigin;
@@ -208,8 +230,19 @@ export interface ConnectionClient {
   readonly unsubscribeWorkspace: (workspaceId: WorkspaceId) => void;
   /** The workspaces asked for, in the order they were asked for. */
   readonly workspaces: () => readonly WorkspaceId[];
-  /** Sends a client event after `auth.ok`. */
-  readonly send: (event: ClientEvent) => SendOutcome;
+  /**
+   * The only way to send a client event. Builds it from the identity of the
+   * current socket's `auth.ok` and sends it on that socket in the same call,
+   * so that no other socket, and no other identity, can come between the
+   * two. Without an authenticated socket the result is `not_connected`, and
+   * `build` is not called. `build` is called at most once; if it throws, the
+   * result is `invalid`, and if it closed the socket, `not_connected`. An
+   * event whose `deviceId`, or whose `user` actor's `userId`, is not the
+   * identity's is refused as `invalid` instead of being sent, because the
+   * server would close the connection for it. The other refusals of
+   * `SendOutcome` apply as well, and only the decoded copy is sent.
+   */
+  readonly sendAs: (build: BuildClientEvent) => SendOutcome;
   /**
    * Calls `listener` with every decoded message of the server after
    * `auth.ok`. The result removes the listener. Main process only.
@@ -232,6 +265,11 @@ interface Live {
   phase: "opening" | "challenge" | "signing" | "auth_ok" | "open";
   /** The device of the signed `auth.response`, once it was sent. */
   deviceId: DeviceId | null;
+  /**
+   * The account and device of `auth.ok`: null before it, and again once
+   * the socket closed or the client closed it.
+   */
+  identity: ConnectionIdentity | null;
   cancelTimer: (() => void) | null;
 }
 
@@ -271,6 +309,14 @@ function reasonOf(status: object): unknown {
 
 function retryAtOf(status: object): unknown {
   return "retryAt" in status ? status.retryAt : undefined;
+}
+
+/** Whether the server binds `event` to `identity` without a mismatch. */
+function boundTo(event: ProtocolEvent, identity: ConnectionIdentity): boolean {
+  return (
+    event.deviceId === identity.deviceId &&
+    (event.actor.kind !== "user" || event.actor.userId === identity.userId)
+  );
 }
 
 export function createConnectionClient(
@@ -388,6 +434,7 @@ export function createConnectionClient(
     if (live === record) {
       live = null;
     }
+    record.identity = null;
     stopTimer(record);
     stopStable();
     const socket = record.socket;
@@ -450,6 +497,7 @@ export function createConnectionClient(
       socket: null,
       phase: "opening",
       deviceId: null,
+      identity: null,
       cancelTimer: null,
     };
     live = record;
@@ -592,7 +640,10 @@ export function createConnectionClient(
           decoded.frame.type === "auth.ok" &&
           decoded.frame.deviceId === record.deviceId
         ) {
-          authenticated(record);
+          authenticated(record, {
+            userId: decoded.frame.userId,
+            deviceId: decoded.frame.deviceId,
+          });
           return;
         }
         refuseMessage(record);
@@ -644,9 +695,10 @@ export function createConnectionClient(
     }
   }
 
-  function authenticated(record: Live): void {
+  function authenticated(record: Live, identity: ConnectionIdentity): void {
     stopTimer(record);
     record.phase = "open";
+    record.identity = Object.freeze({ ...identity });
     log("The connection to the API is authenticated.");
     setStatus({ state: "connected" });
     cancelStable = schedule(() => {
@@ -655,14 +707,11 @@ export function createConnectionClient(
       keyReplacedReconnectUsed = false;
     }, STABLE_CONNECTION_MS);
     for (const workspaceId of workspaces) {
-      transmit(
-        {
-          protocolVersion: PROTOCOL_VERSION,
-          type: "workspace.subscribe",
-          workspaceId,
-        },
-        "frame",
-      );
+      transmit({
+        protocolVersion: PROTOCOL_VERSION,
+        type: "workspace.subscribe",
+        workspaceId,
+      });
     }
   }
 
@@ -686,6 +735,7 @@ export function createConnectionClient(
       return;
     }
     live = null;
+    record.identity = null;
     stopTimer(record);
     stopStable();
     log(`The connection to the API closed with code ${String(code)}.`);
@@ -761,9 +811,14 @@ export function createConnectionClient(
 
   // ---- Sending ------------------------------------------------------------
 
+  /**
+   * Sends on the live socket after `auth.ok`: without `bound`, only a client
+   * frame; with it, only an event that the server binds to that identity.
+   * Anything else is refused as `invalid`.
+   */
   function transmit(
     message: ClientEvent | Record<string, unknown>,
-    kind: "event" | "frame",
+    bound: ConnectionIdentity | null = null,
   ): SendOutcome {
     const record = live;
     if (record === null || record.phase !== "open" || record.socket === null) {
@@ -771,7 +826,12 @@ export function createConnectionClient(
     }
     let text: string;
     try {
-      text = JSON.stringify(message);
+      // `undefined`, a function, or a symbol serializes to nothing.
+      const serialized: string | undefined = JSON.stringify(message);
+      if (serialized === undefined) {
+        return "invalid";
+      }
+      text = serialized;
     } catch {
       return "invalid";
     }
@@ -783,7 +843,14 @@ export function createConnectionClient(
     // frame, or a client event. The decoded copy is sent, so a field that
     // the protocol does not know never leaves.
     const checked = decodeClientMessage(JSON.parse(text) as unknown);
-    if (!checked.ok || checked.kind !== kind) {
+    if (!checked.ok) {
+      return "invalid";
+    }
+    const allowed =
+      bound === null
+        ? checked.kind === "frame"
+        : checked.kind === "event" && boundTo(checked.event, bound);
+    if (!allowed) {
       return "invalid";
     }
     text = JSON.stringify(
@@ -798,6 +865,24 @@ export function createConnectionClient(
       return "not_connected";
     }
     return "sent";
+  }
+
+  function sendAs(build: BuildClientEvent): SendOutcome {
+    const record = live;
+    const identity = record?.phase === "open" ? record.identity : null;
+    if (record === null || identity === null) {
+      return "not_connected";
+    }
+    let event: ClientEvent;
+    try {
+      event = build(identity);
+    } catch {
+      return "invalid";
+    }
+    // `build` runs synchronously, so no socket event comes between. If it
+    // closed the socket itself, `transmit` finds no live socket; any other
+    // socket would be refused unless it has the same identity.
+    return transmit(event, identity);
   }
 
   // ---- Account ------------------------------------------------------------
@@ -901,6 +986,7 @@ export function createConnectionClient(
     const record = live;
     live = null;
     if (record !== null) {
+      record.identity = null;
       stopTimer(record);
       try {
         record.socket?.close(NORMAL_CLOSURE);
@@ -928,30 +1014,24 @@ export function createConnectionClient(
         return;
       }
       workspaces.add(workspaceId);
-      transmit(
-        {
-          protocolVersion: PROTOCOL_VERSION,
-          type: "workspace.subscribe",
-          workspaceId,
-        },
-        "frame",
-      );
+      transmit({
+        protocolVersion: PROTOCOL_VERSION,
+        type: "workspace.subscribe",
+        workspaceId,
+      });
     },
     unsubscribeWorkspace: (workspaceId: WorkspaceId) => {
       if (!workspaces.delete(workspaceId)) {
         return;
       }
-      transmit(
-        {
-          protocolVersion: PROTOCOL_VERSION,
-          type: "workspace.unsubscribe",
-          workspaceId,
-        },
-        "frame",
-      );
+      transmit({
+        protocolVersion: PROTOCOL_VERSION,
+        type: "workspace.unsubscribe",
+        workspaceId,
+      });
     },
     workspaces: () => Object.freeze([...workspaces]),
-    send: (event: ClientEvent) => transmit(event, "event"),
+    sendAs,
     onMessage: (listener: (message: ServerMessage) => void) => {
       const entry = (message: ServerMessage) => listener(message);
       messageListeners.add(entry);
