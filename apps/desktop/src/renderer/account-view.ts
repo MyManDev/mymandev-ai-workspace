@@ -290,6 +290,49 @@ export function createIdleWaits(): IdleWaits {
 }
 
 /**
+ * Follows the account status for the panel: each status becomes the view
+ * and goes to the idle waits, and the end of the subscription, by an error
+ * or by the returned function, ends every wait.
+ */
+export function followAccountStatus(
+  account: Pick<AccountBridge, "subscribeStatus">,
+  idleWaits: IdleWaits,
+  onView: (view: AccountView) => void,
+): () => void {
+  const stop = account.subscribeStatus(
+    (status) => {
+      onView({ kind: "known", status });
+      idleWaits.status(status);
+    },
+    () => {
+      onView({ kind: "unavailable" });
+      idleWaits.end();
+    },
+  );
+  return () => {
+    stop();
+    idleWaits.end();
+  };
+}
+
+/** The pairing code of the sign-in that waits for the browser, or undefined. */
+export function waitingPairingCode(view: AccountView): string | undefined {
+  return view.kind === "known" && view.status.signIn.kind === "waiting"
+    ? view.status.signIn.pairingCode
+    : undefined;
+}
+
+/**
+ * How long after the panel saw a sign-in wait in the browser it offers
+ * "Use another browser" for it. That replaces the sign-in with a cancel and
+ * a new start, and the main process refuses a start within its cooldown,
+ * `SIGN_IN_START_COOLDOWN_MS` in `src/main/account.ts`, of the start that
+ * opened the browser. Without this delay, a cancel in that time would end
+ * the waiting sign-in, and the new start would be refused as too soon.
+ */
+export const ANOTHER_BROWSER_DELAY_MS = 3_000;
+
+/**
  * "Use another browser" (#175): a sign-in that opens no browser and offers
  * its address for copying into a browser of the person's choice. A sign-in
  * that waits in the default browser is cancelled first, because the API
@@ -297,7 +340,8 @@ export function createIdleWaits(): IdleWaits {
  * after that sign-in ended as cancelled. When it ended otherwise, for
  * example because the browser posted meanwhile, nothing starts and the
  * result is undefined. The main process applies its rules to the start as
- * to any other: the cooldown, `busy`, and the key.
+ * to any other: the cooldown, `busy`, and the key; the panel offers it for
+ * a waiting sign-in only after `ANOTHER_BROWSER_DELAY_MS`.
  */
 export async function startInAnotherBrowser(
   account: Pick<AccountBridge, "startSignIn" | "cancelSignIn">,

@@ -439,6 +439,17 @@ test("an account status with every sign-in state, outcome, and key state is acce
         opened: false,
         authorizeUrl: AUTHORIZE_URL,
         warning: "Do not share this address.",
+        browser: "default",
+      },
+    }),
+    accountStatus({
+      signIn: {
+        kind: "waiting",
+        pairingCode: "999999",
+        opened: false,
+        authorizeUrl: AUTHORIZE_URL,
+        warning: "Do not share this address.",
+        browser: "other",
       },
     }),
     accountStatus({
@@ -467,6 +478,7 @@ test("an account status keeps only the narrow fields", () => {
         opened: false,
         authorizeUrl: AUTHORIZE_URL,
         warning: "Do not share this address.",
+        browser: "other",
       },
     }),
     account: {
@@ -502,6 +514,7 @@ test("an account status with a wrong value is refused", () => {
     opened: false,
     authorizeUrl: AUTHORIZE_URL,
     warning: "Do not share this address.",
+    browser: "other",
   } as const;
   for (const value of [
     accountStatus({ revision: -1 }),
@@ -572,6 +585,8 @@ test("an account status with a wrong value is refused", () => {
     accountStatus({
       signIn: { ...waiting, warning: "x".repeat(ACCOUNT_LIMITS.warning + 1) },
     }),
+    accountStatus({ signIn: { ...waiting, browser: "Other" as never } }),
+    accountStatus({ signIn: { ...waiting, browser: undefined as never } }),
     accountStatus({ signIn: { kind: "open" } as never }),
   ]) {
     expect(AccountStatusSchema.safeParse(value).success).toBe(false);

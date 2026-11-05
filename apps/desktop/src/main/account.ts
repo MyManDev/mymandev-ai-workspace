@@ -977,6 +977,9 @@ export function createAccountService(
                   opened: false,
                   authorizeUrl: started.authorizeUrl,
                   warning: started.warning,
+                  // Why the URL is offered, so that the panel words it
+                  // also after it was shown again.
+                  browser: openBrowser ? "default" : "other",
                 },
           );
       publish();

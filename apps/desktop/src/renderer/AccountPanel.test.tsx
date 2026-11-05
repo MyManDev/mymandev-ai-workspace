@@ -72,6 +72,7 @@ function props(
     onStartSignIn: record("onStartSignIn"),
     onUseAnotherBrowser: record("onUseAnotherBrowser"),
     anotherBrowser: false,
+    anotherBrowserReady: true,
     onCancelSignIn: record("onCancelSignIn"),
     onUnlock: record("onUnlock"),
     onForget: record("onForget"),
@@ -246,6 +247,20 @@ test("while the browser is open, the pairing code is shown prominently with a ca
   );
 });
 
+test("another browser is offered for a waiting sign-in only once the main process accepts a new start", () => {
+  const view = known({
+    signIn: { kind: "waiting", pairingCode: "042137", opened: true },
+  });
+
+  expect(render({ view, anotherBrowserReady: false })).toContain(
+    '<div class="account-actions"><button type="button" class="panel-action" disabled="">Use another browser</button><button type="button" class="panel-action">Cancel</button></div>',
+  );
+  // Without a waiting sign-in, nothing is cancelled, and it is offered at once.
+  expect(render({ anotherBrowserReady: false })).toContain(
+    '<div class="account-actions"><button type="button" class="panel-action">Sign in with GitHub</button><button type="button" class="panel-action">Use another browser</button></div>',
+  );
+});
+
 test("when the browser did not open, the URL is in a read-only field with the warning and a button that selects it", () => {
   const view = known({
     signIn: {
@@ -254,6 +269,7 @@ test("when the browser did not open, the URL is in a read-only field with the wa
       opened: false,
       authorizeUrl: AUTHORIZE_URL,
       warning: WARNING,
+      browser: "default",
     },
   });
   const html = render({ view });
@@ -281,9 +297,12 @@ test("in another browser, the URL is shown with the warning for copying, and ano
       opened: false,
       authorizeUrl: AUTHORIZE_URL,
       warning: WARNING,
+      browser: "other",
     },
   });
-  const html = render({ view, anotherBrowser: true });
+  // The status words the address, also when the panel is shown again and
+  // no longer knows what the person asked for.
+  const html = render({ view, anotherBrowser: false });
 
   expect(html).toContain(
     '<p role="status">Continue in your browser, and only if it shows this pairing code:</p><p class="pairing-code">042137</p>',
@@ -298,9 +317,7 @@ test("in another browser, the URL is shown with the warning for copying, and ano
     `<p class="account-warning" id="sign-in-url-warning">${WARNING}</p>`,
   );
   expect(html).not.toContain("The browser did not open.");
-  expect(clickEveryButton({ view, anotherBrowser: true })).toEqual([
-    ["Cancel", ["onCancelSignIn"]],
-  ]);
+  expect(clickEveryButton({ view })).toEqual([["Cancel", ["onCancelSignIn"]]]);
 });
 
 const SIGNED_IN_BUTTONS = [
@@ -452,6 +469,7 @@ test("logins, names, URLs, and warnings are rendered as text, not as markup, and
           opened: false,
           authorizeUrl: 'https://x.example/"><script>x</script>',
           warning: "<img src=x>",
+          browser: "default",
         },
       },
     },

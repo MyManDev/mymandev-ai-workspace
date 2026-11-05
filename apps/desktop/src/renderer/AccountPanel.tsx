@@ -14,6 +14,7 @@ import type {
 } from "../shared/ipc-contract.ts";
 import {
   ACTION_MESSAGES,
+  ANOTHER_BROWSER_DELAY_MS,
   apiOriginProblem,
   createIdleWaits,
   DEVICE_ACTION_MESSAGES,
@@ -21,6 +22,7 @@ import {
   describeDeviceState,
   describeOutcome,
   deviceDetail,
+  followAccountStatus,
   forgetMessage,
   initialAccountView,
   listDevicesMessage,
@@ -29,6 +31,7 @@ import {
   signOutMessage,
   startInAnotherBrowser,
   startMessage,
+  waitingPairingCode,
   type AccountView,
 } from "./account-view.ts";
 
@@ -61,8 +64,17 @@ export interface AccountPanelContentProps {
    * cancelled first, then one starts that offers its address for copying.
    */
   readonly onUseAnotherBrowser: () => void;
-  /** Whether the last start that the panel asked for was in another browser. */
+  /**
+   * Whether the last start that the panel asked for was in another browser,
+   * which words the text while it starts. The address of a waiting sign-in
+   * is worded from the status, which stays when the panel is shown again.
+   */
   readonly anotherBrowser: boolean;
+  /**
+   * Whether "Use another browser" can replace the sign-in that waits in the
+   * browser: only `ANOTHER_BROWSER_DELAY_MS` after the panel saw it wait.
+   */
+  readonly anotherBrowserReady: boolean;
   readonly onCancelSignIn: () => void;
   readonly onUnlock: (passphrase: string) => void;
   /**
@@ -263,6 +275,7 @@ function SignInActions(
         signIn={signIn}
         busy={busy}
         anotherBrowser={props.anotherBrowser}
+        anotherBrowserReady={props.anotherBrowserReady}
         onCancel={props.onCancelSignIn}
         onUseAnotherBrowser={props.onUseAnotherBrowser}
       />
@@ -357,18 +370,21 @@ function SignInProgress({
   signIn,
   busy,
   anotherBrowser,
+  anotherBrowserReady,
   onCancel,
   onUseAnotherBrowser,
 }: {
   readonly signIn: Exclude<SignInState, { readonly kind: "idle" }>;
   readonly busy: boolean;
   readonly anotherBrowser: boolean;
+  readonly anotherBrowserReady: boolean;
   readonly onCancel: () => void;
   readonly onUseAnotherBrowser: () => void;
 }) {
   // Offered while the sign-in waits in the browser that opened, which may
   // hold another GitHub account. The address of this attempt is bound to
-  // that browser, so a new attempt starts.
+  // that browser, so a new attempt starts, once the main process accepts
+  // a new start.
   const offersAnotherBrowser = signIn.kind === "waiting" && signIn.opened;
   const cancel = (
     <div className="account-actions">
@@ -376,7 +392,7 @@ function SignInProgress({
         <button
           type="button"
           className="panel-action"
-          disabled={busy}
+          disabled={busy || !anotherBrowserReady}
           onClick={onUseAnotherBrowser}
         >
           Use another browser
@@ -419,7 +435,7 @@ function SignInProgress({
         <AuthorizeUrl
           url={signIn.authorizeUrl}
           warning={signIn.warning}
-          anotherBrowser={anotherBrowser}
+          anotherBrowser={signIn.browser === "other"}
         />
       )}
       {cancel}
@@ -521,26 +537,30 @@ function useAccountPanel(
   );
   const [anotherBrowser, setAnotherBrowser] = useState(false);
   const [idleWaits] = useState(createIdleWaits);
+  /** The pairing code of a waiting sign-in that can be replaced now. */
+  const [replaceable, setReplaceable] = useState<string | undefined>(undefined);
 
+  useEffect(
+    () =>
+      bridge === undefined
+        ? undefined
+        : followAccountStatus(bridge, idleWaits, setView),
+    [bridge, idleWaits],
+  );
+
+  const waitingCode = waitingPairingCode(view);
   useEffect(() => {
-    if (bridge === undefined) {
+    if (waitingCode === undefined) {
       return undefined;
     }
-    const stop = bridge.subscribeStatus(
-      (status) => {
-        setView({ kind: "known", status });
-        idleWaits.status(status);
-      },
-      () => {
-        setView({ kind: "unavailable" });
-        idleWaits.end();
-      },
+    const timer = setTimeout(
+      () => setReplaceable(waitingCode),
+      ANOTHER_BROWSER_DELAY_MS,
     );
-    return () => {
-      stop();
-      idleWaits.end();
-    };
-  }, [bridge, idleWaits]);
+    return () => clearTimeout(timer);
+  }, [waitingCode]);
+  const anotherBrowserReady =
+    waitingCode !== undefined && replaceable === waitingCode;
 
   /** Runs one action at a time and shows the message that its result names. */
   const run = useCallback(
@@ -574,15 +594,14 @@ function useAccountPanel(
   }, [run]);
 
   const onUseAnotherBrowser = useCallback(() => {
-    const waiting =
-      view.kind === "known" && view.status.signIn.kind === "waiting";
+    const waiting = waitingCode !== undefined;
     setAnotherBrowser(true);
     run(
       (account) => startInAnotherBrowser(account, waiting, idleWaits.wait),
       startMessage,
       ACTION_MESSAGES.startFailed,
     );
-  }, [run, view, idleWaits]);
+  }, [run, waitingCode, idleWaits]);
 
   const onCancelSignIn = useCallback(
     () =>
@@ -659,6 +678,7 @@ function useAccountPanel(
     onStartSignIn,
     onUseAnotherBrowser,
     anotherBrowser,
+    anotherBrowserReady,
     onCancelSignIn,
     onUnlock,
     onForget,

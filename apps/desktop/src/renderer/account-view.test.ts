@@ -23,6 +23,7 @@ import {
   describeDeviceState,
   describeOutcome,
   deviceDetail,
+  followAccountStatus,
   forgetMessage,
   initialAccountView,
   listDevicesMessage,
@@ -32,6 +33,8 @@ import {
   signOutMessage,
   startInAnotherBrowser,
   startMessage,
+  waitingPairingCode,
+  type AccountView,
 } from "./account-view.ts";
 
 const IDLE: AccountStatus = {
@@ -197,6 +200,21 @@ test("another browser while a sign-in waits cancels it first and starts once it 
   expect(fake.log).toEqual(["cancel", 'start {"browser":"other"}']);
 });
 
+test("another browser waits for the cancel's outcome before it cancels, so that an outcome before the answer is not missed", async () => {
+  const fake = fakeAccount();
+  const waits = createIdleWaits();
+  fake.cancel = async () => {
+    // The status of the cancelled sign-in arrives before the answer.
+    waits.status(IDLE);
+    return true;
+  };
+
+  const result = startInAnotherBrowser(fake.account, true, waits.wait);
+  await settle();
+  expect(fake.log).toEqual(["cancel", 'start {"browser":"other"}']);
+  await expect(result).resolves.toEqual({ outcome: "started" });
+});
+
 test("another browser starts nothing when the waiting sign-in ended otherwise or had already ended", async () => {
   const fake = fakeAccount();
   const waits = createIdleWaits();
@@ -238,6 +256,76 @@ test("another browser starts nothing when the cancel fails or the status is no l
   waits.status(IDLE);
   await settle();
   expect(fake.log).toEqual(["cancel", "cancel"]);
+});
+
+test("the panel follows the status: each one becomes the view and reaches the waits, and the end of the subscription ends them", async () => {
+  const views: AccountView[] = [];
+  let listener: (status: AccountStatus) => void = () => undefined;
+  let onError: () => void = () => undefined;
+  let stops = 0;
+  const account: Pick<AccountBridge, "subscribeStatus"> = {
+    subscribeStatus: (next, error) => {
+      listener = next;
+      onError = error ?? (() => undefined);
+      return () => {
+        stops += 1;
+      };
+    },
+  };
+  const waits = createIdleWaits();
+  const stop = followAccountStatus(account, waits, (view) => views.push(view));
+
+  const idle = waits.wait();
+  listener(WAITING);
+  listener(IDLE);
+  await expect(idle.idle).resolves.toBe(IDLE);
+  expect(views).toEqual([
+    { kind: "known", status: WAITING },
+    { kind: "known", status: IDLE },
+  ]);
+
+  // The subscription failed.
+  const failed = waits.wait();
+  onError();
+  await expect(failed.idle).resolves.toBeUndefined();
+  expect(views.at(-1)).toEqual({ kind: "unavailable" });
+
+  // The panel is no longer shown.
+  const unmounted = waits.wait();
+  stop();
+  expect(stops).toBe(1);
+  await expect(unmounted.idle).resolves.toBeUndefined();
+});
+
+test("only a sign-in that waits for the browser has a pairing code that another browser can replace", () => {
+  expect(waitingPairingCode({ kind: "known", status: WAITING })).toBe("042137");
+  expect(
+    waitingPairingCode({
+      kind: "known",
+      status: {
+        ...WAITING,
+        signIn: {
+          kind: "waiting",
+          pairingCode: "123456",
+          opened: false,
+          authorizeUrl: "https://api.mymandev.example/auth/github/authorize",
+          warning: "Do not share this address.",
+          browser: "other",
+        },
+      },
+    }),
+  ).toBe("123456");
+  for (const signIn of [
+    { kind: "idle" },
+    { kind: "starting" },
+    { kind: "completing" },
+  ] as const) {
+    expect(
+      waitingPairingCode({ kind: "known", status: { ...IDLE, signIn } }),
+    ).toBeUndefined();
+  }
+  expect(waitingPairingCode({ kind: "pending" })).toBeUndefined();
+  expect(waitingPairingCode({ kind: "unavailable" })).toBeUndefined();
 });
 
 test("an idle status ends every wait with it, and a stopped wait ends without one", async () => {
