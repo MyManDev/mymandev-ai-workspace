@@ -748,6 +748,14 @@ test("account.device_revoked reloads the agent list alone", async () => {
   );
   expect(h.state.agents[0]?.disabledAt).toBe(LATER);
   expect(runStates(h.state)).toEqual(["01 running"]);
+
+  // While a failed reload waits for its retry, the frame keeps the backoff.
+  h.receive(subscribed());
+  await h.answer("listRuns", failure("rate_limited"));
+  expect(h.openTimers()).toHaveLength(1);
+  h.receive(revoked);
+  expect(h.openTimers()).toHaveLength(1);
+  expect(h.reads).toEqual([]);
 });
 
 test("a server cancellation that disables agents reloads the agent list alone", async () => {

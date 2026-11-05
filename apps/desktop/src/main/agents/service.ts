@@ -72,8 +72,9 @@ export const AGENT_FOLLOW_UP_DELAY_MS = 1_000;
  *   is empty.
  * - `loading`: the open project's activity has not loaded yet.
  * - `ready`: it loaded. It stays `ready` during later reloads.
- * - `unavailable`: the last reload failed, and a retry waits; `problem`
- *   holds the failure. What was loaded before stays.
+ * - `unavailable`: the last reload failed; `problem` holds the failure
+ *   until a reload succeeds (a retry waits, or the next
+ *   `workspace.subscribed` reloads). What was loaded before stays.
  */
 export type AgentActivityStatus =
   "no_project" | "loading" | "ready" | "unavailable";
@@ -670,8 +671,9 @@ export function createAgentActivityService(
       case "account.device_revoked":
         // The revocation disabled the device's agents. Only its unfinished
         // runs are cancelled with an event, so without one, nothing else
-        // reports it.
-        if (projectId !== null) {
+        // reports it. A reload that waits or runs reads the agents anyway,
+        // and the backoff of a failed one stays.
+        if (projectId !== null && gate.state() === "live") {
           followUp("part");
         }
         return;
