@@ -132,6 +132,12 @@ export interface AgentActivityService {
   readonly onChange: (
     listener: (state: AgentActivityState) => void,
   ) => () => void;
+  /**
+   * Whether the open project's activity was reloaded since the selected
+   * workspace's last `workspace.subscribed`, with no reload open. The
+   * development switch sends only while this holds.
+   */
+  readonly gateLive: () => boolean;
   /** Stops listening and cancels the timers, for the quit. */
   readonly close: () => void;
 }
@@ -731,6 +737,11 @@ export function createAgentActivityService(
         listeners.delete(entry);
       };
     },
+    gateLive: () =>
+      !closed &&
+      projectId !== null &&
+      activity !== null &&
+      gate.state() === "live",
     close: () => {
       if (closed) {
         return;
