@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useReducer,
   useState,
   type Dispatch,
@@ -47,10 +48,8 @@ import {
   type ShellView,
 } from "./screens.ts";
 import {
-  followWorkspaceState,
+  createWorkspaceSidebar,
   initialWorkspacePanelView,
-  reportOpenProject,
-  switchWorkspace,
 } from "./workspace-view.ts";
 import { AboutScreen, HomeScreen } from "./WorkspaceScreens.tsx";
 
@@ -174,9 +173,9 @@ function ScreenContent({
 }
 
 /**
- * Follows the workspace state while the shell is mounted: every state
- * replaces the shell's projects. Reports the open project to the main
- * process at the start and after every change, and switches workspaces.
+ * Follows the workspace state while the shell is mounted, reports the open
+ * project to the main process at the start and after every change, and
+ * switches workspaces. The logic is in `createWorkspaceSidebar`.
  */
 function useWorkspaces(
   workspaces: WorkspaceBridge | undefined,
@@ -190,32 +189,22 @@ function useWorkspaces(
       : { kind: "known" as const, state: initialState },
   );
   const [message, setMessage] = useState<string | undefined>(undefined);
-
-  useEffect(
+  const controller = useMemo(
     () =>
       workspaces === undefined
         ? undefined
-        : followWorkspaceState(workspaces, setView, dispatch),
+        : createWorkspaceSidebar(workspaces, dispatch, setView, setMessage),
     [workspaces, dispatch],
   );
 
+  useEffect(() => controller?.start(), [controller]);
   useEffect(
-    () =>
-      workspaces === undefined
-        ? undefined
-        : reportOpenProject(workspaces, openProjectId, dispatch),
-    [workspaces, openProjectId, dispatch],
+    () => controller?.openProjectChanged(openProjectId),
+    [controller, openProjectId],
   );
-
   const onSelect = useCallback(
-    (workspaceId: string) => {
-      if (workspaces === undefined) {
-        return;
-      }
-      setMessage(undefined);
-      void switchWorkspace(workspaces, workspaceId).then(setMessage);
-    },
-    [workspaces],
+    (workspaceId: string) => controller?.select(workspaceId),
+    [controller],
   );
 
   return { view, message, onSelect };

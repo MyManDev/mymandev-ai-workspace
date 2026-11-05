@@ -24,10 +24,10 @@ export function initialWorkspacePanelView(
 export const WORKSPACE_MESSAGES = Object.freeze({
   unavailable: "Workspaces are not available.",
   pending: "Checking the workspaces.",
-  signedOut:
-    "Not signed in. Sign in on the home screen to see your workspaces.",
+  signedOut: "Workspaces appear once this device is signed in and ready.",
   loadingWorkspaces: "Loading the workspaces.",
   noWorkspaces: "No workspaces yet.",
+  noneSelected: "Select a workspace to see its projects.",
   loadingProjects: "Loading the projects.",
   noProjects: "No projects yet.",
   switchFailed: "The workspace could not be switched.",
@@ -56,63 +56,16 @@ export const SELECT_REFUSAL_MESSAGES: Readonly<
 });
 
 /**
- * Follows the workspace state for the shell: each state becomes the view,
- * and its projects replace the shell's projects, also when the shown view
- * stays the same. A refused subscription makes the view unavailable. The
- * returned function ends the subscription.
- */
-export function followWorkspaceState(
-  workspaces: Pick<WorkspaceBridge, "subscribeState">,
-  onView: (view: WorkspacePanelView) => void,
-  dispatch: (action: ShellAction) => void,
-): () => void {
-  return workspaces.subscribeState(
-    (state) => {
-      onView({ kind: "known", state });
-      dispatch({ type: "replace-projects", projects: state.projects });
-    },
-    () => onView({ kind: "unavailable" }),
-  );
-}
-
-/**
- * Tells the main process which project is open, or null for none. The main
- * process closes its open project when the page reloads, so the shell sends
- * its own at the start as well. A project that the main process does not
- * hold (`not_found`) is closed in the shell too; `too_soon` keeps it, and a
- * failed call changes nothing. The returned function drops the answer, for
- * a report that a newer one replaced.
- */
-export function reportOpenProject(
-  workspaces: Pick<WorkspaceBridge, "openProject">,
-  projectId: string | null,
-  dispatch: (action: ShellAction) => void,
-): () => void {
-  let current = true;
-  workspaces.openProject(projectId).then(
-    (result) => {
-      if (
-        current &&
-        projectId !== null &&
-        result.outcome === "refused" &&
-        result.reason === "not_found"
-      ) {
-        dispatch({ type: "show-screen", screen: "home" });
-      }
-    },
-    () => undefined,
-  );
-  return () => {
-    current = false;
-  };
-}
-
-/**
  * Switches to another workspace and resolves to the message to show, or
- * undefined. Every switch of the shell goes through here, so the question
- * before a switch while chat messages wait to be sent (#27) belongs here.
- * The main process closes the open project, and its next state brings the
- * new workspace's projects.
+ * undefined. Every switch of the shell goes through here. The main process
+ * closes the open project, and its next state brings the new workspace's
+ * projects.
+ *
+ * This is where the person will be asked before a switch while chat
+ * messages wait to be sent; it is not built yet. The main process's chat
+ * service detects the waiting messages: the chat IPC of a later part makes
+ * `select` and `openProject` answer `{ outcome: "waiting", count }`, and an
+ * optional `{ discardWaiting: true }` argument repeats the switch.
  */
 export async function switchWorkspace(
   workspaces: Pick<WorkspaceBridge, "select">,
@@ -126,4 +79,105 @@ export async function switchWorkspace(
   } catch {
     return WORKSPACE_MESSAGES.switchFailed;
   }
+}
+
+/** The workspace part of the shell, apart from React: see `createWorkspaceSidebar`. */
+export interface WorkspaceSidebarController {
+  /**
+   * Subscribes to the workspace state. Returns the function that ends the
+   * subscription and drops the answers that are still open.
+   */
+  readonly start: () => () => void;
+  /**
+   * Tells the main process which project is open, or null for none, and
+   * drops the answer of the previous report.
+   */
+  readonly openProjectChanged: (projectId: string | null) => void;
+  /** Switches to another workspace through `switchWorkspace`. */
+  readonly select: (workspaceId: string) => void;
+}
+
+/**
+ * The workspace logic of the shell, which `App` drives from its effects.
+ *
+ * - Every state becomes the view and replaces the shell's projects, also
+ *   when the shown view stays the same. A refused subscription makes the
+ *   view unavailable.
+ * - The main process closes its open project when the page reloads, so the
+ *   shell reports its own, or null, at the start and after every change. A
+ *   project that the main process does not hold (`not_found`) closes in the
+ *   shell too; a failed call changes nothing.
+ * - A switch clears the message first and then shows the text of its
+ *   answer, if any. Only the answer of the latest switch counts. A newer
+ *   workspace state clears the message.
+ */
+export function createWorkspaceSidebar(
+  workspaces: Pick<
+    WorkspaceBridge,
+    "subscribeState" | "openProject" | "select"
+  >,
+  dispatch: (action: ShellAction) => void,
+  onView: (view: WorkspacePanelView) => void,
+  onMessage: (message: string | undefined) => void,
+): WorkspaceSidebarController {
+  /** The revision of the last state, or -1 before the first one. */
+  let revision = -1;
+  /** The revision at which the shown message was set, or undefined. */
+  let messageRevision: number | undefined;
+  /** Each report and switch gets a new token; an older answer is dropped. */
+  let reportToken = 0;
+  let selectToken = 0;
+
+  const setMessage = (message: string | undefined) => {
+    messageRevision = message === undefined ? undefined : revision;
+    onMessage(message);
+  };
+
+  return Object.freeze({
+    start: () => {
+      const stop = workspaces.subscribeState(
+        (state) => {
+          revision = state.revision;
+          onView({ kind: "known", state });
+          dispatch({ type: "replace-projects", projects: state.projects });
+          if (messageRevision !== undefined && revision > messageRevision) {
+            setMessage(undefined);
+          }
+        },
+        () => onView({ kind: "unavailable" }),
+      );
+      return () => {
+        stop();
+        reportToken += 1;
+        selectToken += 1;
+      };
+    },
+    openProjectChanged: (projectId: string | null) => {
+      reportToken += 1;
+      const token = reportToken;
+      workspaces.openProject(projectId).then(
+        (result) => {
+          if (
+            token === reportToken &&
+            projectId !== null &&
+            result.outcome === "refused" &&
+            result.reason === "not_found"
+          ) {
+            dispatch({ type: "show-screen", screen: "home" });
+          }
+        },
+        () => undefined,
+      );
+    },
+    select: (workspaceId: string) => {
+      selectToken += 1;
+      const token = selectToken;
+      setMessage(undefined);
+      void switchWorkspace(workspaces, workspaceId).then((message) => {
+        if (token === selectToken) {
+          setMessage(message);
+        }
+      });
+    },
+  });
 }

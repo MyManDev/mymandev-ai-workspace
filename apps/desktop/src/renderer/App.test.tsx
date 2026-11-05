@@ -379,6 +379,11 @@ const pendingBridge: WorkspaceBridge = {
   openProject: () => Promise.resolve({ outcome: "ok" }),
 };
 
+/** The always present live region of the workspaces, with this text. */
+function statusParagraph(text = ""): string {
+  return `<p class="nav-empty nav-status" role="status">${escaped(text)}</p>`;
+}
+
 test("each workspace state has its own fixed text in the sidebar, and no ID is shown", () => {
   const cases: [Partial<AppProps>, string][] = [
     [
@@ -420,10 +425,12 @@ test("each workspace state has its own fixed text in the sidebar, and no ID is s
     ],
   ];
   for (const [props, text] of cases) {
-    expect(workspacePart(props)).toBe(`${WORKSPACES_HEADING}${text}`);
+    expect(workspacePart(props)).toBe(
+      `${WORKSPACES_HEADING}${text}${statusParagraph()}`,
+    );
   }
 
-  // After a switch, the selected workspace loads its projects.
+  // While the selected workspace loads, on the first load or after a switch.
   const loading = workspacePart({
     initialWorkspaceState: workspaceState([], { status: "loading" }),
   });
@@ -431,32 +438,68 @@ test("each workspace state has its own fixed text in the sidebar, and no ID is s
   expect(loading).toContain(
     `<h2 class="nav-heading" id="projects-heading">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.loadingProjects}</p>`,
   );
-  for (const html of [loading, workspacePart({})]) {
+
+  // Workspaces are listed, but none is selected.
+  const noneSelected = workspacePart({
+    initialWorkspaceState: workspaceState([], { selectedWorkspaceId: null }),
+  });
+  expect(noneSelected).toContain(
+    `</ul>${statusParagraph()}<p class="nav-empty">${WORKSPACE_MESSAGES.noneSelected}</p>`,
+  );
+  expect(noneSelected).not.toContain("aria-current");
+  expect(noneSelected).not.toContain("projects-heading");
+
+  for (const html of [loading, noneSelected, workspacePart({})]) {
     expect(html).not.toContain("workspace-a");
     expect(html).not.toContain("workspace-b");
     expect(html).not.toContain("project-a");
-    expect(html).not.toContain('role="status"');
+    expect(html.match(/role="status"/g)).toHaveLength(1);
+    expect(html).toContain(statusParagraph());
   }
 });
 
-test("a refused switch shows a calm fixed text below the workspaces and keeps the selection", () => {
-  const html = renderToString(
+/** The sidebar for this workspace state with this switch message. */
+function navWith(state: WorkspaceView, message: string | undefined): string {
+  return renderToString(
     <WorkspaceNav
-      state={createShellState(PROJECTS)}
+      state={createShellState(state.projects)}
       dispatch={() => undefined}
       workspaces={{
-        view: { kind: "known", state: workspaceState(PROJECTS) },
-        message: SELECT_REFUSAL_MESSAGES.too_soon,
+        view: { kind: "known", state },
+        message,
         onSelect: () => undefined,
       }}
     />,
   );
+}
+
+test("a refused switch shows a calm fixed text below the workspaces and keeps the selection", () => {
+  const html = navWith(
+    workspaceState(PROJECTS),
+    SELECT_REFUSAL_MESSAGES.too_soon,
+  );
 
   expect(html).toContain(
-    'aria-current="true">Workspace B</button></li></ul><p class="nav-empty" role="status">Wait a moment before switching again.</p>',
+    `aria-current="true">Workspace B</button></li></ul>${statusParagraph("Wait a moment before switching again.")}`,
   );
   expect(html).not.toContain('role="alert"');
   expect(html).not.toContain("panel-message");
+});
+
+test("a switch message is not shown while the device is not ready", () => {
+  const html = navWith(
+    workspaceState([], {
+      status: "signed_out",
+      workspaces: [],
+      selectedWorkspaceId: null,
+    }),
+    SELECT_REFUSAL_MESSAGES.too_soon,
+  );
+
+  expect(html).toContain(
+    `<p class="nav-empty">${WORKSPACE_MESSAGES.signedOut}</p>${statusParagraph()}`,
+  );
+  expect(html).not.toContain(SELECT_REFUSAL_MESSAGES.too_soon);
 });
 
 test("unavailable workspaces keep what was loaded and show the problem as a fixed text", () => {
@@ -474,9 +517,21 @@ test("unavailable workspaces keep what was loaded and show the problem as a fixe
       }),
     });
     expect(kept).toContain(
-      `</ul><p class="nav-empty" role="status">${escaped(WORKSPACE_PROBLEM_MESSAGES[problem])}</p><h2 class="nav-heading" id="projects-heading">Projects</h2>`,
+      `</ul>${statusParagraph(WORKSPACE_PROBLEM_MESSAGES[problem])}<h2 class="nav-heading" id="projects-heading">Projects</h2>`,
     );
     expect(kept).toContain('dir="auto">Project A</button>');
+
+    // The problem says why no project is listed, not "No projects yet."
+    const noProjects = workspacePart({
+      initialWorkspaceState: workspaceState([], {
+        status: "unavailable",
+        problem,
+      }),
+    });
+    expect(noProjects).toMatch(
+      /<h2 class="nav-heading" id="projects-heading">Projects<\/h2>$/,
+    );
+    expect(noProjects).not.toContain(WORKSPACE_MESSAGES.noProjects);
 
     const empty = workspacePart({
       initialWorkspaceState: workspaceState([], {
@@ -487,9 +542,23 @@ test("unavailable workspaces keep what was loaded and show the problem as a fixe
       }),
     });
     expect(empty).toBe(
-      `${WORKSPACES_HEADING}<p class="nav-empty" role="status">${escaped(WORKSPACE_PROBLEM_MESSAGES[problem])}</p>`,
+      `${WORKSPACES_HEADING}${statusParagraph(WORKSPACE_PROBLEM_MESSAGES[problem])}`,
     );
   }
+});
+
+test("the problem and a switch message share the one status paragraph", () => {
+  const html = navWith(
+    workspaceState(PROJECTS, { status: "unavailable", problem: "failed" }),
+    SELECT_REFUSAL_MESSAGES.too_soon,
+  );
+
+  expect(html.match(/role="status"/g)).toHaveLength(1);
+  expect(html).toContain(
+    statusParagraph(
+      `${WORKSPACE_PROBLEM_MESSAGES.failed} ${SELECT_REFUSAL_MESSAGES.too_soon}`,
+    ),
+  );
 });
 
 test("the about screen shows the Electron version from the preload script", () => {

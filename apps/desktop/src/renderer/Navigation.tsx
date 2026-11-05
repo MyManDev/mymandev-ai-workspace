@@ -63,15 +63,11 @@ export function WorkspaceNav({
         Workspaces
       </h2>
       <WorkspaceList {...workspaces} />
-      {workspaces.view.kind === "known" &&
-      workspaces.view.state.status !== "signed_out" &&
-      workspaces.view.state.selectedWorkspaceId !== null ? (
-        <ProjectList
-          state={state}
-          dispatch={dispatch}
-          status={workspaces.view.state.status}
-        />
-      ) : null}
+      <SelectedWorkspace
+        view={workspaces.view}
+        state={state}
+        dispatch={dispatch}
+      />
     </nav>
   );
 }
@@ -79,24 +75,53 @@ export function WorkspaceNav({
 /**
  * The workspaces with the selected one marked, or a fixed text for the
  * state, and below them why the workspaces are unavailable or why the last
- * switch was refused. Selecting the selected workspace does nothing.
+ * switch was refused. The status paragraph is always rendered, empty when
+ * there is nothing to say, so that a screen reader announces a new text.
+ * Selecting the selected workspace does nothing.
  */
 function WorkspaceList({ view, message, onSelect }: WorkspaceSidebar) {
+  const status = view.kind === "known" ? view.state.status : undefined;
   const notices = [
     view.kind === "known" && view.state.status === "unavailable"
       ? WORKSPACE_PROBLEM_MESSAGES[view.state.problem]
       : undefined,
-    message,
+    // A switch message means nothing once the device is no longer ready.
+    status === "signed_out" ? undefined : message,
   ].filter((notice) => notice !== undefined);
   return (
     <>
       <WorkspaceItems view={view} onSelect={onSelect} />
-      {notices.length === 0 ? null : (
-        <p className="nav-empty" role="status">
-          {notices.join(" ")}
-        </p>
-      )}
+      <p className="nav-empty nav-status" role="status">
+        {notices.join(" ")}
+      </p>
     </>
+  );
+}
+
+/**
+ * The selected workspace's projects, or a fixed text when workspaces are
+ * listed but none is selected. Nothing before the first state and while the
+ * device is not ready.
+ */
+function SelectedWorkspace({
+  view,
+  state,
+  dispatch,
+}: {
+  readonly view: WorkspacePanelView;
+  readonly state: ShellState;
+  readonly dispatch: Dispatch<ShellAction>;
+}) {
+  if (view.kind !== "known" || view.state.status === "signed_out") {
+    return null;
+  }
+  if (view.state.selectedWorkspaceId === null) {
+    return view.state.workspaces.length === 0 ? null : (
+      <p className="nav-empty">{WORKSPACE_MESSAGES.noneSelected}</p>
+    );
+  }
+  return (
+    <ProjectList state={state} dispatch={dispatch} status={view.state.status} />
   );
 }
 
