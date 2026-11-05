@@ -143,8 +143,10 @@ const fakeSafeStorage: SystemKeyProtection = Object.freeze({
  * written to a temporary file, renamed, and read back from the folder, so a
  * restart reads what the session wrote. Only the wait for the disk is left
  * out: it guards against a power loss, which no test here can see, and
- * `atomic-file.test.ts` tests it. On a busy machine one flush can wait for
- * the disk for a long time, and a test here makes up to about ten of them.
+ * `atomic-file.test.ts` and `store.test.ts` test it. On a busy disk one
+ * flush can wait for a long time, and many tests here make ten or more of
+ * them. The other file calls stay real, so a test here still waits on the
+ * file system, and its time still grows with the load on the machine.
  */
 const unflushedFileSystem: KeyFileSystem = Object.freeze({
   ...nodeKeyFileSystem,
