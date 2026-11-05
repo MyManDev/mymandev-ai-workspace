@@ -2617,6 +2617,44 @@ describe("remove this device", () => {
     expect(await notesFile()).toBeNull();
   });
 
+  test("a removal noted while a request is on its way stops the request's retry after a 401", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    await h.session.listDevices();
+    const revokePath = `/devices/${DEVICE_ID}/revoke`;
+    // The first request waits for the test; a retry would get its answer.
+    let answerList: ((response: Response) => void) | undefined;
+    api.intercept = (request) => {
+      if (request.path === revokePath) {
+        return Promise.reject(new TypeError("offline"));
+      }
+      if (request.path === "/devices" && answerList === undefined) {
+        return new Promise<Response>((resolve) => {
+          answerList = resolve;
+        });
+      }
+      return undefined;
+    };
+
+    const reading = h.session.request({
+      route: AUTH_ROUTES.listDevices,
+      answer: "empty",
+    });
+    await waitForRequest(h, "GET", "/devices", 2);
+    expect(await h.session.removeDevice()).toEqual({
+      ok: true,
+      value: "pending",
+    });
+    const minted = mints(h);
+    answerList?.(errorAnswer("unauthorized"));
+
+    expect(await reading).toEqual({ ok: false, reason: "removal_pending" });
+    // No new token: the key serves only the removal.
+    expect(mints(h)).toBe(minted);
+    expect(count(h, "GET", "/devices")).toBe(2);
+  });
+
   test("a sign-out or a sign-in ends a pending removal", async () => {
     const api = fakeApi();
     const h = harness(api);

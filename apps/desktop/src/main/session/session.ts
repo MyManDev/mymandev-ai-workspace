@@ -1428,11 +1428,18 @@ export function createDeviceSession(
     call: AuthorizedRequest<T>,
   ): Promise<SessionResult<T | null>> {
     const blocked = await removalBlock();
-    return blocked ?? sendAuthorized(call);
+    return blocked ?? sendAuthorized(call, removalBlock);
   }
 
+  /**
+   * Sends `call` with a token, and once more with a new token after a `401`.
+   * `blockedBeforeRetry`, when given, is asked again before that new token is
+   * minted: a removal noted while the first request was on its way then
+   * stops the retry, as it stops every other use of the key.
+   */
   async function sendAuthorized<T>(
     call: AuthorizedRequest<T>,
+    blockedBeforeRetry?: () => Promise<SessionFailure | null>,
   ): Promise<SessionResult<T | null>> {
     const origin = originOrFailure();
     if (typeof origin !== "string") {
@@ -1470,6 +1477,10 @@ export function createDeviceSession(
       // The token ended (expired, a sign-out, a new sign-in, or a revoked
       // device): one new token, which reports the reason if it fails.
       dropToken(first.token);
+      const blocked = (await blockedBeforeRetry?.()) ?? null;
+      if (blocked !== null) {
+        return blocked;
+      }
       const second = await sessionToken();
       if (!second.ok) {
         return second;

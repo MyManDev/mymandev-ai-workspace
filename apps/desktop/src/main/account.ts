@@ -256,9 +256,12 @@ export interface AccountService {
    * is capped. It takes no `operation` lock: while a sign-in, a sign-out,
    * "This is not me", a device removal, or an unlock runs, it answers
    * `unavailable`, and the caller tries again later. It waits for the
-   * startup refresh and a background refresh to end, like an action. An
-   * answer for a device that is no longer the signed-in one, or that
-   * arrives while such an action runs, is dropped. Never rejects.
+   * startup refresh and a background refresh to end, like an action, but
+   * actions do not wait for a read on its way. Its answer is dropped as
+   * `unavailable` when such an action began while it was on its way, also
+   * one that has ended since, or when the account or the device changed
+   * meanwhile; as `not_signed_in` when no device is signed in any more.
+   * Never rejects.
    */
   readonly readWorkspaceData: <N extends WorkspaceReadName>(
     name: N,
@@ -572,6 +575,16 @@ export function createAccountService(
    * that a later one overtook changes nothing.
    */
   let accountReads = 0;
+  /**
+   * Counts the changes that may end what a workspace read is for: every
+   * action of the person that may change the account or the device (a
+   * sign-in, a sign-out, "This is not me", a device removal, an unlock)
+   * when it begins, and every published change of the account, the key's
+   * state, or the device, except a device that becomes signed in. A read
+   * takes it before its request and drops the answer when it changed, also
+   * when the action that changed it has ended meanwhile.
+   */
+  let accountChanges = 0;
   let revision = 0;
   let current = snapshot();
 
@@ -589,8 +602,16 @@ export function createAccountService(
   }
 
   function publish(): void {
+    const previous = current;
     revision += 1;
     current = snapshot();
+    if (
+      JSON.stringify(previous.account) !== JSON.stringify(current.account) ||
+      previous.deviceKey !== current.deviceKey ||
+      (previous.device !== current.device && current.device !== "signed_in")
+    ) {
+      accountChanges += 1;
+    }
     for (const listener of listeners) {
       try {
         listener(current);
@@ -931,6 +952,7 @@ export function createAccountService(
       return Object.freeze({ outcome: "refused", reason: "too_soon" });
     }
     operation = "starting";
+    accountChanges += 1;
     cancelRequested = false;
     generation += 1;
     callbackArrived = false;
@@ -1048,6 +1070,7 @@ export function createAccountService(
       return Object.freeze({ outcome: "refused", reason: "too_soon" });
     }
     operation = "unlocking";
+    accountChanges += 1;
     try {
       await opened.keyStore.load({ passphrase });
       wrongPassphrases = 0;
@@ -1098,6 +1121,7 @@ export function createAccountService(
       return Object.freeze({ outcome: "refused", reason: "not_signed_in" });
     }
     operation = "forgetting";
+    accountChanges += 1;
     try {
       // A background refresh may still use the key, for example to report a
       // sign-out, and write the record once the API answers: the forget
@@ -1202,6 +1226,9 @@ export function createAccountService(
       return ACTION_BUSY;
     }
     operation = kind;
+    if (kind !== "listing") {
+      accountChanges += 1;
+    }
     await backgroundSettled();
     if (system === null || session === null || account.kind !== "signed_in") {
       return ACTION_NOT_SIGNED_IN;
@@ -1413,6 +1440,7 @@ export function createAccountService(
         return workspaceReadFailed("not_signed_in");
       }
       const deviceId = account.deviceId;
+      const changes = accountChanges;
       const replacementWasPending = replacementPending;
       const result = await held.request(call);
       if (replacementWasPending) {
@@ -1421,13 +1449,15 @@ export function createAccountService(
           report("The account could not be read.");
         });
       }
-      // The answer belongs to the device that asked: when the account
-      // changed meanwhile, or an action that may change it began, it is
-      // dropped.
+      // The answer belongs to the device that asked: when the account or
+      // the device changed meanwhile, or an action that may change them
+      // began, also one that has ended since (`accountChanges`), it is
+      // dropped. Actions do not wait for a read on its way; this check
+      // makes its answer harmless instead.
       if (account.kind !== "signed_in") {
         return workspaceReadFailed("not_signed_in");
       }
-      if (account.deviceId !== deviceId || readsPaused()) {
+      if (account.deviceId !== deviceId || accountChanges !== changes) {
         return workspaceReadFailed("unavailable");
       }
       if (!result.ok) {

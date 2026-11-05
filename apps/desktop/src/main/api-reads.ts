@@ -171,8 +171,10 @@ export interface WorkspaceReadAnswer {
  * - `rate_limited`: the API answered `rate_limited`; the caller tries again
  *   after a fixed time.
  * - `unavailable`: try again later: a sign-in, a sign-out, "This is not me",
- *   or a device removal runs; another device signed in while the read was on
- *   its way; or the API gave no answer, failed, or is not set.
+ *   a device removal, or an unlock runs, or one began while the read was on
+ *   its way, also one that has ended since; the account or the device
+ *   changed meanwhile, for example another device signed in; or the API gave
+ *   no answer, failed, or is not set.
  * - `failed`: the request is outside the allowlist's format, the API refused
  *   it otherwise, or the answer is too large or does not fit its schema.
  */

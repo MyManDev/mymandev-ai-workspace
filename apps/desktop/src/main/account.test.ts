@@ -2970,3 +2970,85 @@ test("an answer is dropped when the signed-in device changed while the read was 
   finish({ ok: true, value: WORKSPACE_LIST });
   await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
 });
+
+test("an answer is dropped when an action began and ended while the read was on its way", async () => {
+  const h = harness();
+  await h.service.initialize();
+
+  // A sign-out that starts and ends: the record is kept, the same device
+  // stays in the account, and no action runs when the answer arrives.
+  let finish = heldAnswer(h);
+  let reading: Promise<unknown> = h.service.readWorkspaceData("listMessages", {
+    projectId: PROJECT_ID,
+  });
+  await tick();
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "signed_out",
+  });
+  expect(h.service.status().account).toMatchObject({
+    kind: "signed_in",
+    deviceId: DEVICE_ID,
+  });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // A removal that ends as pending.
+  finish = heldAnswer(h);
+  reading = h.service.readWorkspaceData("listAgents", {
+    projectId: PROJECT_ID,
+  });
+  await tick();
+  h.removeDevice = async () => ({ ok: true, value: "pending" });
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "pending",
+  });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // A sign-in attempt that starts and is cancelled.
+  finish = heldAnswer(h);
+  reading = h.service.readWorkspaceData("listRuns", { projectId: PROJECT_ID });
+  await tick();
+  const signIn = startedSignIn();
+  h.start = async () => signIn.start;
+  await expect(h.service.startSignIn()).resolves.toMatchObject({
+    outcome: "started",
+  });
+  expect(h.service.cancelSignIn()).toBe(true);
+  await tick();
+  expect(h.service.status().signIn).toEqual({ kind: "idle" });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // Without a change, the next answer comes back.
+  h.request = async () => ({ ok: true, value: WORKSPACE_LIST });
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+});
+
+test("an answer is dropped when the device signed out without an action while the read was on its way, and kept when it only became signed in", async () => {
+  const h = harness();
+  await h.service.initialize();
+
+  // For example a close reason of the connection.
+  let finish = heldAnswer(h);
+  let reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  h.emit({
+    kind: "signed_out",
+    account: SESSION_ACCOUNT,
+    reportPending: false,
+  });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // Signed in again, for example after `refresh`: nothing ended.
+  h.emit({ kind: "auth_failed", account: SESSION_ACCOUNT });
+  finish = heldAnswer(h);
+  reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  h.emit(SESSION_SIGNED_IN);
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+});
