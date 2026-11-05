@@ -160,10 +160,20 @@ function fileError(
   return error;
 }
 
-/** The value of `work`, or its error as a rejection, as a call of `node:fs/promises` settles. */
+/**
+ * The value of `work`, or its error as a rejection, on a later turn of the
+ * event loop, as a call of `node:fs/promises` settles. A write that the
+ * session does not await therefore lands after the code that follows it.
+ */
 function settled<T>(work: () => T): Promise<T> {
-  return new Promise((resolve) => {
-    resolve(work());
+  return new Promise((resolve, reject) => {
+    setImmediate(() => {
+      try {
+        resolve(work());
+      } catch (error) {
+        reject(error);
+      }
+    });
   });
 }
 
@@ -175,8 +185,11 @@ interface MemoryFileSystem extends KeyFileSystem {
 /**
  * A file system in memory with the calls of `KeyFileSystem` and the errors
  * of `node:fs/promises` that the stores handle: ENOENT for a missing file or
- * folder, EEXIST for an exclusive create of a name that exists, and EISDIR
- * or ENOTDIR for a folder where a file belongs or the reverse. A file is
+ * folder, EEXIST for an exclusive create of a name that exists, EISDIR for a
+ * folder where a file belongs (`unlink` of a folder gives EISDIR on Linux
+ * only, EPERM elsewhere), ENOTDIR from `mkdir` under a file, and ENOTDIR from
+ * `readdir` of a file. Other calls under a file give ENOENT, as on Windows;
+ * POSIX gives ENOTDIR there, and no test relies on either. A file is
  * still created under its temporary name, written, closed, and renamed over
  * the target, and a restart reads what the session wrote. A flush does
  * nothing. No call waits for a disk, so the time of a test here does not
@@ -890,11 +903,12 @@ function postCode(redirectUri: string, state: string): Promise<number> {
 
 /**
  * Lets every step that can run now run, without waiting for a time: the
- * files are in memory and the fake API answers at once, so the steps need
- * no more than these turns of the event loop.
+ * files are in memory and the fake API answers at once. Each call of the
+ * memory file system takes one turn of the event loop, so these turns leave
+ * room for a chain of many file calls.
  */
 async function idle(): Promise<void> {
-  for (let turn = 0; turn < 10; turn += 1) {
+  for (let turn = 0; turn < 50; turn += 1) {
     await new Promise((resolve) => setImmediate(resolve));
   }
 }
