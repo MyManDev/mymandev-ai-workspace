@@ -3052,3 +3052,241 @@ test("an answer is dropped when the device signed out without an action while th
   finish({ ok: true, value: WORKSPACE_LIST });
   await expect(reading).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
 });
+
+test("a read refused by its own token request answers the refusal, also when the session published the refused state meanwhile", async () => {
+  const cases: [DeviceSessionState, SessionResult<unknown>][] = [
+    [
+      { kind: "sign_in_required", account: SESSION_ACCOUNT },
+      { ok: false, reason: "refused", code: "sign_in_required" },
+    ],
+    [
+      { kind: "auth_failed", account: SESSION_ACCOUNT },
+      { ok: false, reason: "refused", code: "auth_failed" },
+    ],
+    [
+      { kind: "account_mismatch", account: SESSION_ACCOUNT },
+      { ok: false, reason: "refused", code: "device_account_mismatch" },
+    ],
+    [
+      { kind: "key_lost", account: SESSION_ACCOUNT },
+      { ok: false, reason: "key_lost" },
+    ],
+  ];
+  for (const [state, failure] of cases) {
+    const h = harness();
+    await h.service.initialize();
+    // As the session does: the state is published before the request's
+    // failure resolves.
+    h.request = async () => {
+      h.emit(state);
+      return failure;
+    };
+    await expect(
+      h.service.readWorkspaceData("listWorkspaces", {}),
+      state.kind,
+    ).resolves.toEqual({ ok: false, reason: "not_signed_in" });
+    expect(h.service.status().device, state.kind).toBe(state.kind);
+  }
+});
+
+test("a successful answer without a value fails", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.request = async () => ({ ok: true, value: null });
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: false, reason: "failed" });
+});
+
+/** A harness whose session refresh waits for `gate` while one is set. */
+function gatedRefresh(h: Harness) {
+  let gate: Promise<void> | null = null;
+  let release: () => void = () => undefined;
+  const createSession = h.createSession;
+  h.createSession = () => {
+    const session = createSession();
+    return {
+      ...session,
+      refresh: async () => {
+        await gate;
+        return session.refresh();
+      },
+    };
+  };
+  return {
+    hold: () => {
+      gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    },
+    release: () => release(),
+  };
+}
+
+test("an action that starts while a read waits for the startup refresh makes the read unavailable without a request", async () => {
+  // A sign-out.
+  const h = harness();
+  const refresh = gatedRefresh(h);
+  refresh.hold();
+  const initializing = h.service.initialize();
+  await tick();
+  const reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  const signingOut = h.service.signOut();
+  await tick();
+  refresh.release();
+  await initializing;
+  await expect(reading).resolves.toEqual({
+    ok: false,
+    reason: "unavailable",
+  });
+  await expect(signingOut).resolves.toEqual({ outcome: "signed_out" });
+  expect(h.requests).toEqual([]);
+
+  // The start of a sign-in.
+  const s = harness();
+  const startRefresh = gatedRefresh(s);
+  startRefresh.hold();
+  const starting = s.service.initialize();
+  await tick();
+  const read = s.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  const signIn = startedSignIn();
+  s.start = async () => signIn.start;
+  const started = s.service.startSignIn();
+  await tick();
+  startRefresh.release();
+  await starting;
+  await expect(read).resolves.toEqual({ ok: false, reason: "unavailable" });
+  await expect(started).resolves.toEqual({ outcome: "started" });
+  expect(s.requests).toEqual([]);
+  signIn.settle({ kind: "cancelled" });
+});
+
+test("a read during the refresh after an unlock waits for it and is sent after it", async () => {
+  const h = harness();
+  h.load = async (passphrase) => {
+    if (passphrase === undefined) {
+      throw new DeviceKeyError("passphrase_required");
+    }
+  };
+  const refresh = gatedRefresh(h);
+  await h.service.initialize();
+  refresh.hold();
+  h.log.length = 0;
+
+  await expect(h.service.unlockDeviceKey(PASSPHRASE)).resolves.toEqual({
+    outcome: "unlocked",
+  });
+  const reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  expect(h.requests).toEqual([]);
+
+  refresh.release();
+  await expect(reading).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  expect(h.log.indexOf("session request /workspaces")).toBeGreaterThan(
+    h.log.indexOf("session refresh"),
+  );
+  expect(h.log).toContain("session refresh");
+});
+
+test("a read is unavailable during an unlock, an unlock or This is not me that began meanwhile drops its answer, and a device list does not stop it", async () => {
+  const h = harness();
+  let release: () => void = () => undefined;
+  h.load = (passphrase) => {
+    if (passphrase === undefined) {
+      return Promise.reject(new DeviceKeyError("passphrase_required"));
+    }
+    return new Promise((_resolve, reject) => {
+      release = () => reject(new DeviceKeyError("wrong_passphrase"));
+    });
+  };
+  await h.service.initialize();
+
+  // During an unlock.
+  const unlocking = h.service.unlockDeviceKey("not the passphrase");
+  await tick();
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  expect(h.requests).toEqual([]);
+  release();
+  await expect(unlocking).resolves.toEqual({
+    outcome: "refused",
+    reason: "wrong_passphrase",
+  });
+
+  // An unlock that began and ended, refused, while the read was on its way.
+  h.clock += unlockDelayMs(1);
+  let finish = heldAnswer(h);
+  let reading: Promise<unknown> = h.service.readWorkspaceData(
+    "listWorkspaces",
+    {},
+  );
+  await tick();
+  const revision = h.service.status().revision;
+  const unlock = h.service.unlockDeviceKey("not the passphrase");
+  await tick();
+  release();
+  await expect(unlock).resolves.toMatchObject({ reason: "wrong_passphrase" });
+  expect(h.service.status().revision).toBe(revision);
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // This is not me, cancelled, while the read was on its way.
+  h.confirm = async () => false;
+  finish = heldAnswer(h);
+  reading = h.service.readWorkspaceData("listProjects", {
+    workspaceId: WORKSPACE_ID,
+  });
+  await tick();
+  await expect(h.service.forgetAccount()).resolves.toEqual({
+    outcome: "cancelled",
+  });
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // A device list that runs does not stop a read.
+  let listed: (value: SessionResult<readonly unknown[]>) => void = () =>
+    undefined;
+  h.listDevices = () =>
+    new Promise((resolve) => {
+      listed = resolve;
+    });
+  const listing = h.service.listDevices();
+  await tick();
+  h.request = async () => ({ ok: true, value: WORKSPACE_LIST });
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  listed({ ok: true, value: [DEVICE_ITEM] });
+  await expect(listing).resolves.toMatchObject({ outcome: "listed" });
+});
+
+test("after a read made while a key replacement was pending, the account and the key are read again", async () => {
+  const h = harness();
+  h.keyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: true,
+    passphraseRequired: false,
+  };
+  await h.service.initialize();
+  expect(h.service.status().replacementPending).toBe(true);
+
+  // The read's token confirmed the replacement.
+  h.request = async () => {
+    h.keyStatus = {
+      protection: "system",
+      loaded: true,
+      replacementPending: false,
+      passphraseRequired: false,
+    };
+    return { ok: true, value: WORKSPACE_LIST };
+  };
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  await tick();
+  expect(h.service.status().replacementPending).toBe(false);
+});

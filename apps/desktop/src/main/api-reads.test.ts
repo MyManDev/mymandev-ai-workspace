@@ -1,19 +1,29 @@
 import {
+  AgentListResponseSchema,
+  AgentRunListResponseSchema,
+  ChatHistoryResponseSchema,
+  ProjectListResponseSchema,
   type ProjectId,
   routePath,
   type WorkspaceId,
+  WorkspaceListResponseSchema,
+  WorkspaceViewResponseSchema,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
 import {
   MESSAGE_PAGE_LIMIT,
   WORKSPACE_READ_FAILURES,
   WORKSPACE_READS,
+  type WorkspaceReadFailure,
   type WorkspaceReadName,
   workspaceReadFailureOf,
   workspaceReadRequest,
 } from "./api-reads.ts";
 import { callApi, MAX_API_ANSWER_BYTES } from "./session/api-call.ts";
-import { SESSION_FAILURE_REASONS } from "./session/session.ts";
+import {
+  SESSION_FAILURE_REASONS,
+  type SessionFailureReason,
+} from "./session/session.ts";
 
 const ORIGIN = "https://api.mymandev.example";
 const WORKSPACE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1" as WorkspaceId;
@@ -231,4 +241,53 @@ test("every failure of the session maps into the closed set", () => {
   expect(workspaceReadFailureOf({ ok: false, reason: "no_answer" })).toBe(
     "unavailable",
   );
+});
+
+test("each read's answer schema is the protocol schema of its route", () => {
+  const schemas: Record<WorkspaceReadName, unknown> = {
+    listWorkspaces: WorkspaceListResponseSchema,
+    getWorkspace: WorkspaceViewResponseSchema,
+    listProjects: ProjectListResponseSchema,
+    listMessages: ChatHistoryResponseSchema,
+    listAgents: AgentListResponseSchema,
+    listRuns: AgentRunListResponseSchema,
+  };
+  expect(Object.keys(WORKSPACE_READS).sort()).toEqual(
+    Object.keys(schemas).sort(),
+  );
+  for (const name of Object.keys(schemas) as WorkspaceReadName[]) {
+    expect(WORKSPACE_READS[name].answer, name).toBe(schemas[name]);
+  }
+});
+
+test("each failure reason of the session maps to its fixed failure", () => {
+  // A new reason of the session fails to compile here until it is mapped.
+  const expected: Record<SessionFailureReason, WorkspaceReadFailure> = {
+    api_origin_unset: "unavailable",
+    api_origin_invalid: "unavailable",
+    no_device: "not_signed_in",
+    key_lost: "not_signed_in",
+    key_not_loaded: "not_signed_in",
+    record_unreadable: "unavailable",
+    key_store_failed: "unavailable",
+    signed_out: "not_signed_in",
+    sign_in_running: "unavailable",
+    replacement_pending: "unavailable",
+    removal_pending: "not_signed_in",
+    // Without a code.
+    refused: "failed",
+    record_not_saved: "unavailable",
+    invalid_request: "failed",
+    no_answer: "unavailable",
+    server_error: "unavailable",
+    unexpected_response: "failed",
+  };
+  expect(Object.keys(expected).sort()).toEqual(
+    [...SESSION_FAILURE_REASONS].sort(),
+  );
+  for (const reason of SESSION_FAILURE_REASONS) {
+    expect(workspaceReadFailureOf({ ok: false, reason }), reason).toBe(
+      expected[reason],
+    );
+  }
 });

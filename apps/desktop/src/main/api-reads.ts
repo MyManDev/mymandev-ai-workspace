@@ -165,7 +165,10 @@ export interface WorkspaceReadAnswer {
  *
  * - `not_signed_in`: no device of this installation is signed in, or the API
  *   refused its key or its token; the answer of a device that is no longer
- *   signed in is dropped as well.
+ *   signed in is dropped as well. It also covers a signed-in device whose
+ *   key is not usable: it waits for its passphrase, it is lost, or it serves
+ *   only a pending removal. The caller reads `status().deviceKey` to tell
+ *   an unlock from a sign-in.
  * - `not_found`: the API answered `not_found`: the workspace or the project
  *   does not exist, or the account is not an active member of it.
  * - `rate_limited`: the API answered `rate_limited`; the caller tries again

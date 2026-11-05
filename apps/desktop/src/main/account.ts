@@ -258,10 +258,12 @@ export interface AccountService {
    * `unavailable`, and the caller tries again later. It waits for the
    * startup refresh and a background refresh to end, like an action, but
    * actions do not wait for a read on its way. Its answer is dropped as
+   * `not_signed_in` when no device is signed in any more, and as
+   * `unavailable` when another device is. Data is also dropped as
    * `unavailable` when such an action began while it was on its way, also
    * one that has ended since, or when the account or the device changed
-   * meanwhile; as `not_signed_in` when no device is signed in any more.
-   * Never rejects.
+   * meanwhile; a failure carries no data and is answered as it is, also when
+   * its own refusal changed the device. Never rejects.
    */
   readonly readWorkspaceData: <N extends WorkspaceReadName>(
     name: N,
@@ -1449,19 +1451,26 @@ export function createAccountService(
           report("The account could not be read.");
         });
       }
-      // The answer belongs to the device that asked: when the account or
-      // the device changed meanwhile, or an action that may change them
-      // began, also one that has ended since (`accountChanges`), it is
-      // dropped. Actions do not wait for a read on its way; this check
-      // makes its answer harmless instead.
+      // The answer belongs to the device that asked: when no device or
+      // another one is signed in now, it is dropped.
       if (account.kind !== "signed_in") {
         return workspaceReadFailed("not_signed_in");
       }
-      if (account.deviceId !== deviceId || accountChanges !== changes) {
+      if (account.deviceId !== deviceId) {
         return workspaceReadFailed("unavailable");
       }
+      // A failure carries no data, so it is answered as it is, also when
+      // the request's own refusal (for example `sign_in_required`) changed
+      // the device meanwhile.
       if (!result.ok) {
         return workspaceReadFailed(workspaceReadFailureOf(result));
+      }
+      // Data is dropped when the account or the device changed meanwhile,
+      // or an action that may change them began, also one that has ended
+      // since (`accountChanges`). Actions do not wait for a read on its
+      // way; this check makes its answer harmless instead.
+      if (accountChanges !== changes) {
+        return workspaceReadFailed("unavailable");
       }
       if (result.value === null) {
         return workspaceReadFailed("failed");
