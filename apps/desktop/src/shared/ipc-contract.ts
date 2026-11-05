@@ -869,6 +869,136 @@ export const WorkspaceActionResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type WorkspaceActionResult = z.infer<typeof WorkspaceActionResultSchema>;
 
+// The agent activity of the open project (#28).
+
+/**
+ * Limits of the agent activity message: the number of agents, the most
+ * that one answer of the API holds (the protocol's `MAX_ANSWER_LIST_ITEMS`);
+ * the number of unfinished and of finished runs that the main process
+ * sends (the protocol's `RECENT_FINISHED_RUNS` for the finished ones); and
+ * the length of an agent's name, its owner's name, and a run's reason in
+ * characters (code points; zod counts them like the protocol's `LIMITS`).
+ * The main process sends the newest runs within these limits and cuts a
+ * longer name or reason. The shared contract does not import the protocol
+ * package, so the main process's tests check that the values match.
+ */
+export const AGENT_LIMITS = Object.freeze({
+  agents: 1_000,
+  unfinishedRuns: 200,
+  finishedRuns: 50,
+  agentName: 64,
+  ownerName: 64,
+  runReason: 500,
+});
+
+/**
+ * The states of the agent activity service: `no_project` while no project
+ * is open, `loading` until the open project's activity loaded once,
+ * `ready`, and `unavailable` after a failed reload, until a reload
+ * succeeds.
+ */
+export const AGENT_ACTIVITY_STATUSES = Object.freeze([
+  "no_project",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type AgentActivityStatusView = (typeof AGENT_ACTIVITY_STATUSES)[number];
+
+/** Why the agent activity is `unavailable`: the failure of the last reload. */
+export const AGENT_ACTIVITY_PROBLEMS = Object.freeze([
+  "not_signed_in",
+  "not_found",
+  "rate_limited",
+  "unavailable",
+  "failed",
+] as const);
+export type AgentActivityProblem = (typeof AGENT_ACTIVITY_PROBLEMS)[number];
+
+/** The six run states, like the protocol's `RUN_STATES`. */
+export const AGENT_RUN_STATES = Object.freeze([
+  "queued",
+  "running",
+  "awaiting_input",
+  "completed",
+  "failed",
+  "cancelled",
+] as const);
+export type AgentRunStateView = (typeof AGENT_RUN_STATES)[number];
+
+/**
+ * An agent of the open project, disabled ones included. Its owner crosses
+ * as the display name that the main process resolved, never as a member
+ * ID, and nothing names a device.
+ */
+export const AgentViewSchema = z.object({
+  id: ProtocolIdSchema,
+  name: z.string().min(1).max(AGENT_LIMITS.agentName),
+  ownerName: z.string().min(1).max(AGENT_LIMITS.ownerName),
+  /** When the agent was disabled; null while it is enabled. */
+  disabledAt: TimestampSchema.nullable(),
+});
+export type AgentView = z.infer<typeof AgentViewSchema>;
+
+/** A run of an agent of the open project. */
+export const AgentRunViewSchema = z.object({
+  id: ProtocolIdSchema,
+  agentId: ProtocolIdSchema,
+  state: z.enum(AGENT_RUN_STATES),
+  /** The reason given with the last state change; null without one. */
+  reason: z.string().min(1).max(AGENT_LIMITS.runReason).nullable(),
+  createdAt: TimestampSchema,
+  /** Set exactly when the run is finished. */
+  finishedAt: TimestampSchema.nullable(),
+});
+export type AgentRunView = z.infer<typeof AgentRunViewSchema>;
+
+const AgentActivityViewFields = {
+  /**
+   * Grows by one with every change, also when only an owner's name
+   * changed. A receiver keeps the view with the highest revision, like the
+   * runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /** The selected workspace while a project is open, else null. */
+  workspaceId: ProtocolIdSchema.nullable(),
+  projectId: ProtocolIdSchema.nullable(),
+  /** The open project's agents, in the server's order. */
+  agents: z.array(AgentViewSchema).max(AGENT_LIMITS.agents).readonly(),
+  /** The newest unfinished runs, the most recently created first. */
+  unfinishedRuns: z
+    .array(AgentRunViewSchema)
+    .max(AGENT_LIMITS.unfinishedRuns)
+    .readonly(),
+  /** How many older unfinished runs `unfinishedRuns` leaves out. */
+  moreUnfinishedRuns: z.int().nonnegative(),
+  /** The most recently finished runs, the most recently finished first. */
+  finishedRuns: z
+    .array(AgentRunViewSchema)
+    .max(AGENT_LIMITS.finishedRuns)
+    .readonly(),
+};
+
+/**
+ * What the renderer may know of the open project's agent activity:
+ * `{ revision, status, problem?, workspaceId, projectId, agents,
+ * unfinishedRuns, moreUnfinishedRuns, finishedRuns }`, with a problem only
+ * while `unavailable`. It holds IDs, names, states, reasons, and times
+ * only: no member ID, no device ID, and nothing secret.
+ */
+export const AgentActivityViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum(["no_project", "loading", "ready"]),
+    ...AgentActivityViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(AGENT_ACTIVITY_PROBLEMS),
+    ...AgentActivityViewFields,
+  }),
+]);
+export type AgentActivityView = z.infer<typeof AgentActivityViewSchema>;
+
 /** The schemas of every invoke channel. */
 export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.getRuntimeStatus]: Object.freeze({
@@ -963,6 +1093,14 @@ export const INVOKE_CONTRACT = Object.freeze({
     args: z.tuple([ProtocolIdSchema.nullable()]),
     result: WorkspaceActionResultSchema,
   }),
+  [INVOKE_CHANNELS.getAgentState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: AgentActivityViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeAgentState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: AgentActivityViewSchema,
+  }),
 });
 
 /** The payload schema of every event channel. */
@@ -972,6 +1110,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.accountStatusChanged]: AccountStatusSchema,
   [EVENT_CHANNELS.connectionStatusChanged]: ConnectionStatusSchema,
   [EVENT_CHANNELS.workspaceStateChanged]: WorkspaceViewSchema,
+  [EVENT_CHANNELS.agentStateChanged]: AgentActivityViewSchema,
 });
 
 export type InvokeArgs<C extends InvokeChannel> = z.infer<

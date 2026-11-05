@@ -94,6 +94,16 @@ export const INVOKE_CHANNELS = Object.freeze({
   selectWorkspace: "workspaces:select",
   /** Opens a project of the selected workspace by its ID, or closes it with null. */
   openProject: "workspaces:open-project",
+  /**
+   * What the renderer may know of the open project's agent activity: its
+   * agents with their owners' names, and its newest runs. Read-only.
+   */
+  getAgentState: "agents:get-state",
+  /**
+   * The agent activity. The calling frame then receives every later state
+   * on `EVENT_CHANNELS.agentStateChanged`.
+   */
+  subscribeAgentState: "agents:subscribe-state",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */
@@ -108,6 +118,11 @@ export const EVENT_CHANNELS = Object.freeze({
   connectionStatusChanged: "connection:status-changed",
   /** The workspace state after every change, to the frames that subscribed. */
   workspaceStateChanged: "workspaces:state-changed",
+  /**
+   * The agent activity after changes, at most one every 50 ms, to the
+   * frames that subscribed.
+   */
+  agentStateChanged: "agents:state-changed",
 } as const);
 
 export type InvokeChannel =

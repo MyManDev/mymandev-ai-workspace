@@ -1,5 +1,6 @@
 import type {
   AccountStatus,
+  AgentActivityView,
   ConnectionStatus,
   ForgetResult,
   ListDevicesResult,
@@ -37,6 +38,8 @@ export interface DesktopBridge {
   readonly connection: ConnectionBridge;
   /** The account's workspaces, the selected one's projects, and the open project. */
   readonly workspaces: WorkspaceBridge;
+  /** The agent activity of the open project, read-only. */
+  readonly agents: AgentBridge;
 }
 
 export interface RuntimeBridge {
@@ -206,4 +209,26 @@ export interface WorkspaceBridge {
   readonly openProject: (
     projectId: string | null,
   ) => Promise<WorkspaceActionResult>;
+}
+
+/**
+ * The agents and runs of the open project, which the main process holds.
+ * The renderer reads them and changes nothing: an agent's owner comes as a
+ * display name, never as a member ID, and nothing names a device. The
+ * newest runs come, with a count of the unfinished ones left out.
+ */
+export interface AgentBridge {
+  /** The current agent activity. */
+  readonly getState: () => Promise<AgentActivityView>;
+  /**
+   * Calls `listener` with the current agent activity and then after
+   * changes, at most once every 50 ms with the latest one. An activity
+   * older than the last one delivered is dropped. `onError` is called when
+   * the main process refuses the subscription. Returns a function that ends
+   * the subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: AgentActivityView) => void,
+    onError?: () => void,
+  ) => () => void;
 }
