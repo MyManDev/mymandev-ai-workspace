@@ -251,8 +251,12 @@ class Harness {
   readonly states: WorkspaceState[] = [];
   readonly service: WorkspaceService;
 
-  constructor(status: AccountStatus = accountStatus()) {
+  constructor(
+    status: AccountStatus = accountStatus(),
+    connectionState: "connected" | "offline" = "offline",
+  ) {
     this.accountStatus = status;
+    this.connectionStatus = { state: connectionState, revision: 0 };
     const account: WorkspaceAccount = {
       status: () => this.accountStatus,
       onStatusChange: (listener) => {
@@ -541,6 +545,16 @@ test("every workspace.subscribed reloads the view and the projects, and gateLive
   expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
 });
 
+test("a lost connection notifies the listeners that the gate went down", async () => {
+  const h = await withLiveWorkspace();
+  const revision = h.state.revision;
+  const seen = h.states.length;
+  h.setConnection("connecting");
+  expect(h.service.gateLive(WS_A)).toBe(false);
+  expect(h.state.revision).toBeGreaterThan(revision);
+  expect(h.states.slice(seen)).toEqual([h.state]);
+});
+
 test("an answer of an earlier reload is dropped", async () => {
   const h = await withList();
   h.receive(subscribed());
@@ -573,6 +587,19 @@ test("events that arrive during the reload wait and apply after it", async () =>
       name: "Project One Renamed",
     }),
   );
+  // Events that name a project and a person that the reload will not hold.
+  h.receive(
+    event("workspace.project.renamed", {
+      projectId: UNKNOWN_PROJECT,
+      name: "Project Three",
+    }),
+  );
+  h.receive(
+    event("workspace.member.renamed", {
+      memberId: UNKNOWN_MEMBER,
+      displayName: "Linus Newcomer",
+    }),
+  );
   // Nothing applies before the reload.
   expect(h.state.projects).toEqual([]);
   expect(h.service.memberName(MEMBER)).toBe(UNKNOWN_MEMBER_NAME);
@@ -583,9 +610,12 @@ test("events that arrive during the reload wait and apply after it", async () =>
     { id: PROJECT_2, name: "Project Two", createdByMemberId: OWNER },
   ]);
   expect(h.service.memberName(MEMBER)).toBe("Grace Renamed");
-  expect(h.service.gateLive(WS_A)).toBe(true);
-  // A buffered event that names an unknown project starts no other reload.
+  expect(h.service.memberName(UNKNOWN_MEMBER)).toBe(UNKNOWN_MEMBER_NAME);
+  // The buffered events that name an unknown project or person are skipped
+  // and start no other reload.
+  await settle();
   expect(h.reads).toEqual([]);
+  expect(h.service.gateLive(WS_A)).toBe(true);
 });
 
 test("project and member events apply while live", async () => {
@@ -756,6 +786,51 @@ test("a refusal of the only workspace leaves none selected and does not loop", a
   expect([...h.requested]).toEqual([]);
   expect(h.reads).toEqual([]);
   expect(h.state.status).toBe("ready");
+  // Later lists that still hold it do not subscribe to it either.
+  h.setConnection("connecting");
+  h.setConnection("connected");
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.state.selectedWorkspaceId).toBeNull();
+  expect([...h.requested]).toEqual([]);
+  expect(h.frames).toEqual([`subscribe ${WS_A}`, `unsubscribe ${WS_A}`]);
+  // An approved join request for it counts as a new membership.
+  h.receive(
+    frame({
+      type: "account.join_request_decided",
+      joinRequestId: JOIN_REQUEST_ID,
+      workspaceId: WS_A,
+      decision: "approved",
+      decidedAt: AT,
+    }),
+  );
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.state.selectedWorkspaceId).toBe(WS_A);
+  expect([...h.requested]).toEqual([WS_A]);
+});
+
+test("a refused workspace that a list no longer holds is selected by default again when it is listed later", async () => {
+  const h = await withList([WS_A, WS_B]);
+  h.receive(
+    frame({
+      type: "workspace.subscribe_refused",
+      workspaceId: WS_A,
+      code: "not_found",
+    }),
+  );
+  expect(h.state.selectedWorkspaceId).toBe(WS_B);
+  await h.answer("listWorkspaces", ok(workspaceList(WS_B)));
+  // The person rejoined, for example on another device: the next list
+  // holds it first, and the removal of the selected one selects it.
+  h.receive(
+    frame({
+      type: "account.removed_from_workspace",
+      workspaceId: WS_B,
+      removedAt: AT,
+    }),
+  );
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.state.selectedWorkspaceId).toBe(WS_A);
+  expect([...h.requested]).toEqual([WS_A]);
 });
 
 test("workspace.unsubscribed with membership_ended unsubscribes, selects the next workspace, and reloads the list", async () => {
@@ -800,6 +875,18 @@ test("workspace.unsubscribed with membership_ended unsubscribes, selects the nex
 
 test("workspace.unsubscribed after a request ends the subscription until the next workspace.subscribed", async () => {
   const h = await withLiveWorkspace();
+  // The answer for another workspace changes nothing.
+  const revision = h.state.revision;
+  h.receive(
+    frame({
+      type: "workspace.unsubscribed",
+      workspaceId: WS_B,
+      reason: "requested",
+    }),
+  );
+  expect(h.service.gateLive(WS_A)).toBe(true);
+  expect(h.state.revision).toBe(revision);
+  const seen = h.states.length;
   h.receive(
     frame({
       type: "workspace.unsubscribed",
@@ -808,6 +895,9 @@ test("workspace.unsubscribed after a request ends the subscription until the nex
     }),
   );
   expect(h.service.gateLive(WS_A)).toBe(false);
+  // The listeners learn that the gate went down.
+  expect(h.state.revision).toBeGreaterThan(revision);
+  expect(h.states.slice(seen)).toEqual([h.state]);
   expect([...h.requested]).toEqual([WS_A]);
   expect(h.reads).toEqual([]);
   h.receive(subscribed());
@@ -942,6 +1032,20 @@ test("a failed list load is retried with a backoff, and after 60 seconds after r
   expect(h.readNames()).toEqual(["listWorkspaces"]);
 });
 
+test("a list load that fails after the connection was lost schedules no retry", async () => {
+  const h = new Harness();
+  h.setConnection("connected");
+  h.setConnection("connecting");
+  await h.answer("listWorkspaces", failure("unavailable"));
+  expect(h.state).toMatchObject({
+    status: "unavailable",
+    problem: "unavailable",
+  });
+  expect(h.timers).toEqual([]);
+  h.setConnection("connected");
+  expect(h.readNames()).toEqual(["listWorkspaces"]);
+});
+
 test("a lost connection cancels the list retry; the next connect loads at once", async () => {
   const h = new Harness();
   h.setConnection("connected");
@@ -978,6 +1082,25 @@ test("a failed reload of the workspace is retried with a backoff; events keep wa
   expect(h.state.projects.map((p) => p.id)).toEqual([PROJECT_1, PROJECT_2]);
   expect(h.service.gateLive(WS_A)).toBe(true);
   expect(h.openTimers()).toEqual([]);
+  // The backoff starts again after a success.
+  h.receive(subscribed());
+  await h.answerReload(failure("unavailable"), ok(projectList([PROJECT_1])));
+  h.fire(2_000);
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+});
+
+test("projects of another workspace are refused", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  await h.answerReload(ok(workspaceView()), ok(projectList([PROJECT_3], WS_B)));
+  expect(h.state).toMatchObject({
+    status: "unavailable",
+    problem: "failed",
+    projects: [],
+  });
+  expect(h.service.gateLive(WS_A)).toBe(false);
+  expect(h.service.openProject(PROJECT_3)).toBe(false);
+  expect(h.state.openProjectId).toBeNull();
 });
 
 test("not_found for the workspace reloads the list too", async () => {
@@ -1069,6 +1192,23 @@ test("another device resets the state and loads again once connected", async () 
   expect(h.state.revision).toBe(revision);
 });
 
+test("another device while a list load is open and connected loads a fresh list for it", async () => {
+  const h = new Harness();
+  h.setConnection("connected");
+  const earlier = h.take("listWorkspaces");
+  h.setAccount(accountStatus({}, OTHER_DEVICE_ID));
+  expect(h.readNames()).toEqual(["listWorkspaces"]);
+  earlier.answer(ok(workspaceList(WS_B)));
+  await settle();
+  expect(h.state.workspaces).toEqual([]);
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.state).toMatchObject({
+    workspaces: [{ id: WS_A }],
+    selectedWorkspaceId: WS_A,
+  });
+  expect([...h.requested]).toEqual([WS_A]);
+});
+
 test("only a project of the selected workspace opens, and a vanished one closes", async () => {
   const h = await withList();
   expect(h.service.openProject(PROJECT_1)).toBe(false);
@@ -1111,6 +1251,40 @@ test("a listener that throws is logged, and the others still get the state", asy
   h.service.select(WS_A);
   h.receive(subscribed());
   expect(seen).toHaveLength(count);
+});
+
+test("a service created while the client is connected loads the list", () => {
+  const h = new Harness(accountStatus(), "connected");
+  expect(h.readNames()).toEqual(["listWorkspaces"]);
+});
+
+test("a listener that selects another workspace never lets a later listener see an older state", async () => {
+  const h = await withList([WS_A, WS_B]);
+  const order: number[] = [];
+  let selectedOnce = false;
+  h.service.onChange((state) => {
+    if (!selectedOnce && state.selectedWorkspaceId === WS_A) {
+      selectedOnce = true;
+      h.service.select(WS_B);
+    }
+  });
+  h.service.onChange((state) => order.push(state.revision));
+  h.receive(subscribed());
+  expect(selectedOnce).toBe(true);
+  expect(order.length).toBeGreaterThan(0);
+  expect(order).toEqual([...order].sort((a, b) => a - b));
+  expect(order.at(-1)).toBe(h.state.revision);
+  expect(h.state.selectedWorkspaceId).toBe(WS_B);
+});
+
+test("a list answer after close subscribes nothing", async () => {
+  const h = new Harness();
+  h.setConnection("connected");
+  h.service.close();
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect([...h.requested]).toEqual([]);
+  expect(h.frames).toEqual([]);
+  expect(h.service.selectedWorkspaceId()).toBeNull();
 });
 
 test("close stops listening and cancels the timers", async () => {

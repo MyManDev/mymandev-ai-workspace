@@ -24,13 +24,11 @@
 // fixed text with a failure code at most.
 import type {
   MemberId,
-  MemberRole,
   ProjectId,
   ProjectListResponse,
   ReceivedServerEvent,
   WorkspaceId,
   WorkspaceListResponse,
-  WorkspaceMember,
   WorkspaceViewResponse,
 } from "@mymandev/protocol";
 import type { AccountStatus } from "../../shared/ipc-contract.ts";
@@ -202,21 +200,6 @@ function isWorkspaceEvent(event: ReceivedServerEvent): event is WorkspaceEvent {
   return workspaceEventTypes.has(event.type);
 }
 
-/** What the service keeps of a person: never the user ID or the identity. */
-interface MemberEntry {
-  readonly displayName: string;
-  readonly role: MemberRole;
-  readonly removedAt: string | null;
-}
-
-function memberEntry(member: WorkspaceMember): MemberEntry {
-  return Object.freeze({
-    displayName: member.displayName,
-    role: member.role,
-    removedAt: member.removedAt,
-  });
-}
-
 function projectSummary(project: {
   readonly id: ProjectId;
   readonly name: string;
@@ -289,7 +272,8 @@ export function createWorkspaceService(
   /**
    * Workspaces that refused the subscription. They are never selected by
    * default, so that a list that still holds one does not subscribe to it
-   * again and again; the person can still select it.
+   * again and again; the person can still select it. A list without one
+   * drops it, so that a later listing, a new membership, counts again.
    */
   const refused = new Set<WorkspaceId>();
 
@@ -301,7 +285,12 @@ export function createWorkspaceService(
   let viewProblem: WorkspaceReadFailure | null = null;
   let viewAttempt = 0;
   let cancelViewRetry: (() => void) | null = null;
-  let members = new Map<MemberId, MemberEntry>();
+  /**
+   * The display name of each person of the selected workspace, former
+   * members included: all that `memberName` needs. Never the user ID, the
+   * identity, the role, or the removal time.
+   */
+  let members = new Map<MemberId, string>();
   let projects = NO_PROJECTS;
   let openProjectId: ProjectId | null = null;
 
@@ -477,12 +466,15 @@ export function createWorkspaceService(
       log(`The workspace list did not load (${result.reason}).`);
       const delay = workspaceRetryDelayMs(listAttempt, result.reason);
       listAttempt += 1;
-      cancelListRetry = schedule(() => {
-        run(() => {
-          cancelListRetry = null;
-          loadList();
-        });
-      }, delay);
+      if (connected) {
+        // Offline, the next `connected` loads anyway.
+        cancelListRetry = schedule(() => {
+          run(() => {
+            cancelListRetry = null;
+            loadList();
+          });
+        }, delay);
+      }
       return;
     }
     listAttempt = 0;
@@ -493,6 +485,15 @@ export function createWorkspaceService(
         Object.freeze({ id: workspace.id, name: workspace.name }),
       ),
     );
+    // A refused workspace that the list no longer holds is forgotten, so
+    // that a later listing, a new membership, is selected by default again.
+    // One that the list still holds stays refused, so that it is not
+    // subscribed to in a loop.
+    for (const workspaceId of [...refused]) {
+      if (!listed(workspaceId)) {
+        refused.delete(workspaceId);
+      }
+    }
     touch();
     if (selected === null || !listed(selected)) {
       selectWorkspace(defaultWorkspace());
@@ -564,7 +565,7 @@ export function createWorkspaceService(
       return;
     }
     members = new Map(
-      view.value.members.map((member) => [member.id, memberEntry(member)]),
+      view.value.members.map((member) => [member.id, member.displayName]),
     );
     projects = Object.freeze(list.value.projects.map(projectSummary));
     for (const event of events) {
@@ -609,53 +610,38 @@ export function createWorkspaceService(
 
   // The events.
 
-  function updateMember(
-    memberId: MemberId,
-    change: Partial<MemberEntry>,
-  ): boolean {
-    const entry = members.get(memberId);
-    if (entry === undefined) {
-      return false;
-    }
-    members.set(memberId, Object.freeze({ ...entry, ...change }));
-    return true;
-  }
-
   /**
    * Applies one event. Every event sets the state that it reports, so
    * applying one again changes nothing. False when it names a person or a
-   * project that the workspace does not hold.
+   * project that the workspace does not hold. A removal, a role change, and
+   * an ownership transfer change nothing that the service keeps: a former
+   * member keeps their name.
    */
   function applyEvent(event: WorkspaceEvent): boolean {
-    touch();
     switch (event.type) {
       case "workspace.member.defined":
       case "workspace.member.claimed":
-        members.set(event.payload.member.id, memberEntry(event.payload.member));
+        members.set(event.payload.member.id, event.payload.member.displayName);
+        touch();
         return true;
       case "workspace.member.renamed":
-        return updateMember(event.payload.memberId, {
-          displayName: event.payload.displayName,
-        });
+        if (!members.has(event.payload.memberId)) {
+          return false;
+        }
+        members.set(event.payload.memberId, event.payload.displayName);
+        touch();
+        return true;
       case "workspace.member.removed":
-        return updateMember(event.payload.memberId, {
-          removedAt: event.payload.removedAt,
-        });
       case "workspace.member.role_changed":
-        return updateMember(event.payload.memberId, {
-          role: event.payload.role,
-        });
-      case "workspace.ownership.transferred": {
-        const previous = updateMember(event.payload.previousOwnerMemberId, {
-          role: "admin",
-        });
-        const owner = updateMember(event.payload.ownerMemberId, {
-          role: "owner",
-        });
-        return previous && owner;
-      }
+        return members.has(event.payload.memberId);
+      case "workspace.ownership.transferred":
+        return (
+          members.has(event.payload.previousOwnerMemberId) &&
+          members.has(event.payload.ownerMemberId)
+        );
       case "workspace.project.created": {
         const project = projectSummary(event.payload.project);
+        touch();
         projects = Object.freeze(
           projects.some((held) => held.id === project.id)
             ? projects.map((held) => (held.id === project.id ? project : held))
@@ -673,6 +659,7 @@ export function createWorkspaceService(
             held.id === projectId ? Object.freeze({ ...held, name }) : held,
           ),
         );
+        touch();
         return true;
       }
     }
@@ -857,7 +844,7 @@ export function createWorkspaceService(
         return true;
       }),
     memberName: (memberId: MemberId) =>
-      members.get(memberId)?.displayName ?? UNKNOWN_MEMBER_NAME,
+      members.get(memberId) ?? UNKNOWN_MEMBER_NAME,
     gateLive: (workspaceId: WorkspaceId) =>
       !closed && workspaceId === selected && gate.state() === "live",
     selectedWorkspaceId: () => selected,
