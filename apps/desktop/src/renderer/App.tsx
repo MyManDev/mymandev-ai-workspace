@@ -1,10 +1,19 @@
-import { useEffect, useReducer, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useState,
+  type Dispatch,
+} from "react";
 import type {
   AccountBridge,
   ConnectionBridge,
   RepositoryBridge,
   RuntimeBridge,
+  WorkspaceBridge,
 } from "../shared/desktop-bridge.ts";
+import type { WorkspaceView } from "../shared/ipc-contract.ts";
 import { PRODUCT_NAME } from "../shared/product.ts";
 import {
   CONNECTION_ACTION_LABELS,
@@ -12,7 +21,11 @@ import {
   initialConnectionView,
   type ConnectionView,
 } from "./connection-status.ts";
-import { ProjectNav, WorkspaceNav } from "./Navigation.tsx";
+import {
+  ProjectNav,
+  WorkspaceNav,
+  type WorkspaceSidebar,
+} from "./Navigation.tsx";
 import { ProjectPanel } from "./ProjectPanel.tsx";
 import {
   ChatScreen,
@@ -28,11 +41,16 @@ import {
 import {
   createShellState,
   HOME_VIEW,
+  isProjectView,
   openProject,
   shellReducer,
-  type ProjectSummary,
+  type ShellAction,
   type ShellView,
 } from "./screens.ts";
+import {
+  createWorkspaceSidebar,
+  initialWorkspacePanelView,
+} from "./workspace-view.ts";
 import { AboutScreen, HomeScreen } from "./WorkspaceScreens.tsx";
 
 export interface AppProps {
@@ -46,8 +64,13 @@ export interface AppProps {
   readonly account?: AccountBridge | undefined;
   /** The connection to the cloud API from the preload script; undefined outside Electron. */
   readonly connection?: ConnectionBridge | undefined;
-  /** The workspace's projects, in navigation order, read when the shell mounts. */
-  readonly projects: readonly ProjectSummary[];
+  /** The account's workspaces from the preload script; undefined outside Electron. */
+  readonly workspaces?: WorkspaceBridge | undefined;
+  /**
+   * The workspace state shown until the bridge delivers one, for tests and
+   * previews. Without it, the shell starts without projects.
+   */
+  readonly initialWorkspaceState?: WorkspaceView | undefined;
   /** The view shown first. An invalid view shows the home screen. */
   readonly initialView?: ShellView;
 }
@@ -58,11 +81,18 @@ export function App({
   repositories,
   account,
   connection,
-  projects,
+  workspaces,
+  initialWorkspaceState,
   initialView = HOME_VIEW,
 }: AppProps) {
   const [state, dispatch] = useReducer(shellReducer, initialView, (view) =>
-    createShellState(projects, view),
+    createShellState(initialWorkspaceState?.projects ?? [], view),
+  );
+  const workspaceSidebar = useWorkspaces(
+    workspaces,
+    initialWorkspaceState,
+    dispatch,
+    isProjectView(state.view) ? state.view.projectId : null,
   );
   const runtimeView = useRuntimeView(runtime);
   const connectionView = useConnectionView(connection);
@@ -87,7 +117,11 @@ export function App({
           <RuntimeStatusIndicator view={runtimeView} />
         </div>
       </header>
-      <WorkspaceNav state={state} dispatch={dispatch} />
+      <WorkspaceNav
+        state={state}
+        dispatch={dispatch}
+        workspaces={workspaceSidebar}
+      />
       {open === undefined ? null : (
         <ProjectNav
           project={open.project}
@@ -136,6 +170,44 @@ function ScreenContent({
     case "permissions":
       return <PermissionsScreen />;
   }
+}
+
+/**
+ * Follows the workspace state while the shell is mounted, reports the open
+ * project to the main process at the start and after every change, and
+ * switches workspaces. The logic is in `createWorkspaceSidebar`.
+ */
+function useWorkspaces(
+  workspaces: WorkspaceBridge | undefined,
+  initialState: WorkspaceView | undefined,
+  dispatch: Dispatch<ShellAction>,
+  openProjectId: string | null,
+): WorkspaceSidebar {
+  const [view, setView] = useState(() =>
+    initialState === undefined
+      ? initialWorkspacePanelView(workspaces !== undefined)
+      : { kind: "known" as const, state: initialState },
+  );
+  const [message, setMessage] = useState<string | undefined>(undefined);
+  const controller = useMemo(
+    () =>
+      workspaces === undefined
+        ? undefined
+        : createWorkspaceSidebar(workspaces, dispatch, setView, setMessage),
+    [workspaces, dispatch],
+  );
+
+  useEffect(() => controller?.start(), [controller]);
+  useEffect(
+    () => controller?.openProjectChanged(openProjectId),
+    [controller, openProjectId],
+  );
+  const onSelect = useCallback(
+    (workspaceId: string) => controller?.select(workspaceId),
+    [controller],
+  );
+
+  return { view, message, onSelect };
 }
 
 /** Follows the status of the local runtime while the shell is mounted. */

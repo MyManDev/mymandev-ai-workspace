@@ -1,4 +1,5 @@
 import type { Dispatch } from "react";
+import type { WorkspaceView } from "../shared/ipc-contract.ts";
 import {
   isProjectView,
   PROJECT_SCREENS,
@@ -8,21 +9,38 @@ import {
   type ShellAction,
   type ShellState,
 } from "./screens.ts";
+import {
+  WORKSPACE_MESSAGES,
+  WORKSPACE_PROBLEM_MESSAGES,
+  type WorkspacePanelView,
+} from "./workspace-view.ts";
+
+/** The workspace part of the sidebar, which `App` follows from the bridge. */
+export interface WorkspaceSidebar {
+  readonly view: WorkspacePanelView;
+  /** Why the last switch was refused or failed, or undefined. */
+  readonly message: string | undefined;
+  /** Switches to another workspace. */
+  readonly onSelect: (workspaceId: string) => void;
+}
 
 /**
- * The sidebar: the workspace screens and the workspace's projects. The shown
- * screen is marked with `aria-current="page"`, the open project with
- * `aria-current="true"`.
+ * The sidebar: the workspace screens, the account's workspaces, and the
+ * selected workspace's projects. The shown screen is marked with
+ * `aria-current="page"`, the selected workspace and the open project with
+ * `aria-current="true"`. Names are text that people entered, so each one
+ * takes its direction from its own content (`dir="auto"`).
  */
 export function WorkspaceNav({
   state,
   dispatch,
+  workspaces,
 }: {
   readonly state: ShellState;
   readonly dispatch: Dispatch<ShellAction>;
+  readonly workspaces: WorkspaceSidebar;
 }) {
   const { view } = state;
-  const openProjectId = isProjectView(view) ? view.projectId : undefined;
   return (
     <nav className="shell-nav" aria-label="Workspace">
       <ul className="nav-list">
@@ -41,11 +59,143 @@ export function WorkspaceNav({
           </li>
         ))}
       </ul>
+      <h2 className="nav-heading" id="workspaces-heading">
+        Workspaces
+      </h2>
+      <WorkspaceList {...workspaces} />
+      <SelectedWorkspace
+        view={workspaces.view}
+        state={state}
+        dispatch={dispatch}
+      />
+    </nav>
+  );
+}
+
+/**
+ * The workspaces with the selected one marked, or a fixed text for the
+ * state, and below them why the workspaces are unavailable or why the last
+ * switch was refused. The status paragraph is always rendered, empty when
+ * there is nothing to say, so that a screen reader announces a new text.
+ * Selecting the selected workspace does nothing.
+ */
+function WorkspaceList({ view, message, onSelect }: WorkspaceSidebar) {
+  const status = view.kind === "known" ? view.state.status : undefined;
+  const notices = [
+    view.kind === "known" && view.state.status === "unavailable"
+      ? WORKSPACE_PROBLEM_MESSAGES[view.state.problem]
+      : undefined,
+    // A switch message means nothing once the device is no longer ready.
+    status === "signed_out" ? undefined : message,
+  ].filter((notice) => notice !== undefined);
+  return (
+    <>
+      <WorkspaceItems view={view} onSelect={onSelect} />
+      <p className="nav-empty nav-status" role="status">
+        {notices.join(" ")}
+      </p>
+    </>
+  );
+}
+
+/**
+ * The selected workspace's projects, or a fixed text when workspaces are
+ * listed but none is selected. Nothing before the first state and while the
+ * device is not ready.
+ */
+function SelectedWorkspace({
+  view,
+  state,
+  dispatch,
+}: {
+  readonly view: WorkspacePanelView;
+  readonly state: ShellState;
+  readonly dispatch: Dispatch<ShellAction>;
+}) {
+  if (view.kind !== "known" || view.state.status === "signed_out") {
+    return null;
+  }
+  if (view.state.selectedWorkspaceId === null) {
+    return view.state.workspaces.length === 0 ? null : (
+      <p className="nav-empty">{WORKSPACE_MESSAGES.noneSelected}</p>
+    );
+  }
+  return (
+    <ProjectList state={state} dispatch={dispatch} status={view.state.status} />
+  );
+}
+
+function WorkspaceItems({
+  view,
+  onSelect,
+}: Pick<WorkspaceSidebar, "view" | "onSelect">) {
+  switch (view.kind) {
+    case "unavailable":
+      return <p className="nav-empty">{WORKSPACE_MESSAGES.unavailable}</p>;
+    case "pending":
+      return <p className="nav-empty">{WORKSPACE_MESSAGES.pending}</p>;
+    case "known":
+      break;
+  }
+  const { status, workspaces, selectedWorkspaceId } = view.state;
+  if (status === "signed_out") {
+    return <p className="nav-empty">{WORKSPACE_MESSAGES.signedOut}</p>;
+  }
+  if (workspaces.length === 0) {
+    return status === "loading" ? (
+      <p className="nav-empty">{WORKSPACE_MESSAGES.loadingWorkspaces}</p>
+    ) : status === "ready" ? (
+      <p className="nav-empty">{WORKSPACE_MESSAGES.noWorkspaces}</p>
+    ) : null;
+  }
+  return (
+    <ul className="nav-list" aria-labelledby="workspaces-heading">
+      {workspaces.map((workspace) => {
+        const selected = workspace.id === selectedWorkspaceId;
+        return (
+          <li key={workspace.id}>
+            <button
+              type="button"
+              className="nav-item"
+              dir="auto"
+              aria-current={selected ? "true" : undefined}
+              onClick={selected ? undefined : () => onSelect(workspace.id)}
+            >
+              {workspace.name}
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
+/** The selected workspace's projects, with the open one marked. */
+function ProjectList({
+  state,
+  dispatch,
+  status,
+}: {
+  readonly state: ShellState;
+  readonly dispatch: Dispatch<ShellAction>;
+  readonly status: WorkspaceView["status"];
+}) {
+  const { view } = state;
+  const openProjectId = isProjectView(view) ? view.projectId : undefined;
+  return (
+    <>
       <h2 className="nav-heading" id="projects-heading">
         Projects
       </h2>
       {state.projects.length === 0 ? (
-        <p className="nav-empty">No projects yet.</p>
+        // While unavailable, the problem above says why nothing is listed.
+        status === "unavailable" ? null : (
+          <p className="nav-empty">
+            {status === "loading"
+              ? WORKSPACE_MESSAGES.loadingProjects
+              : WORKSPACE_MESSAGES.noProjects}
+          </p>
+        )
       ) : (
         <ul className="nav-list" aria-labelledby="projects-heading">
           {state.projects.map((project) => (
@@ -53,6 +203,7 @@ export function WorkspaceNav({
               <button
                 type="button"
                 className="nav-item"
+                dir="auto"
                 aria-current={project.id === openProjectId ? "true" : undefined}
                 onClick={() =>
                   dispatch({ type: "open-project", projectId: project.id })
@@ -64,7 +215,7 @@ export function WorkspaceNav({
           ))}
         </ul>
       )}
-    </nav>
+    </>
   );
 }
 
@@ -80,7 +231,9 @@ export function ProjectNav({
 }) {
   return (
     <nav className="project-nav" aria-label="Project">
-      <p className="project-nav-name">{project.name}</p>
+      <p className="project-nav-name" dir="auto">
+        {project.name}
+      </p>
       <ul className="project-nav-list">
         {PROJECT_SCREENS.map((item) => (
           <li key={item.id}>

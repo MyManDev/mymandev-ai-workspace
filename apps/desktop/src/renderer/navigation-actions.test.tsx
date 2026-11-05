@@ -3,7 +3,12 @@
 // handlers: every navigation item must send exactly its own action.
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { expect, test } from "vitest";
-import { ProjectNav, WorkspaceNav } from "./Navigation.tsx";
+import type { WorkspaceView } from "../shared/ipc-contract.ts";
+import {
+  ProjectNav,
+  WorkspaceNav,
+  type WorkspaceSidebar,
+} from "./Navigation.tsx";
 import { ProjectPanel } from "./ProjectPanel.tsx";
 import {
   createShellState,
@@ -33,7 +38,11 @@ const PROJECTS: readonly ProjectSummary[] = [
   { id: "project-b", name: "Project B" },
 ];
 
-/** The element and every element below it, without rendering components. */
+/**
+ * The element and every element below it. A component without hooks is
+ * called to reach its elements; one with hooks cannot run outside React and
+ * stays a leaf.
+ */
 function elementsOf(node: ReactNode): ReactElement<HostProps>[] {
   if (Array.isArray(node)) {
     return node.flatMap((child: ReactNode) => elementsOf(child));
@@ -41,7 +50,39 @@ function elementsOf(node: ReactNode): ReactElement<HostProps>[] {
   if (!isValidElement<HostProps>(node)) {
     return [];
   }
+  if (typeof node.type === "function") {
+    try {
+      return elementsOf(
+        (node.type as (props: HostProps) => ReactNode)(node.props),
+      );
+    } catch {
+      return [node];
+    }
+  }
   return [node, ...elementsOf(node.props.children)];
+}
+
+const WORKSPACE_STATE: WorkspaceView = {
+  revision: 1,
+  status: "ready",
+  workspaces: [
+    { id: "workspace-a", name: "Workspace A" },
+    { id: "workspace-b", name: "Workspace B" },
+  ],
+  selectedWorkspaceId: "workspace-a",
+  projects: [],
+  openProjectId: null,
+};
+
+/** The workspace part of the sidebar, recording each switch in `selected`. */
+function sidebar(selected: string[] = []): WorkspaceSidebar {
+  return {
+    view: { kind: "known", state: WORKSPACE_STATE },
+    message: undefined,
+    onSelect: (workspaceId) => {
+      selected.push(workspaceId);
+    },
+  };
 }
 
 function textOf(node: ReactNode): string {
@@ -90,6 +131,8 @@ test("each sidebar item shows its workspace screen or opens its project", () => 
   const expected = [
     ["Home", [{ type: "show-screen", screen: "home" }]],
     ["About", [{ type: "show-screen", screen: "about" }]],
+    ["Workspace A", []],
+    ["Workspace B", []],
     ["Project A", [{ type: "open-project", projectId: "project-a" }]],
     ["Project B", [{ type: "open-project", projectId: "project-b" }]],
   ];
@@ -102,10 +145,39 @@ test("each sidebar item shows its workspace screen or opens its project", () => 
       panel: "repositories",
     }),
   ]) {
-    expect(clickEveryButton(WorkspaceNav({ state, dispatch }), take)).toEqual(
-      expected,
-    );
+    expect(
+      clickEveryButton(
+        WorkspaceNav({ state, dispatch, workspaces: sidebar() }),
+        take,
+      ),
+    ).toEqual(expected);
   }
+});
+
+test("each workspace item switches to its workspace, and the selected one does nothing", () => {
+  const { dispatch, take } = recorder();
+  const selected: string[] = [];
+  const buttons = elementsOf(
+    WorkspaceNav({
+      state: createShellState(PROJECTS),
+      dispatch,
+      workspaces: sidebar(selected),
+    }),
+  ).filter(
+    (element) =>
+      element.type === "button" &&
+      textOf(element.props.children).startsWith("Workspace"),
+  );
+
+  expect(buttons.map((button) => textOf(button.props.children))).toEqual([
+    "Workspace A",
+    "Workspace B",
+  ]);
+  buttons[0]?.props.onClick?.();
+  expect(selected).toEqual([]);
+  buttons[1]?.props.onClick?.();
+  expect(selected).toEqual(["workspace-b"]);
+  expect(take()).toEqual([]);
 });
 
 test("each project navigation item shows its project screen", () => {
