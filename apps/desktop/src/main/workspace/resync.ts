@@ -52,7 +52,7 @@ export type ResyncGeneration = number;
  * - `failed`: the current reload failed; events still wait in the buffer
  *   until the service retries with `begin`.
  * - `overflowed`: the buffer overflowed and was cleared; events are dropped
- *   until the service starts a reload with `begin`, which must then reload
+ *   until the service starts a reload with `begin`, which then reads
  *   everything that the service holds.
  * - `live`: subscribed and reloaded; events apply at once.
  */
@@ -61,14 +61,26 @@ export type ResyncState =
 
 /**
  * What the service does with a pushed event: `apply` it now; after
- * `overflowed`, which cleared the buffer (the event included), begin a
- * reload of its whole state when its backoff allows. The others need
- * nothing: `buffered` waits for the reload; `dropped` arrived after an
- * overflow, so the next reload holds it; `ignored` arrived without a
- * subscription.
+ * `overflowed`, which cleared the buffer (the event included), call
+ * `begin` when its backoff allows, and that reload reads everything. The
+ * others need nothing: `buffered` waits for the reload; `dropped` arrived
+ * after an overflow, so the next reload holds it; `ignored` arrived without
+ * a subscription.
  */
 export type ResyncPushResult =
   "apply" | "buffered" | "overflowed" | "dropped" | "ignored";
+
+/**
+ * What a reload reads: `all` of the service's state, or a `part` of it,
+ * such as the agent list alone.
+ */
+export type ResyncScope = "all" | "part";
+
+/** A reload that began: the service sends its request for `scope`. */
+export interface ResyncReload {
+  readonly generation: ResyncGeneration;
+  readonly scope: ResyncScope;
+}
 
 export interface ResyncGateOptions<Event> {
   /**
@@ -90,20 +102,24 @@ export interface ResyncGate<Event> {
   readonly generation: () => ResyncGeneration;
   /**
    * `workspace.subscribed` arrived, also a fresh one for an existing
-   * subscription: the subscription is live, and a reload begins as with
-   * `begin`. The service sends its request after this call.
+   * subscription: the subscription is live, and a reload of `all` begins as
+   * with `begin`. The service sends its request after this call.
    */
   readonly subscribed: () => ResyncGeneration;
   /**
    * A reload begins: after a change of the open project, a reload that the
    * service decided on, a retry after `reloadFailed`, and the reload after
-   * an overflow. The previous generation becomes stale. While subscribed,
-   * events wait in the buffer from now on; the events that already wait are
-   * kept, because a reload of only a part of the service's state does not
-   * contain them, and applying them again changes nothing. The service sends
-   * its request after this call.
+   * an overflow. The previous generation becomes stale, so its answer is
+   * dropped. The reload reads the scope that the service asks for, or `all`
+   * while an earlier reload has not answered (it is open, it failed, or an
+   * overflow or `end` made it stale): the dropped answer may have covered
+   * any part of the state, and `live` means that all of it was reloaded
+   * since `subscribed`. The service sends its request for the returned
+   * scope after this call. While subscribed, events wait in the buffer from
+   * now on; the events that already wait are kept, since applying them
+   * again changes nothing.
    */
-  readonly begin: () => ResyncGeneration;
+  readonly begin: (scope: ResyncScope) => ResyncReload;
   /** An event of the subscribed workspace arrived. */
   readonly push: (event: Event) => ResyncPushResult;
   /**
@@ -123,8 +139,11 @@ export interface ResyncGate<Event> {
   /**
    * The subscription ended (`workspace.unsubscribed`, a refusal, or a
    * change of the workspace) or the connection was lost: the buffered events
-   * are dropped, the open reload becomes stale, and later events are ignored
-   * until `subscribed`. Without a subscription it changes nothing.
+   * are dropped, the generation changes, so that the open reload and every
+   * request noted with `generation()` become stale, and later events are
+   * ignored until `subscribed`. This holds without a subscription too: the
+   * answer of a reload begun without one, for example for the previous
+   * workspace, is dropped, and a service that still needs it begins it again.
    */
   readonly end: () => void;
 }
@@ -137,6 +156,11 @@ export function createResyncGate<Event>(
   let generation: ResyncGeneration = 0;
   /** Whether the reload of `generation` has not answered yet. */
   let open = false;
+  /**
+   * Whether a reload began and none answered since, also when an overflow or
+   * `end` made it stale; the next reload then reads `all`.
+   */
+  let unanswered = false;
   /** One of the subscribed states while subscribed, else `inactive`. */
   let state: ResyncState = "inactive";
   let buffer: Event[] = [];
@@ -147,16 +171,18 @@ export function createResyncGate<Event>(
     bufferedBytes = 0;
   }
 
-  function begin(): ResyncGeneration {
+  function begin(asked: ResyncScope): ResyncReload {
+    const scope = unanswered ? "all" : asked;
     generation += 1;
     open = true;
+    unanswered = true;
     if (state === "live" || state === "overflowed") {
       clearBuffer();
     }
     if (state !== "inactive") {
       state = "reloading";
     }
-    return generation;
+    return { generation, scope };
   }
 
   function push(event: Event): ResyncPushResult {
@@ -199,7 +225,7 @@ export function createResyncGate<Event>(
         clearBuffer();
         state = "reloading";
       }
-      return begin();
+      return begin("all").generation;
     },
     begin,
     push,
@@ -208,6 +234,7 @@ export function createResyncGate<Event>(
         return null;
       }
       open = false;
+      unanswered = false;
       const events = Object.freeze(buffer);
       clearBuffer();
       if (state !== "inactive") {
@@ -226,9 +253,6 @@ export function createResyncGate<Event>(
       return true;
     },
     end: () => {
-      if (state === "inactive") {
-        return;
-      }
       clearBuffer();
       generation += 1;
       open = false;

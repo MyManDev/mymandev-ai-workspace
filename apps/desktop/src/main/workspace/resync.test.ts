@@ -64,7 +64,7 @@ test("the returned events are frozen, and later events do not change them", () =
   const events = resync.reloaded(generation);
   expect(Object.isFrozen(events)).toBe(true);
 
-  const next = resync.begin();
+  const next = resync.begin("all").generation;
   resync.push(event("b"));
   expect(ids(events)).toEqual(["a"]);
   expect(ids(resync.reloaded(next))).toEqual(["b"]);
@@ -101,16 +101,79 @@ test("begin while live starts an empty buffer; begin during a reload keeps the w
   resync.reloaded(resync.subscribed());
   expect(resync.push(event("live"))).toBe("apply");
 
-  const projectChange = resync.begin();
+  const projectChange = resync.begin("all");
+  expect(projectChange.scope).toBe("all");
   expect(resync.state()).toBe("reloading");
   resync.push(event("a"));
-  const debounced = resync.begin();
+  const debounced = resync.begin("all");
   resync.push(event("b"));
 
   // The answer for the previous project is dropped.
-  expect(resync.reloaded(projectChange)).toBeNull();
-  expect(ids(resync.reloaded(debounced))).toEqual(["a", "b"]);
+  expect(resync.reloaded(projectChange.generation)).toBeNull();
+  expect(ids(resync.reloaded(debounced.generation))).toEqual(["a", "b"]);
   expect(resync.state()).toBe("live");
+});
+
+test("a part reload while live or settled reads the part", () => {
+  const resync = gate();
+  // Without a subscription and without an earlier reload.
+  const offline = resync.begin("part");
+  expect(offline.scope).toBe("part");
+  resync.reloaded(offline.generation);
+
+  resync.reloaded(resync.subscribed());
+  const agents = resync.begin("part");
+  expect(agents.scope).toBe("part");
+  expect(resync.state()).toBe("reloading");
+  resync.push(event("a"));
+  expect(ids(resync.reloaded(agents.generation))).toEqual(["a"]);
+  expect(resync.state()).toBe("live");
+  // The next part reload follows an answered one.
+  expect(resync.begin("part").scope).toBe("part");
+});
+
+test("a part reload that replaces an open one reads everything", () => {
+  // The agent list goes stale while the reload after subscribed is open.
+  const resync = gate();
+  const full = resync.subscribed();
+  resync.push(event("a"));
+  const agents = resync.begin("part");
+  expect(agents.scope).toBe("all");
+  resync.push(event("b"));
+  expect(resync.reloaded(full)).toBeNull();
+  expect(resync.state()).toBe("reloading");
+  expect(ids(resync.reloaded(agents.generation))).toEqual(["a", "b"]);
+  expect(resync.state()).toBe("live");
+
+  // A second part during a first one reads everything, because the answer
+  // for the first part is dropped.
+  const runs = resync.begin("part");
+  expect(runs.scope).toBe("part");
+  expect(resync.begin("part").scope).toBe("all");
+});
+
+test("a part reload after a failure, an overflow, or end reads everything", () => {
+  const failed = gate();
+  failed.reloadFailed(failed.subscribed());
+  expect(failed.begin("part").scope).toBe("all");
+
+  const overflowed = gate();
+  overflowed.subscribed();
+  overflowed.push(event("a", MAX_BUFFERED_EVENT_BYTES + 1));
+  expect(overflowed.begin("part").scope).toBe("all");
+
+  const ended = gate();
+  ended.subscribed();
+  ended.end();
+  expect(ended.begin("part").scope).toBe("all");
+
+  // Without a subscription, a failed reload is owed too.
+  const offline = gate();
+  offline.reloadFailed(offline.begin("all").generation);
+  const retry = offline.begin("part");
+  expect(retry.scope).toBe("all");
+  expect(offline.reloaded(retry.generation)).toEqual([]);
+  expect(offline.begin("part").scope).toBe("part");
 });
 
 test("a failed reload keeps the waiting events until the retry answers", () => {
@@ -125,7 +188,7 @@ test("a failed reload keeps the waiting events until the retry answers", () => {
   expect(resync.reloadFailed(first)).toBe(false);
   expect(resync.state()).toBe("failed");
 
-  const retry = resync.begin();
+  const retry = resync.begin("all").generation;
   expect(resync.state()).toBe("reloading");
   resync.push(event("c"));
   expect(ids(resync.reloaded(retry))).toEqual(["a", "b", "c"]);
@@ -135,7 +198,7 @@ test("a failed reload keeps the waiting events until the retry answers", () => {
 test("a stale failure changes nothing", () => {
   const resync = gate();
   const first = resync.subscribed();
-  const second = resync.begin();
+  const second = resync.begin("all").generation;
   resync.push(event("a"));
   expect(resync.reloadFailed(first)).toBe(false);
   expect(resync.state()).toBe("reloading");
@@ -160,7 +223,7 @@ test("the 1,001st waiting event overflows, clears the buffer, and makes the relo
   expect(resync.state()).toBe("overflowed");
   expect(resync.reloaded(resync.generation())).toBeNull();
 
-  const recovery = resync.begin();
+  const recovery = resync.begin("all").generation;
   expect(resync.state()).toBe("reloading");
   expect(resync.push(event("after"))).toBe("buffered");
   expect(ids(resync.reloaded(recovery))).toEqual(["after"]);
@@ -179,7 +242,7 @@ test("waiting events overflow above the byte budget, and an event at the budget 
   expect(resync.reloaded(generation)).toBeNull();
 
   // The budget starts again with the next reload.
-  const recovery = resync.begin();
+  const recovery = resync.begin("all").generation;
   expect(resync.push(event("e", MAX_BUFFERED_EVENT_BYTES))).toBe("buffered");
   expect(ids(resync.reloaded(recovery))).toEqual(["e"]);
 });
@@ -210,7 +273,7 @@ test("the buffer also overflows after a failed reload", () => {
   expect(resync.push(event("b", 1))).toBe("overflowed");
   expect(resync.state()).toBe("overflowed");
 
-  const recovery = resync.begin();
+  const recovery = resync.begin("all").generation;
   expect(ids(resync.reloaded(recovery))).toEqual([]);
 });
 
@@ -242,12 +305,27 @@ test("ending the subscription drops the waiting events and makes the reload stal
   expect(ids(resync.reloaded(next))).toEqual(["c"]);
 });
 
-test("ending a live subscription or an overflowed one leaves the gate inactive", () => {
+test("ending a live, a failed, or an overflowed subscription leaves the gate inactive", () => {
   const live = gate();
-  live.reloaded(live.subscribed());
+  const liveGeneration = live.subscribed();
+  live.reloaded(liveGeneration);
   live.end();
   expect(live.state()).toBe("inactive");
+  expect(live.generation()).not.toBe(liveGeneration);
   expect(live.push(event("a"))).toBe("ignored");
+
+  const failed = gate();
+  const failedGeneration = failed.subscribed();
+  failed.push(event("a"));
+  failed.reloadFailed(failedGeneration);
+  failed.end();
+  expect(failed.state()).toBe("inactive");
+  expect(failed.generation()).not.toBe(failedGeneration);
+  expect(failed.reloaded(failedGeneration)).toBeNull();
+  expect(failed.push(event("b"))).toBe("ignored");
+  // The events of the ended subscription do not come back.
+  const next = failed.begin("all").generation;
+  expect(ids(failed.reloaded(next))).toEqual([]);
 
   const overflowed = gate();
   overflowed.subscribed();
@@ -257,26 +335,35 @@ test("ending a live subscription or an overflowed one leaves the gate inactive",
   expect(overflowed.push(event("b"))).toBe("ignored");
 });
 
-test("a reload without a subscription stays inactive and is not ended by end", () => {
+test("a reload without a subscription stays inactive, and end makes it stale", () => {
   const resync = gate();
-  const generation = resync.begin();
+  const generation = resync.begin("all").generation;
   expect(resync.state()).toBe("inactive");
   expect(resync.push(event("a"))).toBe("ignored");
-  resync.end();
-  expect(resync.generation()).toBe(generation);
-
   expect(resync.reloaded(generation)).toEqual([]);
   expect(resync.state()).toBe("inactive");
   expect(resync.push(event("b"))).toBe("ignored");
 
-  const failing = resync.begin();
+  const failing = resync.begin("all").generation;
   expect(resync.reloadFailed(failing)).toBe(true);
   expect(resync.state()).toBe("inactive");
+
+  // A change of the workspace while a reload for the previous one is open.
+  const previous = resync.begin("all").generation;
+  resync.end();
+  expect(resync.state()).toBe("inactive");
+  expect(resync.generation()).not.toBe(previous);
+  expect(resync.reloaded(previous)).toBeNull();
+  expect(resync.reloadFailed(previous)).toBe(false);
+  // Without an open reload, end still changes the generation.
+  const settled = resync.generation();
+  resync.end();
+  expect(resync.generation()).not.toBe(settled);
 });
 
 test("subscribed makes a reload without a subscription stale", () => {
   const resync = gate();
-  const offline = resync.begin();
+  const offline = resync.begin("all").generation;
   const generation = resync.subscribed();
   resync.push(event("a"));
   expect(resync.reloaded(offline)).toBeNull();
