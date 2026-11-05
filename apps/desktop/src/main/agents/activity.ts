@@ -3,8 +3,8 @@
 // `GET /projects/:projectId/agents` and `GET /projects/:projectId/runs`, and
 // kept current with `agent.run.state_changed` events. It is a pure model: no
 // timers, no I/O, and no logging. Every function returns new frozen objects
-// and never changes its arguments. Nothing uses it yet: the agent service,
-// the agent panel, and the development switch follow (#28).
+// and never changes its arguments. The agent activity service (service.ts)
+// uses it; the agent panel and the development switch follow (#28).
 
 import {
   isTerminalRunState,
