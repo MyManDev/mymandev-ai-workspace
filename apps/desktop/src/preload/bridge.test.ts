@@ -420,6 +420,36 @@ test("the account functions call their channels and pass no argument from the re
   ]);
 });
 
+test("startSignIn passes on only its own fixed option, and only when the renderer asks for another browser", async () => {
+  const fake = fakeIpc();
+  const start = createDesktopBridge("44.9.1", fake.ipc).account.startSignIn as (
+    ...args: unknown[]
+  ) => Promise<unknown>;
+
+  const asked = { browser: "other", login: "octocat" };
+  const answers = [
+    start({ browser: "other" }),
+    start(asked, "https://evil.example"),
+    start({ browser: "default" }),
+    start({ browser: "chrome" }),
+    start("other"),
+    start(null),
+  ];
+  for (const answer of fake.answers) {
+    answer.resolve({ outcome: "started" });
+  }
+  await expect(Promise.all(answers)).resolves.toHaveLength(6);
+
+  const other = {
+    channel: INVOKE_CHANNELS.startSignIn,
+    args: [{ browser: "other" }],
+  };
+  const plain = { channel: INVOKE_CHANNELS.startSignIn, args: [] };
+  expect(fake.invoked).toEqual([other, other, plain, plain, plain, plain]);
+  // The option sent is the bridge's own object, never the renderer's.
+  expect(fake.invoked[1]?.args[0]).not.toBe(asked);
+});
+
 test("unlockDeviceKey passes only the passphrase string on", async () => {
   const fake = fakeIpc();
   const unlock = createDesktopBridge("44.9.1", fake.ipc).account

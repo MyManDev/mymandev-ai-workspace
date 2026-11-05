@@ -9,6 +9,7 @@ import type {
   RepositoryList,
   RuntimeStatus,
   SignOutResult,
+  StartSignInOptions,
   StartSignInResult,
   UnlockResult,
 } from "./ipc-contract.ts";
@@ -96,11 +97,16 @@ export interface AccountBridge {
   ) => () => void;
   /**
    * Starts a GitHub sign-in in the system browser. Call it only after the
-   * person's action; it passes nothing from the renderer on. The main
-   * process refuses a start within a few seconds of the last one that
-   * opened the browser (`too_soon`).
+   * person's action. With `{ browser: "other" }` the main process opens no
+   * browser and offers the start address for copying into another one
+   * (#175); the bridge passes on only that fixed choice, nothing else from
+   * the renderer. The main process refuses a start within a few seconds of
+   * the last one that opened the browser or offered its address
+   * (`too_soon`).
    */
-  readonly startSignIn: () => Promise<StartSignInResult>;
+  readonly startSignIn: (
+    options?: StartSignInOptions,
+  ) => Promise<StartSignInResult>;
   /** Ends the open sign-in. Resolves to false when none was open. */
   readonly cancelSignIn: () => Promise<boolean>;
   /**

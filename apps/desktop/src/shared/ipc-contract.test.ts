@@ -30,7 +30,9 @@ import {
   RuntimeStatusSchema,
   SIGN_IN_OUTCOME_CODES,
   SignOutResultSchema,
+  SIGN_IN_BROWSERS,
   START_SIGN_IN_REFUSALS,
+  StartSignInOptionsSchema,
   StartSignInResultSchema,
   UNLOCK_REFUSALS,
   UnlockResultSchema,
@@ -125,13 +127,14 @@ test("a runtime status with a wrong state or revision is refused", () => {
   }
 });
 
-test("the invoke channels except unmount and unlock take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, and the sign-in start take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
-      channel !== INVOKE_CHANNELS.unlockDeviceKey,
+      channel !== INVOKE_CHANNELS.unlockDeviceKey &&
+      channel !== INVOKE_CHANNELS.startSignIn,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 2);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 3);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -195,6 +198,42 @@ function repository(
 function list(repositories: MountedRepository[]): RepositoryList {
   return { revision: 4, repositories };
 }
+
+test("the sign-in start takes no argument or one option with a known browser and no other key", () => {
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.startSignIn];
+
+  expect(SIGN_IN_BROWSERS).toEqual(["default", "other"]);
+  expect(args.parse([])).toEqual([]);
+  for (const browser of SIGN_IN_BROWSERS) {
+    expect(args.parse([{ browser }])).toEqual([{ browser }]);
+  }
+  for (const value of [
+    [undefined],
+    [null],
+    [{}],
+    ["other"],
+    [{ browser: "chrome" }],
+    [{ browser: "Other" }],
+    [{ browser: "other " }],
+    [{ browser: true }],
+    [{ browser: ["other"] }],
+    [{ browser: "other", login: "octocat" }],
+    [{ browser: "other", url: "https://evil.example" }],
+    [{ browser: "other" }, { browser: "other" }],
+    [{ browser: "other" }, "extra"],
+    { browser: "other" },
+    undefined,
+    "",
+  ]) {
+    expect(args.safeParse(value).success).toBe(false);
+  }
+  // An unknown key is refused rather than stripped, also one of the prototype.
+  expect(
+    StartSignInOptionsSchema.safeParse(
+      JSON.parse('{"browser":"other","__proto__":{"browser":"default"}}'),
+    ).success,
+  ).toBe(false);
+});
 
 test("unmount takes exactly one mount ID", () => {
   const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.unmountRepository];

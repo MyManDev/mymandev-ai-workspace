@@ -400,7 +400,8 @@ export type AccountStatus = z.infer<typeof AccountStatusSchema>;
  * Why a sign-in was not started: `busy` while a sign-in is open or the
  * account is being changed, `key_not_ready` while the device key is
  * loading, waits for its passphrase, or cannot be used, and `too_soon`
- * within a few seconds of the last start that opened the browser.
+ * within a few seconds of the last start that opened the browser or offered
+ * its address.
  */
 export const START_SIGN_IN_REFUSALS = Object.freeze([
   "busy",
@@ -421,6 +422,24 @@ export const StartSignInResultSchema = z.discriminatedUnion("outcome", [
   }),
 ]);
 export type StartSignInResult = z.infer<typeof StartSignInResultSchema>;
+
+/**
+ * Where the person completes a sign-in (#175): `default` opens the system's
+ * default browser, and `other` opens none and offers the start address for
+ * copying into a browser of the person's choice, with the same warning as
+ * when the browser does not open. The main process decides what it opens.
+ */
+export const SIGN_IN_BROWSERS = Object.freeze(["default", "other"] as const);
+export type SignInBrowser = (typeof SIGN_IN_BROWSERS)[number];
+
+/**
+ * The option of a sign-in start. It comes from the renderer, so an unknown
+ * key is refused rather than stripped.
+ */
+export const StartSignInOptionsSchema = z.strictObject({
+  browser: z.enum(SIGN_IN_BROWSERS),
+});
+export type StartSignInOptions = z.infer<typeof StartSignInOptionsSchema>;
 
 /** A passphrase for the device key. Only the renderer sends one. */
 export const PassphraseSchema = z
@@ -753,7 +772,8 @@ export const INVOKE_CONTRACT = Object.freeze({
     result: AccountStatusSchema,
   }),
   [INVOKE_CHANNELS.startSignIn]: Object.freeze({
-    args: NoArgumentsSchema,
+    /** None, which opens the default browser, or the option of the start. */
+    args: z.union([NoArgumentsSchema, z.tuple([StartSignInOptionsSchema])]),
     result: StartSignInResultSchema,
   }),
   [INVOKE_CHANNELS.cancelSignIn]: Object.freeze({

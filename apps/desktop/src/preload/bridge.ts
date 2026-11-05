@@ -22,11 +22,29 @@ import type {
   RepositoryList,
   RuntimeStatus,
   SignOutResult,
+  StartSignInOptions,
   StartSignInResult,
   UnlockResult,
 } from "../shared/ipc-contract.ts";
 
 type IpcListener = (event: unknown, ...args: unknown[]) => void;
+
+/**
+ * The only start option that the bridge passes on (#175): a fixed object of
+ * its own, never the renderer's.
+ */
+const OTHER_BROWSER_START: StartSignInOptions = Object.freeze({
+  browser: "other",
+});
+
+/** Whether the renderer asked for a sign-in in another browser. */
+function asksForOtherBrowser(options: unknown): boolean {
+  return (
+    typeof options === "object" &&
+    options !== null &&
+    (options as { readonly browser?: unknown }).browser === "other"
+  );
+}
 
 /** The part of Electron's `ipcRenderer` that the bridge uses. */
 export interface BridgeIpc {
@@ -95,7 +113,8 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * calls one fixed channel of the IPC contract and passes no argument from
  * the renderer on to it, except the mount ID of `repositories.unmount` and
  * the passphrase of `account.unlockDeviceKey`, which must be strings and
- * which the main process validates. Event
+ * which the main process validates. `account.startSignIn` passes on a fixed
+ * option of its own when the renderer asks for another browser. Event
  * objects, which hold `ipcRenderer`, never reach the renderer. The object
  * and its parts are frozen. An error that a renderer callback throws goes
  * to `reportError` and stops nothing else.
@@ -167,8 +186,14 @@ export function createDesktopBridge(
         listener,
         onError,
       ),
-    startSignIn: () =>
-      ipc.invoke(INVOKE_CHANNELS.startSignIn) as Promise<StartSignInResult>,
+    // Any other value starts the sign-in in the default browser; the main
+    // process validates the option again.
+    startSignIn: (options?: StartSignInOptions) =>
+      (asksForOtherBrowser(options)
+        ? ipc.invoke(INVOKE_CHANNELS.startSignIn, OTHER_BROWSER_START)
+        : ipc.invoke(
+            INVOKE_CHANNELS.startSignIn,
+          )) as Promise<StartSignInResult>,
     cancelSignIn: () =>
       ipc.invoke(INVOKE_CHANNELS.cancelSignIn) as Promise<boolean>,
     // The passphrase goes to the main process only; the error names no value.

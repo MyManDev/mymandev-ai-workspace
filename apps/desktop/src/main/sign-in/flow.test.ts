@@ -1608,6 +1608,51 @@ describe("the browser and the listener", () => {
     expect(await start.outcome).toEqual({ kind: "cancelled" });
   });
 
+  test("offers the authorize URL with the warning and opens no browser when the person asked for another one", async () => {
+    const h = harness();
+    const start = started(await h.flow.start({ openBrowser: false }));
+    if (start.opened) {
+      throw new Error("expected opened: false");
+    }
+    expect(h.opened).toEqual([]);
+    expect(h.timers.map((timer) => timer.delayMs)).not.toContain(
+      OPEN_EXTERNAL_TIMEOUT_MS,
+    );
+    expect(start.warning).toBe(SIGN_IN_URL_WARNING);
+    expect(
+      start.authorizeUrl.startsWith(`${API_ORIGIN}/auth/github/authorize?`),
+    ).toBe(true);
+    expect(start.pairingCode).toMatch(/^[0-9]{6}$/u);
+    expect(h.errors).toEqual([]);
+
+    // The attempt runs as usual: the browser that opens the URL completes it.
+    await deliverCode(start.authorizeUrl);
+    expect(await start.outcome).toMatchObject({ kind: "signed_in" });
+    expect(h.requests).toHaveLength(1);
+  });
+
+  test("one attempt runs at a time also when the person asked for another browser", async () => {
+    const h = harness();
+    const first = started(await h.flow.start({ openBrowser: false }));
+    await expect(h.flow.start()).resolves.toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "already_running" },
+    });
+    await expect(h.flow.start({ openBrowser: false })).resolves.toEqual({
+      started: false,
+      outcome: { kind: "failed", reason: "already_running" },
+    });
+    expect(h.opened).toEqual([]);
+    first.cancel();
+    expect(await first.outcome).toEqual({ kind: "cancelled" });
+
+    const again = started(await h.flow.start({ openBrowser: true }));
+    expect(again.opened).toBe(true);
+    expect(h.opened).toHaveLength(1);
+    again.cancel();
+    await again.outcome;
+  });
+
   test("treats a rejected openExternal as not opened", async () => {
     const h = harness();
     h.openResult = () => Promise.reject(new Error("no browser"));

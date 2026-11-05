@@ -47,6 +47,7 @@ const SIGNED_IN: AccountStatus = {
 type Handler = keyof Pick<
   AccountPanelContentProps,
   | "onStartSignIn"
+  | "onUseAnotherBrowser"
   | "onCancelSignIn"
   | "onUnlock"
   | "onForget"
@@ -69,6 +70,8 @@ function props(
     busy: false,
     message: undefined,
     onStartSignIn: record("onStartSignIn"),
+    onUseAnotherBrowser: record("onUseAnotherBrowser"),
+    anotherBrowser: false,
     onCancelSignIn: record("onCancelSignIn"),
     onUnlock: record("onUnlock"),
     onForget: record("onForget"),
@@ -154,33 +157,36 @@ test("without the bridge or before the first status, the panel says so and offer
   expect(loading).not.toContain("<button");
 });
 
-test("signed out, the panel offers to sign in with GitHub", () => {
+test("signed out, the panel offers to sign in with GitHub, in the default browser or in another one", () => {
   const html = render();
 
   expect(html).toContain("<p>Not signed in.</p>");
   expect(html).toContain(
-    '<div class="account-actions"><button type="button" class="panel-action">Sign in with GitHub</button></div>',
+    '<div class="account-actions"><button type="button" class="panel-action">Sign in with GitHub</button><button type="button" class="panel-action">Use another browser</button></div>',
   );
   expect(html).not.toContain('role="alert"');
   expect(clickEveryButton({})).toEqual([
     ["Sign in with GitHub", ["onStartSignIn"]],
+    ["Use another browser", ["onUseAnotherBrowser"]],
   ]);
 });
 
-test("the sign-in button is disabled while busy, while the key is not ready, and without a server address", () => {
-  expect(render({ busy: true })).toContain(
-    '<button type="button" class="panel-action" disabled="">Sign in with GitHub</button>',
-  );
-  expect(render({ view: known({ deviceKey: "corrupt" }) })).toContain(
-    '<button type="button" class="panel-action" disabled="">Sign in with GitHub</button>',
-  );
+test("the sign-in buttons are disabled while busy, while the key is not ready, and without a server address", () => {
+  for (const html of [
+    render({ busy: true }),
+    render({ view: known({ deviceKey: "corrupt" }) }),
+  ]) {
+    expect(html).toContain(
+      '<button type="button" class="panel-action" disabled="">Sign in with GitHub</button><button type="button" class="panel-action" disabled="">Use another browser</button>',
+    );
+  }
   for (const [apiOrigin, code] of [
     ["unset", "api_origin_unset"],
     ["invalid", "api_origin_invalid"],
   ] as const) {
     const html = render({ view: known({ apiOrigin }) });
     expect(html).toContain(
-      '<button type="button" class="panel-action" disabled="" aria-describedby="sign-in-unavailable">Sign in with GitHub</button>',
+      '<button type="button" class="panel-action" disabled="" aria-describedby="sign-in-unavailable">Sign in with GitHub</button><button type="button" class="panel-action" disabled="" aria-describedby="sign-in-unavailable">Use another browser</button>',
     );
     expect(html).toContain(
       `<p class="placeholder-note" id="sign-in-unavailable">${SIGN_IN_OUTCOME_MESSAGES[code]}</p>`,
@@ -195,6 +201,17 @@ test("while the sign-in starts, the panel says so and offers to cancel", () => {
     '<p role="status">Opening the browser.</p><div class="account-actions"><button type="button" class="panel-action">Cancel</button></div>',
   );
   expect(clickEveryButton({ view })).toEqual([["Cancel", ["onCancelSignIn"]]]);
+});
+
+test("while a sign-in in another browser starts, the panel says that it prepares the address, without another browser to choose", () => {
+  const view = known({ signIn: { kind: "starting" } });
+
+  expect(render({ view, anotherBrowser: true })).toContain(
+    '<p role="status">Preparing the sign-in address.</p><div class="account-actions"><button type="button" class="panel-action">Cancel</button></div>',
+  );
+  expect(clickEveryButton({ view, anotherBrowser: true })).toEqual([
+    ["Cancel", ["onCancelSignIn"]],
+  ]);
 });
 
 test("once the browser posted to the application, the panel says that the sign-in completes, without a cancel", () => {
@@ -217,7 +234,16 @@ test("while the browser is open, the pairing code is shown prominently with a ca
   );
   expect(html).not.toContain("Sign in with GitHub");
   expect(html).not.toContain("<textarea");
-  expect(clickEveryButton({ view })).toEqual([["Cancel", ["onCancelSignIn"]]]);
+  expect(html).toContain(
+    '<div class="account-actions"><button type="button" class="panel-action">Use another browser</button><button type="button" class="panel-action">Cancel</button></div>',
+  );
+  expect(clickEveryButton({ view })).toEqual([
+    ["Use another browser", ["onUseAnotherBrowser"]],
+    ["Cancel", ["onCancelSignIn"]],
+  ]);
+  expect(render({ view, busy: true })).toContain(
+    '<button type="button" class="panel-action" disabled="">Use another browser</button><button type="button" class="panel-action" disabled="">Cancel</button>',
+  );
 });
 
 test("when the browser did not open, the URL is in a read-only field with the warning and a button that selects it", () => {
@@ -243,9 +269,38 @@ test("when the browser did not open, the URL is in a read-only field with the wa
     '<button type="button" class="panel-action">Select the address</button>',
   );
   expect(html).toContain("Then copy it, for example with Ctrl+C");
+  expect(html).toContain("<p>The browser did not open.</p>");
+  expect(clickEveryButton({ view })).toEqual([["Cancel", ["onCancelSignIn"]]]);
+});
+
+test("in another browser, the URL is shown with the warning for copying, and another browser is not offered again", () => {
+  const view = known({
+    signIn: {
+      kind: "waiting",
+      pairingCode: "042137",
+      opened: false,
+      authorizeUrl: AUTHORIZE_URL,
+      warning: WARNING,
+    },
+  });
+  const html = render({ view, anotherBrowser: true });
+
   expect(html).toContain(
-    '<button type="button" class="panel-action">Cancel</button>',
+    '<p role="status">Continue in your browser, and only if it shows this pairing code:</p><p class="pairing-code">042137</p>',
   );
+  expect(html).toContain(
+    '<div class="account-url"><p>Copy this address into the browser that you want to sign in with.</p><label class="account-label" for="sign-in-url">Sign-in address</label>',
+  );
+  expect(html).toContain(
+    'aria-describedby="sign-in-url-warning">https://api.mymandev.example/auth/github/authorize?code_challenge=abc&amp;state=def</textarea>',
+  );
+  expect(html).toContain(
+    `<p class="account-warning" id="sign-in-url-warning">${WARNING}</p>`,
+  );
+  expect(html).not.toContain("The browser did not open.");
+  expect(clickEveryButton({ view, anotherBrowser: true })).toEqual([
+    ["Cancel", ["onCancelSignIn"]],
+  ]);
 });
 
 const SIGNED_IN_BUTTONS = [
@@ -458,6 +513,7 @@ test("each state of the device offers its actions", () => {
   ] as const) {
     expect(labels({ ...SIGNED_IN, device }), device).toEqual([
       "Sign in with GitHub",
+      "Use another browser",
       "This is not me",
     ]);
   }
@@ -468,6 +524,7 @@ test("each state of the device offers its actions", () => {
   for (const device of ["removed", "revoked", "no_device"] as const) {
     expect(labels({ ...SIGNED_OUT, device }), device).toEqual([
       "Sign in with GitHub",
+      "Use another browser",
     ]);
   }
   for (const device of ["starting", "unavailable"] as const) {

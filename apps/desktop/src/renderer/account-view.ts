@@ -1,3 +1,4 @@
+import type { AccountBridge } from "../shared/desktop-bridge.ts";
 import type {
   AccountStatus,
   ApiOriginState,
@@ -229,6 +230,101 @@ export function offersSignIn(status: AccountStatus): boolean {
   return (
     status.account.kind === "signed_out" || SIGN_IN_STATES.has(status.device)
   );
+}
+
+/** The message for a start that the main process refused, or none. */
+export function startMessage(
+  result: StartSignInResult | undefined,
+): string | undefined {
+  return result?.outcome === "refused"
+    ? START_REFUSAL_MESSAGES[result.reason]
+    : undefined;
+}
+
+/** A wait for the sign-in of the account status to become idle. */
+export interface IdleWait {
+  /**
+   * Resolves with the next status whose sign-in is idle, or with undefined
+   * when the wait was stopped or the status is no longer followed.
+   */
+  readonly idle: Promise<AccountStatus | undefined>;
+  /** Ends the wait; `idle` then resolves with undefined. */
+  readonly stop: () => void;
+}
+
+/** The waits of the panel for an idle sign-in, fed with each status. */
+export interface IdleWaits {
+  readonly wait: () => IdleWait;
+  /** Passes a status on: an idle one ends every wait with it. */
+  readonly status: (status: AccountStatus) => void;
+  /** Ends every wait with undefined, when the status is no longer followed. */
+  readonly end: () => void;
+}
+
+export function createIdleWaits(): IdleWaits {
+  const waiters = new Set<(status: AccountStatus | undefined) => void>();
+  const endAll = (status: AccountStatus | undefined) => {
+    for (const waiter of [...waiters]) {
+      waiter(status);
+    }
+  };
+  return Object.freeze({
+    wait: (): IdleWait => {
+      let stop: (status: AccountStatus | undefined) => void = () => undefined;
+      const idle = new Promise<AccountStatus | undefined>((resolve) => {
+        stop = (status) => {
+          waiters.delete(stop);
+          resolve(status);
+        };
+      });
+      waiters.add(stop);
+      return Object.freeze({ idle, stop: () => stop(undefined) });
+    },
+    status: (status: AccountStatus) => {
+      if (status.signIn.kind === "idle") {
+        endAll(status);
+      }
+    },
+    end: () => endAll(undefined),
+  });
+}
+
+/**
+ * "Use another browser" (#175): a sign-in that opens no browser and offers
+ * its address for copying into a browser of the person's choice. A sign-in
+ * that waits in the default browser is cancelled first, because the API
+ * binds its address to the browser that opened it; the new one starts only
+ * after that sign-in ended as cancelled. When it ended otherwise, for
+ * example because the browser posted meanwhile, nothing starts and the
+ * result is undefined. The main process applies its rules to the start as
+ * to any other: the cooldown, `busy`, and the key.
+ */
+export async function startInAnotherBrowser(
+  account: Pick<AccountBridge, "startSignIn" | "cancelSignIn">,
+  waiting: boolean,
+  waitForIdle: () => IdleWait,
+): Promise<StartSignInResult | undefined> {
+  if (waiting) {
+    // The wait begins before the cancel, so that its outcome is not missed.
+    const wait = waitForIdle();
+    let cancelled: boolean;
+    try {
+      cancelled = await account.cancelSignIn();
+    } catch (error) {
+      wait.stop();
+      throw error;
+    }
+    if (!cancelled) {
+      // The sign-in had already ended on its own.
+      wait.stop();
+      return undefined;
+    }
+    const ended = await wait.idle;
+    if (ended?.lastOutcome?.code !== "cancelled") {
+      return undefined;
+    }
+  }
+  return account.startSignIn({ browser: "other" });
 }
 
 /** The message for each failure of a sign-out, a removal, or the device list. */

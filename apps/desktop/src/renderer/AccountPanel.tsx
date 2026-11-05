@@ -15,7 +15,7 @@ import type {
 import {
   ACTION_MESSAGES,
   apiOriginProblem,
-  START_REFUSAL_MESSAGES,
+  createIdleWaits,
   DEVICE_ACTION_MESSAGES,
   DEVICE_KEY_PROBLEM_MESSAGES,
   describeDeviceState,
@@ -27,17 +27,19 @@ import {
   offersSignIn,
   removeDeviceMessage,
   signOutMessage,
+  startInAnotherBrowser,
+  startMessage,
   type AccountView,
 } from "./account-view.ts";
 
 /**
- * The account of this installation: sign in with GitHub, the pairing code
- * while the browser is open, the GitHub login after a sign-in with "This is
- * not me" (#149), the passphrase of a device key that needs one, the state
- * of the device with sign-out, removing this device, and a simple device
- * list. The main process runs the sign-in and the device session; the
- * panel never sees a sign-in code, a key, or a token. The screens of #95
- * replace it.
+ * The account of this installation: sign in with GitHub, in the default
+ * browser or in another one (#175), the pairing code while the browser is
+ * open, the GitHub login after a sign-in with "This is not me" (#149), the
+ * passphrase of a device key that needs one, the state of the device with
+ * sign-out, removing this device, and a simple device list. The main
+ * process runs the sign-in and the device session; the panel never sees a
+ * sign-in code, a key, or a token. The screens of #95 replace it.
  */
 export function AccountPanel({
   account,
@@ -54,6 +56,13 @@ export interface AccountPanelContentProps {
   /** Why the last action was refused or failed. */
   readonly message: string | undefined;
   readonly onStartSignIn: () => void;
+  /**
+   * "Use another browser" (#175): a sign-in that waits in the browser is
+   * cancelled first, then one starts that offers its address for copying.
+   */
+  readonly onUseAnotherBrowser: () => void;
+  /** Whether the last start that the panel asked for was in another browser. */
+  readonly anotherBrowser: boolean;
   readonly onCancelSignIn: () => void;
   readonly onUnlock: (passphrase: string) => void;
   /**
@@ -253,7 +262,9 @@ function SignInActions(
       <SignInProgress
         signIn={signIn}
         busy={busy}
+        anotherBrowser={props.anotherBrowser}
         onCancel={props.onCancelSignIn}
+        onUseAnotherBrowser={props.onUseAnotherBrowser}
       />
     );
   }
@@ -263,25 +274,34 @@ function SignInActions(
   const originProblem = canSignIn
     ? apiOriginProblem(status.apiOrigin)
     : undefined;
+  const signInDisabled =
+    busy || status.deviceKey !== "ready" || originProblem !== undefined;
+  const signInDescription =
+    originProblem === undefined ? undefined : "sign-in-unavailable";
   return (
     <>
       <div className="account-actions">
         {canSignIn ? (
-          <button
-            type="button"
-            className="panel-action"
-            disabled={
-              busy ||
-              status.deviceKey !== "ready" ||
-              originProblem !== undefined
-            }
-            aria-describedby={
-              originProblem === undefined ? undefined : "sign-in-unavailable"
-            }
-            onClick={props.onStartSignIn}
-          >
-            Sign in with GitHub
-          </button>
+          <>
+            <button
+              type="button"
+              className="panel-action"
+              disabled={signInDisabled}
+              aria-describedby={signInDescription}
+              onClick={props.onStartSignIn}
+            >
+              Sign in with GitHub
+            </button>
+            <button
+              type="button"
+              className="panel-action"
+              disabled={signInDisabled}
+              aria-describedby={signInDescription}
+              onClick={props.onUseAnotherBrowser}
+            >
+              Use another browser
+            </button>
+          </>
         ) : null}
         {usable ? (
           <>
@@ -336,14 +356,32 @@ function SignInActions(
 function SignInProgress({
   signIn,
   busy,
+  anotherBrowser,
   onCancel,
+  onUseAnotherBrowser,
 }: {
   readonly signIn: Exclude<SignInState, { readonly kind: "idle" }>;
   readonly busy: boolean;
+  readonly anotherBrowser: boolean;
   readonly onCancel: () => void;
+  readonly onUseAnotherBrowser: () => void;
 }) {
+  // Offered while the sign-in waits in the browser that opened, which may
+  // hold another GitHub account. The address of this attempt is bound to
+  // that browser, so a new attempt starts.
+  const offersAnotherBrowser = signIn.kind === "waiting" && signIn.opened;
   const cancel = (
     <div className="account-actions">
+      {offersAnotherBrowser ? (
+        <button
+          type="button"
+          className="panel-action"
+          disabled={busy}
+          onClick={onUseAnotherBrowser}
+        >
+          Use another browser
+        </button>
+      ) : null}
       <button
         type="button"
         className="panel-action"
@@ -357,7 +395,11 @@ function SignInProgress({
   if (signIn.kind === "starting") {
     return (
       <>
-        <p role="status">Opening the browser.</p>
+        <p role="status">
+          {anotherBrowser
+            ? "Preparing the sign-in address."
+            : "Opening the browser."}
+        </p>
         {cancel}
       </>
     );
@@ -374,7 +416,11 @@ function SignInProgress({
       </p>
       <p className="pairing-code">{signIn.pairingCode}</p>
       {signIn.opened ? null : (
-        <AuthorizeUrl url={signIn.authorizeUrl} warning={signIn.warning} />
+        <AuthorizeUrl
+          url={signIn.authorizeUrl}
+          warning={signIn.warning}
+          anotherBrowser={anotherBrowser}
+        />
       )}
       {cancel}
     </>
@@ -382,16 +428,19 @@ function SignInProgress({
 }
 
 /**
- * The authorize URL when the browser did not open. The session denies the
- * clipboard permission, so the button selects the text for the person to
- * copy; the warning from the main process says not to share it (#149).
+ * The authorize URL when the browser did not open, or when the person asked
+ * for it to use another browser (#175). The session denies the clipboard
+ * permission, so the button selects the text for the person to copy; the
+ * warning from the main process says not to share it (#149).
  */
 function AuthorizeUrl({
   url,
   warning,
+  anotherBrowser,
 }: {
   readonly url: string;
   readonly warning: string;
+  readonly anotherBrowser: boolean;
 }) {
   const field = useRef<HTMLTextAreaElement>(null);
   const select = () => {
@@ -400,7 +449,11 @@ function AuthorizeUrl({
   };
   return (
     <div className="account-url">
-      <p>The browser did not open.</p>
+      <p>
+        {anotherBrowser
+          ? "Copy this address into the browser that you want to sign in with."
+          : "The browser did not open."}
+      </p>
       <label className="account-label" htmlFor="sign-in-url">
         Sign-in address
       </label>
@@ -466,16 +519,28 @@ function useAccountPanel(
   const [devices, setDevices] = useState<readonly DeviceView[] | undefined>(
     undefined,
   );
+  const [anotherBrowser, setAnotherBrowser] = useState(false);
+  const [idleWaits] = useState(createIdleWaits);
 
   useEffect(() => {
     if (bridge === undefined) {
       return undefined;
     }
-    return bridge.subscribeStatus(
-      (status) => setView({ kind: "known", status }),
-      () => setView({ kind: "unavailable" }),
+    const stop = bridge.subscribeStatus(
+      (status) => {
+        setView({ kind: "known", status });
+        idleWaits.status(status);
+      },
+      () => {
+        setView({ kind: "unavailable" });
+        idleWaits.end();
+      },
     );
-  }, [bridge]);
+    return () => {
+      stop();
+      idleWaits.end();
+    };
+  }, [bridge, idleWaits]);
 
   /** Runs one action at a time and shows the message that its result names. */
   const run = useCallback(
@@ -499,18 +564,25 @@ function useAccountPanel(
     [bridge],
   );
 
-  const onStartSignIn = useCallback(
-    () =>
-      run(
-        (account) => account.startSignIn(),
-        (result) =>
-          result.outcome === "refused"
-            ? START_REFUSAL_MESSAGES[result.reason]
-            : undefined,
-        ACTION_MESSAGES.startFailed,
-      ),
-    [run],
-  );
+  const onStartSignIn = useCallback(() => {
+    setAnotherBrowser(false);
+    run(
+      (account) => account.startSignIn(),
+      startMessage,
+      ACTION_MESSAGES.startFailed,
+    );
+  }, [run]);
+
+  const onUseAnotherBrowser = useCallback(() => {
+    const waiting =
+      view.kind === "known" && view.status.signIn.kind === "waiting";
+    setAnotherBrowser(true);
+    run(
+      (account) => startInAnotherBrowser(account, waiting, idleWaits.wait),
+      startMessage,
+      ACTION_MESSAGES.startFailed,
+    );
+  }, [run, view, idleWaits]);
 
   const onCancelSignIn = useCallback(
     () =>
@@ -585,6 +657,8 @@ function useAccountPanel(
     busy,
     message,
     onStartSignIn,
+    onUseAnotherBrowser,
+    anotherBrowser,
     onCancelSignIn,
     onUnlock,
     onForget,

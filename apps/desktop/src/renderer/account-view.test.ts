@@ -1,4 +1,5 @@
 import { expect, test } from "vitest";
+import type { AccountBridge } from "../shared/desktop-bridge.ts";
 import {
   type AccountStatus,
   DEVICE_ACTION_FAILURES,
@@ -6,12 +7,14 @@ import {
   DEVICE_STATES,
   SIGN_IN_OUTCOME_CODES,
   START_SIGN_IN_REFUSALS,
+  type StartSignInResult,
   UNLOCK_REFUSALS,
 } from "../shared/ipc-contract.ts";
 import { unlockMessage } from "./AccountPanel.tsx";
 import {
   ACTION_MESSAGES,
   apiOriginProblem,
+  createIdleWaits,
   START_REFUSAL_MESSAGES,
   DEVICE_ACTION_FAILURE_MESSAGES,
   DEVICE_ACTION_MESSAGES,
@@ -27,7 +30,53 @@ import {
   removeDeviceMessage,
   SIGN_IN_OUTCOME_MESSAGES,
   signOutMessage,
+  startInAnotherBrowser,
+  startMessage,
 } from "./account-view.ts";
+
+const IDLE: AccountStatus = {
+  revision: 3,
+  account: { kind: "signed_out" },
+  signIn: { kind: "idle" },
+  lastOutcome: { code: "cancelled" },
+  deviceKey: "ready",
+  replacementPending: false,
+  apiOrigin: "set",
+  device: "no_device",
+};
+
+const WAITING: AccountStatus = {
+  ...IDLE,
+  revision: 2,
+  signIn: { kind: "waiting", pairingCode: "042137", opened: true },
+  lastOutcome: null,
+};
+
+/** The start and cancel of the bridge, with answers that the test gives. */
+function fakeAccount() {
+  const fake = {
+    log: [] as string[],
+    cancel: async (): Promise<boolean> => true,
+    start: async (): Promise<StartSignInResult> => ({ outcome: "started" }),
+  };
+  const account: Pick<AccountBridge, "startSignIn" | "cancelSignIn"> = {
+    startSignIn: (options) => {
+      fake.log.push(`start ${JSON.stringify(options)}`);
+      return fake.start();
+    },
+    cancelSignIn: () => {
+      fake.log.push("cancel");
+      return fake.cancel();
+    },
+  };
+  return Object.assign(fake, { account });
+}
+
+async function settle(): Promise<void> {
+  for (let index = 0; index < 10; index += 1) {
+    await Promise.resolve();
+  }
+}
 
 test("the view starts pending with the bridge and unavailable without it", () => {
   expect(initialAccountView(true)).toEqual({ kind: "pending" });
@@ -104,6 +153,109 @@ test("every refused start has its own message", () => {
   );
   const texts = Object.values(START_REFUSAL_MESSAGES);
   expect(new Set(texts).size).toBe(texts.length);
+  for (const reason of START_SIGN_IN_REFUSALS) {
+    expect(startMessage({ outcome: "refused", reason })).toBe(
+      START_REFUSAL_MESSAGES[reason],
+    );
+  }
+  expect(startMessage({ outcome: "started" })).toBeUndefined();
+  expect(startMessage({ outcome: "failed", code: "failed" })).toBeUndefined();
+  expect(startMessage(undefined)).toBeUndefined();
+});
+
+test("another browser without an open sign-in starts at once, with the option and without a cancel", async () => {
+  const fake = fakeAccount();
+  const waits = createIdleWaits();
+
+  await expect(
+    startInAnotherBrowser(fake.account, false, waits.wait),
+  ).resolves.toEqual({ outcome: "started" });
+  expect(fake.log).toEqual(['start {"browser":"other"}']);
+
+  // The main process's refusal reaches the panel as it is.
+  fake.start = async () => ({ outcome: "refused", reason: "too_soon" });
+  await expect(
+    startInAnotherBrowser(fake.account, false, waits.wait),
+  ).resolves.toEqual({ outcome: "refused", reason: "too_soon" });
+});
+
+test("another browser while a sign-in waits cancels it first and starts once it ended as cancelled", async () => {
+  const fake = fakeAccount();
+  const waits = createIdleWaits();
+
+  const result = startInAnotherBrowser(fake.account, true, waits.wait);
+  await settle();
+  expect(fake.log).toEqual(["cancel"]);
+
+  // A status that is not idle yet starts nothing.
+  waits.status(WAITING);
+  await settle();
+  expect(fake.log).toEqual(["cancel"]);
+
+  waits.status(IDLE);
+  await expect(result).resolves.toEqual({ outcome: "started" });
+  expect(fake.log).toEqual(["cancel", 'start {"browser":"other"}']);
+});
+
+test("another browser starts nothing when the waiting sign-in ended otherwise or had already ended", async () => {
+  const fake = fakeAccount();
+  const waits = createIdleWaits();
+
+  // The browser posted meanwhile, and the sign-in completed.
+  const completed = startInAnotherBrowser(fake.account, true, waits.wait);
+  await settle();
+  waits.status({ ...IDLE, lastOutcome: { code: "signed_in" } });
+  await expect(completed).resolves.toBeUndefined();
+
+  // No sign-in was open any more.
+  fake.cancel = async () => false;
+  await expect(
+    startInAnotherBrowser(fake.account, true, waits.wait),
+  ).resolves.toBeUndefined();
+  // Its wait ended too: a later idle status starts nothing.
+  waits.status(IDLE);
+  await settle();
+  expect(fake.log).toEqual(["cancel", "cancel"]);
+});
+
+test("another browser starts nothing when the cancel fails or the status is no longer followed", async () => {
+  const fake = fakeAccount();
+  const waits = createIdleWaits();
+
+  fake.cancel = async () => {
+    throw new Error("refused");
+  };
+  await expect(
+    startInAnotherBrowser(fake.account, true, waits.wait),
+  ).rejects.toThrow("refused");
+
+  fake.cancel = async () => true;
+  const unfollowed = startInAnotherBrowser(fake.account, true, waits.wait);
+  await settle();
+  waits.end();
+  await expect(unfollowed).resolves.toBeUndefined();
+
+  waits.status(IDLE);
+  await settle();
+  expect(fake.log).toEqual(["cancel", "cancel"]);
+});
+
+test("an idle status ends every wait with it, and a stopped wait ends without one", async () => {
+  const waits = createIdleWaits();
+  const first = waits.wait();
+  const second = waits.wait();
+  const stopped = waits.wait();
+  stopped.stop();
+  await expect(stopped.idle).resolves.toBeUndefined();
+
+  waits.status(WAITING);
+  waits.status(IDLE);
+  await expect(first.idle).resolves.toBe(IDLE);
+  await expect(second.idle).resolves.toBe(IDLE);
+
+  const late = waits.wait();
+  waits.end();
+  await expect(late.idle).resolves.toBeUndefined();
 });
 
 test("every device state has an entry, and only the states that the panel shows otherwise have no message", () => {

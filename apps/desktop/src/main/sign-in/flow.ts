@@ -56,9 +56,10 @@ import type {
 } from "./registration-marker.ts";
 
 /**
- * Shown with the authorize URL when the browser could not be opened (#149):
- * the URL holds the attempt's state, and whoever has it while the attempt is
- * open could sign this device in to another account.
+ * Shown with the authorize URL when the browser could not be opened (#149),
+ * or when the person asked for the address instead of the default browser
+ * (#175): the URL holds the attempt's state, and whoever has it while the
+ * attempt is open could sign this device in to another account.
  */
 export const SIGN_IN_URL_WARNING =
   "Open this address in your own browser. Do not share it with anyone: while this sign-in is open, someone who has it could sign this device in to their account.";
@@ -248,8 +249,9 @@ interface StartedSignInBase {
 }
 
 /**
- * The result of `start`. When the browser could not be opened, the URL is
- * shown for copying together with `SIGN_IN_URL_WARNING`.
+ * The result of `start`. When the browser could not be opened, or the
+ * caller asked not to open it (`openBrowser: false`), the URL is shown for
+ * copying together with `SIGN_IN_URL_WARNING`.
  */
 export type SignInStart =
   | { readonly started: false; readonly outcome: SignInOutcome }
@@ -270,6 +272,14 @@ export interface SignInStartOptions {
   readonly replaceOptions?: ReplaceDeviceKeyOptions;
   /** A device label that the person chose; defaults to `suggestedDeviceLabel`. */
   readonly label?: string;
+  /**
+   * False when the person completes the sign-in in a browser of their
+   * choice (#175): the attempt starts as usual, but the default browser is
+   * not opened, and the result offers the URL with `SIGN_IN_URL_WARNING`
+   * as when the browser did not open. The attempt is bound to the browser
+   * that opens the URL first. Defaults to true.
+   */
+  readonly openBrowser?: boolean;
   /**
    * Called once, right after the listener accepted the valid request (the
    * API's page posted a code or an error), before the key changes and before
@@ -325,7 +335,8 @@ export interface SignInFlowDependencies {
 export interface SignInFlow {
   /**
    * Starts a sign-in after the person's action: creates the attempt, starts
-   * the listener, and opens the browser. Never rejects.
+   * the listener, and opens the browser, unless `openBrowser` is false.
+   * Never rejects.
    */
   readonly start: (options?: SignInStartOptions) => Promise<SignInStart>;
   /**
@@ -819,30 +830,34 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
 
       let opened = false;
       try {
-        opened = await new Promise<boolean>((resolve, reject) => {
-          // A browser launch that never returns must not hold back the
-          // attempt: after the timeout the URL is shown for copying.
-          const cancelTimer = scheduleTimer(
-            () => resolve(false),
-            OPEN_EXTERNAL_TIMEOUT_MS,
-          );
-          Promise.resolve()
-            .then(() => deps.openExternal(url))
-            .then(
-              (value) => {
-                cancelTimer();
-                resolve(value === true);
-              },
-              (error: unknown) => {
-                cancelTimer();
-                reject(error instanceof Error ? error : new Error("failed"));
-              },
+        // Without `openBrowser`, the person opens the URL in a browser of
+        // their choice; nothing is launched.
+        opened =
+          options.openBrowser !== false &&
+          (await new Promise<boolean>((resolve, reject) => {
+            // A browser launch that never returns must not hold back the
+            // attempt: after the timeout the URL is shown for copying.
+            const cancelTimer = scheduleTimer(
+              () => resolve(false),
+              OPEN_EXTERNAL_TIMEOUT_MS,
             );
-        });
+            Promise.resolve()
+              .then(() => deps.openExternal(url))
+              .then(
+                (value) => {
+                  cancelTimer();
+                  resolve(value === true);
+                },
+                (error: unknown) => {
+                  cancelTimer();
+                  reject(error instanceof Error ? error : new Error("failed"));
+                },
+              );
+          }));
       } catch {
         opened = false;
       }
-      if (!opened) {
+      if (!opened && options.openBrowser !== false) {
         report("The system browser could not be opened.");
       }
 
