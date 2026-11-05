@@ -216,8 +216,19 @@ export interface AuthorizedRequest<T> {
   readonly route: ApiRoute;
   /** The `:name` parameters of the route path; every one is an ID. */
   readonly params?: Readonly<Record<string, string>>;
+  /**
+   * The query, encoded with `URLSearchParams` after the filled path, which
+   * stays on the API origin. Without it, or when it is empty, the URL has no
+   * query.
+   */
+  readonly query?: Readonly<Record<string, string>>;
   /** Sent as JSON. */
   readonly body?: unknown;
+  /**
+   * The cap of the answer body in bytes, for a read whose answer can be
+   * larger than `MAX_API_ANSWER_BYTES`, the default.
+   */
+  readonly maxAnswerBytes?: number;
   /** The schema of a `2xx` answer's body, or `empty` for an answer without one (`204`). */
   readonly answer: z.ZodType<T> | "empty";
 }
@@ -1433,6 +1444,10 @@ export function createDeviceSession(
     } catch {
       return failure("invalid_request");
     }
+    const query = new URLSearchParams(call.query).toString();
+    if (query !== "") {
+      path = `${path}?${query}`;
+    }
     const send = (token: string): Promise<ApiAnswer> =>
       callApi({
         fetch: deps.fetch,
@@ -1442,6 +1457,9 @@ export function createDeviceSession(
         path,
         accessToken: token,
         ...(call.body === undefined ? {} : { body: call.body }),
+        ...(call.maxAnswerBytes === undefined
+          ? {}
+          : { maxAnswerBytes: call.maxAnswerBytes }),
       });
     const first = await sessionToken();
     if (!first.ok) {

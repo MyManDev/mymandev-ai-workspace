@@ -22,6 +22,7 @@ import {
   type UserId,
 } from "@mymandev/protocol";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import * as z from "zod";
 import {
   type KeyFileSystem,
   nodeKeyFileSystem,
@@ -47,7 +48,7 @@ import {
   UNCERTAIN_REFUSAL_CODES,
 } from "../sign-in/flow.ts";
 import { createRegistrationMarkerStore } from "../sign-in/registration-marker.ts";
-import { API_REQUEST_TIMEOUT_MS } from "./api-call.ts";
+import { API_REQUEST_TIMEOUT_MS, MAX_API_ANSWER_BYTES } from "./api-call.ts";
 import {
   ACCESS_TOKEN_LIFETIME_MS,
   ACCESS_TOKEN_RENEW_MARGIN_MS,
@@ -209,6 +210,8 @@ function verifies(
 interface ApiRequest {
   readonly method: string;
   readonly path: string;
+  /** The query with its `?`, or "" without one. */
+  readonly search: string;
   readonly authorization: string | null;
   readonly body: Record<string, string> | undefined;
   readonly init: RequestInit;
@@ -337,6 +340,7 @@ function apiFetch(api: FakeApi): DeviceSessionDependencies["fetch"] {
     const request: ApiRequest = {
       method: init.method ?? "GET",
       path: parsed.pathname,
+      search: parsed.search,
       authorization: headers.get("authorization"),
       body:
         init.body === undefined
@@ -912,6 +916,71 @@ describe("access tokens", () => {
     });
     expect(result).toEqual({ ok: false, reason: "invalid_request" });
     expect(h.api.requests).toEqual([]);
+  });
+
+  test("a query is encoded after the path, which stays on the API origin", async () => {
+    const h = harness();
+    await existingDevice(h);
+    const route = { method: "GET", path: "/devices" } as const;
+    h.api.intercept = (request) =>
+      request.path === "/devices"
+        ? Promise.resolve(Response.json({ seen: request.search }))
+        : undefined;
+    const answer = z.object({ seen: z.string() });
+
+    const cases: [Record<string, string> | undefined, string][] = [
+      [undefined, ""],
+      [{}, ""],
+      [{ beforeSeq: "120", limit: "50" }, "?beforeSeq=120&limit=50"],
+      // Every value is encoded, so it cannot end the query or name a host.
+      [
+        { q: "a&b=c d/@//evil.example" },
+        "?q=a%26b%3Dc+d%2F%40%2F%2Fevil.example",
+      ],
+    ];
+    for (const [query, search] of cases) {
+      const result = await h.session.request({
+        route,
+        ...(query === undefined ? {} : { query }),
+        answer,
+      });
+      expect(result, JSON.stringify(query)).toEqual({
+        ok: true,
+        value: { seen: search },
+      });
+    }
+  });
+
+  test("a request's own answer cap replaces the default of 512 KiB", async () => {
+    const h = harness();
+    await existingDevice(h);
+    const route = { method: "GET", path: "/devices" } as const;
+    // An answer of exactly `size` bytes.
+    let size = 0;
+    h.api.intercept = (request) =>
+      request.path === "/devices"
+        ? Promise.resolve(
+            new Response(`"${" ".repeat(size - 2)}"`, { status: 200 }),
+          )
+        : undefined;
+    const cases: [number, number | undefined, boolean][] = [
+      [MAX_API_ANSWER_BYTES, undefined, true],
+      [MAX_API_ANSWER_BYTES + 1, undefined, false],
+      [MAX_API_ANSWER_BYTES + 1, MAX_API_ANSWER_BYTES + 1, true],
+      [MAX_API_ANSWER_BYTES + 2, MAX_API_ANSWER_BYTES + 1, false],
+    ];
+    for (const [bytes, maxAnswerBytes, ok] of cases) {
+      size = bytes;
+      const result = await h.session.request({
+        route,
+        ...(maxAnswerBytes === undefined ? {} : { maxAnswerBytes }),
+        answer: z.string(),
+      });
+      expect(result.ok, `${bytes} bytes, cap ${maxAnswerBytes}`).toBe(ok);
+      if (!ok) {
+        expect(result).toEqual({ ok: false, reason: "unexpected_response" });
+      }
+    }
   });
 });
 
