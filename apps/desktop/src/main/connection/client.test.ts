@@ -1,11 +1,12 @@
 import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type {
-  AuthChallengeFrame,
-  AuthResponseFrame,
-  DeviceId,
-  WorkspaceId,
+import {
+  PROTOCOL_VERSION,
+  type AuthChallengeFrame,
+  type AuthResponseFrame,
+  type DeviceId,
+  type WorkspaceId,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
 import {
@@ -47,6 +48,8 @@ const OTHER_WORKSPACE_ID =
 const MEMBER_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000c";
 const EVENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000001";
 const PROJECT_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000e";
+const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000005";
+const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000000007";
 const NONCE = Buffer.alloc(32, 7).toString("base64url");
 const SIGNATURE = Buffer.alloc(64, 9).toString("base64url");
 const WALL_START = Date.parse("2026-11-03T10:00:00.000Z");
@@ -1341,13 +1344,39 @@ test("events go only through sendAs, which refuses buffered data, oversized and 
         ({ ...chatSendAs(identity), deviceId: null }) as unknown as ClientEvent,
     ),
   ).toBe("invalid");
+  // A valid client frame is not an event.
   expect(
     h.client.sendAs(
       () =>
         ({
-          protocolVersion: 0,
+          protocolVersion: PROTOCOL_VERSION,
           type: "workspace.subscribe",
           workspaceId: WORKSPACE_ID,
+        }) as unknown as ClientEvent,
+    ),
+  ).toBe("invalid");
+  // An event of another protocol version.
+  expect(
+    h.client.sendAs(
+      (identity) =>
+        ({
+          ...chatSendAs(identity),
+          protocolVersion: PROTOCOL_VERSION + 1,
+        }) as unknown as ClientEvent,
+    ),
+  ).toBe("invalid");
+  // Something that JSON cannot carry.
+  for (const value of [undefined, () => undefined, 1n]) {
+    expect(h.client.sendAs(() => value as unknown as ClientEvent)).toBe(
+      "invalid",
+    );
+  }
+  expect(
+    h.client.sendAs(
+      (identity) =>
+        ({
+          ...chatSendAs(identity),
+          payload: { projectId: PROJECT_ID, body: 1n },
         }) as unknown as ClientEvent,
     ),
   ).toBe("invalid");
@@ -1396,4 +1425,40 @@ test("events go only through sendAs, which refuses buffered data, oversized and 
   expect(socket.sentJson().at(-1)).toEqual(chatSend());
   expect(socket.closes).toEqual([]);
   expect(h.client.status().state).toBe("connected");
+});
+
+test("sendAs sends an event of an agent actor from the identity's device, and refuses it from another device", async () => {
+  const h = harness();
+  await h.authenticate();
+  const socket = h.last();
+  /** A run transition that the agent's host device reports. */
+  const runStarted = (deviceId: DeviceId): ClientEvent =>
+    ({
+      protocolVersion: PROTOCOL_VERSION,
+      id: EVENT_ID,
+      type: "agent.run.state_changed",
+      occurredAt: "2026-11-03T10:00:00.000Z",
+      workspaceId: WORKSPACE_ID,
+      actor: { kind: "agent", agentId: AGENT_ID },
+      deviceId,
+      payload: {
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        previousState: "queued",
+        state: "running",
+      },
+    }) as unknown as ClientEvent;
+
+  // The account binds no agent actor; the device does.
+  expect(
+    h.client.sendAs((identity) => ({
+      ...runStarted(identity.deviceId),
+      secret: "kept local",
+    })),
+  ).toBe("sent");
+  expect(socket.sent.at(-1)).not.toContain("kept local");
+  expect(socket.sentJson().at(-1)).toEqual(runStarted(DEVICE_ID));
+  expect(h.client.sendAs(() => runStarted(OTHER_DEVICE_ID))).toBe("invalid");
+  expect(socket.sent).toHaveLength(2);
+  expect(socket.closes).toEqual([]);
 });

@@ -826,7 +826,12 @@ export function createConnectionClient(
     }
     let text: string;
     try {
-      text = JSON.stringify(message);
+      // `undefined`, a function, or a symbol serializes to nothing.
+      const serialized: string | undefined = JSON.stringify(message);
+      if (serialized === undefined) {
+        return "invalid";
+      }
+      text = serialized;
     } catch {
       return "invalid";
     }
