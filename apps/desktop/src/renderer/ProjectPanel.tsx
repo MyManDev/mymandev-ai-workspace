@@ -45,8 +45,8 @@ export function panelForKey(
  * repositories, chosen with tabs. Only the selected tab is in the tab order;
  * the arrow keys, Home, and End select another tab and move the focus to it.
  * The agents are placeholder content: agent execution comes in a later
- * milestone. The repositories are the ones mounted on this device; until
- * projects come from the cloud API, every project shows the same ones.
+ * milestone. The repositories are the ones mounted on this device; a mount
+ * is not linked to a project yet, so every project shows the same ones.
  */
 export function ProjectPanel({
   panel,

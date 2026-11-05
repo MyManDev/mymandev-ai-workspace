@@ -202,6 +202,15 @@ test("invalid transitions are refused and return the same state object", () => {
     { type: "open-project" },
     { type: "open-project", projectId: { toString: () => "project-a" } },
     { type: "navigate", screen: "about" },
+    { type: "replace-projects" },
+    { type: "replace-projects", projects: "project-a" },
+    {
+      type: "replace-projects",
+      projects: [
+        { id: "project-a", name: "Project A" },
+        { id: "project-a", name: "Another project A" },
+      ],
+    },
     {},
   ];
   for (const state of [home, chatA]) {
@@ -228,6 +237,50 @@ test("two projects with the same ID are refused", () => {
     ]),
   ).toThrow("Two projects in the shell state have the same ID.");
   expect(createShellState([]).projects).toEqual([]);
+});
+
+test("replacing the projects keeps the shown view while its project stays", () => {
+  const tasksB = run(
+    home,
+    { type: "open-project", projectId: "project-b" },
+    { type: "show-screen", screen: "tasks" },
+    { type: "show-panel", panel: "repositories" },
+  );
+  const renamed: readonly ProjectSummary[] = [
+    { id: "project-b", name: "Project B, renamed" },
+    { id: "project-c", name: "Project C" },
+  ];
+
+  const after = run(tasksB, { type: "replace-projects", projects: renamed });
+
+  expect(after.projects).toBe(renamed);
+  expect(after.view).toEqual(tasksB.view);
+  expect(openProject(after)?.project.name).toBe("Project B, renamed");
+});
+
+test("replacing the projects shows the home screen when the open project is gone", () => {
+  const remaining: readonly ProjectSummary[] = [
+    { id: "project-b", name: "Project B" },
+  ];
+
+  const after = run(chatA, { type: "replace-projects", projects: remaining });
+
+  expect(after).toEqual({ projects: remaining, view: HOME_VIEW });
+  expect(run(after, { type: "replace-projects", projects: [] })).toEqual({
+    projects: [],
+    view: HOME_VIEW,
+  });
+});
+
+test("replacing the projects with the same ones returns the same state object", () => {
+  const copy = PROJECTS.map((project) => ({ ...project }));
+
+  expect(
+    shellReducer(chatA, { type: "replace-projects", projects: copy }),
+  ).toBe(chatA);
+  expect(
+    shellReducer(home, { type: "replace-projects", projects: copy.slice(1) }),
+  ).not.toBe(home);
 });
 
 test("a transition to the current view returns the same state object", () => {

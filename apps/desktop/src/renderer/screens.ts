@@ -94,7 +94,16 @@ export type ShellAction =
    */
   | { readonly type: "open-project"; readonly projectId: string }
   /** Switches the side panel of the open project. */
-  | { readonly type: "show-panel"; readonly panel: PanelId };
+  | { readonly type: "show-panel"; readonly panel: PanelId }
+  /**
+   * Replaces the workspace's projects, with each workspace state from the
+   * main process. Projects with a duplicate ID are refused. The shown view is
+   * validated again, so a view whose project is gone shows the home screen.
+   */
+  | {
+      readonly type: "replace-projects";
+      readonly projects: readonly ProjectSummary[];
+    };
 
 export const HOME_VIEW: WorkspaceView = Object.freeze({ screen: "home" });
 
@@ -143,22 +152,25 @@ function validView(
   return undefined;
 }
 
+function hasDuplicateIds(projects: readonly ProjectSummary[]): boolean {
+  return (
+    new Set(projects.map((project) => project.id)).size !== projects.length
+  );
+}
+
 /**
  * The first state of the shell. A view that is not valid for these projects,
  * for example one whose project does not exist, shows the home screen instead.
  *
  * Throws when two projects have the same ID, because the navigation and the
- * view name a project only by its ID. The projects are fixed for now; a later
- * action that replaces them, for example when the cloud API delivers them,
- * must refuse duplicate IDs in the same way and validate the shown view
- * again, so that a view whose project is gone shows the home screen.
+ * view name a project only by its ID. The `replace-projects` action refuses
+ * them in the same way.
  */
 export function createShellState(
   projects: readonly ProjectSummary[],
   view: ShellView = HOME_VIEW,
 ): ShellState {
-  const ids = new Set(projects.map((project) => project.id));
-  if (ids.size !== projects.length) {
+  if (hasDuplicateIds(projects)) {
     throw new Error("Two projects in the shell state have the same ID.");
   }
   return { projects, view: validView(projects, view) ?? HOME_VIEW };
@@ -227,14 +239,53 @@ function nextView(
   }
 }
 
+function sameProjects(
+  a: readonly ProjectSummary[],
+  b: readonly ProjectSummary[],
+): boolean {
+  return (
+    a.length === b.length &&
+    a.every(
+      (project, index) =>
+        project.id === b[index]?.id && project.name === b[index]?.name,
+    )
+  );
+}
+
+/** The state with these projects, or undefined when they are refused. */
+function withProjects(
+  state: ShellState,
+  projects: unknown,
+): ShellState | undefined {
+  if (!Array.isArray(projects)) {
+    return undefined;
+  }
+  const next = projects as readonly ProjectSummary[];
+  if (hasDuplicateIds(next)) {
+    return undefined;
+  }
+  const view = validView(next, state.view) ?? HOME_VIEW;
+  if (sameProjects(next, state.projects) && sameView(view, state.view)) {
+    return state;
+  }
+  return {
+    projects: next,
+    view: sameView(view, state.view) ? state.view : view,
+  };
+}
+
 /**
- * Switches what the shell shows. A refused action and an action that changes
- * nothing return the same state object, so React skips the render.
+ * Switches what the shell shows or replaces its projects. A refused action
+ * and an action that changes nothing return the same state object, so React
+ * skips the render.
  */
 export function shellReducer(
   state: ShellState,
   action: ShellAction,
 ): ShellState {
+  if (action.type === "replace-projects") {
+    return withProjects(state, action.projects) ?? state;
+  }
   const view = nextView(state, action);
   return view === undefined || sameView(view, state.view)
     ? state

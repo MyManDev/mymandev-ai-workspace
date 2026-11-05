@@ -277,8 +277,10 @@ code {
   text-align: start;
 }
 
+/* A long workspace or project name wraps instead of widening the sidebar. */
 .shell-nav .nav-item {
   width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .nav-item:hover,
@@ -318,6 +320,7 @@ code {
 .project-nav-name {
   margin: 0;
   font-weight: var(--font-weight-strong);
+  overflow-wrap: anywhere;
 }
 
 .project-nav-list {
