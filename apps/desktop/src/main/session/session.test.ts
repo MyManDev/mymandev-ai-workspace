@@ -1,7 +1,7 @@
 import { createPublicKey, randomBytes, verify } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { request as httpRequest } from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,8 +24,10 @@ import {
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import * as z from "zod";
 import {
+  type KeyFileHandle,
   type KeyFileSystem,
   nodeKeyFileSystem,
+  writeFileAtomic,
 } from "../device-key/atomic-file.ts";
 import {
   createDeviceKeyStore,
@@ -97,12 +99,19 @@ const DEVICE_ITEM = Object.freeze({
   current: true,
 });
 
-let root: string;
+/** The key folder of the test. */
 let folder: string;
+/** The file system of every store in the test: in memory, unless a test runs on the disk. */
+let fileSystem: KeyFileSystem;
+/** The in-memory file system of the test. */
+let memory: MemoryFileSystem;
 /** The wall clock of every session in a test, also across a restart. */
 const wall = { now: 0 };
 /** The monotonic clock of every session in a test. */
 const mono = { now: 0 };
+
+/** The key folder in memory; nothing is written to the disk there. */
+const MEMORY_FOLDER = path.resolve(path.sep, "mymandev-memory", "MyManDev");
 
 /** Time passes: both clocks move on. */
 function advance(ms: number): void {
@@ -110,15 +119,12 @@ function advance(ms: number): void {
   mono.now += ms;
 }
 
-beforeEach(async () => {
+beforeEach(() => {
   wall.now = Date.parse("2026-11-02T10:00:00.000Z");
   mono.now = 1_000;
-  root = await mkdtemp(path.join(tmpdir(), "mymandev-device-session-"));
-  folder = path.join(root, "MyManDev");
-});
-
-afterEach(async () => {
-  await rm(root, { recursive: true, force: true });
+  memory = memoryFileSystem();
+  fileSystem = memory;
+  folder = MEMORY_FOLDER;
 });
 
 /** Every plain text that the fake encrypted: the private keys as PKCS#8 in base64. */
@@ -139,15 +145,206 @@ const fakeSafeStorage: SystemKeyProtection = Object.freeze({
     }),
 });
 
+/** An error as `node:fs/promises` gives it: an `Error` with a code. */
+function fileError(
+  code: string,
+  syscall: string,
+  file: string,
+): NodeJS.ErrnoException {
+  const error: NodeJS.ErrnoException = new Error(
+    `${code}: ${syscall} '${file}'`,
+  );
+  error.code = code;
+  error.syscall = syscall;
+  error.path = file;
+  return error;
+}
+
 /**
- * The real file system without the flush to the disk. Every file is still
- * written to a temporary file, renamed, and read back from the folder, so a
- * restart reads what the session wrote. Only the wait for the disk is left
- * out: it guards against a power loss, which no test here can see, and
- * `atomic-file.test.ts` and `store.test.ts` test it. On a busy disk one
- * flush can wait for a long time, and many tests here make ten or more of
- * them. The other file calls stay real, so a test here still waits on the
- * file system, and its time still grows with the load on the machine.
+ * The value of `work`, or its error as a rejection, on a later turn of the
+ * event loop, as a call of `node:fs/promises` settles. A write that the
+ * session does not await therefore lands after the code that follows it.
+ */
+function settled<T>(work: () => T): Promise<T> {
+  return new Promise((resolve, reject) => {
+    setImmediate(() => {
+      try {
+        resolve(work());
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+interface MemoryFileSystem extends KeyFileSystem {
+  /** Deletes a folder and everything in it, as `rm` with `recursive` does. */
+  removeFolder(folder: string): void;
+}
+
+/**
+ * A file system in memory with the calls of `KeyFileSystem` and the errors
+ * of `node:fs/promises` that the stores handle: ENOENT for a missing file or
+ * folder, EEXIST for an exclusive create of a name that exists, EISDIR for a
+ * folder where a file belongs (`unlink` of a folder gives EISDIR on Linux
+ * only, EPERM elsewhere), ENOTDIR from `mkdir` under a file, and ENOTDIR from
+ * `readdir` of a file. Other calls under a file give ENOENT, as on Windows;
+ * POSIX gives ENOTDIR there, and no test relies on either. A file is
+ * still created under its temporary name, written, closed, and renamed over
+ * the target, and a restart reads what the session wrote. A flush does
+ * nothing. No call waits for a disk, so the time of a test here does not
+ * grow with the load on the machine's disk. "the in-memory file system"
+ * below runs the same calls on both and expects the same results.
+ */
+function memoryFileSystem(): MemoryFileSystem {
+  const files = new Map<string, Uint8Array>();
+  const folders = new Set<string>();
+  const isFolder = (name: string): boolean =>
+    path.dirname(name) === name || folders.has(name);
+
+  function handle(
+    name: string,
+    writable: boolean,
+    file: string,
+  ): KeyFileHandle {
+    let open = true;
+    const check = (syscall: string): void => {
+      if (!open || (syscall === "write" && !writable)) {
+        throw fileError("EBADF", syscall, file);
+      }
+    };
+    return {
+      writeFile: (data: Uint8Array) =>
+        settled(() => {
+          check("write");
+          files.set(name, Uint8Array.from(data));
+        }),
+      sync: () => settled(() => check("fsync")),
+      close: () =>
+        settled(() => {
+          open = false;
+        }),
+    };
+  }
+
+  return {
+    mkdir: (folder: string) =>
+      settled(() => {
+        const name = path.resolve(folder);
+        if (files.has(name)) {
+          throw fileError("EEXIST", "mkdir", folder);
+        }
+        const missing: string[] = [];
+        for (let at = name; !isFolder(at); at = path.dirname(at)) {
+          if (files.has(at)) {
+            throw fileError("ENOTDIR", "mkdir", folder);
+          }
+          missing.push(at);
+        }
+        for (const at of missing) {
+          folders.add(at);
+        }
+        return missing.at(-1);
+      }),
+    open: (file: string, flags: string) =>
+      settled(() => {
+        const name = path.resolve(file);
+        if (flags === "wx") {
+          if (files.has(name) || isFolder(name)) {
+            throw fileError("EEXIST", "open", file);
+          }
+          if (!isFolder(path.dirname(name))) {
+            throw fileError("ENOENT", "open", file);
+          }
+          files.set(name, new Uint8Array());
+          return handle(name, true, file);
+        }
+        if (flags === "r" || flags === "r+") {
+          if (flags === "r+" && isFolder(name)) {
+            throw fileError("EISDIR", "open", file);
+          }
+          if (!files.has(name) && !isFolder(name)) {
+            throw fileError("ENOENT", "open", file);
+          }
+          return handle(name, flags === "r+", file);
+        }
+        throw new Error(`The memory file system has no flags "${flags}".`);
+      }),
+    readFile: (file: string) =>
+      settled(() => {
+        const name = path.resolve(file);
+        const data = files.get(name);
+        if (data === undefined) {
+          throw fileError(isFolder(name) ? "EISDIR" : "ENOENT", "open", file);
+        }
+        return Buffer.from(data);
+      }),
+    readdir: (folder: string) =>
+      settled(() => {
+        const name = path.resolve(folder);
+        if (!isFolder(name)) {
+          throw fileError(
+            files.has(name) ? "ENOTDIR" : "ENOENT",
+            "scandir",
+            folder,
+          );
+        }
+        return [...files.keys(), ...folders]
+          .filter((entry) => entry !== name && path.dirname(entry) === name)
+          .map((entry) => path.basename(entry))
+          .sort();
+      }),
+    rename: (from: string, to: string) =>
+      settled(() => {
+        const source = path.resolve(from);
+        const target = path.resolve(to);
+        const data = files.get(source);
+        if (data === undefined) {
+          if (isFolder(source)) {
+            throw new Error("The memory file system renames files only.");
+          }
+          throw fileError("ENOENT", "rename", from);
+        }
+        if (isFolder(target)) {
+          throw fileError("EISDIR", "rename", from);
+        }
+        if (!isFolder(path.dirname(target))) {
+          throw fileError("ENOENT", "rename", from);
+        }
+        files.delete(source);
+        files.set(target, data);
+      }),
+    unlink: (file: string) =>
+      settled(() => {
+        const name = path.resolve(file);
+        if (isFolder(name)) {
+          throw fileError("EISDIR", "unlink", file);
+        }
+        if (!files.delete(name)) {
+          throw fileError("ENOENT", "unlink", file);
+        }
+      }),
+    removeFolder: (folder: string) => {
+      const name = path.resolve(folder);
+      const inside = (entry: string): boolean =>
+        entry === name || entry.startsWith(`${name}${path.sep}`);
+      for (const entry of [...files.keys()].filter(inside)) {
+        files.delete(entry);
+      }
+      for (const entry of [...folders].filter(inside)) {
+        folders.delete(entry);
+      }
+    },
+  };
+}
+
+/**
+ * The real file system without the flush to the disk, for the tests that
+ * run on the disk (`onRealFileSystem`). Every file is still written to a
+ * temporary file, renamed, and read back from the folder. Only the wait for
+ * the disk is left out: it guards against a power loss, which no test here
+ * can see, and `atomic-file.test.ts` and `store.test.ts` test it. On a busy
+ * disk one flush can wait for a long time.
  */
 const unflushedFileSystem: KeyFileSystem = Object.freeze({
   ...nodeKeyFileSystem,
@@ -160,6 +357,39 @@ const unflushedFileSystem: KeyFileSystem = Object.freeze({
     };
   },
 });
+
+/**
+ * Runs the tests of the calling `describe` on the real file system, in a new
+ * temporary folder, so that the session's files also go through the disk
+ * here: written, renamed, and read back after a restart.
+ */
+function onRealFileSystem(): void {
+  let root = "";
+  beforeEach(async () => {
+    root = await mkdtemp(path.join(tmpdir(), "mymandev-device-session-"));
+    folder = path.join(root, "MyManDev");
+    fileSystem = unflushedFileSystem;
+  });
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+}
+
+/** The text of a file in the key folder; rejects when it is missing. */
+async function readText(name: string): Promise<string> {
+  const bytes = await fileSystem.readFile(path.join(folder, name));
+  return Buffer.from(bytes).toString("utf8");
+}
+
+/** Writes a file in the key folder, as a damaged or an older file. */
+async function writeText(name: string, text: string): Promise<void> {
+  await writeFileAtomic(
+    fileSystem,
+    path.join(folder, name),
+    Buffer.from(text, "utf8"),
+    "win32",
+  );
+}
 
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -387,17 +617,17 @@ function harness(
     folder,
     platform: "win32",
     systemProtection: fakeSafeStorage,
-    fileSystem: unflushedFileSystem,
+    fileSystem,
   });
   const records = createDeviceRecordStore({
     folder,
     platform: "win32",
-    fileSystem: unflushedFileSystem,
+    fileSystem,
   });
   const markers = createSignOutMarkerStore({
     folder,
     platform: "win32",
-    fileSystem: unflushedFileSystem,
+    fileSystem,
   });
   const timers: Harness["timers"] = [];
   const scheduleTimer: ScheduleTimer = (callback, delayMs) => {
@@ -462,7 +692,7 @@ function harness(
     sessionNotes: createSessionNotesStore({
       folder,
       platform: "win32",
-      fileSystem: unflushedFileSystem,
+      fileSystem,
     }),
     fetch: apiFetch(api),
     scheduleTimer,
@@ -542,9 +772,10 @@ function mints(h: Harness): number {
 /** The session notes file as JSON, or null when there is none. */
 async function notesFile(): Promise<Record<string, unknown> | null> {
   try {
-    return JSON.parse(
-      await readFile(path.join(folder, SESSION_NOTES_FILE), "utf8"),
-    ) as Record<string, unknown>;
+    return JSON.parse(await readText(SESSION_NOTES_FILE)) as Record<
+      string,
+      unknown
+    >;
   } catch {
     return null;
   }
@@ -563,7 +794,7 @@ async function keyFiles(): Promise<string[]> {
     DEVICE_RECORD_FILE,
   ]) {
     try {
-      await readFile(path.join(folder, name));
+      await fileSystem.readFile(path.join(folder, name));
       names.push(name);
     } catch {
       // missing
@@ -668,6 +899,18 @@ function postCode(redirectUri: string, state: string): Promise<number> {
     outgoing.on("error", reject);
     outgoing.end(form);
   });
+}
+
+/**
+ * Lets every step that can run now run, without waiting for a time: the
+ * files are in memory and the fake API answers at once. Each call of the
+ * memory file system takes one turn of the event loop, so these turns leave
+ * room for a chain of many file calls.
+ */
+async function idle(): Promise<void> {
+  for (let turn = 0; turn < 50; turn += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
 }
 
 /** A promise that never settles until the request is aborted. */
@@ -1126,7 +1369,7 @@ describe("a pending key replacement", () => {
       registrationMarkers: createRegistrationMarkerStore({
         folder,
         platform: "win32",
-        fileSystem: unflushedFileSystem,
+        fileSystem,
       }),
       openExternal: (url) => {
         opened.push(url);
@@ -1186,7 +1429,7 @@ describe("a pending key replacement", () => {
     await h.keyStore.replace();
     h.api.publicKey = FOREIGN_PUBLIC_KEY;
     if (corrupt) {
-      await writeFile(path.join(folder, SIGN_OUT_MARKER_FILE), "{");
+      await writeText(SIGN_OUT_MARKER_FILE, "{");
     }
     await h.session.refresh();
     advance(REPLACEMENT_GRACE_MS);
@@ -1200,10 +1443,7 @@ describe("a pending key replacement", () => {
 
     expect(h.session.state().kind).toBe("key_lost");
     expect(await keyFiles()).toEqual([DEVICE_RECORD_FILE]);
-    const marker = await readFile(
-      path.join(folder, SIGN_OUT_MARKER_FILE),
-      "utf8",
-    ).catch(() => null);
+    const marker = await readText(SIGN_OUT_MARKER_FILE).catch(() => null);
     expect(marker !== null).toBe(corrupt);
   });
 
@@ -1296,7 +1536,7 @@ describe("a pending key replacement", () => {
     expect(heldKeys(required)).toEqual({ current, previous: null });
     expect(required.session.state().kind).toBe("sign_in_required");
 
-    await rm(folder, { recursive: true, force: true });
+    memory.removeFolder(folder);
     const revoked = harness();
     await pendingReplacement(revoked);
     revoked.api.publicKey = FOREIGN_PUBLIC_KEY;
@@ -1779,7 +2019,7 @@ describe("sign-out", () => {
     ]);
   });
 
-  test("a sign-out while offline holds on the device, survives a restart, and is reported when online", async () => {
+  async function offlineSignOut(): Promise<void> {
     const api = fakeApi();
     const h = harness(api);
     await existingDevice(h);
@@ -1818,9 +2058,9 @@ describe("sign-out", () => {
       kind: "signed_out",
       reportPending: false,
     });
-    const marker = JSON.parse(
-      await readFile(path.join(folder, SIGN_OUT_MARKER_FILE), "utf8"),
-    ) as { reported: boolean };
+    const marker = JSON.parse(await readText(SIGN_OUT_MARKER_FILE)) as {
+      reported: boolean;
+    };
     expect(marker.reported).toBe(true);
 
     // Reported: the key is used for nothing, also after another restart.
@@ -1835,6 +2075,20 @@ describe("sign-out", () => {
       reason: "signed_out",
     });
     expect(api.requests).toHaveLength(count);
+  }
+
+  test(
+    "a sign-out while offline holds on the device, survives a restart, and is reported when online",
+    offlineSignOut,
+  );
+
+  describe("on the real file system", () => {
+    onRealFileSystem();
+
+    test(
+      "a sign-out while offline holds on the device, survives a restart, and is reported when online",
+      offlineSignOut,
+    );
   });
 
   test("a report answered by sign_in_required counts as reported", async () => {
@@ -1897,9 +2151,7 @@ describe("sign-out", () => {
 
     expect(state.kind).toBe("signed_in");
     expect((await h.session.listDevices()).ok).toBe(true);
-    await expect(
-      readFile(path.join(folder, SIGN_OUT_MARKER_FILE)),
-    ).rejects.toThrow();
+    await expect(readText(SIGN_OUT_MARKER_FILE)).rejects.toThrow();
   });
 
   test("a marker that names none of the keys has ended, also without signInFinished", async () => {
@@ -1995,7 +2247,7 @@ describe("sign-out", () => {
   test("a corrupt marker keeps the device signed out until a sign-in", async () => {
     const h = harness();
     await existingDevice(h);
-    await writeFile(path.join(folder, SIGN_OUT_MARKER_FILE), "{not json");
+    await writeText(SIGN_OUT_MARKER_FILE, "{not json");
 
     expect((await h.session.refresh()).kind).toBe("signed_out");
     expect(await h.session.listDevices()).toEqual({
@@ -2058,7 +2310,7 @@ describe("outcomes of the sign-in flow", () => {
     const contents: Record<string, string> = {};
     for (const name of names) {
       try {
-        contents[name] = await readFile(path.join(folder, name), "utf8");
+        contents[name] = await readText(name);
       } catch {
         // missing
       }
@@ -2295,7 +2547,7 @@ describe("the grace period of an uncertain sign-in", () => {
     expect(heldKeys(h)).toEqual({ current: previous, previous: null });
   });
 
-  test("it holds across a restart", async () => {
+  async function holdsAcrossRestart(): Promise<void> {
     const h = harness();
     const { previous, current } = await uncertainSignIn(h);
 
@@ -2308,6 +2560,14 @@ describe("the grace period of an uncertain sign-in", () => {
     const later = await restart(restarted);
     expect((await later.session.authenticate()).ok).toBe(true);
     expect(heldKeys(later)).toEqual({ current: previous, previous: null });
+  }
+
+  test("it holds across a restart", holdsAcrossRestart);
+
+  describe("on the real file system", () => {
+    onRealFileSystem();
+
+    test("it holds across a restart", holdsAcrossRestart);
   });
 
   const mayHaveCommitted: SignInOutcome[] = [
@@ -2381,8 +2641,8 @@ describe("note times", () => {
   const YEAR_MS = 365 * 24 * 60 * 60_000;
 
   async function writeNotes(notes: Record<string, unknown>): Promise<void> {
-    await writeFile(
-      path.join(folder, SESSION_NOTES_FILE),
+    await writeText(
+      SESSION_NOTES_FILE,
       JSON.stringify({
         version: 1,
         removal: null,
@@ -2506,7 +2766,7 @@ describe("note times", () => {
     });
 
     // The same for the grace period.
-    await rm(folder, { recursive: true, force: true });
+    memory.removeFolder(folder);
     const graced = harness();
     const keys = await pendingReplacement(graced, { inGrace: true });
     graced.api.publicKey = keys.previous;
@@ -2558,9 +2818,9 @@ describe("tokens, clocks, and late refusals", () => {
     expect((await h.session.signInFinished({ kind: "signed_in" })).kind).toBe(
       "signed_out",
     );
-    expect(
-      await readFile(path.join(folder, SIGN_OUT_MARKER_FILE), "utf8"),
-    ).toContain(keys.current.publicKey);
+    expect(await readText(SIGN_OUT_MARKER_FILE)).toContain(
+      keys.current.publicKey,
+    );
   });
 });
 
@@ -2923,10 +3183,7 @@ describe("secrets", () => {
     await h.session.listDevices();
     await h.session.signOut();
 
-    const text = await readFile(
-      path.join(folder, SIGN_OUT_MARKER_FILE),
-      "utf8",
-    );
+    const text = await readText(SIGN_OUT_MARKER_FILE);
     expect(Object.keys(JSON.parse(text) as object).sort()).toEqual([
       "publicKeys",
       "reported",
@@ -2939,6 +3196,115 @@ describe("secrets", () => {
     ]) {
       expect(text).not.toContain(secret);
     }
+  });
+});
+
+describe("the in-memory file system", () => {
+  /** The calls of the stores on `files` in `at`, and the result or error code of each. */
+  async function calls(files: KeyFileSystem, at: string): Promise<string[]> {
+    const keyFolder = path.join(at, "MyManDev");
+    const file = path.join(keyFolder, "file.json");
+    const missing = path.join(keyFolder, "missing.json");
+    const results: string[] = [];
+    async function call(
+      name: string,
+      step: () => Promise<unknown>,
+    ): Promise<void> {
+      try {
+        const value = await step();
+        results.push(
+          `${name}: ${
+            value instanceof Uint8Array
+              ? Buffer.from(value).toString("utf8")
+              : Array.isArray(value)
+                ? value.join(",")
+                : "ok"
+          }`,
+        );
+      } catch (error) {
+        results.push(`${name}: ${(error as NodeJS.ErrnoException).code}`);
+      }
+    }
+    async function create(target: string, flags = "wx"): Promise<void> {
+      const handle = await files.open(target, flags, 0o600);
+      await handle.close();
+    }
+    async function write(target: string, text: string): Promise<void> {
+      const handle = await files.open(`${target}.tmp`, "wx", 0o600);
+      await handle.writeFile(Buffer.from(text, "utf8"));
+      await handle.sync();
+      await handle.close();
+      await files.rename(`${target}.tmp`, target);
+    }
+
+    await call("read a missing file", () => files.readFile(file));
+    await call("list a missing folder", () => files.readdir(keyFolder));
+    await call("create in a missing folder", () => create(file));
+    await call("make the folder", () =>
+      files.mkdir(keyFolder, { recursive: true, mode: 0o700 }),
+    );
+    await call("make it again", () =>
+      files.mkdir(keyFolder, { recursive: true, mode: 0o700 }),
+    );
+    await call("write", () => write(file, "one"));
+    await call("read", () => files.readFile(file));
+    await call("create the file exclusively", () => create(file));
+    await call("write over it", () => write(file, "two"));
+    await call("read again", () => files.readFile(file));
+    await call("list the folder", () => files.readdir(keyFolder));
+    await call("open the file for a flush", () => create(file, "r+"));
+    await call("open a missing file for a flush", () => create(missing, "r+"));
+    await call("rename a missing file", () => files.rename(missing, file));
+    await call("delete the file", () => files.unlink(file));
+    await call("delete it again", () => files.unlink(file));
+    await call("list the empty folder", () => files.readdir(keyFolder));
+    return results;
+  }
+
+  test("gives the results and error codes of the real file system", async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "mymandev-memory-check-"));
+    try {
+      const real = await calls(nodeKeyFileSystem, root);
+      const inMemory = await calls(memory, path.dirname(MEMORY_FOLDER));
+
+      expect(inMemory).toEqual(real);
+      expect(real).toEqual([
+        "read a missing file: ENOENT",
+        "list a missing folder: ENOENT",
+        "create in a missing folder: ENOENT",
+        "make the folder: ok",
+        "make it again: ok",
+        "write: ok",
+        "read: one",
+        "create the file exclusively: EEXIST",
+        "write over it: ok",
+        "read again: two",
+        "list the folder: file.json",
+        "open the file for a flush: ok",
+        "open a missing file for a flush: ENOENT",
+        "rename a missing file: ENOENT",
+        "delete the file: ok",
+        "delete it again: ENOENT",
+        "list the empty folder: ",
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test("holds the files of a test in memory, not on the disk", async () => {
+    const h = harness();
+    await existingDevice(h);
+
+    expect(await memory.readdir(folder)).toEqual([
+      CURRENT_KEY_FILE,
+      DEVICE_RECORD_FILE,
+    ]);
+    await expect(nodeKeyFileSystem.readdir(folder)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    memory.removeFolder(folder);
+    expect(await keyFiles()).toEqual([]);
   });
 });
 
@@ -3043,7 +3409,7 @@ describe("answers that arrive after the device was forgotten", () => {
     const authenticating = h.session.authenticate();
     await waitForRequest(h, "POST", "/auth/access-token");
     const removing = h.session.removeDevice();
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await idle();
     expect(await notesFile()).toBeNull();
     expect(h.session.state().kind).toBe("signed_in");
     release();
