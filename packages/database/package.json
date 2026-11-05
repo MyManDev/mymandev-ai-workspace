@@ -16,6 +16,7 @@
     "db:compare": "node --env-file-if-exists=.env src/compare-schema-cli.ts",
     "db:account": "node --env-file-if-exists=.env src/account-cli.ts",
     "db:dev-seed": "node --env-file-if-exists=.env src/dev-seed-cli.ts",
+    "db:dev-workspace": "node --env-file-if-exists=.env src/dev-workspace-cli.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test --test-timeout=120000 \"src/**/*.test.ts\""
   },

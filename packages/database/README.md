@@ -6,16 +6,17 @@ No application uses this package yet. The cloud API imports its query functions 
 
 ## Scripts
 
-| Script        | Runs                                                       |
-| ------------- | ---------------------------------------------------------- |
-| `db:generate` | `drizzle-kit generate`                                     |
-| `db:check`    | `drizzle-kit check`                                        |
-| `db:migrate`  | `node --env-file-if-exists=.env src/migrate-cli.ts`        |
-| `db:compare`  | `node --env-file-if-exists=.env src/compare-schema-cli.ts` |
-| `db:account`  | `node --env-file-if-exists=.env src/account-cli.ts`        |
-| `db:dev-seed` | `node --env-file-if-exists=.env src/dev-seed-cli.ts`       |
-| `typecheck`   | `tsc -p tsconfig.json`                                     |
-| `test`        | `node --test --test-timeout=120000 "src/**/*.test.ts"`     |
+| Script             | Runs                                                       |
+| ------------------ | ---------------------------------------------------------- |
+| `db:generate`      | `drizzle-kit generate`                                     |
+| `db:check`         | `drizzle-kit check`                                        |
+| `db:migrate`       | `node --env-file-if-exists=.env src/migrate-cli.ts`        |
+| `db:compare`       | `node --env-file-if-exists=.env src/compare-schema-cli.ts` |
+| `db:account`       | `node --env-file-if-exists=.env src/account-cli.ts`        |
+| `db:dev-seed`      | `node --env-file-if-exists=.env src/dev-seed-cli.ts`       |
+| `db:dev-workspace` | `node --env-file-if-exists=.env src/dev-workspace-cli.ts`  |
+| `typecheck`        | `tsc -p tsconfig.json`                                     |
+| `test`             | `node --test --test-timeout=120000 "src/**/*.test.ts"`     |
 
 Run them from the repository root with `-w @mymandev/database`, or from `packages/database`. The tests need no server: they run on PGlite, PostgreSQL 18 compiled to WebAssembly, inside the test process.
 
@@ -294,6 +295,45 @@ MYMANDEV_DEV_SEED=1 npm run db:dev-seed -w @mymandev/database -- <device ID> <pr
 In PowerShell, set `$env:MYMANDEV_DEV_SEED = "1"` first. Before it connects, the command (`src/dev-seed-command.ts`) refuses, with exit code 1 and without printing the URL: arguments other than a device ID and a project ID, both UUIDv7, and an optional `--runs` from 1 to 20 (3 by default); an environment without `MYMANDEV_DEV_SEED=1`, an explicit opt-in that no server sets; `NODE_ENV=production`; a `DATABASE_URL` that `checkDatabaseUrl` refuses; and a database that is not on this computer: the URL's host must be `localhost`, an IPv4 address in 127.0.0.0/8 in its usual dotted form (`net.isIPv4`), or `::1`, and the URL must not name a host in its query, which pg would connect to instead. After it connects, it also refuses a server that took the connection on another address than a loopback one (`host(inet_server_addr())`, null for a Unix-domain socket), so that a name that resolves elsewhere cannot pass. Every server database, the production one among them, is reached over the network, so the host decides without a marker in the database itself; a tunnel that forwards a local port to a server defeats this rule, and the opt-in is the second guard against it.
 
 `seedDevAgent(db, { deviceId, projectId, runs, now })` (`src/dev-seed.ts`) then creates, in one transaction, an agent named "Test agent" in the project, owned by the device's account and hosted on the device, and the runs of it in `queued`, requested by the same account, without a repository, one millisecond apart. It refuses a device that does not exist or is revoked, a project that does not exist, a device whose account is not an active member of the project's workspace, and an archived project or workspace, and writes nothing then. It locks the device `FOR SHARE`, then the account's active person `FOR SHARE`, as `src/people.ts` asks of a writer that inserts an agent or a run, then the project `FOR SHARE`. The package index does not export it, so the API cannot call it; only the command and the tests import it. The command prints the agent ID and the run IDs.
+
+## Development workspace
+
+The test data of #27 and #28 (the Project Manager's decision of 2026-11-05): until #95 adds the screens that create workspaces and projects, a development-only command creates a workspace that the account of the developer's device owns, with one project. It connects with the application role in `DATABASE_URL`, like the API, and has the guards of the [development seed](#development-seed):
+
+```sh
+MYMANDEV_DEV_SEED=1 npm run db:dev-workspace -w @mymandev/database -- <device ID> [--workspace <name>] [--project <name>]
+```
+
+In PowerShell, set `$env:MYMANDEV_DEV_SEED = "1"` first. Quote a name that holds spaces. The names default to "Test workspace" and "Test project". Before it connects, the command (`src/dev-workspace-command.ts`) refuses, with exit code 1: arguments other than a device ID (UUIDv7) followed by `--workspace` and `--project`, each at most once and with a name; and a name that the API's request schemas refuse, `CreateWorkspaceRequestSchema` and `CreateProjectRequestSchema`: 1 to 100 characters of single-line text, not blank, without control, format, or invisible characters. A project name is normalized first, as the API normalizes it: to Unicode NFC, without white space at the start and the end; a workspace name is not. The command then refuses exactly what `db:dev-seed` refuses, with the same functions of `src/dev-seed-command.ts` and without printing the URL: an environment without `MYMANDEV_DEV_SEED=1`; `NODE_ENV=production`; a `DATABASE_URL` that `checkDatabaseUrl` refuses, or that does not name a database on this computer or names a host in its query; and, after it connects, a server that did not take the connection on a loopback address.
+
+`createDevWorkspace(db, { deviceId, workspaceName, projectName, now })` (`src/dev-workspace.ts`) then, in one transaction, locks the device's account and then the device, as the API's `lockActor` does, and calls `createWorkspace` and `createProject`, the functions of `POST /workspaces` and `POST /workspaces/:workspaceId/projects`. The account's display name becomes the owner's person name, as the desktop sends it, and the device is the actor's device of the `workspace.created` audit record. It refuses a device that does not exist or is revoked, a disabled account, and a name that the API's schemas refuse, and returns the limits of the two functions: 10 new workspaces and 20 new projects per account within 24 hours, and 100 projects per workspace. A refused project rolls back the new workspace, so nothing is written when the command refuses. Each run creates a new workspace: workspace names are not unique, and a new workspace holds no other project, so the same names never conflict. The package index does not export it, so the API cannot call it. The command prints the account ID, the workspace ID, and the project ID; the project ID is the one that `db:dev-seed` takes.
+
+The command sends no event, as `POST /workspaces` sends none. Once the desktop lists the account's workspaces (#27), it reads them when it connects, so a desktop that is running shows a workspace that the command created after it reconnects or restarts.
+
+### Find the device ID
+
+The UI does not show it. The desktop keeps it as `deviceId` in `device-record.json`, next to the device key: in `%LOCALAPPDATA%\MyManDev` on Windows, `~/Library/Application Support/MyManDev` on macOS, and `~/.config/MyManDev` on Linux (see the desktop's README). Or ask the local database for the devices of a GitHub login that are not revoked, the most recent sign-in first:
+
+```sql
+select d.id, d.label, d.last_sign_in_at
+from devices d
+join user_identities i on i.user_id = d.user_id and i.identity_provider = 'github'
+where i.login = '<GitHub login>' and d.revoked_at is null
+order by d.last_sign_in_at desc;
+```
+
+The command takes a device ID, not a login: `user_identities.login` is for display only, the login of the account's last sign-in, and a GitHub login can change and be reused, so it does not name one account as a device ID does. Every device of the account gives the same result, apart from the audit record's device.
+
+### Two clients with one account
+
+The check with two clients of #27 (the Project Manager's decision of 2026-11-05) uses one GitHub account on two clients. Both clients reach the API at `http://127.0.0.1:3000`: a development build of the desktop accepts `http` only on `127.0.0.1` and `localhost` (`apps/desktop/src/main/api-origin.ts`), and GitHub's callback and the WebSocket `Origin` check need the API's one origin, `API_PUBLIC_ORIGIN`. A check across two accounts follows with the invitations of #95.
+
+1. On the first computer, start PostgreSQL 18 and the API ([API README](../../apps/api/README.md)) with `NODE_ENV=development` and `API_PUBLIC_ORIGIN=http://127.0.0.1:3000`, which the API accepts with `http` only then, and start the first client with `MYMANDEV_API_ORIGIN=http://127.0.0.1:3000`.
+2. Start the second client with the same `MYMANDEV_API_ORIGIN`, in one of two ways:
+   - **Two operating system users on one computer.** Each user has its own data folder and device key, so each client is a device of its own. The renderer's development server of `npm run dev` listens on port 5173, one per computer, so the second user starts the desktop from a checkout of its own with `npx --no-install install-electron`, which downloads the Electron binary once, and then `npx --no-install electron-vite preview` in `apps/desktop`, which builds the application and loads the renderer without that server.
+   - **A second computer.** Forward its port 3000 to the first computer, for example with `ssh -L 3000:127.0.0.1:3000 <user>@<first computer>`, and keep the connection open. The second client and its browser then reach the API at `http://127.0.0.1:3000` too. The database stays on the first computer.
+3. Sign in with the same GitHub account on both clients, then run `db:dev-workspace` on the first computer with either client's device ID, and `db:dev-seed` with the printed project ID if the check needs agent runs.
+4. Restart both clients, or let them reconnect, so that they load the new workspace.
 
 ## Tests
 
