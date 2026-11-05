@@ -43,6 +43,7 @@ import {
   deviceStateOf,
   deviceViewOf,
 } from "./account-session.ts";
+import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
 import type { ApiOrigin } from "./api-origin.ts";
 import { isDeviceKeyError } from "./device-key/errors.ts";
 import type { DeviceKeyStore } from "./device-key/store.ts";
@@ -238,12 +239,9 @@ export interface AccountService {
   ) => Promise<void>;
 }
 
-/**
- * How long after a start that opened the browser, or offered its URL, the
- * next start is refused (`too_soon`), so that even a renderer that
- * misbehaves cannot open the browser in a loop.
- */
-export const SIGN_IN_START_COOLDOWN_MS = 3_000;
+// The cooldown lives in a shared module, so that the renderer's delay for
+// "Use another browser" follows it.
+export { SIGN_IN_START_COOLDOWN_MS };
 
 /**
  * How long after a device list was asked for the next one is refused

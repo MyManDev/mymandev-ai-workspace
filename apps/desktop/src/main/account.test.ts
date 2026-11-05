@@ -49,7 +49,6 @@ import {
   type SignInStart,
 } from "./sign-in/flow.ts";
 import { SIGN_IN_LISTENER_ERRORS } from "./sign-in/listener.ts";
-import { ANOTHER_BROWSER_DELAY_MS } from "../renderer/account-view.ts";
 
 const DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3" as DeviceId;
 const OTHER_DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b7" as DeviceId;
@@ -1351,14 +1350,6 @@ test("a start in another browser opens no browser, offers the URL with the warni
     outcome: "started",
   });
   expect(h.openBrowser).toEqual([false, true]);
-});
-
-test("the panel offers another browser for a waiting sign-in no sooner than the cooldown allows a new start", () => {
-  // Otherwise the cancel would end the waiting sign-in, and the new start
-  // would be refused as too soon.
-  expect(ANOTHER_BROWSER_DELAY_MS).toBeGreaterThanOrEqual(
-    SIGN_IN_START_COOLDOWN_MS,
-  );
 });
 
 test("a sign-in that waits in the browser ends with a cancel before a start in another browser can follow", async () => {

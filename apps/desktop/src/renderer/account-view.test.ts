@@ -10,9 +10,11 @@ import {
   type StartSignInResult,
   UNLOCK_REFUSALS,
 } from "../shared/ipc-contract.ts";
+import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
 import { unlockMessage } from "./AccountPanel.tsx";
 import {
   ACTION_MESSAGES,
+  ANOTHER_BROWSER_DELAY_MS,
   apiOriginProblem,
   createIdleWaits,
   START_REFUSAL_MESSAGES,
@@ -473,4 +475,12 @@ test("a device's detail names its platform and when it was last seen or removed"
       revokedAt: "2026-11-03T09:00:00.000Z",
     }),
   ).toBe("Windows, removed on 2026-11-03");
+});
+
+test("the panel offers another browser for a waiting sign-in no sooner than the cooldown allows a new start", () => {
+  // Otherwise the cancel would end the waiting sign-in, and the new start
+  // would be refused as too soon.
+  expect(ANOTHER_BROWSER_DELAY_MS).toBeGreaterThanOrEqual(
+    SIGN_IN_START_COOLDOWN_MS,
+  );
 });

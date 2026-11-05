@@ -1,4 +1,5 @@
 import type { AccountBridge } from "../shared/desktop-bridge.ts";
+import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
 import type {
   AccountStatus,
   ApiOriginState,
@@ -326,11 +327,11 @@ export function waitingPairingCode(view: AccountView): string | undefined {
  * How long after the panel saw a sign-in wait in the browser it offers
  * "Use another browser" for it. That replaces the sign-in with a cancel and
  * a new start, and the main process refuses a start within its cooldown,
- * `SIGN_IN_START_COOLDOWN_MS` in `src/main/account.ts`, of the start that
- * opened the browser. Without this delay, a cancel in that time would end
- * the waiting sign-in, and the new start would be refused as too soon.
+ * `SIGN_IN_START_COOLDOWN_MS` (`src/shared/sign-in-timing.ts`), of the start
+ * that opened the browser. Without this delay, a cancel in that time would
+ * end the waiting sign-in, and the new start would be refused as too soon.
  */
-export const ANOTHER_BROWSER_DELAY_MS = 3_000;
+export const ANOTHER_BROWSER_DELAY_MS = SIGN_IN_START_COOLDOWN_MS;
 
 /**
  * "Use another browser" (#175): a sign-in that opens no browser and offers
