@@ -32,6 +32,7 @@ Tests must run on every developer machine and in CI on Windows, macOS, and Linux
 - `pglite-server` ignores the pg session parameters `statement_timeout` and `idle_in_transaction_session_timeout`.
 - Update of 2026-10-28 (#59): PGlite stays the default for local runs. With `DATABASE_TEST_URL` set, `createTestDatabase()` creates a database on that server instead, and the Database workflow runs the same tests on PostgreSQL 18 that way. Server-only behavior, such as the session timeouts, is tested there.
 - Update of 2026-10-29 (#86): `@mymandev/database` exports `createTestDatabase()` as `@mymandev/database/testing`, as planned for M2 above. A workspace that imports it declares `@electric-sql/pglite` as a `devDependency` at the identical exact version. The text above is unchanged.
+- Update of 2026-11-05 (#172): the Database workflow also runs the API's tests (`npm test -w @mymandev/api`) on PostgreSQL 18 with `DATABASE_TEST_URL`, in the same job as the database tests, so the API's server-only tests run there instead of being skipped. A change under `apps/api/**` starts the workflow. The text above is unchanged.
 
 ## Dependency policy
 

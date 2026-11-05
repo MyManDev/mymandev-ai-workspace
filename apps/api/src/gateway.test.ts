@@ -1484,6 +1484,9 @@ test("an event in flight on a connection that is replaced or closed meanwhile is
     await replacedOne.client.closed,
     closedWith("connection_replaced"),
   );
+  // The registration closes the replaced connection before the newer one
+  // gets auth.ok, which on a server waits for two more round trips.
+  await until(() => newer !== undefined, "the newer connection");
   await settle();
   assert.equal(received.length, 0, "the replaced connection's event");
 
@@ -1501,10 +1504,18 @@ test("an event in flight on a connection that is replaced or closed meanwhile is
   await settle();
   assert.equal(received.length, 0, "the closed connection's event");
 
-  // Without a change in between, the event arrives.
+  // Without a change in between, the event arrives, and only this one: on a
+  // server, a dropped event's query can still run when the checks above
+  // count the events.
   const { client } = await connected(t, app, device);
-  client.send(runEvent(workspaceId, device.deviceId));
-  await until(() => received.length === 1, "the event");
+  const delivered = runEvent(workspaceId, device.deviceId);
+  client.send(delivered);
+  await until(() => received.length > 0, "the event");
+  await settle();
+  assert.deepEqual(
+    received.map(({ event }) => event.id),
+    [delivered["id"]],
+  );
 });
 
 test("identity mismatches are audited at most once per device per hour and the rest are logged with a count", async (t) => {
