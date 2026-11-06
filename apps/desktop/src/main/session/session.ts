@@ -148,6 +148,12 @@ export interface SessionFailure {
   readonly deviceLogin?: string;
   /** With `key_store_failed`: the code of the store's `DeviceKeyError`. */
   readonly keyError?: DeviceKeyErrorCode;
+  /**
+   * With `refused` and `rate_limited`: the answer's `Retry-After` in
+   * seconds, when it held a valid one (`callApi`), also when the refusal
+   * answered the token request before a request with an access token.
+   */
+  readonly retryAfterSeconds?: number;
 }
 
 export type SessionResult<T> =
@@ -335,8 +341,12 @@ export interface DeviceSession {
   /**
    * Sends a request with an access token. A `401` is answered by minting
    * one new token and sending the request once more; when the new token
-   * cannot be minted, the failure names the reason. Refused while a removal
-   * is pending.
+   * cannot be minted, the failure names the reason. The request is sent
+   * again only for the device and the account of the first token; when the
+   * new token acts for another one, it is refused as `unauthorized`
+   * without a second request. Refused while a removal is pending. A
+   * `rate_limited` refusal, of the request or of its token request, carries
+   * the answer's `Retry-After` as `retryAfterSeconds` when it held one.
    */
   readonly request: <T>(
     request: AuthorizedRequest<T>,
@@ -436,15 +446,20 @@ type Facts =
     };
 type ReadyFacts = Extract<Facts, { kind: "ready" }>;
 
+/** An API refusal: its code, and with `rate_limited` its `Retry-After` when it held one. */
+interface Refusal {
+  readonly code: ApiErrorCode;
+  readonly retryAfterSeconds?: number;
+}
+
 /** What one key got from the API. */
 type KeyAnswer =
   | { readonly kind: "token"; readonly token: string }
-  | {
+  | ({
       readonly kind: "refused";
-      readonly code: ApiErrorCode;
       /** Whether the refusal answered the signature (the access token request). */
       readonly signed: boolean;
-    }
+    } & Refusal)
   | { readonly kind: "failure"; readonly failure: SessionFailure };
 
 type MintResult =
@@ -458,8 +473,17 @@ type MintResult =
     }
   | { readonly kind: "failure"; readonly failure: SessionFailure };
 
-type TokenResult =
-  { readonly ok: true; readonly token: string } | SessionFailure;
+/**
+ * An access token with the device and the account that it acts for: the
+ * record's, when it was minted.
+ */
+interface HeldToken {
+  readonly token: string;
+  readonly deviceId: DeviceId;
+  readonly userId: UserId;
+}
+
+type TokenResult = ({ readonly ok: true } & HeldToken) | SessionFailure;
 
 const scheduleWithSetTimeout: ScheduleTimer = (callback, delayMs) => {
   const timer = setTimeout(callback, delayMs);
@@ -475,6 +499,23 @@ function failure(
 
 function refused(code: ApiErrorCode): SessionFailure {
   return failure("refused", { code });
+}
+
+/** `refused` for an API refusal, with its `Retry-After` when it held one. */
+function refusedWithWait(refusal: Refusal): SessionFailure {
+  return refusal.retryAfterSeconds === undefined
+    ? refused(refusal.code)
+    : failure("refused", {
+        code: refusal.code,
+        retryAfterSeconds: refusal.retryAfterSeconds,
+      });
+}
+
+/** The refusal of an error answer, with its `Retry-After` when it held one. */
+function refusalOf(answer: Extract<ApiAnswer, { kind: "error" }>): Refusal {
+  return answer.retryAfterSeconds === undefined
+    ? { code: answer.code }
+    : { code: answer.code, retryAfterSeconds: answer.retryAfterSeconds };
 }
 
 function succeeded<T>(value: T): SessionResult<T> {
@@ -557,11 +598,12 @@ export function createDeviceSession(
   let publishedSequence = 0;
 
   /** The cached token; never leaves this closure. */
-  let cached: {
-    readonly token: string;
-    readonly validUntil: number;
-    readonly validUntilWall: number;
-  } | null = null;
+  let cached:
+    | (HeldToken & {
+        readonly validUntil: number;
+        readonly validUntilWall: number;
+      })
+    | null = null;
   /** The mint that concurrent callers share. */
   let minting: Promise<TokenResult> | null = null;
   /** Grows when tokens must be forgotten, so a mint that ends later is not cached. */
@@ -601,13 +643,14 @@ export function createDeviceSession(
   }
 
   /** The cached token while both clocks say that it is valid. */
-  function cachedToken(): string | null {
+  function cachedToken(): HeldToken | null {
     if (
       cached !== null &&
       now() < cached.validUntil &&
       wallClock() < cached.validUntilWall
     ) {
-      return cached.token;
+      const { token, deviceId, userId } = cached;
+      return { token, deviceId, userId };
     }
     cached = null;
     return null;
@@ -1169,7 +1212,7 @@ export function createDeviceSession(
       route: AUTH_ROUTES.challenge,
     });
     if (challenge.kind === "error") {
-      return { kind: "refused", code: challenge.code, signed: false };
+      return { kind: "refused", signed: false, ...refusalOf(challenge) };
     }
     if (challenge.kind !== "ok") {
       return { kind: "failure", failure: uncertain(challenge) };
@@ -1202,7 +1245,7 @@ export function createDeviceSession(
       },
     });
     if (minted.kind === "error") {
-      return { kind: "refused", code: minted.code, signed: true };
+      return { kind: "refused", signed: true, ...refusalOf(minted) };
     }
     if (minted.kind !== "ok") {
       return { kind: "failure", failure: uncertain(minted) };
@@ -1255,8 +1298,8 @@ export function createDeviceSession(
       }
       if (!answer.signed) {
         // The challenge was refused, for example `rate_limited`: nothing is
-        // known about the key.
-        return { kind: "failure", failure: refused(answer.code) };
+        // known about the key. Its `Retry-After` goes with the failure.
+        return { kind: "failure", failure: refusedWithWait(answer) };
       }
       switch (answer.code) {
         case "auth_failed":
@@ -1285,8 +1328,9 @@ export function createDeviceSession(
           return { kind: "failure", failure: refused("sign_in_required") };
         }
         default:
-          // For example `rate_limited`: nothing is known about the key.
-          return { kind: "failure", failure: refused(answer.code) };
+          // For example `rate_limited`: nothing is known about the key. Its
+          // `Retry-After` goes with the failure.
+          return { kind: "failure", failure: refusedWithWait(answer) };
       }
     }
     return { kind: "all_refused" };
@@ -1465,14 +1509,20 @@ export function createDeviceSession(
         return failure("signed_out");
       }
       refusal = null;
+      // The token acts for the device that signed for it, the record's.
+      const held: HeldToken = {
+        token: result.token,
+        deviceId: facts.record.deviceId,
+        userId: facts.record.userId,
+      };
       if (epoch === started) {
         cached = {
-          token: result.token,
+          ...held,
           validUntil: result.validUntil,
           validUntilWall: result.validUntilWall,
         };
       }
-      return { ok: true, token: result.token };
+      return { ok: true, ...held };
     } catch {
       report("The device session failed unexpectedly.");
       return failure("key_store_failed");
@@ -1485,7 +1535,7 @@ export function createDeviceSession(
   function sessionToken(): Promise<TokenResult> {
     const token = cachedToken();
     if (token !== null) {
-      return Promise.resolve({ ok: true, token });
+      return Promise.resolve({ ok: true, ...token });
     }
     if (minting !== null) {
       return minting;
@@ -1551,7 +1601,12 @@ export function createDeviceSession(
    * Sends `call` with a token, and once more with a new token after a `401`.
    * `blockedBeforeRetry`, when given, is asked again before that new token is
    * minted: a removal noted while the first request was on its way then
-   * stops the retry, as it stops every other use of the key.
+   * stops the retry, as it stops every other use of the key. The retry goes
+   * only for the device and the account of the first token: when the new
+   * token acts for another one, for example after "This is not me" and a
+   * sign-in with another GitHub account while the first request was on its
+   * way, it is not sent, and the call is refused as `unauthorized`, as the
+   * `401` answered it.
    */
   async function sendAuthorized<T>(
     call: AuthorizedRequest<T>,
@@ -1601,6 +1656,14 @@ export function createDeviceSession(
       if (!second.ok) {
         return second;
       }
+      if (
+        second.deviceId !== first.deviceId ||
+        second.userId !== first.userId
+      ) {
+        // Another device or account signed in meanwhile: the retry would
+        // act for it.
+        return refused("unauthorized");
+      }
       answer = await send(second.token);
       if (isUnauthorized(answer)) {
         dropToken(second.token);
@@ -1620,7 +1683,9 @@ export function createDeviceSession(
           : failure("unexpected_response");
       }
       case "error":
-        return refusedWithLogin(answer.code);
+        return answer.retryAfterSeconds === undefined
+          ? refusedWithLogin(answer.code)
+          : refusedWithWait(refusalOf(answer));
       case "invalid_request":
         return failure("invalid_request");
       default:
@@ -1768,7 +1833,8 @@ export function createDeviceSession(
       }
       // The tokens are dropped first: from now on the key is not used for
       // anything but the report, which uses a token that is still valid.
-      validToken = facts.marker === null ? cachedToken() : null;
+      validToken =
+        facts.marker === null ? (cachedToken()?.token ?? null) : null;
       forgetTokens();
       accountMismatch = false;
       // The key is not used after a sign-out, so a pending removal ends.
