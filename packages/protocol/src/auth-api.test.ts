@@ -370,20 +370,62 @@ test("the access token and device list answers parse", () => {
     current: true,
   };
   assert.equal(
-    DeviceListResponseSchema.safeParse({ devices: [device] }).success,
+    DeviceListResponseSchema.safeParse({
+      devices: [device],
+      registrationLockedUntil: null,
+    }).success,
     true,
   );
   assert.equal(
-    DeviceListResponseSchema.safeParse({ devices: [] }).success,
+    DeviceListResponseSchema.safeParse({
+      devices: [],
+      registrationLockedUntil: null,
+    }).success,
     true,
   );
   assert.equal(
     DeviceListResponseSchema.safeParse({
       devices: [{ ...device, platform: "ios" }],
+      registrationLockedUntil: null,
     }).success,
     false,
   );
   assert.equal(DeviceListResponseSchema.safeParse({}).success, false);
+});
+
+test("the device list answer tells whether a registration lock is in force, as a UTC time or null", () => {
+  const locked = DeviceListResponseSchema.safeParse({
+    devices: [],
+    registrationLockedUntil: "2026-11-13T12:00:00.000Z",
+  });
+  assert.equal(locked.success, true);
+  assert.equal(
+    locked.data?.registrationLockedUntil,
+    "2026-11-13T12:00:00.000Z",
+  );
+  // The field is required: an answer without it is not the answer of this
+  // version.
+  assert.equal(
+    DeviceListResponseSchema.safeParse({ devices: [] }).success,
+    false,
+  );
+  for (const value of [
+    "2026-11-13T12:00:00Z",
+    "2026-11-13T15:00:00.000+03:00",
+    "2026-11-13",
+    "",
+    0,
+    false,
+  ]) {
+    assert.equal(
+      DeviceListResponseSchema.safeParse({
+        devices: [],
+        registrationLockedUntil: value,
+      }).success,
+      false,
+      String(value),
+    );
+  }
 });
 
 test("the device list holds at most MAX_ANSWER_LIST_ITEMS devices", () => {
@@ -401,12 +443,14 @@ test("the device list holds at most MAX_ANSWER_LIST_ITEMS devices", () => {
   assert.equal(
     DeviceListResponseSchema.safeParse({
       devices: Array(MAX_ANSWER_LIST_ITEMS).fill(device),
+      registrationLockedUntil: null,
     }).success,
     true,
   );
   assert.equal(
     DeviceListResponseSchema.safeParse({
       devices: Array(MAX_ANSWER_LIST_ITEMS + 1).fill(device),
+      registrationLockedUntil: null,
     }).success,
     false,
   );

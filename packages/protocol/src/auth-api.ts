@@ -211,6 +211,13 @@ export type AccessTokenResponse = z.infer<typeof AccessTokenResponseSchema>;
 /** The answer of `GET /devices`. */
 export const DeviceListResponseSchema = z.object({
   devices: z.array(DeviceListItemSchema).max(MAX_ANSWER_LIST_ITEMS),
+  /**
+   * The end of the account's registration lock while it is in force: a
+   * device revoked as `lost` starts it, and until then a new device is
+   * refused with `device_registration_locked`. null when no lock is in force,
+   * also after it ended or was lifted.
+   */
+  registrationLockedUntil: UtcTimestampSchema.nullable(),
 });
 export type DeviceListResponse = z.infer<typeof DeviceListResponseSchema>;
 

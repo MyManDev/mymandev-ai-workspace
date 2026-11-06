@@ -551,7 +551,7 @@ function answerApi(api: FakeApi, request: ApiRequest): Response {
     return noContent();
   }
   if (method === "GET" && route === "/devices") {
-    return json(200, { devices: [DEVICE_ITEM] });
+    return json(200, { devices: [DEVICE_ITEM], registrationLockedUntil: null });
   }
   if (method === "POST" && route === `/devices/${DEVICE_ID}/revoke`) {
     api.deviceState = "revoked";

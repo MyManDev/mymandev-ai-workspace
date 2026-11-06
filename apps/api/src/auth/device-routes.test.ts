@@ -799,6 +799,119 @@ test("a lost device locks new registrations for 7 days, existing devices keep wo
   );
 });
 
+const LOCK_MS = 7 * 24 * 60 * 60_000;
+
+/** The registration lock that the device list shows to `device`'s account. */
+async function listedLock(
+  app: App,
+  device: SignedInDevice,
+): Promise<string | null> {
+  const response = await get(app, "/devices", await token(app, device));
+  assert.equal(response.statusCode, 200, response.body);
+  return DeviceListResponseSchema.parse(response.json())
+    .registrationLockedUntil;
+}
+
+/** Revokes `lost` as lost from `current`, which starts the registration lock. */
+async function reportLost(
+  app: App,
+  current: SignedInDevice,
+  lost: SignedInDevice,
+): Promise<void> {
+  const response = await post(
+    app,
+    `/devices/${lost.deviceId}/revoke`,
+    await token(app, current),
+    { reason: "lost" },
+  );
+  assert.equal(response.statusCode, 204, response.body);
+}
+
+test("the device list shows no registration lock while none is in force, also after a device was removed", async (t) => {
+  const app = await tokenApp(t, { githubId: 2031 });
+  const removed = await signInDevice(app);
+  const current = await signInDevice(app);
+  const listed = (await get(app, "/devices", await token(app, current))).json();
+  assert.equal(
+    (listed as { registrationLockedUntil?: unknown }).registrationLockedUntil,
+    null,
+    "the field is sent as null, not left out",
+  );
+  assert.equal(
+    (
+      await post(
+        app,
+        `/devices/${removed.deviceId}/revoke`,
+        await token(app, current),
+        { reason: "removed" },
+      )
+    ).statusCode,
+    204,
+  );
+  assert.equal(await listedLock(app, current), null);
+});
+
+test("the device list shows the end of a registration lock in force, and null from the moment it ends", async (t) => {
+  const clock = fakeClock();
+  const app = await tokenApp(t, { githubId: 2032, now: clock.now });
+  const lost = await signInDevice(app);
+  const current = await signInDevice(app);
+  const lockedAt = clock.now();
+  await reportLost(app, current, lost);
+  const end = new Date(lockedAt + LOCK_MS).toISOString();
+  assert.equal(await listedLock(app, current), end);
+  const [user] = await database()
+    .select()
+    .from(users)
+    .where(eq(users.id, current.userId));
+  assert.equal(user?.deviceRegistrationLockedUntil?.toISOString(), end);
+
+  clock.advance(LOCK_MS - 1);
+  assert.equal(await listedLock(app, current), end);
+
+  // The lock ends at that moment, as the sign-in checks it, although the
+  // column still holds its end.
+  clock.advance(1);
+  assert.equal(await listedLock(app, current), null);
+  const [ended] = await database()
+    .select()
+    .from(users)
+    .where(eq(users.id, current.userId));
+  assert.equal(ended?.deviceRegistrationLockedUntil?.toISOString(), end);
+  await signInDevice(app);
+  assert.equal(await listedLock(app, current), null);
+});
+
+test("the device list shows no registration lock after it was lifted", async (t) => {
+  const app = await tokenApp(t, { githubId: 2033 });
+  const lost = await signInDevice(app);
+  const current = await signInDevice(app);
+  await reportLost(app, current, lost);
+  assert.notEqual(await listedLock(app, current), null);
+  assert.equal(
+    (
+      await post(
+        app,
+        "/account/registration-lock/lift",
+        await token(app, current),
+      )
+    ).statusCode,
+    204,
+  );
+  assert.equal(await listedLock(app, current), null);
+});
+
+test("the device list never shows another account's registration lock", async (t) => {
+  const app = await tokenApp(t, { githubId: 2034 });
+  const device = await signInDevice(app);
+  const otherApp = await tokenApp(t, { githubId: 2035 });
+  const otherLost = await signInDevice(otherApp);
+  const other = await signInDevice(otherApp);
+  await reportLost(otherApp, other, otherLost);
+  assert.notEqual(await listedLock(otherApp, other), null);
+  assert.equal(await listedLock(app, device), null);
+});
+
 test("access tokens are limited per device, with Retry-After", async (t) => {
   const app = await tokenApp(t, { githubId: 2015 });
   const device = await signInDevice(app);
