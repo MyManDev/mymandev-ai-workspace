@@ -172,6 +172,8 @@ test("the checks read every renderer source and no test", () => {
     "./AgentPanel.tsx",
     "./agent-view.ts",
     "./App.tsx",
+    "./ChatScreen.tsx",
+    "./chat-view.ts",
     "./connection-status.ts",
     "./main.tsx",
     "./Navigation.tsx",
@@ -182,6 +184,7 @@ test("the checks read every renderer source and no test", () => {
     "./repository-view.ts",
     "./runtime-status.ts",
     "./screens.ts",
+    "./SwitchQuestion.tsx",
     "./workspace-view.ts",
   ]) {
     expect(FILES).toContain(file);

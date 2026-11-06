@@ -308,7 +308,8 @@ export interface WorkspacePageWindow {
  * file or a blocked link starts one that is then cancelled. The workspace
  * selection stays. It calls the service directly, without the renderer's
  * actions, because no screen is left to ask the person, so chat messages
- * that wait to be sent are dropped.
+ * that wait to be sent are dropped. Before the window closes, the person
+ * was asked about them (`askBeforeClosingWithWaitingMessages`).
  */
 export function closeProjectWithPage(
   window: WorkspacePageWindow,
@@ -336,4 +337,169 @@ export function closeProjectWithPage(
   );
   contents.on("render-process-gone", close);
   window.on("closed", close);
+}
+
+/**
+ * The native confirmation before the window closes while chat messages wait
+ * to be sent (the Project Manager's decision of 2026-11-06 on #27): "Close"
+ * is the default, and "Keep", also for Escape, keeps the window open.
+ * `closeWithWaitingConfirmed` reads its answer.
+ */
+export const CLOSE_WITH_WAITING_CONFIRMATION = Object.freeze({
+  type: "warning",
+  buttons: Object.freeze(["Close", "Keep"] as const),
+  defaultId: 0,
+  cancelId: 1,
+  noLink: true,
+  title: "Messages not sent",
+  detail:
+    "Messages that wait to be sent are kept in memory only, so closing the window discards them. Keep the window open to send them later.",
+} as const);
+
+/** The message of the confirmation, with the count of waiting messages. */
+export function closeWithWaitingMessage(count: number): string {
+  return count === 1
+    ? "1 message has not been sent yet. Close the window and discard it?"
+    : `${count} messages have not been sent yet. Close the window and discard them?`;
+}
+
+/** Whether the person chose "Close" in `CLOSE_WITH_WAITING_CONFIRMATION`. */
+export function closeWithWaitingConfirmed(result: {
+  readonly response: number;
+}): boolean {
+  return result.response === 0;
+}
+
+/** The part of Electron's `BrowserWindow` that `askBeforeClosingWithWaitingMessages` uses. */
+export interface ClosingWindow {
+  on(
+    event: "close",
+    listener: (event: { preventDefault(): void }) => void,
+  ): unknown;
+  once(event: "closed", listener: () => void): unknown;
+  close(): void;
+  isDestroyed(): boolean;
+  isMinimized(): boolean;
+  restore(): void;
+  show(): void;
+  focus(): void;
+}
+
+/** The part of Electron's `app` that `followQuitRequests` uses. */
+export interface QuittingApp {
+  on(event: "before-quit", listener: () => void): unknown;
+  quit(): void;
+}
+
+/** The quits that the person asked for, as `followQuitRequests` keeps them. */
+export interface QuitRequests {
+  /** Whether a quit was asked for since the last call; the call forgets it. */
+  readonly take: () => boolean;
+  /** Quits the application. */
+  readonly quit: () => void;
+}
+
+/**
+ * Notes every quit that begins (`before-quit`), for example Cmd+Q on macOS
+ * or Quit from the Dock. A quit closes the window first, so a close that
+ * `askBeforeClosingWithWaitingMessages` holds ends the quit; the question
+ * then reads the note when it is answered and quits again after "Close".
+ */
+export function followQuitRequests(app: QuittingApp): QuitRequests {
+  let requested = false;
+  app.on("before-quit", () => {
+    requested = true;
+  });
+  return Object.freeze({
+    take: () => {
+      const taken = requested;
+      requested = false;
+      return taken;
+    },
+    quit: () => app.quit(),
+  });
+}
+
+/**
+ * Asks the person before the window closes while chat messages wait to be
+ * sent. Without waiting messages, the window closes at once. With them, the
+ * close is held, the window is brought to the front (restored when it is
+ * minimized, and shown when the application is hidden), and `confirm` asks,
+ * once at a time, with their count; a further close or quit meanwhile is
+ * held without a second question.
+ *
+ * The answer decides, and only then is the note of a quit read (`take`),
+ * because a quit can also begin while the question is open:
+ *
+ * - "Close" closes the window without asking again, and the open project
+ *   closes with it (`closeProjectWithPage`), which drops the messages. When
+ *   a quit was asked for, the application quits once the window closed.
+ * - "Keep" leaves the window open and forgets the quit, which the held close
+ *   ended; the next close asks again.
+ * - A failed question is reported and handled like "Close", so that the
+ *   window can always be closed and a quit still goes ahead.
+ *
+ * Only closing the window can be asked about: when the page reloads, fails
+ * to load, or its render process ends, no page is left to ask through, and
+ * the waiting messages are dropped without a question.
+ */
+export function askBeforeClosingWithWaitingMessages(
+  window: ClosingWindow,
+  waitingCount: () => number,
+  confirm: (count: number) => Promise<boolean>,
+  quits: QuitRequests,
+  onError: (message: string, error: unknown) => void = (message, error) =>
+    console.error(message, error),
+): void {
+  let asking = false;
+  let confirmed = false;
+  const close = () => {
+    confirmed = true;
+    const quitting = quits.take();
+    if (window.isDestroyed()) {
+      if (quitting) {
+        quits.quit();
+      }
+      return;
+    }
+    if (quitting) {
+      window.once("closed", () => quits.quit());
+    }
+    window.close();
+  };
+  window.on("close", (event) => {
+    if (confirmed) {
+      return;
+    }
+    if (asking) {
+      event.preventDefault();
+      return;
+    }
+    const count = waitingCount();
+    if (count === 0) {
+      return;
+    }
+    event.preventDefault();
+    asking = true;
+    if (window.isMinimized()) {
+      window.restore();
+    }
+    window.show();
+    window.focus();
+    confirm(count).then(
+      (closing) => {
+        asking = false;
+        if (closing) {
+          close();
+        } else {
+          quits.take();
+        }
+      },
+      (error: unknown) => {
+        asking = false;
+        onError("Asking before closing the window failed.", error);
+        close();
+      },
+    );
+  });
 }

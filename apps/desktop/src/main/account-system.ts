@@ -9,7 +9,11 @@
 // (index.ts); `initialize` opens the key store, so call it only after the
 // application is ready.
 import { app } from "electron";
-import { createAccountService, type AccountService } from "./account.ts";
+import {
+  createAccountService,
+  type AccountService,
+  type ForgetRemoval,
+} from "./account.ts";
 import { resolveApiOrigin } from "./api-origin.ts";
 import { deviceKeyFolder } from "./device-key/key-folder.ts";
 import { createSystemDeviceKeyStore } from "./device-key/system.ts";
@@ -22,7 +26,10 @@ export interface SystemAccountOptions {
   /** Brings the main window to the front after the browser's callback. */
   readonly focusWindow: () => void;
   /** Asks the person to confirm "This is not me" in a native dialog. */
-  readonly confirmForget: (login: string) => Promise<boolean>;
+  readonly confirmForget: (
+    login: string,
+    removal: ForgetRemoval,
+  ) => Promise<boolean>;
   /** Asks the person to confirm removing this device in a native dialog. */
   readonly confirmRemoveDevice: (login: string) => Promise<boolean>;
   /** Stops local execution after the API revoked this device. */

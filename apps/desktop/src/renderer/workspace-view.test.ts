@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
 import type {
   WorkspaceActionResult,
+  WorkspaceSwitchOptions,
   WorkspaceView,
 } from "../shared/ipc-contract.ts";
 import {
@@ -12,10 +13,12 @@ import {
 } from "./screens.ts";
 import {
   createWorkspaceSidebar,
+  describeSwitchQuestion,
   initialWorkspacePanelView,
   SELECT_REFUSAL_MESSAGES,
   switchWorkspace,
   WORKSPACE_MESSAGES,
+  type SwitchQuestion,
   type WorkspacePanelView,
 } from "./workspace-view.ts";
 
@@ -53,6 +56,10 @@ function deferred<T>(): Deferred<T> {
 
 interface Call<Argument> {
   readonly argument: Argument;
+  /** The switch option, or undefined when the call passed none. */
+  readonly options: WorkspaceSwitchOptions | undefined;
+  /** How many arguments the call passed. */
+  readonly arity: number;
   readonly answer: Deferred<WorkspaceActionResult>;
 }
 
@@ -78,14 +85,28 @@ function fakeBridge() {
           fake.ended += 1;
         };
       },
-      openProject: (projectId: string | null) => {
+      openProject: (
+        ...args: [projectId: string | null, options?: WorkspaceSwitchOptions]
+      ) => {
         const answer = deferred<WorkspaceActionResult>();
-        fake.reports.push({ argument: projectId, answer });
+        fake.reports.push({
+          argument: args[0],
+          options: args[1],
+          arity: args.length,
+          answer,
+        });
         return answer.promise;
       },
-      select: (workspaceId: string) => {
+      select: (
+        ...args: [workspaceId: string, options?: WorkspaceSwitchOptions]
+      ) => {
         const answer = deferred<WorkspaceActionResult>();
-        fake.selects.push({ argument: workspaceId, answer });
+        fake.selects.push({
+          argument: args[0],
+          options: args[1],
+          arity: args.length,
+          answer,
+        });
         return answer.promise;
       },
     } satisfies Pick<
@@ -107,6 +128,7 @@ function harness(initial: ShellState = createShellState(READY.projects)) {
     actions: [] as ShellAction[],
     views: [] as WorkspacePanelView[],
     messages: [] as (string | undefined)[],
+    questions: [] as (SwitchQuestion | undefined)[],
   };
   const controller = createWorkspaceSidebar(
     fake.bridge,
@@ -116,6 +138,7 @@ function harness(initial: ShellState = createShellState(READY.projects)) {
     },
     (view) => app.views.push(view),
     (message) => app.messages.push(message),
+    (question) => app.questions.push(question),
   );
   return { fake, app, controller };
 }
@@ -315,15 +338,277 @@ test("a switch resolves to no message, or to a calm fixed text when refused or f
     () => Promise.resolve(NOT_FOUND),
     () => Promise.reject(new Error("The main process did not answer.")),
   ];
-  const messages: (string | undefined)[] = [];
+  const results: unknown[] = [];
   for (const answer of answers) {
-    messages.push(await switchWorkspace({ select: answer }, WORKSPACE_ID));
+    results.push(await switchWorkspace({ select: answer }, WORKSPACE_ID));
   }
 
-  expect(messages).toEqual([
-    undefined,
-    "Wait a moment before switching again.",
-    SELECT_REFUSAL_MESSAGES.not_found,
-    WORKSPACE_MESSAGES.switchFailed,
+  expect(results).toEqual([
+    { kind: "done", message: undefined },
+    { kind: "done", message: "Wait a moment before switching again." },
+    { kind: "done", message: SELECT_REFUSAL_MESSAGES.not_found },
+    { kind: "done", message: WORKSPACE_MESSAGES.switchFailed },
   ]);
+});
+
+const DISCARD = { discardWaiting: true };
+
+test("a workspace switch that answers waiting asks with the count and changes nothing; keeping the messages ends it", async () => {
+  const { fake, app, controller } = harness();
+  controller.start();
+  fake.listener?.({ ...READY, openProjectId: PROJECT_A });
+  app.state = shellReducer(app.state, {
+    type: "open-project",
+    projectId: PROJECT_A,
+  });
+  const shown = app.state;
+  app.actions.length = 0;
+
+  controller.select(WORKSPACE_ID);
+  fake.selects[0]?.answer.resolve({ outcome: "waiting", count: 3 });
+  await settle();
+  expect(app.questions).toEqual([{ kind: "workspace", count: 3 }]);
+  expect(app.messages).toEqual([undefined]);
+
+  controller.keepWaiting();
+  await settle();
+  expect(app.questions).toEqual([{ kind: "workspace", count: 3 }, undefined]);
+  // The shell never left the open project, and nothing is repeated.
+  expect(app.state).toBe(shown);
+  expect(app.actions).toEqual([]);
+  expect(fake.selects).toHaveLength(1);
+  expect(fake.reports).toHaveLength(0);
+
+  // A second answer changes nothing once the question is closed.
+  controller.keepWaiting();
+  controller.discardWaiting();
+  expect(app.questions).toHaveLength(2);
+  expect(fake.selects).toHaveLength(1);
+});
+
+test("discarding the messages repeats the workspace switch with the discard option, and its answer counts", async () => {
+  const { fake, app, controller } = harness();
+
+  controller.select(WORKSPACE_ID);
+  expect(fake.selects[0]?.arity).toBe(1);
+  fake.selects[0]?.answer.resolve({ outcome: "waiting", count: 1 });
+  await settle();
+
+  controller.discardWaiting();
+  expect(app.questions).toEqual([{ kind: "workspace", count: 1 }, undefined]);
+  expect(fake.selects.map((call) => [call.argument, call.options])).toEqual([
+    [WORKSPACE_ID, undefined],
+    [WORKSPACE_ID, DISCARD],
+  ]);
+  fake.selects[1]?.answer.resolve(TOO_SOON);
+  await settle();
+  expect(app.messages.at(-1)).toBe(SELECT_REFUSAL_MESSAGES.too_soon);
+  expect(fake.reports).toHaveLength(0);
+});
+
+test("opening another project that answers waiting asks, and keeping the messages puts the shell back on the main process's open project", async () => {
+  const { fake, app, controller } = harness();
+  controller.start();
+  fake.listener?.({ ...READY, openProjectId: PROJECT_A });
+  app.state = shellReducer(app.state, {
+    type: "open-project",
+    projectId: PROJECT_B,
+  });
+  app.actions.length = 0;
+
+  controller.openProjectChanged(PROJECT_B);
+  fake.reports[0]?.answer.resolve({ outcome: "waiting", count: 2 });
+  await settle();
+  expect(app.questions).toEqual([{ kind: "project", count: 2 }]);
+  expect(app.state.view).toMatchObject({ projectId: PROJECT_B });
+
+  controller.keepWaiting();
+  expect(app.questions.at(-1)).toBeUndefined();
+  expect(app.actions).toEqual([{ type: "open-project", projectId: PROJECT_A }]);
+  expect(app.state.view).toEqual({
+    screen: "chat",
+    projectId: PROJECT_A,
+    panel: "agents",
+  });
+  // Nothing is repeated with the discard option.
+  expect(fake.reports.map((call) => call.options)).toEqual([undefined]);
+});
+
+test("closing the project that answers waiting asks too, and keeping the messages opens the main process's project again", async () => {
+  const { fake, app, controller } = harness();
+  controller.start();
+  fake.listener?.({ ...READY, openProjectId: PROJECT_B });
+  app.state = shellReducer(app.state, {
+    type: "show-screen",
+    screen: "about",
+  });
+  app.actions.length = 0;
+
+  controller.openProjectChanged(null);
+  fake.reports[0]?.answer.resolve({ outcome: "waiting", count: 50 });
+  await settle();
+  expect(app.questions).toEqual([{ kind: "close", count: 50 }]);
+
+  controller.keepWaiting();
+  expect(app.actions).toEqual([{ type: "open-project", projectId: PROJECT_B }]);
+  expect(app.state.view).toMatchObject({
+    screen: "chat",
+    projectId: PROJECT_B,
+  });
+});
+
+test("keeping the messages shows the home screen when the last state has no open project", async () => {
+  const { fake, app, controller } = harness(
+    createShellState(READY.projects, {
+      screen: "chat",
+      projectId: PROJECT_B,
+      panel: "repositories",
+    }),
+  );
+  controller.start();
+  fake.listener?.(READY);
+  app.actions.length = 0;
+
+  controller.openProjectChanged(PROJECT_B);
+  fake.reports[0]?.answer.resolve({ outcome: "waiting", count: 1 });
+  await settle();
+  controller.keepWaiting();
+
+  expect(app.actions).toEqual([{ type: "show-screen", screen: "home" }]);
+  expect(app.state.view).toEqual({ screen: "home" });
+});
+
+test("discarding the messages repeats the project switch with the discard option; a second waiting answer asks again", async () => {
+  const { fake, app, controller } = harness();
+  controller.start();
+  fake.listener?.({ ...READY, openProjectId: PROJECT_A });
+  app.actions.length = 0;
+
+  controller.openProjectChanged(PROJECT_B);
+  expect(fake.reports[0]?.arity).toBe(1);
+  fake.reports[0]?.answer.resolve({ outcome: "waiting", count: 2 });
+  await settle();
+
+  controller.discardWaiting();
+  expect(fake.reports.map((call) => [call.argument, call.options])).toEqual([
+    [PROJECT_B, undefined],
+    [PROJECT_B, DISCARD],
+  ]);
+  // A message was written meanwhile; the person is asked again.
+  fake.reports[1]?.answer.resolve({ outcome: "waiting", count: 1 });
+  await settle();
+  expect(app.questions).toEqual([
+    { kind: "project", count: 2 },
+    undefined,
+    { kind: "project", count: 1 },
+  ]);
+  controller.discardWaiting();
+  fake.reports[2]?.answer.resolve({ outcome: "ok" });
+  await settle();
+  expect(fake.reports.map((call) => call.options)).toEqual([
+    undefined,
+    DISCARD,
+    DISCARD,
+  ]);
+  expect(app.questions.at(-1)).toBeUndefined();
+  expect(app.actions).toEqual([]);
+
+  // Closing the project is repeated with null.
+  controller.openProjectChanged(null);
+  fake.reports[3]?.answer.resolve({ outcome: "waiting", count: 1 });
+  await settle();
+  controller.discardWaiting();
+  expect(fake.reports[4]?.argument).toBeNull();
+  expect(fake.reports[4]?.options).toEqual(DISCARD);
+});
+
+test("a newer report or switch replaces the question, and a stale waiting answer asks nothing", async () => {
+  const { fake, app, controller } = harness();
+  controller.start();
+  fake.listener?.({ ...READY, openProjectId: PROJECT_A });
+
+  controller.openProjectChanged(PROJECT_B);
+  fake.reports[0]?.answer.resolve({ outcome: "waiting", count: 2 });
+  await settle();
+  expect(app.questions).toEqual([{ kind: "project", count: 2 }]);
+
+  // A newer report closes the question; its answers do nothing.
+  controller.openProjectChanged(PROJECT_A);
+  expect(app.questions).toEqual([{ kind: "project", count: 2 }, undefined]);
+  app.actions.length = 0;
+  controller.keepWaiting();
+  controller.discardWaiting();
+  expect(app.actions).toEqual([]);
+  expect(fake.reports).toHaveLength(2);
+
+  // The waiting answer of a replaced report asks nothing.
+  controller.openProjectChanged(PROJECT_B);
+  controller.openProjectChanged(PROJECT_A);
+  fake.reports[2]?.answer.resolve({ outcome: "waiting", count: 1 });
+  await settle();
+  expect(app.questions).toHaveLength(2);
+
+  // A switch replaces a project question too, and the other way round.
+  controller.openProjectChanged(PROJECT_B);
+  fake.reports[4]?.answer.resolve({ outcome: "waiting", count: 1 });
+  await settle();
+  controller.select(WORKSPACE_ID);
+  expect(app.questions.slice(2)).toEqual([
+    { kind: "project", count: 1 },
+    undefined,
+  ]);
+  fake.selects[0]?.answer.resolve({ outcome: "waiting", count: 4 });
+  await settle();
+  controller.openProjectChanged(null);
+  expect(app.questions.slice(4)).toEqual([
+    { kind: "workspace", count: 4 },
+    undefined,
+  ]);
+  controller.discardWaiting();
+  expect(fake.selects).toHaveLength(1);
+});
+
+test("the end of the subscription closes the question and drops a waiting answer", async () => {
+  const { fake, app, controller } = harness();
+  const stop = controller.start();
+
+  controller.openProjectChanged(PROJECT_A);
+  controller.select(WORKSPACE_ID);
+  fake.selects[0]?.answer.resolve({ outcome: "waiting", count: 1 });
+  await settle();
+  stop();
+  fake.reports[0]?.answer.resolve({ outcome: "waiting", count: 1 });
+  await settle();
+
+  expect(app.questions).toEqual([{ kind: "workspace", count: 1 }, undefined]);
+});
+
+test("a switch that answers waiting passes on its count", async () => {
+  expect(
+    await switchWorkspace(
+      { select: () => Promise.resolve({ outcome: "waiting", count: 7 }) },
+      WORKSPACE_ID,
+    ),
+  ).toEqual({ kind: "waiting", count: 7 });
+});
+
+test("the question names the count, what the switch does, and both answers", () => {
+  expect(describeSwitchQuestion({ kind: "workspace", count: 1 })).toEqual({
+    title: "Discard the message that was not sent?",
+    text: "1 message has not been sent yet. Selecting another workspace discards it.",
+    keep: "Keep the message",
+    discard: "Discard and switch workspace",
+  });
+  expect(describeSwitchQuestion({ kind: "project", count: 2 })).toEqual({
+    title: "Discard the messages that were not sent?",
+    text: "2 messages have not been sent yet. Opening another project discards them.",
+    keep: "Keep the messages",
+    discard: "Discard and open project",
+  });
+  expect(describeSwitchQuestion({ kind: "close", count: 50 })).toEqual({
+    title: "Discard the messages that were not sent?",
+    text: "50 messages have not been sent yet. Closing the project discards them.",
+    keep: "Keep the messages",
+    discard: "Discard and close project",
+  });
 });

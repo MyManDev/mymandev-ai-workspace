@@ -514,8 +514,8 @@ export const ForgetResultSchema = z.discriminatedUnion("outcome", [
   /**
    * The record and the key are deleted on this installation.
    * `removedAtServer` is true when the API confirmed the removal of the
-   * device first; otherwise the device stays registered to that account,
-   * without a usable key, until its sign-in ends or the account removes it.
+   * device first; otherwise the device stays registered to that account at
+   * the API, without a usable key, and nothing removes it on its own (#198).
    */
   z.object({ outcome: z.literal("forgotten"), removedAtServer: z.boolean() }),
   /** The person kept the account in the confirmation of the main process. */

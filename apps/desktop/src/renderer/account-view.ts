@@ -546,8 +546,10 @@ export const DEVICE_ACTION_MESSAGES = Object.freeze({
   signOutFailed: "The sign-out could not be completed. Try again.",
   removeFailed: "The device could not be removed. Try again.",
   listFailed: "The devices could not be listed. Try again.",
+  forgottenAtServer:
+    "The account was removed from this installation, and the server removed this device from it.",
   forgottenLocally:
-    "The account was removed from this installation, but the server could not remove this device from it. The device stays listed in that account, without a key, until its sign-in ends after 30 days or it is removed from another device.",
+    "The account was removed from this installation only. The server did not remove this device, so it stays listed for that GitHub account, without a key.",
 });
 
 /** The message for a device action that did not succeed, or none. */
@@ -604,12 +606,15 @@ export function listDevicesMessage(
   return result.outcome === "listed" ? undefined : deviceActionMessage(result);
 }
 
-/** The message after "This is not me". */
+/**
+ * The message after "This is not me": whether the server removed the device
+ * or it stays listed for that account (#198), or why nothing was deleted.
+ */
 export function forgetMessage(result: ForgetResult): string | undefined {
   switch (result.outcome) {
     case "forgotten":
       return result.removedAtServer
-        ? undefined
+        ? DEVICE_ACTION_MESSAGES.forgottenAtServer
         : DEVICE_ACTION_MESSAGES.forgottenLocally;
     case "cancelled":
       return undefined;

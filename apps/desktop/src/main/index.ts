@@ -10,6 +10,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
   FORGET_CONFIRMATION,
+  forgetConfirmationDetail,
   forgetConfirmationMessage,
   forgetConfirmed,
 } from "./account.ts";
@@ -55,7 +56,15 @@ import { createLocalRuntime } from "./runtime.ts";
 import { stopRuntimeOnQuit } from "./runtime-lifecycle.ts";
 import { createMainWindowOptions } from "./window.ts";
 import { createWorkspaceService } from "./workspace/service.ts";
-import { closeProjectWithPage, registerWorkspaceIpc } from "./workspace-ipc.ts";
+import {
+  askBeforeClosingWithWaitingMessages,
+  CLOSE_WITH_WAITING_CONFIRMATION,
+  closeProjectWithPage,
+  closeWithWaitingConfirmed,
+  closeWithWaitingMessage,
+  followQuitRequests,
+  registerWorkspaceIpc,
+} from "./workspace-ipc.ts";
 
 // The data folder is set first, before anything reads it, and the
 // single-instance lock is then taken in it (data-folder.ts). ADR 0014: the
@@ -122,12 +131,14 @@ function start(): void {
   const account = createSystemAccountService({
     focusWindow: () => focusMainWindow(),
     // "This is not me" is confirmed in a native dialog of the main process,
-    // like the folder dialog of the repositories.
-    confirmForget: async (login) => {
+    // like the folder dialog of the repositories. Its detail says what
+    // happens to the device at the server in this case (#198).
+    confirmForget: async (login, removal) => {
       const options = {
         ...FORGET_CONFIRMATION,
         buttons: [...FORGET_CONFIRMATION.buttons],
         message: forgetConfirmationMessage(login),
+        detail: forgetConfirmationDetail(removal),
       };
       return forgetConfirmed(
         mainWindow === undefined
@@ -268,6 +279,11 @@ function start(): void {
   });
   app.on("will-quit", () => chatIpc.close());
 
+  // A quit, for example with Cmd+Q on macOS, closes the window first. When
+  // the person confirms closing it with waiting chat messages, the quit is
+  // carried out once the window has closed, because the held close ended it.
+  const quits = followQuitRequests(app);
+
   function showMainWindow(): void {
     if (mainWindow !== undefined) {
       if (mainWindow.isMinimized()) {
@@ -285,6 +301,21 @@ function start(): void {
     // document commits, also on a reload, when the page fails to load, when
     // the render process is gone, and when the window closes.
     closeProjectWithPage(window, workspaces);
+    // Closing the window while chat messages wait to be sent asks first, in
+    // a native dialog (the Project Manager's decision of 2026-11-06 on #27).
+    askBeforeClosingWithWaitingMessages(
+      window,
+      () => chat.state().pending.length,
+      async (count) =>
+        closeWithWaitingConfirmed(
+          await dialog.showMessageBox(window, {
+            ...CLOSE_WITH_WAITING_CONFIRMATION,
+            buttons: [...CLOSE_WITH_WAITING_CONFIRMATION.buttons],
+            message: closeWithWaitingMessage(count),
+          }),
+        ),
+      quits,
+    );
     window.on("closed", () => {
       mainWindow = undefined;
     });

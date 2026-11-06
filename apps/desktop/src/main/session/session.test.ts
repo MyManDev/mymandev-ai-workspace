@@ -2976,6 +2976,99 @@ describe("tokens, clocks, and late refusals", () => {
 });
 
 describe("remove this device", () => {
+  test("removalAsksApi says whether removeDevice sends a request, also when a refused sign-in with another GitHub account hides a refusal (#198)", async () => {
+    const revokePath = `/devices/${DEVICE_ID}/revoke`;
+    const MISMATCH: SignInOutcome = {
+      kind: "refused",
+      code: "device_account_mismatch",
+    };
+
+    // Signed in, and a refused sign-in with another account alone (#149):
+    // the key still works, so the removal asks the API.
+    {
+      const api = fakeApi();
+      const h = harness(api);
+      await existingDevice(h);
+      expect(await h.session.removalAsksApi()).toBe(true);
+      await h.session.signInFinished(MISMATCH);
+      expect(h.session.state().kind).toBe("account_mismatch");
+      const asked = api.requests.length;
+      expect(await h.session.removalAsksApi()).toBe(true);
+      // It sends nothing itself.
+      expect(api.requests).toHaveLength(asked);
+      expect(await h.session.removeDevice()).toEqual({
+        ok: true,
+        value: "removed",
+      });
+      expect(count(h, "POST", revokePath)).toBe(1);
+    }
+
+    // A refusal of the API and then a refused sign-in with another account,
+    // in both orders: the state names the mismatch, without `signedOut`,
+    // but the refusal still stops the mint, so nothing is sent.
+    for (const code of ["sign_in_required", "auth_failed"] as const) {
+      for (const order of ["refusal first", "mismatch first"] as const) {
+        memory.removeFolder(folder);
+        const api = fakeApi();
+        const h = harness(api);
+        await existingDevice(h);
+        if (order === "refusal first") {
+          await h.session.deviceRefused(code, DEVICE_ID);
+          await h.session.signInFinished(MISMATCH);
+        } else {
+          // A WebSocket close while the mismatch is shown.
+          await h.session.signInFinished(MISMATCH);
+          await h.session.deviceRefused(code, DEVICE_ID);
+        }
+        const name = `${code}, ${order}`;
+        expect(h.session.state(), name).toEqual({
+          kind: "account_mismatch",
+          account: expect.objectContaining({ deviceId: DEVICE_ID }),
+        });
+        const asked = api.requests.length;
+        expect(await h.session.removalAsksApi(), name).toBe(false);
+        expect(await h.session.removeDevice(), name).toMatchObject({
+          ok: false,
+          reason: "refused",
+          code,
+        });
+        expect(api.requests, name).toHaveLength(asked);
+      }
+    }
+
+    // Signed out, the removal never asks either.
+    memory.removeFolder(folder);
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    await h.session.signOut();
+    const asked = api.requests.length;
+    expect(await h.session.removalAsksApi()).toBe(false);
+    expect(await h.session.removeDevice()).toEqual({
+      ok: false,
+      reason: "signed_out",
+    });
+    expect(api.requests).toHaveLength(asked);
+
+    // Also with a pending key replacement, which a mint would resolve.
+    memory.removeFolder(folder);
+    const pendingApi = fakeApi();
+    const pending = harness(pendingApi);
+    const keys = await pendingReplacement(pending);
+    // Offline, so the sign-out report does not resolve the replacement.
+    pendingApi.intercept = () => Promise.reject(new TypeError("offline"));
+    await pending.session.signOut();
+    pendingApi.intercept = null;
+    expect(heldKeys(pending)).toEqual(keys);
+    const sent = pendingApi.requests.length;
+    expect(await pending.session.removalAsksApi()).toBe(false);
+    expect(await pending.session.removeDevice()).toEqual({
+      ok: false,
+      reason: "signed_out",
+    });
+    expect(pendingApi.requests).toHaveLength(sent);
+  });
+
   test("an offline removal is noted, blocks every other use of the key, holds across a restart, and is retried by refresh", async () => {
     const api = fakeApi();
     const h = harness(api);

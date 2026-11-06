@@ -684,13 +684,25 @@ test("every failure of a device action has its own message, and a success none",
   ).toBeUndefined();
 });
 
-test("This is not me says when the server could not remove the device", () => {
-  expect(
-    forgetMessage({ outcome: "forgotten", removedAtServer: true }),
-  ).toBeUndefined();
-  expect(forgetMessage({ outcome: "forgotten", removedAtServer: false })).toBe(
-    DEVICE_ACTION_MESSAGES.forgottenLocally,
+test("This is not me says whether the server removed the device or it stays listed for that account, without an end of its sign-in (#198)", () => {
+  expect(forgetMessage({ outcome: "forgotten", removedAtServer: true })).toBe(
+    "The account was removed from this installation, and the server removed this device from it.",
   );
+  expect(forgetMessage({ outcome: "forgotten", removedAtServer: false })).toBe(
+    "The account was removed from this installation only. The server did not remove this device, so it stays listed for that GitHub account, without a key.",
+  );
+  expect(DEVICE_ACTION_MESSAGES.forgottenAtServer).toBe(
+    forgetMessage({ outcome: "forgotten", removedAtServer: true }),
+  );
+  expect(DEVICE_ACTION_MESSAGES.forgottenLocally).toBe(
+    forgetMessage({ outcome: "forgotten", removedAtServer: false }),
+  );
+  for (const message of [
+    DEVICE_ACTION_MESSAGES.forgottenAtServer,
+    DEVICE_ACTION_MESSAGES.forgottenLocally,
+  ]) {
+    expect(message).not.toMatch(/30|sign-in ends|until/);
+  }
   expect(forgetMessage({ outcome: "cancelled" })).toBeUndefined();
   expect(forgetMessage({ outcome: "refused", reason: "busy" })).toBe(
     ACTION_MESSAGES.forgetBusy,

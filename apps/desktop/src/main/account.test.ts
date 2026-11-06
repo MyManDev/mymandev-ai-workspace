@@ -23,7 +23,10 @@ import {
   type AccountSystem,
   createAccountService,
   FORGET_CONFIRMATION,
+  FORGET_CONFIRMATION_DETAILS,
+  forgetConfirmationDetail,
   forgetConfirmationMessage,
+  type ForgetRemoval,
   LIST_DEVICES_COOLDOWN_MS,
   forgetConfirmed,
   SIGN_IN_START_COOLDOWN_MS,
@@ -176,8 +179,11 @@ interface Harness {
   readonly openBrowser: (boolean | undefined)[];
   /** The `onCallback` that the service passed to the last `start`. */
   callback: (() => void) | undefined;
-  /** The answer of the native confirmation of "This is not me". */
-  confirm: (login: string) => Promise<boolean>;
+  /**
+   * The answer of the native confirmation of "This is not me", which gets
+   * the case that the service chose.
+   */
+  confirm: (login: string, removal: ForgetRemoval) => Promise<boolean>;
   /** The service's clock in milliseconds. */
   clock: number;
   recordDelete: () => Promise<void>;
@@ -185,6 +191,8 @@ interface Harness {
   keyDelete: () => Promise<void>;
   /** The answer of the native confirmation of removing this device. */
   confirmRemoval: (login: string) => Promise<boolean>;
+  /** What the session's `removalAsksApi` answers. */
+  removalAsks: () => Promise<boolean>;
   /** What the session's `replacementGraceEnd` answers. */
   graceEnd: () => Promise<string | null>;
   /** When set, every read of the record waits for it. */
@@ -252,6 +260,7 @@ function harness(
     markerDelete: async () => undefined,
     keyDelete: async () => undefined,
     confirmRemoval: async () => true,
+    removalAsks: async () => true,
     graceEnd: async () => null,
     readGate: null,
     stopped: 0,
@@ -323,6 +332,7 @@ function harness(
         state.log.push("session removeDevice");
         return state.removeDevice();
       },
+      removalAsksApi: () => state.removalAsks(),
       replacementGraceEnd: async () => {
         state.log.push("session replacementGraceEnd");
         return state.graceEnd();
@@ -409,9 +419,9 @@ function harness(
       state.focused += 1;
       state.log.push("focus");
     },
-    confirmForget: (login) => {
+    confirmForget: (login, removal) => {
       state.log.push(`confirm ${login}`);
-      return state.confirm(login);
+      return state.confirm(login, removal);
     },
     confirmRemoveDevice: (login) => {
       state.log.push(`confirm removal ${login}`);
@@ -1305,8 +1315,6 @@ test("the confirmation of This is not me names the login, offers Keep as the def
     cancelId: 1,
     noLink: true,
     title: "This is not me",
-    detail:
-      "The device key and the account are deleted on this computer. When this device is signed in with a usable key and the server can be reached, it is first removed from that account; otherwise it stays listed there, without a key, until its sign-in ends or the account removes it. You can then sign in with your own GitHub account.",
   });
   expect(Object.isFrozen(FORGET_CONFIRMATION)).toBe(true);
   expect(Object.isFrozen(FORGET_CONFIRMATION.buttons)).toBe(true);
@@ -1316,6 +1324,87 @@ test("the confirmation of This is not me names the login, offers Keep as the def
   expect(forgetConfirmed({ response: 0 })).toBe(true);
   for (const response of [1, 2, -1]) {
     expect(forgetConfirmed({ response })).toBe(false);
+  }
+});
+
+test("the confirmation of This is not me says what happens to the device at the server in each case, without an end of its sign-in (#198)", () => {
+  expect(FORGET_CONFIRMATION_DETAILS).toEqual({
+    server_first:
+      "This device is signed in, so it is first removed from that GitHub account on the server. If the server cannot be reached or does not remove it, the device stays listed for that account, without a key. Either way, the device key and the account are then deleted on this computer, and you can sign in with your own GitHub account.",
+    local_only:
+      'This device cannot use its key with the server now, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then enters the passphrase of the device key or signs in with that account on this device, as the panel asks, and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account.',
+  });
+  expect(Object.isFrozen(FORGET_CONFIRMATION_DETAILS)).toBe(true);
+  for (const removal of ["server_first", "local_only"] as const) {
+    const detail = forgetConfirmationDetail(removal);
+    expect(detail).toBe(FORGET_CONFIRMATION_DETAILS[removal]);
+    expect(detail, removal).toContain("stays listed for that account");
+    expect(detail, removal).not.toMatch(/30|sign-in ends|until/);
+  }
+});
+
+test("This is not me confirms with the case that the session's removalAsksApi answers: the server first only when the removal would ask the API (#198)", async () => {
+  // The session's rules are tested in session.test.ts; the service only
+  // follows its answer, whatever the device state says.
+  const cases: [
+    DeviceSessionState,
+    (() => Promise<boolean>) | "no session",
+    ForgetRemoval,
+  ][] = [
+    [SESSION_SIGNED_IN, async () => true, "server_first"],
+    [SESSION_SIGNED_IN, async () => false, "local_only"],
+    [
+      { kind: "account_mismatch", account: SESSION_ACCOUNT },
+      async () => false,
+      "local_only",
+    ],
+    [
+      { kind: "account_mismatch", account: SESSION_ACCOUNT },
+      async () => true,
+      "server_first",
+    ],
+    [
+      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: true },
+      async () => false,
+      "local_only",
+    ],
+    [
+      SESSION_SIGNED_IN,
+      () => Promise.reject(new Error("broken")),
+      "local_only",
+    ],
+    [SESSION_SIGNED_IN, "no session", "local_only"],
+  ];
+  for (const [state, asks, expected] of cases) {
+    const name = `${state.kind} ${typeof asks === "string" ? asks : expected}`;
+    const h = harness();
+    let asked = 0;
+    if (asks === "no session") {
+      h.createSession = () => {
+        throw new Error("The device session needs a ready application.");
+      };
+    } else {
+      h.sessionState = state;
+      h.removalAsks = () => {
+        asked += 1;
+        return asks();
+      };
+    }
+    // A report that the API does not learn yet leaves the state as it is.
+    h.reportSignOut = async () => ({ ok: true, value: "pending" });
+    const removals: ForgetRemoval[] = [];
+    h.confirm = async (login, removal) => {
+      expect(login, name).toBe("octocat");
+      removals.push(removal);
+      return false;
+    };
+    await h.service.initialize();
+
+    await expect(h.service.forgetAccount(), name).resolves.toEqual({
+      outcome: "cancelled",
+    });
+    expect(removals, name).toEqual([expected]);
+    expect(asked, name).toBe(asks === "no session" ? 0 : 1);
   }
 });
 
