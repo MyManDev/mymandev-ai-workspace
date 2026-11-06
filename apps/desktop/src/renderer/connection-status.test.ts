@@ -12,7 +12,6 @@ import {
   canStartSignIn,
   DEVICE_ACTION_FAILURE_MESSAGES,
   DEVICE_ACTION_MESSAGES,
-  DEVICE_STATE_MESSAGES,
   type AccountView,
 } from "./account-view.ts";
 import {
@@ -26,6 +25,8 @@ import {
   initialConnectionView,
   OFFLINE_SIGN_IN_DETAIL,
   REGISTER_AGAIN_MESSAGE,
+  REMOVAL_NOT_DONE,
+  REMOVAL_PENDING_MESSAGE,
   type DeviceRemovalView,
 } from "./connection-status.ts";
 
@@ -348,18 +349,80 @@ test("offline without a signed-in device names the sign-in on the Account screen
   );
 });
 
-test("the focus moves to the status paragraph only when an action went away and the focus fell to the page", () => {
+test("while the register-again message shows, offline does not ask for the sign-in a second time", () => {
+  const removed = account({ ...SIGNED_OUT, device: "removed" });
+  expect(canStartSignIn({ ...SIGNED_OUT, device: "removed" })).toBe(true);
+  expect(
+    describeConnectionView(
+      { kind: "known", status: OFFLINE_STATUS },
+      removed,
+      REGISTER_AGAIN_MESSAGE,
+    ).detail,
+  ).toBe(NOT_READY_DETAIL);
+  // Any other message, or none, leaves the sign-in sentence.
+  for (const message of [
+    undefined,
+    REMOVAL_PENDING_MESSAGE,
+    `${REMOVAL_NOT_DONE} ${DEVICE_ACTION_MESSAGES.busy}`,
+    DEVICE_ACTION_MESSAGES.removeFailed,
+  ]) {
+    expect(
+      describeConnectionView(
+        { kind: "known", status: OFFLINE_STATUS },
+        removed,
+        message,
+      ).detail,
+      message,
+    ).toBe(OFFLINE_SIGN_IN_DETAIL);
+  }
+  // Only the sentence of offline changes.
+  expect(
+    describeConnectionView(
+      { kind: "known", status: REPLACED_STATUS },
+      SIGNED_IN_VIEW,
+      REGISTER_AGAIN_MESSAGE,
+    ),
+  ).toEqual(known(REPLACED_STATUS));
+  expect(
+    describeConnectionView(
+      {
+        kind: "known",
+        status: { state: "offline", reason: "no_api_origin", revision: 1 },
+      },
+      removed,
+      REGISTER_AGAIN_MESSAGE,
+    ).detail,
+  ).toBe("This build has no server address.");
+});
+
+test("the focus moves to the status paragraph only when the header button that had it went away and the focus fell to the page", () => {
   const replaced = known(REPLACED_STATUS).actions;
-  // The removal is confirmed: the status becomes offline, and both buttons go.
+  const retry = known({
+    state: "waiting",
+    reason: "connection_lost",
+    retryAt: RETRY_AT,
+    revision: 1,
+  }).actions;
+  const connecting = known({ state: "connecting", revision: 2 }).actions;
   const removed = known(
     OFFLINE_STATUS,
     account({ ...SIGNED_OUT, device: "removed" }),
   ).actions;
-  expect(focusesStatus(replaced, removed, true)).toBe(true);
-  // The account status shows the removal first.
+
+  // The backoff turns waiting into connecting: "Retry now" goes, but no
+  // header button had the focus, also when the focus is on the page.
+  expect(focusesStatus(undefined, connecting, true)).toBe(false);
+  expect(focusesStatus(undefined, connecting, false)).toBe(false);
+  // The same after a sign-out on the Account screen, or a confirmed
+  // removal that the person did not start from the header.
+  expect(focusesStatus(undefined, removed, true)).toBe(false);
+
+  // The removal from the header is confirmed: its focused button goes.
+  expect(focusesStatus("remove_and_register", removed, true)).toBe(true);
+  // The account status shows the removal before the connection status.
   expect(
     focusesStatus(
-      replaced,
+      "remove_and_register",
       known(
         REPLACED_STATUS,
         account({ ...SIGNED_IN, device: "removal_pending" }),
@@ -367,47 +430,56 @@ test("the focus moves to the status paragraph only when an action went away and 
       true,
     ),
   ).toBe(true);
-  expect(focusesStatus(["retry_now"], [], true)).toBe(true);
-  expect(focusesStatus(["retry_now"], replaced, true)).toBe(true);
-  // A focus elsewhere stays where it is.
-  expect(focusesStatus(replaced, removed, false)).toBe(false);
-  // Nothing went away.
-  expect(focusesStatus(removed, replaced, true)).toBe(false);
-  expect(focusesStatus(replaced, replaced, true)).toBe(false);
-  expect(focusesStatus([], [], true)).toBe(false);
+  // "Reconnect here once" and "Retry now" start connecting.
+  expect(focusesStatus("reconnect_here", connecting, true)).toBe(true);
+  expect(focusesStatus("retry_now", connecting, true)).toBe(true);
+
+  // The focused button stays.
+  expect(focusesStatus("retry_now", retry, true)).toBe(false);
+  expect(focusesStatus("reconnect_here", replaced, true)).toBe(false);
+  // The focus is somewhere else already.
+  expect(focusesStatus("remove_and_register", removed, false)).toBe(false);
   expect(CONNECTION_STATUS_TEXT_ID).toBe("connection-status-text");
 });
 
-test("every removal result has its message: the way to register again, the waiting removal, the panel's messages, and none after a cancel", () => {
+test("every removal result has its message: the way to register again, the waiting removal, the panel's reason after a refusal or a failure, and none after a cancel", () => {
+  const notDone = (reason: string) => `${REMOVAL_NOT_DONE} ${reason}`;
   const results: readonly [RemoveDeviceResult, string | undefined][] = [
     [{ outcome: "removed" }, REGISTER_AGAIN_MESSAGE],
-    [{ outcome: "pending" }, DEVICE_STATE_MESSAGES.removal_pending],
+    [{ outcome: "pending" }, REMOVAL_PENDING_MESSAGE],
     [{ outcome: "cancelled" }, undefined],
-    [{ outcome: "refused", reason: "busy" }, DEVICE_ACTION_MESSAGES.busy],
+    [
+      { outcome: "refused", reason: "busy" },
+      notDone(DEVICE_ACTION_MESSAGES.busy),
+    ],
     [
       { outcome: "refused", reason: "not_signed_in" },
-      DEVICE_ACTION_MESSAGES.notSignedIn,
+      notDone(DEVICE_ACTION_MESSAGES.notSignedIn),
     ],
     [
-      { outcome: "failed", reason: "no_answer" },
-      DEVICE_ACTION_FAILURE_MESSAGES.no_answer,
-    ],
-    [
-      { outcome: "failed", reason: "device_revoked" },
-      DEVICE_ACTION_FAILURE_MESSAGES.device_revoked,
+      { outcome: "failed", reason: "rate_limited" },
+      notDone(DEVICE_ACTION_FAILURE_MESSAGES.rate_limited),
     ],
     [
       { outcome: "failed", reason: "refused" },
-      DEVICE_ACTION_FAILURE_MESSAGES.refused,
+      notDone(DEVICE_ACTION_FAILURE_MESSAGES.refused),
     ],
+    // The server had revoked the device already, and its key is deleted.
+    [{ outcome: "failed", reason: "device_revoked" }, REGISTER_AGAIN_MESSAGE],
   ];
   for (const [result, message] of results) {
     expect(deviceRemovalMessage(result), result.outcome).toBe(message);
   }
+  expect(notDone(DEVICE_ACTION_FAILURE_MESSAGES.refused)).toBe(
+    "This device could not be removed. The server refused the request.",
+  );
   // The person starts the sign-in on the Account screen; the indicator
   // never does.
   expect(REGISTER_AGAIN_MESSAGE).toBe(
     "This device was removed from its account, and its key was deleted. Sign in with GitHub on the Account screen to register this computer again as a new device.",
+  );
+  expect(REMOVAL_PENDING_MESSAGE).toBe(
+    'The removal of this device waits for the server. It is tried again when the application starts, or when you choose "Remove this device" on the Account screen.',
   );
 });
 
@@ -436,6 +508,8 @@ async function settle(): Promise<void> {
   }
 }
 
+const REFUSED_MESSAGE = `${REMOVAL_NOT_DONE} ${DEVICE_ACTION_FAILURE_MESSAGES.refused}`;
+
 test("the removal calls removeDevice once, ignores clicks while it runs, and shows the result's message", async () => {
   const { removal, answers, views } = removalWithFakeAccount();
   removal.remove();
@@ -458,7 +532,7 @@ test("the removal calls removeDevice once, ignores clicks while it runs, and sho
   await settle();
   expect(views.at(-1)).toEqual({
     running: false,
-    message: DEVICE_ACTION_MESSAGES.busy,
+    message: `${REMOVAL_NOT_DONE} ${DEVICE_ACTION_MESSAGES.busy}`,
   });
 
   removal.remove();
@@ -496,10 +570,7 @@ test("a removal's message stays until a sign-in runs or the next removal starts,
   removal.accountChanged(account({ ...SIGNED_IN, device: "removal_pending" }));
   answers[0]?.({ outcome: "failed", reason: "refused" });
   await settle();
-  expect(views.at(-1)).toEqual({
-    running: false,
-    message: DEVICE_ACTION_FAILURE_MESSAGES.refused,
-  });
+  expect(views.at(-1)).toEqual({ running: false, message: REFUSED_MESSAGE });
   const shown = views.length;
   const others: readonly AccountView[] = [
     SIGNED_IN_VIEW,
@@ -528,9 +599,7 @@ test("a removal's message stays until a sign-in runs or the next removal starts,
     removal.remove();
     answers.at(-1)?.({ outcome: "failed", reason: "refused" });
     await settle();
-    expect(views.at(-1)?.message, signIn.kind).toBe(
-      DEVICE_ACTION_FAILURE_MESSAGES.refused,
-    );
+    expect(views.at(-1)?.message, signIn.kind).toBe(REFUSED_MESSAGE);
     removal.accountChanged(signInRuns(signIn));
     expect(views.at(-1), signIn.kind).toEqual(IDLE_DEVICE_REMOVAL);
   }
@@ -542,4 +611,87 @@ test("a removal's message stays until a sign-in runs or the next removal starts,
   removal.remove();
   removal.accountChanged(starting);
   expect(views.at(-1)).toEqual({ running: true, message: undefined });
+});
+
+test("a reconnect from the header ends the message of the last removal, but not while a removal runs", async () => {
+  const { removal, answers, views } = removalWithFakeAccount();
+  removal.reconnecting();
+  expect(views).toEqual([]);
+
+  for (const result of [
+    { outcome: "refused", reason: "busy" },
+    { outcome: "failed", reason: "rate_limited" },
+    { outcome: "failed", reason: "refused" },
+  ] as const) {
+    removal.remove();
+    answers.at(-1)?.(result);
+    await settle();
+    expect(views.at(-1)?.message, result.reason).toMatch(
+      /^This device could not be removed\. /,
+    );
+    removal.reconnecting();
+    expect(views.at(-1), result.reason).toEqual(IDLE_DEVICE_REMOVAL);
+  }
+  const shown = views.length;
+  removal.reconnecting();
+  expect(views).toHaveLength(shown);
+
+  removal.remove();
+  removal.reconnecting();
+  expect(views.at(-1)).toEqual({ running: true, message: undefined });
+});
+
+test("the message of a removal that waits for the server follows the device: the way to register again once it is removed, none once it is otherwise", async () => {
+  const { removal, answers, views } = removalWithFakeAccount();
+  const pendingStatus: AccountStatus = {
+    ...SIGNED_IN,
+    device: "removal_pending",
+  };
+  const pending = account(pendingStatus);
+  const waits = async () => {
+    removal.remove();
+    removal.accountChanged(pending);
+    answers.at(-1)?.({ outcome: "pending" });
+    await settle();
+    expect(views.at(-1)).toEqual({
+      running: false,
+      message: REMOVAL_PENDING_MESSAGE,
+    });
+    // While the removal waits, the message stays.
+    removal.accountChanged(pending);
+    removal.accountChanged(account({ ...pendingStatus, revision: 2 }));
+    removal.accountChanged({ kind: "pending" });
+    removal.accountChanged({ kind: "unavailable" });
+    expect(views.at(-1)?.message).toBe(REMOVAL_PENDING_MESSAGE);
+  };
+
+  // "Remove this device" on the Account screen succeeds.
+  await waits();
+  removal.accountChanged(account({ ...SIGNED_OUT, device: "removed" }));
+  expect(views.at(-1)).toEqual({
+    running: false,
+    message: REGISTER_AGAIN_MESSAGE,
+  });
+  // The register-again message does not follow the device.
+  removal.accountChanged(SIGNED_IN_VIEW);
+  expect(views.at(-1)?.message).toBe(REGISTER_AGAIN_MESSAGE);
+
+  // The removal ends otherwise: refused, so the device is signed in again,
+  // or revoked from another device.
+  for (const after of [
+    SIGNED_IN_VIEW,
+    account({ ...SIGNED_OUT, device: "revoked" }),
+    account({
+      ...SIGNED_OUT,
+      account: { kind: "hidden" },
+      device: "signed_out",
+    }),
+  ]) {
+    await waits();
+    removal.accountChanged(after);
+    expect(
+      views.at(-1),
+      after.kind === "known" ? after.status.device : after.kind,
+    ).toEqual(IDLE_DEVICE_REMOVAL);
+  }
 });

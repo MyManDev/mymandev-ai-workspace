@@ -121,7 +121,7 @@ export function App({
   const connectionView = useConnectionView(connection);
   const accountView = useAccountView(account);
   const removal = useDeviceRemoval(account, accountView);
-  useConnectionStatusFocus(
+  const onActionFocus = useConnectionStatusFocus(
     describeConnectionView(connectionView, accountView).actions,
   );
   const focusAfterShow = useFocusAfterShow(state.view);
@@ -139,11 +139,13 @@ export function App({
               connection === undefined
                 ? undefined
                 : () => {
+                    removal.onReconnect?.();
                     // The status shows what follows; a refusal changes nothing.
                     connection.reconnect().catch(() => undefined);
                   }
             }
             onRemoveDevice={removal.onRemove}
+            onActionFocus={onActionFocus}
             removal={removal.view}
           />
           <RuntimeStatusIndicator view={runtimeView} />
@@ -398,8 +400,8 @@ function useConnectionView(
 /**
  * "Remove this device and register again" for the connection indicator,
  * through the account bridge, while the shell is mounted. The logic is in
- * `createDeviceRemoval`; the account status ends the message of the last
- * removal once a sign-in runs.
+ * `createDeviceRemoval`; the account status and a reconnect from the
+ * header end the message of the last removal.
  */
 function useDeviceRemoval(
   account: AccountBridge | undefined,
@@ -407,6 +409,7 @@ function useDeviceRemoval(
 ): {
   readonly view: DeviceRemovalView;
   readonly onRemove: (() => void) | undefined;
+  readonly onReconnect: (() => void) | undefined;
 } {
   const [view, setView] = useState(IDLE_DEVICE_REMOVAL);
   const removal = useMemo(
@@ -415,32 +418,49 @@ function useDeviceRemoval(
     [account],
   );
   useEffect(() => removal?.accountChanged(accountView), [removal, accountView]);
-  return { view, onRemove: removal?.remove };
+  return {
+    view,
+    onRemove: removal?.remove,
+    onReconnect: removal?.reconnecting,
+  };
 }
 
 /**
- * Moves the focus to the connection indicator's status paragraph when a
- * header action went away with the focused button (`focusesStatus`), for
- * example once a removal is confirmed and the status becomes `offline`, so
- * that the focus does not drop to the page. The actions are the frozen
- * lists of `describeConnectionView`, so only a change runs the check.
+ * Moves the focus to the connection indicator's status paragraph, without
+ * scrolling, when the header button that had the focus went away with its
+ * action (`focusesStatus`), for example once a removal is confirmed and
+ * the status becomes `offline`, so that the focus does not drop to the
+ * page. The returned function notes which button has the focus. Chromium
+ * fires no blur when it removes the focused element, so the note still
+ * names the button when its action goes. The actions are the frozen lists
+ * of `describeConnectionView`, so only a change runs the check.
  */
-function useConnectionStatusFocus(actions: readonly ConnectionAction[]): void {
-  const shown = useRef(actions);
+function useConnectionStatusFocus(
+  actions: readonly ConnectionAction[],
+): (action: ConnectionAction | undefined) => void {
+  const focused = useRef<ConnectionAction | undefined>(undefined);
   useEffect(() => {
-    const before = shown.current;
-    shown.current = actions;
+    const action = focused.current;
     const active = document.activeElement;
     if (
       focusesStatus(
-        before,
+        action,
         actions,
         active === null || active === document.body,
       )
     ) {
-      document.getElementById(CONNECTION_STATUS_TEXT_ID)?.focus();
+      document
+        .getElementById(CONNECTION_STATUS_TEXT_ID)
+        ?.focus({ preventScroll: true });
+    }
+    if (action !== undefined && !actions.includes(action)) {
+      // The focused button went away with its action.
+      focused.current = undefined;
     }
   }, [actions]);
+  return useCallback((action: ConnectionAction | undefined) => {
+    focused.current = action;
+  }, []);
 }
 
 /**
@@ -459,6 +479,7 @@ export function ConnectionStatusIndicator({
   account,
   onReconnect,
   onRemoveDevice,
+  onActionFocus,
   removal = IDLE_DEVICE_REMOVAL,
 }: {
   readonly view: ConnectionView;
@@ -466,11 +487,18 @@ export function ConnectionStatusIndicator({
   readonly account: AccountView;
   readonly onReconnect?: (() => void) | undefined;
   readonly onRemoveDevice?: (() => void) | undefined;
+  /**
+   * Gets the action of the button that takes the focus, and undefined when
+   * a button that is still in the page loses it.
+   */
+  readonly onActionFocus?:
+    ((action: ConnectionAction | undefined) => void) | undefined;
   readonly removal?: DeviceRemovalView | undefined;
 }) {
   const { tone, label, detail, actions } = describeConnectionView(
     view,
     account,
+    removal.message,
   );
   const handlers: Readonly<Record<ConnectionAction, (() => void) | undefined>> =
     {
@@ -503,6 +531,13 @@ export function ConnectionStatusIndicator({
             type="button"
             aria-disabled={removal.running ? "true" : undefined}
             onClick={removal.running ? undefined : handler}
+            onFocus={() => onActionFocus?.(action)}
+            onBlur={(event) => {
+              // A blur of a button that left the page is not the person's.
+              if (event.currentTarget.isConnected) {
+                onActionFocus?.(undefined);
+              }
+            }}
           >
             {CONNECTION_ACTION_LABELS[action]}
           </button>

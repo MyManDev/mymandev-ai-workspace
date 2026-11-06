@@ -10,7 +10,6 @@ import type {
 import {
   canStartSignIn,
   DEVICE_ACTION_MESSAGES,
-  DEVICE_STATE_MESSAGES,
   deviceSignedIn,
   removeDeviceMessage,
   type AccountView,
@@ -124,11 +123,14 @@ export interface ConnectionIndicator {
  * The text, the tone, and the actions of the connection indicator in the
  * shell. The account status decides what the connection status cannot:
  * whether `offline` with `not_signed_in` asks for a sign-in, and whether
- * the actions after `connection_replaced` are offered.
+ * the actions after `connection_replaced` are offered. While the message of
+ * the last removal already asks for the sign-in (`REGISTER_AGAIN_MESSAGE`),
+ * `offline` does not ask for it again.
  */
 export function describeConnectionView(
   view: ConnectionView,
   account: AccountView,
+  removalMessage?: string | undefined,
 ): ConnectionIndicator {
   switch (view.kind) {
     case "unavailable":
@@ -155,7 +157,11 @@ export function describeConnectionView(
       return {
         tone: status.state,
         label,
-        detail: offlineDetail(status.reason, account),
+        detail: offlineDetail(
+          status.reason,
+          account,
+          removalMessage === REGISTER_AGAIN_MESSAGE,
+        ),
         actions: NO_ACTIONS,
       };
     case "waiting":
@@ -180,16 +186,19 @@ export function describeConnectionView(
 /**
  * The sentence of `offline`: the sign-in only while the account panel
  * offers one that can start now (`canStartSignIn`), so the header never
- * asks for a sign-in that the panel does not offer.
+ * asks for a sign-in that the panel does not offer, and not while another
+ * sentence of the header asks for it already (`signInNamed`).
  */
 function offlineDetail(
   reason: ConnectionOfflineReason | undefined,
   account: AccountView,
+  signInNamed: boolean,
 ): string | null {
   if (reason === undefined) {
     return null;
   }
   return reason === "not_signed_in" &&
+    !signInNamed &&
     account.kind === "known" &&
     canStartSignIn(account.status)
     ? OFFLINE_SIGN_IN_DETAIL
@@ -229,18 +238,22 @@ export const CONNECTION_STATUS_TEXT_ID = "connection-status-text";
 
 /**
  * Whether the focus moves to the indicator's status paragraph after its
- * actions changed: an action went away with its button, and the focus fell
- * to the page, as it does when the focused element is removed. For
+ * actions changed: one of its buttons had the focus (`focused`, from the
+ * buttons' focus and blur), its action is no longer offered, and the focus
+ * fell to the page, as it does when the focused element is removed. For
  * example, once a removal is confirmed, the status becomes `offline` and
- * both buttons of `connection_replaced` go. A focus elsewhere stays where
- * it is.
+ * both buttons of `connection_replaced` go; after "Reconnect here once" or
+ * "Retry now", the status becomes `connecting`. A change that the person
+ * did not start from a header button, such as `waiting` becoming
+ * `connecting` after the backoff, moves no focus, and neither does any
+ * change while the focus is elsewhere.
  */
 export function focusesStatus(
-  before: readonly ConnectionAction[],
+  focused: ConnectionAction | undefined,
   after: readonly ConnectionAction[],
   focusOnPage: boolean,
 ): boolean {
-  return focusOnPage && before.some((action) => !after.includes(action));
+  return focused !== undefined && !after.includes(focused) && focusOnPage;
 }
 
 /**
@@ -270,9 +283,26 @@ export const REGISTER_AGAIN_MESSAGE =
   "This device was removed from its account, and its key was deleted. Sign in with GitHub on the Account screen to register this computer again as a new device.";
 
 /**
+ * While the removal waits for the server. The header hides its buttons
+ * then, so the sentence names the place of the next removal.
+ */
+export const REMOVAL_PENDING_MESSAGE =
+  'The removal of this device waits for the server. It is tried again when the application starts, or when you choose "Remove this device" on the Account screen.';
+
+/**
+ * The start of the indicator's message after a refused or failed removal,
+ * before the account panel's sentence about why: the header shows it next
+ * to the connection's state, which says nothing about the removal.
+ */
+export const REMOVAL_NOT_DONE = "This device could not be removed.";
+
+/**
  * The indicator's message after a removal: the way to register again after
- * `removed`, the device state's message while the removal waits for the
- * server, and the account panel's messages otherwise, none after a cancel.
+ * `removed`, and also after `device_revoked`, when the server had revoked
+ * the device already and the session deleted its key; the place of the
+ * next removal while it waits for the server; `REMOVAL_NOT_DONE` with the
+ * account panel's sentence after a refusal or a failure; none after a
+ * cancel.
  */
 export function deviceRemovalMessage(
   result: RemoveDeviceResult,
@@ -281,10 +311,19 @@ export function deviceRemovalMessage(
     case "removed":
       return REGISTER_AGAIN_MESSAGE;
     case "pending":
-      return DEVICE_STATE_MESSAGES.removal_pending;
-    default:
-      return removeDeviceMessage(result);
+      return REMOVAL_PENDING_MESSAGE;
+    case "cancelled":
+      return undefined;
+    case "failed":
+      if (result.reason === "device_revoked") {
+        return REGISTER_AGAIN_MESSAGE;
+      }
+      break;
+    case "refused":
+      break;
   }
+  const reason = removeDeviceMessage(result);
+  return reason === undefined ? undefined : `${REMOVAL_NOT_DONE} ${reason}`;
 }
 
 export interface DeviceRemoval {
@@ -296,10 +335,19 @@ export interface DeviceRemoval {
   readonly remove: () => void;
   /**
    * Passes the account status on: once a GitHub sign-in runs, the message
-   * of the last removal goes. Otherwise it stays until the next removal,
-   * also when the device connects again after a refused removal.
+   * of the last removal goes. The message of a removal that waits for the
+   * server follows the device: once it is no longer `removal_pending`, for
+   * example after "Remove this device" on the Account screen, it becomes
+   * the way to register again when the device is `removed`, and goes
+   * otherwise. A connection changes nothing, so a refused removal stays
+   * shown also when the device connects again.
    */
   readonly accountChanged: (view: AccountView) => void;
+  /**
+   * The person chose "Reconnect here once" or "Retry now" in the header:
+   * the message of the last removal goes, unless a removal runs.
+   */
+  readonly reconnecting: () => void;
 }
 
 /**
@@ -313,10 +361,13 @@ export function createDeviceRemoval(
   let running = false;
   let message: string | undefined;
   const show = () => onView(Object.freeze({ running, message }));
-  const finish = (next: string | undefined) => {
-    running = false;
+  const showMessage = (next: string | undefined) => {
     message = next;
     show();
+  };
+  const finish = (next: string | undefined) => {
+    running = false;
+    showMessage(next);
   };
   return Object.freeze({
     remove: () => {
@@ -332,14 +383,24 @@ export function createDeviceRemoval(
         .then(finish);
     },
     accountChanged: (view: AccountView) => {
-      if (
-        !running &&
-        message !== undefined &&
-        view.kind === "known" &&
-        view.status.signIn.kind !== "idle"
+      if (running || message === undefined || view.kind !== "known") {
+        return;
+      }
+      const { status } = view;
+      if (status.signIn.kind !== "idle") {
+        showMessage(undefined);
+      } else if (
+        message === REMOVAL_PENDING_MESSAGE &&
+        status.device !== "removal_pending"
       ) {
-        message = undefined;
-        show();
+        showMessage(
+          status.device === "removed" ? REGISTER_AGAIN_MESSAGE : undefined,
+        );
+      }
+    },
+    reconnecting: () => {
+      if (!running && message !== undefined) {
+        showMessage(undefined);
       }
     },
   });
