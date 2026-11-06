@@ -188,16 +188,31 @@ export interface SessionAccount {
  *   deleted.
  * - `revoked`: the API answered `device_revoked`. The caller stops local
  *   execution; the key and the record are deleted.
+ *
+ * `key_lost`, `unavailable`, `key_not_loaded`, and `account_mismatch` come
+ * before `signed_out`; they carry `signedOut: true` while a sign-out marker
+ * exists (P-65), so that the caller still knows that the person signed out
+ * (#195). Without the keys, a marker that exists counts, also one that
+ * cannot be read.
  */
 export type DeviceSessionState =
   | { readonly kind: "starting" }
   | { readonly kind: "no_device" }
-  | { readonly kind: "key_lost"; readonly account: SessionAccount }
+  | {
+      readonly kind: "key_lost";
+      readonly account: SessionAccount;
+      readonly signedOut?: true;
+    }
   | {
       readonly kind: "unavailable";
       readonly reason: "record_unreadable" | "key_store_failed";
+      readonly signedOut?: true;
     }
-  | { readonly kind: "key_not_loaded"; readonly account: SessionAccount }
+  | {
+      readonly kind: "key_not_loaded";
+      readonly account: SessionAccount;
+      readonly signedOut?: true;
+    }
   | { readonly kind: "signed_in"; readonly account: SessionAccount }
   | {
       readonly kind: "signed_out";
@@ -206,7 +221,11 @@ export type DeviceSessionState =
     }
   | { readonly kind: "sign_in_required"; readonly account: SessionAccount }
   | { readonly kind: "auth_failed"; readonly account: SessionAccount }
-  | { readonly kind: "account_mismatch"; readonly account: SessionAccount }
+  | {
+      readonly kind: "account_mismatch";
+      readonly account: SessionAccount;
+      readonly signedOut?: true;
+    }
   | { readonly kind: "removal_pending"; readonly account: SessionAccount }
   | { readonly kind: "removed" }
   | { readonly kind: "revoked" };
@@ -375,9 +394,19 @@ type Facts =
       readonly kind: "missing";
       readonly reason: "no_device" | "record_unreadable" | "key_store_failed";
       readonly keyError?: DeviceKeyErrorCode;
+      /** Whether a sign-out marker exists (`signOutMarked`). */
+      readonly signedOut?: boolean;
     }
-  | { readonly kind: "key_not_loaded"; readonly record: DeviceRecord }
-  | { readonly kind: "key_lost"; readonly record: DeviceRecord }
+  | {
+      readonly kind: "key_not_loaded";
+      readonly record: DeviceRecord;
+      readonly signedOut: boolean;
+    }
+  | {
+      readonly kind: "key_lost";
+      readonly record: DeviceRecord;
+      readonly signedOut: boolean;
+    }
   | {
       readonly kind: "ready";
       readonly record: DeviceRecord;
@@ -472,6 +501,13 @@ function replacementToResolve(facts: ReadyFacts): boolean {
     facts.keys.previous !== null &&
     facts.record.publicKey === facts.keys.previous.publicKey
   );
+}
+
+/** `signedOut: true` for a state that comes before `signed_out`, or nothing. */
+function signedOutFlag(signedOut: boolean | undefined): {
+  readonly signedOut?: true;
+} {
+  return signedOut === true ? { signedOut: true } : {};
 }
 
 function sameState(a: DeviceSessionState, b: DeviceSessionState): boolean {
@@ -748,17 +784,33 @@ export function createDeviceSession(
       case "missing":
         return facts.reason === "no_device"
           ? { kind: "no_device" }
-          : { kind: "unavailable", reason: facts.reason };
+          : {
+              kind: "unavailable",
+              reason: facts.reason,
+              ...signedOutFlag(facts.signedOut),
+            };
       case "key_not_loaded":
-        return { kind: "key_not_loaded", account: accountOf(facts.record) };
+        return {
+          kind: "key_not_loaded",
+          account: accountOf(facts.record),
+          ...signedOutFlag(facts.signedOut),
+        };
       case "key_lost":
-        return { kind: "key_lost", account: accountOf(facts.record) };
+        return {
+          kind: "key_lost",
+          account: accountOf(facts.record),
+          ...signedOutFlag(facts.signedOut),
+        };
       case "ready":
         break;
     }
     const account = accountOf(facts.record);
     if (accountMismatch) {
-      return { kind: "account_mismatch", account };
+      return {
+        kind: "account_mismatch",
+        account,
+        ...signedOutFlag(facts.marker !== null),
+      };
     }
     if (facts.marker !== null) {
       return {
@@ -799,7 +851,11 @@ export function createDeviceSession(
     try {
       facts = await readFacts();
     } catch {
-      facts = { kind: "missing", reason: "key_store_failed" };
+      facts = {
+        kind: "missing",
+        reason: "key_store_failed",
+        signedOut: await signOutMarked(),
+      };
     }
     // A later read was published already; this one is older.
     if (sequence < publishedSequence) {
@@ -890,13 +946,18 @@ export function createDeviceSession(
       try {
         hasKey = await deps.keyStore.hasKey();
       } catch (error) {
-        return { kind: "missing", ...keyFailureFacts(error) };
+        return {
+          kind: "missing",
+          ...keyFailureFacts(error),
+          signedOut: await signOutMarked(),
+        };
       }
       // Without a key file the key is lost: the next sign-in registers a new
       // device that names the record's device.
+      const signedOut = await signOutMarked();
       return hasKey
-        ? { kind: "key_not_loaded", record }
-        : { kind: "key_lost", record };
+        ? { kind: "key_not_loaded", record, signedOut }
+        : { kind: "key_lost", record, signedOut };
     }
     if (
       keys.previous !== null &&
@@ -914,7 +975,7 @@ export function createDeviceSession(
       }
       keys = deps.keyStore.keys();
       if (keys === null) {
-        return { kind: "key_lost", record };
+        return { kind: "key_lost", record, signedOut: await signOutMarked() };
       }
     }
     const named =
@@ -923,7 +984,7 @@ export function createDeviceSession(
     if (!named) {
       // Not the key of the record's device: a lost key too, so the next
       // sign-in registers a new device that names the record's device.
-      return { kind: "key_lost", record };
+      return { kind: "key_lost", record, signedOut: await signOutMarked() };
     }
     const marker = await readMarker(keys);
     return { kind: "ready", record, keys, marker };
@@ -943,6 +1004,22 @@ export function createDeviceSession(
       return (await deps.signOutMarkers.read()).kind !== "none";
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * Whether the person signed out, for facts that cannot apply the marker
+   * to the keys (#195): a marker exists, in the file or in memory. A marker
+   * that cannot be read counts, like a corrupt one.
+   */
+  async function signOutMarked(): Promise<boolean> {
+    if (unsavedMarker !== null) {
+      return true;
+    }
+    try {
+      return (await deps.signOutMarkers.read()).kind !== "none";
+    } catch {
+      return true;
     }
   }
 
@@ -1280,7 +1357,11 @@ export function createDeviceSession(
     forgetTokens();
     refusal = null;
     accountMismatch = false;
-    lastFacts = { kind: "key_lost", record: facts.record };
+    lastFacts = {
+      kind: "key_lost",
+      record: facts.record,
+      signedOut: facts.marker !== null,
+    };
     publish();
     try {
       await deps.keyStore.delete();

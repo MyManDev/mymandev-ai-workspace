@@ -210,9 +210,11 @@ const LoginSchema = z
 
 /**
  * The account that this installation holds, from its device record:
- * `signed_out` without one, and `hidden` while its device is signed out
- * (P-65, #195), when the record is kept but the status names no login,
- * display name, or device ID.
+ * `signed_out` without one, and `hidden` while the person is signed out on
+ * this device (P-65, #195), also when the device state names something else
+ * first, and while that is not known yet. The record is then kept, but the
+ * status names no login, display name, or device ID; after a refused
+ * sign-in with another account, `lastOutcome.deviceLogin` names the login.
  */
 export const AccountSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("signed_out") }),

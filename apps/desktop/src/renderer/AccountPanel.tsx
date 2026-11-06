@@ -177,6 +177,11 @@ function AccountBody(props: AccountPanelContentProps) {
 }
 
 function AccountSummary({ status }: { readonly status: AccountStatus }) {
+  if (status.account.kind === "hidden" && status.device === "starting") {
+    // The main process does not know yet whether the person signed out
+    // (#195); "Checking this device." says what happens.
+    return null;
+  }
   // Also while the device is signed out: the main process then names no
   // account (`hidden`, #195).
   if (status.account.kind !== "signed_in") {

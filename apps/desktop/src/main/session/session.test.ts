@@ -2288,6 +2288,72 @@ describe("sign-out", () => {
       reason: "signed_out",
     });
   });
+
+  test("the states before signed_out say that the person signed out while the marker exists (#195)", async () => {
+    const h = harness();
+    await existingDevice(h);
+    // Without a sign-out, a key that waits for its passphrase says nothing.
+    const before = harness(h.api);
+    await before.session.refresh();
+    expect(before.session.state().kind).toBe("key_not_loaded");
+    expect(before.session.state()).not.toHaveProperty("signedOut");
+    expect(await h.session.signOut()).toEqual({ ok: true, value: "reported" });
+
+    // After a restart, before the passphrase.
+    const locked = harness(h.api);
+    await locked.session.refresh();
+    expect(locked.session.state()).toMatchObject({
+      kind: "key_not_loaded",
+      account: { login: "octocat" },
+      signedOut: true,
+    });
+    // A marker that cannot be read counts.
+    const unreadable = harness(h.api, {
+      signOutMarkers: {
+        read: () => Promise.reject(new Error("unreadable")),
+        write: () => h.markers.write({ publicKeys: [], reported: true }),
+        delete: () => h.markers.delete(),
+      },
+    });
+    await unreadable.session.refresh();
+    expect(unreadable.session.state()).toMatchObject({
+      kind: "key_not_loaded",
+      signedOut: true,
+    });
+    // A key store that fails.
+    const failing = harness(h.api, {
+      keyStore: {
+        hasKey: () => Promise.reject(new Error("key store")),
+        keys: () => null,
+        confirmReplacement: () => Promise.resolve(),
+        abandonReplacement: () => Promise.resolve(),
+        delete: () => Promise.resolve(),
+      },
+    });
+    await failing.session.refresh();
+    expect(failing.session.state()).toEqual({
+      kind: "unavailable",
+      reason: "key_store_failed",
+      signedOut: true,
+    });
+    // A refused sign-in with another GitHub account.
+    expect(
+      await h.session.signInFinished({
+        kind: "refused",
+        code: "device_account_mismatch",
+      }),
+    ).toMatchObject({ kind: "account_mismatch", signedOut: true });
+    // A lost key.
+    await h.keyStore.delete();
+    const lost = harness(h.api);
+    await lost.keyStore.load();
+    await lost.session.refresh();
+    expect(lost.session.state()).toMatchObject({
+      kind: "key_lost",
+      account: { login: "octocat" },
+      signedOut: true,
+    });
+  });
 });
 
 describe("outcomes of the sign-in flow", () => {

@@ -409,6 +409,46 @@ test("while the device is signed out, the panel names no account and no earlier 
   }
 });
 
+test("a hidden account says nothing about the sign-in while the device is checked, and a refused sign-in after a sign-out names the login only (#195)", () => {
+  const starting = known({ account: { kind: "hidden" }, device: "starting" });
+  const html = render({ view: starting });
+
+  expect(html).not.toContain("Not signed in.");
+  expect(html).toContain(
+    `<p class="account-message" role="status">${DEVICE_STATE_MESSAGES.starting}</p>`,
+  );
+  expect(clickEveryButton({ view: starting })).toEqual([
+    ["This is not me", ["onForget"]],
+  ]);
+
+  // A signed-out device whose key waits for its passphrase.
+  const locked = render({
+    view: known({
+      account: { kind: "hidden" },
+      deviceKey: "passphrase_required",
+      device: "key_not_loaded",
+    }),
+  });
+  expect(locked).toContain("<p>Not signed in.</p>");
+  expect(locked).toContain('type="password"');
+  expect(locked).toContain(">This is not me</button>");
+
+  // A sign-in with another GitHub account after a sign-out.
+  const mismatch = render({
+    view: known({
+      account: { kind: "hidden" },
+      device: "account_mismatch",
+      lastOutcome: { code: "device_account_mismatch", deviceLogin: "octocat" },
+    }),
+  });
+  expect(mismatch).toContain("<p>Not signed in.</p>");
+  expect(mismatch).toContain(
+    "This installation belongs to the GitHub account octocat. Sign in with that account.",
+  );
+  expect(mismatch).not.toContain("account-facts");
+  expect(mismatch).not.toContain("The Octocat");
+});
+
 test("every outcome has a fixed message, announced as an alert unless it is a success or a cancel", () => {
   for (const code of SIGN_IN_OUTCOME_CODES) {
     if (code === "signed_in") {

@@ -38,6 +38,17 @@ export function deviceStateOf(state: DeviceSessionState): DeviceState {
   }
 }
 
+/**
+ * Whether the person signed out on this device (P-65): `signed_out`, and
+ * the states that come before it while a sign-out marker exists (#195).
+ */
+export function signedOutOf(state: DeviceSessionState): boolean {
+  return (
+    state.kind === "signed_out" ||
+    ("signedOut" in state && state.signedOut === true)
+  );
+}
+
 /** The API's codes that the screens explain on their own. */
 const API_CODES: Readonly<Partial<Record<ApiErrorCode, DeviceActionFailure>>> =
   Object.freeze({

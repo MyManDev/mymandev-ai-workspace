@@ -17,6 +17,7 @@ import {
   REMOVE_DEVICE_CONFIRMATION,
   removeDeviceConfirmationMessage,
   removeDeviceConfirmed,
+  signedOutOf,
 } from "./account-session.ts";
 import {
   type DeviceSessionState,
@@ -70,6 +71,34 @@ test("every state of the session has its own device state code, and an unknown o
   ]);
   expect([...codes].sort()).toEqual([...DEVICE_STATES].sort());
   expect(deviceStateOf({ kind: "paused" } as never)).toBe("unavailable");
+});
+
+test("the person signed out in signed_out and in every state that says so before it (#195)", () => {
+  const signedOut: DeviceSessionState[] = [
+    { kind: "signed_out", account: ACCOUNT, reportPending: false },
+    { kind: "signed_out", account: ACCOUNT, reportPending: true },
+    { kind: "key_not_loaded", account: ACCOUNT, signedOut: true },
+    { kind: "key_lost", account: ACCOUNT, signedOut: true },
+    { kind: "unavailable", reason: "key_store_failed", signedOut: true },
+    { kind: "account_mismatch", account: ACCOUNT, signedOut: true },
+  ];
+  const not: DeviceSessionState[] = [
+    { kind: "starting" },
+    { kind: "no_device" },
+    { kind: "key_not_loaded", account: ACCOUNT },
+    { kind: "key_lost", account: ACCOUNT },
+    { kind: "unavailable", reason: "record_unreadable" },
+    { kind: "signed_in", account: ACCOUNT },
+    { kind: "sign_in_required", account: ACCOUNT },
+    { kind: "auth_failed", account: ACCOUNT },
+    { kind: "account_mismatch", account: ACCOUNT },
+    { kind: "removal_pending", account: ACCOUNT },
+    { kind: "removed" },
+    { kind: "revoked" },
+  ];
+
+  expect(signedOut.map(signedOutOf)).toEqual(signedOut.map(() => true));
+  expect(not.map(signedOutOf)).toEqual(not.map(() => false));
 });
 
 test("every failure of the session maps to a fixed code, an API code the screens explain to itself, and any other to refused", () => {

@@ -382,6 +382,7 @@ test("a status that breaks the contract is not sent, and the failure is reported
 const API_ORIGIN = "https://api.mymandev.example";
 const SIGN_IN_CODE = "mmdc_ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8";
 const SECOND_CODE = "mmdc_QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWY";
+const MISMATCH_CODE = "mmdc_bWlzbWF0Y2gtbWlzbWF0Y2gtbWlzbWF0Y2gtbWlzbWE";
 const DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3" as DeviceId;
 const USER_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a4" as UserId;
 
@@ -974,6 +975,8 @@ function deviceApi() {
     tokenGate: null as Promise<void> | null,
     /** Called when a request arrives. */
     onRequest: null as ((route: string) => void) | null,
+    /** Refuses every sign-in as another GitHub account's. */
+    accountMismatch: false,
   };
   const nonces = new Map<string, string>();
   const fetch = async (url: string, init: RequestInit): Promise<Response> => {
@@ -995,6 +998,9 @@ function deviceApi() {
       }
       if (api.revokedReason !== null) {
         return refusal("device_revoked");
+      }
+      if (api.accountMismatch) {
+        return refusal("device_account_mismatch");
       }
       api.publicKey = request.device.publicKey;
       api.signedOut = false;
@@ -1158,7 +1164,10 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     answers.push(answer);
     return answer;
   };
-  const signIn = async (code: string) => {
+  const signIn = async (
+    code: string,
+    outcome: AccountStatus["lastOutcome"] = { code: "signed_in" },
+  ) => {
     clock += SIGN_IN_START_COOLDOWN_MS;
     const before = service.status().revision;
     await expect(invoke(INVOKE_CHANNELS.startSignIn)).resolves.toEqual({
@@ -1175,7 +1184,7 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
         }).toString(),
       ),
     ).toBe(200);
-    expect((await done).lastOutcome).toEqual({ code: "signed_in" });
+    expect((await done).lastOutcome).toEqual(outcome);
   };
   const device = async () =>
     ((await invoke(INVOKE_CHANNELS.getAccountStatus)) as AccountStatus).device;
@@ -1231,6 +1240,7 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   for (const detail of ["octocat", "The Octocat", DEVICE_ID, '"signed_in"']) {
     expect(sentSignedOut).not.toContain(detail);
   }
+
   const routesAfterSignOut = api.routes.length;
   clock += LIST_DEVICES_COOLDOWN_MS;
   await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toEqual({
@@ -1242,6 +1252,79 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     reason: "signed_out",
   });
   expect(api.routes.length).toBe(routesAfterSignOut);
+
+  // A restart whose key cannot be decrypted: the session names the key
+  // before the sign-out, and no status names the account either, also while
+  // the session starts.
+  const lockedKeyStore = createDeviceKeyStore({
+    folder,
+    platform: "win32",
+    systemProtection: {
+      isAsyncEncryptionAvailable: () => Promise.resolve(true),
+      getSelectedStorageBackend: () => "unknown",
+      encryptStringAsync: () => Promise.reject(new Error("locked")),
+      decryptStringAsync: () => Promise.reject(new Error("locked")),
+    },
+  });
+  const restarted = createAccountService({
+    apiOrigin: { ok: true, origin: API_ORIGIN },
+    openSystem: () => ({
+      keyStore: lockedKeyStore,
+      deviceRecords: records,
+      registrationMarkers: createRegistrationMarkerStore({
+        folder,
+        platform: "win32",
+      }),
+      createFlow: () => {
+        throw new Error("No sign-in after this restart.");
+      },
+      createSession: () => sessionOver(folder, lockedKeyStore, records, fetch),
+    }),
+    focusWindow: () => undefined,
+    confirmForget: async () => false,
+    confirmRemoveDevice: async () => false,
+  });
+  const restartedStatuses: AccountStatus[] = [];
+  restarted.onStatusChange((status) => restartedStatuses.push(status));
+  await restarted.initialize();
+  expect(restartedStatuses.map((status) => status.device)).toEqual([
+    "starting",
+    "key_not_loaded",
+  ]);
+  expect(restarted.status()).toMatchObject({
+    account: { kind: "hidden" },
+    lastOutcome: null,
+  });
+  const sentAfterRestart = JSON.stringify(restartedStatuses);
+  for (const detail of ["octocat", "The Octocat", DEVICE_ID]) {
+    expect(sentAfterRestart).not.toContain(detail);
+  }
+
+  // A sign-in with another GitHub account: the outcome names the login of
+  // the installation's account, and nothing names its name or device ID.
+  api.accountMismatch = true;
+  const sentBeforeMismatch = subscriber.sent.length;
+  await signIn(MISMATCH_CODE, {
+    code: "device_account_mismatch",
+    deviceLogin: "octocat",
+  });
+  await expect(invoke(INVOKE_CHANNELS.getAccountStatus)).resolves.toMatchObject(
+    { account: { kind: "hidden" }, device: "account_mismatch" },
+  );
+  const sentMismatch = JSON.stringify(
+    subscriber.sent.slice(sentBeforeMismatch),
+  );
+  for (const detail of ["The Octocat", DEVICE_ID]) {
+    expect(sentMismatch).not.toContain(detail);
+  }
+  api.accountMismatch = false;
+  // Removing the device is refused without asking, also after the refused
+  // sign-in.
+  await expect(invoke(INVOKE_CHANNELS.removeDevice)).resolves.toEqual({
+    outcome: "failed",
+    reason: "signed_out",
+  });
+  expect(confirmed).toEqual([]);
 
   // Sign in again: the same device with a new key, signed in once more.
   await signIn(SECOND_CODE);
@@ -1289,13 +1372,16 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   const requests = api.signInBodies.map((body) =>
     SignInRequestSchema.parse(JSON.parse(body)),
   );
+  // The refused sign-in with another account sent the existing device too.
   expect(requests.map((request) => request.device.kind)).toEqual([
     "new",
+    "existing",
     "existing",
   ]);
   const secrets = [
     SIGN_IN_CODE,
     SECOND_CODE,
+    MISMATCH_CODE,
     ...requests.map((request) => request.codeVerifier),
     ...requests.map((request) => request.device.publicKey),
     ...api.issued,
@@ -1307,9 +1393,9 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     ...encrypted.map((pkcs8) => Buffer.from(pkcs8, "base64").toString("hex")),
   ];
   // A token before the sign-out and one after the second sign-in; the
-  // signatures of both sign-ins (three) and of both tokens.
+  // signatures of the three sign-ins (five) and of both tokens.
   expect(api.issued).toHaveLength(2);
-  expect(api.signatures).toHaveLength(5);
+  expect(api.signatures).toHaveLength(7);
   expect(secrets.every((secret) => secret.length >= 32)).toBe(true);
   const sent = JSON.stringify([subscriber.sent, answers]);
   expect(subscriber.sent.length).toBeGreaterThanOrEqual(10);
