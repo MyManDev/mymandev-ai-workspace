@@ -32,6 +32,7 @@ import {
 } from "./access.ts";
 import { registerAgentRoutes } from "./agent-routes.ts";
 import { registerChatRoutes } from "./chat-routes.ts";
+import { registerClaimRoutes } from "./claim-routes.ts";
 import type { AccountFrameHandler, WorkspaceEventHandler } from "./events.ts";
 import { registerInvitationCodeRoutes } from "./invitation-code-routes.ts";
 import { registerInvitationRoutes } from "./invitation-routes.ts";
@@ -73,7 +74,8 @@ export type WorkspaceRouteOptions = Readonly<{
  * Workspaces and the people in them (ADR 0014, "People and roles", "Join
  * requests", and "What a workspace ID allows"): the account's workspaces,
  * creating one, the view of one, its limit of unclaimed people, its people,
- * their invitations, its join requests, and its projects (#155); previewing
+ * their invitations, its join requests, its recent claims (#208), and its
+ * projects (#155); previewing
  * and accepting an invitation code; the account's own join requests; and
  * the routes under `/projects/:projectId`, such as a project's chat history
  * (#27).
@@ -224,6 +226,8 @@ export async function registerWorkspaceRoutes(
       registerInvitationRoutes(workspace, { database, now: options.now });
 
       registerJoinRequestRoutes(workspace, joinRequests);
+
+      registerClaimRoutes(workspace, { database });
 
       registerProjectRoutes(workspace, {
         database,

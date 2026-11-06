@@ -349,6 +349,7 @@ test("on every route under /workspaces/:workspaceId, a non-member gets the answe
     "listJoinRequests",
     "approveJoinRequest",
     "denyJoinRequest",
+    "listClaims",
     "listProjects",
     "createProject",
     "renameProject",
