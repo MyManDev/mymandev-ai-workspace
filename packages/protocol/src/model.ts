@@ -140,7 +140,9 @@ export type IdentityProvider = (typeof IDENTITY_PROVIDERS)[number];
 
 /**
  * Reason codes in `reason` when the server cancels a run with a `system`
- * actor (P-60). The desktop shows a known code as its own text.
+ * actor (P-60). The desktop shows a known code as its own text. They are
+ * the server's alone: it refuses an agent's transition with one of them
+ * with `event.refused` and `conflict` (`runReasonAllowed`, #201).
  */
 export const RUN_CANCEL_REASONS = Object.freeze([
   "member_removed",
@@ -208,7 +210,9 @@ export type WorkspaceUnsubscribeReason =
  *   probe which IDs exist (ADR 0007, ADR 0014).
  * - `conflict`: what the event names exists in the workspace, but is not in
  *   the state that the event needs, for example a run whose stored state is
- *   not `previousState`, an archived project, or a disabled agent.
+ *   not `previousState`, an archived project, or a disabled agent. Also an
+ *   agent's run transition whose `reason` is a code of `RUN_CANCEL_REASONS`,
+ *   which only the server gives (`runReasonAllowed`, #201).
  * - `rate_limited`: the device sent more events than the server's send
  *   limit allows. The limit's values are decided with the API part of #27.
  *

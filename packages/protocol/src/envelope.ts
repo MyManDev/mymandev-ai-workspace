@@ -19,7 +19,12 @@ import {
   UserIdSchema,
   WorkspaceIdSchema,
 } from "./ids.ts";
-import { canTransition, LIMITS, PROTOCOL_VERSION } from "./model.ts";
+import {
+  canTransition,
+  LIMITS,
+  PROTOCOL_VERSION,
+  RUN_CANCEL_REASONS,
+} from "./model.ts";
 import { WorkspaceProjectSchema } from "./project-api.ts";
 
 /**
@@ -72,7 +77,8 @@ export const envelopeHeaderShape = Object.freeze({
  * and event ID, and receivers never de-duplicate relayed run events by
  * event ID alone. A transition whose device and event ID the server already
  * recorded gets the relayed event again, sent only to the sending
- * connection, and is never applied twice.
+ * connection, and is never applied twice. A `reason` that is a code of
+ * `RUN_CANCEL_REASONS` comes only from the server (`runReasonAllowed`).
  */
 export const AgentRunStateChangedPayloadSchema = z
   .object({
@@ -348,6 +354,7 @@ export function actorAllowed(event: ProtocolEvent): boolean {
     case "agent.run.state_changed":
       // The server (system) creates runs; afterwards only the run's agent
       // reports transitions. The server relays them with deviceId null.
+      // Which actor may give which reason is `runReasonAllowed`.
       return (
         event.actor.kind === "system" ||
         (event.actor.kind === "agent" &&
@@ -368,4 +375,26 @@ export function actorAllowed(event: ProtocolEvent): boolean {
       // A person sends from one of their devices; identity binding checks both.
       return event.actor.kind === "user" && event.deviceId !== null;
   }
+}
+
+/**
+ * Whether a run transition's `reason` fits its actor (#201). A code of
+ * `RUN_CANCEL_REASONS` says that the server cancelled the run because a
+ * device was revoked or a person was removed, so only a `system` actor may
+ * give one; an agent may give any other reason, in any state. The decoders
+ * do not apply this rule, unlike `actorAllowed`, because a decode error
+ * closes the connection: the server answers an agent's transition with
+ * such a reason with `event.refused` and `conflict`, stores and relays
+ * nothing, and the connection stays open.
+ */
+export function runReasonAllowed(
+  event: Pick<AgentRunStateChangedEvent, "actor" | "payload">,
+): boolean {
+  const { reason } = event.payload;
+  const reserved: readonly string[] = RUN_CANCEL_REASONS;
+  return (
+    event.actor.kind === "system" ||
+    reason === undefined ||
+    !reserved.includes(reason)
+  );
 }
