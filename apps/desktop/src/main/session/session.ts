@@ -371,6 +371,17 @@ export interface DeviceSession {
    */
   readonly removalAsksApi: () => Promise<boolean>;
   /**
+   * While the grace period of an uncertain sign-in protects the new key of
+   * a pending replacement (`REPLACEMENT_GRACE_MS`): when it ends, in UTC,
+   * by this device's wall clock; null otherwise. Until then the sign-in
+   * flow's `replacement_pending` cannot be resolved, so a new sign-in
+   * cannot start (#199). Null also while a first refusal of both keys is
+   * noted: the replacement then stays pending until the wait for a second
+   * round ends (`LOST_KEY_WAIT_MS`), which can be later. It sends no
+   * request and changes no rule of the grace period. Never rejects.
+   */
+  readonly replacementGraceEnd: () => Promise<string | null>;
+  /**
    * Signs the WebSocket `auth.challenge` with the purpose `ws` and the
    * current key, and returns the `auth.response` frame for #26. It sends no
    * request. Refused while signed out, while a removal is pending, while
@@ -1923,6 +1934,41 @@ export function createDeviceSession(
       : succeeded(Object.freeze(result.value.devices));
   }
 
+  async function replacementGraceEnd(): Promise<string | null> {
+    try {
+      return await exclusive(async () => {
+        if (gone !== null) {
+          return null;
+        }
+        const facts = await readFacts();
+        if (facts.kind !== "ready" || !replacementToResolve(facts)) {
+          return null;
+        }
+        const held = await loadNotes();
+        const note = held.uncertainSignIn;
+        if (
+          note === null ||
+          !graceActive(facts, held) ||
+          // After a first refusal of both keys, the replacement stays
+          // pending after the grace period too, until the wait for a second
+          // round (`LOST_KEY_WAIT_MS`) ends, so the end of the grace period
+          // is not when a new sign-in can start.
+          keysRefusedNote(facts, held) !== null
+        ) {
+          return null;
+        }
+        // The grace period ends when both clocks say so (`noteAge` with
+        // `least`), so what is left of it counts from the smaller age. The
+        // monotonic clock counts fractions of a millisecond, so the end is
+        // rounded up: never before the grace period ends.
+        const left = REPLACEMENT_GRACE_MS - noteAge("grace", note.at, "least");
+        return new Date(Math.ceil(wallClock() + left)).toISOString();
+      });
+    } catch {
+      return null;
+    }
+  }
+
   // ---- WebSocket ---------------------------------------------------------
 
   async function signWebSocketChallenge(
@@ -2089,6 +2135,7 @@ export function createDeviceSession(
     reportSignOut,
     removeDevice,
     removalAsksApi,
+    replacementGraceEnd,
     signWebSocketChallenge,
     deviceRefused,
   });

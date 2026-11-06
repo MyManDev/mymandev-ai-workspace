@@ -90,6 +90,7 @@ export type AccountSession = Pick<
   | "reportSignOut"
   | "removeDevice"
   | "removalAsksApi"
+  | "replacementGraceEnd"
   | "signWebSocketChallenge"
   | "deviceRefused"
   | "request"
@@ -1004,6 +1005,24 @@ export function createAccountService(
     }
   }
 
+  /**
+   * A `replacement_pending` view with the end of the grace period of an
+   * uncertain sign-in as `retryAfter`, while it runs (#199); the view as it
+   * is otherwise, also when the session fails.
+   */
+  async function withRetryAfter(
+    view: SignInOutcomeView,
+    held: AccountSession,
+  ): Promise<SignInOutcomeView> {
+    let end: string | null;
+    try {
+      end = await held.replacementGraceEnd();
+    } catch {
+      end = null;
+    }
+    return end === null ? view : Object.freeze({ ...view, retryAfter: end });
+  }
+
   /** Records how a started sign-in ended. */
   async function finish(
     opened: AccountSystem,
@@ -1085,10 +1104,16 @@ export function createAccountService(
         started = await startFlow(opened, held, current, openBrowser);
       }
       if (started === null || !started.started) {
-        const view =
+        const refusedView =
           started === null
             ? Object.freeze({ code: "failed" as const })
             : signInOutcomeView(started.outcome);
+        // #199: a start refused during the grace period of an uncertain
+        // sign-in says when a new sign-in can start.
+        const view =
+          refusedView.code === "replacement_pending" && held !== null
+            ? await withRetryAfter(refusedView, held)
+            : refusedView;
         // A start that failed may have written a record that the flow kept
         // or deleted a leftover key.
         accountReads += 1;

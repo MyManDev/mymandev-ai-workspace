@@ -29,10 +29,14 @@ import {
   offersForget,
   offersSignIn,
   removeDeviceMessage,
+  signInRetryAt,
+  signInRetryNote,
+  signInTimeFormat,
   signOutMessage,
   startInAnotherBrowser,
   startMessage,
   waitingPairingCode,
+  watchSignInRetry,
   type AccountView,
 } from "./account-view.ts";
 
@@ -90,6 +94,14 @@ export interface AccountPanelContentProps {
   /** The main process confirms the removal in a native dialog. */
   readonly onRemoveDevice: () => void;
   readonly onListDevices: () => void;
+  /**
+   * The renderer's clock in milliseconds. The panel reads it again when the
+   * wait after a start refused during the grace period of an uncertain
+   * sign-in ends, so that its note goes away (#199).
+   */
+  readonly now: number;
+  /** The format of that note's local time; the system's by default. */
+  readonly timeFormat?: Intl.DateTimeFormat | undefined;
 }
 
 export function AccountPanelContent(props: AccountPanelContentProps) {
@@ -119,6 +131,11 @@ function AccountBody(props: AccountPanelContentProps) {
     status.lastOutcome === null || status.signIn.kind !== "idle"
       ? undefined
       : describeOutcome(status.lastOutcome);
+  const retryNote = signInRetryNote(
+    status,
+    props.now,
+    props.timeFormat ?? signInTimeFormat(),
+  );
   const deviceState =
     status.signIn.kind === "idle"
       ? describeDeviceState(status.device)
@@ -160,6 +177,11 @@ function AccountBody(props: AccountPanelContentProps) {
           ) : (
             outcome.text
           )}
+        </p>
+      )}
+      {retryNote === undefined ? null : (
+        <p className="account-message" role="status">
+          {retryNote}
         </p>
       )}
       {message === undefined ? null : (
@@ -571,6 +593,14 @@ function useAccountPanel(
   const anotherBrowserReady =
     waitingCode !== undefined && replaceable === waitingCode;
 
+  // #199: the clock is read again when the wait after a start refused
+  // during the grace period of an uncertain sign-in ends, so that the
+  // panel's note goes away then (`watchSignInRetry`).
+  const [now, setNow] = useState(() => Date.now());
+  const retryAt =
+    view.kind === "known" ? signInRetryAt(view.status) : undefined;
+  useEffect(() => watchSignInRetry(retryAt, now, setNow), [retryAt, now]);
+
   /** Runs one action at a time and shows the message that its result names. */
   const run = useCallback(
     <T,>(
@@ -688,6 +718,7 @@ function useAccountPanel(
     onUseAnotherBrowser,
     anotherBrowser,
     anotherBrowserReady,
+    now,
     onCancelSignIn,
     onUnlock,
     onForget,

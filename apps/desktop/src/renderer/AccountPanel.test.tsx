@@ -15,7 +15,12 @@ import {
   DEVICE_KEY_PROBLEM_MESSAGES,
   DEVICE_STATE_MESSAGES,
   SIGN_IN_OUTCOME_MESSAGES,
+  signInTimeFormat,
 } from "./account-view.ts";
+
+/** The panel's clock in the tests, and a time format that does not depend on the machine. */
+const NOW = Date.parse("2026-11-06T10:00:00.000Z");
+const UTC_TIME = signInTimeFormat({ locale: "en-GB", timeZone: "UTC" });
 
 const AUTHORIZE_URL =
   "https://api.mymandev.example/auth/github/authorize?code_challenge=abc&state=def";
@@ -80,6 +85,8 @@ function props(
     onSignOut: record("onSignOut"),
     onRemoveDevice: record("onRemoveDevice"),
     onListDevices: record("onListDevices"),
+    now: NOW,
+    timeFormat: UTC_TIME,
     ...overrides,
   };
 }
@@ -529,6 +536,78 @@ test("a refused action and a pending key replacement are shown", () => {
   expect(html).toContain(
     '<p class="placeholder-note">The device key of the last sign-in is not confirmed yet.</p>',
   );
+});
+
+test("a start refused during the grace period of an uncertain sign-in shows when a new sign-in can start, until then (#199)", () => {
+  const refusal = `<p class="panel-message" role="alert">${SIGN_IN_OUTCOME_MESSAGES.replacement_pending}</p>`;
+  const note =
+    '<p class="account-message" role="status">A new sign-in can start after 10:10. Try again then.</p>';
+  const graced = known({
+    ...SIGNED_IN,
+    replacementPending: true,
+    lastOutcome: {
+      code: "replacement_pending",
+      retryAfter: "2026-11-06T10:09:30.000Z",
+    },
+  });
+
+  // Next to the refusal, in the local time of the format.
+  const html = render({ view: graced });
+  expect(html).toContain(refusal + note);
+  expect(
+    render({
+      view: graced,
+      timeFormat: signInTimeFormat({ locale: "en-GB", timeZone: "Asia/Tokyo" }),
+    }),
+  ).toContain("A new sign-in can start after 19:10. Try again then.");
+  expect(render({ view: graced, now: NOW + 9 * 60_000 + 29_999 })).toContain(
+    note,
+  );
+
+  // The note goes away when the period ends; the refusal stays.
+  for (const now of [Date.parse("2026-11-06T10:09:30.000Z"), NOW + 3_600_000]) {
+    const ended = render({ view: graced, now });
+    expect(ended).toContain(refusal);
+    expect(ended).not.toContain("A new sign-in can start");
+  }
+
+  // No note without the time, or while a sign-in runs.
+  const plain = render({
+    view: known({
+      ...SIGNED_IN,
+      replacementPending: true,
+      lastOutcome: { code: "replacement_pending" },
+    }),
+  });
+  expect(plain).toContain(refusal);
+  expect(plain).not.toContain("A new sign-in can start");
+  // Nor once the replacement is no longer pending, for example when it was
+  // resolved before that time.
+  const resolved = render({
+    view: known({
+      ...SIGNED_IN,
+      replacementPending: false,
+      lastOutcome: {
+        code: "replacement_pending",
+        retryAfter: "2026-11-06T10:09:30.000Z",
+      },
+    }),
+  });
+  expect(resolved).toContain(refusal);
+  expect(resolved).not.toContain("A new sign-in can start");
+  expect(
+    render({
+      view: known({
+        ...SIGNED_IN,
+        replacementPending: true,
+        signIn: { kind: "starting" },
+        lastOutcome: {
+          code: "replacement_pending",
+          retryAfter: "2026-11-06T10:09:30.000Z",
+        },
+      }),
+    }),
+  ).not.toContain("A new sign-in can start");
 });
 
 test("logins, names, URLs, and warnings are rendered as text, not as markup, and no style attribute is used", () => {
