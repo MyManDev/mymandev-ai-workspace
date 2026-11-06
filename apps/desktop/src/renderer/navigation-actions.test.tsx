@@ -206,7 +206,12 @@ test("each side panel tab selects its panel", () => {
   const { dispatch, take } = recorder();
 
   for (const panel of PANEL_IDS) {
-    expect(clickEveryButton(ProjectPanel({ panel, dispatch }), take)).toEqual([
+    expect(
+      clickEveryButton(
+        ProjectPanel({ panel, projectId: "project-a", dispatch }),
+        take,
+      ),
+    ).toEqual([
       ["Agents", [{ type: "show-panel", panel: "agents" }]],
       ["Repositories", [{ type: "show-panel", panel: "repositories" }]],
     ]);
@@ -218,9 +223,9 @@ function pressKey(
   key: string,
 ): { actions: ShellAction[]; focused: string[]; prevented: boolean } {
   const { dispatch, take } = recorder();
-  const tablist = elementsOf(ProjectPanel({ panel, dispatch })).find(
-    (element) => element.props.role === "tablist",
-  );
+  const tablist = elementsOf(
+    ProjectPanel({ panel, projectId: "project-a", dispatch }),
+  ).find((element) => element.props.role === "tablist");
   const focused: string[] = [];
   let prevented = false;
   tablist?.props.onKeyDown?.({

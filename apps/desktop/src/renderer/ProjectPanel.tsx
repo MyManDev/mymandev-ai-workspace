@@ -1,5 +1,9 @@
 import type { Dispatch, KeyboardEvent } from "react";
-import type { RepositoryBridge } from "../shared/desktop-bridge.ts";
+import type {
+  AgentBridge,
+  RepositoryBridge,
+} from "../shared/desktop-bridge.ts";
+import { AgentPanel } from "./AgentPanel.tsx";
 import { RepositoryPanel } from "./RepositoryPanel.tsx";
 import {
   PANEL_IDS,
@@ -44,17 +48,23 @@ export function panelForKey(
  * The side panel of the open project, beside its screens: its agents or its
  * repositories, chosen with tabs. Only the selected tab is in the tab order;
  * the arrow keys, Home, and End select another tab and move the focus to it.
- * The agents are placeholder content: agent execution comes in a later
- * milestone. The repositories are the ones mounted on this device; a mount
- * is not linked to a project yet, so every project shows the same ones.
+ * The agents are the open project's agents and runs, read-only. The
+ * repositories are the ones mounted on this device; a mount is not linked
+ * to a project yet, so every project shows the same ones.
  */
 export function ProjectPanel({
   panel,
+  projectId,
   dispatch,
+  agents,
   repositories,
 }: {
   readonly panel: PanelId;
+  /** The open project. */
+  readonly projectId: string;
   readonly dispatch: Dispatch<ShellAction>;
+  /** The agent functions from the preload script; undefined outside Electron. */
+  readonly agents?: AgentBridge | undefined;
   /** The repository functions from the preload script; undefined outside Electron. */
   readonly repositories?: RepositoryBridge | undefined;
 }) {
@@ -105,24 +115,11 @@ export function ProjectPanel({
         tabIndex={0}
       >
         {panel === "agents" ? (
-          <AgentPanel />
+          <AgentPanel agents={agents} projectId={projectId} />
         ) : (
           <RepositoryPanel repositories={repositories} />
         )}
       </div>
     </aside>
-  );
-}
-
-function AgentPanel() {
-  return (
-    <>
-      <h2 id="panel-title">Agents</h2>
-      <p>No agents yet.</p>
-      <p className="placeholder-note">
-        The agents of this project, with their owner, their device, and what
-        they are working on, appear here.
-      </p>
-    </>
   );
 }

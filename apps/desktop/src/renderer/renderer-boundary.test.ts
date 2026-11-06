@@ -169,6 +169,8 @@ test("the checks read every renderer source and no test", () => {
   for (const file of [
     "./AccountPanel.tsx",
     "./account-view.ts",
+    "./AgentPanel.tsx",
+    "./agent-view.ts",
     "./App.tsx",
     "./connection-status.ts",
     "./main.tsx",
