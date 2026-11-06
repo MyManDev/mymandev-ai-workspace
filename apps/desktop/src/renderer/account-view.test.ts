@@ -33,6 +33,9 @@ import {
   offersSignIn,
   removeDeviceMessage,
   SIGN_IN_OUTCOME_MESSAGES,
+  signInRetryAt,
+  signInRetryNote,
+  signInTimeFormat,
   signOutMessage,
   startInAnotherBrowser,
   startMessage,
@@ -57,6 +60,74 @@ const WAITING: AccountStatus = {
   signIn: { kind: "waiting", pairingCode: "042137", opened: true },
   lastOutcome: null,
 };
+
+test("the time after which a new sign-in can start is the local time of day, in the system's zone and locale by default (#199)", () => {
+  const at = Date.parse("2026-11-06T09:30:00.000Z");
+  // A zone that is not UTC, so a fixed UTC zone fails here also on a
+  // machine whose zone is UTC.
+  expect(
+    signInTimeFormat({ locale: "en-GB", timeZone: "UTC" }).format(at),
+  ).toBe("09:30");
+  expect(
+    signInTimeFormat({ locale: "en-GB", timeZone: "Asia/Tokyo" }).format(at),
+  ).toBe("18:30");
+
+  // The defaults are the system's time zone and the person's locale.
+  const system = new Intl.DateTimeFormat().resolvedOptions();
+  const defaults = signInTimeFormat().resolvedOptions();
+  expect(defaults.timeZone).toBe(system.timeZone);
+  expect(defaults.locale).toBe(system.locale);
+  expect(defaults.timeStyle).toBe("short");
+  expect(defaults.dateStyle).toBeUndefined();
+  // Each call makes a new format, so a changed system zone is used.
+  expect(signInTimeFormat()).not.toBe(signInTimeFormat());
+});
+
+test("a start refused during the grace period of an uncertain sign-in has a note with the time, rounded up to the minute, until then (#199)", () => {
+  const utc = signInTimeFormat({ locale: "en-GB", timeZone: "UTC" });
+  const refused = (retryAfter?: string): AccountStatus => ({
+    ...IDLE,
+    replacementPending: true,
+    lastOutcome:
+      retryAfter === undefined
+        ? { code: "replacement_pending" }
+        : { code: "replacement_pending", retryAfter },
+  });
+  const now = Date.parse("2026-11-06T10:00:00.000Z");
+
+  const status = refused("2026-11-06T10:09:30.000Z");
+  expect(signInRetryAt(status)).toBe(Date.parse("2026-11-06T10:09:30.000Z"));
+  expect(signInRetryNote(status, now, utc)).toBe(
+    "A new sign-in can start after 10:10. Try again then.",
+  );
+  // A time on the minute is shown as it is.
+  expect(signInRetryNote(refused("2026-11-06T10:10:00.000Z"), now, utc)).toBe(
+    "A new sign-in can start after 10:10. Try again then.",
+  );
+  expect(signInRetryNote(refused("2026-11-06T10:10:00.001Z"), now, utc)).toBe(
+    "A new sign-in can start after 10:11. Try again then.",
+  );
+
+  // Until the time has come.
+  const at = Date.parse("2026-11-06T10:09:30.000Z");
+  expect(signInRetryNote(status, at - 1, utc)).toBeDefined();
+  expect(signInRetryNote(status, at, utc)).toBeUndefined();
+  expect(signInRetryNote(status, at + 60_000, utc)).toBeUndefined();
+
+  // Not without the time, while a sign-in runs, or for another outcome.
+  expect(signInRetryAt(refused())).toBeUndefined();
+  expect(signInRetryNote(refused(), now, utc)).toBeUndefined();
+  for (const signIn of [
+    { kind: "starting" },
+    { kind: "completing" },
+    WAITING.signIn,
+  ] as const) {
+    expect(signInRetryAt({ ...status, signIn })).toBeUndefined();
+    expect(signInRetryNote({ ...status, signIn }, now, utc)).toBeUndefined();
+  }
+  expect(signInRetryAt(IDLE)).toBeUndefined();
+  expect(signInRetryAt({ ...IDLE, lastOutcome: null })).toBeUndefined();
+});
 
 /** The start and cancel of the bridge, with answers that the test gives. */
 function fakeAccount() {

@@ -86,6 +86,67 @@ export interface OutcomeMessage {
   readonly text: string;
 }
 
+/** The options of `signInTimeFormat`; the tests fix them. */
+export interface SignInTimeFormatOptions {
+  /** Defaults to the person's locale. */
+  readonly locale?: string;
+  /** An IANA time zone such as "Europe/Istanbul"; defaults to the system's. */
+  readonly timeZone?: string;
+}
+
+/**
+ * The format of the time after which a new sign-in can start (#199): the
+ * local time of day, for example "14:32" or "2:32 PM". The panel makes a
+ * new one for each render, so that a changed time zone of the system shows
+ * at the next change.
+ */
+export function signInTimeFormat(
+  options: SignInTimeFormatOptions = {},
+): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat(options.locale, {
+    timeStyle: "short",
+    timeZone: options.timeZone,
+  });
+}
+
+/**
+ * When a start that was refused as `replacement_pending` during the grace
+ * period of an uncertain sign-in can be tried again, in milliseconds
+ * (#199): the outcome's `retryAfter`, while no sign-in runs; otherwise
+ * undefined.
+ */
+export function signInRetryAt(status: AccountStatus): number | undefined {
+  const outcome = status.lastOutcome;
+  if (
+    status.signIn.kind !== "idle" ||
+    outcome?.code !== "replacement_pending" ||
+    outcome.retryAfter === undefined
+  ) {
+    return undefined;
+  }
+  const at = Date.parse(outcome.retryAfter);
+  return Number.isNaN(at) ? undefined : at;
+}
+
+/**
+ * The note next to that refusal (#199): the local time after which a new
+ * sign-in can start, rounded up to the minute so that a start at the shown
+ * time is not refused, or undefined once that time has come (`now`, in
+ * milliseconds) or without one.
+ */
+export function signInRetryNote(
+  status: AccountStatus,
+  now: number,
+  format: Intl.DateTimeFormat,
+): string | undefined {
+  const at = signInRetryAt(status);
+  if (at === undefined || now >= at) {
+    return undefined;
+  }
+  const shown = new Date(Math.ceil(at / 60_000) * 60_000);
+  return `A new sign-in can start after ${format.format(shown)}. Try again then.`;
+}
+
 /** The message for the last outcome; the installation's login after an account mismatch. */
 export function describeOutcome(outcome: SignInOutcomeView): OutcomeMessage {
   const text =

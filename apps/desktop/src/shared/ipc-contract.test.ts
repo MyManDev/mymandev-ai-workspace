@@ -493,6 +493,12 @@ test("an account status with every sign-in state, outcome, and key state is acce
     accountStatus({
       lastOutcome: { code: "device_account_mismatch", deviceLogin: "hubot" },
     }),
+    accountStatus({
+      lastOutcome: {
+        code: "replacement_pending",
+        retryAfter: "2026-11-06T10:10:00.000Z",
+      },
+    }),
     ...SIGN_IN_OUTCOME_CODES.map((code) =>
       accountStatus({ lastOutcome: { code } }),
     ),
@@ -544,6 +550,22 @@ test("an account status keeps only the narrow fields", () => {
     /userId|publicKey|signInExpiresAt|mmdc_|verifier|mmda_|accessToken/,
   );
 
+  // The time after which a new sign-in can start (#199) comes alone.
+  expect(
+    AccountStatusSchema.parse({
+      ...accountStatus({}),
+      lastOutcome: {
+        code: "replacement_pending",
+        retryAfter: "2026-11-06T10:10:00.000Z",
+        publicKey: "ab".repeat(32),
+        deviceId: DEVICE_ID,
+      },
+    }).lastOutcome,
+  ).toEqual({
+    code: "replacement_pending",
+    retryAfter: "2026-11-06T10:10:00.000Z",
+  });
+
   // A hidden account (#195) carries nothing but its kind.
   expect(
     AccountStatusSchema.parse({
@@ -577,6 +599,31 @@ test("an account status with a wrong value is refused", () => {
     accountStatus({
       lastOutcome: { code: "device_account_mismatch", deviceLogin: "a b" },
     }),
+    // `retryAfter` (#199) belongs to `replacement_pending` only, and is a
+    // time in UTC.
+    ...SIGN_IN_OUTCOME_CODES.filter(
+      (code) => code !== "replacement_pending",
+    ).map((code) =>
+      accountStatus({
+        lastOutcome: { code, retryAfter: "2026-11-06T10:10:00.000Z" },
+      }),
+    ),
+    ...[
+      "2026-11-06T13:10:00.000+03:00",
+      "2026-11-06T10:10:00",
+      "2026-11-06",
+      "in 10 minutes",
+      "",
+      1_793_000_000_000,
+      null,
+    ].map((retryAfter) =>
+      accountStatus({
+        lastOutcome: {
+          code: "replacement_pending",
+          retryAfter: retryAfter as never,
+        },
+      }),
+    ),
     accountStatus({
       account: {
         kind: "signed_in",

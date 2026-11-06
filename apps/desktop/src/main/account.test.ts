@@ -185,6 +185,8 @@ interface Harness {
   keyDelete: () => Promise<void>;
   /** The answer of the native confirmation of removing this device. */
   confirmRemoval: (login: string) => Promise<boolean>;
+  /** What the session's `replacementGraceEnd` answers. */
+  graceEnd: () => Promise<string | null>;
   /** When set, every read of the record waits for it. */
   readGate: Promise<void> | null;
   /** How often local execution was stopped. */
@@ -250,6 +252,7 @@ function harness(
     markerDelete: async () => undefined,
     keyDelete: async () => undefined,
     confirmRemoval: async () => true,
+    graceEnd: async () => null,
     readGate: null,
     stopped: 0,
     sessionState: SESSION_SIGNED_IN,
@@ -319,6 +322,10 @@ function harness(
       removeDevice: async () => {
         state.log.push("session removeDevice");
         return state.removeDevice();
+      },
+      replacementGraceEnd: async () => {
+        state.log.push("session replacementGraceEnd");
+        return state.graceEnd();
       },
       signWebSocketChallenge: async () => {
         state.log.push("session signWebSocketChallenge");
@@ -1931,6 +1938,72 @@ test("a pending replacement that the authentication does not resolve is reported
       "The pending key replacement could not be resolved.",
     ]);
   }
+});
+
+test("a start refused during the grace period of an uncertain sign-in says when a new sign-in can start, and nothing else (#199)", async () => {
+  const GRACE_END = "2026-11-06T10:10:00.000Z";
+  const h = harness();
+  await h.service.initialize();
+  h.start = async () => REPLACEMENT_PENDING;
+  h.keyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: true,
+    passphraseRequired: false,
+  };
+  // The previous key authenticated during the grace period: both keys stay,
+  // and the replacement is not resolved.
+  h.authenticate = async () => ({ ok: true, value: SESSION_ACCOUNT });
+  h.graceEnd = async () => GRACE_END;
+  h.log.length = 0;
+
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "failed",
+    code: "replacement_pending",
+  });
+  expect(h.log.filter((step) => step.startsWith("session "))).toEqual([
+    "session signInStarted",
+    "session signInFinished failed replacement_pending",
+    "session authenticate",
+    "session replacementGraceEnd",
+  ]);
+  const status = h.service.status();
+  expect(status.lastOutcome).toEqual({
+    code: "replacement_pending",
+    retryAfter: GRACE_END,
+  });
+  expect(Object.isFrozen(status.lastOutcome)).toBe(true);
+  expect(AccountStatusSchema.parse(status)).toEqual(status);
+
+  // Once the grace period has ended, the session names no end, and the
+  // refusal stands alone; so it does when the session fails.
+  for (const graceEnd of [
+    async () => null,
+    () => Promise.reject(new Error("broken")),
+  ]) {
+    h.graceEnd = graceEnd;
+    await expect(h.service.startSignIn()).resolves.toEqual({
+      outcome: "failed",
+      code: "replacement_pending",
+    });
+    expect(h.service.status().lastOutcome).toEqual({
+      code: "replacement_pending",
+    });
+  }
+
+  // A start that is refused for another reason does not ask.
+  const other = harness();
+  await other.service.initialize();
+  other.start = async () => ({
+    started: false,
+    outcome: { kind: "failed", reason: "listener_unavailable" },
+  });
+  other.graceEnd = async () => GRACE_END;
+  await other.service.startSignIn();
+  expect(other.service.status().lastOutcome).toEqual({
+    code: "listener_unavailable",
+  });
+  expect(other.log).not.toContain("session replacementGraceEnd");
 });
 
 test("a cancel while the pending replacement is resolved starts nothing more", async () => {

@@ -313,14 +313,30 @@ export const SIGN_IN_OUTCOME_CODES = Object.freeze([
 ] as const);
 export type SignInOutcomeCode = (typeof SIGN_IN_OUTCOME_CODES)[number];
 
-export const SignInOutcomeSchema = z.object({
-  code: z.enum(SIGN_IN_OUTCOME_CODES),
-  /**
-   * With `device_account_mismatch`: the login of the account that this
-   * installation holds, which the API's answer does not carry.
-   */
-  deviceLogin: LoginSchema.optional(),
-});
+/** A time in UTC, as `Date.prototype.toISOString` writes it. */
+const TimestampSchema = z.iso.datetime();
+
+export const SignInOutcomeSchema = z
+  .object({
+    code: z.enum(SIGN_IN_OUTCOME_CODES),
+    /**
+     * With `device_account_mismatch`: the login of the account that this
+     * installation holds, which the API's answer does not carry.
+     */
+    deviceLogin: LoginSchema.optional(),
+    /**
+     * With `replacement_pending` only, while the grace period of an
+     * uncertain sign-in runs (#199): when it ends, in UTC. A new sign-in is
+     * not refused for it after this time. It names no key and no ID.
+     */
+    retryAfter: TimestampSchema.optional(),
+  })
+  .refine(
+    (outcome) =>
+      outcome.retryAfter === undefined ||
+      outcome.code === "replacement_pending",
+    { message: "retryAfter belongs to replacement_pending only" },
+  );
 export type SignInOutcomeView = z.infer<typeof SignInOutcomeSchema>;
 
 /**
@@ -592,9 +608,6 @@ export const RemoveDeviceResultSchema = z.discriminatedUnion("outcome", [
   DeviceActionFailedSchema,
 ]);
 export type RemoveDeviceResult = z.infer<typeof RemoveDeviceResultSchema>;
-
-/** A timestamp of the API, in UTC. */
-const TimestampSchema = z.iso.datetime();
 
 /**
  * One device of the account, as the device list shows it. `current` marks
