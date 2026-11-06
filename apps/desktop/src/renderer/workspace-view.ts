@@ -62,10 +62,13 @@ export const SELECT_REFUSAL_MESSAGES: Readonly<
  * projects.
  *
  * This is where the person will be asked before a switch while chat
- * messages wait to be sent; it is not built yet. The main process's chat
- * service detects the waiting messages: the chat IPC of a later part makes
- * `select` and `openProject` answer `{ outcome: "waiting", count }`, and an
- * optional `{ discardWaiting: true }` argument repeats the switch.
+ * messages wait to be sent. The main process's chat service detects the
+ * waiting messages: while they wait, `select` and `openProject` change
+ * nothing and answer `{ outcome: "waiting", count }`, and the option
+ * `{ discardWaiting: true }` repeats the switch and drops them. This
+ * function does not handle `waiting` yet; the chat screen adds the
+ * question. Until then no message can wait, because nothing in the
+ * renderer sends one.
  */
 export async function switchWorkspace(
   workspaces: Pick<WorkspaceBridge, "select">,

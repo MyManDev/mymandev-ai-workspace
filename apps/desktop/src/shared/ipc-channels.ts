@@ -90,9 +90,16 @@ export const INVOKE_CHANNELS = Object.freeze({
    * on `EVENT_CHANNELS.workspaceStateChanged`.
    */
   subscribeWorkspaceState: "workspaces:subscribe-state",
-  /** Selects a workspace of the list by its ID. */
+  /**
+   * Selects a workspace of the list by its ID. While chat messages wait to
+   * be sent, it changes nothing and answers how many wait, unless the
+   * option says to discard them.
+   */
   selectWorkspace: "workspaces:select",
-  /** Opens a project of the selected workspace by its ID, or closes it with null. */
+  /**
+   * Opens a project of the selected workspace by its ID, or closes it with
+   * null. Chat messages that wait hold the switch, as with `selectWorkspace`.
+   */
   openProject: "workspaces:open-project",
   /**
    * What the renderer may know of the open project's agent activity: its
@@ -104,6 +111,28 @@ export const INVOKE_CHANNELS = Object.freeze({
    * on `EVENT_CHANNELS.agentStateChanged`.
    */
   subscribeAgentState: "agents:subscribe-state",
+  /**
+   * What the renderer may know of the open project's chat: the newest
+   * messages that fit the view's limits, with their authors' names, and the
+   * person's messages that the server has not stored yet.
+   */
+  getChatState: "chat:get-state",
+  /**
+   * The chat state. The calling frame then receives every later state on
+   * `EVENT_CHANNELS.chatStateChanged`.
+   */
+  subscribeChatState: "chat:subscribe-state",
+  /** Sends the person's message to the open project's chat. */
+  sendChatMessage: "chat:send",
+  /** Tries a message that shows as not sent again, by its event ID. */
+  retryChatMessage: "chat:retry",
+  /** Drops a message that waits or shows as not sent, by its event ID. */
+  discardChatMessage: "chat:discard",
+  /**
+   * Loads the page of chat messages older than the held ones, not again
+   * within the backoff after a page did not load.
+   */
+  loadOlderChatMessages: "chat:load-older",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */
@@ -123,6 +152,11 @@ export const EVENT_CHANNELS = Object.freeze({
    * frames that subscribed.
    */
   agentStateChanged: "agents:state-changed",
+  /**
+   * The chat state after changes, at most one every 50 ms, to the frames
+   * that subscribed.
+   */
+  chatStateChanged: "chat:state-changed",
 } as const);
 
 export type InvokeChannel =

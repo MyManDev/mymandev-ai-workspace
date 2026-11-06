@@ -1,6 +1,7 @@
 import type {
   AccountBridge,
   AgentBridge,
+  ChatBridge,
   ConnectionBridge,
   DesktopBridge,
   RepositoryBridge,
@@ -16,6 +17,9 @@ import {
 import type {
   AccountStatus,
   AgentActivityView,
+  ChatLoadOlderResultView,
+  ChatSendResultView,
+  ChatView,
   ConnectionStatus,
   ForgetResult,
   ListDevicesResult,
@@ -29,6 +33,7 @@ import type {
   StartSignInResult,
   UnlockResult,
   WorkspaceActionResult,
+  WorkspaceSwitchOptions,
   WorkspaceView,
 } from "../shared/ipc-contract.ts";
 
@@ -41,6 +46,23 @@ type IpcListener = (event: unknown, ...args: unknown[]) => void;
 const OTHER_BROWSER_START: StartSignInOptions = Object.freeze({
   browser: "other",
 });
+
+/**
+ * The only switch option that the bridge passes on: a fixed object of its
+ * own, never the renderer's.
+ */
+const DISCARD_WAITING: WorkspaceSwitchOptions = Object.freeze({
+  discardWaiting: true,
+});
+
+/** Whether the renderer asked to discard the chat messages that wait. */
+function discardsWaiting(options: unknown): boolean {
+  return (
+    typeof options === "object" &&
+    options !== null &&
+    (options as { readonly discardWaiting?: unknown }).discardWaiting === true
+  );
+}
 
 /** Whether the renderer asked for a sign-in in another browser. */
 function asksForOtherBrowser(options: unknown): boolean {
@@ -117,13 +139,16 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * The object the preload script exposes as `window.desktop`. Every function
  * calls one fixed channel of the IPC contract and passes no argument from
  * the renderer on to it, except the mount ID of `repositories.unmount`, the
- * passphrase of `account.unlockDeviceKey`, and the IDs of
- * `workspaces.select` and `workspaces.openProject`, which must be strings
- * (or null to close a project) and which the main process validates. `account.startSignIn` passes on a fixed
- * option of its own when the renderer asks for another browser. Event
- * objects, which hold `ipcRenderer`, never reach the renderer. The object
- * and its parts are frozen. An error that a renderer callback throws goes
- * to `reportError` and stops nothing else.
+ * passphrase of `account.unlockDeviceKey`, the IDs of `workspaces.select`
+ * and `workspaces.openProject`, the text of `chat.send`, and the event IDs
+ * of `chat.retry` and `chat.discard`, which must be strings (or null to
+ * close a project) and which the main process validates.
+ * `account.startSignIn` passes on a fixed option of its own when the
+ * renderer asks for another browser, and `workspaces.select` and
+ * `workspaces.openProject` when it asks to discard the chat messages that
+ * wait. Event objects, which hold `ipcRenderer`, never reach the renderer.
+ * The object and its parts are frozen. An error that a renderer callback
+ * throws goes to `reportError` and stops nothing else.
  */
 export function createDesktopBridge(
   electronVersion: string,
@@ -260,19 +285,36 @@ export function createDesktopBridge(
         listener,
         onError,
       ),
-    select: (workspaceId: string) =>
+    // Any other option keeps the waiting chat messages; the main process
+    // validates the option again.
+    select: (workspaceId: string, options?: WorkspaceSwitchOptions) =>
       typeof workspaceId === "string"
-        ? (ipc.invoke(
-            INVOKE_CHANNELS.selectWorkspace,
-            workspaceId,
-          ) as Promise<WorkspaceActionResult>)
+        ? ((discardsWaiting(options)
+            ? ipc.invoke(
+                INVOKE_CHANNELS.selectWorkspace,
+                workspaceId,
+                DISCARD_WAITING,
+              )
+            : ipc.invoke(
+                INVOKE_CHANNELS.selectWorkspace,
+                workspaceId,
+              )) as Promise<WorkspaceActionResult>)
         : Promise.reject(new TypeError("select needs a workspace ID string.")),
-    openProject: (projectId: string | null) =>
+    openProject: (
+      projectId: string | null,
+      options?: WorkspaceSwitchOptions,
+    ) =>
       typeof projectId === "string" || projectId === null
-        ? (ipc.invoke(
-            INVOKE_CHANNELS.openProject,
-            projectId,
-          ) as Promise<WorkspaceActionResult>)
+        ? ((discardsWaiting(options)
+            ? ipc.invoke(
+                INVOKE_CHANNELS.openProject,
+                projectId,
+                DISCARD_WAITING,
+              )
+            : ipc.invoke(
+                INVOKE_CHANNELS.openProject,
+                projectId,
+              )) as Promise<WorkspaceActionResult>)
         : Promise.reject(
             new TypeError("openProject needs a project ID string or null."),
           ),
@@ -296,6 +338,51 @@ export function createDesktopBridge(
       ),
   });
 
+  // The text and the event IDs go to the main process only; the errors
+  // name no value.
+  const chat: ChatBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(INVOKE_CHANNELS.getChatState) as Promise<ChatView>,
+    subscribeState: (
+      listener: (state: ChatView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeChatState,
+        EVENT_CHANNELS.chatStateChanged,
+        "A chat state callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    send: (text: string) =>
+      typeof text === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.sendChatMessage,
+            text,
+          ) as Promise<ChatSendResultView>)
+        : Promise.reject(new TypeError("send needs a text string.")),
+    retry: (eventId: string) =>
+      typeof eventId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.retryChatMessage,
+            eventId,
+          ) as Promise<boolean>)
+        : Promise.reject(new TypeError("retry needs an event ID string.")),
+    discard: (eventId: string) =>
+      typeof eventId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.discardChatMessage,
+            eventId,
+          ) as Promise<boolean>)
+        : Promise.reject(new TypeError("discard needs an event ID string.")),
+    loadOlder: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.loadOlderChatMessages,
+      ) as Promise<ChatLoadOlderResultView>,
+  });
+
   return Object.freeze({
     electronVersion,
     runtime,
@@ -304,5 +391,6 @@ export function createDesktopBridge(
     connection,
     workspaces,
     agents,
+    chat,
   });
 }

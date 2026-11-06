@@ -31,6 +31,7 @@ import {
   APP_SCHEME_PRIVILEGES,
   createAppProtocolHandler,
 } from "./app-protocol.ts";
+import { registerChatIpc } from "./chat-ipc.ts";
 import { createChatService } from "./chat/service.ts";
 import {
   createSystemConnectionClient,
@@ -182,15 +183,15 @@ function start(): void {
   // The account's workspaces and the selected one's people and projects
   // (#27, #28), read over HTTP and kept current with the workspace's events.
   // It subscribes to the selected workspace only. The renderer reads its
-  // IDs and names and selects a workspace or opens a project over IPC; the
-  // chat and agent services read it in the main process. The logs are fixed
-  // text with a failure code at most, never a name or an ID.
+  // IDs and names and selects a workspace or opens a project over IPC,
+  // through the chat service below; the chat and agent services read it in
+  // the main process. The logs are fixed text with a failure code at most,
+  // never a name or an ID.
   const workspaces = createWorkspaceService({
     account,
     connection,
     log: (message) => console.info(message),
   });
-  registerWorkspaceIpc(ipcMain, rendererUrl, workspaces);
   app.on("will-quit", () => workspaces.close());
 
   // The agents and runs of the open project (#28), read over HTTP and kept
@@ -242,10 +243,8 @@ function start(): void {
   // The open project's chat (#27): its history, read over HTTP, its
   // `chat.message.created` events, and the person's messages, sent with the
   // connection's `sendAs`. Messages that wait for the connection stay in
-  // memory only. It has no IPC yet; a switch of the project or the workspace
-  // that the person asks for goes through its `switchProject` and
-  // `selectWorkspace`. The logs are fixed text with a failure code at most,
-  // never a name, an ID, or a message body.
+  // memory only. The logs are fixed text with a failure code at most, never
+  // a name, an ID, or a message body.
   const chat = createChatService({
     account,
     connection,
@@ -253,6 +252,21 @@ function start(): void {
     log: (message) => console.info(message),
   });
   app.on("will-quit", () => chat.close());
+
+  // Every switch of the project or the workspace that the renderer asks for
+  // goes through the chat service's `switchProject` and `selectWorkspace`,
+  // which answer `waiting` while chat messages wait to be sent, so that the
+  // person is asked first.
+  registerWorkspaceIpc(ipcMain, rendererUrl, workspaces, chat);
+
+  // The chat reaches the renderer with the authors' names resolved in the
+  // main process, within the view's limits and text budget, at most one
+  // publish every 50 ms. Its waiting publish is cancelled at quit.
+  const chatIpc = registerChatIpc(ipcMain, rendererUrl, {
+    chat,
+    workspaces,
+  });
+  app.on("will-quit", () => chatIpc.close());
 
   function showMainWindow(): void {
     if (mainWindow !== undefined) {

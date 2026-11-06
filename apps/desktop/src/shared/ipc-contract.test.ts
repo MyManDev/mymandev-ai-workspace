@@ -9,6 +9,16 @@ import {
   AGENT_RUN_STATES,
   AgentActivityViewSchema,
   API_ORIGIN_STATES,
+  CHAT_LIMITS,
+  CHAT_LOAD_OLDER_RESULTS,
+  CHAT_NOT_SENT_REASONS,
+  CHAT_OLDER_STATES,
+  CHAT_PROBLEMS,
+  CHAT_SEND_REFUSALS,
+  CHAT_STATUSES,
+  ChatLoadOlderResultSchema,
+  ChatSendResultSchema,
+  ChatViewSchema,
   CONNECTION_OFFLINE_REASONS,
   CONNECTION_STATES,
   CONNECTION_STOP_REASONS,
@@ -23,6 +33,7 @@ import {
   ForgetResultSchema,
   INVOKE_CONTRACT,
   ListDevicesResultSchema,
+  MAX_WAITING_CHAT_MESSAGES,
   MOUNT_REFUSALS,
   MountResultSchema,
   ProtocolIdSchema,
@@ -47,6 +58,7 @@ import {
   WORKSPACE_PROBLEMS,
   WORKSPACE_STATUSES,
   WorkspaceActionResultSchema,
+  WorkspaceSwitchOptionsSchema,
   WorkspaceViewSchema,
   type AccountStatus,
   type MountedRepository,
@@ -147,16 +159,19 @@ test("a runtime status with a wrong state or revision is refused", () => {
   }
 });
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, and open take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, and the chat's send, retry, and discard take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
       channel !== INVOKE_CHANNELS.unlockDeviceKey &&
       channel !== INVOKE_CHANNELS.startSignIn &&
       channel !== INVOKE_CHANNELS.selectWorkspace &&
-      channel !== INVOKE_CHANNELS.openProject,
+      channel !== INVOKE_CHANNELS.openProject &&
+      channel !== INVOKE_CHANNELS.sendChatMessage &&
+      channel !== INVOKE_CHANNELS.retryChatMessage &&
+      channel !== INVOKE_CHANNELS.discardChatMessage,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 5);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 8);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -983,6 +998,41 @@ test("open takes exactly one lowercase UUIDv7 or null and refuses anything else"
   }
 });
 
+test("select and open also take the switch option, a strict object with a boolean, and nothing else", () => {
+  const select = INVOKE_CONTRACT[INVOKE_CHANNELS.selectWorkspace].args;
+  const open = INVOKE_CONTRACT[INVOKE_CHANNELS.openProject].args;
+  const discard = { discardWaiting: true };
+  const keep = { discardWaiting: false };
+
+  expect(select.parse([WORKSPACE_ID, discard])).toEqual([
+    WORKSPACE_ID,
+    discard,
+  ]);
+  expect(select.parse([WORKSPACE_ID, keep])).toEqual([WORKSPACE_ID, keep]);
+  expect(open.parse([PROJECT_ID, discard])).toEqual([PROJECT_ID, discard]);
+  expect(open.parse([null, discard])).toEqual([null, discard]);
+  for (const option of [
+    {},
+    { discardWaiting: "true" },
+    { discardWaiting: 1 },
+    { discardWaiting: null },
+    { discardWaiting: true, force: true },
+    [true],
+    true,
+    null,
+  ]) {
+    expect(WorkspaceSwitchOptionsSchema.safeParse(option).success).toBe(false);
+    expect(select.safeParse([WORKSPACE_ID, option]).success).toBe(false);
+    expect(open.safeParse([PROJECT_ID, option]).success).toBe(false);
+  }
+  expect(select.safeParse([WORKSPACE_ID, discard, discard]).success).toBe(
+    false,
+  );
+  expect(open.safeParse([null, discard, "extra"]).success).toBe(false);
+  expect(select.safeParse([discard]).success).toBe(false);
+  expect(open.safeParse([discard, PROJECT_ID]).success).toBe(false);
+});
+
 test("a refused ID is not repeated in the error", () => {
   const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.selectWorkspace];
   const result = args.safeParse(["secret-workspace"]);
@@ -1145,6 +1195,28 @@ test("a workspace action result is ok or refused with a known reason, without an
   ]) {
     expect(WorkspaceActionResultSchema.safeParse(value).success).toBe(false);
   }
+});
+
+test("a switch that waits answers the count of waiting chat messages, from 1 to the most that can wait, and nothing else", () => {
+  for (const count of [1, 7, MAX_WAITING_CHAT_MESSAGES]) {
+    expect(
+      WorkspaceActionResultSchema.parse({
+        outcome: "waiting",
+        count,
+        eventIds: [WORKSPACE_ID],
+      }),
+    ).toEqual({ outcome: "waiting", count });
+  }
+  expect(MAX_WAITING_CHAT_MESSAGES).toBe(CHAT_LIMITS.pending);
+  for (const count of [0, -1, 1.5, MAX_WAITING_CHAT_MESSAGES + 1, "3", null]) {
+    expect(
+      WorkspaceActionResultSchema.safeParse({ outcome: "waiting", count })
+        .success,
+    ).toBe(false);
+  }
+  expect(
+    WorkspaceActionResultSchema.safeParse({ outcome: "waiting" }).success,
+  ).toBe(false);
 });
 
 const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000f1";
@@ -1327,4 +1399,297 @@ test("an agent activity over the limits or with wrong values is refused", () => 
       }),
     ).success,
   ).toBe(true);
+});
+
+const CHAT_MESSAGE_ID = "0192f0a0-7b3c-7d4e-8f50-000000001001";
+const CHAT_EVENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000003001";
+const CHAT_USER_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000b1";
+
+function chatMessage(overrides: Record<string, unknown> = {}) {
+  return {
+    id: CHAT_MESSAGE_ID,
+    seq: 1,
+    authorKind: "member",
+    authorName: "Ada Lovelace",
+    body: "Hello",
+    createdAt: RUN_AT,
+    ...overrides,
+  };
+}
+
+function chatPending(overrides: Record<string, unknown> = {}) {
+  return {
+    eventId: CHAT_EVENT_ID,
+    body: "Waiting",
+    status: "waiting",
+    ...overrides,
+  };
+}
+
+function chatViewValue(overrides: Record<string, unknown> = {}) {
+  return {
+    status: "ready",
+    revision: 4,
+    workspaceId: AGENT_WORKSPACE_ID,
+    projectId: AGENT_PROJECT_ID,
+    messages: [chatMessage()],
+    moreMessages: 0,
+    older: "available",
+    pending: [chatPending()],
+    morePending: 0,
+    ...overrides,
+  };
+}
+
+test("a chat view with every status, problem, older state, and pending state is accepted and frozen", () => {
+  for (const status of CHAT_STATUSES) {
+    if (status === "unavailable") {
+      for (const problem of CHAT_PROBLEMS) {
+        const value = chatViewValue({ status, problem });
+        expect(ChatViewSchema.parse(value)).toEqual(value);
+      }
+      continue;
+    }
+    const value = chatViewValue({ status });
+    expect(ChatViewSchema.parse(value)).toEqual(value);
+  }
+  for (const older of CHAT_OLDER_STATES) {
+    for (const olderProblem of [undefined, ...CHAT_PROBLEMS]) {
+      const value = chatViewValue(
+        olderProblem === undefined ? { older } : { older, olderProblem },
+      );
+      expect(ChatViewSchema.parse(value)).toEqual(value);
+    }
+  }
+  const value = chatViewValue({
+    status: "no_project",
+    workspaceId: null,
+    projectId: null,
+    messages: [
+      chatMessage(),
+      chatMessage({ seq: 2, authorKind: "agent", authorName: "Unknown agent" }),
+    ],
+    moreMessages: 9,
+    pending: [
+      chatPending(),
+      chatPending({ status: "sending" }),
+      ...CHAT_NOT_SENT_REASONS.map((reason) =>
+        chatPending({ status: "not_sent", reason }),
+      ),
+    ],
+    morePending: 3,
+  });
+  const parsed = ChatViewSchema.parse(value);
+  expect(parsed).toEqual(value);
+  expect(Object.isFrozen(parsed.messages)).toBe(true);
+  expect(Object.isFrozen(parsed.pending)).toBe(true);
+});
+
+test("a chat view drops unknown keys at every level, so no member ID, user ID, or device ID crosses", () => {
+  const parsed = ChatViewSchema.parse(
+    chatViewValue({
+      problem: "failed",
+      userId: CHAT_USER_ID,
+      deviceId: AGENT_DEVICE_ID,
+      messages: [
+        chatMessage({
+          author: { kind: "member", memberId: MEMBER_ID },
+          memberId: MEMBER_ID,
+          projectId: AGENT_PROJECT_ID,
+        }),
+      ],
+      pending: [
+        chatPending({ userId: CHAT_USER_ID, deviceId: AGENT_DEVICE_ID }),
+      ],
+    }),
+  );
+
+  expect(parsed).toEqual(chatViewValue());
+  for (const hidden of [MEMBER_ID, CHAT_USER_ID, AGENT_DEVICE_ID]) {
+    expect(JSON.stringify(parsed)).not.toContain(hidden);
+  }
+});
+
+test("a chat body is bounded by its length only, because the main process checked it with the protocol's rules", () => {
+  // A character that the protocol refuses passes here: no pattern runs over
+  // the bodies on every publish.
+  const unchecked = "Tab\there";
+  expect(
+    ChatViewSchema.safeParse(
+      chatViewValue({
+        messages: [chatMessage({ body: unchecked })],
+        pending: [chatPending({ body: unchecked })],
+      }),
+    ).success,
+  ).toBe(true);
+
+  // A body over the limit is refused with one issue.
+  const result = ChatViewSchema.safeParse(
+    chatViewValue({
+      messages: [chatMessage({ body: "x".repeat(CHAT_LIMITS.body + 1) })],
+    }),
+  );
+  expect(result.success).toBe(false);
+  expect(result.error?.issues).toHaveLength(1);
+  expect(result.error?.issues[0]?.code).toBe("too_big");
+});
+
+test("a chat view over the limits or with wrong values is refused", () => {
+  const many = <T>(item: T, count: number) =>
+    Array.from({ length: count }, () => item);
+  for (const value of [
+    chatViewValue({ status: "unavailable" }),
+    chatViewValue({ status: "unavailable", problem: "busy" }),
+    chatViewValue({ status: "paused" }),
+    chatViewValue({ revision: -1 }),
+    chatViewValue({ revision: 1.5 }),
+    chatViewValue({ moreMessages: -1 }),
+    chatViewValue({ moreMessages: undefined }),
+    chatViewValue({ morePending: 0.5 }),
+    chatViewValue({ morePending: undefined }),
+    chatViewValue({ older: "more" }),
+    chatViewValue({ older: undefined }),
+    chatViewValue({ olderProblem: "busy" }),
+    chatViewValue({ workspaceId: "workspace" }),
+    chatViewValue({ projectId: AGENT_PROJECT_ID.toUpperCase() }),
+    chatViewValue({
+      messages: many(chatMessage(), CHAT_LIMITS.messages + 1),
+    }),
+    chatViewValue({ pending: many(chatPending(), CHAT_LIMITS.pending + 1) }),
+    chatViewValue({ messages: [chatMessage({ id: MOUNT_ID })] }),
+    chatViewValue({ messages: [chatMessage({ seq: 0 })] }),
+    chatViewValue({ messages: [chatMessage({ seq: 1.5 })] }),
+    chatViewValue({ messages: [chatMessage({ authorKind: "device" })] }),
+    chatViewValue({ messages: [chatMessage({ authorName: "" })] }),
+    chatViewValue({
+      messages: [
+        chatMessage({ authorName: "a".repeat(CHAT_LIMITS.authorName + 1) }),
+      ],
+    }),
+    chatViewValue({ messages: [chatMessage({ authorName: undefined })] }),
+    chatViewValue({ messages: [chatMessage({ body: "" })] }),
+    chatViewValue({
+      messages: [
+        chatMessage({ body: "\u{1F600}".repeat(CHAT_LIMITS.body + 1) }),
+      ],
+    }),
+    chatViewValue({ messages: [chatMessage({ createdAt: "now" })] }),
+    chatViewValue({ pending: [chatPending({ eventId: "event" })] }),
+    chatViewValue({ pending: [chatPending({ body: "" })] }),
+    chatViewValue({
+      pending: [chatPending({ body: "x".repeat(CHAT_LIMITS.body + 1) })],
+    }),
+    chatViewValue({ pending: [chatPending({ status: "stored" })] }),
+    chatViewValue({ pending: [chatPending({ status: "not_sent" })] }),
+    chatViewValue({
+      pending: [chatPending({ status: "not_sent", reason: "too_large" })],
+    }),
+  ]) {
+    expect(ChatViewSchema.safeParse(value).success).toBe(false);
+  }
+
+  // At the limits, everything is accepted.
+  expect(
+    ChatViewSchema.safeParse(
+      chatViewValue({
+        messages: many(
+          chatMessage({
+            authorName: "\u{1F600}".repeat(CHAT_LIMITS.authorName),
+            body: "\u{1F600}".repeat(CHAT_LIMITS.body),
+          }),
+          CHAT_LIMITS.messages,
+        ),
+        pending: many(
+          chatPending({ body: "x".repeat(CHAT_LIMITS.body) }),
+          CHAT_LIMITS.pending,
+        ),
+      }),
+    ).success,
+  ).toBe(true);
+});
+
+test("send takes exactly one string within the limit, counted in characters", () => {
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.sendChatMessage];
+  const longest = "\u{1F600}".repeat(CHAT_LIMITS.sendText);
+
+  expect(args.parse(["Hello"])).toEqual(["Hello"]);
+  expect(args.parse([""])).toEqual([""]);
+  expect(args.parse([longest])).toEqual([longest]);
+  for (const value of [
+    [],
+    ["x".repeat(CHAT_LIMITS.sendText + 1)],
+    [`${longest}x`],
+    [null],
+    [1],
+    [{ text: "Hello" }],
+    ["Hello", "again"],
+    ["Hello", undefined],
+    "Hello",
+  ]) {
+    expect(args.safeParse(value).success).toBe(false);
+  }
+  const result = args.safeParse(["secret-".repeat(10_000)]);
+  expect(JSON.stringify(result.error?.issues)).not.toContain("secret");
+});
+
+test("retry and discard take exactly one lowercase UUIDv7, and the other chat channels nothing", () => {
+  for (const channel of [
+    INVOKE_CHANNELS.retryChatMessage,
+    INVOKE_CHANNELS.discardChatMessage,
+  ]) {
+    const { args } = INVOKE_CONTRACT[channel];
+    expect(args.parse([CHAT_EVENT_ID])).toEqual([CHAT_EVENT_ID]);
+    for (const value of NOT_PROTOCOL_IDS) {
+      expect(args.safeParse([value]).success, String(value)).toBe(false);
+    }
+    for (const value of [[], [null], [CHAT_EVENT_ID, CHAT_EVENT_ID]]) {
+      expect(args.safeParse(value).success).toBe(false);
+    }
+  }
+  for (const channel of [
+    INVOKE_CHANNELS.getChatState,
+    INVOKE_CHANNELS.subscribeChatState,
+    INVOKE_CHANNELS.loadOlderChatMessages,
+  ]) {
+    const { args } = INVOKE_CONTRACT[channel];
+    expect(args.parse([])).toEqual([]);
+    expect(args.safeParse([CHAT_EVENT_ID]).success).toBe(false);
+  }
+  expect(EVENT_CONTRACT[EVENT_CHANNELS.chatStateChanged]).toBe(ChatViewSchema);
+});
+
+test("the results of send, retry, discard, and load-older hold only fixed values and an event ID", () => {
+  expect(
+    ChatSendResultSchema.parse({
+      outcome: "accepted",
+      eventId: CHAT_EVENT_ID,
+      body: "Hello",
+    }),
+  ).toEqual({ outcome: "accepted", eventId: CHAT_EVENT_ID });
+  for (const reason of CHAT_SEND_REFUSALS) {
+    expect(
+      ChatSendResultSchema.parse({ outcome: "refused", reason, text: "x" }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const value of [
+    { outcome: "accepted" },
+    { outcome: "accepted", eventId: "event" },
+    { outcome: "refused", reason: "busy" },
+    { outcome: "sent" },
+    "accepted",
+  ]) {
+    expect(ChatSendResultSchema.safeParse(value).success).toBe(false);
+  }
+  for (const result of CHAT_LOAD_OLDER_RESULTS) {
+    expect(ChatLoadOlderResultSchema.parse(result)).toBe(result);
+  }
+  expect(ChatLoadOlderResultSchema.safeParse("loading").success).toBe(false);
+  for (const channel of [
+    INVOKE_CHANNELS.retryChatMessage,
+    INVOKE_CHANNELS.discardChatMessage,
+  ]) {
+    const { result } = INVOKE_CONTRACT[channel];
+    expect(result.parse(true)).toBe(true);
+    expect(result.safeParse("true").success).toBe(false);
+  }
 });
