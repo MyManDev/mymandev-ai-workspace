@@ -27,12 +27,18 @@ import {
   SIGN_IN_CODE_PATTERN,
 } from "./device-auth.ts";
 import { displayText, multilineText } from "./entities.ts";
-import { envelopeHeaderShape, ProtocolEventSchema } from "./envelope.ts";
+import {
+  envelopeHeaderShape,
+  ProtocolEventSchema,
+  runReasonAllowed,
+} from "./envelope.ts";
+import { decodeClientMessage } from "./frames.ts";
 import { UserIdSchema } from "./ids.ts";
 import {
   EVENT_TYPE_PATTERN,
   GITHUB_LOGIN_PATTERN,
   NOT_BLANK_PATTERN,
+  RUN_CANCEL_REASONS,
   RUN_STATES,
   RUN_TRANSITIONS,
   SAFE_MULTILINE_TEXT_PATTERN,
@@ -555,4 +561,68 @@ test("decodeClientEvent rejects what only the server may originate", () => {
   const accepted = decodeClientEvent(baseEvent());
   assert.ok(accepted.ok);
   assert.deepEqual(accepted.event, baseEvent());
+});
+
+test("a reason of RUN_CANCEL_REASONS fits only the server: runReasonAllowed refuses it from an agent in every transition, and the decoders leave it to the server", () => {
+  // Every transition that a device may send.
+  const transitions = RUN_STATES.flatMap((from) =>
+    RUN_TRANSITIONS[from].map((to) => [from, to] as const),
+  );
+  assert.equal(transitions.length, 10);
+  for (const reason of RUN_CANCEL_REASONS) {
+    for (const [previousState, state] of transitions) {
+      const label = `${reason}: ${previousState} -> ${state}`;
+      const sent = withPayload({ previousState, state, reason });
+      // The decoders accept it, so that the server can answer it with
+      // event.refused and keep the connection open.
+      const decoded = decodeClientEvent(sent);
+      assert.ok(decoded.ok, label);
+      assert.ok(decoded.event.type === "agent.run.state_changed", label);
+      assert.equal(runReasonAllowed(decoded.event), false, label);
+      const message = decodeClientMessage(sent);
+      assert.ok(message.ok && message.kind === "event", label);
+    }
+
+    // The server's own cancellation with the same code.
+    const cancelled = decodeEvent({
+      ...withPayload({
+        previousState: "running",
+        state: "cancelled",
+        reason,
+      }),
+      actor: { kind: "system" },
+      deviceId: null,
+    });
+    assert.ok(cancelled.ok, reason);
+    assert.ok(cancelled.event.type === "agent.run.state_changed", reason);
+    assert.equal(runReasonAllowed(cancelled.event), true, reason);
+  }
+
+  // Any other reason, and none, fits the agent; the codes match exactly.
+  for (const reason of [
+    "Stopped on the host device",
+    "DEVICE_REVOKED",
+    "member_removed.",
+    "device_revoked by hand",
+  ]) {
+    const decoded = decodeClientEvent(
+      withPayload({ previousState: "running", state: "cancelled", reason }),
+    );
+    assert.ok(decoded.ok, reason);
+    assert.ok(decoded.event.type === "agent.run.state_changed", reason);
+    assert.equal(runReasonAllowed(decoded.event), true, reason);
+  }
+  const withoutReason = decodeClientEvent({
+    ...baseEvent(),
+    payload: {
+      runId: RUN_ID,
+      agentId: AGENT_ID,
+      previousState: "running",
+      state: "cancelled",
+    },
+  });
+  assert.ok(withoutReason.ok);
+  assert.ok(withoutReason.event.type === "agent.run.state_changed");
+  assert.equal(withoutReason.event.payload.reason, undefined);
+  assert.equal(runReasonAllowed(withoutReason.event), true);
 });

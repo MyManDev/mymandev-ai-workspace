@@ -25,6 +25,8 @@ import {
   type MemberRole,
   newId,
   type ProjectId,
+  RUN_CANCEL_REASONS,
+  type RunCancelReason,
   type RunId,
   type RunState,
   type ServerEvent,
@@ -40,6 +42,7 @@ import {
   deviceApp,
   type FakeClock,
   fakeClock,
+  newKey,
   type SignedInDevice,
   signInDevice,
   useTestDatabase,
@@ -274,6 +277,31 @@ async function nextRefused(client: Client, eventId: EventId, code: string) {
     type: "event.refused",
     eventId,
     code,
+  });
+}
+
+/** The next message, which must be the server's cancellation of a run with `reason`. */
+async function nextCancelled(
+  client: Client,
+  expected: Readonly<{
+    workspaceId: WorkspaceId;
+    agentId: AgentId;
+    runId: RunId;
+    previousState: RunState;
+    reason: RunCancelReason;
+  }>,
+) {
+  const event = await nextEvent(client);
+  assert.ok(event.type === "agent.run.state_changed", event.type);
+  assert.equal(event.workspaceId, expected.workspaceId);
+  assert.deepEqual(event.actor, { kind: "system" });
+  assert.equal(event.deviceId, null);
+  assert.deepEqual(event.payload, {
+    runId: expected.runId,
+    agentId: expected.agentId,
+    previousState: expected.previousState,
+    state: "cancelled",
+    reason: expected.reason,
   });
 }
 
@@ -554,6 +582,200 @@ test("an unknown agent or run, an agent of another workspace, a run of another a
   adaConnection.client.send(accepted);
   await nextRelayed(adaConnection.client, accepted);
   await nextRelayed(bobConnection.client, accepted);
+});
+
+test("an agent's transition whose reason is a code of RUN_CANCEL_REASONS gets event.refused with conflict on the sending connection only, which stays open, and is neither stored nor relayed; other reasons still pass", async (t) => {
+  const { account } = await instance(t);
+  const ada = await account(3871);
+  const bob = await account(3872);
+  const { workspaceId } = await workspaceOf(ada.device, [bob.device]);
+  const projectId = await projectIn(workspaceId, ada.device);
+  const { agentId, runIds } = await agentOf(projectId, ada.device, {
+    runs: 2,
+  });
+  const [runId, startedRun] = runIds;
+  assert.ok(runId !== undefined && startedRun !== undefined);
+  const adaConnection = await connected(t, ada.app, ada.device);
+  const bobConnection = await connected(t, bob.app, bob.device);
+  await subscribed(bobConnection.client, workspaceId);
+
+  const started = transitionOf(
+    ada.device,
+    workspaceId,
+    agentId,
+    startedRun,
+    "queued",
+    "running",
+  );
+  adaConnection.client.send(started);
+  await nextRelayed(adaConnection.client, started);
+  await nextRelayed(bobConnection.client, started);
+
+  // Each code, with every kind of transition: only the server gives them.
+  const cases = [
+    [runId, "queued", "cancelled"],
+    [runId, "queued", "failed"],
+    [runId, "queued", "running"],
+    [startedRun, "running", "cancelled"],
+    [startedRun, "running", "awaiting_input"],
+  ] as const;
+  for (const reason of RUN_CANCEL_REASONS) {
+    for (const [run, previousState, state] of cases) {
+      const sent = transitionOf(
+        ada.device,
+        workspaceId,
+        agentId,
+        run,
+        previousState,
+        state,
+        { reason },
+      );
+      adaConnection.client.send(sent);
+      await nextRefused(adaConnection.client, sent.id, "conflict");
+    }
+  }
+  // Also an event ID that the device recorded, sent again with a code.
+  const resent = transitionOf(
+    ada.device,
+    workspaceId,
+    agentId,
+    startedRun,
+    "queued",
+    "running",
+    { id: started.id, reason: "device_revoked" },
+  );
+  adaConnection.client.send(resent);
+  await nextRefused(adaConnection.client, resent.id, "conflict");
+  await quiet(adaConnection.client, bobConnection.client);
+  assert.deepEqual(await runState(runId), { state: "queued", reason: null });
+  assert.deepEqual(await recordedOf(runId), []);
+  assert.deepEqual(await runState(startedRun), {
+    state: "running",
+    reason: null,
+  });
+  assert.deepEqual(await recordedOf(startedRun), [
+    { eventId: started.id, state: "running" },
+  ]);
+
+  // The connection stayed open, and the agent's other reasons still pass.
+  assert.ok(isOpen(adaConnection.client));
+  const stopped = transitionOf(
+    ada.device,
+    workspaceId,
+    agentId,
+    runId,
+    "queued",
+    "cancelled",
+    { reason: "Stopped on the host device" },
+  );
+  const failed = transitionOf(
+    ada.device,
+    workspaceId,
+    agentId,
+    startedRun,
+    "running",
+    "failed",
+    { reason: "device_revoked by a test" },
+  );
+  for (const sent of [stopped, failed]) {
+    adaConnection.client.send(sent);
+    await nextRelayed(adaConnection.client, sent);
+    await nextRelayed(bobConnection.client, sent);
+  }
+  await quiet(adaConnection.client, bobConnection.client);
+  assert.deepEqual(await runState(runId), {
+    state: "cancelled",
+    reason: "Stopped on the host device",
+  });
+  assert.deepEqual(await runState(startedRun), {
+    state: "failed",
+    reason: "device_revoked by a test",
+  });
+});
+
+test("the server still cancels runs with the codes that it refuses from an agent: member_removed on a removal and device_revoked on a device revocation", async (t) => {
+  const { account } = await instance(t);
+  const ada = await account(3891);
+  const bob = await account(3892);
+  const cleo = await account(3893);
+  const team = await workspaceOf(ada.device, [bob.device, cleo.device]);
+  const [bobInTeam] = team.memberIds;
+  assert.ok(bobInTeam !== undefined);
+  const projectId = await projectIn(team.workspaceId, ada.device);
+  const bobs = await agentOf(projectId, bob.device, { name: "Helper" });
+  const adas = await agentOf(projectId, ada.device);
+  const [bobsRun] = bobs.runIds;
+  const [adasRun] = adas.runIds;
+  assert.ok(bobsRun !== undefined && adasRun !== undefined);
+  const adaConnection = await connected(t, ada.app, ada.device);
+  const bobConnection = await connected(t, bob.app, bob.device);
+  const cleoConnection = await connected(t, cleo.app, cleo.device);
+  // Only Cleo subscribes, so no presence changes reach her.
+  await subscribed(cleoConnection.client, team.workspaceId);
+
+  // Each agent first gives the code of its later cancellation itself.
+  const bobsTry = transitionOf(
+    bob.device,
+    team.workspaceId,
+    bobs.agentId,
+    bobsRun,
+    "queued",
+    "cancelled",
+    { reason: "member_removed" },
+  );
+  bobConnection.client.send(bobsTry);
+  await nextRefused(bobConnection.client, bobsTry.id, "conflict");
+  const adasTry = transitionOf(
+    ada.device,
+    team.workspaceId,
+    adas.agentId,
+    adasRun,
+    "queued",
+    "cancelled",
+    { reason: "device_revoked" },
+  );
+  adaConnection.client.send(adasTry);
+  await nextRefused(adaConnection.client, adasTry.id, "conflict");
+  await quiet(cleoConnection.client);
+
+  // Ada removes Bob: the server cancels his agent's run with member_removed.
+  const removal = await ada.app.inject({
+    method: "POST",
+    url: `/workspaces/${team.workspaceId}/members/${bobInTeam}/remove`,
+    headers: { authorization: `Bearer ${ada.token}` },
+  });
+  assert.equal(removal.statusCode, 204, removal.body);
+  assert.equal(
+    (await nextEvent(cleoConnection.client)).type,
+    "workspace.member.removed",
+  );
+  await nextCancelled(cleoConnection.client, {
+    workspaceId: team.workspaceId,
+    agentId: bobs.agentId,
+    runId: bobsRun,
+    previousState: "queued",
+    reason: "member_removed",
+  });
+
+  // A sign-in that replaces Ada's device revokes it: the server cancels her
+  // agent's run with device_revoked.
+  await signInDevice(ada.app, newKey(), ada.device.deviceId);
+  await nextCancelled(cleoConnection.client, {
+    workspaceId: team.workspaceId,
+    agentId: adas.agentId,
+    runId: adasRun,
+    previousState: "queued",
+    reason: "device_revoked",
+  });
+  await quiet(cleoConnection.client);
+  assert.deepEqual(await runState(bobsRun), {
+    state: "cancelled",
+    reason: "member_removed",
+  });
+  assert.deepEqual(await runState(adasRun), {
+    state: "cancelled",
+    reason: "device_revoked",
+  });
 });
 
 test("a transition for an agent of the workspace that another device hosts closes the connection with identity_mismatch, is audited, and stores and relays nothing", async (t) => {
@@ -857,6 +1079,67 @@ test(`an account's transitions above ${RUN_TRANSITION_LIMIT.burst.max} in ${RUN_
   const chatLimited = sendOf("Too many");
   client.send(chatLimited);
   await nextRefused(client, chatLimited.id, "rate_limited");
+  assert.ok(isOpen(client));
+  await quiet(client);
+});
+
+test(`an agent's transitions refused for a code of RUN_CANCEL_REASONS count toward the run transition limit: after ${RUN_TRANSITION_LIMIT.burst.max} of them, the next gets rate_limited`, async (t) => {
+  const clock = fakeClock();
+  const { account } = await instance(t, { clock });
+  const ada = await account(3896);
+  const { workspaceId } = await workspaceOf(ada.device);
+  const projectId = await projectIn(workspaceId, ada.device);
+  const { agentId, runIds } = await agentOf(projectId, ada.device);
+  const [runId] = runIds;
+  assert.ok(runId !== undefined);
+  const { client } = await connected(t, ada.app, ada.device);
+
+  for (let index = 0; index < RUN_TRANSITION_LIMIT.burst.max; index += 1) {
+    const sent = transitionOf(
+      ada.device,
+      workspaceId,
+      agentId,
+      runId,
+      "queued",
+      "cancelled",
+      { reason: index % 2 === 0 ? "device_revoked" : "member_removed" },
+    );
+    client.send(sent);
+    await nextRefused(client, sent.id, "conflict");
+    clock.advance(100);
+  }
+  // Above the limit, the limit answers first, also for such a reason.
+  const reserved = transitionOf(
+    ada.device,
+    workspaceId,
+    agentId,
+    runId,
+    "queued",
+    "cancelled",
+    { reason: "device_revoked" },
+  );
+  client.send(reserved);
+  await nextRefused(client, reserved.id, "rate_limited");
+  const limited = transitionOf(
+    ada.device,
+    workspaceId,
+    agentId,
+    runId,
+    "queued",
+    "running",
+  );
+  client.send(limited);
+  await nextRefused(client, limited.id, "rate_limited");
+  assert.deepEqual(await runState(runId), { state: "queued", reason: null });
+  assert.deepEqual(await recordedOf(runId), []);
+
+  // The burst slides: the oldest refused transition leaves it 10 seconds
+  // after it was sent.
+  clock.advance(
+    RUN_TRANSITION_LIMIT.burst.windowMs - 100 * RUN_TRANSITION_LIMIT.burst.max,
+  );
+  client.send(limited);
+  await nextRelayed(client, limited);
   assert.ok(isOpen(client));
   await quiet(client);
 });
