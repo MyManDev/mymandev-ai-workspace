@@ -57,6 +57,7 @@ function id(n: number): string {
 
 const WORKSPACE = id(0xa1) as WorkspaceId;
 const PROJECT = id(0xe1) as ProjectId;
+const OTHER_PROJECT = id(0xe2) as ProjectId;
 const AUTHOR = id(0xc1) as MemberId;
 const OTHER_AUTHOR = id(0xc2) as MemberId;
 const AGENT = id(0xf1);
@@ -890,6 +891,48 @@ test("after an older page did not load, load-older answers too_soon without a re
   fake.setClock(69_000);
   expect(loadOlder()).toBe("started");
   expect(reads()).toBe(5);
+});
+
+test("the count of failed older pages starts again in another project and after a sign-out", () => {
+  const fake = fakeServices(chatState({ hasOlder: true }));
+  const { invoke } = register(fake);
+  const loadOlder = () => invoke(INVOKE_CHANNELS.loadOlderChatMessages);
+  /** An older page of `projectId` on its way, which then fails. */
+  const failedPage = (projectId: ProjectId, at: number) => {
+    fake.setClock(at);
+    fake.setState(chatState({ projectId, hasOlder: true, loadingOlder: true }));
+    fake.setState(
+      chatState({ projectId, hasOlder: true, olderProblem: "unavailable" }),
+    );
+  };
+
+  // Five failures in a row in one project: the fifth waits 32 s, and a
+  // sixth would wait 60 s.
+  for (let index = 0; index < 5; index += 1) {
+    failedPage(PROJECT, index * 100_000);
+  }
+  fake.setClock(400_000 + 31_999);
+  expect(loadOlder()).toBe("too_soon");
+  fake.setClock(400_000 + 32_000);
+  expect(loadOlder()).toBe("started");
+
+  // The first failure in another project waits 2 s, not 60 s.
+  fake.setState(chatState({ projectId: OTHER_PROJECT, hasOlder: true }));
+  failedPage(OTHER_PROJECT, 500_000);
+  fake.setClock(502_000);
+  expect(loadOlder()).toBe("started");
+
+  // Again after a sign-out and a sign-in to the same project.
+  for (let index = 0; index < 5; index += 1) {
+    failedPage(PROJECT, 600_000 + index * 100_000);
+  }
+  fake.setState(NO_PROJECT);
+  fake.setState(chatState({ hasOlder: true }));
+  failedPage(PROJECT, 1_200_000);
+  fake.setClock(1_201_999);
+  expect(loadOlder()).toBe("too_soon");
+  fake.setClock(1_202_000);
+  expect(loadOlder()).toBe("started");
 });
 
 test("author names are cut to their limit in characters", () => {

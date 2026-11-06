@@ -276,8 +276,10 @@ export interface ChatBridge {
    * with its event ID, after which it shows in `pending` until the server
    * stores it, or to `refused` with a reason. The main process applies the
    * protocol's rules to the text: a carriage return becomes a line feed,
-   * and a blank text, more than 16,000 characters, or a control, format, or
-   * invisible character is refused. The bridge passes on only a string.
+   * and a blank text, a body of more than 16,000 characters (code points;
+   * `too_long`), or a control, format, or invisible character is refused.
+   * A text of more than 64,000 characters is refused by the contract
+   * before that, and the call rejects. The bridge passes on only a string.
    */
   readonly send: (text: string) => Promise<ChatSendResultView>;
   /**
@@ -294,9 +296,10 @@ export interface ChatBridge {
   /**
    * Loads the page of messages older than the held ones. Resolves to
    * `none` when there is nothing older to load or the view cannot show
-   * more, to `busy` while a page is on its way, and to `too_soon` for a
-   * few seconds after an older page did not load (a minute after the
-   * server asked to wait).
+   * more, to `busy` while a page is on its way, and to `too_soon` within
+   * the backoff after an older page did not load: 2 s after the first
+   * failure, doubling with each failure in a row up to 60 s, and 60 s after
+   * the server asked to wait.
    */
   readonly loadOlder: () => Promise<ChatLoadOlderResultView>;
 }

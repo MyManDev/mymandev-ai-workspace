@@ -252,9 +252,9 @@ export interface ChatIpc {
  *   (`none`) or the view cannot show another page (`not_shown`), and
  *   `too_soon` without a read after an older page did not load, until the
  *   workspace service's backoff has passed (`workspaceRetryDelayMs`:
- *   min(60 s, 2 s x 2^n) for the n-th failure in a row before this one, and
- *   60 s after `rate_limited`), so that a renderer cannot read the API in a
- *   loop.
+ *   min(60 s, 2 s x 2^n) for the n-th failure in a row before this one in
+ *   the same chat, and 60 s after `rate_limited`), so that a renderer
+ *   cannot read the API in a loop.
  *
  * A change of the chat service, and a change of the workspace service,
  * which also reports a new name of a person, raise the view's revision at
@@ -281,8 +281,11 @@ export function registerChatIpc(
   let closed = false;
   let revision = 0;
   let cancelPublish: (() => void) | null = null;
-  /** Whether an older page was on its way in the last state seen. */
-  let loadingOlder = chat.state().loadingOlder;
+  /** The chat and whether an older page was on its way, in the last state seen. */
+  const initial = chat.state();
+  let chatWorkspaceId = initial.workspaceId;
+  let chatProjectId = initial.projectId;
+  let loadingOlder = initial.loadingOlder;
   /** The older pages that did not load in a row, and when the last one ended. */
   let olderFailures = 0;
   let olderFailedAt = 0;
@@ -312,16 +315,31 @@ export function registerChatIpc(
     cancelPublish ??= schedule(publish, CHAT_PUBLISH_INTERVAL_MS);
   }
 
-  /** Counts the older pages that did not load in a row. */
+  /**
+   * Counts the older pages of the chat that did not load in a row. The
+   * count starts again with another chat: another workspace or project, and
+   * a sign-out or another account or device, which leave no chat first. It
+   * also starts again whenever no older page failed and none is on its
+   * way, for example after a page loaded.
+   */
   function chatChanged(state: ChatState): void {
-    if (loadingOlder && !state.loadingOlder) {
-      if (state.olderProblem === undefined) {
-        olderFailures = 0;
-      } else {
-        olderFailures += 1;
-        olderFailedAt = now();
-      }
+    if (
+      state.workspaceId !== chatWorkspaceId ||
+      state.projectId !== chatProjectId ||
+      (state.olderProblem === undefined && !state.loadingOlder)
+    ) {
+      olderFailures = 0;
+      olderFailedAt = 0;
+    } else if (
+      loadingOlder &&
+      !state.loadingOlder &&
+      state.olderProblem !== undefined
+    ) {
+      olderFailures += 1;
+      olderFailedAt = now();
     }
+    chatWorkspaceId = state.workspaceId;
+    chatProjectId = state.projectId;
     loadingOlder = state.loadingOlder;
     changed();
   }
