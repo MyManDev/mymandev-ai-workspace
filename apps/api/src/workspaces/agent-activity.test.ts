@@ -1083,6 +1083,67 @@ test(`an account's transitions above ${RUN_TRANSITION_LIMIT.burst.max} in ${RUN_
   await quiet(client);
 });
 
+test(`an agent's transitions refused for a code of RUN_CANCEL_REASONS count toward the run transition limit: after ${RUN_TRANSITION_LIMIT.burst.max} of them, the next gets rate_limited`, async (t) => {
+  const clock = fakeClock();
+  const { account } = await instance(t, { clock });
+  const ada = await account(3896);
+  const { workspaceId } = await workspaceOf(ada.device);
+  const projectId = await projectIn(workspaceId, ada.device);
+  const { agentId, runIds } = await agentOf(projectId, ada.device);
+  const [runId] = runIds;
+  assert.ok(runId !== undefined);
+  const { client } = await connected(t, ada.app, ada.device);
+
+  for (let index = 0; index < RUN_TRANSITION_LIMIT.burst.max; index += 1) {
+    const sent = transitionOf(
+      ada.device,
+      workspaceId,
+      agentId,
+      runId,
+      "queued",
+      "cancelled",
+      { reason: index % 2 === 0 ? "device_revoked" : "member_removed" },
+    );
+    client.send(sent);
+    await nextRefused(client, sent.id, "conflict");
+    clock.advance(100);
+  }
+  // Above the limit, the limit answers first, also for such a reason.
+  const reserved = transitionOf(
+    ada.device,
+    workspaceId,
+    agentId,
+    runId,
+    "queued",
+    "cancelled",
+    { reason: "device_revoked" },
+  );
+  client.send(reserved);
+  await nextRefused(client, reserved.id, "rate_limited");
+  const limited = transitionOf(
+    ada.device,
+    workspaceId,
+    agentId,
+    runId,
+    "queued",
+    "running",
+  );
+  client.send(limited);
+  await nextRefused(client, limited.id, "rate_limited");
+  assert.deepEqual(await runState(runId), { state: "queued", reason: null });
+  assert.deepEqual(await recordedOf(runId), []);
+
+  // The burst slides: the oldest refused transition leaves it 10 seconds
+  // after it was sent.
+  clock.advance(
+    RUN_TRANSITION_LIMIT.burst.windowMs - 100 * RUN_TRANSITION_LIMIT.burst.max,
+  );
+  client.send(limited);
+  await nextRelayed(client, limited);
+  assert.ok(isOpen(client));
+  await quiet(client);
+});
+
 test("the largest relayed transitions of one burst fit, with the largest chat messages of one burst, under the backpressure limit of a connection", () => {
   const workspaceId = newId<WorkspaceId>();
   const agentId = newId<AgentId>();

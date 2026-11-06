@@ -78,7 +78,9 @@ export const envelopeHeaderShape = Object.freeze({
  * event ID alone. A transition whose device and event ID the server already
  * recorded gets the relayed event again, sent only to the sending
  * connection, and is never applied twice. A `reason` that is a code of
- * `RUN_CANCEL_REASONS` comes only from the server (`runReasonAllowed`).
+ * `RUN_CANCEL_REASONS` comes only from the server (`runReasonAllowed`): a
+ * transition from the agent with one gets `event.refused` with `conflict`,
+ * also when it resends a recorded event ID.
  */
 export const AgentRunStateChangedPayloadSchema = z
   .object({

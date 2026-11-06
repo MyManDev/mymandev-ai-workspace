@@ -64,10 +64,12 @@ export type RunTransitionOptions = Readonly<{
  * 1. The account's run transition limit (`RUN_TRANSITION_LIMIT`): above it,
  *    `event.refused` with `rate_limited`, and nothing is read or stored.
  * 2. A `reason` that only the server gives, a code of `RUN_CANCEL_REASONS`
- *    (`runReasonAllowed`, #201): `event.refused` with `conflict`, also for
- *    an event ID that the device already recorded, and nothing is read or
- *    stored. The decoders leave this rule to the server, so that the
- *    connection stays open.
+ *    (`runReasonAllowed`, #201): `event.refused` with `conflict`, and
+ *    nothing is read or stored. Like the limit, it comes before the agent
+ *    and the run are checked, so it also answers an event ID that the device
+ *    already recorded, and an agent that another device hosts or another
+ *    account owns, without the audit of step 6. The decoders leave this rule
+ *    to the server, so that the connection stays open.
  * 3. One transaction locks the account and the device (`lockConnection`) and
  *    records the transition with `recordRunTransition` in the event's
  *    workspace, which identity binding verified: the agent must be an agent
@@ -80,7 +82,7 @@ export type RunTransitionOptions = Readonly<{
  *    connections and to the sending connection, also when it is not
  *    subscribed, as its acknowledgement. A transition whose device and event
  *    ID are already recorded gets the stored relayed event, sent only to the
- *    sending connection.
+ *    sending connection, unless step 1 or 2 refused it.
  * 5. `not_found` (an agent or a run that the workspace does not have, a run
  *    of another agent, a repository that is not the run's) and `conflict` (a
  *    disabled agent, an archived project or workspace, a run that is no
@@ -88,8 +90,9 @@ export type RunTransitionOptions = Readonly<{
  *    another workspace) get `event.refused`, sent only to the sending
  *    connection, which stays open.
  * 6. An agent of the workspace that another device hosts or another account
- *    owns is `identity_mismatch`: the gateway audits it and closes the
- *    connection, as for a mismatch that identity binding finds. An account
+ *    owns is `identity_mismatch`, unless step 1 or 2 refused the transition:
+ *    the gateway audits it and closes the connection, as for a mismatch that
+ *    identity binding finds. An account
  *    that stopped being an active member, and a device or an account that
  *    may no longer act, since identity binding, close the connection as
  *    identity binding does.
