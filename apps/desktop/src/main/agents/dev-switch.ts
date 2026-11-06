@@ -14,19 +14,23 @@
 //   disabled, that its owner is the account's own person in the workspace,
 //   and that the workspace service's and the agent activity service's gates
 //   are live. Otherwise it waits: closing the project pauses it, and opening
-//   it again resumes it.
+//   it again resumes it; a sign-out pauses it the same way.
 // - It sends one transition at a time and waits for its acknowledgement, the
 //   relayed transition with the same event ID (D4). The run states come from
 //   the activity and from the acknowledgements, never from what was sent.
-//   Without an acknowledgement within `DEV_SWITCH_ACK_TIMEOUT_MS`, it sends
-//   the same event once more, which the server never applies twice, and then
-//   stops. It stops at the first refusal, and on close. A connection that the
-//   server closed for a refused message while a transition waits, such as
-//   1008 `identity_mismatch` for an agent that another device hosts, also
-//   stops it, because the resend would be refused again.
+//   Without an acknowledgement within `DEV_SWITCH_ACK_TIMEOUT_MS` while the
+//   connection stays open, it sends the same event once more, which the
+//   server never applies twice, and then stops.
+// - It stops for good at the first refusal and at the first close or loss of
+//   the open connection (decided on 2026-11-05: "It stops at the first
+//   refusal or close"), and a reconnect does not resume it, so nothing is
+//   sent again after a close. Only the client's own close for the account,
+//   `offline` after a sign-out, pauses it, unless a transition waits for its
+//   acknowledgement.
 // - At most one send every `DEV_SWITCH_STEP_MS`, resends included, and at
 //   most `DEV_SWITCH_HOURLY_SENDS` in any hour, well below the account's
-//   transition limit (D5).
+//   transition limits that the Project Manager approved on 2026-11-05 (30 in
+//   any 10 seconds and 1,800 in an hour).
 //
 // Every send goes through the connection client's `sendAs` with the agent
 // actor. It has no IPC channel, so a packaged build sends nothing. The logs
@@ -122,7 +126,7 @@ export type DevSwitchAccount = Pick<
 /** The part of the connection client that the switch uses. */
 export type DevSwitchConnection = Pick<
   ConnectionClient,
-  "sendAs" | "onMessage" | "onStatusChange"
+  "sendAs" | "onMessage" | "status" | "onStatusChange"
 >;
 /** The part of the workspace service that the switch uses. */
 export type DevSwitchWorkspaces = Pick<
@@ -175,12 +179,23 @@ interface Pending {
 
 /** Why the switch does not send now. */
 type Notice =
-  "moving" | "waiting" | "no_runs" | "not_host" | "not_owner" | "disabled";
+  | "moving"
+  | "waiting"
+  | "not_signed_in"
+  | "not_listed"
+  | "no_runs"
+  | "not_host"
+  | "not_owner"
+  | "disabled";
 
 const NOTICES = Object.freeze({
   moving: "The development agent switch moves the agent's runs.",
   waiting:
     "The development agent switch waits for the agent's project to open and load.",
+  not_signed_in:
+    "The development agent switch waits: this device is not signed in and ready.",
+  not_listed:
+    "The development agent switch waits: the open project does not list the agent.",
   no_runs: "The development agent switch has no unfinished run to move.",
   not_host:
     "The development agent switch waits: this device does not host the agent.",
@@ -260,6 +275,8 @@ export function createDevAgentSwitch(
   let cancelStep: (() => void) | null = null;
   let cancelAck: (() => void) | null = null;
   let lastNotice: Notice | null = null;
+  /** Whether the connection's last status was `connected`. */
+  let connected = connection.status().state === "connected";
 
   function notice(next: Notice): void {
     if (next !== lastNotice) {
@@ -292,20 +309,19 @@ export function createDevAgentSwitch(
     | Notice {
     const device = signedInDevice(account.status());
     if (device === null) {
-      return "waiting";
+      return "not_signed_in";
     }
     if (device !== hostDeviceId) {
       return "not_host";
     }
     const state = agents.state();
     const { workspaceId } = state;
-    const agent = state.agents.find((item) => item.id === agentId);
-    if (
-      state.status !== "ready" ||
-      workspaceId === null ||
-      agent === undefined
-    ) {
+    if (state.status !== "ready" || workspaceId === null) {
       return "waiting";
+    }
+    const agent = state.agents.find((item) => item.id === agentId);
+    if (agent === undefined) {
+      return "not_listed";
     }
     if (agent.disabledAt !== null) {
       return "disabled";
@@ -502,23 +518,34 @@ export function createDevAgentSwitch(
   }
 
   /**
-   * The server closed the connection for a message that it refused
-   * (`message_refused`, such as 1008 `identity_mismatch`) while a transition
-   * waits for its acknowledgement: most likely for that transition, so it is
-   * not sent again. Any other loss keeps the one resend.
+   * Any close or loss of the open connection stops the switch for good
+   * (decided on 2026-11-05: "It stops at the first refusal or close"),
+   * whether a transition waits or not: a close of the server, which the
+   * client reports as `waiting` or `stopped` with any reason, and the
+   * client's own close and reopen, which it reports as `connecting`. A
+   * transition that waited may have been applied, and it is never sent
+   * again after a close. Only the client's close for the account, `offline`
+   * after a sign-out, a removal, or a key that is not ready, pauses the
+   * switch like the account guard, unless a transition waits. A connection
+   * that was not open yet, such as a first attempt that fails, changes
+   * nothing.
    */
   function connectionChanged(status: ConnectionStatus): void {
-    if (
-      !closed &&
-      !stopped &&
-      pending !== null &&
-      status.state === "waiting" &&
-      status.reason === "message_refused"
-    ) {
-      stop(
-        "The development agent switch stopped: the server closed the connection after a transition (message_refused).",
-      );
+    const wasConnected = connected;
+    connected = status.state === "connected";
+    if (closed || stopped || !wasConnected || connected) {
+      return;
     }
+    if (status.state === "offline" && pending === null) {
+      return;
+    }
+    const code =
+      "reason" in status && status.reason !== undefined
+        ? status.reason
+        : status.state;
+    stop(
+      `The development agent switch stopped: the connection closed (${code}).`,
+    );
   }
 
   const removers = [

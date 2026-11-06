@@ -18,9 +18,12 @@ import {
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
-import type {
-  AccountStatus,
-  ConnectionStatus,
+import {
+  CONNECTION_STOP_REASONS,
+  CONNECTION_WAITING_REASONS,
+  type AccountStatus,
+  type ConnectionStatus,
+  type ConnectionWaitingReason,
 } from "../../shared/ipc-contract.ts";
 import type {
   BuildClientEvent,
@@ -185,14 +188,14 @@ interface HarnessOptions {
   readonly agentsLive?: boolean;
   readonly workspaceLive?: boolean;
   readonly ownMember?: MemberId | null;
+  /** The connection's status when the switch starts; `connected` by default. */
+  readonly connection?: ConnectionStatus;
   /** Replaces the harness's log, which keeps the lines. */
   readonly log?: (message: string) => void;
 }
 
-/** The client backs off: the server closed the connection. */
-function waiting(
-  reason: "message_refused" | "connection_lost",
-): ConnectionStatus {
+/** The client backs off: the connection failed, or it closed or was lost. */
+function waiting(reason: ConnectionWaitingReason): ConnectionStatus {
   return {
     state: "waiting",
     reason,
@@ -201,7 +204,14 @@ function waiting(
   };
 }
 
+const CONNECTING: ConnectionStatus = { state: "connecting", revision: 2 };
 const CONNECTED: ConnectionStatus = { state: "connected", revision: 3 };
+/** The client closed the socket because the device signed out. */
+const SIGNED_OUT_CONNECTION: ConnectionStatus = {
+  state: "offline",
+  reason: "not_signed_in",
+  revision: 4,
+};
 
 class Harness {
   /** The monotonic time in milliseconds. */
@@ -218,6 +228,7 @@ class Harness {
   agentsLive: boolean;
   workspaceLive: boolean;
   ownMember: MemberId | null;
+  connectionStatus: ConnectionStatus;
   readonly sent: AgentRunStateChangedEvent[] = [];
   readonly sentAt: number[] = [];
   readonly timers: Timer[] = [];
@@ -237,6 +248,7 @@ class Harness {
     this.workspaceLive = options.workspaceLive ?? true;
     this.ownMember =
       options.ownMember === undefined ? OWNER : options.ownMember;
+    this.connectionStatus = options.connection ?? CONNECTED;
     const account: DevSwitchAccount = {
       status: () => this.accountStatus,
       onStatusChange: (listener) => {
@@ -250,6 +262,7 @@ class Harness {
         this.messageListeners.add(listener);
         return () => this.messageListeners.delete(listener);
       },
+      status: () => this.connectionStatus,
       onStatusChange: (listener) => {
         this.connectionListeners.add(listener);
         return () => this.connectionListeners.delete(listener);
@@ -408,6 +421,7 @@ class Harness {
   }
 
   setConnection(status: ConnectionStatus): void {
+    this.connectionStatus = status;
     for (const listener of [...this.connectionListeners]) {
       listener(status);
     }
@@ -837,8 +851,44 @@ test("it pauses when the project closes and resumes when it opens again", () => 
   expect(h.logs).toEqual([
     "The development agent switch moves the agent's runs.",
     "The development agent switch waits for the agent's project to open and load.",
+    "The development agent switch waits: the open project does not list the agent.",
+    "The development agent switch waits for the agent's project to open and load.",
     "The development agent switch moves the agent's runs.",
     "The development agent switch waits for the agent's project to open and load.",
+    "The development agent switch moves the agent's runs.",
+  ]);
+});
+
+test("each reason to wait logs its own fixed line, once per change of reason", () => {
+  const h = new Harness({ account: SIGNED_OUT });
+  // The same reason again, also for another cause, logs nothing more.
+  h.setAccount({ ...accountStatus(), deviceKey: "loading" } as AccountStatus);
+  h.setAccount({ ...accountStatus(), apiOrigin: "unset" } as AccountStatus);
+  h.advance(60_000);
+  h.setActivity(NO_PROJECT);
+  // The host device without an open project, then another project that does
+  // not list the agent, twice.
+  h.setAccount(accountStatus());
+  const otherProject: AgentActivityState = {
+    ...activity(),
+    projectId: "0192f0a0-7b3c-7d4e-8f50-0000000000e2" as ProjectId,
+    agents: [],
+    unfinishedRuns: [],
+  };
+  h.setActivity(otherProject);
+  h.setActivity({ ...otherProject, revision: 2 });
+  h.workspaceChanged();
+  h.setAccount(SIGNED_OUT);
+  h.setAccount(accountStatus());
+  expect(h.sent).toEqual([]);
+  h.setActivity(activity());
+  expect(h.walk()).toEqual(["01 queued>running"]);
+  expect(h.logs).toEqual([
+    "The development agent switch waits: this device is not signed in and ready.",
+    "The development agent switch waits for the agent's project to open and load.",
+    "The development agent switch waits: the open project does not list the agent.",
+    "The development agent switch waits: this device is not signed in and ready.",
+    "The development agent switch waits: the open project does not list the agent.",
     "The development agent switch moves the agent's runs.",
   ]);
 });
@@ -910,49 +960,163 @@ test("it never sends more than the account's transition limit allows", () => {
   expect(times[DEV_SWITCH_HOURLY_SENDS]).toBe(3_600_000);
 });
 
-test("a connection that the server closed for a refused message stops the switch without a resend", () => {
-  // As after 1008 identity_mismatch: the database names another host device.
-  const h = new Harness();
-  h.setConnection(waiting("message_refused"));
-  expect(h.logs.at(-1)).toBe(
-    "The development agent switch stopped: the server closed the connection after a transition (message_refused).",
-  );
-  h.setConnection(CONNECTED);
-  h.setActivity(activity());
-  h.advance(60_000);
-  expect(h.sent).toHaveLength(1);
-  expect(h.openTimers()).toEqual([]);
-  expect(h.connectionListeners.size).toBe(0);
+/** Every close or loss of an open connection, as the client reports it. */
+const CLOSES: readonly ConnectionStatus[] = [
+  // A close of the server or a lost socket, after which the client backs
+  // off: 1006 and 1001 (`connection_lost`), 1011 (`server_error`), 1013
+  // (`server_busy`), 1008 such as `identity_mismatch` (`message_refused`),
+  // and the others.
+  ...CONNECTION_WAITING_REASONS.map(waiting),
+  // A close after which the client does not reconnect on its own, such as
+  // 4409 `connection_replaced`.
+  ...CONNECTION_STOP_REASONS.map((reason): ConnectionStatus => ({
+    state: "stopped",
+    reason,
+    revision: 2,
+  })),
+  // The client closed the socket and opens another one, as after the system
+  // resumed.
+  CONNECTING,
+];
 
-  // Without a transition that waits, it changes nothing.
-  const g = new Harness();
-  g.ack();
-  g.setConnection(waiting("message_refused"));
-  g.setConnection(CONNECTED);
-  g.advance(DEV_SWITCH_STEP_MS);
-  expect(g.walk()).toEqual(["01 queued>running", "01 running>awaiting_input"]);
+function closeCode(status: ConnectionStatus): string {
+  return "reason" in status && status.reason !== undefined
+    ? status.reason
+    : status.state;
+}
+
+/** The connection opens again, and the workspace and the project reload. */
+function reconnect(h: Harness): void {
+  h.setConnection(CONNECTING);
+  h.setConnection({ state: "authenticating", revision: 5 });
+  h.setConnection(CONNECTED);
+  h.setAccount(accountStatus());
+  h.workspaceChanged();
+  h.setActivity(activity());
+}
+
+test("every close or loss of the open connection stops the switch for good, and a reconnect does not resume it", () => {
+  for (const close of CLOSES) {
+    // While a transition waits for its acknowledgement, and between two
+    // transitions.
+    for (const waits of [true, false]) {
+      const h = new Harness();
+      if (!waits) {
+        h.ack();
+      }
+      h.setConnection(close);
+      expect(h.logs.at(-1)).toBe(
+        `The development agent switch stopped: the connection closed (${closeCode(close)}).`,
+      );
+      expect(h.openTimers()).toEqual([]);
+      expect(h.connectionListeners.size).toBe(0);
+      expect(h.messageListeners.size).toBe(0);
+      expect(h.accountListeners.size).toBe(0);
+      // No resend and no next transition: not after the reconnect, not
+      // after a late acknowledgement, and not after the acknowledgement's
+      // timeout.
+      reconnect(h);
+      h.ack();
+      h.advance(2 * DEV_SWITCH_ACK_TIMEOUT_MS + 60_000);
+      expect(h.sent).toHaveLength(1);
+    }
+  }
 });
 
-test("an ordinary loss of the connection keeps the one resend", () => {
+test("a close also stops a paused switch and a resend that waits for the guards", () => {
+  // Paused with the project closed.
   const h = new Harness();
-  h.agentsLive = false;
-  h.workspaceLive = false;
+  h.ack();
+  h.setActivity(NO_PROJECT);
   h.setConnection(waiting("connection_lost"));
-  h.advance(DEV_SWITCH_ACK_TIMEOUT_MS);
+  expect(h.logs.at(-1)).toBe(
+    "The development agent switch stopped: the connection closed (connection_lost).",
+  );
+  reconnect(h);
+  h.advance(60_000);
   expect(h.sent).toHaveLength(1);
-  h.setConnection(CONNECTED);
+
+  // The acknowledgement timed out and the resend waits for a gate.
+  const g = new Harness();
+  g.workspaceLive = false;
+  g.advance(DEV_SWITCH_ACK_TIMEOUT_MS);
+  expect(g.sent).toHaveLength(1);
+  g.setConnection(waiting("server_error"));
+  g.workspaceLive = true;
+  reconnect(g);
+  g.advance(60_000);
+  expect(g.sent).toHaveLength(1);
+  expect(g.logs.at(-1)).toBe(
+    "The development agent switch stopped: the connection closed (server_error).",
+  );
+});
+
+test("a sign-out pauses the switch, unless a transition waits for its acknowledgement", () => {
+  const h = new Harness();
+  h.ack();
+  // The sign-out: the client closes the socket, and the gates go down.
+  const signOut = () => {
+    h.agentsLive = false;
+    h.workspaceLive = false;
+    h.setConnection(SIGNED_OUT_CONNECTION);
+    h.setAccount(SIGNED_OUT);
+  };
+  signOut();
+  h.advance(60_000);
+  expect(h.sent).toHaveLength(1);
+  expect(h.logs.at(-1)).toBe(
+    "The development agent switch waits: this device is not signed in and ready.",
+  );
+  // The host device signs in again, connects, and reloads: the walk goes on.
   h.agentsLive = true;
   h.workspaceLive = true;
-  h.setActivity(activity());
-  expect(h.sent).toHaveLength(2);
-  expect(h.sent[1]).toEqual(h.sent[0]);
+  reconnect(h);
+  expect(h.walk()).toEqual(["01 queued>running", "01 running>awaiting_input"]);
+
+  // A sign-out while that transition waits stops the switch: it is never
+  // sent again after a close.
+  signOut();
+  expect(h.logs.at(-1)).toBe(
+    "The development agent switch stopped: the connection closed (not_signed_in).",
+  );
+  h.agentsLive = true;
+  h.workspaceLive = true;
+  reconnect(h);
   h.ack();
-  h.advance(DEV_SWITCH_STEP_MS);
-  expect(h.walk()).toEqual([
-    "01 queued>running",
-    "01 queued>running",
-    "01 running>awaiting_input",
-  ]);
+  h.advance(60_000);
+  expect(h.sent).toHaveLength(2);
+});
+
+test("a connection that was not open yet changes nothing", () => {
+  // The first attempt fails before the switch could send.
+  const h = new Harness({ connection: CONNECTING, agentsLive: false });
+  h.setConnection(waiting("connection_failed"));
+  h.setConnection(CONNECTING);
+  h.setConnection(CONNECTED);
+  h.agentsLive = true;
+  h.setActivity(activity());
+  expect(h.walk()).toEqual(["01 queued>running"]);
+  // Once it was open, its loss stops the switch.
+  h.ack();
+  h.setConnection(waiting("connection_lost"));
+  reconnect(h);
+  h.advance(60_000);
+  expect(h.sent).toHaveLength(1);
+
+  // Signed out at the start: the first connection after the sign-in is the
+  // one that counts.
+  const g = new Harness({
+    account: SIGNED_OUT,
+    connection: SIGNED_OUT_CONNECTION,
+  });
+  g.setConnection(CONNECTING);
+  g.setConnection(waiting("connection_failed"));
+  reconnect(g);
+  expect(g.walk()).toEqual(["01 queued>running"]);
+  g.setConnection({ state: "stopped", reason: "device_revoked", revision: 6 });
+  expect(g.logs.at(-1)).toBe(
+    "The development agent switch stopped: the connection closed (device_revoked).",
+  );
 });
 
 test("a resend waits for the hourly budget too", () => {
