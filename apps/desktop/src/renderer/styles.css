@@ -625,6 +625,99 @@ code {
   list-style: none;
 }
 
+/* Agents and runs */
+
+/* The live region of the agent panel stays in place and takes no room while empty. */
+.agent-status:empty {
+  margin: 0;
+}
+
+.agent-status,
+.agent-note {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.agent-list,
+.agent-run-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Long names and reasons wrap instead of widening the panel. */
+.agent,
+.agent-run {
+  padding-block: var(--space-2);
+  border-block-end: var(--border-width) solid var(--color-border);
+  overflow-wrap: anywhere;
+}
+
+.agent-name,
+.agent-run-agent {
+  margin: 0;
+  font-weight: var(--font-weight-strong);
+}
+
+.agent[data-state="disabled"] .agent-name {
+  color: var(--color-text-muted);
+}
+
+.agent-meta,
+.agent-run-state,
+.agent-run-reason,
+.agent-run-time {
+  margin: var(--space-1) 0 0;
+  font-size: var(--font-size-small);
+}
+
+.agent-meta,
+.agent-run-time {
+  color: var(--color-text-muted);
+}
+
+.agent-runs-heading {
+  margin-block: var(--space-4) var(--space-1);
+  font-size: var(--font-size-base);
+}
+
+.agent-run-state {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/*
+ * The dot repeats the run's state, which is also text, in its status color:
+ * running, waiting (queued or awaiting input), failed, or neutral (finished
+ * or cancelled).
+ */
+.agent-run-dot {
+  flex: none;
+  width: var(--space-2);
+  height: var(--space-2);
+  border-radius: var(--radius-round);
+  background: var(--color-status-neutral);
+}
+
+.agent-run[data-state="running"] .agent-run-dot {
+  background: var(--color-status-running);
+}
+
+.agent-run[data-state="queued"] .agent-run-dot,
+.agent-run[data-state="awaiting_input"] .agent-run-dot {
+  background: var(--color-status-transition);
+}
+
+.agent-run[data-state="failed"] .agent-run-dot {
+  background: var(--color-status-failed);
+}
+
+.agent-run[data-state="completed"] .agent-run-dot,
+.agent-run[data-state="cancelled"] .agent-run-dot {
+  background: var(--color-status-neutral);
+}
+
 /* Narrow windows: the side panel moves below the screen. */
 @media (max-width: 64rem) {
   .shell-project {

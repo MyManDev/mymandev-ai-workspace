@@ -8,6 +8,7 @@ import {
 } from "react";
 import type {
   AccountBridge,
+  AgentBridge,
   ConnectionBridge,
   RepositoryBridge,
   RuntimeBridge,
@@ -66,6 +67,8 @@ export interface AppProps {
   readonly connection?: ConnectionBridge | undefined;
   /** The account's workspaces from the preload script; undefined outside Electron. */
   readonly workspaces?: WorkspaceBridge | undefined;
+  /** The open project's agent activity from the preload script; undefined outside Electron. */
+  readonly agents?: AgentBridge | undefined;
   /**
    * The workspace state shown until the bridge delivers one, for tests and
    * previews. Without it, the shell starts without projects.
@@ -82,6 +85,7 @@ export function App({
   account,
   connection,
   workspaces,
+  agents,
   initialWorkspaceState,
   initialView = HOME_VIEW,
 }: AppProps) {
@@ -139,7 +143,9 @@ export function App({
       {open === undefined ? null : (
         <ProjectPanel
           panel={open.view.panel}
+          projectId={open.project.id}
           dispatch={dispatch}
+          agents={agents}
           repositories={repositories}
         />
       )}

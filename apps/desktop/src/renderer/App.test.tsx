@@ -3,6 +3,7 @@ import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type {
   AccountBridge,
+  AgentBridge,
   ConnectionBridge,
   RepositoryBridge,
   RuntimeBridge,
@@ -240,7 +241,7 @@ test("the side panel shows the agents or the repositories, chosen with tabs of w
     '<aside class="project-panel" aria-labelledby="panel-title"><div class="panel-tabs" role="tablist" aria-label="Side panel">' +
       tab("Agents", true) +
       tab("Repositories", false) +
-      '</div><div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-agents" tabindex="0"><h2 id="panel-title">Agents</h2><p>No agents yet.</p>',
+      '</div><div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-agents" tabindex="0"><h2 id="panel-title">Agents</h2><p class="agent-status" role="status">Agents are not available.</p></div>',
   );
   expect(repositories).toContain(
     '<div class="panel-tabs" role="tablist" aria-label="Side panel">' +
@@ -248,6 +249,23 @@ test("the side panel shows the agents or the repositories, chosen with tabs of w
       tab("Repositories", true) +
       '</div><div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2><p>Repositories are not available.</p>',
   );
+});
+
+test("with the bridge, the agent panel waits for the first agent activity", () => {
+  const agents: AgentBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const html = render({
+    agents,
+    initialView: { screen: "chat", projectId: "project-a", panel: "agents" },
+  });
+
+  // The agent panel is the content of the agents tab.
+  expect(html).toContain(
+    '<div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-agents" tabindex="0"><h2 id="panel-title">Agents</h2><p class="agent-status" role="status">Checking the agents.</p></div>',
+  );
+  expect(html).not.toContain("Agents are not available.");
 });
 
 test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {
