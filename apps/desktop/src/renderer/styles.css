@@ -30,6 +30,7 @@
   --color-status-running: #2da44e;
   --color-status-transition: #9a6700;
   --color-status-failed: #cf222e;
+  --color-backdrop: #1c1f2466;
 
   --font-family: system-ui, sans-serif;
   --font-family-mono: ui-monospace, monospace;
@@ -51,6 +52,7 @@
   --mark-width: 3px;
   --size-sidebar: 14rem;
   --size-panel: 18rem;
+  --size-dialog: 28rem;
 
   font-family: var(--font-family);
 }
@@ -74,6 +76,7 @@
     --color-status-running: #3fb950;
     --color-status-transition: #d29922;
     --color-status-failed: #f85149;
+    --color-backdrop: #000000a6;
   }
 }
 
@@ -93,6 +96,7 @@
   --color-status-running: #3fb950;
   --color-status-transition: #d29922;
   --color-status-failed: #f85149;
+  --color-backdrop: #000000a6;
 }
 
 body {
@@ -540,7 +544,50 @@ code {
   margin-block-end: 0;
 }
 
-.message-list {
+/* The live regions of the chat stay in place and take no room while empty. */
+.chat-status,
+.chat-older-status,
+.composer-status {
+  margin: 0;
+}
+
+.chat-older {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.chat-note,
+.chat-empty,
+.chat-older-status {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.chat-load-older,
+.pending-action {
+  padding: var(--space-1) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-background);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.chat-load-older:hover,
+.pending-action:hover {
+  background: var(--color-hover);
+}
+
+.chat-load-older[aria-disabled="true"] {
+  color: var(--color-text-muted);
+  cursor: progress;
+}
+
+.message-list,
+.pending-list {
   display: flex;
   flex-direction: column;
   gap: var(--space-3);
@@ -549,19 +596,70 @@ code {
   list-style: none;
 }
 
-.message {
+.message,
+.pending {
   padding: var(--space-3);
   border-radius: var(--radius);
   background: var(--color-surface);
 }
 
-.message-author {
-  margin: 0 0 var(--space-1);
-  font-weight: var(--font-weight-strong);
+/* An agent's message has a bar in the accent color. */
+.message[data-author-kind="agent"] {
+  box-shadow: inset var(--mark-width) 0 0 var(--color-accent);
 }
 
-.message-text {
+.message-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0 0 var(--space-1);
+}
+
+.message-author {
+  font-weight: var(--font-weight-strong);
+  overflow-wrap: anywhere;
+}
+
+.message-kind,
+.message-time {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+/* A body is text: its line breaks and spaces stay, and a long word wraps. */
+.message-body {
   margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.pending {
+  border: var(--border-width) dashed var(--color-border);
+}
+
+.pending-heading {
+  margin: 0;
+  font-size: var(--font-size-base);
+}
+
+.pending-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: var(--space-1) 0 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.pending[data-status="not_sent"] .pending-status {
+  color: var(--color-status-failed);
+}
+
+.pending-actions {
+  display: flex;
+  gap: var(--space-2);
+  margin-block-start: var(--space-2);
 }
 
 .composer {
@@ -569,8 +667,15 @@ code {
   gap: var(--space-2);
 }
 
-.composer .placeholder-note {
+.composer-hint {
   margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.composer-status {
+  color: var(--color-status-failed);
+  font-size: var(--font-size-small);
 }
 
 .composer-text {
@@ -598,6 +703,56 @@ code {
   background: var(--color-surface);
   color: var(--color-text-muted);
   cursor: not-allowed;
+}
+
+/* The question before a switch while chat messages wait to be sent. */
+
+.switch-question {
+  max-width: var(--size-dialog);
+  padding: var(--space-4);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-background);
+  color: var(--color-text);
+}
+
+.switch-question::backdrop {
+  background: var(--color-backdrop);
+}
+
+.switch-question h2 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-heading);
+}
+
+.switch-question p {
+  margin: 0 0 var(--space-4);
+}
+
+.switch-question-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.switch-question-keep,
+.switch-question-discard {
+  padding: var(--space-1) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.switch-question-keep:hover,
+.switch-question-discard:hover {
+  background: var(--color-hover);
+}
+
+.switch-question-discard {
+  color: var(--color-status-failed);
 }
 
 /* Permissions */
