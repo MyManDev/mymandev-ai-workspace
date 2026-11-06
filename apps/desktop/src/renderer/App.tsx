@@ -8,6 +8,7 @@ import {
 } from "react";
 import type {
   AccountBridge,
+  AgentBridge,
   ChatBridge,
   ConnectionBridge,
   RepositoryBridge,
@@ -69,6 +70,8 @@ export interface AppProps {
   readonly connection?: ConnectionBridge | undefined;
   /** The account's workspaces from the preload script; undefined outside Electron. */
   readonly workspaces?: WorkspaceBridge | undefined;
+  /** The open project's agent activity from the preload script; undefined outside Electron. */
+  readonly agents?: AgentBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
   readonly chat?: ChatBridge | undefined;
   /**
@@ -87,6 +90,7 @@ export function App({
   account,
   connection,
   workspaces,
+  agents,
   chat,
   initialWorkspaceState,
   initialView = HOME_VIEW,
@@ -146,7 +150,9 @@ export function App({
       {open === undefined ? null : (
         <ProjectPanel
           panel={open.view.panel}
+          projectId={open.project.id}
           dispatch={dispatch}
+          agents={agents}
           repositories={repositories}
         />
       )}

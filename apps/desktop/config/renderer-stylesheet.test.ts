@@ -3,6 +3,10 @@
 // string, and the renderer's own tests have no Node.js API to read it.
 import { readdirSync, readFileSync } from "node:fs";
 import { expect, test } from "vitest";
+import {
+  AGENT_RUN_STATES,
+  type AgentRunStateView,
+} from "../src/shared/ipc-contract.ts";
 
 const RENDERER = new URL("../src/renderer/", import.meta.url);
 
@@ -49,6 +53,18 @@ function colorTokens(declarations: string): string[] {
 
 function names(tokens: readonly string[]): string[] {
   return tokens.map((token) => token.slice(0, token.indexOf(":")));
+}
+
+/**
+ * The declarations of every rule whose selector list holds exactly this
+ * selector, at the top level or inside an at-rule.
+ */
+function rulesWith(selector: string): string[] {
+  return [...CSS.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter(([, selectors]) =>
+      (selectors ?? "").split(",").some((item) => item.trim() === selector),
+    )
+    .map(([, , declarations]) => declarations ?? "");
 }
 
 test("the check finds references to other origins and schemes", () => {
@@ -103,6 +119,26 @@ test("colors are written only in color tokens, so the visual design can replace 
   );
 
   expect(literals).toEqual([]);
+});
+
+test("the dot of each of the six run states has the existing status color of its state", () => {
+  const tokens: Readonly<Record<AgentRunStateView, string>> = {
+    queued: "--color-status-transition",
+    running: "--color-status-running",
+    awaiting_input: "--color-status-transition",
+    completed: "--color-status-neutral",
+    failed: "--color-status-failed",
+    cancelled: "--color-status-neutral",
+  };
+
+  expect(rulesWith(".agent-run-dot")).toEqual([
+    expect.stringContaining("background: var(--color-status-neutral);"),
+  ]);
+  for (const state of AGENT_RUN_STATES) {
+    const rules = rulesWith(`.agent-run[data-state="${state}"] .agent-run-dot`);
+    expect(rules, state).toHaveLength(1);
+    expect(rules[0]?.trim(), state).toBe(`background: var(${tokens[state]});`);
+  }
 });
 
 test("the selected navigation item and tab keep a mark in forced colors", () => {
