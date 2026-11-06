@@ -36,6 +36,7 @@ import {
   startInAnotherBrowser,
   startMessage,
   waitingPairingCode,
+  watchSignInRetry,
   type AccountView,
 } from "./account-view.ts";
 
@@ -594,20 +595,11 @@ function useAccountPanel(
 
   // #199: the clock is read again when the wait after a start refused
   // during the grace period of an uncertain sign-in ends, so that the
-  // panel's note goes away then.
+  // panel's note goes away then (`watchSignInRetry`).
   const [now, setNow] = useState(() => Date.now());
   const retryAt =
     view.kind === "known" ? signInRetryAt(view.status) : undefined;
-  useEffect(() => {
-    if (retryAt === undefined) {
-      return undefined;
-    }
-    const timer = setTimeout(
-      () => setNow(Date.now()),
-      Math.max(0, retryAt - Date.now()),
-    );
-    return () => clearTimeout(timer);
-  }, [retryAt]);
+  useEffect(() => watchSignInRetry(retryAt, now, setNow), [retryAt, now]);
 
   /** Runs one action at a time and shows the message that its result names. */
   const run = useCallback(

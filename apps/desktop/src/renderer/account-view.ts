@@ -112,13 +112,16 @@ export function signInTimeFormat(
 /**
  * When a start that was refused as `replacement_pending` during the grace
  * period of an uncertain sign-in can be tried again, in milliseconds
- * (#199): the outcome's `retryAfter`, while no sign-in runs; otherwise
- * undefined.
+ * (#199): the outcome's `retryAfter`, while no sign-in runs and the status
+ * still reports the pending replacement; otherwise undefined, also when
+ * the replacement was resolved before that time. The main process computed
+ * the time when it refused the start.
  */
 export function signInRetryAt(status: AccountStatus): number | undefined {
   const outcome = status.lastOutcome;
   if (
     status.signIn.kind !== "idle" ||
+    !status.replacementPending ||
     outcome?.code !== "replacement_pending" ||
     outcome.retryAfter === undefined
   ) {
@@ -145,6 +148,68 @@ export function signInRetryNote(
   }
   const shown = new Date(Math.ceil(at / 60_000) * 60_000);
   return `A new sign-in can start after ${format.format(shown)}. Try again then.`;
+}
+
+/** The clock and the timer of `watchSignInRetry`; the tests replace them. */
+export interface SignInRetryClock {
+  /** The time in milliseconds, as `Date.now()` reads it. */
+  readonly now: () => number;
+  /** Runs `run` once after `delayMs`; the returned function stops it. */
+  readonly setTimer: (run: () => void, delayMs: number) => () => void;
+}
+
+/** The renderer's clock and `setTimeout`. */
+export const SYSTEM_RETRY_CLOCK: SignInRetryClock = Object.freeze({
+  now: () => Date.now(),
+  setTimer: (run: () => void, delayMs: number) => {
+    const timer = setTimeout(run, delayMs);
+    return () => clearTimeout(timer);
+  },
+});
+
+/**
+ * The longest delay of `setTimeout`, which runs a longer one at once
+ * (a 32-bit signed integer).
+ */
+const LONGEST_TIMER_MS = 2_147_483_647;
+
+/**
+ * Reads the clock again when the note of `signInRetryNote` ends (#199), so
+ * that the panel removes it: while the note shows at `now`, a timer runs
+ * until `retryAt` (`signInRetryAt`), by the clock's reading. When it fires,
+ * the clock is read again. A time at or after `retryAt` goes to `onTime`.
+ * A clock that still reads earlier, because it was set back or trails the
+ * timer, gets the timer again for the rest, so the note does not stay. No
+ * timer runs once `now` is at or after `retryAt`, so the time that
+ * `onTime` passed on arms no timer of no delay again and again. The
+ * returned function stops the timer that runs; the panel calls it when
+ * `retryAt` or `now` changes and when the panel is no longer shown.
+ */
+export function watchSignInRetry(
+  retryAt: number | undefined,
+  now: number,
+  onTime: (now: number) => void,
+  clock: SignInRetryClock = SYSTEM_RETRY_CLOCK,
+): () => void {
+  if (retryAt === undefined || now >= retryAt) {
+    return () => undefined;
+  }
+  let stop: () => void = () => undefined;
+  const arm = (read: number): void => {
+    stop = clock.setTimer(
+      () => {
+        const later = clock.now();
+        if (later >= retryAt) {
+          onTime(later);
+        } else {
+          arm(later);
+        }
+      },
+      Math.min(Math.max(0, retryAt - read), LONGEST_TIMER_MS),
+    );
+  };
+  arm(clock.now());
+  return () => stop();
 }
 
 /** The message for the last outcome; the installation's login after an account mismatch. */

@@ -581,10 +581,25 @@ test("a start refused during the grace period of an uncertain sign-in shows when
   });
   expect(plain).toContain(refusal);
   expect(plain).not.toContain("A new sign-in can start");
+  // Nor once the replacement is no longer pending, for example when it was
+  // resolved before that time.
+  const resolved = render({
+    view: known({
+      ...SIGNED_IN,
+      replacementPending: false,
+      lastOutcome: {
+        code: "replacement_pending",
+        retryAfter: "2026-11-06T10:09:30.000Z",
+      },
+    }),
+  });
+  expect(resolved).toContain(refusal);
+  expect(resolved).not.toContain("A new sign-in can start");
   expect(
     render({
       view: known({
         ...SIGNED_IN,
+        replacementPending: true,
         signIn: { kind: "starting" },
         lastOutcome: {
           code: "replacement_pending",

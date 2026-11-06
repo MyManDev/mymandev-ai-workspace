@@ -39,7 +39,9 @@ import {
   signOutMessage,
   startInAnotherBrowser,
   startMessage,
+  SYSTEM_RETRY_CLOCK,
   waitingPairingCode,
+  watchSignInRetry,
   type AccountView,
 } from "./account-view.ts";
 
@@ -127,6 +129,156 @@ test("a start refused during the grace period of an uncertain sign-in has a note
   }
   expect(signInRetryAt(IDLE)).toBeUndefined();
   expect(signInRetryAt({ ...IDLE, lastOutcome: null })).toBeUndefined();
+
+  // Not once the status no longer reports the pending replacement, for
+  // example when it was resolved before that time.
+  const resolved = { ...status, replacementPending: false };
+  expect(signInRetryAt(resolved)).toBeUndefined();
+  expect(signInRetryNote(resolved, now, utc)).toBeUndefined();
+});
+
+/** A clock whose time the test sets and whose timers fire when the test says so. */
+function fakeRetryClock(start: number) {
+  const timers: { run: () => void; delayMs: number }[] = [];
+  const clock = {
+    time: start,
+    timers,
+    now: () => clock.time,
+    setTimer: (run: () => void, delayMs: number) => {
+      const timer = { run, delayMs };
+      timers.push(timer);
+      return () => {
+        const index = timers.indexOf(timer);
+        if (index >= 0) {
+          timers.splice(index, 1);
+        }
+      };
+    },
+    /** The delays of the timers that run. */
+    delays: () => timers.map((timer) => timer.delayMs),
+    /** Fires the one timer that runs, at the time that the test set. */
+    fire: () => {
+      expect(timers).toHaveLength(1);
+      timers.shift()?.run();
+    },
+  };
+  return clock;
+}
+
+test("the panel's clock is read again when the note ends, and a time at or after it arms no timer (#199)", () => {
+  const at = Date.parse("2026-11-06T10:09:30.000Z");
+  const times: number[] = [];
+  const onTime = (time: number) => times.push(time);
+
+  // A timer until the time, counted from the clock's reading.
+  const clock = fakeRetryClock(at - 570_000);
+  watchSignInRetry(at, clock.time, onTime, clock);
+  expect(clock.delays()).toEqual([570_000]);
+  clock.time = at;
+  clock.fire();
+  expect(times).toEqual([at]);
+  expect(clock.delays()).toEqual([]);
+
+  // With that time, or a later one, or without a time, nothing is armed,
+  // so the time passed on does not arm timers of no delay again and again.
+  for (const now of [at, at + 1, at + 3_600_000]) {
+    watchSignInRetry(at, now, onTime, clock);
+  }
+  watchSignInRetry(undefined, at - 570_000, onTime, clock);
+  expect(clock.delays()).toEqual([]);
+  expect(times).toEqual([at]);
+
+  // A `now` that the panel read long ago does not lengthen the wait: the
+  // delay counts from the clock. When the clock is already at the time, the
+  // timer has no delay and passes the time on.
+  const stale = fakeRetryClock(at - 60_000);
+  watchSignInRetry(at, at - 3_600_000, onTime, stale);
+  expect(stale.delays()).toEqual([60_000]);
+  const past = fakeRetryClock(at + 5_000);
+  watchSignInRetry(at, at - 60_000, onTime, past);
+  expect(past.delays()).toEqual([0]);
+  past.fire();
+  expect(times).toEqual([at, at + 5_000]);
+  expect(past.delays()).toEqual([]);
+});
+
+test("a clock that still reads earlier when the timer fires gets the timer again for the rest (#199)", () => {
+  const at = Date.parse("2026-11-06T10:09:30.000Z");
+  const times: number[] = [];
+  const clock = fakeRetryClock(at - 570_000);
+  watchSignInRetry(at, clock.time, (time) => times.push(time), clock);
+
+  // The wall clock trails the timer by a millisecond.
+  clock.time = at - 1;
+  clock.fire();
+  expect(times).toEqual([]);
+  expect(clock.delays()).toEqual([1]);
+
+  // The clock was set back by an hour meanwhile.
+  clock.time = at - 3_600_000;
+  clock.fire();
+  expect(times).toEqual([]);
+  expect(clock.delays()).toEqual([3_600_000]);
+
+  clock.time = at + 2;
+  clock.fire();
+  expect(times).toEqual([at + 2]);
+  expect(clock.delays()).toEqual([]);
+
+  // A clock set back further than `setTimeout` can wait (it runs a longer
+  // delay at once) waits as long as it can, and then again.
+  const far = fakeRetryClock(at - 30 * 24 * 3_600_000);
+  watchSignInRetry(at, far.time, (time) => times.push(time), far);
+  expect(far.delays()).toEqual([2_147_483_647]);
+  far.time += 2_147_483_647;
+  far.fire();
+  expect(far.delays()).toEqual([30 * 24 * 3_600_000 - 2_147_483_647]);
+  expect(times).toEqual([at + 2]);
+});
+
+test("stopping the watch stops the timer that runs, also one armed again (#199)", () => {
+  const at = Date.parse("2026-11-06T10:09:30.000Z");
+  const times: number[] = [];
+  const clock = fakeRetryClock(at - 570_000);
+
+  const stop = watchSignInRetry(
+    at,
+    clock.time,
+    (time) => times.push(time),
+    clock,
+  );
+  expect(clock.delays()).toEqual([570_000]);
+  stop();
+  expect(clock.delays()).toEqual([]);
+
+  const again = watchSignInRetry(
+    at,
+    clock.time,
+    (time) => times.push(time),
+    clock,
+  );
+  clock.time = at - 1;
+  clock.fire();
+  expect(clock.delays()).toEqual([1]);
+  again();
+  expect(clock.delays()).toEqual([]);
+  // Stopping twice, or a watch that armed nothing, is harmless.
+  again();
+  watchSignInRetry(undefined, clock.time, (time) => times.push(time), clock)();
+  expect(times).toEqual([]);
+});
+
+test("the system's clock runs its timer once, and its stop keeps it from running (#199)", async () => {
+  const runs: string[] = [];
+  SYSTEM_RETRY_CLOCK.setTimer(() => runs.push("kept"), 1);
+  const stop = SYSTEM_RETRY_CLOCK.setTimer(() => runs.push("stopped"), 1);
+  stop();
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  expect(runs).toEqual(["kept"]);
+  const before = Date.now();
+  const read = SYSTEM_RETRY_CLOCK.now();
+  expect(read).toBeGreaterThanOrEqual(before);
+  expect(read).toBeLessThanOrEqual(Date.now());
 });
 
 /** The start and cancel of the bridge, with answers that the test gives. */
