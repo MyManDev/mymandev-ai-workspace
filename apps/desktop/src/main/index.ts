@@ -21,6 +21,10 @@ import {
   removeDeviceConfirmed,
 } from "./account-session.ts";
 import { createSystemAccountService } from "./account-system.ts";
+import {
+  createDevAgentSwitch,
+  devAgentSwitchSettings,
+} from "./agents/dev-switch.ts";
 import { createAgentActivityService } from "./agents/service.ts";
 import {
   APP_SCHEME,
@@ -210,6 +214,30 @@ function start(): void {
     workspaces,
   });
   app.on("will-quit", () => agentIpc.close());
+  // The development agent switch (#28): only in an unpackaged build, and
+  // only when MYMANDEV_DEV_AGENT_SWITCH holds the agent ID that
+  // `db:dev-seed` printed and MYMANDEV_DEV_AGENT_DEVICE the device ID that
+  // it was given. It moves that agent's runs as the agent, from its host
+  // device, and has no IPC channel, so a packaged build sends nothing. The
+  // logs are fixed text with a code at most, never an ID.
+  if (!app.isPackaged) {
+    const settings = devAgentSwitchSettings(
+      app.isPackaged,
+      process.env,
+      (message) => console.info(message),
+    );
+    if (settings !== null) {
+      const devSwitch = createDevAgentSwitch({
+        settings,
+        account,
+        connection,
+        workspaces,
+        agents,
+        log: (message) => console.info(message),
+      });
+      app.on("will-quit", () => devSwitch.close());
+    }
+  }
 
   // The open project's chat (#27): its history, read over HTTP, its
   // `chat.message.created` events, and the person's messages, sent with the

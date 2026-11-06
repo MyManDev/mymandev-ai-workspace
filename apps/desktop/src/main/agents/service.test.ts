@@ -950,6 +950,44 @@ test("a lost connection ends the gate until the next workspace.subscribed", asyn
   expect(h.openTimers()).toEqual([]);
 });
 
+test("gateLive holds only while the open project is reloaded since workspace.subscribed, with no reload open", async () => {
+  // A project loaded before the subscription is not live.
+  const h = new Harness();
+  h.setWorkspace(WS_A, PROJECT_1);
+  await h.answerReload();
+  expect(h.state.status).toBe("ready");
+  expect(h.service.gateLive()).toBe(false);
+  h.setConnection("connected");
+  h.receive(subscribed());
+  expect(h.service.gateLive()).toBe(false);
+  await h.answer("listRuns", ok(runList([run(1, "running")])));
+  expect(h.service.gateLive()).toBe(false);
+  await h.answer("listAgents", ok(agentList([AGENT_1, AGENT_2])));
+  expect(h.service.gateLive()).toBe(true);
+
+  // A reload of the agents alone is a reload too.
+  h.receive(memberRemoved());
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.service.gateLive()).toBe(false);
+  await h.answer("listAgents", ok(agentList([AGENT_1, AGENT_2])));
+  expect(h.service.gateLive()).toBe(true);
+
+  // A lost connection, a closed project, and close end it.
+  h.setConnection("offline");
+  expect(h.service.gateLive()).toBe(false);
+  h.setConnection("connected");
+  h.receive(subscribed());
+  await h.answerReload();
+  expect(h.service.gateLive()).toBe(true);
+  h.setWorkspace(WS_A, null);
+  expect(h.service.gateLive()).toBe(false);
+  h.setWorkspace(WS_A, PROJECT_1);
+  await h.answerReload();
+  expect(h.service.gateLive()).toBe(true);
+  h.service.close();
+  expect(h.service.gateLive()).toBe(false);
+});
+
 test("a refused or ended subscription ends the gate", async () => {
   for (const ending of [
     frame({
