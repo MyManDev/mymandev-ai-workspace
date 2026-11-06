@@ -1366,8 +1366,11 @@ export function createDeviceSession(
    * on #94). It publishes
    * `key_lost` first, deletes both keys, and keeps the record, so that the
    * next sign-in registers a new device that names the record's device. A
-   * sign-out marker names only keys that are gone then, so it is deleted; a
-   * corrupt one stays until a sign-in.
+   * sign-out marker stays, also one that is not corrupt, so that `key_lost`
+   * still carries `signedOut` (`signOutMarked`, #204). The read after the
+   * next sign-in drops a marker that names no key that the installation
+   * holds (`readMarker`), and the read after "This is not me" deleted the
+   * record drops it with the record.
    */
   async function keysLost(facts: ReadyFacts): Promise<SessionFailure> {
     const held = deps.keyStore.keys();
@@ -1396,9 +1399,6 @@ export function createDeviceSession(
       report("The device keys could not be deleted.");
       refusal = "auth_failed";
       return refused("auth_failed");
-    }
-    if (facts.marker !== null && facts.marker.publicKeys !== null) {
-      await dropMarker();
     }
     return failure("key_lost");
   }

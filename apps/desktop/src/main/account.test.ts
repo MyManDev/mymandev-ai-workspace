@@ -2344,6 +2344,35 @@ test("after a restart of a signed-out device, no status names the account or an 
   ]);
 });
 
+test("a change of the signed-out flag alone, with the same device state, hides the account or names it again (#204)", async () => {
+  const h = harness();
+  h.sessionState = { kind: "key_lost", account: SESSION_ACCOUNT };
+  await h.service.initialize();
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "signed_in", login: "octocat" },
+    device: "key_lost",
+  });
+  const before = h.statuses.length;
+
+  h.emit({ kind: "key_lost", account: SESSION_ACCOUNT, signedOut: true });
+  expect(h.statuses).toHaveLength(before + 1);
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "hidden" },
+    device: "key_lost",
+  });
+
+  h.emit({ kind: "key_lost", account: SESSION_ACCOUNT });
+  expect(h.statuses).toHaveLength(before + 2);
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "signed_in", login: "octocat" },
+    device: "key_lost",
+  });
+
+  // The same state again changes nothing.
+  h.emit({ kind: "key_lost", account: SESSION_ACCOUNT });
+  expect(h.statuses).toHaveLength(before + 2);
+});
+
 test("after a sign-out, a sign-in refused because another GitHub account was used names the installation's login only (#195)", async () => {
   const h = harness();
   h.sessionState = {

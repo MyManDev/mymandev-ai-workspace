@@ -35,6 +35,7 @@ import {
   SIGN_IN_OUTCOME_MESSAGES,
   signInRetryAt,
   signInRetryNote,
+  signInRetryReading,
   signInTimeFormat,
   signOutMessage,
   startInAnotherBrowser,
@@ -266,6 +267,51 @@ test("stopping the watch stops the timer that runs, also one armed again (#199)"
   again();
   watchSignInRetry(undefined, clock.time, (time) => times.push(time), clock)();
   expect(times).toEqual([]);
+});
+
+test("the panel's clock is read again whenever the time of the note changes, so a note shows after the clock was set back (#204)", () => {
+  const utc = signInTimeFormat({ locale: "en-GB", timeZone: "UTC" });
+  const refused = (retryAt: number): AccountStatus => ({
+    ...IDLE,
+    replacementPending: true,
+    lastOutcome: {
+      code: "replacement_pending",
+      retryAfter: new Date(retryAt).toISOString(),
+    },
+  });
+  const first = Date.parse("2026-11-06T10:09:30.000Z");
+  const clock = fakeRetryClock(first - 570_000);
+  const read = signInRetryReading(undefined, first, clock);
+  expect(read).toEqual({ retryAt: first, now: first - 570_000 });
+
+  // The same time keeps the reading; the clock is not read.
+  clock.time = first - 60_000;
+  expect(signInRetryReading(read, first, clock)).toBe(read);
+
+  // The note ended: the watch passed on a reading at its time. Then the
+  // clock is set back by two hours, and a later start is refused with a
+  // time before that reading.
+  const ended = { retryAt: first, now: first + 1_000 };
+  clock.time = first - 2 * 3_600_000;
+  const second = clock.time + 570_000;
+  expect(signInRetryNote(refused(second), ended.now, utc)).toBeUndefined();
+  const again = signInRetryReading(ended, second, clock);
+  expect(again).toEqual({ retryAt: second, now: clock.time });
+  expect(signInRetryNote(refused(second), again.now, utc)).toBe(
+    "A new sign-in can start after 08:19. Try again then.",
+  );
+
+  // Also when the time goes away, for example while a sign-in starts, and
+  // comes back.
+  clock.time += 1_000;
+  const none = signInRetryReading(again, undefined, clock);
+  expect(none).toEqual({ retryAt: undefined, now: clock.time });
+  expect(signInRetryReading(none, undefined, clock)).toBe(none);
+  clock.time += 1_000;
+  expect(signInRetryReading(none, second, clock)).toEqual({
+    retryAt: second,
+    now: clock.time,
+  });
 });
 
 test("the system's clock runs its timer once, and its stop keeps it from running (#199)", async () => {

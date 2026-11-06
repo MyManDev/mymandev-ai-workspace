@@ -1447,14 +1447,17 @@ describe("a pending key replacement", () => {
     });
   });
 
-  test.each([
-    ["a sign-out marker of the lost keys is deleted", false],
-    ["a corrupt sign-out marker stays until a sign-in", true],
-  ])("%s", async (_name, corrupt) => {
-    const h = harness();
+  /**
+   * A signed-out device whose sign-in after the sign-out got no clear
+   * answer, long ago, and whose two keys the API then refuses twice, at
+   * least 10 minutes apart.
+   */
+  async function keysLostAfterSignOut(
+    h: Harness,
+    corrupt: boolean,
+  ): Promise<void> {
     await existingDevice(h);
     expect(await h.session.signOut()).toEqual({ ok: true, value: "reported" });
-    // A sign-in after the sign-out got no clear answer, long ago.
     await h.keyStore.replace();
     h.api.publicKey = FOREIGN_PUBLIC_KEY;
     if (corrupt) {
@@ -1464,16 +1467,102 @@ describe("a pending key replacement", () => {
     advance(REPLACEMENT_GRACE_MS);
     expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
     advance(LOST_KEY_WAIT_MS);
+    h.states.length = 0;
+    h.calls.length = 0;
 
     expect(await h.session.authenticate()).toEqual({
       ok: false,
       reason: "key_lost",
     });
+  }
 
-    expect(h.session.state().kind).toBe("key_lost");
-    expect(await keyFiles()).toEqual([DEVICE_RECORD_FILE]);
-    const marker = await readText(SIGN_OUT_MARKER_FILE).catch(() => null);
-    expect(marker !== null).toBe(corrupt);
+  test.each([
+    ["a sign-out marker", false],
+    ["a corrupt sign-out marker", true],
+  ])(
+    "%s of the lost keys stays, so key_lost says that the person signed out, from its first status on and after a restart (#204)",
+    async (_name, corrupt) => {
+      const h = harness();
+      await keysLostAfterSignOut(h, corrupt);
+
+      // The status published before the keys are deleted already carries
+      // `signedOut`, and no later status drops it.
+      expect(h.calls).toEqual(["state:key_lost", "key.delete"]);
+      expect(h.states).toEqual([
+        {
+          kind: "key_lost",
+          account: {
+            deviceId: DEVICE_ID,
+            userId: USER_ID,
+            login: "octocat",
+            displayName: "The Octocat",
+            signInExpiresAt: "2026-12-01T10:00:00.000Z",
+          },
+          signedOut: true,
+        },
+      ]);
+      expect(await h.session.refresh()).toMatchObject({
+        kind: "key_lost",
+        signedOut: true,
+      });
+      expect(h.states).toHaveLength(1);
+      expect(await keyFiles()).toEqual([DEVICE_RECORD_FILE]);
+      expect((await h.markers.read()).kind).toBe(
+        corrupt ? "corrupt" : "marker",
+      );
+      const restarted = await restart(h);
+      expect(restarted.session.state()).toMatchObject({
+        kind: "key_lost",
+        signedOut: true,
+      });
+    },
+  );
+
+  test("the kept marker of the lost keys ends with the next sign-in, which never reads it (#204)", async () => {
+    const h = harness();
+    await keysLostAfterSignOut(h, false);
+
+    // What the sign-in flow does for a lost key: a new device with a new
+    // key, and a record that names it.
+    h.session.signInStarted();
+    const key = await h.keyStore.create({ kind: "system" });
+    // While the record still names the lost key, the device stays signed
+    // out.
+    expect(await h.session.refresh()).toMatchObject({
+      kind: "key_lost",
+      signedOut: true,
+    });
+    await h.records.write({
+      ...deviceRecord(key.publicKey),
+      deviceId: OTHER_DEVICE_ID,
+    });
+    h.api.publicKey = key.publicKey;
+    h.api.signedOut = false;
+
+    expect(await h.session.signInFinished({ kind: "signed_in" })).toMatchObject(
+      {
+        kind: "signed_in",
+        account: { deviceId: OTHER_DEVICE_ID },
+      },
+    );
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+  });
+
+  test("the kept marker of the lost keys ends with This is not me, which deletes the record (#204)", async () => {
+    const h = harness();
+    await keysLostAfterSignOut(h, false);
+
+    // As the account service does it: the removal at the API first, which
+    // cannot happen without a key, then the record and the key.
+    expect(await h.session.removeDevice()).toEqual({
+      ok: false,
+      reason: "key_lost",
+    });
+    await h.records.delete();
+    await h.keyStore.delete();
+
+    expect(await h.session.refresh()).toEqual({ kind: "no_device" });
+    expect(await h.markers.read()).toEqual({ kind: "none" });
   });
 
   test("a refusal of both keys counts across a restart, and a round before the wait ends deletes nothing", async () => {
@@ -2316,6 +2405,38 @@ describe("sign-out", () => {
       ok: false,
       reason: "signed_out",
     });
+  });
+
+  test("a marker that could not be written, and so is kept in memory only, still says that the person signed out in the states before signed_out (#204)", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    const failing = harness(api, {
+      signOutMarkers: {
+        read: () => h.markers.read(),
+        write: () => Promise.reject(new Error("disk full")),
+        delete: () => h.markers.delete(),
+      },
+    });
+    await failing.keyStore.load();
+    await failing.session.refresh();
+    api.intercept = () => Promise.reject(new TypeError("offline"));
+    expect(await failing.session.signOut()).toEqual({
+      ok: true,
+      value: "pending",
+    });
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+
+    // The key file is lost while the application runs.
+    await failing.keyStore.delete();
+
+    expect(await failing.session.refresh()).toMatchObject({
+      kind: "key_lost",
+      account: { login: "octocat" },
+      signedOut: true,
+    });
+    // The marker in memory holds until the application quits.
+    expect((await restart(h)).session.state()).not.toHaveProperty("signedOut");
   });
 
   test("the states before signed_out say that the person signed out while the marker exists (#195)", async () => {

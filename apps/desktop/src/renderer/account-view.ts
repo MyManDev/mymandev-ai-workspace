@@ -167,6 +167,32 @@ export const SYSTEM_RETRY_CLOCK: SignInRetryClock = Object.freeze({
   },
 });
 
+/** The panel's clock reading, and the time of the note that it was read for. */
+export interface SignInRetryReading {
+  /** The time of the note (`signInRetryAt`) when the clock was read. */
+  readonly retryAt: number | undefined;
+  /** The clock's reading in milliseconds. */
+  readonly now: number;
+}
+
+/**
+ * The clock reading that the panel compares with the time of the note
+ * (#204): `held` while it was read for the same `retryAt`, and a new
+ * reading of the clock once `retryAt` changed, or without one. Otherwise
+ * only `watchSignInRetry` reads the clock, when a note ends, so after the
+ * clock was set back, a later note whose time lies before that reading
+ * would never show.
+ */
+export function signInRetryReading(
+  held: SignInRetryReading | undefined,
+  retryAt: number | undefined,
+  clock: Pick<SignInRetryClock, "now"> = SYSTEM_RETRY_CLOCK,
+): SignInRetryReading {
+  return held !== undefined && held.retryAt === retryAt
+    ? held
+    : Object.freeze({ retryAt, now: clock.now() });
+}
+
 /**
  * The longest delay of `setTimeout`, which runs a longer one at once
  * (a 32-bit signed integer).
