@@ -1,57 +1,6 @@
-// The screens of the open project. They show placeholder content only: the
-// chat backend, tasks, decisions, and granting permissions come in later
-// milestones.
-
-const PLACEHOLDER_MESSAGES = [
-  {
-    id: "placeholder-1",
-    author: "Sample person",
-    text: "This is a placeholder message.",
-  },
-  {
-    id: "placeholder-2",
-    author: "Sample agent",
-    text: "Messages from the people and the agents of this project appear here.",
-  },
-] as const;
-
-export function ChatScreen() {
-  return (
-    <section className="chat" aria-labelledby="chat-title">
-      <h2 id="chat-title">Chat</h2>
-      <ol className="message-list" aria-label="Messages">
-        {PLACEHOLDER_MESSAGES.map((message) => (
-          <li className="message" key={message.id}>
-            <p className="message-author">{message.author}</p>
-            <p className="message-text">{message.text}</p>
-          </li>
-        ))}
-      </ol>
-      <form
-        className="composer"
-        aria-label="New message"
-        onSubmit={(event) => event.preventDefault()}
-      >
-        <label className="composer-label" htmlFor="composer-text">
-          Message
-        </label>
-        <textarea
-          id="composer-text"
-          className="composer-text"
-          rows={3}
-          disabled
-          aria-describedby="composer-note"
-        />
-        <p className="placeholder-note" id="composer-note">
-          Sending messages is not available yet.
-        </p>
-        <button type="submit" className="composer-send" disabled>
-          Send
-        </button>
-      </form>
-    </section>
-  );
-}
+// The other screens of the open project. They show placeholder content
+// only: tasks, decisions, and granting permissions come in later
+// milestones. The chat screen is in ChatScreen.tsx.
 
 export function TasksScreen() {
   return (

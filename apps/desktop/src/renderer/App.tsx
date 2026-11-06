@@ -8,6 +8,7 @@ import {
 } from "react";
 import type {
   AccountBridge,
+  ChatBridge,
   ConnectionBridge,
   RepositoryBridge,
   RuntimeBridge,
@@ -15,6 +16,7 @@ import type {
 } from "../shared/desktop-bridge.ts";
 import type { WorkspaceView } from "../shared/ipc-contract.ts";
 import { PRODUCT_NAME } from "../shared/product.ts";
+import { ChatScreen } from "./ChatScreen.tsx";
 import {
   CONNECTION_ACTION_LABELS,
   describeConnectionView,
@@ -28,7 +30,6 @@ import {
 } from "./Navigation.tsx";
 import { ProjectPanel } from "./ProjectPanel.tsx";
 import {
-  ChatScreen,
   DecisionsScreen,
   PermissionsScreen,
   TasksScreen,
@@ -47,9 +48,11 @@ import {
   type ShellAction,
   type ShellView,
 } from "./screens.ts";
+import { SwitchQuestionDialog } from "./SwitchQuestion.tsx";
 import {
   createWorkspaceSidebar,
   initialWorkspacePanelView,
+  type SwitchQuestion,
 } from "./workspace-view.ts";
 import { AboutScreen, HomeScreen } from "./WorkspaceScreens.tsx";
 
@@ -66,6 +69,8 @@ export interface AppProps {
   readonly connection?: ConnectionBridge | undefined;
   /** The account's workspaces from the preload script; undefined outside Electron. */
   readonly workspaces?: WorkspaceBridge | undefined;
+  /** The open project's chat from the preload script; undefined outside Electron. */
+  readonly chat?: ChatBridge | undefined;
   /**
    * The workspace state shown until the bridge delivers one, for tests and
    * previews. Without it, the shell starts without projects.
@@ -82,13 +87,14 @@ export function App({
   account,
   connection,
   workspaces,
+  chat,
   initialWorkspaceState,
   initialView = HOME_VIEW,
 }: AppProps) {
   const [state, dispatch] = useReducer(shellReducer, initialView, (view) =>
     createShellState(initialWorkspaceState?.projects ?? [], view),
   );
-  const workspaceSidebar = useWorkspaces(
+  const { sidebar: workspaceSidebar, question } = useWorkspaces(
     workspaces,
     initialWorkspaceState,
     dispatch,
@@ -134,6 +140,7 @@ export function App({
           view={state.view}
           electronVersion={electronVersion}
           account={account}
+          chat={chat}
         />
       </main>
       {open === undefined ? null : (
@@ -143,6 +150,7 @@ export function App({
           repositories={repositories}
         />
       )}
+      <SwitchQuestionDialog {...question} />
     </div>
   );
 }
@@ -151,10 +159,12 @@ function ScreenContent({
   view,
   electronVersion,
   account,
+  chat,
 }: {
   readonly view: ShellView;
   readonly electronVersion: string | undefined;
   readonly account: AccountBridge | undefined;
+  readonly chat: ChatBridge | undefined;
 }) {
   switch (view.screen) {
     case "home":
@@ -162,7 +172,14 @@ function ScreenContent({
     case "about":
       return <AboutScreen electronVersion={electronVersion} />;
     case "chat":
-      return <ChatScreen />;
+      // Each project gets its own screen, so no draft moves to another one.
+      return (
+        <ChatScreen
+          key={view.projectId}
+          chat={chat}
+          projectId={view.projectId}
+        />
+      );
     case "tasks":
       return <TasksScreen />;
     case "decisions":
@@ -174,26 +191,43 @@ function ScreenContent({
 
 /**
  * Follows the workspace state while the shell is mounted, reports the open
- * project to the main process at the start and after every change, and
- * switches workspaces. The logic is in `createWorkspaceSidebar`.
+ * project to the main process at the start and after every change,
+ * switches workspaces, and asks the person before a switch while chat
+ * messages wait to be sent. The logic is in `createWorkspaceSidebar`.
  */
 function useWorkspaces(
   workspaces: WorkspaceBridge | undefined,
   initialState: WorkspaceView | undefined,
   dispatch: Dispatch<ShellAction>,
   openProjectId: string | null,
-): WorkspaceSidebar {
+): {
+  readonly sidebar: WorkspaceSidebar;
+  readonly question: {
+    readonly question: SwitchQuestion | undefined;
+    readonly onKeep: () => void;
+    readonly onDiscard: () => void;
+  };
+} {
   const [view, setView] = useState(() =>
     initialState === undefined
       ? initialWorkspacePanelView(workspaces !== undefined)
       : { kind: "known" as const, state: initialState },
   );
   const [message, setMessage] = useState<string | undefined>(undefined);
+  const [question, setQuestion] = useState<SwitchQuestion | undefined>(
+    undefined,
+  );
   const controller = useMemo(
     () =>
       workspaces === undefined
         ? undefined
-        : createWorkspaceSidebar(workspaces, dispatch, setView, setMessage),
+        : createWorkspaceSidebar(
+            workspaces,
+            dispatch,
+            setView,
+            setMessage,
+            setQuestion,
+          ),
     [workspaces, dispatch],
   );
 
@@ -207,7 +241,16 @@ function useWorkspaces(
     [controller],
   );
 
-  return { view, message, onSelect };
+  const onKeep = useCallback(() => controller?.keepWaiting(), [controller]);
+  const onDiscard = useCallback(
+    () => controller?.discardWaiting(),
+    [controller],
+  );
+
+  return {
+    sidebar: { view, message, onSelect },
+    question: { question, onKeep, onDiscard },
+  };
 }
 
 /** Follows the status of the local runtime while the shell is mounted. */

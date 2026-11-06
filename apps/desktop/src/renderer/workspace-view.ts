@@ -2,6 +2,7 @@ import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
 import type {
   WorkspaceActionRefusal,
   WorkspaceProblem,
+  WorkspaceSwitchOptions,
   WorkspaceView,
 } from "../shared/ipc-contract.ts";
 import type { ShellAction } from "./screens.ts";
@@ -56,31 +57,100 @@ export const SELECT_REFUSAL_MESSAGES: Readonly<
 });
 
 /**
- * Switches to another workspace and resolves to the message to show, or
- * undefined. Every switch of the shell goes through here. The main process
- * closes the open project, and its next state brings the new workspace's
- * projects.
- *
- * This is where the person will be asked before a switch while chat
- * messages wait to be sent. The main process's chat service detects the
- * waiting messages: while they wait, `select` and `openProject` change
- * nothing and answer `{ outcome: "waiting", count }`, and the option
- * `{ discardWaiting: true }` repeats the switch and drops them. This
- * function does not handle `waiting` yet; the chat screen adds the
- * question. Until then no message can wait, because nothing in the
- * renderer sends one.
+ * A switch that waits for the person's answer, because chat messages wait
+ * to be sent (the Project Manager's decision of 2026-11-05 on #27).
+ */
+export interface SwitchQuestion {
+  /** Selecting another workspace, opening another project, or closing the project. */
+  readonly kind: "workspace" | "project" | "close";
+  /** How many chat messages wait to be sent, from 1. */
+  readonly count: number;
+}
+
+/** The texts of the question before a switch. */
+export interface SwitchQuestionTexts {
+  readonly title: string;
+  readonly text: string;
+  readonly keep: string;
+  readonly discard: string;
+}
+
+const SWITCH_ACTIONS = Object.freeze({
+  workspace: {
+    text: "Selecting another workspace discards",
+    discard: "Discard and switch workspace",
+  },
+  project: {
+    text: "Opening another project discards",
+    discard: "Discard and open project",
+  },
+  close: {
+    text: "Closing the project discards",
+    discard: "Discard and close project",
+  },
+});
+
+/** The texts of a question: what waits, what the switch does, and the two answers. */
+export function describeSwitchQuestion(
+  question: SwitchQuestion,
+): SwitchQuestionTexts {
+  const one = question.count === 1;
+  const action = SWITCH_ACTIONS[question.kind];
+  return {
+    title: one
+      ? "Discard the message that was not sent?"
+      : "Discard the messages that were not sent?",
+    text: one
+      ? `1 message has not been sent yet. ${action.text} it.`
+      : `${question.count} messages have not been sent yet. ${action.text} them.`,
+    keep: one ? "Keep the message" : "Keep the messages",
+    discard: action.discard,
+  };
+}
+
+/** The option that repeats a switch and drops the waiting chat messages. */
+const DISCARD_WAITING: WorkspaceSwitchOptions = Object.freeze({
+  discardWaiting: true,
+});
+
+/** The answer of a switch to another workspace. */
+export type SwitchAnswer =
+  /** Done or refused, with the message to show, or undefined. */
+  | { readonly kind: "done"; readonly message: string | undefined }
+  /** Nothing changed, because `count` chat messages wait to be sent. */
+  | { readonly kind: "waiting"; readonly count: number };
+
+/**
+ * Switches to another workspace and resolves to its answer. Every switch of
+ * the shell goes through here. The main process closes the open project,
+ * and its next state brings the new workspace's projects. While chat
+ * messages wait to be sent, nothing changes and the answer is `waiting`
+ * with their count; `{ discardWaiting: true }` repeats the switch and
+ * drops them.
  */
 export async function switchWorkspace(
   workspaces: Pick<WorkspaceBridge, "select">,
   workspaceId: string,
-): Promise<string | undefined> {
+  options?: WorkspaceSwitchOptions,
+): Promise<SwitchAnswer> {
   try {
-    const result = await workspaces.select(workspaceId);
-    return result.outcome === "refused"
-      ? SELECT_REFUSAL_MESSAGES[result.reason]
-      : undefined;
+    const result =
+      options === undefined
+        ? await workspaces.select(workspaceId)
+        : await workspaces.select(workspaceId, options);
+    switch (result.outcome) {
+      case "ok":
+        return { kind: "done", message: undefined };
+      case "waiting":
+        return { kind: "waiting", count: result.count };
+      case "refused":
+        return {
+          kind: "done",
+          message: SELECT_REFUSAL_MESSAGES[result.reason],
+        };
+    }
   } catch {
-    return WORKSPACE_MESSAGES.switchFailed;
+    return { kind: "done", message: WORKSPACE_MESSAGES.switchFailed };
   }
 }
 
@@ -98,7 +168,19 @@ export interface WorkspaceSidebarController {
   readonly openProjectChanged: (projectId: string | null) => void;
   /** Switches to another workspace through `switchWorkspace`. */
   readonly select: (workspaceId: string) => void;
+  /**
+   * The person keeps the waiting chat messages: the switch does not happen,
+   * and the shell shows the main process's open project again.
+   */
+  readonly keepWaiting: () => void;
+  /** The person discards the waiting chat messages: the switch is repeated with them dropped. */
+  readonly discardWaiting: () => void;
 }
+
+/** The switch that the open question belongs to. */
+type WaitingSwitch =
+  | { readonly kind: "select"; readonly workspaceId: string }
+  | { readonly kind: "open"; readonly projectId: string | null };
 
 /**
  * The workspace logic of the shell, which `App` drives from its effects.
@@ -113,6 +195,13 @@ export interface WorkspaceSidebarController {
  * - A switch clears the message first and then shows the text of its
  *   answer, if any. Only the answer of the latest switch counts. A newer
  *   workspace state clears the message.
+ * - When a switch or a report answers `waiting`, nothing changed in the
+ *   main process, and the person is asked (`onQuestion`). Keeping the
+ *   messages puts the shell back on the main process's open project, from
+ *   the last state, or on the home screen without one; a workspace switch
+ *   had not changed the shell. Discarding them repeats the switch with
+ *   `{ discardWaiting: true }`. A newer switch or report replaces the
+ *   question.
  */
 export function createWorkspaceSidebar(
   workspaces: Pick<
@@ -122,18 +211,88 @@ export function createWorkspaceSidebar(
   dispatch: (action: ShellAction) => void,
   onView: (view: WorkspacePanelView) => void,
   onMessage: (message: string | undefined) => void,
+  onQuestion: (question: SwitchQuestion | undefined) => void,
 ): WorkspaceSidebarController {
   /** The revision of the last state, or -1 before the first one. */
   let revision = -1;
+  /** The main process's open project, from the last state. */
+  let mainOpenProjectId: string | null = null;
   /** The revision at which the shown message was set, or undefined. */
   let messageRevision: number | undefined;
   /** Each report and switch gets a new token; an older answer is dropped. */
   let reportToken = 0;
   let selectToken = 0;
+  /** The switch that the shown question belongs to, or undefined. */
+  let waiting: WaitingSwitch | undefined;
 
   const setMessage = (message: string | undefined) => {
     messageRevision = message === undefined ? undefined : revision;
     onMessage(message);
+  };
+
+  const ask = (next: WaitingSwitch, count: number) => {
+    waiting = next;
+    onQuestion({
+      kind:
+        next.kind === "select"
+          ? "workspace"
+          : next.projectId === null
+            ? "close"
+            : "project",
+      count,
+    });
+  };
+
+  const closeQuestion = () => {
+    if (waiting !== undefined) {
+      waiting = undefined;
+      onQuestion(undefined);
+    }
+  };
+
+  const report = (
+    projectId: string | null,
+    options?: WorkspaceSwitchOptions,
+  ) => {
+    reportToken += 1;
+    const token = reportToken;
+    const call =
+      options === undefined
+        ? workspaces.openProject(projectId)
+        : workspaces.openProject(projectId, options);
+    call.then(
+      (result) => {
+        if (token !== reportToken) {
+          return;
+        }
+        if (result.outcome === "waiting") {
+          ask({ kind: "open", projectId }, result.count);
+        } else if (
+          projectId !== null &&
+          result.outcome === "refused" &&
+          result.reason === "not_found"
+        ) {
+          dispatch({ type: "show-screen", screen: "home" });
+        }
+      },
+      () => undefined,
+    );
+  };
+
+  const switchTo = (workspaceId: string, options?: WorkspaceSwitchOptions) => {
+    selectToken += 1;
+    const token = selectToken;
+    setMessage(undefined);
+    void switchWorkspace(workspaces, workspaceId, options).then((answer) => {
+      if (token !== selectToken) {
+        return;
+      }
+      if (answer.kind === "waiting") {
+        ask({ kind: "select", workspaceId }, answer.count);
+      } else {
+        setMessage(answer.message);
+      }
+    });
   };
 
   return Object.freeze({
@@ -141,6 +300,7 @@ export function createWorkspaceSidebar(
       const stop = workspaces.subscribeState(
         (state) => {
           revision = state.revision;
+          mainOpenProjectId = state.openProjectId;
           onView({ kind: "known", state });
           dispatch({ type: "replace-projects", projects: state.projects });
           if (messageRevision !== undefined && revision > messageRevision) {
@@ -153,34 +313,36 @@ export function createWorkspaceSidebar(
         stop();
         reportToken += 1;
         selectToken += 1;
+        closeQuestion();
       };
     },
     openProjectChanged: (projectId: string | null) => {
-      reportToken += 1;
-      const token = reportToken;
-      workspaces.openProject(projectId).then(
-        (result) => {
-          if (
-            token === reportToken &&
-            projectId !== null &&
-            result.outcome === "refused" &&
-            result.reason === "not_found"
-          ) {
-            dispatch({ type: "show-screen", screen: "home" });
-          }
-        },
-        () => undefined,
-      );
+      closeQuestion();
+      report(projectId);
     },
     select: (workspaceId: string) => {
-      selectToken += 1;
-      const token = selectToken;
-      setMessage(undefined);
-      void switchWorkspace(workspaces, workspaceId).then((message) => {
-        if (token === selectToken) {
-          setMessage(message);
-        }
-      });
+      closeQuestion();
+      switchTo(workspaceId);
+    },
+    keepWaiting: () => {
+      const kept = waiting;
+      closeQuestion();
+      if (kept?.kind === "open") {
+        dispatch(
+          mainOpenProjectId === null
+            ? { type: "show-screen", screen: "home" }
+            : { type: "open-project", projectId: mainOpenProjectId },
+        );
+      }
+    },
+    discardWaiting: () => {
+      const discarded = waiting;
+      closeQuestion();
+      if (discarded?.kind === "open") {
+        report(discarded.projectId, DISCARD_WAITING);
+      } else if (discarded?.kind === "select") {
+        switchTo(discarded.workspaceId, DISCARD_WAITING);
+      }
     },
   });
 }

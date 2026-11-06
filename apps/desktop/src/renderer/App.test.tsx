@@ -3,6 +3,7 @@ import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type {
   AccountBridge,
+  ChatBridge,
   ConnectionBridge,
   RepositoryBridge,
   RuntimeBridge,
@@ -102,7 +103,7 @@ const SCREEN_CASES: readonly ScreenCase[] = [
   {
     view: { screen: "chat", projectId: "project-b", panel: "agents" },
     title: '<h2 id="chat-title">Chat</h2>',
-    placeholder: "This is a placeholder message.",
+    placeholder: "The chat is not available.",
     current: ["Workspace B (true)", "Project B (true)", "Chat (page)"],
   },
   {
@@ -155,9 +156,12 @@ test.each(SCREEN_CASES)(
       ...attributeValues(html, "aria-describedby"),
       ...attributeValues(html, "aria-controls"),
       ...attributeValues(html, "for"),
-    ]) {
+    ].flatMap((value) => value.split(" "))) {
       expect(ids).toContain(reference);
     }
+
+    // The question before a switch waits in the page, closed and empty.
+    expect(html).toContain('<dialog class="switch-question"></dialog>');
 
     // The Content Security Policy allows no inline styles.
     expect(html).not.toMatch(/\sstyle=/);
@@ -200,24 +204,45 @@ test("the project navigation names the open project and reaches tasks and decisi
   }
 });
 
-test("the chat shows a message list and a disabled composer", () => {
+test("without the bridge, the chat is not available and its composer is disabled", () => {
   const html = render({
     initialView: { screen: "chat", projectId: "project-a", panel: "agents" },
   });
 
-  expect(html).toContain('<ol class="message-list" aria-label="Messages">');
-  expect(html.match(/<li class="message">/g)).toHaveLength(2);
+  expect(html).toContain(
+    '<section class="chat" aria-labelledby="chat-title"><h2 id="chat-title">Chat</h2><p class="chat-status" role="status">The chat is not available.</p>',
+  );
+  expect(html).not.toContain("<ol");
   expect(html).toContain('<form class="composer" aria-label="New message">');
   expect(html).toContain(
     '<label class="composer-label" for="composer-text">Message</label>',
   );
-  expect(html).toMatch(
-    /<textarea id="composer-text" class="composer-text" rows="3" disabled="" aria-describedby="composer-note"><\/textarea>/,
+  expect(html).toContain(
+    '<textarea id="composer-text" class="composer-text" rows="3" dir="auto" disabled="" aria-describedby="composer-hint composer-status"></textarea>',
   );
   expect(html).toContain(
     '<button type="submit" class="composer-send" disabled="">Send</button>',
   );
-  expect(html).toContain("Sending messages is not available yet.");
+});
+
+test("with the bridge, the chat waits for the first state", () => {
+  const chat: ChatBridge = {
+    getState: () => new Promise(() => undefined),
+    subscribeState: () => () => undefined,
+    send: () => new Promise(() => undefined),
+    retry: () => Promise.resolve(false),
+    discard: () => Promise.resolve(false),
+    loadOlder: () => Promise.resolve("none"),
+  };
+  const html = render({
+    chat,
+    initialView: { screen: "chat", projectId: "project-a", panel: "agents" },
+  });
+
+  expect(html).toContain(
+    '<p class="chat-status" role="status">Checking the chat.</p>',
+  );
+  expect(html).toContain('disabled=""');
 });
 
 function tab(label: string, selected: boolean): string {

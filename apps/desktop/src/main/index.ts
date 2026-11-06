@@ -55,7 +55,14 @@ import { createLocalRuntime } from "./runtime.ts";
 import { stopRuntimeOnQuit } from "./runtime-lifecycle.ts";
 import { createMainWindowOptions } from "./window.ts";
 import { createWorkspaceService } from "./workspace/service.ts";
-import { closeProjectWithPage, registerWorkspaceIpc } from "./workspace-ipc.ts";
+import {
+  askBeforeClosingWithWaitingMessages,
+  CLOSE_WITH_WAITING_CONFIRMATION,
+  closeProjectWithPage,
+  closeWithWaitingConfirmed,
+  closeWithWaitingMessage,
+  registerWorkspaceIpc,
+} from "./workspace-ipc.ts";
 
 // The data folder is set first, before anything reads it, and the
 // single-instance lock is then taken in it (data-folder.ts). ADR 0014: the
@@ -268,6 +275,14 @@ function start(): void {
   });
   app.on("will-quit", () => chatIpc.close());
 
+  // A quit, for example with Cmd+Q on macOS, closes the window first. When
+  // the person confirms closing it with waiting chat messages, the quit is
+  // carried out once the window has closed, because the held close ended it.
+  let quitRequested = false;
+  app.on("before-quit", () => {
+    quitRequested = true;
+  });
+
   function showMainWindow(): void {
     if (mainWindow !== undefined) {
       if (mainWindow.isMinimized()) {
@@ -285,6 +300,27 @@ function start(): void {
     // document commits, also on a reload, when the page fails to load, when
     // the render process is gone, and when the window closes.
     closeProjectWithPage(window, workspaces);
+    // Closing the window while chat messages wait to be sent asks first, in
+    // a native dialog (the Project Manager's decision of 2026-11-06 on #27).
+    askBeforeClosingWithWaitingMessages(
+      window,
+      () => chat.state().pending.length,
+      async (count) => {
+        const quitting = quitRequested;
+        quitRequested = false;
+        const closing = closeWithWaitingConfirmed(
+          await dialog.showMessageBox(window, {
+            ...CLOSE_WITH_WAITING_CONFIRMATION,
+            buttons: [...CLOSE_WITH_WAITING_CONFIRMATION.buttons],
+            message: closeWithWaitingMessage(count),
+          }),
+        );
+        if (closing && quitting) {
+          window.once("closed", () => app.quit());
+        }
+        return closing;
+      },
+    );
     window.on("closed", () => {
       mainWindow = undefined;
     });
