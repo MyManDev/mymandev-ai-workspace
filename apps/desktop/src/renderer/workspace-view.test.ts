@@ -1,10 +1,13 @@
 import { expect, test } from "vitest";
 import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
-import type {
-  WorkspaceActionResult,
-  WorkspaceSwitchOptions,
-  WorkspaceView,
+import {
+  WORKSPACE_STATUSES,
+  type AccountStatus,
+  type WorkspaceActionResult,
+  type WorkspaceSwitchOptions,
+  type WorkspaceView,
 } from "../shared/ipc-contract.ts";
+import type { AccountView } from "./account-view.ts";
 import {
   createShellState,
   shellReducer,
@@ -14,7 +17,10 @@ import {
 import {
   createWorkspaceSidebar,
   describeSwitchQuestion,
+  HOME_SIGN_IN_MESSAGES,
+  homeSignIn,
   initialWorkspacePanelView,
+  noDeviceSignedIn,
   SELECT_REFUSAL_MESSAGES,
   switchWorkspace,
   WORKSPACE_MESSAGES,
@@ -611,4 +617,146 @@ test("the question names the count, what the switch does, and both answers", () 
     keep: "Keep the messages",
     discard: "Discard and close project",
   });
+});
+
+test("no device is signed in only while the workspace state is signed_out", () => {
+  const states = WORKSPACE_STATUSES.map((status) => [
+    status,
+    noDeviceSignedIn({
+      kind: "known",
+      state:
+        status === "unavailable"
+          ? { ...READY, status, problem: "unavailable" }
+          : { ...READY, status },
+    }),
+  ]);
+  expect(Object.fromEntries(states)).toEqual({
+    signed_out: true,
+    loading: false,
+    ready: false,
+    unavailable: false,
+  });
+  // Before the first state and without the bridge, the shell does not know.
+  expect(noDeviceSignedIn({ kind: "pending" })).toBe(false);
+  expect(noDeviceSignedIn({ kind: "unavailable" })).toBe(false);
+});
+
+/** An account status in which the account panel offers a sign-in that can start now. */
+const SIGN_IN_OFFERED: AccountStatus = {
+  revision: 1,
+  account: { kind: "signed_out" },
+  signIn: { kind: "idle" },
+  lastOutcome: null,
+  deviceKey: "ready",
+  replacementPending: false,
+  apiOrigin: "set",
+  device: "no_device",
+};
+
+function knownAccount(status: Partial<AccountStatus>): AccountView {
+  return { kind: "known", status: { ...SIGN_IN_OFFERED, ...status } };
+}
+
+const SIGNED_OUT_WORKSPACES: WorkspacePanelView = {
+  kind: "known",
+  state: {
+    ...READY,
+    status: "signed_out",
+    workspaces: [],
+    selectedWorkspaceId: null,
+    projects: [],
+  },
+};
+
+test("the home screen asks for a sign-in on the Account screen only while the account panel offers one that can start now", () => {
+  const signedInAccount = {
+    kind: "signed_in",
+    login: "octocat",
+    displayName: "The Octocat",
+    deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+  } as const;
+  const cases: [string, AccountView, string][] = [
+    ["idle sign-in offered", knownAccount({}), "sign_in"],
+    [
+      "signed out on this device",
+      knownAccount({ account: { kind: "hidden" }, device: "signed_out" }),
+      "sign_in",
+    ],
+    [
+      "device revoked",
+      knownAccount({ account: signedInAccount, device: "revoked" }),
+      "sign_in",
+    ],
+    ["no account status yet", { kind: "pending" }, "not_ready"],
+    ["no account bridge", { kind: "unavailable" }, "not_ready"],
+    [
+      "starting",
+      knownAccount({ account: { kind: "hidden" }, device: "starting" }),
+      "not_ready",
+    ],
+    ["key loading", knownAccount({ deviceKey: "loading" }), "not_ready"],
+    [
+      "passphrase required",
+      knownAccount({
+        account: { kind: "hidden" },
+        deviceKey: "passphrase_required",
+        device: "key_not_loaded",
+      }),
+      "not_ready",
+    ],
+    ["key unusable", knownAccount({ deviceKey: "corrupt" }), "not_ready"],
+    ["api origin unset", knownAccount({ apiOrigin: "unset" }), "not_ready"],
+    ["api origin invalid", knownAccount({ apiOrigin: "invalid" }), "not_ready"],
+    [
+      "removal pending",
+      knownAccount({ account: signedInAccount, device: "removal_pending" }),
+      "not_ready",
+    ],
+    [
+      "sign-in starting",
+      knownAccount({ signIn: { kind: "starting" } }),
+      "not_ready",
+    ],
+    [
+      "sign-in waiting",
+      knownAccount({
+        signIn: { kind: "waiting", pairingCode: "042137", opened: true },
+      }),
+      "not_ready",
+    ],
+    [
+      "sign-in completing",
+      knownAccount({ signIn: { kind: "completing" } }),
+      "not_ready",
+    ],
+  ];
+  for (const [name, account, expected] of cases) {
+    expect(homeSignIn(SIGNED_OUT_WORKSPACES, account), name).toBe(expected);
+  }
+
+  // Nothing unless no device is signed in and ready, whatever the account says.
+  const otherWorkspaces: WorkspacePanelView[] = [
+    { kind: "pending" },
+    { kind: "unavailable" },
+    { kind: "known", state: READY },
+    { kind: "known", state: { ...READY, status: "loading" } },
+    {
+      kind: "known",
+      state: { ...READY, status: "unavailable", problem: "unavailable" },
+    },
+  ];
+  for (const workspaces of otherWorkspaces) {
+    for (const [name, account] of cases) {
+      expect(homeSignIn(workspaces, account), name).toBe("none");
+    }
+  }
+});
+
+test("the home screen's sentences are fixed, and the one without a sign-in is the sidebar's for signed_out", () => {
+  expect(HOME_SIGN_IN_MESSAGES).toEqual({
+    sign_in:
+      "Sign in with GitHub on the Account screen to see your workspaces.",
+    not_ready: "Workspaces appear once this device is signed in and ready.",
+  });
+  expect(HOME_SIGN_IN_MESSAGES.not_ready).toBe(WORKSPACE_MESSAGES.signedOut);
 });

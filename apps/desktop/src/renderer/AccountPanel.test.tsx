@@ -155,7 +155,7 @@ function clickEveryButton(
 
 test("without the bridge or before the first status, the panel says so and offers nothing", () => {
   expect(render({ view: { kind: "unavailable" } })).toBe(
-    '<section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">Account</h3><p>Sign-in is not available.</p></section>',
+    '<section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">This device</h3><p>Sign-in is not available.</p></section>',
   );
   expect(render({ view: { kind: "pending" } })).toContain(
     "<p>Checking the sign-in.</p>",

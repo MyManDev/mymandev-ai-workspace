@@ -46,6 +46,9 @@ test("the shell starts on the home screen unless a valid view is given", () => {
   expect(createShellState(PROJECTS, { screen: "about" }).view).toEqual({
     screen: "about",
   });
+  for (const screen of ["account", "people", "join"] as const) {
+    expect(createShellState(PROJECTS, { screen }).view).toEqual({ screen });
+  }
   expect(
     createShellState(PROJECTS, {
       screen: "tasks",
@@ -310,4 +313,20 @@ test("the navigation lists every screen and every panel once", () => {
     ...SCREEN_IDS,
   ]);
   expect(PANELS.map((panel) => panel.id)).toEqual([...PANEL_IDS]);
+});
+
+test("the workspace screens are home, account, people, join, and about, in this order", () => {
+  expect(WORKSPACE_SCREENS).toEqual([
+    { id: "home", label: "Home" },
+    { id: "account", label: "Account" },
+    { id: "people", label: "People" },
+    { id: "join", label: "Join" },
+    { id: "about", label: "About" },
+  ]);
+  // A workspace screen closes the open project, also the new ones.
+  for (const screen of ["account", "people", "join"] as const) {
+    const state = run(chatA, { type: "show-screen", screen });
+    expect(state.view).toEqual({ screen });
+    expect(openProject(state)).toBeUndefined();
+  }
 });

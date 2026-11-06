@@ -147,7 +147,7 @@ test("waiting offers Retry now, and only connection_replaced offers Reconnect he
   ).toEqual({
     tone: "stopped",
     label: "Cloud: Stopped",
-    detail: "Sign in with GitHub on the home screen to connect again.",
+    detail: "Sign in with GitHub on the Account screen to connect again.",
     actions: [],
   });
 });

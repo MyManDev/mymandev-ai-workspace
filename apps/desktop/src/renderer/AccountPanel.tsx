@@ -16,6 +16,7 @@ import {
   ACTION_MESSAGES,
   ANOTHER_BROWSER_DELAY_MS,
   apiOriginProblem,
+  canStartSignIn,
   createIdleWaits,
   DEVICE_ACTION_MESSAGES,
   DEVICE_KEY_PROBLEM_MESSAGES,
@@ -31,6 +32,7 @@ import {
   removeDeviceMessage,
   signInRetryAt,
   signInRetryNote,
+  signInRetryReading,
   signInTimeFormat,
   signOutMessage,
   startInAnotherBrowser,
@@ -107,7 +109,7 @@ export interface AccountPanelContentProps {
 export function AccountPanelContent(props: AccountPanelContentProps) {
   return (
     <section className="account-panel" aria-labelledby="account-title">
-      <h3 id="account-title">Account</h3>
+      <h3 id="account-title">This device</h3>
       <AccountBody {...props} />
     </section>
   );
@@ -318,8 +320,8 @@ function SignInActions(
   const originProblem = canSignIn
     ? apiOriginProblem(status.apiOrigin)
     : undefined;
-  const signInDisabled =
-    busy || status.deviceKey !== "ready" || originProblem !== undefined;
+  // The sign-in is idle here, so this checks the key and the server address.
+  const signInDisabled = busy || !canStartSignIn(status);
   const signInDescription =
     originProblem === undefined ? undefined : "sign-in-unavailable";
   return (
@@ -595,11 +597,28 @@ function useAccountPanel(
 
   // #199: the clock is read again when the wait after a start refused
   // during the grace period of an uncertain sign-in ends, so that the
-  // panel's note goes away then (`watchSignInRetry`).
-  const [now, setNow] = useState(() => Date.now());
+  // panel's note goes away then (`watchSignInRetry`), and #204: whenever
+  // the time of the note changes (`signInRetryReading`), so that a note
+  // whose time lies before an earlier reading shows after the clock was
+  // set back. A new reading is stored during the render, and React renders
+  // again at once with it.
   const retryAt =
     view.kind === "known" ? signInRetryAt(view.status) : undefined;
-  useEffect(() => watchSignInRetry(retryAt, now, setNow), [retryAt, now]);
+  const [heldReading, setReading] = useState(() =>
+    signInRetryReading(undefined, retryAt),
+  );
+  const reading = signInRetryReading(heldReading, retryAt);
+  if (reading !== heldReading) {
+    setReading(reading);
+  }
+  const { now } = reading;
+  useEffect(
+    () =>
+      watchSignInRetry(retryAt, now, (later) =>
+        setReading(Object.freeze({ retryAt, now: later })),
+      ),
+    [retryAt, now],
+  );
 
   /** Runs one action at a time and shows the message that its result names. */
   const run = useCallback(

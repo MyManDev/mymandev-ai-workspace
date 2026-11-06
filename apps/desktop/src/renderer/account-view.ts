@@ -167,6 +167,32 @@ export const SYSTEM_RETRY_CLOCK: SignInRetryClock = Object.freeze({
   },
 });
 
+/** The panel's clock reading, and the time of the note that it was read for. */
+export interface SignInRetryReading {
+  /** The time of the note (`signInRetryAt`) when the clock was read. */
+  readonly retryAt: number | undefined;
+  /** The clock's reading in milliseconds. */
+  readonly now: number;
+}
+
+/**
+ * The clock reading that the panel compares with the time of the note
+ * (#204): `held` while it was read for the same `retryAt`, and a new
+ * reading of the clock once `retryAt` changed, or without one. Otherwise
+ * only `watchSignInRetry` reads the clock, when a note ends, so after the
+ * clock was set back, a later note whose time lies before that reading
+ * would never show.
+ */
+export function signInRetryReading(
+  held: SignInRetryReading | undefined,
+  retryAt: number | undefined,
+  clock: Pick<SignInRetryClock, "now"> = SYSTEM_RETRY_CLOCK,
+): SignInRetryReading {
+  return held !== undefined && held.retryAt === retryAt
+    ? held
+    : Object.freeze({ retryAt, now: clock.now() });
+}
+
 /**
  * The longest delay of `setTimeout`, which runs a longer one at once
  * (a 32-bit signed integer).
@@ -356,6 +382,22 @@ const SIGN_IN_STATES: ReadonlySet<DeviceState> = new Set<DeviceState>([
 export function offersSignIn(status: AccountStatus): boolean {
   return (
     status.account.kind === "signed_out" || SIGN_IN_STATES.has(status.device)
+  );
+}
+
+/**
+ * Whether the panel offers a GitHub sign-in that can start now: no sign-in
+ * runs, the panel offers one (`offersSignIn`), the device key is ready, and
+ * the build has a usable server address. Otherwise the panel shows no
+ * sign-in button or a disabled one. The home screen asks the person to
+ * sign in on the account screen only then.
+ */
+export function canStartSignIn(status: AccountStatus): boolean {
+  return (
+    status.signIn.kind === "idle" &&
+    offersSignIn(status) &&
+    status.deviceKey === "ready" &&
+    apiOriginProblem(status.apiOrigin) === undefined
   );
 }
 
