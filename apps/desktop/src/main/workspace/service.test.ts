@@ -953,6 +953,54 @@ test("account.removed_from_workspace drops the workspace and reloads the list", 
   expect(h.readNames()).toEqual(["listWorkspaces"]);
 });
 
+test("ownMemberId gives the account's own person of each listed workspace", async () => {
+  const h = new Harness();
+  expect(h.service.ownMemberId(WS_A)).toBeNull();
+  h.setConnection("connected");
+  await h.answer(
+    "listWorkspaces",
+    ok(
+      WorkspaceListResponseSchema.parse({
+        workspaces: [
+          {
+            workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
+            member: memberOf(WS_A, OWNER, "Ada Owner", "owner", USER_ID),
+          },
+          {
+            workspace: { id: WS_B, name: WORKSPACE_NAMES[WS_B] },
+            member: memberOf(WS_B, MEMBER, "Ada Owner", "member", USER_ID),
+          },
+        ],
+      }),
+    ),
+  );
+  expect(h.service.ownMemberId(WS_A)).toBe(OWNER);
+  expect(h.service.ownMemberId(WS_B)).toBe(MEMBER);
+  expect(h.service.ownMemberId(WS_C)).toBeNull();
+
+  // An ended membership forgets it at once; the next list replaces them.
+  h.receive(
+    frame({
+      type: "account.removed_from_workspace",
+      workspaceId: WS_B,
+      removedAt: AT,
+    }),
+  );
+  expect(h.service.ownMemberId(WS_B)).toBeNull();
+  expect(h.service.ownMemberId(WS_A)).toBe(OWNER);
+  await h.answer("listWorkspaces", ok(workspaceList(WS_C)));
+  expect(h.service.ownMemberId(WS_A)).toBeNull();
+  expect(h.service.ownMemberId(WS_C)).toBe(OWNER);
+
+  // A sign-out forgets them, and so does close.
+  h.setAccount(SIGNED_OUT);
+  expect(h.service.ownMemberId(WS_C)).toBeNull();
+  const g = await withList([WS_A]);
+  expect(g.service.ownMemberId(WS_A)).toBe(OWNER);
+  g.service.close();
+  expect(g.service.ownMemberId(WS_A)).toBeNull();
+});
+
 test("a trigger during a list load drops its answer and loads again", async () => {
   const h = await withList([WS_A, WS_B]);
   h.receive(

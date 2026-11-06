@@ -174,6 +174,12 @@ export interface WorkspaceService {
   readonly gateLive: (workspaceId: WorkspaceId) => boolean;
   /** The selected workspace, or null. */
   readonly selectedWorkspaceId: () => WorkspaceId | null;
+  /**
+   * The account's own person in a workspace of the list, from the list's
+   * answer, or null for a workspace that the list does not hold. The
+   * development switch checks an agent's owner with it.
+   */
+  readonly ownMemberId: (workspaceId: WorkspaceId) => MemberId | null;
   /** Stops listening and cancels the timers, for the quit. */
   readonly close: () => void;
 }
@@ -263,6 +269,8 @@ export function createWorkspaceService(
   let connected = false;
 
   let workspaces = NO_WORKSPACES;
+  /** The account's own person in each listed workspace. */
+  let ownMembers = new Map<WorkspaceId, MemberId>();
   let listLoaded = false;
   let listProblem: WorkspaceReadFailure | null = null;
   let listInFlight = false;
@@ -380,6 +388,7 @@ export function createWorkspaceService(
     }
     gate.end();
     workspaces = NO_WORKSPACES;
+    ownMembers = new Map();
     listLoaded = false;
     listProblem = null;
     listInFlight = false;
@@ -485,6 +494,12 @@ export function createWorkspaceService(
       result.value.workspaces.map(({ workspace }) =>
         Object.freeze({ id: workspace.id, name: workspace.name }),
       ),
+    );
+    ownMembers = new Map(
+      result.value.workspaces.map(({ workspace, member }) => [
+        workspace.id,
+        member.id,
+      ]),
     );
     // A refused workspace that the list no longer holds is forgotten, so
     // that a later listing, a new membership, is selected by default again.
@@ -719,6 +734,7 @@ export function createWorkspaceService(
    */
   function membershipLost(workspaceId: WorkspaceId): void {
     connection.unsubscribeWorkspace(workspaceId);
+    ownMembers.delete(workspaceId);
     if (listed(workspaceId)) {
       workspaces = Object.freeze(
         workspaces.filter((workspace) => workspace.id !== workspaceId),
@@ -869,6 +885,8 @@ export function createWorkspaceService(
     gateLive: (workspaceId: WorkspaceId) =>
       !closed && workspaceId === selected && gate.state() === "live",
     selectedWorkspaceId: () => selected,
+    ownMemberId: (workspaceId: WorkspaceId) =>
+      closed ? null : (ownMembers.get(workspaceId) ?? null),
     close: () => {
       if (closed) {
         return;

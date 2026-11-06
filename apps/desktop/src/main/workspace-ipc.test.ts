@@ -587,6 +587,7 @@ async function realService() {
             value: {
               workspaces: [WORKSPACE_ID, OTHER_WORKSPACE_ID].map((id) => ({
                 workspace: { id, name: "Team" },
+                member: { id: MEMBER_ID },
               })),
             },
           } as WorkspaceReadResult<unknown>)
