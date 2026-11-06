@@ -23,8 +23,10 @@ import { initialAccountView, type AccountView } from "./account-view.ts";
 import { ChatScreen } from "./ChatScreen.tsx";
 import {
   CONNECTION_ACTION_LABELS,
+  CONNECTION_STATUS_TEXT_ID,
   createDeviceRemoval,
   describeConnectionView,
+  focusesStatus,
   IDLE_DEVICE_REMOVAL,
   initialConnectionView,
   type ConnectionAction,
@@ -118,7 +120,10 @@ export function App({
   const runtimeView = useRuntimeView(runtime);
   const connectionView = useConnectionView(connection);
   const accountView = useAccountView(account);
-  const removal = useDeviceRemoval(account, connectionView);
+  const removal = useDeviceRemoval(account, accountView);
+  useConnectionStatusFocus(
+    describeConnectionView(connectionView, accountView).actions,
+  );
   const focusAfterShow = useFocusAfterShow(state.view);
   const open = openProject(state);
 
@@ -129,6 +134,7 @@ export function App({
         <div className="shell-status">
           <ConnectionStatusIndicator
             view={connectionView}
+            account={accountView}
             onReconnect={
               connection === undefined
                 ? undefined
@@ -320,7 +326,8 @@ function useFocusAfterShow(view: ShellView): (id: string) => void {
 
 /**
  * Follows the account status while the shell is mounted, for the home
- * screen. The account panel follows it on its own while it is shown.
+ * screen and the connection indicator. The account panel follows it on its
+ * own while it is shown.
  */
 function useAccountView(account: AccountBridge | undefined): AccountView {
   const [view, setView] = useState(() =>
@@ -391,11 +398,12 @@ function useConnectionView(
 /**
  * "Remove this device and register again" for the connection indicator,
  * through the account bridge, while the shell is mounted. The logic is in
- * `createDeviceRemoval`.
+ * `createDeviceRemoval`; the account status ends the message of the last
+ * removal once a sign-in runs.
  */
 function useDeviceRemoval(
   account: AccountBridge | undefined,
-  connectionView: ConnectionView,
+  accountView: AccountView,
 ): {
   readonly view: DeviceRemovalView;
   readonly onRemove: (() => void) | undefined;
@@ -406,11 +414,33 @@ function useDeviceRemoval(
       account === undefined ? undefined : createDeviceRemoval(account, setView),
     [account],
   );
-  useEffect(
-    () => removal?.connectionChanged(connectionView),
-    [removal, connectionView],
-  );
+  useEffect(() => removal?.accountChanged(accountView), [removal, accountView]);
   return { view, onRemove: removal?.remove };
+}
+
+/**
+ * Moves the focus to the connection indicator's status paragraph when a
+ * header action went away with the focused button (`focusesStatus`), for
+ * example once a removal is confirmed and the status becomes `offline`, so
+ * that the focus does not drop to the page. The actions are the frozen
+ * lists of `describeConnectionView`, so only a change runs the check.
+ */
+function useConnectionStatusFocus(actions: readonly ConnectionAction[]): void {
+  const shown = useRef(actions);
+  useEffect(() => {
+    const before = shown.current;
+    shown.current = actions;
+    const active = document.activeElement;
+    if (
+      focusesStatus(
+        before,
+        actions,
+        active === null || active === document.body,
+      )
+    ) {
+      document.getElementById(CONNECTION_STATUS_TEXT_ID)?.focus();
+    }
+  }, [actions]);
 }
 
 /**
@@ -418,21 +448,30 @@ function useDeviceRemoval(
  * the reason, and "Retry now", or "Reconnect here once" and "Remove this
  * device and register again", where the person can act. An action shows
  * only with its handler. The main process confirms a removal in a native
- * dialog; the result's message joins the status. A sign-in starts only
- * from the account panel, on the person's click.
+ * dialog; the result's message joins the status. While a removal runs, the
+ * buttons stay focusable and do nothing (`aria-disabled`), so the dialog
+ * gives the focus back to the button (the Project Manager's decision of
+ * 2026-11-06). A sign-in starts only from the account panel, on the
+ * person's click.
  */
 export function ConnectionStatusIndicator({
   view,
+  account,
   onReconnect,
   onRemoveDevice,
   removal = IDLE_DEVICE_REMOVAL,
 }: {
   readonly view: ConnectionView;
+  /** The account status: it decides the sign-in sentence and the actions after `connection_replaced`. */
+  readonly account: AccountView;
   readonly onReconnect?: (() => void) | undefined;
   readonly onRemoveDevice?: (() => void) | undefined;
   readonly removal?: DeviceRemovalView | undefined;
 }) {
-  const { tone, label, detail, actions } = describeConnectionView(view);
+  const { tone, label, detail, actions } = describeConnectionView(
+    view,
+    account,
+  );
   const handlers: Readonly<Record<ConnectionAction, (() => void) | undefined>> =
     {
       retry_now: onReconnect,
@@ -441,7 +480,12 @@ export function ConnectionStatusIndicator({
     };
   return (
     <div className="connection-status" data-state={tone}>
-      <p className="connection-status-text" role="status">
+      <p
+        className="connection-status-text"
+        id={CONNECTION_STATUS_TEXT_ID}
+        role="status"
+        tabIndex={-1}
+      >
         <span className="connection-status-dot" aria-hidden="true" />
         {label}
         {detail === null ? null : (
@@ -457,8 +501,8 @@ export function ConnectionStatusIndicator({
           <button
             key={action}
             type="button"
-            disabled={action === "remove_and_register" && removal.running}
-            onClick={handler}
+            aria-disabled={removal.running ? "true" : undefined}
+            onClick={removal.running ? undefined : handler}
           >
             {CONNECTION_ACTION_LABELS[action]}
           </button>

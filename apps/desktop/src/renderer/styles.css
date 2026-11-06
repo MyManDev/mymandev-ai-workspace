@@ -242,6 +242,11 @@ code {
   background: var(--color-status-failed);
 }
 
+.connection-status button[aria-disabled="true"] {
+  color: var(--color-text-muted);
+  cursor: progress;
+}
+
 /* Navigation and tabs */
 
 .shell-nav {

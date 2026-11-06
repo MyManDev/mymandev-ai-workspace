@@ -402,6 +402,16 @@ export function canStartSignIn(status: AccountStatus): boolean {
 }
 
 /**
+ * Whether this installation's device is signed in: the status names its
+ * account, and the device session holds the device as signed in. The
+ * connection header offers the actions after `connection_replaced` only
+ * then.
+ */
+export function deviceSignedIn(status: AccountStatus): boolean {
+  return status.account.kind === "signed_in" && status.device === "signed_in";
+}
+
+/**
  * Whether the panel offers "This is not me": whenever the installation holds
  * an account, also while its device is signed out and the status names no
  * account (`hidden`, #195). The main process confirms it with the login.

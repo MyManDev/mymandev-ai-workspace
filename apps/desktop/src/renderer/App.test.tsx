@@ -10,7 +10,11 @@ import type {
   RuntimeBridge,
   WorkspaceBridge,
 } from "../shared/desktop-bridge.ts";
-import type { WorkspaceView } from "../shared/ipc-contract.ts";
+import type {
+  AccountStatus,
+  RemoveDeviceResult,
+  WorkspaceView,
+} from "../shared/ipc-contract.ts";
 import {
   App,
   ConnectionStatusIndicator,
@@ -21,11 +25,15 @@ import {
   DEVICE_ACTION_FAILURE_MESSAGES,
   DEVICE_ACTION_MESSAGES,
   DEVICE_STATE_MESSAGES,
+  type AccountView,
 } from "./account-view.ts";
 import {
-  deviceRemovalMessage,
+  createDeviceRemoval,
+  IDLE_DEVICE_REMOVAL,
+  OFFLINE_SIGN_IN_DETAIL,
   REGISTER_AGAIN_MESSAGE,
   type ConnectionView,
+  type DeviceRemovalView,
 } from "./connection-status.ts";
 import { WorkspaceNav } from "./Navigation.tsx";
 import {
@@ -673,6 +681,10 @@ test("the indicator shows the state of the runtime", () => {
   ).toContain('data-state="failed"');
 });
 
+/** The start of the connection indicator's status paragraph. */
+const CONNECTION_STATUS_TEXT =
+  '<p class="connection-status-text" id="connection-status-text" role="status" tabindex="-1">';
+
 test("the header shows the connection status until the first status arrives", () => {
   const connection: ConnectionBridge = {
     getStatus: () => new Promise(() => undefined),
@@ -680,32 +692,62 @@ test("the header shows the connection status until the first status arrives", ()
     reconnect: () => Promise.resolve({ outcome: "reconnecting" }),
   };
   expect(render({ connection })).toContain(
-    '<div class="connection-status" data-state="unknown"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Checking</p></div>',
+    `<div class="connection-status" data-state="unknown">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Checking</p></div>`,
   );
   expect(render()).toContain("Cloud: Unavailable");
 });
+
+const SIGNED_OUT_STATUS: AccountStatus = {
+  revision: 1,
+  account: { kind: "signed_out" },
+  signIn: { kind: "idle" },
+  lastOutcome: null,
+  deviceKey: "ready",
+  replacementPending: false,
+  apiOrigin: "set",
+  device: "no_device",
+};
+
+const SIGNED_IN_STATUS: AccountStatus = {
+  ...SIGNED_OUT_STATUS,
+  account: {
+    kind: "signed_in",
+    login: "octocat",
+    displayName: "The Octocat",
+    deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+  },
+  device: "signed_in",
+};
+
+function knownAccount(status: AccountStatus): AccountView {
+  return { kind: "known", status };
+}
+
+const SIGNED_IN_ACCOUNT = knownAccount(SIGNED_IN_STATUS);
 
 test("the connection indicator shows the state, the reason, and the action of the status", () => {
   expect(
     renderToString(
       <ConnectionStatusIndicator
         view={{ kind: "known", status: { state: "connected", revision: 2 } }}
+        account={SIGNED_IN_ACCOUNT}
         onReconnect={() => undefined}
       />,
     ),
   ).toBe(
-    '<div class="connection-status" data-state="connected"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Connected</p></div>',
+    `<div class="connection-status" data-state="connected">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Connected</p></div>`,
   );
   expect(
     renderToString(
       <ConnectionStatusIndicator
         view={REPLACED}
+        account={SIGNED_IN_ACCOUNT}
         onReconnect={() => undefined}
         onRemoveDevice={() => undefined}
       />,
     ),
   ).toBe(
-    `<div class="connection-status" data-state="stopped"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">${REPLACED_DETAIL}</span></p><button type="button">Reconnect here once</button><button type="button">Remove this device and register again</button></div>`,
+    `<div class="connection-status" data-state="stopped">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">${REPLACED_DETAIL}</span></p><button type="button">Reconnect here once</button><button type="button">Remove this device and register again</button></div>`,
   );
   // Without the bridge, no action is offered.
   expect(
@@ -720,6 +762,7 @@ test("the connection indicator shows the state, the reason, and the action of th
             revision: 4,
           },
         }}
+        account={SIGNED_IN_ACCOUNT}
       />,
     ),
   ).not.toContain("<button");
@@ -733,85 +776,301 @@ const REPLACED: ConnectionView = {
 const REPLACED_DETAIL =
   "Another installation connected with this device&#x27;s key. The key is in use there. Reconnect here once, or remove this device and register this computer again as a new device.";
 
-test("without the account bridge, connection_replaced offers no removal, and without both bridges no button", () => {
+/** The status after the client ended connection_replaced (#216). */
+const OFFLINE: ConnectionView = {
+  kind: "known",
+  status: { state: "offline", reason: "not_signed_in", revision: 4 },
+};
+
+/** The labels of the indicator's buttons, with "(inert)" for aria-disabled. */
+function buttonsOf(html: string): string[] {
+  return [...html.matchAll(/<button([^>]*)>([^<]*)<\/button>/g)].map(
+    ([, attributes = "", label = ""]) =>
+      attributes.includes('aria-disabled="true"') ? `${label} (inert)` : label,
+  );
+}
+
+/** The indicator's status paragraph with these sentences after the label. */
+function offlineIndicator(...sentences: readonly string[]): string {
+  const details = sentences
+    .map(
+      (sentence) =>
+        `<span class="connection-status-detail">${escaped(sentence)}</span>`,
+    )
+    .join("");
+  return `<div class="connection-status" data-state="offline">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Offline${details}</p></div>`;
+}
+
+test("connection_replaced offers no removal without its handler, and no action without a signed-in device or without both bridges", () => {
   expect(
     renderToString(
       <ConnectionStatusIndicator
         view={REPLACED}
+        account={SIGNED_IN_ACCOUNT}
         onReconnect={() => undefined}
       />,
     ),
   ).toBe(
-    `<div class="connection-status" data-state="stopped"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">${REPLACED_DETAIL}</span></p><button type="button">Reconnect here once</button></div>`,
+    `<div class="connection-status" data-state="stopped">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">${REPLACED_DETAIL}</span></p><button type="button">Reconnect here once</button></div>`,
   );
   expect(
-    renderToString(<ConnectionStatusIndicator view={REPLACED} />),
+    renderToString(
+      <ConnectionStatusIndicator view={REPLACED} account={SIGNED_IN_ACCOUNT} />,
+    ),
   ).not.toContain("<button");
+  // Without the account bridge, or before its first status, the shell does
+  // not know that the device is signed in.
+  for (const unknownAccount of [
+    { kind: "unavailable" },
+    { kind: "pending" },
+  ] as const) {
+    expect(
+      renderToString(
+        <ConnectionStatusIndicator
+          view={REPLACED}
+          account={unknownAccount}
+          onReconnect={() => undefined}
+          onRemoveDevice={() => undefined}
+        />,
+      ),
+      unknownAccount.kind,
+    ).not.toContain("<button");
+  }
   expect(render()).not.toContain("Remove this device and register again");
 });
 
-test("the removal button is disabled while the removal runs, and only that button", () => {
+test("while a removal runs, both buttons stay focusable and do nothing (the Project Manager's decision of 2026-11-06)", () => {
+  let reconnects = 0;
+  let removals = 0;
+  const props = {
+    view: REPLACED,
+    account: SIGNED_IN_ACCOUNT,
+    onReconnect: () => {
+      reconnects += 1;
+    },
+    onRemoveDevice: () => {
+      removals += 1;
+    },
+  };
+  const running: DeviceRemovalView = { running: true, message: undefined };
+  const html = renderToString(
+    <ConnectionStatusIndicator {...props} removal={running} />,
+  );
+  expect(html).toBe(
+    `<div class="connection-status" data-state="stopped">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">${REPLACED_DETAIL}</span></p><button type="button" aria-disabled="true">Reconnect here once</button><button type="button" aria-disabled="true">Remove this device and register again</button></div>`,
+  );
+  // Not `disabled`, so the native dialog gives the focus back to a button.
+  expect(html).not.toMatch(/\sdisabled=/);
+  const inert = elementsOf(
+    ConnectionStatusIndicator({ ...props, removal: running }),
+  ).filter((element) => element.type === "button");
+  expect(inert).toHaveLength(2);
+  for (const button of inert) {
+    expect(button.props.onClick).toBeUndefined();
+    button.props.onClick?.();
+  }
+  expect([reconnects, removals]).toEqual([0, 0]);
+
+  // Once the removal ended, both work again.
+  const idle = elementsOf(
+    ConnectionStatusIndicator({ ...props, removal: IDLE_DEVICE_REMOVAL }),
+  ).filter((element) => element.type === "button");
+  for (const button of idle) {
+    button.props.onClick?.();
+  }
+  expect([reconnects, removals]).toEqual([1, 1]);
   expect(
-    renderToString(
-      <ConnectionStatusIndicator
-        view={REPLACED}
-        onReconnect={() => undefined}
-        onRemoveDevice={() => undefined}
-        removal={{ running: true, message: undefined }}
-      />,
+    renderToString(<ConnectionStatusIndicator {...props} />),
+  ).not.toContain("aria-disabled");
+});
+
+/** Lets the removal's promise handlers run. */
+async function settle(): Promise<void> {
+  for (let turn = 0; turn < 5; turn += 1) {
+    await Promise.resolve();
+  }
+}
+
+/**
+ * The connection indicator as the shell shows it, with "Remove this device
+ * and register again" through a fake account bridge whose `removeDevice`
+ * waits until the test answers it. Each call passes the account status on,
+ * as the shell's effect does, and renders the indicator.
+ */
+function removalSequence() {
+  const answers: ((result: RemoveDeviceResult) => void)[] = [];
+  let removalView: DeviceRemovalView = IDLE_DEVICE_REMOVAL;
+  const removal = createDeviceRemoval(
+    {
+      removeDevice: () =>
+        new Promise<RemoveDeviceResult>((resolve) => {
+          answers.push(resolve);
+        }),
+    },
+    (view) => {
+      removalView = view;
+    },
+  );
+  const indicator = (view: ConnectionView, account: AccountView) => {
+    removal.accountChanged(account);
+    return ConnectionStatusIndicator({
+      view,
+      account,
+      onReconnect: () => undefined,
+      onRemoveDevice: removal.remove,
+      removal: removalView,
+    });
+  };
+  return {
+    answers,
+    show: (view: ConnectionView, account: AccountView) =>
+      renderToString(indicator(view, account)),
+    click: (view: ConnectionView, account: AccountView, label: string) => {
+      const button = elementsOf(indicator(view, account)).find(
+        (element) =>
+          element.type === "button" && element.props.children === label,
+      );
+      expect(button, label).toBeDefined();
+      button?.props.onClick?.();
+    },
+  };
+}
+
+const REMOVE_LABEL = "Remove this device and register again";
+const NOT_READY_DETAIL = "This device connects once it is signed in and ready.";
+const REMOVAL_PENDING_ACCOUNT = knownAccount({
+  ...SIGNED_IN_STATUS,
+  device: "removal_pending",
+});
+
+test("after connection_replaced, a confirmed removal ends offline with the way to register again on the Account screen, and no button", async () => {
+  const { answers, show, click } = removalSequence();
+  expect(buttonsOf(show(REPLACED, SIGNED_IN_ACCOUNT))).toEqual([
+    "Reconnect here once",
+    REMOVE_LABEL,
+  ]);
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  expect(answers).toHaveLength(1);
+  // While the main process asks in its native dialog, both buttons stay.
+  expect(buttonsOf(show(REPLACED, SIGNED_IN_ACCOUNT))).toEqual([
+    "Reconnect here once (inert)",
+    `${REMOVE_LABEL} (inert)`,
+  ]);
+  // The session notes the removal; the account status may arrive first.
+  expect(buttonsOf(show(REPLACED, REMOVAL_PENDING_ACCOUNT))).toEqual([]);
+  // The client ends connection_replaced (#216), and the panel offers no
+  // sign-in while the removal waits for the server.
+  expect(show(OFFLINE, REMOVAL_PENDING_ACCOUNT)).toBe(
+    offlineIndicator(NOT_READY_DETAIL),
+  );
+  // The server confirms: the key is deleted, and the panel offers a sign-in.
+  answers[0]?.({ outcome: "removed" });
+  await settle();
+  const removed = knownAccount({ ...SIGNED_OUT_STATUS, device: "removed" });
+  expect(show(OFFLINE, removed)).toBe(
+    offlineIndicator(OFFLINE_SIGN_IN_DETAIL, REGISTER_AGAIN_MESSAGE),
+  );
+  expect(REGISTER_AGAIN_MESSAGE).toContain("on the Account screen");
+  // A sign-in on the Account screen ends the message.
+  expect(
+    show(
+      OFFLINE,
+      knownAccount({
+        ...SIGNED_OUT_STATUS,
+        device: "removed",
+        signIn: { kind: "starting" },
+      }),
     ),
-  ).toBe(
-    `<div class="connection-status" data-state="stopped"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">${REPLACED_DETAIL}</span></p><button type="button">Reconnect here once</button><button type="button" disabled="">Remove this device and register again</button></div>`,
+  ).toBe(offlineIndicator(NOT_READY_DETAIL));
+});
+
+test("a removal that waits for the server ends offline with its message and the neutral sentence, and no button", async () => {
+  const { answers, show, click } = removalSequence();
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  expect(buttonsOf(show(REPLACED, REMOVAL_PENDING_ACCOUNT))).toEqual([]);
+  answers[0]?.({ outcome: "pending" });
+  await settle();
+  const waits = DEVICE_STATE_MESSAGES.removal_pending ?? "";
+  expect(waits).toMatch(/^The removal of this device waits for the server\./);
+  expect(show(OFFLINE, REMOVAL_PENDING_ACCOUNT)).toBe(
+    offlineIndicator(NOT_READY_DETAIL, waits),
   );
 });
 
-test("each removal result's message shows in the status area, also after the connection changed, and a cancel shows none", () => {
-  const offline: ConnectionView = {
-    kind: "known",
-    status: { state: "offline", reason: "not_signed_in", revision: 4 },
-  };
-  const messages = [
-    [{ outcome: "removed" }, REGISTER_AGAIN_MESSAGE],
-    [{ outcome: "pending" }, DEVICE_STATE_MESSAGES.removal_pending],
-    [{ outcome: "refused", reason: "busy" }, DEVICE_ACTION_MESSAGES.busy],
-    [
-      { outcome: "failed", reason: "no_answer" },
-      DEVICE_ACTION_FAILURE_MESSAGES.no_answer,
-    ],
-  ] as const;
-  for (const [result, expected = ""] of messages) {
-    const message = deviceRemovalMessage(result);
-    expect(expected, result.outcome).not.toBe("");
-    expect(message, result.outcome).toBe(expected);
-    for (const view of [REPLACED, offline]) {
-      const html = renderToString(
-        <ConnectionStatusIndicator
-          view={view}
-          onReconnect={() => undefined}
-          onRemoveDevice={() => undefined}
-          removal={{ running: false, message }}
-        />,
-      );
-      expect(html, result.outcome).toContain(
-        `<span class="connection-status-detail">${escaped(expected).replaceAll('"', "&quot;")}</span></p>`,
-      );
-    }
+test("a removal that the server refused keeps its message while the device is signed in again and connects", async () => {
+  const { answers, show, click } = removalSequence();
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  expect(buttonsOf(show(REPLACED, REMOVAL_PENDING_ACCOUNT))).toEqual([]);
+  expect(show(OFFLINE, REMOVAL_PENDING_ACCOUNT)).toBe(
+    offlineIndicator(NOT_READY_DETAIL),
+  );
+  // For example `conflict`: the session ends the removal, and the device is
+  // signed in again with the same ID, so the client connects again.
+  answers[0]?.({ outcome: "failed", reason: "refused" });
+  await settle();
+  const refused = DEVICE_ACTION_FAILURE_MESSAGES.refused;
+  expect(refused).toBe("The server refused the request.");
+  for (const [state, label] of [
+    ["connecting", "Connecting"],
+    ["authenticating", "Authenticating"],
+    ["connected", "Connected"],
+  ] as const) {
+    const html = show(
+      { kind: "known", status: { state, revision: 6 } },
+      SIGNED_IN_ACCOUNT,
+    );
+    expect(html, state).toContain(
+      `Cloud: ${label}<span class="connection-status-detail">${refused}</span></p></div>`,
+    );
   }
-  expect(
-    renderToString(
-      <ConnectionStatusIndicator
-        view={REPLACED}
-        onReconnect={() => undefined}
-        onRemoveDevice={() => undefined}
-        removal={{
-          running: false,
-          message: deviceRemovalMessage({ outcome: "cancelled" }),
-        }}
-      />,
-    ),
-  ).toContain(
+});
+
+test("a removal that the main process refused or that was cancelled leaves both buttons usable", async () => {
+  const { answers, show, click } = removalSequence();
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  answers[0]?.({ outcome: "refused", reason: "busy" });
+  await settle();
+  const html = show(REPLACED, SIGNED_IN_ACCOUNT);
+  expect(buttonsOf(html)).toEqual(["Reconnect here once", REMOVE_LABEL]);
+  expect(html).toContain(
+    `<span class="connection-status-detail">${DEVICE_ACTION_MESSAGES.busy}</span></p>`,
+  );
+
+  // The next removal clears the message; a cancel shows none.
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  answers[1]?.({ outcome: "cancelled" });
+  await settle();
+  const cancelled = show(REPLACED, SIGNED_IN_ACCOUNT);
+  expect(buttonsOf(cancelled)).toEqual(["Reconnect here once", REMOVE_LABEL]);
+  expect(cancelled).toContain(
     `<span class="connection-status-detail">${REPLACED_DETAIL}</span></p>`,
   );
+});
+
+test("no button is offered once the device is no longer signed in, as after a sign-out or This is not me", () => {
+  const { show } = removalSequence();
+  const signedOut: readonly AccountStatus[] = [
+    // A sign-out: the main process names no account (#195).
+    { ...SIGNED_IN_STATUS, account: { kind: "hidden" }, device: "signed_out" },
+    {
+      ...SIGNED_IN_STATUS,
+      account: { kind: "hidden" },
+      device: "sign_out_report_pending",
+    },
+    // "This is not me": no account and no device.
+    SIGNED_OUT_STATUS,
+    { ...SIGNED_OUT_STATUS, device: "removed" },
+  ];
+  for (const status of signedOut) {
+    const signedOutAccount = knownAccount(status);
+    // Also before the client's offline status arrives.
+    expect(buttonsOf(show(REPLACED, signedOutAccount)), status.device).toEqual(
+      [],
+    );
+    expect(show(OFFLINE, signedOutAccount), status.device).toBe(
+      offlineIndicator(OFFLINE_SIGN_IN_DETAIL),
+    );
+  }
 });
 
 /** The element and every element below it, without rendering components. */
@@ -842,6 +1101,7 @@ test("Retry now and Reconnect here once call the reconnect, the removal calls it
         revision: 1,
       },
     },
+    account: SIGNED_IN_ACCOUNT,
     onReconnect,
   });
   const buttons = elementsOf(waiting).filter(
@@ -854,6 +1114,7 @@ test("Retry now and Reconnect here once call the reconnect, the removal calls it
   let removals = 0;
   const replaced = ConnectionStatusIndicator({
     view: REPLACED,
+    account: SIGNED_IN_ACCOUNT,
     onReconnect,
     onRemoveDevice: () => {
       removals += 1;
@@ -882,6 +1143,7 @@ test("Retry now and Reconnect here once call the reconnect, the removal calls it
         kind: "known",
         status: { state: "stopped", reason, revision: 1 },
       },
+      account: SIGNED_IN_ACCOUNT,
       onReconnect,
     });
     expect(
