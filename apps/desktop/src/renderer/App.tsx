@@ -20,9 +20,13 @@ import { PRODUCT_NAME } from "../shared/product.ts";
 import { ChatScreen } from "./ChatScreen.tsx";
 import {
   CONNECTION_ACTION_LABELS,
+  createDeviceRemoval,
   describeConnectionView,
+  IDLE_DEVICE_REMOVAL,
   initialConnectionView,
+  type ConnectionAction,
   type ConnectionView,
+  type DeviceRemovalView,
 } from "./connection-status.ts";
 import {
   ProjectNav,
@@ -106,6 +110,7 @@ export function App({
   );
   const runtimeView = useRuntimeView(runtime);
   const connectionView = useConnectionView(connection);
+  const removal = useDeviceRemoval(account, connectionView);
   const open = openProject(state);
 
   return (
@@ -123,6 +128,8 @@ export function App({
                     connection.reconnect().catch(() => undefined);
                   }
             }
+            onRemoveDevice={removal.onRemove}
+            removal={removal.view}
           />
           <RuntimeStatusIndicator view={runtimeView} />
         </div>
@@ -310,18 +317,56 @@ function useConnectionView(
 }
 
 /**
+ * "Remove this device and register again" for the connection indicator,
+ * through the account bridge, while the shell is mounted. The logic is in
+ * `createDeviceRemoval`.
+ */
+function useDeviceRemoval(
+  account: AccountBridge | undefined,
+  connectionView: ConnectionView,
+): {
+  readonly view: DeviceRemovalView;
+  readonly onRemove: (() => void) | undefined;
+} {
+  const [view, setView] = useState(IDLE_DEVICE_REMOVAL);
+  const removal = useMemo(
+    () =>
+      account === undefined ? undefined : createDeviceRemoval(account, setView),
+    [account],
+  );
+  useEffect(
+    () => removal?.connectionChanged(connectionView),
+    [removal, connectionView],
+  );
+  return { view, onRemove: removal?.remove };
+}
+
+/**
  * The connection status in the header: the state, a fixed sentence about
- * the reason, and "Retry now" or "Reconnect here once" where the person can
- * act. A sign-in starts only from the account panel, on the person's click.
+ * the reason, and "Retry now", or "Reconnect here once" and "Remove this
+ * device and register again", where the person can act. An action shows
+ * only with its handler. The main process confirms a removal in a native
+ * dialog; the result's message joins the status. A sign-in starts only
+ * from the account panel, on the person's click.
  */
 export function ConnectionStatusIndicator({
   view,
   onReconnect,
+  onRemoveDevice,
+  removal = IDLE_DEVICE_REMOVAL,
 }: {
   readonly view: ConnectionView;
   readonly onReconnect?: (() => void) | undefined;
+  readonly onRemoveDevice?: (() => void) | undefined;
+  readonly removal?: DeviceRemovalView | undefined;
 }) {
-  const { tone, label, detail, action } = describeConnectionView(view);
+  const { tone, label, detail, actions } = describeConnectionView(view);
+  const handlers: Readonly<Record<ConnectionAction, (() => void) | undefined>> =
+    {
+      retry_now: onReconnect,
+      reconnect_here: onReconnect,
+      remove_and_register: onRemoveDevice,
+    };
   return (
     <div className="connection-status" data-state={tone}>
       <p className="connection-status-text" role="status">
@@ -330,12 +375,23 @@ export function ConnectionStatusIndicator({
         {detail === null ? null : (
           <span className="connection-status-detail">{detail}</span>
         )}
+        {removal.message === undefined ? null : (
+          <span className="connection-status-detail">{removal.message}</span>
+        )}
       </p>
-      {action === null || onReconnect === undefined ? null : (
-        <button type="button" onClick={onReconnect}>
-          {CONNECTION_ACTION_LABELS[action]}
-        </button>
-      )}
+      {actions.map((action) => {
+        const handler = handlers[action];
+        return handler === undefined ? null : (
+          <button
+            key={action}
+            type="button"
+            disabled={action === "remove_and_register" && removal.running}
+            onClick={handler}
+          >
+            {CONNECTION_ACTION_LABELS[action]}
+          </button>
+        );
+      })}
     </div>
   );
 }
