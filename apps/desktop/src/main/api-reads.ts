@@ -1,8 +1,10 @@
 // The reads of workspace, chat, and agent data that the main process may
-// send to the API for #27 and #28: a frozen allowlist of six `GET` routes,
-// each with the protocol's response schema and a fixed cap on the size of
-// its answer. The account service sends them with the device session
-// (`readWorkspaceData`); no IPC channel and no bridge member reach them.
+// send to the API for #27 and #28, and the reads of invitations and join
+// requests for the screens of #95 (decision D1 of 2026-11-06): a frozen
+// allowlist of nine `GET` routes, each with the protocol's response schema
+// and a fixed cap on the size of its answer. The account service sends them
+// with the device session (`readWorkspaceData`); no IPC channel and no
+// bridge member reach them.
 // Chat messages are sent over the connection, never here.
 import {
   AGENT_ROUTES,
@@ -16,7 +18,13 @@ import {
   type ChatHistoryResponse,
   ChatHistoryQuerySchema,
   ChatHistoryResponseSchema,
+  type InvitationListResponse,
+  InvitationListResponseSchema,
+  type JoinRequestListResponse,
+  JoinRequestListResponseSchema,
   MEMBERSHIP_ROUTES,
+  type OwnJoinRequestListResponse,
+  OwnJoinRequestListResponseSchema,
   PROJECT_ROUTES,
   type ProjectId,
   type ProjectListResponse,
@@ -70,7 +78,9 @@ function read<T>(
  * of 100 projects about 57 KB, a page of 50 messages about 3.2 MB, the
  * agents about 0.46 MB, and the runs with 50 finished runs about 2.4 MB.
  * The runs' cap holds up to about 900 finished runs; a server that sends
- * more needs a desktop with a larger cap.
+ * more needs a desktop with a larger cap. For #95, 1,000 live invitations
+ * are about 0.29 MB, 1,000 join requests in the approver's view about
+ * 0.69 MB, and 1,000 of the account's own join requests about 0.52 MB.
  */
 export const WORKSPACE_READS = Object.freeze({
   /** `GET /workspaces`: the account's workspaces. */
@@ -115,6 +125,30 @@ export const WORKSPACE_READS = Object.freeze({
     AgentRunListResponseSchema,
     4 * MIB,
   ),
+  /** `GET /workspaces/:workspaceId/invitations`: the live invitations. */
+  listInvitations: read(
+    MEMBERSHIP_ROUTES.listInvitations,
+    ["workspaceId"],
+    InvitationListResponseSchema,
+    512 * KIB,
+  ),
+  /**
+   * `GET /workspaces/:workspaceId/join-requests`: the pending join requests
+   * and the blocks in force.
+   */
+  listJoinRequests: read(
+    MEMBERSHIP_ROUTES.listJoinRequests,
+    ["workspaceId"],
+    JoinRequestListResponseSchema,
+    1 * MIB,
+  ),
+  /** `GET /join-requests`: the account's own join requests. */
+  listOwnJoinRequests: read(
+    MEMBERSHIP_ROUTES.listOwnJoinRequests,
+    [],
+    OwnJoinRequestListResponseSchema,
+    1 * MIB,
+  ),
 });
 export type WorkspaceReadName = keyof typeof WORKSPACE_READS;
 
@@ -129,6 +163,9 @@ export interface WorkspaceReadParams {
   readonly listMessages: { readonly projectId: ProjectId };
   readonly listAgents: { readonly projectId: ProjectId };
   readonly listRuns: { readonly projectId: ProjectId };
+  readonly listInvitations: { readonly workspaceId: WorkspaceId };
+  readonly listJoinRequests: { readonly workspaceId: WorkspaceId };
+  readonly listOwnJoinRequests: NoParams;
 }
 
 /**
@@ -148,6 +185,9 @@ export interface WorkspaceReadQuery {
   readonly listMessages: MessagePageQuery;
   readonly listAgents: never;
   readonly listRuns: never;
+  readonly listInvitations: never;
+  readonly listJoinRequests: never;
+  readonly listOwnJoinRequests: never;
 }
 
 /** The answer of each read, as its response schema parsed it. */
@@ -158,6 +198,9 @@ export interface WorkspaceReadAnswer {
   readonly listMessages: ChatHistoryResponse;
   readonly listAgents: AgentListResponse;
   readonly listRuns: AgentRunListResponse;
+  readonly listInvitations: InvitationListResponse;
+  readonly listJoinRequests: JoinRequestListResponse;
+  readonly listOwnJoinRequests: OwnJoinRequestListResponse;
 }
 
 /**
@@ -171,6 +214,8 @@ export interface WorkspaceReadAnswer {
  *   an unlock from a sign-in.
  * - `not_found`: the API answered `not_found`: the workspace or the project
  *   does not exist, or the account is not an active member of it.
+ *   `forbidden`, for example for the invitations of a person who is not
+ *   the owner or an admin, is `failed`.
  * - `rate_limited`: the API answered `rate_limited`; the caller tries again
  *   after a fixed time.
  * - `unavailable`: try again later: a sign-in, a sign-out, "This is not me",

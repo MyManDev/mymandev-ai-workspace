@@ -8,8 +8,10 @@
 // forgets the account for "This is not me" (#149). It also lends the
 // device session to the connection client of #26 in the main process: the
 // signature of the WebSocket challenge and the close reasons that refuse the
-// device. And it sends the six reads of workspace, chat, and agent data of
-// #27 and #28 (`api-reads.ts`) for the main process only.
+// device. And it sends the reads of workspace, chat, and agent data of #27
+// and #28 and of invitations and join requests of #95 (`api-reads.ts`), and
+// the writes of the screens of #95 (`api-actions.ts`), for the main process
+// only.
 //
 // The renderer gets a narrow status only: the account's login, display name,
 // and device ID (none of them while the person is signed out or the device
@@ -47,6 +49,17 @@ import {
   signedOutOf,
 } from "./account-session.ts";
 import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
+import {
+  WORKSPACE_ACTION_BUDGET,
+  type WorkspaceActionAnswer,
+  type WorkspaceActionBody,
+  type WorkspaceActionName,
+  type WorkspaceActionParams,
+  type WorkspaceActionResult,
+  workspaceActionFailed,
+  workspaceActionFailedFor,
+  workspaceActionRequest,
+} from "./api-actions.ts";
 import type { ApiOrigin } from "./api-origin.ts";
 import {
   type WorkspaceReadAnswer,
@@ -278,6 +291,25 @@ export interface AccountService {
     params: WorkspaceReadParams[N],
     query?: WorkspaceReadQuery[N],
   ) => Promise<WorkspaceReadResult<WorkspaceReadAnswer[N]>>;
+  /**
+   * Sends one write of the allowlist in `api-actions.ts` with the device
+   * session, for the main process only (#95, D1); never for the renderer.
+   * The path parameters and the body are checked with the entry's schemas
+   * first, and the answer is parsed with its schema. It takes no
+   * `operation` lock and answers `unavailable` while a sign-in, a
+   * sign-out, "This is not me", a device removal, or an unlock runs, and it
+   * waits for the startup refresh and a background refresh, as a read does.
+   * It is sent once: an uncertain answer is never sent again and answers
+   * `unknown`, as does a successful answer when the account or the device
+   * changed while it was on its way. Writes beyond `WORKSPACE_ACTION_BUDGET`
+   * answer `too_soon` without a request. An invitation code in the body or
+   * the answer is never kept, logged, or published (D2). Never rejects.
+   */
+  readonly sendWorkspaceAction: <N extends WorkspaceActionName>(
+    name: N,
+    params: WorkspaceActionParams[N],
+    body?: WorkspaceActionBody[N],
+  ) => Promise<WorkspaceActionResult<WorkspaceActionAnswer[N]>>;
 }
 
 // The cooldown lives in a shared module, so that the renderer's delay for
@@ -1622,6 +1654,99 @@ export function createAccountService(
     }
   }
 
+  // ---- Workspace actions (#95, D1 and D2) --------------------------------
+
+  /** When each write within the budget's window was sent, the oldest first. */
+  const sentWrites: number[] = [];
+
+  /** How long until the budget allows one more write; 0 when it does now. */
+  function writeBudgetWait(at: number): number {
+    const { writes, windowMs } = WORKSPACE_ACTION_BUDGET;
+    while (
+      sentWrites.length > 0 &&
+      at - (sentWrites[0] as number) >= windowMs
+    ) {
+      sentWrites.shift();
+    }
+    return sentWrites.length < writes
+      ? 0
+      : (sentWrites[0] as number) + windowMs - at;
+  }
+
+  async function sendWorkspaceAction<N extends WorkspaceActionName>(
+    name: N,
+    params: WorkspaceActionParams[N],
+    body?: WorkspaceActionBody[N],
+  ): Promise<WorkspaceActionResult<WorkspaceActionAnswer[N]>> {
+    let sent = false;
+    try {
+      const call = workspaceActionRequest(name, params, body);
+      if (call === null) {
+        return workspaceActionFailed("invalid");
+      }
+      // As a read: no `operation` lock, no request while an action of the
+      // person or a sign-in may change the account, and none during a
+      // background refresh that uses the key.
+      if (readsPaused()) {
+        return workspaceActionFailed("unavailable");
+      }
+      await backgroundSettled();
+      if (readsPaused() || deviceKey === "loading") {
+        return workspaceActionFailed("unavailable");
+      }
+      const held = session;
+      if (system === null || held === null || account.kind !== "signed_in") {
+        return workspaceActionFailed("not_signed_in");
+      }
+      const at = now();
+      const wait = writeBudgetWait(at);
+      if (wait > 0) {
+        return workspaceActionFailed("too_soon", wait);
+      }
+      sentWrites.push(at);
+      const deviceId = account.deviceId;
+      const changes = accountChanges;
+      const replacementWasPending = replacementPending;
+      sent = true;
+      // Sent once. An uncertain answer is never sent again on its own: a
+      // second invitation, for example, would revoke the first one and
+      // lose its code.
+      const result = await held.request(call);
+      if (replacementWasPending) {
+        // A token may have confirmed or abandoned the key's replacement.
+        void refreshAccount().catch(() => {
+          report("The account could not be read.");
+        });
+      }
+      // A failure carries no data, so it is answered as it is.
+      if (!result.ok) {
+        return workspaceActionFailedFor(result);
+      }
+      // The answer belongs to the account and the device that sent it: when
+      // they changed meanwhile, or an action that may change them began, it
+      // is not passed on, and the write's effect is not known to the caller.
+      if (
+        account.kind !== "signed_in" ||
+        account.deviceId !== deviceId ||
+        accountChanges !== changes
+      ) {
+        return workspaceActionFailed("unknown");
+      }
+      if (call.answer !== "empty" && result.value === null) {
+        return workspaceActionFailed("unknown");
+      }
+      return Object.freeze({
+        ok: true,
+        value: result.value as WorkspaceActionAnswer[N],
+      });
+    } catch {
+      // A fixed message: never the error, which might hold the body. Before
+      // the request, only a value that throws when it is read can fail.
+      report("A workspace action could not be sent.");
+      return workspaceActionFailed(sent ? "unknown" : "invalid");
+    }
+  }
+
   return Object.freeze({
     status: () => current,
     onStatusChange: (listener: (status: AccountStatus) => void) => {
@@ -1652,5 +1777,6 @@ export function createAccountService(
     signWebSocketChallenge,
     deviceRefused,
     readWorkspaceData,
+    sendWorkspaceAction,
   });
 }

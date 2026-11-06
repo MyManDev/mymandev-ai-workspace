@@ -6,6 +6,7 @@ import {
   GITHUB_LOGIN_PATTERN,
   LIMITS,
   MAX_ANSWER_LIST_ITEMS,
+  type MemberId,
   type ProjectId,
   type UserId,
   type WorkspaceId,
@@ -41,6 +42,7 @@ import {
 import { PASSPHRASE_MAX_CHARACTERS } from "./device-key/key-file.ts";
 import type { DeviceKeyStatus } from "./device-key/store.ts";
 import type { DeviceRecord, DeviceRecordRead } from "./device-record.ts";
+import { WORKSPACE_ACTION_BUDGET, WORKSPACE_ACTIONS } from "./api-actions.ts";
 import { WORKSPACE_READS } from "./api-reads.ts";
 import type {
   AuthorizedRequest,
@@ -3694,6 +3696,527 @@ test("after a read made while a key replacement was pending, the account and the
   await expect(
     h.service.readWorkspaceData("listWorkspaces", {}),
   ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+  await tick();
+  expect(h.service.status().replacementPending).toBe(false);
+});
+
+// ---- Workspace actions (#95, D1 and D2) --------------------------------
+
+const MEMBER_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f1" as MemberId;
+const IN_WORKSPACE = Object.freeze({ workspaceId: WORKSPACE_ID });
+/** An invitation code of the protocol's format, as a person pastes it. */
+const INVITATION_CODE = `mmdi_${"Q7x-_9kPz2".repeat(4)}Lmw`;
+const CREATED = Object.freeze({ created: true });
+
+test("a workspace action goes to the session once with the allowlist's route, its IDs, and the parsed body, and only the answer comes back", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.log.length = 0;
+
+  h.request = async () => ({ ok: true, value: CREATED });
+  await expect(
+    h.service.sendWorkspaceAction("createProject", IN_WORKSPACE, {
+      name: " Docs ",
+    }),
+  ).resolves.toEqual({ ok: true, value: CREATED });
+  h.request = async () => ({ ok: true, value: null });
+  await expect(
+    h.service.sendWorkspaceAction("removeMember", {
+      workspaceId: WORKSPACE_ID,
+      memberId: MEMBER_ID,
+    }),
+  ).resolves.toEqual({ ok: true, value: null });
+  expect(h.log).toEqual([
+    "session request /workspaces/:workspaceId/projects",
+    "session request /workspaces/:workspaceId/members/:memberId/remove",
+  ]);
+  expect(h.requests).toEqual([
+    {
+      route: WORKSPACE_ACTIONS.createProject.route,
+      params: { workspaceId: WORKSPACE_ID },
+      body: { name: "Docs" },
+      answer: WORKSPACE_ACTIONS.createProject.answer,
+    },
+    {
+      route: WORKSPACE_ACTIONS.removeMember.route,
+      params: { workspaceId: WORKSPACE_ID, memberId: MEMBER_ID },
+      answer: "empty",
+    },
+  ]);
+});
+
+test("only the allowlist's writes are sent, checked by type and at runtime", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const send = h.service.sendWorkspaceAction;
+  const ws = IN_WORKSPACE;
+  const upper = WORKSPACE_ID.toUpperCase() as WorkspaceId;
+  const refused: (() => Promise<unknown>)[] = [
+    // @ts-expect-error A read is not a write.
+    () => send("listWorkspaces", {}),
+    // @ts-expect-error A route that no screen of #95 sends.
+    () => send("setUnclaimedMemberLimit", ws, { maxUnclaimedMembers: 5 }),
+    () => send("toString" as "leaveWorkspace", ws),
+    // @ts-expect-error A missing path parameter.
+    () => send("removeMember", ws),
+    () => send("leaveWorkspace", { ...ws, extra: WORKSPACE_ID } as never),
+    () => send("leaveWorkspace", { workspaceId: upper }),
+    () => send("leaveWorkspace", { workspaceId: "../x" as WorkspaceId }),
+    // @ts-expect-error A body for a route without one.
+    () => send("leaveWorkspace", ws, {}),
+    () => send("defineMember", ws),
+    () => send("defineMember", ws, { displayName: "a".repeat(65) }),
+    () => send("defineMember", ws, { displayName: "G", role: "x" } as never),
+    () => send("previewInvitation", {}, { code: "not a code" }),
+  ];
+  for (const call of refused) {
+    await expect(call()).resolves.toEqual({ ok: false, reason: "invalid" });
+  }
+  expect(h.requests).toEqual([]);
+});
+
+test("a write is not signed in without an account, and maps the session's failures to a closed set, with the wait after rate_limited", async () => {
+  const none = harness();
+  none.record = { kind: "none" };
+  await none.service.initialize();
+  await expect(
+    none.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
+  ).resolves.toEqual({ ok: false, reason: "not_signed_in" });
+  expect(none.requests).toEqual([]);
+
+  const h = harness();
+  await h.service.initialize();
+  const cases: [SessionResult<unknown>, unknown][] = [
+    [
+      { ok: false, reason: "refused", code: "conflict" },
+      { ok: false, reason: "conflict" },
+    ],
+    [
+      { ok: false, reason: "refused", code: "forbidden" },
+      { ok: false, reason: "forbidden" },
+    ],
+    [
+      { ok: false, reason: "refused", code: "device_too_new" },
+      { ok: false, reason: "device_too_new" },
+    ],
+    [
+      {
+        ok: false,
+        reason: "refused",
+        code: "rate_limited",
+        retryAfterSeconds: 30,
+      },
+      { ok: false, reason: "rate_limited", retryAfterMs: 30_000 },
+    ],
+    [
+      { ok: false, reason: "refused", code: "rate_limited" },
+      { ok: false, reason: "rate_limited", retryAfterMs: 60_000 },
+    ],
+    [
+      { ok: false, reason: "refused", code: "unauthorized" },
+      { ok: false, reason: "not_signed_in" },
+    ],
+    [
+      { ok: false, reason: "refused", code: "bad_request" },
+      { ok: false, reason: "failed" },
+    ],
+    [
+      { ok: false, reason: "signed_out" },
+      { ok: false, reason: "not_signed_in" },
+    ],
+    [
+      { ok: false, reason: "sign_in_running" },
+      { ok: false, reason: "unavailable" },
+    ],
+    [
+      { ok: false, reason: "no_answer" },
+      { ok: false, reason: "unknown" },
+    ],
+    [
+      { ok: false, reason: "server_error" },
+      { ok: false, reason: "unknown" },
+    ],
+    // An answer too large or outside the answer schema.
+    [
+      { ok: false, reason: "unexpected_response" },
+      { ok: false, reason: "unknown" },
+    ],
+  ];
+  for (const [result, failure] of cases) {
+    h.request = async () => result;
+    await expect(
+      h.service.sendWorkspaceAction("promoteMember", {
+        workspaceId: WORKSPACE_ID,
+        memberId: MEMBER_ID,
+      }),
+      JSON.stringify(result),
+    ).resolves.toEqual(failure);
+  }
+
+  // A session that throws once the write was handed to it.
+  h.request = () => Promise.reject(new Error("broken"));
+  await expect(
+    h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
+  ).resolves.toEqual({ ok: false, reason: "unknown" });
+  expect(h.errors).toEqual(["A workspace action could not be sent."]);
+  // A successful answer without the body that its schema needs.
+  h.request = async () => ({ ok: true, value: null });
+  await expect(
+    h.service.sendWorkspaceAction("defineMember", IN_WORKSPACE, {
+      displayName: "Grace",
+    }),
+  ).resolves.toEqual({ ok: false, reason: "unknown" });
+});
+
+test("a write whose answer is uncertain is sent once and never again on its own", async () => {
+  for (const reason of [
+    "no_answer",
+    "server_error",
+    "unexpected_response",
+  ] as const) {
+    const h = harness();
+    await h.service.initialize();
+    h.log.length = 0;
+    h.request = async () => ({ ok: false, reason });
+    await expect(
+      h.service.sendWorkspaceAction("createInvitation", IN_WORKSPACE, {
+        memberId: MEMBER_ID,
+      }),
+    ).resolves.toEqual({ ok: false, reason: "unknown" });
+    await tick();
+    await tick();
+    expect(h.log, reason).toEqual([
+      "session request /workspaces/:workspaceId/invitations",
+    ]);
+    expect(h.requests, reason).toHaveLength(1);
+  }
+});
+
+test("a write is unavailable during This is not me, a sign-out, a device removal, and a sign-in, and sends nothing", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const leave = () =>
+    h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE);
+
+  let confirm: (value: boolean) => void = () => undefined;
+  h.confirm = () =>
+    new Promise((resolve) => {
+      confirm = resolve;
+    });
+  const forgetting = h.service.forgetAccount();
+  await tick();
+  await expect(leave()).resolves.toEqual({ ok: false, reason: "unavailable" });
+  confirm(false);
+  await forgetting;
+
+  let signedOut: (value: SessionResult<"reported" | "pending">) => void = () =>
+    undefined;
+  h.signOut = () =>
+    new Promise((resolve) => {
+      signedOut = resolve;
+    });
+  const signingOut = h.service.signOut();
+  await tick();
+  await expect(leave()).resolves.toEqual({ ok: false, reason: "unavailable" });
+  signedOut({ ok: true, value: "reported" });
+  await signingOut;
+
+  h.confirmRemoval = () =>
+    new Promise((resolve) => {
+      confirm = resolve;
+    });
+  const removing = h.service.removeDevice();
+  await tick();
+  await expect(leave()).resolves.toEqual({ ok: false, reason: "unavailable" });
+  confirm(false);
+  await removing;
+
+  const signIn = startedSignIn();
+  h.start = async () => signIn.start;
+  await expect(h.service.startSignIn()).resolves.toMatchObject({
+    outcome: "started",
+  });
+  await expect(leave()).resolves.toEqual({ ok: false, reason: "unavailable" });
+  signIn.settle({ kind: "cancelled" });
+
+  expect(h.requests).toEqual([]);
+});
+
+test("a write is unavailable during an unlock, and sends nothing", async () => {
+  const h = harness();
+  let release: () => void = () => undefined;
+  h.load = (passphrase) => {
+    if (passphrase === undefined) {
+      return Promise.reject(new DeviceKeyError("passphrase_required"));
+    }
+    return new Promise((_resolve, reject) => {
+      release = () => reject(new DeviceKeyError("wrong_passphrase"));
+    });
+  };
+  await h.service.initialize();
+  const unlocking = h.service.unlockDeviceKey("not the passphrase");
+  await tick();
+  await expect(
+    h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
+  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  release();
+  await unlocking;
+  expect(h.requests).toEqual([]);
+});
+
+test("a write during the startup waits for the startup refresh, and one that a sign-out overtakes there is unavailable", async () => {
+  const h = harness();
+  const refresh = gatedRefresh(h);
+  refresh.hold();
+  h.request = async () => ({ ok: true, value: null });
+  const initializing = h.service.initialize();
+  await tick();
+  const sending = h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE);
+  await tick();
+  expect(h.requests).toEqual([]);
+  refresh.release();
+  await initializing;
+  await expect(sending).resolves.toEqual({ ok: true, value: null });
+  expect(h.requests).toHaveLength(1);
+
+  const s = harness();
+  const startRefresh = gatedRefresh(s);
+  startRefresh.hold();
+  const starting = s.service.initialize();
+  await tick();
+  const overtaken = s.service.sendWorkspaceAction(
+    "leaveWorkspace",
+    IN_WORKSPACE,
+  );
+  await tick();
+  const signingOut = s.service.signOut();
+  await tick();
+  startRefresh.release();
+  await starting;
+  await expect(overtaken).resolves.toEqual({
+    ok: false,
+    reason: "unavailable",
+  });
+  await expect(signingOut).resolves.toEqual({ outcome: "signed_out" });
+  expect(s.requests).toEqual([]);
+});
+
+test("the answer of a write is never dropped silently: after a change of the account or the device meanwhile a success answers unknown, and a failure is answered as it is", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const leave = () =>
+    h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE);
+
+  // A sign-out that starts and ends while the write is on its way.
+  let finish = heldAnswer(h);
+  let sending = leave();
+  await tick();
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "signed_out",
+  });
+  finish({ ok: true, value: null });
+  await expect(sending).resolves.toEqual({ ok: false, reason: "unknown" });
+
+  // A failure carries no data.
+  finish = heldAnswer(h);
+  sending = leave();
+  await tick();
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "signed_out",
+  });
+  finish({ ok: false, reason: "refused", code: "conflict" });
+  await expect(sending).resolves.toEqual({ ok: false, reason: "conflict" });
+
+  // The device is revoked meanwhile: no device is signed in.
+  const revoked = harness();
+  await revoked.service.initialize();
+  finish = heldAnswer(revoked);
+  sending = revoked.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE);
+  await tick();
+  revoked.emit({ kind: "revoked" });
+  finish({ ok: true, value: null });
+  await expect(sending).resolves.toEqual({ ok: false, reason: "unknown" });
+
+  // Without a change, the answer comes back.
+  const other = harness();
+  await other.service.initialize();
+  other.request = async () => ({ ok: true, value: null });
+  await expect(
+    other.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
+  ).resolves.toEqual({ ok: true, value: null });
+});
+
+test("the write budget sends 30 writes within a minute and refuses more as too_soon without a request, until the oldest leaves the window", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.request = async () => ({ ok: true, value: null });
+  const { writes, windowMs } = WORKSPACE_ACTION_BUDGET;
+  for (let index = 0; index < writes; index += 1) {
+    h.clock = index * 100;
+    await expect(
+      h.service.sendWorkspaceAction(
+        index % 2 === 0 ? "pauseJoinRequests" : "resumeJoinRequests",
+        IN_WORKSPACE,
+      ),
+    ).resolves.toEqual({ ok: true, value: null });
+  }
+  h.clock = 3_000;
+  await expect(
+    h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
+  ).resolves.toEqual({ ok: false, reason: "too_soon", retryAfterMs: 57_000 });
+  // A write outside the format is refused as it is, and counts for nothing.
+  await expect(
+    h.service.sendWorkspaceAction("defineMember", IN_WORKSPACE),
+  ).resolves.toEqual({ ok: false, reason: "invalid" });
+  expect(h.requests).toHaveLength(writes);
+
+  // The first write leaves the window; the second one is still in it.
+  h.clock = windowMs;
+  await expect(
+    h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
+  ).resolves.toEqual({ ok: true, value: null });
+  h.clock = windowMs + 50;
+  await expect(
+    h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
+  ).resolves.toEqual({ ok: false, reason: "too_soon", retryAfterMs: 50 });
+  expect(h.requests).toHaveLength(writes + 1);
+});
+
+test("the invitation code goes only in the body of a preview or an accept and comes back only in the answer of a create, never in a log, the status, an error, or a failure (D2)", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const created = Object.freeze({
+    invitation: Object.freeze({ id: "i" }),
+    code: INVITATION_CODE,
+  });
+  h.request = async (call) => ({
+    ok: true,
+    value:
+      call.route === WORKSPACE_ACTIONS.createInvitation.route
+        ? created
+        : CREATED,
+  });
+  const results: unknown[] = [];
+
+  // The create answers the code once, to the caller.
+  await expect(
+    h.service.sendWorkspaceAction("createInvitation", IN_WORKSPACE, {
+      memberId: MEMBER_ID,
+    }),
+  ).resolves.toEqual({ ok: true, value: created });
+  for (const name of ["previewInvitation", "acceptInvitation"] as const) {
+    await expect(
+      h.service.sendWorkspaceAction(name, {}, { code: INVITATION_CODE }),
+    ).resolves.toEqual({ ok: true, value: CREATED });
+    // A pasted text with a line break is not a code: nothing is sent.
+    results.push(
+      await h.service.sendWorkspaceAction(
+        name,
+        {},
+        { code: `${INVITATION_CODE}\n` },
+      ),
+    );
+  }
+  expect(h.requests.map((call) => call.body)).toEqual([
+    { memberId: MEMBER_ID },
+    { code: INVITATION_CODE },
+    { code: INVITATION_CODE },
+  ]);
+  for (const call of h.requests) {
+    expect(JSON.stringify(call.params)).not.toContain(INVITATION_CODE);
+  }
+
+  // Refusals, and a session that fails with the code in its error.
+  for (const failure of [
+    { ok: false, reason: "refused", code: "invitation_invalid" },
+    { ok: false, reason: "refused", code: "already_member" },
+    { ok: false, reason: "no_answer" },
+  ] as const) {
+    h.request = async () => failure;
+    results.push(
+      await h.service.sendWorkspaceAction(
+        "acceptInvitation",
+        {},
+        { code: INVITATION_CODE },
+      ),
+    );
+  }
+  h.request = () => Promise.reject(new Error(`refused ${INVITATION_CODE}`));
+  results.push(
+    await h.service.sendWorkspaceAction(
+      "previewInvitation",
+      {},
+      { code: INVITATION_CODE },
+    ),
+  );
+  // Parameters that throw with the code when they are read, before any
+  // request.
+  const requests = h.requests.length;
+  const throwing = new Proxy(
+    {},
+    {
+      ownKeys: () => {
+        throw new Error(INVITATION_CODE);
+      },
+    },
+  );
+  results.push(
+    await h.service.sendWorkspaceAction(
+      "acceptInvitation",
+      throwing as Record<string, never>,
+      { code: INVITATION_CODE },
+    ),
+  );
+  expect(h.requests).toHaveLength(requests);
+  expect(results).toEqual([
+    { ok: false, reason: "invalid" },
+    { ok: false, reason: "invalid" },
+    { ok: false, reason: "invitation_invalid" },
+    { ok: false, reason: "already_member" },
+    { ok: false, reason: "unknown" },
+    { ok: false, reason: "unknown" },
+    { ok: false, reason: "invalid" },
+  ]);
+  expect(h.errors).toEqual([
+    "A workspace action could not be sent.",
+    "A workspace action could not be sent.",
+  ]);
+
+  const seen = JSON.stringify([
+    results,
+    h.log,
+    h.errors,
+    h.statuses,
+    h.service.status(),
+  ]);
+  expect(seen).not.toContain(INVITATION_CODE);
+  expect(seen).not.toContain(INVITATION_CODE.slice("mmdi_".length));
+});
+
+test("after a write made while a key replacement was pending, the account and the key are read again", async () => {
+  const h = harness();
+  h.keyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: true,
+    passphraseRequired: false,
+  };
+  await h.service.initialize();
+  expect(h.service.status().replacementPending).toBe(true);
+
+  // The write's token confirmed the replacement.
+  h.request = async () => {
+    h.keyStatus = {
+      protection: "system",
+      loaded: true,
+      replacementPending: false,
+      passphraseRequired: false,
+    };
+    return { ok: true, value: null };
+  };
+  await expect(
+    h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
+  ).resolves.toEqual({ ok: true, value: null });
   await tick();
   expect(h.service.status().replacementPending).toBe(false);
 });

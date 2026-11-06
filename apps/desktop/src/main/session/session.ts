@@ -148,6 +148,12 @@ export interface SessionFailure {
   readonly deviceLogin?: string;
   /** With `key_store_failed`: the code of the store's `DeviceKeyError`. */
   readonly keyError?: DeviceKeyErrorCode;
+  /**
+   * With `refused` and `rate_limited`, from a request with an access token:
+   * the answer's `Retry-After` in seconds, when it held a valid one
+   * (`callApi`).
+   */
+  readonly retryAfterSeconds?: number;
 }
 
 export type SessionResult<T> =
@@ -1620,7 +1626,12 @@ export function createDeviceSession(
           : failure("unexpected_response");
       }
       case "error":
-        return refusedWithLogin(answer.code);
+        return answer.retryAfterSeconds === undefined
+          ? refusedWithLogin(answer.code)
+          : failure("refused", {
+              code: answer.code,
+              retryAfterSeconds: answer.retryAfterSeconds,
+            });
       case "invalid_request":
         return failure("invalid_request");
       default:

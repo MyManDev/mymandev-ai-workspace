@@ -1225,6 +1225,35 @@ describe("access tokens", () => {
       }
     }
   });
+
+  test("a rate_limited refusal of a request carries the API's Retry-After", async () => {
+    const h = harness();
+    await existingDevice(h);
+    const route = { method: "POST", path: "/workspaces" } as const;
+    let retryAfter: string | undefined = "90";
+    h.api.intercept = (request) => {
+      if (request.path !== "/workspaces") {
+        return undefined;
+      }
+      const answer = errorAnswer("rate_limited");
+      if (retryAfter !== undefined) {
+        answer.headers.set("retry-after", retryAfter);
+      }
+      return Promise.resolve(answer);
+    };
+    expect(await h.session.request({ route, answer: "empty" })).toEqual({
+      ok: false,
+      reason: "refused",
+      code: "rate_limited",
+      retryAfterSeconds: 90,
+    });
+    retryAfter = undefined;
+    expect(await h.session.request({ route, answer: "empty" })).toEqual({
+      ok: false,
+      reason: "refused",
+      code: "rate_limited",
+    });
+  });
 });
 
 describe("a pending key replacement", () => {

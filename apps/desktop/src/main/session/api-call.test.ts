@@ -6,6 +6,7 @@ import {
   type ApiFetch,
   callApi,
   MAX_API_ANSWER_BYTES,
+  MAX_RETRY_AFTER_SECONDS,
 } from "./api-call.ts";
 
 const ORIGIN = "https://api.mymandev.example";
@@ -154,6 +155,72 @@ describe("callApi", () => {
         await callApi({ ...h, origin: ORIGIN, route: AUTH_ROUTES.listDevices }),
       ).toEqual(expected);
     }
+  });
+
+  test("a rate_limited refusal carries its Retry-After when it is a whole number of seconds, capped at a day", async () => {
+    const refusal = (code: string, status: number, retryAfter?: string) =>
+      new Response(
+        JSON.stringify({ statusCode: status, error: "E", message: "E", code }),
+        {
+          status,
+          headers: {
+            "content-type": "application/json",
+            ...(retryAfter === undefined ? {} : { "retry-after": retryAfter }),
+          },
+        },
+      );
+    const cases: [Response, unknown][] = [
+      [
+        refusal("rate_limited", 429, "120"),
+        {
+          kind: "error",
+          status: 429,
+          code: "rate_limited",
+          retryAfterSeconds: 120,
+        },
+      ],
+      [
+        refusal("rate_limited", 429, "1"),
+        {
+          kind: "error",
+          status: 429,
+          code: "rate_limited",
+          retryAfterSeconds: 1,
+        },
+      ],
+      [
+        refusal("rate_limited", 429, String(MAX_RETRY_AFTER_SECONDS + 1)),
+        {
+          kind: "error",
+          status: 429,
+          code: "rate_limited",
+          retryAfterSeconds: MAX_RETRY_AFTER_SECONDS,
+        },
+      ],
+      // Not a whole number of seconds from 1: no wait.
+      ...["0", "-5", "1.5", "Wed, 21 Oct 2026 07:28:00 GMT", "1e3", ""].map(
+        (value): [Response, unknown] => [
+          refusal("rate_limited", 429, value),
+          { kind: "error", status: 429, code: "rate_limited" },
+        ],
+      ),
+      [
+        refusal("rate_limited", 429),
+        { kind: "error", status: 429, code: "rate_limited" },
+      ],
+      // Only a rate limit carries a wait.
+      [
+        refusal("conflict", 409, "120"),
+        { kind: "error", status: 409, code: "conflict" },
+      ],
+    ];
+    for (const [answer, expected] of cases) {
+      const h = harness(() => Promise.resolve(answer));
+      expect(
+        await callApi({ ...h, origin: ORIGIN, route: AUTH_ROUTES.listDevices }),
+      ).toEqual(expected);
+    }
+    expect(MAX_RETRY_AFTER_SECONDS).toBe(86_400);
   });
 
   test("a body over the limit is not read, with or without Content-Length", async () => {

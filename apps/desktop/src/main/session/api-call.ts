@@ -21,6 +21,12 @@ export const API_REQUEST_TIMEOUT_MS = 30_000;
  */
 export const MAX_API_ANSWER_BYTES = 512 * 1024;
 
+/**
+ * The longest wait that a `Retry-After` of the API sets: one day, the
+ * longest window of the API's limits. A longer value is read as this one.
+ */
+export const MAX_RETRY_AFTER_SECONDS = 86_400;
+
 /** The `fetch` that the session uses; production passes Electron's `net.fetch`. */
 export type ApiFetch = (url: string, init: RequestInit) => Promise<Response>;
 
@@ -30,7 +36,10 @@ export type ApiFetch = (url: string, init: RequestInit) => Promise<Response>;
  * - `ok`: a `2xx`. `value` is the parsed JSON body, or null for an empty body
  *   (`204`).
  * - `error`: a `4xx` with the API's error body whose status fits it. Only
- *   this answer is certain: the API refused and committed nothing.
+ *   this answer is certain: the API refused and committed nothing. With
+ *   `rate_limited`, `retryAfterSeconds` holds the answer's `Retry-After`
+ *   when it is a whole number of seconds from 1, capped at
+ *   `MAX_RETRY_AFTER_SECONDS`.
  * - `server_error`: a `5xx`. The API may have committed before it failed.
  * - `unexpected_response`: any other answer, for example from a proxy, a
  *   body too large, or a body that is not JSON.
@@ -44,6 +53,7 @@ export type ApiAnswer =
       readonly kind: "error";
       readonly status: number;
       readonly code: ApiErrorCode;
+      readonly retryAfterSeconds?: number;
     }
   | { readonly kind: "server_error" }
   | { readonly kind: "unexpected_response" }
@@ -110,6 +120,19 @@ async function readBodyText(
   }
 }
 
+/**
+ * The `Retry-After` of an answer in seconds, or undefined when it is not a
+ * whole number of seconds from 1. The API sends seconds, never a date.
+ */
+function retryAfterSecondsOf(response: Response): number | undefined {
+  const value = response.headers.get("retry-after");
+  if (value === null || !/^[0-9]{1,10}$/u.test(value)) {
+    return undefined;
+  }
+  const seconds = Number(value);
+  return seconds >= 1 ? Math.min(seconds, MAX_RETRY_AFTER_SECONDS) : undefined;
+}
+
 async function readAnswer(
   response: Response,
   maxBytes: number,
@@ -139,7 +162,12 @@ async function readAnswer(
   if (status >= 400 && status <= 499) {
     const parsed = ApiErrorBodySchema.safeParse(value);
     if (parsed.success && parsed.data.statusCode === status) {
-      return { kind: "error", status, code: parsed.data.code };
+      const code = parsed.data.code;
+      const retryAfterSeconds =
+        code === "rate_limited" ? retryAfterSecondsOf(response) : undefined;
+      return retryAfterSeconds === undefined
+        ? { kind: "error", status, code }
+        : { kind: "error", status, code, retryAfterSeconds };
     }
   }
   return { kind: "unexpected_response" };
