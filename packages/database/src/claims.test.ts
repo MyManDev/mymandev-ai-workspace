@@ -4,6 +4,7 @@ import { after, before, test } from "node:test";
 import {
   type Claim,
   ClaimListResponseSchema,
+  type ClaimVia,
   type DeviceId,
   type InvitationId,
   type MemberId,
@@ -223,6 +224,7 @@ function claim(
   workspaceId: WorkspaceId,
   memberId: MemberId,
   who: Account | null,
+  via: ClaimVia,
   claimedAt: Date,
   accountCreatedAt: Date = GITHUB_CREATED,
 ): Claim {
@@ -238,6 +240,7 @@ function claim(
             verifiedAt: NOW.toISOString(),
             accountCreatedAt: accountCreatedAt.toISOString(),
           },
+    via,
     claimedAt: claimedAt.toISOString(),
   };
 }
@@ -249,7 +252,7 @@ async function setRole(memberId: MemberId, role: "admin" | "member") {
     .where(eq(workspaceMembers.id, memberId));
 }
 
-test("the owner and admins list the accepted invitations and approved join requests, the most recent first, with the claimer's GitHub login and the creation date of that GitHub account", async () => {
+test("the owner and admins list the accepted invitations and approved join requests, the most recent first, with the claimer's GitHub login, the creation date of that GitHub account, and how each person was claimed", async () => {
   const [owner, ada, bob, carol, dave] = await accounts(5);
   assert.ok(owner && ada && bob && carol && dave);
   const { workspaceId } = await workspaceOf(owner);
@@ -345,8 +348,15 @@ test("the owner and admins list the accepted invitations and approved join reque
   // The owner's own person, which the workspace's creation claimed, is no
   // claim either.
   const expected = [
-    claim(workspaceId, bobPerson, bob, at(2 * HOUR_MS)),
-    claim(workspaceId, adaPerson, ada, at(HOUR_MS), FRESH_GITHUB_CREATED),
+    claim(workspaceId, bobPerson, bob, "join_request", at(2 * HOUR_MS)),
+    claim(
+      workspaceId,
+      adaPerson,
+      ada,
+      "invitation",
+      at(HOUR_MS),
+      FRESH_GITHUB_CREATED,
+    ),
   ];
   assert.deepEqual(await claimsOf(workspaceId, owner), expected);
 
@@ -455,12 +465,18 @@ test("a removed person's claim stays listed, an erased account's claim has no cl
     .where(eq(userIdentities.userId, erased.userId));
 
   assert.deepEqual(await claimsOf(workspaceId, owner), [
-    claim(workspaceId, erasedPerson, null, at(2 * HOUR_MS)),
-    claim(workspaceId, adaPerson, ada, at(HOUR_MS)),
+    claim(workspaceId, erasedPerson, null, "join_request", at(2 * HOUR_MS)),
+    claim(workspaceId, adaPerson, ada, "invitation", at(HOUR_MS)),
   ]);
   assert.deepEqual(await claimsOf(other.workspaceId, otherOwner), [
-    claim(other.workspaceId, bobElsewhere, bob, at(4 * HOUR_MS)),
-    claim(other.workspaceId, adaElsewhere, ada, at(3 * HOUR_MS)),
+    claim(other.workspaceId, bobElsewhere, bob, "invitation", at(4 * HOUR_MS)),
+    claim(
+      other.workspaceId,
+      adaElsewhere,
+      ada,
+      "join_request",
+      at(3 * HOUR_MS),
+    ),
   ]);
 });
 
@@ -472,17 +488,32 @@ test("the list holds the RECENT_CLAIMS most recent claims, whatever their age, t
 
   // 51 claims of one account, written directly: 50 earlier people, each
   // removed after its claim, and its active person. Each has an accepted
-  // invitation. The two oldest are about a year old, and two others share a
-  // time.
+  // invitation. The two oldest are about a year old.
   const people = Array.from({ length: RECENT_CLAIMS + 1 }, (_, index) => ({
     id: newId<MemberId>(),
     claimedAt: index < 2 ? at((index - 365) * DAY_MS) : at(index * MINUTE_MS),
     removed: index < RECENT_CLAIMS,
   }));
-  const tied = people[20];
-  assert.ok(tied);
-  const twin = { id: newId<MemberId>(), claimedAt: tied.claimedAt };
-  people[21] = { ...twin, removed: true };
+  // Two groups of four claims share a time each. Their person IDs, which grow
+  // in the order they were made, are handed out of order, so that neither the
+  // order in which the rows are written nor its reverse is the order by ID.
+  const ties = [
+    [10, [2, 0, 3, 1]],
+    [30, [1, 3, 0, 2]],
+  ] as const;
+  const tiedGroups: Readonly<{ claimedAt: Date; ids: MemberId[] }>[] = [];
+  for (const [start, order] of ties) {
+    const group = people.slice(start, start + order.length);
+    const ids = group.map((person) => person.id).sort();
+    const claimedAt = group[0]?.claimedAt;
+    assert.ok(claimedAt);
+    order.forEach((rank, offset) => {
+      const id = ids[rank];
+      assert.ok(id);
+      people[start + offset] = { id, claimedAt, removed: true };
+    });
+    tiedGroups.push({ claimedAt, ids });
+  }
   await database()
     .insert(workspaceMembers)
     .values(
@@ -530,11 +561,16 @@ test("the list holds the RECENT_CLAIMS most recent claims, whatever their age, t
       .slice(0, RECENT_CLAIMS)
       .map((person) => [person.id, person.claimedAt.toISOString()]),
   );
-  // The tie: the higher person ID comes first, and both are listed.
-  const tiedIds = claims
-    .filter((item) => item.claimedAt === tied.claimedAt.toISOString())
-    .map((item) => item.memberId);
-  assert.deepEqual(tiedIds, [tied.id, twin.id].sort().reverse());
+  // Within each tie, the higher person ID comes first, and all are listed.
+  for (const { claimedAt, ids } of tiedGroups) {
+    assert.deepEqual(
+      claims
+        .filter((item) => item.claimedAt === claimedAt.toISOString())
+        .map((item) => item.memberId),
+      [...ids].reverse(),
+    );
+  }
+  assert.ok(claims.every((item) => item.via === "invitation"));
   // Of the two claims of about a year ago, the newer one is still listed,
   // last, and only the oldest claim is cut.
   assert.equal(claims.at(-1)?.memberId, people[1]?.id);

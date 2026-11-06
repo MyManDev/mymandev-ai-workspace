@@ -163,6 +163,21 @@ export type OwnershipOfferEndReason =
   (typeof OWNERSHIP_OFFER_END_REASONS)[number];
 
 /**
+ * How an account claimed a person (#208; Project Manager decision of
+ * 2026-11-06): by accepting an invitation, or through a join request that an
+ * owner or admin approved. Nobody vetted the account of an invitation claim
+ * before it joined, while the approver of a join request saw its GitHub login
+ * and the creation date of the account (ADR 0014, "Threats", a leaked
+ * invitation code). The list is closed: a third way of claiming a person
+ * needs a protocol change, because an older desktop refuses an unknown value.
+ */
+export const CLAIM_VIAS = Object.freeze([
+  "invitation",
+  "join_request",
+] as const);
+export type ClaimVia = (typeof CLAIM_VIAS)[number];
+
+/**
  * A person's presence in a workspace (#110). A person is `online` while at
  * least one connection of its account is subscribed to the workspace, and
  * `offline` otherwise; an unclaimed person is always `offline`. Presence is

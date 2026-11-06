@@ -1,10 +1,11 @@
 import {
   type Claim,
+  type ClaimVia,
   RECENT_CLAIMS,
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { and, desc, eq, exists, isNotNull, or } from "drizzle-orm";
+import { and, desc, eq, exists, isNotNull, or, sql } from "drizzle-orm";
 import type { Database } from "./db.ts";
 import { withDatabaseErrors } from "./errors.ts";
 import { activePersonOf } from "./membership.ts";
@@ -47,7 +48,12 @@ export type ListClaimsResult =
  * claim. A claim stays listed after its person was removed. Each shows the
  * claiming account's GitHub identity as it is now, with the login, the time
  * it was last verified (`user_identities.last_sign_in_at`), and the creation
- * date of the GitHub account, or null after the account's data was erased.
+ * date of the GitHub account, or null after the account's data was erased,
+ * and how the person was claimed: `invitation` or `join_request`. A person is
+ * claimed by exactly one of the two, because an approved join request creates
+ * a new, claimed person, and an invitation is only for an unclaimed one; a
+ * row with both or neither makes the whole list throw ("Invariant broken:
+ * ...").
  *
  * The role check and the list are read in one read-only `REPEATABLE READ`
  * transaction, from one snapshot, so that a demotion or a removal that
@@ -103,6 +109,8 @@ export async function listClaims(
             login: userIdentities.login,
             verifiedAt: userIdentities.lastSignInAt,
             accountCreatedAt: userIdentities.accountCreatedAt,
+            byInvitation: sql<boolean>`${exists(acceptedInvitation)}`,
+            byJoinRequest: sql<boolean>`${exists(approvedRequest)}`,
           })
           .from(workspaceMembers)
           .leftJoin(
@@ -137,6 +145,12 @@ export async function listClaims(
         // `withDatabaseErrors`, so that the message reaches the log.
         throw new Error("Invariant broken: a claim has no claim time");
       }
+      if (row.byInvitation === row.byJoinRequest) {
+        throw new Error(
+          "Invariant broken: a person is claimed by exactly one of an invitation and a join request",
+        );
+      }
+      const via: ClaimVia = row.byInvitation ? "invitation" : "join_request";
       return {
         workspaceId: row.workspaceId,
         memberId: row.memberId,
@@ -152,6 +166,7 @@ export async function listClaims(
                 verifiedAt: row.verifiedAt.toISOString(),
                 accountCreatedAt: row.accountCreatedAt.toISOString(),
               },
+        via,
         claimedAt: row.claimedAt.toISOString(),
       };
     }),

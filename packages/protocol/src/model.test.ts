@@ -7,6 +7,7 @@ import {
   CAPABILITIES,
   canTransition,
   CHAT_HISTORY_PAGE,
+  CLAIM_VIAS,
   DEVICE_KEY_ALGORITHMS,
   DEVICE_PLATFORMS,
   DEVICE_REVOCATION_REASONS,
@@ -179,9 +180,11 @@ test("event refusals, the chat history page, and the finished runs are the value
   assert.ok(RECENT_FINISHED_RUNS <= MAX_ANSWER_LIST_ITEMS);
 });
 
-test("the list of recent claims holds the 50 most recent claims (#208)", () => {
+test("the list of recent claims holds the 50 most recent claims, each with how it happened (#208)", () => {
   assert.equal(RECENT_CLAIMS, 50);
   assert.ok(RECENT_CLAIMS <= MAX_ANSWER_LIST_ITEMS);
+  // A closed list: a third way of claiming needs a protocol change.
+  assert.deepEqual(CLAIM_VIAS, ["invitation", "join_request"]);
 });
 
 test("a device sign-in lasts 30 days, and an open connection 24 hours more", () => {
@@ -308,6 +311,7 @@ test("the exported constants are frozen, nested values included", () => {
     ["IDENTITY_PROVIDERS", IDENTITY_PROVIDERS],
     ["RUN_CANCEL_REASONS", RUN_CANCEL_REASONS],
     ["OWNERSHIP_OFFER_END_REASONS", OWNERSHIP_OFFER_END_REASONS],
+    ["CLAIM_VIAS", CLAIM_VIAS],
     ["PRESENCE_STATUSES", PRESENCE_STATUSES],
     ["WORKSPACE_SUBSCRIBE_REFUSAL_CODES", WORKSPACE_SUBSCRIBE_REFUSAL_CODES],
     ["WORKSPACE_UNSUBSCRIBE_REASONS", WORKSPACE_UNSUBSCRIBE_REASONS],
@@ -327,7 +331,7 @@ test("the exported constants are frozen, nested values included", () => {
     ["CHAT_HISTORY_PAGE", CHAT_HISTORY_PAGE],
     ["WS_CLOSE_CODES", WS_CLOSE_CODES],
   ];
-  assert.equal(arrays.length, 23);
+  assert.equal(arrays.length, 24);
   assert.equal(objects.length, 7);
 
   // Modules run in strict mode, so a write to a frozen value throws.

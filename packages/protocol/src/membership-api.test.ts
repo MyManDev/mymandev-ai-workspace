@@ -1212,7 +1212,7 @@ test("an approval may change the display name and answers with the new person", 
   ]);
 });
 
-test("owners and admins see each recent claim with the claimer's GitHub login and account creation date, the most recent first", () => {
+test("owners and admins see each recent claim with the claimer's GitHub login and account creation date and how the person was claimed, the most recent first", () => {
   const claimer = {
     provider: "github",
     login: "ada-l",
@@ -1223,6 +1223,7 @@ test("owners and admins see each recent claim with the claimer's GitHub login an
     workspaceId: WORKSPACE_ID,
     memberId: MEMBER_ID,
     claimer,
+    via: "invitation",
     claimedAt: LATER,
   };
   // The claim of an account whose data was erased stays, without a claimer.
@@ -1230,9 +1231,11 @@ test("owners and admins see each recent claim with the claimer's GitHub login an
     ...recent,
     memberId: FORMER_ID,
     claimer: null,
+    via: "join_request",
     claimedAt: NOW,
   };
   assert.equal(ClaimSchema.safeParse(recent).success, true);
+  assert.equal(ClaimSchema.safeParse(erased).success, true);
   assert.equal(
     ClaimListResponseSchema.safeParse({ claims: [recent, erased] }).success,
     true,
@@ -1293,9 +1296,14 @@ test("owners and admins see each recent claim with the claimer's GitHub login an
       one({ ...recent, memberId: MEMBER_ID.toUpperCase() }),
     ],
     ["invalid workspace ID", one({ ...recent, workspaceId: "x" })],
+    // A closed list: a third way of claiming needs a protocol change.
+    ["unknown way of claiming", one({ ...recent, via: "approval" })],
+    ["the creator's own person", one({ ...recent, via: "workspace_created" })],
+    ["no way of claiming", one({ ...recent, via: null })],
+    ["way of claiming in capitals", one({ ...recent, via: "INVITATION" })],
     ["no list", { claims: null }],
   ]);
-  // Nothing beyond the person, the claimer's identity, and the time.
+  // Nothing beyond the person, the claimer's identity, how, and when.
   const parsed = ClaimListResponseSchema.parse(
     one({
       ...recent,
@@ -1315,6 +1323,7 @@ test("owners and admins see each recent claim with the claimer's GitHub login an
     "claimedAt",
     "claimer",
     "memberId",
+    "via",
     "workspaceId",
   ]);
   assert.deepEqual(Object.keys(item.claimer ?? {}).sort(), [
@@ -1423,6 +1432,7 @@ test("every answer list holds at most MAX_ANSWER_LIST_ITEMS items", () => {
     workspaceId: WORKSPACE_ID,
     memberId: MEMBER_ID,
     claimer: joinRequest.requester,
+    via: "join_request",
     claimedAt: NOW,
   };
   const lists: [

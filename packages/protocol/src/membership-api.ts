@@ -25,6 +25,7 @@ import {
 } from "./ids.ts";
 import type { ApiErrorCode } from "./model.ts";
 import {
+  CLAIM_VIAS,
   INVITATION_LIFETIME_SECONDS,
   LIMITS,
   MAX_ANSWER_LIST_ITEMS,
@@ -721,9 +722,18 @@ export const ClaimerIdentitySchema = JoinRequesterIdentitySchema;
 export type ClaimerIdentity = JoinRequesterIdentity;
 
 /**
+ * How the account claimed the person (`CLAIM_VIAS`): `invitation` when it
+ * accepted an invitation code, which nobody vetted the account for, and
+ * `join_request` when an owner or admin approved its join request after
+ * seeing its GitHub login and the creation date of the account. A closed
+ * list: a third way of claiming needs a protocol change.
+ */
+export const ClaimViaSchema = z.enum(CLAIM_VIAS);
+
+/**
  * One claim as owners and admins see it: an account claimed the person
  * `memberId` at `claimedAt`, by accepting an invitation or through an
- * approved join request. The desktop shows the person through the workspace
+ * approved join request, as `via` says. The desktop shows the person through the workspace
  * view. `claimer` is the claiming account's GitHub identity as it is now: its
  * login and the time that login was last verified change with the account's
  * sign-ins. It is null only after the account's data was erased. A claim
@@ -733,6 +743,7 @@ export const ClaimSchema = z.object({
   workspaceId: WorkspaceIdSchema,
   memberId: MemberIdSchema,
   claimer: ClaimerIdentitySchema.nullable(),
+  via: ClaimViaSchema,
   claimedAt: UtcTimestampSchema,
 });
 export type Claim = z.infer<typeof ClaimSchema>;

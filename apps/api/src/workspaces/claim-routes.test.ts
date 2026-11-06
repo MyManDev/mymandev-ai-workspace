@@ -1,4 +1,6 @@
 import {
+  DEVICE_TOO_NEW_MS,
+  devices,
   userIdentities,
   workspaceInvitations,
   workspaceMembers,
@@ -196,7 +198,7 @@ function answer(response: {
   return [response.statusCode, response.headers["content-type"], response.body];
 }
 
-test("the owner and an admin read the recent claims, the most recent first, with the GitHub login, the creation date of that GitHub account, and the claim time", async (t) => {
+test("the owner and an admin read the recent claims, the most recent first, with the GitHub login, the creation date of that GitHub account, how the person was claimed, and the claim time", async (t) => {
   const clock = fakeClock();
   const owner = await signedIn(
     await claimApp(t, { githubId: 3601, now: clock.now }),
@@ -234,12 +236,14 @@ test("the owner and an admin read the recent claims, the most recent first, with
       workspaceId: workspace.id,
       memberId: bobPerson,
       claimer: await identityOf(bob.device.userId),
+      via: "join_request",
       claimedAt: bobClaimedAt,
     },
     {
       workspaceId: workspace.id,
       memberId: adaPerson,
       claimer: adaIdentity,
+      via: "invitation",
       claimedAt: adaClaimedAt,
     },
   ];
@@ -249,7 +253,7 @@ test("the owner and an admin read the recent claims, the most recent first, with
   assert.deepEqual(response.json(), { claims: expected });
   assert.deepEqual(
     Object.keys((response.json() as { claims: object[] }).claims[0] ?? {}),
-    ["workspaceId", "memberId", "claimer", "claimedAt"],
+    ["workspaceId", "memberId", "claimer", "via", "claimedAt"],
     "no user ID, display name, or invitation leaves the API",
   );
 
@@ -400,6 +404,7 @@ test("the answer holds the workspace's RECENT_CLAIMS most recent claims, never a
         workspaceId: workspace.id,
         memberId: person.id,
         claimer: person.claimer === erased ? null : adaIdentity,
+        via: "invitation",
         claimedAt: person.claimedAt.toISOString(),
       })),
   );
@@ -409,10 +414,68 @@ test("the answer holds the workspace's RECENT_CLAIMS most recent claims, never a
       item.workspaceId,
       item.memberId,
       item.claimer?.login ?? null,
+      item.via,
     ]),
     [
-      [other.id, erasedElsewhere, null],
-      [other.id, adaElsewhere, adaIdentity.login],
+      [other.id, erasedElsewhere, null, "join_request"],
+      [other.id, adaElsewhere, adaIdentity.login, "invitation"],
     ],
   );
+});
+
+test("after an ownership transfer the former owner reads the claims as an admin, and after a demotion gets 403 with forbidden", async (t) => {
+  const owner = await signedIn(await claimApp(t, { githubId: 3631 }));
+  const ada = await signedIn(await claimApp(t, { githubId: 3632 }));
+  const { workspace, member } = await createWorkspace(owner);
+  const adaPerson = await claimedByInvitation(owner, workspace.id, ada);
+  // An ownership offer needs a device registered more than 72 hours ago.
+  await database()
+    .update(devices)
+    .set({ createdAt: new Date(Date.now() - DEVICE_TOO_NEW_MS - 60_000) })
+    .where(eq(devices.id, owner.device.deviceId));
+
+  const offered = await request(
+    owner,
+    "POST",
+    `/workspaces/${workspace.id}/ownership-offer`,
+    { memberId: adaPerson },
+  );
+  assert.equal(offered.statusCode, 204, offered.body);
+  const accepted = await request(
+    ada,
+    "POST",
+    `/workspaces/${workspace.id}/ownership-offer/accept`,
+  );
+  assert.equal(accepted.statusCode, 204, accepted.body);
+
+  // The former owner is now an admin and still reads the list; so does the
+  // new owner, whose own claim it shows.
+  const asFormerOwner = await listClaims(owner, workspace.id);
+  assert.equal(asFormerOwner.statusCode, 200, asFormerOwner.body);
+  assert.deepEqual(
+    ClaimListResponseSchema.parse(asFormerOwner.json()).claims.map((item) => [
+      item.memberId,
+      item.via,
+    ]),
+    [[adaPerson, "invitation"]],
+  );
+  const asNewOwner = await listClaims(ada, workspace.id);
+  assert.equal(asNewOwner.body, asFormerOwner.body);
+
+  // The new owner demotes the former owner through the demotion route.
+  const demoted = await request(
+    ada,
+    "POST",
+    `/workspaces/${workspace.id}/members/${member.id}/demote`,
+  );
+  assert.equal(demoted.statusCode, 204, demoted.body);
+  const asMember = await listClaims(owner, workspace.id);
+  assert.equal(asMember.statusCode, 403);
+  assert.deepEqual(asMember.json(), FORBIDDEN);
+  const invitations = await request(
+    owner,
+    "GET",
+    `/workspaces/${workspace.id}/invitations`,
+  );
+  assert.deepEqual(answer(asMember), answer(invitations));
 });
