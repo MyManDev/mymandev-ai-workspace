@@ -361,6 +361,16 @@ export interface DeviceSession {
    */
   readonly removeDevice: () => Promise<SessionResult<"removed" | "pending">>;
   /**
+   * Whether `removeDevice` would now send a request to the API: the same
+   * checks as `removeDevice` and its access token (an API origin, a device
+   * that is not gone, a loaded key, no sign-out, and a cached token or a mint
+   * that `mintBlocked` lets through). A refusal that a refused sign-in with
+   * another GitHub account hides counts too (#198). Whether the API then
+   * answers or removes the device is not known. It sends no request and
+   * never rejects.
+   */
+  readonly removalAsksApi: () => Promise<boolean>;
+  /**
    * Signs the WebSocket `auth.challenge` with the purpose `ws` and the
    * current key, and returns the `auth.response` frame for #26. It sends no
    * request. Refused while signed out, while a removal is pending, while
@@ -1376,6 +1386,39 @@ export function createDeviceSession(
     return failure("key_lost");
   }
 
+  /**
+   * Why a mint for these facts does not ask the API now, or null when it
+   * does. `removalAsksApi` uses the same rules.
+   */
+  async function mintBlocked(
+    facts: ReadyFacts,
+  ): Promise<SessionFailure | null> {
+    const resolving = replacementToResolve(facts);
+    if (resolving && signInsRunning > 0) {
+      return failure("sign_in_running");
+    }
+    // A pending replacement is resolved also while signed out or refused,
+    // because the next sign-in cannot start before it is.
+    if (facts.marker !== null && !resolving) {
+      return failure("signed_out");
+    }
+    if (refusal !== null && !resolving) {
+      return refused(refusal);
+    }
+    if (resolving && refusal === "auth_failed") {
+      // Both keys were refused: the next round runs only after the wait,
+      // or after `refresh` when the person asks to try again.
+      const first = keysRefusedNote(facts, await loadNotes());
+      if (
+        first !== null &&
+        noteAge("refused", first.at, "least") < LOST_KEY_WAIT_MS
+      ) {
+        return refused("auth_failed");
+      }
+    }
+    return null;
+  }
+
   async function mintForSession(started: number): Promise<TokenResult> {
     try {
       const origin = originOrFailure();
@@ -1391,28 +1434,9 @@ export function createDeviceSession(
       if (facts.kind !== "ready") {
         return factsFailure(facts);
       }
-      const resolving = replacementToResolve(facts);
-      if (resolving && signInsRunning > 0) {
-        return failure("sign_in_running");
-      }
-      // A pending replacement is resolved also while signed out or refused,
-      // because the next sign-in cannot start before it is.
-      if (facts.marker !== null && !resolving) {
-        return failure("signed_out");
-      }
-      if (refusal !== null && !resolving) {
-        return refused(refusal);
-      }
-      if (resolving && refusal === "auth_failed") {
-        // Both keys were refused: the next round runs only after the wait,
-        // or after `refresh` when the person asks to try again.
-        const first = keysRefusedNote(facts, await loadNotes());
-        if (
-          first !== null &&
-          noteAge("refused", first.at, "least") < LOST_KEY_WAIT_MS
-        ) {
-          return refused("auth_failed");
-        }
+      const blocked = await mintBlocked(facts);
+      if (blocked !== null) {
+        return blocked;
       }
       const result = await mint(facts, origin);
       if (result.kind === "failure") {
@@ -1805,6 +1829,26 @@ export function createDeviceSession(
     return attemptRemoval(noted);
   }
 
+  async function removalAsksApi(): Promise<boolean> {
+    try {
+      // In the key queue, like `removeDevice`, so that it reads what a
+      // mint or a sign-out report that runs left behind.
+      return await exclusive(async () => {
+        if (typeof originOrFailure() !== "string" || gone !== null) {
+          return false;
+        }
+        const facts = await readFacts();
+        if (facts.kind !== "ready" || facts.marker !== null) {
+          return false;
+        }
+        // The request uses a cached token as it is, and mints one otherwise.
+        return cachedToken() !== null || (await mintBlocked(facts)) === null;
+      });
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Refusals that leave a removal pending: the API did not answer the
    * revoke itself, or it may take it later.
@@ -2044,6 +2088,7 @@ export function createDeviceSession(
     signOut,
     reportSignOut,
     removeDevice,
+    removalAsksApi,
     signWebSocketChallenge,
     deviceRefused,
   });

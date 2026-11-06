@@ -89,6 +89,7 @@ export type AccountSession = Pick<
   | "signOut"
   | "reportSignOut"
   | "removeDevice"
+  | "removalAsksApi"
   | "signWebSocketChallenge"
   | "deviceRefused"
   | "request"
@@ -148,10 +149,14 @@ export interface AccountServiceOptions {
   /**
    * Asks the person, in a native dialog of the main process, whether to
    * remove the account with this login from the installation ("This is not
-   * me"). Resolves to true only for the remove button
+   * me"), and says what happens to the device at the server (`removal`,
+   * `forgetConfirmationDetail`). Resolves to true only for the remove button
    * (`FORGET_CONFIRMATION` and `forgetConfirmed`).
    */
-  readonly confirmForget: (login: string) => Promise<boolean>;
+  readonly confirmForget: (
+    login: string,
+    removal: ForgetRemoval,
+  ) => Promise<boolean>;
   /**
    * Asks the person, in a native dialog of the main process, whether to
    * remove this device from the account with this login. Resolves to true
@@ -309,7 +314,8 @@ export function unlockDelayMs(failures: number): number {
 /**
  * The native confirmation of "This is not me" (#149): a warning with the
  * remove button first and "Keep" as the default and the cancel button, like
- * the folder dialog of the repositories. `forgetConfirmed` reads its answer.
+ * the folder dialog of the repositories. Its detail depends on the case
+ * (`forgetConfirmationDetail`). `forgetConfirmed` reads its answer.
  */
 export const FORGET_CONFIRMATION = Object.freeze({
   type: "warning",
@@ -318,9 +324,38 @@ export const FORGET_CONFIRMATION = Object.freeze({
   cancelId: 1,
   noLink: true,
   title: "This is not me",
-  detail:
-    "The device key and the account are deleted on this computer. When this device is signed in with a usable key and the server can be reached, it is first removed from that account; otherwise it stays listed there, without a key, until its sign-in ends or the account removes it. You can then sign in with your own GitHub account.",
 } as const);
+
+/**
+ * What "This is not me" does to the device at the server, as the main
+ * process knows it before the person confirms (#198), from the session's
+ * `removalAsksApi`:
+ * - `server_first`: the session's `removeDevice` asks the API to remove
+ *   the device first. When the API cannot be reached or does not remove it,
+ *   the device is forgotten on this installation only, as below.
+ * - `local_only`: the device cannot ask the API: it is signed out, its key
+ *   waits for its passphrase or cannot be used, the API asks for a sign-in
+ *   or refused the key (also behind a refused sign-in with another GitHub
+ *   account), or there is no session. The device is forgotten on this
+ *   installation only and stays listed for its account at the API, without
+ *   a key (ADR 0014, update of 2026-11-06).
+ */
+export type ForgetRemoval = "server_first" | "local_only";
+
+/** The detail of the confirmation for each case of `ForgetRemoval`. */
+export const FORGET_CONFIRMATION_DETAILS: Readonly<
+  Record<ForgetRemoval, string>
+> = Object.freeze({
+  server_first:
+    "This device is signed in, so it is first removed from that GitHub account on the server. If the server cannot be reached or does not remove it, the device stays listed for that account, without a key. Either way, the device key and the account are then deleted on this computer, and you can sign in with your own GitHub account.",
+  local_only:
+    'This device cannot use its key with the server now, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then enters the passphrase of the device key or signs in with that account on this device, as the panel asks, and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account.',
+});
+
+/** The detail of the confirmation for the case. */
+export function forgetConfirmationDetail(removal: ForgetRemoval): string {
+  return FORGET_CONFIRMATION_DETAILS[removal];
+}
 
 /** The message of the confirmation, with the login of the account. */
 export function forgetConfirmationMessage(login: string): string {
@@ -951,6 +986,24 @@ export function createAccountService(
     }
   }
 
+  /**
+   * The case of "This is not me": `server_first` only when the session's
+   * `removeDevice` would ask the API now (`removalAsksApi`), and
+   * `local_only` without a session or when the session fails.
+   */
+  async function forgetRemovalOf(
+    held: AccountSession | null,
+  ): Promise<ForgetRemoval> {
+    if (held === null) {
+      return "local_only";
+    }
+    try {
+      return (await held.removalAsksApi()) ? "server_first" : "local_only";
+    } catch {
+      return "local_only";
+    }
+  }
+
   /** Records how a started sign-in ended. */
   async function finish(
     opened: AccountSystem,
@@ -1173,10 +1226,12 @@ export function createAccountService(
       }
       const { login } = account;
       // The confirmation runs in the main process, so that a renderer that
-      // misbehaves cannot delete the key without the person.
+      // misbehaves cannot delete the key without the person. It says
+      // whether the server removes the device first (#198).
+      const removal = await forgetRemovalOf(session);
       let confirmed: boolean;
       try {
-        confirmed = await options.confirmForget(login);
+        confirmed = await options.confirmForget(login, removal);
       } catch {
         report("The confirmation could not be shown.");
         return Object.freeze({ outcome: "failed" });
@@ -1192,9 +1247,9 @@ export function createAccountService(
       // stops the local part, so the account never stays on the
       // installation because the API could not be reached; the device then
       // stays registered to that account at the API, without a key that can
-      // use it, until its 30-day sign-in ends or the account removes it
-      // from another device. The removal itself only deletes files after the
-      // API confirmed it, so it can never bring the account back either.
+      // use it, and nothing revokes it on its own (ADR 0014, update of
+      // 2026-11-06). The removal itself only deletes files after the API
+      // confirmed it, so it can never bring the account back either.
       let removedAtServer = false;
       if (session !== null) {
         try {

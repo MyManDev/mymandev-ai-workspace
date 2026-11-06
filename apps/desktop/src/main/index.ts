@@ -10,6 +10,7 @@ import { readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import {
   FORGET_CONFIRMATION,
+  forgetConfirmationDetail,
   forgetConfirmationMessage,
   forgetConfirmed,
 } from "./account.ts";
@@ -130,12 +131,14 @@ function start(): void {
   const account = createSystemAccountService({
     focusWindow: () => focusMainWindow(),
     // "This is not me" is confirmed in a native dialog of the main process,
-    // like the folder dialog of the repositories.
-    confirmForget: async (login) => {
+    // like the folder dialog of the repositories. Its detail says what
+    // happens to the device at the server in this case (#198).
+    confirmForget: async (login, removal) => {
       const options = {
         ...FORGET_CONFIRMATION,
         buttons: [...FORGET_CONFIRMATION.buttons],
         message: forgetConfirmationMessage(login),
+        detail: forgetConfirmationDetail(removal),
       };
       return forgetConfirmed(
         mainWindow === undefined
