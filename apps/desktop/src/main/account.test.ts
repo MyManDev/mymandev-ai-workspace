@@ -15,6 +15,8 @@ import {
   ACCOUNT_LIMITS,
   AccountStatusSchema,
   type AccountStatus,
+  DEVICE_STATES,
+  type DeviceState,
   type SignInOutcomeCode,
 } from "../shared/ipc-contract.ts";
 import {
@@ -23,7 +25,11 @@ import {
   type AccountSystem,
   createAccountService,
   FORGET_CONFIRMATION,
+  FORGET_CONFIRMATION_DETAILS,
+  forgetConfirmationDetail,
   forgetConfirmationMessage,
+  type ForgetRemoval,
+  forgetRemoval,
   LIST_DEVICES_COOLDOWN_MS,
   forgetConfirmed,
   SIGN_IN_START_COOLDOWN_MS,
@@ -176,8 +182,11 @@ interface Harness {
   readonly openBrowser: (boolean | undefined)[];
   /** The `onCallback` that the service passed to the last `start`. */
   callback: (() => void) | undefined;
-  /** The answer of the native confirmation of "This is not me". */
-  confirm: (login: string) => Promise<boolean>;
+  /**
+   * The answer of the native confirmation of "This is not me", which gets
+   * the case that the service chose.
+   */
+  confirm: (login: string, removal: ForgetRemoval) => Promise<boolean>;
   /** The service's clock in milliseconds. */
   clock: number;
   recordDelete: () => Promise<void>;
@@ -402,9 +411,9 @@ function harness(
       state.focused += 1;
       state.log.push("focus");
     },
-    confirmForget: (login) => {
+    confirmForget: (login, removal) => {
       state.log.push(`confirm ${login}`);
-      return state.confirm(login);
+      return state.confirm(login, removal);
     },
     confirmRemoveDevice: (login) => {
       state.log.push(`confirm removal ${login}`);
@@ -1298,8 +1307,6 @@ test("the confirmation of This is not me names the login, offers Keep as the def
     cancelId: 1,
     noLink: true,
     title: "This is not me",
-    detail:
-      "The device key and the account are deleted on this computer. When this device is signed in with a usable key and the server can be reached, it is first removed from that account; otherwise it stays listed there, without a key, until its sign-in ends or the account removes it. You can then sign in with your own GitHub account.",
   });
   expect(Object.isFrozen(FORGET_CONFIRMATION)).toBe(true);
   expect(Object.isFrozen(FORGET_CONFIRMATION.buttons)).toBe(true);
@@ -1309,6 +1316,92 @@ test("the confirmation of This is not me names the login, offers Keep as the def
   expect(forgetConfirmed({ response: 0 })).toBe(true);
   for (const response of [1, 2, -1]) {
     expect(forgetConfirmed({ response })).toBe(false);
+  }
+});
+
+test("the confirmation of This is not me says what happens to the device at the server in each case, without an end of its sign-in (#198)", () => {
+  expect(FORGET_CONFIRMATION_DETAILS).toEqual({
+    server_first:
+      "This device is signed in, so it is first removed from that GitHub account on the server. If the server cannot be reached or does not remove it, the device stays listed for that account, without a key. Either way, the device key and the account are then deleted on this computer, and you can sign in with your own GitHub account.",
+    local_only:
+      'This device is not signed in with a usable key, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then signs in with it on this device and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account.',
+  });
+  expect(Object.isFrozen(FORGET_CONFIRMATION_DETAILS)).toBe(true);
+  for (const removal of ["server_first", "local_only"] as const) {
+    const detail = forgetConfirmationDetail(removal);
+    expect(detail).toBe(FORGET_CONFIRMATION_DETAILS[removal]);
+    expect(detail, removal).toContain("stays listed for that account");
+    expect(detail, removal).not.toMatch(/30|sign-in ends|until/);
+  }
+});
+
+test("This is not me asks the server first only while the device is signed in with a loaded key, has not signed out, and has a session (#198)", () => {
+  const serverFirst: readonly DeviceState[] = [
+    "signed_in",
+    "removal_pending",
+    "account_mismatch",
+  ];
+  for (const device of DEVICE_STATES) {
+    expect(forgetRemoval(device, false, true), device).toBe(
+      serverFirst.includes(device) ? "server_first" : "local_only",
+    );
+    expect(forgetRemoval(device, true, true), device).toBe("local_only");
+    expect(forgetRemoval(device, false, false), device).toBe("local_only");
+  }
+});
+
+test("This is not me confirms with the case of the device: the server first while signed in, otherwise this installation only (#198)", async () => {
+  const cases: [DeviceSessionState | "no session", ForgetRemoval][] = [
+    [SESSION_SIGNED_IN, "server_first"],
+    [{ kind: "removal_pending", account: SESSION_ACCOUNT }, "server_first"],
+    [{ kind: "account_mismatch", account: SESSION_ACCOUNT }, "server_first"],
+    [
+      { kind: "account_mismatch", account: SESSION_ACCOUNT, signedOut: true },
+      "local_only",
+    ],
+    [
+      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: false },
+      "local_only",
+    ],
+    [
+      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: true },
+      "local_only",
+    ],
+    [{ kind: "key_not_loaded", account: SESSION_ACCOUNT }, "local_only"],
+    [
+      { kind: "key_not_loaded", account: SESSION_ACCOUNT, signedOut: true },
+      "local_only",
+    ],
+    [{ kind: "key_lost", account: SESSION_ACCOUNT }, "local_only"],
+    [{ kind: "unavailable", reason: "key_store_failed" }, "local_only"],
+    [{ kind: "sign_in_required", account: SESSION_ACCOUNT }, "local_only"],
+    [{ kind: "auth_failed", account: SESSION_ACCOUNT }, "local_only"],
+    ["no session", "local_only"],
+  ];
+  for (const [state, expected] of cases) {
+    const name = typeof state === "string" ? state : state.kind;
+    const h = harness();
+    if (state === "no session") {
+      h.createSession = () => {
+        throw new Error("The device session needs a ready application.");
+      };
+    } else {
+      h.sessionState = state;
+    }
+    // A report that the API does not learn yet leaves the state as it is.
+    h.reportSignOut = async () => ({ ok: true, value: "pending" });
+    const removals: ForgetRemoval[] = [];
+    h.confirm = async (login, removal) => {
+      expect(login, name).toBe("octocat");
+      removals.push(removal);
+      return false;
+    };
+    await h.service.initialize();
+
+    await expect(h.service.forgetAccount(), name).resolves.toEqual({
+      outcome: "cancelled",
+    });
+    expect(removals, name).toEqual([expected]);
   }
 });
 
