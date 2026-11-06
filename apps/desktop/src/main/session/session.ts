@@ -365,8 +365,10 @@ export interface DeviceSession {
    * a pending replacement (`REPLACEMENT_GRACE_MS`): when it ends, in UTC,
    * by this device's wall clock; null otherwise. Until then the sign-in
    * flow's `replacement_pending` cannot be resolved, so a new sign-in
-   * cannot start (#199). It sends no request and changes no rule of the
-   * grace period. Never rejects.
+   * cannot start (#199). Null also while a first refusal of both keys is
+   * noted: the replacement then stays pending until the wait for a second
+   * round ends (`LOST_KEY_WAIT_MS`), which can be later. It sends no
+   * request and changes no rule of the grace period. Never rejects.
    */
   readonly replacementGraceEnd: () => Promise<string | null>;
   /**
@@ -1900,13 +1902,23 @@ export function createDeviceSession(
         }
         const held = await loadNotes();
         const note = held.uncertainSignIn;
-        if (note === null || !graceActive(facts, held)) {
+        if (
+          note === null ||
+          !graceActive(facts, held) ||
+          // After a first refusal of both keys, the replacement stays
+          // pending after the grace period too, until the wait for a second
+          // round (`LOST_KEY_WAIT_MS`) ends, so the end of the grace period
+          // is not when a new sign-in can start.
+          keysRefusedNote(facts, held) !== null
+        ) {
           return null;
         }
         // The grace period ends when both clocks say so (`noteAge` with
-        // `least`), so what is left of it counts from the smaller age.
+        // `least`), so what is left of it counts from the smaller age. The
+        // monotonic clock counts fractions of a millisecond, so the end is
+        // rounded up: never before the grace period ends.
         const left = REPLACEMENT_GRACE_MS - noteAge("grace", note.at, "least");
-        return new Date(wallClock() + left).toISOString();
+        return new Date(Math.ceil(wallClock() + left)).toISOString();
       });
     } catch {
       return null;

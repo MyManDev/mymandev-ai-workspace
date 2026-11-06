@@ -2580,12 +2580,18 @@ describe("the grace period of an uncertain sign-in", () => {
     expect(await notesFile()).toMatchObject({
       keysRefused: { publicKeys: [current, previous] },
     });
+    // #199: no end is named while the refusal counts.
+    expect(await h.session.replacementGraceEnd()).toBeNull();
     // The glitch ends: the previous key authenticates, and both keys stay.
     h.api.publicKey = previous;
     await h.session.refresh();
     expect((await h.session.authenticate()).ok).toBe(true);
     expect(heldKeys(h)).toEqual({ current, previous });
     expect(await notesFile()).toMatchObject({ keysRefused: null });
+    // No time has passed: the grace period still ends 10 minutes from now.
+    expect(await h.session.replacementGraceEnd()).toBe(
+      new Date(wall.now + REPLACEMENT_GRACE_MS).toISOString(),
+    );
 
     // After the grace period, one more glitch only starts a new wait.
     advance(REPLACEMENT_GRACE_MS);
@@ -2631,6 +2637,52 @@ describe("the grace period of an uncertain sign-in", () => {
 
     advance(REPLACEMENT_GRACE_MS / 2);
     expect(await restarted.session.replacementGraceEnd()).toBeNull();
+  });
+
+  test("its end is rounded up, so it is never early (#199)", async () => {
+    const h = harness();
+    const started = wall.now;
+    await uncertainSignIn(h);
+    // The monotonic clock counts fractions of a millisecond. Trailing the
+    // wall clock by a quarter of one, it ends the grace period at
+    // `started + REPLACEMENT_GRACE_MS + 0.25`.
+    wall.now += 1;
+    mono.now += 0.75;
+
+    expect(await h.session.replacementGraceEnd()).toBe(
+      new Date(started + REPLACEMENT_GRACE_MS + 1).toISOString(),
+    );
+  });
+
+  test("no end is named after a first refusal of both keys during it, because the replacement then stays pending after it (#199)", async () => {
+    const h = harness();
+    const { previous, current } = await uncertainSignIn(h);
+
+    // A minute in, the API refuses both keys once.
+    advance(60_000);
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(await notesFile()).toMatchObject({
+      keysRefused: { publicKeys: [current, previous] },
+    });
+    expect(await h.session.replacementGraceEnd()).toBeNull();
+
+    // When the grace period ends, the replacement stays pending, even with
+    // the previous key held by the API again: the session asks nothing
+    // until the wait for a second round ends.
+    advance(REPLACEMENT_GRACE_MS - 60_000);
+    h.api.publicKey = previous;
+    const asked = h.api.requests.length;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(h.api.requests).toHaveLength(asked);
+    expect(heldKeys(h)).toEqual({ current, previous });
+    expect(await h.session.replacementGraceEnd()).toBeNull();
+
+    // Only then does the previous key abandon the replacement.
+    advance(60_000);
+    expect((await h.session.authenticate()).ok).toBe(true);
+    expect(heldKeys(h)).toEqual({ current: previous, previous: null });
+    expect(await h.session.replacementGraceEnd()).toBeNull();
   });
 
   test("after it, the previous key abandons the replacement", async () => {
