@@ -52,7 +52,7 @@ import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
 import {
   WORKSPACE_ACTION_BUDGET,
   type WorkspaceActionAnswer,
-  type WorkspaceActionBody,
+  type WorkspaceActionBodyArgument,
   type WorkspaceActionName,
   type WorkspaceActionParams,
   type WorkspaceActionResult,
@@ -303,12 +303,14 @@ export interface AccountService {
    * `unknown`, as does a successful answer when the account or the device
    * changed while it was on its way. Writes beyond `WORKSPACE_ACTION_BUDGET`
    * answer `too_soon` without a request. An invitation code in the body or
-   * the answer is never kept, logged, or published (D2). Never rejects.
+   * the answer is never kept, logged, or published (D2). The body is
+   * required for a write with one and not allowed for one without. Never
+   * rejects.
    */
   readonly sendWorkspaceAction: <N extends WorkspaceActionName>(
     name: N,
     params: WorkspaceActionParams[N],
-    body?: WorkspaceActionBody[N],
+    ...body: WorkspaceActionBodyArgument<N>
   ) => Promise<WorkspaceActionResult<WorkspaceActionAnswer[N]>>;
 }
 
@@ -1676,11 +1678,17 @@ export function createAccountService(
   async function sendWorkspaceAction<N extends WorkspaceActionName>(
     name: N,
     params: WorkspaceActionParams[N],
-    body?: WorkspaceActionBody[N],
+    ...body: WorkspaceActionBodyArgument<N>
   ): Promise<WorkspaceActionResult<WorkspaceActionAnswer[N]>> {
     let sent = false;
     try {
-      const call = workspaceActionRequest(name, params, body);
+      // The types do not hold at runtime: the body is checked with the
+      // entry's schema, and a body for a write without one is refused.
+      const call = workspaceActionRequest(
+        name,
+        params,
+        (body as readonly unknown[])[0],
+      );
       if (call === null) {
         return workspaceActionFailed("invalid");
       }
@@ -1703,6 +1711,9 @@ export function createAccountService(
       if (wait > 0) {
         return workspaceActionFailed("too_soon", wait);
       }
+      // Counted before the request, so that writes started together count
+      // at once, and also when the session sends nothing: the budget limits
+      // the token requests too.
       sentWrites.push(at);
       const deviceId = account.deviceId;
       const changes = accountChanges;

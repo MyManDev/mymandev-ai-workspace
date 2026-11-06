@@ -4,6 +4,7 @@ import {
   type AuthResponseFrame,
   type DeviceId,
   GITHUB_LOGIN_PATTERN,
+  type JoinRequestId,
   LIMITS,
   MAX_ANSWER_LIST_ITEMS,
   type MemberId,
@@ -3736,6 +3737,7 @@ const IN_WORKSPACE = Object.freeze({ workspaceId: WORKSPACE_ID });
 /** An invitation code of the protocol's format, as a person pastes it. */
 const INVITATION_CODE = `mmdi_${"Q7x-_9kPz2".repeat(4)}Lmw`;
 const CREATED = Object.freeze({ created: true });
+const JOIN_REQUEST_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f2" as JoinRequestId;
 
 test("a workspace action goes to the session once with the allowlist's route, its IDs, and the parsed body, and only the answer comes back", async () => {
   const h = harness();
@@ -3793,7 +3795,10 @@ test("only the allowlist's writes are sent, checked by type and at runtime", asy
     () => send("leaveWorkspace", { workspaceId: "../x" as WorkspaceId }),
     // @ts-expect-error A body for a route without one.
     () => send("leaveWorkspace", ws, {}),
+    // @ts-expect-error A route with a body needs it.
     () => send("defineMember", ws),
+    // @ts-expect-error Also when every key of it is optional.
+    () => send("approveJoinRequest", { ...ws, joinRequestId: JOIN_REQUEST_ID }),
     () => send("defineMember", ws, { displayName: "a".repeat(65) }),
     () => send("defineMember", ws, { displayName: "G", role: "x" } as never),
     () => send("previewInvitation", {}, { code: "not a code" }),
@@ -4093,9 +4098,12 @@ test("the write budget sends 30 writes within a minute and refuses more as too_s
   await expect(
     h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
   ).resolves.toEqual({ ok: false, reason: "too_soon", retryAfterMs: 57_000 });
-  // A write outside the format is refused as it is, and counts for nothing.
+  // A write that the service refuses itself, here one outside the format,
+  // does not count.
   await expect(
-    h.service.sendWorkspaceAction("defineMember", IN_WORKSPACE),
+    h.service.sendWorkspaceAction("defineMember", IN_WORKSPACE, {
+      displayName: "",
+    }),
   ).resolves.toEqual({ ok: false, reason: "invalid" });
   expect(h.requests).toHaveLength(writes);
 
@@ -4109,6 +4117,40 @@ test("the write budget sends 30 writes within a minute and refuses more as too_s
     h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
   ).resolves.toEqual({ ok: false, reason: "too_soon", retryAfterMs: 50 });
   expect(h.requests).toHaveLength(writes + 1);
+});
+
+test("writes started together count at once: exactly 30 reach the session and the rest answer too_soon", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.clock = 5_000;
+  // The session holds every answer until the test settles them.
+  const answers: ((result: SessionResult<unknown>) => void)[] = [];
+  h.request = () =>
+    new Promise((resolve) => {
+      answers.push(resolve);
+    });
+  const { writes, windowMs } = WORKSPACE_ACTION_BUDGET;
+  const over = 5;
+
+  const sending = Array.from({ length: writes + over }, () =>
+    h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
+  );
+  await tick();
+  await tick();
+  expect(h.requests).toHaveLength(writes);
+  for (const answer of answers) {
+    answer({ ok: true, value: null });
+  }
+
+  expect(await Promise.all(sending)).toEqual([
+    ...Array.from({ length: writes }, () => ({ ok: true, value: null })),
+    ...Array.from({ length: over }, () => ({
+      ok: false,
+      reason: "too_soon",
+      retryAfterMs: windowMs,
+    })),
+  ]);
+  expect(h.requests).toHaveLength(writes);
 });
 
 test("the invitation code goes only in the body of a preview or an accept and comes back only in the answer of a create, never in a log, the status, an error, or a failure (D2)", async () => {

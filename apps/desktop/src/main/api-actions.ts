@@ -327,6 +327,17 @@ export interface WorkspaceActionBody {
   readonly createProject: z.input<typeof CreateProjectRequestSchema>;
 }
 
+/**
+ * The body argument of a write: required for a write with a body, also when
+ * every key of it is optional (`approveJoinRequest` takes `{}`), and not
+ * allowed for a write without one.
+ */
+export type WorkspaceActionBodyArgument<N extends WorkspaceActionName> = [
+  WorkspaceActionBody[N],
+] extends [never]
+  ? []
+  : [body: WorkspaceActionBody[N]];
+
 /** The answer of each write, as its schema parsed it; null for a `204`. */
 export interface WorkspaceActionAnswer {
   readonly createWorkspace: CreateWorkspaceResponse;
@@ -360,7 +371,13 @@ export interface WorkspaceActionAnswer {
  * The write budget of an installation: at most `writes` writes are sent
  * within any `windowMs`, far below the API's 300 requests a minute, so that
  * even a renderer that misbehaves cannot send writes in a loop. A write over
- * it is refused as `too_soon` without a request.
+ * it is refused as `too_soon` without a request. A write counts once the
+ * account service hands it to the session, also when the session then sends
+ * nothing (for example while signed out, while a removal is pending, without
+ * a loaded key or an API origin, or when its token cannot be minted),
+ * because the budget also limits the token requests. Only a write that the
+ * service refuses itself (`invalid`, `unavailable`, `not_signed_in`, or
+ * `too_soon`) does not count.
  */
 export const WORKSPACE_ACTION_BUDGET = Object.freeze({
   writes: 30,
@@ -380,7 +397,9 @@ export const ACTION_RATE_LIMITED_WAIT_MS = 60_000;
  *
  * - `invalid`: the name is not on the allowlist, a path parameter is missing,
  *   extra, or not an ID, or the body is outside its request schema, for
- *   example a pasted text that is not an invitation code. Nothing was sent.
+ *   example a pasted text that is not an invitation code; or the session
+ *   found a value outside the protocol's format (`invalid_request`). Nothing
+ *   was sent.
  * - `too_soon`: the write budget is spent (`WORKSPACE_ACTION_BUDGET`);
  *   `retryAfterMs` says when the next write may go. Nothing was sent.
  * - `not_signed_in`: as for the reads: no device of this installation is
@@ -581,8 +600,10 @@ export function workspaceActionFailureOf(
       if (NOT_SIGNED_IN_CODES.has(code)) {
         return "not_signed_in";
       }
-      // The session reads an error body only from a 4xx, so this comes only
-      // from an API that failed after it may have acted.
+      // Defensive only: the session never refuses with `internal_error`.
+      // The error body allows it only with a 5xx (`ApiErrorBodySchema`), and
+      // `callApi` answers every 5xx as `server_error` before it reads a
+      // body. Should one come, the API may have acted.
       return code === "internal_error" ? "unknown" : "failed";
     }
     // Nothing was sent, or the write itself was refused with a 401 before
@@ -595,8 +616,11 @@ export function workspaceActionFailureOf(
     case "replacement_pending":
     case "record_not_saved":
       return "unavailable";
+    // Nothing was sent: a value of the call is outside the protocol's
+    // format, as with `invalid`. The allowlist checks every value first, so
+    // the session should never find one.
     case "invalid_request":
-      return "failed";
+      return "invalid";
     // The write, or the token request before it, may have reached the API.
     case "no_answer":
     case "server_error":

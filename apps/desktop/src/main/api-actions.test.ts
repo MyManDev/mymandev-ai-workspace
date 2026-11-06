@@ -488,7 +488,8 @@ test("every failure of the session maps into the closed set, and only an uncerta
     // Without a code.
     refused: "failed",
     record_not_saved: "unavailable",
-    invalid_request: "failed",
+    // Nothing was sent: a value outside the protocol's format.
+    invalid_request: "invalid",
     no_answer: "unknown",
     server_error: "unknown",
     unexpected_response: "unknown",
@@ -525,7 +526,8 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     conflict: "conflict",
     sign_in_code_used: "failed",
     rate_limited: "rate_limited",
-    // Only with a 5xx, which the session reads as `server_error`.
+    // Defensive: only with a 5xx, which the session reads as
+    // `server_error`, so it never comes as a refusal.
     internal_error: "unknown",
     sign_in_unavailable: "failed",
   };

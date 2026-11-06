@@ -22,10 +22,16 @@ export const API_REQUEST_TIMEOUT_MS = 30_000;
 export const MAX_API_ANSWER_BYTES = 512 * 1024;
 
 /**
- * The longest wait that a `Retry-After` of the API sets: one day, the
- * longest window of the API's limits. A longer value is read as this one.
+ * The longest wait that a `Retry-After` of the API sets: 7 days, the API's
+ * longest wait. A workspace with 50 live invitations waits until the
+ * soonest one expires, and an invitation lives up to 7 days
+ * (`packages/database/src/invitations.ts`, `INVITATION_LIFETIME_SECONDS`);
+ * an account with 5 pending join requests waits until the soonest one
+ * ends, and a join request lives 168 hours
+ * (`packages/database/src/join-requests.ts`). A longer value is read as
+ * this one.
  */
-export const MAX_RETRY_AFTER_SECONDS = 86_400;
+export const MAX_RETRY_AFTER_SECONDS = 604_800;
 
 /** The `fetch` that the session uses; production passes Electron's `net.fetch`. */
 export type ApiFetch = (url: string, init: RequestInit) => Promise<Response>;

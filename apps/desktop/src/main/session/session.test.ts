@@ -15,6 +15,7 @@ import {
   deviceAuthInput,
   type DeviceAuthInput,
   type DeviceId,
+  MEMBERSHIP_ROUTES,
   newUuidV7,
   PROTOCOL_VERSION,
   type SignInRequest,
@@ -77,6 +78,7 @@ const API_ORIGIN = "https://api.mymandev.example";
 const DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3" as DeviceId;
 const USER_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a4" as UserId;
 const OTHER_DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b7" as DeviceId;
+const OTHER_USER_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b8" as UserId;
 const SIGN_IN_CODE = "mmdc_ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8";
 const AUTH_FAILED = Object.freeze({
   ok: false,
@@ -1101,6 +1103,119 @@ describe("access tokens", () => {
     expect(count(h, "GET", "/devices")).toBe(2);
   });
 
+  test("the retry after a 401 goes only for the device and the account of the first token, for a write and for a read", async () => {
+    // While the first request was on its way, "This is not me" deleted the
+    // device and a sign-in registered a new one: a retry with the new token
+    // would act for that account or that device.
+    const swaps: [string, Partial<DeviceRecord>][] = [
+      [
+        "another account on a new device",
+        {
+          deviceId: OTHER_DEVICE_ID,
+          userId: OTHER_USER_ID,
+          login: "hubot",
+          displayName: "Hubot",
+        },
+      ],
+      ["the same account on a new device", { deviceId: OTHER_DEVICE_ID }],
+      [
+        "a record of the device that names another account",
+        { userId: OTHER_USER_ID, login: "hubot", displayName: "Hubot" },
+      ],
+    ];
+    const calls = [
+      {
+        route: MEMBERSHIP_ROUTES.acceptInvitation,
+        body: { code: "the pasted code" },
+      },
+      { route: MEMBERSHIP_ROUTES.listWorkspaces },
+    ];
+    for (const [name, swap] of swaps) {
+      for (const call of calls) {
+        const { method, path: route } = call.route;
+        // Each case starts with empty files.
+        memory = memoryFileSystem();
+        fileSystem = memory;
+        const api = fakeApi();
+        const h = harness(api);
+        await existingDevice(h);
+        let first = true;
+        api.intercept = (request) => {
+          if (
+            request.path === "/auth/access-token" &&
+            request.body?.deviceId === OTHER_DEVICE_ID
+          ) {
+            // The API holds the new device of that sign-in.
+            const accessToken = `mmda_${randomBytes(32).toString("base64url")}`;
+            api.tokens.add(accessToken);
+            api.issued.push(accessToken);
+            return Promise.resolve(
+              json(200, {
+                accessToken,
+                expiresAt: new Date(
+                  Date.now() + ACCESS_TOKEN_LIFETIME_MS,
+                ).toISOString(),
+              }),
+            );
+          }
+          if (request.path !== route) {
+            return undefined;
+          }
+          if (!first) {
+            return Promise.resolve(noContent());
+          }
+          first = false;
+          return (async () => {
+            await h.keyStore.delete();
+            const key = await h.keyStore.create({ kind: "system" });
+            await h.records.write({ ...deviceRecord(key.publicKey), ...swap });
+            api.publicKey = key.publicKey;
+            return errorAnswer("unauthorized");
+          })();
+        };
+
+        const result = await h.session.request({ ...call, answer: "empty" });
+
+        expect(result, `${name}, ${method} ${route}`).toEqual({
+          ok: false,
+          reason: "refused",
+          code: "unauthorized",
+        });
+        expect(count(h, method, route), `${name}, ${method} ${route}`).toBe(1);
+      }
+    }
+
+    // The same device and account after a new sign-in, with a new key: the
+    // retry goes.
+    memory = memoryFileSystem();
+    fileSystem = memory;
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    let first = true;
+    api.intercept = (request) => {
+      if (request.path !== "/invitations/accept" || !first) {
+        return undefined;
+      }
+      first = false;
+      return (async () => {
+        await h.keyStore.delete();
+        const key = await h.keyStore.create({ kind: "system" });
+        await h.records.write(deviceRecord(key.publicKey));
+        api.publicKey = key.publicKey;
+        return errorAnswer("unauthorized");
+      })();
+    };
+    expect(
+      await h.session.request({
+        route: MEMBERSHIP_ROUTES.acceptInvitation,
+        body: { code: "the pasted code" },
+        answer: "empty",
+      }),
+    ).toEqual({ ok: false, reason: "refused", code: "not_found" });
+    expect(count(h, "POST", "/invitations/accept")).toBe(2);
+  });
+
   test("the new token's failure reports the reason", async () => {
     const h = harness();
     await existingDevice(h);
@@ -1253,6 +1368,44 @@ describe("access tokens", () => {
       reason: "refused",
       code: "rate_limited",
     });
+  });
+
+  test("a rate_limited refusal of the token request carries its Retry-After to the request, which is not sent", async () => {
+    const cases: [string, string | undefined, object][] = [
+      ["/auth/challenge", "45", { retryAfterSeconds: 45 }],
+      ["/auth/access-token", "75", { retryAfterSeconds: 75 }],
+      ["/auth/challenge", undefined, {}],
+      ["/auth/access-token", undefined, {}],
+    ];
+    for (const [tokenPath, retryAfter, wait] of cases) {
+      memory = memoryFileSystem();
+      fileSystem = memory;
+      const h = harness();
+      await existingDevice(h);
+      h.api.intercept = (request) => {
+        if (request.path !== tokenPath) {
+          return undefined;
+        }
+        const answer = errorAnswer("rate_limited");
+        if (retryAfter !== undefined) {
+          answer.headers.set("retry-after", retryAfter);
+        }
+        return Promise.resolve(answer);
+      };
+      expect(
+        await h.session.request({
+          route: MEMBERSHIP_ROUTES.createWorkspace,
+          answer: "empty",
+        }),
+        `${tokenPath} ${retryAfter}`,
+      ).toEqual({
+        ok: false,
+        reason: "refused",
+        code: "rate_limited",
+        ...wait,
+      });
+      expect(count(h, "POST", "/workspaces")).toBe(0);
+    }
   });
 });
 
