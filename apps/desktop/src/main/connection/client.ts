@@ -89,7 +89,11 @@ export const RECONNECT_COOLDOWN_MS = 3_000;
 export const RECONNECT_BUDGET = 10;
 export const RECONNECT_BUDGET_WINDOW_MS = 10 * 60_000;
 
-/** The stop reasons after which a reconnect may be asked for. */
+/**
+ * The stop reasons after which a reconnect may be asked for. They hold for
+ * the connection of the signed-in device only, so they also end when no
+ * device is signed in any more (`accountChanged`).
+ */
 const RECONNECTABLE_STOPS: ReadonlySet<ConnectionStopReason> = new Set([
   "connection_replaced",
   "protocol_violation",
@@ -917,6 +921,20 @@ export function createConnectionClient(
       if (live !== null) {
         closeLive(live);
       }
+    }
+    if (next === null && latch !== null && RECONNECTABLE_STOPS.has(latch)) {
+      // No device to connect as: a sign-out, "This is not me", a removal
+      // (also one that waits for the API), or a key that is not ready.
+      // `connection_replaced` and `protocol_violation` held for the
+      // connection of the previous device, and their reconnect would now be
+      // refused, so the status becomes the one of no device. A refusal of
+      // the server (`auth_failed`, `device_revoked`, `sign_in_required`)
+      // stays: the session moves the device to the refused state right after
+      // it, which makes it ineligible, and only a GitHub sign-in ends it, as
+      // its sentence says. `update_required` stays as well: the server's
+      // protocol version does not change with a sign-out, nor with a new
+      // device.
+      latch = null;
     }
     pump();
   }
