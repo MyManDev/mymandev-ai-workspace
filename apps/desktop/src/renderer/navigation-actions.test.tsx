@@ -4,6 +4,7 @@
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { expect, test } from "vitest";
 import type { WorkspaceView } from "../shared/ipc-contract.ts";
+import { ACCOUNT_SCREEN_TITLE_ID } from "./AccountScreen.tsx";
 import {
   ProjectNav,
   WorkspaceNav,
@@ -279,12 +280,42 @@ test("other keys in the tab list do nothing", () => {
   }
 });
 
-test("Go to Account on the home screen shows the account screen, and it is offered only while no device is signed in", () => {
+test("Go to Account on the home screen shows the account screen and moves the focus to its title, and it is offered only while no device is signed in", () => {
+  for (const signIn of ["sign_in", "not_ready"] as const) {
+    const { dispatch, take } = recorder();
+    const steps: string[] = [];
+    const home = HomeScreen({
+      signIn,
+      dispatch: (action) => {
+        steps.push(`dispatch ${action.type}`);
+        dispatch(action);
+      },
+      focusAfterShow: (id) => {
+        steps.push(`focus #${id}`);
+      },
+    });
+    expect(clickEveryButton(home, take), signIn).toEqual([
+      ["Go to Account", [{ type: "show-screen", screen: "account" }]],
+    ]);
+    // The focus is asked for before the view changes, and goes to the
+    // title that the account screen renders with this ID.
+    expect(steps, signIn).toEqual([
+      `focus #${ACCOUNT_SCREEN_TITLE_ID}`,
+      "dispatch show-screen",
+    ]);
+  }
+  expect(ACCOUNT_SCREEN_TITLE_ID).toBe("account-screen-title");
   const { dispatch, take } = recorder();
+  const focused: string[] = [];
   expect(
-    clickEveryButton(HomeScreen({ signedOut: true, dispatch }), take),
-  ).toEqual([["Go to Account", [{ type: "show-screen", screen: "account" }]]]);
-  expect(
-    clickEveryButton(HomeScreen({ signedOut: false, dispatch }), take),
+    clickEveryButton(
+      HomeScreen({
+        signIn: "none",
+        dispatch,
+        focusAfterShow: (id) => focused.push(id),
+      }),
+      take,
+    ),
   ).toEqual([]);
+  expect(focused).toEqual([]);
 });

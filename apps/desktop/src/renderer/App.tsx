@@ -3,6 +3,7 @@ import {
   useEffect,
   useMemo,
   useReducer,
+  useRef,
   useState,
   type Dispatch,
 } from "react";
@@ -18,6 +19,7 @@ import type {
 import type { WorkspaceView } from "../shared/ipc-contract.ts";
 import { PRODUCT_NAME } from "../shared/product.ts";
 import { AccountScreen } from "./AccountScreen.tsx";
+import { initialAccountView, type AccountView } from "./account-view.ts";
 import { ChatScreen } from "./ChatScreen.tsx";
 import {
   CONNECTION_ACTION_LABELS,
@@ -55,8 +57,9 @@ import {
 import { SwitchQuestionDialog } from "./SwitchQuestion.tsx";
 import {
   createWorkspaceSidebar,
+  homeSignIn,
   initialWorkspacePanelView,
-  noDeviceSignedIn,
+  type HomeSignIn,
   type SwitchQuestion,
 } from "./workspace-view.ts";
 import { AboutScreen, HomeScreen } from "./WorkspaceScreens.tsx";
@@ -110,6 +113,8 @@ export function App({
   );
   const runtimeView = useRuntimeView(runtime);
   const connectionView = useConnectionView(connection);
+  const accountView = useAccountView(account);
+  const focusAfterShow = useFocusAfterShow(state.view);
   const open = openProject(state);
 
   return (
@@ -149,8 +154,9 @@ export function App({
           electronVersion={electronVersion}
           account={account}
           chat={chat}
-          signedOut={noDeviceSignedIn(workspaceSidebar.view)}
+          homeSignIn={homeSignIn(workspaceSidebar.view, accountView)}
           dispatch={dispatch}
+          focusAfterShow={focusAfterShow}
         />
       </main>
       {open === undefined ? null : (
@@ -172,20 +178,28 @@ function ScreenContent({
   electronVersion,
   account,
   chat,
-  signedOut,
+  homeSignIn,
   dispatch,
+  focusAfterShow,
 }: {
   readonly view: ShellView;
   readonly electronVersion: string | undefined;
   readonly account: AccountBridge | undefined;
   readonly chat: ChatBridge | undefined;
-  /** True while no device is signed in and ready. */
-  readonly signedOut: boolean;
+  /** What the home screen says about the sign-in. */
+  readonly homeSignIn: HomeSignIn;
   readonly dispatch: Dispatch<ShellAction>;
+  readonly focusAfterShow: (id: string) => void;
 }) {
   switch (view.screen) {
     case "home":
-      return <HomeScreen signedOut={signedOut} dispatch={dispatch} />;
+      return (
+        <HomeScreen
+          signIn={homeSignIn}
+          dispatch={dispatch}
+          focusAfterShow={focusAfterShow}
+        />
+      );
     case "account":
       return <AccountScreen account={account} />;
     case "people":
@@ -274,6 +288,47 @@ function useWorkspaces(
     sidebar: { view, message, onSelect },
     question: { question, onKeep, onDiscard },
   };
+}
+
+/**
+ * Moves the focus to an element of the next view once the shell shows it,
+ * for a button that leaves the page with its own screen, where the focus
+ * would drop to the page. The returned function names the element by its
+ * ID before the button changes the view; each change of the view takes the
+ * request, also when the element is not there.
+ */
+function useFocusAfterShow(view: ShellView): (id: string) => void {
+  const pending = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const id = pending.current;
+    pending.current = undefined;
+    if (id !== undefined) {
+      document.getElementById(id)?.focus();
+    }
+  }, [view]);
+  return useCallback((id: string) => {
+    pending.current = id;
+  }, []);
+}
+
+/**
+ * Follows the account status while the shell is mounted, for the home
+ * screen. The account panel follows it on its own while it is shown.
+ */
+function useAccountView(account: AccountBridge | undefined): AccountView {
+  const [view, setView] = useState(() =>
+    initialAccountView(account !== undefined),
+  );
+  useEffect(() => {
+    if (account === undefined) {
+      return undefined;
+    }
+    return account.subscribeStatus(
+      (status) => setView({ kind: "known", status }),
+      () => setView({ kind: "unavailable" }),
+    );
+  }, [account]);
+  return view;
 }
 
 /** Follows the status of the local runtime while the shell is mounted. */

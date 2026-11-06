@@ -8,8 +8,8 @@ export function JoinScreen() {
       <p>Joining is not available yet.</p>
       <p className="placeholder-note">
         Here you will paste an invitation code that a workspace sent you, or ask
-        to join a workspace by its ID. Your own join requests appear here while
-        they wait, and you can withdraw them.
+        to join a workspace by its ID. Your own join requests will appear here
+        while they wait, and you will be able to withdraw them.
       </p>
     </section>
   );

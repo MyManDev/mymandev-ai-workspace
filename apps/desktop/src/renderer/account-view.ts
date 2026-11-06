@@ -386,6 +386,22 @@ export function offersSignIn(status: AccountStatus): boolean {
 }
 
 /**
+ * Whether the panel offers a GitHub sign-in that can start now: no sign-in
+ * runs, the panel offers one (`offersSignIn`), the device key is ready, and
+ * the build has a usable server address. Otherwise the panel shows no
+ * sign-in button or a disabled one. The home screen asks the person to
+ * sign in on the account screen only then.
+ */
+export function canStartSignIn(status: AccountStatus): boolean {
+  return (
+    status.signIn.kind === "idle" &&
+    offersSignIn(status) &&
+    status.deviceKey === "ready" &&
+    apiOriginProblem(status.apiOrigin) === undefined
+  );
+}
+
+/**
  * Whether the panel offers "This is not me": whenever the installation holds
  * an account, also while its device is signed out and the status names no
  * account (`hidden`, #195). The main process confirms it with the login.

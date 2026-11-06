@@ -16,6 +16,7 @@ import {
   ACTION_MESSAGES,
   ANOTHER_BROWSER_DELAY_MS,
   apiOriginProblem,
+  canStartSignIn,
   createIdleWaits,
   DEVICE_ACTION_MESSAGES,
   DEVICE_KEY_PROBLEM_MESSAGES,
@@ -108,7 +109,7 @@ export interface AccountPanelContentProps {
 export function AccountPanelContent(props: AccountPanelContentProps) {
   return (
     <section className="account-panel" aria-labelledby="account-title">
-      <h3 id="account-title">Account</h3>
+      <h3 id="account-title">This device</h3>
       <AccountBody {...props} />
     </section>
   );
@@ -319,8 +320,8 @@ function SignInActions(
   const originProblem = canSignIn
     ? apiOriginProblem(status.apiOrigin)
     : undefined;
-  const signInDisabled =
-    busy || status.deviceKey !== "ready" || originProblem !== undefined;
+  // The sign-in is idle here, so this checks the key and the server address.
+  const signInDisabled = busy || !canStartSignIn(status);
   const signInDescription =
     originProblem === undefined ? undefined : "sign-in-unavailable";
   return (

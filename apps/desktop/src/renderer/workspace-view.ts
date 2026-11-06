@@ -5,6 +5,7 @@ import type {
   WorkspaceSwitchOptions,
   WorkspaceView,
 } from "../shared/ipc-contract.ts";
+import { canStartSignIn, type AccountView } from "./account-view.ts";
 import type { ShellAction } from "./screens.ts";
 
 /** What the sidebar knows about the account's workspaces. */
@@ -41,6 +42,49 @@ export const WORKSPACE_MESSAGES = Object.freeze({
  */
 export function noDeviceSignedIn(view: WorkspacePanelView): boolean {
   return view.kind === "known" && view.state.status === "signed_out";
+}
+
+/**
+ * What the home screen says about the sign-in, with "Go to Account" in both
+ * cases that say something (the Project Manager's decision of 2026-11-06).
+ */
+export type HomeSignIn =
+  /** A device is signed in and ready, or the shell does not know. */
+  | "none"
+  /** No device is signed in and ready, and the account panel offers a sign-in that can start now. */
+  | "sign_in"
+  /**
+   * No device is signed in and ready, and something else comes first: the
+   * first account status, the device key, a sign-in that runs, a removal
+   * that waits for the server, or a build without a server address.
+   */
+  | "not_ready";
+
+/** The fixed sentence of the home screen for each case that says something. */
+export const HOME_SIGN_IN_MESSAGES: Readonly<
+  Record<Exclude<HomeSignIn, "none">, string>
+> = Object.freeze({
+  sign_in: "Sign in with GitHub on the Account screen to see your workspaces.",
+  // True in every case, like the sidebar's text for `signed_out`.
+  not_ready: WORKSPACE_MESSAGES.signedOut,
+});
+
+/**
+ * The home screen's case: nothing unless no device is signed in and ready
+ * (`noDeviceSignedIn`); then "sign_in" only while the account panel offers
+ * a sign-in that can start now (`canStartSignIn`), and "not_ready" in every
+ * other case, also before the first account status and without the bridge.
+ */
+export function homeSignIn(
+  workspaces: WorkspacePanelView,
+  account: AccountView,
+): HomeSignIn {
+  if (!noDeviceSignedIn(workspaces)) {
+    return "none";
+  }
+  return account.kind === "known" && canStartSignIn(account.status)
+    ? "sign_in"
+    : "not_ready";
 }
 
 /**

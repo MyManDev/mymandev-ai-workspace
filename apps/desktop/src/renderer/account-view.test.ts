@@ -16,6 +16,7 @@ import {
   ACTION_MESSAGES,
   ANOTHER_BROWSER_DELAY_MS,
   apiOriginProblem,
+  canStartSignIn,
   createIdleWaits,
   START_REFUSAL_MESSAGES,
   DEVICE_ACTION_FAILURE_MESSAGES,
@@ -672,6 +673,53 @@ test("the sign-in is offered without an account and in every state that needs on
     expect(
       offersSignIn({ ...status(device), account: { kind: "hidden" } }),
     ).toBe(true);
+  }
+});
+
+test("a sign-in can start now only while it is offered and idle, with a ready key and a server address", () => {
+  const signedIn = {
+    kind: "signed_in",
+    login: "octocat",
+    displayName: "The Octocat",
+    deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+  } as const;
+  const startable: AccountStatus = { ...IDLE, lastOutcome: null };
+  expect(canStartSignIn(startable)).toBe(true);
+  expect(
+    canStartSignIn({
+      ...startable,
+      account: { kind: "hidden" },
+      device: "signed_out",
+    }),
+  ).toBe(true);
+
+  const blocked: [string, AccountStatus][] = [
+    ["sign-in starting", { ...startable, signIn: { kind: "starting" } }],
+    ["sign-in waiting", { ...WAITING }],
+    ["sign-in completing", { ...startable, signIn: { kind: "completing" } }],
+    [
+      "not offered: signed in",
+      { ...startable, account: signedIn, device: "signed_in" },
+    ],
+    [
+      "not offered: removal pending",
+      { ...startable, account: signedIn, device: "removal_pending" },
+    ],
+    [
+      "not offered: starting",
+      { ...startable, account: { kind: "hidden" }, device: "starting" },
+    ],
+    ["api origin unset", { ...startable, apiOrigin: "unset" }],
+    ["api origin invalid", { ...startable, apiOrigin: "invalid" }],
+  ];
+  for (const deviceKey of DEVICE_KEY_STATES) {
+    if (deviceKey !== "ready") {
+      blocked.push([deviceKey, { ...startable, deviceKey }]);
+    }
+  }
+  // Each case differs from a status that can start in one way only.
+  for (const [name, status] of blocked) {
+    expect(canStartSignIn(status), name).toBe(false);
   }
 });
 
