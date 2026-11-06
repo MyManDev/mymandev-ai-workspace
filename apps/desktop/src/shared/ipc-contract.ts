@@ -859,9 +859,38 @@ export const WORKSPACE_ACTION_REFUSALS = Object.freeze([
 ] as const);
 export type WorkspaceActionRefusal = (typeof WORKSPACE_ACTION_REFUSALS)[number];
 
-/** The result of selecting a workspace or opening a project. */
+/**
+ * The most chat messages that wait to be sent at once, as the chat service
+ * holds them (`MAX_PENDING_CHAT_MESSAGES`): the largest count of a
+ * `waiting` switch.
+ */
+export const MAX_WAITING_CHAT_MESSAGES = 50;
+
+/**
+ * The option of a switch: `discardWaiting: true` drops the chat messages
+ * that wait to be sent and switches, after the person chose to discard
+ * them (the Project Manager's decision of 2026-11-05 on #27). It comes from
+ * the renderer, so an unknown key is refused rather than stripped.
+ */
+export const WorkspaceSwitchOptionsSchema = z.strictObject({
+  discardWaiting: z.boolean(),
+});
+export type WorkspaceSwitchOptions = z.infer<
+  typeof WorkspaceSwitchOptionsSchema
+>;
+
+/**
+ * The result of selecting a workspace or opening a project: `ok`, `waiting`
+ * when `count` chat messages wait to be sent and nothing changed, so that
+ * the renderer can ask the person and repeat the switch with
+ * `discardWaiting`, or `refused`.
+ */
 export const WorkspaceActionResultSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("ok") }),
+  z.object({
+    outcome: z.literal("waiting"),
+    count: z.int().min(1).max(MAX_WAITING_CHAT_MESSAGES),
+  }),
   z.object({
     outcome: z.literal("refused"),
     reason: z.enum(WORKSPACE_ACTION_REFUSALS),
@@ -999,6 +1028,228 @@ export const AgentActivityViewSchema = z.discriminatedUnion("status", [
 ]);
 export type AgentActivityView = z.infer<typeof AgentActivityViewSchema>;
 
+// The chat of the open project (#27).
+
+/**
+ * Limits of the chat messages:
+ *
+ * - `messages` and `pending`: the number of held messages and of waiting
+ *   messages in one view. `pending` is the chat service's
+ *   `MAX_PENDING_CHAT_MESSAGES`.
+ * - `body` and `authorName`: the length of a message body and of an
+ *   author's name in characters (code points), the protocol's
+ *   `LIMITS.messageBody` and `LIMITS.displayName`.
+ * - `text`: the budget of body text in one view, in UTF-16 code units, the
+ *   unit that IPC carries a string in (at most two bytes each), so one view
+ *   holds at most about 1 MB of text. The waiting messages come first, in
+ *   order, then the newest held messages; what does not fit is left out and
+ *   counted.
+ * - `sendText`: the length of a text that the renderer sends, in
+ *   characters. The main process prepares the body with the protocol's
+ *   rules and answers `too_long` above `body`; this limit only bounds the
+ *   message.
+ *
+ * The shared contract does not import the protocol package, so the main
+ * process's tests check that the values match.
+ */
+export const CHAT_LIMITS = Object.freeze({
+  messages: 1_000,
+  pending: MAX_WAITING_CHAT_MESSAGES,
+  body: 16_000,
+  authorName: 64,
+  text: 500_000,
+  sendText: 64_000,
+});
+
+/**
+ * The states of the chat service: `no_project` while no project is open,
+ * `loading` until the open project's newest page loaded, `ready`, and
+ * `unavailable` after the last load of the newest page failed, until a
+ * reload succeeds.
+ */
+export const CHAT_STATUSES = Object.freeze([
+  "no_project",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type ChatStatusView = (typeof CHAT_STATUSES)[number];
+
+/** Why the chat or an older page did not load: the failure of the read. */
+export const CHAT_PROBLEMS = Object.freeze([
+  "not_signed_in",
+  "not_found",
+  "rate_limited",
+  "unavailable",
+  "failed",
+] as const);
+export type ChatProblem = (typeof CHAT_PROBLEMS)[number];
+
+/** Who wrote a message: a person of the workspace, or an agent. */
+export const CHAT_AUTHOR_KINDS = Object.freeze(["member", "agent"] as const);
+
+/**
+ * Why a message shows as not sent: the code of the server's refusal, or
+ * `not_sendable` when the connection client refused to send it.
+ */
+export const CHAT_NOT_SENT_REASONS = Object.freeze([
+  "not_found",
+  "conflict",
+  "rate_limited",
+  "not_sendable",
+] as const);
+export type ChatNotSentReasonView = (typeof CHAT_NOT_SENT_REASONS)[number];
+
+/**
+ * A message body that crosses IPC. The main process checked every body with
+ * the protocol's rules before it held it, so the schema bounds its length
+ * only, and no pattern runs over every body on every publish. zod counts
+ * code points only for a string longer than the limit in UTF-16 code
+ * units, so the check is cheap.
+ */
+const ChatBodySchema = z.string().min(1).max(CHAT_LIMITS.body);
+
+/**
+ * A message of the open project's chat. Its author crosses as the kind and
+ * the display name that the main process resolved, never as a member ID or
+ * an agent ID.
+ */
+export const ChatMessageViewSchema = z.object({
+  id: ProtocolIdSchema,
+  /** The message's number in the project's chat, from 1. */
+  seq: z.int().positive(),
+  authorKind: z.enum(CHAT_AUTHOR_KINDS),
+  authorName: z.string().min(1).max(CHAT_LIMITS.authorName),
+  body: ChatBodySchema,
+  createdAt: TimestampSchema,
+});
+export type ChatMessageView = z.infer<typeof ChatMessageViewSchema>;
+
+/**
+ * One of the person's messages that the server has not stored yet, by the
+ * event ID that `retry` and `discard` take: `waiting` for the connection or
+ * for its next try, `sending`, or `not_sent` with a reason.
+ */
+export const ChatPendingViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    eventId: ProtocolIdSchema,
+    body: ChatBodySchema,
+    status: z.enum(["waiting", "sending"]),
+  }),
+  z.object({
+    eventId: ProtocolIdSchema,
+    body: ChatBodySchema,
+    status: z.literal("not_sent"),
+    reason: z.enum(CHAT_NOT_SENT_REASONS),
+  }),
+]);
+export type ChatPendingView = z.infer<typeof ChatPendingViewSchema>;
+
+/**
+ * Whether older messages can be shown: `none` when the view shows the whole
+ * chat, `available` when `loadOlder` can load the page before the held
+ * messages, `loading` while one is on its way, and `not_shown` when older
+ * messages exist but the view is full, so that loading more would show
+ * nothing more.
+ */
+export const CHAT_OLDER_STATES = Object.freeze([
+  "none",
+  "available",
+  "loading",
+  "not_shown",
+] as const);
+export type ChatOlderState = (typeof CHAT_OLDER_STATES)[number];
+
+const ChatViewFields = {
+  /**
+   * Grows by one with every change, also when only an author's name
+   * changed. A receiver keeps the view with the highest revision, like the
+   * runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /** The selected workspace while a project is open, else null. */
+  workspaceId: ProtocolIdSchema.nullable(),
+  projectId: ProtocolIdSchema.nullable(),
+  /** The newest held messages that fit the view, the oldest first. */
+  messages: z.array(ChatMessageViewSchema).max(CHAT_LIMITS.messages).readonly(),
+  /** How many older held messages `messages` leaves out. */
+  moreMessages: z.int().nonnegative(),
+  older: z.enum(CHAT_OLDER_STATES),
+  /** Why the last older page did not load, until the next one is asked for. */
+  olderProblem: z.enum(CHAT_PROBLEMS).optional(),
+  /** The first of the person's waiting messages, in the order written. */
+  pending: z.array(ChatPendingViewSchema).max(CHAT_LIMITS.pending).readonly(),
+  /** How many later waiting messages `pending` leaves out. */
+  morePending: z.int().nonnegative(),
+};
+
+/**
+ * What the renderer may know of the open project's chat: `{ revision,
+ * status, problem?, workspaceId, projectId, messages, moreMessages, older,
+ * olderProblem?, pending, morePending }`, with a problem only while
+ * `unavailable`. It holds IDs, names, bodies, and times only: no member ID,
+ * user ID, device ID, or anything secret. `pending.length + morePending` is
+ * the number of messages that a switch would discard.
+ */
+export const ChatViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum(["no_project", "loading", "ready"]),
+    ...ChatViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(CHAT_PROBLEMS),
+    ...ChatViewFields,
+  }),
+]);
+export type ChatView = z.infer<typeof ChatViewSchema>;
+
+/** A text that the renderer sends as a message. */
+export const ChatSendTextSchema = z.string().max(CHAT_LIMITS.sendText);
+
+/**
+ * Why a message was not accepted: `blank`, `too_long`, or
+ * `invalid_characters` for a body that the protocol refuses,
+ * `too_many_pending` while `CHAT_LIMITS.pending` messages wait, and
+ * `no_project` without an open project or a signed-in device.
+ */
+export const CHAT_SEND_REFUSALS = Object.freeze([
+  "blank",
+  "too_long",
+  "invalid_characters",
+  "too_many_pending",
+  "no_project",
+] as const);
+export type ChatSendRefusal = (typeof CHAT_SEND_REFUSALS)[number];
+
+/**
+ * The result of a send: `accepted` with the event ID under which the
+ * message waits in `pending` until the server stores it, or `refused`, and
+ * nothing is kept.
+ */
+export const ChatSendResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("accepted"), eventId: ProtocolIdSchema }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(CHAT_SEND_REFUSALS),
+  }),
+]);
+export type ChatSendResultView = z.infer<typeof ChatSendResultSchema>;
+
+/**
+ * The result of `loadOlder`: `started`, `busy` while a page is on its way,
+ * `none` when nothing older can be loaded and shown, or `too_soon` within
+ * the backoff after an older page did not load.
+ */
+export const CHAT_LOAD_OLDER_RESULTS = Object.freeze([
+  "started",
+  "busy",
+  "none",
+  "too_soon",
+] as const);
+export const ChatLoadOlderResultSchema = z.enum(CHAT_LOAD_OLDER_RESULTS);
+export type ChatLoadOlderResultView = z.infer<typeof ChatLoadOlderResultSchema>;
+
 /** The schemas of every invoke channel. */
 export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.getRuntimeStatus]: Object.freeze({
@@ -1085,12 +1336,19 @@ export const INVOKE_CONTRACT = Object.freeze({
     result: WorkspaceViewSchema,
   }),
   [INVOKE_CHANNELS.selectWorkspace]: Object.freeze({
-    args: z.tuple([ProtocolIdSchema]),
+    /** A workspace ID, and the option of the switch. */
+    args: z.union([
+      z.tuple([ProtocolIdSchema]),
+      z.tuple([ProtocolIdSchema, WorkspaceSwitchOptionsSchema]),
+    ]),
     result: WorkspaceActionResultSchema,
   }),
   [INVOKE_CHANNELS.openProject]: Object.freeze({
-    /** A project ID, or null to close the open project. */
-    args: z.tuple([ProtocolIdSchema.nullable()]),
+    /** A project ID, or null to close the open project, and the option. */
+    args: z.union([
+      z.tuple([ProtocolIdSchema.nullable()]),
+      z.tuple([ProtocolIdSchema.nullable(), WorkspaceSwitchOptionsSchema]),
+    ]),
     result: WorkspaceActionResultSchema,
   }),
   [INVOKE_CHANNELS.getAgentState]: Object.freeze({
@@ -1100,6 +1358,34 @@ export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.subscribeAgentState]: Object.freeze({
     args: NoArgumentsSchema,
     result: AgentActivityViewSchema,
+  }),
+  [INVOKE_CHANNELS.getChatState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ChatViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeChatState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ChatViewSchema,
+  }),
+  [INVOKE_CHANNELS.sendChatMessage]: Object.freeze({
+    args: z.tuple([ChatSendTextSchema]),
+    result: ChatSendResultSchema,
+  }),
+  [INVOKE_CHANNELS.retryChatMessage]: Object.freeze({
+    /** The event ID of a message that shows as not sent. */
+    args: z.tuple([ProtocolIdSchema]),
+    /** True when the message is tried again. */
+    result: z.boolean(),
+  }),
+  [INVOKE_CHANNELS.discardChatMessage]: Object.freeze({
+    /** The event ID of a message that waits or shows as not sent. */
+    args: z.tuple([ProtocolIdSchema]),
+    /** True when the message was dropped. */
+    result: z.boolean(),
+  }),
+  [INVOKE_CHANNELS.loadOlderChatMessages]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ChatLoadOlderResultSchema,
   }),
 });
 
@@ -1111,6 +1397,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.connectionStatusChanged]: ConnectionStatusSchema,
   [EVENT_CHANNELS.workspaceStateChanged]: WorkspaceViewSchema,
   [EVENT_CHANNELS.agentStateChanged]: AgentActivityViewSchema,
+  [EVENT_CHANNELS.chatStateChanged]: ChatViewSchema,
 });
 
 export type InvokeArgs<C extends InvokeChannel> = z.infer<

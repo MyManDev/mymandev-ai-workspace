@@ -11,6 +11,7 @@ import {
 import { expect, test } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import {
+  MAX_WAITING_CHAT_MESSAGES,
   ProtocolIdSchema,
   WORKSPACE_LIMITS,
   WORKSPACE_PROBLEMS,
@@ -23,6 +24,8 @@ import {
   type WorkspaceReadResult,
 } from "./api-reads.ts";
 import { APP_ENTRY_URL } from "./app-protocol.ts";
+import { MAX_PENDING_CHAT_MESSAGES } from "./chat/timeline.ts";
+import type { ChatSwitchOptions, ChatSwitchResult } from "./chat/service.ts";
 import type {
   IpcFrame,
   IpcInvokeEvent,
@@ -35,6 +38,7 @@ import {
   type WorkspaceAccount,
   type WorkspaceConnection,
   type WorkspaceServiceStatus,
+  type WorkspaceService,
   type WorkspaceState,
   type WorkspaceSummary,
 } from "./workspace/service.ts";
@@ -47,6 +51,7 @@ import {
   WORKSPACE_SWITCH_WINDOW_MS,
   workspaceView,
   type WorkspacePageWindow,
+  type WorkspaceSwitcher,
 } from "./workspace-ipc.ts";
 
 const DEV_URL = "http://localhost:5173/";
@@ -198,10 +203,33 @@ function fakeService(initial: WorkspaceState = STATE) {
   };
 }
 
+type SwitchedService = Pick<
+  WorkspaceService,
+  "state" | "onChange" | "selectedWorkspaceId" | "select" | "openProject"
+>;
+
+/**
+ * The chat service's switch wrappers while no chat message waits: they
+ * switch through the service at once, as the chat service then does.
+ */
+function directSwitcher(
+  service: Pick<WorkspaceService, "select" | "openProject">,
+): WorkspaceSwitcher {
+  return {
+    selectWorkspace: (workspaceId) =>
+      service.select(workspaceId) ? { kind: "switched" } : { kind: "refused" },
+    switchProject: (projectId) =>
+      service.openProject(projectId)
+        ? { kind: "switched" }
+        : { kind: "refused" },
+  };
+}
+
 function register(
-  fake: { readonly service: Parameters<typeof registerWorkspaceIpc>[2] },
+  fake: { readonly service: SwitchedService },
   appUrl: string = DEV_URL,
   now?: () => number,
+  switcher: WorkspaceSwitcher = directSwitcher(fake.service),
 ) {
   const handlers = new Map<string, IpcInvokeListener>();
   const errors: string[] = [];
@@ -209,6 +237,7 @@ function register(
     { handle: (channel, listener) => handlers.set(channel, listener) },
     appUrl,
     fake.service,
+    switcher,
     (message) => errors.push(message),
     now,
   );
@@ -328,6 +357,9 @@ test("select refuses an ID that is not a lowercase UUIDv7, a wrong type, a missi
     [WORKSPACE_ID, WORKSPACE_ID],
     [WORKSPACE_ID, undefined],
     [WORKSPACE_ID, { force: true }],
+    [WORKSPACE_ID, { discardWaiting: true, force: true }],
+    [WORKSPACE_ID, { discardWaiting: "true" }],
+    [WORKSPACE_ID, { discardWaiting: true }, { discardWaiting: true }],
   ]) {
     expect(() => call(channel, ...args)).toThrow(refused);
   }
@@ -348,6 +380,9 @@ test("open refuses an ID that is not a lowercase UUIDv7, a wrong type, a missing
     [PROJECT_ID, PROJECT_ID],
     [null, null],
     [PROJECT_ID, "extra"],
+    [PROJECT_ID, {}],
+    [null, { discardWaiting: 1 }],
+    [PROJECT_ID, { discardWaiting: true }, "extra"],
   ]) {
     expect(() => call(channel, ...args)).toThrow(refused);
   }
@@ -400,7 +435,10 @@ test("select and open pass a valid ID to the service and answer ok or refused", 
 
 test("the actions check every ID with the protocol's ID schemas, also without the contract", () => {
   const fake = fakeService();
-  const actions = createWorkspaceActions(fake.service);
+  const actions = createWorkspaceActions(
+    fake.service,
+    directSwitcher(fake.service),
+  );
   const select = actions.selectWorkspace as (value: unknown) => unknown;
   const open = actions.openProject as (value: unknown) => unknown;
 
@@ -544,7 +582,9 @@ test("a refused close of the open project answers refused, through IPC and the a
     },
   };
 
-  expect(createWorkspaceActions(stub).openProject(null)).toEqual(NOT_FOUND);
+  expect(
+    createWorkspaceActions(stub, directSwitcher(stub)).openProject(null),
+  ).toEqual(NOT_FOUND);
   const { call } = register({ service: stub });
   expect(call(INVOKE_CHANNELS.openProject, null)).toEqual(NOT_FOUND);
   expect(calls).toEqual([null, null]);
@@ -673,7 +713,11 @@ test("a loop of alternating selects reaches the connection only within the budge
 test("a refused select of an unknown workspace does not count against the budget", () => {
   const fake = fakeService();
   let clock = 0;
-  const actions = createWorkspaceActions(fake.service, () => clock);
+  const actions = createWorkspaceActions(
+    fake.service,
+    directSwitcher(fake.service),
+    () => clock,
+  );
   const unknown = "019a5b2c-3d4e-7f62-8a1b-2c3d4e5f6a7b";
 
   for (let index = 0; index < WORKSPACE_SWITCH_BUDGET * 3; index += 1) {
@@ -682,6 +726,208 @@ test("a refused select of an unknown workspace does not count against the budget
   }
   expect(actions.selectWorkspace(OTHER_WORKSPACE_ID)).toEqual({
     outcome: "ok",
+  });
+});
+
+/**
+ * The chat service's switch wrappers while `count` messages wait: like the
+ * chat service, they answer `waiting` and change nothing for a switch to
+ * another workspace or project, unless `discardWaiting` drops the messages
+ * first. They record every call with its options.
+ */
+function waitingSwitcher(
+  service: Pick<
+    WorkspaceService,
+    "state" | "select" | "openProject" | "selectedWorkspaceId"
+  >,
+  count: number,
+) {
+  let waiting = count;
+  const calls: { method: string; id: string | null; options: unknown }[] = [];
+  const decide = (
+    unchanged: boolean,
+    options: ChatSwitchOptions,
+    apply: () => boolean,
+  ): ChatSwitchResult => {
+    if (!unchanged && waiting > 0 && !options.discardWaiting) {
+      return { kind: "waiting", count: waiting };
+    }
+    if (!unchanged) {
+      waiting = 0;
+    }
+    return apply() ? { kind: "switched" } : { kind: "refused" };
+  };
+  const switcher: WorkspaceSwitcher = {
+    selectWorkspace: (workspaceId, options) => {
+      calls.push({ method: "selectWorkspace", id: workspaceId, options });
+      return decide(
+        workspaceId === service.selectedWorkspaceId(),
+        options,
+        () => service.select(workspaceId),
+      );
+    },
+    switchProject: (projectId, options) => {
+      calls.push({ method: "switchProject", id: projectId, options });
+      return decide(projectId === service.state().openProjectId, options, () =>
+        service.openProject(projectId),
+      );
+    },
+  };
+  return { switcher, calls, waiting: () => waiting };
+}
+
+const KEEP = { discardWaiting: false };
+const DISCARD = { discardWaiting: true };
+
+test("every switch asks the chat service's wrappers, and waiting messages hold it until the person discards them", () => {
+  const fake = fakeService();
+  const chat = waitingSwitcher(fake.service, 3);
+  const { call } = register(fake, DEV_URL, undefined, chat.switcher);
+
+  expect(call(INVOKE_CHANNELS.selectWorkspace, OTHER_WORKSPACE_ID)).toEqual({
+    outcome: "waiting",
+    count: 3,
+  });
+  expect(call(INVOKE_CHANNELS.openProject, null)).toEqual({
+    outcome: "waiting",
+    count: 3,
+  });
+  expect(
+    call(INVOKE_CHANNELS.selectWorkspace, OTHER_WORKSPACE_ID, KEEP),
+  ).toEqual({ outcome: "waiting", count: 3 });
+  // Nothing changed meanwhile, and the open project stays open.
+  expect(fake.current()).toBe(STATE);
+  // Asking for the open project or the selected workspace is no switch.
+  expect(call(INVOKE_CHANNELS.openProject, PROJECT_ID)).toEqual({
+    outcome: "ok",
+  });
+  expect(call(INVOKE_CHANNELS.selectWorkspace, WORKSPACE_ID)).toEqual({
+    outcome: "ok",
+  });
+
+  expect(
+    call(INVOKE_CHANNELS.selectWorkspace, OTHER_WORKSPACE_ID, DISCARD),
+  ).toEqual({ outcome: "ok" });
+  expect(chat.waiting()).toBe(0);
+  expect(fake.current().selectedWorkspaceId).toBe(OTHER_WORKSPACE_ID);
+  expect(chat.calls).toEqual([
+    { method: "selectWorkspace", id: OTHER_WORKSPACE_ID, options: KEEP },
+    { method: "switchProject", id: null, options: KEEP },
+    { method: "selectWorkspace", id: OTHER_WORKSPACE_ID, options: KEEP },
+    { method: "switchProject", id: PROJECT_ID, options: KEEP },
+    { method: "selectWorkspace", id: WORKSPACE_ID, options: KEEP },
+    { method: "selectWorkspace", id: OTHER_WORKSPACE_ID, options: DISCARD },
+  ]);
+  // The options that reach the wrappers are the actions' own frozen ones.
+  for (const { options } of chat.calls) {
+    expect(Object.isFrozen(options)).toBe(true);
+  }
+  // The service is asked only through the wrappers.
+  expect(fake.calls.filter(({ method }) => method !== "state")).toEqual([
+    { method: "openProject", args: [PROJECT_ID] },
+    { method: "select", args: [WORKSPACE_ID] },
+    { method: "select", args: [OTHER_WORKSPACE_ID] },
+  ]);
+});
+
+test("open-project passes the discard option on through IPC, and keeps the messages without it", () => {
+  const fake = fakeService();
+  const chat = waitingSwitcher(fake.service, 2);
+  const { call } = register(fake, DEV_URL, undefined, chat.switcher);
+
+  expect(call(INVOKE_CHANNELS.openProject, null, KEEP)).toEqual({
+    outcome: "waiting",
+    count: 2,
+  });
+  expect(fake.current().openProjectId).toBe(PROJECT_ID);
+  expect(call(INVOKE_CHANNELS.openProject, null, DISCARD)).toEqual({
+    outcome: "ok",
+  });
+  expect(fake.current().openProjectId).toBeNull();
+  expect(chat.calls).toEqual([
+    { method: "switchProject", id: null, options: KEEP },
+    { method: "switchProject", id: null, options: DISCARD },
+  ]);
+});
+
+test("closing the open project waits too, and goes ahead once the person discards the messages", () => {
+  const fake = fakeService();
+  const chat = waitingSwitcher(fake.service, MAX_PENDING_CHAT_MESSAGES);
+  const actions = createWorkspaceActions(fake.service, chat.switcher);
+
+  expect(actions.openProject(null)).toEqual({
+    outcome: "waiting",
+    count: MAX_PENDING_CHAT_MESSAGES,
+  });
+  expect(fake.current().openProjectId).toBe(PROJECT_ID);
+  expect(actions.openProject(null, { discardWaiting: true })).toEqual({
+    outcome: "ok",
+  });
+  expect(fake.current().openProjectId).toBeNull();
+  // An ID that the protocol refuses never reaches the wrappers.
+  expect(actions.openProject("not-an-id", { discardWaiting: true })).toEqual(
+    NOT_FOUND,
+  );
+  expect(chat.calls.map(({ options }) => options)).toEqual([KEEP, DISCARD]);
+});
+
+test("a switch beyond the budget never reaches the wrappers, so no waiting message is dropped, and a switch that waits does not count", () => {
+  const fake = fakeService();
+  const chat = waitingSwitcher(fake.service, 2);
+  let clock = 0;
+  const actions = createWorkspaceActions(
+    fake.service,
+    chat.switcher,
+    () => clock,
+  );
+
+  // Questions that change nothing never use the budget.
+  for (let index = 0; index < WORKSPACE_SWITCH_BUDGET * 2; index += 1) {
+    clock += 1;
+    expect(actions.selectWorkspace(OTHER_WORKSPACE_ID)).toEqual({
+      outcome: "waiting",
+      count: 2,
+    });
+  }
+  // The budget is then used up by switches without waiting messages.
+  expect(
+    actions.selectWorkspace(OTHER_WORKSPACE_ID, { discardWaiting: true }),
+  ).toEqual({ outcome: "ok" });
+  for (let index = 1; index < WORKSPACE_SWITCH_BUDGET; index += 1) {
+    clock += 1;
+    expect(
+      actions.selectWorkspace(
+        index % 2 === 0 ? OTHER_WORKSPACE_ID : WORKSPACE_ID,
+      ),
+    ).toEqual({ outcome: "ok" });
+  }
+  const before = chat.calls.length;
+  expect(
+    actions.selectWorkspace(
+      fake.current().selectedWorkspaceId === WORKSPACE_ID
+        ? OTHER_WORKSPACE_ID
+        : WORKSPACE_ID,
+      { discardWaiting: true },
+    ),
+  ).toEqual(TOO_SOON);
+  expect(chat.calls).toHaveLength(before);
+});
+
+test("the count of a waiting switch is capped at the most messages that can wait, as the chat service holds them", () => {
+  expect(MAX_WAITING_CHAT_MESSAGES).toBe(MAX_PENDING_CHAT_MESSAGES);
+  const fake = fakeService();
+  const actions = createWorkspaceActions(fake.service, {
+    selectWorkspace: () => ({ kind: "waiting", count: 1_000 }),
+    switchProject: () => ({ kind: "waiting", count: 1_000 }),
+  });
+
+  expect(actions.selectWorkspace(OTHER_WORKSPACE_ID)).toEqual({
+    outcome: "waiting",
+    count: MAX_WAITING_CHAT_MESSAGES,
+  });
+  expect(actions.openProject(null)).toEqual({
+    outcome: "waiting",
+    count: MAX_WAITING_CHAT_MESSAGES,
   });
 });
 

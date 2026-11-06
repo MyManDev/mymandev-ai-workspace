@@ -1,6 +1,9 @@
 import type {
   AccountStatus,
   AgentActivityView,
+  ChatLoadOlderResultView,
+  ChatSendResultView,
+  ChatView,
   ConnectionStatus,
   ForgetResult,
   ListDevicesResult,
@@ -14,6 +17,7 @@ import type {
   StartSignInResult,
   UnlockResult,
   WorkspaceActionResult,
+  WorkspaceSwitchOptions,
   WorkspaceView,
 } from "./ipc-contract.ts";
 
@@ -40,6 +44,8 @@ export interface DesktopBridge {
   readonly workspaces: WorkspaceBridge;
   /** The agent activity of the open project, read-only. */
   readonly agents: AgentBridge;
+  /** The chat of the open project. */
+  readonly chat: ChatBridge;
 }
 
 export interface RuntimeBridge {
@@ -196,18 +202,29 @@ export interface WorkspaceBridge {
    * another workspace (`WORKSPACE_SWITCH_BUDGET` per minute); selecting the
    * selected workspace is not counted. The main process accepts only a
    * lowercase UUIDv7.
+   *
+   * While chat messages wait to be sent, nothing changes and it resolves to
+   * `waiting` with their count: the renderer asks the person, and repeats
+   * the switch with `{ discardWaiting: true }` to drop them. The bridge
+   * passes on only that fixed option of its own, nothing else from the
+   * renderer.
    */
-  readonly select: (workspaceId: string) => Promise<WorkspaceActionResult>;
+  readonly select: (
+    workspaceId: string,
+    options?: WorkspaceSwitchOptions,
+  ) => Promise<WorkspaceActionResult>;
   /**
    * Opens a project of the selected workspace, or closes the open one with
    * null. Resolves to `refused` with `not_found` for a project that the
-   * selected workspace does not hold. The main process closes the open
+   * selected workspace does not hold, and to `waiting` while chat messages
+   * wait to be sent, like `select`. The main process closes the open
    * project itself when a new page commits, also on a reload, when the page
    * fails to load, when the render process is gone, and when the window
    * closes.
    */
   readonly openProject: (
     projectId: string | null,
+    options?: WorkspaceSwitchOptions,
   ) => Promise<WorkspaceActionResult>;
 }
 
@@ -231,4 +248,55 @@ export interface AgentBridge {
     listener: (state: AgentActivityView) => void,
     onError?: () => void,
   ) => () => void;
+}
+
+/**
+ * The chat of the open project, which the main process holds. The renderer
+ * gets the newest messages that fit the view's limits, each author as a
+ * display name, never as a member ID, and the person's messages that the
+ * server has not stored yet, by their event IDs. It can send a message,
+ * retry or discard one that waits, and load older messages.
+ */
+export interface ChatBridge {
+  /** The current chat state. */
+  readonly getState: () => Promise<ChatView>;
+  /**
+   * Calls `listener` with the current chat state and then after changes,
+   * at most once every 50 ms with the latest one. A state older than the
+   * last one delivered is dropped. `onError` is called when the main
+   * process refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: ChatView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Sends a message to the open project's chat. Resolves to `accepted`
+   * with its event ID, after which it shows in `pending` until the server
+   * stores it, or to `refused` with a reason. The main process applies the
+   * protocol's rules to the text: a carriage return becomes a line feed,
+   * and a blank text, more than 16,000 characters, or a control, format, or
+   * invisible character is refused. The bridge passes on only a string.
+   */
+  readonly send: (text: string) => Promise<ChatSendResultView>;
+  /**
+   * Tries a message that shows as not sent again, by its event ID.
+   * Resolves to false for any other message.
+   */
+  readonly retry: (eventId: string) => Promise<boolean>;
+  /**
+   * Drops a message that waits or shows as not sent, by its event ID.
+   * Resolves to false for a message that is being sent and for an unknown
+   * one.
+   */
+  readonly discard: (eventId: string) => Promise<boolean>;
+  /**
+   * Loads the page of messages older than the held ones. Resolves to
+   * `none` when there is nothing older to load or the view cannot show
+   * more, to `busy` while a page is on its way, and to `too_soon` for a
+   * few seconds after an older page did not load (a minute after the
+   * server asked to wait).
+   */
+  readonly loadOlder: () => Promise<ChatLoadOlderResultView>;
 }

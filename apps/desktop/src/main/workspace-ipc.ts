@@ -1,10 +1,17 @@
 import { ProjectIdSchema, WorkspaceIdSchema } from "@mymandev/protocol";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import {
+  MAX_WAITING_CHAT_MESSAGES,
   WORKSPACE_LIMITS,
   type WorkspaceActionResult,
+  type WorkspaceSwitchOptions,
   type WorkspaceView,
 } from "../shared/ipc-contract.ts";
+import type {
+  ChatService,
+  ChatSwitchOptions,
+  ChatSwitchResult,
+} from "./chat/service.ts";
 import {
   createEventPublisher,
   createInvokeHandler,
@@ -20,6 +27,12 @@ const NOT_FOUND: WorkspaceActionResult = Object.freeze({
 const TOO_SOON: WorkspaceActionResult = Object.freeze({
   outcome: "refused",
   reason: "too_soon",
+});
+const KEEP_WAITING: ChatSwitchOptions = Object.freeze({
+  discardWaiting: false,
+});
+const DISCARD_WAITING: ChatSwitchOptions = Object.freeze({
+  discardWaiting: true,
 });
 
 /** `name`, cut to `WORKSPACE_LIMITS.name` characters (code points). */
@@ -77,37 +90,73 @@ export const WORKSPACE_SWITCH_WINDOW_MS = 60_000;
 
 /** The renderer's actions on the workspace service. */
 export interface WorkspaceActions {
-  readonly selectWorkspace: (workspaceId: string) => WorkspaceActionResult;
-  readonly openProject: (projectId: string | null) => WorkspaceActionResult;
+  readonly selectWorkspace: (
+    workspaceId: string,
+    options?: WorkspaceSwitchOptions,
+  ) => WorkspaceActionResult;
+  readonly openProject: (
+    projectId: string | null,
+    options?: WorkspaceSwitchOptions,
+  ) => WorkspaceActionResult;
+}
+
+/**
+ * The chat service's switch wrappers (chat/service.ts). While chat messages
+ * wait to be sent, they answer `waiting` with the count and change nothing,
+ * unless `discardWaiting` drops the messages first; otherwise they call the
+ * workspace service's `select` or `openProject`.
+ */
+export type WorkspaceSwitcher = Pick<
+  ChatService,
+  "selectWorkspace" | "switchProject"
+>;
+
+function switchResult(result: ChatSwitchResult): WorkspaceActionResult {
+  switch (result.kind) {
+    case "switched":
+      return OK;
+    case "waiting":
+      return Object.freeze({
+        outcome: "waiting",
+        count: Math.min(result.count, MAX_WAITING_CHAT_MESSAGES),
+      });
+    case "refused":
+      return NOT_FOUND;
+  }
 }
 
 /**
  * The renderer's two actions, in one place. Each checks its ID with the
  * protocol's ID schema, after the contract's own check, and refuses
- * anything else before the service is asked. A switch to another workspace
- * also counts against `WORKSPACE_SWITCH_BUDGET`. The chat service (a later
- * part) routes these actions through its own wrappers, which ask the person
- * before a switch while chat messages wait to be sent, and so keeps the
- * checks and the budget. `now` is a monotonic clock in milliseconds.
+ * anything else before anything is asked. A switch to another workspace
+ * also counts against `WORKSPACE_SWITCH_BUDGET`, before the question, so a
+ * switch beyond the budget never drops a waiting message. Every switch then
+ * goes through the chat service's wrappers (`switcher`), which answer
+ * `waiting` while chat messages wait to be sent, unless the option
+ * `discardWaiting` says that the person chose to discard them (the Project
+ * Manager's decision of 2026-11-05 on #27). Only a switch that happened
+ * counts against the budget. `now` is a monotonic clock in milliseconds.
  */
 export function createWorkspaceActions(
-  service: Pick<
-    WorkspaceService,
-    "state" | "select" | "openProject" | "selectedWorkspaceId"
-  >,
+  service: Pick<WorkspaceService, "state" | "selectedWorkspaceId">,
+  switcher: WorkspaceSwitcher,
   now: () => number = () => performance.now(),
 ): WorkspaceActions {
   /** When the switches within the budget's window were accepted, oldest first. */
   const switches: number[] = [];
 
   return Object.freeze({
-    selectWorkspace: (value: string) => {
+    selectWorkspace: (value: string, options?: WorkspaceSwitchOptions) => {
       const workspaceId = WorkspaceIdSchema.safeParse(value);
       if (!workspaceId.success) {
         return NOT_FOUND;
       }
+      const switchOptions =
+        options?.discardWaiting === true ? DISCARD_WAITING : KEEP_WAITING;
       if (workspaceId.data === service.selectedWorkspaceId()) {
-        return service.select(workspaceId.data) ? OK : NOT_FOUND;
+        return switchResult(
+          switcher.selectWorkspace(workspaceId.data, switchOptions),
+        );
       }
       // A workspace that the list does not hold is refused as not found
       // before the budget, which counts switches only.
@@ -127,19 +176,21 @@ export function createWorkspaceActions(
       if (switches.length >= WORKSPACE_SWITCH_BUDGET) {
         return TOO_SOON;
       }
-      if (!service.select(workspaceId.data)) {
-        return NOT_FOUND;
+      const result = switcher.selectWorkspace(workspaceId.data, switchOptions);
+      if (result.kind === "switched") {
+        switches.push(at);
       }
-      switches.push(at);
-      return OK;
+      return switchResult(result);
     },
-    openProject: (value: string | null) => {
+    openProject: (value: string | null, options?: WorkspaceSwitchOptions) => {
+      const switchOptions =
+        options?.discardWaiting === true ? DISCARD_WAITING : KEEP_WAITING;
       if (value === null) {
-        return service.openProject(null) ? OK : NOT_FOUND;
+        return switchResult(switcher.switchProject(null, switchOptions));
       }
       const projectId = ProjectIdSchema.safeParse(value);
-      return projectId.success && service.openProject(projectId.data)
-        ? OK
+      return projectId.success
+        ? switchResult(switcher.switchProject(projectId.data, switchOptions))
         : NOT_FOUND;
     },
   });
@@ -149,19 +200,20 @@ export function createWorkspaceActions(
  * Registers the handlers of the workspace channels and sends each change of
  * the workspace state to the frames that subscribed. Every handler checks
  * the sender and the arguments first (`createInvokeHandler`): `select` takes
- * exactly one workspace ID and `openProject` exactly one project ID or
- * null, each a lowercase UUIDv7, and the actions check the ID with the
- * protocol as well, and a switch counts against the budget. Only IDs,
- * names, and fixed codes reach the renderer. Call it before the first
- * window loads. `now` is the budget's monotonic clock.
+ * one workspace ID and `openProject` one project ID or null, each a
+ * lowercase UUIDv7, and each may take the switch option `{ discardWaiting
+ * }` as well. The actions check the ID with the protocol, a switch counts
+ * against the budget, and every switch goes through the chat service's
+ * wrappers (`switcher`), which answer `waiting` while chat messages wait to
+ * be sent. Only IDs, names, counts, and fixed codes reach the renderer.
+ * Call it before the first window loads. `now` is the budget's monotonic
+ * clock.
  */
 export function registerWorkspaceIpc(
   ipc: IpcRegistry,
   appUrl: string,
-  service: Pick<
-    WorkspaceService,
-    "state" | "onChange" | "select" | "openProject" | "selectedWorkspaceId"
-  >,
+  service: Pick<WorkspaceService, "state" | "onChange" | "selectedWorkspaceId">,
+  switcher: WorkspaceSwitcher,
   onError: (message: string, error: unknown) => void = (message, error) =>
     console.error(message, error),
   now?: () => number,
@@ -170,7 +222,7 @@ export function registerWorkspaceIpc(
     EVENT_CHANNELS.workspaceStateChanged,
     appUrl,
   );
-  const actions = createWorkspaceActions(service, now);
+  const actions = createWorkspaceActions(service, switcher, now);
 
   ipc.handle(
     INVOKE_CHANNELS.getWorkspaceState,
@@ -194,15 +246,17 @@ export function registerWorkspaceIpc(
     createInvokeHandler(
       INVOKE_CHANNELS.selectWorkspace,
       appUrl,
-      (_event, [workspaceId]) => actions.selectWorkspace(workspaceId),
+      (_event, args) =>
+        actions.selectWorkspace(
+          args[0],
+          args.length === 2 ? args[1] : undefined,
+        ),
     ),
   );
   ipc.handle(
     INVOKE_CHANNELS.openProject,
-    createInvokeHandler(
-      INVOKE_CHANNELS.openProject,
-      appUrl,
-      (_event, [projectId]) => actions.openProject(projectId),
+    createInvokeHandler(INVOKE_CHANNELS.openProject, appUrl, (_event, args) =>
+      actions.openProject(args[0], args.length === 2 ? args[1] : undefined),
     ),
   );
   service.onChange((state) => {
@@ -253,7 +307,8 @@ export interface WorkspacePageWindow {
  * shows it. The start of a load alone changes nothing, because a dropped
  * file or a blocked link starts one that is then cancelled. The workspace
  * selection stays. It calls the service directly, without the renderer's
- * actions, because no screen is left to ask the person.
+ * actions, because no screen is left to ask the person, so chat messages
+ * that wait to be sent are dropped.
  */
 export function closeProjectWithPage(
   window: WorkspacePageWindow,

@@ -58,12 +58,13 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, and the agent functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the agent, and the chat functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
     "account",
     "agents",
+    "chat",
     "connection",
     "electronVersion",
     "repositories",
@@ -106,6 +107,14 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "getState",
     "subscribeState",
   ]);
+  expect(Object.keys(bridge.chat).sort()).toEqual([
+    "discard",
+    "getState",
+    "loadOlder",
+    "retry",
+    "send",
+    "subscribeState",
+  ]);
   expect(bridge.electronVersion).toBe("44.9.1");
   expect(Object.isFrozen(bridge)).toBe(true);
   expect(Object.isFrozen(bridge.runtime)).toBe(true);
@@ -114,6 +123,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   expect(Object.isFrozen(bridge.connection)).toBe(true);
   expect(Object.isFrozen(bridge.workspaces)).toBe(true);
   expect(Object.isFrozen(bridge.agents)).toBe(true);
+  expect(Object.isFrozen(bridge.chat)).toBe(true);
   for (const value of [
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
@@ -121,6 +131,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
     ...Object.values(bridge.agents),
+    ...Object.values(bridge.chat),
   ]) {
     expect(typeof value).toBe("function");
   }
@@ -137,6 +148,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
     ...Object.values(bridge.agents),
+    ...Object.values(bridge.chat),
   ] as unknown[];
 
   expect(values).not.toContain(ipc);
@@ -664,6 +676,49 @@ test("openProject passes only the project ID string or null on", async () => {
   ]);
 });
 
+test("select and openProject pass on only their own fixed option, and only when the renderer asks to discard the waiting messages", async () => {
+  const fake = fakeIpc();
+  const workspaces = createDesktopBridge("44.9.1", fake.ipc)
+    .workspaces as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const asked = { discardWaiting: true, force: true };
+
+  void workspaces["select"]?.(WORKSPACE_ID, asked);
+  void workspaces["openProject"]?.(PROJECT_ID, { discardWaiting: true });
+  void workspaces["openProject"]?.(null, { discardWaiting: true }, "extra");
+  for (const option of [
+    { discardWaiting: false },
+    { discardWaiting: "true" },
+    { discardWaiting: 1 },
+    {},
+    true,
+    null,
+    "discard",
+  ]) {
+    void workspaces["select"]?.(WORKSPACE_ID, option);
+    void workspaces["openProject"]?.(PROJECT_ID, option);
+  }
+
+  const discard = { discardWaiting: true };
+  expect(fake.invoked.slice(0, 3)).toEqual([
+    { channel: INVOKE_CHANNELS.selectWorkspace, args: [WORKSPACE_ID, discard] },
+    { channel: INVOKE_CHANNELS.openProject, args: [PROJECT_ID, discard] },
+    { channel: INVOKE_CHANNELS.openProject, args: [null, discard] },
+  ]);
+  // The option is the bridge's own frozen object, never the renderer's.
+  const sent = fake.invoked[0]?.args[1];
+  expect(sent).not.toBe(asked);
+  expect(Object.isFrozen(sent)).toBe(true);
+  expect(fake.invoked.slice(3)).toEqual(
+    Array.from({ length: 7 }, () => [
+      { channel: INVOKE_CHANNELS.selectWorkspace, args: [WORKSPACE_ID] },
+      { channel: INVOKE_CHANNELS.openProject, args: [PROJECT_ID] },
+    ]).flat(),
+  );
+});
+
 test("select and openProject refuse a value of another type without calling the main process", async () => {
   const fake = fakeIpc();
   const workspaces = createDesktopBridge("44.9.1", fake.ipc)
@@ -786,6 +841,130 @@ test("the agent subscription delivers the activity and every newer one, without 
   );
   fake.emit(EVENT_CHANNELS.agentStateChanged, { status: "ready", revision: 5 });
   expect(reported).toEqual(["An agent activity callback failed."]);
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+  expect(refused).toBe(1);
+});
+
+const EVENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000003001";
+
+test("the chat state and load-older call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const chat = createDesktopBridge("44.9.1", fake.ipc)
+    .chat as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const empty = { status: "no_project", revision: 0 };
+
+  const answers = [
+    chat["getState"]?.("chat:send", "Hello"),
+    chat["loadOlder"]?.(5, { beforeSeq: 1 }),
+  ];
+  fake.answers[0]?.resolve(empty);
+  fake.answers[1]?.resolve("started");
+
+  await expect(Promise.all(answers)).resolves.toEqual([empty, "started"]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getChatState, args: [] },
+    { channel: INVOKE_CHANNELS.loadOlderChatMessages, args: [] },
+  ]);
+});
+
+test("send passes only the text string on, and retry and discard only the event ID string", async () => {
+  const fake = fakeIpc();
+  const chat = createDesktopBridge("44.9.1", fake.ipc)
+    .chat as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  const answers = [
+    chat["send"]?.("Hello\r\nthere", { projectId: "other" }),
+    chat["retry"]?.(EVENT_ID, "extra"),
+    chat["discard"]?.(EVENT_ID, EVENT_ID),
+  ];
+  fake.answers[0]?.resolve({ outcome: "accepted", eventId: EVENT_ID });
+  fake.answers[1]?.resolve(true);
+  fake.answers[2]?.resolve(false);
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    { outcome: "accepted", eventId: EVENT_ID },
+    true,
+    false,
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.sendChatMessage, args: ["Hello\r\nthere"] },
+    { channel: INVOKE_CHANNELS.retryChatMessage, args: [EVENT_ID] },
+    { channel: INVOKE_CHANNELS.discardChatMessage, args: [EVENT_ID] },
+  ]);
+});
+
+test("send, retry, and discard refuse a value of another type without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const chat = createDesktopBridge("44.9.1", fake.ipc)
+    .chat as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  for (const name of ["send", "retry", "discard"]) {
+    for (const value of [
+      undefined,
+      null,
+      1,
+      { text: "secret" },
+      ["secret"],
+      new String("secret"),
+    ]) {
+      const answer = chat[name]?.(value);
+      await expect(answer).rejects.toThrow(TypeError);
+      await answer?.catch((error: unknown) => {
+        expect(String(error)).not.toContain("secret");
+      });
+    }
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("the chat subscription delivers the state and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const calls: unknown[][] = [];
+  const reported: string[] = [];
+  const unsubscribe = bridge.chat.subscribeState((...args) => calls.push(args));
+
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeChatState, args: [] },
+  ]);
+  fake.answers[0]?.resolve({ status: "loading", revision: 3 });
+  await settle();
+  fake.emit(EVENT_CHANNELS.chatStateChanged, { status: "ready", revision: 4 });
+  fake.emit(EVENT_CHANNELS.chatStateChanged, {
+    status: "loading",
+    revision: 2,
+  });
+  expect(calls).toEqual([
+    [{ status: "loading", revision: 3 }],
+    [{ status: "ready", revision: 4 }],
+  ]);
+  unsubscribe();
+  expect(fake.listenerCount(EVENT_CHANNELS.chatStateChanged)).toBe(0);
+
+  const failing = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  let refused = 0;
+  failing.chat.subscribeState(
+    () => {
+      throw new Error("broken");
+    },
+    () => {
+      refused += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.chatStateChanged, { status: "ready", revision: 5 });
+  expect(reported).toEqual(["A chat state callback failed."]);
   fake.answers[1]?.reject(new Error("refused"));
   await settle();
   expect(refused).toBe(1);
