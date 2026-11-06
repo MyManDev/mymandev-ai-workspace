@@ -61,6 +61,7 @@ import {
   closeProjectWithPage,
   closeWithWaitingConfirmed,
   closeWithWaitingMessage,
+  followQuitRequests,
   registerWorkspaceIpc,
 } from "./workspace-ipc.ts";
 
@@ -278,10 +279,7 @@ function start(): void {
   // A quit, for example with Cmd+Q on macOS, closes the window first. When
   // the person confirms closing it with waiting chat messages, the quit is
   // carried out once the window has closed, because the held close ended it.
-  let quitRequested = false;
-  app.on("before-quit", () => {
-    quitRequested = true;
-  });
+  const quits = followQuitRequests(app);
 
   function showMainWindow(): void {
     if (mainWindow !== undefined) {
@@ -305,21 +303,15 @@ function start(): void {
     askBeforeClosingWithWaitingMessages(
       window,
       () => chat.state().pending.length,
-      async (count) => {
-        const quitting = quitRequested;
-        quitRequested = false;
-        const closing = closeWithWaitingConfirmed(
+      async (count) =>
+        closeWithWaitingConfirmed(
           await dialog.showMessageBox(window, {
             ...CLOSE_WITH_WAITING_CONFIRMATION,
             buttons: [...CLOSE_WITH_WAITING_CONFIRMATION.buttons],
             message: closeWithWaitingMessage(count),
           }),
-        );
-        if (closing && quitting) {
-          window.once("closed", () => app.quit());
-        }
-        return closing;
-      },
+        ),
+      quits,
     );
     window.on("closed", () => {
       mainWindow = undefined;

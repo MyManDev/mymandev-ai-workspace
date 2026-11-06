@@ -49,6 +49,7 @@ import {
   closeWithWaitingConfirmed,
   closeWithWaitingMessage,
   createWorkspaceActions,
+  followQuitRequests,
   NAVIGATION_ABORTED,
   registerWorkspaceIpc,
   WORKSPACE_SWITCH_BUDGET,
@@ -940,12 +941,15 @@ test("the count of a waiting switch is capped at the most messages that can wait
 /**
  * A window whose events the test fires with Electron's arguments, like
  * Electron's after "closed". `close` fires "close" and then "closed",
- * unless a listener prevented it, as Electron does.
+ * unless a listener prevented it, as Electron does. It records the calls
+ * that bring it to the front.
  */
 function fakeWindow() {
   const listeners = new Map<string, ((...args: never[]) => void)[]>();
   let destroyed = false;
   let closeCalls = 0;
+  let minimized = false;
+  const calls: string[] = [];
   const add = (event: string, listener: (...args: never[]) => void) => {
     listeners.set(event, [...(listeners.get(event) ?? []), listener]);
   };
@@ -979,6 +983,16 @@ function fakeWindow() {
       return contents;
     },
     on: add,
+    once: (event: string, listener: (...args: never[]) => void) => {
+      const once = (...args: never[]) => {
+        listeners.set(
+          event,
+          (listeners.get(event) ?? []).filter((entry) => entry !== once),
+        );
+        listener(...args);
+      };
+      add(event, once);
+    },
     close: () => {
       if (destroyed) {
         throw new Error("Object has been destroyed");
@@ -987,6 +1001,17 @@ function fakeWindow() {
       tryClose();
     },
     isDestroyed: () => destroyed,
+    isMinimized: () => minimized,
+    restore: () => {
+      calls.push("restore");
+      minimized = false;
+    },
+    show: () => {
+      calls.push("show");
+    },
+    focus: () => {
+      calls.push("focus");
+    },
   };
   return {
     window,
@@ -994,6 +1019,10 @@ function fakeWindow() {
     fire,
     tryClose,
     closeCalls: () => closeCalls,
+    minimize: () => {
+      minimized = true;
+    },
+    calls,
   };
 }
 
@@ -1139,33 +1168,64 @@ function fakeQuestion() {
   };
 }
 
+/**
+ * An application whose quits the test begins, as Electron does: "before-quit"
+ * and then a close of the window, which a listener may hold.
+ */
+function fakeApp(page?: ReturnType<typeof fakeWindow>) {
+  const beforeQuit: (() => void)[] = [];
+  const app = {
+    quits: 0,
+    on: (_event: "before-quit", listener: () => void) => {
+      beforeQuit.push(listener);
+    },
+    quit: () => {
+      app.quits += 1;
+      for (const listener of beforeQuit) {
+        listener();
+      }
+      if (page !== undefined && !page.window.isDestroyed()) {
+        page.tryClose();
+      }
+    },
+  };
+  return app;
+}
+
 function settle(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-test("without waiting chat messages the window closes at once, and the open project with it", () => {
+/** The window, its question, and the application, wired as index.ts does. */
+function closing(waiting: () => number) {
   const fake = fakeService();
   const page = fakeWindow();
   const question = fakeQuestion();
+  const app = fakeApp(page);
+  const errors: string[] = [];
   closeProjectWithPage(page.window, fake.service);
-  askBeforeClosingWithWaitingMessages(page.window, () => 0, question.confirm);
+  askBeforeClosingWithWaitingMessages(
+    page.window,
+    waiting,
+    question.confirm,
+    followQuitRequests(app),
+    (message) => errors.push(message),
+  );
+  return { fake, page, question, app, errors };
+}
+
+test("without waiting chat messages the window closes at once, and the open project with it", () => {
+  const { fake, page, question } = closing(() => 0);
 
   expect(page.tryClose()).toBe(true);
   expect(question.asked).toEqual([]);
+  expect(page.calls).toEqual([]);
   expect(fake.current().openProjectId).toBeNull();
 });
 
 test("with waiting chat messages the close is held and asked once; keeping them keeps the window open, and the next close asks again", async () => {
-  const fake = fakeService();
-  const page = fakeWindow();
-  const question = fakeQuestion();
   let waiting = 3;
-  closeProjectWithPage(page.window, fake.service);
-  askBeforeClosingWithWaitingMessages(
-    page.window,
-    () => waiting,
-    question.confirm,
-  );
+  const { fake, page, question } = closing(() => waiting);
 
   expect(page.tryClose()).toBe(false);
   // A second close while the question is open is held without a second one.
@@ -1184,11 +1244,7 @@ test("with waiting chat messages the close is held and asked once; keeping them 
 });
 
 test("choosing to close closes the window without asking again, and the open project closes with it", async () => {
-  const fake = fakeService();
-  const page = fakeWindow();
-  const question = fakeQuestion();
-  closeProjectWithPage(page.window, fake.service);
-  askBeforeClosingWithWaitingMessages(page.window, () => 2, question.confirm);
+  const { fake, page, question, app } = closing(() => 2);
 
   expect(page.tryClose()).toBe(false);
   question.answers[0]?.resolve(true);
@@ -1198,37 +1254,93 @@ test("choosing to close closes the window without asking again, and the open pro
   expect(question.asked).toEqual([2]);
   expect(fake.calls).toEqual([{ method: "openProject", args: [null] }]);
   expect(fake.current().openProjectId).toBeNull();
+  // Without a quit, closing the window does not quit.
+  expect(app.quits).toBe(0);
 });
 
-test("a failed question is reported and the window still closes; a destroyed window is not closed again", async () => {
-  const errors: string[] = [];
-  const page = fakeWindow();
-  const question = fakeQuestion();
-  askBeforeClosingWithWaitingMessages(
-    page.window,
-    () => 1,
-    question.confirm,
-    (message) => errors.push(message),
-  );
+test("the question brings the window to the front first, restoring it when it is minimized", () => {
+  const shown = closing(() => 1);
+  expect(shown.page.tryClose()).toBe(false);
+  expect(shown.page.calls).toEqual(["show", "focus"]);
 
+  const minimized = closing(() => 1);
+  minimized.page.minimize();
+  expect(minimized.page.tryClose()).toBe(false);
+  expect(minimized.page.calls).toEqual(["restore", "show", "focus"]);
+  expect(minimized.question.asked).toEqual([1]);
+});
+
+test("a quit that the held close ended goes ahead after Close, once the window closed", async () => {
+  const { page, question, app } = closing(() => 2);
+
+  app.quit();
+  expect(page.events()).toContain("close");
+  expect(question.asked).toEqual([2]);
+  expect(page.window.isDestroyed()).toBe(false);
+
+  question.answers[0]?.resolve(true);
+  await settle();
+  expect(page.window.isDestroyed()).toBe(true);
+  expect(app.quits).toBe(2);
+});
+
+test("a quit that begins while the question is open counts when it is answered", async () => {
+  // The close button, then Cmd+Q while the dialog is open, then Close.
+  const closed = closing(() => 1);
+  expect(closed.page.tryClose()).toBe(false);
+  closed.app.quit();
+  expect(closed.question.asked).toEqual([1]);
+  closed.question.answers[0]?.resolve(true);
+  await settle();
+  expect(closed.page.window.isDestroyed()).toBe(true);
+  expect(closed.app.quits).toBe(2);
+
+  // The same with Keep: the quit is forgotten, so a later Close only closes.
+  const kept = closing(() => 1);
+  expect(kept.page.tryClose()).toBe(false);
+  kept.app.quit();
+  kept.question.answers[0]?.resolve(false);
+  await settle();
+  expect(kept.page.window.isDestroyed()).toBe(false);
+  expect(kept.page.tryClose()).toBe(false);
+  kept.question.answers[1]?.resolve(true);
+  await settle();
+  expect(kept.page.window.isDestroyed()).toBe(true);
+  expect(kept.app.quits).toBe(1);
+});
+
+test("a failed question is reported, the window still closes, and a quit still goes ahead", async () => {
+  const { page, question, errors } = closing(() => 1);
   expect(page.tryClose()).toBe(false);
   question.answers[0]?.reject(new Error("The dialog failed."));
   await settle();
   expect(errors).toEqual(["Asking before closing the window failed."]);
   expect(page.closeCalls()).toBe(1);
 
-  const other = fakeWindow();
-  const otherQuestion = fakeQuestion();
-  askBeforeClosingWithWaitingMessages(
-    other.window,
-    () => 1,
-    otherQuestion.confirm,
-  );
-  expect(other.tryClose()).toBe(false);
-  other.fire("closed");
-  otherQuestion.answers[0]?.resolve(true);
+  const quitting = closing(() => 1);
+  quitting.app.quit();
+  quitting.question.answers[0]?.reject(new Error("The dialog failed."));
   await settle();
-  expect(other.closeCalls()).toBe(0);
+  expect(quitting.page.window.isDestroyed()).toBe(true);
+  expect(quitting.app.quits).toBe(2);
+});
+
+test("a window destroyed meanwhile is not closed again, and a quit still goes ahead", async () => {
+  const plain = closing(() => 1);
+  expect(plain.page.tryClose()).toBe(false);
+  plain.page.fire("closed");
+  plain.question.answers[0]?.resolve(true);
+  await settle();
+  expect(plain.page.closeCalls()).toBe(0);
+  expect(plain.app.quits).toBe(0);
+
+  const quitting = closing(() => 1);
+  quitting.app.quit();
+  quitting.page.fire("closed");
+  quitting.question.answers[0]?.resolve(true);
+  await settle();
+  expect(quitting.page.closeCalls()).toBe(0);
+  expect(quitting.app.quits).toBe(2);
 });
 
 test("the confirmation offers Close as the default and Keep as the cancel, with the count in its message", () => {

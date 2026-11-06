@@ -6,6 +6,7 @@ import {
   CHAT_NOT_SENT_REASONS,
   CHAT_PROBLEMS,
   CHAT_SEND_REFUSALS,
+  ChatSendTextSchema,
   type ChatLoadOlderResultView,
   type ChatSendResultView,
   type ChatView,
@@ -22,11 +23,13 @@ import {
   EMPTY_COMPOSER,
   formatChatTime,
   initialChatScreenView,
+  isOverSendLimit,
   LOAD_OLDER_MESSAGES,
   NOT_SENT_REASON_MESSAGES,
   OLDER_PROBLEM_MESSAGES,
   pendingRow,
   SEND_REFUSAL_MESSAGES,
+  SEND_TEXT_LIMIT,
   type ChatComposer,
   type ChatLists,
   type ChatScreenView,
@@ -485,4 +488,41 @@ test("loading older messages asks one at a time and shows the text of its answer
   expect(screen.notices.at(-1)).toBe(CHAT_MESSAGES.loadOlderFailed);
   expect(LOAD_OLDER_MESSAGES.started).toBeUndefined();
   expect(LOAD_OLDER_MESSAGES.busy).toBeUndefined();
+});
+
+test("the send limit is the contract's, counted in characters as the bridge counts them", () => {
+  expect(SEND_TEXT_LIMIT).toBe(CHAT_LIMITS.sendText);
+  for (const text of [
+    "",
+    "x".repeat(SEND_TEXT_LIMIT),
+    "x".repeat(SEND_TEXT_LIMIT + 1),
+    "😀".repeat(SEND_TEXT_LIMIT),
+    "😀".repeat(SEND_TEXT_LIMIT + 1),
+    `${"😀".repeat(SEND_TEXT_LIMIT - 1)}xy`,
+  ]) {
+    expect(isOverSendLimit(text)).toBe(
+      !ChatSendTextSchema.safeParse(text).success,
+    );
+  }
+});
+
+test("a text longer than the bridge takes shows the too-long refusal without a call, and keeps the text", async () => {
+  const { fake, screen, controller } = harness();
+  controller.start();
+  const text = "x".repeat(SEND_TEXT_LIMIT + 1);
+
+  controller.textChanged(text);
+  controller.send();
+  await settle();
+  expect(fake.sends).toEqual([]);
+  expect(screen.composers.at(-1)).toEqual({
+    text,
+    sending: false,
+    notice: SEND_REFUSAL_MESSAGES.too_long,
+  });
+
+  // A text at the limit goes to the main process, which decides.
+  controller.textChanged("😀".repeat(SEND_TEXT_LIMIT));
+  controller.send();
+  expect(fake.sends).toHaveLength(1);
 });

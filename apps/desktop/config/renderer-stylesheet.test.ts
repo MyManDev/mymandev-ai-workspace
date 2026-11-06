@@ -141,6 +141,24 @@ test("the dot of each of the six run states has the existing status color of its
   }
 });
 
+test("a chat message body keeps its line breaks and spaces, and a long word wraps", () => {
+  const rules = rulesWith(".message-body");
+  expect(rules.some((rule) => rule.includes("white-space: pre-wrap;"))).toBe(
+    true,
+  );
+  expect(rules.some((rule) => rule.includes("overflow-wrap: anywhere;"))).toBe(
+    true,
+  );
+  // No rule that names a body sets another white-space.
+  const others = [...CSS.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .filter(([, selectors]) => (selectors ?? "").includes(".message-body"))
+    .flatMap(([, , declarations]) => [
+      ...(declarations ?? "").matchAll(/white-space:\s*([^;]+);/g),
+    ])
+    .map(([, value]) => value);
+  expect(others).toEqual(["pre-wrap"]);
+});
+
 test("the selected navigation item and tab keep a mark in forced colors", () => {
   expect(CSS).toMatch(
     /@media \(forced-colors: active\) \{\s*\.nav-item\[aria-current\],\s*\.panel-tab\[aria-selected="true"\] \{\s*text-decoration: underline;/,

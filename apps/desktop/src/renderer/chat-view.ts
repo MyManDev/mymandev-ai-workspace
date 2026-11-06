@@ -84,6 +84,24 @@ export const LOAD_OLDER_MESSAGES: Readonly<
   too_soon: "Wait a moment before loading older messages again.",
 });
 
+/**
+ * The longest text that `send` takes, in characters (code points): the
+ * contract's `CHAT_LIMITS.sendText`, which the bridge enforces. The renderer
+ * imports no values from the contract, so a test checks that they match.
+ */
+export const SEND_TEXT_LIMIT = 64_000;
+
+/**
+ * Whether a text is longer than `send` takes, so that it would be refused
+ * before the main process sees it. The characters are counted only when the
+ * text is longer in UTF-16 code units, which costs nothing for a usual text.
+ */
+export function isOverSendLimit(text: string): boolean {
+  return (
+    text.length > SEND_TEXT_LIMIT && Array.from(text).length > SEND_TEXT_LIMIT
+  );
+}
+
 /** Why a message was not accepted; the text stays in the composer. */
 export const SEND_REFUSAL_MESSAGES: Readonly<Record<ChatSendRefusal, string>> =
   Object.freeze({
@@ -362,10 +380,11 @@ export interface ChatScreenController {
  * - Every state becomes the view; a refused subscription makes the view
  *   unavailable.
  * - A send passes the text on as it is: the main process applies the
- *   protocol's rules. The text cannot change until the answer arrives. It
- *   is cleared only when the send is accepted; a refusal keeps it and
- *   shows the refusal as a fixed text, which the next change of the text
- *   clears.
+ *   protocol's rules. A text longer than the bridge takes shows the
+ *   `too_long` refusal at once, without a call. The text cannot change
+ *   until the answer arrives. It is cleared only when the send is
+ *   accepted; a refusal keeps it and shows the refusal as a fixed text,
+ *   which the next change of the text clears.
  * - Retry and discard change nothing here: the next state shows what
  *   followed.
  * - Loading older messages shows the text of its answer, if any, until a
@@ -425,6 +444,15 @@ export function createChatScreen(
         return;
       }
       const { text } = composer;
+      if (isOverSendLimit(text)) {
+        // The bridge refuses it, and trying again would never help.
+        setComposer({
+          text,
+          sending: false,
+          notice: SEND_REFUSAL_MESSAGES.too_long,
+        });
+        return;
+      }
       setComposer({ text, sending: true, notice: undefined });
       chat.send(text).then(
         (result) => {
