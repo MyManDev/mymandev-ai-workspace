@@ -23,9 +23,15 @@ import { initialAccountView, type AccountView } from "./account-view.ts";
 import { ChatScreen } from "./ChatScreen.tsx";
 import {
   CONNECTION_ACTION_LABELS,
+  CONNECTION_STATUS_TEXT_ID,
+  createDeviceRemoval,
   describeConnectionView,
+  focusesStatus,
+  IDLE_DEVICE_REMOVAL,
   initialConnectionView,
+  type ConnectionAction,
   type ConnectionView,
+  type DeviceRemovalView,
 } from "./connection-status.ts";
 import { JoinScreen } from "./JoinScreen.tsx";
 import {
@@ -114,6 +120,10 @@ export function App({
   const runtimeView = useRuntimeView(runtime);
   const connectionView = useConnectionView(connection);
   const accountView = useAccountView(account);
+  const removal = useDeviceRemoval(account, accountView);
+  const onActionFocus = useConnectionStatusFocus(
+    describeConnectionView(connectionView, accountView).actions,
+  );
   const focusAfterShow = useFocusAfterShow(state.view);
   const open = openProject(state);
 
@@ -124,14 +134,19 @@ export function App({
         <div className="shell-status">
           <ConnectionStatusIndicator
             view={connectionView}
+            account={accountView}
             onReconnect={
               connection === undefined
                 ? undefined
                 : () => {
+                    removal.onReconnect?.();
                     // The status shows what follows; a refusal changes nothing.
                     connection.reconnect().catch(() => undefined);
                   }
             }
+            onRemoveDevice={removal.onRemove}
+            onActionFocus={onActionFocus}
+            removal={removal.view}
           />
           <RuntimeStatusIndicator view={runtimeView} />
         </div>
@@ -313,7 +328,8 @@ function useFocusAfterShow(view: ShellView): (id: string) => void {
 
 /**
  * Follows the account status while the shell is mounted, for the home
- * screen. The account panel follows it on its own while it is shown.
+ * screen and the connection indicator. The account panel follows it on its
+ * own while it is shown.
  */
 function useAccountView(account: AccountBridge | undefined): AccountView {
   const [view, setView] = useState(() =>
@@ -382,32 +398,151 @@ function useConnectionView(
 }
 
 /**
+ * "Remove this device and register again" for the connection indicator,
+ * through the account bridge, while the shell is mounted. The logic is in
+ * `createDeviceRemoval`; the account status and a reconnect from the
+ * header end the message of the last removal.
+ */
+function useDeviceRemoval(
+  account: AccountBridge | undefined,
+  accountView: AccountView,
+): {
+  readonly view: DeviceRemovalView;
+  readonly onRemove: (() => void) | undefined;
+  readonly onReconnect: (() => void) | undefined;
+} {
+  const [view, setView] = useState(IDLE_DEVICE_REMOVAL);
+  const removal = useMemo(
+    () =>
+      account === undefined ? undefined : createDeviceRemoval(account, setView),
+    [account],
+  );
+  useEffect(() => removal?.accountChanged(accountView), [removal, accountView]);
+  return {
+    view,
+    onRemove: removal?.remove,
+    onReconnect: removal?.reconnecting,
+  };
+}
+
+/**
+ * Moves the focus to the connection indicator's status paragraph, without
+ * scrolling, when the header button that had the focus went away with its
+ * action (`focusesStatus`), for example once a removal is confirmed and
+ * the status becomes `offline`, so that the focus does not drop to the
+ * page. The returned function notes which button has the focus. Chromium
+ * fires no blur when it removes the focused element, so the note still
+ * names the button when its action goes. The actions are the frozen lists
+ * of `describeConnectionView`, so only a change runs the check.
+ */
+function useConnectionStatusFocus(
+  actions: readonly ConnectionAction[],
+): (action: ConnectionAction | undefined) => void {
+  const focused = useRef<ConnectionAction | undefined>(undefined);
+  useEffect(() => {
+    const action = focused.current;
+    const active = document.activeElement;
+    if (
+      focusesStatus(
+        action,
+        actions,
+        active === null || active === document.body,
+      )
+    ) {
+      document
+        .getElementById(CONNECTION_STATUS_TEXT_ID)
+        ?.focus({ preventScroll: true });
+    }
+    if (action !== undefined && !actions.includes(action)) {
+      // The focused button went away with its action.
+      focused.current = undefined;
+    }
+  }, [actions]);
+  return useCallback((action: ConnectionAction | undefined) => {
+    focused.current = action;
+  }, []);
+}
+
+/**
  * The connection status in the header: the state, a fixed sentence about
- * the reason, and "Retry now" or "Reconnect here once" where the person can
- * act. A sign-in starts only from the account panel, on the person's click.
+ * the reason, and "Retry now", or "Reconnect here once" and "Remove this
+ * device and register again", where the person can act. An action shows
+ * only with its handler. The main process confirms a removal in a native
+ * dialog; the result's message joins the status. While a removal runs, the
+ * buttons stay focusable and do nothing (`aria-disabled`), so the dialog
+ * gives the focus back to the button (the Project Manager's decision of
+ * 2026-11-06). A sign-in starts only from the account panel, on the
+ * person's click.
  */
 export function ConnectionStatusIndicator({
   view,
+  account,
   onReconnect,
+  onRemoveDevice,
+  onActionFocus,
+  removal = IDLE_DEVICE_REMOVAL,
 }: {
   readonly view: ConnectionView;
+  /** The account status: it decides the sign-in sentence and the actions after `connection_replaced`. */
+  readonly account: AccountView;
   readonly onReconnect?: (() => void) | undefined;
+  readonly onRemoveDevice?: (() => void) | undefined;
+  /**
+   * Gets the action of the button that takes the focus, and undefined when
+   * a button that is still in the page loses it.
+   */
+  readonly onActionFocus?:
+    ((action: ConnectionAction | undefined) => void) | undefined;
+  readonly removal?: DeviceRemovalView | undefined;
 }) {
-  const { tone, label, detail, action } = describeConnectionView(view);
+  const { tone, label, detail, actions } = describeConnectionView(
+    view,
+    account,
+    removal.message,
+  );
+  const handlers: Readonly<Record<ConnectionAction, (() => void) | undefined>> =
+    {
+      retry_now: onReconnect,
+      reconnect_here: onReconnect,
+      remove_and_register: onRemoveDevice,
+    };
   return (
     <div className="connection-status" data-state={tone}>
-      <p className="connection-status-text" role="status">
+      <p
+        className="connection-status-text"
+        id={CONNECTION_STATUS_TEXT_ID}
+        role="status"
+        tabIndex={-1}
+      >
         <span className="connection-status-dot" aria-hidden="true" />
         {label}
         {detail === null ? null : (
           <span className="connection-status-detail">{detail}</span>
         )}
+        {removal.message === undefined ? null : (
+          <span className="connection-status-detail">{removal.message}</span>
+        )}
       </p>
-      {action === null || onReconnect === undefined ? null : (
-        <button type="button" onClick={onReconnect}>
-          {CONNECTION_ACTION_LABELS[action]}
-        </button>
-      )}
+      {actions.map((action) => {
+        const handler = handlers[action];
+        return handler === undefined ? null : (
+          <button
+            key={action}
+            type="button"
+            aria-disabled={removal.running ? "true" : undefined}
+            onClick={removal.running ? undefined : handler}
+            onFocus={() => onActionFocus?.(action)}
+            onBlur={(event) => {
+              // A blur of a button that left the page is not the person's.
+              if (event.currentTarget.isConnected) {
+                onActionFocus?.(undefined);
+              }
+            }}
+          >
+            {CONNECTION_ACTION_LABELS[action]}
+          </button>
+        );
+      })}
     </div>
   );
 }

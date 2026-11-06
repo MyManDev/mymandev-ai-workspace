@@ -26,6 +26,7 @@ import {
   describeDeviceState,
   describeOutcome,
   deviceDetail,
+  deviceSignedIn,
   followAccountStatus,
   forgetMessage,
   initialAccountView,
@@ -720,6 +721,27 @@ test("a sign-in can start now only while it is offered and idle, with a ready ke
   // Each case differs from a status that can start in one way only.
   for (const [name, status] of blocked) {
     expect(canStartSignIn(status), name).toBe(false);
+  }
+});
+
+test("the device is signed in only while the status names its account and the session holds it signed in", () => {
+  const signedIn: AccountStatus = {
+    ...IDLE,
+    lastOutcome: null,
+    account: {
+      kind: "signed_in",
+      login: "octocat",
+      displayName: "The Octocat",
+      deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+    },
+    device: "signed_in",
+  };
+  expect(deviceSignedIn(signedIn)).toBe(true);
+  expect(
+    DEVICE_STATES.filter((device) => deviceSignedIn({ ...signedIn, device })),
+  ).toEqual(["signed_in"]);
+  for (const account of [{ kind: "signed_out" }, { kind: "hidden" }] as const) {
+    expect(deviceSignedIn({ ...signedIn, account }), account.kind).toBe(false);
   }
 });
 

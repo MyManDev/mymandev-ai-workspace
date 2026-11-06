@@ -10,13 +10,32 @@ import type {
   RuntimeBridge,
   WorkspaceBridge,
 } from "../shared/desktop-bridge.ts";
-import type { WorkspaceView } from "../shared/ipc-contract.ts";
+import type {
+  AccountStatus,
+  RemoveDeviceResult,
+  WorkspaceView,
+} from "../shared/ipc-contract.ts";
 import {
   App,
   ConnectionStatusIndicator,
   RuntimeStatusIndicator,
   type AppProps,
 } from "./App.tsx";
+import {
+  DEVICE_ACTION_FAILURE_MESSAGES,
+  DEVICE_ACTION_MESSAGES,
+  type AccountView,
+} from "./account-view.ts";
+import {
+  createDeviceRemoval,
+  IDLE_DEVICE_REMOVAL,
+  OFFLINE_SIGN_IN_DETAIL,
+  REGISTER_AGAIN_MESSAGE,
+  REMOVAL_NOT_DONE,
+  REMOVAL_PENDING_MESSAGE,
+  type ConnectionView,
+  type DeviceRemovalView,
+} from "./connection-status.ts";
 import { WorkspaceNav } from "./Navigation.tsx";
 import {
   createShellState,
@@ -663,6 +682,10 @@ test("the indicator shows the state of the runtime", () => {
   ).toContain('data-state="failed"');
 });
 
+/** The start of the connection indicator's status paragraph. */
+const CONNECTION_STATUS_TEXT =
+  '<p class="connection-status-text" id="connection-status-text" role="status" tabindex="-1">';
+
 test("the header shows the connection status until the first status arrives", () => {
   const connection: ConnectionBridge = {
     getStatus: () => new Promise(() => undefined),
@@ -670,38 +693,62 @@ test("the header shows the connection status until the first status arrives", ()
     reconnect: () => Promise.resolve({ outcome: "reconnecting" }),
   };
   expect(render({ connection })).toContain(
-    '<div class="connection-status" data-state="unknown"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Checking</p></div>',
+    `<div class="connection-status" data-state="unknown">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Checking</p></div>`,
   );
   expect(render()).toContain("Cloud: Unavailable");
 });
+
+const SIGNED_OUT_STATUS: AccountStatus = {
+  revision: 1,
+  account: { kind: "signed_out" },
+  signIn: { kind: "idle" },
+  lastOutcome: null,
+  deviceKey: "ready",
+  replacementPending: false,
+  apiOrigin: "set",
+  device: "no_device",
+};
+
+const SIGNED_IN_STATUS: AccountStatus = {
+  ...SIGNED_OUT_STATUS,
+  account: {
+    kind: "signed_in",
+    login: "octocat",
+    displayName: "The Octocat",
+    deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+  },
+  device: "signed_in",
+};
+
+function knownAccount(status: AccountStatus): AccountView {
+  return { kind: "known", status };
+}
+
+const SIGNED_IN_ACCOUNT = knownAccount(SIGNED_IN_STATUS);
 
 test("the connection indicator shows the state, the reason, and the action of the status", () => {
   expect(
     renderToString(
       <ConnectionStatusIndicator
         view={{ kind: "known", status: { state: "connected", revision: 2 } }}
+        account={SIGNED_IN_ACCOUNT}
         onReconnect={() => undefined}
       />,
     ),
   ).toBe(
-    '<div class="connection-status" data-state="connected"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Connected</p></div>',
+    `<div class="connection-status" data-state="connected">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Connected</p></div>`,
   );
   expect(
     renderToString(
       <ConnectionStatusIndicator
-        view={{
-          kind: "known",
-          status: {
-            state: "stopped",
-            reason: "connection_replaced",
-            revision: 3,
-          },
-        }}
+        view={REPLACED}
+        account={SIGNED_IN_ACCOUNT}
         onReconnect={() => undefined}
+        onRemoveDevice={() => undefined}
       />,
     ),
   ).toBe(
-    '<div class="connection-status" data-state="stopped"><p class="connection-status-text" role="status"><span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">Another installation connected with this device&#x27;s key. The key is in use there.</span></p><button type="button">Reconnect here once</button></div>',
+    `<div class="connection-status" data-state="stopped">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">${REPLACED_DETAIL}</span></p><button type="button">Reconnect here once</button><button type="button">Remove this device and register again</button></div>`,
   );
   // Without the bridge, no action is offered.
   expect(
@@ -716,25 +763,439 @@ test("the connection indicator shows the state, the reason, and the action of th
             revision: 4,
           },
         }}
+        account={SIGNED_IN_ACCOUNT}
       />,
     ),
   ).not.toContain("<button");
 });
 
+const REPLACED: ConnectionView = {
+  kind: "known",
+  status: { state: "stopped", reason: "connection_replaced", revision: 3 },
+};
+
+const REPLACED_DETAIL =
+  "Another installation connected with this device&#x27;s key. The key is in use there. Reconnect here once, or remove this device and register this computer again as a new device.";
+
+/** The status after the client ended connection_replaced (#216). */
+const OFFLINE: ConnectionView = {
+  kind: "known",
+  status: { state: "offline", reason: "not_signed_in", revision: 4 },
+};
+
+/** The labels of the indicator's buttons, with "(inert)" for aria-disabled. */
+function buttonsOf(html: string): string[] {
+  return [...html.matchAll(/<button([^>]*)>([^<]*)<\/button>/g)].map(
+    ([, attributes = "", label = ""]) =>
+      attributes.includes('aria-disabled="true"') ? `${label} (inert)` : label,
+  );
+}
+
+/** The indicator's status paragraph with these sentences after the label. */
+function offlineIndicator(...sentences: readonly string[]): string {
+  const details = sentences
+    .map(
+      (sentence) =>
+        `<span class="connection-status-detail">${escaped(sentence).replaceAll('"', "&quot;")}</span>`,
+    )
+    .join("");
+  return `<div class="connection-status" data-state="offline">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Offline${details}</p></div>`;
+}
+
+test("connection_replaced offers no removal without its handler, and no action without a signed-in device or without both bridges", () => {
+  expect(
+    renderToString(
+      <ConnectionStatusIndicator
+        view={REPLACED}
+        account={SIGNED_IN_ACCOUNT}
+        onReconnect={() => undefined}
+      />,
+    ),
+  ).toBe(
+    `<div class="connection-status" data-state="stopped">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">${REPLACED_DETAIL}</span></p><button type="button">Reconnect here once</button></div>`,
+  );
+  expect(
+    renderToString(
+      <ConnectionStatusIndicator view={REPLACED} account={SIGNED_IN_ACCOUNT} />,
+    ),
+  ).not.toContain("<button");
+  // Without the account bridge, or before its first status, the shell does
+  // not know that the device is signed in.
+  for (const unknownAccount of [
+    { kind: "unavailable" },
+    { kind: "pending" },
+  ] as const) {
+    expect(
+      renderToString(
+        <ConnectionStatusIndicator
+          view={REPLACED}
+          account={unknownAccount}
+          onReconnect={() => undefined}
+          onRemoveDevice={() => undefined}
+        />,
+      ),
+      unknownAccount.kind,
+    ).not.toContain("<button");
+  }
+  expect(render()).not.toContain("Remove this device and register again");
+});
+
+test("while a removal runs, both buttons stay focusable and do nothing (the Project Manager's decision of 2026-11-06)", () => {
+  let reconnects = 0;
+  let removals = 0;
+  const props = {
+    view: REPLACED,
+    account: SIGNED_IN_ACCOUNT,
+    onReconnect: () => {
+      reconnects += 1;
+    },
+    onRemoveDevice: () => {
+      removals += 1;
+    },
+  };
+  const running: DeviceRemovalView = { running: true, message: undefined };
+  const html = renderToString(
+    <ConnectionStatusIndicator {...props} removal={running} />,
+  );
+  expect(html).toBe(
+    `<div class="connection-status" data-state="stopped">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Stopped<span class="connection-status-detail">${REPLACED_DETAIL}</span></p><button type="button" aria-disabled="true">Reconnect here once</button><button type="button" aria-disabled="true">Remove this device and register again</button></div>`,
+  );
+  // Not `disabled`, so the native dialog gives the focus back to a button.
+  expect(html).not.toMatch(/\sdisabled=/);
+  const inert = elementsOf(
+    ConnectionStatusIndicator({ ...props, removal: running }),
+  ).filter((element) => element.type === "button");
+  expect(inert).toHaveLength(2);
+  for (const button of inert) {
+    expect(button.props.onClick).toBeUndefined();
+    button.props.onClick?.();
+  }
+  expect([reconnects, removals]).toEqual([0, 0]);
+
+  // Once the removal ended, both work again.
+  const idle = elementsOf(
+    ConnectionStatusIndicator({ ...props, removal: IDLE_DEVICE_REMOVAL }),
+  ).filter((element) => element.type === "button");
+  for (const button of idle) {
+    button.props.onClick?.();
+  }
+  expect([reconnects, removals]).toEqual([1, 1]);
+  expect(
+    renderToString(<ConnectionStatusIndicator {...props} />),
+  ).not.toContain("aria-disabled");
+});
+
+/** Lets the removal's promise handlers run. */
+async function settle(): Promise<void> {
+  for (let turn = 0; turn < 5; turn += 1) {
+    await Promise.resolve();
+  }
+}
+
+/**
+ * The connection indicator as the shell shows it, with "Remove this device
+ * and register again" through a fake account bridge whose `removeDevice`
+ * waits until the test answers it. Each call passes the account status on,
+ * as the shell's effect does, and renders the indicator. A reconnect from
+ * the header ends the removal's message, as in the shell.
+ */
+function removalSequence() {
+  const answers: ((result: RemoveDeviceResult) => void)[] = [];
+  let reconnects = 0;
+  let removalView: DeviceRemovalView = IDLE_DEVICE_REMOVAL;
+  const removal = createDeviceRemoval(
+    {
+      removeDevice: () =>
+        new Promise<RemoveDeviceResult>((resolve) => {
+          answers.push(resolve);
+        }),
+    },
+    (view) => {
+      removalView = view;
+    },
+  );
+  const indicator = (view: ConnectionView, account: AccountView) => {
+    removal.accountChanged(account);
+    return ConnectionStatusIndicator({
+      view,
+      account,
+      onReconnect: () => {
+        removal.reconnecting();
+        reconnects += 1;
+      },
+      onRemoveDevice: removal.remove,
+      removal: removalView,
+    });
+  };
+  return {
+    answers,
+    reconnects: () => reconnects,
+    show: (view: ConnectionView, account: AccountView) =>
+      renderToString(indicator(view, account)),
+    click: (view: ConnectionView, account: AccountView, label: string) => {
+      const button = elementsOf(indicator(view, account)).find(
+        (element) =>
+          element.type === "button" && element.props.children === label,
+      );
+      expect(button, label).toBeDefined();
+      button?.props.onClick?.();
+    },
+  };
+}
+
+const REMOVE_LABEL = "Remove this device and register again";
+const RECONNECT_LABEL = "Reconnect here once";
+const NOT_READY_DETAIL = "This device connects once it is signed in and ready.";
+const REMOVAL_PENDING_ACCOUNT = knownAccount({
+  ...SIGNED_IN_STATUS,
+  device: "removal_pending",
+});
+const REMOVED_ACCOUNT = knownAccount({
+  ...SIGNED_OUT_STATUS,
+  device: "removed",
+});
+
+test("after connection_replaced, a confirmed removal ends offline with the way to register again on the Account screen, once, and no button", async () => {
+  const { answers, show, click } = removalSequence();
+  expect(buttonsOf(show(REPLACED, SIGNED_IN_ACCOUNT))).toEqual([
+    RECONNECT_LABEL,
+    REMOVE_LABEL,
+  ]);
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  expect(answers).toHaveLength(1);
+  // While the main process asks in its native dialog, both buttons stay.
+  expect(buttonsOf(show(REPLACED, SIGNED_IN_ACCOUNT))).toEqual([
+    `${RECONNECT_LABEL} (inert)`,
+    `${REMOVE_LABEL} (inert)`,
+  ]);
+  // The session notes the removal; the account status may arrive first.
+  expect(buttonsOf(show(REPLACED, REMOVAL_PENDING_ACCOUNT))).toEqual([]);
+  // The client ends connection_replaced (#216), and the panel offers no
+  // sign-in while the removal waits for the server.
+  expect(show(OFFLINE, REMOVAL_PENDING_ACCOUNT)).toBe(
+    offlineIndicator(NOT_READY_DETAIL),
+  );
+  // The server confirms: the key is deleted, and the panel offers a
+  // sign-in. The register-again message asks for it, so the offline
+  // sentence does not ask a second time.
+  answers[0]?.({ outcome: "removed" });
+  await settle();
+  const html = show(OFFLINE, REMOVED_ACCOUNT);
+  expect(html).toBe(offlineIndicator(NOT_READY_DETAIL, REGISTER_AGAIN_MESSAGE));
+  expect(html.split("Sign in with GitHub")).toHaveLength(2);
+  expect(REGISTER_AGAIN_MESSAGE).toContain("on the Account screen");
+  // A sign-in on the Account screen ends the message.
+  expect(
+    show(
+      OFFLINE,
+      knownAccount({
+        ...SIGNED_OUT_STATUS,
+        device: "removed",
+        signIn: { kind: "starting" },
+      }),
+    ),
+  ).toBe(offlineIndicator(NOT_READY_DETAIL));
+  // Once it ended without a sign-in, the offline sentence asks for one again.
+  expect(show(OFFLINE, REMOVED_ACCOUNT)).toBe(
+    offlineIndicator(OFFLINE_SIGN_IN_DETAIL),
+  );
+});
+
+test("a removal that waits for the server names the Account screen, and becomes the way to register again once Remove this device succeeds there", async () => {
+  const { answers, show, click } = removalSequence();
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  expect(buttonsOf(show(REPLACED, REMOVAL_PENDING_ACCOUNT))).toEqual([]);
+  answers[0]?.({ outcome: "pending" });
+  await settle();
+  expect(show(OFFLINE, REMOVAL_PENDING_ACCOUNT)).toBe(
+    offlineIndicator(NOT_READY_DETAIL, REMOVAL_PENDING_MESSAGE),
+  );
+  expect(REMOVAL_PENDING_MESSAGE).toContain(
+    'choose "Remove this device" on the Account screen',
+  );
+  // "Remove this device" on the Account screen: the server confirms.
+  expect(show(OFFLINE, REMOVED_ACCOUNT)).toBe(
+    offlineIndicator(NOT_READY_DETAIL, REGISTER_AGAIN_MESSAGE),
+  );
+});
+
+test("a removal that the server refused names the removal and keeps its message while the device is signed in again and connects", async () => {
+  const { answers, show, click } = removalSequence();
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  expect(buttonsOf(show(REPLACED, REMOVAL_PENDING_ACCOUNT))).toEqual([]);
+  expect(show(OFFLINE, REMOVAL_PENDING_ACCOUNT)).toBe(
+    offlineIndicator(NOT_READY_DETAIL),
+  );
+  // For example `conflict`: the session ends the removal, and the device is
+  // signed in again with the same ID, so the client connects again.
+  answers[0]?.({ outcome: "failed", reason: "refused" });
+  await settle();
+  const refused =
+    "This device could not be removed. The server refused the request.";
+  expect(`${REMOVAL_NOT_DONE} ${DEVICE_ACTION_FAILURE_MESSAGES.refused}`).toBe(
+    refused,
+  );
+  for (const [state, label] of [
+    ["connecting", "Connecting"],
+    ["authenticating", "Authenticating"],
+    ["connected", "Connected"],
+  ] as const) {
+    const html = show(
+      { kind: "known", status: { state, revision: 6 } },
+      SIGNED_IN_ACCOUNT,
+    );
+    expect(html, state).toContain(
+      `Cloud: ${label}<span class="connection-status-detail">${refused}</span></p></div>`,
+    );
+  }
+});
+
+test("a removal that the main process refused leaves both buttons usable, and Reconnect here once ends its message", async () => {
+  const { answers, reconnects, show, click } = removalSequence();
+  for (const result of [
+    { outcome: "refused", reason: "busy" },
+    { outcome: "failed", reason: "rate_limited" },
+  ] as const) {
+    click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+    answers.at(-1)?.(result);
+    await settle();
+    const html = show(REPLACED, SIGNED_IN_ACCOUNT);
+    expect(buttonsOf(html), result.reason).toEqual([
+      RECONNECT_LABEL,
+      REMOVE_LABEL,
+    ]);
+    expect(html, result.reason).toContain(
+      `<span class="connection-status-detail">${REMOVAL_NOT_DONE} `,
+    );
+    // The person reconnects here; the connection then says what follows.
+    click(REPLACED, SIGNED_IN_ACCOUNT, RECONNECT_LABEL);
+    const connected = show(
+      { kind: "known", status: { state: "connected", revision: 7 } },
+      SIGNED_IN_ACCOUNT,
+    );
+    expect(connected, result.reason).toBe(
+      `<div class="connection-status" data-state="connected">${CONNECTION_STATUS_TEXT}<span class="connection-status-dot" aria-hidden="true"></span>Cloud: Connected</p></div>`,
+    );
+  }
+  expect(reconnects()).toBe(2);
+  expect(
+    `${REMOVAL_NOT_DONE} ${DEVICE_ACTION_MESSAGES.busy}`.startsWith(
+      "This device could not be removed. Wait until",
+    ),
+  ).toBe(true);
+
+  // The next removal clears a message; a cancel shows none.
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  answers.at(-1)?.({ outcome: "refused", reason: "busy" });
+  await settle();
+  click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
+  answers.at(-1)?.({ outcome: "cancelled" });
+  await settle();
+  const cancelled = show(REPLACED, SIGNED_IN_ACCOUNT);
+  expect(buttonsOf(cancelled)).toEqual([RECONNECT_LABEL, REMOVE_LABEL]);
+  expect(cancelled).toContain(
+    `<span class="connection-status-detail">${REPLACED_DETAIL}</span></p>`,
+  );
+});
+
+test("no button is offered once the device is no longer signed in, as after a sign-out or This is not me", () => {
+  const { show } = removalSequence();
+  const signedOut: readonly AccountStatus[] = [
+    // A sign-out: the main process names no account (#195).
+    { ...SIGNED_IN_STATUS, account: { kind: "hidden" }, device: "signed_out" },
+    {
+      ...SIGNED_IN_STATUS,
+      account: { kind: "hidden" },
+      device: "sign_out_report_pending",
+    },
+    // "This is not me": no account and no device.
+    SIGNED_OUT_STATUS,
+    { ...SIGNED_OUT_STATUS, device: "removed" },
+  ];
+  for (const status of signedOut) {
+    const signedOutAccount = knownAccount(status);
+    // Also before the client's offline status arrives.
+    expect(buttonsOf(show(REPLACED, signedOutAccount)), status.device).toEqual(
+      [],
+    );
+    expect(show(OFFLINE, signedOutAccount), status.device).toBe(
+      offlineIndicator(OFFLINE_SIGN_IN_DETAIL),
+    );
+  }
+});
+
+/** The props of an element that the tests read or call. */
+interface TestProps {
+  readonly children?: ReactNode;
+  readonly onClick?: () => void;
+  readonly onFocus?: () => void;
+  readonly onBlur?: (event: {
+    readonly currentTarget: { readonly isConnected: boolean };
+  }) => void;
+}
+
 /** The element and every element below it, without rendering components. */
-function elementsOf(
-  node: ReactNode,
-): ReactElement<{ children?: ReactNode; onClick?: () => void }>[] {
+function elementsOf(node: ReactNode): ReactElement<TestProps>[] {
   if (Array.isArray(node)) {
     return node.flatMap((child: ReactNode) => elementsOf(child));
   }
-  if (!isValidElement<{ children?: ReactNode; onClick?: () => void }>(node)) {
+  if (!isValidElement<TestProps>(node)) {
     return [];
   }
   return [node, ...elementsOf(node.props.children)];
 }
 
-test("Retry now and Reconnect here once call the reconnect, and nothing else does", () => {
+test("each header button reports when it takes the focus, and when it loses it while it is still in the page", () => {
+  const reports: (string | undefined)[] = [];
+  const indicator = (view: ConnectionView) =>
+    ConnectionStatusIndicator({
+      view,
+      account: SIGNED_IN_ACCOUNT,
+      onReconnect: () => undefined,
+      onRemoveDevice: () => undefined,
+      onActionFocus: (action) => reports.push(action),
+    });
+  const buttons = (view: ConnectionView) =>
+    elementsOf(indicator(view)).filter((element) => element.type === "button");
+
+  const [reconnect, remove] = buttons(REPLACED);
+  reconnect?.props.onFocus?.();
+  reconnect?.props.onBlur?.({ currentTarget: { isConnected: true } });
+  remove?.props.onFocus?.();
+  // Chromium fires no blur when it removes the focused button; a blur of a
+  // button that already left the page is not the person's, so the note
+  // keeps naming it until the shell checks the new actions.
+  remove?.props.onBlur?.({ currentTarget: { isConnected: false } });
+  const [retry] = buttons({
+    kind: "known",
+    status: {
+      state: "waiting",
+      reason: "timeout",
+      retryAt: "2026-11-03T10:00:01.000Z",
+      revision: 1,
+    },
+  });
+  retry?.props.onFocus?.();
+  expect(reports).toEqual([
+    "reconnect_here",
+    undefined,
+    "remove_and_register",
+    "retry_now",
+  ]);
+  // Without the callback, focus and blur do nothing.
+  const [plain] = elementsOf(
+    ConnectionStatusIndicator({
+      view: REPLACED,
+      account: SIGNED_IN_ACCOUNT,
+      onReconnect: () => undefined,
+    }),
+  ).filter((element) => element.type === "button");
+  plain?.props.onFocus?.();
+  plain?.props.onBlur?.({ currentTarget: { isConnected: true } });
+  expect(reports).toHaveLength(4);
+});
+
+test("Retry now and Reconnect here once call the reconnect, the removal calls its own handler, and nothing else does", () => {
   let reconnects = 0;
   const onReconnect = () => {
     reconnects += 1;
@@ -749,6 +1210,7 @@ test("Retry now and Reconnect here once call the reconnect, and nothing else doe
         revision: 1,
       },
     },
+    account: SIGNED_IN_ACCOUNT,
     onReconnect,
   });
   const buttons = elementsOf(waiting).filter(
@@ -757,6 +1219,27 @@ test("Retry now and Reconnect here once call the reconnect, and nothing else doe
   expect(buttons.map((button) => button.props.children)).toEqual(["Retry now"]);
   buttons[0]?.props.onClick?.();
   expect(reconnects).toBe(1);
+
+  let removals = 0;
+  const replaced = ConnectionStatusIndicator({
+    view: REPLACED,
+    account: SIGNED_IN_ACCOUNT,
+    onReconnect,
+    onRemoveDevice: () => {
+      removals += 1;
+    },
+  });
+  const replacedButtons = elementsOf(replaced).filter(
+    (element) => element.type === "button",
+  );
+  expect(replacedButtons.map((button) => button.props.children)).toEqual([
+    "Reconnect here once",
+    "Remove this device and register again",
+  ]);
+  replacedButtons[0]?.props.onClick?.();
+  expect([reconnects, removals]).toEqual([2, 0]);
+  replacedButtons[1]?.props.onClick?.();
+  expect([reconnects, removals]).toEqual([2, 1]);
 
   for (const reason of [
     "auth_failed",
@@ -769,6 +1252,7 @@ test("Retry now and Reconnect here once call the reconnect, and nothing else doe
         kind: "known",
         status: { state: "stopped", reason, revision: 1 },
       },
+      account: SIGNED_IN_ACCOUNT,
       onReconnect,
     });
     expect(
