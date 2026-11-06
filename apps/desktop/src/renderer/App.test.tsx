@@ -24,10 +24,13 @@ import {
   type ShellView,
 } from "./screens.ts";
 import {
+  HOME_SIGN_IN_MESSAGES,
   SELECT_REFUSAL_MESSAGES,
   WORKSPACE_MESSAGES,
   WORKSPACE_PROBLEM_MESSAGES,
+  type HomeSignIn,
 } from "./workspace-view.ts";
+import { HomeScreen } from "./WorkspaceScreens.tsx";
 
 const runtime: RuntimeBridge = {
   getStatus: () => Promise.resolve({ state: "running", revision: 2 }),
@@ -94,6 +97,24 @@ const SCREEN_CASES: readonly ScreenCase[] = [
     title: '<h2 id="home-title">Home</h2>',
     placeholder: "Open a project to see its chat",
     current: ["Home (page)", "Workspace B (true)"],
+  },
+  {
+    view: { screen: "account" },
+    title: '<h2 id="account-screen-title" tabindex="-1">Account</h2>',
+    placeholder: "<p>Sign-in is not available.</p>",
+    current: ["Account (page)", "Workspace B (true)"],
+  },
+  {
+    view: { screen: "people" },
+    title: '<h2 id="people-title">People</h2>',
+    placeholder: "No people are shown yet.",
+    current: ["People (page)", "Workspace B (true)"],
+  },
+  {
+    view: { screen: "join" },
+    title: '<h2 id="join-title">Join a workspace</h2>',
+    placeholder: "Joining is not available yet.",
+    current: ["Join (page)", "Workspace B (true)"],
   },
   {
     view: { screen: "about" },
@@ -757,25 +778,106 @@ test("Retry now and Reconnect here once call the reconnect, and nothing else doe
   }
 });
 
-test("the home screen holds the account panel, which waits for the first status with the bridge", () => {
-  const account: AccountBridge = {
-    getStatus: () => new Promise(() => undefined),
-    subscribeStatus: () => () => undefined,
-    startSignIn: () => Promise.resolve({ outcome: "started" }),
-    cancelSignIn: () => Promise.resolve(false),
-    unlockDeviceKey: () => Promise.resolve({ outcome: "unlocked" }),
-    forgetAccount: () =>
-      Promise.resolve({ outcome: "forgotten", removedAtServer: true }),
-    signOut: () => Promise.resolve({ outcome: "signed_out" }),
-    removeDevice: () => Promise.resolve({ outcome: "removed" }),
-    listDevices: () => Promise.resolve({ outcome: "listed", devices: [] }),
-  };
+/** An account bridge whose first status does not arrive. */
+const pendingAccount: AccountBridge = {
+  getStatus: () => new Promise(() => undefined),
+  subscribeStatus: () => () => undefined,
+  startSignIn: () => Promise.resolve({ outcome: "started" }),
+  cancelSignIn: () => Promise.resolve(false),
+  unlockDeviceKey: () => Promise.resolve({ outcome: "unlocked" }),
+  forgetAccount: () =>
+    Promise.resolve({ outcome: "forgotten", removedAtServer: true }),
+  signOut: () => Promise.resolve({ outcome: "signed_out" }),
+  removeDevice: () => Promise.resolve({ outcome: "removed" }),
+  listDevices: () => Promise.resolve({ outcome: "listed", devices: [] }),
+};
 
-  expect(render({ account })).toContain(
-    '<section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">Account</h3><p>Checking the sign-in.</p></section></section>',
+test("the account screen holds the account panel under This device, which waits for the first status with the bridge", () => {
+  const accountView = { screen: "account" } as const;
+  expect(
+    render({ account: pendingAccount, initialView: accountView }),
+  ).toContain(
+    '<section aria-labelledby="account-screen-title"><h2 id="account-screen-title" tabindex="-1">Account</h2><p>Sign in this device with GitHub, and manage the device and its sign-in.</p><section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">This device</h3><p>Checking the sign-in.</p></section></section>',
   );
-  expect(render()).toContain("<p>Sign-in is not available.</p>");
-  expect(render({ account, initialView: { screen: "about" } })).not.toContain(
-    "account-panel",
+  expect(render({ initialView: accountView })).toContain(
+    "<p>Sign-in is not available.</p>",
+  );
+  // The panel moved from the home screen to the account screen.
+  for (const screen of ["home", "people", "join", "about"] as const) {
+    expect(
+      render({ account: pendingAccount, initialView: { screen } }),
+      screen,
+    ).not.toContain("account-panel");
+  }
+});
+
+const HOME_HINT =
+  '<section aria-labelledby="home-title"><h2 id="home-title">Home</h2><p>Open a project to see its chat, tasks, decisions, and permissions, and its agents and repositories.</p>';
+
+/** The end of the home screen with this sentence and "Go to Account". */
+function goToAccount(sentence: string): string {
+  return `<p>${sentence}</p><p><button type="button" class="panel-action">Go to Account</button></p></section>`;
+}
+
+test("the home screen says the sentence of its case, with Go to Account whenever it says one", () => {
+  const home = (signIn: HomeSignIn) =>
+    renderToString(
+      <HomeScreen
+        signIn={signIn}
+        dispatch={() => undefined}
+        focusAfterShow={() => undefined}
+      />,
+    );
+  expect(home("sign_in")).toBe(
+    HOME_HINT +
+      goToAccount(
+        "Sign in with GitHub on the Account screen to see your workspaces.",
+      ),
+  );
+  expect(home("not_ready")).toBe(
+    HOME_HINT +
+      goToAccount("Workspaces appear once this device is signed in and ready."),
+  );
+  expect(home("none")).toBe(`${HOME_HINT}</section>`);
+});
+
+test("the home screen offers Go to Account only while no device is signed in, with the neutral sentence until the account status is known", () => {
+  const signedOut = workspaceState([], {
+    status: "signed_out",
+    workspaces: [],
+    selectedWorkspaceId: null,
+  });
+  // Without the account bridge and before its first status, the panel
+  // offers no sign-in yet.
+  for (const account of [undefined, pendingAccount]) {
+    const html = render({ account, initialWorkspaceState: signedOut });
+    expect(html).toContain(
+      HOME_HINT + goToAccount(HOME_SIGN_IN_MESSAGES.not_ready),
+    );
+    expect(html).not.toContain(HOME_SIGN_IN_MESSAGES.sign_in);
+  }
+  // Only the home screen offers it.
+  expect(
+    render({
+      initialWorkspaceState: signedOut,
+      initialView: { screen: "about" },
+    }),
+  ).not.toContain("Go to Account");
+  for (const state of [
+    workspaceState(PROJECTS),
+    workspaceState([], { status: "loading" }),
+    workspaceState(PROJECTS, { status: "unavailable", problem: "unavailable" }),
+  ]) {
+    expect(
+      render({ account: pendingAccount, initialWorkspaceState: state }),
+      state.status,
+    ).toContain(`${HOME_HINT}</section>`);
+  }
+  // Before the first workspace state and without the bridge, it says nothing.
+  expect(
+    render({ workspaces: pendingBridge, initialWorkspaceState: undefined }),
+  ).not.toContain("Go to Account");
+  expect(render({ initialWorkspaceState: undefined })).not.toContain(
+    "Go to Account",
   );
 });

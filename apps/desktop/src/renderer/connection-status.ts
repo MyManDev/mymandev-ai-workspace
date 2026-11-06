@@ -52,7 +52,8 @@ const STOP_DETAILS: Readonly<Record<ConnectionStopReason, string>> = {
     "The server did not accept the device key. Sign in with GitHub again.",
   device_revoked:
     "This device was removed from the account. Sign in with GitHub to add it again.",
-  sign_in_required: "Sign in with GitHub on the home screen to connect again.",
+  sign_in_required:
+    "Sign in with GitHub on the Account screen to connect again.",
   connection_replaced:
     "Another installation connected with this device's key. The key is in use there.",
   protocol_violation:
