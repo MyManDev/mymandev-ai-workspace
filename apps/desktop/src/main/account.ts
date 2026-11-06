@@ -89,6 +89,7 @@ export type AccountSession = Pick<
   | "signOut"
   | "reportSignOut"
   | "removeDevice"
+  | "removalAsksApi"
   | "signWebSocketChallenge"
   | "deviceRefused"
   | "request"
@@ -327,42 +328,19 @@ export const FORGET_CONFIRMATION = Object.freeze({
 
 /**
  * What "This is not me" does to the device at the server, as the main
- * process knows it before the person confirms (#198):
- * - `server_first`: the device is signed in with a loaded key, so the
- *   session asks the API to remove it first. When the API cannot be reached
- *   or does not remove it, the device is forgotten on this installation
- *   only, as below.
+ * process knows it before the person confirms (#198), from the session's
+ * `removalAsksApi`:
+ * - `server_first`: the session's `removeDevice` asks the API to remove
+ *   the device first. When the API cannot be reached or does not remove it,
+ *   the device is forgotten on this installation only, as below.
  * - `local_only`: the device cannot ask the API: it is signed out, its key
  *   waits for its passphrase or cannot be used, the API asks for a sign-in
- *   or refused the key, or there is no session. The device is forgotten on
- *   this installation only and stays listed for its account at the API,
- *   without a key (ADR 0014, update of 2026-11-06).
+ *   or refused the key (also behind a refused sign-in with another GitHub
+ *   account), or there is no session. The device is forgotten on this
+ *   installation only and stays listed for its account at the API, without
+ *   a key (ADR 0014, update of 2026-11-06).
  */
 export type ForgetRemoval = "server_first" | "local_only";
-
-/**
- * The case of "This is not me" for the device state of the session, whether
- * the person signed out on this device (`signedOutOf`), and whether a
- * session exists: `server_first` only in the states in which the session's
- * `removeDevice` asks the API, which needs a loaded key and no sign-out.
- */
-export function forgetRemoval(
-  device: DeviceState,
-  signedOut: boolean,
-  hasSession: boolean,
-): ForgetRemoval {
-  if (!hasSession || signedOut) {
-    return "local_only";
-  }
-  switch (device) {
-    case "signed_in":
-    case "removal_pending":
-    case "account_mismatch":
-      return "server_first";
-    default:
-      return "local_only";
-  }
-}
 
 /** The detail of the confirmation for each case of `ForgetRemoval`. */
 export const FORGET_CONFIRMATION_DETAILS: Readonly<
@@ -371,7 +349,7 @@ export const FORGET_CONFIRMATION_DETAILS: Readonly<
   server_first:
     "This device is signed in, so it is first removed from that GitHub account on the server. If the server cannot be reached or does not remove it, the device stays listed for that account, without a key. Either way, the device key and the account are then deleted on this computer, and you can sign in with your own GitHub account.",
   local_only:
-    'This device is not signed in with a usable key, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then signs in with it on this device and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account.',
+    'This device cannot use its key with the server now, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then enters the passphrase of the device key or signs in with that account on this device, as the panel asks, and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account.',
 });
 
 /** The detail of the confirmation for the case. */
@@ -1008,6 +986,24 @@ export function createAccountService(
     }
   }
 
+  /**
+   * The case of "This is not me": `server_first` only when the session's
+   * `removeDevice` would ask the API now (`removalAsksApi`), and
+   * `local_only` without a session or when the session fails.
+   */
+  async function forgetRemovalOf(
+    held: AccountSession | null,
+  ): Promise<ForgetRemoval> {
+    if (held === null) {
+      return "local_only";
+    }
+    try {
+      return (await held.removalAsksApi()) ? "server_first" : "local_only";
+    } catch {
+      return "local_only";
+    }
+  }
+
   /** Records how a started sign-in ended. */
   async function finish(
     opened: AccountSystem,
@@ -1232,7 +1228,7 @@ export function createAccountService(
       // The confirmation runs in the main process, so that a renderer that
       // misbehaves cannot delete the key without the person. It says
       // whether the server removes the device first (#198).
-      const removal = forgetRemoval(device, deviceSignedOut, session !== null);
+      const removal = await forgetRemovalOf(session);
       let confirmed: boolean;
       try {
         confirmed = await options.confirmForget(login, removal);

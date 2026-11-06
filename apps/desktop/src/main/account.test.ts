@@ -15,8 +15,6 @@ import {
   ACCOUNT_LIMITS,
   AccountStatusSchema,
   type AccountStatus,
-  DEVICE_STATES,
-  type DeviceState,
   type SignInOutcomeCode,
 } from "../shared/ipc-contract.ts";
 import {
@@ -29,7 +27,6 @@ import {
   forgetConfirmationDetail,
   forgetConfirmationMessage,
   type ForgetRemoval,
-  forgetRemoval,
   LIST_DEVICES_COOLDOWN_MS,
   forgetConfirmed,
   SIGN_IN_START_COOLDOWN_MS,
@@ -194,6 +191,8 @@ interface Harness {
   keyDelete: () => Promise<void>;
   /** The answer of the native confirmation of removing this device. */
   confirmRemoval: (login: string) => Promise<boolean>;
+  /** What the session's `removalAsksApi` answers. */
+  removalAsks: () => Promise<boolean>;
   /** When set, every read of the record waits for it. */
   readGate: Promise<void> | null;
   /** How often local execution was stopped. */
@@ -259,6 +258,7 @@ function harness(
     markerDelete: async () => undefined,
     keyDelete: async () => undefined,
     confirmRemoval: async () => true,
+    removalAsks: async () => true,
     readGate: null,
     stopped: 0,
     sessionState: SESSION_SIGNED_IN,
@@ -329,6 +329,7 @@ function harness(
         state.log.push("session removeDevice");
         return state.removeDevice();
       },
+      removalAsksApi: () => state.removalAsks(),
       signWebSocketChallenge: async () => {
         state.log.push("session signWebSocketChallenge");
         return state.signChallenge();
@@ -1324,7 +1325,7 @@ test("the confirmation of This is not me says what happens to the device at the 
     server_first:
       "This device is signed in, so it is first removed from that GitHub account on the server. If the server cannot be reached or does not remove it, the device stays listed for that account, without a key. Either way, the device key and the account are then deleted on this computer, and you can sign in with your own GitHub account.",
     local_only:
-      'This device is not signed in with a usable key, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then signs in with it on this device and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account.',
+      'This device cannot use its key with the server now, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then enters the passphrase of the device key or signs in with that account on this device, as the panel asks, and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account.',
   });
   expect(Object.isFrozen(FORGET_CONFIRMATION_DETAILS)).toBe(true);
   for (const removal of ["server_first", "local_only"] as const) {
@@ -1335,58 +1336,52 @@ test("the confirmation of This is not me says what happens to the device at the 
   }
 });
 
-test("This is not me asks the server first only while the device is signed in with a loaded key, has not signed out, and has a session (#198)", () => {
-  const serverFirst: readonly DeviceState[] = [
-    "signed_in",
-    "removal_pending",
-    "account_mismatch",
-  ];
-  for (const device of DEVICE_STATES) {
-    expect(forgetRemoval(device, false, true), device).toBe(
-      serverFirst.includes(device) ? "server_first" : "local_only",
-    );
-    expect(forgetRemoval(device, true, true), device).toBe("local_only");
-    expect(forgetRemoval(device, false, false), device).toBe("local_only");
-  }
-});
-
-test("This is not me confirms with the case of the device: the server first while signed in, otherwise this installation only (#198)", async () => {
-  const cases: [DeviceSessionState | "no session", ForgetRemoval][] = [
-    [SESSION_SIGNED_IN, "server_first"],
-    [{ kind: "removal_pending", account: SESSION_ACCOUNT }, "server_first"],
-    [{ kind: "account_mismatch", account: SESSION_ACCOUNT }, "server_first"],
+test("This is not me confirms with the case that the session's removalAsksApi answers: the server first only when the removal would ask the API (#198)", async () => {
+  // The session's rules are tested in session.test.ts; the service only
+  // follows its answer, whatever the device state says.
+  const cases: [
+    DeviceSessionState,
+    (() => Promise<boolean>) | "no session",
+    ForgetRemoval,
+  ][] = [
+    [SESSION_SIGNED_IN, async () => true, "server_first"],
+    [SESSION_SIGNED_IN, async () => false, "local_only"],
     [
-      { kind: "account_mismatch", account: SESSION_ACCOUNT, signedOut: true },
+      { kind: "account_mismatch", account: SESSION_ACCOUNT },
+      async () => false,
       "local_only",
     ],
     [
-      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: false },
-      "local_only",
+      { kind: "account_mismatch", account: SESSION_ACCOUNT },
+      async () => true,
+      "server_first",
     ],
     [
       { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: true },
+      async () => false,
       "local_only",
     ],
-    [{ kind: "key_not_loaded", account: SESSION_ACCOUNT }, "local_only"],
     [
-      { kind: "key_not_loaded", account: SESSION_ACCOUNT, signedOut: true },
+      SESSION_SIGNED_IN,
+      () => Promise.reject(new Error("broken")),
       "local_only",
     ],
-    [{ kind: "key_lost", account: SESSION_ACCOUNT }, "local_only"],
-    [{ kind: "unavailable", reason: "key_store_failed" }, "local_only"],
-    [{ kind: "sign_in_required", account: SESSION_ACCOUNT }, "local_only"],
-    [{ kind: "auth_failed", account: SESSION_ACCOUNT }, "local_only"],
-    ["no session", "local_only"],
+    [SESSION_SIGNED_IN, "no session", "local_only"],
   ];
-  for (const [state, expected] of cases) {
-    const name = typeof state === "string" ? state : state.kind;
+  for (const [state, asks, expected] of cases) {
+    const name = `${state.kind} ${typeof asks === "string" ? asks : expected}`;
     const h = harness();
-    if (state === "no session") {
+    let asked = 0;
+    if (asks === "no session") {
       h.createSession = () => {
         throw new Error("The device session needs a ready application.");
       };
     } else {
       h.sessionState = state;
+      h.removalAsks = () => {
+        asked += 1;
+        return asks();
+      };
     }
     // A report that the API does not learn yet leaves the state as it is.
     h.reportSignOut = async () => ({ ok: true, value: "pending" });
@@ -1402,6 +1397,7 @@ test("This is not me confirms with the case of the device: the server first whil
       outcome: "cancelled",
     });
     expect(removals, name).toEqual([expected]);
+    expect(asked, name).toBe(asks === "no session" ? 0 : 1);
   }
 });
 
