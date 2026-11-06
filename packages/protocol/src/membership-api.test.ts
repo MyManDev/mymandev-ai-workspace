@@ -7,7 +7,9 @@ import { AUTH_ROUTES, routePath } from "./auth-api.ts";
 import {
   InvitationIdSchema,
   JoinRequestIdSchema,
+  type MemberId,
   MemberIdSchema,
+  newId,
   WorkspaceIdSchema,
 } from "./ids.ts";
 import {
@@ -15,6 +17,8 @@ import {
   AcceptInvitationResponseSchema,
   ApproveJoinRequestRequestSchema,
   ApproveJoinRequestResponseSchema,
+  ClaimListResponseSchema,
+  ClaimSchema,
   CreateInvitationRequestSchema,
   CreateInvitationResponseSchema,
   CreateJoinRequestRequestSchema,
@@ -197,6 +201,7 @@ test("the membership routes are fixed, frozen, and apart from the authentication
     "POST /workspaces/:workspaceId/join-requests/deny-all",
     "POST /workspaces/:workspaceId/join-requests/pause",
     "POST /workspaces/:workspaceId/join-requests/resume",
+    "GET /workspaces/:workspaceId/claims",
   ]);
   assert.equal(new Set(table).size, table.length);
   assert.equal(Object.isFrozen(MEMBERSHIP_ROUTES), true);
@@ -340,6 +345,7 @@ test("each route answers only known error codes, the common ones included", () =
     denyAllJoinRequests: ["not_found", "forbidden"],
     pauseJoinRequests: ["not_found", "forbidden"],
     resumeJoinRequests: ["not_found", "forbidden"],
+    listClaims: ["not_found", "forbidden"],
   });
 
   const holders = (code: ApiErrorCode) =>
@@ -1206,6 +1212,119 @@ test("an approval may change the display name and answers with the new person", 
   ]);
 });
 
+test("owners and admins see each recent claim with the claimer's GitHub login and account creation date, the most recent first", () => {
+  const claimer = {
+    provider: "github",
+    login: "ada-l",
+    verifiedAt: LATER,
+    accountCreatedAt: GITHUB_CREATED,
+  };
+  const recent = {
+    workspaceId: WORKSPACE_ID,
+    memberId: MEMBER_ID,
+    claimer,
+    claimedAt: LATER,
+  };
+  // The claim of an account whose data was erased stays, without a claimer.
+  const erased = {
+    ...recent,
+    memberId: FORMER_ID,
+    claimer: null,
+    claimedAt: NOW,
+  };
+  assert.equal(ClaimSchema.safeParse(recent).success, true);
+  assert.equal(
+    ClaimListResponseSchema.safeParse({ claims: [recent, erased] }).success,
+    true,
+  );
+  assert.equal(ClaimListResponseSchema.safeParse({ claims: [] }).success, true);
+  assert.equal(
+    ClaimListResponseSchema.safeParse({
+      claims: [{ ...erased, claimedAt: LATER }, recent],
+    }).success,
+    true,
+    "claims of the same time keep any order",
+  );
+  const one = (value: unknown) => ({ claims: [value] });
+  assertRejects(ClaimListResponseSchema, [
+    ...withoutEach({ claims: [recent] }),
+    ...withoutEach(recent, one, "claim."),
+    ...withoutEach(
+      claimer,
+      (value) => one({ ...recent, claimer: value }),
+      "claimer.",
+    ),
+    ["the oldest first", { claims: [erased, recent] }],
+    ["a person twice", { claims: [recent, { ...recent, claimedAt: NOW }] }],
+    [
+      "a claim of another workspace",
+      { claims: [recent, { ...erased, workspaceId: OTHER_WORKSPACE_ID }] },
+    ],
+    [
+      "claim time without milliseconds",
+      one({ ...recent, claimedAt: "2026-11-05T12:00:00Z" }),
+    ],
+    [
+      "claim time with an offset",
+      one({ ...recent, claimedAt: "2026-11-05T14:00:00.000+02:00" }),
+    ],
+    ["claim time null", one({ ...recent, claimedAt: null })],
+    [
+      "account creation date without milliseconds",
+      one({
+        ...recent,
+        claimer: { ...claimer, accountCreatedAt: "2011-01-25T18:44:36Z" },
+      }),
+    ],
+    [
+      "account creation date null",
+      one({ ...recent, claimer: { ...claimer, accountCreatedAt: null } }),
+    ],
+    [
+      "claimer with a bad login",
+      one({ ...recent, claimer: { ...claimer, login: "-".repeat(40) } }),
+    ],
+    [
+      "claimer of an unknown provider",
+      one({ ...recent, claimer: { ...claimer, provider: "gitlab" } }),
+    ],
+    [
+      "invalid person ID",
+      one({ ...recent, memberId: MEMBER_ID.toUpperCase() }),
+    ],
+    ["invalid workspace ID", one({ ...recent, workspaceId: "x" })],
+    ["no list", { claims: null }],
+  ]);
+  // Nothing beyond the person, the claimer's identity, and the time.
+  const parsed = ClaimListResponseSchema.parse(
+    one({
+      ...recent,
+      userId: USER_ID,
+      displayName: "Ada",
+      invitationId: INVITATION_ID,
+      claimer: {
+        ...claimer,
+        subject: "583231",
+        email: "never@example.invalid",
+      },
+    }),
+  );
+  const [item] = parsed.claims;
+  assert.ok(item);
+  assert.deepEqual(Object.keys(item).sort(), [
+    "claimedAt",
+    "claimer",
+    "memberId",
+    "workspaceId",
+  ]);
+  assert.deepEqual(Object.keys(item.claimer ?? {}).sort(), [
+    "accountCreatedAt",
+    "login",
+    "provider",
+    "verifiedAt",
+  ]);
+});
+
 test("every route with a body has its schemas, and they export to JSON Schema", () => {
   const schemas = {
     listWorkspaces: [null, WorkspaceListResponseSchema],
@@ -1255,6 +1374,7 @@ test("every route with a body has its schemas, and they export to JSON Schema", 
     denyAllJoinRequests: [null, null],
     pauseJoinRequests: [null, null],
     resumeJoinRequests: [null, null],
+    listClaims: [null, ClaimListResponseSchema],
   } satisfies Record<
     MembershipRouteName,
     [request: z.ZodType | null, response: z.ZodType | null]
@@ -1298,6 +1418,12 @@ test("every answer list holds at most MAX_ANSWER_LIST_ITEMS items", () => {
     expiresAt: LATER,
     decision: null,
     decidedAt: null,
+  };
+  const claim = {
+    workspaceId: WORKSPACE_ID,
+    memberId: MEMBER_ID,
+    claimer: joinRequest.requester,
+    claimedAt: NOW,
   };
   const lists: [
     label: string,
@@ -1346,6 +1472,17 @@ test("every answer list holds at most MAX_ANSWER_LIST_ITEMS items", () => {
         }),
       }),
       OwnJoinRequestListResponseSchema,
+    ],
+    [
+      "claims",
+      // A person is claimed once, so each claim names its own person.
+      (count) => ({
+        claims: Array.from({ length: count }, () => ({
+          ...claim,
+          memberId: newId<MemberId>(),
+        })),
+      }),
+      ClaimListResponseSchema,
     ],
   ];
   assert.equal(MAX_ANSWER_LIST_ITEMS, 1_000);

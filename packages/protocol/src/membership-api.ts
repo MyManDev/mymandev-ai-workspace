@@ -216,6 +216,13 @@ export const MEMBERSHIP_ROUTES = Object.freeze({
     "POST",
     "/workspaces/:workspaceId/join-requests/resume",
   ),
+  /**
+   * The workspace's most recent claims, the most recent first: who claimed
+   * which person, with the GitHub login and the creation date of that GitHub
+   * account, and when (#208). A claim is an accepted invitation or an
+   * approved join request. Owner or admin.
+   */
+  listClaims: route("GET", "/workspaces/:workspaceId/claims"),
 });
 export type MembershipRouteName = keyof typeof MEMBERSHIP_ROUTES;
 
@@ -297,6 +304,7 @@ export const MEMBERSHIP_ROUTE_ERRORS = Object.freeze({
   denyAllJoinRequests: errors("not_found", "forbidden"),
   pauseJoinRequests: errors("not_found", "forbidden"),
   resumeJoinRequests: errors("not_found", "forbidden"),
+  listClaims: errors("not_found", "forbidden"),
 } satisfies Record<MembershipRouteName, readonly ApiErrorCode[]>);
 
 /** A person's display name in a workspace: 1 to 64 characters. */
@@ -702,3 +710,74 @@ export const ApproveJoinRequestResponseSchema = z.object({
 export type ApproveJoinRequestResponse = z.infer<
   typeof ApproveJoinRequestResponseSchema
 >;
+
+/**
+ * The GitHub account that claimed a person, as owners and admins see it next
+ * to the claim: the same fields as a join requester's, the login, the time it
+ * was last verified, and the creation time of the account, so that a freshly
+ * made account stands out (ADR 0014, "Invitations").
+ */
+export const ClaimerIdentitySchema = JoinRequesterIdentitySchema;
+export type ClaimerIdentity = JoinRequesterIdentity;
+
+/**
+ * One claim as owners and admins see it: an account claimed the person
+ * `memberId` at `claimedAt`, by accepting an invitation or through an
+ * approved join request. The desktop shows the person through the workspace
+ * view. `claimer` is the claiming account's GitHub identity as it is now: its
+ * login and the time that login was last verified change with the account's
+ * sign-ins. It is null only after the account's data was erased. A claim
+ * stays listed after its person was removed.
+ */
+export const ClaimSchema = z.object({
+  workspaceId: WorkspaceIdSchema,
+  memberId: MemberIdSchema,
+  claimer: ClaimerIdentitySchema.nullable(),
+  claimedAt: UtcTimestampSchema,
+});
+export type Claim = z.infer<typeof ClaimSchema>;
+
+/**
+ * The answer of `GET /workspaces/:workspaceId/claims`: the workspace's most
+ * recent claims, the most recent first. The server sends at most
+ * `RECENT_CLAIMS` (50) of them, and the schema accepts up to
+ * `MAX_ANSWER_LIST_ITEMS`, so that raising the server's count never breaks an
+ * older desktop. Every claim belongs to one workspace, and a person is
+ * claimed once, so it is listed once.
+ */
+export const ClaimListResponseSchema = z
+  .object({
+    claims: z.array(ClaimSchema).max(MAX_ANSWER_LIST_ITEMS),
+  })
+  .superRefine((list, ctx) => {
+    const workspaceId = list.claims[0]?.workspaceId;
+    const seen = new Set<string>();
+    list.claims.forEach((claim, index) => {
+      if (claim.workspaceId !== workspaceId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "Every claim belongs to one workspace",
+          path: ["claims", index, "workspaceId"],
+        });
+      }
+      if (seen.has(claim.memberId)) {
+        ctx.addIssue({
+          code: "custom",
+          message: "A person is claimed once",
+          path: ["claims", index, "memberId"],
+        });
+      }
+      seen.add(claim.memberId);
+      // Both times are UTC with three fractional digits, so the text order
+      // is the time order.
+      const previous = list.claims[index - 1];
+      if (previous !== undefined && claim.claimedAt > previous.claimedAt) {
+        ctx.addIssue({
+          code: "custom",
+          message: "The most recent claim comes first",
+          path: ["claims", index, "claimedAt"],
+        });
+      }
+    });
+  });
+export type ClaimListResponse = z.infer<typeof ClaimListResponseSchema>;

@@ -24,6 +24,7 @@ import {
   OWN_JOIN_REQUEST_DECISIONS,
   OWNERSHIP_OFFER_END_REASONS,
   PRESENCE_STATUSES,
+  RECENT_CLAIMS,
   RECENT_FINISHED_RUNS,
   RUN_CANCEL_REASONS,
   RUN_STATES,
@@ -176,6 +177,11 @@ test("event refusals, the chat history page, and the finished runs are the value
   assert.ok(CHAT_HISTORY_PAGE.max <= MAX_ANSWER_LIST_ITEMS);
   assert.equal(RECENT_FINISHED_RUNS, 50);
   assert.ok(RECENT_FINISHED_RUNS <= MAX_ANSWER_LIST_ITEMS);
+});
+
+test("the list of recent claims holds the 50 most recent claims (#208)", () => {
+  assert.equal(RECENT_CLAIMS, 50);
+  assert.ok(RECENT_CLAIMS <= MAX_ANSWER_LIST_ITEMS);
 });
 
 test("a device sign-in lasts 30 days, and an open connection 24 hours more", () => {

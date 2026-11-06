@@ -370,6 +370,18 @@ export const CHAT_HISTORY_PAGE = Object.freeze({
  */
 export const RECENT_FINISHED_RUNS = 50;
 
+/**
+ * How many claims the server puts in a workspace's list of recent claims
+ * (#208): its most recent claims, the most recent first, whatever their age.
+ * A count and no time window, so that a claim that the owner or an admin
+ * missed while offline stays readable until 50 newer claims exist. 50 is
+ * the size of the other lists that ADR 0014 bounds per workspace, 50 live
+ * invitations and 50 pending join requests. The answer's schema accepts up
+ * to `MAX_ANSWER_LIST_ITEMS` claims, so that raising this count never
+ * breaks an older desktop.
+ */
+export const RECENT_CLAIMS = 50;
+
 /** A UUIDv7 in canonical lowercase form. Uppercase is rejected on purpose. */
 export const UUIDV7_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;

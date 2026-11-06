@@ -158,6 +158,11 @@ export {
   type WorkspaceJoinRequestsRefusal,
 } from "./join-requests.ts";
 export {
+  listClaims,
+  type ListClaimsInput,
+  type ListClaimsResult,
+} from "./claims.ts";
+export {
   createProject,
   type CreateProjectInput,
   type CreateProjectResult,
