@@ -10,6 +10,7 @@ import {
 import {
   AGENT_MESSAGES,
   AGENT_PROBLEM_MESSAGES,
+  agentTimeFormat,
   describeAgentPanel,
   describeMoreUnfinishedRuns,
   describeRunReason,
@@ -327,7 +328,8 @@ test("every run state has its own label", () => {
 });
 
 // The renderer cannot import the protocol package, so the codes of its
-// RUN_CANCEL_REASONS are written out here.
+// RUN_CANCEL_REASONS are written out here; config/renderer-protocol.test.ts
+// checks them against the protocol.
 test("each known cancellation code has its own text", () => {
   expect(RUN_CANCEL_MESSAGES).toEqual({
     member_removed:
@@ -368,31 +370,50 @@ test("a known cancellation code of a cancelled run is its own text, and every ot
   }
 });
 
-test("the note about older runs in progress counts them", () => {
-  expect(describeMoreUnfinishedRuns(1)).toBe(
+test("the note about older runs in progress counts them, with the digits grouped in the locale", () => {
+  const english = new Intl.NumberFormat("en-US");
+
+  expect(describeMoreUnfinishedRuns(1, english)).toBe(
     "1 more run in progress is not shown.",
   );
-  expect(describeMoreUnfinishedRuns(2)).toBe(
+  expect(describeMoreUnfinishedRuns(2, english)).toBe(
     "2 more runs in progress are not shown.",
   );
-  expect(describeMoreUnfinishedRuns(800)).toBe(
-    "800 more runs in progress are not shown.",
+  expect(describeMoreUnfinishedRuns(1200, english)).toBe(
+    "1,200 more runs in progress are not shown.",
+  );
+  expect(describeMoreUnfinishedRuns(1200, new Intl.NumberFormat("de-DE"))).toBe(
+    "1.200 more runs in progress are not shown.",
+  );
+  // Without a format, the person's locale groups the digits.
+  expect(describeMoreUnfinishedRuns(1200)).toBe(
+    `${new Intl.NumberFormat().format(1200)} more runs in progress are not shown.`,
   );
 });
 
-test("a time is formatted for the person, and a timestamp that is not a date stays as it is", () => {
-  const format = new Intl.DateTimeFormat("en-GB", {
-    dateStyle: "medium",
-    timeStyle: "short",
-    timeZone: "UTC",
-  });
+test("a time is shown in the time zone of the format, by default the system's, and a timestamp that is not a date stays as it is", () => {
+  const at = (timeZone: string) =>
+    formatAgentTime(
+      FINISHED_AT,
+      agentTimeFormat({ locale: "en-GB", timeZone }),
+    );
 
-  expect(formatAgentTime(FINISHED_AT, format)).toBe("6 Nov 2026, 09:30");
-  expect(formatAgentTime("not a time", format)).toBe("not a time");
-  expect(formatAgentTime(FINISHED_AT)).toBe(
-    new Intl.DateTimeFormat(undefined, {
-      dateStyle: "medium",
-      timeStyle: "short",
-    }).format(new Date(FINISHED_AT)),
-  );
+  // 09:30 UTC; two zones that are not UTC, so a fixed UTC zone fails here
+  // also on a machine whose zone is UTC.
+  expect(at("UTC")).toBe("6 Nov 2026, 09:30");
+  expect(at("Asia/Tokyo")).toBe("6 Nov 2026, 18:30");
+  expect(at("America/New_York")).toBe("6 Nov 2026, 04:30");
+  expect(
+    formatAgentTime("not a time", agentTimeFormat({ timeZone: "Asia/Tokyo" })),
+  ).toBe("not a time");
+
+  // The defaults are the system's time zone and the person's locale.
+  const system = new Intl.DateTimeFormat().resolvedOptions();
+  const defaults = agentTimeFormat().resolvedOptions();
+  expect(defaults.timeZone).toBe(system.timeZone);
+  expect(defaults.locale).toBe(system.locale);
+  expect(defaults.dateStyle).toBe("medium");
+  expect(defaults.timeStyle).toBe("short");
+  // Each call makes a new format, so a changed system zone is used.
+  expect(agentTimeFormat()).not.toBe(agentTimeFormat());
 });

@@ -10,6 +10,7 @@ import {
 import { AgentPanelContent } from "./AgentPanel.tsx";
 import {
   AGENT_PROBLEM_MESSAGES,
+  agentTimeFormat,
   formatAgentTime,
   RUN_STATE_LABELS,
   type AgentPanelView,
@@ -84,9 +85,26 @@ function known(overrides: Partial<AgentActivityView> = {}): AgentPanelView {
   };
 }
 
+/** A fixed locale and a time zone that is not UTC, whatever the machine's. */
+const TOKYO_TIMES = agentTimeFormat({
+  locale: "en-GB",
+  timeZone: "Asia/Tokyo",
+});
+
+/** The times of the fixtures as `TOKYO_TIMES` shows them. */
+const SHOWN_TIMES: Readonly<Record<string, string>> = {
+  [CREATED_AT]: "6 Nov 2026, 17:00",
+  [FINISHED_AT]: "6 Nov 2026, 18:30",
+  [DISABLED_AT]: "5 Nov 2026, 21:00",
+};
+
 function render(view: AgentPanelView, projectId = PROJECT): string {
   return renderToString(
-    <AgentPanelContent view={view} projectId={projectId} />,
+    <AgentPanelContent
+      view={view}
+      projectId={projectId}
+      timeFormat={TOKYO_TIMES}
+    />,
   );
 }
 
@@ -96,7 +114,7 @@ function status(text: string): string {
 }
 
 function time(timestamp: string): string {
-  return `<time dateTime="${timestamp}">${formatAgentTime(timestamp)}</time>`;
+  return `<time dateTime="${timestamp}">${SHOWN_TIMES[timestamp] ?? ""}</time>`;
 }
 
 function attributeValues(html: string, name: string): string[] {
@@ -201,6 +219,19 @@ test("each run shows its agent, its state as text and as data-state, its reason,
     "failed",
     "completed",
   ]);
+});
+
+test("without a time format, the times are in the person's locale and the system's time zone", () => {
+  const html = renderToString(
+    <AgentPanelContent view={known()} projectId={PROJECT} />,
+  );
+  const system = agentTimeFormat();
+
+  for (const timestamp of [CREATED_AT, FINISHED_AT, DISABLED_AT]) {
+    expect(html).toContain(
+      `<time dateTime="${timestamp}">${formatAgentTime(timestamp, system)}</time>`,
+    );
+  }
 });
 
 test("every one of the six run states is set as data-state with its own label", () => {

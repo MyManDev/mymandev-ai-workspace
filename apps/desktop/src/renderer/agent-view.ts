@@ -226,26 +226,50 @@ export function describeAgentPanel(
   return { status: "", lists: listsOf(state) };
 }
 
-/** The note below the unfinished runs when older ones are not listed. */
-export function describeMoreUnfinishedRuns(count: number): string {
+/**
+ * The note below the unfinished runs when older ones are not listed, with
+ * the count's digits grouped as `format` groups them, by default in the
+ * person's locale ("1,200" in English).
+ */
+export function describeMoreUnfinishedRuns(
+  count: number,
+  format: Intl.NumberFormat = new Intl.NumberFormat(),
+): string {
+  const shown = format.format(count);
   return count === 1
-    ? "1 more run in progress is not shown."
-    : `${count} more runs in progress are not shown.`;
+    ? `${shown} more run in progress is not shown.`
+    : `${shown} more runs in progress are not shown.`;
 }
 
-const TIME_FORMAT = new Intl.DateTimeFormat(undefined, {
-  dateStyle: "medium",
-  timeStyle: "short",
-});
+export interface AgentTimeFormatOptions {
+  /** Defaults to the person's locale. */
+  readonly locale?: string;
+  /** An IANA time zone such as "Europe/Istanbul"; defaults to the system's. */
+  readonly timeZone?: string;
+}
 
 /**
- * A time of the agent activity in the person's locale and time zone, for
- * example "Nov 6, 2026, 9:30 AM". A timestamp that is not a date stays as
- * it is.
+ * The format of the panel's times: the date and the time, for example
+ * "Nov 6, 2026, 9:30 AM". The panel makes a new one for each render, so
+ * that a changed time zone of the system shows at the next change.
+ */
+export function agentTimeFormat(
+  options: AgentTimeFormatOptions = {},
+): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat(options.locale, {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: options.timeZone,
+  });
+}
+
+/**
+ * A time of the agent activity in `format`. A timestamp that is not a date
+ * stays as it is.
  */
 export function formatAgentTime(
   timestamp: string,
-  format: Intl.DateTimeFormat = TIME_FORMAT,
+  format: Intl.DateTimeFormat,
 ): string {
   const date = new Date(timestamp);
   return Number.isNaN(date.getTime()) ? timestamp : format.format(date);

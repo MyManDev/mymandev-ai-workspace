@@ -3,6 +3,7 @@ import type { AgentBridge } from "../shared/desktop-bridge.ts";
 import type { AgentView } from "../shared/ipc-contract.ts";
 import {
   AGENT_MESSAGES,
+  agentTimeFormat,
   describeAgentPanel,
   describeMoreUnfinishedRuns,
   followAgentActivity,
@@ -35,6 +36,11 @@ export interface AgentPanelContentProps {
   readonly view: AgentPanelView;
   /** The project that the shell shows; another project's activity is not shown. */
   readonly projectId: string;
+  /**
+   * The format of the times, for tests. By default, a new `agentTimeFormat`
+   * for each render, in the person's locale and the system's time zone.
+   */
+  readonly timeFormat?: Intl.DateTimeFormat | undefined;
 }
 
 /**
@@ -44,8 +50,13 @@ export interface AgentPanelContentProps {
  * entered, so each one takes its direction from its own content
  * (`dir="auto"`). A run's state is text; its dot only repeats it in color.
  */
-export function AgentPanelContent({ view, projectId }: AgentPanelContentProps) {
+export function AgentPanelContent({
+  view,
+  projectId,
+  timeFormat,
+}: AgentPanelContentProps) {
   const { status, lists } = describeAgentPanel(view, projectId);
+  const format = timeFormat ?? agentTimeFormat();
   return (
     <>
       <h2 id="panel-title">Agents</h2>
@@ -54,7 +65,7 @@ export function AgentPanelContent({ view, projectId }: AgentPanelContentProps) {
       </p>
       {lists === null ? null : (
         <>
-          <AgentList agents={lists.agents} />
+          <AgentList agents={lists.agents} format={format} />
           <h3 className="agent-runs-heading" id="unfinished-runs-heading">
             Runs in progress
           </h3>
@@ -62,6 +73,7 @@ export function AgentPanelContent({ view, projectId }: AgentPanelContentProps) {
             runs={lists.unfinishedRuns}
             labelledBy="unfinished-runs-heading"
             empty={AGENT_MESSAGES.noUnfinishedRuns}
+            format={format}
           />
           {lists.moreUnfinishedRuns === 0 ? null : (
             <p className="agent-note">
@@ -75,6 +87,7 @@ export function AgentPanelContent({ view, projectId }: AgentPanelContentProps) {
             runs={lists.finishedRuns}
             labelledBy="finished-runs-heading"
             empty={AGENT_MESSAGES.noFinishedRuns}
+            format={format}
           />
         </>
       )}
@@ -82,7 +95,13 @@ export function AgentPanelContent({ view, projectId }: AgentPanelContentProps) {
   );
 }
 
-function AgentList({ agents }: { readonly agents: readonly AgentView[] }) {
+function AgentList({
+  agents,
+  format,
+}: {
+  readonly agents: readonly AgentView[];
+  readonly format: Intl.DateTimeFormat;
+}) {
   if (agents.length === 0) {
     return <p>{AGENT_MESSAGES.noAgents}</p>;
   }
@@ -102,7 +121,8 @@ function AgentList({ agents }: { readonly agents: readonly AgentView[] }) {
           </p>
           {agent.disabledAt === null ? null : (
             <p className="agent-meta">
-              Disabled since <Time timestamp={agent.disabledAt} />
+              {"Disabled since "}
+              <Time timestamp={agent.disabledAt} format={format} />
             </p>
           )}
         </li>
@@ -115,11 +135,13 @@ function RunList({
   runs,
   labelledBy,
   empty,
+  format,
 }: {
   readonly runs: readonly RunRow[];
   readonly labelledBy: string;
   /** The text without runs. */
   readonly empty: string;
+  readonly format: Intl.DateTimeFormat;
 }) {
   if (runs.length === 0) {
     return <p>{empty}</p>;
@@ -127,13 +149,19 @@ function RunList({
   return (
     <ul className="agent-run-list" aria-labelledby={labelledBy}>
       {runs.map((run) => (
-        <RunItem key={run.id} run={run} />
+        <RunItem key={run.id} run={run} format={format} />
       ))}
     </ul>
   );
 }
 
-function RunItem({ run }: { readonly run: RunRow }) {
+function RunItem({
+  run,
+  format,
+}: {
+  readonly run: RunRow;
+  readonly format: Intl.DateTimeFormat;
+}) {
   const { reason } = run;
   return (
     <li className="agent-run" data-state={run.state}>
@@ -154,19 +182,25 @@ function RunItem({ run }: { readonly run: RunRow }) {
         </p>
       )}
       <p className="agent-run-time">
-        Created <Time timestamp={run.createdAt} />
+        Created <Time timestamp={run.createdAt} format={format} />
       </p>
       {run.finishedAt === null ? null : (
         <p className="agent-run-time">
-          Finished <Time timestamp={run.finishedAt} />
+          Finished <Time timestamp={run.finishedAt} format={format} />
         </p>
       )}
     </li>
   );
 }
 
-function Time({ timestamp }: { readonly timestamp: string }) {
-  return <time dateTime={timestamp}>{formatAgentTime(timestamp)}</time>;
+function Time({
+  timestamp,
+  format,
+}: {
+  readonly timestamp: string;
+  readonly format: Intl.DateTimeFormat;
+}) {
+  return <time dateTime={timestamp}>{formatAgentTime(timestamp, format)}</time>;
 }
 
 /** Follows the agent activity while the panel is shown. */
