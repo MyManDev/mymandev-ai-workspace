@@ -1074,6 +1074,7 @@ function deviceApi() {
               current: true,
             },
           ],
+          registrationLockedUntil: null,
         });
       case `POST /devices/${DEVICE_ID}/revoke`:
         api.revokedReason = body["reason"] ?? null;

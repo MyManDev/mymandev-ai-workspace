@@ -229,16 +229,35 @@ export async function registerDeviceRoutes(
       AUTH_ROUTES.listDevices.path,
       async (request): Promise<DeviceListResponse> => {
         const auth = authOf(request);
-        const rows = await database
-          .select()
-          .from(devices)
-          .where(eq(devices.userId, auth.userId))
-          .orderBy(desc(devices.createdAt))
-          .limit(MAX_ANSWER_LIST_ITEMS);
+        const now = options.now();
+        // One snapshot, so that a revocation as lost never shows its lock
+        // without the revoked device, or the device without its lock.
+        const { rows, lockedUntil } = await database.transaction(
+          async (tx) => {
+            const listed = await tx
+              .select()
+              .from(devices)
+              .where(eq(devices.userId, auth.userId))
+              .orderBy(desc(devices.createdAt))
+              .limit(MAX_ANSWER_LIST_ITEMS);
+            const [user] = await tx
+              .select({ lockedUntil: users.deviceRegistrationLockedUntil })
+              .from(users)
+              .where(eq(users.id, auth.userId));
+            return { rows: listed, lockedUntil: user?.lockedUntil ?? null };
+          },
+          { isolationLevel: "repeatable read", accessMode: "read only" },
+        );
         return {
           devices: rows.map((row) =>
             deviceListItem(row, row.id === auth.deviceId),
           ),
+          // In force while its end is later than now, as the sign-in checks
+          // it; an ended lock reads null although the column keeps it.
+          registrationLockedUntil:
+            lockedUntil !== null && lockedUntil.getTime() > now
+              ? lockedUntil.toISOString()
+              : null,
         };
       },
     );
