@@ -377,7 +377,8 @@ export interface WorkspaceActionAnswer {
  * a loaded key or an API origin, or when its token cannot be minted),
  * because the budget also limits the token requests. Only a write that the
  * service refuses itself (`invalid`, `unavailable`, `not_signed_in`, or
- * `too_soon`) does not count.
+ * `too_soon`) does not count. A session's `invalid_request`, which the
+ * service also answers as `invalid`, has counted already.
  */
 export const WORKSPACE_ACTION_BUDGET = Object.freeze({
   writes: 30,
