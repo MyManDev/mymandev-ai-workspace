@@ -12,10 +12,10 @@
 // #27 and #28 (`api-reads.ts`) for the main process only.
 //
 // The renderer gets a narrow status only: the account's login, display name,
-// and device ID, the pairing code, the authorize URL when the browser did not
-// open, the device list, and fixed codes. The sign-in code, the verifier,
-// signatures, keys, tokens, and the passphrase never reach the status, a
-// result, or a message.
+// and device ID (none of them while the device is signed out, #195), the
+// pairing code, the authorize URL when the browser did not open, the device
+// list, and fixed codes. The sign-in code, the verifier, signatures, keys,
+// tokens, and the passphrase never reach the status, a result, or a message.
 import type {
   ApiErrorCode,
   AuthChallengeFrame,
@@ -333,6 +333,7 @@ export function forgetConfirmed(result: {
 }
 
 const SIGNED_OUT: Account = Object.freeze({ kind: "signed_out" });
+const HIDDEN: Account = Object.freeze({ kind: "hidden" });
 const IDLE: SignInState = Object.freeze({ kind: "idle" });
 const STARTING: SignInState = Object.freeze({ kind: "starting" });
 const COMPLETING: SignInState = Object.freeze({ kind: "completing" });
@@ -449,6 +450,14 @@ function signedIn(
     displayName: account.displayName,
     deviceId: account.deviceId,
   });
+}
+
+/**
+ * Whether the person signed out on this device (P-65), also while the API
+ * has not learned it yet.
+ */
+function signedOut(device: DeviceState): boolean {
+  return device === "signed_out" || device === "sign_out_report_pending";
 }
 
 /** The state of the key after `load` rejected with `error`. */
@@ -588,12 +597,18 @@ export function createAccountService(
    */
   let accountChanges = 0;
   let revision = 0;
+  /** The account behind the last status, also while the status hides it. */
+  let publishedAccount = account;
   let current = snapshot();
 
   function snapshot(): AccountStatus {
     return Object.freeze({
       revision,
-      account,
+      // #195: while the device is signed out, the record and the key stay
+      // (P-65), but the status names no account. "This is not me" still
+      // reads the login from `account`, in the main process only.
+      account:
+        account.kind === "signed_in" && signedOut(device) ? HIDDEN : account,
       signIn,
       lastOutcome,
       deviceKey,
@@ -605,10 +620,14 @@ export function createAccountService(
 
   function publish(): void {
     const previous = current;
+    const previousAccount = publishedAccount;
     revision += 1;
     current = snapshot();
+    publishedAccount = account;
+    // The account itself counts, not whether the status hides it: that
+    // follows the device, which counts on its own.
     if (
-      JSON.stringify(previous.account) !== JSON.stringify(current.account) ||
+      JSON.stringify(previousAccount) !== JSON.stringify(account) ||
       previous.deviceKey !== current.deviceKey ||
       (previous.device !== current.device && current.device !== "signed_in")
     ) {
@@ -698,6 +717,12 @@ export function createAccountService(
     const next = deviceStateOf(state);
     if (next === device) {
       return;
+    }
+    if (signedOut(next) && !signedOut(device)) {
+      // #195: the outcome of the last sign-in ("now signed in to GitHub
+      // as") ends with the sign-out. It is kept in memory only, so it does
+      // not come back after a restart either.
+      lastOutcome = null;
     }
     device = next;
     if (next === "revoked") {

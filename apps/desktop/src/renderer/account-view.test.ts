@@ -29,6 +29,7 @@ import {
   forgetMessage,
   initialAccountView,
   listDevicesMessage,
+  offersForget,
   offersSignIn,
   removeDeviceMessage,
   SIGN_IN_OUTCOME_MESSAGES,
@@ -397,6 +398,33 @@ test("the sign-in is offered without an account and in every state that needs on
   for (const device of DEVICE_STATES) {
     expect(offersSignIn(status(device, false))).toBe(true);
   }
+  // While the device is signed out, the main process names no account.
+  for (const device of ["signed_out", "sign_out_report_pending"] as const) {
+    expect(
+      offersSignIn({ ...status(device), account: { kind: "hidden" } }),
+    ).toBe(true);
+  }
+});
+
+test("This is not me is offered whenever the installation holds an account, also one that the status does not name (#195)", () => {
+  const status = (account: AccountStatus["account"]): AccountStatus => ({
+    ...IDLE,
+    account,
+    device: account.kind === "hidden" ? "signed_out" : "signed_in",
+  });
+
+  expect(
+    offersForget(
+      status({
+        kind: "signed_in",
+        login: "octocat",
+        displayName: "The Octocat",
+        deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+      }),
+    ),
+  ).toBe(true);
+  expect(offersForget(status({ kind: "hidden" }))).toBe(true);
+  expect(offersForget(status({ kind: "signed_out" }))).toBe(false);
 });
 
 test("every failure of a device action has its own message, and a success none", () => {

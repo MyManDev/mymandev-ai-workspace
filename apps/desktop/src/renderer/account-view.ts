@@ -233,6 +233,15 @@ export function offersSignIn(status: AccountStatus): boolean {
   );
 }
 
+/**
+ * Whether the panel offers "This is not me": whenever the installation holds
+ * an account, also while its device is signed out and the status names no
+ * account (`hidden`, #195). The main process confirms it with the login.
+ */
+export function offersForget(status: AccountStatus): boolean {
+  return status.account.kind !== "signed_out";
+}
+
 /** The message for a start that the main process refused, or none. */
 export function startMessage(
   result: StartSignInResult | undefined,

@@ -1211,6 +1211,7 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
 
   // Sign out (P-65): the key and the record stay, and the API ended the
   // tokens; the key is not used until the next sign-in.
+  const sentBeforeSignOut = subscriber.sent.length;
   await expect(invoke(INVOKE_CHANNELS.signOut)).resolves.toEqual({
     outcome: "signed_out",
   });
@@ -1218,6 +1219,18 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   expect(await device()).toBe("signed_out");
   await expect(keyStore.hasKey()).resolves.toBe(true);
   expect(await records.read()).toMatchObject({ kind: "record" });
+  // #195: no status that reached the renderer since the sign-out names the
+  // account or the outcome of the sign-in.
+  await expect(invoke(INVOKE_CHANNELS.getAccountStatus)).resolves.toMatchObject(
+    { account: { kind: "hidden" }, lastOutcome: null },
+  );
+  const sentSignedOut = JSON.stringify(
+    subscriber.sent.slice(sentBeforeSignOut),
+  );
+  expect(sentSignedOut).toContain('"hidden"');
+  for (const detail of ["octocat", "The Octocat", DEVICE_ID, '"signed_in"']) {
+    expect(sentSignedOut).not.toContain(detail);
+  }
   const routesAfterSignOut = api.routes.length;
   clock += LIST_DEVICES_COOLDOWN_MS;
   await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toEqual({
@@ -1236,6 +1249,16 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     "octocat",
   );
   expect(await device()).toBe("signed_in");
+  await expect(invoke(INVOKE_CHANNELS.getAccountStatus)).resolves.toMatchObject(
+    {
+      account: {
+        kind: "signed_in",
+        login: "octocat",
+        displayName: "The Octocat",
+      },
+      lastOutcome: { code: "signed_in" },
+    },
+  );
   clock += LIST_DEVICES_COOLDOWN_MS;
   await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toMatchObject({
     outcome: "listed",

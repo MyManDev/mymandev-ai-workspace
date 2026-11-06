@@ -26,6 +26,7 @@ import {
   forgetMessage,
   initialAccountView,
   listDevicesMessage,
+  offersForget,
   offersSignIn,
   removeDeviceMessage,
   signOutMessage,
@@ -38,11 +39,12 @@ import {
 /**
  * The account of this installation: sign in with GitHub, in the default
  * browser or in another one (#175), the pairing code while the browser is
- * open, the GitHub login after a sign-in with "This is not me" (#149), the
- * passphrase of a device key that needs one, the state of the device with
- * sign-out, removing this device, and a simple device list. The main
- * process runs the sign-in and the device session; the panel never sees a
- * sign-in code, a key, or a token. The screens of #95 replace it.
+ * open, the GitHub login after a sign-in with "This is not me" (#149) and no
+ * account while the device is signed out (#195), the passphrase of a device
+ * key that needs one, the state of the device with sign-out, removing this
+ * device, and a simple device list. The main process runs the sign-in and
+ * the device session; the panel never sees a sign-in code, a key, or a
+ * token. The screens of #95 replace it.
  */
 export function AccountPanel({
   account,
@@ -175,7 +177,9 @@ function AccountBody(props: AccountPanelContentProps) {
 }
 
 function AccountSummary({ status }: { readonly status: AccountStatus }) {
-  if (status.account.kind === "signed_out") {
+  // Also while the device is signed out: the main process then names no
+  // account (`hidden`, #195).
+  if (status.account.kind !== "signed_in") {
     return <p>Not signed in.</p>;
   }
   return (
@@ -346,7 +350,7 @@ function SignInActions(
             Remove this device
           </button>
         ) : null}
-        {signedIn ? (
+        {offersForget(status) ? (
           <button
             type="button"
             className="panel-action"

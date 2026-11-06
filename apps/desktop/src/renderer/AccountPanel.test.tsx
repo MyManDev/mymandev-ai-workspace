@@ -369,6 +369,46 @@ test("after a sign-in, the panel names the login that the device is signed in to
   expect(html).toContain(">This is not me</button>");
 });
 
+test("while the device is signed out, the panel names no account and no earlier sign-in, and still offers This is not me (#195)", () => {
+  for (const device of ["signed_out", "sign_out_report_pending"] as const) {
+    // As the main process sends it: no account details and no outcome.
+    const status: Partial<AccountStatus> = {
+      account: { kind: "hidden" },
+      device,
+    };
+    const view = known(status);
+    const html = render({ view });
+
+    expect(html, device).toContain("<p>Not signed in.</p>");
+    expect(html, device).toContain(
+      `<p class="account-message" role="status">${DEVICE_STATE_MESSAGES[device]}</p>`,
+    );
+    for (const text of [
+      "account-facts",
+      "GitHub login",
+      "octocat",
+      "The Octocat",
+      "now signed in",
+    ]) {
+      expect(html, device).not.toContain(text);
+    }
+    expect(clickEveryButton({ view }), device).toEqual([
+      ["Sign in with GitHub", ["onStartSignIn"]],
+      ["Use another browser", ["onUseAnotherBrowser"]],
+      ["This is not me", ["onForget"]],
+    ]);
+    // A later sign-in that did not finish still shows its outcome.
+    expect(
+      render({
+        view: known({ ...status, lastOutcome: { code: "cancelled" } }),
+      }),
+      device,
+    ).toContain(
+      `<p class="account-message" role="status">${SIGN_IN_OUTCOME_MESSAGES.cancelled}</p>`,
+    );
+  }
+});
+
 test("every outcome has a fixed message, announced as an alert unless it is a success or a cancel", () => {
   for (const code of SIGN_IN_OUTCOME_CODES) {
     if (code === "signed_in") {
