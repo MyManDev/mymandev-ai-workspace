@@ -208,7 +208,14 @@ const LoginSchema = z
   .string()
   .regex(/^[A-Za-z0-9_-]{1,39}$/, "Expected a GitHub login");
 
-/** The account that this installation holds, from its device record. */
+/**
+ * The account that this installation holds, from its device record:
+ * `signed_out` without one, and `hidden` while the person is signed out on
+ * this device (P-65, #195), also when the device state names something else
+ * first, and while that is not known yet. The record is then kept, but the
+ * status names no login, display name, or device ID; after a refused
+ * sign-in with another account, `lastOutcome.deviceLogin` names the login.
+ */
 export const AccountSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("signed_out") }),
   z.object({
@@ -217,6 +224,7 @@ export const AccountSchema = z.discriminatedUnion("kind", [
     displayName: z.string().min(1).max(ACCOUNT_LIMITS.displayName),
     deviceId: z.uuid(),
   }),
+  z.object({ kind: z.literal("hidden") }),
 ]);
 export type Account = z.infer<typeof AccountSchema>;
 
@@ -394,7 +402,10 @@ export const AccountStatusSchema = z.object({
   revision: z.int().nonnegative(),
   account: AccountSchema,
   signIn: SignInStateSchema,
-  /** How the last sign-in ended; null before the first one and after "This is not me". */
+  /**
+   * How the last sign-in ended; null before the first one, after "This is
+   * not me", and once the device signs out (#195).
+   */
   lastOutcome: SignInOutcomeSchema.nullable(),
   deviceKey: z.enum(DEVICE_KEY_STATES),
   /**

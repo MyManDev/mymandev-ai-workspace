@@ -464,6 +464,7 @@ test("an account status with every sign-in state, outcome, and key state is acce
   const values: AccountStatus[] = [
     accountStatus(),
     accountStatus({ account: { kind: "signed_out" } }),
+    accountStatus({ account: { kind: "hidden" }, device: "signed_out" }),
     accountStatus({ signIn: { kind: "starting" } }),
     accountStatus({ signIn: { kind: "completing" } }),
     accountStatus({
@@ -542,6 +543,19 @@ test("an account status keeps only the narrow fields", () => {
   expect(JSON.stringify(parsed)).not.toMatch(
     /userId|publicKey|signInExpiresAt|mmdc_|verifier|mmda_|accessToken/,
   );
+
+  // A hidden account (#195) carries nothing but its kind.
+  expect(
+    AccountStatusSchema.parse({
+      ...accountStatus({ device: "signed_out" }),
+      account: {
+        kind: "hidden",
+        login: "octocat",
+        displayName: "The Octocat",
+        deviceId: DEVICE_ID,
+      },
+    }).account,
+  ).toEqual({ kind: "hidden" });
 });
 
 test("an account status with a wrong value is refused", () => {

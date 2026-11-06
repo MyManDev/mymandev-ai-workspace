@@ -12,10 +12,11 @@
 // #27 and #28 (`api-reads.ts`) for the main process only.
 //
 // The renderer gets a narrow status only: the account's login, display name,
-// and device ID, the pairing code, the authorize URL when the browser did not
-// open, the device list, and fixed codes. The sign-in code, the verifier,
-// signatures, keys, tokens, and the passphrase never reach the status, a
-// result, or a message.
+// and device ID (none of them while the person is signed out or the device
+// is not read yet, #195), the pairing code, the authorize URL when the
+// browser did not open, the device list, and fixed codes. The sign-in code,
+// the verifier, signatures, keys, tokens, and the passphrase never reach the
+// status, a result, or a message.
 import type {
   ApiErrorCode,
   AuthChallengeFrame,
@@ -43,6 +44,7 @@ import {
   deviceActionFailure,
   deviceStateOf,
   deviceViewOf,
+  signedOutOf,
 } from "./account-session.ts";
 import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
 import type { ApiOrigin } from "./api-origin.ts";
@@ -333,6 +335,7 @@ export function forgetConfirmed(result: {
 }
 
 const SIGNED_OUT: Account = Object.freeze({ kind: "signed_out" });
+const HIDDEN: Account = Object.freeze({ kind: "hidden" });
 const IDLE: SignInState = Object.freeze({ kind: "idle" });
 const STARTING: SignInState = Object.freeze({ kind: "starting" });
 const COMPLETING: SignInState = Object.freeze({ kind: "completing" });
@@ -573,6 +576,12 @@ export function createAccountService(
   let replacementPending = false;
   let device: DeviceState = "starting";
   /**
+   * Whether the person signed out on this device (P-65, `signedOutOf`), also
+   * while the device state names something else first, for example a key
+   * that waits for its passphrase or a refused sign-in with another account.
+   */
+  let deviceSignedOut = false;
+  /**
    * Counts the reads of the account that may publish it, so that a read
    * that a later one overtook changes nothing.
    */
@@ -588,12 +597,27 @@ export function createAccountService(
    */
   let accountChanges = 0;
   let revision = 0;
+  /** The account behind the last status, also while the status hides it. */
+  let publishedAccount = account;
   let current = snapshot();
+
+  /**
+   * Whether the status hides the account (#195): while the person is signed
+   * out on this device, where the record and the key stay (P-65), and while
+   * that is not known yet, before the session has read the device or when
+   * there is no session. After a refused sign-in with another account, the
+   * outcome's `deviceLogin` still names the login, and only the login.
+   * "This is not me" reads the login from `account`, in the main process.
+   */
+  function accountHidden(): boolean {
+    return deviceSignedOut || device === "starting" || session === null;
+  }
 
   function snapshot(): AccountStatus {
     return Object.freeze({
       revision,
-      account,
+      account:
+        account.kind === "signed_in" && accountHidden() ? HIDDEN : account,
       signIn,
       lastOutcome,
       deviceKey,
@@ -605,10 +629,14 @@ export function createAccountService(
 
   function publish(): void {
     const previous = current;
+    const previousAccount = publishedAccount;
     revision += 1;
     current = snapshot();
+    publishedAccount = account;
+    // The account itself counts, not whether the status hides it, which
+    // follows the device and the sign-out (`accountHidden`).
     if (
-      JSON.stringify(previous.account) !== JSON.stringify(current.account) ||
+      JSON.stringify(previousAccount) !== JSON.stringify(account) ||
       previous.deviceKey !== current.deviceKey ||
       (previous.device !== current.device && current.device !== "signed_in")
     ) {
@@ -696,11 +724,20 @@ export function createAccountService(
   /** Follows the state of the device session. */
   function sessionChanged(state: DeviceSessionState): void {
     const next = deviceStateOf(state);
-    if (next === device) {
+    const nextSignedOut = signedOutOf(state);
+    if (next === device && nextSignedOut === deviceSignedOut) {
       return;
     }
+    if (nextSignedOut && !deviceSignedOut) {
+      // #195: the outcome of the last sign-in ("now signed in to GitHub
+      // as") ends with the sign-out. It is kept in memory only, so it does
+      // not come back after a restart either.
+      lastOutcome = null;
+    }
+    const changed = next !== device;
+    deviceSignedOut = nextSignedOut;
     device = next;
-    if (next === "revoked") {
+    if (changed && next === "revoked") {
       // ADR 0014: a revoked device stops local execution. The session
       // publishes `revoked` before it deletes the key.
       stopLocalExecution();
@@ -807,7 +844,9 @@ export function createAccountService(
       const created = opened.createSession();
       session = created;
       created.onChange(sessionChanged);
-      device = deviceStateOf(created.state());
+      const state = created.state();
+      device = deviceStateOf(state);
+      deviceSignedOut = signedOutOf(state);
     } catch {
       device = "unavailable";
       report("The device session could not be created.");
@@ -1291,8 +1330,9 @@ export function createAccountService(
       }
       // The person is not asked for a removal that cannot happen: the API
       // takes no request of a signed-out device (they sign in first), and a
-      // key that waits for its passphrase cannot sign.
-      if (device === "signed_out" || device === "sign_out_report_pending") {
+      // key that waits for its passphrase cannot sign. A signed-out device
+      // may name a refused sign-in first (`account_mismatch`, #195).
+      if (deviceSignedOut) {
         return Object.freeze({ outcome: "failed", reason: "signed_out" });
       }
       if (device === "key_not_loaded" || deviceKey !== "ready") {

@@ -191,6 +191,11 @@ interface Harness {
   stopped: number;
   /** The state of the fake device session, which `state` and `refresh` return. */
   sessionState: DeviceSessionState;
+  /**
+   * The state that `refresh` moves to, as the real session moves from
+   * `starting` at startup; undefined keeps the state.
+   */
+  refreshTo: DeviceSessionState | undefined;
   /** Sets the session's state and calls its listeners, as the session does. */
   emit: (state: DeviceSessionState) => void;
   authenticate: () => Promise<SessionResult<SessionAccount>>;
@@ -248,6 +253,7 @@ function harness(
     readGate: null,
     stopped: 0,
     sessionState: SESSION_SIGNED_IN,
+    refreshTo: undefined,
     emit: () => undefined,
     authenticate: async () => ({ ok: true, value: SESSION_ACCOUNT }),
     signOut: async () => ({ ok: true, value: "reported" }),
@@ -279,6 +285,9 @@ function harness(
       },
       refresh: async () => {
         state.log.push("session refresh");
+        if (state.refreshTo !== undefined) {
+          state.sessionState = state.refreshTo;
+        }
         return state.sessionState;
       },
       signInStarted: () => {
@@ -1568,8 +1577,10 @@ test("a session that cannot be created is reported, and its actions are refused"
 
   await h.service.initialize();
 
+  // Without a session it is not known whether the person signed out, so
+  // the status names no account (#195).
   expect(h.service.status()).toMatchObject({
-    account: { kind: "signed_in" },
+    account: { kind: "hidden" },
     deviceKey: "ready",
     device: "unavailable",
   });
@@ -1963,8 +1974,9 @@ test("sign-out asks the session, which keeps the key, and maps its answer", asyn
   });
   expect(h.log).not.toContain("delete key");
   expect(h.log).not.toContain("delete record");
+  // The record stays, but the status names no account while signed out.
   expect(h.service.status()).toMatchObject({
-    account: { kind: "signed_in", login: "octocat" },
+    account: { kind: "hidden" },
     device: "signed_out",
   });
 
@@ -1994,6 +2006,224 @@ test("sign-out asks the session, which keeps the key, and maps its answer", asyn
     reason: "failed",
   });
   expect(h.errors).toEqual(["The sign-out failed."]);
+});
+
+/** The details of the record's account, which no signed-out status names. */
+const ACCOUNT_DETAILS = ["octocat", "The Octocat", DEVICE_ID];
+
+test("while the device is signed out, the status names no account and no earlier outcome, and the next sign-in names them again (#195)", async () => {
+  const h = harness();
+  h.record = { kind: "none" };
+  h.sessionState = { kind: "no_device" };
+  await h.service.initialize();
+  /** Runs a sign-in that ends with `outcome`, as the session would see it. */
+  const signIn = async (outcome: SignInOutcome) => {
+    const attempt = startedSignIn();
+    h.start = async () => attempt.start;
+    h.clock += SIGN_IN_START_COOLDOWN_MS;
+    await expect(h.service.startSignIn()).resolves.toEqual({
+      outcome: "started",
+    });
+    const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+    attempt.settle(outcome);
+    return done;
+  };
+  const signedIn: SignInOutcome = {
+    kind: "signed_in",
+    account: {
+      userId: USER_ID,
+      login: "octocat",
+      displayName: "The Octocat",
+      deviceId: DEVICE_ID,
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    },
+    newDevice: true,
+    login: "octocat",
+  };
+  h.record = { kind: "record", record: RECORD };
+  h.sessionState = SESSION_SIGNED_IN;
+  expect(await signIn(signedIn)).toMatchObject({
+    account: {
+      kind: "signed_in",
+      login: "octocat",
+      displayName: "The Octocat",
+      deviceId: DEVICE_ID,
+    },
+    lastOutcome: { code: "signed_in" },
+    device: "signed_in",
+  });
+
+  // A sign-out whose report waits: the same status drops the account and
+  // the outcome of the sign-in, and the record and the key stay (P-65).
+  const signedOutFrom = h.statuses.length;
+  h.signOut = async () => {
+    h.emit({
+      kind: "signed_out",
+      account: SESSION_ACCOUNT,
+      reportPending: true,
+    });
+    return { ok: true, value: "pending" };
+  };
+  await expect(h.service.signOut()).resolves.toEqual({ outcome: "pending" });
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "hidden" },
+    lastOutcome: null,
+    device: "sign_out_report_pending",
+  });
+  expect(h.log).not.toContain("delete record");
+  expect(h.log).not.toContain("delete key");
+
+  // A sign-in that does not finish shows its own outcome, still without the
+  // account, also once the API learned the sign-out.
+  expect(await signIn({ kind: "cancelled" })).toMatchObject({
+    account: { kind: "hidden" },
+    lastOutcome: { code: "cancelled" },
+    device: "sign_out_report_pending",
+  });
+  h.emit({
+    kind: "signed_out",
+    account: SESSION_ACCOUNT,
+    reportPending: false,
+  });
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "hidden" },
+    lastOutcome: { code: "cancelled" },
+    device: "signed_out",
+  });
+  const signedOut = JSON.stringify(h.statuses.slice(signedOutFrom));
+  for (const detail of ACCOUNT_DETAILS) {
+    expect(signedOut).not.toContain(detail);
+  }
+
+  // The next sign-in names the account and its outcome again.
+  h.sessionState = SESSION_SIGNED_IN;
+  expect(await signIn({ ...signedIn, newDevice: false })).toMatchObject({
+    account: {
+      kind: "signed_in",
+      login: "octocat",
+      displayName: "The Octocat",
+      deviceId: DEVICE_ID,
+    },
+    lastOutcome: { code: "signed_in" },
+    device: "signed_in",
+  });
+});
+
+test("after a restart of a signed-out device, no status names the account or an outcome, also while the session starts or the key is not usable, and This is not me confirms with the login in the main process (#195)", async () => {
+  // The real session starts in `starting` and moves at its first refresh.
+  // Before `signed_out` it may name a key that waits for its passphrase, a
+  // lost key, or a key store that failed, with `signedOut`.
+  const cases: [DeviceSessionState, AccountStatus["device"]][] = [
+    [
+      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: false },
+      "signed_out",
+    ],
+    [
+      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: true },
+      "sign_out_report_pending",
+    ],
+    [
+      { kind: "key_not_loaded", account: SESSION_ACCOUNT, signedOut: true },
+      "key_not_loaded",
+    ],
+    [
+      { kind: "key_lost", account: SESSION_ACCOUNT, signedOut: true },
+      "key_lost",
+    ],
+    [
+      { kind: "unavailable", reason: "key_store_failed", signedOut: true },
+      "unavailable",
+    ],
+  ];
+  for (const [state, device] of cases) {
+    const h = harness();
+    h.sessionState = { kind: "starting" };
+    h.refreshTo = state;
+    // A report that the API does not learn yet leaves the state as it is.
+    h.reportSignOut = async () => ({ ok: true, value: "pending" });
+    await h.service.initialize();
+
+    expect(
+      h.statuses.map((status) => status.device),
+      device,
+    ).toEqual(["starting", device]);
+    expect(h.service.status(), device).toMatchObject({
+      account: { kind: "hidden" },
+      lastOutcome: null,
+      device,
+    });
+    const sent = JSON.stringify(h.statuses);
+    for (const detail of ACCOUNT_DETAILS) {
+      expect(sent, device).not.toContain(detail);
+    }
+
+    // The session refuses the API removal of a signed-out device; the
+    // account is forgotten locally all the same.
+    h.removeDevice = async () => ({ ok: false, reason: "signed_out" });
+    await expect(h.service.forgetAccount(), device).resolves.toEqual({
+      outcome: "forgotten",
+      removedAtServer: false,
+    });
+    expect(h.log, device).toContain("confirm octocat");
+    expect(h.log, device).toContain("delete record");
+    expect(h.service.status().account, device).toEqual({ kind: "signed_out" });
+  }
+
+  // A device that did not sign out is named once the session has read it.
+  const h = harness();
+  h.sessionState = { kind: "starting" };
+  h.refreshTo = { kind: "key_not_loaded", account: SESSION_ACCOUNT };
+  await h.service.initialize();
+  expect(h.statuses.map((status) => status.account.kind)).toEqual([
+    "hidden",
+    "signed_in",
+  ]);
+});
+
+test("after a sign-out, a sign-in refused because another GitHub account was used names the installation's login only (#195)", async () => {
+  const h = harness();
+  h.sessionState = {
+    kind: "signed_out",
+    account: SESSION_ACCOUNT,
+    reportPending: false,
+  };
+  await h.service.initialize();
+  const attempt = startedSignIn();
+  h.start = async () => attempt.start;
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  // As the session answers: the sign-out marker stays.
+  h.sessionState = {
+    kind: "account_mismatch",
+    account: SESSION_ACCOUNT,
+    signedOut: true,
+  };
+  attempt.settle({
+    kind: "refused",
+    code: "device_account_mismatch",
+    deviceLogin: "octocat",
+  });
+
+  expect(await done).toMatchObject({
+    account: { kind: "hidden" },
+    lastOutcome: { code: "device_account_mismatch", deviceLogin: "octocat" },
+    device: "account_mismatch",
+  });
+  const sent = JSON.stringify(h.statuses);
+  expect(sent).not.toContain("The Octocat");
+  expect(sent).not.toContain(DEVICE_ID);
+
+  // Without a sign-out, the mismatch names the account as before (#149).
+  const kept = harness();
+  kept.sessionState = { kind: "account_mismatch", account: SESSION_ACCOUNT };
+  await kept.service.initialize();
+  expect(kept.service.status().account).toMatchObject({
+    kind: "signed_in",
+    login: "octocat",
+    displayName: "The Octocat",
+  });
 });
 
 test("sign-out, removal, and the device list are refused while busy and without an account", async () => {
@@ -3049,6 +3279,21 @@ test("an answer is dropped when the device signed out without an action while th
   reading = h.service.readWorkspaceData("listWorkspaces", {});
   await tick();
   h.emit(SESSION_SIGNED_IN);
+  finish({ ok: true, value: WORKSPACE_LIST });
+  await expect(reading).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
+
+  // Also from a sign-out: the status names the account again (#195), but
+  // the account itself did not change.
+  h.emit({
+    kind: "signed_out",
+    account: SESSION_ACCOUNT,
+    reportPending: false,
+  });
+  finish = heldAnswer(h);
+  reading = h.service.readWorkspaceData("listWorkspaces", {});
+  await tick();
+  h.emit(SESSION_SIGNED_IN);
+  expect(h.service.status().account).toMatchObject({ kind: "signed_in" });
   finish({ ok: true, value: WORKSPACE_LIST });
   await expect(reading).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
 });
