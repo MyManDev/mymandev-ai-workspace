@@ -17,6 +17,7 @@ import {
   type ProjectSummary,
   type ShellAction,
 } from "./screens.ts";
+import { HomeScreen } from "./WorkspaceScreens.tsx";
 
 interface HostProps {
   readonly children?: ReactNode;
@@ -130,6 +131,9 @@ test("each sidebar item shows its workspace screen or opens its project", () => 
   const { dispatch, take } = recorder();
   const expected = [
     ["Home", [{ type: "show-screen", screen: "home" }]],
+    ["Account", [{ type: "show-screen", screen: "account" }]],
+    ["People", [{ type: "show-screen", screen: "people" }]],
+    ["Join", [{ type: "show-screen", screen: "join" }]],
     ["About", [{ type: "show-screen", screen: "about" }]],
     ["Workspace A", []],
     ["Workspace B", []],
@@ -273,4 +277,14 @@ test("other keys in the tab list do nothing", () => {
       prevented: false,
     });
   }
+});
+
+test("Go to Account on the home screen shows the account screen, and it is offered only while no device is signed in", () => {
+  const { dispatch, take } = recorder();
+  expect(
+    clickEveryButton(HomeScreen({ signedOut: true, dispatch }), take),
+  ).toEqual([["Go to Account", [{ type: "show-screen", screen: "account" }]]]);
+  expect(
+    clickEveryButton(HomeScreen({ signedOut: false, dispatch }), take),
+  ).toEqual([]);
 });

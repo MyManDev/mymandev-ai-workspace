@@ -17,6 +17,7 @@ import type {
 } from "../shared/desktop-bridge.ts";
 import type { WorkspaceView } from "../shared/ipc-contract.ts";
 import { PRODUCT_NAME } from "../shared/product.ts";
+import { AccountScreen } from "./AccountScreen.tsx";
 import { ChatScreen } from "./ChatScreen.tsx";
 import {
   CONNECTION_ACTION_LABELS,
@@ -24,11 +25,13 @@ import {
   initialConnectionView,
   type ConnectionView,
 } from "./connection-status.ts";
+import { JoinScreen } from "./JoinScreen.tsx";
 import {
   ProjectNav,
   WorkspaceNav,
   type WorkspaceSidebar,
 } from "./Navigation.tsx";
+import { PeopleScreen } from "./PeopleScreen.tsx";
 import { ProjectPanel } from "./ProjectPanel.tsx";
 import {
   DecisionsScreen,
@@ -53,6 +56,7 @@ import { SwitchQuestionDialog } from "./SwitchQuestion.tsx";
 import {
   createWorkspaceSidebar,
   initialWorkspacePanelView,
+  noDeviceSignedIn,
   type SwitchQuestion,
 } from "./workspace-view.ts";
 import { AboutScreen, HomeScreen } from "./WorkspaceScreens.tsx";
@@ -145,6 +149,8 @@ export function App({
           electronVersion={electronVersion}
           account={account}
           chat={chat}
+          signedOut={noDeviceSignedIn(workspaceSidebar.view)}
+          dispatch={dispatch}
         />
       </main>
       {open === undefined ? null : (
@@ -166,15 +172,26 @@ function ScreenContent({
   electronVersion,
   account,
   chat,
+  signedOut,
+  dispatch,
 }: {
   readonly view: ShellView;
   readonly electronVersion: string | undefined;
   readonly account: AccountBridge | undefined;
   readonly chat: ChatBridge | undefined;
+  /** True while no device is signed in and ready. */
+  readonly signedOut: boolean;
+  readonly dispatch: Dispatch<ShellAction>;
 }) {
   switch (view.screen) {
     case "home":
-      return <HomeScreen account={account} />;
+      return <HomeScreen signedOut={signedOut} dispatch={dispatch} />;
+    case "account":
+      return <AccountScreen account={account} />;
+    case "people":
+      return <PeopleScreen />;
+    case "join":
+      return <JoinScreen />;
     case "about":
       return <AboutScreen electronVersion={electronVersion} />;
     case "chat":

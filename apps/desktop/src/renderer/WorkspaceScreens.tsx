@@ -1,12 +1,18 @@
-import type { AccountBridge } from "../shared/desktop-bridge.ts";
+import type { Dispatch } from "react";
 import { PRODUCT_NAME } from "../shared/product.ts";
-import { AccountPanel } from "./AccountPanel.tsx";
+import type { ShellAction } from "./screens.ts";
 
+/**
+ * The home screen: a hint to open a project, and while no device is signed
+ * in and ready, a way to the account screen, where the person signs in.
+ */
 export function HomeScreen({
-  account,
+  signedOut,
+  dispatch,
 }: {
-  /** The account functions from the preload script; undefined outside Electron. */
-  readonly account?: AccountBridge | undefined;
+  /** True while no device is signed in and ready (`noDeviceSignedIn`). */
+  readonly signedOut: boolean;
+  readonly dispatch: Dispatch<ShellAction>;
 }) {
   return (
     <section aria-labelledby="home-title">
@@ -15,7 +21,24 @@ export function HomeScreen({
         Open a project to see its chat, tasks, decisions, and permissions, and
         its agents and repositories.
       </p>
-      <AccountPanel account={account} />
+      {signedOut ? (
+        <>
+          <p>
+            Sign in with GitHub on the Account screen to see your workspaces.
+          </p>
+          <p>
+            <button
+              type="button"
+              className="panel-action"
+              onClick={() =>
+                dispatch({ type: "show-screen", screen: "account" })
+              }
+            >
+              Go to Account
+            </button>
+          </p>
+        </>
+      ) : null}
     </section>
   );
 }

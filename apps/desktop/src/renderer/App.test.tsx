@@ -96,6 +96,24 @@ const SCREEN_CASES: readonly ScreenCase[] = [
     current: ["Home (page)", "Workspace B (true)"],
   },
   {
+    view: { screen: "account" },
+    title: '<h2 id="account-screen-title">Account</h2>',
+    placeholder: "<p>Sign-in is not available.</p>",
+    current: ["Account (page)", "Workspace B (true)"],
+  },
+  {
+    view: { screen: "people" },
+    title: '<h2 id="people-title">People</h2>',
+    placeholder: "No people are shown yet.",
+    current: ["People (page)", "Workspace B (true)"],
+  },
+  {
+    view: { screen: "join" },
+    title: '<h2 id="join-title">Join a workspace</h2>',
+    placeholder: "Joining is not available yet.",
+    current: ["Join (page)", "Workspace B (true)"],
+  },
+  {
     view: { screen: "about" },
     title: '<h2 id="about-title">About</h2>',
     placeholder: "Electron 44.9.0",
@@ -757,7 +775,7 @@ test("Retry now and Reconnect here once call the reconnect, and nothing else doe
   }
 });
 
-test("the home screen holds the account panel, which waits for the first status with the bridge", () => {
+test("the account screen holds the account panel, which waits for the first status with the bridge", () => {
   const account: AccountBridge = {
     getStatus: () => new Promise(() => undefined),
     subscribeStatus: () => () => undefined,
@@ -771,11 +789,54 @@ test("the home screen holds the account panel, which waits for the first status 
     listDevices: () => Promise.resolve({ outcome: "listed", devices: [] }),
   };
 
-  expect(render({ account })).toContain(
-    '<section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">Account</h3><p>Checking the sign-in.</p></section></section>',
+  const accountView = { screen: "account" } as const;
+  expect(render({ account, initialView: accountView })).toContain(
+    '<section aria-labelledby="account-screen-title"><h2 id="account-screen-title">Account</h2><p>Sign in this device with GitHub, and manage the device and its sign-in.</p><section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">Account</h3><p>Checking the sign-in.</p></section></section>',
   );
-  expect(render()).toContain("<p>Sign-in is not available.</p>");
-  expect(render({ account, initialView: { screen: "about" } })).not.toContain(
-    "account-panel",
+  expect(render({ initialView: accountView })).toContain(
+    "<p>Sign-in is not available.</p>",
+  );
+  // The panel moved from the home screen to the account screen.
+  for (const screen of ["home", "people", "join", "about"] as const) {
+    expect(render({ account, initialView: { screen } }), screen).not.toContain(
+      "account-panel",
+    );
+  }
+});
+
+const GO_TO_ACCOUNT =
+  '<p>Sign in with GitHub on the Account screen to see your workspaces.</p><p><button type="button" class="panel-action">Go to Account</button></p></section>';
+
+test("the home screen keeps its hint and offers Go to Account only while no device is signed in", () => {
+  const signedOut = workspaceState([], {
+    status: "signed_out",
+    workspaces: [],
+    selectedWorkspaceId: null,
+  });
+  expect(render({ initialWorkspaceState: signedOut })).toContain(
+    `<h2 id="home-title">Home</h2><p>Open a project to see its chat, tasks, decisions, and permissions, and its agents and repositories.</p>${GO_TO_ACCOUNT}`,
+  );
+  // Only the home screen offers it.
+  expect(
+    render({
+      initialWorkspaceState: signedOut,
+      initialView: { screen: "about" },
+    }),
+  ).not.toContain("Go to Account");
+  for (const state of [
+    workspaceState(PROJECTS),
+    workspaceState([], { status: "loading" }),
+    workspaceState(PROJECTS, { status: "unavailable", problem: "unavailable" }),
+  ]) {
+    expect(render({ initialWorkspaceState: state }), state.status).toContain(
+      '<h2 id="home-title">Home</h2><p>Open a project to see its chat, tasks, decisions, and permissions, and its agents and repositories.</p></section>',
+    );
+  }
+  // Before the first workspace state and without the bridge, it says nothing.
+  expect(
+    render({ workspaces: pendingBridge, initialWorkspaceState: undefined }),
+  ).not.toContain("Go to Account");
+  expect(render({ initialWorkspaceState: undefined })).not.toContain(
+    "Go to Account",
   );
 });

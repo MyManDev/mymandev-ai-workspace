@@ -168,6 +168,7 @@ test("the checks find foreign imports, shared value imports, and forbidden APIs"
 test("the checks read every renderer source and no test", () => {
   for (const file of [
     "./AccountPanel.tsx",
+    "./AccountScreen.tsx",
     "./account-view.ts",
     "./AgentPanel.tsx",
     "./agent-view.ts",
@@ -175,8 +176,10 @@ test("the checks read every renderer source and no test", () => {
     "./ChatScreen.tsx",
     "./chat-view.ts",
     "./connection-status.ts",
+    "./JoinScreen.tsx",
     "./main.tsx",
     "./Navigation.tsx",
+    "./PeopleScreen.tsx",
     "./ProjectPanel.tsx",
     "./ProjectScreens.tsx",
     "./WorkspaceScreens.tsx",

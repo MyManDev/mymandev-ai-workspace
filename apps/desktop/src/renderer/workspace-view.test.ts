@@ -1,9 +1,10 @@
 import { expect, test } from "vitest";
 import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
-import type {
-  WorkspaceActionResult,
-  WorkspaceSwitchOptions,
-  WorkspaceView,
+import {
+  WORKSPACE_STATUSES,
+  type WorkspaceActionResult,
+  type WorkspaceSwitchOptions,
+  type WorkspaceView,
 } from "../shared/ipc-contract.ts";
 import {
   createShellState,
@@ -15,6 +16,7 @@ import {
   createWorkspaceSidebar,
   describeSwitchQuestion,
   initialWorkspacePanelView,
+  noDeviceSignedIn,
   SELECT_REFUSAL_MESSAGES,
   switchWorkspace,
   WORKSPACE_MESSAGES,
@@ -611,4 +613,26 @@ test("the question names the count, what the switch does, and both answers", () 
     keep: "Keep the messages",
     discard: "Discard and close project",
   });
+});
+
+test("no device is signed in only while the workspace state is signed_out", () => {
+  const states = WORKSPACE_STATUSES.map((status) => [
+    status,
+    noDeviceSignedIn({
+      kind: "known",
+      state:
+        status === "unavailable"
+          ? { ...READY, status, problem: "unavailable" }
+          : { ...READY, status },
+    }),
+  ]);
+  expect(Object.fromEntries(states)).toEqual({
+    signed_out: true,
+    loading: false,
+    ready: false,
+    unavailable: false,
+  });
+  // Before the first state and without the bridge, the shell does not know.
+  expect(noDeviceSignedIn({ kind: "pending" })).toBe(false);
+  expect(noDeviceSignedIn({ kind: "unavailable" })).toBe(false);
 });

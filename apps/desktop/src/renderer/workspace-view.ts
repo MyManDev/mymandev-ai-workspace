@@ -35,6 +35,15 @@ export const WORKSPACE_MESSAGES = Object.freeze({
 });
 
 /**
+ * Whether no device is signed in and ready: the workspace state is
+ * `signed_out`. Before the first state and without the bridge, the shell
+ * does not know, so it says nothing.
+ */
+export function noDeviceSignedIn(view: WorkspacePanelView): boolean {
+  return view.kind === "known" && view.state.status === "signed_out";
+}
+
+/**
  * Why the workspaces are `unavailable`. What was loaded before stays shown,
  * and the main process loads again by itself.
  */

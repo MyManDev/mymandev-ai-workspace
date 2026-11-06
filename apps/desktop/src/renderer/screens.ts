@@ -4,7 +4,13 @@
 // project, which also shows a side panel with its agents or its repositories.
 
 /** The screens outside a project. */
-export const WORKSPACE_SCREEN_IDS = ["home", "about"] as const;
+export const WORKSPACE_SCREEN_IDS = [
+  "home",
+  "account",
+  "people",
+  "join",
+  "about",
+] as const;
 
 /** The screens of the open project. */
 export const PROJECT_SCREEN_IDS = [
@@ -36,6 +42,9 @@ export interface NavigationItem<Id extends string> {
 /** The workspace screens in navigation order. */
 export const WORKSPACE_SCREENS: readonly NavigationItem<WorkspaceScreenId>[] = [
   { id: "home", label: "Home" },
+  { id: "account", label: "Account" },
+  { id: "people", label: "People" },
+  { id: "join", label: "Join" },
   { id: "about", label: "About" },
 ];
 
