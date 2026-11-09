@@ -767,8 +767,9 @@ export function createPeopleActions(
    *
    * A confirmed leave is apart, because its membership event can switch
    * the workspace before its answer arrives: it keeps its sentence while
-   * the same session is signed in, and it resolves to true, because its
-   * control goes with its workspace in any case. Its sentence stays through
+   * the same session is signed in, and in that session it resolves to true,
+   * because its control goes with its workspace in any case; after a
+   * sign-out it moves no focus either. Its sentence stays through
    * the next switch only while nothing switched yet, because that switch is
    * the one that the leave brings.
    */
@@ -809,7 +810,7 @@ export function createPeopleActions(
     keepThroughSwitch = still && left;
     running = false;
     show();
-    return ok && (kind === "leave" || (still && LEAVING_ACTIONS.has(kind)));
+    return left || (still && ok && LEAVING_ACTIONS.has(kind));
   }
 
   function send(

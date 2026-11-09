@@ -987,7 +987,7 @@ test("a confirmed leave whose answer arrives after the switch keeps its sentence
   expect(last().message).toBeUndefined();
 });
 
-test("a confirmed leave whose answer arrives after a sign-out shows no sentence, also once the next session is signed in", async () => {
+test("a confirmed leave whose answer arrives after a sign-out shows no sentence and moves no focus, also once the next session is signed in", async () => {
   for (const after of [
     [known({ status: "signed_out", workspaceId: null })],
     [
@@ -1010,7 +1010,7 @@ test("a confirmed leave whose answer arrives after a sign-out shows no sentence,
       actions.listChanged(view, NOW);
     }
     resolve({ outcome: "ok" });
-    await expect(done).resolves.toBe(true);
+    await expect(done).resolves.toBe(false);
     expect(last().message, String(after.length)).toBeUndefined();
   }
   // Without a sign-out, the leave's own switch to no workspace keeps it.
@@ -1026,8 +1026,25 @@ test("a confirmed leave whose answer arrives after a sign-out shows no sentence,
     NOW,
   );
   resolve({ outcome: "ok" });
-  await done;
+  await expect(done).resolves.toBe(true);
   expect(last().message).toBe("You left the workspace.");
+});
+
+test("every sign-out ends the session, not only the first one of the controller's life", async () => {
+  const { answer, resolve } = pending();
+  const { actions, last } = controllerWith(
+    answer,
+    known({ ownMemberId: MEMBER }),
+  );
+  const signedOut = known({ status: "signed_out", workspaceId: null });
+  actions.listChanged(signedOut, NOW);
+  actions.listChanged(known({ ownMemberId: MEMBER }), NOW);
+  await actions.start({ kind: "leave", ...IN_WORKSPACE });
+  const done = actions.confirm();
+  actions.listChanged(signedOut, NOW);
+  resolve({ outcome: "ok" });
+  await expect(done).resolves.toBe(false);
+  expect(last().message).toBeUndefined();
 });
 
 test("an answer after a switch away and back to its workspace counts as after a switch", async () => {
