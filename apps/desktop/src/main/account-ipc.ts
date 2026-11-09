@@ -10,11 +10,12 @@ import {
  * Registers the handlers of the account channels and sends each change of
  * the account status to the frames that subscribed. Every handler checks the
  * sender and the arguments first (`createInvokeHandler`) and answers with a
- * value parsed by the contract, so only the narrow status, fixed codes,
- * and the device list reach the renderer (ADR 0014). `unlockDeviceKey`
- * takes the passphrase, which goes to the key store and is never sent back
- * or logged, and `startSignIn` an optional choice of the browser (#175).
- * Call it before the first window loads.
+ * value parsed by the contract, so only the narrow status and fixed codes
+ * reach the renderer (ADR 0014); the device list has channels of its own
+ * (`device-ipc.ts`). `unlockDeviceKey` takes the passphrase, which goes to
+ * the key store and is never sent back or logged, and `startSignIn` an
+ * optional choice of the browser (#175). Call it before the first window
+ * loads.
  */
 export function registerAccountIpc(
   ipc: IpcRegistry,
@@ -29,7 +30,6 @@ export function registerAccountIpc(
     | "forgetAccount"
     | "signOut"
     | "removeDevice"
-    | "listDevices"
   >,
   onError: (message: string, error: unknown) => void = (message, error) =>
     console.error(message, error),
@@ -94,12 +94,6 @@ export function registerAccountIpc(
     INVOKE_CHANNELS.removeDevice,
     createInvokeHandler(INVOKE_CHANNELS.removeDevice, appUrl, () =>
       service.removeDevice(),
-    ),
-  );
-  ipc.handle(
-    INVOKE_CHANNELS.listDevices,
-    createInvokeHandler(INVOKE_CHANNELS.listDevices, appUrl, () =>
-      service.listDevices(),
     ),
   );
   service.onStatusChange((status) => {

@@ -932,7 +932,10 @@ describe("access tokens", () => {
     const first = await h.session.listDevices();
     const second = await h.session.listDevices();
 
-    expect(first).toEqual({ ok: true, value: [DEVICE_ITEM] });
+    expect(first).toEqual({
+      ok: true,
+      value: { devices: [DEVICE_ITEM], registrationLockedUntil: null },
+    });
     expect(second).toEqual(first);
     expect(h.api.requests.map((r) => `${r.method} ${r.path}`)).toEqual([
       "POST /auth/challenge",
@@ -3594,6 +3597,46 @@ describe("remove this device", () => {
 });
 
 describe("device list", () => {
+  test("the answer holds the devices and the end of a registration lock in force, frozen", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    const revoked = {
+      ...DEVICE_ITEM,
+      id: "0192f0a0-7b3c-7d4e-8f50-000000000099",
+      label: "Lost laptop",
+      revokedAt: "2026-11-06T09:00:00.000Z",
+      current: false,
+    };
+    api.intercept = (request) =>
+      request.path === "/devices"
+        ? Promise.resolve(
+            json(200, {
+              devices: [DEVICE_ITEM, revoked],
+              registrationLockedUntil: "2026-11-13T09:00:00.000Z",
+            }),
+          )
+        : undefined;
+
+    const result = await h.session.listDevices();
+
+    expect(result).toEqual({
+      ok: true,
+      value: {
+        devices: [DEVICE_ITEM, revoked],
+        registrationLockedUntil: "2026-11-13T09:00:00.000Z",
+      },
+    });
+    if (!result.ok) {
+      throw new Error("The device list was not read.");
+    }
+    expect(Object.isFrozen(result.value)).toBe(true);
+    expect(Object.isFrozen(result.value.devices)).toBe(true);
+    expect(
+      result.value.devices.every((device) => Object.isFrozen(device)),
+    ).toBe(true);
+  });
+
   test("an answer that does not pass the schema is unexpected", async () => {
     const api = fakeApi();
     const h = harness(api);

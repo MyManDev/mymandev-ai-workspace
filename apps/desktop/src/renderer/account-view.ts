@@ -7,9 +7,7 @@ import type {
   DeviceActionFailure,
   DeviceKeyState,
   DeviceState,
-  DeviceView,
   ForgetResult,
-  ListDevicesResult,
   RemoveDeviceResult,
   SignInOutcomeCode,
   SignInOutcomeView,
@@ -559,7 +557,7 @@ export async function startInAnotherBrowser(
   return account.startSignIn({ browser: "other" });
 }
 
-/** The message for each failure of a sign-out, a removal, or the device list. */
+/** The message for each failure of a sign-out or a removal. */
 export const DEVICE_ACTION_FAILURE_MESSAGES: Readonly<
   Record<DeviceActionFailure, string>
 > = Object.freeze({
@@ -594,10 +592,8 @@ export const DEVICE_ACTION_FAILURE_MESSAGES: Readonly<
 export const DEVICE_ACTION_MESSAGES = Object.freeze({
   busy: "Wait until the sign-in or the current change of the account is finished.",
   notSignedIn: "This installation holds no account.",
-  tooSoon: "Wait a few seconds before you ask for the devices again.",
   signOutFailed: "The sign-out could not be completed. Try again.",
   removeFailed: "The device could not be removed. Try again.",
-  listFailed: "The devices could not be listed. Try again.",
   forgottenAtServer:
     "The account was removed from this installation, and the server removed this device from it.",
   forgottenLocally:
@@ -609,7 +605,7 @@ function deviceActionMessage(
   result:
     | {
         readonly outcome: "refused";
-        readonly reason: "busy" | "not_signed_in" | "too_soon";
+        readonly reason: "busy" | "not_signed_in";
       }
     | { readonly outcome: "failed"; readonly reason: DeviceActionFailure },
 ): string {
@@ -619,8 +615,6 @@ function deviceActionMessage(
         return DEVICE_ACTION_MESSAGES.busy;
       case "not_signed_in":
         return DEVICE_ACTION_MESSAGES.notSignedIn;
-      case "too_soon":
-        return DEVICE_ACTION_MESSAGES.tooSoon;
     }
   }
   return DEVICE_ACTION_FAILURE_MESSAGES[result.reason];
@@ -651,13 +645,6 @@ export function removeDeviceMessage(
   }
 }
 
-/** The message after the device list was asked for; the list shows itself. */
-export function listDevicesMessage(
-  result: ListDevicesResult,
-): string | undefined {
-  return result.outcome === "listed" ? undefined : deviceActionMessage(result);
-}
-
 /**
  * The message after "This is not me": whether the server removed the device
  * or it stays listed for that account (#198), or why nothing was deleted.
@@ -677,22 +664,4 @@ export function forgetMessage(result: ForgetResult): string | undefined {
     case "failed":
       return ACTION_MESSAGES.forgetFailed;
   }
-}
-
-const PLATFORM_NAMES: Readonly<Record<DeviceView["platform"], string>> =
-  Object.freeze({
-    windows: "Windows",
-    macos: "macOS",
-    linux: "Linux",
-  });
-
-/** One line of detail for a device of the list: its platform and its state. */
-export function deviceDetail(device: DeviceView): string {
-  const platform = PLATFORM_NAMES[device.platform];
-  if (device.revokedAt !== null) {
-    return `${platform}, removed on ${device.revokedAt.slice(0, 10)}`;
-  }
-  return device.lastSeenAt === null
-    ? `${platform}, not connected yet`
-    : `${platform}, last seen on ${device.lastSeenAt.slice(0, 10)}`;
 }

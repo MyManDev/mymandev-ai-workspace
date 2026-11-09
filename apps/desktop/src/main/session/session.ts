@@ -159,6 +159,16 @@ export interface SessionFailure {
 export type SessionResult<T> =
   { readonly ok: true; readonly value: T } | SessionFailure;
 
+/**
+ * The answer of `GET /devices`, frozen: the person's own devices, the most
+ * recently created first, and the end of the account's registration lock
+ * while it is in force, or null (#95, D5b).
+ */
+export interface DeviceList {
+  readonly devices: readonly DeviceListItem[];
+  readonly registrationLockedUntil: string | null;
+}
+
 /** The account and the device of this installation, from the device record. */
 export interface SessionAccount {
   readonly deviceId: DeviceId;
@@ -351,8 +361,11 @@ export interface DeviceSession {
   readonly request: <T>(
     request: AuthorizedRequest<T>,
   ) => Promise<SessionResult<T | null>>;
-  /** `GET /devices`: the person's own devices. */
-  readonly listDevices: () => Promise<SessionResult<readonly DeviceListItem[]>>;
+  /**
+   * `GET /devices`: the person's own devices, and the end of the account's
+   * registration lock while it is in force, or null (#95, D5b). Frozen.
+   */
+  readonly listDevices: () => Promise<SessionResult<DeviceList>>;
   /**
    * Signs out (P-65): the device and its key stay, the tokens are dropped,
    * and the key is not used until the next GitHub sign-in. The sign-out
@@ -1985,9 +1998,7 @@ export function createDeviceSession(
     return result;
   }
 
-  async function listDevices(): Promise<
-    SessionResult<readonly DeviceListItem[]>
-  > {
+  async function listDevices(): Promise<SessionResult<DeviceList>> {
     const result = await request({
       route: AUTH_ROUTES.listDevices,
       answer: DeviceListResponseSchema,
@@ -1997,7 +2008,14 @@ export function createDeviceSession(
     }
     return result.value === null
       ? failure("unexpected_response")
-      : succeeded(Object.freeze(result.value.devices));
+      : succeeded(
+          Object.freeze({
+            devices: Object.freeze(
+              result.value.devices.map((device) => Object.freeze(device)),
+            ),
+            registrationLockedUntil: result.value.registrationLockedUntil,
+          }),
+        );
   }
 
   async function replacementGraceEnd(): Promise<string | null> {

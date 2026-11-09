@@ -4,6 +4,7 @@ import type {
   ChatBridge,
   ConnectionBridge,
   DesktopBridge,
+  DeviceListBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -21,8 +22,9 @@ import type {
   ChatSendResultView,
   ChatView,
   ConnectionStatus,
+  DeviceListLoadResult,
+  DeviceListView,
   ForgetResult,
-  ListDevicesResult,
   MountResult,
   ReconnectResult,
   RemoveDeviceResult,
@@ -142,7 +144,8 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * passphrase of `account.unlockDeviceKey`, the IDs of `workspaces.select`
  * and `workspaces.openProject`, the text of `chat.send`, and the event IDs
  * of `chat.retry` and `chat.discard`, which must be strings (or null to
- * close a project) and which the main process validates.
+ * close a project) and which the main process validates, and the device IDs
+ * of `devices.dismissNewDevices`, an array of strings that it copies.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -243,8 +246,6 @@ export function createDesktopBridge(
       ipc.invoke(INVOKE_CHANNELS.signOut) as Promise<SignOutResult>,
     removeDevice: () =>
       ipc.invoke(INVOKE_CHANNELS.removeDevice) as Promise<RemoveDeviceResult>,
-    listDevices: () =>
-      ipc.invoke(INVOKE_CHANNELS.listDevices) as Promise<ListDevicesResult>,
   });
 
   const connection: ConnectionBridge = Object.freeze({
@@ -383,6 +384,39 @@ export function createDesktopBridge(
       ) as Promise<ChatLoadOlderResultView>,
   });
 
+  const devices: DeviceListBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(INVOKE_CHANNELS.getDeviceList) as Promise<DeviceListView>,
+    subscribeState: (
+      listener: (state: DeviceListView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeDeviceList,
+        EVENT_CHANNELS.deviceListChanged,
+        "A device list callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    load: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.loadDeviceList,
+      ) as Promise<DeviceListLoadResult>,
+    // Only a new array of the strings goes on; the main process checks each
+    // ID. Another value is refused here without naming it.
+    dismissNewDevices: (deviceIds: readonly string[]) =>
+      Array.isArray(deviceIds) &&
+      deviceIds.every((deviceId) => typeof deviceId === "string")
+        ? (ipc.invoke(INVOKE_CHANNELS.dismissNewDevices, [
+            ...deviceIds,
+          ]) as Promise<boolean>)
+        : Promise.reject(
+            new TypeError("dismissNewDevices needs an array of ID strings."),
+          ),
+  });
+
   return Object.freeze({
     electronVersion,
     runtime,
@@ -392,5 +426,6 @@ export function createDesktopBridge(
     workspaces,
     agents,
     chat,
+    devices,
   });
 }

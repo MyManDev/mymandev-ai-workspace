@@ -6,6 +6,7 @@ import type {
   AgentBridge,
   ChatBridge,
   ConnectionBridge,
+  DeviceListBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -1273,25 +1274,42 @@ const pendingAccount: AccountBridge = {
     Promise.resolve({ outcome: "forgotten", removedAtServer: true }),
   signOut: () => Promise.resolve({ outcome: "signed_out" }),
   removeDevice: () => Promise.resolve({ outcome: "removed" }),
-  listDevices: () => Promise.resolve({ outcome: "listed", devices: [] }),
 };
 
-test("the account screen holds the account panel under This device, which waits for the first status with the bridge", () => {
+/** A device list bridge whose first state does not arrive. */
+const pendingDevices: DeviceListBridge = {
+  getState: () => new Promise(() => undefined),
+  subscribeState: () => () => undefined,
+  load: () => Promise.resolve({ outcome: "loading" }),
+  dismissNewDevices: () => Promise.resolve(false),
+};
+
+test("the account screen holds the account panel under This device and the account's devices beside it, which wait for their first states with the bridges", () => {
   const accountView = { screen: "account" } as const;
   expect(
-    render({ account: pendingAccount, initialView: accountView }),
+    render({
+      account: pendingAccount,
+      devices: pendingDevices,
+      initialView: accountView,
+    }),
   ).toContain(
-    '<section aria-labelledby="account-screen-title"><h2 id="account-screen-title" tabindex="-1">Account</h2><p>Sign in this device with GitHub, and manage the device and its sign-in.</p><section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">This device</h3><p>Checking the sign-in.</p></section></section>',
+    '<section aria-labelledby="account-screen-title"><h2 id="account-screen-title" tabindex="-1">Account</h2><p>Sign in this device with GitHub, manage the device and its sign-in, and see every device of the account.</p><section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">This device</h3><p>Checking the sign-in.</p></section><section class="account-panel" aria-labelledby="devices-title"><h3 id="devices-title" tabindex="-1">Devices</h3><p class="account-message" role="status">Checking the devices.</p></section></section>',
   );
-  expect(render({ initialView: accountView })).toContain(
-    "<p>Sign-in is not available.</p>",
+  const without = render({ initialView: accountView });
+  expect(without).toContain("<p>Sign-in is not available.</p>");
+  expect(without).toContain(
+    '<p class="account-message" role="status">Devices are not available.</p>',
   );
-  // The panel moved from the home screen to the account screen.
+  // The panel moved from the home screen to the account screen, and the
+  // devices show there only.
   for (const screen of ["home", "people", "join", "about"] as const) {
-    expect(
-      render({ account: pendingAccount, initialView: { screen } }),
-      screen,
-    ).not.toContain("account-panel");
+    const html = render({
+      account: pendingAccount,
+      devices: pendingDevices,
+      initialView: { screen },
+    });
+    expect(html, screen).not.toContain("account-panel");
+    expect(html, screen).not.toContain("devices-title");
   }
 });
 

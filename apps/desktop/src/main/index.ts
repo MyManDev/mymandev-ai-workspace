@@ -40,6 +40,8 @@ import {
 } from "./connection/system.ts";
 import { registerConnectionIpc } from "./connection-ipc.ts";
 import { claimDataFolder } from "./data-folder.ts";
+import { registerDeviceIpc } from "./device-ipc.ts";
+import { createDeviceListService } from "./devices/service.ts";
 import {
   createSessionGuardInstaller,
   installContentsGuards,
@@ -190,6 +192,22 @@ function start(): void {
   });
   registerConnectionIpc(ipcMain, rendererUrl, connection);
   app.on("will-quit", () => connection.close());
+
+  // The account's devices and the end of a registration lock in force (#95,
+  // D4 and D5b), read over HTTP once the Account screen asked for them and
+  // again after the account frames, a reconnect, and the person's device
+  // actions, with the notices of new devices from the live frame. It
+  // reaches the renderer through its own channels, at most one publish every
+  // 50 ms. The logs are fixed text with a failure code at most, never a
+  // label or an ID.
+  const devices = createDeviceListService({
+    account,
+    connection,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => devices.close());
+  const deviceIpc = registerDeviceIpc(ipcMain, rendererUrl, { devices });
+  app.on("will-quit", () => deviceIpc.close());
 
   // The account's workspaces and the selected one's people and projects
   // (#27, #28), read over HTTP and kept current with the workspace's events.

@@ -27,12 +27,18 @@ import {
   DEVICE_ACTION_FAILURES,
   DEVICE_ACTION_REFUSALS,
   DEVICE_KEY_STATES,
+  DEVICE_LIST_LIMITS,
+  DEVICE_LIST_LOAD_REFUSALS,
+  DEVICE_LIST_PROBLEMS,
+  DEVICE_LIST_STATUSES,
+  DEVICE_PLATFORMS,
   DEVICE_STATES,
+  DeviceListLoadResultSchema,
+  DeviceListViewSchema,
   EVENT_CONTRACT,
   FORGET_REFUSALS,
   ForgetResultSchema,
   INVOKE_CONTRACT,
-  ListDevicesResultSchema,
   MAX_WAITING_CHAT_MESSAGES,
   MOUNT_REFUSALS,
   MountResultSchema,
@@ -108,6 +114,11 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     AGENT_ACTIVITY_STATUSES,
     AGENT_ACTIVITY_PROBLEMS,
     AGENT_RUN_STATES,
+    DEVICE_LIST_LIMITS,
+    DEVICE_LIST_STATUSES,
+    DEVICE_LIST_PROBLEMS,
+    DEVICE_LIST_LOAD_REFUSALS,
+    DEVICE_PLATFORMS,
   ]) {
     expect(Object.isFrozen(list)).toBe(true);
   }
@@ -159,7 +170,7 @@ test("a runtime status with a wrong state or revision is refused", () => {
   }
 });
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, and the chat's send, retry, and discard take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, and the dismissal of new devices take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -169,9 +180,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.openProject &&
       channel !== INVOKE_CHANNELS.sendChatMessage &&
       channel !== INVOKE_CHANNELS.retryChatMessage &&
-      channel !== INVOKE_CHANNELS.discardChatMessage,
+      channel !== INVOKE_CHANNELS.discardChatMessage &&
+      channel !== INVOKE_CHANNELS.dismissNewDevices,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 8);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 9);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -759,17 +771,7 @@ test("the results of start, unlock, and forget hold only fixed values", () => {
   }
 });
 
-const DEVICE_VIEW = Object.freeze({
-  id: DEVICE_ID,
-  label: "Mac",
-  platform: "macos",
-  lastSeenAt: "2026-11-02T09:00:00.000Z",
-  signInExpiresAt: "2026-12-02T10:00:00.000Z",
-  revokedAt: null,
-  current: true,
-});
-
-test("the results of sign-out, removal, and the device list hold only fixed values and the device fields", () => {
+test("the results of sign-out and removal hold only fixed values", () => {
   const refusals = DEVICE_ACTION_REFUSALS.map((reason) => ({
     outcome: "refused",
     reason,
@@ -795,34 +797,6 @@ test("the results of sign-out, removal, and the device list hold only fixed valu
   ]) {
     expect(RemoveDeviceResultSchema.parse(value)).toEqual(value);
   }
-  for (const value of [
-    { outcome: "listed", devices: [] },
-    {
-      outcome: "listed",
-      devices: [
-        DEVICE_VIEW,
-        {
-          ...DEVICE_VIEW,
-          platform: "windows",
-          lastSeenAt: null,
-          revokedAt: "2026-11-02T10:00:00.000Z",
-          current: false,
-        },
-      ],
-    },
-    ...refusals,
-    ...failures,
-  ]) {
-    expect(ListDevicesResultSchema.parse(value)).toEqual(value);
-  }
-
-  // Unknown fields are dropped, also inside a device.
-  const parsed = ListDevicesResultSchema.parse({
-    outcome: "listed",
-    devices: [{ ...DEVICE_VIEW, publicKey: "ab".repeat(32), userId: "x" }],
-    accessToken: "mmda_secret",
-  });
-  expect(JSON.stringify(parsed)).not.toMatch(/publicKey|userId|mmda_/);
   expect(
     SignOutResultSchema.parse({ outcome: "pending", accessToken: "mmda_x" }),
   ).toEqual({ outcome: "pending" });
@@ -830,62 +804,25 @@ test("the results of sign-out, removal, and the device list hold only fixed valu
   for (const [schema, value] of [
     [SignOutResultSchema, { outcome: "failed", reason: "other" }],
     [SignOutResultSchema, { outcome: "refused", reason: "other" }],
+    // The device list has its own channels, so no device action is refused
+    // as too soon.
+    [SignOutResultSchema, { outcome: "refused", reason: "too_soon" }],
+    [RemoveDeviceResultSchema, { outcome: "refused", reason: "too_soon" }],
     [SignOutResultSchema, { outcome: "removed" }],
     [RemoveDeviceResultSchema, { outcome: "signed_out" }],
     [RemoveDeviceResultSchema, { outcome: "failed" }],
-    [ListDevicesResultSchema, { outcome: "listed" }],
-    [
-      ListDevicesResultSchema,
-      {
-        outcome: "listed",
-        devices: Array.from(
-          { length: ACCOUNT_LIMITS.devices + 1 },
-          () => DEVICE_VIEW,
-        ),
-      },
-    ],
-    [
-      ListDevicesResultSchema,
-      { outcome: "listed", devices: [{ ...DEVICE_VIEW, id: "x" }] },
-    ],
-    [
-      ListDevicesResultSchema,
-      { outcome: "listed", devices: [{ ...DEVICE_VIEW, label: "" }] },
-    ],
-    [
-      ListDevicesResultSchema,
-      {
-        outcome: "listed",
-        devices: [
-          { ...DEVICE_VIEW, label: "x".repeat(ACCOUNT_LIMITS.deviceLabel + 1) },
-        ],
-      },
-    ],
-    [
-      ListDevicesResultSchema,
-      { outcome: "listed", devices: [{ ...DEVICE_VIEW, platform: "android" }] },
-    ],
-    [
-      ListDevicesResultSchema,
-      {
-        outcome: "listed",
-        devices: [{ ...DEVICE_VIEW, lastSeenAt: "yesterday" }],
-      },
-    ],
-    [
-      ListDevicesResultSchema,
-      { outcome: "listed", devices: [{ ...DEVICE_VIEW, current: "yes" }] },
-    ],
   ] as const) {
     expect(schema.safeParse(value).success).toBe(false);
   }
 });
 
-test("sign-out, removal, and the device list take no argument", () => {
+test("sign-out, removal, and the device list's reads and load take no argument", () => {
   for (const channel of [
     INVOKE_CHANNELS.signOut,
     INVOKE_CHANNELS.removeDevice,
-    INVOKE_CHANNELS.listDevices,
+    INVOKE_CHANNELS.getDeviceList,
+    INVOKE_CHANNELS.subscribeDeviceList,
+    INVOKE_CHANNELS.loadDeviceList,
   ]) {
     const { args } = INVOKE_CONTRACT[channel];
     expect(args.parse([])).toEqual([]);
@@ -893,6 +830,200 @@ test("sign-out, removal, and the device list take no argument", () => {
       expect(args.safeParse(value).success).toBe(false);
     }
   }
+});
+
+test("the dismissal of new devices takes 1 to 10 device IDs, each a lowercase UUIDv7", () => {
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.dismissNewDevices];
+  const most = Array.from(
+    { length: DEVICE_LIST_LIMITS.newDevices },
+    (_, n) =>
+      `0192f2a0-7c3e-7a1b-8c4d-5e6f7081${n.toString(16).padStart(4, "0")}`,
+  );
+  expect(args.parse([[DEVICE_ID]])).toEqual([[DEVICE_ID]]);
+  expect(args.parse([most])).toEqual([most]);
+  for (const value of [
+    [],
+    [[]],
+    [DEVICE_ID],
+    [[DEVICE_ID], [DEVICE_ID]],
+    [[DEVICE_ID.toUpperCase()]],
+    [["0192f2a0-7c3e-4a1b-8c4d-5e6f708192a3"]],
+    [[`${DEVICE_ID} `]],
+    [[null]],
+    [[...most, DEVICE_ID]],
+  ]) {
+    expect(args.safeParse(value).success, JSON.stringify(value)).toBe(false);
+  }
+});
+
+const DEVICE_VIEW = Object.freeze({
+  id: DEVICE_ID,
+  label: "Mac",
+  platform: "macos",
+  createdAt: "2026-10-01T10:00:00.000Z",
+  lastSeenAt: "2026-11-02T09:00:00.000Z",
+  lastSignInAt: "2026-11-02T08:00:00.000Z",
+  signInExpiresAt: "2026-12-02T08:00:00.000Z",
+  revokedAt: null,
+  current: true,
+});
+
+const NEW_DEVICE = Object.freeze({
+  id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b4",
+  label: "Work laptop",
+  platform: "windows",
+  createdAt: "2026-11-09T09:00:00.000Z",
+});
+
+const DEVICE_LIST = Object.freeze({
+  revision: 4,
+  devices: [
+    DEVICE_VIEW,
+    {
+      ...DEVICE_VIEW,
+      id: NEW_DEVICE.id,
+      platform: "windows",
+      lastSeenAt: null,
+      revokedAt: "2026-11-09T10:00:00.000Z",
+      current: false,
+    },
+  ],
+  registrationLockedUntil: "2026-11-16T10:00:00.000Z",
+  newDevices: [NEW_DEVICE],
+});
+
+test("a device list view holds the devices, the lock, and the notices, and a problem only while unavailable", () => {
+  for (const status of ["signed_out", "loading", "ready"] as const) {
+    const value = { status, ...DEVICE_LIST };
+    expect(DeviceListViewSchema.parse(value)).toEqual(value);
+  }
+  for (const problem of DEVICE_LIST_PROBLEMS) {
+    const value = { status: "unavailable", problem, ...DEVICE_LIST };
+    expect(DeviceListViewSchema.parse(value)).toEqual(value);
+  }
+  const empty = {
+    status: "ready",
+    revision: 0,
+    devices: [],
+    registrationLockedUntil: null,
+    newDevices: [],
+  };
+  expect(DeviceListViewSchema.parse(empty)).toEqual(empty);
+  // A label counts characters, as the protocol does: 64 characters outside
+  // the Basic Multilingual Plane fit.
+  const astral = "\u{1F4BB}".repeat(DEVICE_LIST_LIMITS.label);
+  expect(
+    DeviceListViewSchema.safeParse({
+      status: "ready",
+      ...DEVICE_LIST,
+      devices: [{ ...DEVICE_VIEW, label: astral }],
+      newDevices: [{ ...NEW_DEVICE, label: astral }],
+    }).success,
+  ).toBe(true);
+
+  // Unknown fields are dropped, also inside a device and a notice: no user
+  // ID or token crosses.
+  const parsed = DeviceListViewSchema.parse({
+    status: "ready",
+    ...DEVICE_LIST,
+    devices: [{ ...DEVICE_VIEW, publicKey: "ab".repeat(32), userId: "x" }],
+    newDevices: [{ ...NEW_DEVICE, userId: "x" }],
+    accessToken: "mmda_secret",
+  });
+  expect(JSON.stringify(parsed)).not.toMatch(/publicKey|userId|mmda_/);
+
+  const ready = { status: "ready", ...DEVICE_LIST };
+  for (const value of [
+    { ...DEVICE_LIST, status: "unavailable" },
+    { ...DEVICE_LIST, status: "unavailable", problem: "not_found" },
+    { ...DEVICE_LIST, status: "idle" },
+    { ...ready, revision: -1 },
+    { ...ready, registrationLockedUntil: "next week" },
+    {
+      ...ready,
+      devices: Array.from(
+        { length: DEVICE_LIST_LIMITS.devices + 1 },
+        () => DEVICE_VIEW,
+      ),
+    },
+    {
+      ...ready,
+      newDevices: Array.from(
+        { length: DEVICE_LIST_LIMITS.newDevices + 1 },
+        () => NEW_DEVICE,
+      ),
+    },
+    // A device ID crosses as a lowercase UUIDv7 only.
+    { ...ready, devices: [{ ...DEVICE_VIEW, id: "x" }] },
+    {
+      ...ready,
+      devices: [{ ...DEVICE_VIEW, id: DEVICE_ID.toUpperCase() }],
+    },
+    {
+      ...ready,
+      devices: [{ ...DEVICE_VIEW, id: "0192f2a0-7c3e-4a1b-8c4d-5e6f708192a3" }],
+    },
+    { ...ready, devices: [{ ...DEVICE_VIEW, label: "" }] },
+    {
+      ...ready,
+      devices: [{ ...DEVICE_VIEW, label: `${astral}x` }],
+    },
+    { ...ready, devices: [{ ...DEVICE_VIEW, platform: "android" }] },
+    { ...ready, devices: [{ ...DEVICE_VIEW, lastSeenAt: "yesterday" }] },
+    { ...ready, devices: [{ ...DEVICE_VIEW, createdAt: null }] },
+    { ...ready, devices: [{ ...DEVICE_VIEW, lastSignInAt: undefined }] },
+    { ...ready, devices: [{ ...DEVICE_VIEW, signInExpiresAt: null }] },
+    { ...ready, devices: [{ ...DEVICE_VIEW, revokedAt: "removed" }] },
+    { ...ready, devices: [{ ...DEVICE_VIEW, current: "yes" }] },
+    { ...ready, newDevices: [{ ...NEW_DEVICE, id: "x" }] },
+    { ...ready, newDevices: [{ ...NEW_DEVICE, label: "" }] },
+    { ...ready, newDevices: [{ ...NEW_DEVICE, platform: "ios" }] },
+    { ...ready, newDevices: [{ ...NEW_DEVICE, createdAt: "today" }] },
+  ]) {
+    expect(
+      DeviceListViewSchema.safeParse(value).success,
+      JSON.stringify(value).slice(0, 120),
+    ).toBe(false);
+  }
+  expect(DEVICE_LIST_STATUSES).toEqual([
+    "signed_out",
+    "loading",
+    "ready",
+    "unavailable",
+  ]);
+  expect(DEVICE_PLATFORMS).toEqual(["windows", "macos", "linux"]);
+});
+
+test("the device list's load answers loading or a fixed refusal, and its dismissal a boolean", () => {
+  const load = INVOKE_CONTRACT[INVOKE_CHANNELS.loadDeviceList].result;
+  expect(load).toBe(DeviceListLoadResultSchema);
+  expect(load.parse({ outcome: "loading" })).toEqual({ outcome: "loading" });
+  for (const reason of DEVICE_LIST_LOAD_REFUSALS) {
+    expect(load.parse({ outcome: "refused", reason })).toEqual({
+      outcome: "refused",
+      reason,
+    });
+  }
+  for (const value of [
+    { outcome: "listed" },
+    { outcome: "refused", reason: "busy" },
+    { outcome: "refused" },
+    "loading",
+  ]) {
+    expect(load.safeParse(value).success).toBe(false);
+  }
+  const dismiss = INVOKE_CONTRACT[INVOKE_CHANNELS.dismissNewDevices].result;
+  expect(dismiss.parse(true)).toBe(true);
+  expect(dismiss.safeParse("yes").success).toBe(false);
+  for (const channel of [
+    INVOKE_CHANNELS.getDeviceList,
+    INVOKE_CHANNELS.subscribeDeviceList,
+  ]) {
+    expect(INVOKE_CONTRACT[channel].result).toBe(DeviceListViewSchema);
+  }
+  expect(EVENT_CONTRACT[EVENT_CHANNELS.deviceListChanged]).toBe(
+    DeviceListViewSchema,
+  );
 });
 
 test("a connection status holds a reason and a retry time only where its state has them", () => {

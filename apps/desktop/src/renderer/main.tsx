@@ -19,6 +19,7 @@ createRoot(container).render(
       workspaces={window.desktop?.workspaces}
       agents={window.desktop?.agents}
       chat={window.desktop?.chat}
+      devices={window.desktop?.devices}
     />
   </StrictMode>,
 );

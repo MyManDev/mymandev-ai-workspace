@@ -65,8 +65,6 @@ export const INVOKE_CHANNELS = Object.freeze({
    * the API confirmed the removal.
    */
   removeDevice: "account:remove-device",
-  /** The devices of the account, without anything secret. */
-  listDevices: "account:list-devices",
   /** The status of the connection to the cloud API. */
   getConnectionStatus: "connection:get-status",
   /**
@@ -133,6 +131,27 @@ export const INVOKE_CHANNELS = Object.freeze({
    * within the backoff after a page did not load.
    */
   loadOlderChatMessages: "chat:load-older",
+  /**
+   * What the renderer may know of the account's devices: the device list,
+   * the end of a registration lock in force, and the notices of new devices
+   * (#95, D4 and D5b). Never a user ID or a token.
+   */
+  getDeviceList: "devices:get-state",
+  /**
+   * The device list state. The calling frame then receives every later state
+   * on `EVENT_CHANNELS.deviceListChanged`.
+   */
+  subscribeDeviceList: "devices:subscribe-state",
+  /**
+   * Loads the device list again, when the Account screen shows it; not
+   * within a few seconds of the last time. The renderer sends nothing.
+   */
+  loadDeviceList: "devices:load",
+  /**
+   * Dismisses the notices of new devices that the renderer showed, by the
+   * device IDs that they name.
+   */
+  dismissNewDevices: "devices:dismiss-new-devices",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */
@@ -157,6 +176,11 @@ export const EVENT_CHANNELS = Object.freeze({
    * that subscribed.
    */
   chatStateChanged: "chat:state-changed",
+  /**
+   * The device list state after changes, at most one every 50 ms, to the
+   * frames that subscribed.
+   */
+  deviceListChanged: "devices:state-changed",
 } as const);
 
 export type InvokeChannel =
