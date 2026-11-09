@@ -3422,6 +3422,150 @@ describe("tokens, clocks, and late refusals", () => {
       ).toBe(keys.current.publicKey);
     },
   );
+
+  /**
+   * Holds the answer of the next token request, made when it arrives, until
+   * the result is called.
+   */
+  function holdTokenAnswer(
+    api: FakeApi,
+    answer: (request: ApiRequest) => Response = (request) =>
+      answerApi(api, request),
+  ): () => void {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    api.intercept = (request) => {
+      if (request.path !== "/auth/access-token") {
+        return undefined;
+      }
+      api.intercept = null;
+      const made = answer(request);
+      return gate.then(() => made);
+    };
+    return () => release();
+  }
+
+  test("a late device_revoked of the previous key still revokes the device after the key was replaced", async () => {
+    // A revocation names the device, not the key.
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    h.session.signInStarted();
+    api.deviceState = "revoked";
+    const release = holdTokenAnswer(api);
+    const reading = h.session.listDevices();
+    await waitForRequest(h, "POST", "/auth/access-token");
+    const keys = await h.keyStore.replace();
+    await h.records.write(deviceRecord(keys.current.publicKey));
+    release();
+
+    expect(await reading).toEqual({
+      ok: false,
+      reason: "refused",
+      code: "device_revoked",
+    });
+    expect(h.session.state().kind).toBe("revoked");
+    expect(heldKeys(h)).toBeNull();
+  });
+
+  test("a late rate_limited of the previous key's token request after the key was replaced keeps its wait", async () => {
+    // It says nothing about the key, and its wait still reaches the caller.
+    const h = harness();
+    await existingDevice(h);
+    h.session.signInStarted();
+    const release = holdTokenAnswer(h.api, () => {
+      const answer = errorAnswer("rate_limited");
+      answer.headers.set("retry-after", "60");
+      return answer;
+    });
+    const reading = h.session.listDevices();
+    await waitForRequest(h, "POST", "/auth/access-token");
+    const keys = await h.keyStore.replace();
+    await h.records.write(deviceRecord(keys.current.publicKey));
+    release();
+
+    expect(await reading).toEqual({
+      ok: false,
+      reason: "refused",
+      code: "rate_limited",
+      retryAfterSeconds: 60,
+    });
+  });
+
+  test.each(["auth_failed", "sign_in_required"] as const)(
+    "a late %s of a key whose record and keys This is not me deleted meanwhile changes nothing",
+    async (code) => {
+      const api = fakeApi();
+      const h = harness(api);
+      await existingDevice(h);
+      const release = holdTokenAnswer(api, () => errorAnswer(code));
+      const reading = h.session.listDevices();
+      await waitForRequest(h, "POST", "/auth/access-token");
+      await h.records.delete();
+      await h.keyStore.delete();
+      h.calls.length = 0;
+      release();
+
+      expect(await reading).toEqual({ ok: false, reason: "no_device" });
+      expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
+      expect(await keyFiles()).toEqual([]);
+      expect(await h.markers.read()).toEqual({ kind: "none" });
+
+      // No refusal was kept: the next device of this installation mints
+      // a token at once.
+      const key = await h.keyStore.create({ kind: "system" });
+      await h.records.write(deviceRecord(key.publicKey));
+      api.publicKey = key.publicKey;
+      expect((await h.session.listDevices()).ok).toBe(true);
+      expect(h.session.state().kind).toBe("signed_in");
+    },
+  );
+
+  test("a late auth_failed of the previous key after the pending replacement was confirmed meanwhile changes nothing", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    const { previous, current } = await pendingReplacement(h);
+    // The API holds the previous key: the new key is refused first, and the
+    // previous key's token request waits.
+    api.publicKey = previous;
+    let tokenRequestsSeen = 0;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    api.intercept = (request) => {
+      if (request.path !== "/auth/access-token") {
+        return undefined;
+      }
+      tokenRequestsSeen += 1;
+      return tokenRequestsSeen === 2
+        ? gate.then(() => answerApi(api, request))
+        : undefined;
+    };
+    const reading = h.session.listDevices();
+    await waitForRequest(h, "POST", "/auth/access-token", 2);
+    expect(signerOf(api, tokenRequests(api).at(-1), [current, previous])).toBe(
+      previous,
+    );
+
+    // Meanwhile the new key was proven and confirmed, for example by a
+    // late commit of the uncertain sign-in, and the API holds only it.
+    api.publicKey = current;
+    await h.records.write(deviceRecord(current));
+    await h.keyStore.confirmReplacement();
+    h.calls.length = 0;
+    release();
+
+    expect(await reading).toEqual({ ok: false, reason: "no_device" });
+    expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
+    expect(heldKeys(h)).toEqual({ current, previous: null });
+    expect((await notesFile())?.["keysRefused"] ?? null).toBeNull();
+    api.intercept = null;
+    expect((await h.session.listDevices()).ok).toBe(true);
+    expect(h.session.state().kind).toBe("signed_in");
+  });
 });
 
 describe("remove this device", () => {
