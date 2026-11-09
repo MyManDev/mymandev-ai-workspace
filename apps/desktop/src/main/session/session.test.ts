@@ -3523,49 +3523,63 @@ describe("tokens, clocks, and late refusals", () => {
     },
   );
 
-  test("a late auth_failed of the previous key after the pending replacement was confirmed meanwhile changes nothing", async () => {
-    const api = fakeApi();
-    const h = harness(api);
-    const { previous, current } = await pendingReplacement(h);
-    // The API holds the previous key: the new key is refused first, and the
-    // previous key's token request waits.
-    api.publicKey = previous;
-    let tokenRequestsSeen = 0;
-    let release: () => void = () => undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    api.intercept = (request) => {
-      if (request.path !== "/auth/access-token") {
-        return undefined;
+  test.each(["auth_failed", "sign_in_required"] as const)(
+    "a late %s of the previous key after the pending replacement was confirmed meanwhile changes nothing",
+    async (code) => {
+      const api = fakeApi();
+      const h = harness(api);
+      const { previous, current } = await pendingReplacement(h);
+      // The API holds the previous key: the new key is refused first, and the
+      // previous key's token request waits. `auth_failed` is the API's answer
+      // once it holds only the new key, and `sign_in_required` its answer
+      // before, which arrives late.
+      api.publicKey = previous;
+      if (code === "sign_in_required") {
+        api.deviceState = "sign_in_required";
       }
-      tokenRequestsSeen += 1;
-      return tokenRequestsSeen === 2
-        ? gate.then(() => answerApi(api, request))
-        : undefined;
-    };
-    const reading = h.session.listDevices();
-    await waitForRequest(h, "POST", "/auth/access-token", 2);
-    expect(signerOf(api, tokenRequests(api).at(-1), [current, previous])).toBe(
-      previous,
-    );
+      let tokenRequestsSeen = 0;
+      let release: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      api.intercept = (request) => {
+        if (request.path !== "/auth/access-token") {
+          return undefined;
+        }
+        tokenRequestsSeen += 1;
+        if (tokenRequestsSeen !== 2) {
+          return undefined;
+        }
+        if (code === "sign_in_required") {
+          const answer = answerApi(api, request);
+          return gate.then(() => answer);
+        }
+        return gate.then(() => answerApi(api, request));
+      };
+      const reading = h.session.listDevices();
+      await waitForRequest(h, "POST", "/auth/access-token", 2);
+      expect(
+        signerOf(api, tokenRequests(api).at(-1), [current, previous]),
+      ).toBe(previous);
 
-    // Meanwhile the new key was proven and confirmed, for example by a
-    // late commit of the uncertain sign-in, and the API holds only it.
-    api.publicKey = current;
-    await h.records.write(deviceRecord(current));
-    await h.keyStore.confirmReplacement();
-    h.calls.length = 0;
-    release();
+      // Meanwhile the new key was proven and confirmed, for example by a
+      // late commit of the uncertain sign-in, and the API holds only it.
+      api.publicKey = current;
+      api.deviceState = "ok";
+      await h.records.write(deviceRecord(current));
+      await h.keyStore.confirmReplacement();
+      h.calls.length = 0;
+      release();
 
-    expect(await reading).toEqual({ ok: false, reason: "no_device" });
-    expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
-    expect(heldKeys(h)).toEqual({ current, previous: null });
-    expect((await notesFile())?.["keysRefused"] ?? null).toBeNull();
-    api.intercept = null;
-    expect((await h.session.listDevices()).ok).toBe(true);
-    expect(h.session.state().kind).toBe("signed_in");
-  });
+      expect(await reading).toEqual({ ok: false, reason: "no_device" });
+      expect(h.calls.filter((call) => !call.startsWith("state:"))).toEqual([]);
+      expect(heldKeys(h)).toEqual({ current, previous: null });
+      expect((await notesFile())?.["keysRefused"] ?? null).toBeNull();
+      api.intercept = null;
+      expect((await h.session.listDevices()).ok).toBe(true);
+      expect(h.session.state().kind).toBe("signed_in");
+    },
+  );
 });
 
 describe("remove this device", () => {

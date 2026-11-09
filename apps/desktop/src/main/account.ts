@@ -1060,7 +1060,11 @@ export function createAccountService(
   /**
    * Whether a sign-in whose attempt opens now renews the sign-in of the
    * device that is signed in (D4 on #95): a signed-in account and device, a
-   * ready key, and no pending key replacement.
+   * ready key, and no pending key replacement. Today no sign-in can start
+   * without a ready key (`key_not_ready`), and nothing changes the key's
+   * state while a sign-in runs, so a test cannot reach the key's clause. It
+   * stays so that a later change to the start does not turn such a sign-in
+   * into a renewal.
    */
   function renewing(): boolean {
     return (
