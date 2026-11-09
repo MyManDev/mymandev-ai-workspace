@@ -1019,6 +1019,7 @@ test("an invitation code appears in exactly one create answer, and never in a pu
     "trace",
     "dir",
     "table",
+    "dirxml",
   ] as const) {
     vi.spyOn(console, method).mockImplementation((...args: unknown[]) => {
       logged.push(args);
@@ -1027,7 +1028,16 @@ test("an invitation code appears in exactly one create answer, and never in a pu
   const written: unknown[][] = [];
   for (const stream of [process.stdout, process.stderr]) {
     vi.spyOn(stream, "write").mockImplementation((...args: unknown[]) => {
-      written.push(args);
+      // A chunk of bytes is checked as its text.
+      written.push(
+        args.map((arg) =>
+          arg instanceof Uint8Array
+            ? Buffer.from(arg.buffer, arg.byteOffset, arg.byteLength).toString(
+                "utf8",
+              )
+            : arg,
+        ),
+      );
       return true;
     });
   }
@@ -1305,7 +1315,13 @@ test("an invitation code appears in exactly one create answer, and never in a pu
       workspaces.state(),
       workspaces.people(),
     ],
-    { depth: Infinity, showHidden: true, maxArrayLength: null },
+    {
+      depth: Infinity,
+      showHidden: true,
+      maxArrayLength: null,
+      maxStringLength: null,
+      breakLength: Infinity,
+    },
   );
   for (const code of [CODE, PASTED, PASTED.toUpperCase()]) {
     expect(elsewhere).not.toContain(code);

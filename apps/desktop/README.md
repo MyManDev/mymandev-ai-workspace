@@ -441,7 +441,7 @@ The invitations of #95 (ADR 0014, "Invitations"; decisions D1 to D3) are in the 
 - **When it loads (D3).** Nothing is read until the screen asks (`load`, when it opens and on the person's refresh). A request is refused as `not_signed_in`, `no_workspace`, or `not_allowed` without a read, but it counts, so the list loads once it may; within 2 seconds of the last request that was not refused it is `too_soon` (`INVITATION_LOAD_COOLDOWN_MS`). From then on, while the application runs, the list loads again after each `workspace.subscribed` of the selected workspace, on each `workspace.member.claimed` of it, because a claim consumes an invitation, and after a create or a revocation. A promotion to admin, and the role once the people loaded, load it as well.
 - **Merged and backed off.** As the workspace service's `reload`: while a load is on its way, one more follows its answer, which is dropped, however many triggers came; while a retry waits out its backoff, the retry reads the change. A failed load keeps what was loaded, shows its failure as `unavailable` with the problem, and is retried with the workspace service's backoff (`workspaceRetryDelayMs`) while connected; offline, the next `workspace.subscribed` loads. After `rate_limited`, also when a trigger came during the load, the next load waits 60 seconds. A list that names another workspace is `failed`. Another selected workspace, a sign-out, or another device drops the list and the answers on their way.
 - **View.** `{ revision, status, problem?, workspaceId, invitations }`, with each invitation's ID, the member ID of the unclaimed person that it claims, its creator's display name, resolved with the workspace service's `memberName` (the creator's member ID stays in the main process), and its creation and expiry times. An invitation past its expiry is left out. A change of the service or of the workspace service, which reports a new name, publishes at most one view every 50 ms.
-- **Create and revoke.** `create(workspaceId, memberId, lifetimeSeconds)` takes the unclaimed person, which is what the protocol's create takes, and a lifetime of 1 hour to 7 days, or null for the API's 7 days; `revoke(workspaceId, invitationId)` takes the invitation. The main process checks each ID again with the protocol's ID schemas (`invalid`) and refuses a workspace that is not the selected one as `not_selected`; the account service checks the lifetime with the protocol's request schema. A confirmed create answers the invitation's ID, its code, and its expiry only; an answer for another workspace or person is `unknown`, and its code is dropped. A new invitation for a person revokes the previous one, so a create is never sent again on its own: an uncertain answer is `unknown`. The refusals (`INVITATION_ACTION_REFUSALS`) are the account service's own and the API's `forbidden` as `not_allowed`, `not_found`, `conflict`, and `rate_limited`, which are the codes that these routes answer; any other refusal is `failed`. The list reloads after `ok`, `unknown`, `not_found`, and `conflict`.
+- **Create and revoke.** `create(workspaceId, memberId, lifetimeSeconds)` takes the unclaimed person, which is what the protocol's create takes, and a lifetime of 1 hour to 7 days, or null for the API's 7 days; the channel always takes all three, and the bridge's `lifetimeSeconds` may be left out, which sends null; `revoke(workspaceId, invitationId)` takes the invitation. The main process checks each ID again with the protocol's ID schemas (`invalid`) and refuses a workspace that is not the selected one as `not_selected`; the account service checks the lifetime with the protocol's request schema. A confirmed create answers the invitation's ID, its code, and its expiry only; an answer for another workspace or person is `unknown`, and its code is dropped. A new invitation for a person revokes the previous one, so a create is never sent again on its own: an uncertain answer is `unknown`. The refusals (`INVITATION_ACTION_REFUSALS`) are the account service's own and the API's `forbidden` as `not_allowed`, `not_found`, `conflict`, and `rate_limited`, which are the codes that these routes answer; any other refusal is `failed`. The list reloads after `ok`, `unknown`, `not_found`, and `conflict`.
 - **Preview and accept.** They are not tied to the selected workspace, because the person is joining one. The main process checks the pasted text with the protocol's `InvitationCodeSchema` exactly (`invalid`). A preview answers the workspace's name, the display name of the person that the code claims, the inviter's display name and GitHub login with the time it was last verified, and the expiry; an accept answers the joined workspace's ID and name, never the person's user ID. The refusals (`JOIN_INVITATION_REFUSALS`) are the account service's own, `invitation_invalid`, `already_member`, and `rate_limited`, which also covers the API's limit of 10 failed previews or accepts in 15 minutes; any other refusal is `failed`. After an accept that answers `ok` or `unknown`, the workspace service loads the list again (`reloadList`), because no account frame reports the new membership.
 - **Logs.** Fixed text with a failure code at most, never a name, an ID, or a code.
 
@@ -541,72 +541,72 @@ The tests ([`service.test.ts`](src/main/devices/service.test.ts)) use a fake acc
 
 The renderer reaches the main process only through the functions of `window.desktop`. There is no `ipcRenderer` in the renderer and no function that takes a channel name.
 
-| Channel                       | Direction                        | Arguments                 | Result or payload            | Bridge function                           |
-| ----------------------------- | -------------------------------- | ------------------------- | ---------------------------- | ----------------------------------------- |
-| `runtime:get-status`          | renderer to main, `invoke`       | none                      | the runtime status           | `window.desktop.runtime.getStatus`        |
-| `runtime:subscribe-status`    | renderer to main, `invoke`       | none                      | the runtime status           | `subscribeStatus`                         |
-| `runtime:status-changed`      | main to subscribed frames, event |                           | the runtime status           | `subscribeStatus`                         |
-| `repositories:list`           | renderer to main, `invoke`       | none                      | the repository list          | `window.desktop.repositories.list`        |
-| `repositories:subscribe`      | renderer to main, `invoke`       | none                      | the repository list          | `subscribe`                               |
-| `repositories:changed`        | main to subscribed frames, event |                           | the repository list          | `subscribe`                               |
-| `repositories:mount`          | renderer to main, `invoke`       | none                      | the mount result             | `mount`                                   |
-| `repositories:unmount`        | renderer to main, `invoke`       | a mount ID                | true when it was mounted     | `unmount`                                 |
-| `account:get-status`          | renderer to main, `invoke`       | none                      | the account status           | `window.desktop.account.getStatus`        |
-| `account:subscribe-status`    | renderer to main, `invoke`       | none                      | the account status           | `subscribeStatus`                         |
-| `account:status-changed`      | main to subscribed frames, event |                           | the account status           | `subscribeStatus`                         |
-| `account:start-sign-in`       | renderer to main, `invoke`       | [option]                  | the start result             | `startSignIn`                             |
-| `account:cancel-sign-in`      | renderer to main, `invoke`       | none                      | true when one was open       | `cancelSignIn`                            |
-| `account:unlock-key`          | renderer to main, `invoke`       | passphrase                | the unlock result            | `unlockDeviceKey`                         |
-| `account:forget`              | renderer to main, `invoke`       | none                      | the forget result            | `forgetAccount`                           |
-| `account:sign-out`            | renderer to main, `invoke`       | none                      | the sign-out result          | `signOut`                                 |
-| `account:remove-device`       | renderer to main, `invoke`       | none                      | the removal result           | `removeDevice`                            |
-| `connection:get-status`       | renderer to main, `invoke`       | none                      | the connection status        | `window.desktop.connection.getStatus`     |
-| `connection:subscribe-status` | renderer to main, `invoke`       | none                      | the connection status        | `subscribeStatus`                         |
-| `connection:status-changed`   | main to subscribed frames, event |                           | the connection status        | `subscribeStatus`                         |
-| `connection:reconnect`        | renderer to main, `invoke`       | none                      | the reconnect result         | `reconnect`                               |
-| `workspaces:get-state`        | renderer to main, `invoke`       | none                      | the workspace state          | `window.desktop.workspaces.getState`      |
-| `workspaces:subscribe-state`  | renderer to main, `invoke`       | none                      | the workspace state          | `subscribeState`                          |
-| `workspaces:state-changed`    | main to subscribed frames, event |                           | the workspace state          | `subscribeState`                          |
-| `workspaces:select`           | renderer to main, `invoke`       | ID, [option]              | the action result            | `select`                                  |
-| `workspaces:open-project`     | renderer to main, `invoke`       | ID or null, [option]      | the action result            | `openProject`                             |
-| `people:get-state`            | renderer to main, `invoke`       | none                      | the people                   | `window.desktop.people.getState`          |
-| `people:subscribe-state`      | renderer to main, `invoke`       | none                      | the people                   | `subscribeState`                          |
-| `people:state-changed`        | main to subscribed frames, event |                           | the people                   | `subscribeState`                          |
-| `people:define`               | renderer to main, `invoke`       | ID, name                  | the definition result        | `window.desktop.peopleActions.define`     |
-| `people:rename`               | renderer to main, `invoke`       | ID, member ID, name       | the action result            | `rename`                                  |
-| `people:remove`               | renderer to main, `invoke`       | ID, member ID             | the action result            | `remove`                                  |
-| `people:promote`              | renderer to main, `invoke`       | ID, member ID             | the action result            | `promote`                                 |
-| `people:demote`               | renderer to main, `invoke`       | ID, member ID             | the action result            | `demote`                                  |
-| `people:leave`                | renderer to main, `invoke`       | ID                        | the action result            | `leave`                                   |
-| `people:offer-ownership`      | renderer to main, `invoke`       | ID, member ID             | the action result            | `offerOwnership`                          |
-| `people:withdraw-offer`       | renderer to main, `invoke`       | ID                        | the action result            | `withdrawOwnershipOffer`                  |
-| `people:accept-offer`         | renderer to main, `invoke`       | ID                        | the action result            | `acceptOwnershipOffer`                    |
-| `invitations:get-state`       | renderer to main, `invoke`       | none                      | the invitations              | `window.desktop.invitations.getState`     |
-| `invitations:subscribe-state` | renderer to main, `invoke`       | none                      | the invitations              | `subscribeState`                          |
-| `invitations:state-changed`   | main to subscribed frames, event |                           | the invitations              | `subscribeState`                          |
-| `invitations:load`            | renderer to main, `invoke`       | none                      | the load result              | `load`                                    |
-| `invitations:create`          | renderer to main, `invoke`       | ID, member ID, [lifetime] | the create result            | `window.desktop.invitationActions.create` |
-| `invitations:revoke`          | renderer to main, `invoke`       | ID, invitation ID         | the revocation result        | `revoke`                                  |
-| `invitations:preview`         | renderer to main, `invoke`       | a pasted code             | the preview result           | `preview`                                 |
-| `invitations:accept`          | renderer to main, `invoke`       | a pasted code             | the accept result            | `accept`                                  |
-| `agents:get-state`            | renderer to main, `invoke`       | none                      | the agent activity           | `window.desktop.agents.getState`          |
-| `agents:subscribe-state`      | renderer to main, `invoke`       | none                      | the agent activity           | `subscribeState`                          |
-| `agents:state-changed`        | main to subscribed frames, event |                           | the agent activity           | `subscribeState`                          |
-| `chat:get-state`              | renderer to main, `invoke`       | none                      | the chat state               | `window.desktop.chat.getState`            |
-| `chat:subscribe-state`        | renderer to main, `invoke`       | none                      | the chat state               | `subscribeState`                          |
-| `chat:state-changed`          | main to subscribed frames, event |                           | the chat state               | `subscribeState`                          |
-| `chat:send`                   | renderer to main, `invoke`       | a text                    | the send result              | `send`                                    |
-| `chat:retry`                  | renderer to main, `invoke`       | an event ID               | true when tried again        | `retry`                                   |
-| `chat:discard`                | renderer to main, `invoke`       | an event ID               | true when dropped            | `discard`                                 |
-| `chat:load-older`             | renderer to main, `invoke`       | none                      | the load result              | `loadOlder`                               |
-| `devices:get-state`           | renderer to main, `invoke`       | none                      | the device list              | `window.desktop.devices.getState`         |
-| `devices:subscribe-state`     | renderer to main, `invoke`       | none                      | the device list              | `subscribeState`                          |
-| `devices:state-changed`       | main to subscribed frames, event |                           | the device list              | `subscribeState`                          |
-| `devices:load`                | renderer to main, `invoke`       | none                      | the load result              | `load`                                    |
-| `devices:dismiss-new-devices` | renderer to main, `invoke`       | the shown device IDs      | true when a notice was ended | `dismissNewDevices`                       |
-| `devices:revoke`              | renderer to main, `invoke`       | a device ID, reason       | the revocation result        | `revokeDevice`                            |
-| `devices:lift-lock`           | renderer to main, `invoke`       | none                      | the lift result              | `liftRegistrationLock`                    |
-| `devices:dismiss-advice`      | renderer to main, `invoke`       | none                      | true when the advice ended   | `dismissLostDeviceAdvice`                 |
+| Channel                       | Direction                        | Arguments                       | Result or payload            | Bridge function                           |
+| ----------------------------- | -------------------------------- | ------------------------------- | ---------------------------- | ----------------------------------------- |
+| `runtime:get-status`          | renderer to main, `invoke`       | none                            | the runtime status           | `window.desktop.runtime.getStatus`        |
+| `runtime:subscribe-status`    | renderer to main, `invoke`       | none                            | the runtime status           | `subscribeStatus`                         |
+| `runtime:status-changed`      | main to subscribed frames, event |                                 | the runtime status           | `subscribeStatus`                         |
+| `repositories:list`           | renderer to main, `invoke`       | none                            | the repository list          | `window.desktop.repositories.list`        |
+| `repositories:subscribe`      | renderer to main, `invoke`       | none                            | the repository list          | `subscribe`                               |
+| `repositories:changed`        | main to subscribed frames, event |                                 | the repository list          | `subscribe`                               |
+| `repositories:mount`          | renderer to main, `invoke`       | none                            | the mount result             | `mount`                                   |
+| `repositories:unmount`        | renderer to main, `invoke`       | a mount ID                      | true when it was mounted     | `unmount`                                 |
+| `account:get-status`          | renderer to main, `invoke`       | none                            | the account status           | `window.desktop.account.getStatus`        |
+| `account:subscribe-status`    | renderer to main, `invoke`       | none                            | the account status           | `subscribeStatus`                         |
+| `account:status-changed`      | main to subscribed frames, event |                                 | the account status           | `subscribeStatus`                         |
+| `account:start-sign-in`       | renderer to main, `invoke`       | [option]                        | the start result             | `startSignIn`                             |
+| `account:cancel-sign-in`      | renderer to main, `invoke`       | none                            | true when one was open       | `cancelSignIn`                            |
+| `account:unlock-key`          | renderer to main, `invoke`       | passphrase                      | the unlock result            | `unlockDeviceKey`                         |
+| `account:forget`              | renderer to main, `invoke`       | none                            | the forget result            | `forgetAccount`                           |
+| `account:sign-out`            | renderer to main, `invoke`       | none                            | the sign-out result          | `signOut`                                 |
+| `account:remove-device`       | renderer to main, `invoke`       | none                            | the removal result           | `removeDevice`                            |
+| `connection:get-status`       | renderer to main, `invoke`       | none                            | the connection status        | `window.desktop.connection.getStatus`     |
+| `connection:subscribe-status` | renderer to main, `invoke`       | none                            | the connection status        | `subscribeStatus`                         |
+| `connection:status-changed`   | main to subscribed frames, event |                                 | the connection status        | `subscribeStatus`                         |
+| `connection:reconnect`        | renderer to main, `invoke`       | none                            | the reconnect result         | `reconnect`                               |
+| `workspaces:get-state`        | renderer to main, `invoke`       | none                            | the workspace state          | `window.desktop.workspaces.getState`      |
+| `workspaces:subscribe-state`  | renderer to main, `invoke`       | none                            | the workspace state          | `subscribeState`                          |
+| `workspaces:state-changed`    | main to subscribed frames, event |                                 | the workspace state          | `subscribeState`                          |
+| `workspaces:select`           | renderer to main, `invoke`       | ID, [option]                    | the action result            | `select`                                  |
+| `workspaces:open-project`     | renderer to main, `invoke`       | ID or null, [option]            | the action result            | `openProject`                             |
+| `people:get-state`            | renderer to main, `invoke`       | none                            | the people                   | `window.desktop.people.getState`          |
+| `people:subscribe-state`      | renderer to main, `invoke`       | none                            | the people                   | `subscribeState`                          |
+| `people:state-changed`        | main to subscribed frames, event |                                 | the people                   | `subscribeState`                          |
+| `people:define`               | renderer to main, `invoke`       | ID, name                        | the definition result        | `window.desktop.peopleActions.define`     |
+| `people:rename`               | renderer to main, `invoke`       | ID, member ID, name             | the action result            | `rename`                                  |
+| `people:remove`               | renderer to main, `invoke`       | ID, member ID                   | the action result            | `remove`                                  |
+| `people:promote`              | renderer to main, `invoke`       | ID, member ID                   | the action result            | `promote`                                 |
+| `people:demote`               | renderer to main, `invoke`       | ID, member ID                   | the action result            | `demote`                                  |
+| `people:leave`                | renderer to main, `invoke`       | ID                              | the action result            | `leave`                                   |
+| `people:offer-ownership`      | renderer to main, `invoke`       | ID, member ID                   | the action result            | `offerOwnership`                          |
+| `people:withdraw-offer`       | renderer to main, `invoke`       | ID                              | the action result            | `withdrawOwnershipOffer`                  |
+| `people:accept-offer`         | renderer to main, `invoke`       | ID                              | the action result            | `acceptOwnershipOffer`                    |
+| `invitations:get-state`       | renderer to main, `invoke`       | none                            | the invitations              | `window.desktop.invitations.getState`     |
+| `invitations:subscribe-state` | renderer to main, `invoke`       | none                            | the invitations              | `subscribeState`                          |
+| `invitations:state-changed`   | main to subscribed frames, event |                                 | the invitations              | `subscribeState`                          |
+| `invitations:load`            | renderer to main, `invoke`       | none                            | the load result              | `load`                                    |
+| `invitations:create`          | renderer to main, `invoke`       | ID, member ID, lifetime or null | the create result            | `window.desktop.invitationActions.create` |
+| `invitations:revoke`          | renderer to main, `invoke`       | ID, invitation ID               | the revocation result        | `revoke`                                  |
+| `invitations:preview`         | renderer to main, `invoke`       | a pasted code                   | the preview result           | `preview`                                 |
+| `invitations:accept`          | renderer to main, `invoke`       | a pasted code                   | the accept result            | `accept`                                  |
+| `agents:get-state`            | renderer to main, `invoke`       | none                            | the agent activity           | `window.desktop.agents.getState`          |
+| `agents:subscribe-state`      | renderer to main, `invoke`       | none                            | the agent activity           | `subscribeState`                          |
+| `agents:state-changed`        | main to subscribed frames, event |                                 | the agent activity           | `subscribeState`                          |
+| `chat:get-state`              | renderer to main, `invoke`       | none                            | the chat state               | `window.desktop.chat.getState`            |
+| `chat:subscribe-state`        | renderer to main, `invoke`       | none                            | the chat state               | `subscribeState`                          |
+| `chat:state-changed`          | main to subscribed frames, event |                                 | the chat state               | `subscribeState`                          |
+| `chat:send`                   | renderer to main, `invoke`       | a text                          | the send result              | `send`                                    |
+| `chat:retry`                  | renderer to main, `invoke`       | an event ID                     | true when tried again        | `retry`                                   |
+| `chat:discard`                | renderer to main, `invoke`       | an event ID                     | true when dropped            | `discard`                                 |
+| `chat:load-older`             | renderer to main, `invoke`       | none                            | the load result              | `loadOlder`                               |
+| `devices:get-state`           | renderer to main, `invoke`       | none                            | the device list              | `window.desktop.devices.getState`         |
+| `devices:subscribe-state`     | renderer to main, `invoke`       | none                            | the device list              | `subscribeState`                          |
+| `devices:state-changed`       | main to subscribed frames, event |                                 | the device list              | `subscribeState`                          |
+| `devices:load`                | renderer to main, `invoke`       | none                            | the load result              | `load`                                    |
+| `devices:dismiss-new-devices` | renderer to main, `invoke`       | the shown device IDs            | true when a notice was ended | `dismissNewDevices`                       |
+| `devices:revoke`              | renderer to main, `invoke`       | a device ID, reason             | the revocation result        | `revokeDevice`                            |
+| `devices:lift-lock`           | renderer to main, `invoke`       | none                            | the lift result              | `liftRegistrationLock`                    |
+| `devices:dismiss-advice`      | renderer to main, `invoke`       | none                            | true when the advice ended   | `dismissLostDeviceAdvice`                 |
 
 The runtime status is `{ state, revision }` (`RuntimeStatusSchema`). `subscribeStatus(listener, onError)` delivers the current status and every later one, drops a status older than the last one delivered, and returns a function that ends the subscription.
 
