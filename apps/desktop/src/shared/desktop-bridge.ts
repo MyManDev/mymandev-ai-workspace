@@ -11,6 +11,7 @@ import type {
   LiftRegistrationLockResult,
   MountResult,
   OtherDeviceRevocation,
+  PeopleView,
   ReconnectResult,
   RemoveDeviceResult,
   RevokeOtherDeviceResult,
@@ -46,6 +47,8 @@ export interface DesktopBridge {
   readonly connection: ConnectionBridge;
   /** The account's workspaces, the selected one's projects, and the open project. */
   readonly workspaces: WorkspaceBridge;
+  /** The people of the selected workspace, read-only. */
+  readonly people: PeopleBridge;
   /** The agent activity of the open project, read-only. */
   readonly agents: AgentBridge;
   /** The chat of the open project. */
@@ -230,6 +233,30 @@ export interface WorkspaceBridge {
     projectId: string | null,
     options?: WorkspaceSwitchOptions,
   ) => Promise<WorkspaceActionResult>;
+}
+
+/**
+ * The people of the selected workspace, which the workspace service in the
+ * main process holds and keeps current with the membership events. The
+ * renderer reads them and changes nothing: each person comes with its
+ * member ID, display name, role, GitHub login, and whether it is claimed or
+ * a former member, and the account's own person is named by its member ID.
+ * No user ID crosses.
+ */
+export interface PeopleBridge {
+  /** The current people of the selected workspace. */
+  readonly getState: () => Promise<PeopleView>;
+  /**
+   * Calls `listener` with the current people and then after changes, at
+   * most once every 50 ms with the latest ones. A state older than the last
+   * one delivered is dropped. `onError` is called when the main process
+   * refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: PeopleView) => void,
+    onError?: () => void,
+  ) => () => void;
 }
 
 /**

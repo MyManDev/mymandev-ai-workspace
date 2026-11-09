@@ -55,6 +55,7 @@ import {
 } from "./guards.ts";
 import { registerRuntimeIpc } from "./ipc.ts";
 import { isAppNavigation, resolveRendererUrl } from "./navigation.ts";
+import { registerPeopleIpc } from "./people-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
 import {
   createSystemRepositoryService,
@@ -332,6 +333,12 @@ function start(): void {
   // which answer `waiting` while chat messages wait to be sent, so that the
   // person is asked first.
   registerWorkspaceIpc(ipcMain, rendererUrl, workspaces, chat);
+
+  // The selected workspace's people (#95, D3) reach the renderer read-only:
+  // member IDs, names, roles, and logins, never a user ID, at most one
+  // publish every 50 ms. Its waiting publish is cancelled at quit.
+  const peopleIpc = registerPeopleIpc(ipcMain, rendererUrl, { workspaces });
+  app.on("will-quit", () => peopleIpc.close());
 
   // The chat reaches the renderer with the authors' names resolved in the
   // main process, within the view's limits and text budget, at most one

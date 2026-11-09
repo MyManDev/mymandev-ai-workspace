@@ -907,6 +907,113 @@ export const WorkspaceActionResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type WorkspaceActionResult = z.infer<typeof WorkspaceActionResultSchema>;
 
+// The people of the selected workspace (#95, decision D3).
+
+/**
+ * Limits of the people message: the number of people, the most that one
+ * answer of the API holds (the protocol's `MAX_ANSWER_LIST_ITEMS`), and the
+ * length of a display name in characters (code points; the protocol's
+ * `LIMITS.displayName`). The main process sends the active people first,
+ * then the former members, within the limit, and cuts a longer name. The
+ * shared contract does not import the protocol package, so the main
+ * process's tests check that the values match.
+ */
+export const PEOPLE_LIMITS = Object.freeze({
+  people: 1_000,
+  displayName: 64,
+});
+
+/** The roles of a person, like the protocol's `MEMBER_ROLES`. */
+export const PERSON_ROLES = Object.freeze([
+  "owner",
+  "admin",
+  "member",
+] as const);
+export type PersonRoleView = (typeof PERSON_ROLES)[number];
+
+/**
+ * A person of the selected workspace (ADR 0014, "People and roles"). Its
+ * member ID crosses, because the actions of the people screen will name
+ * it; the user ID of the account that claimed it never does.
+ */
+export const PersonViewSchema = z.object({
+  memberId: ProtocolIdSchema,
+  displayName: z.string().min(1).max(PEOPLE_LIMITS.displayName),
+  role: z.enum(PERSON_ROLES),
+  /** Whether an account claimed the person. */
+  claimed: z.boolean(),
+  /**
+   * The GitHub login of the account that claimed the person, and when it
+   * was last verified; both null while the person is unclaimed, and for a
+   * former member whose account's data was erased.
+   */
+  login: LoginSchema.nullable(),
+  verifiedAt: TimestampSchema.nullable(),
+  /** Whether the person was removed or left: a former member. */
+  former: z.boolean(),
+});
+export type PersonView = z.infer<typeof PersonViewSchema>;
+
+/**
+ * The states of the people: `signed_out` without a signed-in device with a
+ * ready key, `no_workspace` when the list loaded and no workspace is
+ * selected, `loading` until the list and the selected workspace's people
+ * loaded once, `ready`, and `unavailable` while a retry of a failed load of
+ * the workspaces waits. They follow the workspace state.
+ */
+export const PEOPLE_STATUSES = Object.freeze([
+  "signed_out",
+  "no_workspace",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type PeopleStatusView = (typeof PEOPLE_STATUSES)[number];
+
+const PeopleViewFields = {
+  /**
+   * Grows with every change. A receiver keeps the state with the highest
+   * revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /** The selected workspace, or null. */
+  workspaceId: ProtocolIdSchema.nullable(),
+  /**
+   * The selected workspace's name from the workspace list, the same as the
+   * sidebar's, cut to `WORKSPACE_LIMITS.name`; null without a selection.
+   */
+  workspaceName: WorkspaceNameSchema.nullable(),
+  /** The account's own person in the selected workspace, or null. */
+  ownMemberId: ProtocolIdSchema.nullable(),
+  /**
+   * The active people in the main process's order, which is the server's,
+   * then the former members.
+   */
+  people: z.array(PersonViewSchema).max(PEOPLE_LIMITS.people).readonly(),
+  /** How many people `people` leaves out beyond the limit. */
+  morePeople: z.int().nonnegative(),
+};
+
+/**
+ * What the renderer may know of the selected workspace's people:
+ * `{ revision, status, problem?, workspaceId, workspaceName, ownMemberId,
+ * people, morePeople }`, with a problem only while `unavailable`. It holds
+ * member IDs, names, roles, logins, and times only: no user ID and nothing
+ * secret.
+ */
+export const PeopleViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum(["signed_out", "no_workspace", "loading", "ready"]),
+    ...PeopleViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(WORKSPACE_PROBLEMS),
+    ...PeopleViewFields,
+  }),
+]);
+export type PeopleView = z.infer<typeof PeopleViewSchema>;
+
 // The agent activity of the open project (#28).
 
 /**
@@ -1646,6 +1753,14 @@ export const INVOKE_CONTRACT = Object.freeze({
     ]),
     result: WorkspaceActionResultSchema,
   }),
+  [INVOKE_CHANNELS.getPeopleState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: PeopleViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribePeopleState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: PeopleViewSchema,
+  }),
   [INVOKE_CHANNELS.getAgentState]: Object.freeze({
     args: NoArgumentsSchema,
     result: AgentActivityViewSchema,
@@ -1723,6 +1838,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.accountStatusChanged]: AccountStatusSchema,
   [EVENT_CHANNELS.connectionStatusChanged]: ConnectionStatusSchema,
   [EVENT_CHANNELS.workspaceStateChanged]: WorkspaceViewSchema,
+  [EVENT_CHANNELS.peopleStateChanged]: PeopleViewSchema,
   [EVENT_CHANNELS.agentStateChanged]: AgentActivityViewSchema,
   [EVENT_CHANNELS.chatStateChanged]: ChatViewSchema,
   [EVENT_CHANNELS.deviceListChanged]: DeviceListViewSchema,

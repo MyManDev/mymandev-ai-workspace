@@ -13,6 +13,7 @@ import type {
   ChatBridge,
   ConnectionBridge,
   DeviceListBridge,
+  PeopleBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -84,6 +85,8 @@ export interface AppProps {
   readonly connection?: ConnectionBridge | undefined;
   /** The account's workspaces from the preload script; undefined outside Electron. */
   readonly workspaces?: WorkspaceBridge | undefined;
+  /** The selected workspace's people from the preload script; undefined outside Electron. */
+  readonly people?: PeopleBridge | undefined;
   /** The open project's agent activity from the preload script; undefined outside Electron. */
   readonly agents?: AgentBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
@@ -106,6 +109,7 @@ export function App({
   account,
   connection,
   workspaces,
+  people,
   agents,
   chat,
   devices,
@@ -171,6 +175,7 @@ export function App({
         <ScreenContent
           view={state.view}
           electronVersion={electronVersion}
+          people={people}
           account={account}
           chat={chat}
           devices={devices}
@@ -196,6 +201,7 @@ export function App({
 function ScreenContent({
   view,
   electronVersion,
+  people,
   account,
   chat,
   devices,
@@ -205,6 +211,7 @@ function ScreenContent({
 }: {
   readonly view: ShellView;
   readonly electronVersion: string | undefined;
+  readonly people: PeopleBridge | undefined;
   readonly account: AccountBridge | undefined;
   readonly chat: ChatBridge | undefined;
   readonly devices: DeviceListBridge | undefined;
@@ -225,7 +232,7 @@ function ScreenContent({
     case "account":
       return <AccountScreen account={account} devices={devices} />;
     case "people":
-      return <PeopleScreen />;
+      return <PeopleScreen people={people} />;
     case "join":
       return <JoinScreen />;
     case "about":
