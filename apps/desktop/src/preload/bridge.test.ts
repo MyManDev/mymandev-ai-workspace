@@ -58,7 +58,7 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the agent, the chat, and the device list functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the people action, the agent, the chat, and the device list functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
@@ -69,6 +69,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "devices",
     "electronVersion",
     "people",
+    "peopleActions",
     "repositories",
     "runtime",
     "workspaces",
@@ -108,6 +109,17 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "getState",
     "subscribeState",
   ]);
+  expect(Object.keys(bridge.peopleActions).sort()).toEqual([
+    "acceptOwnershipOffer",
+    "define",
+    "demote",
+    "leave",
+    "offerOwnership",
+    "promote",
+    "remove",
+    "rename",
+    "withdrawOwnershipOffer",
+  ]);
   expect(Object.keys(bridge.agents).sort()).toEqual([
     "getState",
     "subscribeState",
@@ -137,6 +149,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   expect(Object.isFrozen(bridge.connection)).toBe(true);
   expect(Object.isFrozen(bridge.workspaces)).toBe(true);
   expect(Object.isFrozen(bridge.people)).toBe(true);
+  expect(Object.isFrozen(bridge.peopleActions)).toBe(true);
   expect(Object.isFrozen(bridge.agents)).toBe(true);
   expect(Object.isFrozen(bridge.chat)).toBe(true);
   expect(Object.isFrozen(bridge.devices)).toBe(true);
@@ -147,6 +160,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
     ...Object.values(bridge.people),
+    ...Object.values(bridge.peopleActions),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
@@ -166,8 +180,10 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
     ...Object.values(bridge.people),
+    ...Object.values(bridge.peopleActions),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
+    ...Object.values(bridge.devices),
   ] as unknown[];
 
   expect(values).not.toContain(ipc);
@@ -988,6 +1004,88 @@ test("the people subscription delivers the people and every newer state, without
   fake.answers[1]?.reject(new Error("refused"));
   await settle();
   expect(refused).toBe(1);
+});
+
+const MEMBER_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000c1";
+
+/** Each people action, its channel, and the strings it takes. */
+const PEOPLE_ACTIONS = [
+  ["define", INVOKE_CHANNELS.definePerson, [WORKSPACE_ID, "Linus"]],
+  ["rename", INVOKE_CHANNELS.renamePerson, [WORKSPACE_ID, MEMBER_ID, "Linus"]],
+  ["remove", INVOKE_CHANNELS.removePerson, [WORKSPACE_ID, MEMBER_ID]],
+  ["promote", INVOKE_CHANNELS.promotePerson, [WORKSPACE_ID, MEMBER_ID]],
+  ["demote", INVOKE_CHANNELS.demotePerson, [WORKSPACE_ID, MEMBER_ID]],
+  ["leave", INVOKE_CHANNELS.leaveWorkspace, [WORKSPACE_ID]],
+  ["offerOwnership", INVOKE_CHANNELS.offerOwnership, [WORKSPACE_ID, MEMBER_ID]],
+  [
+    "withdrawOwnershipOffer",
+    INVOKE_CHANNELS.withdrawOwnershipOffer,
+    [WORKSPACE_ID],
+  ],
+  [
+    "acceptOwnershipOffer",
+    INVOKE_CHANNELS.acceptOwnershipOffer,
+    [WORKSPACE_ID],
+  ],
+] as const;
+
+test("each people action calls its own channel with only its strings, and passes the answer through", async () => {
+  const fake = fakeIpc();
+  const actions = createDesktopBridge("44.9.1", fake.ipc)
+    .peopleActions as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  const answers = PEOPLE_ACTIONS.map(([name, , args]) =>
+    // An extra argument is not passed on.
+    actions[name]?.(...args, { force: true }, "people:remove"),
+  );
+  for (const [index, answer] of fake.answers.entries()) {
+    answer.resolve(
+      index === 0
+        ? { outcome: "ok", memberId: MEMBER_ID }
+        : { outcome: "unknown" },
+    );
+  }
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    { outcome: "ok", memberId: MEMBER_ID },
+    ...PEOPLE_ACTIONS.slice(1).map(() => ({ outcome: "unknown" })),
+  ]);
+  expect(fake.invoked).toEqual(
+    PEOPLE_ACTIONS.map(([, channel, args]) => ({ channel, args: [...args] })),
+  );
+});
+
+test("each people action refuses a value that is not a string without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const actions = createDesktopBridge("44.9.1", fake.ipc)
+    .peopleActions as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  for (const [name, , args] of PEOPLE_ACTIONS) {
+    for (const [index] of args.entries()) {
+      for (const value of [
+        undefined,
+        null,
+        1,
+        ["secret-value"],
+        { toString: () => "secret-value" },
+      ]) {
+        const call = args.map((arg, at) => (at === index ? value : arg));
+        const result = actions[name]?.(...call);
+        await expect(result, name).rejects.toThrow(TypeError);
+        await result?.catch((error: unknown) => {
+          expect(String(error)).not.toContain("secret-value");
+        });
+      }
+    }
+    await expect(actions[name]?.(), name).rejects.toThrow(TypeError);
+  }
+  expect(fake.invoked).toEqual([]);
 });
 
 test("the agent functions call their channels and pass no argument from the renderer on", async () => {

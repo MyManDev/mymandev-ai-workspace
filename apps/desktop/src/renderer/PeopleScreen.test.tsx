@@ -62,6 +62,8 @@ const READY: PeopleView = {
     }),
   ],
   morePeople: 0,
+  ownershipOffer: null,
+  maxUnclaimedMembers: null,
 };
 
 function known(overrides: Partial<PeopleView> = {}): PeopleScreenView {

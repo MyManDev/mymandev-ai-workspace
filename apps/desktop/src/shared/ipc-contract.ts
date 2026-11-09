@@ -911,16 +911,18 @@ export type WorkspaceActionResult = z.infer<typeof WorkspaceActionResultSchema>;
 
 /**
  * Limits of the people message: the number of people, the most that one
- * answer of the API holds (the protocol's `MAX_ANSWER_LIST_ITEMS`), and the
+ * answer of the API holds (the protocol's `MAX_ANSWER_LIST_ITEMS`), the
  * length of a display name in characters (code points; the protocol's
- * `LIMITS.displayName`). The main process sends the active people first,
- * then the former members, within the limit, and cuts a longer name. The
- * shared contract does not import the protocol package, so the main
- * process's tests check that the values match.
+ * `LIMITS.displayName`), and the highest limit of unclaimed people (the
+ * protocol's `UNCLAIMED_MEMBER_LIMIT.max`). The main process sends the
+ * active people first, then the former members, within the limit, and cuts
+ * a longer name. The shared contract does not import the protocol package,
+ * so the main process's tests check that the values match.
  */
 export const PEOPLE_LIMITS = Object.freeze({
   people: 1_000,
   displayName: 64,
+  maxUnclaimedMembers: 500,
 });
 
 /** The roles of a person, like the protocol's `MEMBER_ROLES`. */
@@ -992,14 +994,34 @@ const PeopleViewFields = {
   people: z.array(PersonViewSchema).max(PEOPLE_LIMITS.people).readonly(),
   /** How many people `people` leaves out beyond the limit. */
   morePeople: z.int().nonnegative(),
+  /**
+   * The workspace's live ownership offer, only for the owner, who made it,
+   * and for its target, who may accept it: the target's member ID and when
+   * the offer expires. Null for everyone else, without an offer, and once
+   * it expired; the screen hides it past `expiresAt` as well.
+   */
+  ownershipOffer: z
+    .object({ memberId: ProtocolIdSchema, expiresAt: TimestampSchema })
+    .nullable(),
+  /**
+   * How many active unclaimed people the workspace may hold, from its last
+   * reload, only for the owner and the admins, who define them; null for a
+   * member and until the workspace loaded. No event reports a change of the
+   * limit, so it can be out of date until the next reload.
+   */
+  maxUnclaimedMembers: z
+    .int()
+    .min(1)
+    .max(PEOPLE_LIMITS.maxUnclaimedMembers)
+    .nullable(),
 };
 
 /**
  * What the renderer may know of the selected workspace's people:
  * `{ revision, status, problem?, workspaceId, workspaceName, ownMemberId,
- * people, morePeople }`, with a problem only while `unavailable`. It holds
- * member IDs, names, roles, logins, and times only: no user ID and nothing
- * secret.
+ * people, morePeople, ownershipOffer, maxUnclaimedMembers }`, with a problem
+ * only while `unavailable`. It holds member IDs, names, roles, logins,
+ * times, and a count only: no user ID and nothing secret.
  */
 export const PeopleViewSchema = z.discriminatedUnion("status", [
   z.object({
@@ -1013,6 +1035,115 @@ export const PeopleViewSchema = z.discriminatedUnion("status", [
   }),
 ]);
 export type PeopleView = z.infer<typeof PeopleViewSchema>;
+
+// The people actions (#95, decisions D1 and D3): one strict channel each.
+
+/**
+ * A display name that the renderer sends for a person: 1 to 64 characters
+ * (`PEOPLE_LIMITS.displayName`), counted as the protocol counts them. A
+ * longer string is refused before anything else runs. The main process
+ * checks it with the protocol's request schema as well, which also refuses
+ * a blank name and control, format, and invisible characters.
+ */
+export const PersonNameSchema = z
+  .string()
+  .min(1)
+  .max(PEOPLE_LIMITS.displayName, { abort: true });
+
+/**
+ * Why a people action was refused. Only the outcome `unknown` leaves open
+ * whether the API acted; after a refusal it did not.
+ *
+ * - `invalid`: an ID is not one of the protocol's, or the name is outside
+ *   the protocol's rule. Nothing was sent.
+ * - `not_selected`: the workspace is not the selected one, for example
+ *   after a switch. Nothing was sent.
+ * - `not_signed_in`: no device of this installation is signed in, or the
+ *   API refused its key or token.
+ * - `unavailable`: a sign-in, a sign-out, "This is not me", a device
+ *   removal, or an unlock runs, or the device cannot send now. Nothing was
+ *   sent.
+ * - `too_soon`: the installation's budget of writes is spent; nothing was
+ *   sent. `retryAfterMs` says when the next write may go.
+ * - `rate_limited`: the API's limit, with `retryAfterMs` from its answer.
+ *   For a definition, `rate_limited` can also mean that the workspace holds
+ *   as many active unclaimed people as its limit (`maxUnclaimedMembers`).
+ * - `not_allowed`: the account's role does not allow the action
+ *   (`forbidden`), for example the owner leaving.
+ * - `not_found`: the API does not know the workspace or the person for
+ *   this account.
+ * - `conflict`: the person or the offer is not in the state that the action
+ *   needs, for example a removed person, a second offer, or no live offer
+ *   to withdraw or accept.
+ * - `device_too_new`: a promotion or an offer from a device younger than
+ *   72 hours.
+ * - `failed`: the API refused it otherwise.
+ */
+export const PERSON_ACTION_REFUSALS = Object.freeze([
+  "invalid",
+  "not_selected",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "not_allowed",
+  "not_found",
+  "conflict",
+  "device_too_new",
+  "failed",
+] as const);
+export type PersonActionRefusal = (typeof PERSON_ACTION_REFUSALS)[number];
+
+/** The refusals that say when the next write may go. */
+const PERSON_ACTION_WAITS: ReadonlySet<PersonActionRefusal> = new Set([
+  "too_soon",
+  "rate_limited",
+]);
+
+const PersonActionRefusedSchema = z
+  .object({
+    outcome: z.literal("refused"),
+    reason: z.enum(PERSON_ACTION_REFUSALS),
+    /**
+     * How long to wait before the next try, in milliseconds, for
+     * `too_soon` and `rate_limited` only; null otherwise.
+     */
+    retryAfterMs: z.int().positive().nullable(),
+  })
+  .refine(
+    (value) =>
+      PERSON_ACTION_WAITS.has(value.reason) === (value.retryAfterMs !== null),
+    { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
+  );
+
+/**
+ * `unknown`: whether the API acted is not known. The action is never sent
+ * again on its own; the screen asks the person to check the list.
+ */
+const PersonActionUnknownSchema = z.object({ outcome: z.literal("unknown") });
+
+/**
+ * The result of a people action other than a definition: `ok` when the API
+ * confirmed it, `refused` with a reason, or `unknown`. The people view
+ * shows the change once its event arrives.
+ */
+export const PersonActionResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  PersonActionRefusedSchema,
+  PersonActionUnknownSchema,
+]);
+export type PersonActionResult = z.infer<typeof PersonActionResultSchema>;
+
+/**
+ * The result of defining a person: `ok` with the new person's member ID,
+ * `refused`, or `unknown`, as for the other actions.
+ */
+export const DefinePersonResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok"), memberId: ProtocolIdSchema }),
+  PersonActionRefusedSchema,
+  PersonActionUnknownSchema,
+]);
+export type DefinePersonResult = z.infer<typeof DefinePersonResultSchema>;
 
 // The agent activity of the open project (#28).
 
@@ -1760,6 +1891,47 @@ export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.subscribePeopleState]: Object.freeze({
     args: NoArgumentsSchema,
     result: PeopleViewSchema,
+  }),
+  [INVOKE_CHANNELS.definePerson]: Object.freeze({
+    /** The selected workspace's ID and the new person's display name. */
+    args: z.tuple([ProtocolIdSchema, PersonNameSchema]),
+    result: DefinePersonResultSchema,
+  }),
+  [INVOKE_CHANNELS.renamePerson]: Object.freeze({
+    /** The workspace ID, the person's member ID, and the new name. */
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema, PersonNameSchema]),
+    result: PersonActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.removePerson]: Object.freeze({
+    /** The workspace ID and the person's member ID. */
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
+    result: PersonActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.promotePerson]: Object.freeze({
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
+    result: PersonActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.demotePerson]: Object.freeze({
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
+    result: PersonActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.leaveWorkspace]: Object.freeze({
+    /** The workspace ID. */
+    args: z.tuple([ProtocolIdSchema]),
+    result: PersonActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.offerOwnership]: Object.freeze({
+    /** The workspace ID and the target's member ID. */
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
+    result: PersonActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.withdrawOwnershipOffer]: Object.freeze({
+    args: z.tuple([ProtocolIdSchema]),
+    result: PersonActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.acceptOwnershipOffer]: Object.freeze({
+    args: z.tuple([ProtocolIdSchema]),
+    result: PersonActionResultSchema,
   }),
   [INVOKE_CHANNELS.getAgentState]: Object.freeze({
     args: NoArgumentsSchema,

@@ -4,6 +4,7 @@ import {
   MAX_ANSWER_LIST_ITEMS,
   MEMBER_ROLES,
   type MemberId,
+  UNCLAIMED_MEMBER_LIMIT,
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
@@ -156,6 +157,14 @@ function fakeService(
         ownMemberId: (workspaceId: WorkspaceId) => {
           reads += 1;
           return workspaceId === WORKSPACE ? OWNER : null;
+        },
+        ownershipOffer: () => {
+          reads += 1;
+          return null;
+        },
+        unclaimedMemberLimit: () => {
+          reads += 1;
+          return 500;
         },
         onChange: (listener: (state: WorkspaceState) => void) => {
           listeners.add(listener);
@@ -320,7 +329,118 @@ test("the view holds each person's member ID, name, role, claim, login, and form
       },
     ],
     morePeople: 0,
+    ownershipOffer: null,
+    maxUnclaimedMembers: 500,
   });
+});
+
+test("the ownership offer crosses only to the owner and its target, before its expiry, and the unclaimed limit only to the owner and the admins", () => {
+  const expiresAt = "2026-11-12T10:00:00.000Z";
+  const expiry = Date.parse(expiresAt);
+  const settings = (now: number = expiry - 1) => ({
+    ownershipOffer: Object.freeze({ memberId: ADMIN, expiresAt }),
+    unclaimedMemberLimit: 40,
+    now,
+  });
+  const MEMBER = id(0xc5) as MemberId;
+  const people = [...PEOPLE, person(MEMBER, "Mary Member")];
+  const view = (own: MemberId | null, now?: number) =>
+    peopleView(workspaceState(), people, own, settings(now));
+  const offer = { memberId: ADMIN, expiresAt };
+
+  // The owner made the offer, and the target may accept it.
+  expect(view(OWNER)).toMatchObject({
+    ownershipOffer: offer,
+    maxUnclaimedMembers: 40,
+  });
+  expect(view(ADMIN)).toMatchObject({
+    ownershipOffer: offer,
+    maxUnclaimedMembers: 40,
+  });
+  // A member sees neither; nor does a former member or an unknown person.
+  for (const own of [MEMBER, FORMER, id(0xc9) as MemberId, null]) {
+    expect(view(own), String(own)).toMatchObject({
+      ownershipOffer: null,
+      maxUnclaimedMembers: null,
+    });
+  }
+  // Another admin sees the limit, but not an offer to someone else.
+  const other = id(0xc6) as MemberId;
+  const withOther = [...people, person(other, "Ola Admin", { role: "admin" })];
+  expect(
+    peopleView(workspaceState(), withOther, other, settings()),
+  ).toMatchObject({ ownershipOffer: null, maxUnclaimedMembers: 40 });
+  // An offer at or past its expiry is no offer.
+  expect(view(OWNER, expiry).ownershipOffer).toBeNull();
+  expect(view(ADMIN, expiry + 1).ownershipOffer).toBeNull();
+  // Without a selection, nothing.
+  expect(
+    peopleView(
+      workspaceState({ selectedWorkspaceId: null }),
+      people,
+      OWNER,
+      settings(),
+    ),
+  ).toMatchObject({ ownershipOffer: null, maxUnclaimedMembers: null });
+  // Without a loaded view, nothing either.
+  expect(peopleView(workspaceState(), people, OWNER)).toMatchObject({
+    ownershipOffer: null,
+    maxUnclaimedMembers: null,
+  });
+  const shown = view(OWNER);
+  expect(Object.isFrozen(shown.ownershipOffer)).toBe(true);
+  expect(Object.keys(shown.ownershipOffer ?? {}).sort()).toEqual([
+    "expiresAt",
+    "memberId",
+  ]);
+  expect(PeopleViewSchema.safeParse(shown).success).toBe(true);
+});
+
+test("an offer to a plain member crosses to that member without the limit, and not to an admin who is not its target", () => {
+  const expiresAt = "2026-11-12T10:00:00.000Z";
+  const MEMBER = id(0xc5) as MemberId;
+  const people = [...PEOPLE, person(MEMBER, "Mary Member")];
+  const view = (own: MemberId) =>
+    peopleView(workspaceState(), people, own, {
+      ownershipOffer: Object.freeze({ memberId: MEMBER, expiresAt }),
+      unclaimedMemberLimit: 40,
+      now: Date.parse(expiresAt) - 1,
+    });
+
+  expect(view(MEMBER)).toMatchObject({
+    ownershipOffer: { memberId: MEMBER, expiresAt },
+    maxUnclaimedMembers: null,
+  });
+  expect(view(ADMIN)).toMatchObject({
+    ownershipOffer: null,
+    maxUnclaimedMembers: 40,
+  });
+  expect(view(OWNER)).toMatchObject({
+    ownershipOffer: { memberId: MEMBER, expiresAt },
+    maxUnclaimedMembers: 40,
+  });
+});
+
+test("the channels read the offer and the limit from the service, and the offer's expiry with the clock", () => {
+  const expiresAt = "2026-11-12T10:00:00.000Z";
+  const fake = fakeService();
+  let clock = Date.parse(expiresAt) - 1;
+  const { call } = register({
+    ...fake.options,
+    workspaces: {
+      ...fake.options.workspaces,
+      ownershipOffer: () => Object.freeze({ memberId: ADMIN, expiresAt }),
+      unclaimedMemberLimit: () => 7,
+    },
+    now: () => clock,
+  });
+
+  expect(call(INVOKE_CHANNELS.getPeopleState)).toMatchObject({
+    ownershipOffer: { memberId: ADMIN, expiresAt },
+    maxUnclaimedMembers: 7,
+  });
+  clock += 1;
+  expect(call(INVOKE_CHANNELS.getPeopleState).ownershipOffer).toBeNull();
 });
 
 test("the status follows the workspace state, with no_workspace once the list loaded without a selection", () => {
@@ -588,6 +708,7 @@ test("the contract's statuses, roles, problems, and limits match the service and
   expect([...PERSON_ROLES]).toEqual([...MEMBER_ROLES]);
   expect(PEOPLE_LIMITS.people).toBe(MAX_ANSWER_LIST_ITEMS);
   expect(PEOPLE_LIMITS.displayName).toBe(LIMITS.displayName);
+  expect(PEOPLE_LIMITS.maxUnclaimedMembers).toBe(UNCLAIMED_MEMBER_LIMIT.max);
   // Every status of the workspace service has a people status, plus the
   // one without a selected workspace.
   expect([...PEOPLE_STATUSES].sort()).toEqual(

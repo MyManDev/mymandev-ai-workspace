@@ -5,6 +5,7 @@ import type {
   ConnectionBridge,
   DesktopBridge,
   DeviceListBridge,
+  PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
   RuntimeBridge,
@@ -23,6 +24,7 @@ import type {
   ChatSendResultView,
   ChatView,
   ConnectionStatus,
+  DefinePersonResult,
   DeviceListLoadResult,
   DeviceListView,
   ForgetResult,
@@ -30,6 +32,7 @@ import type {
   MountResult,
   OtherDeviceRevocation,
   PeopleView,
+  PersonActionResult,
   ReconnectResult,
   RemoveDeviceResult,
   RevokeOtherDeviceResult,
@@ -165,9 +168,10 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * and `workspaces.openProject`, the text of `chat.send`, and the event IDs
  * of `chat.retry` and `chat.discard`, which must be strings (or null to
  * close a project) and which the main process validates, the device IDs
- * of `devices.dismissNewDevices`, an array of strings that it copies, and
- * the device ID of `devices.revokeDevice`, a string, with one of its own two
- * reasons.
+ * of `devices.dismissNewDevices`, an array of strings that it copies, the
+ * device ID of `devices.revokeDevice`, a string, with one of its own two
+ * reasons, and the workspace IDs, member IDs, and display names of the
+ * `peopleActions`, each a string.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -361,6 +365,68 @@ export function createDesktopBridge(
       ),
   });
 
+  // Only strings go on; the main process checks each ID and name. Another
+  // value is refused here without naming it.
+  const strings = (...values: readonly unknown[]) =>
+    values.every((value) => typeof value === "string");
+  const ofPerson =
+    (channel: InvokeChannel, name: string) =>
+    (workspaceId: string, memberId: string) =>
+      strings(workspaceId, memberId)
+        ? (ipc.invoke(
+            channel,
+            workspaceId,
+            memberId,
+          ) as Promise<PersonActionResult>)
+        : Promise.reject(
+            new TypeError(
+              `${name} needs a workspace ID and a member ID string.`,
+            ),
+          );
+  const ofWorkspace =
+    (channel: InvokeChannel, name: string) => (workspaceId: string) =>
+      strings(workspaceId)
+        ? (ipc.invoke(channel, workspaceId) as Promise<PersonActionResult>)
+        : Promise.reject(new TypeError(`${name} needs a workspace ID string.`));
+  const peopleActions: PeopleActionsBridge = Object.freeze({
+    define: (workspaceId: string, displayName: string) =>
+      strings(workspaceId, displayName)
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.definePerson,
+            workspaceId,
+            displayName,
+          ) as Promise<DefinePersonResult>)
+        : Promise.reject(
+            new TypeError("define needs a workspace ID and a name string."),
+          ),
+    rename: (workspaceId: string, memberId: string, displayName: string) =>
+      strings(workspaceId, memberId, displayName)
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.renamePerson,
+            workspaceId,
+            memberId,
+            displayName,
+          ) as Promise<PersonActionResult>)
+        : Promise.reject(
+            new TypeError(
+              "rename needs a workspace ID, a member ID, and a name string.",
+            ),
+          ),
+    remove: ofPerson(INVOKE_CHANNELS.removePerson, "remove"),
+    promote: ofPerson(INVOKE_CHANNELS.promotePerson, "promote"),
+    demote: ofPerson(INVOKE_CHANNELS.demotePerson, "demote"),
+    leave: ofWorkspace(INVOKE_CHANNELS.leaveWorkspace, "leave"),
+    offerOwnership: ofPerson(INVOKE_CHANNELS.offerOwnership, "offerOwnership"),
+    withdrawOwnershipOffer: ofWorkspace(
+      INVOKE_CHANNELS.withdrawOwnershipOffer,
+      "withdrawOwnershipOffer",
+    ),
+    acceptOwnershipOffer: ofWorkspace(
+      INVOKE_CHANNELS.acceptOwnershipOffer,
+      "acceptOwnershipOffer",
+    ),
+  });
+
   const agents: AgentBridge = Object.freeze({
     getState: () =>
       ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
@@ -487,6 +553,7 @@ export function createDesktopBridge(
     connection,
     workspaces,
     people,
+    peopleActions,
     agents,
     chat,
     devices,

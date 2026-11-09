@@ -14,6 +14,7 @@ import {
 } from "./ipc.ts";
 import type { ScheduleTimer } from "./runtime.ts";
 import type {
+  OwnershipOfferState,
   PersonState,
   WorkspaceService,
   WorkspaceState,
@@ -47,6 +48,23 @@ function personView(person: PersonState): PersonView {
 }
 
 /**
+ * What the people view shows besides the people: the selected workspace's
+ * live ownership offer and its limit of unclaimed people, as the workspace
+ * service holds them, and the current time in milliseconds since the epoch.
+ */
+export interface PeopleViewSettings {
+  readonly ownershipOffer: OwnershipOfferState | null;
+  readonly unclaimedMemberLimit: number | null;
+  readonly now: number;
+}
+
+const NO_SETTINGS: PeopleViewSettings = Object.freeze({
+  ownershipOffer: null,
+  unclaimedMemberLimit: null,
+  now: 0,
+});
+
+/**
  * The frozen copy of the selected workspace's people that crosses IPC, with
  * the workspace state's revision. Each person crosses with its member ID,
  * display name, role, whether it is claimed, its GitHub login with the time
@@ -59,11 +77,17 @@ function personView(person: PersonState): PersonView {
  * `ownMemberId` names the account's own person in it. The status is the workspace
  * service's, except that a `ready` state without a selected workspace is
  * `no_workspace`.
+ *
+ * The rest is as narrow as the actions need (D3), by the role of the
+ * account's own active person: the live ownership offer crosses only to the
+ * owner and to its target, and only before its `expiresAt`, and the limit
+ * of unclaimed people only to the owner and the admins, who define them.
  */
 export function peopleView(
   state: WorkspaceState,
   people: readonly PersonState[],
   ownMemberId: MemberId | null,
+  settings: PeopleViewSettings = NO_SETTINGS,
 ): PeopleView {
   const ordered = [
     ...people.filter((person) => person.removedAt === null),
@@ -73,6 +97,18 @@ export function peopleView(
   const selected = state.workspaces.find(
     (workspace) => workspace.id === state.selectedWorkspaceId,
   );
+  const own =
+    state.selectedWorkspaceId === null || ownMemberId === null
+      ? undefined
+      : people.find(
+          (person) => person.id === ownMemberId && person.removedAt === null,
+        );
+  const offer = settings.ownershipOffer;
+  const offerShown =
+    own !== undefined &&
+    offer !== null &&
+    (own.role === "owner" || offer.memberId === own.id) &&
+    Date.parse(offer.expiresAt) > settings.now;
   const fields = {
     revision: state.revision,
     workspaceId: state.selectedWorkspaceId,
@@ -81,6 +117,17 @@ export function peopleView(
     ownMemberId: state.selectedWorkspaceId === null ? null : ownMemberId,
     people: Object.freeze(shown.map(personView)),
     morePeople: ordered.length - shown.length,
+    ownershipOffer:
+      offerShown && offer !== null
+        ? Object.freeze({
+            memberId: offer.memberId,
+            expiresAt: offer.expiresAt,
+          })
+        : null,
+    maxUnclaimedMembers:
+      own?.role === "owner" || own?.role === "admin"
+        ? settings.unclaimedMemberLimit
+        : null,
   };
   if (state.status === "unavailable") {
     return Object.freeze({
@@ -107,10 +154,20 @@ function scheduleWithSetTimeout(
 export interface PeopleIpcOptions {
   readonly workspaces: Pick<
     WorkspaceService,
-    "state" | "onChange" | "people" | "ownMemberId"
+    | "state"
+    | "onChange"
+    | "people"
+    | "ownMemberId"
+    | "ownershipOffer"
+    | "unclaimedMemberLimit"
   >;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
+  /**
+   * The current time in milliseconds since the epoch, for the expiry of an
+   * ownership offer. Defaults to `Date.now`.
+   */
+  readonly now?: () => number;
   /** Defaults to `console.error`. */
   readonly onError?: (message: string, error: unknown) => void;
 }
@@ -123,10 +180,11 @@ export interface PeopleIpc {
 /**
  * Registers the handlers of the people channels and sends the people of
  * the selected workspace to the frames that subscribed (#95, decision D3).
- * The channels are read-only and take no argument. Every handler checks the
- * sender and the arguments first (`createInvokeHandler`) and answers with a
- * view parsed by the contract (`peopleView`), so only member IDs, names,
- * roles, logins, times, and fixed codes reach the renderer, never a user
+ * The channels are read-only and take no argument; the actions have their
+ * own channels (`people-actions-ipc.ts`). Every handler checks the sender
+ * and the arguments first (`createInvokeHandler`) and answers with a view
+ * parsed by the contract (`peopleView`), so only member IDs, names, roles,
+ * logins, times, a count, and fixed codes reach the renderer, never a user
  * ID.
  *
  * A change of the workspace service, which also reports every change of its
@@ -141,6 +199,7 @@ export function registerPeopleIpc(
 ): PeopleIpc {
   const { workspaces } = options;
   const schedule = options.scheduleTimer ?? scheduleWithSetTimeout;
+  const now = options.now ?? Date.now;
   const onError =
     options.onError ??
     ((message: string, error: unknown) => console.error(message, error));
@@ -159,6 +218,11 @@ export function registerPeopleIpc(
       state,
       workspaces.people(),
       selected === null ? null : workspaces.ownMemberId(selected),
+      {
+        ownershipOffer: workspaces.ownershipOffer(),
+        unclaimedMemberLimit: workspaces.unclaimedMemberLimit(),
+        now: now(),
+      },
     );
   }
 

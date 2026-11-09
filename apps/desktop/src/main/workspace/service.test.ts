@@ -1263,6 +1263,331 @@ test("a claim that waited during a reload never shows the login of an erased acc
   expect(JSON.stringify(h.service.people())).not.toContain("erased-login");
 });
 
+const OFFER = Object.freeze({
+  memberId: MEMBER,
+  offeredAt: AT,
+  expiresAt: "2026-11-12T10:00:00.000Z",
+});
+
+/**
+ * The view of `WS_A` with an ownership offer, a limit of unclaimed people,
+ * and the unclaimed person `NEW_MEMBER`.
+ */
+function offerView(
+  offer: typeof OFFER | null = OFFER,
+  maxUnclaimedMembers = 40,
+) {
+  return WorkspaceViewResponseSchema.parse({
+    ...workspaceView(),
+    members: [
+      memberOf(WS_A, OWNER, "Ada Owner", "owner", USER_ID),
+      memberOf(WS_A, MEMBER, "Grace Member", "member"),
+      memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+    ],
+    maxUnclaimedMembers,
+    ownershipOffer: offer,
+  });
+}
+
+function offerFrame(
+  type: "account.ownership_offered" | "account.ownership_offer_ended",
+  workspaceId: WorkspaceId = WS_A,
+): ServerMessage {
+  return frame(
+    type === "account.ownership_offered"
+      ? { type, workspaceId, offer: OFFER }
+      : { type, workspaceId, reason: "withdrawn", endedAt: AT },
+  );
+}
+
+test("the view's ownership offer and limit of unclaimed people are kept, without the offer's start, and dropped with the workspace's data", async () => {
+  const h = await withList();
+  expect(h.service.ownershipOffer()).toBeNull();
+  expect(h.service.unclaimedMemberLimit()).toBeNull();
+  h.receive(subscribed());
+  await h.answerReload(ok(offerView()));
+
+  const offer = h.service.ownershipOffer();
+  expect(offer).toEqual({ memberId: MEMBER, expiresAt: OFFER.expiresAt });
+  expect(Object.isFrozen(offer)).toBe(true);
+  expect(h.service.unclaimedMemberLimit()).toBe(40);
+  // A reload without an offer clears it.
+  h.receive(subscribed());
+  await h.answerReload(ok(offerView(null, 500)));
+  expect(h.service.ownershipOffer()).toBeNull();
+  expect(h.service.unclaimedMemberLimit()).toBe(500);
+
+  h.receive(subscribed());
+  await h.answerReload(ok(offerView()));
+  expect(h.service.select(WS_B)).toBe(true);
+  expect(h.service.ownershipOffer()).toBeNull();
+  expect(h.service.unclaimedMemberLimit()).toBeNull();
+});
+
+test("a transfer to the offer's target and the target's removal end the offer, live and after a reload, and other changes keep it", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  await h.answerReload(ok(offerView()));
+
+  // The removal of another person and a role change keep it.
+  const revision = h.state.revision;
+  h.receive(
+    event("workspace.member.removed", { memberId: NEW_MEMBER, removedAt: AT }),
+  );
+  h.receive(
+    event("workspace.member.role_changed", { memberId: MEMBER, role: "admin" }),
+  );
+  expect(h.service.ownershipOffer()?.memberId).toBe(MEMBER);
+  // The transfer to the target ends it, and its replay changes nothing.
+  h.receive(
+    event("workspace.ownership.transferred", {
+      previousOwnerMemberId: OWNER,
+      ownerMemberId: MEMBER,
+    }),
+  );
+  expect(h.service.ownershipOffer()).toBeNull();
+  expect(h.state.revision).toBeGreaterThan(revision);
+
+  // The target's removal ends it.
+  h.receive(subscribed());
+  await h.answerReload(ok(offerView()));
+  h.receive(
+    event("workspace.member.removed", { memberId: MEMBER, removedAt: AT }),
+  );
+  expect(h.service.ownershipOffer()).toBeNull();
+  expect(h.service.people().find((p) => p.id === MEMBER)?.removedAt).toBe(AT);
+
+  // A transfer that waited during a reload ends the offer of the answer.
+  h.receive(subscribed());
+  h.receive(
+    event("workspace.ownership.transferred", {
+      previousOwnerMemberId: OWNER,
+      ownerMemberId: MEMBER,
+    }),
+  );
+  await h.answerReload(ok(offerView()));
+  expect(h.service.ownershipOffer()).toBeNull();
+  expect(h.reads).toEqual([]);
+});
+
+test("the account frames of an ownership offer reload the selected workspace, and only it", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  await h.answerReload(ok(offerView(null)));
+
+  h.receive(offerFrame("account.ownership_offered"));
+  expect(h.readNames().sort()).toEqual(["getWorkspace", "listProjects"]);
+  expect(h.service.gateLive(WS_A)).toBe(false);
+  await h.answerReload(ok(offerView()));
+  expect(h.service.ownershipOffer()?.memberId).toBe(MEMBER);
+  expect(h.service.gateLive(WS_A)).toBe(true);
+
+  h.receive(offerFrame("account.ownership_offer_ended"));
+  expect(h.readNames().sort()).toEqual(["getWorkspace", "listProjects"]);
+  await h.answerReload(ok(offerView(null)));
+  expect(h.service.ownershipOffer()).toBeNull();
+
+  // Another workspace's frames read nothing.
+  h.receive(offerFrame("account.ownership_offered", WS_B));
+  h.receive(offerFrame("account.ownership_offer_ended", WS_B));
+  expect(h.reads).toEqual([]);
+  expect(h.service.gateLive(WS_A)).toBe(true);
+});
+
+test("reload reads the selected workspace again through the gate, and nothing for another workspace, without a subscription, or after close", async () => {
+  const h = await withList();
+  // Not subscribed yet: the coming `workspace.subscribed` reloads.
+  expect(h.service.reload(WS_A)).toBe(false);
+  h.receive(subscribed());
+  await h.answerReload();
+  expect(h.service.reload(WS_B)).toBe(false);
+  expect(h.reads).toEqual([]);
+
+  const revision = h.state.revision;
+  expect(h.service.reload(WS_A)).toBe(true);
+  expect(h.reads.map((read) => [read.name, read.params])).toEqual([
+    ["getWorkspace", { workspaceId: WS_A }],
+    ["listProjects", { workspaceId: WS_A }],
+  ]);
+  expect(h.service.gateLive(WS_A)).toBe(false);
+  expect(h.state.revision).toBeGreaterThan(revision);
+  // An event during the reload waits and applies after it.
+  h.receive(
+    event("workspace.member.renamed", {
+      memberId: MEMBER,
+      displayName: "Grace Renamed",
+    }),
+  );
+  await h.answerReload(ok(offerView()));
+  expect(h.service.gateLive(WS_A)).toBe(true);
+  expect(h.service.memberName(MEMBER)).toBe("Grace Renamed");
+  expect(h.service.ownershipOffer()?.memberId).toBe(MEMBER);
+
+  h.setConnection("offline");
+  expect(h.service.reload(WS_A)).toBe(false);
+  h.service.close();
+  expect(h.service.reload(WS_A)).toBe(false);
+  expect(h.reads).toEqual([]);
+});
+
+test("reloads asked while a reload is open are merged into one more reload after its answer", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  await h.answerReload();
+
+  expect(h.service.reload(WS_A)).toBe(true);
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+  // Actions and frames while it is open read nothing yet.
+  expect(h.service.reload(WS_A)).toBe(true);
+  h.receive(offerFrame("account.ownership_offered"));
+  h.receive(offerFrame("account.ownership_offer_ended"));
+  expect(h.service.reload(WS_A)).toBe(true);
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+
+  // Its answer may be older than the change: one more reload follows.
+  await h.answerReload(ok(offerView(null)));
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+  expect(h.service.gateLive(WS_A)).toBe(false);
+  await h.answerReload(ok(offerView()));
+  expect(h.service.ownershipOffer()?.memberId).toBe(MEMBER);
+  expect(h.service.gateLive(WS_A)).toBe(true);
+  // And no other.
+  await settle();
+  expect(h.reads).toEqual([]);
+
+  // A reload that `workspace.subscribed` began merges the same way.
+  h.receive(subscribed());
+  expect(h.service.reload(WS_A)).toBe(true);
+  await h.answerReload();
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+  await h.answerReload();
+  expect(h.reads).toEqual([]);
+});
+
+test("while a failed reload waits out its backoff, also after rate_limited, asked reloads read nothing and the retry reads once", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  await h.answerReload(failure("rate_limited"), ok(projectList([PROJECT_1])));
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([60_000]);
+
+  expect(h.service.reload(WS_A)).toBe(true);
+  h.receive(offerFrame("account.ownership_offered"));
+  expect(h.service.reload(WS_A)).toBe(true);
+  expect(h.reads).toEqual([]);
+  // The backoff stays as it was.
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([60_000]);
+
+  h.fire(60_000);
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+  await h.answerReload(ok(offerView()));
+  expect(h.service.ownershipOffer()?.memberId).toBe(MEMBER);
+  await settle();
+  // The retry read the change; nothing follows it.
+  expect(h.reads).toEqual([]);
+
+  // A reload asked during a reload that then fails is left to the retry.
+  expect(h.service.reload(WS_A)).toBe(true);
+  expect(h.service.reload(WS_A)).toBe(true);
+  await h.answerReload(failure("unavailable"), ok(projectList([PROJECT_1])));
+  expect(h.reads).toEqual([]);
+  h.fire(2_000);
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+  await h.answerReload(ok(offerView(null)));
+  await settle();
+  expect(h.reads).toEqual([]);
+  expect(h.service.ownershipOffer()).toBeNull();
+});
+
+/** Overflows the buffer of the open reload with renames of a project. */
+function overflow(h: Harness): void {
+  for (let n = 0; n <= MAX_BUFFERED_EVENTS; n += 1) {
+    h.receive(
+      event("workspace.project.renamed", {
+        projectId: PROJECT_1,
+        name: "Project One Renamed",
+      }),
+    );
+  }
+  expect(h.logs).toContain(
+    "Too many workspace events waited; the workspace reloads.",
+  );
+}
+
+test("a reload asked while an overflow waits for its retry reads nothing, and the retry reads once", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  overflow(h);
+  // The reload that `workspace.subscribed` began is stale now.
+  await h.answerReload();
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([2_000]);
+
+  expect(h.service.reload(WS_A)).toBe(true);
+  h.receive(offerFrame("account.ownership_offered"));
+  expect(h.reads).toEqual([]);
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([2_000]);
+
+  h.fire(2_000);
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+  await h.answerReload(ok(offerView()));
+  expect(h.service.gateLive(WS_A)).toBe(true);
+  expect(h.service.ownershipOffer()?.memberId).toBe(MEMBER);
+  await settle();
+  expect(h.reads).toEqual([]);
+});
+
+test("a reload asked during an open reload that then overflows is taken by the overflow's retry, with no read before it", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  await h.answerReload();
+
+  expect(h.service.reload(WS_A)).toBe(true);
+  const open = [h.take("getWorkspace"), h.take("listProjects")];
+  // Merged into the open reload.
+  expect(h.service.reload(WS_A)).toBe(true);
+  overflow(h);
+  // The open reload's answer is stale and starts nothing.
+  for (const read of open) {
+    read.answer(
+      ok(read.name === "getWorkspace" ? offerView(null) : projectList([])),
+    );
+  }
+  await settle();
+  expect(h.reads).toEqual([]);
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([2_000]);
+
+  // The retry reads the asked change, and nothing follows it.
+  h.fire(2_000);
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+  await h.answerReload(ok(offerView()));
+  expect(h.service.ownershipOffer()?.memberId).toBe(MEMBER);
+  await settle();
+  expect(h.reads).toEqual([]);
+});
+
+test("a removal of the offer's target that waited during a reload keeps a newer offer to another person", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  await h.answerReload(ok(offerView()));
+  // The target is removed, and the owner offers to another person, while
+  // a reload is open; the removal waits and replays over the newer answer.
+  h.receive(subscribed());
+  h.receive(
+    event("workspace.member.removed", { memberId: MEMBER, removedAt: AT }),
+  );
+  const newer = WorkspaceViewResponseSchema.parse({
+    ...offerView(null),
+    members: [
+      memberOf(WS_A, OWNER, "Ada Owner", "owner", USER_ID),
+      { ...memberOf(WS_A, MEMBER, "Grace Member", "member"), removedAt: AT },
+      memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+    ],
+    ownershipOffer: { ...OFFER, memberId: NEW_MEMBER },
+  });
+  await h.answerReload(ok(newer));
+  expect(h.service.ownershipOffer()?.memberId).toBe(NEW_MEMBER);
+  expect(h.service.people().find((p) => p.id === MEMBER)?.removedAt).toBe(AT);
+});
+
 test("the people are dropped on a workspace switch, the end of the membership, a sign-out, and another device, and kept while offline", async () => {
   const peopleOf = (h: Harness) => h.service.people().map((entry) => entry.id);
 

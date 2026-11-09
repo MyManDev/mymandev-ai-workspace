@@ -55,6 +55,7 @@ import {
 } from "./guards.ts";
 import { registerRuntimeIpc } from "./ipc.ts";
 import { isAppNavigation, resolveRendererUrl } from "./navigation.ts";
+import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
 import {
@@ -339,6 +340,11 @@ function start(): void {
   // publish every 50 ms. Its waiting publish is cancelled at quit.
   const peopleIpc = registerPeopleIpc(ipcMain, rendererUrl, { workspaces });
   app.on("will-quit", () => peopleIpc.close());
+  // The people actions (#95, D1) have one strict channel each. Each sends
+  // one write of the allowlist with the account service, once, and only for
+  // the selected workspace; its membership event then changes the people,
+  // and the offer actions reload the workspace.
+  registerPeopleActionsIpc(ipcMain, rendererUrl, { account, workspaces });
 
   // The chat reaches the renderer with the authors' names resolved in the
   // main process, within the view's limits and text budget, at most one
