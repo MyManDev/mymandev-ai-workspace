@@ -46,6 +46,10 @@ import {
   MOUNT_REFUSALS,
   MountResultSchema,
   OTHER_DEVICE_REVOCATIONS,
+  PEOPLE_LIMITS,
+  PEOPLE_STATUSES,
+  PeopleViewSchema,
+  PERSON_ROLES,
   ProtocolIdSchema,
   RECONNECT_REFUSALS,
   ReconnectResultSchema,
@@ -116,6 +120,9 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     WORKSPACE_STATUSES,
     WORKSPACE_PROBLEMS,
     WORKSPACE_ACTION_REFUSALS,
+    PEOPLE_LIMITS,
+    PEOPLE_STATUSES,
+    PERSON_ROLES,
     AGENT_LIMITS,
     AGENT_ACTIVITY_STATUSES,
     AGENT_ACTIVITY_PROBLEMS,
@@ -1543,6 +1550,149 @@ test("a switch that waits answers the count of waiting chat messages, from 1 to 
   expect(
     WorkspaceActionResultSchema.safeParse({ outcome: "waiting" }).success,
   ).toBe(false);
+});
+
+const PERSON_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000c1";
+const OTHER_PERSON_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000c2";
+const PERSON_USER_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000b1";
+const VERIFIED_AT = "2026-11-05T10:00:00.000Z";
+
+function personValue(overrides: Record<string, unknown> = {}) {
+  return {
+    memberId: PERSON_ID,
+    displayName: "Ada Lovelace",
+    role: "owner",
+    claimed: true,
+    login: "octocat",
+    verifiedAt: VERIFIED_AT,
+    former: false,
+    ...overrides,
+  };
+}
+
+function peopleValue(overrides: Record<string, unknown> = {}) {
+  return {
+    status: "ready",
+    revision: 3,
+    workspaceId: WORKSPACE_ID,
+    workspaceName: "Team",
+    ownMemberId: PERSON_ID,
+    people: [
+      personValue(),
+      personValue({
+        memberId: OTHER_PERSON_ID,
+        displayName: "Linus Newcomer",
+        role: "member",
+        claimed: false,
+        login: null,
+        verifiedAt: null,
+      }),
+    ],
+    morePeople: 0,
+    ...overrides,
+  };
+}
+
+test("a people view with every status, problem, and role is accepted and frozen", () => {
+  for (const status of PEOPLE_STATUSES) {
+    if (status === "unavailable") {
+      for (const problem of WORKSPACE_PROBLEMS) {
+        const value = peopleValue({ status, problem });
+        expect(PeopleViewSchema.parse(value)).toEqual(value);
+      }
+      continue;
+    }
+    const value = peopleValue({ status });
+    expect(PeopleViewSchema.parse(value)).toEqual(value);
+  }
+  const value = peopleValue({
+    workspaceId: null,
+    workspaceName: null,
+    ownMemberId: null,
+    people: PERSON_ROLES.map((role) => personValue({ role, former: true })),
+    morePeople: 12,
+  });
+  const parsed = PeopleViewSchema.parse(value);
+  expect(parsed).toEqual(value);
+  expect(Object.isFrozen(parsed.people)).toBe(true);
+});
+
+test("a people view drops unknown keys at every level, so no user ID crosses", () => {
+  const parsed = PeopleViewSchema.parse(
+    peopleValue({
+      problem: "failed",
+      userId: PERSON_USER_ID,
+      people: [
+        personValue({
+          userId: PERSON_USER_ID,
+          identity: { login: "octocat", userId: PERSON_USER_ID },
+          removedAt: VERIFIED_AT,
+        }),
+      ],
+    }),
+  );
+
+  expect(parsed).toEqual(peopleValue({ people: [personValue()] }));
+  expect(JSON.stringify(parsed)).not.toContain(PERSON_USER_ID);
+});
+
+test("a people view over the limits or with wrong values is refused", () => {
+  const many = <T>(item: T, count: number) =>
+    Array.from({ length: count }, () => item);
+  for (const value of [
+    peopleValue({ status: "unavailable" }),
+    peopleValue({ status: "unavailable", problem: "busy" }),
+    peopleValue({ status: "paused" }),
+    peopleValue({ revision: -1 }),
+    peopleValue({ revision: 1.5 }),
+    peopleValue({ morePeople: -1 }),
+    peopleValue({ morePeople: 0.5 }),
+    peopleValue({ morePeople: undefined }),
+    peopleValue({ workspaceId: "workspace" }),
+    peopleValue({ ownMemberId: PERSON_ID.toUpperCase() }),
+    peopleValue({ ownMemberId: undefined }),
+    peopleValue({ workspaceName: undefined }),
+    peopleValue({ workspaceName: "" }),
+    peopleValue({ workspaceName: "a".repeat(WORKSPACE_LIMITS.name + 1) }),
+    peopleValue({ people: many(personValue(), PEOPLE_LIMITS.people + 1) }),
+    peopleValue({ people: [personValue({ memberId: MOUNT_ID })] }),
+    peopleValue({ people: [personValue({ memberId: null })] }),
+    peopleValue({ people: [personValue({ displayName: "" })] }),
+    peopleValue({
+      people: [
+        personValue({
+          displayName: "a".repeat(PEOPLE_LIMITS.displayName + 1),
+        }),
+      ],
+    }),
+    peopleValue({ people: [personValue({ role: "guest" })] }),
+    peopleValue({ people: [personValue({ claimed: "yes" })] }),
+    peopleValue({ people: [personValue({ former: undefined })] }),
+    peopleValue({ people: [personValue({ login: "" })] }),
+    peopleValue({ people: [personValue({ login: "octo cat" })] }),
+    peopleValue({ people: [personValue({ login: "a".repeat(40) })] }),
+    peopleValue({ people: [personValue({ login: "<b>octocat</b>" })] }),
+    peopleValue({ people: [personValue({ verifiedAt: "yesterday" })] }),
+    peopleValue({ people: [personValue({ verifiedAt: undefined })] }),
+  ]) {
+    expect(PeopleViewSchema.safeParse(value).success).toBe(false);
+  }
+
+  // At the limits, everything is accepted.
+  expect(
+    PeopleViewSchema.safeParse(
+      peopleValue({
+        workspaceName: "\u{1F600}".repeat(WORKSPACE_LIMITS.name),
+        people: many(
+          personValue({
+            displayName: "\u{1F600}".repeat(PEOPLE_LIMITS.displayName),
+            login: "a".repeat(39),
+          }),
+          PEOPLE_LIMITS.people,
+        ),
+      }),
+    ).success,
+  ).toBe(true);
 });
 
 const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000f1";

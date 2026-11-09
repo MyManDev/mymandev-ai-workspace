@@ -58,7 +58,7 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the agent, the chat, and the device list functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the agent, the chat, and the device list functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
@@ -68,6 +68,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "connection",
     "devices",
     "electronVersion",
+    "people",
     "repositories",
     "runtime",
     "workspaces",
@@ -103,6 +104,10 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "select",
     "subscribeState",
   ]);
+  expect(Object.keys(bridge.people).sort()).toEqual([
+    "getState",
+    "subscribeState",
+  ]);
   expect(Object.keys(bridge.agents).sort()).toEqual([
     "getState",
     "subscribeState",
@@ -131,6 +136,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   expect(Object.isFrozen(bridge.account)).toBe(true);
   expect(Object.isFrozen(bridge.connection)).toBe(true);
   expect(Object.isFrozen(bridge.workspaces)).toBe(true);
+  expect(Object.isFrozen(bridge.people)).toBe(true);
   expect(Object.isFrozen(bridge.agents)).toBe(true);
   expect(Object.isFrozen(bridge.chat)).toBe(true);
   expect(Object.isFrozen(bridge.devices)).toBe(true);
@@ -140,6 +146,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     ...Object.values(bridge.account),
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
+    ...Object.values(bridge.people),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
@@ -158,6 +165,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.account),
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
+    ...Object.values(bridge.people),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
   ] as unknown[];
@@ -909,6 +917,77 @@ test("the workspace subscription delivers the state and every newer one, without
 
   expect(errors).toBe(1);
   expect(reported).toEqual(["A workspace state callback failed."]);
+});
+
+test("the people functions call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const people = createDesktopBridge("44.9.1", fake.ipc)
+    .people as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const empty = { status: "signed_out", revision: 0 };
+
+  const answer = people["getState"]?.("people:subscribe-state", {
+    memberId: "other",
+  });
+  fake.answers[0]?.resolve(empty);
+
+  await expect(answer).resolves.toEqual(empty);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getPeopleState, args: [] },
+  ]);
+});
+
+test("the people subscription delivers the people and every newer state, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const calls: unknown[][] = [];
+  const reported: string[] = [];
+  const unsubscribe = bridge.people.subscribeState((...args) =>
+    calls.push(args),
+  );
+
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribePeopleState, args: [] },
+  ]);
+  fake.answers[0]?.resolve({ status: "loading", revision: 3 });
+  await settle();
+  fake.emit(EVENT_CHANNELS.peopleStateChanged, {
+    status: "ready",
+    revision: 4,
+  });
+  fake.emit(EVENT_CHANNELS.peopleStateChanged, {
+    status: "loading",
+    revision: 2,
+  });
+  expect(calls).toEqual([
+    [{ status: "loading", revision: 3 }],
+    [{ status: "ready", revision: 4 }],
+  ]);
+  unsubscribe();
+  expect(fake.listenerCount(EVENT_CHANNELS.peopleStateChanged)).toBe(0);
+
+  const failing = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  let refused = 0;
+  failing.people.subscribeState(
+    () => {
+      throw new Error("broken");
+    },
+    () => {
+      refused += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.peopleStateChanged, {
+    status: "ready",
+    revision: 5,
+  });
+  expect(reported).toEqual(["A people state callback failed."]);
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+  expect(refused).toBe(1);
 });
 
 test("the agent functions call their channels and pass no argument from the renderer on", async () => {

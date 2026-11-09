@@ -100,6 +100,17 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   openProject: "workspaces:open-project",
   /**
+   * What the renderer may know of the selected workspace's people: each
+   * person's member ID, display name, role, GitHub login, and whether it is
+   * claimed or a former member, and the account's own member ID. Read-only.
+   */
+  getPeopleState: "people:get-state",
+  /**
+   * The people of the selected workspace. The calling frame then receives
+   * every later state on `EVENT_CHANNELS.peopleStateChanged`.
+   */
+  subscribePeopleState: "people:subscribe-state",
+  /**
    * What the renderer may know of the open project's agent activity: its
    * agents with their owners' names, and its newest runs. Read-only.
    */
@@ -183,6 +194,11 @@ export const EVENT_CHANNELS = Object.freeze({
   connectionStatusChanged: "connection:status-changed",
   /** The workspace state after every change, to the frames that subscribed. */
   workspaceStateChanged: "workspaces:state-changed",
+  /**
+   * The people of the selected workspace after changes, at most one every
+   * 50 ms, to the frames that subscribed.
+   */
+  peopleStateChanged: "people:state-changed",
   /**
    * The agent activity after changes, at most one every 50 ms, to the
    * frames that subscribed.

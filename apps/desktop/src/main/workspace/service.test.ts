@@ -29,6 +29,7 @@ import {
   WORKSPACE_RETRY_BASE_MS,
   WORKSPACE_RETRY_MAX_MS,
   workspaceRetryDelayMs,
+  type PersonState,
   type WorkspaceAccount,
   type WorkspaceConnection,
   type WorkspaceService,
@@ -660,8 +661,8 @@ test("project and member events apply while live", async () => {
     }),
   );
   expect(h.service.memberName(MEMBER)).toBe("Grace Renamed");
-  // A role, an owner, or a removal changes nothing that the service keeps,
-  // and neither does a name or a project name that is already held.
+  // A name or a project name that is already held changes nothing, not
+  // even the revision.
   const afterNames = h.state.revision;
   const published = h.states.length;
   h.receive(
@@ -676,23 +677,14 @@ test("project and member events apply while live", async () => {
       name: "Project One Renamed",
     }),
   );
-  h.receive(
-    event("workspace.member.role_changed", { memberId: MEMBER, role: "admin" }),
-  );
-  h.receive(
-    event("workspace.ownership.transferred", {
-      previousOwnerMemberId: OWNER,
-      ownerMemberId: MEMBER,
-    }),
-  );
+  expect(h.state.revision).toBe(afterNames);
+  expect(h.states).toHaveLength(published);
   // A former member keeps their name for the chat history.
   h.receive(
     event("workspace.member.removed", { memberId: MEMBER, removedAt: AT }),
   );
   expect(h.service.memberName(MEMBER)).toBe("Grace Renamed");
   expect(h.service.memberName(UNKNOWN_MEMBER)).toBe(UNKNOWN_MEMBER_NAME);
-  expect(h.state.revision).toBe(afterNames);
-  expect(h.states).toHaveLength(published);
   expect(h.reads).toEqual([]);
 
   // Events of another workspace, chat messages, runs, and presence change
@@ -747,14 +739,586 @@ test("a live event that names an unknown person or project reloads the workspace
       previousOwnerMemberId: OWNER,
       ownerMemberId: UNKNOWN_MEMBER,
     }),
+    event("workspace.ownership.transferred", {
+      previousOwnerMemberId: UNKNOWN_MEMBER,
+      ownerMemberId: MEMBER,
+    }),
   ]) {
     const h = await withLiveWorkspace();
+    const people = h.service.people();
     h.receive(unknown);
     expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
     expect(h.service.gateLive(WS_A)).toBe(false);
+    // Nothing of it applies, so a transfer to an unknown person demotes
+    // no owner, and a transfer from an unknown person promotes nobody.
+    expect(h.service.people()).toBe(people);
     await h.answerReload();
     expect(h.service.gateLive(WS_A)).toBe(true);
   }
+});
+
+const FORMER_MEMBER = "0192f0a0-7b3c-7d4e-8f50-0000000000c4" as MemberId;
+const ERASED_USER_ID = "0192f0a0-7b3c-7d4e-8f50-000000000029";
+const LATER = "2026-11-06T09:30:00.000Z";
+
+/** `memberOf`, claimed by another GitHub login that was verified `LATER`. */
+function memberWithLogin(
+  id: string,
+  displayName: string,
+  role: "owner" | "admin" | "member",
+  login: string,
+) {
+  return {
+    ...memberOf(WS_A, id, displayName, role),
+    identity: { provider: "github", login, verifiedAt: LATER },
+  };
+}
+
+/** The person that the service keeps for `memberOf` and its overrides. */
+function person(
+  id: MemberId,
+  displayName: string,
+  overrides: Partial<PersonState> = {},
+): PersonState {
+  return {
+    id,
+    displayName,
+    role: "member",
+    claimed: true,
+    identity: { login: "octocat", verifiedAt: AT },
+    removedAt: null,
+    ...overrides,
+  };
+}
+
+test("the people come from the selected workspace's view, former members included, frozen and without user IDs", async () => {
+  const h = await withList();
+  expect(h.service.people()).toEqual([]);
+  h.receive(subscribed());
+  expect(h.service.people()).toEqual([]);
+  await h.answerReload(
+    ok(
+      WorkspaceViewResponseSchema.parse({
+        workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
+        members: [
+          memberOf(WS_A, OWNER, "Ada Owner", "owner", USER_ID),
+          memberWithLogin(MEMBER, "Grace Member", "admin", "grace-h"),
+          memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+          {
+            // A former member whose account's data was erased.
+            ...memberOf(WS_A, FORMER_MEMBER, "Alan Former", "admin"),
+            userId: ERASED_USER_ID,
+            identity: null,
+            removedAt: AT,
+          },
+        ],
+        joinRequestsPausedAt: null,
+        maxUnclaimedMembers: 500,
+        ownershipOffer: null,
+      }),
+    ),
+  );
+
+  const people = h.service.people();
+  expect(people).toEqual([
+    person(OWNER, "Ada Owner", { role: "owner" }),
+    person(MEMBER, "Grace Member", {
+      role: "admin",
+      identity: { login: "grace-h", verifiedAt: LATER },
+    }),
+    person(NEW_MEMBER, "Linus Newcomer", { claimed: false, identity: null }),
+    person(FORMER_MEMBER, "Alan Former", {
+      role: "admin",
+      identity: null,
+      removedAt: AT,
+    }),
+  ]);
+  expect(Object.isFrozen(people)).toBe(true);
+  for (const entry of people) {
+    expect(Object.isFrozen(entry)).toBe(true);
+    expect(entry.identity === null || Object.isFrozen(entry.identity)).toBe(
+      true,
+    );
+  }
+  const text = JSON.stringify(people);
+  for (const userId of [USER_ID, OTHER_USER_ID, ERASED_USER_ID]) {
+    expect(text).not.toContain(userId);
+  }
+  // The same list until something changes.
+  expect(h.service.people()).toBe(people);
+  expect(h.service.memberName(FORMER_MEMBER)).toBe("Alan Former");
+});
+
+test("the membership events change the people while live, and an event that repeats what is held changes nothing", async () => {
+  const h = await withLiveWorkspace();
+  const changes: readonly ServerMessage[] = [
+    event("workspace.member.defined", {
+      member: memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+    }),
+    event("workspace.member.claimed", {
+      member: memberWithLogin(NEW_MEMBER, "Linus Newcomer", "member", "linus"),
+    }),
+    event("workspace.member.renamed", {
+      memberId: MEMBER,
+      displayName: "Grace Renamed",
+    }),
+    event("workspace.member.role_changed", { memberId: MEMBER, role: "admin" }),
+    event("workspace.ownership.transferred", {
+      previousOwnerMemberId: OWNER,
+      ownerMemberId: MEMBER,
+    }),
+    event("workspace.member.removed", { memberId: NEW_MEMBER, removedAt: AT }),
+  ];
+  const expected: readonly (readonly PersonState[])[] = [
+    [
+      person(OWNER, "Ada Owner", { role: "owner" }),
+      person(MEMBER, "Grace Member"),
+      person(NEW_MEMBER, "Linus Newcomer", { claimed: false, identity: null }),
+    ],
+    [
+      person(OWNER, "Ada Owner", { role: "owner" }),
+      person(MEMBER, "Grace Member"),
+      person(NEW_MEMBER, "Linus Newcomer", {
+        identity: { login: "linus", verifiedAt: LATER },
+      }),
+    ],
+    [
+      person(OWNER, "Ada Owner", { role: "owner" }),
+      person(MEMBER, "Grace Renamed"),
+      person(NEW_MEMBER, "Linus Newcomer", {
+        identity: { login: "linus", verifiedAt: LATER },
+      }),
+    ],
+    [
+      person(OWNER, "Ada Owner", { role: "owner" }),
+      person(MEMBER, "Grace Renamed", { role: "admin" }),
+      person(NEW_MEMBER, "Linus Newcomer", {
+        identity: { login: "linus", verifiedAt: LATER },
+      }),
+    ],
+    // The transfer demotes the owner to admin and promotes the target.
+    [
+      person(OWNER, "Ada Owner", { role: "admin" }),
+      person(MEMBER, "Grace Renamed", { role: "owner" }),
+      person(NEW_MEMBER, "Linus Newcomer", {
+        identity: { login: "linus", verifiedAt: LATER },
+      }),
+    ],
+    // A removed person stays in place as a former member.
+    [
+      person(OWNER, "Ada Owner", { role: "admin" }),
+      person(MEMBER, "Grace Renamed", { role: "owner" }),
+      person(NEW_MEMBER, "Linus Newcomer", {
+        identity: { login: "linus", verifiedAt: LATER },
+        removedAt: AT,
+      }),
+    ],
+  ];
+  for (const [index, change] of changes.entries()) {
+    const revision = h.state.revision;
+    const published = h.states.length;
+    h.receive(change);
+    expect(h.service.people(), `event ${index}`).toEqual(expected[index]);
+    expect(h.state.revision).toBeGreaterThan(revision);
+    expect(h.states).toHaveLength(published + 1);
+
+    // The same event again changes nothing, not even the revision.
+    const people = h.service.people();
+    const changed = h.state.revision;
+    h.receive(change);
+    expect(h.service.people(), `event ${index} again`).toBe(people);
+    expect(h.state.revision).toBe(changed);
+    expect(h.states).toHaveLength(published + 1);
+  }
+  expect(h.reads).toEqual([]);
+  const text = JSON.stringify(h.service.people());
+  expect(text).not.toContain(USER_ID);
+  expect(text).not.toContain(OTHER_USER_ID);
+});
+
+test("membership events that arrive during a reload wait and apply after it, each person once", async () => {
+  // The reload's answer is older than the events.
+  const h = await withList();
+  h.receive(subscribed());
+  for (const change of [
+    event("workspace.member.defined", {
+      member: memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+    }),
+    event("workspace.member.claimed", {
+      member: memberWithLogin(NEW_MEMBER, "Linus Newcomer", "member", "linus"),
+    }),
+    event("workspace.member.role_changed", { memberId: MEMBER, role: "admin" }),
+    event("workspace.member.renamed", {
+      memberId: OWNER,
+      displayName: "Ada Renamed",
+    }),
+    event("workspace.member.removed", { memberId: MEMBER, removedAt: AT }),
+  ]) {
+    h.receive(change);
+  }
+  expect(h.service.people()).toEqual([]);
+  await h.answerReload();
+  expect(h.service.people()).toEqual([
+    person(OWNER, "Ada Renamed", { role: "owner" }),
+    person(MEMBER, "Grace Member", { role: "admin", removedAt: AT }),
+    person(NEW_MEMBER, "Linus Newcomer", {
+      identity: { login: "linus", verifiedAt: LATER },
+    }),
+  ]);
+  expect(h.reads).toEqual([]);
+  expect(h.service.gateLive(WS_A)).toBe(true);
+
+  // The reload's answer already holds the events: applying them again on
+  // top adds no person twice and leaves the reload's state.
+  const g = await withList();
+  g.receive(subscribed());
+  const claimed = memberWithLogin(
+    NEW_MEMBER,
+    "Linus Newcomer",
+    "member",
+    "linus",
+  );
+  g.receive(
+    event("workspace.member.defined", {
+      member: memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+    }),
+  );
+  g.receive(event("workspace.member.claimed", { member: claimed }));
+  g.receive(
+    event("workspace.ownership.transferred", {
+      previousOwnerMemberId: OWNER,
+      ownerMemberId: MEMBER,
+    }),
+  );
+  await g.answerReload(
+    ok(
+      WorkspaceViewResponseSchema.parse({
+        workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
+        members: [
+          memberOf(WS_A, MEMBER, "Grace Member", "owner"),
+          memberOf(WS_A, OWNER, "Ada Owner", "admin", USER_ID),
+          claimed,
+        ],
+        joinRequestsPausedAt: null,
+        maxUnclaimedMembers: 500,
+        ownershipOffer: null,
+      }),
+    ),
+  );
+  expect(g.service.people()).toEqual([
+    person(MEMBER, "Grace Member", { role: "owner" }),
+    person(OWNER, "Ada Owner", { role: "admin" }),
+    person(NEW_MEMBER, "Linus Newcomer", {
+      identity: { login: "linus", verifiedAt: LATER },
+    }),
+  ]);
+  expect(g.reads).toEqual([]);
+});
+
+test("a reload replaces the people with its answer, in its order, without the people held before", async () => {
+  const h = await withLiveWorkspace();
+  h.receive(
+    event("workspace.member.defined", {
+      member: memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+    }),
+  );
+  expect(h.service.people().map((entry) => entry.id)).toEqual([
+    OWNER,
+    MEMBER,
+    NEW_MEMBER,
+  ]);
+
+  // The next reload holds fewer people, in another order.
+  h.receive(subscribed());
+  await h.answerReload(
+    ok(
+      WorkspaceViewResponseSchema.parse({
+        workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
+        members: [
+          memberOf(WS_A, MEMBER, "Grace Member", "owner"),
+          memberOf(WS_A, OWNER, "Ada Owner", "admin", USER_ID),
+        ],
+        joinRequestsPausedAt: null,
+        maxUnclaimedMembers: 500,
+        ownershipOffer: null,
+      }),
+    ),
+  );
+  expect(h.service.people()).toEqual([
+    person(MEMBER, "Grace Member", { role: "owner" }),
+    person(OWNER, "Ada Owner", { role: "admin" }),
+  ]);
+  expect(h.service.memberName(NEW_MEMBER)).toBe(UNKNOWN_MEMBER_NAME);
+});
+
+/** A view of WS_A with the owner and `newMember`. */
+function viewWith(newMember: Record<string, unknown>) {
+  return WorkspaceViewResponseSchema.parse({
+    workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
+    members: [memberOf(WS_A, OWNER, "Ada Owner", "owner", USER_ID), newMember],
+    joinRequestsPausedAt: null,
+    maxUnclaimedMembers: 500,
+    ownershipOffer: null,
+  });
+}
+
+const DEFINE_NEW_MEMBER = () =>
+  event("workspace.member.defined", {
+    member: memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+  });
+
+/** A claim of NEW_MEMBER by `login`, verified at `verifiedAt`. */
+function claimOfNewMember(login = "octocat", verifiedAt = AT): ServerMessage {
+  return event("workspace.member.claimed", {
+    member: {
+      ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+      identity: { provider: "github", login, verifiedAt },
+    },
+  });
+}
+
+/** NEW_MEMBER as the service holds it. */
+function newMemberOf(h: Harness): PersonState | undefined {
+  return h.service.people().find((entry) => entry.id === NEW_MEMBER);
+}
+
+test("a claim of a person held as claimed is a replay and changes nothing, whatever its login or verification", async () => {
+  const EARLIER = "2026-11-04T08:00:00.000Z";
+  const claimed = (login: string, verifiedAt: string) =>
+    event("workspace.member.claimed", {
+      member: {
+        ...memberOf(WS_A, MEMBER, "Grace Member", "member"),
+        identity: { provider: "github", login, verifiedAt },
+      },
+    });
+  const h = await withLiveWorkspace();
+  const people = h.service.people();
+  const revision = h.state.revision;
+  const published = h.states.length;
+  for (const [login, verifiedAt] of [
+    ["octocat", EARLIER],
+    ["octocat", LATER],
+    ["grace-h", LATER],
+  ] as const) {
+    h.receive(claimed(login, verifiedAt));
+  }
+  expect(h.service.people()).toBe(people);
+  expect(h.state.revision).toBe(revision);
+  expect(h.states).toHaveLength(published);
+  expect(h.reads).toEqual([]);
+});
+
+test("a claim of an unclaimed person, live, sets the whole person from the event, also of a person that the service does not hold", async () => {
+  const claimedNewMember = person(NEW_MEMBER, "Linus Newcomer", {
+    identity: { login: "linus", verifiedAt: LATER },
+  });
+  const h = await withLiveWorkspace();
+  h.receive(DEFINE_NEW_MEMBER());
+  expect(newMemberOf(h)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", { claimed: false, identity: null }),
+  );
+  h.receive(claimOfNewMember("linus", LATER));
+  expect(newMemberOf(h)).toEqual(claimedNewMember);
+
+  const g = await withLiveWorkspace();
+  g.receive(claimOfNewMember("linus", LATER));
+  expect(g.service.people().map((entry) => entry.id)).toEqual([
+    OWNER,
+    MEMBER,
+    NEW_MEMBER,
+  ]);
+  expect(newMemberOf(g)).toEqual(claimedNewMember);
+  expect(g.reads).toEqual([]);
+});
+
+test("a claim that waited during a reload whose answer holds the person removed never shows the person active, also before the live removal arrives", async () => {
+  const h = await withList();
+  const seen: (PersonState | undefined)[] = [];
+  h.service.onChange(() => seen.push(newMemberOf(h)));
+  h.receive(subscribed());
+  h.receive(claimOfNewMember());
+  // The removal committed before the server read the view, but its event
+  // is relayed only after the answer.
+  await h.answerReload(
+    ok(
+      viewWith({
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+        removedAt: AT,
+      }),
+    ),
+  );
+  const removed = person(NEW_MEMBER, "Linus Newcomer", { removedAt: AT });
+  expect(newMemberOf(h)).toEqual(removed);
+  h.receive(
+    event("workspace.member.removed", { memberId: NEW_MEMBER, removedAt: AT }),
+  );
+  expect(newMemberOf(h)).toEqual(removed);
+  // No state that the service published showed the person active.
+  const published = seen.filter((entry) => entry !== undefined);
+  expect(published.length).toBeGreaterThan(0);
+  for (const entry of published) {
+    expect(entry).toEqual(removed);
+  }
+});
+
+test("a claim that waited during a reload, or comes again live, keeps the role of the answer", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  h.receive(claimOfNewMember());
+  await h.answerReload(
+    ok(viewWith(memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "admin"))),
+  );
+  expect(newMemberOf(h)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", { role: "admin" }),
+  );
+  const revision = h.state.revision;
+  h.receive(claimOfNewMember());
+  expect(newMemberOf(h)?.role).toBe("admin");
+  expect(h.state.revision).toBe(revision);
+});
+
+test("a definition that waited during a reload keeps the removal of a person never claimed", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  h.receive(DEFINE_NEW_MEMBER());
+  await h.answerReload(
+    ok(
+      viewWith({
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+        removedAt: AT,
+      }),
+    ),
+  );
+  expect(newMemberOf(h)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", {
+      claimed: false,
+      identity: null,
+      removedAt: AT,
+    }),
+  );
+  // Live, a definition of a held person changes nothing either.
+  const revision = h.state.revision;
+  h.receive(DEFINE_NEW_MEMBER());
+  expect(newMemberOf(h)?.removedAt).toBe(AT);
+  expect(h.state.revision).toBe(revision);
+});
+
+test("a definition and a claim that waited during a reload keep the identity of a newer answer", async () => {
+  // The answer holds the person claimed, with a later verification under a
+  // new login.
+  const h = await withList();
+  h.receive(subscribed());
+  h.receive(DEFINE_NEW_MEMBER());
+  h.receive(claimOfNewMember("octocat", AT));
+  await h.answerReload(
+    ok(
+      viewWith({
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+        identity: {
+          provider: "github",
+          login: "renamed-login",
+          verifiedAt: LATER,
+        },
+      }),
+    ),
+  );
+  expect(newMemberOf(h)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", {
+      identity: { login: "renamed-login", verifiedAt: LATER },
+    }),
+  );
+
+  // Live, a definition of a claimed person changes nothing either.
+  const people = h.service.people();
+  const revision = h.state.revision;
+  h.receive(DEFINE_NEW_MEMBER());
+  expect(h.service.people()).toBe(people);
+  expect(h.state.revision).toBe(revision);
+  expect(h.reads).toEqual([]);
+});
+
+test("a claim that waited during a reload never shows the login of an erased account again", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  h.receive(claimOfNewMember("erased-login", AT));
+  h.receive(
+    event("workspace.member.removed", { memberId: NEW_MEMBER, removedAt: AT }),
+  );
+  // The answer holds the person as a former member whose account's data
+  // was erased: claimed, without an identity.
+  await h.answerReload(
+    ok(
+      viewWith({
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+        userId: ERASED_USER_ID,
+        identity: null,
+        removedAt: AT,
+      }),
+    ),
+  );
+  expect(newMemberOf(h)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", { identity: null, removedAt: AT }),
+  );
+  expect(JSON.stringify(h.service.people())).not.toContain("erased-login");
+});
+
+test("the people are dropped on a workspace switch, the end of the membership, a sign-out, and another device, and kept while offline", async () => {
+  const peopleOf = (h: Harness) => h.service.people().map((entry) => entry.id);
+
+  const h = await withLiveWorkspace([WS_A, WS_B]);
+  expect(peopleOf(h)).toEqual([OWNER, MEMBER]);
+  // A lost connection keeps them until the next reload.
+  h.setConnection("connecting");
+  expect(peopleOf(h)).toEqual([OWNER, MEMBER]);
+  h.setConnection("connected");
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A, WS_B)));
+  expect(peopleOf(h)).toEqual([OWNER, MEMBER]);
+
+  // A switch drops them until the other workspace loaded.
+  expect(h.service.select(WS_B)).toBe(true);
+  expect(peopleOf(h)).toEqual([]);
+  expect(h.service.memberName(OWNER)).toBe(UNKNOWN_MEMBER_NAME);
+  h.receive(subscribed(WS_B));
+  await h.answerReload(ok(workspaceView(WS_B)), ok(projectList([], WS_B)));
+  expect(peopleOf(h)).toEqual([OWNER, MEMBER]);
+
+  // The end of the membership drops them with the workspace.
+  h.receive(
+    frame({
+      type: "account.removed_from_workspace",
+      workspaceId: WS_B,
+      removedAt: AT,
+    }),
+  );
+  expect(h.state.selectedWorkspaceId).toBe(WS_A);
+  expect(peopleOf(h)).toEqual([]);
+
+  for (const end of [
+    frame({
+      type: "workspace.unsubscribed",
+      workspaceId: WS_A,
+      reason: "membership_ended",
+    }),
+    frame({
+      type: "workspace.subscribe_refused",
+      workspaceId: WS_A,
+      code: "not_found",
+    }),
+  ]) {
+    const g = await withLiveWorkspace([WS_A]);
+    expect(peopleOf(g)).toEqual([OWNER, MEMBER]);
+    g.receive(end);
+    expect(g.state.selectedWorkspaceId).toBeNull();
+    expect(peopleOf(g)).toEqual([]);
+  }
+
+  const signedOut = await withLiveWorkspace();
+  signedOut.setAccount(SIGNED_OUT);
+  expect(peopleOf(signedOut)).toEqual([]);
+
+  const otherDevice = await withLiveWorkspace();
+  otherDevice.setAccount(accountStatus({}, OTHER_DEVICE_ID));
+  expect(peopleOf(otherDevice)).toEqual([]);
 });
 
 test("a refused subscription leaves the client's set, the next workspace is selected, and the list reloads", async () => {

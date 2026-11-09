@@ -7,6 +7,7 @@ import type {
   ChatBridge,
   ConnectionBridge,
   DeviceListBridge,
+  PeopleBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -127,7 +128,7 @@ const SCREEN_CASES: readonly ScreenCase[] = [
   {
     view: { screen: "people" },
     title: '<h2 id="people-title">People</h2>',
-    placeholder: "No people are shown yet.",
+    placeholder: "People are not available.",
     current: ["People (page)", "Workspace B (true)"],
   },
   {
@@ -332,6 +333,21 @@ test("with the bridge, the agent panel waits for the first agent activity", () =
     '<div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-agents" tabindex="0"><h2 id="panel-title">Agents</h2><p class="agent-status" role="status">Checking the agents.</p></div>',
   );
   expect(html).not.toContain("Agents are not available.");
+});
+
+test("with the bridge, the people screen waits for the first people", () => {
+  const people: PeopleBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const html = render({ people, initialView: { screen: "people" } });
+
+  expect(html).toContain(
+    '<main class="shell-main"><section aria-labelledby="people-title"><h2 id="people-title">People</h2><p class="people-status" role="status">Checking the people.</p>',
+  );
+  expect(html).not.toContain("People are not available.");
+  // Only the people screen follows the people.
+  expect(render({ people })).not.toContain("people-status");
 });
 
 test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {

@@ -17,6 +17,7 @@ createRoot(container).render(
       account={window.desktop?.account}
       connection={window.desktop?.connection}
       workspaces={window.desktop?.workspaces}
+      people={window.desktop?.people}
       agents={window.desktop?.agents}
       chat={window.desktop?.chat}
       devices={window.desktop?.devices}

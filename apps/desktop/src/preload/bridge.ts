@@ -5,6 +5,7 @@ import type {
   ConnectionBridge,
   DesktopBridge,
   DeviceListBridge,
+  PeopleBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -28,6 +29,7 @@ import type {
   LiftRegistrationLockResult,
   MountResult,
   OtherDeviceRevocation,
+  PeopleView,
   ReconnectResult,
   RemoveDeviceResult,
   RevokeOtherDeviceResult,
@@ -341,6 +343,24 @@ export function createDesktopBridge(
           ),
   });
 
+  const people: PeopleBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(INVOKE_CHANNELS.getPeopleState) as Promise<PeopleView>,
+    subscribeState: (
+      listener: (state: PeopleView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribePeopleState,
+        EVENT_CHANNELS.peopleStateChanged,
+        "A people state callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+  });
+
   const agents: AgentBridge = Object.freeze({
     getState: () =>
       ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
@@ -466,6 +486,7 @@ export function createDesktopBridge(
     account,
     connection,
     workspaces,
+    people,
     agents,
     chat,
     devices,
