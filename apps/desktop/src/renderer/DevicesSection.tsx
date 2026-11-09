@@ -51,9 +51,8 @@ export function DevicesSection({
   /** The device list functions from the preload script; undefined outside Electron. */
   readonly devices: DeviceListBridge | undefined;
 }) {
-  const view = useDeviceSection(devices);
+  const { view, actions, controller } = useDeviceSection(devices);
   const now = useDeviceListClock(view);
-  const { actions, controller } = useDeviceActions(devices, view);
   const onDismissAdvice = useCallback(
     (): Promise<boolean> =>
       devices === undefined
@@ -573,35 +572,20 @@ function Time({
 
 /**
  * Follows the device list while the section is shown, and asks the main
- * process to load it once when the section opens (`followDeviceList`).
+ * process to load it once when the section opens (`followDeviceList`). The
+ * device actions of the section (`createDeviceActions`), undefined without
+ * the bridge, follow every view of the list in the same call, so that the
+ * sentence of the last action goes in the same render as a sign-out or
+ * another account or device.
  */
-function useDeviceSection(
-  bridge: DeviceListBridge | undefined,
-): DeviceSectionView {
-  const [view, setView] = useState(() =>
-    initialDeviceSectionView(bridge !== undefined),
-  );
-  useEffect(
-    () =>
-      bridge === undefined ? undefined : followDeviceList(bridge, setView),
-    [bridge],
-  );
-  return view;
-}
-
-/**
- * The device actions of the section (`createDeviceActions`) while it is
- * shown, which follow every view of the list, so that the sentence of the
- * last action goes with a sign-out or another account or device; undefined
- * without the bridge.
- */
-function useDeviceActions(
-  bridge: DeviceListBridge | undefined,
-  view: DeviceSectionView,
-): {
+function useDeviceSection(bridge: DeviceListBridge | undefined): {
+  readonly view: DeviceSectionView;
   readonly actions: DeviceActionsView;
   readonly controller: DeviceActions | undefined;
 } {
+  const [view, setView] = useState(() =>
+    initialDeviceSectionView(bridge !== undefined),
+  );
   const [actions, setActions] = useState(IDLE_DEVICE_ACTIONS);
   const controller = useMemo(
     () =>
@@ -610,8 +594,14 @@ function useDeviceActions(
         : createDeviceActions(bridge, setActions),
     [bridge],
   );
-  useEffect(() => controller?.listChanged(view), [controller, view]);
-  return { actions, controller };
+  useEffect(
+    () =>
+      bridge === undefined
+        ? undefined
+        : followDeviceList(bridge, setView, controller),
+    [bridge, controller],
+  );
+  return { view, actions, controller };
 }
 
 /**
