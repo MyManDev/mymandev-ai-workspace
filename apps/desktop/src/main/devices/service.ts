@@ -365,7 +365,9 @@ export function createDeviceListService(
     inFlight = false;
     if (again) {
       // A trigger came after this load was sent: only a newer answer counts.
-      send();
+      // A sign-in that began meanwhile makes it wait.
+      again = false;
+      reload();
       return;
     }
     if (!result.ok) {

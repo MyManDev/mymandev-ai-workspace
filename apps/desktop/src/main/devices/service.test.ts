@@ -517,6 +517,15 @@ test("while a sign-in runs, a load waits for its end, also when the status alrea
   expect(h.sent).toBe(2);
   h.setAccount(accountStatus());
   expect(h.sent).toBe(3);
+
+  // A load that a trigger overtook, answered while a sign-in runs, loads
+  // again only after the sign-in.
+  h.receive(revoked(OTHER_DEVICE_ID));
+  h.setAccount(accountStatus({ signIn: { kind: "starting" } }));
+  await h.answer(ok(OWN_LIST));
+  expect(h.sent).toBe(3);
+  h.setAccount(accountStatus());
+  expect(h.sent).toBe(4);
 });
 
 test("a failed load keeps what was loaded, shows its problem, and is retried with the backoff while connected; offline, the next connection loads", async () => {
