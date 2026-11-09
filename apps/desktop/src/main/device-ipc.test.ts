@@ -16,6 +16,9 @@ import {
   DeviceListViewSchema,
   type DeviceListLoadResult,
   type DeviceListView,
+  type LiftRegistrationLockResult,
+  type OtherDeviceRevocation,
+  type RevokeOtherDeviceResult,
 } from "../shared/ipc-contract.ts";
 import { WORKSPACE_READ_FAILURES } from "./api-reads.ts";
 import { APP_ENTRY_URL } from "./app-protocol.ts";
@@ -94,6 +97,7 @@ function listState(overrides: Partial<DeviceListState> = {}): DeviceListState {
     ]),
     registrationLockedUntil: LOCK_END,
     newDevices: Object.freeze([notice()]),
+    lostDeviceAdvice: false,
     ...overrides,
   } as DeviceListState);
 }
@@ -104,6 +108,7 @@ const SIGNED_OUT: DeviceListState = Object.freeze({
   devices: Object.freeze([]),
   registrationLockedUntil: null,
   newDevices: Object.freeze([]),
+  lostDeviceAdvice: false,
 });
 
 interface Timer {
@@ -122,6 +127,12 @@ function fakeService(initial: DeviceListState = listState()) {
   const calls: string[] = [];
   let loadAnswer: DeviceListLoadResult = { outcome: "loading" };
   let dismissAnswer = true;
+  let revokeAnswer: RevokeOtherDeviceResult = {
+    outcome: "revoked",
+    reason: "lost",
+  };
+  let liftAnswer: LiftRegistrationLockResult = { outcome: "lifted" };
+  let dismissAdviceAnswer = true;
   return {
     timers,
     errors,
@@ -132,6 +143,15 @@ function fakeService(initial: DeviceListState = listState()) {
     },
     answerDismiss(answer: boolean) {
       dismissAnswer = answer;
+    },
+    answerRevoke(answer: RevokeOtherDeviceResult) {
+      revokeAnswer = answer;
+    },
+    answerLift(answer: LiftRegistrationLockResult) {
+      liftAnswer = answer;
+    },
+    answerDismissAdvice(answer: boolean) {
+      dismissAdviceAnswer = answer;
     },
     /** The timers that were neither cancelled nor fired. */
     waiting: () => timers.filter((timer) => !timer.cancelled && !timer.fired),
@@ -169,6 +189,21 @@ function fakeService(initial: DeviceListState = listState()) {
         dismissNewDevices: (deviceIds: readonly string[]) => {
           calls.push(`dismissNewDevices ${deviceIds.join(",")}`);
           return dismissAnswer;
+        },
+        revokeDevice: async (
+          deviceId: string,
+          reason: OtherDeviceRevocation,
+        ) => {
+          calls.push(`revokeDevice ${deviceId} ${reason}`);
+          return revokeAnswer;
+        },
+        dismissLostDeviceAdvice: () => {
+          calls.push("dismissLostDeviceAdvice");
+          return dismissAdviceAnswer;
+        },
+        liftRegistrationLock: async () => {
+          calls.push("liftRegistrationLock");
+          return liftAnswer;
         },
       },
       scheduleTimer: (callback: () => void, delayMs: number) => {
@@ -262,6 +297,9 @@ const DEVICE_CHANNELS = [
   INVOKE_CHANNELS.subscribeDeviceList,
   INVOKE_CHANNELS.loadDeviceList,
   INVOKE_CHANNELS.dismissNewDevices,
+  INVOKE_CHANNELS.revokeDevice,
+  INVOKE_CHANNELS.liftRegistrationLock,
+  INVOKE_CHANNELS.dismissLostDeviceAdvice,
 ];
 
 test("the device list channels are registered, and nothing else", () => {
@@ -289,26 +327,41 @@ test("every handler refuses a foreign sender and arguments outside the contract,
       );
     }
     const refused: unknown[][] =
-      channel === INVOKE_CHANNELS.dismissNewDevices
+      channel === INVOKE_CHANNELS.revokeDevice
         ? [
             [],
-            [DEVICE],
-            [[]],
-            [[DEVICE], "extra"],
-            [[DEVICE.toUpperCase()]],
+            [OTHER_DEVICE],
+            [OTHER_DEVICE, "lost", "extra"],
+            [OTHER_DEVICE, "replaced"],
+            [OTHER_DEVICE, "Lost"],
+            [OTHER_DEVICE.toUpperCase(), "lost"],
             // A UUID of another version.
-            [["0192f0a0-7b3c-4d4e-8f50-0000000000d1"]],
-            [[`${DEVICE}x`]],
-            [[1]],
-            [{ 0: DEVICE, length: 1 }],
-            [
-              Array.from(
-                { length: DEVICE_LIST_LIMITS.newDevices + 1 },
-                (_, n) => id(0x8000 + n),
-              ),
-            ],
+            ["0192f0a0-7b3c-4d4e-8f50-0000000000d2", "removed"],
+            [`${OTHER_DEVICE}x`, "removed"],
+            [[OTHER_DEVICE], "removed"],
+            [{ id: OTHER_DEVICE }, "lost"],
+            [1, "lost"],
           ]
-        : [[DEVICE], [{ force: true }], [undefined], [true, 1]];
+        : channel === INVOKE_CHANNELS.dismissNewDevices
+          ? [
+              [],
+              [DEVICE],
+              [[]],
+              [[DEVICE], "extra"],
+              [[DEVICE.toUpperCase()]],
+              // A UUID of another version.
+              [["0192f0a0-7b3c-4d4e-8f50-0000000000d1"]],
+              [[`${DEVICE}x`]],
+              [[1]],
+              [{ 0: DEVICE, length: 1 }],
+              [
+                Array.from(
+                  { length: DEVICE_LIST_LIMITS.newDevices + 1 },
+                  (_, n) => id(0x8000 + n),
+                ),
+              ],
+            ]
+          : [[DEVICE], [{ force: true }], [undefined], [true, 1]];
     for (const args of refused) {
       expect(
         () => handler(event(frame(APP_ENTRY_URL)), ...args),
@@ -361,7 +414,29 @@ test("the view holds each device's ID, label, platform, times, and current mark,
         createdAt: LATER,
       },
     ],
+    lostDeviceAdvice: false,
   });
+  // The advice after a revocation as lost crosses as the service holds it.
+  expect(
+    deviceListView(listState({ lostDeviceAdvice: true }), 1).lostDeviceAdvice,
+  ).toBe(true);
+});
+
+test("the dismissal of the advice takes nothing, goes to the service, and answers as it does", () => {
+  const fake = fakeService();
+  const { call } = register(fake);
+  expect(call(INVOKE_CHANNELS.dismissLostDeviceAdvice)).toBe(true);
+  fake.answerDismissAdvice(false);
+  expect(call(INVOKE_CHANNELS.dismissLostDeviceAdvice)).toBe(false);
+  expect(() =>
+    call(INVOKE_CHANNELS.dismissLostDeviceAdvice, receiver(), true),
+  ).toThrow(
+    `The call on ${INVOKE_CHANNELS.dismissLostDeviceAdvice} was refused: the arguments do not match the contract.`,
+  );
+  expect(fake.calls).toEqual([
+    "dismissLostDeviceAdvice",
+    "dismissLostDeviceAdvice",
+  ]);
 });
 
 test("no user ID, key, token, or other key of the model crosses", () => {
@@ -564,6 +639,51 @@ test("load and the dismissal go to the service and answer as it does", () => {
     "load",
     `dismissNewDevices ${NEW_DEVICE},${DEVICE}`,
     `dismissNewDevices ${NEW_DEVICE}`,
+  ]);
+});
+
+test("the revocation passes the device ID and the reason on, the lift nothing, and each answers as the service does, parsed by the contract", async () => {
+  const fake = fakeService();
+  const { call } = register(fake);
+
+  await expect(
+    call(INVOKE_CHANNELS.revokeDevice, receiver(), OTHER_DEVICE, "lost"),
+  ).resolves.toEqual({ outcome: "revoked", reason: "lost" });
+  fake.answerRevoke({ outcome: "refused", reason: "not_listed" });
+  await expect(
+    call(INVOKE_CHANNELS.revokeDevice, receiver(), NEW_DEVICE, "removed"),
+  ).resolves.toEqual({ outcome: "refused", reason: "not_listed" });
+  // A key that the contract does not know never reaches the renderer.
+  fake.answerRevoke({
+    outcome: "unknown",
+    deviceId: OTHER_DEVICE,
+    label: "Old laptop",
+  } as unknown as RevokeOtherDeviceResult);
+  await expect(
+    call(INVOKE_CHANNELS.revokeDevice, receiver(), OTHER_DEVICE, "lost"),
+  ).resolves.toEqual({ outcome: "unknown" });
+  await expect(call(INVOKE_CHANNELS.liftRegistrationLock)).resolves.toEqual({
+    outcome: "lifted",
+  });
+  fake.answerLift({ outcome: "failed", reason: "rate_limited" });
+  await expect(call(INVOKE_CHANNELS.liftRegistrationLock)).resolves.toEqual({
+    outcome: "failed",
+    reason: "rate_limited",
+  });
+  // An answer outside the fixed set is refused, not sent.
+  fake.answerLift({
+    outcome: "failed",
+    reason: "no_answer",
+  } as unknown as LiftRegistrationLockResult);
+  await expect(call(INVOKE_CHANNELS.liftRegistrationLock)).rejects.toThrow();
+
+  expect(fake.calls).toEqual([
+    `revokeDevice ${OTHER_DEVICE} lost`,
+    `revokeDevice ${NEW_DEVICE} removed`,
+    `revokeDevice ${OTHER_DEVICE} lost`,
+    "liftRegistrationLock",
+    "liftRegistrationLock",
+    "liftRegistrationLock",
   ]);
 });
 

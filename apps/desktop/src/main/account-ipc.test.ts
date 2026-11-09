@@ -207,12 +207,16 @@ function registerDevices(devices: DeviceListService) {
       },
     },
   );
-  return (channel: string, ipcEvent: IpcInvokeEvent): unknown => {
+  return (
+    channel: string,
+    ipcEvent: IpcInvokeEvent,
+    ...args: unknown[]
+  ): unknown => {
     const handler = handlers.get(channel);
     if (handler === undefined) {
       throw new Error(`no handler for ${channel}`);
     }
-    return handler(ipcEvent);
+    return handler(ipcEvent, ...args);
   };
 }
 
@@ -575,6 +579,8 @@ test("a new and a repeated sign-in through IPC send no code, verifier, signature
     },
     confirmForget: async () => true,
     confirmRemoveDevice: async () => true,
+    confirmRevokeDevice: async () => false,
+    confirmLiftRegistrationLock: async () => false,
     now: () => clock,
     onError: (message) => errors.push(message),
   });
@@ -771,6 +777,8 @@ test("a This is not me whose key delete fails after an unsaved record never brin
     focusWindow: () => undefined,
     confirmForget: async () => true,
     confirmRemoveDevice: async () => true,
+    confirmRevokeDevice: async () => false,
+    confirmLiftRegistrationLock: async () => false,
     now: () => clock,
   });
   await service.initialize();
@@ -888,6 +896,8 @@ test("This is not me deletes the registration marker, so a key whose delete fail
     focusWindow: () => undefined,
     confirmForget: async () => true,
     confirmRemoveDevice: async () => true,
+    confirmRevokeDevice: async () => false,
+    confirmLiftRegistrationLock: async () => false,
     now: () => clock,
   });
   await service.initialize();
@@ -1011,6 +1021,23 @@ function deviceApi() {
     onRequest: null as ((route: string) => void) | null,
     /** Refuses every sign-in as another GitHub account's. */
     accountMismatch: false,
+    /**
+     * Another device of the account, listed after this one, with its
+     * revocation once revoked; null without one.
+     */
+    otherDevice: null as {
+      readonly id: DeviceId;
+      readonly label: string;
+      revokedAt: string | null;
+      revokedReason: string | null;
+    } | null,
+    /** The end of the registration lock, or null without one. */
+    lockedUntil: null as string | null,
+    /**
+     * Answers a route that needs a token in place of the API when it
+     * returns a response; for example an uncertain answer.
+     */
+    override: null as ((route: string) => Response | undefined) | null,
   };
   const nonces = new Map<string, string>();
   const fetch = async (url: string, init: RequestInit): Promise<Response> => {
@@ -1088,6 +1115,11 @@ function deviceApi() {
     if (!api.tokens.has(token)) {
       return refusal("unauthorized");
     }
+    const overridden = api.override?.(route);
+    if (overridden !== undefined) {
+      return overridden;
+    }
+    const other = api.otherDevice;
     switch (route) {
       case "POST /auth/sign-out":
         api.signedOut = true;
@@ -1107,16 +1139,52 @@ function deviceApi() {
               revokedAt: null,
               current: true,
             },
+            ...(other === null
+              ? []
+              : [
+                  {
+                    id: other.id,
+                    label: other.label,
+                    platform: "linux",
+                    createdAt: "2026-10-01T10:00:00.000Z",
+                    lastSeenAt: "2026-11-01T10:00:00.000Z",
+                    lastSignInAt: "2026-10-20T10:00:00.000Z",
+                    signInExpiresAt: "2026-11-19T10:00:00.000Z",
+                    revokedAt: other.revokedAt,
+                    current: false,
+                  },
+                ]),
           ],
-          registrationLockedUntil: null,
+          registrationLockedUntil:
+            api.lockedUntil !== null && Date.parse(api.lockedUntil) > Date.now()
+              ? api.lockedUntil
+              : null,
         });
       case `POST /devices/${DEVICE_ID}/revoke`:
         api.revokedReason = body["reason"] ?? null;
         api.tokens.clear();
         return new Response(null, { status: 204 });
+      case "POST /account/registration-lock/lift":
+        api.lockedUntil = null;
+        return new Response(null, { status: 204 });
       default:
-        return refusal("not_found");
+        break;
     }
+    // Another device of the account, as the API's revoke route answers it.
+    if (other !== null && route === `POST /devices/${other.id}/revoke`) {
+      if (other.revokedAt !== null) {
+        return refusal("conflict");
+      }
+      other.revokedAt = new Date().toISOString();
+      other.revokedReason = body["reason"] ?? null;
+      if (other.revokedReason === "lost") {
+        api.lockedUntil = new Date(
+          Date.now() + 7 * 24 * 60 * 60_000,
+        ).toISOString();
+      }
+      return new Response(null, { status: 204 });
+    }
+    return refusal("not_found");
   };
   return { api, fetch };
 }
@@ -1184,6 +1252,8 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
       confirmed.push(login);
       return true;
     },
+    confirmRevokeDevice: async () => false,
+    confirmLiftRegistrationLock: async () => false,
     stopLocalExecution: () => {
       stopped += 1;
     },
@@ -1274,6 +1344,7 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     devices: [LISTED_DEVICE],
     registrationLockedUntil: null,
     newDevices: [],
+    lostDeviceAdvice: false,
   });
   expect(listRequests()).toBe(1);
 
@@ -1347,6 +1418,8 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     focusWindow: () => undefined,
     confirmForget: async () => false,
     confirmRemoveDevice: async () => false,
+    confirmRevokeDevice: async () => false,
+    confirmLiftRegistrationLock: async () => false,
   });
   const restartedStatuses: AccountStatus[] = [];
   restarted.onStatusChange((status) => restartedStatuses.push(status));
@@ -1493,6 +1566,212 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   expect(sent).not.toContain(USER_ID);
 }, 20_000);
 
+test("revoke another device as lost and lift the registration lock through IPC with the real session: confirmed in the main process, sent once, and the list loads again after each", async () => {
+  const folder = path.join(root, "MyManDev");
+  const keyStore = createDeviceKeyStore({
+    folder,
+    platform: "win32",
+    systemProtection: {
+      isAsyncEncryptionAvailable: () => Promise.resolve(true),
+      getSelectedStorageBackend: () => "unknown",
+      encryptStringAsync: (plainText) =>
+        Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8")),
+      decryptStringAsync: (ciphertext) =>
+        Promise.resolve({
+          shouldReEncrypt: false,
+          result: ciphertext.toString("utf8").slice("fake:".length),
+        }),
+    },
+  });
+  const records = createDeviceRecordStore({ folder, platform: "win32" });
+  const { api, fetch } = deviceApi();
+  const otherId = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c9" as DeviceId;
+  api.otherDevice = {
+    id: otherId,
+    label: "Old laptop",
+    revokedAt: null,
+    revokedReason: null,
+  };
+  const opened: string[] = [];
+  const confirmations: string[] = [];
+  const errors: string[] = [];
+  let clock = 0;
+  const service = createAccountService({
+    apiOrigin: { ok: true, origin: API_ORIGIN },
+    openSystem: () => ({
+      keyStore,
+      deviceRecords: records,
+      registrationMarkers: createRegistrationMarkerStore({
+        folder,
+        platform: "win32",
+      }),
+      createFlow: () =>
+        createSignInFlow({
+          apiOrigin: { ok: true, origin: API_ORIGIN },
+          keyStore,
+          deviceRecords: records,
+          registrationMarkers: createRegistrationMarkerStore({
+            folder,
+            platform: "win32",
+          }),
+          openExternal: async (url) => {
+            opened.push(url);
+            return true;
+          },
+          fetch,
+          platform: "win32",
+          scheduleTimer: () => () => undefined,
+          listenerConnectionTimeoutMs: 2_000,
+          onError: (message) => errors.push(message),
+        }),
+      createSession: () => sessionOver(folder, keyStore, records, fetch),
+    }),
+    focusWindow: () => undefined,
+    confirmForget: async () => false,
+    confirmRemoveDevice: async () => false,
+    confirmRevokeDevice: async (login, device, reason) => {
+      confirmations.push(
+        `${login} ${device.id} ${device.label} ${device.platform} ${reason}`,
+      );
+      return true;
+    },
+    confirmLiftRegistrationLock: async (login, lockedUntil) => {
+      confirmations.push(`lift ${login} ${lockedUntil}`);
+      return true;
+    },
+    now: () => clock,
+    onError: (message) => errors.push(message),
+  });
+  const { call } = register(service);
+  const devices = createDeviceListService({
+    account: service,
+    connection: OFFLINE_CONNECTION,
+    now: () => clock,
+  });
+  const callDevices = registerDevices(devices);
+  const app = () => event(frame(DEV_URL), receiver());
+  const ask = async (channel: string, ...args: unknown[]) =>
+    await callDevices(channel, app(), ...args);
+  const routes = (route: string) =>
+    api.routes.filter((sent) => sent === route).length;
+  const revokeRoute = `POST /devices/${otherId}/revoke`;
+  const liftRoute = "POST /account/registration-lock/lift";
+
+  await service.initialize();
+  await expect(ask(INVOKE_CHANNELS.loadDeviceList)).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+  });
+  clock += SIGN_IN_START_COOLDOWN_MS;
+  const before = service.status().revision;
+  await expect(call(INVOKE_CHANNELS.startSignIn, app())).resolves.toEqual({
+    outcome: "started",
+  });
+  const query = new URL(opened.at(-1) ?? "").searchParams;
+  const done = idleWithOutcome(service, before);
+  await postForm(
+    query.get("redirect_uri") ?? "",
+    new URLSearchParams({
+      code: SIGN_IN_CODE,
+      state: query.get("state") ?? "",
+    }).toString(),
+  );
+  expect((await done).lastOutcome).toEqual({ code: "signed_in" });
+  await deviceListWhen(
+    devices,
+    (state) => state.status === "ready" && state.devices.length === 2,
+  );
+  const listsBefore = routes("GET /devices");
+
+  // This device and an ID that the list does not hold are refused before
+  // anything is asked or sent.
+  await expect(
+    ask(INVOKE_CHANNELS.revokeDevice, DEVICE_ID, "lost"),
+  ).resolves.toEqual({ outcome: "refused", reason: "current_device" });
+  await expect(
+    ask(
+      INVOKE_CHANNELS.revokeDevice,
+      "0192f2a0-7c3e-7a1b-8c4d-5e6f708192ff",
+      "lost",
+    ),
+  ).resolves.toEqual({ outcome: "refused", reason: "not_listed" });
+  // No lock is in force yet.
+  await expect(ask(INVOKE_CHANNELS.liftRegistrationLock)).resolves.toEqual({
+    outcome: "refused",
+    reason: "no_lock",
+  });
+  expect(confirmations).toEqual([]);
+  expect(routes(revokeRoute) + routes(liftRoute)).toBe(0);
+
+  // Revoke the other device as lost: confirmed with the login, its label,
+  // and its platform, sent once, and the list loads again on its own with
+  // the device revoked and the lock in force.
+  await expect(
+    ask(INVOKE_CHANNELS.revokeDevice, otherId, "lost"),
+  ).resolves.toEqual({ outcome: "revoked", reason: "lost" });
+  expect(confirmations).toEqual([`octocat ${otherId} Old laptop linux lost`]);
+  expect(routes(revokeRoute)).toBe(1);
+  expect(api.otherDevice.revokedReason).toBe("lost");
+  const revokedList = await deviceListWhen(
+    devices,
+    (state) =>
+      state.devices.some(
+        (device) => device.id === otherId && device.revokedAt !== null,
+      ) && state.registrationLockedUntil !== null,
+  );
+  expect(revokedList.status).toBe("ready");
+  expect(routes("GET /devices")).toBeGreaterThan(listsBefore);
+  // This device stays signed in.
+  expect(service.status().device).toBe("signed_in");
+  // The advice after a revocation as lost reaches the renderer with the
+  // list, and stays until it is dismissed through its channel.
+  await expect(ask(INVOKE_CHANNELS.getDeviceList)).resolves.toMatchObject({
+    lostDeviceAdvice: true,
+  });
+  await expect(ask(INVOKE_CHANNELS.dismissLostDeviceAdvice)).resolves.toBe(
+    true,
+  );
+  await expect(ask(INVOKE_CHANNELS.getDeviceList)).resolves.toMatchObject({
+    lostDeviceAdvice: false,
+  });
+  // A revoked device is no longer listed as active.
+  await expect(
+    ask(INVOKE_CHANNELS.revokeDevice, otherId, "removed"),
+  ).resolves.toEqual({ outcome: "refused", reason: "not_listed" });
+
+  // An uncertain answer to the lift is unknown and never sent again.
+  api.override = (route) =>
+    route === liftRoute
+      ? json(503, { statusCode: 503, code: "unavailable" })
+      : undefined;
+  await expect(ask(INVOKE_CHANNELS.liftRegistrationLock)).resolves.toEqual({
+    outcome: "unknown",
+  });
+  expect(routes(liftRoute)).toBe(1);
+  api.override = null;
+  const listsAfterUnknown = routes("GET /devices");
+
+  // The lift: confirmed, sent once, and the list loads again without it.
+  await expect(ask(INVOKE_CHANNELS.liftRegistrationLock)).resolves.toEqual({
+    outcome: "lifted",
+  });
+  expect(routes(liftRoute)).toBe(2);
+  // Each confirmation names the end of the lock that the list reported.
+  const lockEnd = revokedList.registrationLockedUntil;
+  expect(confirmations.slice(1)).toEqual([
+    `lift octocat ${lockEnd}`,
+    `lift octocat ${lockEnd}`,
+  ]);
+  await deviceListWhen(
+    devices,
+    (state) =>
+      state.registrationLockedUntil === null &&
+      routes("GET /devices") > listsAfterUnknown,
+  );
+  expect(errors).toEqual([]);
+  devices.close();
+}, 20_000);
+
 test("This is not me during a sign-out report of the startup refresh never writes the other account back", async () => {
   const folder = path.join(root, "MyManDev");
   const keyStore = createDeviceKeyStore({
@@ -1571,6 +1850,8 @@ test("This is not me during a sign-out report of the startup refresh never write
     focusWindow: () => undefined,
     confirmForget: async () => true,
     confirmRemoveDevice: async () => true,
+    confirmRevokeDevice: async () => false,
+    confirmLiftRegistrationLock: async () => false,
   });
 
   // The startup refresh finds the pending report and sends it.
@@ -1657,6 +1938,8 @@ test("a workspace read refused by its own token request answers not_signed_in, a
       focusWindow: () => undefined,
       confirmForget: async () => false,
       confirmRemoveDevice: async () => false,
+      confirmRevokeDevice: async () => false,
+      confirmLiftRegistrationLock: async () => false,
     });
     await service.initialize();
     expect(service.status().device, name).toBe("signed_in");

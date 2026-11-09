@@ -1,15 +1,31 @@
 import { expect, test } from "vitest";
 import type { DeviceListBridge } from "../shared/desktop-bridge.ts";
 import {
+  DEVICE_LIST_ACTION_FAILURES,
   DEVICE_LIST_PROBLEMS,
   DEVICE_PLATFORMS,
+  LIFT_REGISTRATION_LOCK_REFUSALS,
+  REVOKE_DEVICE_REFUSALS,
   type DeviceListLoadResult,
   type DeviceListView,
   type DeviceView,
+  type LiftRegistrationLockResult,
+  type RevokeOtherDeviceResult,
 } from "../shared/ipc-contract.ts";
 import {
+  createDeviceActions,
+  DEVICE_ACTION_LABELS,
+  DEVICE_ACTION_REFUSAL_MESSAGES,
+  DEVICE_ACTION_RESULT_MESSAGES,
+  DEVICE_LIST_ACTION_FAILURE_MESSAGES,
   DEVICE_LIST_MESSAGES,
   DEVICE_LIST_PROBLEM_MESSAGES,
+  focusesTitleAfterAction,
+  IDLE_DEVICE_ACTIONS,
+  liftRegistrationLockOutcome,
+  LOST_DEVICE_ADVICE,
+  revokeDeviceOutcome,
+  type DeviceActionsView,
   describeDeviceList,
   deviceTimeFormat,
   followDeviceList,
@@ -71,6 +87,7 @@ function known(state: Partial<DeviceListView>): DeviceSectionView {
       devices: [NEW_LAPTOP, THIS_DEVICE, LOST_LAPTOP],
       registrationLockedUntil: null,
       newDevices: [],
+      lostDeviceAdvice: false,
       ...state,
     } as DeviceListView,
   };
@@ -139,6 +156,7 @@ test("each state has its fixed text, and an unavailable list keeps what was load
     newDevices: [],
     lockedUntil: null,
     lists: null,
+    lostDeviceAdvice: false,
   });
   expect(describeDeviceList({ kind: "pending" }, NOW).status).toBe(
     DEVICE_LIST_MESSAGES.pending,
@@ -150,6 +168,7 @@ test("each state has its fixed text, and an unavailable list keeps what was load
     newDevices: [],
     lockedUntil: null,
     lists: null,
+    lostDeviceAdvice: false,
   });
   expect(
     describeDeviceList(known({ status: "loading", devices: [] }), NOW),
@@ -335,4 +354,272 @@ test("the times show in the locale and the time zone given, as the chat screen s
   expect(deviceTimeFormat().resolvedOptions().timeZone).toBe(
     new Intl.DateTimeFormat().resolvedOptions().timeZone,
   );
+});
+
+// ---- The device actions (#95, D1) ----------------------------------------
+
+test("every result of a revocation has its fixed sentence, which points to the advice after a revocation as lost, also when the answer does not show whether it was revoked", () => {
+  expect(
+    revokeDeviceOutcome({ outcome: "revoked", reason: "lost" }, "lost"),
+  ).toEqual({
+    message: DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost,
+    done: true,
+  });
+  expect(
+    revokeDeviceOutcome({ outcome: "revoked", reason: "removed" }, "removed"),
+  ).toEqual({ message: DEVICE_ACTION_RESULT_MESSAGES.removed, done: true });
+  expect(revokeDeviceOutcome({ outcome: "cancelled" }, "lost")).toEqual({
+    message: undefined,
+    done: false,
+  });
+  expect(revokeDeviceOutcome({ outcome: "unknown" }, "lost")).toEqual({
+    message: `${DEVICE_ACTION_RESULT_MESSAGES.revokeUnknown} ${DEVICE_ACTION_RESULT_MESSAGES.adviceFollows}`,
+    done: false,
+  });
+  expect(revokeDeviceOutcome({ outcome: "unknown" }, "removed")).toEqual({
+    message: DEVICE_ACTION_RESULT_MESSAGES.revokeUnknown,
+    done: false,
+  });
+  for (const reason of REVOKE_DEVICE_REFUSALS) {
+    expect(
+      revokeDeviceOutcome({ outcome: "refused", reason }, "lost"),
+      reason,
+    ).toEqual({
+      message: `${DEVICE_ACTION_RESULT_MESSAGES.revokeNotDone} ${DEVICE_ACTION_REFUSAL_MESSAGES[reason]}`,
+      done: false,
+    });
+  }
+  for (const reason of DEVICE_LIST_ACTION_FAILURES) {
+    expect(
+      revokeDeviceOutcome({ outcome: "failed", reason }, "lost"),
+      reason,
+    ).toEqual({
+      message: `${DEVICE_ACTION_RESULT_MESSAGES.revokeNotDone} ${DEVICE_LIST_ACTION_FAILURE_MESSAGES[reason]}`,
+      done: false,
+    });
+  }
+  expect(DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost).toContain("7 days");
+  expect(DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost).toContain(
+    "Follow the advice below.",
+  );
+  expect(DEVICE_LIST_ACTION_FAILURE_MESSAGES.conflict).toBe(
+    "The device was revoked already.",
+  );
+});
+
+test("every result of a lift has its fixed sentence", () => {
+  expect(liftRegistrationLockOutcome({ outcome: "lifted" })).toEqual({
+    message: DEVICE_ACTION_RESULT_MESSAGES.lifted,
+    done: true,
+  });
+  expect(DEVICE_ACTION_RESULT_MESSAGES.lifted).toBe(
+    "The registration lock was lifted. New devices can register on this account again.",
+  );
+  expect(liftRegistrationLockOutcome({ outcome: "cancelled" })).toEqual({
+    message: undefined,
+    done: false,
+  });
+  expect(liftRegistrationLockOutcome({ outcome: "unknown" })).toEqual({
+    message: DEVICE_ACTION_RESULT_MESSAGES.liftUnknown,
+    done: false,
+  });
+  for (const reason of LIFT_REGISTRATION_LOCK_REFUSALS) {
+    expect(
+      liftRegistrationLockOutcome({ outcome: "refused", reason }).message,
+      reason,
+    ).toBe(
+      `${DEVICE_ACTION_RESULT_MESSAGES.liftNotDone} ${DEVICE_ACTION_REFUSAL_MESSAGES[reason]}`,
+    );
+  }
+  for (const reason of DEVICE_LIST_ACTION_FAILURES) {
+    expect(
+      liftRegistrationLockOutcome({ outcome: "failed", reason }).message,
+      reason,
+    ).toBe(
+      `${DEVICE_ACTION_RESULT_MESSAGES.liftNotDone} ${DEVICE_LIST_ACTION_FAILURE_MESSAGES[reason]}`,
+    );
+  }
+});
+
+test("the advice after a revocation as lost names ADR 0014's three steps, with GitHub's sessions as an address in the text, and shows while the list holds it", () => {
+  expect(LOST_DEVICE_ADVICE).toEqual({
+    title: "After a lost device",
+    steps: [
+      "End that device's GitHub sessions: open github.com/settings/sessions in your browser and revoke them.",
+      "If the device was unlocked, change your GitHub password.",
+      "Rotate the AI provider credentials that are stored on that device. The server cannot reach them.",
+    ],
+  });
+  expect(Object.isFrozen(LOST_DEVICE_ADVICE.steps)).toBe(true);
+  expect(DEVICE_ACTION_LABELS).toEqual({
+    remove: "Remove",
+    revokeAsLost: "Revoke as lost",
+    notMe: "This was not me: revoke as lost",
+    liftLock: "Lift the registration lock",
+    dismissAdvice: "Dismiss the advice",
+  });
+  // The main process holds the advice; the model passes it on, also while
+  // the list loads again or is unavailable, and never without a state.
+  for (const state of [
+    {},
+    { status: "loading", devices: [] },
+    { status: "unavailable", problem: "failed" },
+  ] as Partial<DeviceListView>[]) {
+    expect(
+      describeDeviceList(known({ ...state, lostDeviceAdvice: true }), NOW)
+        .lostDeviceAdvice,
+      JSON.stringify(state),
+    ).toBe(true);
+  }
+  expect(describeDeviceList(known({}), NOW).lostDeviceAdvice).toBe(false);
+  for (const view of [{ kind: "pending" }, { kind: "unavailable" }] as const) {
+    expect(describeDeviceList(view, NOW).lostDeviceAdvice).toBe(false);
+  }
+});
+
+/** A device list bridge whose answers the test settles. */
+function actionBridge() {
+  const calls: string[] = [];
+  let settleRevoke: (result: RevokeOtherDeviceResult) => void = () => undefined;
+  let failRevoke: (error: Error) => void = () => undefined;
+  let settleLift: (result: LiftRegistrationLockResult) => void = () =>
+    undefined;
+  const bridge: Pick<
+    DeviceListBridge,
+    "revokeDevice" | "liftRegistrationLock"
+  > = {
+    revokeDevice: (deviceId, reason) => {
+      calls.push(`revoke ${deviceId} ${reason}`);
+      return new Promise((resolve, reject) => {
+        settleRevoke = resolve;
+        failRevoke = reject;
+      });
+    },
+    liftRegistrationLock: () => {
+      calls.push("lift");
+      return new Promise((resolve) => {
+        settleLift = resolve;
+      });
+    },
+  };
+  return {
+    bridge,
+    calls,
+    revoked: (result: RevokeOtherDeviceResult) => settleRevoke(result),
+    revokeFails: () => failRevoke(new Error("refused")),
+    lifted: (result: LiftRegistrationLockResult) => settleLift(result),
+  };
+}
+
+test("one device action runs at a time and the view says so, and a new action clears the last sentence", async () => {
+  const fake = actionBridge();
+  const views: DeviceActionsView[] = [];
+  const actions = createDeviceActions(fake.bridge, (view) => views.push(view));
+
+  const revoking = actions.revoke(NEW_LAPTOP.id, "lost");
+  expect(views.at(-1)).toEqual({ running: true, message: undefined });
+  // A click while it runs changes nothing.
+  await expect(actions.revoke(NEW_LAPTOP.id, "removed")).resolves.toBe(false);
+  await expect(actions.lift()).resolves.toBe(false);
+  expect(fake.calls).toEqual([`revoke ${NEW_LAPTOP.id} lost`]);
+
+  fake.revoked({ outcome: "revoked", reason: "lost" });
+  await expect(revoking).resolves.toBe(true);
+  expect(views.at(-1)).toEqual({
+    running: false,
+    message: DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost,
+  });
+
+  // The next action clears the sentence.
+  const lifting = actions.lift();
+  expect(views.at(-1)).toEqual({ running: true, message: undefined });
+  fake.lifted({ outcome: "refused", reason: "no_lock" });
+  await expect(lifting).resolves.toBe(false);
+  expect(views.at(-1)).toEqual({
+    running: false,
+    message: `${DEVICE_ACTION_RESULT_MESSAGES.liftNotDone} ${DEVICE_ACTION_REFUSAL_MESSAGES.no_lock}`,
+  });
+  expect(Object.isFrozen(views.at(-1))).toBe(true);
+  expect(IDLE_DEVICE_ACTIONS).toEqual({ running: false, message: undefined });
+});
+
+test("a call that fails says that the action could not be done and to try again, and a kept confirmation says nothing", async () => {
+  const fake = actionBridge();
+  const views: DeviceActionsView[] = [];
+  const actions = createDeviceActions(fake.bridge, (view) => views.push(view));
+
+  const failing = actions.revoke(NEW_LAPTOP.id, "removed");
+  fake.revokeFails();
+  await expect(failing).resolves.toBe(false);
+  expect(views.at(-1)).toEqual({
+    running: false,
+    message: "The device could not be revoked. Try again.",
+  });
+
+  const kept = actions.revoke(NEW_LAPTOP.id, "lost");
+  fake.revoked({ outcome: "cancelled" });
+  await expect(kept).resolves.toBe(false);
+  expect(views.at(-1)).toEqual({ running: false, message: undefined });
+
+  const lifted = actions.lift();
+  fake.lifted({ outcome: "lifted" });
+  await expect(lifted).resolves.toBe(true);
+  expect(views.at(-1)?.message).toBe(DEVICE_ACTION_RESULT_MESSAGES.lifted);
+});
+
+test("the sentence of the last action goes with a sign-out, a list that loads again for a device, and another device named as this one, and stays otherwise", async () => {
+  const sentence = async () => {
+    const fake = actionBridge();
+    const views: DeviceActionsView[] = [];
+    const actions = createDeviceActions(fake.bridge, (view) =>
+      views.push(view),
+    );
+    actions.listChanged(known({}));
+    const removing = actions.revoke(NEW_LAPTOP.id, "removed");
+    fake.revoked({ outcome: "revoked", reason: "removed" });
+    await removing;
+    expect(views.at(-1)?.message).toBe(DEVICE_ACTION_RESULT_MESSAGES.removed);
+    return { actions, views };
+  };
+
+  // The same device's list, also updated, unavailable, or before the first
+  // state, keeps it.
+  const kept = await sentence();
+  for (const view of [
+    known({ revision: 2, devices: [THIS_DEVICE] }),
+    known({ status: "unavailable", problem: "failed" }),
+    { kind: "pending" },
+    { kind: "unavailable" },
+  ] as DeviceSectionView[]) {
+    kept.actions.listChanged(view);
+  }
+  expect(kept.views.at(-1)?.message).toBe(
+    DEVICE_ACTION_RESULT_MESSAGES.removed,
+  );
+
+  const otherThis: DeviceView = {
+    ...THIS_DEVICE,
+    id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b9",
+  };
+  for (const [name, view] of [
+    ["signed out", known({ status: "signed_out", devices: [] })],
+    ["loading after a drop", known({ status: "loading", devices: [] })],
+    ["another device", known({ devices: [otherThis, NEW_LAPTOP] })],
+  ] as const) {
+    const { actions, views } = await sentence();
+    const count = views.length;
+    actions.listChanged(view);
+    expect(views.at(-1), name).toEqual({ running: false, message: undefined });
+    expect(views, name).toHaveLength(count + 1);
+    // Nothing more to clear.
+    actions.listChanged(view);
+    expect(views, name).toHaveLength(count + 1);
+  }
+});
+
+test("the focus moves to the section's title only after an action whose button leaves the page, while the focus is still on that button or on the page", () => {
+  expect(focusesTitleAfterAction(true, true)).toBe(true);
+  expect(focusesTitleAfterAction(true, false)).toBe(false);
+  expect(focusesTitleAfterAction(false, true)).toBe(false);
+  expect(focusesTitleAfterAction(false, false)).toBe(false);
 });

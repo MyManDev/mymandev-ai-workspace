@@ -33,17 +33,34 @@
 //   the screen showed, and ends only those, so that a notice that arrived
 //   after the last published state is not dismissed unseen.
 // - A sign-out, another account, or another device drops the list, the
-//   lock, and the notices, and the answers on their way.
+//   lock, the notices, the advice, and the answers on their way.
+// - The device actions of the list (#95, D1) go to the account service,
+//   which confirms each in a native dialog and holds its action lock: a
+//   revocation of another device, accepted only for an active device that
+//   the list holds now or the device of a notice held now, never this
+//   installation's, and a lift of the registration lock, accepted while the
+//   last list reported a lock. While one runs, the triggers of a load wait,
+//   because every read answers `unavailable` under the lock; the list loads
+//   once when it ended, through the account service's `onDeviceAction`. A
+//   revocation as lost starts the advice of ADR 0014, which stays until the
+//   person dismisses it or the list is dropped.
 //
 // The state holds no user ID or token: the API's device list has none. The
 // logs are fixed text with a failure code at most, never a label or an ID.
-import type {
-  AccountDeviceRegisteredFrame,
-  DeviceId,
-  DeviceListItem,
+import {
+  type AccountDeviceRegisteredFrame,
+  type DeviceId,
+  DeviceIdSchema,
+  type DeviceListItem,
 } from "@mymandev/protocol";
-import type { AccountStatus } from "../../shared/ipc-contract.ts";
+import type {
+  AccountStatus,
+  LiftRegistrationLockResult,
+  OtherDeviceRevocation,
+  RevokeOtherDeviceResult,
+} from "../../shared/ipc-contract.ts";
 import type { AccountService } from "../account.ts";
+import type { OtherDevice } from "../account-session.ts";
 import type {
   WorkspaceReadFailure,
   WorkspaceReadResult,
@@ -97,6 +114,12 @@ export interface DeviceListState {
   readonly registrationLockedUntil: string | null;
   /** The notices of new devices, the oldest first. */
   readonly newDevices: readonly NewDeviceNotice[];
+  /**
+   * Whether the advice after a revocation as lost shows: from such a
+   * revocation through `revokeDevice`, also one whose answer is `unknown`,
+   * until the person dismisses it or the list is dropped.
+   */
+  readonly lostDeviceAdvice: boolean;
 }
 
 /** The answer to the Account screen's request for the list. */
@@ -110,7 +133,12 @@ export type DeviceListLoadOutcome =
 /** The part of the account service that the device list service uses. */
 export type DeviceListAccount = Pick<
   AccountService,
-  "status" | "onStatusChange" | "readDeviceList" | "onDeviceAction"
+  | "status"
+  | "onStatusChange"
+  | "readDeviceList"
+  | "onDeviceAction"
+  | "revokeOtherDevice"
+  | "liftRegistrationLock"
 >;
 
 /**
@@ -156,6 +184,36 @@ export interface DeviceListService {
    * them was held.
    */
   readonly dismissNewDevices: (deviceIds: readonly string[]) => boolean;
+  /**
+   * Revokes another device of the account as removed or as lost, with the
+   * account service's `revokeOtherDevice`, which asks the person first. Only
+   * an active device that the list holds now, or the device of a notice of a
+   * new device that is held now, is accepted: `not_listed` for any other ID
+   * and for a device that the list shows revoked, `current_device` for this
+   * installation's own, and `not_signed_in` while no device is signed in,
+   * each without asking. A revocation as lost that the server confirmed, or
+   * whose answer is `unknown`, starts the advice (`lostDeviceAdvice`). While
+   * it runs, the triggers of a load wait, and the list loads once when it
+   * ended. Never rejects.
+   */
+  readonly revokeDevice: (
+    deviceId: string,
+    reason: OtherDeviceRevocation,
+  ) => Promise<RevokeOtherDeviceResult>;
+  /**
+   * Lifts the registration lock with the account service's
+   * `liftRegistrationLock`, which asks the person first; only while the
+   * last list reported a lock (`no_lock` otherwise), whatever this device's
+   * clock says, because the API lifts it or answers that there was none,
+   * and `not_signed_in` while no device is signed in. The triggers of a load
+   * wait as for a revocation. Never rejects.
+   */
+  readonly liftRegistrationLock: () => Promise<LiftRegistrationLockResult>;
+  /**
+   * Ends the advice after a revocation as lost; false when it did not
+   * show.
+   */
+  readonly dismissLostDeviceAdvice: () => boolean;
   /** Stops listening and cancels the retry, for the quit. */
   readonly close: () => void;
 }
@@ -171,6 +229,24 @@ const TOO_SOON: DeviceListLoadOutcome = Object.freeze({
 });
 const NO_DEVICES: readonly DeviceListItem[] = Object.freeze([]);
 const NO_NOTICES: readonly NewDeviceNotice[] = Object.freeze([]);
+const ACTION_NOT_SIGNED_IN = Object.freeze({
+  outcome: "refused" as const,
+  reason: "not_signed_in" as const,
+});
+const NOT_LISTED: RevokeOtherDeviceResult = Object.freeze({
+  outcome: "refused",
+  reason: "not_listed",
+});
+const CURRENT_DEVICE: RevokeOtherDeviceResult = Object.freeze({
+  outcome: "refused",
+  reason: "current_device",
+});
+const NO_LOCK: LiftRegistrationLockResult = Object.freeze({
+  outcome: "refused",
+  reason: "no_lock",
+});
+/** A device action whose account service rejected: whether it acted is not known. */
+const ACTION_UNKNOWN = Object.freeze({ outcome: "unknown" as const });
 
 /**
  * The signed-in device, or null, under the same condition as the workspace
@@ -258,6 +334,18 @@ export function createDeviceListService(
    * null. Until then nothing loads; a trigger loads at its end.
    */
   let rateLimitedUntil: number | null = null;
+  /** Whether the advice after a revocation as lost shows. */
+  let lostDeviceAdvice = false;
+  /**
+   * The device actions of this service on their way (`revokeDevice`,
+   * `liftRegistrationLock`). The account service holds its action lock
+   * meanwhile and answers every read `unavailable`, so a trigger waits
+   * (`heldBack`) instead of showing that as a problem: the API's revocation
+   * frame, for example, reaches this device before the answer.
+   */
+  let ownActions = 0;
+  /** A trigger came while an own device action ran. */
+  let heldBack = false;
 
   let revision = 0;
   let dirty = false;
@@ -270,6 +358,7 @@ export function createDeviceListService(
       devices: list?.devices ?? NO_DEVICES,
       registrationLockedUntil: list?.registrationLockedUntil ?? null,
       newDevices: notices,
+      lostDeviceAdvice,
     };
     if (device === null) {
       return Object.freeze({ ...base, status: "signed_out" });
@@ -335,6 +424,7 @@ export function createDeviceListService(
     list = null;
     problem = null;
     notices = NO_NOTICES;
+    lostDeviceAdvice = false;
     attempt = 0;
     rateLimitedUntil = null;
     touch();
@@ -358,10 +448,18 @@ export function createDeviceListService(
    * that is signed in. During the wait after `rate_limited`, the load goes
    * when the wait ends. While a sign-in runs, the load waits for it to end.
    * While a load is on its way, its answer is dropped and the list loads
-   * again after it.
+   * again after it. While an own device action runs, the load waits for its
+   * end, unless `afterAction` says that the action has ended: the account
+   * service tells its listeners before it answers the action.
    */
-  function reload(): void {
+  function reload(afterAction = false): void {
     if (closed || device === null || !requested) {
+      return;
+    }
+    if (afterAction) {
+      heldBack = false;
+    } else if (ownActions > 0) {
+      heldBack = true;
       return;
     }
     const wait = rateLimitWait();
@@ -416,6 +514,12 @@ export function createDeviceListService(
       if (!result.ok && result.reason === "rate_limited") {
         rateLimitedUntil =
           now() + workspaceRetryDelayMs(attempt, "rate_limited");
+        if (list === null) {
+          // Nothing is loaded yet, so without the problem the screen would
+          // say for the whole wait that the list loads.
+          problem = "rate_limited";
+          touch();
+        }
       }
       reload();
       return;
@@ -576,9 +680,137 @@ export function createDeviceListService(
     return notices !== before;
   }
 
+  /**
+   * Runs a device action of this service: the triggers of a load wait for
+   * its end. The account service's `onDeviceAction` loads the list once when
+   * the action ended; after an action that ended without telling it, for
+   * example a kept confirmation, the triggers that waited load here.
+   */
+  async function ownAction<T>(action: () => Promise<T>): Promise<T> {
+    ownActions += 1;
+    try {
+      return await action();
+    } finally {
+      ownActions -= 1;
+      if (ownActions === 0 && heldBack) {
+        heldBack = false;
+        run(() => reload());
+      }
+    }
+  }
+
+  /**
+   * The device that a revocation names: an active device of the list as it
+   * is now, or else the device of a notice that is held now, which came
+   * from this account's own connection; the API checks that the device is
+   * the account's. The renderer names it by an ID that crossed IPC, so it is
+   * checked with the protocol's schema too.
+   */
+  function revocationTarget(
+    deviceId: string,
+  ): OtherDevice | RevokeOtherDeviceResult {
+    const parsed = DeviceIdSchema.safeParse(deviceId);
+    if (!parsed.success) {
+      return NOT_LISTED;
+    }
+    const id = parsed.data;
+    if (id === device) {
+      return CURRENT_DEVICE;
+    }
+    const listed = list?.devices.find((item) => item.id === id);
+    if (listed !== undefined) {
+      if (listed.revokedAt !== null) {
+        return NOT_LISTED;
+      }
+      if (listed.current) {
+        return CURRENT_DEVICE;
+      }
+      return Object.freeze({
+        id,
+        label: listed.label,
+        platform: listed.platform,
+      });
+    }
+    const notice = notices.find((held) => held.id === id);
+    return notice === undefined
+      ? NOT_LISTED
+      : Object.freeze({ id, label: notice.label, platform: notice.platform });
+  }
+
+  async function revokeDevice(
+    deviceId: string,
+    reason: OtherDeviceRevocation,
+  ): Promise<RevokeOtherDeviceResult> {
+    if (closed || device === null) {
+      return ACTION_NOT_SIGNED_IN;
+    }
+    const target = revocationTarget(deviceId);
+    if ("outcome" in target) {
+      return target;
+    }
+    const started = epoch;
+    const result = await ownAction(async () => {
+      try {
+        return await account.revokeOtherDevice(target, reason);
+      } catch {
+        // The account service never rejects; if it did, whether the server
+        // acted is not known.
+        log("A device could not be revoked.");
+        return ACTION_UNKNOWN;
+      }
+    });
+    // ADR 0014: after a revocation as lost, the advice shows until it is
+    // dismissed, also when the answer does not show whether the server
+    // revoked the device, because the person confirmed that it is lost. It
+    // belongs to this account and device: not after a drop meanwhile.
+    if (
+      reason === "lost" &&
+      (result.outcome === "revoked" || result.outcome === "unknown") &&
+      started === epoch &&
+      !closed
+    ) {
+      run(() => {
+        lostDeviceAdvice = true;
+        touch();
+      });
+    }
+    return result;
+  }
+
+  async function liftRegistrationLock(): Promise<LiftRegistrationLockResult> {
+    if (closed || device === null) {
+      return ACTION_NOT_SIGNED_IN;
+    }
+    // Any lock that the last list reported counts, whatever this device's
+    // clock says: the API lifts a lock in force and answers the same when
+    // there was none, so a clock that runs ahead does not stop the person.
+    const until = list?.registrationLockedUntil ?? null;
+    if (until === null) {
+      return NO_LOCK;
+    }
+    return ownAction(async () => {
+      try {
+        return await account.liftRegistrationLock(until);
+      } catch {
+        log("The registration lock could not be lifted.");
+        return ACTION_UNKNOWN;
+      }
+    });
+  }
+
+  function dismissLostDeviceAdvice(): boolean {
+    if (closed || !lostDeviceAdvice) {
+      return false;
+    }
+    lostDeviceAdvice = false;
+    touch();
+    return true;
+  }
+
   const removers = [
     account.onStatusChange((status) => run(() => accountChanged(status))),
-    account.onDeviceAction(() => run(() => reload())),
+    // The action has ended, also an own one whose answer is still on its way.
+    account.onDeviceAction(() => run(() => reload(true))),
     connection.onStatusChange((status) =>
       run(() => connectionChanged(status.state)),
     ),
@@ -602,6 +834,9 @@ export function createDeviceListService(
     load: () => run(load),
     dismissNewDevices: (deviceIds: readonly string[]) =>
       run(() => dismissNewDevices(deviceIds)),
+    revokeDevice,
+    liftRegistrationLock,
+    dismissLostDeviceAdvice: () => run(dismissLostDeviceAdvice),
     close: () => {
       if (closed) {
         return;

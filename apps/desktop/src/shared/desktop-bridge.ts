@@ -8,9 +8,12 @@ import type {
   DeviceListLoadResult,
   DeviceListView,
   ForgetResult,
+  LiftRegistrationLockResult,
   MountResult,
+  OtherDeviceRevocation,
   ReconnectResult,
   RemoveDeviceResult,
+  RevokeOtherDeviceResult,
   RepositoryList,
   RuntimeStatus,
   SignOutResult,
@@ -343,4 +346,29 @@ export interface DeviceListBridge {
   readonly dismissNewDevices: (
     deviceIds: readonly string[],
   ) => Promise<boolean>;
+  /**
+   * Revokes another active device of the list, by its device ID, as
+   * `removed` or as `lost`, which starts the account's 7-day registration
+   * lock. The main process asks the person to confirm in a native dialog,
+   * accepts only a lowercase UUIDv7 of an active device that its list holds
+   * and that is not this one, and sends the request once; `unknown` says
+   * that the answer does not show whether the server revoked it. The bridge
+   * passes on only a string and one of the two reasons.
+   */
+  readonly revokeDevice: (
+    deviceId: string,
+    reason: OtherDeviceRevocation,
+  ) => Promise<RevokeOtherDeviceResult>;
+  /**
+   * Lifts the account's registration lock while the list reports one. The
+   * main process asks the person to confirm in a native dialog, which names
+   * the end of the lock. It passes nothing from the renderer on.
+   */
+  readonly liftRegistrationLock: () => Promise<LiftRegistrationLockResult>;
+  /**
+   * Ends the advice after a revocation as lost, which the device list
+   * holds until then (`lostDeviceAdvice`). Resolves to false when it did
+   * not show. It passes nothing from the renderer on.
+   */
+  readonly dismissLostDeviceAdvice: () => Promise<boolean>;
 }

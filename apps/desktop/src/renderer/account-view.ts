@@ -597,7 +597,7 @@ export const DEVICE_ACTION_MESSAGES = Object.freeze({
   forgottenAtServer:
     "The account was removed from this installation, and the server removed this device from it.",
   forgottenLocally:
-    "The account was removed from this installation only. The server did not remove this device, so it stays listed for that GitHub account, without a key.",
+    'The account was removed from this installation only. The server did not remove this device, so it stays listed for that GitHub account, without a key. Whoever owns that account can remove it from another of their devices, with "Remove" in the device list on the Account screen.',
 });
 
 /** The message for a device action that did not succeed, or none. */

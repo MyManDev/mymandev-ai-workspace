@@ -116,9 +116,12 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "subscribeState",
   ]);
   expect(Object.keys(bridge.devices).sort()).toEqual([
+    "dismissLostDeviceAdvice",
     "dismissNewDevices",
     "getState",
+    "liftRegistrationLock",
     "load",
+    "revokeDevice",
     "subscribeState",
   ]);
   expect(bridge.electronVersion).toBe("44.9.1");
@@ -462,6 +465,7 @@ function deviceList(revision: number) {
     devices: [],
     registrationLockedUntil: null,
     newDevices: [],
+    lostDeviceAdvice: false,
   };
 }
 
@@ -512,6 +516,65 @@ test("dismissNewDevices refuses a value that is not an array of strings without 
   ]) {
     await expect(dismiss(value)).rejects.toThrow(
       "dismissNewDevices needs an array of ID strings.",
+    );
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("revokeDevice passes on only the device ID string and its own reason, and liftRegistrationLock and dismissLostDeviceAdvice nothing", async () => {
+  const fake = fakeIpc();
+  const devices = createDesktopBridge("44.9.1", fake.ipc)
+    .devices as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const deviceId = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b4";
+
+  const answers = [
+    devices["revokeDevice"]?.(deviceId, "removed", { force: true }),
+    devices["revokeDevice"]?.(deviceId, "lost"),
+    devices["liftRegistrationLock"]?.("devices:revoke", deviceId),
+    devices["dismissLostDeviceAdvice"]?.("devices:dismiss-new-devices", [
+      deviceId,
+    ]),
+  ];
+  fake.answers[0]?.resolve({ outcome: "revoked", reason: "removed" });
+  fake.answers[1]?.resolve({ outcome: "unknown" });
+  fake.answers[2]?.resolve({ outcome: "lifted" });
+  fake.answers[3]?.resolve(true);
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    { outcome: "revoked", reason: "removed" },
+    { outcome: "unknown" },
+    { outcome: "lifted" },
+    true,
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.revokeDevice, args: [deviceId, "removed"] },
+    { channel: INVOKE_CHANNELS.revokeDevice, args: [deviceId, "lost"] },
+    { channel: INVOKE_CHANNELS.liftRegistrationLock, args: [] },
+    { channel: INVOKE_CHANNELS.dismissLostDeviceAdvice, args: [] },
+  ]);
+});
+
+test("revokeDevice refuses an ID that is not a string or another reason without calling the main process or naming the value", async () => {
+  const fake = fakeIpc();
+  const revoke = createDesktopBridge("44.9.1", fake.ipc).devices
+    .revokeDevice as (...args: unknown[]) => Promise<unknown>;
+  const deviceId = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b4";
+
+  for (const args of [
+    [],
+    [deviceId],
+    [deviceId, "replaced"],
+    [deviceId, "LOST"],
+    [deviceId, { toString: () => "lost" }],
+    [[deviceId], "lost"],
+    [{ id: deviceId }, "removed"],
+    [undefined, "removed"],
+  ]) {
+    await expect(revoke(...args)).rejects.toThrow(
+      "revokeDevice needs a device ID string and a revocation reason.",
     );
   }
   expect(fake.invoked).toEqual([]);

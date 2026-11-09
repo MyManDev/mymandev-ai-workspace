@@ -152,6 +152,23 @@ export const INVOKE_CHANNELS = Object.freeze({
    * device IDs that they name.
    */
   dismissNewDevices: "devices:dismiss-new-devices",
+  /**
+   * Revokes another active device of the account's list, by its device ID,
+   * as removed or as lost: the main process asks the person to confirm in a
+   * native dialog first.
+   */
+  revokeDevice: "devices:revoke",
+  /**
+   * Lifts the account's registration lock while the list reports one: the
+   * main process asks the person to confirm in a native dialog first. The
+   * renderer sends nothing.
+   */
+  liftRegistrationLock: "devices:lift-lock",
+  /**
+   * Ends the advice after a revocation as lost, which the device list holds
+   * until then. The renderer sends nothing.
+   */
+  dismissLostDeviceAdvice: "devices:dismiss-advice",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */

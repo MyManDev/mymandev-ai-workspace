@@ -17,9 +17,16 @@ import {
 import { registerAccountIpc } from "./account-ipc.ts";
 import { registerAgentIpc } from "./agent-ipc.ts";
 import {
+  dialogTimeFormat,
+  LIFT_REGISTRATION_LOCK_CONFIRMATION,
+  liftRegistrationLockConfirmationMessage,
+  liftRegistrationLockConfirmed,
   REMOVE_DEVICE_CONFIRMATION,
   removeDeviceConfirmationMessage,
   removeDeviceConfirmed,
+  REVOKE_DEVICE_CONFIRMATIONS,
+  revokeDeviceConfirmationMessage,
+  revokeDeviceConfirmed,
 } from "./account-session.ts";
 import { createSystemAccountService } from "./account-system.ts";
 import {
@@ -161,6 +168,40 @@ function start(): void {
           : await dialog.showMessageBox(mainWindow, options),
       );
     },
+    // Revoking another device of the account (#95) is confirmed the same
+    // way, with the device's label and platform and, for a lost device, the
+    // 7-day registration lock that it starts.
+    confirmRevokeDevice: async (login, device, reason) => {
+      const confirmation = REVOKE_DEVICE_CONFIRMATIONS[reason];
+      const options = {
+        ...confirmation,
+        buttons: [...confirmation.buttons],
+        message: revokeDeviceConfirmationMessage(login, device, reason),
+      };
+      return revokeDeviceConfirmed(
+        mainWindow === undefined
+          ? await dialog.showMessageBox(options)
+          : await dialog.showMessageBox(mainWindow, options),
+      );
+    },
+    // And lifting the registration lock, with the end of the lock in the
+    // application's locale and the system's time zone.
+    confirmLiftRegistrationLock: async (login, lockedUntil) => {
+      const options = {
+        ...LIFT_REGISTRATION_LOCK_CONFIRMATION,
+        buttons: [...LIFT_REGISTRATION_LOCK_CONFIRMATION.buttons],
+        message: liftRegistrationLockConfirmationMessage(
+          login,
+          lockedUntil,
+          dialogTimeFormat(app.getLocale()),
+        ),
+      };
+      return liftRegistrationLockConfirmed(
+        mainWindow === undefined
+          ? await dialog.showMessageBox(options)
+          : await dialog.showMessageBox(mainWindow, options),
+      );
+    },
     // ADR 0014: a revoked device stops local execution. The local runtime
     // is a placeholder that executes nothing yet (runtime.ts), so there is
     // nothing to stop; stopping it would only leave it stopped with no way
@@ -197,6 +238,10 @@ function start(): void {
   // D4 and D5b), read over HTTP once the Account screen asked for them and
   // again after the account frames, a reconnect, and the person's device
   // actions, with the notices of new devices from the live frame. It
+  // revokes another device of its list or of a notice and lifts a lock
+  // that its list reported, through the account service, which confirms
+  // each in a native dialog, and it keeps the advice after a revocation as
+  // lost until the person dismisses it. It
   // reaches the renderer through its own channels, at most one publish every
   // 50 ms. The logs are fixed text with a failure code at most, never a
   // label or an ID.
