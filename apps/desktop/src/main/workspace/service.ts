@@ -18,6 +18,10 @@
 //   membership events (#95, decision D3): each person's display name, role,
 //   whether it is claimed, the GitHub login with the time it was last
 //   verified, and whether it was removed. The user IDs are never kept.
+// - The selected workspace's live ownership offer and its limit of unclaimed
+//   people come from its view (#95, D3). No workspace event reports an
+//   offer or its end, so the account frames of an offer, and the people
+//   actions after an offer or its withdrawal, reload the view.
 // - When the membership ends or the subscription is refused, the
 //   subscription is dropped from the connection client, which would
 //   otherwise send it again after every `auth.ok`, the list is reloaded, and
@@ -129,6 +133,17 @@ export interface PersonState {
   readonly removedAt: string | null;
 }
 
+/**
+ * The live ownership offer of the selected workspace (ADR 0014, "Removal
+ * and ownership"), as the service keeps it: the target and when the offer
+ * expires. An offer past `expiresAt` is no offer.
+ */
+export interface OwnershipOfferState {
+  readonly memberId: MemberId;
+  /** An ISO 8601 time in UTC. */
+  readonly expiresAt: string;
+}
+
 /** The service's state. Every value is frozen. */
 export interface WorkspaceState {
   /**
@@ -204,6 +219,27 @@ export interface WorkspaceService {
    * selected workspace's view has loaded. The people screen reads it.
    */
   readonly people: () => readonly PersonState[];
+  /**
+   * The selected workspace's live ownership offer from its last reload, or
+   * null: none, or not loaded yet. A transfer to its target and the
+   * target's removal end it at once; an offer, its withdrawal, and its
+   * expiry show after the next reload, which the account frames of the
+   * offer's target and `reload` begin. It may be past its `expiresAt`.
+   */
+  readonly ownershipOffer: () => OwnershipOfferState | null;
+  /**
+   * How many active unclaimed people the selected workspace may hold, from
+   * its last reload, or null until it loaded.
+   */
+  readonly unclaimedMemberLimit: () => number | null;
+  /**
+   * Reloads the selected workspace's view and projects through the resync
+   * gate, for a change that no workspace event reports, such as an
+   * ownership offer or its withdrawal. False, with nothing read, for
+   * another workspace, and while it is not subscribed, because the next
+   * `workspace.subscribed` reloads it anyway.
+   */
+  readonly reload: (workspaceId: WorkspaceId) => boolean;
   /**
    * Whether `workspaceId` is the selected workspace, subscribed, and
    * reloaded since its last `workspace.subscribed`, with no reload open. The
@@ -372,6 +408,8 @@ export function createWorkspaceService(
   let members = new Map<MemberId, PersonState>();
   /** The frozen list of `members` for `people`, or null after a change. */
   let peopleList: readonly PersonState[] | null = NO_PEOPLE;
+  let ownershipOffer: OwnershipOfferState | null = null;
+  let unclaimedMemberLimit: number | null = null;
   let projects = NO_PROJECTS;
   let openProjectId: ProjectId | null = null;
 
@@ -478,6 +516,8 @@ export function createWorkspaceService(
     viewAttempt = 0;
     members = new Map();
     peopleList = NO_PEOPLE;
+    ownershipOffer = null;
+    unclaimedMemberLimit = null;
     projects = NO_PROJECTS;
     openProjectId = null;
   }
@@ -657,6 +697,15 @@ export function createWorkspaceService(
       view.value.members.map((member) => [member.id, personState(member)]),
     );
     peopleList = null;
+    const offer = view.value.ownershipOffer;
+    ownershipOffer =
+      offer === null
+        ? null
+        : Object.freeze({
+            memberId: offer.memberId,
+            expiresAt: offer.expiresAt,
+          });
+    unclaimedMemberLimit = view.value.maxUnclaimedMembers;
     projects = Object.freeze(list.value.projects.map(projectSummary));
     for (const event of events) {
       // The reload is newer than an event that it already holds, and an
@@ -727,11 +776,24 @@ export function createWorkspaceService(
     return true;
   }
 
+  /** Ends the held ownership offer when it names `memberId`. */
+  function endOfferTo(memberId: MemberId): void {
+    if (ownershipOffer?.memberId === memberId) {
+      ownershipOffer = null;
+      touch();
+    }
+  }
+
   /**
    * Applies one event. Every event sets the state that it reports, so
    * applying one again changes nothing. False, with nothing changed, when it
    * names a person or a project that the workspace does not hold. A removed
    * person stays as a former member with their name and role.
+   *
+   * The removal of an offer's target and the transfer to it end the held
+   * offer: an offer names an active person who is not the owner, and a
+   * removed person never becomes active again, so a replay never ends a
+   * newer offer either.
    *
    * The replay rule: `defined` is the first event of a person's life, and a
    * claim happens once, so `defined` for a person that the service holds,
@@ -759,6 +821,10 @@ export function createWorkspaceService(
           displayName: event.payload.displayName,
         });
       case "workspace.member.removed":
+        if (!members.has(event.payload.memberId)) {
+          return false;
+        }
+        endOfferTo(event.payload.memberId);
         return changePerson(event.payload.memberId, {
           removedAt: event.payload.removedAt,
         });
@@ -777,6 +843,7 @@ export function createWorkspaceService(
         // The transfer demotes the owner to admin and promotes the target.
         changePerson(previousOwnerMemberId, { role: "admin" });
         changePerson(ownerMemberId, { role: "owner" });
+        endOfferTo(ownerMemberId);
         return true;
       }
       case "workspace.project.created": {
@@ -840,6 +907,15 @@ export function createWorkspaceService(
   }
 
   // The frames.
+
+  /** Reloads the selected workspace while it is subscribed; see `reload`. */
+  function reloadSelected(workspaceId: WorkspaceId): boolean {
+    if (workspaceId !== selected || gate.state() === "inactive") {
+      return false;
+    }
+    startReload(gate.begin("all").generation);
+    return true;
+  }
 
   /**
    * The membership ended or the subscription was refused: the subscription
@@ -905,6 +981,13 @@ export function createWorkspaceService(
           refused.delete(frame.workspaceId);
           loadList();
         }
+        return;
+      case "account.ownership_offered":
+      case "account.ownership_offer_ended":
+        // Only the target's account gets them, and no workspace event
+        // follows. The view is read again rather than set from the frame,
+        // so that an older reload answer can never undo it.
+        reloadSelected(frame.workspaceId);
         return;
       default:
         // Presence (no issue owns it yet), event refusals (the chat and
@@ -995,6 +1078,10 @@ export function createWorkspaceService(
         }
         return true;
       }),
+    ownershipOffer: () => ownershipOffer,
+    unclaimedMemberLimit: () => unclaimedMemberLimit,
+    reload: (workspaceId: WorkspaceId) =>
+      run(() => !closed && device !== null && reloadSelected(workspaceId)),
     memberName: (memberId: MemberId) =>
       members.get(memberId)?.displayName ?? UNKNOWN_MEMBER_NAME,
     people: () => {

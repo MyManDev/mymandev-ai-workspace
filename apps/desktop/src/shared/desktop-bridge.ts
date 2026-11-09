@@ -5,6 +5,7 @@ import type {
   ChatSendResultView,
   ChatView,
   ConnectionStatus,
+  DefinePersonResult,
   DeviceListLoadResult,
   DeviceListView,
   ForgetResult,
@@ -12,6 +13,7 @@ import type {
   MountResult,
   OtherDeviceRevocation,
   PeopleView,
+  PersonActionResult,
   ReconnectResult,
   RemoveDeviceResult,
   RevokeOtherDeviceResult,
@@ -49,6 +51,8 @@ export interface DesktopBridge {
   readonly workspaces: WorkspaceBridge;
   /** The people of the selected workspace, read-only. */
   readonly people: PeopleBridge;
+  /** The actions on the people of the selected workspace. */
+  readonly peopleActions: PeopleActionsBridge;
   /** The agent activity of the open project, read-only. */
   readonly agents: AgentBridge;
   /** The chat of the open project. */
@@ -257,6 +261,70 @@ export interface PeopleBridge {
     listener: (state: PeopleView) => void,
     onError?: () => void,
   ) => () => void;
+}
+
+/**
+ * The actions on the people of the selected workspace (#95, D1), each
+ * through its own channel. Every function takes the selected workspace's ID
+ * and, where it names a person, the member ID from the people view, and the
+ * main process refuses another workspace as `not_selected`. A display name
+ * is 1 to 64 characters; the main process also refuses a blank one and
+ * control, format, and invisible characters (`invalid`). Each action is
+ * sent once: `unknown` says that the answer does not show whether the API
+ * acted, and nothing sends it again, so the screen asks the person to check
+ * the list. `too_soon` and `rate_limited` come with `retryAfterMs`. The
+ * people view shows a confirmed change once its event arrives. The bridge
+ * passes on only strings and refuses any other value without a call.
+ */
+export interface PeopleActionsBridge {
+  /**
+   * Defines an unclaimed person. Resolves to `ok` with the new person's
+   * member ID. `rate_limited` also says that the workspace holds as many
+   * active unclaimed people as its limit (`maxUnclaimedMembers`).
+   */
+  readonly define: (
+    workspaceId: string,
+    displayName: string,
+  ) => Promise<DefinePersonResult>;
+  /** Renames the account's own person or an unclaimed person. */
+  readonly rename: (
+    workspaceId: string,
+    memberId: string,
+    displayName: string,
+  ) => Promise<PersonActionResult>;
+  /** Removes a person; the API decides who may remove whom. */
+  readonly remove: (
+    workspaceId: string,
+    memberId: string,
+  ) => Promise<PersonActionResult>;
+  /** Makes a claimed member an admin; the owner only. */
+  readonly promote: (
+    workspaceId: string,
+    memberId: string,
+  ) => Promise<PersonActionResult>;
+  /** Makes an admin a member again; the owner only. */
+  readonly demote: (
+    workspaceId: string,
+    memberId: string,
+  ) => Promise<PersonActionResult>;
+  /**
+   * The account's own person leaves the workspace; the owner cannot. Once
+   * the API confirmed it, the workspace leaves the workspace list.
+   */
+  readonly leave: (workspaceId: string) => Promise<PersonActionResult>;
+  /** Offers the ownership to an active, claimed person; the owner only. */
+  readonly offerOwnership: (
+    workspaceId: string,
+    memberId: string,
+  ) => Promise<PersonActionResult>;
+  /** Withdraws the live ownership offer; the owner only. */
+  readonly withdrawOwnershipOffer: (
+    workspaceId: string,
+  ) => Promise<PersonActionResult>;
+  /** Accepts the live ownership offer to the account's own person. */
+  readonly acceptOwnershipOffer: (
+    workspaceId: string,
+  ) => Promise<PersonActionResult>;
 }
 
 /**

@@ -34,6 +34,7 @@ import {
   DEVICE_LIST_STATUSES,
   DEVICE_PLATFORMS,
   DEVICE_STATES,
+  DefinePersonResultSchema,
   DeviceListLoadResultSchema,
   DeviceListViewSchema,
   EVENT_CONTRACT,
@@ -49,7 +50,10 @@ import {
   PEOPLE_LIMITS,
   PEOPLE_STATUSES,
   PeopleViewSchema,
+  PERSON_ACTION_REFUSALS,
   PERSON_ROLES,
+  PersonActionResultSchema,
+  PersonNameSchema,
   ProtocolIdSchema,
   RECONNECT_REFUSALS,
   ReconnectResultSchema,
@@ -123,6 +127,7 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     PEOPLE_LIMITS,
     PEOPLE_STATUSES,
     PERSON_ROLES,
+    PERSON_ACTION_REFUSALS,
     AGENT_LIMITS,
     AGENT_ACTIVITY_STATUSES,
     AGENT_ACTIVITY_PROBLEMS,
@@ -183,7 +188,20 @@ test("a runtime status with a wrong state or revision is refused", () => {
   }
 });
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, the dismissal of new devices, and the revocation of a device take no arguments and refuse any", () => {
+/** The people action channels, which take IDs and names. */
+const PEOPLE_ACTION_CHANNELS: ReadonlySet<string> = new Set([
+  INVOKE_CHANNELS.definePerson,
+  INVOKE_CHANNELS.renamePerson,
+  INVOKE_CHANNELS.removePerson,
+  INVOKE_CHANNELS.promotePerson,
+  INVOKE_CHANNELS.demotePerson,
+  INVOKE_CHANNELS.leaveWorkspace,
+  INVOKE_CHANNELS.offerOwnership,
+  INVOKE_CHANNELS.withdrawOwnershipOffer,
+  INVOKE_CHANNELS.acceptOwnershipOffer,
+]);
+
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, and the people actions take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -195,9 +213,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.retryChatMessage &&
       channel !== INVOKE_CHANNELS.discardChatMessage &&
       channel !== INVOKE_CHANNELS.dismissNewDevices &&
-      channel !== INVOKE_CHANNELS.revokeDevice,
+      channel !== INVOKE_CHANNELS.revokeDevice &&
+      !PEOPLE_ACTION_CHANNELS.has(channel),
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 10);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 19);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -1625,6 +1644,8 @@ function peopleValue(overrides: Record<string, unknown> = {}) {
       }),
     ],
     morePeople: 0,
+    ownershipOffer: null,
+    maxUnclaimedMembers: 500,
     ...overrides,
   };
 }
@@ -1647,10 +1668,16 @@ test("a people view with every status, problem, and role is accepted and frozen"
     ownMemberId: null,
     people: PERSON_ROLES.map((role) => personValue({ role, former: true })),
     morePeople: 12,
+    maxUnclaimedMembers: null,
   });
   const parsed = PeopleViewSchema.parse(value);
   expect(parsed).toEqual(value);
   expect(Object.isFrozen(parsed.people)).toBe(true);
+  const offered = peopleValue({
+    ownershipOffer: { memberId: OTHER_PERSON_ID, expiresAt: VERIFIED_AT },
+    maxUnclaimedMembers: 1,
+  });
+  expect(PeopleViewSchema.parse(offered)).toEqual(offered);
 });
 
 test("a people view drops unknown keys at every level, so no user ID crosses", () => {
@@ -1665,10 +1692,21 @@ test("a people view drops unknown keys at every level, so no user ID crosses", (
           removedAt: VERIFIED_AT,
         }),
       ],
+      ownershipOffer: {
+        memberId: OTHER_PERSON_ID,
+        expiresAt: VERIFIED_AT,
+        offeredAt: VERIFIED_AT,
+        userId: PERSON_USER_ID,
+      },
     }),
   );
 
-  expect(parsed).toEqual(peopleValue({ people: [personValue()] }));
+  expect(parsed).toEqual(
+    peopleValue({
+      people: [personValue()],
+      ownershipOffer: { memberId: OTHER_PERSON_ID, expiresAt: VERIFIED_AT },
+    }),
+  );
   expect(JSON.stringify(parsed)).not.toContain(PERSON_USER_ID);
 });
 
@@ -1710,6 +1748,21 @@ test("a people view over the limits or with wrong values is refused", () => {
     peopleValue({ people: [personValue({ login: "<b>octocat</b>" })] }),
     peopleValue({ people: [personValue({ verifiedAt: "yesterday" })] }),
     peopleValue({ people: [personValue({ verifiedAt: undefined })] }),
+    peopleValue({ ownershipOffer: undefined }),
+    peopleValue({ ownershipOffer: { memberId: OTHER_PERSON_ID } }),
+    peopleValue({
+      ownershipOffer: { memberId: "member", expiresAt: VERIFIED_AT },
+    }),
+    peopleValue({
+      ownershipOffer: { memberId: OTHER_PERSON_ID, expiresAt: "next week" },
+    }),
+    peopleValue({ maxUnclaimedMembers: undefined }),
+    peopleValue({ maxUnclaimedMembers: 0 }),
+    peopleValue({
+      maxUnclaimedMembers: PEOPLE_LIMITS.maxUnclaimedMembers + 1,
+    }),
+    peopleValue({ maxUnclaimedMembers: 1.5 }),
+    peopleValue({ maxUnclaimedMembers: "500" }),
   ]) {
     expect(PeopleViewSchema.safeParse(value).success).toBe(false);
   }
@@ -1729,6 +1782,161 @@ test("a people view over the limits or with wrong values is refused", () => {
       }),
     ).success,
   ).toBe(true);
+});
+
+// The people actions.
+
+/** Each people action channel and its argument kinds, in order. */
+const PEOPLE_ACTION_ARGUMENTS = Object.freeze({
+  [INVOKE_CHANNELS.definePerson]: ["id", "name"],
+  [INVOKE_CHANNELS.renamePerson]: ["id", "id", "name"],
+  [INVOKE_CHANNELS.removePerson]: ["id", "id"],
+  [INVOKE_CHANNELS.promotePerson]: ["id", "id"],
+  [INVOKE_CHANNELS.demotePerson]: ["id", "id"],
+  [INVOKE_CHANNELS.leaveWorkspace]: ["id"],
+  [INVOKE_CHANNELS.offerOwnership]: ["id", "id"],
+  [INVOKE_CHANNELS.withdrawOwnershipOffer]: ["id"],
+  [INVOKE_CHANNELS.acceptOwnershipOffer]: ["id"],
+} as const);
+
+function actionArguments(
+  kinds: readonly ("id" | "name")[],
+): readonly unknown[] {
+  return kinds.map((kind, index) =>
+    kind === "name" ? "Linus Newcomer" : index === 0 ? WORKSPACE_ID : PERSON_ID,
+  );
+}
+
+test("each people action takes exactly its IDs, each a lowercase UUIDv7, and its name, and refuses anything else", () => {
+  expect(Object.keys(PEOPLE_ACTION_ARGUMENTS).sort()).toEqual(
+    [...PEOPLE_ACTION_CHANNELS].sort(),
+  );
+  for (const [channel, kinds] of Object.entries(PEOPLE_ACTION_ARGUMENTS)) {
+    const { args } = INVOKE_CONTRACT[channel as keyof typeof INVOKE_CONTRACT];
+    const valid = actionArguments(kinds);
+    expect(args.parse(valid), channel).toEqual(valid);
+    // Missing, extra, and no arguments.
+    for (const value of [
+      [],
+      valid.slice(0, -1),
+      [...valid, PERSON_ID],
+      [...valid, undefined],
+      undefined,
+      {},
+      valid[0],
+    ]) {
+      expect(args.safeParse(value).success, channel).toBe(false);
+    }
+    for (const [index, kind] of kinds.entries()) {
+      const at = (value: unknown) =>
+        valid.map((v, i) => (i === index ? value : v));
+      if (kind === "id") {
+        for (const value of NOT_PROTOCOL_IDS) {
+          expect(args.safeParse(at(value)).success, channel).toBe(false);
+        }
+      } else {
+        for (const value of [
+          "",
+          "a".repeat(PEOPLE_LIMITS.displayName + 1),
+          "x".repeat(1_000_000),
+          1,
+          null,
+          undefined,
+          ["Linus"],
+          { displayName: "Linus" },
+        ]) {
+          expect(args.safeParse(at(value)).success, channel).toBe(false);
+        }
+        // At the limit, in characters, it is accepted.
+        expect(
+          args.safeParse(at("\u{1F600}".repeat(PEOPLE_LIMITS.displayName)))
+            .success,
+        ).toBe(true);
+      }
+    }
+  }
+});
+
+test("a display name is checked by its length only, and a too long one is refused with one issue", () => {
+  // The protocol's text rule runs in the main process.
+  expect(PersonNameSchema.parse(" ")).toBe(" ");
+  const result = PersonNameSchema.safeParse("secret".repeat(1_000));
+  expect(result.success).toBe(false);
+  expect(result.error?.issues).toHaveLength(1);
+  expect(JSON.stringify(result.error?.issues)).not.toContain("secret");
+});
+
+test("a people action answers ok, refused with a known reason and a wait only for a wait, or unknown, and a definition the new member ID", () => {
+  const waits = new Set(["too_soon", "rate_limited"]);
+  for (const schema of [PersonActionResultSchema, DefinePersonResultSchema]) {
+    expect(schema.parse({ outcome: "unknown" })).toEqual({
+      outcome: "unknown",
+    });
+    for (const reason of PERSON_ACTION_REFUSALS) {
+      const retryAfterMs = waits.has(reason) ? 1_500 : null;
+      const value = { outcome: "refused", reason, retryAfterMs };
+      expect(schema.parse(value), reason).toEqual(value);
+      // A wait needs its time, and nothing else has one.
+      expect(
+        schema.safeParse({
+          ...value,
+          retryAfterMs: retryAfterMs === null ? 1_500 : null,
+        }).success,
+        reason,
+      ).toBe(false);
+      expect(
+        schema.safeParse({ outcome: "refused", reason }).success,
+        reason,
+      ).toBe(false);
+    }
+    for (const value of [
+      undefined,
+      null,
+      "ok",
+      {},
+      { outcome: "done" },
+      { outcome: "failed" },
+      { outcome: "refused", reason: "busy", retryAfterMs: null },
+      { outcome: "refused", reason: "forbidden", retryAfterMs: null },
+      { outcome: "refused", reason: "too_soon", retryAfterMs: 0 },
+      { outcome: "refused", reason: "too_soon", retryAfterMs: 1.5 },
+      { outcome: "refused", reason: "rate_limited", retryAfterMs: -1 },
+      { outcome: "refused", reason: "rate_limited", retryAfterMs: "60" },
+    ]) {
+      expect(schema.safeParse(value).success).toBe(false);
+    }
+  }
+  expect(PersonActionResultSchema.parse({ outcome: "ok" })).toEqual({
+    outcome: "ok",
+  });
+  expect(
+    DefinePersonResultSchema.parse({ outcome: "ok", memberId: PERSON_ID }),
+  ).toEqual({ outcome: "ok", memberId: PERSON_ID });
+  for (const memberId of [undefined, null, "member", MOUNT_ID]) {
+    expect(
+      DefinePersonResultSchema.safeParse({ outcome: "ok", memberId }).success,
+    ).toBe(false);
+  }
+  // Unknown keys are dropped, so no user ID crosses.
+  const parsed = DefinePersonResultSchema.parse({
+    outcome: "ok",
+    memberId: PERSON_ID,
+    userId: PERSON_USER_ID,
+    member: { id: PERSON_ID, userId: PERSON_USER_ID },
+  });
+  expect(parsed).toEqual({ outcome: "ok", memberId: PERSON_ID });
+  expect(
+    PersonActionResultSchema.parse({ outcome: "ok", memberId: PERSON_ID }),
+  ).toEqual({ outcome: "ok" });
+  // Each action channel answers with one of the two.
+  for (const channel of PEOPLE_ACTION_CHANNELS) {
+    const { result } = INVOKE_CONTRACT[channel as keyof typeof INVOKE_CONTRACT];
+    expect(result, channel).toBe(
+      channel === INVOKE_CHANNELS.definePerson
+        ? DefinePersonResultSchema
+        : PersonActionResultSchema,
+    );
+  }
 });
 
 const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000f1";

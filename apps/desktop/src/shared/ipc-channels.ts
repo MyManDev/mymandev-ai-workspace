@@ -111,6 +111,33 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   subscribePeopleState: "people:subscribe-state",
   /**
+   * Defines an unclaimed person in the selected workspace, by the
+   * workspace ID and a display name.
+   */
+  definePerson: "people:define",
+  /**
+   * Renames the account's own person or an unclaimed person, by the
+   * workspace ID, the member ID, and a display name.
+   */
+  renamePerson: "people:rename",
+  /** Removes a person, by the workspace ID and the member ID. */
+  removePerson: "people:remove",
+  /** Makes a claimed member an admin, by the workspace ID and the member ID. */
+  promotePerson: "people:promote",
+  /** Makes an admin a member again, by the workspace ID and the member ID. */
+  demotePerson: "people:demote",
+  /** The account's own person leaves the selected workspace, by its ID. */
+  leaveWorkspace: "people:leave",
+  /**
+   * Offers the ownership of the selected workspace to a person, by the
+   * workspace ID and the target's member ID.
+   */
+  offerOwnership: "people:offer-ownership",
+  /** Withdraws the live ownership offer, by the workspace ID. */
+  withdrawOwnershipOffer: "people:withdraw-offer",
+  /** Accepts the live ownership offer to the account's person, by the workspace ID. */
+  acceptOwnershipOffer: "people:accept-offer",
+  /**
    * What the renderer may know of the open project's agent activity: its
    * agents with their owners' names, and its newest runs. Read-only.
    */
