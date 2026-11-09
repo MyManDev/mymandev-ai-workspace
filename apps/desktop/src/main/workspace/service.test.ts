@@ -1051,62 +1051,6 @@ test("a reload replaces the people with its answer, in its order, without the pe
   expect(h.service.memberName(NEW_MEMBER)).toBe(UNKNOWN_MEMBER_NAME);
 });
 
-test("a claimed event never brings back an older verification of the login, and a verification at the same time or later replaces it, whatever the login", async () => {
-  const EARLIER = "2026-11-04T08:00:00.000Z";
-  const claimed = (login: string, verifiedAt: string) =>
-    event("workspace.member.claimed", {
-      member: {
-        ...memberOf(WS_A, MEMBER, "Grace Member", "member"),
-        identity: { provider: "github", login, verifiedAt },
-      },
-    });
-  const identityOf = (h: Harness) =>
-    h.service.people().find((entry) => entry.id === MEMBER)?.identity;
-
-  // Live: the held identity was verified at AT.
-  const h = await withLiveWorkspace();
-  const people = h.service.people();
-  const revision = h.state.revision;
-  h.receive(claimed("octocat", EARLIER));
-  expect(h.service.people()).toBe(people);
-  expect(h.state.revision).toBe(revision);
-  // A later verification replaces it.
-  h.receive(claimed("octocat", LATER));
-  expect(identityOf(h)).toEqual({ login: "octocat", verifiedAt: LATER });
-  expect(h.state.revision).toBeGreaterThan(revision);
-  // Another login verified earlier is older too, and is kept out; a real
-  // rename of the GitHub account comes with a later verification.
-  const afterLater = h.state.revision;
-  h.receive(claimed("grace-h", AT));
-  expect(identityOf(h)).toEqual({ login: "octocat", verifiedAt: LATER });
-  expect(h.state.revision).toBe(afterLater);
-  // Another login verified at the same time replaces it.
-  h.receive(claimed("grace-h", LATER));
-  expect(identityOf(h)).toEqual({ login: "grace-h", verifiedAt: LATER });
-  expect(h.state.revision).toBeGreaterThan(afterLater);
-
-  // Over a reload: the claim waited during the reload, whose answer holds
-  // a later verification of the same login.
-  const g = await withList();
-  g.receive(subscribed());
-  g.receive(claimed("octocat", AT));
-  await g.answerReload(
-    ok(
-      WorkspaceViewResponseSchema.parse({
-        workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
-        members: [
-          memberOf(WS_A, OWNER, "Ada Owner", "owner", USER_ID),
-          memberWithLogin(MEMBER, "Grace Member", "member", "octocat"),
-        ],
-        joinRequestsPausedAt: null,
-        maxUnclaimedMembers: 500,
-        ownershipOffer: null,
-      }),
-    ),
-  );
-  expect(identityOf(g)).toEqual({ login: "octocat", verifiedAt: LATER });
-});
-
 /** A view of WS_A with the owner and `newMember`. */
 function viewWith(newMember: Record<string, unknown>) {
   return WorkspaceViewResponseSchema.parse({
@@ -1118,26 +1062,154 @@ function viewWith(newMember: Record<string, unknown>) {
   });
 }
 
-test("a defined event never undoes a claim, so a claim that waited behind it does not bring back an older login", async () => {
-  const defined = event("workspace.member.defined", {
+const DEFINE_NEW_MEMBER = () =>
+  event("workspace.member.defined", {
     member: memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
   });
-  const newMember = (h: Harness) =>
-    h.service.people().find((entry) => entry.id === NEW_MEMBER);
 
-  // During a reload, the definition and the claim wait; the answer holds
-  // the person claimed, with a later verification under a new login.
-  const h = await withList();
-  h.receive(subscribed());
-  h.receive(defined);
-  h.receive(
+/** A claim of NEW_MEMBER by `login`, verified at `verifiedAt`. */
+function claimOfNewMember(login = "octocat", verifiedAt = AT): ServerMessage {
+  return event("workspace.member.claimed", {
+    member: {
+      ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+      identity: { provider: "github", login, verifiedAt },
+    },
+  });
+}
+
+/** NEW_MEMBER as the service holds it. */
+function newMemberOf(h: Harness): PersonState | undefined {
+  return h.service.people().find((entry) => entry.id === NEW_MEMBER);
+}
+
+test("a claim of a person held as claimed is a replay and changes nothing, whatever its login or verification", async () => {
+  const EARLIER = "2026-11-04T08:00:00.000Z";
+  const claimed = (login: string, verifiedAt: string) =>
     event("workspace.member.claimed", {
       member: {
-        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
-        identity: { provider: "github", login: "octocat", verifiedAt: AT },
+        ...memberOf(WS_A, MEMBER, "Grace Member", "member"),
+        identity: { provider: "github", login, verifiedAt },
       },
+    });
+  const h = await withLiveWorkspace();
+  const people = h.service.people();
+  const revision = h.state.revision;
+  const published = h.states.length;
+  for (const [login, verifiedAt] of [
+    ["octocat", EARLIER],
+    ["octocat", LATER],
+    ["grace-h", LATER],
+  ] as const) {
+    h.receive(claimed(login, verifiedAt));
+  }
+  expect(h.service.people()).toBe(people);
+  expect(h.state.revision).toBe(revision);
+  expect(h.states).toHaveLength(published);
+  expect(h.reads).toEqual([]);
+});
+
+test("a claim of an unclaimed person, live, sets the whole person from the event, also of a person that the service does not hold", async () => {
+  const claimedNewMember = person(NEW_MEMBER, "Linus Newcomer", {
+    identity: { login: "linus", verifiedAt: LATER },
+  });
+  const h = await withLiveWorkspace();
+  h.receive(DEFINE_NEW_MEMBER());
+  expect(newMemberOf(h)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", { claimed: false, identity: null }),
+  );
+  h.receive(claimOfNewMember("linus", LATER));
+  expect(newMemberOf(h)).toEqual(claimedNewMember);
+
+  const g = await withLiveWorkspace();
+  g.receive(claimOfNewMember("linus", LATER));
+  expect(g.service.people().map((entry) => entry.id)).toEqual([
+    OWNER,
+    MEMBER,
+    NEW_MEMBER,
+  ]);
+  expect(newMemberOf(g)).toEqual(claimedNewMember);
+  expect(g.reads).toEqual([]);
+});
+
+test("a claim that waited during a reload whose answer holds the person removed never shows the person active, also before the live removal arrives", async () => {
+  const h = await withList();
+  const seen: (PersonState | undefined)[] = [];
+  h.service.onChange(() => seen.push(newMemberOf(h)));
+  h.receive(subscribed());
+  h.receive(claimOfNewMember());
+  // The removal committed before the server read the view, but its event
+  // is relayed only after the answer.
+  await h.answerReload(
+    ok(
+      viewWith({
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+        removedAt: AT,
+      }),
+    ),
+  );
+  const removed = person(NEW_MEMBER, "Linus Newcomer", { removedAt: AT });
+  expect(newMemberOf(h)).toEqual(removed);
+  h.receive(
+    event("workspace.member.removed", { memberId: NEW_MEMBER, removedAt: AT }),
+  );
+  expect(newMemberOf(h)).toEqual(removed);
+  // No state that the service published showed the person active.
+  const published = seen.filter((entry) => entry !== undefined);
+  expect(published.length).toBeGreaterThan(0);
+  for (const entry of published) {
+    expect(entry).toEqual(removed);
+  }
+});
+
+test("a claim that waited during a reload, or comes again live, keeps the role of the answer", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  h.receive(claimOfNewMember());
+  await h.answerReload(
+    ok(viewWith(memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "admin"))),
+  );
+  expect(newMemberOf(h)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", { role: "admin" }),
+  );
+  const revision = h.state.revision;
+  h.receive(claimOfNewMember());
+  expect(newMemberOf(h)?.role).toBe("admin");
+  expect(h.state.revision).toBe(revision);
+});
+
+test("a definition that waited during a reload keeps the removal of a person never claimed", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  h.receive(DEFINE_NEW_MEMBER());
+  await h.answerReload(
+    ok(
+      viewWith({
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+        removedAt: AT,
+      }),
+    ),
+  );
+  expect(newMemberOf(h)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", {
+      claimed: false,
+      identity: null,
+      removedAt: AT,
     }),
   );
+  // Live, a definition of a held person changes nothing either.
+  const revision = h.state.revision;
+  h.receive(DEFINE_NEW_MEMBER());
+  expect(newMemberOf(h)?.removedAt).toBe(AT);
+  expect(h.state.revision).toBe(revision);
+});
+
+test("a definition and a claim that waited during a reload keep the identity of a newer answer", async () => {
+  // The answer holds the person claimed, with a later verification under a
+  // new login.
+  const h = await withList();
+  h.receive(subscribed());
+  h.receive(DEFINE_NEW_MEMBER());
+  h.receive(claimOfNewMember("octocat", AT));
   await h.answerReload(
     ok(
       viewWith({
@@ -1150,7 +1222,7 @@ test("a defined event never undoes a claim, so a claim that waited behind it doe
       }),
     ),
   );
-  expect(newMember(h)).toEqual(
+  expect(newMemberOf(h)).toEqual(
     person(NEW_MEMBER, "Linus Newcomer", {
       identity: { login: "renamed-login", verifiedAt: LATER },
     }),
@@ -1159,7 +1231,7 @@ test("a defined event never undoes a claim, so a claim that waited behind it doe
   // Live, a definition of a claimed person changes nothing either.
   const people = h.service.people();
   const revision = h.state.revision;
-  h.receive(defined);
+  h.receive(DEFINE_NEW_MEMBER());
   expect(h.service.people()).toBe(people);
   expect(h.state.revision).toBe(revision);
   expect(h.reads).toEqual([]);
@@ -1168,14 +1240,7 @@ test("a defined event never undoes a claim, so a claim that waited behind it doe
 test("a claim that waited during a reload never shows the login of an erased account again", async () => {
   const h = await withList();
   h.receive(subscribed());
-  h.receive(
-    event("workspace.member.claimed", {
-      member: {
-        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
-        identity: { provider: "github", login: "erased-login", verifiedAt: AT },
-      },
-    }),
-  );
+  h.receive(claimOfNewMember("erased-login", AT));
   h.receive(
     event("workspace.member.removed", { memberId: NEW_MEMBER, removedAt: AT }),
   );
@@ -1191,7 +1256,7 @@ test("a claim that waited during a reload never shows the login of an erased acc
       }),
     ),
   );
-  expect(h.service.people().find((entry) => entry.id === NEW_MEMBER)).toEqual(
+  expect(newMemberOf(h)).toEqual(
     person(NEW_MEMBER, "Linus Newcomer", { identity: null, removedAt: AT }),
   );
   expect(JSON.stringify(h.service.people())).not.toContain("erased-login");

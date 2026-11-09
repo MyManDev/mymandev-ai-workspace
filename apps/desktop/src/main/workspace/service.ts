@@ -277,30 +277,6 @@ function personState(member: WorkspaceMember): PersonState {
   });
 }
 
-/**
- * The identity that a `claimed` event leaves on a person held as claimed:
- * none when the held person has none, because only the erasure of a former
- * member's account leaves a claimed person without one, and that is
- * permanent; otherwise the event's identity when it was verified at the
- * same time as the held one or later, whatever the login, and the held one
- * when the event's is older.
- */
-function newerIdentity(
-  held: PersonIdentity | null,
-  next: PersonIdentity | null,
-): PersonIdentity | null {
-  if (held === null) {
-    return null;
-  }
-  // A claimed event always names an identity; without one, the held stays.
-  if (next === null) {
-    return held;
-  }
-  return Date.parse(next.verifiedAt) < Date.parse(held.verifiedAt)
-    ? held
-    : next;
-}
-
 function samePerson(held: PersonState, next: PersonState): boolean {
   return (
     held.displayName === next.displayName &&
@@ -757,40 +733,27 @@ export function createWorkspaceService(
    * names a person or a project that the workspace does not hold. A removed
    * person stays as a former member with their name and role.
    *
-   * A `defined` or `claimed` event applied after a reload may be older than
-   * the reload's answer, so the events never undo what cannot change back:
-   *
-   * - a claim cannot be undone, so `defined` changes nothing for a person
-   *   held as claimed;
-   * - a claimed person without an identity is a former member whose
-   *   account's data was erased, which is permanent, so `claimed` keeps the
-   *   identity null and never shows the erased login again;
-   * - no event reports a new verification of a login, so `claimed` replaces
-   *   a held identity only with one verified at the same time or later,
-   *   whatever the login.
+   * The replay rule: `defined` is the first event of a person's life, and a
+   * claim happens once, so `defined` for a person that the service holds,
+   * and `claimed` for a person held as claimed, can only be replays, for
+   * example events that waited during a reload whose answer is newer. They
+   * change nothing, so a replay never undoes a removal, a role change, a
+   * rename, a newer verification of the login, or the erasure of a former
+   * member's account. A claim of a held unclaimed person, or of a person
+   * that the service does not hold, sets the whole person from the event.
    */
   function applyEvent(event: WorkspaceEvent): boolean {
     switch (event.type) {
-      case "workspace.member.defined": {
-        const person = personState(event.payload.member);
-        if (members.get(person.id)?.claimed !== true) {
-          setPerson(person);
+      case "workspace.member.defined":
+        if (!members.has(event.payload.member.id)) {
+          setPerson(personState(event.payload.member));
         }
         return true;
-      }
-      case "workspace.member.claimed": {
-        const person = personState(event.payload.member);
-        const held = members.get(person.id);
-        setPerson(
-          held === undefined || !held.claimed
-            ? person
-            : Object.freeze({
-                ...person,
-                identity: newerIdentity(held.identity, person.identity),
-              }),
-        );
+      case "workspace.member.claimed":
+        if (members.get(event.payload.member.id)?.claimed !== true) {
+          setPerson(personState(event.payload.member));
+        }
         return true;
-      }
       case "workspace.member.renamed":
         return changePerson(event.payload.memberId, {
           displayName: event.payload.displayName,
