@@ -277,6 +277,30 @@ function personState(member: WorkspaceMember): PersonState {
   });
 }
 
+/**
+ * The identity that a `claimed` event leaves on a person held as claimed:
+ * none when the held person has none, because only the erasure of a former
+ * member's account leaves a claimed person without one, and that is
+ * permanent; otherwise the event's identity when it was verified at the
+ * same time as the held one or later, whatever the login, and the held one
+ * when the event's is older.
+ */
+function newerIdentity(
+  held: PersonIdentity | null,
+  next: PersonIdentity | null,
+): PersonIdentity | null {
+  if (held === null) {
+    return null;
+  }
+  // A claimed event always names an identity; without one, the held stays.
+  if (next === null) {
+    return held;
+  }
+  return Date.parse(next.verifiedAt) < Date.parse(held.verifiedAt)
+    ? held
+    : next;
+}
+
 function samePerson(held: PersonState, next: PersonState): boolean {
   return (
     held.displayName === next.displayName &&
@@ -731,24 +755,39 @@ export function createWorkspaceService(
    * Applies one event. Every event sets the state that it reports, so
    * applying one again changes nothing. False, with nothing changed, when it
    * names a person or a project that the workspace does not hold. A removed
-   * person stays as a former member with their name and role. No event
-   * reports a new verification of a login, so a `defined` or `claimed`
-   * event applied after a reload may carry an older one than the reload's:
-   * a held identity is never replaced by one verified earlier.
+   * person stays as a former member with their name and role.
+   *
+   * A `defined` or `claimed` event applied after a reload may be older than
+   * the reload's answer, so the events never undo what cannot change back:
+   *
+   * - a claim cannot be undone, so `defined` changes nothing for a person
+   *   held as claimed;
+   * - a claimed person without an identity is a former member whose
+   *   account's data was erased, which is permanent, so `claimed` keeps the
+   *   identity null and never shows the erased login again;
+   * - no event reports a new verification of a login, so `claimed` replaces
+   *   a held identity only with one verified at the same time or later,
+   *   whatever the login.
    */
   function applyEvent(event: WorkspaceEvent): boolean {
     switch (event.type) {
-      case "workspace.member.defined":
+      case "workspace.member.defined": {
+        const person = personState(event.payload.member);
+        if (members.get(person.id)?.claimed !== true) {
+          setPerson(person);
+        }
+        return true;
+      }
       case "workspace.member.claimed": {
         const person = personState(event.payload.member);
-        const held = members.get(person.id)?.identity;
+        const held = members.get(person.id);
         setPerson(
-          held !== undefined &&
-            held !== null &&
-            person.identity !== null &&
-            Date.parse(person.identity.verifiedAt) < Date.parse(held.verifiedAt)
-            ? Object.freeze({ ...person, identity: held })
-            : person,
+          held === undefined || !held.claimed
+            ? person
+            : Object.freeze({
+                ...person,
+                identity: newerIdentity(held.identity, person.identity),
+              }),
         );
         return true;
       }

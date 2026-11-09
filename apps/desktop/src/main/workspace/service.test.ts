@@ -1051,7 +1051,7 @@ test("a reload replaces the people with its answer, in its order, without the pe
   expect(h.service.memberName(NEW_MEMBER)).toBe(UNKNOWN_MEMBER_NAME);
 });
 
-test("a claimed event never brings back an older verification of the login, and a newer one or another login replaces it", async () => {
+test("a claimed event never brings back an older verification of the login, and a verification at the same time or later replaces it, whatever the login", async () => {
   const EARLIER = "2026-11-04T08:00:00.000Z";
   const claimed = (login: string, verifiedAt: string) =>
     event("workspace.member.claimed", {
@@ -1070,11 +1070,17 @@ test("a claimed event never brings back an older verification of the login, and 
   h.receive(claimed("octocat", EARLIER));
   expect(h.service.people()).toBe(people);
   expect(h.state.revision).toBe(revision);
-  // A later verification replaces it, and so does another login.
+  // A later verification replaces it.
   h.receive(claimed("octocat", LATER));
   expect(identityOf(h)).toEqual({ login: "octocat", verifiedAt: LATER });
   expect(h.state.revision).toBeGreaterThan(revision);
+  // Another login verified earlier is older too, and is kept out; a real
+  // rename of the GitHub account comes with a later verification.
   const afterLater = h.state.revision;
+  h.receive(claimed("grace-h", AT));
+  expect(identityOf(h)).toEqual({ login: "octocat", verifiedAt: LATER });
+  expect(h.state.revision).toBe(afterLater);
+  // Another login verified at the same time replaces it.
   h.receive(claimed("grace-h", LATER));
   expect(identityOf(h)).toEqual({ login: "grace-h", verifiedAt: LATER });
   expect(h.state.revision).toBeGreaterThan(afterLater);
@@ -1099,6 +1105,96 @@ test("a claimed event never brings back an older verification of the login, and 
     ),
   );
   expect(identityOf(g)).toEqual({ login: "octocat", verifiedAt: LATER });
+});
+
+/** A view of WS_A with the owner and `newMember`. */
+function viewWith(newMember: Record<string, unknown>) {
+  return WorkspaceViewResponseSchema.parse({
+    workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
+    members: [memberOf(WS_A, OWNER, "Ada Owner", "owner", USER_ID), newMember],
+    joinRequestsPausedAt: null,
+    maxUnclaimedMembers: 500,
+    ownershipOffer: null,
+  });
+}
+
+test("a defined event never undoes a claim, so a claim that waited behind it does not bring back an older login", async () => {
+  const defined = event("workspace.member.defined", {
+    member: memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+  });
+  const newMember = (h: Harness) =>
+    h.service.people().find((entry) => entry.id === NEW_MEMBER);
+
+  // During a reload, the definition and the claim wait; the answer holds
+  // the person claimed, with a later verification under a new login.
+  const h = await withList();
+  h.receive(subscribed());
+  h.receive(defined);
+  h.receive(
+    event("workspace.member.claimed", {
+      member: {
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+        identity: { provider: "github", login: "octocat", verifiedAt: AT },
+      },
+    }),
+  );
+  await h.answerReload(
+    ok(
+      viewWith({
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+        identity: {
+          provider: "github",
+          login: "renamed-login",
+          verifiedAt: LATER,
+        },
+      }),
+    ),
+  );
+  expect(newMember(h)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", {
+      identity: { login: "renamed-login", verifiedAt: LATER },
+    }),
+  );
+
+  // Live, a definition of a claimed person changes nothing either.
+  const people = h.service.people();
+  const revision = h.state.revision;
+  h.receive(defined);
+  expect(h.service.people()).toBe(people);
+  expect(h.state.revision).toBe(revision);
+  expect(h.reads).toEqual([]);
+});
+
+test("a claim that waited during a reload never shows the login of an erased account again", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  h.receive(
+    event("workspace.member.claimed", {
+      member: {
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+        identity: { provider: "github", login: "erased-login", verifiedAt: AT },
+      },
+    }),
+  );
+  h.receive(
+    event("workspace.member.removed", { memberId: NEW_MEMBER, removedAt: AT }),
+  );
+  // The answer holds the person as a former member whose account's data
+  // was erased: claimed, without an identity.
+  await h.answerReload(
+    ok(
+      viewWith({
+        ...memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member"),
+        userId: ERASED_USER_ID,
+        identity: null,
+        removedAt: AT,
+      }),
+    ),
+  );
+  expect(h.service.people().find((entry) => entry.id === NEW_MEMBER)).toEqual(
+    person(NEW_MEMBER, "Linus Newcomer", { identity: null, removedAt: AT }),
+  );
+  expect(JSON.stringify(h.service.people())).not.toContain("erased-login");
 });
 
 test("the people are dropped on a workspace switch, the end of the membership, a sign-out, and another device, and kept while offline", async () => {
