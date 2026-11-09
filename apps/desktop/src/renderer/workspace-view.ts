@@ -1,11 +1,19 @@
-import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
+import type {
+  AccountBridge,
+  WorkspaceBridge,
+} from "../shared/desktop-bridge.ts";
 import type {
   WorkspaceActionRefusal,
   WorkspaceProblem,
   WorkspaceSwitchOptions,
   WorkspaceView,
 } from "../shared/ipc-contract.ts";
-import { canStartSignIn, type AccountView } from "./account-view.ts";
+import {
+  ACTION_MESSAGES,
+  canStartSignIn,
+  startMessage,
+  type AccountView,
+} from "./account-view.ts";
 import type { ShellAction } from "./screens.ts";
 
 /** What the sidebar knows about the account's workspaces. */
@@ -46,12 +54,16 @@ export function noDeviceSignedIn(view: WorkspacePanelView): boolean {
 
 /**
  * What the home screen says about the sign-in, with "Go to Account" in both
- * cases that say something (the Project Manager's decision of 2026-11-06).
+ * cases that say something (the Project Manager's decision of 2026-11-06),
+ * and "Sign in with GitHub" in the first (#219).
  */
 export type HomeSignIn =
   /** A device is signed in and ready, or the shell does not know. */
   | "none"
-  /** No device is signed in and ready, and the account panel offers a sign-in that can start now. */
+  /**
+   * No device is signed in and ready, and the account panel offers a
+   * sign-in that can start now: the home screen offers it too.
+   */
   | "sign_in"
   /**
    * No device is signed in and ready, and something else comes first: the
@@ -64,7 +76,8 @@ export type HomeSignIn =
 export const HOME_SIGN_IN_MESSAGES: Readonly<
   Record<Exclude<HomeSignIn, "none">, string>
 > = Object.freeze({
-  sign_in: "Sign in with GitHub on the Account screen to see your workspaces.",
+  sign_in:
+    "Sign in with GitHub to see your workspaces. The sign-in continues on the Account screen.",
   // True in every case, like the sidebar's text for `signed_out`.
   not_ready: WORKSPACE_MESSAGES.signedOut,
 });
@@ -85,6 +98,101 @@ export function homeSignIn(
   return account.kind === "known" && canStartSignIn(account.status)
     ? "sign_in"
     : "not_ready";
+}
+
+/** What the home screen shows of the sign-in that it started (#219). */
+export interface HomeSignInStartView {
+  /** True while the main process answers the start. */
+  readonly running: boolean;
+  /** Why the last start was refused or failed, or undefined. */
+  readonly message: string | undefined;
+}
+
+export const IDLE_HOME_SIGN_IN_START: HomeSignInStartView = Object.freeze({
+  running: false,
+  message: undefined,
+});
+
+export interface HomeSignInStart {
+  /**
+   * "Sign in with GitHub" on the home screen: the account panel's
+   * `startSignIn()`, once; a click while a start runs changes nothing. The
+   * home screen offers it under the panel's rule (`homeSignIn`), and the
+   * main process applies its own rules to the start as to any other.
+   */
+  readonly start: () => void;
+  /**
+   * Passes the account status on. While a start runs, the first status
+   * whose sign-in runs shows the account screen, so that the person sees
+   * the progress and the pairing code there. Otherwise a sign-in that runs
+   * ends the message of the last start, which then no longer applies.
+   */
+  readonly accountChanged: (view: AccountView) => void;
+}
+
+/**
+ * The start of the sign-in from the home screen (#219), through the
+ * account bridge's existing `startSignIn`. The main process publishes the
+ * running sign-in before it opens the browser and answers the start only
+ * afterwards, so `showAccount` follows the account status, and the answer
+ * itself only when no such status came: once per start, for a start that
+ * began or failed. A failure shows on the account screen with the status's
+ * outcome. A refusal and a call that failed keep the home screen and show
+ * the account panel's sentence there; `onView` gets every change.
+ */
+export function createHomeSignInStart(
+  account: Pick<AccountBridge, "startSignIn">,
+  showAccount: () => void,
+  onView: (view: HomeSignInStartView) => void,
+): HomeSignInStart {
+  let running = false;
+  let shown = false;
+  let message: string | undefined;
+  const show = () => onView(Object.freeze({ running, message }));
+  const showAccountOnce = () => {
+    if (!shown) {
+      shown = true;
+      showAccount();
+    }
+  };
+  return Object.freeze({
+    start: () => {
+      if (running) {
+        return;
+      }
+      running = true;
+      shown = false;
+      message = undefined;
+      show();
+      void account
+        .startSignIn()
+        .then(
+          (result) => {
+            if (result.outcome !== "refused") {
+              showAccountOnce();
+            }
+            return startMessage(result);
+          },
+          () => ACTION_MESSAGES.startFailed,
+        )
+        .then((next) => {
+          running = false;
+          message = next;
+          show();
+        });
+    },
+    accountChanged: (view: AccountView) => {
+      if (view.kind !== "known" || view.status.signIn.kind === "idle") {
+        return;
+      }
+      if (running) {
+        showAccountOnce();
+      } else if (message !== undefined) {
+        message = undefined;
+        show();
+      }
+    },
+  });
 }
 
 /**

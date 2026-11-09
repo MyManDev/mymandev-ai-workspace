@@ -64,13 +64,20 @@ import {
 } from "./screens.ts";
 import { SwitchQuestionDialog } from "./SwitchQuestion.tsx";
 import {
+  createHomeSignInStart,
   createWorkspaceSidebar,
   homeSignIn,
+  IDLE_HOME_SIGN_IN_START,
   initialWorkspacePanelView,
   type HomeSignIn,
+  type HomeSignInStartView,
   type SwitchQuestion,
 } from "./workspace-view.ts";
-import { AboutScreen, HomeScreen } from "./WorkspaceScreens.tsx";
+import {
+  AboutScreen,
+  HomeScreen,
+  showAccountScreen,
+} from "./WorkspaceScreens.tsx";
 
 export interface AppProps {
   /** The Electron version from the preload script; undefined outside Electron. */
@@ -133,6 +140,12 @@ export function App({
     describeConnectionView(connectionView, accountView).actions,
   );
   const focusAfterShow = useFocusAfterShow(state.view);
+  const homeStart = useHomeSignInStart(
+    account,
+    accountView,
+    dispatch,
+    focusAfterShow,
+  );
   const open = openProject(state);
 
   return (
@@ -180,6 +193,8 @@ export function App({
           chat={chat}
           devices={devices}
           homeSignIn={homeSignIn(workspaceSidebar.view, accountView)}
+          homeStart={homeStart.view}
+          onStartSignIn={homeStart.onStart}
           dispatch={dispatch}
           focusAfterShow={focusAfterShow}
         />
@@ -206,6 +221,8 @@ function ScreenContent({
   chat,
   devices,
   homeSignIn,
+  homeStart,
+  onStartSignIn,
   dispatch,
   focusAfterShow,
 }: {
@@ -217,6 +234,9 @@ function ScreenContent({
   readonly devices: DeviceListBridge | undefined;
   /** What the home screen says about the sign-in. */
   readonly homeSignIn: HomeSignIn;
+  /** The sign-in that the home screen started. */
+  readonly homeStart: HomeSignInStartView;
+  readonly onStartSignIn: () => void;
   readonly dispatch: Dispatch<ShellAction>;
   readonly focusAfterShow: (id: string) => void;
 }) {
@@ -225,6 +245,8 @@ function ScreenContent({
       return (
         <HomeScreen
           signIn={homeSignIn}
+          start={homeStart}
+          onStartSignIn={onStartSignIn}
           dispatch={dispatch}
           focusAfterShow={focusAfterShow}
         />
@@ -338,6 +360,39 @@ function useFocusAfterShow(view: ShellView): (id: string) => void {
   return useCallback((id: string) => {
     pending.current = id;
   }, []);
+}
+
+/**
+ * "Sign in with GitHub" on the home screen (#219), through the account
+ * bridge, while the shell is mounted. The logic is in
+ * `createHomeSignInStart`; the account status shows the account screen
+ * once the sign-in runs, and the start's message lives in the shell, so it
+ * stays when the person leaves the home screen and comes back.
+ */
+function useHomeSignInStart(
+  account: AccountBridge | undefined,
+  accountView: AccountView,
+  dispatch: Dispatch<ShellAction>,
+  focusAfterShow: (id: string) => void,
+): {
+  readonly view: HomeSignInStartView;
+  readonly onStart: () => void;
+} {
+  const [view, setView] = useState(IDLE_HOME_SIGN_IN_START);
+  const start = useMemo(
+    () =>
+      account === undefined
+        ? undefined
+        : createHomeSignInStart(
+            account,
+            () => showAccountScreen(dispatch, focusAfterShow),
+            setView,
+          ),
+    [account, dispatch, focusAfterShow],
+  );
+  useEffect(() => start?.accountChanged(accountView), [start, accountView]);
+  const onStart = useCallback(() => start?.start(), [start]);
+  return { view, onStart };
 }
 
 /**
@@ -489,8 +544,8 @@ function useConnectionStatusFocus(
  * dialog; the result's message joins the status. While a removal runs, the
  * buttons stay focusable and do nothing (`aria-disabled`), so the dialog
  * gives the focus back to the button (the Project Manager's decision of
- * 2026-11-06). A sign-in starts only from the account panel, on the
- * person's click.
+ * 2026-11-06). A sign-in starts only from the account panel or the home
+ * screen, on the person's click.
  */
 export function ConnectionStatusIndicator({
   view,

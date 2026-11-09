@@ -12,10 +12,13 @@ import type {
   RuntimeBridge,
   WorkspaceBridge,
 } from "../shared/desktop-bridge.ts";
-import type {
-  AccountStatus,
-  RemoveDeviceResult,
-  WorkspaceView,
+import {
+  API_ORIGIN_STATES,
+  DEVICE_KEY_STATES,
+  DEVICE_STATES,
+  type AccountStatus,
+  type RemoveDeviceResult,
+  type WorkspaceView,
 } from "../shared/ipc-contract.ts";
 import {
   App,
@@ -23,9 +26,13 @@ import {
   RuntimeStatusIndicator,
   type AppProps,
 } from "./App.tsx";
+import { AccountPanelContent } from "./AccountPanel.tsx";
 import {
+  ACTION_MESSAGES,
+  canStartSignIn,
   DEVICE_ACTION_FAILURE_MESSAGES,
   DEVICE_ACTION_MESSAGES,
+  START_REFUSAL_MESSAGES,
   type AccountView,
 } from "./account-view.ts";
 import {
@@ -49,10 +56,13 @@ import {
 } from "./screens.ts";
 import {
   HOME_SIGN_IN_MESSAGES,
+  homeSignIn,
+  IDLE_HOME_SIGN_IN_START,
   SELECT_REFUSAL_MESSAGES,
   WORKSPACE_MESSAGES,
   WORKSPACE_PROBLEM_MESSAGES,
   type HomeSignIn,
+  type HomeSignInStartView,
 } from "./workspace-view.ts";
 import { HomeScreen } from "./WorkspaceScreens.tsx";
 
@@ -1430,31 +1440,185 @@ test("the account screen holds the account panel under This device and the accou
 const HOME_HINT =
   '<section aria-labelledby="home-title"><h2 id="home-title">Home</h2><p>Open a project to see its chat, tasks, decisions, and permissions, and its agents and repositories.</p>';
 
-/** The end of the home screen with this sentence and "Go to Account". */
-function goToAccount(sentence: string): string {
-  return `<p>${sentence}</p><p><button type="button" class="panel-action">Go to Account</button></p></section>`;
+/** The end of the home screen with this sentence, its buttons, and a message. */
+function homeEnd(
+  sentence: string,
+  { signIn = "", message = "" }: { signIn?: string; message?: string } = {},
+): string {
+  return `<p>${sentence}</p><div class="account-actions">${signIn}<button type="button" class="panel-action">Go to Account</button></div>${message}</section>`;
 }
 
-test("the home screen says the sentence of its case, with Go to Account whenever it says one", () => {
-  const home = (signIn: HomeSignIn) =>
-    renderToString(
-      <HomeScreen
-        signIn={signIn}
-        dispatch={() => undefined}
-        focusAfterShow={() => undefined}
-      />,
-    );
-  expect(home("sign_in")).toBe(
+/** The end of the home screen with this sentence and "Go to Account" alone. */
+function goToAccount(sentence: string): string {
+  return homeEnd(sentence);
+}
+
+const HOME_SIGN_IN_BUTTON =
+  '<button type="button" class="panel-action">Sign in with GitHub</button>';
+
+function renderHome(
+  signIn: HomeSignIn,
+  start: HomeSignInStartView = IDLE_HOME_SIGN_IN_START,
+): string {
+  return renderToString(
+    <HomeScreen
+      signIn={signIn}
+      start={start}
+      onStartSignIn={() => undefined}
+      dispatch={() => undefined}
+      focusAfterShow={() => undefined}
+    />,
+  );
+}
+
+test("the home screen says the sentence of its case, with Go to Account whenever it says one and Sign in with GitHub while a sign-in can start", () => {
+  expect(renderHome("sign_in")).toBe(
     HOME_HINT +
-      goToAccount(
-        "Sign in with GitHub on the Account screen to see your workspaces.",
+      homeEnd(
+        "Sign in with GitHub to see your workspaces. The sign-in continues on the Account screen.",
+        { signIn: HOME_SIGN_IN_BUTTON },
       ),
   );
-  expect(home("not_ready")).toBe(
+  expect(renderHome("not_ready")).toBe(
     HOME_HINT +
       goToAccount("Workspaces appear once this device is signed in and ready."),
   );
-  expect(home("none")).toBe(`${HOME_HINT}</section>`);
+  expect(renderHome("none")).toBe(`${HOME_HINT}</section>`);
+});
+
+test("the home screen's Sign in with GitHub is disabled while its start runs, and the message of a refused or failed start shows as an alert", () => {
+  expect(renderHome("sign_in", { running: true, message: undefined })).toBe(
+    HOME_HINT +
+      homeEnd(HOME_SIGN_IN_MESSAGES.sign_in, {
+        signIn:
+          '<button type="button" class="panel-action" disabled="">Sign in with GitHub</button>',
+      }),
+  );
+  const alert = `<p class="panel-message" role="alert">${escaped(START_REFUSAL_MESSAGES.too_soon)}</p>`;
+  expect(
+    renderHome("sign_in", {
+      running: false,
+      message: START_REFUSAL_MESSAGES.too_soon,
+    }),
+  ).toBe(
+    HOME_HINT +
+      homeEnd(HOME_SIGN_IN_MESSAGES.sign_in, {
+        signIn: HOME_SIGN_IN_BUTTON,
+        message: alert,
+      }),
+  );
+  // Also where the refusal's reason took the sign-in away, for example a
+  // key that is no longer ready.
+  const keyNotReady = `<p class="panel-message" role="alert">${START_REFUSAL_MESSAGES.key_not_ready}</p>`;
+  expect(
+    renderHome("not_ready", {
+      running: false,
+      message: START_REFUSAL_MESSAGES.key_not_ready,
+    }),
+  ).toBe(
+    HOME_HINT +
+      homeEnd(HOME_SIGN_IN_MESSAGES.not_ready, { message: keyNotReady }),
+  );
+  // Nothing while a device is signed in and ready.
+  expect(
+    renderHome("none", { running: true, message: ACTION_MESSAGES.startFailed }),
+  ).toBe(`${HOME_HINT}</section>`);
+});
+
+/** The panel's and the home screen's "Sign in with GitHub" buttons, and whether each is enabled. */
+function signInButtons(html: string): boolean[] {
+  return [
+    ...html.matchAll(/<button([^>]*)>Sign in with GitHub<\/button>/g),
+  ].map(([, attributes]) => !(attributes ?? "").includes("disabled"));
+}
+
+test("the home screen offers Sign in with GitHub exactly when the account panel offers one that can start now, by one rule, in every signed-out state", () => {
+  const signedOut = {
+    kind: "known",
+    state: workspaceState([], {
+      status: "signed_out",
+      workspaces: [],
+      selectedWorkspaceId: null,
+    }),
+  } as const;
+  const accounts: AccountStatus["account"][] = [
+    { kind: "signed_out" },
+    { kind: "hidden" },
+    {
+      kind: "signed_in",
+      login: "octocat",
+      displayName: "The Octocat",
+      deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    },
+  ];
+  const signIns: AccountStatus["signIn"][] = [
+    { kind: "idle" },
+    { kind: "starting" },
+    { kind: "waiting", pairingCode: "042137", opened: true },
+    { kind: "completing" },
+  ];
+  let offered = 0;
+  let total = 0;
+  for (const account of accounts) {
+    for (const signIn of signIns) {
+      for (const deviceKey of DEVICE_KEY_STATES) {
+        for (const apiOrigin of API_ORIGIN_STATES) {
+          for (const device of DEVICE_STATES) {
+            const status: AccountStatus = {
+              revision: 1,
+              account,
+              signIn,
+              lastOutcome: null,
+              deviceKey,
+              replacementPending: false,
+              apiOrigin,
+              device,
+            };
+            const view: AccountView = { kind: "known", status };
+            const name = JSON.stringify(status);
+            const panel = signInButtons(
+              renderToString(
+                <AccountPanelContent
+                  view={view}
+                  busy={false}
+                  message={undefined}
+                  onStartSignIn={() => undefined}
+                  onUseAnotherBrowser={() => undefined}
+                  anotherBrowser={false}
+                  anotherBrowserReady
+                  onCancelSignIn={() => undefined}
+                  onUnlock={() => undefined}
+                  onForget={() => undefined}
+                  onSignOut={() => undefined}
+                  onRemoveDevice={() => undefined}
+                  now={Date.parse("2026-11-09T10:00:00.000Z")}
+                />,
+              ),
+            );
+            const panelOffers = panel.includes(true);
+            const home = signInButtons(renderHome(homeSignIn(signedOut, view)));
+            // The home screen's button is never disabled while it is idle.
+            expect(home, name).toEqual(panelOffers ? [true] : []);
+            expect(panelOffers, name).toBe(canStartSignIn(status));
+            total += 1;
+            offered += panelOffers ? 1 : 0;
+          }
+        }
+      }
+    }
+  }
+  // Both cases occur.
+  expect(total).toBe(3 * 4 * 8 * 3 * 14);
+  expect(offered).toBeGreaterThan(0);
+  expect(offered).toBeLessThan(total);
+  // Without a known account status, the panel offers nothing, and neither
+  // does the home screen.
+  for (const view of [{ kind: "pending" }, { kind: "unavailable" }] as const) {
+    expect(renderHome(homeSignIn(signedOut, view)), view.kind).not.toContain(
+      "Sign in with GitHub</button>",
+    );
+  }
 });
 
 test("the home screen offers Go to Account only while no device is signed in, with the neutral sentence until the account status is known", () => {

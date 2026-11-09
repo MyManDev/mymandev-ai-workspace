@@ -1,13 +1,22 @@
 import { expect, test } from "vitest";
-import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
+import type {
+  AccountBridge,
+  WorkspaceBridge,
+} from "../shared/desktop-bridge.ts";
 import {
+  START_SIGN_IN_REFUSALS,
   WORKSPACE_STATUSES,
   type AccountStatus,
+  type StartSignInResult,
   type WorkspaceActionResult,
   type WorkspaceSwitchOptions,
   type WorkspaceView,
 } from "../shared/ipc-contract.ts";
-import type { AccountView } from "./account-view.ts";
+import {
+  ACTION_MESSAGES,
+  START_REFUSAL_MESSAGES,
+  type AccountView,
+} from "./account-view.ts";
 import {
   createShellState,
   shellReducer,
@@ -15,6 +24,7 @@ import {
   type ShellState,
 } from "./screens.ts";
 import {
+  createHomeSignInStart,
   createWorkspaceSidebar,
   describeSwitchQuestion,
   HOME_SIGN_IN_MESSAGES,
@@ -24,6 +34,7 @@ import {
   SELECT_REFUSAL_MESSAGES,
   switchWorkspace,
   WORKSPACE_MESSAGES,
+  type HomeSignInStartView,
   type SwitchQuestion,
   type WorkspacePanelView,
 } from "./workspace-view.ts";
@@ -668,7 +679,7 @@ const SIGNED_OUT_WORKSPACES: WorkspacePanelView = {
   },
 };
 
-test("the home screen asks for a sign-in on the Account screen only while the account panel offers one that can start now", () => {
+test("the home screen offers a sign-in only while the account panel offers one that can start now", () => {
   const signedInAccount = {
     kind: "signed_in",
     login: "octocat",
@@ -756,8 +767,135 @@ test("the home screen asks for a sign-in on the Account screen only while the ac
 test("the home screen's sentences are fixed, and the one without a sign-in is the sidebar's for signed_out", () => {
   expect(HOME_SIGN_IN_MESSAGES).toEqual({
     sign_in:
-      "Sign in with GitHub on the Account screen to see your workspaces.",
+      "Sign in with GitHub to see your workspaces. The sign-in continues on the Account screen.",
     not_ready: "Workspaces appear once this device is signed in and ready.",
   });
   expect(HOME_SIGN_IN_MESSAGES.not_ready).toBe(WORKSPACE_MESSAGES.signedOut);
+});
+
+/** A fake account bridge whose starts the test answers, and what the start shows. */
+function homeStartHarness() {
+  const starts: Deferred<StartSignInResult>[] = [];
+  const calls: unknown[][] = [];
+  const steps: string[] = [];
+  const views: HomeSignInStartView[] = [];
+  const account: Pick<AccountBridge, "startSignIn"> = {
+    startSignIn: (...args: unknown[]) => {
+      calls.push(args);
+      const start = deferred<StartSignInResult>();
+      starts.push(start);
+      return start.promise;
+    },
+  };
+  const start = createHomeSignInStart(
+    account,
+    () => steps.push("show account"),
+    (view) => {
+      views.push(view);
+      steps.push(`view ${JSON.stringify(view)}`);
+    },
+  );
+  return { start, starts, calls, steps, views };
+}
+
+const RUNNING = '{"running":true}';
+const IDLE = '{"running":false}';
+
+test("Sign in with GitHub on the home screen calls the account panel's startSignIn once, without options, and shows the account screen once the status shows the sign-in running", async () => {
+  const { start, starts, calls, steps } = homeStartHarness();
+  start.start();
+  // A second click while the start runs changes nothing.
+  start.start();
+  expect(calls).toEqual([[]]);
+  expect(steps).toEqual([`view ${RUNNING}`]);
+  // Before the answer, an idle status or none known shows nothing.
+  start.accountChanged(knownAccount({}));
+  start.accountChanged({ kind: "pending" });
+  start.accountChanged({ kind: "unavailable" });
+  expect(steps).toEqual([`view ${RUNNING}`]);
+  // The main process publishes the running sign-in before it opens the
+  // browser and answers.
+  start.accountChanged(knownAccount({ signIn: { kind: "starting" } }));
+  expect(steps).toEqual([`view ${RUNNING}`, "show account"]);
+  start.accountChanged(
+    knownAccount({
+      signIn: { kind: "waiting", pairingCode: "042137", opened: true },
+    }),
+  );
+  starts[0]?.resolve({ outcome: "started" });
+  await settle();
+  // Once per start: neither the next status nor the answer shows it again,
+  // also when the person went back to the home screen meanwhile.
+  expect(steps).toEqual([`view ${RUNNING}`, "show account", `view ${IDLE}`]);
+  // After the start, a status of a running sign-in shows nothing.
+  start.accountChanged(knownAccount({ signIn: { kind: "completing" } }));
+  expect(steps).toEqual([`view ${RUNNING}`, "show account", `view ${IDLE}`]);
+});
+
+test("a start of the home screen shows the account screen with its answer when no status showed the sign-in running, also after a failure, whose outcome the account panel shows", async () => {
+  for (const result of [
+    { outcome: "started" },
+    { outcome: "failed", code: "no_answer" },
+  ] as const) {
+    const { start, starts, steps } = homeStartHarness();
+    start.start();
+    starts[0]?.resolve(result);
+    await settle();
+    expect(steps, result.outcome).toEqual([
+      `view ${RUNNING}`,
+      "show account",
+      `view ${IDLE}`,
+    ]);
+  }
+});
+
+test("a refused or failed start of the home screen keeps the home screen and shows the account panel's sentence until the next start or a sign-in that runs", async () => {
+  const cases: [
+    string,
+    (start: Deferred<StartSignInResult>) => void,
+    string,
+  ][] = [
+    ...START_SIGN_IN_REFUSALS.map(
+      (
+        reason,
+      ): [string, (start: Deferred<StartSignInResult>) => void, string] => [
+        reason,
+        (start) => start.resolve({ outcome: "refused", reason }),
+        START_REFUSAL_MESSAGES[reason],
+      ],
+    ),
+    [
+      "rejected",
+      (start) => start.reject(new Error("The IPC call failed.")),
+      ACTION_MESSAGES.startFailed,
+    ],
+  ];
+  for (const [name, answer, message] of cases) {
+    const { start, starts, calls, steps, views } = homeStartHarness();
+    start.start();
+    const first = starts[0];
+    if (first === undefined) {
+      throw new Error("The start did not call the bridge.");
+    }
+    answer(first);
+    await settle();
+    expect(steps, name).toEqual([
+      `view ${RUNNING}`,
+      `view ${JSON.stringify({ running: false, message })}`,
+    ]);
+    // An idle status keeps the message.
+    start.accountChanged(knownAccount({}));
+    expect(views.at(-1), name).toEqual({ running: false, message });
+    // The next start ends it at once.
+    start.start();
+    expect(calls, name).toEqual([[], []]);
+    expect(views.at(-1), name).toEqual({ running: true, message: undefined });
+    starts[1]?.resolve({ outcome: "refused", reason: "too_soon" });
+    await settle();
+    // A sign-in that runs, for example one started on the account screen,
+    // ends it too, without a switch.
+    start.accountChanged(knownAccount({ signIn: { kind: "starting" } }));
+    expect(views.at(-1), name).toEqual({ running: false, message: undefined });
+    expect(steps, name).not.toContain("show account");
+  }
 });
