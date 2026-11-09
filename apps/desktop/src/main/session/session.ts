@@ -2,7 +2,9 @@
 // authentication", "Revocation, sign-out, and recovery", and "Storage and
 // transport on the device"). It is part 3 of #94: access tokens, the
 // pending key replacement, the device states, sign-out, removing this
-// device, the device list, and the signature of the WebSocket challenge.
+// device, the device list, and the signature of the WebSocket challenge;
+// and, for #95, revoking another device of the account and lifting the
+// registration lock.
 //
 // It joins the device key store, the device record, and the sign-out
 // marker. Access tokens stay in this module's memory: no function returns
@@ -21,6 +23,7 @@ import {
   type DeviceListItem,
   DeviceListResponseSchema,
   type RevokeDeviceRequest,
+  RevokeDeviceRequestSchema,
   routePath,
   type UserId,
 } from "@mymandev/protocol";
@@ -366,6 +369,28 @@ export interface DeviceSession {
    * registration lock while it is in force, or null (#95, D5b). Frozen.
    */
   readonly listDevices: () => Promise<SessionResult<DeviceList>>;
+  /**
+   * Revokes another device of the account (`POST /devices/:deviceId/revoke`;
+   * #95, D1) with the reason `removed`, or `lost`, which starts the
+   * account's 7-day registration lock (ADR 0014). It goes through `request`,
+   * so it gets the one retry after a `401`, bound to the device and the
+   * account of the first token, and it is refused while a removal of this
+   * device is pending. The device of this installation's record is refused
+   * as `invalid_request` without a request: `removeDevice` removes it, and
+   * deletes the key once the API confirmed. Nothing is sent again after an
+   * uncertain answer.
+   */
+  readonly revokeOtherDevice: (
+    deviceId: DeviceId,
+    reason: RevokeDeviceRequest["reason"],
+  ) => Promise<SessionResult<null>>;
+  /**
+   * Lifts the account's registration lock
+   * (`POST /account/registration-lock/lift`; #95, D1 and D5b) through
+   * `request`, like `revokeOtherDevice`. The API answers `204` also when no
+   * lock was in force.
+   */
+  readonly liftRegistrationLock: () => Promise<SessionResult<null>>;
   /**
    * Signs out (P-65): the device and its key stay, the tokens are dropped,
    * and the key is not used until the next GitHub sign-in. The sign-out
@@ -2018,6 +2043,51 @@ export function createDeviceSession(
         );
   }
 
+  // ---- The account's other devices (#95, D1) -----------------------------
+
+  /** The device ID of this installation's record, or null without one. */
+  function recordDeviceId(): Promise<DeviceId | null> {
+    // In the key queue, like `removeDevice`, so that it reads the record
+    // that a sign-in or "This is not me" that runs leaves behind.
+    return exclusive(async () => {
+      try {
+        const read = await deps.deviceRecords.read();
+        return read.kind === "record" ? read.record.deviceId : null;
+      } catch {
+        return null;
+      }
+    });
+  }
+
+  async function revokeOtherDevice(
+    deviceId: DeviceId,
+    reason: RevokeDeviceRequest["reason"],
+  ): Promise<SessionResult<null>> {
+    const body = RevokeDeviceRequestSchema.safeParse({ reason });
+    if (!body.success) {
+      return failure("invalid_request");
+    }
+    // This path never revokes this installation's own device: a revocation
+    // here would leave its key and record behind, which `removeDevice`
+    // deletes after the API confirmed.
+    if ((await recordDeviceId()) === deviceId) {
+      return failure("invalid_request");
+    }
+    return request<null>({
+      route: AUTH_ROUTES.revokeDevice,
+      params: { deviceId },
+      body: body.data,
+      answer: "empty",
+    });
+  }
+
+  function liftRegistrationLock(): Promise<SessionResult<null>> {
+    return request<null>({
+      route: AUTH_ROUTES.liftRegistrationLock,
+      answer: "empty",
+    });
+  }
+
   async function replacementGraceEnd(): Promise<string | null> {
     try {
       return await exclusive(async () => {
@@ -2215,6 +2285,8 @@ export function createDeviceSession(
     authenticate,
     request,
     listDevices,
+    revokeOtherDevice,
+    liftRegistrationLock,
     signOut,
     reportSignOut,
     removeDevice,

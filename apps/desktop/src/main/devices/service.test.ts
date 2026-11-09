@@ -9,6 +9,8 @@ import { expect, test } from "vitest";
 import type {
   AccountStatus,
   ConnectionStatus,
+  LiftRegistrationLockResult,
+  RevokeOtherDeviceResult,
 } from "../../shared/ipc-contract.ts";
 import type {
   WorkspaceReadFailure,
@@ -152,6 +154,17 @@ class Harness {
   accountStatus: AccountStatus;
   connectionStatus: ConnectionStatus;
   clock = 0;
+  /** The wall clock in milliseconds, for the end of the lock. */
+  wall = Date.parse(AT);
+  /** Every device action that reached the account service, in order. */
+  readonly accountActions: string[] = [];
+  revokeAnswer: () => Promise<RevokeOtherDeviceResult> = async () => ({
+    outcome: "revoked",
+    reason: "lost",
+  });
+  liftAnswer: () => Promise<LiftRegistrationLockResult> = async () => ({
+    outcome: "lifted",
+  });
   readonly accountListeners = new Set<(status: AccountStatus) => void>();
   readonly actionListeners = new Set<() => void>();
   readonly connectionListeners = new Set<(status: ConnectionStatus) => void>();
@@ -189,6 +202,14 @@ class Harness {
           this.sent += 1;
           this.reads.push(resolve);
         }),
+      revokeOtherDevice: (device, reason) => {
+        this.accountActions.push(`revoke ${JSON.stringify(device)} ${reason}`);
+        return this.revokeAnswer();
+      },
+      liftRegistrationLock: () => {
+        this.accountActions.push("lift");
+        return this.liftAnswer();
+      },
     };
     const client: DeviceListConnection = {
       status: () => this.connectionStatus,
@@ -205,6 +226,7 @@ class Harness {
       account,
       connection: client,
       now: () => this.clock,
+      wallClock: () => this.wall,
       scheduleTimer: (callback, delayMs) => {
         const timer: Timer = { callback, delayMs, cancelled: false };
         this.timers.push(timer);
@@ -673,6 +695,185 @@ test("a rate_limited answer of a load that a trigger overtook still makes the ne
   expect(h.openTimers()).toEqual([]);
 });
 
+test("a rate_limited answer of the very first load that a trigger overtook shows the problem, so the screen does not say for the whole wait that the list loads", async () => {
+  const h = new Harness();
+  expect(h.service.load()).toEqual({ outcome: "loading" });
+  // A trigger overtakes the first load on its way.
+  h.receive(registered());
+  await h.answer(failure("rate_limited"));
+
+  expect(h.sent).toBe(1);
+  expect(h.service.state()).toMatchObject({
+    status: "unavailable",
+    problem: "rate_limited",
+    devices: [],
+  });
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([
+    RATE_LIMITED_RETRY_MS,
+  ]);
+  h.clock += RATE_LIMITED_RETRY_MS;
+  h.fire();
+  expect(h.sent).toBe(2);
+  await h.answer(ok(OWN_LIST));
+  expect(h.service.state().status).toBe("ready");
+  expect(h.service.state()).not.toHaveProperty("problem");
+});
+
+/** A list with this device, another active device, a revoked one, and a lock. */
+const ACTION_LIST = list(
+  [
+    item(NEW_DEVICE_ID, { label: "Work laptop", platform: "linux" }),
+    item(DEVICE_ID),
+    item(OTHER_DEVICE_ID, { revokedAt: LATER }),
+  ],
+  LOCK_END,
+);
+
+test("a revocation is passed on only for another active device of the list as it is now, with its label and platform, and answers as the account service does", async () => {
+  const h = new Harness();
+  await h.loaded(ACTION_LIST);
+
+  await expect(h.service.revokeDevice(NEW_DEVICE_ID, "lost")).resolves.toEqual({
+    outcome: "revoked",
+    reason: "lost",
+  });
+  h.revokeAnswer = async () => ({ outcome: "unknown" });
+  await expect(
+    h.service.revokeDevice(NEW_DEVICE_ID, "removed"),
+  ).resolves.toEqual({ outcome: "unknown" });
+  expect(h.accountActions).toEqual([
+    `revoke ${JSON.stringify({ id: NEW_DEVICE_ID, label: "Work laptop", platform: "linux" })} lost`,
+    `revoke ${JSON.stringify({ id: NEW_DEVICE_ID, label: "Work laptop", platform: "linux" })} removed`,
+  ]);
+
+  // This installation's device, a revoked one, one that the list does not
+  // hold, and an ID outside the protocol's format are refused without
+  // asking the account service.
+  await expect(h.service.revokeDevice(DEVICE_ID, "removed")).resolves.toEqual({
+    outcome: "refused",
+    reason: "current_device",
+  });
+  for (const id of [
+    OTHER_DEVICE_ID,
+    "0192f0a0-7b3c-7d4e-8f50-0000000000ff",
+    NEW_DEVICE_ID.toUpperCase(),
+    "not an ID",
+  ]) {
+    await expect(h.service.revokeDevice(id, "lost"), id).resolves.toEqual({
+      outcome: "refused",
+      reason: "not_listed",
+    });
+  }
+  // A device that the server marks as the caller's own counts as this one.
+  const marked = new Harness();
+  await marked.loaded(
+    list([item(DEVICE_ID), item(NEW_DEVICE_ID, { current: true })]),
+  );
+  await expect(
+    marked.service.revokeDevice(NEW_DEVICE_ID, "lost"),
+  ).resolves.toEqual({ outcome: "refused", reason: "current_device" });
+  expect(marked.accountActions).toEqual([]);
+  expect(h.accountActions).toHaveLength(2);
+});
+
+test("a revocation and a lift are refused without a signed-in device, before the list loaded, and after close, without asking", async () => {
+  const out = new Harness(SIGNED_OUT);
+  await expect(
+    out.service.revokeDevice(NEW_DEVICE_ID, "lost"),
+  ).resolves.toEqual({ outcome: "refused", reason: "not_signed_in" });
+  await expect(out.service.liftRegistrationLock()).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+  });
+
+  // Signed in, but nothing loaded yet: no device is listed and no lock.
+  const early = new Harness();
+  await expect(
+    early.service.revokeDevice(NEW_DEVICE_ID, "lost"),
+  ).resolves.toEqual({ outcome: "refused", reason: "not_listed" });
+  await expect(early.service.liftRegistrationLock()).resolves.toEqual({
+    outcome: "refused",
+    reason: "no_lock",
+  });
+
+  // A sign-out drops the list.
+  const h = new Harness();
+  await h.loaded(ACTION_LIST);
+  h.setAccount(SIGNED_OUT);
+  await expect(h.service.revokeDevice(NEW_DEVICE_ID, "lost")).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+  });
+  h.setAccount(accountStatus());
+  await expect(h.service.revokeDevice(NEW_DEVICE_ID, "lost")).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_listed",
+  });
+
+  const closed = new Harness();
+  await closed.loaded(ACTION_LIST);
+  closed.service.close();
+  await expect(
+    closed.service.revokeDevice(NEW_DEVICE_ID, "lost"),
+  ).resolves.toEqual({ outcome: "refused", reason: "not_signed_in" });
+  await expect(closed.service.liftRegistrationLock()).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+  });
+  for (const harness of [out, early, h, closed]) {
+    expect(harness.accountActions).toEqual([]);
+  }
+});
+
+test("the lift is passed on only while the list holds a lock whose end is later than the wall clock", async () => {
+  const h = new Harness();
+  await h.loaded(ACTION_LIST);
+  h.wall = Date.parse(LOCK_END) - 1;
+  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+    outcome: "lifted",
+  });
+  h.liftAnswer = async () => ({ outcome: "failed", reason: "rate_limited" });
+  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+    outcome: "failed",
+    reason: "rate_limited",
+  });
+  expect(h.accountActions).toEqual(["lift", "lift"]);
+
+  // At its end the lock no longer holds, as the API checks it.
+  h.wall = Date.parse(LOCK_END);
+  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+    outcome: "refused",
+    reason: "no_lock",
+  });
+  // A list without a lock.
+  const none = new Harness();
+  await none.loaded(list([item(DEVICE_ID)]));
+  await expect(none.service.liftRegistrationLock()).resolves.toEqual({
+    outcome: "refused",
+    reason: "no_lock",
+  });
+  expect(h.accountActions).toHaveLength(2);
+  expect(none.accountActions).toEqual([]);
+});
+
+test("an account service that rejects makes the action unknown, and the log names neither the device nor its label", async () => {
+  const h = new Harness();
+  await h.loaded(ACTION_LIST);
+  h.revokeAnswer = () => Promise.reject(new Error(`broken ${NEW_DEVICE_ID}`));
+  h.liftAnswer = () => Promise.reject(new Error("broken"));
+
+  await expect(h.service.revokeDevice(NEW_DEVICE_ID, "lost")).resolves.toEqual({
+    outcome: "unknown",
+  });
+  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+    outcome: "unknown",
+  });
+  expect(h.logs).toEqual([
+    "A device could not be revoked.",
+    "The registration lock could not be lifted.",
+  ]);
+});
+
 test("a request of the Account screen while no device is signed in counts: the list loads once a device is, and no cooldown starts", async () => {
   for (const status of [
     SIGNED_OUT,
@@ -749,6 +950,8 @@ test("a read that rejects counts as unavailable", async () => {
       onStatusChange: () => () => undefined,
       onDeviceAction: () => () => undefined,
       readDeviceList: () => Promise.reject(new Error("broken")),
+      revokeOtherDevice: () => Promise.reject(new Error("broken")),
+      liftRegistrationLock: () => Promise.reject(new Error("broken")),
     },
     connection: {
       status: () => ({ state: "offline", revision: 0 }),

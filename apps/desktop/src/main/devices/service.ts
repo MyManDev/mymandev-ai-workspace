@@ -34,15 +34,28 @@
 //   after the last published state is not dismissed unseen.
 // - A sign-out, another account, or another device drops the list, the
 //   lock, and the notices, and the answers on their way.
+// - The device actions of the list (#95, D1) go to the account service,
+//   which confirms each in a native dialog and holds its action lock: a
+//   revocation of another device, accepted only for an active device that
+//   the list holds now and that is not this installation's, and a lift of
+//   the registration lock, accepted only while the list holds a lock in
+//   force by the wall clock. The list loads again after each one through
+//   the account service's `onDeviceAction`.
 //
 // The state holds no user ID or token: the API's device list has none. The
 // logs are fixed text with a failure code at most, never a label or an ID.
-import type {
-  AccountDeviceRegisteredFrame,
-  DeviceId,
-  DeviceListItem,
+import {
+  type AccountDeviceRegisteredFrame,
+  type DeviceId,
+  DeviceIdSchema,
+  type DeviceListItem,
 } from "@mymandev/protocol";
-import type { AccountStatus } from "../../shared/ipc-contract.ts";
+import type {
+  AccountStatus,
+  LiftRegistrationLockResult,
+  OtherDeviceRevocation,
+  RevokeOtherDeviceResult,
+} from "../../shared/ipc-contract.ts";
 import type { AccountService } from "../account.ts";
 import type {
   WorkspaceReadFailure,
@@ -110,7 +123,12 @@ export type DeviceListLoadOutcome =
 /** The part of the account service that the device list service uses. */
 export type DeviceListAccount = Pick<
   AccountService,
-  "status" | "onStatusChange" | "readDeviceList" | "onDeviceAction"
+  | "status"
+  | "onStatusChange"
+  | "readDeviceList"
+  | "onDeviceAction"
+  | "revokeOtherDevice"
+  | "liftRegistrationLock"
 >;
 
 /**
@@ -129,6 +147,11 @@ export interface DeviceListServiceOptions {
   readonly scheduleTimer?: ScheduleTimer;
   /** A monotonic clock in milliseconds; defaults to `performance.now`. */
   readonly now?: () => number;
+  /**
+   * The wall clock in milliseconds, for the end of the registration lock,
+   * which the API gives in UTC; defaults to `Date.now`.
+   */
+  readonly wallClock?: () => number;
   /**
    * Receives fixed messages with a failure code at most, never a label or
    * an ID. An error that it throws is ignored.
@@ -156,6 +179,26 @@ export interface DeviceListService {
    * them was held.
    */
   readonly dismissNewDevices: (deviceIds: readonly string[]) => boolean;
+  /**
+   * Revokes another device of the account as removed or as lost, with the
+   * account service's `revokeOtherDevice`, which asks the person first. Only
+   * a device that the list holds now is accepted: `not_listed` for any other
+   * ID and for a revoked device, `current_device` for this installation's
+   * own, and `not_signed_in` while no device is signed in, each without
+   * asking. Never rejects.
+   */
+  readonly revokeDevice: (
+    deviceId: string,
+    reason: OtherDeviceRevocation,
+  ) => Promise<RevokeOtherDeviceResult>;
+  /**
+   * Lifts the registration lock with the account service's
+   * `liftRegistrationLock`, which asks the person first; only while the
+   * list holds a lock whose end is later than the wall clock (`no_lock`
+   * otherwise), and `not_signed_in` while no device is signed in. Never
+   * rejects.
+   */
+  readonly liftRegistrationLock: () => Promise<LiftRegistrationLockResult>;
   /** Stops listening and cancels the retry, for the quit. */
   readonly close: () => void;
 }
@@ -171,6 +214,24 @@ const TOO_SOON: DeviceListLoadOutcome = Object.freeze({
 });
 const NO_DEVICES: readonly DeviceListItem[] = Object.freeze([]);
 const NO_NOTICES: readonly NewDeviceNotice[] = Object.freeze([]);
+const ACTION_NOT_SIGNED_IN = Object.freeze({
+  outcome: "refused" as const,
+  reason: "not_signed_in" as const,
+});
+const NOT_LISTED: RevokeOtherDeviceResult = Object.freeze({
+  outcome: "refused",
+  reason: "not_listed",
+});
+const CURRENT_DEVICE: RevokeOtherDeviceResult = Object.freeze({
+  outcome: "refused",
+  reason: "current_device",
+});
+const NO_LOCK: LiftRegistrationLockResult = Object.freeze({
+  outcome: "refused",
+  reason: "no_lock",
+});
+/** A device action whose account service rejected: whether it acted is not known. */
+const ACTION_UNKNOWN = Object.freeze({ outcome: "unknown" as const });
 
 /**
  * The signed-in device, or null, under the same condition as the workspace
@@ -213,6 +274,7 @@ export function createDeviceListService(
   const { account, connection } = options;
   const schedule = options.scheduleTimer ?? scheduleWithSetTimeout;
   const now = options.now ?? (() => performance.now());
+  const wallClock = options.wallClock ?? (() => Date.now());
 
   function log(message: string): void {
     try {
@@ -416,6 +478,12 @@ export function createDeviceListService(
       if (!result.ok && result.reason === "rate_limited") {
         rateLimitedUntil =
           now() + workspaceRetryDelayMs(attempt, "rate_limited");
+        if (list === null) {
+          // Nothing is loaded yet, so without the problem the screen would
+          // say for the whole wait that the list loads.
+          problem = "rate_limited";
+          touch();
+        }
       }
       reload();
       return;
@@ -576,6 +644,60 @@ export function createDeviceListService(
     return notices !== before;
   }
 
+  async function revokeDevice(
+    deviceId: string,
+    reason: OtherDeviceRevocation,
+  ): Promise<RevokeOtherDeviceResult> {
+    if (closed || device === null) {
+      return ACTION_NOT_SIGNED_IN;
+    }
+    // Only a device of the list as it is now: the renderer names it by an
+    // ID that crossed IPC, so it is checked with the protocol's schema too.
+    const parsed = DeviceIdSchema.safeParse(deviceId);
+    const target = parsed.success
+      ? list?.devices.find((item) => item.id === parsed.data)
+      : undefined;
+    if (target === undefined || target.revokedAt !== null) {
+      return NOT_LISTED;
+    }
+    if (target.current || target.id === device) {
+      return CURRENT_DEVICE;
+    }
+    try {
+      return await account.revokeOtherDevice(
+        Object.freeze({
+          id: target.id,
+          label: target.label,
+          platform: target.platform,
+        }),
+        reason,
+      );
+    } catch {
+      // The account service never rejects; if it did, whether the server
+      // acted is not known.
+      log("A device could not be revoked.");
+      return ACTION_UNKNOWN;
+    }
+  }
+
+  async function liftRegistrationLock(): Promise<LiftRegistrationLockResult> {
+    if (closed || device === null) {
+      return ACTION_NOT_SIGNED_IN;
+    }
+    // The lock is in force while its end is later than now, as the API
+    // checks it; a list without one, or one whose lock ended, holds none.
+    const until = list?.registrationLockedUntil ?? null;
+    if (until === null || !(Date.parse(until) > wallClock())) {
+      return NO_LOCK;
+    }
+    try {
+      return await account.liftRegistrationLock();
+    } catch {
+      log("The registration lock could not be lifted.");
+      return ACTION_UNKNOWN;
+    }
+  }
+
   const removers = [
     account.onStatusChange((status) => run(() => accountChanged(status))),
     account.onDeviceAction(() => run(() => reload())),
@@ -602,6 +724,8 @@ export function createDeviceListService(
     load: () => run(load),
     dismissNewDevices: (deviceIds: readonly string[]) =>
       run(() => dismissNewDevices(deviceIds)),
+    revokeDevice,
+    liftRegistrationLock,
     close: () => {
       if (closed) {
         return;

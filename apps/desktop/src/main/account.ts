@@ -4,8 +4,10 @@
 // reads the device record to learn whether the installation holds an
 // account, creates the device session and refreshes it, starts and cancels
 // the sign-in flow on the person's action, unlocks a key that a passphrase
-// protects, signs out, removes this device, and forgets the account for
-// "This is not me" (#149). It also lends the device session to the
+// protects, signs out, removes this device, forgets the account for "This
+// is not me" (#149), and, for the device list of #95, revokes another
+// device of the account and lifts the registration lock. It also lends the
+// device session to the
 // connection client of #26 in the main process: the signature of the
 // WebSocket challenge and the close reasons that refuse the device. And it
 // sends the reads of workspace, chat, and agent data of #27 and #28, of
@@ -32,7 +34,10 @@ import type {
   DeviceKeyState,
   DeviceState,
   ForgetResult,
+  LiftRegistrationLockResult,
+  OtherDeviceRevocation,
   RemoveDeviceResult,
+  RevokeOtherDeviceResult,
   SignInOutcomeCode,
   SignInOutcomeView,
   SignInState,
@@ -43,7 +48,9 @@ import type {
 } from "../shared/ipc-contract.ts";
 import {
   deviceActionFailure,
+  deviceListActionFailure,
   deviceStateOf,
+  type OtherDevice,
   signedOutOf,
 } from "./account-session.ts";
 import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
@@ -99,6 +106,8 @@ export type AccountSession = Pick<
   | "signInFinished"
   | "authenticate"
   | "listDevices"
+  | "revokeOtherDevice"
+  | "liftRegistrationLock"
   | "signOut"
   | "reportSignOut"
   | "removeDevice"
@@ -179,6 +188,26 @@ export interface AccountServiceOptions {
    */
   readonly confirmRemoveDevice: (login: string) => Promise<boolean>;
   /**
+   * Asks the person, in a native dialog of the main process, whether to
+   * revoke another device of the account with this login, as removed or as
+   * lost; the dialog names the device's label and platform, and says that a
+   * revocation as lost starts the 7-day registration lock. Resolves to true
+   * only for the revoke button (`REVOKE_DEVICE_CONFIRMATIONS` and
+   * `revokeDeviceConfirmed`).
+   */
+  readonly confirmRevokeDevice: (
+    login: string,
+    device: OtherDevice,
+    reason: OtherDeviceRevocation,
+  ) => Promise<boolean>;
+  /**
+   * Asks the person, in a native dialog of the main process, whether to lift
+   * the registration lock of the account with this login. Resolves to true
+   * only for the lift button (`LIFT_REGISTRATION_LOCK_CONFIRMATION` and
+   * `liftRegistrationLockConfirmed`).
+   */
+  readonly confirmLiftRegistrationLock: (login: string) => Promise<boolean>;
+  /**
    * Stops local execution after the API revoked this device (ADR 0014:
    * after `device_revoked` the desktop "stops local execution"). Called
    * each time the device state moves to `revoked`, after the session
@@ -249,10 +278,36 @@ export interface AccountService {
    */
   readonly removeDevice: () => Promise<RemoveDeviceResult>;
   /**
+   * Revokes another device of the account (#95, D1), for the device list
+   * service of the main process, which passes only an active device of its
+   * list. It is an action of the person, like a removal: while a sign-in, a
+   * sign-out, a removal, "This is not me", an unlock, or another device
+   * action runs, or the key loads, it answers `unavailable`; otherwise it
+   * takes the `operation` lock, so those answer `busy` meanwhile, and waits
+   * for a background refresh. It needs a signed-in device with a ready key
+   * (`not_signed_in` otherwise) and refuses this installation's own device
+   * (`current_device`). It asks the person with `confirmRevokeDevice`, then
+   * the session's `revokeOtherDevice`, once: an uncertain answer is
+   * `unknown`, and nothing is sent again on its own. Never rejects.
+   */
+  readonly revokeOtherDevice: (
+    device: OtherDevice,
+    reason: OtherDeviceRevocation,
+  ) => Promise<RevokeOtherDeviceResult>;
+  /**
+   * Lifts the account's registration lock (#95, D1 and D5b), for the device
+   * list service, which asks only while its list holds a lock in force. It
+   * follows the rules of `revokeOtherDevice`, with the confirmation
+   * `confirmLiftRegistrationLock` and the session's `liftRegistrationLock`.
+   * Never rejects.
+   */
+  readonly liftRegistrationLock: () => Promise<LiftRegistrationLockResult>;
+  /**
    * Calls `listener` after a device action of the person ended that may
    * have changed the account's devices: a sign-out, a removal of this
-   * device, or "This is not me", with any result but a refusal before it
-   * began (`refused`) or a kept confirmation (`cancelled`). The device list
+   * device, "This is not me", a revocation of another device, or a lift of
+   * the registration lock, with any result but a refusal before it began
+   * (`refused`) or a kept confirmation (`cancelled`). The device list
    * service reloads then (#95). The result removes the listener.
    */
   readonly onDeviceAction: (listener: () => void) => () => void;
@@ -282,7 +337,9 @@ export interface AccountService {
    * The answer is parsed with the protocol's response schema and its size
    * is capped. It takes no `operation` lock: while a sign-in, a sign-out,
    * "This is not me", a device removal, or an unlock runs, it answers
-   * `unavailable`, and the caller tries again later. It waits for the
+   * `unavailable` (also while a revocation of another device or a lift of
+   * the registration lock holds the lock), and the caller tries again
+   * later. It waits for the
    * startup refresh and a background refresh to end, like an action, but
    * actions do not wait for a read on its way. Its answer is dropped as
    * `not_signed_in` when no device is signed in any more, and as
@@ -314,7 +371,8 @@ export interface AccountService {
    * The path parameters and the body are checked with the entry's schemas
    * first, and the answer is parsed with its schema. It takes no
    * `operation` lock and answers `unavailable` while a sign-in, a
-   * sign-out, "This is not me", a device removal, or an unlock runs, and it
+   * sign-out, "This is not me", a device removal, or an unlock runs (also
+   * while a device action of the device list holds the lock), and it
    * waits for the startup refresh and a background refresh, as a read does.
    * It is sent once: an uncertain answer is never sent again and answers
    * `unknown`, as does a successful answer when the account or the device
@@ -394,7 +452,7 @@ export const FORGET_CONFIRMATION_DETAILS: Readonly<
   server_first:
     "This device is signed in, so it is first removed from that GitHub account on the server. If the server cannot be reached or does not remove it, the device stays listed for that account, without a key. Either way, the device key and the account are then deleted on this computer, and you can sign in with your own GitHub account.",
   local_only:
-    'This device cannot use its key with the server now, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then enters the passphrase of the device key or signs in with that account on this device, as the panel asks, and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account.',
+    'This device cannot use its key with the server now, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then enters the passphrase of the device key or signs in with that account on this device, as the panel asks, and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account. Either way, whoever owns the account can also remove this device from another of their devices, with "Remove" in the device list on the Account screen.',
 });
 
 /** The detail of the confirmation for the case. */
@@ -594,6 +652,11 @@ const ACTION_NOT_SIGNED_IN = Object.freeze({
   outcome: "refused" as const,
   reason: "not_signed_in" as const,
 });
+const LIST_ACTION_FAILED = Object.freeze({
+  outcome: "failed" as const,
+  reason: "failed" as const,
+});
+const LIST_ACTION_UNKNOWN = Object.freeze({ outcome: "unknown" as const });
 
 const CHALLENGE_NOT_SIGNED: ChallengeAnswer = Object.freeze({ ok: false });
 
@@ -623,6 +686,8 @@ export function createAccountService(
     | "forgetting"
     | "signing_out"
     | "removing"
+    | "revoking"
+    | "lifting"
     | null = null;
   /**
    * The work that runs in the background: the startup (from the key's load
@@ -1529,6 +1594,155 @@ export function createAccountService(
     }
   }
 
+  // ---- The account's other devices (#95, D1) -----------------------------
+
+  /** The signed-in device that a device action of the device list acts from. */
+  interface SignedInDevice {
+    readonly held: AccountSession;
+    readonly login: string;
+    readonly deviceId: string;
+  }
+
+  /**
+   * Starts a device action of the device list (`revokeOtherDevice`,
+   * `liftRegistrationLock`): `unavailable` while an action of the person or
+   * a sign-in runs or the key loads, and otherwise the `operation` lock, a
+   * wait for a background refresh, and `not_signed_in` unless a signed-in
+   * device with a ready key acts. The caller releases the lock in `finally`
+   * when the answer is not `unavailable`.
+   */
+  async function beginDeviceListAction(
+    kind: "revoking" | "lifting",
+  ): Promise<SignedInDevice | "unavailable" | "not_signed_in"> {
+    if (operation !== null || attempt !== null || deviceKey === "loading") {
+      return "unavailable";
+    }
+    operation = kind;
+    await backgroundSettled();
+    // These actions change no device of this installation and no account,
+    // so they do not count as changes for the reads (`accountChanges`); a
+    // read or a write meanwhile answers `unavailable` while the lock holds.
+    if (
+      system === null ||
+      session === null ||
+      account.kind !== "signed_in" ||
+      device !== "signed_in" ||
+      deviceSignedOut ||
+      deviceKey !== "ready"
+    ) {
+      return "not_signed_in";
+    }
+    return {
+      held: session,
+      login: account.login,
+      deviceId: account.deviceId,
+    };
+  }
+
+  async function revokeOtherDevice(
+    target: OtherDevice,
+    reason: OtherDeviceRevocation,
+  ): Promise<RevokeOtherDeviceResult> {
+    const result = await revokeOtherDeviceNow(target, reason);
+    deviceActionEnded(result.outcome);
+    return result;
+  }
+
+  async function revokeOtherDeviceNow(
+    target: OtherDevice,
+    reason: OtherDeviceRevocation,
+  ): Promise<RevokeOtherDeviceResult> {
+    const begun = await beginDeviceListAction("revoking");
+    if (begun === "unavailable") {
+      return Object.freeze({ outcome: "refused", reason: "unavailable" });
+    }
+    let sent = false;
+    try {
+      if (begun === "not_signed_in") {
+        return Object.freeze({ outcome: "refused", reason: "not_signed_in" });
+      }
+      // "Remove this device" removes this installation's own device; a
+      // revocation here would leave its key and record behind.
+      if (target.id === begun.deviceId) {
+        return Object.freeze({ outcome: "refused", reason: "current_device" });
+      }
+      // The confirmation runs in the main process, so that a renderer that
+      // misbehaves cannot revoke a device without the person.
+      let confirmed: boolean;
+      try {
+        confirmed = await options.confirmRevokeDevice(
+          begun.login,
+          target,
+          reason,
+        );
+      } catch {
+        report("The confirmation could not be shown.");
+        return LIST_ACTION_FAILED;
+      }
+      if (!confirmed) {
+        return Object.freeze({ outcome: "cancelled" });
+      }
+      // Sent once: an uncertain answer is never sent again on its own.
+      sent = true;
+      const result = await begun.held.revokeOtherDevice(target.id, reason);
+      if (result.ok) {
+        return Object.freeze({ outcome: "revoked", reason });
+      }
+      const failure = deviceListActionFailure(result);
+      return failure === "unknown"
+        ? LIST_ACTION_UNKNOWN
+        : Object.freeze({ outcome: "failed", reason: failure });
+    } catch {
+      report("The device could not be revoked.");
+      return sent ? LIST_ACTION_UNKNOWN : LIST_ACTION_FAILED;
+    } finally {
+      operation = null;
+    }
+  }
+
+  async function liftRegistrationLock(): Promise<LiftRegistrationLockResult> {
+    const result = await liftRegistrationLockNow();
+    deviceActionEnded(result.outcome);
+    return result;
+  }
+
+  async function liftRegistrationLockNow(): Promise<LiftRegistrationLockResult> {
+    const begun = await beginDeviceListAction("lifting");
+    if (begun === "unavailable") {
+      return Object.freeze({ outcome: "refused", reason: "unavailable" });
+    }
+    let sent = false;
+    try {
+      if (begun === "not_signed_in") {
+        return Object.freeze({ outcome: "refused", reason: "not_signed_in" });
+      }
+      let confirmed: boolean;
+      try {
+        confirmed = await options.confirmLiftRegistrationLock(begun.login);
+      } catch {
+        report("The confirmation could not be shown.");
+        return LIST_ACTION_FAILED;
+      }
+      if (!confirmed) {
+        return Object.freeze({ outcome: "cancelled" });
+      }
+      sent = true;
+      const result = await begun.held.liftRegistrationLock();
+      if (result.ok) {
+        return Object.freeze({ outcome: "lifted" });
+      }
+      const failure = deviceListActionFailure(result);
+      return failure === "unknown"
+        ? LIST_ACTION_UNKNOWN
+        : Object.freeze({ outcome: "failed", reason: failure });
+    } catch {
+      report("The registration lock could not be lifted.");
+      return sent ? LIST_ACTION_UNKNOWN : LIST_ACTION_FAILED;
+    } finally {
+      operation = null;
+    }
+  }
+
   async function signWebSocketChallenge(
     challenge: AuthChallengeFrame,
   ): Promise<ChallengeAnswer> {
@@ -1812,6 +2026,8 @@ export function createAccountService(
     forgetAccount,
     signOut,
     removeDevice,
+    revokeOtherDevice,
+    liftRegistrationLock,
     onDeviceAction: (listener: () => void) => {
       const entry = () => listener();
       deviceActionListeners.add(entry);

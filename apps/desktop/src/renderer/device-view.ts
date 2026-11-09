@@ -1,11 +1,16 @@
 import type { DeviceListBridge } from "../shared/desktop-bridge.ts";
 import type {
+  DeviceListActionFailure,
   DeviceListProblem,
   DeviceListView,
   DevicePlatformView,
   DeviceView,
+  LiftRegistrationLockResult,
   NewDeviceNoticeView,
+  OtherDeviceRevocation,
+  RevokeOtherDeviceResult,
 } from "../shared/ipc-contract.ts";
+import { DEVICE_ACTION_FAILURE_MESSAGES } from "./account-view.ts";
 
 /** What the devices section knows about the account's devices. */
 export type DeviceSectionView =
@@ -57,6 +62,308 @@ export const DEVICE_LIST_MESSAGES = Object.freeze({
   /** The button that ends the notices that are shown. */
   dismiss: "Dismiss the notices",
 });
+
+/** The labels of the device actions (#95). */
+export const DEVICE_ACTION_LABELS = Object.freeze({
+  /** On each other active device: revoke it as removed, without a lock. */
+  remove: "Remove",
+  /** On each other active device: revoke it as lost, with the lock. */
+  revokeAsLost: "Revoke as lost",
+  /** On each notice of a new device (the Project Manager's decision of 2026-11-09). */
+  notMe: "This was not me: revoke as lost",
+  /** On the line of the registration lock, while it is in force (D5b). */
+  liftLock: "Lift the registration lock",
+  /** Ends the advice after a revocation as lost. */
+  dismissAdvice: "Dismiss the advice",
+});
+
+/**
+ * The advice after a revocation as lost (ADR 0014, "Revocation, sign-out,
+ * and recovery"): fixed sentences, with the address of GitHub's sessions as
+ * text, never as a link that opens on its own.
+ */
+export const LOST_DEVICE_ADVICE = Object.freeze({
+  title: "After a lost device",
+  steps: Object.freeze([
+    "End that device's GitHub sessions: open github.com/settings/sessions in your browser and revoke them.",
+    "If the device was unlocked, change your GitHub password.",
+    "Rotate the AI provider credentials that are stored on that device. The server cannot reach them.",
+  ]),
+});
+
+/** The sentences after a device action of the devices section. */
+export const DEVICE_ACTION_RESULT_MESSAGES = Object.freeze({
+  removed: "The device was removed from the account.",
+  revokedAsLost:
+    "The device was revoked as lost, and no new device can register on this account for 7 days unless you lift the registration lock. Follow the advice below.",
+  revokeUnknown:
+    "The server's answer did not show whether the device was revoked. The device list shows it once it loads again; the request is not sent again on its own.",
+  /** Added after `revokeUnknown` for a revocation as lost. */
+  adviceFollows: "Follow the advice below for the lost device.",
+  lifted:
+    "The registration lock was lifted. New devices can register on this account again.",
+  liftUnknown:
+    "The server's answer did not show whether the registration lock was lifted. The device list shows it once it loads again; the request is not sent again on its own.",
+  /** The start of a refusal or a failure of a revocation. */
+  revokeNotDone: "The device could not be revoked.",
+  /** The start of a refusal or a failure of a lift. */
+  liftNotDone: "The registration lock could not be lifted.",
+  /** A call that failed in the renderer or on its way. */
+  tryAgain: "Try again.",
+});
+
+/** Why the main process refused a device action before it asked the person. */
+export const DEVICE_ACTION_REFUSAL_MESSAGES = Object.freeze({
+  unavailable:
+    "Wait until the sign-in or the current change of the account is finished, then try again.",
+  not_signed_in:
+    "This device is not signed in, so it cannot change the account's devices.",
+  current_device:
+    'It is this device: use "Remove this device" in the panel instead.',
+  not_listed:
+    "It is not an active device of the current list. Wait until the list has loaded, then try again.",
+  no_lock: "No registration lock is in force.",
+});
+
+/** Why a device action failed after the person confirmed it. */
+export const DEVICE_LIST_ACTION_FAILURE_MESSAGES: Readonly<
+  Record<DeviceListActionFailure, string>
+> = Object.freeze({
+  api_origin_unset: DEVICE_ACTION_FAILURE_MESSAGES.api_origin_unset,
+  api_origin_invalid: DEVICE_ACTION_FAILURE_MESSAGES.api_origin_invalid,
+  no_device: DEVICE_ACTION_FAILURE_MESSAGES.no_device,
+  key_lost: DEVICE_ACTION_FAILURE_MESSAGES.key_lost,
+  key_not_loaded: DEVICE_ACTION_FAILURE_MESSAGES.key_not_loaded,
+  record_unreadable: DEVICE_ACTION_FAILURE_MESSAGES.record_unreadable,
+  key_store_failed: DEVICE_ACTION_FAILURE_MESSAGES.key_store_failed,
+  signed_out: DEVICE_ACTION_FAILURE_MESSAGES.signed_out,
+  sign_in_running: DEVICE_ACTION_FAILURE_MESSAGES.sign_in_running,
+  replacement_pending: DEVICE_ACTION_FAILURE_MESSAGES.replacement_pending,
+  removal_pending: DEVICE_ACTION_FAILURE_MESSAGES.removal_pending,
+  record_not_saved: DEVICE_ACTION_FAILURE_MESSAGES.record_not_saved,
+  sign_in_required: DEVICE_ACTION_FAILURE_MESSAGES.sign_in_required,
+  auth_failed: DEVICE_ACTION_FAILURE_MESSAGES.auth_failed,
+  device_revoked: DEVICE_ACTION_FAILURE_MESSAGES.device_revoked,
+  device_account_mismatch:
+    DEVICE_ACTION_FAILURE_MESSAGES.device_account_mismatch,
+  rate_limited: DEVICE_ACTION_FAILURE_MESSAGES.rate_limited,
+  not_found: "The server does not list that device for this account.",
+  conflict: "The device was revoked already.",
+  refused: DEVICE_ACTION_FAILURE_MESSAGES.refused,
+  failed: DEVICE_ACTION_FAILURE_MESSAGES.failed,
+});
+
+/** What the section says after a revocation, and whether the advice follows. */
+export interface DeviceActionOutcome {
+  /** A fixed sentence, or undefined after a kept confirmation. */
+  readonly message: string | undefined;
+  /** Whether the advice after a revocation as lost shows from now on. */
+  readonly advice: boolean;
+  /**
+   * Whether the action's button leaves the page with the next list: the
+   * device was revoked, or the lock lifted.
+   */
+  readonly done: boolean;
+}
+
+/**
+ * The section's answer to a revocation of `reason`: a sentence for every
+ * result, and the advice of ADR 0014 after a revocation as lost that the
+ * server confirmed, and also when its answer does not show whether it
+ * acted, because the person confirmed that the device is lost either way.
+ */
+export function revokeDeviceOutcome(
+  result: RevokeOtherDeviceResult,
+  reason: OtherDeviceRevocation,
+): DeviceActionOutcome {
+  switch (result.outcome) {
+    case "revoked":
+      return result.reason === "lost"
+        ? {
+            message: DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost,
+            advice: true,
+            done: true,
+          }
+        : {
+            message: DEVICE_ACTION_RESULT_MESSAGES.removed,
+            advice: false,
+            done: true,
+          };
+    case "cancelled":
+      return { message: undefined, advice: false, done: false };
+    case "unknown":
+      return reason === "lost"
+        ? {
+            message: `${DEVICE_ACTION_RESULT_MESSAGES.revokeUnknown} ${DEVICE_ACTION_RESULT_MESSAGES.adviceFollows}`,
+            advice: true,
+            done: false,
+          }
+        : {
+            message: DEVICE_ACTION_RESULT_MESSAGES.revokeUnknown,
+            advice: false,
+            done: false,
+          };
+    case "refused":
+      return {
+        message: `${DEVICE_ACTION_RESULT_MESSAGES.revokeNotDone} ${DEVICE_ACTION_REFUSAL_MESSAGES[result.reason]}`,
+        advice: false,
+        done: false,
+      };
+    case "failed":
+      return {
+        message: `${DEVICE_ACTION_RESULT_MESSAGES.revokeNotDone} ${DEVICE_LIST_ACTION_FAILURE_MESSAGES[result.reason]}`,
+        advice: false,
+        done: false,
+      };
+  }
+}
+
+/** The section's answer to a lift of the registration lock. */
+export function liftRegistrationLockOutcome(
+  result: LiftRegistrationLockResult,
+): DeviceActionOutcome {
+  switch (result.outcome) {
+    case "lifted":
+      return {
+        message: DEVICE_ACTION_RESULT_MESSAGES.lifted,
+        advice: false,
+        done: true,
+      };
+    case "cancelled":
+      return { message: undefined, advice: false, done: false };
+    case "unknown":
+      return {
+        message: DEVICE_ACTION_RESULT_MESSAGES.liftUnknown,
+        advice: false,
+        done: false,
+      };
+    case "refused":
+      return {
+        message: `${DEVICE_ACTION_RESULT_MESSAGES.liftNotDone} ${DEVICE_ACTION_REFUSAL_MESSAGES[result.reason]}`,
+        advice: false,
+        done: false,
+      };
+    case "failed":
+      return {
+        message: `${DEVICE_ACTION_RESULT_MESSAGES.liftNotDone} ${DEVICE_LIST_ACTION_FAILURE_MESSAGES[result.reason]}`,
+        advice: false,
+        done: false,
+      };
+  }
+}
+
+/** What the section shows of its device actions. */
+export interface DeviceActionsView {
+  /**
+   * True while the main process asks the person in its native dialog and
+   * the server: every device action's button stays focusable and does
+   * nothing (`aria-disabled`).
+   */
+  readonly running: boolean;
+  /** A fixed sentence about the last action, or undefined. */
+  readonly message: string | undefined;
+  /** Whether the advice after a revocation as lost shows. */
+  readonly advice: boolean;
+}
+
+export const IDLE_DEVICE_ACTIONS: DeviceActionsView = Object.freeze({
+  running: false,
+  message: undefined,
+  advice: false,
+});
+
+export interface DeviceActions {
+  /**
+   * Revokes another device as removed or lost, once: a call while an
+   * action runs changes nothing and resolves to false. Resolves to true
+   * when the device was revoked, so that its button leaves the page.
+   */
+  readonly revoke: (
+    deviceId: string,
+    reason: OtherDeviceRevocation,
+  ) => Promise<boolean>;
+  /** Lifts the registration lock, by the same rules; true when it was lifted. */
+  readonly lift: () => Promise<boolean>;
+  /** Ends the advice after a revocation as lost. */
+  readonly dismissAdvice: () => void;
+}
+
+/**
+ * The device actions of the devices section, through the device list
+ * bridge; `onView` gets every change of what the section shows. One action
+ * runs at a time. A new action clears the last sentence; the advice after a
+ * revocation as lost stays until the person dismisses it.
+ */
+export function createDeviceActions(
+  devices: Pick<DeviceListBridge, "revokeDevice" | "liftRegistrationLock">,
+  onView: (view: DeviceActionsView) => void,
+): DeviceActions {
+  let running = false;
+  let message: string | undefined;
+  let advice = false;
+  const show = () => onView(Object.freeze({ running, message, advice }));
+
+  async function act(
+    call: () => Promise<DeviceActionOutcome>,
+    failed: string,
+  ): Promise<boolean> {
+    if (running) {
+      return false;
+    }
+    running = true;
+    message = undefined;
+    show();
+    let done = false;
+    try {
+      const outcome = await call();
+      message = outcome.message;
+      advice ||= outcome.advice;
+      done = outcome.done;
+    } catch {
+      message = `${failed} ${DEVICE_ACTION_RESULT_MESSAGES.tryAgain}`;
+    }
+    running = false;
+    show();
+    return done;
+  }
+
+  return Object.freeze({
+    revoke: (deviceId: string, reason: OtherDeviceRevocation) =>
+      act(
+        async () =>
+          revokeDeviceOutcome(
+            await devices.revokeDevice(deviceId, reason),
+            reason,
+          ),
+        DEVICE_ACTION_RESULT_MESSAGES.revokeNotDone,
+      ),
+    lift: () =>
+      act(
+        async () =>
+          liftRegistrationLockOutcome(await devices.liftRegistrationLock()),
+        DEVICE_ACTION_RESULT_MESSAGES.liftNotDone,
+      ),
+    dismissAdvice: () => {
+      if (advice) {
+        advice = false;
+        show();
+      }
+    },
+  });
+}
+
+/**
+ * Whether the focus moves to the sentence of the action, after an action
+ * whose button leaves the page with the next list (`done`): only while the
+ * focus is still on that button or on the page, so that a person who moved
+ * on keeps their place.
+ */
+export function focusesActionMessage(
+  done: boolean,
+  focusOnButtonOrPage: boolean,
+): boolean {
+  return done && focusOnButtonOrPage;
+}
 
 /**
  * Why the device list is `unavailable`. What was loaded before stays shown,

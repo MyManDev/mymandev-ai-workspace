@@ -1297,7 +1297,7 @@ const DeviceLabelSchema = z.string().min(1).max(DEVICE_LIST_LIMITS.label);
 
 /**
  * One device of the account, as the device list shows it. Its ID crosses as
- * a typed string, because the later device actions name the device by it
+ * a typed string, because the device actions name the device by it
  * (D1). `current` marks the device of this installation. It holds no user
  * ID, key, or token.
  */
@@ -1397,6 +1397,133 @@ export const DeviceListLoadResultSchema = z.discriminatedUnion("outcome", [
   }),
 ]);
 export type DeviceListLoadResult = z.infer<typeof DeviceListLoadResultSchema>;
+
+/**
+ * How the person revokes another device of the account (#95; ADR 0014,
+ * "Revocation, sign-out, and recovery"): `removed`, which starts no lock, or
+ * `lost`, which starts the account's 7-day registration lock. The API's
+ * revoke route takes both for another device; `replaced` and
+ * `account_erased` are the server's own reasons.
+ */
+export const OTHER_DEVICE_REVOCATIONS = Object.freeze([
+  "removed",
+  "lost",
+] as const);
+export type OtherDeviceRevocation = (typeof OTHER_DEVICE_REVOCATIONS)[number];
+
+/**
+ * Why a revocation of another device was not taken, before the person was
+ * asked:
+ *
+ * - `unavailable`: a sign-in, a sign-out, a removal of this device, "This is
+ *   not me", an unlock, or another device action runs, or the key loads;
+ * - `not_signed_in`: no device of this installation is signed in;
+ * - `current_device`: the device is this installation's own, which "Remove
+ *   this device" removes;
+ * - `not_listed`: the device is not an active device of the list that the
+ *   main process holds.
+ */
+export const REVOKE_DEVICE_REFUSALS = Object.freeze([
+  "unavailable",
+  "not_signed_in",
+  "current_device",
+  "not_listed",
+] as const);
+
+/**
+ * Why lifting the registration lock was not taken, before the person was
+ * asked: `unavailable` and `not_signed_in` as for a revocation, and
+ * `no_lock` when the list that the main process holds has no lock in force.
+ */
+export const LIFT_REGISTRATION_LOCK_REFUSALS = Object.freeze([
+  "unavailable",
+  "not_signed_in",
+  "no_lock",
+] as const);
+
+/**
+ * Why a device action of the device list failed after the person confirmed
+ * it, as a fixed code: the codes of `DEVICE_ACTION_FAILURES` without the
+ * uncertain answers, and the revoke route's `not_found` and `conflict`. An
+ * uncertain answer (no answer, a `5xx`, or an answer that cannot be read) is
+ * the outcome `unknown` instead, because whether the server acted is not
+ * known; it is never sent again on its own.
+ */
+export const DEVICE_LIST_ACTION_FAILURES = Object.freeze([
+  "api_origin_unset",
+  "api_origin_invalid",
+  "no_device",
+  "key_lost",
+  "key_not_loaded",
+  "record_unreadable",
+  "key_store_failed",
+  "signed_out",
+  "sign_in_running",
+  "replacement_pending",
+  "removal_pending",
+  "record_not_saved",
+  "sign_in_required",
+  "auth_failed",
+  "device_revoked",
+  "device_account_mismatch",
+  "rate_limited",
+  "not_found",
+  "conflict",
+  "refused",
+  "failed",
+] as const);
+export type DeviceListActionFailure =
+  (typeof DEVICE_LIST_ACTION_FAILURES)[number];
+
+const DeviceListActionFailedSchema = z.object({
+  outcome: z.literal("failed"),
+  reason: z.enum(DEVICE_LIST_ACTION_FAILURES),
+});
+
+/**
+ * The result of revoking another device: `revoked` with the reason when the
+ * API confirmed it, `cancelled` when the person kept the device in the
+ * native confirmation, `unknown` when the answer does not show whether the
+ * API revoked it, or `refused` or `failed` with a code.
+ */
+export const RevokeOtherDeviceResultSchema = z.discriminatedUnion("outcome", [
+  z.object({
+    outcome: z.literal("revoked"),
+    reason: z.enum(OTHER_DEVICE_REVOCATIONS),
+  }),
+  z.object({ outcome: z.literal("cancelled") }),
+  z.object({ outcome: z.literal("unknown") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(REVOKE_DEVICE_REFUSALS),
+  }),
+  DeviceListActionFailedSchema,
+]);
+export type RevokeOtherDeviceResult = z.infer<
+  typeof RevokeOtherDeviceResultSchema
+>;
+
+/**
+ * The result of lifting the registration lock: `lifted` when the API
+ * confirmed it, `cancelled`, `unknown`, `refused`, or `failed`, as for a
+ * revocation.
+ */
+export const LiftRegistrationLockResultSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z.object({ outcome: z.literal("lifted") }),
+    z.object({ outcome: z.literal("cancelled") }),
+    z.object({ outcome: z.literal("unknown") }),
+    z.object({
+      outcome: z.literal("refused"),
+      reason: z.enum(LIFT_REGISTRATION_LOCK_REFUSALS),
+    }),
+    DeviceListActionFailedSchema,
+  ],
+);
+export type LiftRegistrationLockResult = z.infer<
+  typeof LiftRegistrationLockResultSchema
+>;
 
 /** The schemas of every invoke channel. */
 export const INVOKE_CONTRACT = Object.freeze({
@@ -1548,6 +1675,15 @@ export const INVOKE_CONTRACT = Object.freeze({
     args: z.tuple([DismissedDevicesSchema]),
     /** True when a notice of them was held and ended. */
     result: z.boolean(),
+  }),
+  [INVOKE_CHANNELS.revokeDevice]: Object.freeze({
+    /** The device ID of an active device of the list, and the reason. */
+    args: z.tuple([ProtocolIdSchema, z.enum(OTHER_DEVICE_REVOCATIONS)]),
+    result: RevokeOtherDeviceResultSchema,
+  }),
+  [INVOKE_CHANNELS.liftRegistrationLock]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: LiftRegistrationLockResultSchema,
   }),
 });
 

@@ -27,6 +27,7 @@ import {
   DEVICE_ACTION_FAILURES,
   DEVICE_ACTION_REFUSALS,
   DEVICE_KEY_STATES,
+  DEVICE_LIST_ACTION_FAILURES,
   DEVICE_LIST_LIMITS,
   DEVICE_LIST_LOAD_REFUSALS,
   DEVICE_LIST_PROBLEMS,
@@ -39,9 +40,12 @@ import {
   FORGET_REFUSALS,
   ForgetResultSchema,
   INVOKE_CONTRACT,
+  LIFT_REGISTRATION_LOCK_REFUSALS,
+  LiftRegistrationLockResultSchema,
   MAX_WAITING_CHAT_MESSAGES,
   MOUNT_REFUSALS,
   MountResultSchema,
+  OTHER_DEVICE_REVOCATIONS,
   ProtocolIdSchema,
   RECONNECT_REFUSALS,
   ReconnectResultSchema,
@@ -49,6 +53,8 @@ import {
   REPOSITORY_PROBLEMS,
   RemoveDeviceResultSchema,
   RepositoryListSchema,
+  REVOKE_DEVICE_REFUSALS,
+  RevokeOtherDeviceResultSchema,
   RUNTIME_STATES,
   RuntimeStatusSchema,
   SIGN_IN_OUTCOME_CODES,
@@ -170,7 +176,7 @@ test("a runtime status with a wrong state or revision is refused", () => {
   }
 });
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, and the dismissal of new devices take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, the dismissal of new devices, and the revocation of a device take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -181,9 +187,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.sendChatMessage &&
       channel !== INVOKE_CHANNELS.retryChatMessage &&
       channel !== INVOKE_CHANNELS.discardChatMessage &&
-      channel !== INVOKE_CHANNELS.dismissNewDevices,
+      channel !== INVOKE_CHANNELS.dismissNewDevices &&
+      channel !== INVOKE_CHANNELS.revokeDevice,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 9);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 10);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -1024,6 +1031,120 @@ test("the device list's load answers loading or a fixed refusal, and its dismiss
   expect(EVENT_CONTRACT[EVENT_CHANNELS.deviceListChanged]).toBe(
     DeviceListViewSchema,
   );
+});
+
+test("the revocation of another device takes one device ID, a lowercase UUIDv7, and the reason removed or lost", () => {
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.revokeDevice];
+  expect(OTHER_DEVICE_REVOCATIONS).toEqual(["removed", "lost"]);
+  for (const reason of OTHER_DEVICE_REVOCATIONS) {
+    expect(args.parse([DEVICE_ID, reason])).toEqual([DEVICE_ID, reason]);
+  }
+  for (const value of [
+    [],
+    [DEVICE_ID],
+    ["lost"],
+    [DEVICE_ID, "lost", "extra"],
+    [DEVICE_ID, "replaced"],
+    [DEVICE_ID, "account_erased"],
+    [DEVICE_ID, "LOST"],
+    [DEVICE_ID, undefined],
+    [DEVICE_ID.toUpperCase(), "lost"],
+    // A UUID of another version.
+    ["0192f2a0-7c3e-4a1b-8c4d-5e6f708192a3", "lost"],
+    [`${DEVICE_ID} `, "removed"],
+    [[DEVICE_ID], "removed"],
+    [{ id: DEVICE_ID }, "removed"],
+    [null, "removed"],
+  ]) {
+    expect(args.safeParse(value).success, JSON.stringify(value)).toBe(false);
+  }
+});
+
+test("the device actions of the device list answer from a fixed set, and an uncertain answer is unknown, never a failure", () => {
+  const revoke = INVOKE_CONTRACT[INVOKE_CHANNELS.revokeDevice].result;
+  const lift = INVOKE_CONTRACT[INVOKE_CHANNELS.liftRegistrationLock].result;
+  expect(revoke).toBe(RevokeOtherDeviceResultSchema);
+  expect(lift).toBe(LiftRegistrationLockResultSchema);
+  expect(REVOKE_DEVICE_REFUSALS).toEqual([
+    "unavailable",
+    "not_signed_in",
+    "current_device",
+    "not_listed",
+  ]);
+  expect(LIFT_REGISTRATION_LOCK_REFUSALS).toEqual([
+    "unavailable",
+    "not_signed_in",
+    "no_lock",
+  ]);
+  // The failures of the other device actions without the uncertain
+  // answers, and the revoke route's own refusals.
+  const uncertain = ["no_answer", "server_error", "unexpected_response"];
+  expect([...DEVICE_LIST_ACTION_FAILURES].sort()).toEqual(
+    [
+      ...DEVICE_ACTION_FAILURES.filter((code) => !uncertain.includes(code)),
+      "not_found",
+      "conflict",
+    ].sort(),
+  );
+
+  const revokeAccepted: unknown[] = [
+    ...OTHER_DEVICE_REVOCATIONS.map((reason) => ({
+      outcome: "revoked",
+      reason,
+    })),
+    { outcome: "cancelled" },
+    { outcome: "unknown" },
+    ...REVOKE_DEVICE_REFUSALS.map((reason) => ({ outcome: "refused", reason })),
+    ...DEVICE_LIST_ACTION_FAILURES.map((reason) => ({
+      outcome: "failed",
+      reason,
+    })),
+  ];
+  for (const value of revokeAccepted) {
+    expect(revoke.parse(value), JSON.stringify(value)).toEqual(value);
+  }
+  const liftAccepted: unknown[] = [
+    { outcome: "lifted" },
+    { outcome: "cancelled" },
+    { outcome: "unknown" },
+    ...LIFT_REGISTRATION_LOCK_REFUSALS.map((reason) => ({
+      outcome: "refused",
+      reason,
+    })),
+    ...DEVICE_LIST_ACTION_FAILURES.map((reason) => ({
+      outcome: "failed",
+      reason,
+    })),
+  ];
+  for (const value of liftAccepted) {
+    expect(lift.parse(value), JSON.stringify(value)).toEqual(value);
+  }
+  for (const value of [
+    { outcome: "revoked" },
+    { outcome: "revoked", reason: "replaced" },
+    { outcome: "refused", reason: "no_lock" },
+    { outcome: "refused", reason: "busy" },
+    ...uncertain.map((reason) => ({ outcome: "failed", reason })),
+    { outcome: "lifted" },
+    "revoked",
+  ]) {
+    expect(revoke.safeParse(value).success, JSON.stringify(value)).toBe(false);
+  }
+  for (const value of [
+    { outcome: "revoked", reason: "lost" },
+    { outcome: "refused", reason: "not_listed" },
+    { outcome: "refused", reason: "current_device" },
+    ...uncertain.map((reason) => ({ outcome: "failed", reason })),
+  ]) {
+    expect(lift.safeParse(value).success, JSON.stringify(value)).toBe(false);
+  }
+  // Unknown keys are dropped.
+  expect(
+    revoke.parse({ outcome: "revoked", reason: "lost", deviceId: DEVICE_ID }),
+  ).toEqual({ outcome: "revoked", reason: "lost" });
+  expect(lift.parse({ outcome: "lifted", until: "later" })).toEqual({
+    outcome: "lifted",
+  });
 });
 
 test("a connection status holds a reason and a retry time only where its state has them", () => {

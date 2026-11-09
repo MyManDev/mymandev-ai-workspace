@@ -9,11 +9,13 @@
 // (index.ts); `initialize` opens the key store, so call it only after the
 // application is ready.
 import { app } from "electron";
+import type { OtherDeviceRevocation } from "../shared/ipc-contract.ts";
 import {
   createAccountService,
   type AccountService,
   type ForgetRemoval,
 } from "./account.ts";
+import type { OtherDevice } from "./account-session.ts";
 import { resolveApiOrigin } from "./api-origin.ts";
 import { deviceKeyFolder } from "./device-key/key-folder.ts";
 import { createSystemDeviceKeyStore } from "./device-key/system.ts";
@@ -32,6 +34,14 @@ export interface SystemAccountOptions {
   ) => Promise<boolean>;
   /** Asks the person to confirm removing this device in a native dialog. */
   readonly confirmRemoveDevice: (login: string) => Promise<boolean>;
+  /** Asks the person to confirm revoking another device in a native dialog. */
+  readonly confirmRevokeDevice: (
+    login: string,
+    device: OtherDevice,
+    reason: OtherDeviceRevocation,
+  ) => Promise<boolean>;
+  /** Asks the person to confirm lifting the registration lock in a native dialog. */
+  readonly confirmLiftRegistrationLock: (login: string) => Promise<boolean>;
   /** Stops local execution after the API revoked this device. */
   readonly stopLocalExecution: () => void;
   /** Receives fixed messages; the key store's errors hold no secret. */
@@ -85,6 +95,8 @@ export function createSystemAccountService(
     focusWindow: options.focusWindow,
     confirmForget: options.confirmForget,
     confirmRemoveDevice: options.confirmRemoveDevice,
+    confirmRevokeDevice: options.confirmRevokeDevice,
+    confirmLiftRegistrationLock: options.confirmLiftRegistrationLock,
     stopLocalExecution: options.stopLocalExecution,
     onError: (message) => options.onError(message),
   });

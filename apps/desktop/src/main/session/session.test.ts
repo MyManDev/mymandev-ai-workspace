@@ -3658,6 +3658,298 @@ describe("device list", () => {
   });
 });
 
+describe("the account's other devices (#95)", () => {
+  /** Another device of the account, which the tests revoke. */
+  const TARGET_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c9" as DeviceId;
+  const TARGET_REVOKE = `/devices/${TARGET_ID}/revoke`;
+  const LIFT = AUTH_ROUTES.liftRegistrationLock.path;
+
+  /**
+   * The API's routes for another device and the lock: a valid token gets a
+   * `204`, as `apps/api/src/auth/device-routes.ts` answers both, and any
+   * other token a `401`.
+   */
+  function otherDeviceRoutes(
+    api: FakeApi,
+    answer: (request: ApiRequest) => Promise<Response> | undefined = () =>
+      undefined,
+  ): void {
+    api.intercept = (request) => {
+      if (request.path !== TARGET_REVOKE && request.path !== LIFT) {
+        return undefined;
+      }
+      const token = request.authorization?.replace(/^Bearer /u, "") ?? "";
+      if (!api.tokens.has(token)) {
+        return Promise.resolve(errorAnswer("unauthorized"));
+      }
+      return answer(request) ?? Promise.resolve(noContent());
+    };
+  }
+
+  test("revokes another device with each reason, and lifts the lock, each with one request and the access token", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    otherDeviceRoutes(api);
+
+    expect(await h.session.revokeOtherDevice(TARGET_ID, "removed")).toEqual({
+      ok: true,
+      value: null,
+    });
+    expect(await h.session.revokeOtherDevice(TARGET_ID, "lost")).toEqual({
+      ok: true,
+      value: null,
+    });
+    expect(await h.session.liftRegistrationLock()).toEqual({
+      ok: true,
+      value: null,
+    });
+
+    const sent = api.requests.filter(
+      (request) => request.path === TARGET_REVOKE || request.path === LIFT,
+    );
+    expect(
+      sent.map((request) => [request.method, request.path, request.body]),
+    ).toEqual([
+      ["POST", TARGET_REVOKE, { reason: "removed" }],
+      ["POST", TARGET_REVOKE, { reason: "lost" }],
+      ["POST", LIFT, undefined],
+    ]);
+    for (const request of sent) {
+      expect(request.authorization).toBe(`Bearer ${api.issued[0]}`);
+    }
+    // This device stays as it was.
+    expect(h.session.state().kind).toBe("signed_in");
+    expect(api.deviceState).toBe("ok");
+    expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
+  });
+
+  test("this installation's own device, a reason other than removed or lost, and an ID outside the format are refused without a request", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    otherDeviceRoutes(api);
+
+    for (const reason of ["removed", "lost"] as const) {
+      expect(await h.session.revokeOtherDevice(DEVICE_ID, reason)).toEqual({
+        ok: false,
+        reason: "invalid_request",
+      });
+    }
+    for (const reason of ["replaced", "account_erased", "LOST"]) {
+      expect(
+        await h.session.revokeOtherDevice(
+          TARGET_ID,
+          reason as unknown as "lost",
+        ),
+        reason,
+      ).toEqual({ ok: false, reason: "invalid_request" });
+    }
+    for (const id of [TARGET_ID.toUpperCase(), "x", `${TARGET_ID}/..`]) {
+      expect(
+        await h.session.revokeOtherDevice(id as DeviceId, "lost"),
+        id,
+      ).toEqual({ ok: false, reason: "invalid_request" });
+    }
+    expect(api.requests).toEqual([]);
+    expect(h.session.state().kind).toBe("signed_in");
+  });
+
+  test("a 401 gets one new token and one retry, for the revocation and for the lift", async () => {
+    for (const call of ["revoke", "lift"] as const) {
+      memory = memoryFileSystem();
+      fileSystem = memory;
+      const api = fakeApi();
+      const h = harness(api);
+      await existingDevice(h);
+      await h.session.listDevices();
+      otherDeviceRoutes(api);
+      // The API ended the token, for example after its 15 minutes.
+      api.tokens.clear();
+
+      const result =
+        call === "revoke"
+          ? await h.session.revokeOtherDevice(TARGET_ID, "lost")
+          : await h.session.liftRegistrationLock();
+
+      expect(result, call).toEqual({ ok: true, value: null });
+      expect(mints(h), call).toBe(2);
+      expect(
+        count(h, "POST", call === "revoke" ? TARGET_REVOKE : LIFT),
+        call,
+      ).toBe(2);
+    }
+  });
+
+  test("the retry after a 401 goes only for the device and the account of the first token", async () => {
+    // While the first request was on its way, "This is not me" deleted the
+    // device and a sign-in with another account registered a new one.
+    for (const call of ["revoke", "lift"] as const) {
+      memory = memoryFileSystem();
+      fileSystem = memory;
+      const api = fakeApi();
+      const h = harness(api);
+      await existingDevice(h);
+      const route = call === "revoke" ? TARGET_REVOKE : LIFT;
+      let first = true;
+      api.intercept = (request) => {
+        if (
+          request.path === "/auth/access-token" &&
+          request.body?.deviceId === OTHER_DEVICE_ID
+        ) {
+          const accessToken = `mmda_${randomBytes(32).toString("base64url")}`;
+          api.tokens.add(accessToken);
+          api.issued.push(accessToken);
+          return Promise.resolve(
+            json(200, {
+              accessToken,
+              expiresAt: new Date(
+                Date.now() + ACCESS_TOKEN_LIFETIME_MS,
+              ).toISOString(),
+            }),
+          );
+        }
+        if (request.path !== route) {
+          return undefined;
+        }
+        if (!first) {
+          return Promise.resolve(noContent());
+        }
+        first = false;
+        return (async () => {
+          await h.keyStore.delete();
+          const key = await h.keyStore.create({ kind: "system" });
+          await h.records.write({
+            ...deviceRecord(key.publicKey),
+            deviceId: OTHER_DEVICE_ID,
+            userId: OTHER_USER_ID,
+            login: "hubot",
+            displayName: "Hubot",
+          });
+          api.publicKey = key.publicKey;
+          return errorAnswer("unauthorized");
+        })();
+      };
+
+      const result =
+        call === "revoke"
+          ? await h.session.revokeOtherDevice(TARGET_ID, "lost")
+          : await h.session.liftRegistrationLock();
+
+      expect(result, call).toEqual({
+        ok: false,
+        reason: "refused",
+        code: "unauthorized",
+      });
+      expect(count(h, "POST", route), call).toBe(1);
+    }
+  });
+
+  test.each([
+    ["a network error", () => Promise.reject(new TypeError("offline"))],
+    [
+      "a 5xx",
+      () =>
+        Promise.resolve(json(502, { statusCode: 502, code: "internal_error" })),
+    ],
+    [
+      "an answer that is not the API's",
+      () => Promise.resolve(new Response("<html>", { status: 404 })),
+    ],
+  ])(
+    "an uncertain answer (%s) is reported as it is and never sent again",
+    async (_name, answer) => {
+      for (const call of ["revoke", "lift"] as const) {
+        memory = memoryFileSystem();
+        fileSystem = memory;
+        const api = fakeApi();
+        const h = harness(api);
+        await existingDevice(h);
+        otherDeviceRoutes(api, () => answer());
+
+        const result =
+          call === "revoke"
+            ? await h.session.revokeOtherDevice(TARGET_ID, "lost")
+            : await h.session.liftRegistrationLock();
+
+        expect(result.ok, call).toBe(false);
+        expect(
+          ["no_answer", "server_error", "unexpected_response"],
+          call,
+        ).toContain(result.ok ? "" : result.reason);
+        expect(
+          count(h, "POST", call === "revoke" ? TARGET_REVOKE : LIFT),
+          call,
+        ).toBe(1);
+        expect(h.session.state().kind, call).toBe("signed_in");
+      }
+    },
+  );
+
+  test("the API's refusals come back with their codes, and nothing is sent while signed out or while a removal of this device is pending", async () => {
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    otherDeviceRoutes(api, (request) =>
+      request.path === TARGET_REVOKE
+        ? Promise.resolve(errorAnswer("conflict"))
+        : Promise.resolve(errorAnswer("rate_limited")),
+    );
+    expect(await h.session.revokeOtherDevice(TARGET_ID, "lost")).toEqual({
+      ok: false,
+      reason: "refused",
+      code: "conflict",
+    });
+    expect(await h.session.liftRegistrationLock()).toMatchObject({
+      ok: false,
+      reason: "refused",
+      code: "rate_limited",
+    });
+
+    // A removal of this device that waits for the server keeps the key for
+    // the removal alone.
+    memory = memoryFileSystem();
+    fileSystem = memory;
+    const pending = harness(fakeApi());
+    await existingDevice(pending);
+    pending.api.intercept = (request) =>
+      request.path.endsWith(`${DEVICE_ID}/revoke`)
+        ? Promise.reject(new TypeError("offline"))
+        : undefined;
+    expect(await pending.session.removeDevice()).toEqual({
+      ok: true,
+      value: "pending",
+    });
+    const before = pending.api.requests.length;
+    expect(await pending.session.revokeOtherDevice(TARGET_ID, "lost")).toEqual({
+      ok: false,
+      reason: "removal_pending",
+    });
+    expect(await pending.session.liftRegistrationLock()).toEqual({
+      ok: false,
+      reason: "removal_pending",
+    });
+    expect(pending.api.requests).toHaveLength(before);
+
+    // A signed-out device uses no token for them.
+    memory = memoryFileSystem();
+    fileSystem = memory;
+    const out = harness(fakeApi());
+    await existingDevice(out);
+    expect((await out.session.signOut()).ok).toBe(true);
+    const sentBefore = out.api.requests.length;
+    expect(await out.session.revokeOtherDevice(TARGET_ID, "lost")).toEqual({
+      ok: false,
+      reason: "signed_out",
+    });
+    expect(await out.session.liftRegistrationLock()).toEqual({
+      ok: false,
+      reason: "signed_out",
+    });
+    expect(out.api.requests).toHaveLength(sentBefore);
+  });
+});
+
 function challengeFrame(): AuthChallengeFrame {
   return {
     protocolVersion: PROTOCOL_VERSION,

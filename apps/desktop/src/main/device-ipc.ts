@@ -7,7 +7,9 @@ import {
   type DeviceListStatusView,
   type DeviceListView,
   type DeviceView,
+  type LiftRegistrationLockResult,
   type NewDeviceNoticeView,
+  type RevokeOtherDeviceResult,
 } from "../shared/ipc-contract.ts";
 import type { WorkspaceReadFailure } from "./api-reads.ts";
 import type {
@@ -90,7 +92,7 @@ function noticeView(notice: NewDeviceNotice): NewDeviceNoticeView {
 /**
  * The frozen copy of the service's state that crosses IPC, with `revision`
  * as its revision. Each device keeps only the fields that the screen shows
- * and the ID that the later device actions name; no user ID, key, or token
+ * and the ID that the device actions name; no user ID, key, or token
  * crosses, and neither does a field that the protocol adds later. The lists
  * keep the service's order and are cut to `DEVICE_LIST_LIMITS`: the devices
  * from the most recently created, and the newest notices. Labels are cut to
@@ -132,7 +134,12 @@ function scheduleWithSetTimeout(
 export interface DeviceIpcOptions {
   readonly devices: Pick<
     DeviceListService,
-    "state" | "onChange" | "load" | "dismissNewDevices"
+    | "state"
+    | "onChange"
+    | "load"
+    | "dismissNewDevices"
+    | "revokeDevice"
+    | "liftRegistrationLock"
   >;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
@@ -158,7 +165,12 @@ export interface DeviceIpc {
  * `devices:dismiss-new-devices` takes the device IDs of the notices that the
  * renderer showed, 1 to 10 lowercase UUIDv7s, and ends only those, so that
  * a notice that arrived after the last published view stays (the Project
- * Manager's decision of 2026-11-09). A change of the service raises the
+ * Manager's decision of 2026-11-09). `devices:revoke` takes one device ID,
+ * a lowercase UUIDv7, and the reason `removed` or `lost`, and
+ * `devices:lift-lock` takes nothing; the service accepts only
+ * an active device of its list and a lock in force, the account service
+ * asks the person in a native dialog, and the result is a fixed code. A
+ * change of the service raises the
  * view's revision at once and publishes the latest view after
  * `DEVICE_PUBLISH_INTERVAL_MS`, so at most one view goes out in each
  * interval and the last change of a burst is always sent. Call it before
@@ -239,6 +251,25 @@ export function registerDeviceIpc(
       // The contract checked each ID as a lowercase UUIDv7; the service
       // ends only the notices that they name.
       (_event, [deviceIds]) => devices.dismissNewDevices(deviceIds),
+    ),
+  );
+  ipc.handle(
+    INVOKE_CHANNELS.revokeDevice,
+    createInvokeHandler(
+      INVOKE_CHANNELS.revokeDevice,
+      appUrl,
+      // The contract checked the ID as a lowercase UUIDv7 and the reason;
+      // the service accepts only an active device of its list.
+      (_event, [deviceId, reason]): Promise<RevokeOtherDeviceResult> =>
+        devices.revokeDevice(deviceId, reason),
+    ),
+  );
+  ipc.handle(
+    INVOKE_CHANNELS.liftRegistrationLock,
+    createInvokeHandler(
+      INVOKE_CHANNELS.liftRegistrationLock,
+      appUrl,
+      (): Promise<LiftRegistrationLockResult> => devices.liftRegistrationLock(),
     ),
   );
   const remove = devices.onChange(changed);
