@@ -733,11 +733,11 @@ export const ClaimViaSchema = z.enum(CLAIM_VIAS);
 /**
  * One claim as owners and admins see it: an account claimed the person
  * `memberId` at `claimedAt`, by accepting an invitation or through an
- * approved join request, as `via` says. The desktop shows the person through the workspace
- * view. `claimer` is the claiming account's GitHub identity as it is now: its
- * login and the time that login was last verified change with the account's
- * sign-ins. It is null only after the account's data was erased. A claim
- * stays listed after its person was removed.
+ * approved join request, as `via` says. The desktop shows the person through
+ * the workspace view. `claimer` is the claiming account's GitHub identity as
+ * it is now: its login and the time that login was last verified change with
+ * the account's sign-ins. It is null only after the account's data was erased.
+ * A claim stays listed after its person was removed.
  */
 export const ClaimSchema = z.object({
   workspaceId: WorkspaceIdSchema,
