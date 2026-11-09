@@ -14,6 +14,10 @@
 // - After each `workspace.subscribed` of the selected workspace, its view and
 //   its projects are reloaded through the service's own resync gate, and
 //   the events that arrived meanwhile are applied after the reload.
+// - The selected workspace's people come from its view and follow the
+//   membership events (#95, decision D3): each person's display name, role,
+//   whether it is claimed, the GitHub login with the time it was last
+//   verified, and whether it was removed. The user IDs are never kept.
 // - When the membership ends or the subscription is refused, the
 //   subscription is dropped from the connection client, which would
 //   otherwise send it again after every `auth.ok`, the list is reloaded, and
@@ -24,11 +28,13 @@
 // fixed text with a failure code at most.
 import type {
   MemberId,
+  MemberRole,
   ProjectId,
   ProjectListResponse,
   ReceivedServerEvent,
   WorkspaceId,
   WorkspaceListResponse,
+  WorkspaceMember,
   WorkspaceViewResponse,
 } from "@mymandev/protocol";
 import type { AccountStatus } from "../../shared/ipc-contract.ts";
@@ -97,11 +103,37 @@ export interface ProjectSummary {
   readonly createdByMemberId: MemberId;
 }
 
+/** The GitHub account that claimed a person, as the service keeps it. */
+export interface PersonIdentity {
+  readonly login: string;
+  /** When the login was last verified, an ISO 8601 time in UTC. */
+  readonly verifiedAt: string;
+}
+
+/**
+ * A person of the selected workspace (ADR 0014, "People and roles"), as the
+ * service keeps it: never the user ID of the account that claimed it.
+ */
+export interface PersonState {
+  readonly id: MemberId;
+  readonly displayName: string;
+  readonly role: MemberRole;
+  /** Whether an account claimed the person. */
+  readonly claimed: boolean;
+  /**
+   * The GitHub login of the account that claimed the person; null while it
+   * is unclaimed, and for a former member whose account's data was erased.
+   */
+  readonly identity: PersonIdentity | null;
+  /** When the person was removed or left; null while it is active. */
+  readonly removedAt: string | null;
+}
+
 /** The service's state. Every value is frozen. */
 export interface WorkspaceState {
   /**
-   * Grows by one with every change, also when only `gateLive` or
-   * `memberName` would answer differently.
+   * Grows by one with every change, also when only `gateLive`,
+   * `memberName`, or `people` would answer differently.
    */
   readonly revision: number;
   readonly status: WorkspaceServiceStatus;
@@ -166,6 +198,13 @@ export interface WorkspaceService {
    */
   readonly memberName: (memberId: MemberId) => string;
   /**
+   * The people of the selected workspace, former members included, as a
+   * frozen list: in the order of the last reload, which is the server's,
+   * with the people that events added since at the end. Empty until the
+   * selected workspace's view has loaded. The people screen reads it.
+   */
+  readonly people: () => readonly PersonState[];
+  /**
    * Whether `workspaceId` is the selected workspace, subscribed, and
    * reloaded since its last `workspace.subscribed`, with no reload open. The
    * chat and agent services and the development switch send events for a
@@ -177,7 +216,8 @@ export interface WorkspaceService {
   /**
    * The account's own person in a workspace of the list, from the list's
    * answer, or null for a workspace that the list does not hold. The
-   * development switch checks an agent's owner with it.
+   * development switch checks an agent's owner with it, and the people
+   * screen marks the account's own person.
    */
   readonly ownMemberId: (workspaceId: WorkspaceId) => MemberId | null;
   /** Stops listening and cancels the timers, for the quit. */
@@ -219,6 +259,35 @@ function projectSummary(project: {
   });
 }
 
+/** A person of the protocol as the service keeps it, without the user ID. */
+function personState(member: WorkspaceMember): PersonState {
+  return Object.freeze({
+    id: member.id,
+    displayName: member.displayName,
+    role: member.role,
+    claimed: member.userId !== null,
+    identity:
+      member.identity === null
+        ? null
+        : Object.freeze({
+            login: member.identity.login,
+            verifiedAt: member.identity.verifiedAt,
+          }),
+    removedAt: member.removedAt,
+  });
+}
+
+function samePerson(held: PersonState, next: PersonState): boolean {
+  return (
+    held.displayName === next.displayName &&
+    held.role === next.role &&
+    held.claimed === next.claimed &&
+    held.removedAt === next.removedAt &&
+    held.identity?.login === next.identity?.login &&
+    held.identity?.verifiedAt === next.identity?.verifiedAt
+  );
+}
+
 /**
  * The signed-in device, or null: the same condition under which the
  * connection client connects. The device ID is kept only to notice a change
@@ -246,6 +315,7 @@ function scheduleWithSetTimeout(
 
 const NO_WORKSPACES: readonly WorkspaceSummary[] = Object.freeze([]);
 const NO_PROJECTS: readonly ProjectSummary[] = Object.freeze([]);
+const NO_PEOPLE: readonly PersonState[] = Object.freeze([]);
 
 export function createWorkspaceService(
   options: WorkspaceServiceOptions,
@@ -295,11 +365,13 @@ export function createWorkspaceService(
   let viewAttempt = 0;
   let cancelViewRetry: (() => void) | null = null;
   /**
-   * The display name of each person of the selected workspace, former
-   * members included: all that `memberName` needs. Never the user ID, the
-   * identity, the role, or the removal time.
+   * Each person of the selected workspace, former members included, in the
+   * order of the last reload, with the people that events added since at
+   * the end. Never a user ID.
    */
-  let members = new Map<MemberId, string>();
+  let members = new Map<MemberId, PersonState>();
+  /** The frozen list of `members` for `people`, or null after a change. */
+  let peopleList: readonly PersonState[] | null = NO_PEOPLE;
   let projects = NO_PROJECTS;
   let openProjectId: ProjectId | null = null;
 
@@ -405,6 +477,7 @@ export function createWorkspaceService(
     viewProblem = null;
     viewAttempt = 0;
     members = new Map();
+    peopleList = NO_PEOPLE;
     projects = NO_PROJECTS;
     openProjectId = null;
   }
@@ -581,8 +654,9 @@ export function createWorkspaceService(
       return;
     }
     members = new Map(
-      view.value.members.map((member) => [member.id, member.displayName]),
+      view.value.members.map((member) => [member.id, personState(member)]),
     );
+    peopleList = null;
     projects = Object.freeze(list.value.projects.map(projectSummary));
     for (const event of events) {
       // The reload is newer than an event that it already holds, and an
@@ -627,43 +701,69 @@ export function createWorkspaceService(
   // The events.
 
   /**
-   * Applies one event. Every event sets the state that it reports, so
-   * applying one again changes nothing. False when it names a person or a
-   * project that the workspace does not hold. A removal, a role change, and
-   * an ownership transfer change nothing that the service keeps: a former
-   * member keeps their name.
+   * Keeps `person`, in its place when it is held and at the end otherwise,
+   * and touches the state only when it changes.
    */
-  /** Keeps a person's name, and touches the state only when it changes. */
-  function setMemberName(memberId: MemberId, displayName: string): void {
-    if (members.get(memberId) !== displayName) {
-      members.set(memberId, displayName);
-      touch();
+  function setPerson(person: PersonState): void {
+    const held = members.get(person.id);
+    if (held !== undefined && samePerson(held, person)) {
+      return;
     }
+    members.set(person.id, person);
+    peopleList = null;
+    touch();
   }
 
+  /** Changes a held person; false when the workspace does not hold it. */
+  function changePerson(
+    memberId: MemberId,
+    change: Partial<Pick<PersonState, "displayName" | "role" | "removedAt">>,
+  ): boolean {
+    const held = members.get(memberId);
+    if (held === undefined) {
+      return false;
+    }
+    setPerson(Object.freeze({ ...held, ...change }));
+    return true;
+  }
+
+  /**
+   * Applies one event. Every event sets the state that it reports, so
+   * applying one again changes nothing. False, with nothing changed, when it
+   * names a person or a project that the workspace does not hold. A removed
+   * person stays as a former member with their name and role.
+   */
   function applyEvent(event: WorkspaceEvent): boolean {
     switch (event.type) {
       case "workspace.member.defined":
       case "workspace.member.claimed":
-        setMemberName(
-          event.payload.member.id,
-          event.payload.member.displayName,
-        );
+        setPerson(personState(event.payload.member));
         return true;
       case "workspace.member.renamed":
-        if (!members.has(event.payload.memberId)) {
+        return changePerson(event.payload.memberId, {
+          displayName: event.payload.displayName,
+        });
+      case "workspace.member.removed":
+        return changePerson(event.payload.memberId, {
+          removedAt: event.payload.removedAt,
+        });
+      case "workspace.member.role_changed":
+        return changePerson(event.payload.memberId, {
+          role: event.payload.role,
+        });
+      case "workspace.ownership.transferred": {
+        const { previousOwnerMemberId, ownerMemberId } = event.payload;
+        if (
+          !members.has(previousOwnerMemberId) ||
+          !members.has(ownerMemberId)
+        ) {
           return false;
         }
-        setMemberName(event.payload.memberId, event.payload.displayName);
+        // The transfer demotes the owner to admin and promotes the target.
+        changePerson(previousOwnerMemberId, { role: "admin" });
+        changePerson(ownerMemberId, { role: "owner" });
         return true;
-      case "workspace.member.removed":
-      case "workspace.member.role_changed":
-        return members.has(event.payload.memberId);
-      case "workspace.ownership.transferred":
-        return (
-          members.has(event.payload.previousOwnerMemberId) &&
-          members.has(event.payload.ownerMemberId)
-        );
+      }
       case "workspace.project.created": {
         const project = projectSummary(event.payload.project);
         const held = projects.find((entry) => entry.id === project.id);
@@ -881,7 +981,11 @@ export function createWorkspaceService(
         return true;
       }),
     memberName: (memberId: MemberId) =>
-      members.get(memberId) ?? UNKNOWN_MEMBER_NAME,
+      members.get(memberId)?.displayName ?? UNKNOWN_MEMBER_NAME,
+    people: () => {
+      peopleList ??= Object.freeze([...members.values()]);
+      return peopleList;
+    },
     gateLive: (workspaceId: WorkspaceId) =>
       !closed && workspaceId === selected && gate.state() === "live",
     selectedWorkspaceId: () => selected,
