@@ -92,12 +92,54 @@ export const RECONNECT_BUDGET_WINDOW_MS = 10 * 60_000;
 /**
  * The stop reasons after which a reconnect may be asked for. They hold for
  * the connection of the signed-in device only, so they also end when no
- * device is signed in any more (`accountChanged`).
+ * device is signed in any more (`accountChanged`). The client remembers
+ * such a stop with its device, and brings it back when that device is
+ * signed in again without a new sign-in (`RememberedStop`).
  */
 const RECONNECTABLE_STOPS: ReadonlySet<ConnectionStopReason> = new Set([
   "connection_replaced",
   "protocol_violation",
 ]);
+
+/**
+ * A stop of `RECONNECTABLE_STOPS` that ended because its device was no
+ * longer eligible (#215), with that device (#217). When the same device is
+ * eligible again and no new sign-in came between (`signedInAgain`), the
+ * stop comes back instead of a connection: for example after
+ * "Remove this device and register again", when the API refused the revoke
+ * (`conflict`), the session ends the removal and the device is signed in
+ * again with the same ID, and the person never chose "Reconnect here once".
+ * It is forgotten when that device returns, or when another device is
+ * eligible.
+ */
+interface RememberedStop {
+  readonly reason: ConnectionStopReason;
+  readonly deviceId: DeviceId;
+  /** Whether a sign-in ran since the stop was remembered. */
+  signInSeen: boolean;
+}
+
+/**
+ * Whether `status` shows a new sign-in since `stop` was remembered. The
+ * sign-in state is the signal. The account status names no sign-in time,
+ * and a sign-in of the same device after a sign-out keeps its device ID
+ * and its key (P-65), so neither the device ID nor a key replacement tells.
+ * Every sign-in of the account service publishes `starting` first, and the
+ * service takes no action of the person, such as a removal or a sign-out,
+ * while a sign-in runs, so a device that is eligible again during a sign-in
+ * came back through it. A sign-in counts while it still runs, because the
+ * session reports the device signed in before the sign-in state is `idle`
+ * again, and once it ended with `signed_in`; one that was cancelled or
+ * failed does not count. A device state that passed through `signed_out`
+ * would not do: a sign-in that ends a pending removal or a refusal never
+ * shows `signed_out`.
+ */
+function signedInAgain(stop: RememberedStop, status: AccountStatus): boolean {
+  return (
+    status.signIn.kind !== "idle" ||
+    (stop.signInSeen && status.lastOutcome?.code === "signed_in")
+  );
+}
 
 /**
  * How long the client waits for the close event of a socket that it closed
@@ -358,6 +400,8 @@ export function createConnectionClient(
   let offlineReason: ConnectionOfflineReason | undefined;
   /** Why the client stopped; it does not reconnect on its own meanwhile. */
   let latch: ConnectionStopReason | null = null;
+  /** A reconnectable stop that ended with its device, while that device is not eligible. */
+  let remembered: RememberedStop | null = null;
   let live: Live | null = null;
   /** A socket that the client closed, until its close event arrives. */
   let draining: Live | null = null;
@@ -909,11 +953,23 @@ export function createConnectionClient(
     offlineReason = "reason" in eligible ? eligible.reason : undefined;
     const previous = target;
     target = next;
+    if (remembered !== null && status.signIn.kind !== "idle") {
+      remembered.signInSeen = true;
+    }
     if (next !== null && next !== previous) {
       // A device that is newly signed in, or another device: whatever
-      // stopped the previous one does not hold for it, except an update.
+      // stopped the previous one does not hold for it, except an update,
+      // and a stop that this device left with and returns to without a new
+      // sign-in (#217).
+      const restored =
+        remembered !== null &&
+        remembered.deviceId === next &&
+        !signedInAgain(remembered, status)
+          ? remembered.reason
+          : null;
+      remembered = null;
       if (latch !== "update_required") {
-        latch = null;
+        latch = restored;
       }
       attempt = 0;
       keyReplacedReconnectUsed = false;
@@ -933,7 +989,15 @@ export function createConnectionClient(
       // it, which makes it ineligible, and only a GitHub sign-in ends it, as
       // its sentence says. `update_required` stays as well: the server's
       // protocol version does not change with a sign-out, nor with a new
-      // device.
+      // device. The stop is remembered with its device, so that the same
+      // device's return without a new sign-in brings it back (#217).
+      if (previous !== null) {
+        remembered = {
+          reason: latch,
+          deviceId: previous,
+          signInSeen: status.signIn.kind !== "idle",
+        };
+      }
       latch = null;
     }
     pump();

@@ -750,23 +750,111 @@ test("each way of losing the device ends connection_replaced and protocol_violat
   }
 });
 
-test("after connection_replaced or protocol_violation and a sign-out, a sign-in of the same or another device connects", async () => {
-  for (const [code, reason] of RECONNECTABLE_CLOSES) {
-    for (const deviceId of [DEVICE_ID, OTHER_DEVICE_ID]) {
-      const h = harness();
-      await h.authenticate();
-      h.last().closed(code, reason);
-      h.emit(accountStatus({ ...SIGNED_OUT, revision: 2 }));
+/** The outcome of a sign-in that succeeded. */
+const SIGNED_IN_OUTCOME: AccountStatus["lastOutcome"] = Object.freeze({
+  code: "signed_in",
+});
 
-      h.emit(accountStatus({ revision: 3 }, deviceId));
-      expect(h.sockets, reason).toHaveLength(2);
-      expect(h.client.status().state, reason).toBe("connecting");
-      expect(h.client.reconnect(), reason).toEqual({
-        outcome: "refused",
-        reason: "already_open",
-      });
-      await h.authenticate();
-      expect(h.client.status().state, reason).toBe("connected");
+/**
+ * The account statuses of a GitHub sign-in that starts from `from`, from
+ * revision `revision` on, as the account service publishes them:
+ * `starting`, `waiting`, and `completing`; with `deviceFirst`, the device
+ * signed in while the sign-in still runs, as the session reports it before
+ * the service ends the sign-in; and last the device signed in with the
+ * sign-in `idle` again and the outcome `signed_in`.
+ */
+function signInStatuses(
+  from: AccountStatus,
+  revision: number,
+  deviceId: string,
+  deviceFirst: boolean,
+): AccountStatus[] {
+  const running = (
+    signIn: AccountStatus["signIn"],
+    at: number,
+  ): AccountStatus =>
+    accountStatus({ ...from, revision: at, signIn, lastOutcome: null });
+  const statuses = [
+    running({ kind: "starting" }, revision),
+    running(
+      { kind: "waiting", pairingCode: "123456", opened: true },
+      revision + 1,
+    ),
+    running({ kind: "completing" }, revision + 2),
+  ];
+  if (deviceFirst) {
+    statuses.push(
+      accountStatus(
+        { revision: revision + 3, signIn: { kind: "completing" } },
+        deviceId,
+      ),
+    );
+  }
+  statuses.push(
+    accountStatus(
+      { revision: revision + 4, lastOutcome: SIGNED_IN_OUTCOME },
+      deviceId,
+    ),
+  );
+  return statuses;
+}
+
+/**
+ * Ways in which a device stops being eligible that a sign-in ends. Only a
+ * sign-out passes through `signed_out`: a sign-in also ends a pending
+ * removal and a refusal, for example when the token request of the removal
+ * got `sign_in_required`.
+ */
+const BEFORE_SIGN_IN: readonly [string, AccountStatus][] = [
+  ["a sign-out", accountStatus({ ...SIGNED_OUT, revision: 2 })],
+  [
+    "a removal that waits for the API",
+    accountStatus({
+      revision: 2,
+      device: "removal_pending",
+      lastOutcome: SIGNED_IN_OUTCOME,
+    }),
+  ],
+  [
+    "a removal whose token request needs a sign-in",
+    accountStatus({
+      revision: 2,
+      device: "sign_in_required",
+      lastOutcome: SIGNED_IN_OUTCOME,
+    }),
+  ],
+];
+
+test("after connection_replaced or protocol_violation, a new sign-in of the same or another device connects", async () => {
+  for (const [code, reason] of RECONNECTABLE_CLOSES) {
+    for (const [name, from] of BEFORE_SIGN_IN) {
+      for (const deviceId of [DEVICE_ID, OTHER_DEVICE_ID]) {
+        for (const deviceFirst of [true, false]) {
+          const label = `${reason}, ${name}, ${deviceId}, ${String(deviceFirst)}`;
+          // The person signed in earlier, so the last outcome may already
+          // be `signed_in` before this sign-in.
+          const h = harness({
+            status: accountStatus({ lastOutcome: SIGNED_IN_OUTCOME }),
+          });
+          await h.authenticate();
+          h.last().closed(code, reason);
+          h.emit(from);
+          const before = h.statuses.length;
+
+          for (const status of signInStatuses(from, 3, deviceId, deviceFirst)) {
+            h.emit(status);
+          }
+          expect(h.sockets, label).toHaveLength(2);
+          // The stop never comes back on the way.
+          expect(h.states().slice(before), label).toEqual(["connecting"]);
+          expect(h.client.reconnect(), label).toEqual({
+            outcome: "refused",
+            reason: "already_open",
+          });
+          await h.authenticate();
+          expect(h.client.status().state, label).toBe("connected");
+        }
+      }
     }
   }
 });
@@ -794,6 +882,184 @@ test("another device that signs in while connection_replaced or protocol_violati
     h.emit(accountStatus({ revision: 2 }, OTHER_DEVICE_ID));
     expect(h.sockets, reason).toHaveLength(2);
     expect(h.client.status().state, reason).toBe("connecting");
+  }
+});
+
+test("after connection_replaced or protocol_violation, a removal that the API refuses brings the stop back and opens no socket", async () => {
+  for (const [code, reason] of RECONNECTABLE_CLOSES) {
+    // The person signed in earlier, so the last outcome is `signed_in`
+    // throughout; it is not a new sign-in.
+    const signedIn = accountStatus({ lastOutcome: SIGNED_IN_OUTCOME });
+    const h = harness({ status: signedIn });
+    await h.authenticate();
+    h.last().closed(code, reason);
+    const stopped = { state: "stopped", reason };
+    const offline = { state: "offline", reason: "not_signed_in" };
+    expect(h.client.status(), reason).toMatchObject(stopped);
+    const before = h.statuses.length;
+
+    for (const revision of [2, 4]) {
+      // "Remove this device and register again": the session notes the
+      // removal, and the stop ends (#215).
+      h.emit(
+        accountStatus({ ...signedIn, revision, device: "removal_pending" }),
+      );
+      expect(h.client.status(), reason).toMatchObject(offline);
+      // The API refused the revoke, for example with `conflict`: the
+      // session ends the removal, and the device is signed in again with
+      // the same ID.
+      h.emit(accountStatus({ ...signedIn, revision: revision + 1 }));
+      expect(h.client.status(), reason).toMatchObject(stopped);
+      expect(h.sockets, reason).toHaveLength(1);
+    }
+    // One status per change, and each fits the contract.
+    expect(h.statuses.slice(before).map(withoutRevision), reason).toEqual([
+      offline,
+      stopped,
+      offline,
+      stopped,
+    ]);
+    for (const status of h.statuses) {
+      expect(ConnectionStatusSchema.parse(status), reason).toEqual(status);
+    }
+    h.advance(10 * 60_000);
+    h.client.systemResumed();
+    expect(h.sockets, reason).toHaveLength(1);
+    expect(h.client.status(), reason).toMatchObject(stopped);
+
+    // The header's actions work again: "Reconnect here once" (or "Retry
+    // now") connects.
+    expect(h.client.reconnect(), reason).toEqual({ outcome: "reconnecting" });
+    expect(h.sockets, reason).toHaveLength(2);
+    await h.authenticate();
+    expect(h.client.status().state, reason).toBe("connected");
+  }
+});
+
+test("the same device that becomes eligible again without a sign-in brings connection_replaced or protocol_violation back, whichever way it left", async () => {
+  for (const [code, reason] of RECONNECTABLE_CLOSES) {
+    for (const [name, status] of NO_DEVICE) {
+      const label = `${reason}, ${name}`;
+      const h = harness();
+      await h.authenticate();
+      h.last().closed(code, reason);
+      h.emit(status);
+      expect(h.client.status().state, label).toBe("offline");
+
+      h.emit(accountStatus({ revision: 3 }));
+      expect(h.client.status(), label).toMatchObject({
+        state: "stopped",
+        reason,
+      });
+      expect(h.sockets, label).toHaveLength(1);
+    }
+  }
+});
+
+test("a sign-in that was cancelled or failed while the device was not eligible does not count as a new sign-in", async () => {
+  for (const [code, reason] of RECONNECTABLE_CLOSES) {
+    for (const outcome of ["cancelled", "sign_in_failed"] as const) {
+      const label = `${reason}, ${outcome}`;
+      const h = harness({
+        status: accountStatus({ lastOutcome: SIGNED_IN_OUTCOME }),
+      });
+      await h.authenticate();
+      h.last().closed(code, reason);
+      const pending = accountStatus({
+        revision: 2,
+        device: "removal_pending",
+        lastOutcome: SIGNED_IN_OUTCOME,
+      });
+      h.emit(pending);
+      h.emit(
+        accountStatus({
+          ...pending,
+          revision: 3,
+          signIn: { kind: "starting" },
+          lastOutcome: null,
+        }),
+      );
+      h.emit(
+        accountStatus({
+          ...pending,
+          revision: 4,
+          lastOutcome: { code: outcome },
+        }),
+      );
+
+      // The removal is tried again, and the API refuses it.
+      h.emit(accountStatus({ revision: 5, lastOutcome: { code: outcome } }));
+      expect(h.client.status(), label).toMatchObject({
+        state: "stopped",
+        reason,
+      });
+      expect(h.sockets, label).toHaveLength(1);
+    }
+  }
+});
+
+test("the remembered connection_replaced or protocol_violation is forgotten after a reconnect, a new sign-in, or another device", async () => {
+  /** A removal that the API refuses: the device leaves and comes back. */
+  const refusedRemoval = (
+    h: ReturnType<typeof harness>,
+    revision: number,
+    deviceId: string = DEVICE_ID,
+  ): void => {
+    h.emit(accountStatus({ revision, device: "removal_pending" }, deviceId));
+    // The client closed its socket; its close event arrives.
+    const socket = h.sockets.at(-1);
+    if (socket !== undefined && socket.closes.length > 0) {
+      socket.closed(1000);
+    }
+    h.emit(accountStatus({ revision: revision + 1 }, deviceId));
+  };
+
+  for (const [code, reason] of RECONNECTABLE_CLOSES) {
+    // A reconnect from the stop that came back.
+    const reconnected = harness();
+    await reconnected.authenticate();
+    reconnected.last().closed(code, reason);
+    refusedRemoval(reconnected, 2);
+    expect(reconnected.client.status(), reason).toMatchObject({
+      state: "stopped",
+      reason,
+    });
+    expect(reconnected.client.reconnect(), reason).toEqual({
+      outcome: "reconnecting",
+    });
+    await reconnected.authenticate();
+    refusedRemoval(reconnected, 4);
+    expect(reconnected.sockets, reason).toHaveLength(3);
+    expect(reconnected.client.status().state, reason).toBe("connecting");
+
+    // A new sign-in after a sign-out.
+    const signedIn = harness();
+    await signedIn.authenticate();
+    signedIn.last().closed(code, reason);
+    signedIn.emit(accountStatus({ ...SIGNED_OUT, revision: 2 }));
+    for (const status of signInStatuses(SIGNED_OUT, 3, DEVICE_ID, true)) {
+      signedIn.emit(status);
+    }
+    await signedIn.authenticate();
+    refusedRemoval(signedIn, 8);
+    expect(signedIn.sockets, reason).toHaveLength(3);
+    expect(signedIn.client.status().state, reason).toBe("connecting");
+
+    // Another device, and then the first device again.
+    const other = harness();
+    await other.authenticate();
+    other.last().closed(code, reason);
+    other.emit(accountStatus({ revision: 2, device: "removal_pending" }));
+    other.emit(accountStatus({ revision: 3 }, OTHER_DEVICE_ID));
+    expect(other.sockets, reason).toHaveLength(2);
+    await other.authenticate();
+    refusedRemoval(other, 4, OTHER_DEVICE_ID);
+    expect(other.sockets, reason).toHaveLength(3);
+    other.emit(accountStatus({ ...SIGNED_OUT, revision: 6 }));
+    other.last().closed(1000);
+    other.emit(accountStatus({ revision: 7 }));
+    expect(other.sockets, reason).toHaveLength(4);
+    expect(other.client.status().state, reason).toBe("connecting");
   }
 });
 
