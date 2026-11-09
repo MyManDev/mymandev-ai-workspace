@@ -1145,6 +1145,324 @@ export const DefinePersonResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type DefinePersonResult = z.infer<typeof DefinePersonResultSchema>;
 
+// The invitations (#95, decisions D1 to D3): the live invitations of the
+// selected workspace, and one strict channel for each invitation action.
+
+/**
+ * Limits of the invitation messages: the number of live invitations, the
+ * most that one answer of the API holds (the protocol's
+ * `MAX_ANSWER_LIST_ITEMS`); the length of a person's display name and of a
+ * workspace name in characters (code points; the protocol's `LIMITS`); and
+ * the lifetime of a new invitation in seconds (the protocol's
+ * `INVITATION_LIFETIME_SECONDS`). The main process cuts a longer name. The
+ * shared contract does not import the protocol package, so the main
+ * process's tests check that the values match.
+ */
+export const INVITATION_LIMITS = Object.freeze({
+  invitations: 1_000,
+  displayName: 64,
+  workspaceName: 100,
+  minLifetimeSeconds: 3_600,
+  maxLifetimeSeconds: 604_800,
+});
+
+/** An invitation code, like the protocol's `INVITATION_CODE_PATTERN`. */
+const INVITATION_CODE_PATTERN = /^mmdi_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u;
+
+/**
+ * An invitation code (`mmdi_`), a credential (D2), in exactly the
+ * protocol's form. It crosses IPC in two places only: from the renderer as
+ * the text that the person pasted, for a preview and an accept, and from
+ * the main process once, in the answer of a create. A longer string is
+ * refused before the pattern runs, and no error repeats the text. Trimming
+ * a pasted text is the join screen's job, so text with white space around
+ * the code is refused.
+ */
+export const InvitationCodeTextSchema = z
+  .string()
+  .max(48, { abort: true })
+  .regex(INVITATION_CODE_PATTERN, "Expected an invitation code");
+
+/**
+ * The lifetime of a new invitation in seconds, from 1 hour to 7 days; the
+ * create channel takes null for the API's default of 7 days.
+ */
+export const InvitationLifetimeSchema = z
+  .int()
+  .min(INVITATION_LIMITS.minLifetimeSeconds)
+  .max(INVITATION_LIMITS.maxLifetimeSeconds);
+
+/**
+ * A live invitation of the selected workspace (ADR 0014, "Invitations"):
+ * its ID, the member ID of the unclaimed person that it claims, its
+ * creator's display name, and its times. It never holds the code, which
+ * the API shows once, in the answer of the create, or a user ID.
+ */
+export const InvitationViewSchema = z.object({
+  invitationId: ProtocolIdSchema,
+  memberId: ProtocolIdSchema,
+  /** The creator's display name in the workspace, cut to its limit. */
+  creatorName: z.string().min(1).max(INVITATION_LIMITS.displayName),
+  createdAt: TimestampSchema,
+  expiresAt: TimestampSchema,
+});
+export type InvitationView = z.infer<typeof InvitationViewSchema>;
+
+/**
+ * The states of the live invitations: `signed_out` without a signed-in
+ * device with a ready key, `no_workspace` without a selected workspace,
+ * `not_allowed` when the account's own person is not the owner or an admin
+ * of it, `loading` until they loaded once for the selected workspace,
+ * `ready`, and `unavailable` after a failed load, until a load succeeds.
+ */
+export const INVITATION_STATUSES = Object.freeze([
+  "signed_out",
+  "no_workspace",
+  "not_allowed",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type InvitationStatusView = (typeof INVITATION_STATUSES)[number];
+
+const InvitationsViewFields = {
+  /**
+   * Grows with every change. A receiver keeps the state with the highest
+   * revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /** The selected workspace, or null. */
+  workspaceId: ProtocolIdSchema.nullable(),
+  /**
+   * The live invitations in the API's order, without the ones past their
+   * `expiresAt`; empty unless the status is `ready` or `unavailable`.
+   */
+  invitations: z
+    .array(InvitationViewSchema)
+    .max(INVITATION_LIMITS.invitations)
+    .readonly(),
+};
+
+/**
+ * What the renderer may know of the selected workspace's live invitations:
+ * `{ revision, status, problem?, workspaceId, invitations }`, with a
+ * problem only while `unavailable`. It holds IDs, names, and times only:
+ * no invitation code and no user ID.
+ */
+export const InvitationsViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum([
+      "signed_out",
+      "no_workspace",
+      "not_allowed",
+      "loading",
+      "ready",
+    ]),
+    ...InvitationsViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(WORKSPACE_PROBLEMS),
+    ...InvitationsViewFields,
+  }),
+]);
+export type InvitationsView = z.infer<typeof InvitationsViewSchema>;
+
+/**
+ * Why a request to load the live invitations was refused: `not_signed_in`,
+ * `no_workspace`, `not_allowed` as for the statuses, and `too_soon` within
+ * a few seconds of the last request that loaded.
+ */
+export const INVITATION_LOAD_REFUSALS = Object.freeze([
+  "not_signed_in",
+  "no_workspace",
+  "not_allowed",
+  "too_soon",
+] as const);
+
+/**
+ * The answer to a request to load the live invitations: `loading`, also
+ * while the workspace's people load and the role is not known yet, or
+ * `refused` with a reason.
+ */
+export const InvitationLoadResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("loading") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(INVITATION_LOAD_REFUSALS),
+  }),
+]);
+export type InvitationLoadResult = z.infer<typeof InvitationLoadResultSchema>;
+
+/**
+ * Why a create or a revocation was refused. Only the outcome `unknown`
+ * leaves open whether the API acted; after a refusal it did not.
+ *
+ * - `invalid`, `not_selected`, `not_signed_in`, `unavailable`, `too_soon`,
+ *   `not_allowed`, and `not_found` as for the people actions.
+ * - `rate_limited`: the API's limit, with `retryAfterMs` from its answer,
+ *   also the workspace's limits of 50 live invitations and 100 new
+ *   invitations in 24 hours.
+ * - `conflict`: the person or the invitation is not in the state that the
+ *   action needs, for example a claimed or removed person, or an
+ *   invitation that is no longer live.
+ * - `failed`: the API refused it otherwise.
+ */
+export const INVITATION_ACTION_REFUSALS = Object.freeze([
+  "invalid",
+  "not_selected",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "not_allowed",
+  "not_found",
+  "conflict",
+  "failed",
+] as const);
+export type InvitationActionRefusal =
+  (typeof INVITATION_ACTION_REFUSALS)[number];
+
+/**
+ * Why a preview or an accept of a pasted code was refused.
+ *
+ * - `invalid`: the text is not an invitation code. Nothing was sent.
+ * - `not_signed_in`, `unavailable`, `too_soon` as for the other actions.
+ * - `rate_limited`: the API's limit, with `retryAfterMs`, also its limit of
+ *   10 failed previews or accepts in 15 minutes.
+ * - `invitation_invalid`: the code is unknown, used, expired, or revoked,
+ *   or its person was removed; the API does not say which.
+ * - `already_member`: the account is already an active member of the
+ *   workspace.
+ * - `failed`: the API refused it otherwise.
+ */
+export const JOIN_INVITATION_REFUSALS = Object.freeze([
+  "invalid",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "invitation_invalid",
+  "already_member",
+  "failed",
+] as const);
+export type JoinInvitationRefusal = (typeof JOIN_INVITATION_REFUSALS)[number];
+
+/** The refusals of an invitation action that say when the next write may go. */
+const INVITATION_ACTION_WAITS: ReadonlySet<string> = new Set([
+  "too_soon",
+  "rate_limited",
+]);
+
+/** A refusal of one of `reasons`, with `retryAfterMs` for a wait only. */
+function invitationRefusedSchema<const T extends readonly string[]>(
+  reasons: T,
+) {
+  return z
+    .object({
+      outcome: z.literal("refused"),
+      reason: z.enum(reasons),
+      /**
+       * How long to wait before the next try, in milliseconds, for
+       * `too_soon` and `rate_limited` only; null otherwise.
+       */
+      retryAfterMs: z.int().positive().nullable(),
+    })
+    .refine(
+      (value) =>
+        INVITATION_ACTION_WAITS.has(value.reason) ===
+        (value.retryAfterMs !== null),
+      { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
+    );
+}
+
+const InvitationActionRefusedSchema = invitationRefusedSchema(
+  INVITATION_ACTION_REFUSALS,
+);
+const JoinInvitationRefusedSchema = invitationRefusedSchema(
+  JOIN_INVITATION_REFUSALS,
+);
+
+/**
+ * `unknown`: whether the API acted is not known. The action is never sent
+ * again on its own; the screen asks the person to check the list. For a
+ * preview, which changes nothing, it may still count as a failed one.
+ */
+const InvitationUnknownSchema = z.object({ outcome: z.literal("unknown") });
+
+/**
+ * The result of a create: `ok` with the new invitation's ID, its code, and
+ * when it expires, `refused`, or `unknown`. The answer is the only place
+ * where the main process sends a code (D2): it keeps none, and no channel
+ * sends it again. A new invitation for the same person revokes the
+ * previous one.
+ */
+export const CreateInvitationResultSchema = z.discriminatedUnion("outcome", [
+  z.object({
+    outcome: z.literal("ok"),
+    invitationId: ProtocolIdSchema,
+    code: InvitationCodeTextSchema,
+    expiresAt: TimestampSchema,
+  }),
+  InvitationActionRefusedSchema,
+  InvitationUnknownSchema,
+]);
+export type CreateInvitationResult = z.infer<
+  typeof CreateInvitationResultSchema
+>;
+
+/** The result of a revocation: `ok`, `refused`, or `unknown`. */
+export const RevokeInvitationResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  InvitationActionRefusedSchema,
+  InvitationUnknownSchema,
+]);
+export type RevokeInvitationResult = z.infer<
+  typeof RevokeInvitationResultSchema
+>;
+
+/**
+ * The result of a preview (ADR 0014, "Invitations"): `ok` with the
+ * workspace's name, the display name of the person that the code claims,
+ * the inviter's display name and GitHub login with the time it was last
+ * verified, and when the invitation expires; `refused`, or `unknown`. It
+ * never repeats the code.
+ */
+export const PreviewInvitationResultSchema = z.discriminatedUnion("outcome", [
+  z.object({
+    outcome: z.literal("ok"),
+    workspaceName: z.string().min(1).max(INVITATION_LIMITS.workspaceName),
+    displayName: z.string().min(1).max(INVITATION_LIMITS.displayName),
+    inviterName: z.string().min(1).max(INVITATION_LIMITS.displayName),
+    inviterLogin: LoginSchema,
+    inviterVerifiedAt: TimestampSchema,
+    expiresAt: TimestampSchema,
+  }),
+  JoinInvitationRefusedSchema,
+  InvitationUnknownSchema,
+]);
+export type PreviewInvitationResult = z.infer<
+  typeof PreviewInvitationResultSchema
+>;
+
+/**
+ * The result of an accept: `ok` with the joined workspace's ID and name,
+ * `refused`, or `unknown`. The main process loads the workspace list again
+ * after `ok` and `unknown`, so that the joined workspace appears in it.
+ */
+export const AcceptInvitationResultSchema = z.discriminatedUnion("outcome", [
+  z.object({
+    outcome: z.literal("ok"),
+    workspaceId: ProtocolIdSchema,
+    workspaceName: z.string().min(1).max(INVITATION_LIMITS.workspaceName),
+  }),
+  JoinInvitationRefusedSchema,
+  InvitationUnknownSchema,
+]);
+export type AcceptInvitationResult = z.infer<
+  typeof AcceptInvitationResultSchema
+>;
+
 // The agent activity of the open project (#28).
 
 /**
@@ -1933,6 +2251,45 @@ export const INVOKE_CONTRACT = Object.freeze({
     args: z.tuple([ProtocolIdSchema]),
     result: PersonActionResultSchema,
   }),
+  [INVOKE_CHANNELS.getInvitationState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: InvitationsViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeInvitationState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: InvitationsViewSchema,
+  }),
+  [INVOKE_CHANNELS.loadInvitations]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: InvitationLoadResultSchema,
+  }),
+  [INVOKE_CHANNELS.createInvitation]: Object.freeze({
+    /**
+     * The selected workspace's ID, the unclaimed person's member ID, and
+     * the lifetime in seconds, or null for the API's default.
+     */
+    args: z.tuple([
+      ProtocolIdSchema,
+      ProtocolIdSchema,
+      InvitationLifetimeSchema.nullable(),
+    ]),
+    result: CreateInvitationResultSchema,
+  }),
+  [INVOKE_CHANNELS.revokeInvitation]: Object.freeze({
+    /** The selected workspace's ID and the invitation's ID. */
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
+    result: RevokeInvitationResultSchema,
+  }),
+  [INVOKE_CHANNELS.previewInvitation]: Object.freeze({
+    /** The pasted code. */
+    args: z.tuple([InvitationCodeTextSchema]),
+    result: PreviewInvitationResultSchema,
+  }),
+  [INVOKE_CHANNELS.acceptInvitation]: Object.freeze({
+    /** The pasted code. */
+    args: z.tuple([InvitationCodeTextSchema]),
+    result: AcceptInvitationResultSchema,
+  }),
   [INVOKE_CHANNELS.getAgentState]: Object.freeze({
     args: NoArgumentsSchema,
     result: AgentActivityViewSchema,
@@ -2011,6 +2368,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.connectionStatusChanged]: ConnectionStatusSchema,
   [EVENT_CHANNELS.workspaceStateChanged]: WorkspaceViewSchema,
   [EVENT_CHANNELS.peopleStateChanged]: PeopleViewSchema,
+  [EVENT_CHANNELS.invitationStateChanged]: InvitationsViewSchema,
   [EVENT_CHANNELS.agentStateChanged]: AgentActivityViewSchema,
   [EVENT_CHANNELS.chatStateChanged]: ChatViewSchema,
   [EVENT_CHANNELS.deviceListChanged]: DeviceListViewSchema,

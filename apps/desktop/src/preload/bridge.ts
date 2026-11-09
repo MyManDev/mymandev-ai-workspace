@@ -5,6 +5,8 @@ import type {
   ConnectionBridge,
   DesktopBridge,
   DeviceListBridge,
+  InvitationActionsBridge,
+  InvitationsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -18,23 +20,29 @@ import {
   type InvokeChannel,
 } from "../shared/ipc-channels.ts";
 import type {
+  AcceptInvitationResult,
   AccountStatus,
   AgentActivityView,
   ChatLoadOlderResultView,
   ChatSendResultView,
   ChatView,
   ConnectionStatus,
+  CreateInvitationResult,
   DefinePersonResult,
   DeviceListLoadResult,
   DeviceListView,
   ForgetResult,
+  InvitationLoadResult,
+  InvitationsView,
   LiftRegistrationLockResult,
   MountResult,
   OtherDeviceRevocation,
   PeopleView,
   PersonActionResult,
+  PreviewInvitationResult,
   ReconnectResult,
   RemoveDeviceResult,
+  RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
   RuntimeStatus,
@@ -170,8 +178,10 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * close a project) and which the main process validates, the device IDs
  * of `devices.dismissNewDevices`, an array of strings that it copies, the
  * device ID of `devices.revokeDevice`, a string, with one of its own two
- * reasons, and the workspace IDs, member IDs, and display names of the
- * `peopleActions`, each a string.
+ * reasons, the workspace IDs, member IDs, and display names of the
+ * `peopleActions`, each a string, and the IDs and pasted codes of the
+ * `invitationActions`, each a string, with the lifetime of `create`, a
+ * whole number or null.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -427,6 +437,87 @@ export function createDesktopBridge(
     ),
   });
 
+  const invitations: InvitationsBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.getInvitationState,
+      ) as Promise<InvitationsView>,
+    subscribeState: (
+      listener: (state: InvitationsView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeInvitationState,
+        EVENT_CHANNELS.invitationStateChanged,
+        "An invitation state callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    load: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.loadInvitations,
+      ) as Promise<InvitationLoadResult>,
+  });
+
+  // Only strings, and a lifetime that is a whole number or null, go on; the
+  // main process checks each ID, the lifetime, and the code. Another value
+  // is refused here without naming it, and a pasted code never appears in
+  // an error.
+  const invitationActions: InvitationActionsBridge = Object.freeze({
+    create: (
+      workspaceId: string,
+      memberId: string,
+      lifetimeSeconds?: number | null,
+    ) => {
+      const lifetime =
+        lifetimeSeconds === undefined || lifetimeSeconds === null
+          ? null
+          : Number.isInteger(lifetimeSeconds)
+            ? lifetimeSeconds
+            : undefined;
+      return strings(workspaceId, memberId) && lifetime !== undefined
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.createInvitation,
+            workspaceId,
+            memberId,
+            lifetime,
+          ) as Promise<CreateInvitationResult>)
+        : Promise.reject(
+            new TypeError(
+              "create needs a workspace ID and a member ID string, and a whole number or null.",
+            ),
+          );
+    },
+    revoke: (workspaceId: string, invitationId: string) =>
+      strings(workspaceId, invitationId)
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.revokeInvitation,
+            workspaceId,
+            invitationId,
+          ) as Promise<RevokeInvitationResult>)
+        : Promise.reject(
+            new TypeError(
+              "revoke needs a workspace ID and an invitation ID string.",
+            ),
+          ),
+    preview: (code: string) =>
+      strings(code)
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.previewInvitation,
+            code,
+          ) as Promise<PreviewInvitationResult>)
+        : Promise.reject(new TypeError("preview needs a code string.")),
+    accept: (code: string) =>
+      strings(code)
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.acceptInvitation,
+            code,
+          ) as Promise<AcceptInvitationResult>)
+        : Promise.reject(new TypeError("accept needs a code string.")),
+  });
+
   const agents: AgentBridge = Object.freeze({
     getState: () =>
       ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
@@ -554,6 +645,8 @@ export function createDesktopBridge(
     workspaces,
     people,
     peopleActions,
+    invitations,
+    invitationActions,
     agents,
     chat,
     devices,
