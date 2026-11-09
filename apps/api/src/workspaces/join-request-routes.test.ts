@@ -578,7 +578,8 @@ test("an owner blocks: the requester's connection gets denied, a new request ans
   assert.equal(unknown.statusCode, 404);
   assert.deepEqual(unknown.json(), NOT_FOUND);
 
-  // A lifted block starts no 24-hour wait, and lifting it sends nothing.
+  // A lifted block starts no 24-hour wait, and lifting it sends the
+  // requester nothing.
   const fresh = await asked(guest, workspace.id);
   assert.notEqual(fresh.id, joinRequest.id);
   await settle();

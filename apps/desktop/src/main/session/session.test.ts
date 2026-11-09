@@ -12,9 +12,14 @@ import {
   type AuthChallengeFrame,
   AuthResponseFrameSchema,
   type ConnectionId,
+  DEVICE_PLATFORMS,
   deviceAuthInput,
   type DeviceAuthInput,
   type DeviceId,
+  DeviceListItemSchema,
+  DeviceListResponseSchema,
+  LIMITS,
+  MAX_ANSWER_LIST_ITEMS,
   MEMBERSHIP_ROUTES,
   newUuidV7,
   PROTOCOL_VERSION,
@@ -56,6 +61,7 @@ import {
   ACCESS_TOKEN_LIFETIME_MS,
   ACCESS_TOKEN_RENEW_MARGIN_MS,
   createDeviceSession,
+  DEVICE_LIST_MAX_ANSWER_BYTES,
   KEYS_REFUSED_MAX_AGE_MS,
   LOST_KEY_WAIT_MS,
   REPLACEMENT_GRACE_MS,
@@ -3730,6 +3736,119 @@ describe("device list", () => {
       ok: false,
       reason: "unexpected_response",
     });
+  });
+
+  /** The longest label: four-byte characters, as many as the protocol allows. */
+  const LONGEST_LABEL = "\u{1F5A5}".repeat(LIMITS.deviceLabel);
+
+  /**
+   * A device with every field at its longest form: the longest label and
+   * platform, every timestamp set (each has exactly 24 characters), and
+   * `current` false.
+   */
+  function longestDevice(index: number) {
+    const at = "2026-11-02T10:00:00.000Z";
+    return {
+      id: `0192f2a0-7c3e-7a1b-8c4d-${index.toString(16).padStart(12, "0")}`,
+      label: LONGEST_LABEL,
+      platform: DEVICE_PLATFORMS.reduce((longest, platform) =>
+        platform.length > longest.length ? platform : longest,
+      ),
+      createdAt: at,
+      lastSeenAt: at,
+      lastSignInAt: at,
+      signInExpiresAt: at,
+      revokedAt: at,
+      current: false,
+    };
+  }
+
+  /** An answer of exactly `bytes` bytes, with `content-length` or without it. */
+  function answerOf(body: string, bytes: number, declared: boolean): Response {
+    expect(Buffer.byteLength(body)).toBe(bytes);
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        ...(declared ? { "content-length": String(bytes) } : {}),
+      },
+    });
+  }
+
+  test("the largest answer that the protocol allows is read, although it is over the default cap (#224)", async () => {
+    const list = {
+      devices: Array.from({ length: MAX_ANSWER_LIST_ITEMS }, (_, index) =>
+        longestDevice(index),
+      ),
+      registrationLockedUntil: "2026-11-13T09:00:00.000Z",
+    };
+    // At the protocol's limits: one more device, or one more character in a
+    // label, is refused.
+    expect(DeviceListResponseSchema.safeParse(list).success).toBe(true);
+    expect(
+      DeviceListResponseSchema.safeParse({
+        ...list,
+        devices: [...list.devices, longestDevice(MAX_ANSWER_LIST_ITEMS)],
+      }).success,
+    ).toBe(false);
+    expect(
+      DeviceListItemSchema.safeParse({
+        ...longestDevice(0),
+        label: `${LONGEST_LABEL}\u{1F5A5}`,
+      }).success,
+    ).toBe(false);
+    // As the API writes it, with `JSON.stringify`.
+    const body = JSON.stringify(list);
+    const bytes = Buffer.byteLength(body);
+    expect(bytes).toBe(555_066);
+    expect(bytes).toBeGreaterThan(MAX_API_ANSWER_BYTES);
+    expect(bytes).toBeLessThanOrEqual(DEVICE_LIST_MAX_ANSWER_BYTES);
+
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    for (const declared of [true, false]) {
+      api.intercept = (request) =>
+        request.path === "/devices"
+          ? Promise.resolve(answerOf(body, bytes, declared))
+          : undefined;
+
+      expect(
+        await h.session.listDevices(),
+        `content-length: ${declared}`,
+      ).toEqual({ ok: true, value: list });
+    }
+  });
+
+  test("an answer is read up to the device list's own cap of 1 MiB, and one byte more is refused (#224)", async () => {
+    expect(DEVICE_LIST_MAX_ANSWER_BYTES).toBe(1024 * 1024);
+    const list = { devices: [DEVICE_ITEM], registrationLockedUntil: null };
+    const api = fakeApi();
+    const h = harness(api);
+    await existingDevice(h);
+    const cases: [number, boolean][] = [
+      [DEVICE_LIST_MAX_ANSWER_BYTES, true],
+      [DEVICE_LIST_MAX_ANSWER_BYTES + 1, false],
+    ];
+    for (const declared of [true, false]) {
+      for (const [bytes, ok] of cases) {
+        // A valid answer, padded with white space after the JSON.
+        const body = JSON.stringify(list).padEnd(bytes, " ");
+        api.intercept = (request) =>
+          request.path === "/devices"
+            ? Promise.resolve(answerOf(body, bytes, declared))
+            : undefined;
+
+        expect(
+          await h.session.listDevices(),
+          `${bytes} bytes, content-length: ${declared}`,
+        ).toEqual(
+          ok
+            ? { ok: true, value: list }
+            : { ok: false, reason: "unexpected_response" },
+        );
+      }
+    }
   });
 });
 

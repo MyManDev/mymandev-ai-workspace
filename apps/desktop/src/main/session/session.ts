@@ -85,6 +85,16 @@ export const LOST_KEY_WAIT_MS = 10 * 60_000;
 export const KEYS_REFUSED_MAX_AGE_MS = 24 * 60 * 60_000;
 
 /**
+ * The cap of the answer of `GET /devices` in bytes, in place of the default
+ * of 512 KiB (`MAX_API_ANSWER_BYTES`), like the caps of the other list reads
+ * (`api-reads.ts`). The largest device list that the protocol's limits
+ * allow, 1,000 devices with every field at its longest and 64 four-byte
+ * characters in each label, is about 555 KB; this cap holds it with room to
+ * spare, up to about 1,889 such devices (#224).
+ */
+export const DEVICE_LIST_MAX_ANSWER_BYTES = 1024 * 1024;
+
+/**
  * Why a call of the session failed:
  *
  * - `api_origin_unset`, `api_origin_invalid`: see `resolveApiOrigin`.
@@ -2034,6 +2044,7 @@ export function createDeviceSession(
   async function listDevices(): Promise<SessionResult<DeviceList>> {
     const result = await request({
       route: AUTH_ROUTES.listDevices,
+      maxAnswerBytes: DEVICE_LIST_MAX_ANSWER_BYTES,
       answer: DeviceListResponseSchema,
     });
     if (!result.ok) {

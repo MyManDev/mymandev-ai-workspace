@@ -10,6 +10,7 @@ import {
   SERVER_ONLY_EVENT_TYPES,
   WorkspaceJoinRequestCreatedEventSchema,
   WorkspaceJoinRequestResolvedEventSchema,
+  WorkspaceJoinRequestUnblockedEventSchema,
 } from "./envelope.ts";
 import { decodeClientMessage, decodeServerMessage } from "./frames.ts";
 import {
@@ -1168,12 +1169,16 @@ const created = (joinRequest: unknown) =>
 const resolved = (payload: unknown) =>
   joinRequestEvent("workspace.join_request.resolved", payload);
 
+const unblocked = (payload: unknown) =>
+  joinRequestEvent("workspace.join_request.unblocked", payload);
+
 test("a join request event comes only from the server, with a system actor and no device, and reaches a device", () => {
   const events = [
     created(pendingRequest),
     ...["approved", "denied", "withdrawn", "blocked"].map((outcome) =>
       resolved({ joinRequestId: JOIN_REQUEST_ID, outcome }),
     ),
+    unblocked({ joinRequestId: JOIN_REQUEST_ID }),
   ];
   for (const event of events) {
     const label = `${event.type} ${JSON.stringify(event.payload)}`;
@@ -1352,6 +1357,54 @@ test("workspace.join_request.resolved carries the request ID and its outcome, ne
       label,
     );
   }
+});
+
+test("workspace.join_request.unblocked carries only the ID of the request whose block was lifted", () => {
+  const valid = { joinRequestId: JOIN_REQUEST_ID };
+  assert.deepEqual(decodeEvent(unblocked(valid)), {
+    ok: true,
+    event: unblocked(valid),
+  });
+  // An unknown field is stripped, as on every event: a lifted block has no
+  // outcome, and the requester stays unnamed.
+  const parsed = WorkspaceJoinRequestUnblockedEventSchema.parse(
+    unblocked({
+      ...valid,
+      outcome: "unblocked",
+      requesterUserId: USER_ID,
+      unblockedBy: OWNER_USER_ID,
+    }),
+  );
+  assert.deepEqual(parsed.payload, valid);
+  assert.deepEqual(Object.keys(parsed.payload), ["joinRequestId"]);
+
+  const rejected: [label: string, value: unknown][] = [
+    ...withoutEach(valid, unblocked, "payload."),
+    ["no payload", unblocked(undefined)],
+    ["a null payload", unblocked(null)],
+    ["a null request ID", unblocked({ joinRequestId: null })],
+    [
+      "an invalid request ID",
+      unblocked({ joinRequestId: JOIN_REQUEST_ID.toUpperCase() }),
+    ],
+    ["a member ID instead", unblocked({ memberId: MEMBER_ID })],
+  ];
+  for (const [label, value] of rejected) {
+    assert.deepEqual(
+      decodeEvent(value),
+      { ok: false, code: "invalid_payload" },
+      label,
+    );
+  }
+  // A device never sends it, also when it is otherwise valid.
+  assert.deepEqual(decodeClientEvent(unblocked(valid)), {
+    ok: false,
+    code: "not_allowed_from_device",
+  });
+  assert.deepEqual(decodeClientMessage(unblocked(valid)), {
+    ok: false,
+    code: "not_allowed_from_device",
+  });
 });
 
 test("the requester's own list shows how each request ended, a block as a denial, and nothing about the workspace", () => {

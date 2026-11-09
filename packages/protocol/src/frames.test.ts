@@ -647,6 +647,7 @@ test("membership events come only from the server, with a system actor and no de
         "workspace.project.renamed",
         "workspace.join_request.created",
         "workspace.join_request.resolved",
+        "workspace.join_request.unblocked",
       ])
       .sort(),
   );
