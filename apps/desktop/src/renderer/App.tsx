@@ -147,11 +147,11 @@ export function App({
               connection === undefined
                 ? undefined
                 : () => {
-                    removal.onReconnect?.();
                     // The status shows what follows; a refusal changes nothing.
                     connection.reconnect().catch(() => undefined);
                   }
             }
+            onReconnecting={removal.onReconnecting}
             onRemoveDevice={removal.onRemove}
             onActionFocus={onActionFocus}
             removal={removal.view}
@@ -423,7 +423,7 @@ function useDeviceRemoval(
 ): {
   readonly view: DeviceRemovalView;
   readonly onRemove: (() => void) | undefined;
-  readonly onReconnect: (() => void) | undefined;
+  readonly onReconnecting: (() => void) | undefined;
 } {
   const [view, setView] = useState(IDLE_DEVICE_REMOVAL);
   const removal = useMemo(
@@ -435,7 +435,7 @@ function useDeviceRemoval(
   return {
     view,
     onRemove: removal?.remove,
-    onReconnect: removal?.reconnecting,
+    onReconnecting: removal?.reconnecting,
   };
 }
 
@@ -446,8 +446,12 @@ function useDeviceRemoval(
  * the status becomes `offline`, so that the focus does not drop to the
  * page. The returned function notes which button has the focus. Chromium
  * fires no blur when it removes the focused element, so the note still
- * names the button when its action goes. The actions are the frozen lists
- * of `describeConnectionView`, so only a change runs the check.
+ * names the button when its action goes. A blur while the window has no
+ * focus, as when the main process opens its native dialog, keeps the note
+ * too: the button stays the page's focused element, whether the status
+ * removes it before the window comes back or Chromium focuses it again
+ * first. The actions are the frozen lists of `describeConnectionView`, so
+ * only a change runs the check.
  */
 function useConnectionStatusFocus(
   actions: readonly ConnectionAction[],
@@ -492,6 +496,7 @@ export function ConnectionStatusIndicator({
   view,
   account,
   onReconnect,
+  onReconnecting,
   onRemoveDevice,
   onActionFocus,
   removal = IDLE_DEVICE_REMOVAL,
@@ -500,10 +505,16 @@ export function ConnectionStatusIndicator({
   /** The account status: it decides the sign-in sentence and the actions after `connection_replaced`. */
   readonly account: AccountView;
   readonly onReconnect?: (() => void) | undefined;
+  /**
+   * The removal's `reconnecting`: "Retry now" and "Reconnect here once"
+   * call it before `onReconnect`, so the message of the last removal ends.
+   */
+  readonly onReconnecting?: (() => void) | undefined;
   readonly onRemoveDevice?: (() => void) | undefined;
   /**
    * Gets the action of the button that takes the focus, and undefined when
-   * a button that is still in the page loses it.
+   * a button that is still in the page loses it while the window has the
+   * focus.
    */
   readonly onActionFocus?:
     ((action: ConnectionAction | undefined) => void) | undefined;
@@ -514,10 +525,17 @@ export function ConnectionStatusIndicator({
     account,
     removal.message,
   );
+  const reconnect =
+    onReconnect === undefined
+      ? undefined
+      : () => {
+          onReconnecting?.();
+          onReconnect();
+        };
   const handlers: Readonly<Record<ConnectionAction, (() => void) | undefined>> =
     {
-      retry_now: onReconnect,
-      reconnect_here: onReconnect,
+      retry_now: reconnect,
+      reconnect_here: reconnect,
       remove_and_register: onRemoveDevice,
     };
   return (
@@ -547,8 +565,12 @@ export function ConnectionStatusIndicator({
             onClick={removal.running ? undefined : handler}
             onFocus={() => onActionFocus?.(action)}
             onBlur={(event) => {
-              // A blur of a button that left the page is not the person's.
-              if (event.currentTarget.isConnected) {
+              // A blur of a button that left the page is not the person's,
+              // and neither is one while the window has no focus, as when
+              // the removal's native dialog opens: the button stays the
+              // page's focused element.
+              const button = event.currentTarget;
+              if (button.isConnected && button.ownerDocument.hasFocus()) {
                 onActionFocus?.(undefined);
               }
             }}

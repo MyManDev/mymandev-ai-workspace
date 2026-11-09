@@ -30,11 +30,14 @@ import {
 } from "./account-view.ts";
 import {
   createDeviceRemoval,
+  describeConnectionView,
+  focusesStatus,
   IDLE_DEVICE_REMOVAL,
   OFFLINE_SIGN_IN_DETAIL,
   REGISTER_AGAIN_MESSAGE,
   REMOVAL_NOT_DONE,
   REMOVAL_PENDING_MESSAGE,
+  type ConnectionAction,
   type ConnectionView,
   type DeviceRemovalView,
 } from "./connection-status.ts";
@@ -914,8 +917,9 @@ async function settle(): Promise<void> {
  * The connection indicator as the shell shows it, with "Remove this device
  * and register again" through a fake account bridge whose `removeDevice`
  * waits until the test answers it. Each call passes the account status on,
- * as the shell's effect does, and renders the indicator. A reconnect from
- * the header ends the removal's message, as in the shell.
+ * as the shell's effect does, and renders the indicator. The indicator gets
+ * the removal's `reconnecting`, as in the shell, so a reconnect from the
+ * header ends the removal's message only when the indicator calls it.
  */
 function removalSequence() {
   const answers: ((result: RemoveDeviceResult) => void)[] = [];
@@ -938,9 +942,9 @@ function removalSequence() {
       view,
       account,
       onReconnect: () => {
-        removal.reconnecting();
         reconnects += 1;
       },
+      onReconnecting: removal.reconnecting,
       onRemoveDevice: removal.remove,
       removal: removalView,
     });
@@ -1165,9 +1169,28 @@ interface TestProps {
   readonly children?: ReactNode;
   readonly onClick?: () => void;
   readonly onFocus?: () => void;
-  readonly onBlur?: (event: {
-    readonly currentTarget: { readonly isConnected: boolean };
-  }) => void;
+  readonly onBlur?: (event: TestBlurEvent) => void;
+}
+
+/** What a header button's blur handler reads of its event. */
+interface TestBlurEvent {
+  readonly currentTarget: {
+    readonly isConnected: boolean;
+    readonly ownerDocument: { readonly hasFocus: () => boolean };
+  };
+}
+
+/**
+ * A blur of a header button that is still in the page or not, while the
+ * window has the focus or not.
+ */
+function blurEvent(isConnected: boolean, windowFocused = true): TestBlurEvent {
+  return {
+    currentTarget: {
+      isConnected,
+      ownerDocument: { hasFocus: () => windowFocused },
+    },
+  };
 }
 
 /** The element and every element below it, without rendering components. */
@@ -1181,7 +1204,7 @@ function elementsOf(node: ReactNode): ReactElement<TestProps>[] {
   return [node, ...elementsOf(node.props.children)];
 }
 
-test("each header button reports when it takes the focus, and when it loses it while it is still in the page", () => {
+test("each header button reports when it takes the focus, and when it loses it while it is still in the page and the window has the focus", () => {
   const reports: (string | undefined)[] = [];
   const indicator = (view: ConnectionView) =>
     ConnectionStatusIndicator({
@@ -1196,12 +1219,12 @@ test("each header button reports when it takes the focus, and when it loses it w
 
   const [reconnect, remove] = buttons(REPLACED);
   reconnect?.props.onFocus?.();
-  reconnect?.props.onBlur?.({ currentTarget: { isConnected: true } });
+  reconnect?.props.onBlur?.(blurEvent(true));
   remove?.props.onFocus?.();
   // Chromium fires no blur when it removes the focused button; a blur of a
   // button that already left the page is not the person's, so the note
   // keeps naming it until the shell checks the new actions.
-  remove?.props.onBlur?.({ currentTarget: { isConnected: false } });
+  remove?.props.onBlur?.(blurEvent(false));
   const [retry] = buttons({
     kind: "known",
     status: {
@@ -1227,14 +1250,65 @@ test("each header button reports when it takes the focus, and when it loses it w
     }),
   ).filter((element) => element.type === "button");
   plain?.props.onFocus?.();
-  plain?.props.onBlur?.({ currentTarget: { isConnected: true } });
+  plain?.props.onBlur?.(blurEvent(true));
   expect(reports).toHaveLength(4);
 });
 
-test("Retry now and Reconnect here once call the reconnect, the removal calls its own handler, and nothing else does", () => {
-  let reconnects = 0;
+test("a blur while the window has no focus, as when the removal's native dialog opens, keeps the note, so the status paragraph takes the focus once the buttons go", () => {
+  let note: ConnectionAction | undefined;
+  const removeButton = (removal: DeviceRemovalView) =>
+    elementsOf(
+      ConnectionStatusIndicator({
+        view: REPLACED,
+        account: SIGNED_IN_ACCOUNT,
+        onReconnect: () => undefined,
+        onRemoveDevice: () => undefined,
+        onActionFocus: (action) => {
+          note = action;
+        },
+        removal,
+      }),
+    ).find(
+      (element) =>
+        element.type === "button" && element.props.children === REMOVE_LABEL,
+    );
+  const running: DeviceRemovalView = { running: true, message: undefined };
+  // Once the removal is confirmed, the account status removes both buttons.
+  const confirmed = describeConnectionView(
+    REPLACED,
+    REMOVAL_PENDING_ACCOUNT,
+  ).actions;
+  expect(confirmed).toEqual([]);
+
+  // The person moves the focus to the removal and chooses it.
+  removeButton(IDLE_DEVICE_REMOVAL)?.props.onFocus?.();
+  expect(note).toBe("remove_and_register");
+  // The main process opens its native dialog, which deactivates the
+  // window: the button, inert now, blurs while it is still in the page.
+  removeButton(running)?.props.onBlur?.(blurEvent(true, false));
+  expect(note).toBe("remove_and_register");
+  // When the status removes the buttons before the window comes back, the
+  // focus fell to the page, and the status paragraph takes it.
+  expect(focusesStatus(note, confirmed, true)).toBe(true);
+  // When the window comes back first, Chromium focuses the button again.
+  removeButton(running)?.props.onFocus?.();
+  expect(note).toBe("remove_and_register");
+  expect(focusesStatus(note, confirmed, true)).toBe(true);
+
+  // A blur while the window has the focus is the person's: the focus moved
+  // to another element of the page, and stays there.
+  removeButton(running)?.props.onBlur?.(blurEvent(true));
+  expect(note).toBeUndefined();
+  expect(focusesStatus(note, confirmed, true)).toBe(false);
+});
+
+test("Retry now and Reconnect here once call the removal's reconnecting and then the reconnect, the removal calls its own handler, and nothing else does", () => {
+  const calls: string[] = [];
   const onReconnect = () => {
-    reconnects += 1;
+    calls.push("reconnect");
+  };
+  const onReconnecting = () => {
+    calls.push("reconnecting");
   };
   const waiting = ConnectionStatusIndicator({
     view: {
@@ -1248,21 +1322,22 @@ test("Retry now and Reconnect here once call the reconnect, the removal calls it
     },
     account: SIGNED_IN_ACCOUNT,
     onReconnect,
+    onReconnecting,
   });
   const buttons = elementsOf(waiting).filter(
     (element) => element.type === "button",
   );
   expect(buttons.map((button) => button.props.children)).toEqual(["Retry now"]);
   buttons[0]?.props.onClick?.();
-  expect(reconnects).toBe(1);
+  expect(calls).toEqual(["reconnecting", "reconnect"]);
 
-  let removals = 0;
   const replaced = ConnectionStatusIndicator({
     view: REPLACED,
     account: SIGNED_IN_ACCOUNT,
     onReconnect,
+    onReconnecting,
     onRemoveDevice: () => {
-      removals += 1;
+      calls.push("remove");
     },
   });
   const replacedButtons = elementsOf(replaced).filter(
@@ -1272,10 +1347,11 @@ test("Retry now and Reconnect here once call the reconnect, the removal calls it
     "Reconnect here once",
     "Remove this device and register again",
   ]);
+  calls.length = 0;
   replacedButtons[0]?.props.onClick?.();
-  expect([reconnects, removals]).toEqual([2, 0]);
+  expect(calls).toEqual(["reconnecting", "reconnect"]);
   replacedButtons[1]?.props.onClick?.();
-  expect([reconnects, removals]).toEqual([2, 1]);
+  expect(calls).toEqual(["reconnecting", "reconnect", "remove"]);
 
   for (const reason of [
     "auth_failed",
