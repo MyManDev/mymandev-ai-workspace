@@ -60,6 +60,7 @@ function known(state: Partial<DeviceListView> = {}): DeviceSectionView {
       devices: [NEW_LAPTOP, THIS_DEVICE, LOST_LAPTOP],
       registrationLockedUntil: null,
       newDevices: [],
+      lostDeviceAdvice: false,
       ...state,
     } as DeviceListView,
   };
@@ -370,8 +371,14 @@ test("the notices of new devices name each label as text and its platform in one
   expect(none).not.toContain("<button");
 });
 
-/** The props of every device action, which note each call in `calls`. */
-function actionProps(calls: string[]): Partial<DevicesSectionContentProps> {
+/**
+ * The props of every device action, which note each call in `calls`; the
+ * dismissal of the advice answers `adviceEnded`.
+ */
+function actionProps(
+  calls: string[],
+  adviceEnded: Promise<boolean> = Promise.resolve(true),
+): Partial<DevicesSectionContentProps> {
   return {
     onRevokeDevice: (deviceId, reason, button) => {
       calls.push(`revoke ${deviceId} ${reason} ${String(button)}`);
@@ -381,6 +388,7 @@ function actionProps(calls: string[]): Partial<DevicesSectionContentProps> {
     },
     onDismissAdvice: () => {
       calls.push("dismiss the advice");
+      return adviceEnded;
     },
     onFocusTitle: () => {
       calls.push("focus the title");
@@ -471,7 +479,7 @@ test("each notice of a new device has This was not me: revoke as lost, bound to 
   ]);
 });
 
-test("while a device action runs, every device action's button stays focusable and does nothing, and the other buttons still work", () => {
+test("while a device action runs, every device action's button stays focusable and does nothing, and the other buttons still work", async () => {
   const calls: string[] = [];
   const running = {
     view: known({
@@ -484,13 +492,14 @@ test("while a device action runs, every device action's button stays focusable a
           createdAt: NEW_LAPTOP.createdAt,
         },
       ],
+      lostDeviceAdvice: true,
     }),
-    actions: { running: true, message: undefined, advice: true },
+    actions: { running: true, message: undefined },
+    ...actionProps(calls, Promise.resolve(false)),
     onDismissNewDevices: () => {
       calls.push("dismiss the notices");
-      return Promise.resolve(true);
+      return Promise.resolve(false);
     },
-    ...actionProps(calls),
   };
   const html = render(running);
   for (const label of [
@@ -508,12 +517,9 @@ test("while a device action runs, every device action's button stays focusable a
   for (const button of buttons) {
     button.props.onClick?.({ currentTarget: "button" });
   }
+  await settle();
   // Only the dismissals act.
-  expect(calls).toEqual([
-    "dismiss the advice",
-    "focus the title",
-    "dismiss the notices",
-  ]);
+  expect(calls).toEqual(["dismiss the advice", "dismiss the notices"]);
   expect(
     buttons
       .filter((button) => button.props["aria-disabled"] === "true")
@@ -528,37 +534,48 @@ test("while a device action runs, every device action's button stays focusable a
   expect(render(actionProps([]))).not.toContain("aria-disabled");
 });
 
-test("the sentence of the last device action sits in its own status paragraph, which takes the focus without a tab stop, and the advice follows a revocation as lost until it is dismissed", () => {
+test("the sentence of the last device action sits in its own status paragraph, which never takes the focus, and the advice shows while the list holds it, until it is dismissed", async () => {
   const calls: string[] = [];
   const idle = render(actionProps(calls));
   expect(idle).toContain(
-    '<p class="account-message" role="status"></p><p class="account-message" id="device-action-message" role="status" tabindex="-1"></p>',
+    '<p class="account-message" role="status"></p><p class="account-message" id="device-action-message" role="status"></p>',
   );
   expect(idle).not.toContain("After a lost device");
   // Without the bridge there is no paragraph of the actions.
   expect(render()).not.toContain("device-action-message");
 
-  const after = {
-    actions: {
-      running: false,
-      message: "The device was revoked as lost.",
-      advice: true,
-    },
-    ...actionProps(calls),
-  };
-  const html = render(after);
+  const after = (adviceEnded: Promise<boolean>) => ({
+    view: known({ lostDeviceAdvice: true }),
+    actions: { running: false, message: "The device was revoked as lost." },
+    ...actionProps(calls, adviceEnded),
+  });
+  const html = render(after(Promise.resolve(true)));
   expect(html).toContain(
-    '<p class="account-message" id="device-action-message" role="status" tabindex="-1">The device was revoked as lost.</p><div class="device-advice"><h4 id="lost-device-advice-title">After a lost device</h4><ul aria-labelledby="lost-device-advice-title"><li>End that device&#x27;s GitHub sessions: open github.com/settings/sessions in your browser and revoke them.</li><li>If the device was unlocked, change your GitHub password.</li><li>Rotate the AI provider credentials that are stored on that device. The server cannot reach them.</li></ul><div class="account-actions"><button type="button" class="panel-action">Dismiss the advice</button></div></div>',
+    '<p class="account-message" id="device-action-message" role="status">The device was revoked as lost.</p><div class="device-advice"><h4 id="lost-device-advice-title">After a lost device</h4><ul aria-labelledby="lost-device-advice-title"><li>End that device&#x27;s GitHub sessions: open github.com/settings/sessions in your browser and revoke them.</li><li>If the device was unlocked, change your GitHub password.</li><li>Rotate the AI provider credentials that are stored on that device. The server cannot reach them.</li></ul><div class="account-actions"><button type="button" class="panel-action">Dismiss the advice</button></div></div>',
   );
   // The address is text: no link that opens on its own.
   expect(html).not.toContain("<a");
   expect(html).not.toContain("href");
   expect(html).not.toContain("https://");
+  // The advice follows the list, not the last action: it shows also
+  // without a sentence, for example after the screen was opened again.
+  expect(
+    render({ view: known({ lostDeviceAdvice: true }), ...actionProps([]) }),
+  ).toContain("After a lost device");
 
-  const dismiss = buttonsOf(after).find(
-    (button) => button.props.children === "Dismiss the advice",
-  );
-  dismiss?.props.onClick?.();
-  // The button goes away with the advice, so the focus moves to the title.
-  expect(calls).toEqual(["dismiss the advice", "focus the title"]);
+  // The button goes away with the advice once the main process ended it,
+  // so only then does the focus move to the title.
+  for (const [ended, expected] of [
+    [Promise.resolve(true), ["dismiss the advice", "focus the title"]],
+    [Promise.resolve(false), ["dismiss the advice"]],
+    [Promise.reject(new Error("refused")), ["dismiss the advice"]],
+  ] as const) {
+    calls.length = 0;
+    const dismiss = buttonsOf(after(ended)).find(
+      (button) => button.props.children === "Dismiss the advice",
+    );
+    dismiss?.props.onClick?.();
+    await settle();
+    expect(calls).toEqual(expected);
+  }
 });

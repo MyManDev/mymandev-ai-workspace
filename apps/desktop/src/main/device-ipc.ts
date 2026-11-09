@@ -111,6 +111,7 @@ export function deviceListView(
     newDevices: Object.freeze(
       state.newDevices.slice(-DEVICE_LIST_LIMITS.newDevices).map(noticeView),
     ),
+    lostDeviceAdvice: state.lostDeviceAdvice,
   };
   const status = STATUS_VIEWS[state.status];
   if (status === "unavailable") {
@@ -140,6 +141,7 @@ export interface DeviceIpcOptions {
     | "dismissNewDevices"
     | "revokeDevice"
     | "liftRegistrationLock"
+    | "dismissLostDeviceAdvice"
   >;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
@@ -168,8 +170,10 @@ export interface DeviceIpc {
  * Manager's decision of 2026-11-09). `devices:revoke` takes one device ID,
  * a lowercase UUIDv7, and the reason `removed` or `lost`, and
  * `devices:lift-lock` takes nothing; the service accepts only an active
- * device of its list and a lock in force, the account service asks the
- * person in a native dialog, and the result is a fixed code. A change of
+ * device of its list or of a notice, and a lock that its list reported, the
+ * account service asks the person in a native dialog, and the result is a
+ * fixed code. `devices:dismiss-advice` takes nothing and ends the advice
+ * after a revocation as lost. A change of
  * the service raises the view's revision at once and publishes the latest
  * view after `DEVICE_PUBLISH_INTERVAL_MS`, so at most one view goes out in
  * each interval and the last change of a burst is always sent. Call it
@@ -269,6 +273,12 @@ export function registerDeviceIpc(
       INVOKE_CHANNELS.liftRegistrationLock,
       appUrl,
       (): Promise<LiftRegistrationLockResult> => devices.liftRegistrationLock(),
+    ),
+  );
+  ipc.handle(
+    INVOKE_CHANNELS.dismissLostDeviceAdvice,
+    createInvokeHandler(INVOKE_CHANNELS.dismissLostDeviceAdvice, appUrl, () =>
+      devices.dismissLostDeviceAdvice(),
     ),
   );
   const remove = devices.onChange(changed);

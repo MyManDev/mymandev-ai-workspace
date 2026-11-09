@@ -41,7 +41,10 @@ export interface SystemAccountOptions {
     reason: OtherDeviceRevocation,
   ) => Promise<boolean>;
   /** Asks the person to confirm lifting the registration lock in a native dialog. */
-  readonly confirmLiftRegistrationLock: (login: string) => Promise<boolean>;
+  readonly confirmLiftRegistrationLock: (
+    login: string,
+    lockedUntil: string,
+  ) => Promise<boolean>;
   /** Stops local execution after the API revoked this device. */
   readonly stopLocalExecution: () => void;
   /** Receives fixed messages; the key store's errors hold no secret. */

@@ -1284,6 +1284,7 @@ const pendingDevices: DeviceListBridge = {
   dismissNewDevices: () => Promise.resolve(false),
   revokeDevice: () => Promise.resolve({ outcome: "cancelled" }),
   liftRegistrationLock: () => Promise.resolve({ outcome: "cancelled" }),
+  dismissLostDeviceAdvice: () => Promise.resolve(false),
 };
 
 test("the account screen holds the account panel under This device and the account's devices beside it, which wait for their first states with the bridges", () => {
@@ -1295,7 +1296,7 @@ test("the account screen holds the account panel under This device and the accou
       initialView: accountView,
     }),
   ).toContain(
-    '<section aria-labelledby="account-screen-title"><h2 id="account-screen-title" tabindex="-1">Account</h2><p>Sign in this device with GitHub, manage the device and its sign-in, and see every device of the account.</p><section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">This device</h3><p>Checking the sign-in.</p></section><section class="account-panel" aria-labelledby="devices-title"><h3 id="devices-title" tabindex="-1">Devices</h3><p class="account-message" role="status">Checking the devices.</p><p class="account-message" id="device-action-message" role="status" tabindex="-1"></p></section></section>',
+    '<section aria-labelledby="account-screen-title"><h2 id="account-screen-title" tabindex="-1">Account</h2><p>Sign in this device with GitHub, manage the device and its sign-in, and see every device of the account.</p><section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">This device</h3><p>Checking the sign-in.</p></section><section class="account-panel" aria-labelledby="devices-title"><h3 id="devices-title" tabindex="-1">Devices</h3><p class="account-message" role="status">Checking the devices.</p><p class="account-message" id="device-action-message" role="status"></p></section></section>',
   );
   const without = render({ initialView: accountView });
   expect(without).toContain("<p>Sign-in is not available.</p>");

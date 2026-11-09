@@ -794,8 +794,10 @@ test("This is not me says whether the server removed the device or it stays list
   expect(forgetMessage({ outcome: "forgotten", removedAtServer: true })).toBe(
     "The account was removed from this installation, and the server removed this device from it.",
   );
+  // The message names the removal from another device, as the dialog does
+  // (the Project Manager's decision of 2026-11-09).
   expect(forgetMessage({ outcome: "forgotten", removedAtServer: false })).toBe(
-    "The account was removed from this installation only. The server did not remove this device, so it stays listed for that GitHub account, without a key.",
+    'The account was removed from this installation only. The server did not remove this device, so it stays listed for that GitHub account, without a key. Whoever owns that account can remove it from another of their devices, with "Remove" in the device list on the Account screen.',
   );
   expect(DEVICE_ACTION_MESSAGES.forgottenAtServer).toBe(
     forgetMessage({ outcome: "forgotten", removedAtServer: true }),

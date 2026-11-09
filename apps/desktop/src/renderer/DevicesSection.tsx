@@ -7,7 +7,7 @@ import {
   DEVICE_LIST_MESSAGES,
   describeDeviceList,
   deviceTimeFormat,
-  focusesActionMessage,
+  focusesTitleAfterAction,
   followDeviceList,
   formatDeviceTime,
   IDLE_DEVICE_ACTIONS,
@@ -25,11 +25,7 @@ import {
 /** The ID of the section's title. */
 export const DEVICES_TITLE_ID = "devices-title";
 
-/**
- * The ID of the paragraph with the sentence of the last device action. It
- * takes the focus without a tab stop once an action's button leaves the
- * page with the list.
- */
+/** The ID of the paragraph with the sentence of the last device action. */
 export const DEVICE_ACTION_MESSAGE_ID = "device-action-message";
 
 /** The ID of the line of the registration lock, which describes its button. */
@@ -57,7 +53,14 @@ export function DevicesSection({
 }) {
   const view = useDeviceSection(devices);
   const now = useDeviceListClock(view);
-  const { actions, controller } = useDeviceActions(devices);
+  const { actions, controller } = useDeviceActions(devices, view);
+  const onDismissAdvice = useCallback(
+    (): Promise<boolean> =>
+      devices === undefined
+        ? Promise.resolve(false)
+        : devices.dismissLostDeviceAdvice().catch(() => false),
+    [devices],
+  );
   const onDismissNewDevices = useCallback(
     (deviceIds: readonly string[]): Promise<boolean> =>
       // The next state shows what changed; a failed call ends nothing.
@@ -96,7 +99,7 @@ export function DevicesSection({
       onLiftRegistrationLock={
         controller === undefined ? undefined : onLiftRegistrationLock
       }
-      onDismissAdvice={controller?.dismissAdvice}
+      onDismissAdvice={devices === undefined ? undefined : onDismissAdvice}
       onFocusTitle={focusTitle}
     />
   );
@@ -108,19 +111,21 @@ function focusTitle(): void {
 }
 
 /**
- * Moves the focus to the action's sentence once the action's button leaves
- * the page with the next list (`focusesActionMessage`), while the focus is
- * still on that button or on the page.
+ * Moves the focus to the section's title once the action's button leaves
+ * the page with the next list (`focusesTitleAfterAction`), while the focus
+ * is still on that button or on the page. The action's sentence is read
+ * from its status paragraph, which does not take the focus, so a screen
+ * reader reads it once.
  */
 function focusAfterAction(done: boolean, button: Element | null): void {
   const active = document.activeElement;
   if (
-    focusesActionMessage(
+    focusesTitleAfterAction(
       done,
       active === null || active === document.body || active === button,
     )
   ) {
-    document.getElementById(DEVICE_ACTION_MESSAGE_ID)?.focus();
+    focusTitle();
   }
 }
 
@@ -159,12 +164,17 @@ export interface DevicesSectionContentProps {
   /** Lifts the registration lock; gets the button. Undefined without the bridge. */
   readonly onLiftRegistrationLock?:
     ((button: Element | null) => void) | undefined;
-  /** Ends the advice after a revocation as lost. */
-  readonly onDismissAdvice?: (() => void) | undefined;
   /**
-   * Moves the focus to the section's title. "Dismiss the notices" calls it
-   * once the main process ended a notice, and "Dismiss the advice" at once,
-   * because each button goes away and the focus would drop to the page.
+   * Ends the advice after a revocation as lost, which the main process
+   * holds, and resolves to true when it ended; undefined without the
+   * bridge.
+   */
+  readonly onDismissAdvice?: (() => Promise<boolean>) | undefined;
+  /**
+   * Moves the focus to the section's title. "Dismiss the notices" and
+   * "Dismiss the advice" call it once the main process ended what they
+   * dismiss, because each button goes away and the focus would drop to the
+   * page.
    */
   readonly onFocusTitle?: (() => void) | undefined;
 }
@@ -217,12 +227,11 @@ export function DevicesSectionContent({
           className="account-message"
           id={DEVICE_ACTION_MESSAGE_ID}
           role="status"
-          tabIndex={-1}
         >
           {actions.message ?? ""}
         </p>
       ) : null}
-      {actions.advice ? (
+      {model.lostDeviceAdvice ? (
         <LostDeviceAdvice
           onDismiss={onDismissAdvice}
           onFocusTitle={onFocusTitle}
@@ -326,14 +335,14 @@ function ActionButton({
 
 /**
  * The advice after a revocation as lost (ADR 0014): fixed sentences under a
- * heading, until the person dismisses it. The address of GitHub's sessions
- * is text, not a link.
+ * heading, while the main process holds it, until the person dismisses it.
+ * The address of GitHub's sessions is text, not a link.
  */
 function LostDeviceAdvice({
   onDismiss,
   onFocusTitle,
 }: {
-  readonly onDismiss: (() => void) | undefined;
+  readonly onDismiss: (() => Promise<boolean>) | undefined;
   readonly onFocusTitle: (() => void) | undefined;
 }) {
   return (
@@ -350,9 +359,16 @@ function LostDeviceAdvice({
             type="button"
             className="panel-action"
             onClick={() => {
-              onDismiss();
-              // The button goes away with the advice.
-              onFocusTitle?.();
+              // The button goes away with the advice once the main process
+              // ended it; a call that failed ends nothing.
+              void onDismiss().then(
+                (ended) => {
+                  if (ended) {
+                    onFocusTitle?.();
+                  }
+                },
+                () => undefined,
+              );
             }}
           >
             {DEVICE_ACTION_LABELS.dismissAdvice}
@@ -575,9 +591,14 @@ function useDeviceSection(
 
 /**
  * The device actions of the section (`createDeviceActions`) while it is
- * shown; undefined without the bridge.
+ * shown, which follow every view of the list, so that the sentence of the
+ * last action goes with a sign-out or another account or device; undefined
+ * without the bridge.
  */
-function useDeviceActions(bridge: DeviceListBridge | undefined): {
+function useDeviceActions(
+  bridge: DeviceListBridge | undefined,
+  view: DeviceSectionView,
+): {
   readonly actions: DeviceActionsView;
   readonly controller: DeviceActions | undefined;
 } {
@@ -589,6 +610,7 @@ function useDeviceActions(bridge: DeviceListBridge | undefined): {
         : createDeviceActions(bridge, setActions),
     [bridge],
   );
+  useEffect(() => controller?.listChanged(view), [controller, view]);
   return { actions, controller };
 }
 

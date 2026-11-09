@@ -202,11 +202,16 @@ export interface AccountServiceOptions {
   ) => Promise<boolean>;
   /**
    * Asks the person, in a native dialog of the main process, whether to lift
-   * the registration lock of the account with this login. Resolves to true
-   * only for the lift button (`LIFT_REGISTRATION_LOCK_CONFIRMATION` and
+   * the registration lock of the account with this login, which the device
+   * list reported to end at `lockedUntil` (UTC); the dialog names that time.
+   * Resolves to true only for the lift button
+   * (`LIFT_REGISTRATION_LOCK_CONFIRMATION` and
    * `liftRegistrationLockConfirmed`).
    */
-  readonly confirmLiftRegistrationLock: (login: string) => Promise<boolean>;
+  readonly confirmLiftRegistrationLock: (
+    login: string,
+    lockedUntil: string,
+  ) => Promise<boolean>;
   /**
    * Stops local execution after the API revoked this device (ADR 0014:
    * after `device_revoked` the desktop "stops local execution"). Called
@@ -296,12 +301,14 @@ export interface AccountService {
   ) => Promise<RevokeOtherDeviceResult>;
   /**
    * Lifts the account's registration lock (#95, D1 and D5b), for the device
-   * list service, which asks only while its list holds a lock in force. It
-   * follows the rules of `revokeOtherDevice`, with the confirmation
-   * `confirmLiftRegistrationLock` and the session's `liftRegistrationLock`.
-   * Never rejects.
+   * list service, which asks only while its last list reported a lock,
+   * ending at `lockedUntil`. It follows the rules of `revokeOtherDevice`,
+   * with the confirmation `confirmLiftRegistrationLock`, which names that
+   * time, and the session's `liftRegistrationLock`. Never rejects.
    */
-  readonly liftRegistrationLock: () => Promise<LiftRegistrationLockResult>;
+  readonly liftRegistrationLock: (
+    lockedUntil: string,
+  ) => Promise<LiftRegistrationLockResult>;
   /**
    * Calls `listener` after a device action of the person ended that may
    * have changed the account's devices: a sign-out, a removal of this
@@ -1622,12 +1629,15 @@ export function createAccountService(
     // These actions change no device of this installation and no account,
     // so they do not count as changes for the reads (`accountChanges`); a
     // read or a write meanwhile answers `unavailable` while the lock holds.
+    // A device that is `signed_in` is never signed out: the device state and
+    // the sign-out flag come from the same state of the session, and that
+    // state carries no `signedOut`. The key's state comes from the key
+    // store's load instead, so it is checked on its own.
     if (
       system === null ||
       session === null ||
       account.kind !== "signed_in" ||
       device !== "signed_in" ||
-      deviceSignedOut ||
       deviceKey !== "ready"
     ) {
       return "not_signed_in";
@@ -1700,13 +1710,17 @@ export function createAccountService(
     }
   }
 
-  async function liftRegistrationLock(): Promise<LiftRegistrationLockResult> {
-    const result = await liftRegistrationLockNow();
+  async function liftRegistrationLock(
+    lockedUntil: string,
+  ): Promise<LiftRegistrationLockResult> {
+    const result = await liftRegistrationLockNow(lockedUntil);
     deviceActionEnded(result.outcome);
     return result;
   }
 
-  async function liftRegistrationLockNow(): Promise<LiftRegistrationLockResult> {
+  async function liftRegistrationLockNow(
+    lockedUntil: string,
+  ): Promise<LiftRegistrationLockResult> {
     const begun = await beginDeviceListAction("lifting");
     if (begun === "unavailable") {
       return Object.freeze({ outcome: "refused", reason: "unavailable" });
@@ -1718,7 +1732,10 @@ export function createAccountService(
       }
       let confirmed: boolean;
       try {
-        confirmed = await options.confirmLiftRegistrationLock(begun.login);
+        confirmed = await options.confirmLiftRegistrationLock(
+          begun.login,
+          lockedUntil,
+        );
       } catch {
         report("The confirmation could not be shown.");
         return LIST_ACTION_FAILED;

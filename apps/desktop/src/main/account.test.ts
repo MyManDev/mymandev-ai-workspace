@@ -38,6 +38,7 @@ import {
 } from "./account.ts";
 import {
   deviceListActionFailure,
+  dialogTimeFormat,
   LIFT_REGISTRATION_LOCK_CONFIRMATION,
   liftRegistrationLockConfirmationMessage,
   liftRegistrationLockConfirmed,
@@ -475,8 +476,8 @@ function harness(
       state.log.push(`confirm revoke ${login} ${device.label} ${reason}`);
       return state.confirmRevoke(login, device, reason);
     },
-    confirmLiftRegistrationLock: (login) => {
-      state.log.push(`confirm lift ${login}`);
+    confirmLiftRegistrationLock: (login, lockedUntil) => {
+      state.log.push(`confirm lift ${login} until ${lockedUntil}`);
       return state.confirmLift(login);
     },
     stopLocalExecution: () => {
@@ -2655,6 +2656,9 @@ test("removing this device asks nothing of the session when the person keeps it 
 
 // ---- The account's other devices (#95, D1) -------------------------------
 
+/** The end of a registration lock that the device list reported. */
+const LOCK_END = "2026-11-16T10:00:00.000Z";
+
 const OTHER_DEVICE: OtherDevice = Object.freeze({
   id: OTHER_DEVICE_ID,
   label: "Work laptop",
@@ -2675,11 +2679,12 @@ test("revoking another device asks the person with the login, the device, and th
     ]);
   }
   h.log.length = 0;
-  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
     outcome: "lifted",
   });
+  // The confirmation gets the end of the lock that the device list reported.
   expect(h.log).toEqual([
-    "confirm lift octocat",
+    `confirm lift octocat until ${LOCK_END}`,
     "session liftRegistrationLock",
   ]);
   // This device stays signed in, and no status changed.
@@ -2699,7 +2704,7 @@ test("an uncertain answer is unknown and never sent again; a refusal or a failur
     await expect(
       h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
     ).resolves.toEqual({ outcome: "unknown" });
-    await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+    await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
       outcome: "unknown",
     });
     // One request each, and no other afterwards.
@@ -2732,7 +2737,7 @@ test("an uncertain answer is unknown and never sent again; a refusal or a failur
     await expect(
       h.service.revokeOtherDevice(OTHER_DEVICE, "removed"),
     ).resolves.toEqual({ outcome: "failed", reason });
-    await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+    await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
       outcome: "failed",
       reason,
     });
@@ -2745,7 +2750,7 @@ test("an uncertain answer is unknown and never sent again; a refusal or a failur
   await expect(
     h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
   ).resolves.toEqual({ outcome: "unknown" });
-  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
     outcome: "unknown",
   });
   expect(h.errors).toEqual([
@@ -2798,9 +2803,10 @@ test("the device actions of the list are unavailable while a sign-in, a sign-out
       h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
       name,
     ).resolves.toEqual(refusal);
-    await expect(h.service.liftRegistrationLock(), name).resolves.toEqual(
-      refusal,
-    );
+    await expect(
+      h.service.liftRegistrationLock(LOCK_END),
+      name,
+    ).resolves.toEqual(refusal);
   };
 
   // The key is still loading.
@@ -2918,7 +2924,7 @@ test("while a device action of the list runs, the other actions answer busy, rea
   await expect(
     h.service.revokeOtherDevice(OTHER_DEVICE, "removed"),
   ).resolves.toEqual({ outcome: "refused", reason: "unavailable" });
-  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
     outcome: "refused",
     reason: "unavailable",
   });
@@ -2929,7 +2935,7 @@ test("while a device action of the list runs, the other actions answer busy, rea
     reason: "lost",
   });
   // The lock is released: the next action runs.
-  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
     outcome: "lifted",
   });
   expect(
@@ -2945,7 +2951,7 @@ test("the device actions of the list ask nothing when the person keeps the confi
   await expect(
     h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
   ).resolves.toEqual({ outcome: "cancelled" });
-  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
     outcome: "cancelled",
   });
   h.confirmRevoke = () => Promise.reject(new Error("no dialog"));
@@ -2953,7 +2959,7 @@ test("the device actions of the list ask nothing when the person keeps the confi
   await expect(
     h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
   ).resolves.toEqual({ outcome: "failed", reason: "failed" });
-  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
     outcome: "failed",
     reason: "failed",
   });
@@ -2986,13 +2992,26 @@ test("the device actions of the list ask nothing when the person keeps the confi
     await other.service.initialize();
     harnesses.push(other);
   }
+  // The key's state comes from the key store's load, apart from the
+  // session's state: a key that could not be loaded refuses the actions
+  // too, also while the session names the device signed in.
+  const unreadable = harness();
+  unreadable.load = async () => {
+    throw new DeviceKeyError("unreadable");
+  };
+  await unreadable.service.initialize();
+  expect(unreadable.service.status()).toMatchObject({
+    deviceKey: "unreadable",
+    device: "signed_in",
+  });
+  harnesses.push(unreadable);
   for (const other of harnesses) {
     await expect(
       other.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
       other.service.status().device,
     ).resolves.toEqual({ outcome: "refused", reason: "not_signed_in" });
     await expect(
-      other.service.liftRegistrationLock(),
+      other.service.liftRegistrationLock(LOCK_END),
       other.service.status().device,
     ).resolves.toEqual({ outcome: "refused", reason: "not_signed_in" });
   }
@@ -3021,12 +3040,12 @@ test("the listeners of a device action hear of a revocation and a lift that ende
   });
 
   await h.service.revokeOtherDevice(OTHER_DEVICE, "lost");
-  await h.service.liftRegistrationLock();
+  await h.service.liftRegistrationLock(LOCK_END);
   expect(heard).toBe(2);
   h.revokeOther = async () => ({ ok: false, reason: "no_answer" });
   await h.service.revokeOtherDevice(OTHER_DEVICE, "removed");
   h.liftLock = async () => ({ ok: false, reason: "refused", code: "conflict" });
-  await h.service.liftRegistrationLock();
+  await h.service.liftRegistrationLock(LOCK_END);
   expect(heard).toBe(4);
   await settle();
   expect(h.log.filter((step) => step === "session listDevices")).toHaveLength(
@@ -3039,7 +3058,7 @@ test("the listeners of a device action hear of a revocation and a lift that ende
   expect(heard).toBe(4);
 });
 
-test("the confirmations of a revocation name the device's label and platform and the login, keep the device by default, and only the revocation as lost names the 7-day lock", () => {
+test("the confirmations of a revocation name the device's label and platform and the login, keep the device by default, and only the revocation as lost names the 7-day lock; the lift names the end of the lock", () => {
   expect(REVOKE_DEVICE_CONFIRMATIONS).toEqual({
     removed: {
       type: "warning",
@@ -3108,9 +3127,35 @@ test("the confirmations of a revocation name the device's label and platform and
       "New devices can then register on this account again at once. The lock protects the account after a device was lost: lift it only when you are about to register a new device yourself.",
   });
   expect(Object.isFrozen(LIFT_REGISTRATION_LOCK_CONFIRMATION)).toBe(true);
-  expect(liftRegistrationLockConfirmationMessage("octocat")).toBe(
-    "Lift the registration lock of the GitHub account octocat?",
+  // The message names the end of the lock, in the format of the devices
+  // section: the date and the time, in the given locale and time zone.
+  expect(
+    liftRegistrationLockConfirmationMessage(
+      "octocat",
+      "2026-11-16T10:00:00.000Z",
+      dialogTimeFormat("en-GB", "UTC"),
+    ),
+  ).toBe(
+    "Lift the registration lock of the GitHub account octocat, which ends at 16 Nov 2026, 10:00?",
   );
+  expect(
+    liftRegistrationLockConfirmationMessage(
+      "octocat",
+      "2026-11-16T10:00:00.000Z",
+      dialogTimeFormat("en-GB", "Europe/Istanbul"),
+    ),
+  ).toContain("which ends at 16 Nov 2026, 13:00?");
+  expect(
+    liftRegistrationLockConfirmationMessage("octocat", "not a time"),
+  ).toContain("which ends at not a time?");
+  // By default, the system's time zone.
+  expect(dialogTimeFormat().resolvedOptions().timeZone).toBe(
+    new Intl.DateTimeFormat().resolvedOptions().timeZone,
+  );
+  expect(dialogTimeFormat("en-GB").resolvedOptions()).toMatchObject({
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
   expect(liftRegistrationLockConfirmed({ response: 0 })).toBe(true);
   expect(liftRegistrationLockConfirmed({ response: 1 })).toBe(false);
 });

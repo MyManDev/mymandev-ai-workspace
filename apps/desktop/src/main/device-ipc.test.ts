@@ -97,6 +97,7 @@ function listState(overrides: Partial<DeviceListState> = {}): DeviceListState {
     ]),
     registrationLockedUntil: LOCK_END,
     newDevices: Object.freeze([notice()]),
+    lostDeviceAdvice: false,
     ...overrides,
   } as DeviceListState);
 }
@@ -107,6 +108,7 @@ const SIGNED_OUT: DeviceListState = Object.freeze({
   devices: Object.freeze([]),
   registrationLockedUntil: null,
   newDevices: Object.freeze([]),
+  lostDeviceAdvice: false,
 });
 
 interface Timer {
@@ -130,6 +132,7 @@ function fakeService(initial: DeviceListState = listState()) {
     reason: "lost",
   };
   let liftAnswer: LiftRegistrationLockResult = { outcome: "lifted" };
+  let dismissAdviceAnswer = true;
   return {
     timers,
     errors,
@@ -146,6 +149,9 @@ function fakeService(initial: DeviceListState = listState()) {
     },
     answerLift(answer: LiftRegistrationLockResult) {
       liftAnswer = answer;
+    },
+    answerDismissAdvice(answer: boolean) {
+      dismissAdviceAnswer = answer;
     },
     /** The timers that were neither cancelled nor fired. */
     waiting: () => timers.filter((timer) => !timer.cancelled && !timer.fired),
@@ -190,6 +196,10 @@ function fakeService(initial: DeviceListState = listState()) {
         ) => {
           calls.push(`revokeDevice ${deviceId} ${reason}`);
           return revokeAnswer;
+        },
+        dismissLostDeviceAdvice: () => {
+          calls.push("dismissLostDeviceAdvice");
+          return dismissAdviceAnswer;
         },
         liftRegistrationLock: async () => {
           calls.push("liftRegistrationLock");
@@ -289,6 +299,7 @@ const DEVICE_CHANNELS = [
   INVOKE_CHANNELS.dismissNewDevices,
   INVOKE_CHANNELS.revokeDevice,
   INVOKE_CHANNELS.liftRegistrationLock,
+  INVOKE_CHANNELS.dismissLostDeviceAdvice,
 ];
 
 test("the device list channels are registered, and nothing else", () => {
@@ -403,7 +414,29 @@ test("the view holds each device's ID, label, platform, times, and current mark,
         createdAt: LATER,
       },
     ],
+    lostDeviceAdvice: false,
   });
+  // The advice after a revocation as lost crosses as the service holds it.
+  expect(
+    deviceListView(listState({ lostDeviceAdvice: true }), 1).lostDeviceAdvice,
+  ).toBe(true);
+});
+
+test("the dismissal of the advice takes nothing, goes to the service, and answers as it does", () => {
+  const fake = fakeService();
+  const { call } = register(fake);
+  expect(call(INVOKE_CHANNELS.dismissLostDeviceAdvice)).toBe(true);
+  fake.answerDismissAdvice(false);
+  expect(call(INVOKE_CHANNELS.dismissLostDeviceAdvice)).toBe(false);
+  expect(() =>
+    call(INVOKE_CHANNELS.dismissLostDeviceAdvice, receiver(), true),
+  ).toThrow(
+    `The call on ${INVOKE_CHANNELS.dismissLostDeviceAdvice} was refused: the arguments do not match the contract.`,
+  );
+  expect(fake.calls).toEqual([
+    "dismissLostDeviceAdvice",
+    "dismissLostDeviceAdvice",
+  ]);
 });
 
 test("no user ID, key, token, or other key of the model crosses", () => {

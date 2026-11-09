@@ -455,6 +455,8 @@ export function createDesktopBridge(
       ipc.invoke(
         INVOKE_CHANNELS.liftRegistrationLock,
       ) as Promise<LiftRegistrationLockResult>,
+    dismissLostDeviceAdvice: () =>
+      ipc.invoke(INVOKE_CHANNELS.dismissLostDeviceAdvice) as Promise<boolean>,
   });
 
   return Object.freeze({

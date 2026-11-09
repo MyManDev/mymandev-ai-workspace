@@ -154,8 +154,6 @@ class Harness {
   accountStatus: AccountStatus;
   connectionStatus: ConnectionStatus;
   clock = 0;
-  /** The wall clock in milliseconds, for the end of the lock. */
-  wall = Date.parse(AT);
   /** Every device action that reached the account service, in order. */
   readonly accountActions: string[] = [];
   revokeAnswer: () => Promise<RevokeOtherDeviceResult> = async () => ({
@@ -206,8 +204,8 @@ class Harness {
         this.accountActions.push(`revoke ${JSON.stringify(device)} ${reason}`);
         return this.revokeAnswer();
       },
-      liftRegistrationLock: () => {
-        this.accountActions.push("lift");
+      liftRegistrationLock: (lockedUntil) => {
+        this.accountActions.push(`lift until ${lockedUntil}`);
         return this.liftAnswer();
       },
     };
@@ -226,7 +224,6 @@ class Harness {
       account,
       connection: client,
       now: () => this.clock,
-      wallClock: () => this.wall,
       scheduleTimer: (callback, delayMs) => {
         const timer: Timer = { callback, delayMs, cancelled: false };
         this.timers.push(timer);
@@ -312,6 +309,7 @@ test("nothing is read until the Account screen asks; then the state holds the de
     devices: [],
     registrationLockedUntil: null,
     newDevices: [],
+    lostDeviceAdvice: false,
   });
   expect(h.sent).toBe(0);
 
@@ -334,6 +332,7 @@ test("nothing is read until the Account screen asks; then the state holds the de
     devices: answer.devices,
     registrationLockedUntil: LOCK_END,
     newDevices: [],
+    lostDeviceAdvice: false,
   });
   expect(state.devices.map((device) => device.id)).toEqual([
     NEW_DEVICE_ID,
@@ -599,6 +598,7 @@ test("a failed load keeps what was loaded, shows its problem, and is retried wit
     devices: OWN_LIST.devices,
     registrationLockedUntil: null,
     newDevices: [],
+    lostDeviceAdvice: false,
   });
   // A success starts the backoff again.
   h.deviceAction();
@@ -825,10 +825,12 @@ test("a revocation and a lift are refused without a signed-in device, before the
   }
 });
 
-test("the lift is passed on only while the list holds a lock whose end is later than the wall clock", async () => {
+test("the lift is passed on with the lock's end whenever the last list reported a lock, whatever this device's clock says", async () => {
   const h = new Harness();
-  await h.loaded(ACTION_LIST);
-  h.wall = Date.parse(LOCK_END) - 1;
+  // The reported end lies before this device's clock, which may run ahead:
+  // the API lifts a lock in force and answers the same when there was none.
+  const past = "2020-01-01T00:00:00.000Z";
+  await h.loaded(list([item(DEVICE_ID)], past));
   await expect(h.service.liftRegistrationLock()).resolves.toEqual({
     outcome: "lifted",
   });
@@ -837,23 +839,193 @@ test("the lift is passed on only while the list holds a lock whose end is later 
     outcome: "failed",
     reason: "rate_limited",
   });
-  expect(h.accountActions).toEqual(["lift", "lift"]);
+  expect(h.accountActions).toEqual([
+    `lift until ${past}`,
+    `lift until ${past}`,
+  ]);
 
-  // At its end the lock no longer holds, as the API checks it.
-  h.wall = Date.parse(LOCK_END);
-  await expect(h.service.liftRegistrationLock()).resolves.toEqual({
-    outcome: "refused",
-    reason: "no_lock",
-  });
-  // A list without a lock.
+  // A list without a lock, and none loaded yet.
   const none = new Harness();
   await none.loaded(list([item(DEVICE_ID)]));
   await expect(none.service.liftRegistrationLock()).resolves.toEqual({
     outcome: "refused",
     reason: "no_lock",
   });
-  expect(h.accountActions).toHaveLength(2);
   expect(none.accountActions).toEqual([]);
+});
+
+test("a revocation as lost starts the advice, which stays until it is dismissed, a sign-out, or another account or device", async () => {
+  const h = new Harness();
+  await h.loaded(ACTION_LIST);
+  expect(h.service.dismissLostDeviceAdvice()).toBe(false);
+
+  // Removed, cancelled, refused, or failed: no advice.
+  for (const [answer, reason] of [
+    [{ outcome: "revoked", reason: "removed" }, "removed"],
+    [{ outcome: "unknown" }, "removed"],
+    [{ outcome: "cancelled" }, "lost"],
+    [{ outcome: "refused", reason: "unavailable" }, "lost"],
+    [{ outcome: "failed", reason: "conflict" }, "lost"],
+  ] as const) {
+    h.revokeAnswer = async () => answer;
+    await h.service.revokeDevice(NEW_DEVICE_ID, reason);
+    expect(h.service.state().lostDeviceAdvice, JSON.stringify(answer)).toBe(
+      false,
+    );
+  }
+
+  // Revoked as lost, and an answer that does not show whether it was.
+  for (const answer of [
+    { outcome: "revoked", reason: "lost" },
+    { outcome: "unknown" },
+  ] as const) {
+    h.revokeAnswer = async () => answer;
+    await h.service.revokeDevice(NEW_DEVICE_ID, "lost");
+    expect(h.service.state().lostDeviceAdvice, answer.outcome).toBe(true);
+    // The reloads keep it; the dismissal ends it once.
+    h.deviceAction();
+    await h.answer(ok(ACTION_LIST));
+    expect(h.service.state().lostDeviceAdvice).toBe(true);
+    expect(h.service.dismissLostDeviceAdvice()).toBe(true);
+    expect(h.service.state().lostDeviceAdvice).toBe(false);
+    expect(h.service.dismissLostDeviceAdvice()).toBe(false);
+  }
+
+  // A sign-out, another account, and another device drop it.
+  h.revokeAnswer = async () => ({ outcome: "revoked", reason: "lost" });
+  for (const drop of [
+    SIGNED_OUT,
+    accountStatus({}, OTHER_DEVICE_ID),
+    accountStatus({
+      account: Object.freeze({
+        kind: "signed_in",
+        login: "hubot",
+        displayName: "Hubot",
+        deviceId: NEW_DEVICE_ID,
+      }),
+    }),
+  ]) {
+    h.setAccount(accountStatus());
+    while (h.reads.length > 0) {
+      await h.answer(ok(ACTION_LIST));
+    }
+    await h.service.revokeDevice(NEW_DEVICE_ID, "lost");
+    expect(h.service.state().lostDeviceAdvice).toBe(true);
+    h.setAccount(drop);
+    expect(h.service.state().lostDeviceAdvice, drop.device).toBe(false);
+  }
+
+  // A drop while the revocation is on its way starts no advice for the
+  // next account or device.
+  const late = new Harness();
+  await late.loaded(ACTION_LIST);
+  let release: (result: RevokeOtherDeviceResult) => void = () => undefined;
+  late.revokeAnswer = () =>
+    new Promise((resolve) => {
+      release = resolve;
+    });
+  const revoking = late.service.revokeDevice(NEW_DEVICE_ID, "lost");
+  late.setAccount(SIGNED_OUT);
+  late.setAccount(accountStatus({}, OTHER_DEVICE_ID));
+  release({ outcome: "revoked", reason: "lost" });
+  await revoking;
+  expect(late.service.state().lostDeviceAdvice).toBe(false);
+});
+
+test("while an own device action runs, the triggers of a load wait, so no unavailable answer is shown, and the list loads once when it ended", async () => {
+  const h = new Harness();
+  await h.loaded(ACTION_LIST);
+  const published = h.states.length;
+  let release: (result: RevokeOtherDeviceResult) => void = () => undefined;
+  h.revokeAnswer = () =>
+    new Promise((resolve) => {
+      release = resolve;
+    });
+
+  const revoking = h.service.revokeDevice(NEW_DEVICE_ID, "lost");
+  // The API's revocation frame reaches this device before its answer, and
+  // a reconnect and the screen's request come meanwhile: nothing is read
+  // while the account service would answer unavailable.
+  h.receive(revoked(NEW_DEVICE_ID));
+  h.setConnection("offline");
+  h.setConnection("connected");
+  h.clock += DEVICE_LIST_LOAD_COOLDOWN_MS;
+  expect(h.service.load()).toEqual({ outcome: "loading" });
+  expect(h.sent).toBe(1);
+
+  // The account service tells its listeners when the action ended, before
+  // it answers: the list loads once.
+  h.deviceAction();
+  expect(h.sent).toBe(2);
+  release({ outcome: "revoked", reason: "lost" });
+  await revoking;
+  await h.answer(
+    ok(list([item(NEW_DEVICE_ID, { revokedAt: LATER }), item(DEVICE_ID)])),
+  );
+  expect(h.sent).toBe(2);
+  expect(
+    h.states.slice(published).some((state) => state.status === "unavailable"),
+  ).toBe(false);
+  expect(h.service.state().status).toBe("ready");
+
+  // An action that ended without telling the listeners, such as a kept
+  // confirmation, loads once for the triggers that waited.
+  h.revokeAnswer = () =>
+    new Promise((resolve) => {
+      release = resolve;
+    });
+  h.receive(registered("0192f0a0-7b3c-7d4e-8f50-000000000034"));
+  await h.answer(ok(ACTION_LIST));
+  const sentBefore = h.sent;
+  const keeping = h.service.revokeDevice(NEW_DEVICE_ID, "removed");
+  h.receive(revoked(OTHER_DEVICE_ID));
+  h.setConnection("offline");
+  h.setConnection("connected");
+  expect(h.sent).toBe(sentBefore);
+  release({ outcome: "cancelled" });
+  await keeping;
+  expect(h.sent).toBe(sentBefore + 1);
+  // Without a trigger meanwhile, nothing loads.
+  await h.answer(ok(ACTION_LIST));
+  h.liftAnswer = async () => ({ outcome: "cancelled" });
+  await h.service.liftRegistrationLock();
+  expect(h.sent).toBe(sentBefore + 1);
+});
+
+test("the action of a notice is accepted while the list does not hold its device, with the notice's label and platform, but never for this device", async () => {
+  // The list did not load: the notice's device is not in it.
+  const h = new Harness();
+  expect(h.service.load()).toEqual({ outcome: "loading" });
+  h.receive(registered(NEW_DEVICE_ID, "Work laptop"));
+  await h.answer(failure("rate_limited"));
+  expect(h.service.state().status).toBe("unavailable");
+
+  await expect(h.service.revokeDevice(NEW_DEVICE_ID, "lost")).resolves.toEqual({
+    outcome: "revoked",
+    reason: "lost",
+  });
+  expect(h.accountActions).toEqual([
+    `revoke ${JSON.stringify({ id: NEW_DEVICE_ID, label: "Work laptop", platform: "linux" })} lost`,
+  ]);
+  // This installation's device is refused, also without a list.
+  await expect(h.service.revokeDevice(DEVICE_ID, "lost")).resolves.toEqual({
+    outcome: "refused",
+    reason: "current_device",
+  });
+  // A device that is neither listed nor in a notice is not.
+  await expect(
+    h.service.revokeDevice("0192f0a0-7b3c-7d4e-8f50-0000000000ff", "lost"),
+  ).resolves.toEqual({ outcome: "refused", reason: "not_listed" });
+
+  // A list that shows the notice's device revoked wins over the notice.
+  const listed = new Harness();
+  await listed.loaded(ACTION_LIST);
+  listed.receive(registered(OTHER_DEVICE_ID));
+  await expect(
+    listed.service.revokeDevice(OTHER_DEVICE_ID, "lost"),
+  ).resolves.toEqual({ outcome: "refused", reason: "not_listed" });
+  expect(listed.accountActions).toEqual([]);
+  expect(h.accountActions).toHaveLength(1);
 });
 
 test("an account service that rejects makes the action unknown, and the log names neither the device nor its label", async () => {

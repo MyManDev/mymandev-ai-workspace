@@ -1344,6 +1344,7 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     devices: [LISTED_DEVICE],
     registrationLockedUntil: null,
     newDevices: [],
+    lostDeviceAdvice: false,
   });
   expect(listRequests()).toBe(1);
 
@@ -1634,8 +1635,8 @@ test("revoke another device as lost and lift the registration lock through IPC w
       );
       return true;
     },
-    confirmLiftRegistrationLock: async (login) => {
-      confirmations.push(`lift ${login}`);
+    confirmLiftRegistrationLock: async (login, lockedUntil) => {
+      confirmations.push(`lift ${login} ${lockedUntil}`);
       return true;
     },
     now: () => clock,
@@ -1722,6 +1723,17 @@ test("revoke another device as lost and lift the registration lock through IPC w
   expect(routes("GET /devices")).toBeGreaterThan(listsBefore);
   // This device stays signed in.
   expect(service.status().device).toBe("signed_in");
+  // The advice after a revocation as lost reaches the renderer with the
+  // list, and stays until it is dismissed through its channel.
+  await expect(ask(INVOKE_CHANNELS.getDeviceList)).resolves.toMatchObject({
+    lostDeviceAdvice: true,
+  });
+  await expect(ask(INVOKE_CHANNELS.dismissLostDeviceAdvice)).resolves.toBe(
+    true,
+  );
+  await expect(ask(INVOKE_CHANNELS.getDeviceList)).resolves.toMatchObject({
+    lostDeviceAdvice: false,
+  });
   // A revoked device is no longer listed as active.
   await expect(
     ask(INVOKE_CHANNELS.revokeDevice, otherId, "removed"),
@@ -1744,7 +1756,12 @@ test("revoke another device as lost and lift the registration lock through IPC w
     outcome: "lifted",
   });
   expect(routes(liftRoute)).toBe(2);
-  expect(confirmations.slice(1)).toEqual(["lift octocat", "lift octocat"]);
+  // Each confirmation names the end of the lock that the list reported.
+  const lockEnd = revokedList.registrationLockedUntil;
+  expect(confirmations.slice(1)).toEqual([
+    `lift octocat ${lockEnd}`,
+    `lift octocat ${lockEnd}`,
+  ]);
   await deviceListWhen(
     devices,
     (state) =>

@@ -360,9 +360,15 @@ export interface DeviceListBridge {
     reason: OtherDeviceRevocation,
   ) => Promise<RevokeOtherDeviceResult>;
   /**
-   * Lifts the account's registration lock while the list holds one in
-   * force. The main process asks the person to confirm in a native dialog.
-   * It passes nothing from the renderer on.
+   * Lifts the account's registration lock while the list reports one. The
+   * main process asks the person to confirm in a native dialog, which names
+   * the end of the lock. It passes nothing from the renderer on.
    */
   readonly liftRegistrationLock: () => Promise<LiftRegistrationLockResult>;
+  /**
+   * Ends the advice after a revocation as lost, which the device list
+   * holds until then (`lostDeviceAdvice`). Resolves to false when it did
+   * not show. It passes nothing from the renderer on.
+   */
+  readonly dismissLostDeviceAdvice: () => Promise<boolean>;
 }

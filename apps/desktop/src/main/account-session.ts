@@ -249,9 +249,36 @@ export const LIFT_REGISTRATION_LOCK_CONFIRMATION = Object.freeze({
     "New devices can then register on this account again at once. The lock protects the account after a device was lost: lift it only when you are about to register a new device yourself.",
 } as const);
 
-/** The message of the confirmation, with the login of the account. */
-export function liftRegistrationLockConfirmationMessage(login: string): string {
-  return `Lift the registration lock of the GitHub account ${login}?`;
+/**
+ * The format of a time in a native dialog: the date and the time, for
+ * example "Nov 15, 2026, 8:00 AM", as the devices section shows the same
+ * time, in `locale` (the application's) and the system's time zone unless
+ * the tests name one.
+ */
+export function dialogTimeFormat(
+  locale?: string,
+  timeZone?: string,
+): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat(locale, {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone,
+  });
+}
+
+/**
+ * The message of the confirmation, with the login of the account and the end
+ * of the lock that the device list reported, in `format`. A time that is not
+ * a date stays as it is.
+ */
+export function liftRegistrationLockConfirmationMessage(
+  login: string,
+  lockedUntil: string,
+  format: Intl.DateTimeFormat = dialogTimeFormat(),
+): string {
+  const end = new Date(lockedUntil);
+  const time = Number.isNaN(end.getTime()) ? lockedUntil : format.format(end);
+  return `Lift the registration lock of the GitHub account ${login}, which ends at ${time}?`;
 }
 
 /** Whether the person chose the lift button of `LIFT_REGISTRATION_LOCK_CONFIRMATION`. */

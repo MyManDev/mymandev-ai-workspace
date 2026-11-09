@@ -17,6 +17,7 @@ import {
 import { registerAccountIpc } from "./account-ipc.ts";
 import { registerAgentIpc } from "./agent-ipc.ts";
 import {
+  dialogTimeFormat,
   LIFT_REGISTRATION_LOCK_CONFIRMATION,
   liftRegistrationLockConfirmationMessage,
   liftRegistrationLockConfirmed,
@@ -183,12 +184,17 @@ function start(): void {
           : await dialog.showMessageBox(mainWindow, options),
       );
     },
-    // And lifting the registration lock.
-    confirmLiftRegistrationLock: async (login) => {
+    // And lifting the registration lock, with the end of the lock in the
+    // application's locale and the system's time zone.
+    confirmLiftRegistrationLock: async (login, lockedUntil) => {
       const options = {
         ...LIFT_REGISTRATION_LOCK_CONFIRMATION,
         buttons: [...LIFT_REGISTRATION_LOCK_CONFIRMATION.buttons],
-        message: liftRegistrationLockConfirmationMessage(login),
+        message: liftRegistrationLockConfirmationMessage(
+          login,
+          lockedUntil,
+          dialogTimeFormat(app.getLocale()),
+        ),
       };
       return liftRegistrationLockConfirmed(
         mainWindow === undefined
@@ -232,8 +238,10 @@ function start(): void {
   // D4 and D5b), read over HTTP once the Account screen asked for them and
   // again after the account frames, a reconnect, and the person's device
   // actions, with the notices of new devices from the live frame. It
-  // revokes another active device of its list and lifts a lock in force
-  // through the account service, which confirms each in a native dialog. It
+  // revokes another device of its list or of a notice and lifts a lock
+  // that its list reported, through the account service, which confirms
+  // each in a native dialog, and it keeps the advice after a revocation as
+  // lost until the person dismisses it. It
   // reaches the renderer through its own channels, at most one publish every
   // 50 ms. The logs are fixed text with a failure code at most, never a
   // label or an ID.

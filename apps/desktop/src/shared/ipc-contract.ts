@@ -1346,13 +1346,21 @@ const DeviceListViewFields = {
     .array(NewDeviceNoticeSchema)
     .max(DEVICE_LIST_LIMITS.newDevices)
     .readonly(),
+  /**
+   * Whether the advice after a revocation as lost shows (ADR 0014; the
+   * Project Manager's decision of 2026-11-09): from such a revocation of
+   * this device's account until the person dismisses it, a sign-out, or
+   * another account or device.
+   */
+  lostDeviceAdvice: z.boolean(),
 };
 
 /**
  * What the renderer may know of the device list service's state:
  * `{ revision, status, problem?, devices, registrationLockedUntil,
- * newDevices }`, with a problem only while `unavailable`. It holds device
- * IDs, labels, platforms, and times only: no user ID and nothing secret.
+ * newDevices, lostDeviceAdvice }`, with a problem only while `unavailable`.
+ * It holds device IDs, labels, platforms, times, and a flag only: no user
+ * ID and nothing secret.
  */
 export const DeviceListViewSchema = z.discriminatedUnion("status", [
   z.object({
@@ -1433,7 +1441,8 @@ export const REVOKE_DEVICE_REFUSALS = Object.freeze([
 /**
  * Why lifting the registration lock was not taken, before the person was
  * asked: `unavailable` and `not_signed_in` as for a revocation, and
- * `no_lock` when the list that the main process holds has no lock in force.
+ * `no_lock` when the last list that the main process holds reported no
+ * lock.
  */
 export const LIFT_REGISTRATION_LOCK_REFUSALS = Object.freeze([
   "unavailable",
@@ -1684,6 +1693,11 @@ export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.liftRegistrationLock]: Object.freeze({
     args: NoArgumentsSchema,
     result: LiftRegistrationLockResultSchema,
+  }),
+  [INVOKE_CHANNELS.dismissLostDeviceAdvice]: Object.freeze({
+    args: NoArgumentsSchema,
+    /** True when the advice showed and ended. */
+    result: z.boolean(),
   }),
 });
 

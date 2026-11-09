@@ -897,6 +897,7 @@ const DEVICE_LIST = Object.freeze({
   ],
   registrationLockedUntil: "2026-11-16T10:00:00.000Z",
   newDevices: [NEW_DEVICE],
+  lostDeviceAdvice: false,
 });
 
 test("a device list view holds the devices, the lock, and the notices, and a problem only while unavailable", () => {
@@ -914,6 +915,7 @@ test("a device list view holds the devices, the lock, and the notices, and a pro
     devices: [],
     registrationLockedUntil: null,
     newDevices: [],
+    lostDeviceAdvice: true,
   };
   expect(DeviceListViewSchema.parse(empty)).toEqual(empty);
   // A label counts characters, as the protocol does: 64 characters outside
@@ -986,6 +988,9 @@ test("a device list view holds the devices, the lock, and the notices, and a pro
     { ...ready, newDevices: [{ ...NEW_DEVICE, label: "" }] },
     { ...ready, newDevices: [{ ...NEW_DEVICE, platform: "ios" }] },
     { ...ready, newDevices: [{ ...NEW_DEVICE, createdAt: "today" }] },
+    // The advice is a flag of the list, never missing.
+    { ...ready, lostDeviceAdvice: "yes" },
+    { ...ready, lostDeviceAdvice: undefined },
   ]) {
     expect(
       DeviceListViewSchema.safeParse(value).success,
@@ -1022,6 +1027,14 @@ test("the device list's load answers loading or a fixed refusal, and its dismiss
   const dismiss = INVOKE_CONTRACT[INVOKE_CHANNELS.dismissNewDevices].result;
   expect(dismiss.parse(true)).toBe(true);
   expect(dismiss.safeParse("yes").success).toBe(false);
+  // The dismissal of the advice takes nothing and answers a boolean.
+  const advice = INVOKE_CONTRACT[INVOKE_CHANNELS.dismissLostDeviceAdvice];
+  expect(advice.args.parse([])).toEqual([]);
+  for (const value of [[true], [{ force: true }], [undefined]]) {
+    expect(advice.args.safeParse(value).success).toBe(false);
+  }
+  expect(advice.result.parse(false)).toBe(false);
+  expect(advice.result.safeParse("yes").success).toBe(false);
   for (const channel of [
     INVOKE_CHANNELS.getDeviceList,
     INVOKE_CHANNELS.subscribeDeviceList,
