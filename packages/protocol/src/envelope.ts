@@ -264,13 +264,13 @@ export const WorkspaceProjectRenamedEventSchema = z.object({
   }),
 });
 
-// Join request events (#210): the pending join requests of a workspace,
-// which only its owner and admins see. Only the server originates them,
-// after the commit, with a `system` actor and `deviceId: null`, like the
-// membership events (see `actorAllowed`). The server sends them only to the
-// connections subscribed to the workspace as its owner or an admin, never
-// to the requester and never to members. An expiry sends no event: a
-// receiver drops a request at its `expiresAt`.
+// Join request events (#210, #227): the pending join requests and the
+// blocks in force of a workspace, which only its owner and admins see. Only
+// the server originates them, after the commit, with a `system` actor and
+// `deviceId: null`, like the membership events (see `actorAllowed`). The
+// server sends them only to the connections subscribed to the workspace as
+// its owner or an admin, never to the requester and never to members. An
+// expiry sends no event: a receiver drops a request at its `expiresAt`.
 
 /**
  * An account asked to join the workspace. The payload is the new pending
@@ -329,6 +329,20 @@ export const WorkspaceJoinRequestResolvedEventSchema = z.object({
     joinRequestId: JoinRequestIdSchema,
     outcome: JoinRequestOutcomeSchema,
   }),
+});
+
+/**
+ * The owner or an admin lifted a block in force (#227), so the approvers'
+ * list no longer shows it. The request was not pending, so this is not a
+ * `workspace.join_request.resolved`: its decision stays `blocked`, and the
+ * requester still sees `denied` and is told nothing. The event's
+ * `occurredAt` is the time that the server stores as `unblocked_at`. A
+ * refused unblock sends nothing.
+ */
+export const WorkspaceJoinRequestUnblockedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.join_request.unblocked"),
+  payload: z.object({ joinRequestId: JoinRequestIdSchema }),
 });
 
 // Chat events (#110). A project's chat has one stream of messages; the
@@ -390,6 +404,7 @@ export const ProtocolEventSchema = z.discriminatedUnion("type", [
   WorkspaceProjectRenamedEventSchema,
   WorkspaceJoinRequestCreatedEventSchema,
   WorkspaceJoinRequestResolvedEventSchema,
+  WorkspaceJoinRequestUnblockedEventSchema,
   ChatMessageSendEventSchema,
   ChatMessageCreatedEventSchema,
 ]);
@@ -409,6 +424,7 @@ export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
   "workspace.project.renamed",
   "workspace.join_request.created",
   "workspace.join_request.resolved",
+  "workspace.join_request.unblocked",
   "chat.message.created",
 ] as const satisfies readonly EventType[]);
 export type ServerOnlyEventType = (typeof SERVER_ONLY_EVENT_TYPES)[number];
@@ -449,6 +465,7 @@ export function actorAllowed(event: ProtocolEvent): boolean {
     case "workspace.project.renamed":
     case "workspace.join_request.created":
     case "workspace.join_request.resolved":
+    case "workspace.join_request.unblocked":
     case "chat.message.created":
       // Only the server reports membership, project, and join request
       // changes and stored messages.

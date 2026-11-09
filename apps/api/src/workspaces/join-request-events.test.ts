@@ -46,13 +46,14 @@ import {
   type WorkspaceEventHandler,
 } from "./events.ts";
 
-// The join request events (#210): a new request reaches the subscribed
+// The join request events (#210, #227): a new request reaches the subscribed
 // connections of the workspace's owner and admins as
-// `workspace.join_request.created`, and every way a pending request ends
-// but an expiry as `workspace.join_request.resolved`. A member, the
-// requester, and another workspace's connections never get them. The relay
-// reads the owner and admins inside the transaction of each change, so a
-// role change counts from the next change on.
+// `workspace.join_request.created`, every way a pending request ends but an
+// expiry as `workspace.join_request.resolved`, and a lifted block as
+// `workspace.join_request.unblocked`. A member, the requester, and another
+// workspace's connections never get them. The relay reads the owner and
+// admins inside the transaction of each change, so a role change counts from
+// the next change on.
 
 let testDatabase: TestDatabase | undefined;
 
@@ -524,10 +525,10 @@ test("approving, denying, blocking, withdrawing, and denying all reach the owner
   await expectDecided(lee, "denied");
   await quiet(...everyone);
 
-  // Nothing pending, a lifted block, a pause, and a resume send nothing.
+  // Nothing pending, a pause, and a resume send nothing. A lifted block has
+  // its own event, tested below.
   for (const response of [
     await onAll(bob, team.workspaceId, "deny-all"),
-    await decide(ada, team.workspaceId, requestOf(ivy), "unblock"),
     await onAll(ada, team.workspaceId, "pause"),
     await onAll(ada, team.workspaceId, "resume"),
   ]) {
@@ -757,6 +758,189 @@ test("a refused or rolled-back change sends no join request event, and the same 
   await quiet(...everyone);
 });
 
+test("lifting a block reaches every connection subscribed as the owner or an admin as workspace.join_request.unblocked, and no member, blocked account, demoted admin, or other workspace; a refused or rolled-back unblock sends nothing", async (t) => {
+  const { account, delivered, failNextCommit } = await instance(t);
+  const ada = await account(3651);
+  // The second devices sign in before any device connects.
+  const adaPhone = await signInDevice(ada.app);
+  const bob = await account(3652);
+  const bobPhone = await signInDevice(bob.app);
+  const cleo = await account(3653);
+  const dan = await account(3654);
+  const ivy = await account(3655);
+  const jo = await account(3656);
+  const kim = await account(3657);
+  const eve = await account(3658);
+  const team = await workspaceOf(ada, [
+    [bob, "admin"],
+    [cleo, "member"],
+    [dan, "admin"],
+  ]);
+  const [bobInTeam, , danInTeam] = team.memberIds;
+  assert.ok(bobInTeam !== undefined && danInTeam !== undefined);
+  // The blocked account owns another workspace, with Eve as its admin.
+  const other = await workspaceOf(ivy, [[eve, "admin"]]);
+
+  // Before anyone connects, Ivy and Jo are blocked, and Kim's request stays
+  // pending.
+  const ivyRequest = await asked(ivy, team.workspaceId);
+  const joRequest = await asked(jo, team.workspaceId);
+  const kimRequest = await asked(kim, team.workspaceId);
+  for (const { id } of [ivyRequest, joRequest]) {
+    const blocked = await decide(ada, team.workspaceId, id, "block");
+    assert.equal(blocked.statusCode, 204, blocked.body);
+  }
+  delivered.splice(0);
+
+  const adaLaptop = (await connected(t, ada.app, ada.device)).client;
+  const adaPhoneClient = (await connected(t, ada.app, adaPhone)).client;
+  const bobLaptop = (await connected(t, bob.app, bob.device)).client;
+  const bobPhoneClient = (await connected(t, bob.app, bobPhone)).client;
+  const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  const danClient = (await connected(t, dan.app, dan.device)).client;
+  const ivyClient = (await connected(t, ivy.app, ivy.device)).client;
+  const eveClient = (await connected(t, eve.app, eve.device)).client;
+  const inTeam = [
+    adaLaptop,
+    adaPhoneClient,
+    bobLaptop,
+    bobPhoneClient,
+    cleoClient,
+    danClient,
+  ];
+  const everyone = [...inTeam, ivyClient, eveClient];
+  for (const client of inTeam) {
+    await subscribed(client, team.workspaceId);
+  }
+  await subscribed(ivyClient, other.workspaceId);
+  await subscribed(eveClient, other.workspaceId);
+  await drainPresence(...everyone);
+
+  /** The blocks in force that the approvers' list shows. */
+  const blocksShown = async () =>
+    (await approversList(ada, team.workspaceId))
+      .filter((shown) => shown.decision === "blocked")
+      .map((shown) => shown.id)
+      .sort();
+  const unblockedAt = async (joinRequestId: JoinRequestId) => {
+    const [row] = await database()
+      .select({ unblockedAt: workspaceJoinRequests.unblockedAt })
+      .from(workspaceJoinRequests)
+      .where(eq(workspaceJoinRequests.id, joinRequestId));
+    assert.ok(row !== undefined);
+    return row.unblockedAt;
+  };
+  /** The unblocked event that each of `clients` gets next. */
+  const expectUnblocked = async (
+    joinRequestId: JoinRequestId,
+    clients: readonly Client[],
+  ) => {
+    const at = await unblockedAt(joinRequestId);
+    assert.ok(at !== null);
+    for (const client of clients) {
+      const event = await nextEvent(client);
+      assert.ok(event.type === "workspace.join_request.unblocked", event.type);
+      assert.equal(event.workspaceId, team.workspaceId);
+      assert.deepEqual(event.actor, { kind: "system" });
+      assert.equal(event.deviceId, null);
+      // The time that the server stored as `unblocked_at`.
+      assert.equal(event.occurredAt, at.toISOString());
+      assert.deepEqual(event.payload, { joinRequestId });
+    }
+  };
+  const bothBlocks = [ivyRequest.id, joRequest.id].sort();
+  assert.deepEqual(await blocksShown(), bothBlocks);
+
+  // Refused: a member, a pending request, an unknown request, a non-member,
+  // and the owner of another workspace, which does not have the request.
+  for (const [response, status] of [
+    [await decide(cleo, team.workspaceId, ivyRequest.id, "unblock"), 403],
+    [await decide(ada, team.workspaceId, kimRequest.id, "unblock"), 409],
+    [
+      await decide(ada, team.workspaceId, newId<JoinRequestId>(), "unblock"),
+      404,
+    ],
+    [await decide(eve, team.workspaceId, ivyRequest.id, "unblock"), 404],
+    [await decide(ivy, other.workspaceId, ivyRequest.id, "unblock"), 404],
+  ] as const) {
+    assert.equal(response.statusCode, status, response.body);
+  }
+  await quiet(...everyone);
+  assert.equal(delivered.length, 0);
+
+  // Rolled back: the unblock ran to its end, and its commit failed.
+  failNextCommit();
+  const rolledBack = await decide(
+    bob,
+    team.workspaceId,
+    ivyRequest.id,
+    "unblock",
+  );
+  assert.equal(rolledBack.statusCode, 500, rolledBack.body);
+  assert.equal(await unblockedAt(ivyRequest.id), null);
+  assert.deepEqual(await blocksShown(), bothBlocks);
+  await quiet(...everyone);
+  assert.equal(delivered.length, 0);
+
+  // Committed: the admin lifts Ivy's block. Both connections of the owner
+  // and of the admin, and the other admin, get it.
+  const lifted = await decide(bob, team.workspaceId, ivyRequest.id, "unblock");
+  assert.equal(lifted.statusCode, 204, lifted.body);
+  await expectUnblocked(ivyRequest.id, [
+    adaLaptop,
+    adaPhoneClient,
+    bobLaptop,
+    bobPhoneClient,
+    danClient,
+  ]);
+  // Cleo is a member, Ivy is the blocked account and is told nothing, and
+  // Eve is an admin of another workspace.
+  await quiet(...everyone);
+  assert.equal(delivered.length, 1);
+  assert.deepEqual(
+    delivered[0]?.approvers,
+    [team.ownerId, bobInTeam, danInTeam].sort(),
+  );
+  // The approvers' list no longer shows the block.
+  assert.deepEqual(await blocksShown(), [joRequest.id]);
+  // Lifting it again is refused and sends nothing.
+  const again = await decide(ada, team.workspaceId, ivyRequest.id, "unblock");
+  assert.equal(again.statusCode, 409, again.body);
+  await quiet(...everyone);
+  assert.equal(delivered.length, 1);
+
+  // The owner demotes Dan, who stays subscribed as a member.
+  const demoted = await post(
+    ada,
+    `/workspaces/${team.workspaceId}/members/${danInTeam}/demote`,
+  );
+  assert.equal(demoted.statusCode, 204, demoted.body);
+  for (const client of inTeam) {
+    assert.deepEqual(await drained(client), ["workspace.member.role_changed"]);
+  }
+  await quiet(...everyone);
+  delivered.splice(0);
+  const liftedAgain = await decide(
+    ada,
+    team.workspaceId,
+    joRequest.id,
+    "unblock",
+  );
+  assert.equal(liftedAgain.statusCode, 204, liftedAgain.body);
+  await expectUnblocked(joRequest.id, [
+    adaLaptop,
+    adaPhoneClient,
+    bobLaptop,
+    bobPhoneClient,
+  ]);
+  await quiet(...everyone);
+  assert.deepEqual(
+    delivered.map(({ approvers }) => approvers),
+    [[team.ownerId, bobInTeam].sort()],
+  );
+  assert.deepEqual(await blocksShown(), []);
+});
+
 const SERVER_ONLY = {
   skip:
     process.env["DATABASE_TEST_URL"] === undefined &&
@@ -773,7 +957,7 @@ async function lockWaiters(): Promise<number> {
 }
 
 test(
-  "every change reads the owner and admins after it waited for its locks: a demotion that commits while a new request, a withdrawal, an approval, a denial, a block, or denying all waits leaves the demoted admin out of its event",
+  "every change reads the owner and admins after it waited for its locks: a demotion that commits while a new request, a withdrawal, an approval, a denial, a block, an unblock, or denying all waits leaves the demoted admin out of its event",
   SERVER_ONLY,
   async (t) => {
     const url = testDatabase?.url;
@@ -786,6 +970,7 @@ test(
     const jo = await account(3645);
     const kim = await account(3646);
     const lee = await account(3647);
+    const mei = await account(3648);
     const team = await workspaceOf(ada, [[bob, "admin"]]);
     const [bobInTeam] = team.memberIds;
     assert.ok(bobInTeam !== undefined);
@@ -794,6 +979,15 @@ test(
     const joRequest = await asked(jo, team.workspaceId);
     const kimRequest = await asked(kim, team.workspaceId);
     const leeRequest = await asked(lee, team.workspaceId);
+    // The block that the unblock lifts.
+    const meiRequest = await asked(mei, team.workspaceId);
+    const meiBlocked = await decide(
+      ada,
+      team.workspaceId,
+      meiRequest.id,
+      "block",
+    );
+    assert.equal(meiBlocked.statusCode, 204, meiBlocked.body);
     const adaClient = (await connected(t, ada.app, ada.device)).client;
     const bobClient = (await connected(t, bob.app, bob.device)).client;
     await subscribed(adaClient, team.workspaceId);
@@ -903,6 +1097,12 @@ test(
         expected: "blocked",
       },
       {
+        name: "an unblock waits for the request",
+        hold: holdRequest(meiRequest.id),
+        change: () => decide(ada, team.workspaceId, meiRequest.id, "unblock"),
+        expected: "unblocked",
+      },
+      {
         name: "denying all waits for the pending request",
         hold: holdRequest(leeRequest.id),
         change: () => onAll(ada, team.workspaceId, "deny-all"),
@@ -926,7 +1126,7 @@ test(
           delivered.map(({ event, approvers }) => [
             event.type === "workspace.join_request.resolved"
               ? event.payload.outcome
-              : "created",
+              : event.type.slice("workspace.join_request.".length),
             approvers,
           ]),
           [[expected, [team.ownerId]]],
@@ -952,6 +1152,10 @@ test("the type checker refuses a join request event where an event for every mem
       JoinRequestEvent,
       { type: "workspace.join_request.resolved" }
     >,
+    unblocked: Extract<
+      JoinRequestEvent,
+      { type: "workspace.join_request.unblocked" }
+    >,
     removed: Extract<WorkspaceEvent, { type: "workspace.member.removed" }>,
     run: AgentRunStateChangedEvent,
     registry: ConnectionRegistry,
@@ -962,21 +1166,31 @@ test("the type checker refuses a join request event where an event for every mem
     registry.sendToWorkspace(created);
     // @ts-expect-error -- sendEvent ignores the person's role
     registry.sendEvent(context, resolved);
+    // @ts-expect-error -- sendToWorkspace sends to every subscriber
+    registry.sendToWorkspace(unblocked);
+    // @ts-expect-error -- sendEvent ignores the person's role
+    registry.sendEvent(context, unblocked);
     registry.sendToPeople(created, []);
+    registry.sendToPeople(unblocked, []);
     registry.sendToWorkspace(removed);
     registry.sendEvent(context, run);
     // @ts-expect-error -- a join request event goes to the owner and admins only
     void handler(created);
     // @ts-expect-error -- a join request event goes to the owner and admins only
     void handler(resolved);
+    // @ts-expect-error -- a join request event goes to the owner and admins only
+    void handler(unblocked);
     // @ts-expect-error -- deliverWorkspaceEvent sends to every subscriber
     deliverWorkspaceEvent(registry, resolved, log);
+    // @ts-expect-error -- deliverWorkspaceEvent sends to every subscriber
+    deliverWorkspaceEvent(registry, unblocked, log);
     // @ts-expect-error -- a membership event is not a join request event
     void approverHandler(removed, []);
     // @ts-expect-error -- a run event is not a join request event
     void approverHandler(run, []);
     void approverHandler(created, []);
     void approverHandler(resolved, []);
+    void approverHandler(unblocked, []);
     void handler(removed);
   };
   assert.equal(typeof typeOnly, "function");
