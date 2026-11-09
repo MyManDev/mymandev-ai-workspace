@@ -306,8 +306,9 @@ export function createDeviceListService(
   let connected = false;
   /**
    * Whether the account status shows a sign-in that runs. The account
-   * service answers every read `unavailable` until it ended, and it may
-   * show the device signed in before that, so a load waits for it.
+   * service answers reads `unavailable` for most of it (all but the browser
+   * part of a renewal, #233), and it may show the device signed in before
+   * it ended, so a load waits for it.
    */
   let signInRunning = false;
   /** A load waits for the sign-in that runs to end. */

@@ -1746,6 +1746,150 @@ test("renew the sign-in of a signed-in device through IPC with the real flow and
   expect(errors).toEqual([]);
 });
 
+test("a read on its way when the code of a renewal arrives, with the real flow and session: it was sent while the browser was open, its token request that the previous key signed is refused after the key was replaced, and the renewed device stays signed in and reads again (#233)", async () => {
+  const folder = path.join(root, "MyManDev");
+  const keyStore = createDeviceKeyStore({
+    folder,
+    platform: "win32",
+    systemProtection: {
+      isAsyncEncryptionAvailable: () => Promise.resolve(true),
+      getSelectedStorageBackend: () => "unknown",
+      encryptStringAsync: (plainText) =>
+        Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8")),
+      decryptStringAsync: (ciphertext) =>
+        Promise.resolve({
+          shouldReEncrypt: false,
+          result: ciphertext.toString("utf8").slice("fake:".length),
+        }),
+    },
+  });
+  const records = createDeviceRecordStore({ folder, platform: "win32" });
+  const { api, fetch } = deviceApi();
+  const opened: string[] = [];
+  const errors: string[] = [];
+  let clock = 0;
+  const markers = () =>
+    createRegistrationMarkerStore({ folder, platform: "win32" });
+  const service = createAccountService({
+    apiOrigin: { ok: true, origin: API_ORIGIN },
+    openSystem: () => ({
+      keyStore,
+      deviceRecords: records,
+      registrationMarkers: markers(),
+      createFlow: () =>
+        createSignInFlow({
+          apiOrigin: { ok: true, origin: API_ORIGIN },
+          keyStore,
+          deviceRecords: records,
+          registrationMarkers: markers(),
+          openExternal: async (url) => {
+            opened.push(url);
+            return true;
+          },
+          fetch,
+          platform: "win32",
+          scheduleTimer: () => () => undefined,
+          listenerConnectionTimeoutMs: 2_000,
+          onError: (message) => errors.push(message),
+        }),
+      createSession: () => sessionOver(folder, keyStore, records, fetch),
+    }),
+    focusWindow: () => undefined,
+    confirmForget: async () => false,
+    confirmRemoveDevice: async () => false,
+    confirmRevokeDevice: async () => false,
+    confirmLiftRegistrationLock: async () => false,
+    now: () => clock,
+    onError: (message) => errors.push(message),
+  });
+  /** Starts a sign-in; the result posts the code and waits for the outcome. */
+  const start = async () => {
+    clock += SIGN_IN_START_COOLDOWN_MS;
+    const before = service.status().revision;
+    await expect(service.startSignIn()).resolves.toEqual({
+      outcome: "started",
+    });
+    const authorize = new URL(opened.at(-1) ?? "");
+    return async (code: string) => {
+      const done = idleWithOutcome(service, before);
+      expect(
+        await postForm(
+          authorize.searchParams.get("redirect_uri") ?? "",
+          new URLSearchParams({
+            code,
+            state: authorize.searchParams.get("state") ?? "",
+          }).toString(),
+        ),
+      ).toBe(200);
+      return done;
+    };
+  };
+
+  await service.initialize();
+  await (
+    await start()
+  )(SIGN_IN_CODE);
+  const firstKey = api.publicKey;
+
+  // The renewal's browser is open, and a read mints a token with the
+  // current key; the API holds its answer.
+  api.signInExpiresAt = "2026-12-09T10:00:00.000Z";
+  const postCode = await start();
+  expect(service.status().signIn).toMatchObject({ kind: "waiting" });
+  let release: () => void = () => undefined;
+  api.tokenGate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const asked = new Promise<void>((resolve) => {
+    api.onRequest = (route) => {
+      if (route === "POST /auth/access-token") {
+        resolve();
+      }
+    };
+  });
+  const reading = service.readDeviceList();
+  await Promise.race([
+    asked,
+    reading.then(() => {
+      throw new Error("The read was answered without a token request.");
+    }),
+  ]);
+  api.onRequest = null;
+
+  // The code arrives: the flow replaces the key, and the API commits the
+  // renewal and holds only the new key before it answers the token request.
+  const renewed = await postCode(SECOND_CODE);
+  expect(renewed).toMatchObject({
+    account: {
+      deviceId: DEVICE_ID,
+      signInExpiresAt: "2026-12-09T10:00:00.000Z",
+    },
+    device: "signed_in",
+    lastOutcome: { code: "signed_in" },
+  });
+  expect(api.publicKey).not.toBe(firstKey);
+  const tokensBefore = api.issued.length;
+  release();
+  api.tokenGate = null;
+
+  // The previous key's token request was refused, and that refusal says
+  // nothing about the renewed device: no data comes back, and the device
+  // is not refused.
+  await expect(reading).resolves.toEqual({
+    ok: false,
+    reason: "not_signed_in",
+  });
+  expect(api.issued.length).toBe(tokensBefore);
+  expect(service.status()).toMatchObject({
+    account: { kind: "signed_in", deviceId: DEVICE_ID },
+    device: "signed_in",
+    replacementPending: false,
+  });
+  await expect(service.readDeviceList()).resolves.toMatchObject({ ok: true });
+  expect(api.issued.length).toBe(tokensBefore + 1);
+  expect(errors).toEqual([]);
+});
+
 test("revoke another device as lost and lift the registration lock through IPC with the real session: confirmed in the main process, sent once, and the list loads again after each", async () => {
   const folder = path.join(root, "MyManDev");
   const keyStore = createDeviceKeyStore({

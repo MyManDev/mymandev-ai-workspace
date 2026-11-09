@@ -14,11 +14,13 @@ import { ProjectPanel } from "./ProjectPanel.tsx";
 import {
   createShellState,
   PANEL_IDS,
+  shellReducer,
   type PanelId,
   type ProjectSummary,
   type ShellAction,
 } from "./screens.ts";
-import { HomeScreen } from "./WorkspaceScreens.tsx";
+import { IDLE_HOME_SIGN_IN_START } from "./workspace-view.ts";
+import { HomeScreen, showAccountScreen } from "./WorkspaceScreens.tsx";
 
 interface HostProps {
   readonly children?: ReactNode;
@@ -286,6 +288,10 @@ test("Go to Account on the home screen shows the account screen and moves the fo
     const steps: string[] = [];
     const home = HomeScreen({
       signIn,
+      start: IDLE_HOME_SIGN_IN_START,
+      onStartSignIn: () => {
+        steps.push("start");
+      },
       dispatch: (action) => {
         steps.push(`dispatch ${action.type}`);
         dispatch(action);
@@ -294,12 +300,21 @@ test("Go to Account on the home screen shows the account screen and moves the fo
         steps.push(`focus #${id}`);
       },
     });
-    expect(clickEveryButton(home, take), signIn).toEqual([
-      ["Go to Account", [{ type: "show-screen", screen: "account" }]],
-    ]);
+    const goToAccount: [string, ShellAction[]] = [
+      "Go to Account",
+      [{ type: "show-screen", screen: "account" }],
+    ];
+    // "Sign in with GitHub" starts the sign-in and leaves the switch to
+    // the start (`createHomeSignInStart`).
+    expect(clickEveryButton(home, take), signIn).toEqual(
+      signIn === "sign_in"
+        ? [["Sign in with GitHub", []], goToAccount]
+        : [goToAccount],
+    );
     // The focus is asked for before the view changes, and goes to the
     // title that the account screen renders with this ID.
     expect(steps, signIn).toEqual([
+      ...(signIn === "sign_in" ? ["start"] : []),
       `focus #${ACCOUNT_SCREEN_TITLE_ID}`,
       "dispatch show-screen",
     ]);
@@ -311,6 +326,8 @@ test("Go to Account on the home screen shows the account screen and moves the fo
     clickEveryButton(
       HomeScreen({
         signIn: "none",
+        start: IDLE_HOME_SIGN_IN_START,
+        onStartSignIn: () => focused.push("start"),
         dispatch,
         focusAfterShow: (id) => focused.push(id),
       }),
@@ -318,4 +335,43 @@ test("Go to Account on the home screen shows the account screen and moves the fo
     ),
   ).toEqual([]);
   expect(focused).toEqual([]);
+});
+
+test("while its start runs, Sign in with GitHub on the home screen stays focusable and does nothing", () => {
+  const { dispatch, take } = recorder();
+  const started: string[] = [];
+  const home = HomeScreen({
+    signIn: "sign_in",
+    start: { running: true, message: undefined },
+    onStartSignIn: () => started.push("start"),
+    dispatch,
+    focusAfterShow: () => undefined,
+  });
+  const button = elementsOf(home).find(
+    (element) => textOf(element.props.children) === "Sign in with GitHub",
+  );
+  expect(button?.props).toMatchObject({ "aria-disabled": "true" });
+  expect(button?.props).not.toHaveProperty("disabled");
+  expect(clickEveryButton(home, take)).toEqual([
+    ["Sign in with GitHub", []],
+    ["Go to Account", [{ type: "show-screen", screen: "account" }]],
+  ]);
+  expect(started).toEqual([]);
+});
+
+test("the shell switch of a sign-in started on the home screen asks for the focus on the account screen's title first, and shows the account screen from the home screen", () => {
+  const steps: string[] = [];
+  let state = createShellState(PROJECTS);
+  showAccountScreen(
+    (action) => {
+      steps.push(`dispatch ${action.type}`);
+      state = shellReducer(state, action);
+    },
+    (id) => steps.push(`focus #${id}`),
+  );
+  expect(steps).toEqual([
+    `focus #${ACCOUNT_SCREEN_TITLE_ID}`,
+    "dispatch show-screen",
+  ]);
+  expect(state.view).toEqual({ screen: "account" });
 });

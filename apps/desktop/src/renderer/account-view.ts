@@ -387,8 +387,8 @@ export function offersSignIn(status: AccountStatus): boolean {
  * Whether the panel offers a GitHub sign-in that can start now: no sign-in
  * runs, the panel offers one (`offersSignIn`), the device key is ready, and
  * the build has a usable server address. Otherwise the panel shows no
- * sign-in button or a disabled one. The home screen asks the person to
- * sign in on the account screen only then.
+ * sign-in button or a disabled one. The home screen offers its "Sign in
+ * with GitHub" only then (#219).
  */
 export function canStartSignIn(status: AccountStatus): boolean {
   return (
