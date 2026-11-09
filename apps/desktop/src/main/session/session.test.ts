@@ -3360,6 +3360,68 @@ describe("tokens, clocks, and late refusals", () => {
       keys.current.publicKey,
     );
   });
+
+  // #233: the reads of a signed-in device go on during the browser part of
+  // a renewal, so one may still mint with the previous key when the code
+  // arrives and the flow replaces the key.
+  test.each([
+    ["auth_failed", "ok"],
+    ["sign_in_required", "sign_in_required"],
+  ] as const)(
+    "a %s refusal of the previous key that arrives after a renewal replaced it changes nothing",
+    async (_code, deviceState) => {
+      const api = fakeApi();
+      const h = harness(api);
+      await existingDevice(h);
+      api.deviceState = deviceState;
+      h.session.signInStarted();
+      // `auth_failed` is the API's answer after the renewal committed, and
+      // `sign_in_required` its answer before, which arrives late.
+      let release: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      api.intercept = (request) => {
+        if (request.path !== "/auth/access-token") {
+          return undefined;
+        }
+        if (deviceState === "sign_in_required") {
+          const answer = answerApi(api, request);
+          return gate.then(() => answer);
+        }
+        return gate.then(() => answerApi(api, request));
+      };
+      const reading = h.session.listDevices();
+      await waitForRequest(h, "POST", "/auth/access-token");
+
+      // What the flow does once the code arrived: it replaces the key, the
+      // API commits the renewal and holds only the new key, and the flow
+      // writes the record and confirms the replacement.
+      const keys = await h.keyStore.replace();
+      api.publicKey = keys.current.publicKey;
+      api.deviceState = "ok";
+      await h.records.write(deviceRecord(keys.current.publicKey));
+      await h.keyStore.confirmReplacement();
+      expect((await h.session.signInFinished({ kind: "signed_in" })).kind).toBe(
+        "signed_in",
+      );
+      h.calls.length = 0;
+      release();
+
+      expect(await reading).toEqual({ ok: false, reason: "no_device" });
+      expect(h.session.state().kind).toBe("signed_in");
+      expect(h.calls).toEqual([]);
+      expect(heldKeys(h)).toEqual({
+        current: keys.current.publicKey,
+        previous: null,
+      });
+      api.intercept = null;
+      expect((await h.session.listDevices()).ok).toBe(true);
+      expect(
+        signerOf(api, tokenRequests(api).at(-1), [keys.current.publicKey]),
+      ).toBe(keys.current.publicKey);
+    },
+  );
 });
 
 describe("remove this device", () => {
