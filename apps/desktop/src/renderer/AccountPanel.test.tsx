@@ -340,7 +340,7 @@ test("signed in, the panel shows the login, the name, and the end of the sign-in
   const html = render({ view: { kind: "known", status: SIGNED_IN } });
 
   expect(html).toContain(
-    '<dl class="account-facts"><dt>GitHub login</dt><dd>octocat</dd><dt>Name</dt><dd>The Octocat</dd><dt>Signed in until</dt><dd><time dateTime="2026-12-02T10:00:00.000Z">2 December 2026</time></dd></dl>',
+    '<dl class="account-facts"><dt>GitHub login</dt><dd>octocat</dd><dt>Name</dt><dd>The Octocat</dd><dt>Signed in until</dt><dd><time dateTime="2026-12-02T10:00:00.000Z">2 December 2026 at 10:00</time></dd></dl>',
   );
   expect(html).not.toContain("0192f2a0");
   expect(html).not.toContain("Sign in with GitHub");
@@ -740,8 +740,8 @@ function endingAt(endsAt: number, base: AccountStatus = SIGNED_IN) {
   } satisfies AccountStatus;
 }
 
-test("before the last 5 days, the end of the sign-in shows and the renewal is offered without a prompt (D4)", () => {
-  for (const left of [29 * DAY_MS, 6 * DAY_MS, 5 * DAY_MS + 1]) {
+test("before day 25 of the sign-in, the end shows and the renewal is offered without a prompt (D4)", () => {
+  for (const left of [29 * DAY_MS, 7 * DAY_MS, 6 * DAY_MS + 1]) {
     const view = { kind: "known", status: endingAt(NOW + left) } as const;
     const html = render({ view });
 
@@ -758,8 +758,9 @@ test("before the last 5 days, the end of the sign-in shows and the renewal is of
   }
 });
 
-test("from 5 days before the end, a fixed sentence asks to renew the sign-in and describes its button; after the end it says that the sign-in ended (D4)", () => {
+test("from day 25, 6 days before the end, a fixed sentence asks to renew the sign-in and describes its button; after the end it says that the sign-in ended (D4)", () => {
   for (const [left, sentence] of [
+    [6 * DAY_MS, SIGN_IN_RENEWAL_MESSAGES.due],
     [5 * DAY_MS, SIGN_IN_RENEWAL_MESSAGES.due],
     [DAY_MS, SIGN_IN_RENEWAL_MESSAGES.due],
     [1, SIGN_IN_RENEWAL_MESSAGES.due],
@@ -779,8 +780,8 @@ test("from 5 days before the end, a fixed sentence asks to renew the sign-in and
       '<button type="button" class="panel-action" disabled="" aria-describedby="sign-in-renewal">Renew the sign-in</button>',
     );
   }
-  // The date in the person's locale and time zone: an end at 23:30 UTC is
-  // the next day in Istanbul.
+  // The date and the time in the person's locale and time zone: an end at
+  // 23:30 UTC is the next day in Istanbul.
   expect(
     render({
       view: {
@@ -788,12 +789,12 @@ test("from 5 days before the end, a fixed sentence asks to renew the sign-in and
         status: endingAt(Date.parse("2026-12-09T23:30:00.000Z")),
       },
       endFormat: signInEndFormat({
-        locale: "en-US",
+        locale: "en-GB",
         timeZone: "Europe/Istanbul",
       }),
     }),
   ).toContain(
-    '<dt>Signed in until</dt><dd><time dateTime="2026-12-09T23:30:00.000Z">December 10, 2026</time></dd>',
+    '<dt>Signed in until</dt><dd><time dateTime="2026-12-09T23:30:00.000Z">10 December 2026 at 02:30</time></dd>',
   );
 });
 
@@ -855,4 +856,28 @@ test("the end of the sign-in and its renewal show only while the device is signe
       },
     }),
   ).not.toContain("Signed in until");
+});
+
+test("after a renewal that the API refused for another GitHub account, the device stays signed in, and the panel asks to sign in with the installation's account, never to remove the device (D4)", () => {
+  const view = {
+    kind: "known",
+    status: {
+      ...endingAt(NOW + 2 * DAY_MS),
+      lastOutcome: { code: "device_account_mismatch", deviceLogin: "octocat" },
+    },
+  } as const;
+  const html = render({ view });
+
+  expect(html).toContain(
+    '<p class="panel-message" role="alert">This installation belongs to the GitHub account octocat. Sign in with that account.</p>',
+  );
+  expect(html).not.toContain(DEVICE_STATE_MESSAGES.account_mismatch);
+  expect(html).not.toMatch(/remove this device so that/i);
+  expect(html).toContain("<dt>Signed in until</dt>");
+  expect(clickEveryButton({ view }).map(([label]) => label)).toEqual([
+    "Renew the sign-in",
+    "Sign out",
+    "Remove this device",
+    "This is not me",
+  ]);
 });

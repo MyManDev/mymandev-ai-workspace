@@ -2008,6 +2008,46 @@ test("a renewal is a GitHub sign-in of the signed-in device: it starts without a
   expect(h.log).toContain("session signInFinished signed_in");
 });
 
+test("a renewal that the API refused for another GitHub account keeps the device signed in and names the installation's login in the outcome (D4)", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const attempt = startedSignIn();
+  h.start = async () => attempt.start;
+  const before = h.statuses.length;
+
+  await h.service.startSignIn();
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  // The session keeps a device that was signed in when the sign-in
+  // started signed in (the Project Manager's decision of 2026-11-09).
+  attempt.settle({
+    kind: "refused",
+    code: "device_account_mismatch",
+    deviceLogin: "octocat",
+  });
+
+  expect(await done).toMatchObject({
+    account: {
+      kind: "signed_in",
+      login: "octocat",
+      deviceId: DEVICE_ID,
+      signInExpiresAt: RECORD.signInExpiresAt,
+    },
+    lastOutcome: { code: "device_account_mismatch", deviceLogin: "octocat" },
+    device: "signed_in",
+  });
+  expect(h.log).toContain("session signInStarted");
+  expect(h.log).toContain(
+    "session signInFinished refused device_account_mismatch",
+  );
+  for (const status of h.statuses.slice(before)) {
+    expect(status.device).toBe("signed_in");
+    expect(status.account).toMatchObject({
+      kind: "signed_in",
+      deviceId: DEVICE_ID,
+    });
+  }
+});
+
 const REPLACEMENT_PENDING: SignInStart = Object.freeze({
   started: false,
   outcome: Object.freeze({ kind: "failed", reason: "replacement_pending" }),

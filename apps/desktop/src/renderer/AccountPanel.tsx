@@ -55,8 +55,8 @@ const RENEWAL_PROMPT_ID = "sign-in-renewal";
  * account while the device is signed out (#195), the passphrase of a device
  * key that needs one, and the state of the device with sign-out and
  * removing this device. While the device is signed in, it shows when the
- * sign-in ends and offers to renew it, and from 5 days before the end it
- * asks the person to (D4 on #95). The main process runs the sign-in and the
+ * sign-in ends and offers to renew it, and from day 25 of the 30 days (6
+ * days before the end) it asks the person to (D4 on #95). The main process runs the sign-in and the
  * device session; the panel never sees a sign-in code, a key, or a token.
  * The account's devices are listed beside it (`DevicesSection.tsx`).
  */
@@ -104,14 +104,14 @@ export interface AccountPanelContentProps {
   /**
    * The renderer's clock in milliseconds. The panel reads it again when the
    * wait after a start refused during the grace period of an uncertain
-   * sign-in ends, so that its note goes away (#199), when the last 5 days of
-   * the sign-in begin or the sign-in ends (D4 on #95), and when the window
-   * gets the focus or becomes visible again.
+   * sign-in ends, so that its note goes away (#199), when day 25 of the
+   * sign-in begins or the sign-in ends (D4 on #95), and when the window gets
+   * the focus or becomes visible again.
    */
   readonly now: number;
   /** The format of that note's local time; the system's by default. */
   readonly timeFormat?: Intl.DateTimeFormat | undefined;
-  /** The format of the end of the sign-in, a date; the system's by default. */
+  /** The format of the end of the sign-in, a date and time; the system's by default. */
   readonly endFormat?: Intl.DateTimeFormat | undefined;
 }
 
@@ -355,8 +355,8 @@ function SignInActions(
   const signInDescription =
     originProblem === undefined ? undefined : "sign-in-unavailable";
   // D4 on #95: a renewal can start at any time while the device is signed
-  // in; from 5 days before the end a sentence asks for it and describes the
-  // button.
+  // in; from day 25 (6 days before the end) a sentence asks for it and
+  // describes the button.
   const renewal = offersRenewal(status);
   const renewalPrompt = renewal ? props.expiry?.prompt : undefined;
   return (
@@ -634,8 +634,8 @@ function useAccountPanel(
       ),
     [retryAt, now],
   );
-  // D4 on #95: the clock is read again when the last 5 days of the sign-in
-  // begin and when it ends (`nextSignInExpiryChange`), with the same watch
+  // D4 on #95: the clock is read again when day 25 of the sign-in begins
+  // and when it ends (`nextSignInExpiryChange`), with the same watch
   // as the note above, which reads the clock again when its timer fires,
   // and whenever the window gets the focus or becomes visible again,
   // because a timer can fire late after the computer slept. So the prompt

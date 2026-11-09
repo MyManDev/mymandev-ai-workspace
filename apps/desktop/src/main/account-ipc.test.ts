@@ -1570,7 +1570,7 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   expect(sent).not.toContain(USER_ID);
 }, 20_000);
 
-test("renew the sign-in of a signed-in device through IPC with the real flow and session: the same device with a new key and a new end, no sign-out, and the API asked with the new key afterwards (D4)", async () => {
+test("renew the sign-in of a signed-in device through IPC with the real flow and session: one refused for another GitHub account keeps the device signed in, and one that succeeds keeps the same device with a new key and a new end, no sign-out, and the API asked with the new key afterwards (D4)", async () => {
   const folder = path.join(root, "MyManDev");
   const keyStore = createDeviceKeyStore({
     folder,
@@ -1665,6 +1665,26 @@ test("renew the sign-in of a signed-in device through IPC with the real flow and
   await expect(service.readDeviceList()).resolves.toMatchObject({ ok: true });
   const firstKey = api.publicKey;
   const sentBefore = subscriber.sent.length;
+
+  // A renewal in a browser that holds another GitHub account: the API
+  // refuses it and commits nothing, and the device stays signed in with its
+  // key (the Project Manager's decision of 2026-11-09). The outcome names
+  // the installation's login.
+  api.accountMismatch = true;
+  const mismatch = await signIn(MISMATCH_CODE);
+  expect(mismatch.status).toMatchObject({
+    account: {
+      kind: "signed_in",
+      deviceId: DEVICE_ID,
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    },
+    device: "signed_in",
+    replacementPending: false,
+    lastOutcome: { code: "device_account_mismatch", deviceLogin: "octocat" },
+  });
+  expect(api.publicKey).toBe(firstKey);
+  await expect(service.readDeviceList()).resolves.toMatchObject({ ok: true });
+  api.accountMismatch = false;
 
   // "Renew the sign-in" starts the same sign-in while the device is signed
   // in. It names the device's login in the browser, and the API replaces

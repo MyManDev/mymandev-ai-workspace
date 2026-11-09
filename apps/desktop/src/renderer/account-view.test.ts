@@ -857,8 +857,8 @@ const RENEWABLE: AccountStatus = {
   device: "signed_in",
 };
 
-test("the panel asks to renew the sign-in from 5 days before its end, and says after the end that it ended (D4)", () => {
-  expect(SIGN_IN_RENEWAL_WINDOW_MS).toBe(5 * 24 * 60 * 60 * 1000);
+test("the panel asks to renew the sign-in from day 25 of the 30 days, 6 days before its end, and says after the end that it ended (D4)", () => {
+  expect(SIGN_IN_RENEWAL_WINDOW_MS).toBe(6 * 24 * 60 * 60 * 1000);
   const start = END - SIGN_IN_RENEWAL_WINDOW_MS;
   for (const [now, prompt] of [
     [END - 30 * 24 * 60 * 60 * 1000, undefined],
@@ -873,13 +873,14 @@ test("the panel asks to renew the sign-in from 5 days before its end, and says a
       prompt,
     });
   }
-  // Day 25 of the 30 days is the first day of the prompt.
-  expect(
-    describeSignInExpiry(
-      RENEWABLE,
-      END - 30 * 24 * 60 * 60 * 1000 + 25 * 24 * 60 * 60 * 1000,
-    )?.prompt,
-  ).toBe(SIGN_IN_RENEWAL_MESSAGES.due);
+  // Day 25 of the 30 days begins after 24 days, with the prompt; day 24
+  // ends without it.
+  const signedInAt = END - 30 * 24 * 60 * 60 * 1000;
+  const day25 = signedInAt + 24 * 24 * 60 * 60 * 1000;
+  expect(describeSignInExpiry(RENEWABLE, day25)?.prompt).toBe(
+    SIGN_IN_RENEWAL_MESSAGES.due,
+  );
+  expect(describeSignInExpiry(RENEWABLE, day25 - 1)?.prompt).toBe(undefined);
 });
 
 test("the end of the sign-in shows only while this device is signed in and the status names its account (D4)", () => {
@@ -939,19 +940,19 @@ test("the renewal is offered at any time while this device is signed in, no sign
   }
 });
 
-test("the end of the sign-in is a date in the person's locale and time zone (D4)", () => {
+test("the end of the sign-in is a date and a time of day in the person's locale and time zone (D4)", () => {
   const at = Date.parse("2026-12-09T22:30:00.000Z");
   expect(signInEndFormat({ locale: "en-GB", timeZone: "UTC" }).format(at)).toBe(
-    "9 December 2026",
+    "9 December 2026 at 22:30",
   );
   expect(
-    signInEndFormat({ locale: "en-US", timeZone: "Asia/Tokyo" }).format(at),
-  ).toBe("December 10, 2026");
+    signInEndFormat({ locale: "en-GB", timeZone: "Asia/Tokyo" }).format(at),
+  ).toBe("10 December 2026 at 07:30");
   expect(
     signInEndFormat({ locale: "tr-TR", timeZone: "Europe/Istanbul" }).format(
       at,
     ),
-  ).toBe("10 Aral\u0131k 2026");
+  ).toBe("10 Aral\u0131k 2026 01:30");
   // The defaults are the system's time zone and the person's locale.
   const system = new Intl.DateTimeFormat().resolvedOptions();
   const defaults = signInEndFormat().resolvedOptions();

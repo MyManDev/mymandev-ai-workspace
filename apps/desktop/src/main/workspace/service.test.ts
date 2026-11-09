@@ -1825,7 +1825,7 @@ test("another device resets the state and loads again once connected", async () 
   expect(h.state.revision).toBe(revision);
 });
 
-test("a renewal of the sign-in keeps the workspaces, the selection, the subscription, and the open project (D4)", async () => {
+test("a renewal of the sign-in, also after an attempt refused for another GitHub account, keeps the workspaces, the selection, the subscription, and the open project (D4)", async () => {
   const h = await withLiveWorkspace();
   h.service.openProject(PROJECT_1);
   const before = h.state;
@@ -1833,6 +1833,14 @@ test("a renewal of the sign-in keeps the workspaces, the selection, the subscrip
 
   // The renewal is a sign-in of the same device: the status shows it run
   // and then names a new end of the sign-in, for the same device.
+  // A first attempt in a browser with another GitHub account was refused,
+  // and the device stayed signed in.
+  h.setAccount(accountStatus({ signIn: { kind: "starting" } }));
+  h.setAccount(
+    accountStatus({
+      lastOutcome: { code: "device_account_mismatch", deviceLogin: "octocat" },
+    }),
+  );
   h.setAccount(accountStatus({ signIn: { kind: "starting" } }));
   h.setAccount(accountStatus({ signIn: { kind: "completing" } }));
   const renewed = accountStatus().account as Extract<

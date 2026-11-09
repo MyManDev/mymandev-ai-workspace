@@ -874,15 +874,22 @@ test("a lost connection turns sending messages back to waiting, and they go out 
   expect(h.pendingStatuses()).toEqual(["sending"]);
 });
 
-test("a renewal of the sign-in keeps the waiting messages: they go out again with the same event ID after the reconnect with the new key (D4)", async () => {
+test("a renewal of the sign-in, also after an attempt refused for another GitHub account, keeps the waiting messages: they go out again with the same event ID after the reconnect with the new key (D4)", async () => {
   const h = await withChat();
   const result = h.service.send("Hello from the composer");
   const eventId = result.kind === "accepted" ? result.eventId : undefined;
   expect(h.pendingStatuses()).toEqual(["sending"]);
 
   // The renewal is a sign-in of the same device: the status shows it run
-  // and then names a new end of the sign-in, for the same device.
+  // and then names a new end of the sign-in, for the same device. A first
+  // attempt in a browser with another GitHub account was refused, and the
+  // device stayed signed in.
   const renewing = accountStatus();
+  h.setAccount({ ...renewing, signIn: { kind: "starting" } });
+  h.setAccount({
+    ...renewing,
+    lastOutcome: { code: "device_account_mismatch", deviceLogin: "octocat" },
+  });
   for (const kind of ["starting", "completing"] as const) {
     h.setAccount({ ...renewing, signIn: { kind } });
   }

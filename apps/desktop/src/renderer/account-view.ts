@@ -412,15 +412,16 @@ export function deviceSignedIn(status: AccountStatus): boolean {
 /**
  * How long before the end of the device's sign-in the panel asks the person
  * to renew it (D4 on #95): from day 25 of the 30 days (ADR 0014,
- * "Lifetimes"), so 5 days or less before the end.
+ * "Lifetimes"). Day 25 begins after 24 days, so 6 days before the end (the
+ * Project Manager's decision of 2026-11-09).
  */
-export const SIGN_IN_RENEWAL_WINDOW_MS = 5 * 24 * 60 * 60 * 1000;
+export const SIGN_IN_RENEWAL_WINDOW_MS = 6 * 24 * 60 * 60 * 1000;
 
 /** The label of the action that renews the sign-in (D4 on #95). */
 export const RENEW_SIGN_IN_LABEL = "Renew the sign-in";
 
 /**
- * The fixed sentences that ask the person to renew the sign-in: from 5 days
+ * The fixed sentences that ask the person to renew the sign-in: from 6 days
  * before its end (`due`), and after the end by the renderer's clock while
  * the server still accepts the device (`ended`; an open connection may go
  * on for up to 24 hours). Once the server refuses the device, its state
@@ -437,7 +438,7 @@ export const SIGN_IN_RENEWAL_MESSAGES = Object.freeze({
 export interface SignInExpiry {
   /** The end in UTC, as the status names it. */
   readonly endsAt: string;
-  /** The sentence that asks to renew it, or undefined before the last 5 days. */
+  /** The sentence that asks to renew it, or undefined before day 25. */
   readonly prompt: string | undefined;
 }
 
@@ -484,7 +485,7 @@ export function describeSignInExpiry(
 /**
  * The next time after `now`, in milliseconds, at which
  * `describeSignInExpiry` says something else by the clock alone: the start
- * of the last 5 days, or the end. Undefined when nothing changes.
+ * of day 25, or the end. Undefined when nothing changes.
  */
 export function nextSignInExpiryChange(
   status: AccountStatus,
@@ -517,15 +518,17 @@ export function offersRenewal(status: AccountStatus): boolean {
 }
 
 /**
- * The format of the end of the sign-in: a date, for example
- * "9 December 2026", in the person's locale and time zone. The panel makes
- * a new one for each render, like `signInTimeFormat`.
+ * The format of the end of the sign-in: the date and the time of day, for
+ * example "9 December 2026 at 10:00", in the person's locale and time zone
+ * (the Project Manager's decision of 2026-11-09). The panel makes a new one
+ * for each render, like `signInTimeFormat`.
  */
 export function signInEndFormat(
   options: SignInTimeFormatOptions = {},
 ): Intl.DateTimeFormat {
   return new Intl.DateTimeFormat(options.locale, {
     dateStyle: "long",
+    timeStyle: "short",
     timeZone: options.timeZone,
   });
 }

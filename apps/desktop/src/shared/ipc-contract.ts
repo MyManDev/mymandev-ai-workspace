@@ -233,7 +233,7 @@ export const AccountSchema = z.discriminatedUnion("kind", [
     /**
      * The end of the device's sign-in, as the last GitHub sign-in that this
      * installation saw answered it (D4 on #95). The Account screen asks the
-     * person to renew it from 5 days before.
+     * person to renew it from day 25 of the 30 days, 6 days before.
      */
     signInExpiresAt: SignInExpirySchema,
   }),
