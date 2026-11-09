@@ -176,6 +176,8 @@ test("the checks read every renderer source and no test", () => {
     "./ChatScreen.tsx",
     "./chat-view.ts",
     "./connection-status.ts",
+    "./device-view.ts",
+    "./DevicesSection.tsx",
     "./JoinScreen.tsx",
     "./main.tsx",
     "./Navigation.tsx",

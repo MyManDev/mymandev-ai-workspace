@@ -16,16 +16,23 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import type {
   AccountStatus,
-  ListDevicesResult,
+  ConnectionStatus,
 } from "../shared/ipc-contract.ts";
 import {
   createAccountService,
-  LIST_DEVICES_COOLDOWN_MS,
   SIGN_IN_START_COOLDOWN_MS,
   type AccountService,
 } from "./account.ts";
 import { registerAccountIpc } from "./account-ipc.ts";
 import { APP_ENTRY_URL } from "./app-protocol.ts";
+import { registerDeviceIpc } from "./device-ipc.ts";
+import {
+  createDeviceListService,
+  DEVICE_LIST_LOAD_COOLDOWN_MS,
+  type DeviceListConnection,
+  type DeviceListService,
+  type DeviceListState,
+} from "./devices/service.ts";
 import {
   createDeviceKeyStore,
   type DeviceKeyStore,
@@ -129,25 +136,6 @@ function fakeService() {
       calls.push({ method: "removeDevice", args: [] });
       return { outcome: "failed", reason: "no_answer" };
     },
-    listDevices: async () => {
-      calls.push({ method: "listDevices", args: [] });
-      return {
-        outcome: "listed",
-        devices: [
-          {
-            id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
-            label: "Mac",
-            platform: "macos",
-            lastSeenAt: null,
-            signInExpiresAt: "2026-12-02T10:00:00.000Z",
-            revokedAt: null,
-            current: true,
-            // A field that the contract does not name is dropped.
-            publicKey: "ab".repeat(32),
-          } as never,
-        ],
-      };
-    },
   };
   return {
     service,
@@ -188,6 +176,65 @@ function register(service: AccountPart) {
   return { handlers, call, errors };
 }
 
+/** A connection that stays offline and receives nothing. */
+const OFFLINE_CONNECTION: DeviceListConnection = Object.freeze({
+  status: (): ConnectionStatus => ({ state: "offline", revision: 0 }),
+  onStatusChange: () => () => undefined,
+  onMessage: () => () => undefined,
+});
+
+/**
+ * Registers the device list channels over `devices`, with publishes on a
+ * microtask, and returns a call that answers like the account channels.
+ */
+function registerDevices(devices: DeviceListService) {
+  const handlers = new Map<string, IpcInvokeListener>();
+  registerDeviceIpc(
+    { handle: (channel, listener) => handlers.set(channel, listener) },
+    DEV_URL,
+    {
+      devices,
+      scheduleTimer: (callback) => {
+        let active = true;
+        queueMicrotask(() => {
+          if (active) {
+            callback();
+          }
+        });
+        return () => {
+          active = false;
+        };
+      },
+    },
+  );
+  return (channel: string, ipcEvent: IpcInvokeEvent): unknown => {
+    const handler = handlers.get(channel);
+    if (handler === undefined) {
+      throw new Error(`no handler for ${channel}`);
+    }
+    return handler(ipcEvent);
+  };
+}
+
+/** Resolves with the first device list state, the current one included, that `accept` takes. */
+function deviceListWhen(
+  devices: DeviceListService,
+  accept: (state: DeviceListState) => boolean,
+): Promise<DeviceListState> {
+  return new Promise((resolve) => {
+    if (accept(devices.state())) {
+      resolve(devices.state());
+      return;
+    }
+    const stop = devices.onChange((state) => {
+      if (accept(state)) {
+        stop();
+        resolve(state);
+      }
+    });
+  });
+}
+
 const ACCOUNT_CHANNELS = Object.values(INVOKE_CHANNELS).filter((channel) =>
   channel.startsWith("account:"),
 );
@@ -195,7 +242,9 @@ const ACCOUNT_CHANNELS = Object.values(INVOKE_CHANNELS).filter((channel) =>
 test("a handler is registered for every account channel and nothing else", () => {
   const { handlers } = register(fakeService().service);
 
-  expect(ACCOUNT_CHANNELS).toHaveLength(9);
+  // The device list has channels of its own (device-ipc.ts).
+  expect(ACCOUNT_CHANNELS).toHaveLength(8);
+  expect(ACCOUNT_CHANNELS).not.toContain("account:list-devices");
   expect([...handlers.keys()].sort()).toEqual([...ACCOUNT_CHANNELS].sort());
 });
 
@@ -297,20 +346,6 @@ test("the handlers answer with the service's values, and unlock passes the passp
     outcome: "failed",
     reason: "no_answer",
   });
-  await expect(call(INVOKE_CHANNELS.listDevices, app)).resolves.toEqual({
-    outcome: "listed",
-    devices: [
-      {
-        id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
-        label: "Mac",
-        platform: "macos",
-        lastSeenAt: null,
-        signInExpiresAt: "2026-12-02T10:00:00.000Z",
-        revokedAt: null,
-        current: true,
-      },
-    ],
-  });
 
   expect(unlocked).toEqual({ outcome: "refused", reason: "wrong_passphrase" });
   expect(JSON.stringify(unlocked)).not.toContain(PASSPHRASE);
@@ -323,7 +358,6 @@ test("the handlers answer with the service's values, and unlock passes the passp
     "forgetAccount",
     "signOut",
     "removeDevice",
-    "listDevices",
   ]);
   expect(fake.calls[1]?.args).toEqual([]);
   expect(fake.calls[2]?.args).toEqual([{ browser: "other" }]);
@@ -1157,11 +1191,21 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     onError: (message) => errors.push(message),
   });
   const { call } = register(service);
+  // The device list service over the real account service, as index.ts
+  // creates it, with its channels.
+  const devices = createDeviceListService({
+    account: service,
+    connection: OFFLINE_CONNECTION,
+    now: () => clock,
+  });
+  const callDevices = registerDevices(devices);
   const subscriber = receiver();
   const app = () => event(frame(DEV_URL), subscriber);
   const answers: unknown[] = [];
   const invoke = async (channel: string): Promise<unknown> => {
-    const answer = await call(channel, app());
+    const answer = await (channel.startsWith("devices:")
+      ? callDevices(channel, app())
+      : call(channel, app()));
     answers.push(answer);
     return answer;
   };
@@ -1189,35 +1233,49 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   };
   const device = async () =>
     ((await invoke(INVOKE_CHANNELS.getAccountStatus)) as AccountStatus).device;
+  const LISTED_DEVICE = {
+    id: DEVICE_ID,
+    label: "Windows computer",
+    platform: "windows",
+    createdAt: "2026-11-01T10:00:00.000Z",
+    lastSeenAt: null,
+    lastSignInAt: "2026-11-02T10:00:00.000Z",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    revokedAt: null,
+    current: true,
+  };
+  const listRequests = () =>
+    api.routes.filter((route) => route === "GET /devices").length;
 
   answers.push(call(INVOKE_CHANNELS.subscribeAccountStatus, app()));
+  answers.push(callDevices(INVOKE_CHANNELS.subscribeDeviceList, app()));
   await service.initialize();
   expect(await device()).toBe("no_device");
-  await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toEqual({
+  // The Account screen opens before the sign-in and asks once, as the
+  // section does when it opens; the request is refused but counts.
+  await expect(invoke(INVOKE_CHANNELS.loadDeviceList)).resolves.toEqual({
     outcome: "refused",
     reason: "not_signed_in",
   });
+  await expect(invoke(INVOKE_CHANNELS.getDeviceList)).resolves.toMatchObject({
+    status: "signed_out",
+    devices: [],
+  });
+  expect(listRequests()).toBe(0);
 
-  // Sign in: a new device.
+  // Sign in on the open screen: a new device. The list loads on its own,
+  // without another request of the screen.
   await signIn(SIGN_IN_CODE);
   expect(await device()).toBe("signed_in");
-  const listed = (await invoke(
-    INVOKE_CHANNELS.listDevices,
-  )) as ListDevicesResult;
-  expect(listed).toEqual({
-    outcome: "listed",
-    devices: [
-      {
-        id: DEVICE_ID,
-        label: "Windows computer",
-        platform: "windows",
-        lastSeenAt: null,
-        signInExpiresAt: "2026-12-02T10:00:00.000Z",
-        revokedAt: null,
-        current: true,
-      },
-    ],
+  await deviceListWhen(devices, (state) => state.status === "ready");
+  await expect(invoke(INVOKE_CHANNELS.getDeviceList)).resolves.toEqual({
+    status: "ready",
+    revision: expect.any(Number),
+    devices: [LISTED_DEVICE],
+    registrationLockedUntil: null,
+    newDevices: [],
   });
+  expect(listRequests()).toBe(1);
 
   // Sign out (P-65): the key and the record stay, and the API ended the
   // tokens; the key is not used until the next sign-in.
@@ -1242,11 +1300,16 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     expect(sentSignedOut).not.toContain(detail);
   }
 
+  // The device list is dropped with the sign-out, and no list is read.
   const routesAfterSignOut = api.routes.length;
-  clock += LIST_DEVICES_COOLDOWN_MS;
-  await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toEqual({
-    outcome: "failed",
-    reason: "signed_out",
+  clock += DEVICE_LIST_LOAD_COOLDOWN_MS;
+  await expect(invoke(INVOKE_CHANNELS.getDeviceList)).resolves.toMatchObject({
+    status: "signed_out",
+    devices: [],
+  });
+  await expect(invoke(INVOKE_CHANNELS.loadDeviceList)).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
   });
   await expect(invoke(INVOKE_CHANNELS.removeDevice)).resolves.toEqual({
     outcome: "failed",
@@ -1343,10 +1406,14 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
       lastOutcome: { code: "signed_in" },
     },
   );
-  clock += LIST_DEVICES_COOLDOWN_MS;
-  await expect(invoke(INVOKE_CHANNELS.listDevices)).resolves.toMatchObject({
-    outcome: "listed",
+  // The Account screen asked for the list before, so it loads again on its
+  // own once the sign-in ended, with the device's new token.
+  await deviceListWhen(devices, (state) => state.status === "ready");
+  await expect(invoke(INVOKE_CHANNELS.getDeviceList)).resolves.toMatchObject({
+    status: "ready",
+    devices: [LISTED_DEVICE],
   });
+  expect(listRequests()).toBe(2);
 
   // Remove this device: confirmed in the main process, revoked at the API,
   // and only then are the key and the record deleted.
@@ -1364,6 +1431,12 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     account: { kind: "signed_out" },
     device: "removed",
   });
+  // The removal drops the list, and nothing reads it again.
+  await expect(invoke(INVOKE_CHANNELS.getDeviceList)).resolves.toMatchObject({
+    status: "signed_out",
+    devices: [],
+  });
+  expect(listRequests()).toBe(2);
   // A removal is not a revocation by the API: local execution goes on.
   expect(stopped).toBe(0);
   expect(errors).toEqual([]);
@@ -1400,12 +1473,24 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   expect(secrets.every((secret) => secret.length >= 32)).toBe(true);
   const sent = JSON.stringify([subscriber.sent, answers]);
   expect(subscriber.sent.length).toBeGreaterThanOrEqual(10);
+  // The device lists that reached the renderer, the ready ones included,
+  // are part of the search.
+  const deviceLists = subscriber.sent.filter(
+    ([channel]) => channel === EVENT_CHANNELS.deviceListChanged,
+  );
+  expect(
+    deviceLists.some(
+      ([, payload]) => (payload as { status: string }).status === "ready",
+    ),
+  ).toBe(true);
   for (const secret of secrets) {
     expect(sent).not.toContain(secret);
   }
   expect(sent).not.toMatch(
     /mmdc_|mmda_|codeVerifier|Signature|pkcs8|publicKey|accessToken|userId/i,
   );
+  // The user ID that the API answered never reaches the renderer either.
+  expect(sent).not.toContain(USER_ID);
 }, 20_000);
 
 test("This is not me during a sign-out report of the startup refresh never writes the other account back", async () => {

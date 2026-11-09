@@ -6,7 +6,6 @@ import {
   GITHUB_LOGIN_PATTERN,
   type JoinRequestId,
   LIMITS,
-  MAX_ANSWER_LIST_ITEMS,
   type MemberId,
   type ProjectId,
   type UserId,
@@ -29,7 +28,6 @@ import {
   forgetConfirmationDetail,
   forgetConfirmationMessage,
   type ForgetRemoval,
-  LIST_DEVICES_COOLDOWN_MS,
   forgetConfirmed,
   SIGN_IN_START_COOLDOWN_MS,
   signInOutcomeView,
@@ -47,6 +45,7 @@ import { WORKSPACE_ACTION_BUDGET, WORKSPACE_ACTIONS } from "./api-actions.ts";
 import { WORKSPACE_READS } from "./api-reads.ts";
 import type {
   AuthorizedRequest,
+  DeviceList,
   DeviceSessionState,
   SessionAccount,
   SessionResult,
@@ -101,6 +100,12 @@ const DEVICE_ITEM = Object.freeze({
   revokedAt: null,
   current: true,
 } as const);
+
+/** The session's answer of the device list: this device, and no lock. */
+const DEVICE_LIST: DeviceList = Object.freeze({
+  devices: Object.freeze([DEVICE_ITEM]),
+  registrationLockedUntil: null,
+}) as unknown as DeviceList;
 
 const CHALLENGE: AuthChallengeFrame = Object.freeze({
   protocolVersion: 0,
@@ -215,7 +220,7 @@ interface Harness {
   signOut: () => Promise<SessionResult<"reported" | "pending">>;
   reportSignOut: () => Promise<SessionResult<"reported" | "pending">>;
   removeDevice: () => Promise<SessionResult<"removed" | "pending">>;
-  listDevices: () => Promise<SessionResult<readonly unknown[]>>;
+  listDevices: () => Promise<SessionResult<DeviceList>>;
   /** The answers of the session's `signWebSocketChallenge`, one per call. */
   signChallenge: () => Promise<SessionResult<AuthResponseFrame>>;
   /** What the session's `request` answers. */
@@ -274,7 +279,7 @@ function harness(
     signOut: async () => ({ ok: true, value: "reported" }),
     reportSignOut: async () => ({ ok: true, value: "reported" }),
     removeDevice: async () => ({ ok: true, value: "removed" }),
-    listDevices: async () => ({ ok: true, value: [DEVICE_ITEM] }),
+    listDevices: async () => ({ ok: true, value: DEVICE_LIST }),
     signChallenge: async () => ({ ok: true, value: AUTH_RESPONSE }),
     request: async () => ({ ok: true, value: WORKSPACE_LIST }),
     requests: [] as AuthorizedRequest<unknown>[],
@@ -1588,8 +1593,6 @@ test("after a wrong passphrase the next unlock waits 1 second, doubling up to 30
 
 test("the contract's limits follow the protocol and the key store", () => {
   expect(ACCOUNT_LIMITS.displayName).toBe(LIMITS.displayName);
-  expect(ACCOUNT_LIMITS.deviceLabel).toBe(LIMITS.deviceLabel);
-  expect(ACCOUNT_LIMITS.devices).toBe(MAX_ANSWER_LIST_ITEMS);
   // NFC can join up to four UTF-16 code units into one character, and the
   // store counts characters after normalization.
   expect(ACCOUNT_LIMITS.passphrase).toBeGreaterThanOrEqual(
@@ -1684,16 +1687,16 @@ test("a session that cannot be created is reported, and its actions are refused"
     device: "unavailable",
   });
   expect(h.errors).toEqual(["The device session could not be created."]);
-  for (const action of [
-    h.service.signOut,
-    h.service.removeDevice,
-    h.service.listDevices,
-  ]) {
+  for (const action of [h.service.signOut, h.service.removeDevice]) {
     await expect(action()).resolves.toEqual({
       outcome: "refused",
       reason: "not_signed_in",
     });
   }
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: false,
+    reason: "not_signed_in",
+  });
   // A sign-in and "This is not me" still work without the session.
   await expect(h.service.startSignIn()).resolves.toEqual({
     outcome: "started",
@@ -2420,34 +2423,30 @@ test("after a sign-out, a sign-in refused because another GitHub account was use
   });
 });
 
-test("sign-out, removal, and the device list are refused while busy and without an account", async () => {
+test("sign-out and removal are refused while busy and without an account, and the device list is not read then", async () => {
+  const unavailable = { ok: false, reason: "unavailable" };
   const before = harness();
-  for (const action of [
-    before.service.signOut,
-    before.service.removeDevice,
-    before.service.listDevices,
-  ]) {
+  for (const action of [before.service.signOut, before.service.removeDevice]) {
     await expect(action()).resolves.toEqual({
       outcome: "refused",
       reason: "busy",
     });
   }
+  // The key is still loading.
+  await expect(before.service.readDeviceList()).resolves.toEqual(unavailable);
 
   const h = harness();
   await h.service.initialize();
   const attempt = startedSignIn();
   h.start = async () => attempt.start;
   await h.service.startSignIn();
-  for (const action of [
-    h.service.signOut,
-    h.service.removeDevice,
-    h.service.listDevices,
-  ]) {
+  for (const action of [h.service.signOut, h.service.removeDevice]) {
     await expect(action()).resolves.toEqual({
       outcome: "refused",
       reason: "busy",
     });
   }
+  await expect(h.service.readDeviceList()).resolves.toEqual(unavailable);
   const done = nextStatus(h, (status) => status.signIn.kind === "idle");
   attempt.settle({ kind: "cancelled" });
   await done;
@@ -2461,7 +2460,6 @@ test("sign-out, removal, and the device list are refused while busy and without 
   for (const action of [
     h.service.signOut,
     h.service.removeDevice,
-    h.service.listDevices,
     h.service.forgetAccount,
   ]) {
     await expect(action()).resolves.toEqual({
@@ -2473,8 +2471,10 @@ test("sign-out, removal, and the device list are refused while busy and without 
     outcome: "refused",
     reason: "busy",
   });
+  await expect(h.service.readDeviceList()).resolves.toEqual(unavailable);
   release();
   await expect(signingOut).resolves.toEqual({ outcome: "signed_out" });
+  expect(h.log).not.toContain("session listDevices");
 
   const signedOut = harness();
   signedOut.record = { kind: "none" };
@@ -2482,13 +2482,16 @@ test("sign-out, removal, and the device list are refused while busy and without 
   for (const action of [
     signedOut.service.signOut,
     signedOut.service.removeDevice,
-    signedOut.service.listDevices,
   ]) {
     await expect(action()).resolves.toEqual({
       outcome: "refused",
       reason: "not_signed_in",
     });
   }
+  await expect(signedOut.service.readDeviceList()).resolves.toEqual({
+    ok: false,
+    reason: "not_signed_in",
+  });
   expect(signedOut.log.filter((step) => step.startsWith("session"))).toEqual([
     "session create",
     "session refresh",
@@ -2599,14 +2602,13 @@ test("removing this device asks nothing of the session when the person keeps it 
   expect(h.log).not.toContain("session removeDevice");
 });
 
-test("the device list holds only the fields that the renderer may see, with the current device marked", async () => {
+test("the device list read answers the session's devices and lock, maps the session's failures like a read, and reports a session that throws", async () => {
   const h = harness();
   await h.service.initialize();
-  h.listDevices = async () => ({
-    ok: true,
-    value: [
-      { ...DEVICE_ITEM, publicKey: PUBLIC_KEY, userId: USER_ID },
-      {
+  const list = Object.freeze({
+    devices: Object.freeze([
+      DEVICE_ITEM,
+      Object.freeze({
         ...DEVICE_ITEM,
         id: OTHER_DEVICE_ID,
         label: "Windows computer",
@@ -2614,52 +2616,188 @@ test("the device list holds only the fields that the renderer may see, with the 
         lastSeenAt: null,
         revokedAt: "2026-11-02T08:00:00.000Z",
         current: false,
-      },
-    ],
-  });
+      }),
+    ]),
+    registrationLockedUntil: "2026-11-09T08:00:00.000Z",
+  }) as unknown as DeviceList;
+  h.listDevices = async () => ({ ok: true, value: list });
 
-  const listed = await h.service.listDevices();
-
-  expect(listed).toEqual({
-    outcome: "listed",
-    devices: [
-      {
-        id: DEVICE_ID,
-        label: "Mac",
-        platform: "macos",
-        lastSeenAt: "2026-11-02T09:00:00.000Z",
-        signInExpiresAt: "2026-12-01T10:00:00.000Z",
-        revokedAt: null,
-        current: true,
-      },
-      {
-        id: OTHER_DEVICE_ID,
-        label: "Windows computer",
-        platform: "windows",
-        lastSeenAt: null,
-        signInExpiresAt: "2026-12-01T10:00:00.000Z",
-        revokedAt: "2026-11-02T08:00:00.000Z",
-        current: false,
-      },
-    ],
+  // The main process keeps every field; the IPC view chooses what crosses.
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: true,
+    value: list,
   });
-  expect(JSON.stringify(listed)).not.toMatch(
-    new RegExp(`${PUBLIC_KEY}|${USER_ID}|createdAt|lastSignInAt`),
+  // A read, not an action: it takes no lock and needs no cooldown.
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: true,
+    value: list,
+  });
+  expect(h.log.filter((step) => step === "session listDevices")).toHaveLength(
+    2,
   );
 
-  h.listDevices = async () => ({ ok: false, reason: "no_answer" });
-  h.clock += LIST_DEVICES_COOLDOWN_MS;
-  await expect(h.service.listDevices()).resolves.toEqual({
-    outcome: "failed",
-    reason: "no_answer",
-  });
+  const cases: [SessionResult<DeviceList>, string][] = [
+    [{ ok: false, reason: "no_answer" }, "unavailable"],
+    [{ ok: false, reason: "server_error" }, "unavailable"],
+    [{ ok: false, reason: "refused", code: "rate_limited" }, "rate_limited"],
+    [
+      { ok: false, reason: "refused", code: "sign_in_required" },
+      "not_signed_in",
+    ],
+    [{ ok: false, reason: "signed_out" }, "not_signed_in"],
+    [{ ok: false, reason: "refused", code: "forbidden" }, "failed"],
+    [{ ok: false, reason: "unexpected_response" }, "failed"],
+  ];
+  for (const [result, reason] of cases) {
+    h.listDevices = async () => result;
+    await expect(
+      h.service.readDeviceList(),
+      JSON.stringify(result),
+    ).resolves.toEqual({ ok: false, reason });
+  }
+  expect(h.errors).toEqual([]);
+
   h.listDevices = () => Promise.reject(new Error("broken"));
-  h.clock += LIST_DEVICES_COOLDOWN_MS;
-  await expect(h.service.listDevices()).resolves.toEqual({
-    outcome: "failed",
-    reason: "failed",
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: false,
+    reason: "unavailable",
   });
   expect(h.errors).toEqual(["The device list could not be read."]);
+});
+
+test("a device list read is unavailable during a device action, and its answer is dropped when an action began or the device changed meanwhile", async () => {
+  const h = harness();
+  await h.service.initialize();
+  let answer: (value: SessionResult<DeviceList>) => void = () => undefined;
+  h.listDevices = () =>
+    new Promise((resolve) => {
+      answer = resolve;
+    });
+
+  // A removal whose confirmation is kept begins and ends while the read is
+  // on its way.
+  const reading = h.service.readDeviceList();
+  await tick();
+  h.confirmRemoval = async () => false;
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "cancelled",
+  });
+  answer({ ok: true, value: DEVICE_LIST });
+  await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
+
+  // During the removal's confirmation, no read is sent.
+  let confirm: (value: boolean) => void = () => undefined;
+  h.confirmRemoval = () =>
+    new Promise((resolve) => {
+      confirm = resolve;
+    });
+  const removing = h.service.removeDevice();
+  await tick();
+  const sent = h.log.filter((step) => step === "session listDevices").length;
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: false,
+    reason: "unavailable",
+  });
+  expect(h.log.filter((step) => step === "session listDevices")).toHaveLength(
+    sent,
+  );
+  confirm(false);
+  await expect(removing).resolves.toEqual({ outcome: "cancelled" });
+
+  // The session finds the device revoked while the list is on its way.
+  h.listDevices = async () => {
+    h.emit({ kind: "revoked" });
+    return { ok: true, value: DEVICE_LIST };
+  };
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: false,
+    reason: "not_signed_in",
+  });
+});
+
+test("the listeners of a device action hear of a sign-out, a removal, and This is not me that ended, and of no refusal or kept confirmation", async () => {
+  const heard: string[] = [];
+  const listen = (h: Harness) =>
+    h.service.onDeviceAction(() => {
+      // A read that the listener starts is not refused for the action
+      // itself: its lock is released.
+      heard.push(`${h.service.status().device}`);
+    });
+
+  const h = harness();
+  await h.service.initialize();
+  const stop = listen(h);
+  h.confirmRemoval = async () => false;
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "cancelled",
+  });
+  h.confirm = async () => false;
+  await expect(h.service.forgetAccount()).resolves.toEqual({
+    outcome: "cancelled",
+  });
+  expect(heard).toEqual([]);
+
+  // A removal that the API refused changed nothing on the device, but the
+  // account's devices may have changed.
+  h.confirmRemoval = async () => true;
+  h.removeDevice = async () => ({
+    ok: false,
+    reason: "refused",
+    code: "conflict",
+  });
+  await expect(h.service.removeDevice()).resolves.toEqual({
+    outcome: "failed",
+    reason: "refused",
+  });
+  expect(heard).toEqual(["signed_in"]);
+
+  // A read in the listener is sent: the action's lock is released.
+  const reads: unknown[] = [];
+  const stopRead = h.service.onDeviceAction(() => {
+    reads.push(h.service.readDeviceList());
+  });
+  h.signOut = async () => ({ ok: true, value: "reported" });
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "signed_out",
+  });
+  expect(heard).toEqual(["signed_in", "signed_in"]);
+  await expect(reads[0]).resolves.toEqual({ ok: true, value: DEVICE_LIST });
+  stopRead();
+
+  // A refusal before the action began is not heard.
+  const busy = harness();
+  const stopBusy = listen(busy);
+  await expect(busy.service.signOut()).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  await expect(busy.service.forgetAccount()).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  expect(heard).toHaveLength(2);
+  stopBusy();
+
+  // This is not me that forgot the account is heard, and a listener that
+  // throws is reported without stopping the others.
+  const forget = harness();
+  await forget.service.initialize();
+  forget.service.onDeviceAction(() => {
+    throw new Error("broken");
+  });
+  const stopForget = listen(forget);
+  await expect(forget.service.forgetAccount()).resolves.toMatchObject({
+    outcome: "forgotten",
+  });
+  expect(heard).toHaveLength(3);
+  expect(forget.errors).toContain("A device action listener failed.");
+
+  // A removed listener hears nothing more.
+  stop();
+  stopForget();
+  h.signOut = async () => ({ ok: true, value: "reported" });
+  await h.service.signOut();
+  expect(heard).toHaveLength(3);
 });
 
 test("This is not me forgets the account on this installation also when the API removal is pending, refused, or fails", async () => {
@@ -2740,13 +2878,16 @@ test("This is not me waits for the background refresh before it asks, removes, o
     h.service.forgetAccount,
     h.service.signOut,
     h.service.removeDevice,
-    h.service.listDevices,
   ]) {
     await expect(action()).resolves.toEqual({
       outcome: "refused",
       reason: "busy",
     });
   }
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: false,
+    reason: "unavailable",
+  });
   await settle();
   expect(h.log.at(-1)).toBe("session reportSignOut");
 
@@ -2768,7 +2909,7 @@ test("every action of the session waits for the background refresh, also the one
   const actions: [string, (h: Harness) => Promise<unknown>, string][] = [
     ["sign-out", (h) => h.service.signOut(), "session signOut"],
     ["removal", (h) => h.service.removeDevice(), "confirm removal octocat"],
-    ["list", (h) => h.service.listDevices(), "session listDevices"],
+    ["list", (h) => h.service.readDeviceList(), "session listDevices"],
     ["sign-in", (h) => h.service.startSignIn(), "session signInStarted"],
   ];
   for (const [name, act, step] of actions) {
@@ -2828,49 +2969,23 @@ test("removing this device is refused before the confirmation while the key wait
   expect(h.log).not.toContain("session removeDevice");
 });
 
-test("the device list takes the lock, waits a cooldown between requests, and is dropped when the account changed meanwhile", async () => {
+test("a device list read takes no lock: the person's actions run while it is on its way, and its answer is dropped", async () => {
   const h = harness();
   await h.service.initialize();
   let answer: () => void = () => undefined;
   h.listDevices = () =>
     new Promise((resolve) => {
-      answer = () => resolve({ ok: true, value: [DEVICE_ITEM] });
+      answer = () => resolve({ ok: true, value: DEVICE_LIST });
     });
 
-  const listing = h.service.listDevices();
+  const listing = h.service.readDeviceList();
   await settle();
-  for (const action of [
-    h.service.signOut,
-    h.service.removeDevice,
-    h.service.forgetAccount,
-  ]) {
-    await expect(action()).resolves.toEqual({
-      outcome: "refused",
-      reason: "busy",
-    });
-  }
+  // The sign-out is not refused as busy.
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "signed_out",
+  });
   answer();
-  await expect(listing).resolves.toMatchObject({ outcome: "listed" });
-
-  h.clock += LIST_DEVICES_COOLDOWN_MS - 1;
-  await expect(h.service.listDevices()).resolves.toEqual({
-    outcome: "refused",
-    reason: "too_soon",
-  });
-  expect(h.log.filter((step) => step === "session listDevices")).toHaveLength(
-    1,
-  );
-
-  // The session finds the device revoked while the list is on its way.
-  h.clock += 1;
-  h.listDevices = async () => {
-    h.emit({ kind: "revoked" });
-    return { ok: true, value: [DEVICE_ITEM] };
-  };
-  await expect(h.service.listDevices()).resolves.toEqual({
-    outcome: "refused",
-    reason: "not_signed_in",
-  });
+  await expect(listing).resolves.toEqual({ ok: false, reason: "unavailable" });
 });
 
 test("a cancel while the sign-in waits for the background refresh never opens the browser", async () => {
@@ -3218,7 +3333,7 @@ test("a read is not signed in without an account, and maps the session's failure
   expect(h.errors).toEqual(["The workspace data could not be read."]);
 });
 
-test("a read takes no lock: an action runs while a read is on its way", async () => {
+test("a read takes no lock: the device list is read while a read is on its way, and both keep their answers", async () => {
   const h = harness();
   await h.service.initialize();
   const finish = heldAnswer(h);
@@ -3226,8 +3341,9 @@ test("a read takes no lock: an action runs while a read is on its way", async ()
   await tick();
   expect(h.requests).toHaveLength(1);
 
-  await expect(h.service.listDevices()).resolves.toMatchObject({
-    outcome: "listed",
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: true,
+    value: DEVICE_LIST,
   });
 
   finish({ ok: true, value: WORKSPACE_LIST });
@@ -3685,21 +3801,20 @@ test("a read is unavailable during an unlock, an unlock or This is not me that b
   finish({ ok: true, value: WORKSPACE_LIST });
   await expect(reading).resolves.toEqual({ ok: false, reason: "unavailable" });
 
-  // A device list that runs does not stop a read.
-  let listed: (value: SessionResult<readonly unknown[]>) => void = () =>
-    undefined;
+  // A device list read that runs does not stop a read.
+  let listed: (value: SessionResult<DeviceList>) => void = () => undefined;
   h.listDevices = () =>
     new Promise((resolve) => {
       listed = resolve;
     });
-  const listing = h.service.listDevices();
+  const listing = h.service.readDeviceList();
   await tick();
   h.request = async () => ({ ok: true, value: WORKSPACE_LIST });
   await expect(
     h.service.readWorkspaceData("listWorkspaces", {}),
   ).resolves.toEqual({ ok: true, value: WORKSPACE_LIST });
-  listed({ ok: true, value: [DEVICE_ITEM] });
-  await expect(listing).resolves.toMatchObject({ outcome: "listed" });
+  listed({ ok: true, value: DEVICE_LIST });
+  await expect(listing).resolves.toEqual({ ok: true, value: DEVICE_LIST });
 });
 
 test("after a read made while a key replacement was pending, the account and the key are read again", async () => {

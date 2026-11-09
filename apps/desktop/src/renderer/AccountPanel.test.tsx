@@ -4,7 +4,6 @@ import { expect, test } from "vitest";
 import {
   type AccountStatus,
   DEVICE_STATES,
-  type DeviceView,
   SIGN_IN_OUTCOME_CODES,
 } from "../shared/ipc-contract.ts";
 import {
@@ -58,7 +57,6 @@ type Handler = keyof Pick<
   | "onForget"
   | "onSignOut"
   | "onRemoveDevice"
-  | "onListDevices"
 >;
 
 function props(
@@ -81,10 +79,8 @@ function props(
     onCancelSignIn: record("onCancelSignIn"),
     onUnlock: record("onUnlock"),
     onForget: record("onForget"),
-    devices: undefined,
     onSignOut: record("onSignOut"),
     onRemoveDevice: record("onRemoveDevice"),
-    onListDevices: record("onListDevices"),
     now: NOW,
     timeFormat: UTC_TIME,
     ...overrides,
@@ -328,7 +324,6 @@ test("in another browser, the URL is shown with the warning for copying, and ano
 });
 
 const SIGNED_IN_BUTTONS = [
-  ["Show devices", ["onListDevices"]],
   ["Sign out", ["onSignOut"]],
   ["Remove this device", ["onRemoveDevice"]],
   ["This is not me", ["onForget"]],
@@ -674,8 +669,8 @@ test("each state of the device offers its actions", () => {
       ([label]) => label,
     );
 
+  // The account's devices are listed beside the panel, without a button.
   expect(labels(SIGNED_IN)).toEqual([
-    "Show devices",
     "Sign out",
     "Remove this device",
     "This is not me",
@@ -714,52 +709,11 @@ test("each state of the device offers its actions", () => {
     view: { kind: "known", status: SIGNED_IN },
     busy: true,
   });
-  for (const label of ["Show devices", "Sign out", "Remove this device"]) {
+  for (const label of ["Sign out", "Remove this device"]) {
     expect(busy).toContain(
       `<button type="button" class="panel-action" disabled="">${label}</button>`,
     );
   }
-});
-
-const DEVICES: DeviceView[] = [
-  {
-    id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
-    label: "Mac",
-    platform: "macos",
-    lastSeenAt: "2026-11-02T09:00:00.000Z",
-    signInExpiresAt: "2026-12-02T10:00:00.000Z",
-    revokedAt: null,
-    current: true,
-  },
-  {
-    id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b7",
-    label: "<b>Windows computer</b>",
-    platform: "windows",
-    lastSeenAt: null,
-    signInExpiresAt: "2026-12-02T10:00:00.000Z",
-    revokedAt: "2026-11-02T08:00:00.000Z",
-    current: false,
-  },
-];
-
-test("the device list marks the device of this installation, as text, and only while it is signed in", () => {
-  const html = render({
-    view: { kind: "known", status: SIGNED_IN },
-    devices: DEVICES,
-  });
-
-  expect(html).toContain(
-    '<section aria-labelledby="devices-title"><h4 id="devices-title">Devices</h4><ul class="device-list"><li aria-current="true">Mac<!-- --> (this device)<span class="device-detail">macOS, last seen on 2026-11-02</span></li><li>&lt;b&gt;Windows computer&lt;/b&gt;<span class="device-detail">Windows, removed on 2026-11-02</span></li></ul></section>',
-  );
-  expect(
-    render({ view: { kind: "known", status: SIGNED_IN }, devices: [] }),
-  ).toContain('<p class="placeholder-note">No devices are listed.</p>');
-  for (const status of [
-    { ...SIGNED_IN, device: "signed_out" as const },
-    { ...SIGNED_IN, signIn: { kind: "starting" as const } },
-  ]) {
-    expect(
-      render({ view: { kind: "known", status }, devices: DEVICES }),
-    ).not.toContain("devices-title");
-  }
+  expect(busy).not.toContain("Show devices");
+  expect(busy).not.toContain("devices-title");
 });

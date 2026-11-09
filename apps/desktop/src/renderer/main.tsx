@@ -20,6 +20,7 @@ createRoot(container).render(
       people={window.desktop?.people}
       agents={window.desktop?.agents}
       chat={window.desktop?.chat}
+      devices={window.desktop?.devices}
     />
   </StrictMode>,
 );

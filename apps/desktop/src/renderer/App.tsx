@@ -12,6 +12,7 @@ import type {
   AgentBridge,
   ChatBridge,
   ConnectionBridge,
+  DeviceListBridge,
   PeopleBridge,
   RepositoryBridge,
   RuntimeBridge,
@@ -90,6 +91,8 @@ export interface AppProps {
   readonly agents?: AgentBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
   readonly chat?: ChatBridge | undefined;
+  /** The account's devices from the preload script; undefined outside Electron. */
+  readonly devices?: DeviceListBridge | undefined;
   /**
    * The workspace state shown until the bridge delivers one, for tests and
    * previews. Without it, the shell starts without projects.
@@ -109,6 +112,7 @@ export function App({
   people,
   agents,
   chat,
+  devices,
   initialWorkspaceState,
   initialView = HOME_VIEW,
 }: AppProps) {
@@ -174,6 +178,7 @@ export function App({
           people={people}
           account={account}
           chat={chat}
+          devices={devices}
           homeSignIn={homeSignIn(workspaceSidebar.view, accountView)}
           dispatch={dispatch}
           focusAfterShow={focusAfterShow}
@@ -199,6 +204,7 @@ function ScreenContent({
   people,
   account,
   chat,
+  devices,
   homeSignIn,
   dispatch,
   focusAfterShow,
@@ -208,6 +214,7 @@ function ScreenContent({
   readonly people: PeopleBridge | undefined;
   readonly account: AccountBridge | undefined;
   readonly chat: ChatBridge | undefined;
+  readonly devices: DeviceListBridge | undefined;
   /** What the home screen says about the sign-in. */
   readonly homeSignIn: HomeSignIn;
   readonly dispatch: Dispatch<ShellAction>;
@@ -223,7 +230,7 @@ function ScreenContent({
         />
       );
     case "account":
-      return <AccountScreen account={account} />;
+      return <AccountScreen account={account} devices={devices} />;
     case "people":
       return <PeopleScreen people={people} />;
     case "join":

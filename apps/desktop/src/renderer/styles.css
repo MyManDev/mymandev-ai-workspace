@@ -524,9 +524,30 @@ code {
   overflow-wrap: anywhere;
 }
 
-.device-detail {
-  display: block;
+.device-name {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.device-label {
+  font-weight: var(--font-weight-strong);
+}
+
+.device-mark {
+  padding-inline: var(--space-1);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
   color: var(--color-text-muted);
+}
+
+/* The log region of the notices is always rendered, also empty. */
+.device-notices:not(:empty) {
+  margin-block: var(--space-2);
+}
+
+.device-notices p {
+  margin: 0 0 var(--space-1);
+  overflow-wrap: anywhere;
 }
 
 .pairing-code {

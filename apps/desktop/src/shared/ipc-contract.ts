@@ -184,20 +184,18 @@ export const MountResultSchema = z.discriminatedUnion("outcome", [
 export type MountResult = z.infer<typeof MountResultSchema>;
 
 /**
- * Limits of the account messages, in UTF-16 code units: a display name and
- * a device label as the protocol limits them, the authorize URL, the
- * warning shown with it, and the passphrase; and the number of devices in
- * the device list, the most that the API sends. The device key store counts
+ * Limits of the account messages: a display name as the protocol limits it
+ * (in characters, which zod counts as code points), and the authorize URL,
+ * the warning shown with it, and the passphrase. The device key store counts
  * at most 1,024 characters of a passphrase after NFC normalization and
- * refuses a longer one itself; this limit only bounds the message.
+ * refuses a longer one itself; this limit only bounds the message. The
+ * device list has its own limits (`DEVICE_LIST_LIMITS`).
  */
 export const ACCOUNT_LIMITS = Object.freeze({
   displayName: 64,
-  deviceLabel: 64,
   authorizeUrl: 4096,
   warning: 512,
   passphrase: 4096,
-  devices: 1_000,
 });
 
 /**
@@ -527,16 +525,14 @@ export const ForgetResultSchema = z.discriminatedUnion("outcome", [
 export type ForgetResult = z.infer<typeof ForgetResultSchema>;
 
 /**
- * Why an action of the device session (sign-out, removing this device, the
- * device list) was not taken: `busy` while a sign-in is open, the key is
- * loading or being unlocked, or another change of the account runs,
- * `not_signed_in` when this installation holds no account, and `too_soon`
- * for a device list within a few seconds of the last one.
+ * Why an action of the device session (sign-out, removing this device) was
+ * not taken: `busy` while a sign-in is open, the key is loading or being
+ * unlocked, or another change of the account runs, and `not_signed_in` when
+ * this installation holds no account.
  */
 export const DEVICE_ACTION_REFUSALS = Object.freeze([
   "busy",
   "not_signed_in",
-  "too_soon",
 ] as const);
 
 /**
@@ -608,32 +604,6 @@ export const RemoveDeviceResultSchema = z.discriminatedUnion("outcome", [
   DeviceActionFailedSchema,
 ]);
 export type RemoveDeviceResult = z.infer<typeof RemoveDeviceResultSchema>;
-
-/**
- * One device of the account, as the device list shows it. `current` marks
- * the device of this installation. Holds no key or token.
- */
-export const DeviceViewSchema = z.object({
-  id: z.uuid(),
-  label: z.string().min(1).max(ACCOUNT_LIMITS.deviceLabel),
-  platform: z.enum(["windows", "macos", "linux"]),
-  /** null until the device first connects. */
-  lastSeenAt: TimestampSchema.nullable(),
-  signInExpiresAt: TimestampSchema,
-  revokedAt: TimestampSchema.nullable(),
-  current: z.boolean(),
-});
-export type DeviceView = z.infer<typeof DeviceViewSchema>;
-
-export const ListDevicesResultSchema = z.discriminatedUnion("outcome", [
-  z.object({
-    outcome: z.literal("listed"),
-    devices: z.array(DeviceViewSchema).max(ACCOUNT_LIMITS.devices),
-  }),
-  DeviceActionRefusedSchema,
-  DeviceActionFailedSchema,
-]);
-export type ListDevicesResult = z.infer<typeof ListDevicesResultSchema>;
 
 /**
  * The states of the connection to the cloud API (#26):
@@ -1375,6 +1345,160 @@ export const CHAT_LOAD_OLDER_RESULTS = Object.freeze([
 export const ChatLoadOlderResultSchema = z.enum(CHAT_LOAD_OLDER_RESULTS);
 export type ChatLoadOlderResultView = z.infer<typeof ChatLoadOlderResultSchema>;
 
+// The account's devices (#95, decisions D4 and D5b of 2026-11-06).
+
+/**
+ * Limits of the device list message: the number of devices, the most that
+ * one answer of the API holds (the protocol's `MAX_ANSWER_LIST_ITEMS`); the
+ * length of a device label in characters (code points, which zod counts
+ * like the protocol's `LIMITS.deviceLabel`); and the number of notices of
+ * new devices, the most new devices that an account registers in 24 hours.
+ * The main process sends no more than these and cuts a longer label. The
+ * shared contract does not import the protocol package, so the main
+ * process's tests check that the values match.
+ */
+export const DEVICE_LIST_LIMITS = Object.freeze({
+  devices: 1_000,
+  label: 64,
+  newDevices: 10,
+});
+
+/**
+ * The states of the device list service: `signed_out` without a signed-in
+ * device with a ready key, `loading` until the list loaded once for this
+ * device, `ready`, and `unavailable` after a failed load, until a load
+ * succeeds.
+ */
+export const DEVICE_LIST_STATUSES = Object.freeze([
+  "signed_out",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type DeviceListStatusView = (typeof DEVICE_LIST_STATUSES)[number];
+
+/** Why the device list is `unavailable`: the failure of the last load. */
+export const DEVICE_LIST_PROBLEMS = Object.freeze([
+  "not_signed_in",
+  "rate_limited",
+  "unavailable",
+  "failed",
+] as const);
+export type DeviceListProblem = (typeof DEVICE_LIST_PROBLEMS)[number];
+
+/** The platforms of a device, like the protocol's `DEVICE_PLATFORMS`. */
+export const DEVICE_PLATFORMS = Object.freeze([
+  "windows",
+  "macos",
+  "linux",
+] as const);
+export type DevicePlatformView = (typeof DEVICE_PLATFORMS)[number];
+
+const DeviceLabelSchema = z.string().min(1).max(DEVICE_LIST_LIMITS.label);
+
+/**
+ * One device of the account, as the device list shows it. Its ID crosses as
+ * a typed string, because the later device actions name the device by it
+ * (D1). `current` marks the device of this installation. It holds no user
+ * ID, key, or token.
+ */
+export const DeviceViewSchema = z.object({
+  id: ProtocolIdSchema,
+  label: DeviceLabelSchema,
+  platform: z.enum(DEVICE_PLATFORMS),
+  createdAt: TimestampSchema,
+  /** null until the device first connects. */
+  lastSeenAt: TimestampSchema.nullable(),
+  lastSignInAt: TimestampSchema,
+  /** 30 days after the last sign-in. */
+  signInExpiresAt: TimestampSchema,
+  revokedAt: TimestampSchema.nullable(),
+  current: z.boolean(),
+});
+export type DeviceView = z.infer<typeof DeviceViewSchema>;
+
+/**
+ * A new device of the account, from the live `account.device_registered`
+ * frame (D4), until the person dismisses the notice.
+ */
+export const NewDeviceNoticeSchema = z.object({
+  id: ProtocolIdSchema,
+  label: DeviceLabelSchema,
+  platform: z.enum(DEVICE_PLATFORMS),
+  createdAt: TimestampSchema,
+});
+export type NewDeviceNoticeView = z.infer<typeof NewDeviceNoticeSchema>;
+
+const DeviceListViewFields = {
+  /**
+   * Grows by one with every change. A receiver keeps the state with the
+   * highest revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /** In the server's order, the most recently created first. */
+  devices: z.array(DeviceViewSchema).max(DEVICE_LIST_LIMITS.devices).readonly(),
+  /**
+   * The end of the account's registration lock while the last list said it
+   * was in force (D5b), in UTC; otherwise null.
+   */
+  registrationLockedUntil: TimestampSchema.nullable(),
+  /** The notices of new devices, the oldest first. */
+  newDevices: z
+    .array(NewDeviceNoticeSchema)
+    .max(DEVICE_LIST_LIMITS.newDevices)
+    .readonly(),
+};
+
+/**
+ * What the renderer may know of the device list service's state:
+ * `{ revision, status, problem?, devices, registrationLockedUntil,
+ * newDevices }`, with a problem only while `unavailable`. It holds device
+ * IDs, labels, platforms, and times only: no user ID and nothing secret.
+ */
+export const DeviceListViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum(["signed_out", "loading", "ready"]),
+    ...DeviceListViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(DEVICE_LIST_PROBLEMS),
+    ...DeviceListViewFields,
+  }),
+]);
+export type DeviceListView = z.infer<typeof DeviceListViewSchema>;
+
+/**
+ * Why the device list was not loaded on the renderer's request:
+ * `not_signed_in` without a signed-in device with a ready key, and
+ * `too_soon` within a few seconds of the last request.
+ */
+export const DEVICE_LIST_LOAD_REFUSALS = Object.freeze([
+  "not_signed_in",
+  "too_soon",
+] as const);
+
+/**
+ * The devices whose notices the renderer showed and the person dismissed
+ * (the Project Manager's decision of 2026-11-09): 1 to `newDevices` device
+ * IDs, each a lowercase UUIDv7. A notice that arrived after the last state
+ * that the renderer showed is not named, so it stays.
+ */
+export const DismissedDevicesSchema = z
+  .array(ProtocolIdSchema)
+  .min(1)
+  .max(DEVICE_LIST_LIMITS.newDevices);
+
+/** The result of `devices:load`: `loading`, or `refused` with a reason. */
+export const DeviceListLoadResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("loading") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(DEVICE_LIST_LOAD_REFUSALS),
+  }),
+]);
+export type DeviceListLoadResult = z.infer<typeof DeviceListLoadResultSchema>;
+
 /** The schemas of every invoke channel. */
 export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.getRuntimeStatus]: Object.freeze({
@@ -1435,10 +1559,6 @@ export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.removeDevice]: Object.freeze({
     args: NoArgumentsSchema,
     result: RemoveDeviceResultSchema,
-  }),
-  [INVOKE_CHANNELS.listDevices]: Object.freeze({
-    args: NoArgumentsSchema,
-    result: ListDevicesResultSchema,
   }),
   [INVOKE_CHANNELS.getConnectionStatus]: Object.freeze({
     args: NoArgumentsSchema,
@@ -1520,6 +1640,24 @@ export const INVOKE_CONTRACT = Object.freeze({
     args: NoArgumentsSchema,
     result: ChatLoadOlderResultSchema,
   }),
+  [INVOKE_CHANNELS.getDeviceList]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: DeviceListViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeDeviceList]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: DeviceListViewSchema,
+  }),
+  [INVOKE_CHANNELS.loadDeviceList]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: DeviceListLoadResultSchema,
+  }),
+  [INVOKE_CHANNELS.dismissNewDevices]: Object.freeze({
+    /** The device IDs of the notices that the renderer showed. */
+    args: z.tuple([DismissedDevicesSchema]),
+    /** True when a notice of them was held and ended. */
+    result: z.boolean(),
+  }),
 });
 
 /** The payload schema of every event channel. */
@@ -1532,6 +1670,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.peopleStateChanged]: PeopleViewSchema,
   [EVENT_CHANNELS.agentStateChanged]: AgentActivityViewSchema,
   [EVENT_CHANNELS.chatStateChanged]: ChatViewSchema,
+  [EVENT_CHANNELS.deviceListChanged]: DeviceListViewSchema,
 });
 
 export type InvokeArgs<C extends InvokeChannel> = z.infer<
