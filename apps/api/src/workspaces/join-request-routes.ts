@@ -156,9 +156,12 @@ type JoinRequestChange<T> = Readonly<{
  * reads the owner and admins of `announceIn` last (`joinRequestApprovers`),
  * after every lock that the change took, so that a demotion or a removal
  * that committed while the change waited for a lock leaves the person out.
- * A refusal throws inside `change`, so the transaction rolls back and
- * nothing is read or sent. Every route that sends a join request event runs
- * its change through it, so that they share one order.
+ * A refused decision or withdrawal throws inside `change`, so the
+ * transaction rolls back and nothing is read or sent; a refused new request
+ * writes nothing and returns `announceIn: null`, so nothing is read or sent
+ * either, and its route throws after the commit. Every route that sends a
+ * join request event runs its change through it, so that they share one
+ * order.
  */
 async function changeThenReadApprovers<T>(
   database: Database,
