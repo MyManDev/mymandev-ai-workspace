@@ -18,6 +18,7 @@ const OWNER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c1";
 const MEMBER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c3";
 const UNCLAIMED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c4";
 const FORMER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c5";
+const NEVER_CLAIMED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c6";
 
 const VERIFIED_AT = "2026-11-06T22:30:00.000Z";
 
@@ -42,6 +43,7 @@ const READY: PeopleView = {
   revision: 4,
   status: "ready",
   workspaceId: WORKSPACE,
+  workspaceName: "Team",
   ownMemberId: OWNER,
   people: [
     person(OWNER, "Ada", { role: "owner", login: "ada-l" }),
@@ -52,6 +54,12 @@ const READY: PeopleView = {
       verifiedAt: null,
     }),
     person(FORMER, "Alan", { role: "admin", former: true, login: "alan-t" }),
+    person(NEVER_CLAIMED, "Barbara", {
+      former: true,
+      claimed: false,
+      login: null,
+      verifiedAt: null,
+    }),
   ],
   morePeople: 0,
 };
@@ -81,6 +89,9 @@ const TITLE =
   '<section aria-labelledby="people-title"><h2 id="people-title">People</h2>';
 const ACTIONS_LATER = `<p class="placeholder-note">${PEOPLE_MESSAGES.actionsLater}</p></section>`;
 const HINT = `<p class="people-hint">${PEOPLE_MESSAGES.adminHint}</p>`;
+/** The selected workspace's name below the heading. */
+const NAMED =
+  '<p class="people-workspace">Workspace: <span dir="auto">Team</span></p>';
 
 function status(text: string): string {
   return `<p class="people-status" role="status">${escaped(text)}</p>`;
@@ -92,23 +103,28 @@ function attributeValues(html: string, name: string): string[] {
   );
 }
 
-test("each state without people shows its text in the status paragraph, and no list", () => {
-  const cases: [PeopleScreenView, string][] = [
-    [{ kind: "unavailable" }, "People are not available."],
-    [{ kind: "pending" }, "Checking the people."],
+test("each state without people shows its text in the status paragraph, and no list, below the workspace's name when there is one", () => {
+  const unnamed = { workspaceId: null, workspaceName: null, people: [] };
+  const cases: [PeopleScreenView, string, string][] = [
+    [{ kind: "unavailable" }, "People are not available.", ""],
+    [{ kind: "pending" }, "Checking the people.", ""],
     [
-      known({ status: "signed_out", workspaceId: null, people: [] }),
+      known({ status: "signed_out", ...unnamed }),
       "People appear once this device is signed in and ready.",
+      "",
     ],
     [
-      known({ status: "no_workspace", workspaceId: null, people: [] }),
-      "Select a workspace to see its people.",
+      known({ status: "no_workspace", ...unnamed }),
+      "No workspace is selected.",
+      "",
     ],
-    [known({ status: "loading", people: [] }), "Loading the people."],
-    [known({ people: [] }), "No people yet."],
+    [known({ status: "loading", people: [] }), "Loading the people.", NAMED],
+    [known({ people: [] }), "No people yet.", NAMED],
   ];
-  for (const [view, text] of cases) {
-    expect(render(view), text).toBe(TITLE + status(text) + ACTIONS_LATER);
+  for (const [view, text, name] of cases) {
+    expect(render(view), text).toBe(
+      TITLE + name + status(text) + ACTIONS_LATER,
+    );
   }
 });
 
@@ -117,6 +133,7 @@ test("a ready state lists each person with the name, the role, and the login wit
 
   expect(html).toBe(
     TITLE +
+      NAMED +
       status("") +
       HINT +
       '<ul class="people-list" aria-labelledby="people-title">' +
@@ -142,14 +159,26 @@ test("a ready state lists each person with the name, the role, and the login wit
       '<p class="person-name"><span dir="auto">Alan</span></p>' +
       '<p class="person-meta">GitHub <span class="person-login" translate="no">alan-t</span>, last verified <time dateTime="2026-11-06T22:30:00.000Z">7 Nov 2026</time></p>' +
       "</li>" +
+      '<li class="person">' +
+      '<p class="person-name"><span dir="auto">Barbara</span></p>' +
+      '<p class="person-meta">Never claimed</p>' +
+      "</li>" +
       "</ul>" +
       ACTIONS_LATER,
   );
 });
 
-test("the hint to make someone an admin shows to the owner only", () => {
+test("the hint to make someone an admin shows to the owner only, when someone could become an admin", () => {
   expect(render(known())).toContain(HINT);
   expect(render(known({ ownMemberId: MEMBER }))).not.toContain("people-hint");
+  // Only unclaimed people besides the owner: nobody can be promoted.
+  expect(
+    render(
+      known({
+        people: READY.people.filter((entry) => entry.memberId !== MEMBER),
+      }),
+    ),
+  ).not.toContain("people-hint");
   expect(
     render(
       known({
@@ -162,6 +191,15 @@ test("the hint to make someone an admin shows to the owner only", () => {
       }),
     ),
   ).not.toContain("people-hint");
+});
+
+test("people left out are counted after the last list", () => {
+  const html = render(known({ morePeople: 2 }));
+  const note = `<p class="people-note">${new Intl.NumberFormat().format(2)} more people are not shown.</p>`;
+  expect(html).toContain(`</ul>${note}${ACTIONS_LATER}`);
+  expect(html.indexOf(note)).toBeGreaterThan(
+    html.indexOf("former-people-heading"),
+  );
 });
 
 test("without former members there is no former group, and people left out are counted", () => {
@@ -197,7 +235,7 @@ test("an unavailable state shows its problem with the people loaded before, or a
       } as Partial<PeopleView>),
     );
     expect(alone).toBe(
-      TITLE + status(PEOPLE_PROBLEM_MESSAGES[problem]) + ACTIONS_LATER,
+      TITLE + NAMED + status(PEOPLE_PROBLEM_MESSAGES[problem]) + ACTIONS_LATER,
     );
   }
 });
@@ -205,6 +243,7 @@ test("an unavailable state shows its problem with the people loaded before, or a
 test("names and logins are rendered as text, never as markup", () => {
   const html = render(
     known({
+      workspaceName: "<b>Team</b>",
       people: [
         person(OWNER, '<img src="x" onerror="alert(1)">', { role: "owner" }),
         // A right-to-left name takes its direction from its content.
@@ -218,6 +257,9 @@ test("names and logins are rendered as text, never as markup", () => {
   );
   expect(html).toContain(
     '<span dir="auto">\u05e9\u05dc\u05d5\u05dd &lt;b&gt;</span>',
+  );
+  expect(html).toContain(
+    '<p class="people-workspace">Workspace: <span dir="auto">&lt;b&gt;Team&lt;/b&gt;</span></p>',
   );
   expect(html).not.toContain("<img");
   expect(html).not.toContain("<b>");

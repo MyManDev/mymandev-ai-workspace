@@ -26,6 +26,9 @@ const MEMBER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c3";
 const UNCLAIMED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c4";
 const FORMER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c5";
 const ERASED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c6";
+const NEVER_CLAIMED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c7";
+const SECOND_MEMBER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c8";
+const SECOND_UNCLAIMED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c9";
 
 const VERIFIED_AT = "2026-11-06T08:00:00.000Z";
 
@@ -57,12 +60,19 @@ const PEOPLE: readonly PersonView[] = [
   }),
   person(FORMER, "Alan", { role: "admin", former: true, login: "alan-t" }),
   person(ERASED, "Edsger", { former: true, login: null, verifiedAt: null }),
+  person(NEVER_CLAIMED, "Barbara", {
+    former: true,
+    claimed: false,
+    login: null,
+    verifiedAt: null,
+  }),
 ];
 
 const READY: PeopleView = {
   revision: 4,
   status: "ready",
   workspaceId: WORKSPACE,
+  workspaceName: "Team",
   ownMemberId: MEMBER,
   people: PEOPLE,
   morePeople: 0,
@@ -106,24 +116,29 @@ test("following the people reports every state, a refused subscription, and ends
   expect(fake.ended).toBe(1);
 });
 
-test("each state without people has its own fixed text and lists nothing", () => {
-  const cases: readonly [PeopleScreenView, string][] = [
-    [{ kind: "unavailable" }, "People are not available."],
-    [{ kind: "pending" }, "Checking the people."],
+test("each state without people has its own fixed text and lists nothing, with the workspace's name when there is one", () => {
+  const unnamed = { workspaceId: null, workspaceName: null, people: [] };
+  const cases: readonly [PeopleScreenView, string, string | null][] = [
+    [{ kind: "unavailable" }, "People are not available.", null],
+    [{ kind: "pending" }, "Checking the people.", null],
     [
-      known({ status: "signed_out", workspaceId: null, people: [] }),
+      known({ status: "signed_out", ...unnamed }),
       "People appear once this device is signed in and ready.",
+      null,
     ],
+    // True both without any workspace and without a selected one.
     [
-      known({ status: "no_workspace", workspaceId: null, people: [] }),
-      "Select a workspace to see its people.",
+      known({ status: "no_workspace", ...unnamed }),
+      "No workspace is selected.",
+      null,
     ],
-    [known({ status: "loading", people: [] }), "Loading the people."],
-    [known({ people: [] }), "No people yet."],
+    [known({ status: "loading", people: [] }), "Loading the people.", "Team"],
+    [known({ people: [] }), "No people yet.", "Team"],
   ];
-  for (const [view, status] of cases) {
+  for (const [view, status, workspaceName] of cases) {
     expect(describePeopleScreen(view), status).toEqual({
       status,
+      workspaceName,
       lists: null,
       adminHint: false,
     });
@@ -169,7 +184,7 @@ test("a ready state lists the active people and then the former members apart, i
     },
   ]);
   // A former member shows no role; one whose account's data was erased
-  // shows that no login is kept.
+  // shows that no login is kept, and one that was never claimed says so.
   expect(lists?.former).toEqual([
     {
       memberId: FORMER,
@@ -187,8 +202,45 @@ test("a ready state lists the active people and then the former members apart, i
       github: null,
       note: "No GitHub login",
     },
+    {
+      memberId: NEVER_CLAIMED,
+      displayName: "Barbara",
+      role: null,
+      you: false,
+      github: null,
+      note: "Never claimed",
+    },
   ]);
   expect(lists?.morePeople).toBe(0);
+});
+
+test("the active people are sorted owner, admins, claimed members, then unclaimed people, each group in the main process's order", () => {
+  const unclaimed = { claimed: false, login: null, verifiedAt: null };
+  const { lists } = describePeopleScreen(
+    known({
+      // The main process's order, after events added people at the end.
+      people: [
+        person(UNCLAIMED, "Margaret", unclaimed),
+        person(SECOND_MEMBER, "Barbara L"),
+        person(FORMER, "Alan", { role: "admin", former: true }),
+        person(ADMIN, "Grace", { role: "admin" }),
+        person(SECOND_UNCLAIMED, "Hedy", unclaimed),
+        person(MEMBER, "Linus"),
+        person(OWNER, "Ada", { role: "owner" }),
+        person(ERASED, "Edsger", { former: true }),
+      ],
+    }),
+  );
+  expect(lists?.active.map((row) => row.memberId)).toEqual([
+    OWNER,
+    ADMIN,
+    SECOND_MEMBER,
+    MEMBER,
+    UNCLAIMED,
+    SECOND_UNCLAIMED,
+  ]);
+  // The former members keep the main process's order.
+  expect(lists?.former.map((row) => row.memberId)).toEqual([FORMER, ERASED]);
 });
 
 test("only the account's own person is marked", () => {
@@ -201,23 +253,42 @@ test("only the account's own person is marked", () => {
   }
 });
 
-test("the hint to make someone an admin shows to the owner only, while no active person is an admin", () => {
+test("the hint to make someone an admin shows to the owner only, while no active person is an admin and an active, claimed person could become one", () => {
   const noAdmin = PEOPLE.map((entry) =>
     entry.memberId === ADMIN ? { ...entry, role: "member" as const } : entry,
   );
   const hint = (overrides: Partial<PeopleView>) =>
     describePeopleScreen(known(overrides)).adminHint;
 
-  // The owner of a workspace without an admin; a former admin does not count.
+  // The owner of a workspace without an admin, with claimed members; a
+  // former admin does not count.
   expect(hint({ ownMemberId: OWNER, people: noAdmin })).toBe(true);
   // An active admin ends it.
   expect(hint({ ownMemberId: OWNER, people: PEOPLE })).toBe(false);
-  // Nobody else sees it.
+  // Without an active, claimed person besides the owner, nobody could be
+  // promoted: only unclaimed people and former members.
+  const ownerAlone = noAdmin.filter(
+    (entry) => entry.role === "owner" || entry.former || !entry.claimed,
+  );
+  expect(ownerAlone.some((entry) => !entry.former && !entry.claimed)).toBe(
+    true,
+  );
+  expect(ownerAlone.some((entry) => entry.former && entry.claimed)).toBe(true);
+  expect(hint({ ownMemberId: OWNER, people: ownerAlone })).toBe(false);
+  // One claimed member is enough.
+  expect(
+    hint({
+      ownMemberId: OWNER,
+      people: [...ownerAlone, person(SECOND_MEMBER, "Barbara L")],
+    }),
+  ).toBe(true);
+  // Nobody else sees it, and never an admin.
   for (const ownMemberId of [MEMBER, UNCLAIMED, FORMER, null]) {
     expect(hint({ ownMemberId, people: noAdmin }), String(ownMemberId)).toBe(
       false,
     );
   }
+  expect(hint({ ownMemberId: ADMIN, people: PEOPLE })).toBe(false);
   // With people left out, the screen cannot know.
   expect(hint({ ownMemberId: OWNER, people: noAdmin, morePeople: 1 })).toBe(
     false,
@@ -243,7 +314,7 @@ test("the hint to make someone an admin shows to the owner only, while no active
     }),
   ).toBe(false);
   expect(PEOPLE_MESSAGES.adminHint).toBe(
-    "Only you can manage this workspace. Consider making a person you trust an admin, so that someone else can also invite people and answer join requests.",
+    "Only you can manage this workspace. Consider making someone you trust an admin, so they can also invite people and answer join requests.",
   );
 });
 
@@ -263,6 +334,7 @@ test("an unavailable state shows its problem, with the people loaded before or a
     );
     expect(alone).toEqual({
       status: PEOPLE_PROBLEM_MESSAGES[problem],
+      workspaceName: "Team",
       lists: null,
       adminHint: false,
     });
@@ -287,7 +359,11 @@ test("a workspace without active people says so and still lists its former membe
   );
   expect(status).toBe(PEOPLE_MESSAGES.noPeople);
   expect(lists?.active).toEqual([]);
-  expect(lists?.former.map((row) => row.memberId)).toEqual([FORMER, ERASED]);
+  expect(lists?.former.map((row) => row.memberId)).toEqual([
+    FORMER,
+    ERASED,
+    NEVER_CLAIMED,
+  ]);
 });
 
 test("the note counts the people left out, with the digits grouped in the locale", () => {

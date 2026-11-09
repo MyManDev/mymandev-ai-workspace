@@ -40,21 +40,25 @@ export const PEOPLE_MESSAGES = Object.freeze({
   unavailable: "People are not available.",
   pending: "Checking the people.",
   signedOut: "People appear once this device is signed in and ready.",
-  noWorkspace: "Select a workspace to see its people.",
+  /** True whether the account has no workspace or none is selected. */
+  noWorkspace: "No workspace is selected.",
   loading: "Loading the people.",
   noPeople: "No people yet.",
   /** After the display name of the account's own person. */
   you: "(you)",
-  /** A person whom no account has claimed yet. */
+  /** An active person whom no account has claimed yet. */
   unclaimed: "Not claimed yet",
+  /** A former member whom no account claimed: it can never be claimed now. */
+  neverClaimed: "Never claimed",
   /** A claimed former member whose account's data was erased. */
   noLogin: "No GitHub login",
   /**
-   * To the owner only, while no active person is an admin (#95: "encourage
-   * at least one admin besides the owner").
+   * To the owner only, while no active person is an admin and an active,
+   * claimed person could become one (#95: "encourage at least one admin
+   * besides the owner"; the Project Manager's decision of 2026-11-09).
    */
   adminHint:
-    "Only you can manage this workspace. Consider making a person you trust an admin, so that someone else can also invite people and answer join requests.",
+    "Only you can manage this workspace. Consider making someone you trust an admin, so they can also invite people and answer join requests.",
   /** What the screen does not offer yet. */
   actionsLater:
     "Inviting people, answering join requests, and changing people and roles will be added here.",
@@ -96,13 +100,21 @@ export interface PersonRow {
     readonly login: string;
     readonly verifiedAt: string;
   } | null;
-  /** What shows instead of a login: unclaimed, or no login; null with one. */
+  /**
+   * What shows instead of a login: not claimed yet, never claimed (a former
+   * member), or no login; null with one.
+   */
   readonly note: string | null;
 }
 
-/** What the screen lists, in the order of the main process. */
+/** What the screen lists. */
 export interface PeopleLists {
+  /**
+   * The active people: the owner, the admins, the claimed members, then the
+   * unclaimed people, each group in the main process's order.
+   */
   readonly active: readonly PersonRow[];
+  /** The former members, in the main process's order. */
   readonly former: readonly PersonRow[];
   /** How many people the main process left out. */
   readonly morePeople: number;
@@ -111,6 +123,8 @@ export interface PeopleLists {
 export interface PeopleScreenModel {
   /** The text of the screen's status paragraph; empty when there is none. */
   readonly status: string;
+  /** The name of the selected workspace, or null without one. */
+  readonly workspaceName: string | null;
   /** The people, or null when there is nothing to list. */
   readonly lists: PeopleLists | null;
   /** Whether the screen shows the hint to make someone an admin. */
@@ -133,14 +147,36 @@ function personRow(person: PersonView, ownMemberId: string | null): PersonRow {
         ? null
         : person.claimed
           ? PEOPLE_MESSAGES.noLogin
-          : PEOPLE_MESSAGES.unclaimed,
+          : person.former
+            ? PEOPLE_MESSAGES.neverClaimed
+            : PEOPLE_MESSAGES.unclaimed,
   };
 }
 
 /**
- * Whether the owner sees the hint to make someone an admin: the account's
- * own person is the active owner, and no active person is an admin. With
- * people left out, the screen cannot know, so it shows no hint.
+ * The place of an active person's group on the screen: the owner, the
+ * admins, the claimed members, then the unclaimed people (the Project
+ * Manager's decision of 2026-11-09).
+ */
+function activeGroup(person: PersonView): number {
+  switch (person.role) {
+    case "owner":
+      return 0;
+    case "admin":
+      return 1;
+    case "member":
+      return person.claimed ? 2 : 3;
+  }
+}
+
+/**
+ * Whether the owner sees the hint to make someone an admin, only when the
+ * owner can act on it (the Project Manager's decision of 2026-11-09): the
+ * account's own person is the active owner, no active person is an admin,
+ * and at least one active, claimed person other than the owner could
+ * become one; an unclaimed person cannot be promoted. With people left
+ * out by the main process, the screen cannot know whether an admin is
+ * among them, so it shows no hint.
  */
 function needsAdmin(state: PeopleView): boolean {
   if (state.morePeople > 0) {
@@ -149,14 +185,18 @@ function needsAdmin(state: PeopleView): boolean {
   const active = state.people.filter((person) => !person.former);
   const own = active.find((person) => person.memberId === state.ownMemberId);
   return (
-    own?.role === "owner" && !active.some((person) => person.role === "admin")
+    own?.role === "owner" &&
+    !active.some((person) => person.role === "admin") &&
+    active.some((person) => person.claimed && person.role !== "owner")
   );
 }
 
 function listsOf(state: PeopleView): PeopleLists {
   return {
+    // A stable sort keeps the main process's order within each group.
     active: state.people
       .filter((person) => !person.former)
+      .sort((a, b) => activeGroup(a) - activeGroup(b))
       .map((person) => personRow(person, state.ownMemberId)),
     former: state.people
       .filter((person) => person.former)
@@ -165,7 +205,11 @@ function listsOf(state: PeopleView): PeopleLists {
   };
 }
 
-const NOTHING_LISTED = { lists: null, adminHint: false } as const;
+const NOTHING_LISTED = {
+  workspaceName: null,
+  lists: null,
+  adminHint: false,
+} as const;
 
 /**
  * What the people screen shows:
@@ -173,14 +217,16 @@ const NOTHING_LISTED = { lists: null, adminHint: false } as const;
  * - a fixed text without the bridge, before the first state, while no
  *   device is signed in and ready, while no workspace is selected, and
  *   while the people load;
- * - when `ready`, the active people and then the former members, in the
- *   main process's order, with "No people yet." when no person is active;
+ * - when `ready`, the active people, the owner first, then the admins, the
+ *   claimed members, and the unclaimed people, and then the former
+ *   members, with "No people yet." when no person is active;
  * - when `unavailable`, the problem as a fixed text, with what was loaded
  *   before. Without any of it, only the problem shows, because an empty
  *   list would claim what was never loaded.
  *
  * The hint to make someone an admin shows with the lists, to the owner
- * only (`needsAdmin`).
+ * only (`needsAdmin`). The selected workspace's name shows whenever the
+ * main process names one.
  */
 export function describePeopleScreen(
   view: PeopleScreenView,
@@ -194,18 +240,20 @@ export function describePeopleScreen(
       break;
   }
   const { state } = view;
+  const named = { ...NOTHING_LISTED, workspaceName: state.workspaceName };
   switch (state.status) {
     case "signed_out":
-      return { status: PEOPLE_MESSAGES.signedOut, ...NOTHING_LISTED };
+      return { ...named, status: PEOPLE_MESSAGES.signedOut };
     case "no_workspace":
-      return { status: PEOPLE_MESSAGES.noWorkspace, ...NOTHING_LISTED };
+      return { ...named, status: PEOPLE_MESSAGES.noWorkspace };
     case "loading":
-      return { status: PEOPLE_MESSAGES.loading, ...NOTHING_LISTED };
+      return { ...named, status: PEOPLE_MESSAGES.loading };
     case "unavailable":
       return state.people.length === 0
-        ? { status: PEOPLE_PROBLEM_MESSAGES[state.problem], ...NOTHING_LISTED }
+        ? { ...named, status: PEOPLE_PROBLEM_MESSAGES[state.problem] }
         : {
             status: PEOPLE_PROBLEM_MESSAGES[state.problem],
+            workspaceName: state.workspaceName,
             lists: listsOf(state),
             adminHint: needsAdmin(state),
           };
@@ -213,6 +261,7 @@ export function describePeopleScreen(
       const lists = listsOf(state);
       return {
         status: lists.active.length === 0 ? PEOPLE_MESSAGES.noPeople : "",
+        workspaceName: state.workspaceName,
         lists:
           lists.active.length === 0 && lists.former.length === 0 ? null : lists,
         adminHint: needsAdmin(state),

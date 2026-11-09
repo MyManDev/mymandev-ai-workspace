@@ -2,6 +2,7 @@ import type { MemberId } from "@mymandev/protocol";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import {
   PEOPLE_LIMITS,
+  WORKSPACE_LIMITS,
   type PeopleStatusView,
   type PeopleView,
   type PersonView,
@@ -53,8 +54,9 @@ function personView(person: PersonState): PersonView {
  * stays in the main process (the workspace service never keeps it). The
  * active people come first, in the service's order, then the former
  * members; at most `PEOPLE_LIMITS.people` cross, and `morePeople` counts
- * the rest. Names are cut to their limit. `ownMemberId` names the account's
- * own person in the selected workspace. The status is the workspace
+ * the rest. Names are cut to their limit. `workspaceName` is the selected
+ * workspace's name from the workspace list, the same as the sidebar's, and
+ * `ownMemberId` names the account's own person in it. The status is the workspace
  * service's, except that a `ready` state without a selected workspace is
  * `no_workspace`.
  */
@@ -68,9 +70,14 @@ export function peopleView(
     ...people.filter((person) => person.removedAt !== null),
   ];
   const shown = ordered.slice(0, PEOPLE_LIMITS.people);
+  const selected = state.workspaces.find(
+    (workspace) => workspace.id === state.selectedWorkspaceId,
+  );
   const fields = {
     revision: state.revision,
     workspaceId: state.selectedWorkspaceId,
+    workspaceName:
+      selected === undefined ? null : cut(selected.name, WORKSPACE_LIMITS.name),
     ownMemberId: state.selectedWorkspaceId === null ? null : ownMemberId,
     people: Object.freeze(shown.map(personView)),
     morePeople: ordered.length - shown.length,

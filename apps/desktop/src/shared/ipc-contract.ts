@@ -963,6 +963,11 @@ const PeopleViewFields = {
   revision: z.int().nonnegative(),
   /** The selected workspace, or null. */
   workspaceId: ProtocolIdSchema.nullable(),
+  /**
+   * The selected workspace's name from the workspace list, the same as the
+   * sidebar's, cut to `WORKSPACE_LIMITS.name`; null without a selection.
+   */
+  workspaceName: WorkspaceNameSchema.nullable(),
   /** The account's own person in the selected workspace, or null. */
   ownMemberId: ProtocolIdSchema.nullable(),
   /**
@@ -976,9 +981,10 @@ const PeopleViewFields = {
 
 /**
  * What the renderer may know of the selected workspace's people:
- * `{ revision, status, problem?, workspaceId, ownMemberId, people,
- * morePeople }`, with a problem only while `unavailable`. It holds member
- * IDs, names, roles, logins, and times only: no user ID and nothing secret.
+ * `{ revision, status, problem?, workspaceId, workspaceName, ownMemberId,
+ * people, morePeople }`, with a problem only while `unavailable`. It holds
+ * member IDs, names, roles, logins, and times only: no user ID and nothing
+ * secret.
  */
 export const PeopleViewSchema = z.discriminatedUnion("status", [
   z.object({

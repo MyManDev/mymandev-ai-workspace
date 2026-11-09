@@ -11,6 +11,7 @@ import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import {
   PEOPLE_LIMITS,
   PEOPLE_STATUSES,
+  WORKSPACE_LIMITS,
   PeopleViewSchema,
   PERSON_ROLES,
   WORKSPACE_PROBLEMS,
@@ -278,6 +279,7 @@ test("the view holds each person's member ID, name, role, claim, login, and form
     status: "ready",
     revision: 3,
     workspaceId: WORKSPACE,
+    workspaceName: "Workspace Alpha",
     ownMemberId: OWNER,
     people: [
       {
@@ -329,6 +331,7 @@ test("the status follows the workspace state, with no_workspace once the list lo
     expect.objectContaining({
       status: "signed_out",
       workspaceId: null,
+      workspaceName: null,
       ownMemberId: null,
     }),
   );
@@ -340,6 +343,7 @@ test("the status follows the workspace state, with no_workspace once the list lo
     expect.objectContaining({
       status: "no_workspace",
       workspaceId: null,
+      workspaceName: null,
       ownMemberId: null,
     }),
   );
@@ -364,6 +368,45 @@ test("the status follows the workspace state, with no_workspace once the list lo
       ).success,
     ).toBe(true);
   }
+});
+
+test("the view names the selected workspace from the workspace list, cut to the limit, with the state's revision", () => {
+  const face = "\u{1f600}";
+  const other = id(0xa2) as WorkspaceId;
+  const workspaces = Object.freeze([
+    Object.freeze({ id: other, name: "Workspace Beta" }),
+    Object.freeze({
+      id: WORKSPACE,
+      name: face.repeat(WORKSPACE_LIMITS.name + 5),
+    }),
+  ]);
+  const view = peopleView(
+    workspaceState({ revision: 9, workspaces }),
+    PEOPLE,
+    OWNER,
+  );
+  expect(view.revision).toBe(9);
+  expect(view.workspaceName).toBe(face.repeat(WORKSPACE_LIMITS.name));
+  expect(PeopleViewSchema.safeParse(view).success).toBe(true);
+  expect(
+    peopleView(
+      workspaceState({ workspaces, selectedWorkspaceId: other }),
+      [],
+      null,
+    ).workspaceName,
+  ).toBe("Workspace Beta");
+  // A selection that the list does not hold, or none, names nothing.
+  expect(
+    peopleView(workspaceState({ workspaces: Object.freeze([]) }), PEOPLE, OWNER)
+      .workspaceName,
+  ).toBeNull();
+  expect(
+    peopleView(
+      workspaceState({ workspaces, selectedWorkspaceId: null }),
+      [],
+      null,
+    ).workspaceName,
+  ).toBeNull();
 });
 
 test("no user ID, device ID, or other key of the service crosses", () => {
@@ -687,6 +730,7 @@ test("with the real workspace service, the people of its view and of a claim cro
   expect(first).toMatchObject({
     status: "ready",
     workspaceId: WORKSPACE,
+    workspaceName: "Workspace Alpha",
     ownMemberId: OWNER,
   });
   expect(first.people.map((entry) => [entry.memberId, entry.claimed])).toEqual([

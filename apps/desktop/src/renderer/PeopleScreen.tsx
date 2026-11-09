@@ -43,17 +43,25 @@ export interface PeopleScreenContentProps {
  * announces a new text. Display names are text that people entered, so
  * each one takes its direction from its own content (`dir="auto"`); a
  * GitHub login is shown in a monospace font, so that a display name cannot
- * pass for it (ADR 0014, "People and roles").
+ * pass for it (ADR 0014, "People and roles"). The heading stays "People",
+ * a fixed landmark, and the selected workspace's name follows it as text.
  */
 export function PeopleScreenContent({
   view,
   dateFormat,
 }: PeopleScreenContentProps) {
-  const { status, lists, adminHint } = describePeopleScreen(view);
+  const { status, workspaceName, lists, adminHint } =
+    describePeopleScreen(view);
   const format = dateFormat ?? peopleDateFormat();
   return (
     <section aria-labelledby="people-title">
       <h2 id="people-title">People</h2>
+      {workspaceName === null ? null : (
+        <p className="people-workspace">
+          {"Workspace: "}
+          <span dir="auto">{workspaceName}</span>
+        </p>
+      )}
       <p className="people-status" role="status">
         {status}
       </p>
@@ -67,11 +75,6 @@ export function PeopleScreenContent({
             labelledBy="people-title"
             format={format}
           />
-          {lists.morePeople === 0 ? null : (
-            <p className="people-note">
-              {describeMorePeople(lists.morePeople)}
-            </p>
-          )}
           {lists.former.length === 0 ? null : (
             <>
               <h3 className="people-heading" id="former-people-heading">
@@ -83,6 +86,11 @@ export function PeopleScreenContent({
                 format={format}
               />
             </>
+          )}
+          {lists.morePeople === 0 ? null : (
+            <p className="people-note">
+              {describeMorePeople(lists.morePeople)}
+            </p>
           )}
         </>
       )}

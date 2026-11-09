@@ -159,13 +159,14 @@ test("a chat message body keeps its line breaks and spaces, and a long word wrap
   expect(others).toEqual(["pre-wrap"]);
 });
 
-test("a GitHub login on the people screen is shown in the monospace font, and a long name wraps", () => {
+test("a GitHub login on the people screen is shown in the monospace font, and a long name or workspace name wraps", () => {
   // ADR 0014: the login is shown in a monospace font, so that a display
   // name cannot pass for it.
   expect(rulesWith(".person-login")).toEqual([
     expect.stringContaining("font-family: var(--font-family-mono);"),
   ]);
   expect(rule(".person")).toContain("overflow-wrap: anywhere;");
+  expect(rule(".people-workspace")).toContain("overflow-wrap: anywhere;");
 });
 
 test("the selected navigation item and tab keep a mark in forced colors", () => {

@@ -1441,6 +1441,7 @@ function peopleValue(overrides: Record<string, unknown> = {}) {
     status: "ready",
     revision: 3,
     workspaceId: WORKSPACE_ID,
+    workspaceName: "Team",
     ownMemberId: PERSON_ID,
     people: [
       personValue(),
@@ -1472,6 +1473,7 @@ test("a people view with every status, problem, and role is accepted and frozen"
   }
   const value = peopleValue({
     workspaceId: null,
+    workspaceName: null,
     ownMemberId: null,
     people: PERSON_ROLES.map((role) => personValue({ role, former: true })),
     morePeople: 12,
@@ -1515,6 +1517,9 @@ test("a people view over the limits or with wrong values is refused", () => {
     peopleValue({ workspaceId: "workspace" }),
     peopleValue({ ownMemberId: PERSON_ID.toUpperCase() }),
     peopleValue({ ownMemberId: undefined }),
+    peopleValue({ workspaceName: undefined }),
+    peopleValue({ workspaceName: "" }),
+    peopleValue({ workspaceName: "a".repeat(WORKSPACE_LIMITS.name + 1) }),
     peopleValue({ people: many(personValue(), PEOPLE_LIMITS.people + 1) }),
     peopleValue({ people: [personValue({ memberId: MOUNT_ID })] }),
     peopleValue({ people: [personValue({ memberId: null })] }),
@@ -1543,6 +1548,7 @@ test("a people view over the limits or with wrong values is refused", () => {
   expect(
     PeopleViewSchema.safeParse(
       peopleValue({
+        workspaceName: "\u{1F600}".repeat(WORKSPACE_LIMITS.name),
         people: many(
           personValue({
             displayName: "\u{1F600}".repeat(PEOPLE_LIMITS.displayName),
