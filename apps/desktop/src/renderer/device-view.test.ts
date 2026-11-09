@@ -687,12 +687,75 @@ test("the list's first load for a device keeps the sentence of a notice's action
   expect(views.at(-1)?.message).toBe(
     DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost,
   );
+
+  // A drop to another device without a sign-out: the list loads again
+  // after a list that had loaded, and then names another device.
+  actions.listChanged(loading);
+  expect(views.at(-1)?.message).toBeUndefined();
+  await notMe();
+  for (const view of afterwards([NEW_LAPTOP, THIS_DEVICE])) {
+    actions.listChanged(view);
+  }
+  expect(views.at(-1)?.message).toBe(
+    DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost,
+  );
 });
 
-test("an action whose answer comes after a sign-out, a drop of the list, or another device shows no sentence", async () => {
-  for (const [name, drop] of [
+test("an action whose answer comes after a sign-out, a drop of the list, or another device shows no sentence, whatever the answer", async () => {
+  type Fake = ReturnType<typeof actionBridge>;
+  type Actions = ReturnType<typeof createDeviceActions>;
+  // Each kind of answer: the call, and how the test settles it.
+  const answers: readonly (readonly [
+    string,
+    (actions: Actions) => Promise<boolean>,
+    (fake: Fake) => void,
+  ])[] = [
+    [
+      "removed",
+      (actions) => actions.revoke(NEW_LAPTOP.id, "removed"),
+      (fake) => fake.revoked({ outcome: "revoked", reason: "removed" }),
+    ],
+    [
+      "revoked as lost",
+      (actions) => actions.revoke(NEW_LAPTOP.id, "lost"),
+      (fake) => fake.revoked({ outcome: "revoked", reason: "lost" }),
+    ],
+    [
+      "a rejected call",
+      (actions) => actions.revoke(NEW_LAPTOP.id, "removed"),
+      (fake) => fake.revokeFails(),
+    ],
+    [
+      "a refused revocation",
+      (actions) => actions.revoke(NEW_LAPTOP.id, "removed"),
+      (fake) => fake.revoked({ outcome: "refused", reason: "not_listed" }),
+    ],
+    [
+      "an unknown revocation",
+      (actions) => actions.revoke(NEW_LAPTOP.id, "lost"),
+      (fake) => fake.revoked({ outcome: "unknown" }),
+    ],
+    [
+      "lifted",
+      (actions) => actions.lift(),
+      (fake) => fake.lifted({ outcome: "lifted" }),
+    ],
+    [
+      "a refused lift",
+      (actions) => actions.lift(),
+      (fake) => fake.lifted({ outcome: "refused", reason: "no_lock" }),
+    ],
+  ];
+  const drops: readonly (readonly [string, readonly DeviceSectionView[]])[] = [
     ["signed out", [known({ status: "signed_out", devices: [] })]],
-    ["loading after a drop", [known({ status: "loading", devices: [] })]],
+    ["loading after ready", [known({ status: "loading", devices: [] })]],
+    [
+      "loading after unavailable",
+      [
+        known({ status: "unavailable", problem: "failed" }),
+        known({ status: "loading", devices: [] }),
+      ],
+    ],
     [
       "signed out and in as another device",
       [
@@ -702,29 +765,50 @@ test("an action whose answer comes after a sign-out, a drop of the list, or anot
       ],
     ],
     ["another device", [known({ devices: [ANOTHER_THIS_DEVICE] })]],
-  ] as const) {
-    const fake = actionBridge();
-    const views: DeviceActionsView[] = [];
-    const actions = createDeviceActions(fake.bridge, (view) =>
-      views.push(view),
-    );
-    actions.listChanged(known({}));
-    const removing = actions.revoke(NEW_LAPTOP.id, "removed");
-    for (const view of drop) {
-      actions.listChanged(view);
-    }
-    fake.revoked({ outcome: "revoked", reason: "removed" });
-    await expect(removing, name).resolves.toBe(true);
-    expect(views.at(-1), name).toEqual({ running: false, message: undefined });
+  ];
+  for (const [dropName, drop] of drops) {
+    for (const [answerName, start, settle] of answers) {
+      const name = `${dropName}, ${answerName}`;
+      const fake = actionBridge();
+      const views: DeviceActionsView[] = [];
+      const actions = createDeviceActions(fake.bridge, (view) =>
+        views.push(view),
+      );
+      actions.listChanged(known({}));
+      const acting = start(actions);
+      for (const view of drop) {
+        actions.listChanged(view);
+      }
+      settle(fake);
+      await acting;
+      expect(views.at(-1), name).toEqual({
+        running: false,
+        message: undefined,
+      });
 
-    // The next action on the same list says its sentence again.
-    const lifting = actions.lift();
-    fake.lifted({ outcome: "lifted" });
-    await lifting;
-    expect(views.at(-1)?.message, name).toBe(
-      DEVICE_ACTION_RESULT_MESSAGES.lifted,
-    );
+      // The next action on the same list says its sentence again.
+      const lifting = actions.lift();
+      fake.lifted({ outcome: "lifted" });
+      await lifting;
+      expect(views.at(-1)?.message, name).toBe(
+        DEVICE_ACTION_RESULT_MESSAGES.lifted,
+      );
+    }
   }
+});
+
+test("a list that loads again after one that failed is a drop and clears the sentence", async () => {
+  const fake = actionBridge();
+  const views: DeviceActionsView[] = [];
+  const actions = createDeviceActions(fake.bridge, (view) => views.push(view));
+  actions.listChanged(known({}));
+  const removing = actions.revoke(NEW_LAPTOP.id, "removed");
+  fake.revoked({ outcome: "revoked", reason: "removed" });
+  await removing;
+  actions.listChanged(known({ status: "unavailable", problem: "failed" }));
+  expect(views.at(-1)?.message).toBe(DEVICE_ACTION_RESULT_MESSAGES.removed);
+  actions.listChanged(known({ status: "loading", devices: [] }));
+  expect(views.at(-1)).toEqual({ running: false, message: undefined });
 });
 
 test("following the device list with the device actions tells them each view first, in the same call, so the sentence goes in the same render as the list", async () => {
