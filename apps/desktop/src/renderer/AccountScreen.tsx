@@ -7,9 +7,9 @@ import { DevicesSection } from "./DevicesSection.tsx";
 
 /**
  * The ID of the account screen's title. "Go to Account" on the home screen
- * moves the focus there, because the button leaves the page with the home
- * screen; `tabIndex={-1}` lets the title take the focus without putting it
- * in the tab order.
+ * and a sign-in started there move the focus there, because the button
+ * leaves the page with the home screen; `tabIndex={-1}` lets the title take
+ * the focus without putting it in the tab order.
  */
 export const ACCOUNT_SCREEN_TITLE_ID = "account-screen-title";
 
