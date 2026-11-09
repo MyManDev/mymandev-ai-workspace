@@ -14,7 +14,7 @@ import {
   startMessage,
   type AccountView,
 } from "./account-view.ts";
-import type { ShellAction } from "./screens.ts";
+import type { ShellAction, ShellView } from "./screens.ts";
 
 /** What the sidebar knows about the account's workspaces. */
 export type WorkspacePanelView =
@@ -100,6 +100,18 @@ export function homeSignIn(
     : "not_ready";
 }
 
+/**
+ * What the start of the home screen gets as `homeChanged`: the home
+ * screen's case (`homeSignIn`) while the shell shows the home screen, and
+ * undefined on every other screen.
+ */
+export function homeCaseForView(
+  view: ShellView,
+  home: HomeSignIn,
+): HomeSignIn | undefined {
+  return view.screen === "home" ? home : undefined;
+}
+
 /** What the home screen shows of the sign-in that it started (#219). */
 export interface HomeSignInStartView {
   /** True while the main process answers the start. */
@@ -148,8 +160,9 @@ export interface HomeSignInStart {
  * began or failed. A failure shows on the account screen with the status's
  * outcome. A refusal and a call that failed keep the home screen and show
  * the account panel's sentence there, until the next start, a sign-in that
- * runs, or a change of the home screen (`homeChanged`); `onView` gets every
- * change.
+ * runs, or a change of the home screen (`homeChanged`); an answer that
+ * comes while the shell shows another screen shows nothing. `onView` gets
+ * every change.
  */
 export function createHomeSignInStart(
   account: Pick<AccountBridge, "startSignIn">,
@@ -195,7 +208,10 @@ export function createHomeSignInStart(
         )
         .then((next) => {
           running = false;
-          message = next;
+          // An answer that comes while the shell shows another screen, for
+          // example after the status showed the account screen, has no
+          // home screen to show it on.
+          message = home === undefined ? undefined : next;
           show();
         });
     },

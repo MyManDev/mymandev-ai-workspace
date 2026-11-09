@@ -19,13 +19,17 @@ import {
 } from "./account-view.ts";
 import {
   createShellState,
+  PROJECT_SCREEN_IDS,
   shellReducer,
+  WORKSPACE_SCREEN_IDS,
   type ShellAction,
   type ShellState,
+  type ShellView,
 } from "./screens.ts";
 import {
   createHomeSignInStart,
   createWorkspaceSidebar,
+  homeCaseForView,
   describeSwitchQuestion,
   HOME_SIGN_IN_MESSAGES,
   homeSignIn,
@@ -795,6 +799,9 @@ function homeStartHarness() {
       steps.push(`view ${JSON.stringify(view)}`);
     },
   );
+  // The shell shows the home screen with a sign-in, as `App` reports it
+  // once it is mounted.
+  start.homeChanged("sign_in");
   return { start, starts, calls, steps, views };
 }
 
@@ -980,8 +987,7 @@ test("the message of a refused home screen start shows only while the shell show
   expect(left.views.at(-1)).toEqual({ running: false, message: undefined });
   left.start.homeChanged("sign_in");
   expect(left.views.at(-1)).toEqual({ running: false, message: undefined });
-  // Another answer of the account panel's rule ends it, also when the key
-  // becomes ready again and the button is enabled.
+  // Another answer of the account panel's rule ends it.
   for (const next of ["not_ready", "none"] as const) {
     const changed = await refused();
     changed.start.homeChanged(next);
@@ -990,4 +996,63 @@ test("the message of a refused home screen start shows only while the shell show
       message: undefined,
     });
   }
+  // Also when the key becomes ready again and the button is enabled: the
+  // case became `not_ready` while the start ran, and its refusal came then.
+  const ready = homeStartHarness();
+  ready.start.start();
+  ready.start.homeChanged("not_ready");
+  ready.starts[0]?.resolve({ outcome: "refused", reason: "key_not_ready" });
+  await settle();
+  expect(ready.views.at(-1)).toEqual({
+    running: false,
+    message: START_REFUSAL_MESSAGES.key_not_ready,
+  });
+  ready.start.homeChanged("sign_in");
+  expect(ready.views.at(-1)).toEqual({ running: false, message: undefined });
+});
+
+test("the answer of a home screen start that comes while the shell shows another screen shows no message there or after the return", async () => {
+  const answers: [string, (start: Deferred<StartSignInResult>) => void][] = [
+    [
+      "refused",
+      (start) => start.resolve({ outcome: "refused", reason: "too_soon" }),
+    ],
+    ["rejected", (start) => start.reject(new Error("The IPC call failed."))],
+  ];
+  for (const [name, answer] of answers) {
+    const { start, starts, views } = homeStartHarness();
+    start.start();
+    // The status showed the account screen, or the person left the home
+    // screen, before the answer.
+    start.accountChanged(knownAccount({ signIn: { kind: "starting" } }));
+    start.homeChanged(undefined);
+    const first = starts[0];
+    if (first === undefined) {
+      throw new Error("The start did not call the bridge.");
+    }
+    answer(first);
+    await settle();
+    expect(views.at(-1), name).toEqual({ running: false, message: undefined });
+    const count = views.length;
+    start.homeChanged("sign_in");
+    expect(views.length, name).toBe(count);
+  }
+});
+
+test("the start of the home screen sees the home screen's case only while the shell shows the home screen", () => {
+  const projectView = (screen: (typeof PROJECT_SCREEN_IDS)[number]) =>
+    ({ screen, projectId: PROJECT_A, panel: "agents" }) as const;
+  const views: ShellView[] = [
+    ...WORKSPACE_SCREEN_IDS.map((screen) => ({ screen })),
+    ...PROJECT_SCREEN_IDS.map(projectView),
+  ];
+  for (const home of ["none", "sign_in", "not_ready"] as const) {
+    for (const view of views) {
+      expect(homeCaseForView(view, home), `${view.screen} ${home}`).toBe(
+        view.screen === "home" ? home : undefined,
+      );
+    }
+  }
+  expect(homeCaseForView({ screen: "home" }, "sign_in")).toBe("sign_in");
+  expect(homeCaseForView({ screen: "account" }, "sign_in")).toBeUndefined();
 });

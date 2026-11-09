@@ -66,6 +66,7 @@ import { SwitchQuestionDialog } from "./SwitchQuestion.tsx";
 import {
   createHomeSignInStart,
   createWorkspaceSidebar,
+  homeCaseForView,
   homeSignIn,
   IDLE_HOME_SIGN_IN_START,
   initialWorkspacePanelView,
@@ -144,7 +145,7 @@ export function App({
   const homeStart = useHomeSignInStart(
     account,
     accountView,
-    state.view.screen === "home" ? homeCase : undefined,
+    homeCaseForView(state.view, homeCase),
     dispatch,
     focusAfterShow,
   );
