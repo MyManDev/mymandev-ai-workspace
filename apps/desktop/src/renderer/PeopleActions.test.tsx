@@ -295,7 +295,7 @@ test("the definition is a name field with Add person, and submits the workspace'
     actions: { ...IDLE_PEOPLE_ACTIONS, defineDraft: "<b>Grace</b>" },
   });
   expect(html).toContain(
-    '<form class="people-form" aria-labelledby="define-person-title"><h3 class="people-heading" id="define-person-title">Add a person</h3><p class="person-meta" id="define-person-hint">Add someone by name before they join. They show as not claimed until they accept an invitation for this person.</p><label class="account-label" for="define-person-name">Name</label><input id="define-person-name" class="account-input" type="text" dir="auto" autoComplete="off" spellCheck="false" maxLength="64" aria-describedby="define-person-hint people-action-message" value="&lt;b&gt;Grace&lt;/b&gt;"/><div class="account-actions"><button type="submit" class="panel-action">Add person</button></div></form>',
+    '<form class="people-form" aria-labelledby="define-person-title"><h3 class="people-heading" id="define-person-title">Add a person</h3><p class="person-meta" id="define-person-hint">Add someone by name before they join. They show as not claimed until they accept an invitation for this person.</p><label class="account-label" for="define-person-name">Name</label><input id="define-person-name" class="account-input" type="text" dir="auto" autoComplete="off" spellCheck="false" maxLength="64" aria-describedby="define-person-hint define-person-problem" value="&lt;b&gt;Grace&lt;/b&gt;"/><p class="panel-message" id="define-person-problem" role="alert"></p><div class="account-actions"><button type="submit" class="panel-action">Add person</button></div></form>',
   );
   // After the active people, before the former members.
   expect(html.indexOf("define-person-title")).toBeLessThan(
@@ -317,36 +317,88 @@ test("the definition is a name field with Add person, and submits the workspace'
   expect(calls).toEqual(["define draft Grace", `define ${WORKSPACE}`]);
 });
 
-test("while an action runs, every action's control stays focusable and does nothing, and the definition does not submit", () => {
-  const { calls, handlers } = recorder();
-  const running = {
-    view: known({
-      ownershipOffer: { memberId: MEMBER, expiresAt: EXPIRES_AT },
-    }),
-    actions: { ...IDLE_PEOPLE_ACTIONS, running: true },
-    handlers,
-  };
-  const html = render(running);
-  const buttons = [...html.matchAll(/<button [^>]*>[^<]*<\/button>/g)].map(
-    ([button]) => button,
+test("a problem of the definition's name shows in the field's own alert, not in the status paragraph, and marks the field", () => {
+  const html = render({
+    actions: {
+      ...IDLE_PEOPLE_ACTIONS,
+      message: "The person was removed.",
+      defineDraft: " ",
+      defineProblem: "Enter a name.",
+    },
+  });
+  expect(html).toContain(
+    'aria-invalid="true" aria-describedby="define-person-hint define-person-problem" value=" "/><p class="panel-message" id="define-person-problem" role="alert">Enter a name.</p>',
   );
-  expect(buttons.length).toBeGreaterThan(5);
-  for (const button of buttons) {
-    expect(button).toContain('aria-disabled="true"');
-  }
-  expect(html).not.toContain(" disabled");
-  const elements = elementsOf(screen(running));
-  for (const element of elements) {
-    if (element.type === "button") {
-      expect(element.props.onClick).toBeUndefined();
+  // The field is not described by the results of other actions.
+  expect(html).not.toMatch(/aria-describedby="[^"]*people-action-message/);
+  expect(html).toContain(
+    '<p class="people-status" id="people-action-message" role="status">The person was removed.</p>',
+  );
+});
+
+test("while an action runs, every action's control stays focusable and does nothing, and the definition does not submit, for the owner, an admin, and the offer's target", () => {
+  const offered = {
+    ownershipOffer: { memberId: MEMBER, expiresAt: EXPIRES_AT },
+  };
+  const cases: [PeopleScreenView, string[]][] = [
+    [
+      known(offered),
+      [
+        "Withdraw the offer",
+        "Make member",
+        "Make admin",
+        "Rename",
+        "Remove",
+        "Add person",
+      ],
+    ],
+    [
+      known({ ownMemberId: ADMIN }),
+      ["Rename", "Remove", "Add person", "Leave this workspace"],
+    ],
+    [
+      known({ ...offered, ownMemberId: MEMBER }),
+      ["Accept the ownership", "Leave this workspace"],
+    ],
+  ];
+  for (const [view, labels] of cases) {
+    const { calls, handlers } = recorder();
+    const running = {
+      view,
+      actions: { ...IDLE_PEOPLE_ACTIONS, running: true },
+      handlers,
+    };
+    const html = render(running);
+    const buttons = [...html.matchAll(/<button [^>]*>([^<]*)<\/button>/g)];
+    const shown = buttons.map(([, label]) => label);
+    for (const label of labels) {
+      expect(shown, label).toContain(label);
     }
+    for (const [button] of buttons) {
+      expect(button).toContain('aria-disabled="true"');
+    }
+    expect(html).not.toContain(" disabled");
+    const elements = elementsOf(screen(running));
+    const elementButtons = elements.filter(
+      (element) => element.type === "button",
+    );
+    expect(elementButtons).toHaveLength(buttons.length);
+    for (const element of elementButtons) {
+      if (element.props.type === "button") {
+        expect(
+          element.props.onClick,
+          String(element.props.children),
+        ).toBeUndefined();
+      }
+      element.props.onClick?.({ currentTarget: "button" });
+    }
+    elements
+      .find((element) => element.type === "form")
+      ?.props.onSubmit?.({ preventDefault: () => undefined });
+    expect(calls).toEqual([]);
+    // Idle, none is inert.
+    expect(render({ view }), "idle").not.toContain("aria-disabled");
   }
-  elements
-    .find((element) => element.type === "form")
-    ?.props.onSubmit?.({ preventDefault: () => undefined });
-  expect(calls).toEqual([]);
-  // Idle, none is inert.
-  expect(render()).not.toContain("aria-disabled");
 });
 
 test("the sentence of the last action sits in its own status paragraph, always rendered with the bridge", () => {
@@ -432,7 +484,7 @@ test("an open question is a dialog with its title, the name as text, its sentenc
     />,
   );
   expect(html).toBe(
-    '<dialog class="people-dialog" aria-labelledby="people-dialog-title" aria-describedby="people-dialog-text"><form><h2 id="people-dialog-title">Remove this person?</h2><p class="people-dialog-name"><span dir="auto">Linus</span></p><p id="people-dialog-text">They lose access to the workspace at once. Their agents in its projects are disabled, the permissions on them are revoked, and their unfinished runs are cancelled. Their messages stay, and they are listed as a former member. To come back, they need a new invitation or join request.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Remove</button></div></form></dialog>',
+    '<dialog class="people-dialog" aria-labelledby="people-dialog-title" aria-describedby="people-dialog-name people-dialog-text"><form><h2 id="people-dialog-title">Remove this person?</h2><p class="people-dialog-name" id="people-dialog-name"><span dir="auto">Linus</span></p><p id="people-dialog-text">They lose access to the workspace at once. Their agents in its projects are disabled, the permissions on them are revoked, their unfinished runs are cancelled, and the invitations that they created and that are still open are revoked. Their messages stay, and they are listed as a former member. To come back, they need a new invitation or join request.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Remove</button></div></form></dialog>',
   );
   // Without a question, the dialog stays in the page, closed and empty.
   expect(
@@ -445,6 +497,31 @@ test("an open question is a dialog with its title, the name as text, its sentenc
       />,
     ),
   ).toBe('<dialog class="people-dialog"></dialog>');
+});
+
+test("the dialog is described by the name before its sentence, and by the sentence alone without a name", () => {
+  const { handlers } = recorder();
+  const leave = (workspaceName: string | null) =>
+    renderToString(
+      <PeopleActionDialogContent
+        dialog={dialogOf({
+          kind: "leave",
+          workspaceId: WORKSPACE,
+          workspaceName,
+        })}
+        onConfirm={handlers.onConfirm}
+        onCancel={handlers.onCancel}
+        onDraft={handlers.onDialogDraft}
+      />,
+    );
+  expect(leave("Team")).toContain(
+    'aria-describedby="people-dialog-name people-dialog-text"><form><h2 id="people-dialog-title">Leave this workspace?</h2><p class="people-dialog-name" id="people-dialog-name"><span dir="auto">Team</span></p>',
+  );
+  const unnamed = leave(null);
+  expect(unnamed).toContain(
+    'aria-describedby="people-dialog-text"><form><h2 id="people-dialog-title">Leave this workspace?</h2><p id="people-dialog-text">',
+  );
+  expect(unnamed).not.toContain("people-dialog-name");
 });
 
 test("the dialog confirms on submit, and cancels on Cancel, on Escape, and when the browser closes it", () => {
@@ -581,7 +658,7 @@ test("names are rendered as text with their own direction in the rows, the offer
     `Ownership offered to <span dir="auto">${escapedMarkup}</span> until`,
   );
   expect(html).toContain(
-    '<p class="people-dialog-name"><span dir="auto">\u05e9\u05dc\u05d5\u05dd &lt;b&gt;</span></p>',
+    '<p class="people-dialog-name" id="people-dialog-name"><span dir="auto">\u05e9\u05dc\u05d5\u05dd &lt;b&gt;</span></p>',
   );
   expect(html).toContain('value="\u05e9\u05dc\u05d5\u05dd &lt;b&gt;"');
   expect(html).toContain(`value="${escapedMarkup}"`);

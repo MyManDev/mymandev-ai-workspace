@@ -54,7 +54,7 @@ export function PeopleScreen({
 }) {
   const view = usePeopleScreen(people);
   const now = usePeopleClock(view);
-  const { actions, handlers } = usePeopleActions(peopleActions, view);
+  const { actions, handlers } = usePeopleActions(peopleActions, view, now);
   return (
     <PeopleScreenContent
       view={view}
@@ -179,6 +179,7 @@ export function PeopleScreenContent({
             <DefinePersonForm
               workspaceId={defineIn}
               draft={actions.defineDraft}
+              problem={actions.defineProblem}
               inert={inert}
               onDraft={handlers.onDefineDraft}
               onDefine={handlers.onDefine}

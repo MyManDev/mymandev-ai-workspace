@@ -6,6 +6,7 @@ import type {
   PersonActionResult,
   PersonView,
 } from "../shared/ipc-contract.ts";
+import { MAX_CLOCK_WAIT_MS } from "./device-view.ts";
 import type { PeopleScreenView } from "./people-view.ts";
 
 /**
@@ -56,9 +57,10 @@ export type PeopleActionRequest =
     };
 
 /**
- * The actions that ask first: every destructive or role-changing one, and
- * a rename, which asks for the new name. A promotion, a withdrawal of the
- * offer, and a definition run at once.
+ * The actions that ask first: every destructive one and every role change
+ * except a promotion (remove, make member, offer and accept the ownership,
+ * leave), and a rename, which asks for the new name. A promotion, a
+ * withdrawal of the offer, and a definition run at once.
  */
 export const ASKING_ACTIONS: ReadonlySet<PeopleActionKind> = new Set([
   "rename",
@@ -136,7 +138,7 @@ export function describePeopleActionQuestion(
       return request.claimed
         ? {
             title: "Remove this person?",
-            text: "They lose access to the workspace at once. Their agents in its projects are disabled, the permissions on them are revoked, and their unfinished runs are cancelled. Their messages stay, and they are listed as a former member. To come back, they need a new invitation or join request.",
+            text: "They lose access to the workspace at once. Their agents in its projects are disabled, the permissions on them are revoked, their unfinished runs are cancelled, and the invitations that they created and that are still open are revoked. Their messages stay, and they are listed as a former member. To come back, they need a new invitation or join request.",
             confirm: "Remove",
             name: request.name,
           }
@@ -170,7 +172,7 @@ export function describePeopleActionQuestion(
     case "leave":
       return {
         title: "Leave this workspace?",
-        text: "You lose access to the workspace and its projects at once. Your agents in its projects are disabled, and the permissions on them are revoked. To come back, you need a new invitation or join request.",
+        text: "You lose access to the workspace and its projects at once. Your agents in its projects are disabled, the permissions on them are revoked, your unfinished runs are cancelled, and the invitations that you created and that are still open are revoked. To come back, you need a new invitation or join request.",
         confirm: "Leave",
         name: request.workspaceName,
       };
@@ -336,19 +338,23 @@ export function describePeopleActions(
 }
 
 /**
- * Whether the screen still offers `request`: the same action on the same
- * person in the same workspace. A question whose action went away, for
- * example with the person or with an offer that expired, closes.
+ * Whether the screen still offers `request` as it is: the same action on
+ * the same person in the same workspace, with the same name, and for a
+ * removal the same claim. A question whose action went away or changed,
+ * for example with the person, a claim, a new name, or an offer that
+ * expired, closes, so that it never shows a text that is no longer true.
  */
 export function isOffered(
   model: PeopleActionsModel,
   request: PeopleActionRequest,
 ): boolean {
+  const fields = Object.entries(request);
   const same = (other: PeopleActionRequest | null | undefined) =>
     other !== null &&
     other !== undefined &&
-    other.kind === request.kind &&
-    other.workspaceId === request.workspaceId;
+    fields.every(
+      ([key, value]) => (other as Record<string, unknown>)[key] === value,
+    );
   switch (request.kind) {
     case "leave":
       return same(model.leave);
@@ -376,6 +382,53 @@ export function nextPeopleActionsChange(
   }
   const end = Date.parse(view.state.ownershipOffer.expiresAt);
   return Number.isNaN(end) || end <= now ? undefined : end;
+}
+
+/**
+ * How long to wait, in milliseconds, from `now` until the clock is read
+ * again at `at`: never less than 0, and at most `MAX_CLOCK_WAIT_MS`, the
+ * longest delay of one timer.
+ */
+export function clockDelay(at: number, now: number): number {
+  return Math.min(Math.max(at - now, 0), MAX_CLOCK_WAIT_MS);
+}
+
+/** The part of the window and the document that the clock listens to. */
+export type ClockEventTarget = Pick<
+  EventTarget,
+  "addEventListener" | "removeEventListener"
+>;
+
+/**
+ * Calls `onRead` when the window gets the focus or the document's
+ * visibility changes, because a timer can fire late after the computer
+ * slept. Returns the function that stops it.
+ */
+export function watchClockReads(
+  win: ClockEventTarget,
+  doc: ClockEventTarget,
+  onRead: () => void,
+): () => void {
+  const read = () => onRead();
+  win.addEventListener("focus", read);
+  doc.addEventListener("visibilitychange", read);
+  return () => {
+    win.removeEventListener("focus", read);
+    doc.removeEventListener("visibilitychange", read);
+  };
+}
+
+/**
+ * Whether the focus moves to the screen's title as the question ends: it
+ * was open, it is closed now, and the button that opened it left the page,
+ * so the dialog cannot give the focus back to it.
+ */
+export function focusesTitleAfterClose(
+  wasOpen: boolean,
+  isOpen: boolean,
+  triggerGone: boolean,
+): boolean {
+  return wasOpen && !isOpen && triggerGone;
 }
 
 /** The sentence after an action that the API confirmed. */
@@ -595,6 +648,11 @@ export interface PeopleActionsView {
   readonly dialog: PeopleActionDialog | undefined;
   /** The name in the field of a definition. */
   readonly defineDraft: string;
+  /**
+   * Why the name of the definition was not sent, or undefined. It shows
+   * with the field, apart from the results in the status paragraph.
+   */
+  readonly defineProblem: string | undefined;
 }
 
 export const IDLE_PEOPLE_ACTIONS: PeopleActionsView = Object.freeze({
@@ -602,6 +660,7 @@ export const IDLE_PEOPLE_ACTIONS: PeopleActionsView = Object.freeze({
   message: undefined,
   dialog: undefined,
   defineDraft: "",
+  defineProblem: undefined,
 });
 
 /**
@@ -640,18 +699,23 @@ export interface PeopleActions {
   readonly editDefineDraft: (text: string) => void;
   /**
    * Defines a person in `workspaceId` with the trimmed name of the field,
-   * once it passes `namePrompt`; empties the field once the API confirmed
-   * it. Resolves to false.
+   * once it passes `namePrompt`, and keeps the problem otherwise; empties
+   * the field once the API confirmed it. Resolves to false.
    */
   readonly define: (workspaceId: string) => Promise<boolean>;
   /**
-   * Follows the screen's view. The question, the field of a definition,
-   * and the sentence of the last action belong to the workspace that they
-   * were about, so they go when another workspace or none is selected; the
-   * sentence of a confirmed leave stays through the switch that the leave
-   * brings.
+   * Follows the screen's view by the renderer's clock `now`:
+   *
+   * - the open question ends once the screen no longer offers it as it is
+   *   (`isOffered`), so that it never comes back on its own and a later
+   *   `confirm` sends nothing;
+   * - the question, the field of a definition, and the sentence of the
+   *   last action belong to the workspace that they were about, so they go
+   *   when another workspace or none is selected, and always with a
+   *   sign-out; the sentence of a confirmed leave stays through the switch
+   *   that the leave brings.
    */
-  readonly listChanged: (view: PeopleScreenView) => void;
+  readonly listChanged: (view: PeopleScreenView, now: number) => void;
 }
 
 /**
@@ -668,6 +732,7 @@ export function createPeopleActions(
   let message: string | undefined;
   let dialog: PeopleActionDialog | undefined;
   let defineDraft = "";
+  let defineProblem: string | undefined;
   /** The latest people, for the limit of unclaimed people. */
   let latest: PeopleView | undefined;
   /** The selected workspace of the latest view; undefined before one. */
@@ -675,10 +740,21 @@ export function createPeopleActions(
   /** Whether the sentence of a confirmed leave stays through the next switch. */
   let keepThroughSwitch = false;
   const show = () =>
-    onView(Object.freeze({ running, message, dialog, defineDraft }));
+    onView(
+      Object.freeze({ running, message, dialog, defineDraft, defineProblem }),
+    );
 
+  /**
+   * Runs an action on `workspaceId` and says how it went, but only while
+   * that workspace is still the selected one: an answer that arrives after
+   * a switch or a sign-out shows no sentence, moves no focus, and leaves a
+   * name typed since then alone. A confirmed leave keeps its sentence, and
+   * it stays through the next switch only while the leave's workspace is
+   * still selected, because that switch is the one that the leave brings.
+   */
   async function run(
     kind: PeopleActionKind,
+    workspaceId: string,
     call: () => Promise<PersonActionResult | DefinePersonResult>,
   ): Promise<boolean> {
     running = true;
@@ -687,20 +763,28 @@ export function createPeopleActions(
     keepThroughSwitch = false;
     show();
     let ok = false;
+    let sentence: string;
     try {
       const result = await call();
       ok = result.outcome === "ok";
-      message = describePeopleActionResult(kind, result, latest);
+      // The sentence shows only while the action's workspace is still
+      // selected, so the latest people are that workspace's, with its limit
+      // of unclaimed people, or none while it is not known.
+      sentence = describePeopleActionResult(kind, result, latest);
     } catch {
-      message = `${PEOPLE_ACTION_NOT_DONE_MESSAGES[kind]} ${PEOPLE_ACTION_NOT_SENT}`;
+      sentence = `${PEOPLE_ACTION_NOT_DONE_MESSAGES[kind]} ${PEOPLE_ACTION_NOT_SENT}`;
     }
-    if (ok && kind === "define") {
+    const still = selected === workspaceId;
+    if (still || (ok && kind === "leave")) {
+      message = sentence;
+    }
+    if (still && ok && kind === "define") {
       defineDraft = "";
     }
-    keepThroughSwitch = ok && kind === "leave";
+    keepThroughSwitch = still && ok && kind === "leave";
     running = false;
     show();
-    return ok && LEAVING_ACTIONS.has(kind);
+    return still && ok && LEAVING_ACTIONS.has(kind);
   }
 
   function send(
@@ -745,7 +829,7 @@ export function createPeopleActions(
         show();
         return Promise.resolve(false);
       }
-      return run(request.kind, () => send(request, ""));
+      return run(request.kind, request.workspaceId, () => send(request, ""));
     },
     confirm: () => {
       const open = dialog;
@@ -761,7 +845,9 @@ export function createPeopleActions(
           return Promise.resolve(false);
         }
       }
-      return run(open.request.kind, () => send(open.request, name));
+      return run(open.request.kind, open.request.workspaceId, () =>
+        send(open.request, name),
+      );
     },
     cancel: () => {
       if (dialog !== undefined) {
@@ -784,35 +870,57 @@ export function createPeopleActions(
         return false;
       }
       const name = defineDraft.trim();
-      const problem = namePrompt(name);
-      if (problem !== undefined) {
-        message = `${PEOPLE_ACTION_NOT_DONE_MESSAGES.define} ${problem}`;
+      defineProblem = namePrompt(name);
+      if (defineProblem !== undefined) {
         show();
         return false;
       }
-      await run("define", () => bridge.define(workspaceId, name));
+      await run("define", workspaceId, () => bridge.define(workspaceId, name));
       return false;
     },
-    listChanged: (view: PeopleScreenView) => {
-      if (view.kind !== "known") {
-        return;
+    listChanged: (view: PeopleScreenView, now: number) => {
+      let changed = false;
+      if (
+        dialog !== undefined &&
+        !isOffered(describePeopleActions(view, now), dialog.request)
+      ) {
+        dialog = undefined;
+        changed = true;
       }
-      const { state } = view;
-      latest = state;
-      const signedOut = state.status === "signed_out";
-      const workspace = signedOut ? null : state.workspaceId;
-      const before = selected;
-      selected = workspace;
-      if (before === undefined || before === workspace) {
-        return;
+      if (view.kind === "known") {
+        const { state } = view;
+        latest = state;
+        const before = selected;
+        if (state.status === "signed_out") {
+          // A sign-out ends everything, also after no workspace was selected.
+          selected = null;
+          changed ||=
+            dialog !== undefined ||
+            message !== undefined ||
+            defineDraft !== "" ||
+            defineProblem !== undefined;
+          dialog = undefined;
+          message = undefined;
+          keepThroughSwitch = false;
+          defineDraft = "";
+          defineProblem = undefined;
+        } else {
+          selected = state.workspaceId;
+          if (before !== undefined && before !== selected) {
+            dialog = undefined;
+            defineDraft = "";
+            defineProblem = undefined;
+            if (!keepThroughSwitch) {
+              message = undefined;
+            }
+            keepThroughSwitch = false;
+            changed = true;
+          }
+        }
       }
-      dialog = undefined;
-      defineDraft = "";
-      if (!keepThroughSwitch || signedOut) {
-        message = undefined;
+      if (changed) {
+        show();
       }
-      keepThroughSwitch = false;
-      show();
     },
   });
 }

@@ -9,13 +9,16 @@ import {
   type PersonActionResult,
   type PersonView,
 } from "../shared/ipc-contract.ts";
+import { MAX_CLOCK_WAIT_MS } from "./device-view.ts";
 import {
   ASKING_ACTIONS,
+  clockDelay,
   createPeopleActions,
   describePeopleActionQuestion,
   describePeopleActionResult,
   describePeopleActions,
   describeWait,
+  focusesTitleAfterClose,
   IDLE_PEOPLE_ACTIONS,
   isOffered,
   MAX_PERSON_NAME_LENGTH,
@@ -24,6 +27,7 @@ import {
   PEOPLE_ACTION_NOT_DONE_MESSAGES,
   PEOPLE_ACTION_UNKNOWN_MESSAGES,
   unclaimedLimitReached,
+  watchClockReads,
   type PeopleActionKind,
   type PeopleActionRequest,
   type PeopleActionsView,
@@ -288,6 +292,9 @@ test("a request is offered while the screen offers the same action on the same p
     false,
   );
   expect(isOffered(model, { ...remove, memberId: FORMER })).toBe(false);
+  // The same person with another claim or name is another question.
+  expect(isOffered(model, { ...remove, claimed: false })).toBe(false);
+  expect(isOffered(model, { ...remove, name: "Linus T." })).toBe(false);
   expect(
     isOffered(model, {
       kind: "rename",
@@ -345,7 +352,7 @@ const ALL_KINDS: readonly PeopleActionKind[] = [
   "leave",
 ];
 
-test("every destructive or role-changing action and a rename ask first; a promotion, a withdrawal, and a definition do not", () => {
+test("every destructive action, every role change except a promotion, and a rename ask first; a promotion, a withdrawal, and a definition do not", () => {
   expect([...ASKING_ACTIONS].sort()).toEqual([
     "accept",
     "demote",
@@ -364,7 +371,7 @@ test("every destructive or role-changing action and a rename ask first; a promot
     describePeopleActionQuestion({ kind: "remove", ...target, claimed: true }),
   ).toEqual({
     title: "Remove this person?",
-    text: "They lose access to the workspace at once. Their agents in its projects are disabled, the permissions on them are revoked, and their unfinished runs are cancelled. Their messages stay, and they are listed as a former member. To come back, they need a new invitation or join request.",
+    text: "They lose access to the workspace at once. Their agents in its projects are disabled, the permissions on them are revoked, their unfinished runs are cancelled, and the invitations that they created and that are still open are revoked. Their messages stay, and they are listed as a former member. To come back, they need a new invitation or join request.",
     confirm: "Remove",
     name: "<i>Linus</i>",
   });
@@ -397,6 +404,7 @@ test("every destructive or role-changing action and a rename ask first; a promot
     describePeopleActionQuestion({ kind: "leave", ...workspace }),
   ).toMatchObject({
     title: "Leave this workspace?",
+    text: "You lose access to the workspace and its projects at once. Your agents in its projects are disabled, the permissions on them are revoked, your unfinished runs are cancelled, and the invitations that you created and that are still open are revoked. To come back, you need a new invitation or join request.",
     confirm: "Leave",
     name: "<b>Team</b>",
   });
@@ -595,14 +603,33 @@ function fakeBridge(
   return { bridge, calls };
 }
 
+/**
+ * A controller over a fake bridge that has seen `first`, the owner's ready
+ * people by default, as the screen shows them before any click.
+ */
 function controllerWith(
   answer: () => Promise<PersonActionResult | DefinePersonResult>,
+  first: PeopleScreenView = known(),
 ) {
   const { bridge, calls } = fakeBridge(answer);
   const views: PeopleActionsView[] = [];
   const actions = createPeopleActions(bridge, (view) => views.push(view));
+  actions.listChanged(first, NOW);
   const last = () => views.at(-1) ?? IDLE_PEOPLE_ACTIONS;
   return { actions, calls, views, last };
+}
+
+/** An answer that waits until the test resolves it. */
+function pending() {
+  const answers: ((result: PersonActionResult | DefinePersonResult) => void)[] =
+    [];
+  const answer = () =>
+    new Promise<PersonActionResult | DefinePersonResult>((done) => {
+      answers.push(done);
+    });
+  const resolve = (result: PersonActionResult | DefinePersonResult) =>
+    answers.shift()?.(result);
+  return { answer, resolve };
 }
 
 async function settle(): Promise<void> {
@@ -641,6 +668,7 @@ test("an action that asks first opens its question and sends nothing until it is
       message: PEOPLE_ACTION_DONE_MESSAGES[request.kind],
       dialog: undefined,
       defineDraft: "",
+      defineProblem: undefined,
     });
     // The control leaves the page with the next people, except a rename's.
     expect(done, request.kind).toBe(request.kind !== "rename");
@@ -729,6 +757,7 @@ test("an unknown answer says so, asks to check the list, and is never sent again
       message: PEOPLE_ACTION_UNKNOWN_MESSAGES[request.kind],
       dialog: undefined,
       defineDraft: "",
+      defineProblem: undefined,
     });
   }
   const { actions, calls, last } = controllerWith(() =>
@@ -763,18 +792,18 @@ test("a refusal's sentence uses the latest people for the unclaimed limit", asyn
   const { actions, last } = controllerWith(() =>
     Promise.resolve(refused("rate_limited", 5_000)),
   );
-  actions.listChanged(known({ maxUnclaimedMembers: 1 }));
+  actions.listChanged(known({ maxUnclaimedMembers: 1 }), NOW);
   actions.editDefineDraft("Grace");
   await actions.define(WORKSPACE);
   expect(last().message).toContain("as many unclaimed people as it allows (1)");
-  actions.listChanged(known({ maxUnclaimedMembers: 3 }));
+  actions.listChanged(known({ maxUnclaimedMembers: 3 }), NOW);
   await actions.define(WORKSPACE);
   expect(last().message).toBe(
     "The person could not be added. The server asked to wait. Try again in 5 seconds.",
   );
 });
 
-test("a definition sends the trimmed name, empties the field once confirmed, and checks the name first", async () => {
+test("a definition sends the trimmed name, empties the field once confirmed, and checks the name first, with the problem apart from the results", async () => {
   const { actions, calls, last } = controllerWith(() =>
     Promise.resolve({ outcome: "ok", memberId: UNCLAIMED }),
   );
@@ -790,8 +819,9 @@ test("a definition sends the trimmed name, empties the field once confirmed, and
     await actions.define(WORKSPACE);
     expect(last()).toMatchObject({
       running: false,
-      message: `The person could not be added. ${problem}`,
+      message: undefined,
       defineDraft: draft,
+      defineProblem: problem,
     });
   }
   expect(calls).toEqual([]);
@@ -804,7 +834,43 @@ test("a definition sends the trimmed name, empties the field once confirmed, and
   expect(last()).toMatchObject({
     message: "The person was added.",
     defineDraft: "",
+    defineProblem: undefined,
   });
+});
+
+// 32 characters outside the Basic Multilingual Plane are 64 UTF-16 code
+// units: the most that the contract and the protocol's zod `.max` allow.
+const WIDE_NAME = "\u{1F600}".repeat(32);
+
+test("a name is counted in UTF-16 code units, as the contract and the protocol count it", async () => {
+  expect(WIDE_NAME).toHaveLength(MAX_PERSON_NAME_LENGTH);
+  const { actions, calls, last } = controllerWith(() =>
+    Promise.resolve({ outcome: "ok", memberId: UNCLAIMED }),
+  );
+  actions.editDefineDraft(`${WIDE_NAME}a`);
+  await actions.define(WORKSPACE);
+  expect(calls).toEqual([]);
+  expect(last().defineProblem).toBe("A name has at most 64 characters.");
+  actions.editDefineDraft(WIDE_NAME);
+  await actions.define(WORKSPACE);
+  expect(calls).toEqual([{ name: "define", args: [WORKSPACE, WIDE_NAME] }]);
+
+  calls.length = 0;
+  await actions.start({
+    kind: "rename",
+    workspaceId: WORKSPACE,
+    memberId: UNCLAIMED,
+    name: "Margaret",
+  });
+  actions.editDialogDraft(`${WIDE_NAME}a`);
+  await actions.confirm();
+  expect(calls).toEqual([]);
+  expect(last().dialog?.problem).toBe("A name has at most 64 characters.");
+  actions.editDialogDraft(WIDE_NAME);
+  await actions.confirm();
+  expect(calls).toEqual([
+    { name: "rename", args: [WORKSPACE, UNCLAIMED, WIDE_NAME] },
+  ]);
 });
 
 test("a refused definition keeps the name in the field", async () => {
@@ -850,7 +916,6 @@ test("another selected workspace closes the question, empties the field, and dro
   const { actions, last } = controllerWith(() =>
     Promise.resolve({ outcome: "ok" }),
   );
-  actions.listChanged(known());
   await actions.start({ kind: "promote", ...TARGET });
   await actions.start({ kind: "remove", ...TARGET, claimed: true });
   actions.editDefineDraft("Grace");
@@ -859,10 +924,10 @@ test("another selected workspace closes the question, empties the field, and dro
     defineDraft: "Grace",
   });
   // The same workspace changes nothing.
-  actions.listChanged(known({ revision: 5 }));
+  actions.listChanged(known({ revision: 5 }), NOW);
   expect(last().dialog).toBeDefined();
 
-  actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }));
+  actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), NOW);
   expect(last()).toEqual(IDLE_PEOPLE_ACTIONS);
 });
 
@@ -871,33 +936,257 @@ test("the sentence of a confirmed leave stays through the switch that the leave 
     { workspaceId: OTHER_WORKSPACE },
     { status: "no_workspace", workspaceId: null },
   ] as const) {
-    const { actions, last } = controllerWith(() =>
-      Promise.resolve({ outcome: "ok" }),
+    const { actions, last } = controllerWith(
+      () => Promise.resolve({ outcome: "ok" }),
+      known({ ownMemberId: MEMBER }),
     );
-    actions.listChanged(known({ ownMemberId: MEMBER }));
     await actions.start({ kind: "leave", ...IN_WORKSPACE });
     await actions.confirm();
-    actions.listChanged(known(next));
+    actions.listChanged(known(next), NOW);
     expect(last().message).toBe("You left the workspace.");
-    actions.listChanged(known({ workspaceId: WORKSPACE }));
+    actions.listChanged(known({ workspaceId: WORKSPACE }), NOW);
     expect(last().message).toBeUndefined();
   }
-  const { actions, last } = controllerWith(() =>
-    Promise.resolve({ outcome: "ok" }),
+  const { actions, last } = controllerWith(
+    () => Promise.resolve({ outcome: "ok" }),
+    known({ ownMemberId: MEMBER }),
   );
-  actions.listChanged(known({ ownMemberId: MEMBER }));
   await actions.start({ kind: "leave", ...IN_WORKSPACE });
   await actions.confirm();
-  actions.listChanged(known({ status: "signed_out", workspaceId: null }));
+  actions.listChanged(known({ status: "signed_out", workspaceId: null }), NOW);
   expect(last().message).toBeUndefined();
 
   // A leave that was not confirmed keeps no sentence through a switch.
-  const unknown = controllerWith(() => Promise.resolve({ outcome: "unknown" }));
-  unknown.actions.listChanged(known({ ownMemberId: MEMBER }));
+  const unknown = controllerWith(
+    () => Promise.resolve({ outcome: "unknown" }),
+    known({ ownMemberId: MEMBER }),
+  );
   await unknown.actions.start({ kind: "leave", ...IN_WORKSPACE });
   await unknown.actions.confirm();
-  unknown.actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }));
+  unknown.actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), NOW);
   expect(unknown.last().message).toBeUndefined();
+});
+
+test("a confirmed leave whose answer arrives after the switch keeps its sentence, but not through the next switch", async () => {
+  const { answer, resolve } = pending();
+  const { actions, last } = controllerWith(
+    answer,
+    known({ ownMemberId: MEMBER }),
+  );
+  await actions.start({ kind: "leave", ...IN_WORKSPACE });
+  const done = actions.confirm();
+  actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), NOW);
+  resolve({ outcome: "ok" });
+  // The leave's control is gone with the old workspace: no focus moves.
+  await expect(done).resolves.toBe(false);
+  expect(last().message).toBe("You left the workspace.");
+  // The switch that the leave brought has happened: a later one, by the
+  // person, ends the sentence.
+  actions.listChanged(known({ workspaceId: WORKSPACE }), NOW);
+  expect(last().message).toBeUndefined();
+});
+
+test("a sign-out always ends the question, the field, and the sentence, also after no workspace was selected", async () => {
+  const { actions, last } = controllerWith(
+    () => Promise.resolve({ outcome: "ok" }),
+    known({ ownMemberId: MEMBER }),
+  );
+  await actions.start({ kind: "leave", ...IN_WORKSPACE });
+  await actions.confirm();
+  const none = { status: "no_workspace", workspaceId: null } as const;
+  actions.listChanged(known(none), NOW);
+  expect(last().message).toBe("You left the workspace.");
+  actions.listChanged(known({ status: "signed_out", workspaceId: null }), NOW);
+  expect(last()).toEqual(IDLE_PEOPLE_ACTIONS);
+
+  // With a field and its problem.
+  const other = controllerWith(() => Promise.resolve({ outcome: "ok" }));
+  other.actions.editDefineDraft(" ");
+  await other.actions.define(WORKSPACE);
+  other.actions.listChanged(known({ status: "loading" }), NOW);
+  expect(other.last()).toMatchObject({
+    defineDraft: " ",
+    defineProblem: "Enter a name.",
+  });
+  other.actions.listChanged(
+    known({ status: "signed_out", workspaceId: WORKSPACE }),
+    NOW,
+  );
+  expect(other.last()).toEqual(IDLE_PEOPLE_ACTIONS);
+});
+
+test("an answer that arrives after another workspace was selected or after a sign-out shows no sentence, moves no focus, and keeps a name typed since", async () => {
+  for (const next of [
+    known({ workspaceId: OTHER_WORKSPACE }),
+    known({ status: "signed_out", workspaceId: null }),
+  ]) {
+    const { answer, resolve } = pending();
+    const { actions, last } = controllerWith(answer);
+    const promoted = actions.start({ kind: "promote", ...TARGET });
+    actions.listChanged(next, NOW);
+    actions.editDefineDraft("Typed after the switch");
+    resolve({ outcome: "ok" });
+    await expect(promoted).resolves.toBe(false);
+    expect(last()).toEqual({
+      ...IDLE_PEOPLE_ACTIONS,
+      defineDraft: "Typed after the switch",
+    });
+  }
+
+  // A definition confirmed after the switch leaves the new field alone.
+  const { answer, resolve } = pending();
+  const { actions, last } = controllerWith(answer);
+  actions.editDefineDraft("Grace");
+  const defined = actions.define(WORKSPACE);
+  actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), NOW);
+  actions.editDefineDraft("Edsger");
+  resolve({ outcome: "ok", memberId: UNCLAIMED });
+  await defined;
+  expect(last()).toMatchObject({ message: undefined, defineDraft: "Edsger" });
+});
+
+test("a definition's rate limit names the unclaimed limit of its own workspace only while that limit is known", async () => {
+  const { answer, resolve } = pending();
+  const { actions, last } = controllerWith(
+    answer,
+    known({ maxUnclaimedMembers: 1 }),
+  );
+  actions.editDefineDraft("Grace");
+  const defined = actions.define(WORKSPACE);
+  // The same workspace reloads, and the limit is not known for now.
+  actions.listChanged(known({ revision: 5, maxUnclaimedMembers: null }), NOW);
+  resolve(refused("rate_limited", 5_000));
+  await defined;
+  expect(last().message).toBe(
+    "The person could not be added. The server asked to wait. Try again in 5 seconds.",
+  );
+});
+
+test("an open question that the screen stops offering ends in the controller, never comes back on its own, and sends nothing", async () => {
+  const admin = known({ ownMemberId: ADMIN });
+  // Linus, a claimed member, is promoted to admin: an admin cannot remove
+  // an admin.
+  const promoted = known({
+    ownMemberId: ADMIN,
+    people: PEOPLE.map((entry) =>
+      entry.memberId === MEMBER ? { ...entry, role: "admin" as const } : entry,
+    ),
+  });
+  const offered = {
+    ownershipOffer: { memberId: MEMBER, expiresAt: EXPIRES_AT },
+  };
+  const cases: [
+    PeopleScreenView,
+    PeopleActionRequest,
+    PeopleScreenView,
+    number,
+  ][] = [
+    [admin, { kind: "remove", ...TARGET, claimed: true }, promoted, NOW],
+    [
+      admin,
+      { kind: "remove", ...TARGET, claimed: true },
+      known({ ownMemberId: ADMIN, status: "loading" }),
+      NOW,
+    ],
+    [
+      admin,
+      { kind: "remove", ...TARGET, claimed: true },
+      { kind: "pending" },
+      NOW,
+    ],
+    [
+      known({ ...offered, ownMemberId: MEMBER }),
+      { kind: "accept", ...IN_WORKSPACE },
+      known({ ...offered, ownMemberId: MEMBER }),
+      Date.parse(EXPIRES_AT),
+    ],
+  ];
+  for (const [first, request, gone, at] of cases) {
+    const { actions, calls, last } = controllerWith(
+      () => Promise.resolve({ outcome: "ok" }),
+      first,
+    );
+    await actions.start(request);
+    expect(last().dialog?.request).toBe(request);
+    actions.listChanged(first, NOW);
+    expect(last().dialog?.request, "still offered").toBe(request);
+    actions.listChanged(gone, at);
+    expect(last().dialog, JSON.stringify(gone)).toBeUndefined();
+    // Offered again: the question stays closed.
+    actions.listChanged(first, NOW);
+    expect(last().dialog).toBeUndefined();
+    await expect(actions.confirm()).resolves.toBe(false);
+    expect(calls).toEqual([]);
+  }
+});
+
+test("an open Remove question ends when its person is claimed or renamed, so it never shows an outdated text", async () => {
+  const unclaimed = {
+    kind: "remove",
+    workspaceId: WORKSPACE,
+    memberId: UNCLAIMED,
+    name: "Margaret",
+    claimed: false,
+  } as const;
+  for (const change of [
+    {
+      claimed: true,
+      login: "margaret-h",
+      verifiedAt: "2026-11-09T10:00:00.000Z",
+    },
+    { displayName: "Margaret H." },
+  ]) {
+    const { actions, calls, last } = controllerWith(() =>
+      Promise.resolve({ outcome: "ok" }),
+    );
+    await actions.start(unclaimed);
+    actions.listChanged(
+      known({
+        people: PEOPLE.map((entry) =>
+          entry.memberId === UNCLAIMED ? { ...entry, ...change } : entry,
+        ),
+      }),
+      NOW,
+    );
+    expect(last().dialog, JSON.stringify(change)).toBeUndefined();
+    await actions.confirm();
+    expect(calls).toEqual([]);
+  }
+});
+
+test("the focus moves to the title when a question ends after its button left the page", () => {
+  expect(focusesTitleAfterClose(true, false, true)).toBe(true);
+  expect(focusesTitleAfterClose(true, false, false)).toBe(false);
+  expect(focusesTitleAfterClose(true, true, true)).toBe(false);
+  expect(focusesTitleAfterClose(false, false, true)).toBe(false);
+});
+
+test("the clock waits until the change, never less than nothing, and at most the longest timer", () => {
+  expect(clockDelay(Date.parse(EXPIRES_AT), NOW)).toBe(
+    Date.parse(EXPIRES_AT) - NOW,
+  );
+  expect(clockDelay(NOW - 1, NOW)).toBe(0);
+  expect(clockDelay(NOW + MAX_CLOCK_WAIT_MS + 1, NOW)).toBe(MAX_CLOCK_WAIT_MS);
+  expect(MAX_CLOCK_WAIT_MS).toBe(2_147_483_647);
+});
+
+test("the clock is read again when the window gets the focus or the visibility changes, and not after the watch ends", () => {
+  const win = new EventTarget();
+  const doc = new EventTarget();
+  let reads = 0;
+  const stop = watchClockReads(win, doc, () => {
+    reads += 1;
+  });
+  win.dispatchEvent(new Event("focus"));
+  doc.dispatchEvent(new Event("visibilitychange"));
+  // Other events do not read it.
+  win.dispatchEvent(new Event("visibilitychange"));
+  doc.dispatchEvent(new Event("focus"));
+  expect(reads).toBe(2);
+  stop();
+  win.dispatchEvent(new Event("focus"));
+  doc.dispatchEvent(new Event("visibilitychange"));
+  expect(reads).toBe(2);
 });
 
 test("the people never change from an answer: the controller holds no people", async () => {
@@ -908,6 +1197,7 @@ test("the people never change from an answer: the controller holds no people", a
   await actions.define(WORKSPACE);
   expect(Object.keys(last()).sort()).toEqual([
     "defineDraft",
+    "defineProblem",
     "dialog",
     "message",
     "running",

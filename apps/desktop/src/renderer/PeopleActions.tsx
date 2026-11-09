@@ -7,10 +7,12 @@ import {
   type RefObject,
 } from "react";
 import type { PeopleActionsBridge } from "../shared/desktop-bridge.ts";
-import { focusesTitleAfterAction, MAX_CLOCK_WAIT_MS } from "./device-view.ts";
+import { focusesTitleAfterAction } from "./device-view.ts";
 import {
+  clockDelay,
   createPeopleActions,
   describePeopleActionQuestion,
+  focusesTitleAfterClose,
   IDLE_PEOPLE_ACTIONS,
   MAX_PERSON_NAME_LENGTH,
   nextPeopleActionsChange,
@@ -20,6 +22,7 @@ import {
   type PeopleActionDialog,
   type PeopleActionRequest,
   type PeopleActionsView,
+  watchClockReads,
 } from "./people-actions-view.ts";
 import type { PeopleScreenView } from "./people-view.ts";
 
@@ -172,18 +175,23 @@ function formatTime(timestamp: string, format: Intl.DateTimeFormat): string {
 
 /**
  * The definition of a person, for the owner and the admins: a name field
- * and "Add person". While an action runs, the field keeps its text and the
- * button does nothing.
+ * and "Add person". The field is described by its hint and by its own
+ * alert, which says why a name was not sent; the results go to the status
+ * paragraph of the actions. While an action runs, the field keeps its text
+ * and the button does nothing.
  */
 export function DefinePersonForm({
   workspaceId,
   draft,
+  problem,
   inert,
   onDraft,
   onDefine,
 }: {
   readonly workspaceId: string;
   readonly draft: string;
+  /** Why the name was not sent, or undefined. */
+  readonly problem: string | undefined;
   readonly inert: boolean;
   readonly onDraft: (text: string) => void;
   readonly onDefine: (workspaceId: string) => void;
@@ -217,9 +225,13 @@ export function DefinePersonForm({
         spellCheck={false}
         maxLength={MAX_PERSON_NAME_LENGTH}
         value={draft}
-        aria-describedby={`define-person-hint ${PEOPLE_ACTION_MESSAGE_ID}`}
+        aria-invalid={problem === undefined ? undefined : "true"}
+        aria-describedby="define-person-hint define-person-problem"
         onChange={(event) => onDraft(event.currentTarget.value)}
       />
+      <p className="panel-message" id="define-person-problem" role="alert">
+        {problem ?? ""}
+      </p>
       <div className="account-actions">
         <button
           type="submit"
@@ -291,7 +303,8 @@ export function PeopleActionDialogBox(props: PeopleActionDialogProps) {
  * The dialog for a question, without state. The element stays in the page
  * while no question is open, empty and closed, so that closing it can
  * return the focus. The person's or the workspace's name is text with
- * `dir="auto"`. "Cancel" comes first, so that a destructive action is not
+ * `dir="auto"`, and it describes the dialog before the sentence, so that a
+ * screen reader says whom the question is about; its element ID is fixed. "Cancel" comes first, so that a destructive action is not
  * the default focus. A rename's problem shows in an alert inside the
  * dialog, because the page behind it is inert.
  */
@@ -316,7 +329,11 @@ export function PeopleActionDialogContent({
       ref={dialogRef}
       className="people-dialog"
       aria-labelledby="people-dialog-title"
-      aria-describedby="people-dialog-text"
+      aria-describedby={
+        question.name === null
+          ? "people-dialog-text"
+          : "people-dialog-name people-dialog-text"
+      }
       onCancel={(event) => {
         // Escape cancels; the dialog closes with the question.
         event.preventDefault();
@@ -333,7 +350,7 @@ export function PeopleActionDialogContent({
       >
         <h2 id="people-dialog-title">{question.title}</h2>
         {question.name === null ? null : (
-          <p className="people-dialog-name">
+          <p className="people-dialog-name" id="people-dialog-name">
             <span dir="auto">{question.name}</span>
           </p>
         )}
@@ -404,13 +421,16 @@ function focusAfterAction(done: boolean, button: Element | null): void {
 
 /**
  * The people actions of the screen (`createPeopleActions`) while it is
- * shown, which follow every view of the people; undefined handlers without
- * the bridge. A question remembers the button that opened it, which the
- * dialog gives the focus back to.
+ * shown, which follow every view of the people and every reading of the
+ * clock `now`; undefined handlers without the bridge. A question remembers
+ * the button that opened it, which the dialog gives the focus back to;
+ * when the question ends after that button left the page, the focus moves
+ * to the screen's title (`focusesTitleAfterClose`).
  */
 export function usePeopleActions(
   bridge: PeopleActionsBridge | undefined,
   view: PeopleScreenView,
+  now: number,
 ): {
   readonly actions: PeopleActionsView;
   readonly handlers: PeopleActionHandlers | undefined;
@@ -423,8 +443,23 @@ export function usePeopleActions(
         : createPeopleActions(bridge, setActions),
     [bridge],
   );
-  useEffect(() => controller?.listChanged(view), [controller, view]);
+  useEffect(() => controller?.listChanged(view, now), [controller, view, now]);
   const trigger = useRef<Element | null>(null);
+  const wasOpen = useRef(false);
+  const open = actions.dialog !== undefined;
+  useEffect(() => {
+    const button = trigger.current;
+    if (
+      focusesTitleAfterClose(
+        wasOpen.current,
+        open,
+        button !== null && !button.isConnected,
+      )
+    ) {
+      focusTitle();
+    }
+    wasOpen.current = open;
+  }, [open]);
   const onStart = useCallback(
     (request: PeopleActionRequest, button: Element | null) => {
       trigger.current = button;
@@ -478,19 +513,16 @@ export function usePeopleClock(view: PeopleScreenView): number {
     }
     const timer = setTimeout(
       () => setReading((last) => ({ view: last.view, now: Date.now() })),
-      Math.min(Math.max(at - Date.now(), 0), MAX_CLOCK_WAIT_MS),
+      clockDelay(at, Date.now()),
     );
     return () => clearTimeout(timer);
   }, [at, now]);
-  useEffect(() => {
-    const readAgain = () =>
-      setReading((last) => ({ view: last.view, now: Date.now() }));
-    window.addEventListener("focus", readAgain);
-    document.addEventListener("visibilitychange", readAgain);
-    return () => {
-      window.removeEventListener("focus", readAgain);
-      document.removeEventListener("visibilitychange", readAgain);
-    };
-  }, []);
+  useEffect(
+    () =>
+      watchClockReads(window, document, () =>
+        setReading((last) => ({ view: last.view, now: Date.now() })),
+      ),
+    [],
+  );
   return now;
 }
