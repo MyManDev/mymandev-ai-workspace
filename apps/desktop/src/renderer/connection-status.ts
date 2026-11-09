@@ -338,14 +338,17 @@ export interface DeviceRemoval {
    * of the last removal goes. The message of a removal that waits for the
    * server follows the device: once it is no longer `removal_pending`, for
    * example after "Remove this device" on the Account screen, it becomes
-   * the way to register again when the device is `removed`, and goes
+   * the way to register again when the device is `removed`, or `revoked`
+   * because the server had revoked it already and the session deleted its
+   * key, as after `device_revoked` from the header's own removal, and goes
    * otherwise. A connection changes nothing, so a refused removal stays
    * shown also when the device connects again.
    */
   readonly accountChanged: (view: AccountView) => void;
   /**
    * The person chose "Reconnect here once" or "Retry now" in the header:
-   * the message of the last removal goes, unless a removal runs.
+   * the message of the last removal goes, unless a removal runs. The
+   * indicator calls it from both buttons, before the reconnect.
    */
   readonly reconnecting: () => void;
 }
@@ -394,7 +397,9 @@ export function createDeviceRemoval(
         status.device !== "removal_pending"
       ) {
         showMessage(
-          status.device === "removed" ? REGISTER_AGAIN_MESSAGE : undefined,
+          status.device === "removed" || status.device === "revoked"
+            ? REGISTER_AGAIN_MESSAGE
+            : undefined,
         );
       }
     },

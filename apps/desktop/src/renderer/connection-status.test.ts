@@ -641,7 +641,7 @@ test("a reconnect from the header ends the message of the last removal, but not 
   expect(views.at(-1)).toEqual({ running: true, message: undefined });
 });
 
-test("the message of a removal that waits for the server follows the device: the way to register again once it is removed, none once it is otherwise", async () => {
+test("the message of a removal that waits for the server follows the device: the way to register again once it is removed or revoked, none once it is otherwise", async () => {
   const { removal, answers, views } = removalWithFakeAccount();
   const pendingStatus: AccountStatus = {
     ...SIGNED_IN,
@@ -676,11 +676,23 @@ test("the message of a removal that waits for the server follows the device: the
   removal.accountChanged(SIGNED_IN_VIEW);
   expect(views.at(-1)?.message).toBe(REGISTER_AGAIN_MESSAGE);
 
+  // "Remove this device" on the Account screen gets `device_revoked`: the
+  // server had revoked the device already, and the session deleted its key,
+  // as when the header's own removal fails with `device_revoked`.
+  await waits();
+  removal.accountChanged(account({ ...SIGNED_OUT, device: "revoked" }));
+  expect(views.at(-1)).toEqual({
+    running: false,
+    message: REGISTER_AGAIN_MESSAGE,
+  });
+  expect(views.at(-1)?.message).toBe(
+    deviceRemovalMessage({ outcome: "failed", reason: "device_revoked" }),
+  );
+
   // The removal ends otherwise: refused, so the device is signed in again,
-  // or revoked from another device.
+  // or signed out.
   for (const after of [
     SIGNED_IN_VIEW,
-    account({ ...SIGNED_OUT, device: "revoked" }),
     account({
       ...SIGNED_OUT,
       account: { kind: "hidden" },
