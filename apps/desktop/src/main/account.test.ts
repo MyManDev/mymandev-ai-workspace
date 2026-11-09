@@ -15,7 +15,9 @@ import { expect, test } from "vitest";
 import {
   ACCOUNT_LIMITS,
   AccountStatusSchema,
+  DEVICE_LIST_ACTION_FAILURES,
   type AccountStatus,
+  type OtherDeviceRevocation,
   type SignInOutcomeCode,
 } from "../shared/ipc-contract.ts";
 import {
@@ -34,6 +36,17 @@ import {
   UNLOCK_DELAY_MAX_MS,
   unlockDelayMs,
 } from "./account.ts";
+import {
+  deviceListActionFailure,
+  dialogTimeFormat,
+  LIFT_REGISTRATION_LOCK_CONFIRMATION,
+  liftRegistrationLockConfirmationMessage,
+  liftRegistrationLockConfirmed,
+  type OtherDevice,
+  REVOKE_DEVICE_CONFIRMATIONS,
+  revokeDeviceConfirmationMessage,
+  revokeDeviceConfirmed,
+} from "./account-session.ts";
 import {
   DeviceKeyError,
   type DeviceKeyErrorCode,
@@ -199,6 +212,18 @@ interface Harness {
   keyDelete: () => Promise<void>;
   /** The answer of the native confirmation of removing this device. */
   confirmRemoval: (login: string) => Promise<boolean>;
+  /** The answer of the native confirmation of revoking another device. */
+  confirmRevoke: (
+    login: string,
+    device: OtherDevice,
+    reason: OtherDeviceRevocation,
+  ) => Promise<boolean>;
+  /** The answer of the native confirmation of lifting the registration lock. */
+  confirmLift: (login: string) => Promise<boolean>;
+  /** What the session's `revokeOtherDevice` answers. */
+  revokeOther: () => Promise<SessionResult<null>>;
+  /** What the session's `liftRegistrationLock` answers. */
+  liftLock: () => Promise<SessionResult<null>>;
   /** What the session's `removalAsksApi` answers. */
   removalAsks: () => Promise<boolean>;
   /** What the session's `replacementGraceEnd` answers. */
@@ -268,6 +293,10 @@ function harness(
     markerDelete: async () => undefined,
     keyDelete: async () => undefined,
     confirmRemoval: async () => true,
+    confirmRevoke: async () => true,
+    confirmLift: async () => true,
+    revokeOther: async () => ({ ok: true, value: null }),
+    liftLock: async () => ({ ok: true, value: null }),
     removalAsks: async () => true,
     graceEnd: async () => null,
     readGate: null,
@@ -327,6 +356,14 @@ function harness(
       listDevices: async () => {
         state.log.push("session listDevices");
         return (await state.listDevices()) as never;
+      },
+      revokeOtherDevice: async (deviceId, reason) => {
+        state.log.push(`session revokeOtherDevice ${deviceId} ${reason}`);
+        return state.revokeOther();
+      },
+      liftRegistrationLock: async () => {
+        state.log.push("session liftRegistrationLock");
+        return state.liftLock();
       },
       signOut: async () => {
         state.log.push("session signOut");
@@ -434,6 +471,14 @@ function harness(
     confirmRemoveDevice: (login) => {
       state.log.push(`confirm removal ${login}`);
       return state.confirmRemoval(login);
+    },
+    confirmRevokeDevice: (login, device, reason) => {
+      state.log.push(`confirm revoke ${login} ${device.label} ${reason}`);
+      return state.confirmRevoke(login, device, reason);
+    },
+    confirmLiftRegistrationLock: (login, lockedUntil) => {
+      state.log.push(`confirm lift ${login} until ${lockedUntil}`);
+      return state.confirmLift(login);
     },
     stopLocalExecution: () => {
       state.stopped += 1;
@@ -1252,6 +1297,8 @@ test("a listener that throws and a window that cannot come up are reported and c
     },
     confirmForget: async () => true,
     confirmRemoveDevice: async () => true,
+    confirmRevokeDevice: async () => true,
+    confirmLiftRegistrationLock: async () => true,
     onError: (message) => h.errors.push(message),
   });
   const attempt = startedSignIn();
@@ -1340,8 +1387,13 @@ test("the confirmation of This is not me says what happens to the device at the 
     server_first:
       "This device is signed in, so it is first removed from that GitHub account on the server. If the server cannot be reached or does not remove it, the device stays listed for that account, without a key. Either way, the device key and the account are then deleted on this computer, and you can sign in with your own GitHub account.",
     local_only:
-      'This device cannot use its key with the server now, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then enters the passphrase of the device key or signs in with that account on this device, as the panel asks, and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account.',
+      'This device cannot use its key with the server now, so the server cannot remove it from that GitHub account: it stays listed for that account, without a key. To remove it there, choose Keep; whoever owns the account then enters the passphrase of the device key or signs in with that account on this device, as the panel asks, and chooses "Remove this device". Otherwise, the device key and the account are deleted on this computer only, and you can sign in with your own GitHub account. Either way, whoever owns the account can also remove this device from another of their devices, with "Remove" in the device list on the Account screen.',
   });
+  // The device that cannot reach the server names the removal from another
+  // device of the account too (#95, note of 2026-11-06 from #198 and #205).
+  expect(FORGET_CONFIRMATION_DETAILS.local_only).toContain(
+    "remove this device from another of their devices",
+  );
   expect(Object.isFrozen(FORGET_CONFIRMATION_DETAILS)).toBe(true);
   for (const removal of ["server_first", "local_only"] as const) {
     const detail = forgetConfirmationDetail(removal);
@@ -2600,6 +2652,512 @@ test("removing this device asks nothing of the session when the person keeps it 
   answer(false);
   await expect(removing).resolves.toEqual({ outcome: "cancelled" });
   expect(h.log).not.toContain("session removeDevice");
+});
+
+// ---- The account's other devices (#95, D1) -------------------------------
+
+/** The end of a registration lock that the device list reported. */
+const LOCK_END = "2026-11-16T10:00:00.000Z";
+
+const OTHER_DEVICE: OtherDevice = Object.freeze({
+  id: OTHER_DEVICE_ID,
+  label: "Work laptop",
+  platform: "windows",
+});
+
+test("revoking another device asks the person with the login, the device, and the reason, then the session once, and answers revoked with the reason", async () => {
+  const h = harness();
+  await h.service.initialize();
+  for (const reason of ["removed", "lost"] as const) {
+    h.log.length = 0;
+    await expect(
+      h.service.revokeOtherDevice(OTHER_DEVICE, reason),
+    ).resolves.toEqual({ outcome: "revoked", reason });
+    expect(h.log).toEqual([
+      `confirm revoke octocat Work laptop ${reason}`,
+      `session revokeOtherDevice ${OTHER_DEVICE_ID} ${reason}`,
+    ]);
+  }
+  h.log.length = 0;
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
+    outcome: "lifted",
+  });
+  // The confirmation gets the end of the lock that the device list reported.
+  expect(h.log).toEqual([
+    `confirm lift octocat until ${LOCK_END}`,
+    "session liftRegistrationLock",
+  ]);
+  // This device stays signed in, and no status changed.
+  expect(h.service.status()).toMatchObject({
+    account: { kind: "signed_in", deviceId: DEVICE_ID },
+    device: "signed_in",
+  });
+});
+
+test("an uncertain answer is unknown and never sent again; a refusal or a failure is mapped to a closed set", async () => {
+  const h = harness();
+  await h.service.initialize();
+  for (const reason of ["no_answer", "server_error", "unexpected_response"]) {
+    h.revokeOther = async () => ({ ok: false, reason }) as SessionResult<null>;
+    h.liftLock = async () => ({ ok: false, reason }) as SessionResult<null>;
+    h.log.length = 0;
+    await expect(
+      h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
+    ).resolves.toEqual({ outcome: "unknown" });
+    await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
+      outcome: "unknown",
+    });
+    // One request each, and no other afterwards.
+    await settle();
+    expect(
+      h.log.filter((step) => step.startsWith("session")),
+      reason,
+    ).toEqual([
+      `session revokeOtherDevice ${OTHER_DEVICE_ID} lost`,
+      "session liftRegistrationLock",
+    ]);
+  }
+
+  for (const [failure, reason] of [
+    [{ ok: false, reason: "refused", code: "not_found" }, "not_found"],
+    [{ ok: false, reason: "refused", code: "conflict" }, "conflict"],
+    [{ ok: false, reason: "refused", code: "rate_limited" }, "rate_limited"],
+    [
+      { ok: false, reason: "refused", code: "device_revoked" },
+      "device_revoked",
+    ],
+    [{ ok: false, reason: "refused", code: "unauthorized" }, "refused"],
+    [{ ok: false, reason: "refused", code: "forbidden" }, "refused"],
+    [{ ok: false, reason: "removal_pending" }, "removal_pending"],
+    [{ ok: false, reason: "signed_out" }, "signed_out"],
+    [{ ok: false, reason: "invalid_request" }, "failed"],
+  ] as const) {
+    h.revokeOther = async () => failure;
+    h.liftLock = async () => failure;
+    await expect(
+      h.service.revokeOtherDevice(OTHER_DEVICE, "removed"),
+    ).resolves.toEqual({ outcome: "failed", reason });
+    await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
+      outcome: "failed",
+      reason,
+    });
+  }
+
+  // A session that throws once it was asked: whether the server acted is
+  // not known.
+  h.revokeOther = () => Promise.reject(new Error(`broken ${OTHER_DEVICE_ID}`));
+  h.liftLock = () => Promise.reject(new Error("broken"));
+  await expect(
+    h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
+  ).resolves.toEqual({ outcome: "unknown" });
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
+    outcome: "unknown",
+  });
+  expect(h.errors).toEqual([
+    "The device could not be revoked.",
+    "The registration lock could not be lifted.",
+  ]);
+});
+
+test("every failure of the session maps to the closed set of the device list's actions, and an uncertain one to unknown", () => {
+  const uncertain = new Set([
+    "no_answer",
+    "server_error",
+    "unexpected_response",
+  ]);
+  const seen = new Set<string>();
+  for (const reason of [
+    "api_origin_unset",
+    "api_origin_invalid",
+    "no_device",
+    "key_lost",
+    "key_not_loaded",
+    "record_unreadable",
+    "key_store_failed",
+    "signed_out",
+    "sign_in_running",
+    "replacement_pending",
+    "removal_pending",
+    "record_not_saved",
+    "invalid_request",
+    "no_answer",
+    "server_error",
+    "unexpected_response",
+  ] as const) {
+    const code = deviceListActionFailure({ ok: false, reason });
+    expect(code === "unknown", reason).toBe(uncertain.has(reason));
+    seen.add(code);
+  }
+  for (const code of API_ERROR_CODES) {
+    seen.add(deviceListActionFailure({ ok: false, reason: "refused", code }));
+  }
+  seen.add(deviceListActionFailure({ ok: false, reason: "refused" }));
+  seen.delete("unknown");
+  expect([...seen].sort()).toEqual([...DEVICE_LIST_ACTION_FAILURES].sort());
+});
+
+test("the device actions of the list are unavailable while a sign-in, a sign-out, a removal, This is not me, or an unlock runs, or the key loads, and ask nothing then", async () => {
+  const refusal = { outcome: "refused", reason: "unavailable" };
+  const tryBoth = async (h: Harness, name: string) => {
+    await expect(
+      h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
+      name,
+    ).resolves.toEqual(refusal);
+    await expect(
+      h.service.liftRegistrationLock(LOCK_END),
+      name,
+    ).resolves.toEqual(refusal);
+  };
+
+  // The key is still loading.
+  const loading = harness();
+  await tryBoth(loading, "loading");
+
+  const h = harness();
+  await h.service.initialize();
+  // A sign-in.
+  const attempt = startedSignIn();
+  h.start = async () => attempt.start;
+  await h.service.startSignIn();
+  await tryBoth(h, "sign-in");
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  attempt.settle({ kind: "cancelled" });
+  await done;
+
+  // A sign-out, a removal, and This is not me, each while it runs.
+  const held: [string, () => Promise<unknown>, () => void][] = [];
+  let release: () => void = () => undefined;
+  h.signOut = () =>
+    new Promise((resolve) => {
+      release = () => resolve({ ok: true, value: "reported" });
+    });
+  held.push(["sign-out", h.service.signOut, () => release()]);
+  for (const [name, start, end] of held) {
+    const running = start();
+    await tryBoth(h, name);
+    end();
+    await running;
+  }
+  let answerRemoval: (confirmed: boolean) => void = () => undefined;
+  h.confirmRemoval = () =>
+    new Promise((resolve) => {
+      answerRemoval = resolve;
+    });
+  const removing = h.service.removeDevice();
+  await tryBoth(h, "removal");
+  answerRemoval(false);
+  await removing;
+  let answerForget: (confirmed: boolean) => void = () => undefined;
+  h.confirm = () =>
+    new Promise((resolve) => {
+      answerForget = resolve;
+    });
+  const forgetting = h.service.forgetAccount();
+  await settle();
+  await tryBoth(h, "This is not me");
+  answerForget(false);
+  await forgetting;
+
+  // An unlock.
+  const locked = harness();
+  locked.load = async (passphrase) => {
+    if (passphrase === undefined) {
+      throw new DeviceKeyError("passphrase_required");
+    }
+  };
+  await locked.service.initialize();
+  let unlocked: () => void = () => undefined;
+  locked.load = () =>
+    new Promise((resolve) => {
+      unlocked = () => resolve();
+    });
+  const unlocking = locked.service.unlockDeviceKey(PASSPHRASE);
+  await tryBoth(locked, "unlock");
+  unlocked();
+  await unlocking;
+
+  for (const harnessOf of [loading, h, locked]) {
+    expect(
+      harnessOf.log.filter(
+        (step) =>
+          step.startsWith("confirm revoke") ||
+          step.startsWith("confirm lift") ||
+          step.startsWith("session revokeOtherDevice") ||
+          step === "session liftRegistrationLock",
+      ),
+    ).toEqual([]);
+  }
+});
+
+test("while a device action of the list runs, the other actions answer busy, reads and writes unavailable, and a second device action unavailable", async () => {
+  const h = harness();
+  await h.service.initialize();
+  let answer: (confirmed: boolean) => void = () => undefined;
+  h.confirmRevoke = () =>
+    new Promise((resolve) => {
+      answer = resolve;
+    });
+  const revoking = h.service.revokeOtherDevice(OTHER_DEVICE, "lost");
+  await settle();
+
+  for (const action of [
+    h.service.signOut,
+    h.service.removeDevice,
+    h.service.forgetAccount,
+  ]) {
+    await expect(action()).resolves.toEqual({
+      outcome: "refused",
+      reason: "busy",
+    });
+  }
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: false,
+    reason: "unavailable",
+  });
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  await expect(
+    h.service.revokeOtherDevice(OTHER_DEVICE, "removed"),
+  ).resolves.toEqual({ outcome: "refused", reason: "unavailable" });
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
+    outcome: "refused",
+    reason: "unavailable",
+  });
+
+  answer(true);
+  await expect(revoking).resolves.toEqual({
+    outcome: "revoked",
+    reason: "lost",
+  });
+  // The lock is released: the next action runs.
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
+    outcome: "lifted",
+  });
+  expect(
+    h.log.filter((step) => step.startsWith("session revokeOtherDevice")),
+  ).toEqual([`session revokeOtherDevice ${OTHER_DEVICE_ID} lost`]);
+});
+
+test("the device actions of the list ask nothing when the person keeps the confirmation or it fails, and refuse this device and a device that is not signed in", async () => {
+  const h = harness();
+  await h.service.initialize();
+  h.confirmRevoke = async () => false;
+  h.confirmLift = async () => false;
+  await expect(
+    h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
+  ).resolves.toEqual({ outcome: "cancelled" });
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
+    outcome: "cancelled",
+  });
+  h.confirmRevoke = () => Promise.reject(new Error("no dialog"));
+  h.confirmLift = () => Promise.reject(new Error("no dialog"));
+  await expect(
+    h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
+  ).resolves.toEqual({ outcome: "failed", reason: "failed" });
+  await expect(h.service.liftRegistrationLock(LOCK_END)).resolves.toEqual({
+    outcome: "failed",
+    reason: "failed",
+  });
+  expect(h.errors).toEqual([
+    "The confirmation could not be shown.",
+    "The confirmation could not be shown.",
+  ]);
+
+  // This installation's device has "Remove this device" instead; nothing
+  // is asked.
+  h.confirmRevoke = async () => true;
+  await expect(
+    h.service.revokeOtherDevice({ ...OTHER_DEVICE, id: DEVICE_ID }, "lost"),
+  ).resolves.toEqual({ outcome: "refused", reason: "current_device" });
+
+  // Without a device that is signed in with a ready key, nothing is asked.
+  const signedOut = harness();
+  signedOut.record = { kind: "none" };
+  const states: DeviceSessionState[] = [
+    { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: false },
+    { kind: "sign_in_required", account: SESSION_ACCOUNT },
+    { kind: "removal_pending", account: SESSION_ACCOUNT },
+    { kind: "key_not_loaded", account: SESSION_ACCOUNT },
+  ];
+  await signedOut.service.initialize();
+  const harnesses = [signedOut];
+  for (const state of states) {
+    const other = harness();
+    other.sessionState = state;
+    await other.service.initialize();
+    harnesses.push(other);
+  }
+  // The key's state comes from the key store's load, apart from the
+  // session's state: a key that could not be loaded refuses the actions
+  // too, also while the session names the device signed in.
+  const unreadable = harness();
+  unreadable.load = async () => {
+    throw new DeviceKeyError("unreadable");
+  };
+  await unreadable.service.initialize();
+  expect(unreadable.service.status()).toMatchObject({
+    deviceKey: "unreadable",
+    device: "signed_in",
+  });
+  harnesses.push(unreadable);
+  for (const other of harnesses) {
+    await expect(
+      other.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
+      other.service.status().device,
+    ).resolves.toEqual({ outcome: "refused", reason: "not_signed_in" });
+    await expect(
+      other.service.liftRegistrationLock(LOCK_END),
+      other.service.status().device,
+    ).resolves.toEqual({ outcome: "refused", reason: "not_signed_in" });
+  }
+  for (const other of [h, ...harnesses]) {
+    expect(
+      other.log.filter(
+        (step) =>
+          step.startsWith("session revokeOtherDevice") ||
+          step === "session liftRegistrationLock",
+      ),
+    ).toEqual([]);
+  }
+  expect(
+    h.log.filter((step) => step.startsWith("confirm revoke")),
+  ).toHaveLength(2);
+});
+
+test("the listeners of a device action hear of a revocation and a lift that ended, and of no refusal or kept confirmation", async () => {
+  const h = harness();
+  await h.service.initialize();
+  let heard = 0;
+  h.service.onDeviceAction(() => {
+    heard += 1;
+    // The action released its lock before the listeners run.
+    void h.service.readDeviceList();
+  });
+
+  await h.service.revokeOtherDevice(OTHER_DEVICE, "lost");
+  await h.service.liftRegistrationLock(LOCK_END);
+  expect(heard).toBe(2);
+  h.revokeOther = async () => ({ ok: false, reason: "no_answer" });
+  await h.service.revokeOtherDevice(OTHER_DEVICE, "removed");
+  h.liftLock = async () => ({ ok: false, reason: "refused", code: "conflict" });
+  await h.service.liftRegistrationLock(LOCK_END);
+  expect(heard).toBe(4);
+  await settle();
+  expect(h.log.filter((step) => step === "session listDevices")).toHaveLength(
+    4,
+  );
+
+  h.confirmRevoke = async () => false;
+  await h.service.revokeOtherDevice(OTHER_DEVICE, "lost");
+  await h.service.revokeOtherDevice({ ...OTHER_DEVICE, id: DEVICE_ID }, "lost");
+  expect(heard).toBe(4);
+});
+
+test("the confirmations of a revocation name the device's label and platform and the login, keep the device by default, and only the revocation as lost names the 7-day lock; the lift names the end of the lock", () => {
+  expect(REVOKE_DEVICE_CONFIRMATIONS).toEqual({
+    removed: {
+      type: "warning",
+      buttons: ["Remove the device", "Keep"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      title: "Remove a device",
+      detail:
+        "The server revokes the device at once: it can no longer connect, the agents that it hosts are disabled, and their unfinished runs are cancelled. A revoked device never comes back; that computer can sign in with GitHub again as a new device. No registration lock starts.",
+    },
+    lost: {
+      type: "warning",
+      buttons: ["Revoke as lost", "Keep"],
+      defaultId: 1,
+      cancelId: 1,
+      noLink: true,
+      title: "Revoke a lost device",
+      detail:
+        "The server revokes the device at once: it can no longer connect, the agents that it hosts are disabled, and their unfinished runs are cancelled. This starts a 7-day registration lock: for 7 days no new device can register on this account, unless you lift the lock on one of your active devices. Devices that are registered already can still sign in.",
+    },
+  });
+  expect(REVOKE_DEVICE_CONFIRMATIONS.lost.detail).toContain(
+    "7-day registration lock",
+  );
+  expect(REVOKE_DEVICE_CONFIRMATIONS.removed.detail).not.toMatch(/7-day/);
+  for (const confirmation of Object.values(REVOKE_DEVICE_CONFIRMATIONS)) {
+    expect(Object.isFrozen(confirmation)).toBe(true);
+    expect(Object.isFrozen(confirmation.buttons)).toBe(true);
+  }
+  expect(Object.isFrozen(REVOKE_DEVICE_CONFIRMATIONS)).toBe(true);
+  expect(
+    revokeDeviceConfirmationMessage("octocat", OTHER_DEVICE, "removed"),
+  ).toBe(
+    'Remove the device "Work laptop" (Windows) from the GitHub account octocat?',
+  );
+  expect(
+    revokeDeviceConfirmationMessage(
+      "octocat",
+      { label: "Mac", platform: "macos" },
+      "lost",
+    ),
+  ).toBe(
+    'Revoke the device "Mac" (macOS) of the GitHub account octocat as lost?',
+  );
+  expect(
+    revokeDeviceConfirmationMessage(
+      "octocat",
+      { label: "Server", platform: "linux" },
+      "lost",
+    ),
+  ).toContain("(Linux)");
+  expect(revokeDeviceConfirmed({ response: 0 })).toBe(true);
+  for (const response of [1, 2, -1]) {
+    expect(revokeDeviceConfirmed({ response })).toBe(false);
+  }
+
+  expect(LIFT_REGISTRATION_LOCK_CONFIRMATION).toEqual({
+    type: "warning",
+    buttons: ["Lift the lock", "Keep"],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+    title: "Lift the registration lock",
+    detail:
+      "New devices can then register on this account again at once. The lock protects the account after a device was lost: lift it only when you are about to register a new device yourself.",
+  });
+  expect(Object.isFrozen(LIFT_REGISTRATION_LOCK_CONFIRMATION)).toBe(true);
+  // The message names the end of the lock, in the format of the devices
+  // section: the date and the time, in the given locale and time zone.
+  expect(
+    liftRegistrationLockConfirmationMessage(
+      "octocat",
+      "2026-11-16T10:00:00.000Z",
+      dialogTimeFormat("en-GB", "UTC"),
+    ),
+  ).toBe(
+    "Lift the registration lock of the GitHub account octocat, which ends at 16 Nov 2026, 10:00?",
+  );
+  expect(
+    liftRegistrationLockConfirmationMessage(
+      "octocat",
+      "2026-11-16T10:00:00.000Z",
+      dialogTimeFormat("en-GB", "Europe/Istanbul"),
+    ),
+  ).toContain("which ends at 16 Nov 2026, 13:00?");
+  expect(
+    liftRegistrationLockConfirmationMessage("octocat", "not a time"),
+  ).toContain("which ends at not a time?");
+  // By default, the system's time zone.
+  expect(dialogTimeFormat().resolvedOptions().timeZone).toBe(
+    new Intl.DateTimeFormat().resolvedOptions().timeZone,
+  );
+  expect(dialogTimeFormat("en-GB").resolvedOptions()).toMatchObject({
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+  expect(liftRegistrationLockConfirmed({ response: 0 })).toBe(true);
+  expect(liftRegistrationLockConfirmed({ response: 1 })).toBe(false);
 });
 
 test("the device list read answers the session's devices and lock, maps the session's failures like a read, and reports a session that throws", async () => {

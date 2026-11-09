@@ -26,10 +26,13 @@ import type {
   DeviceListLoadResult,
   DeviceListView,
   ForgetResult,
+  LiftRegistrationLockResult,
   MountResult,
+  OtherDeviceRevocation,
   PeopleView,
   ReconnectResult,
   RemoveDeviceResult,
+  RevokeOtherDeviceResult,
   RepositoryList,
   RuntimeStatus,
   SignOutResult,
@@ -42,6 +45,21 @@ import type {
 } from "../shared/ipc-contract.ts";
 
 type IpcListener = (event: unknown, ...args: unknown[]) => void;
+
+/**
+ * The reason of a revocation that the bridge passes on: one of its own two
+ * strings, never another value of the renderer.
+ */
+function revocationOf(reason: unknown): OtherDeviceRevocation | null {
+  switch (reason) {
+    case "removed":
+      return "removed";
+    case "lost":
+      return "lost";
+    default:
+      return null;
+  }
+}
 
 /**
  * The only start option that the bridge passes on (#175): a fixed object of
@@ -146,8 +164,10 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * passphrase of `account.unlockDeviceKey`, the IDs of `workspaces.select`
  * and `workspaces.openProject`, the text of `chat.send`, and the event IDs
  * of `chat.retry` and `chat.discard`, which must be strings (or null to
- * close a project) and which the main process validates, and the device IDs
- * of `devices.dismissNewDevices`, an array of strings that it copies.
+ * close a project) and which the main process validates, the device IDs
+ * of `devices.dismissNewDevices`, an array of strings that it copies, and
+ * the device ID of `devices.revokeDevice`, a string, with one of its own two
+ * reasons.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -435,6 +455,28 @@ export function createDesktopBridge(
         : Promise.reject(
             new TypeError("dismissNewDevices needs an array of ID strings."),
           ),
+    // Only a string and one of the two reasons go on; the main process
+    // checks the ID and accepts only an active device of its list.
+    revokeDevice: (deviceId: string, reason: OtherDeviceRevocation) => {
+      const revocation = revocationOf(reason);
+      return typeof deviceId === "string" && revocation !== null
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.revokeDevice,
+            deviceId,
+            revocation,
+          ) as Promise<RevokeOtherDeviceResult>)
+        : Promise.reject(
+            new TypeError(
+              "revokeDevice needs a device ID string and a revocation reason.",
+            ),
+          );
+    },
+    liftRegistrationLock: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.liftRegistrationLock,
+      ) as Promise<LiftRegistrationLockResult>,
+    dismissLostDeviceAdvice: () =>
+      ipc.invoke(INVOKE_CHANNELS.dismissLostDeviceAdvice) as Promise<boolean>,
   });
 
   return Object.freeze({

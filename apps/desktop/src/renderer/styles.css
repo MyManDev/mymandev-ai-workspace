@@ -550,6 +550,27 @@ code {
   overflow-wrap: anywhere;
 }
 
+.device-notice {
+  margin-block-end: var(--space-2);
+}
+
+/* A device action's button while an action runs: focusable, and inert. */
+.panel-action[aria-disabled="true"] {
+  color: var(--color-text-muted);
+  cursor: progress;
+}
+
+.device-advice {
+  margin-block: var(--space-2);
+  font-size: var(--font-size-small);
+}
+
+.device-advice ul {
+  margin: var(--space-1) 0;
+  padding-inline-start: var(--space-4);
+  overflow-wrap: anywhere;
+}
+
 .pairing-code {
   margin: var(--space-2) 0;
   font-family: var(--font-family-mono);

@@ -33,6 +33,8 @@ import { serializeError, serializeRequest } from "./log.ts";
 import { runTransitionHandler } from "./workspaces/agent-events.ts";
 import { chatSendHandler } from "./workspaces/chat-events.ts";
 import {
+  type ApproverEventHandler,
+  deliverApproverEvent,
   deliverWorkspaceEvent,
   type WorkspaceEventHandler,
 } from "./workspaces/events.ts";
@@ -57,6 +59,13 @@ export type BuildAppOptions = Readonly<{
    * observe the events. Default: nothing more.
    */
   onWorkspaceEvent?: WorkspaceEventHandler;
+  /**
+   * Receives each join request event (#210) with the workspace's owner and
+   * admins, after the transaction that made the change committed and after
+   * the gateway delivered it to their subscribed connections. Tests use it
+   * to observe the events. Default: nothing more.
+   */
+  onApproverEvent?: ApproverEventHandler;
   /**
    * The open WebSocket connections. The default is a new registry; tests
    * pass one to count or close connections.
@@ -317,6 +326,12 @@ export async function buildApp(
     deliverWorkspaceEvent(connections, event, app.log);
     return options.onWorkspaceEvent?.(event);
   };
+  // Every join request event goes only to the connections subscribed as the
+  // workspace's owner or an admin (#210), then to the option.
+  const onApproverEvent: ApproverEventHandler = (event, approvers) => {
+    deliverApproverEvent(connections, event, approvers, app.log);
+    return options.onApproverEvent?.(event, approvers);
+  };
   await app.register(websocket, {
     // The ws default (100 MiB) is far above what one message needs. Larger
     // frames close with 1009.
@@ -443,6 +458,7 @@ export async function buildApp(
         requireAccessToken,
         now,
         onWorkspaceEvent,
+        onApproverEvent,
         // Account frames go to the account's open connections at once.
         onAccountFrame: (userId, frame) => {
           connections.sendToUser(userId, frame);

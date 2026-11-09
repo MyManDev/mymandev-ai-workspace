@@ -2,6 +2,7 @@ import type { CancelledRun } from "@mymandev/database";
 import {
   type AgentRunStateChangedEvent,
   type EventId,
+  type MemberId,
   newId,
   PROTOCOL_VERSION,
   type ProtocolEvent,
@@ -12,17 +13,30 @@ import type { FastifyBaseLogger, FastifyRequest } from "fastify";
 import type { AccountFrame, ConnectionRegistry } from "../gateway.ts";
 
 /**
+ * A join request event (#210): `workspace.join_request.created` and
+ * `workspace.join_request.resolved`. Only the server originates it, with a
+ * `system` actor and `deviceId: null`, and it goes only to the connections
+ * subscribed to the workspace as its owner or an admin, never to every
+ * member, so it is not a `WorkspaceEvent`.
+ */
+export type JoinRequestEvent = Extract<
+  ProtocolEvent,
+  { type: `workspace.join_request.${string}` }
+>;
+
+/**
  * A membership event: a change of the people that every member of the
  * workspace must see (`workspace.member.*` and
  * `workspace.ownership.transferred`). Only the server originates it, with a
  * `system` actor and `deviceId: null` (ADR 0014, "Protocol"). The project
  * events `workspace.project.created` and `workspace.project.renamed` (#155)
  * share the type and its delivery. Other events that only the server
- * originates, such as `chat.message.created`, are not membership events.
+ * originates, such as `chat.message.created`, are not membership events, and
+ * neither are the join request events, which only the owner and admins get.
  */
-export type WorkspaceEvent = Extract<
-  ProtocolEvent,
-  { type: `workspace.${string}` }
+export type WorkspaceEvent = Exclude<
+  Extract<ProtocolEvent, { type: `workspace.${string}` }>,
+  JoinRequestEvent
 >;
 
 /**
@@ -54,6 +68,37 @@ export function deliverWorkspaceEvent(
   log.debug(
     { eventType: event.type, workspaceId: event.workspaceId, sent },
     "workspace event",
+  );
+}
+
+/**
+ * Receives each join request event after the transaction that made the
+ * change committed, as a frozen copy, with the workspace's owner and admins
+ * as that transaction read them (`joinRequestApprovers`). The route does not
+ * wait for it.
+ */
+export type ApproverEventHandler = (
+  event: JoinRequestEvent,
+  approvers: readonly MemberId[],
+) => void | Promise<void>;
+
+/**
+ * Delivers a join request event only to the connections subscribed to its
+ * workspace as one of `approvers`, the owner and admins that the change's
+ * transaction read (#210): never to a member, to the requester, or to a
+ * connection subscribed to another workspace. Logs the event type, the
+ * workspace ID, and the number of connections at debug level.
+ */
+export function deliverApproverEvent(
+  connections: ConnectionRegistry,
+  event: JoinRequestEvent,
+  approvers: readonly MemberId[],
+  log: FastifyBaseLogger,
+): void {
+  const sent = connections.sendToPeople(event, approvers);
+  log.debug(
+    { eventType: event.type, workspaceId: event.workspaceId, sent },
+    "join request event",
   );
 }
 
@@ -126,7 +171,9 @@ function deepFreeze<T>(value: T): T {
  * A deeply frozen copy of an event, so that the event handler shares no
  * object with the HTTP answer and cannot change it.
  */
-export function frozenCopy(event: WorkspaceEvent): WorkspaceEvent {
+export function frozenCopy<T extends WorkspaceEvent | JoinRequestEvent>(
+  event: T,
+): T {
   return deepFreeze(structuredClone(event));
 }
 
@@ -154,6 +201,37 @@ export function sendWorkspaceEvent(
   };
   try {
     Promise.resolve(handler(copy)).catch(failed);
+  } catch (error) {
+    failed(error);
+  }
+}
+
+/**
+ * Hands a frozen copy of a join request event and of its approvers to
+ * `handler` without waiting for it, as `sendWorkspaceEvent` does: the change
+ * is already committed, so a failure is only logged, with the event type,
+ * the workspace ID, and the error's type, never its message.
+ */
+export function sendApproverEvent(
+  request: FastifyRequest,
+  handler: ApproverEventHandler,
+  event: JoinRequestEvent,
+  approvers: readonly MemberId[],
+): void {
+  const copy = frozenCopy(event);
+  const people = Object.freeze([...approvers]);
+  const failed = (error: unknown) => {
+    request.log.error(
+      {
+        eventType: copy.type,
+        workspaceId: copy.workspaceId,
+        errorType: error instanceof Error ? error.name : typeof error,
+      },
+      "join request event failed",
+    );
+  };
+  try {
+    Promise.resolve(handler(copy, people)).catch(failed);
   } catch (error) {
     failed(error);
   }
