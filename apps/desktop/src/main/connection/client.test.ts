@@ -1185,6 +1185,42 @@ test("a sign-in that already ran when connection_replaced or protocol_violation 
   }
 });
 
+test("a sign-in that ended one connection_replaced or protocol_violation does not count for the next one", async () => {
+  for (const [code, reason] of RECONNECTABLE_CLOSES) {
+    const h = harness();
+    await h.authenticate();
+    h.last().closed(code, reason);
+
+    // A sign-in succeeds while the first stop holds: the client connects.
+    const statuses = signInStatuses(accountStatus(), 2, DEVICE_ID, true);
+    for (const status of statuses) {
+      h.emit(status);
+    }
+    expect(h.sockets, reason).toHaveLength(2);
+    await h.authenticate();
+    expect(h.client.status().state, reason).toBe("connected");
+
+    // A second stop, while the last outcome is still `signed_in`.
+    h.last().closed(code, reason);
+    const stopped = { state: "stopped", reason };
+    expect(h.client.status(), reason).toMatchObject(stopped);
+    const signedIn = accountStatus({ lastOutcome: SIGNED_IN_OUTCOME });
+
+    // Any other account status keeps it.
+    h.emit(
+      accountStatus({ ...signedIn, revision: 7, replacementPending: true }),
+    );
+    expect(h.client.status(), reason).toMatchObject(stopped);
+    // A removal that the API refuses brings it back.
+    h.emit(
+      accountStatus({ ...signedIn, revision: 8, device: "removal_pending" }),
+    );
+    h.emit(accountStatus({ ...signedIn, revision: 9 }));
+    expect(h.client.status(), reason).toMatchObject(stopped);
+    expect(h.sockets, reason).toHaveLength(2);
+  }
+});
+
 test("the refusals and update_required stay when the device signs out, and a sign-in ends all but update_required", async () => {
   const cases: [number, string, AccountStatus["device"] | null][] = [
     [4000, "auth_failed", "auth_failed"],
