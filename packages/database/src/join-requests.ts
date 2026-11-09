@@ -1,5 +1,6 @@
 import {
   type DeviceId,
+  type IdentityProvider,
   type JoinRequest,
   type JoinRequestDecision,
   type JoinRequestId,
@@ -18,6 +19,7 @@ import {
   desc,
   eq,
   gt,
+  inArray,
   isNotNull,
   isNull,
   max,
@@ -497,6 +499,57 @@ export type ListJoinRequestsResult =
   | Readonly<{ listed: false; refusal: "not_member" | "forbidden" }>;
 
 /**
+ * The columns of a request in the approvers' view, read with a left join of
+ * the requester's GitHub identity (`withRequester`).
+ */
+const approverColumns = {
+  ...ownColumns,
+  decision: workspaceJoinRequests.decision,
+  decidedAt: workspaceJoinRequests.decidedAt,
+  provider: userIdentities.identityProvider,
+  login: userIdentities.login,
+  verifiedAt: userIdentities.lastSignInAt,
+  accountCreatedAt: userIdentities.accountCreatedAt,
+};
+
+/** The requester's GitHub identity, if it was not erased, for `approverColumns`. */
+const withRequester = and(
+  eq(userIdentities.userId, workspaceJoinRequests.requesterUserId),
+  eq(userIdentities.identityProvider, "github"),
+);
+
+type ApproverRow = OwnRow &
+  Readonly<{
+    decision: JoinRequestDecision | null;
+    decidedAt: Date | null;
+    provider: IdentityProvider | null;
+    login: string | null;
+    verifiedAt: Date | null;
+    accountCreatedAt: Date | null;
+  }>;
+
+/** A request as the owner and admins see it, the protocol's `JoinRequest`. */
+function toApproverView(row: ApproverRow): JoinRequest {
+  return {
+    ...toOwn(row),
+    requester:
+      row.provider === null ||
+      row.login === null ||
+      row.verifiedAt === null ||
+      row.accountCreatedAt === null
+        ? null
+        : {
+            provider: row.provider,
+            login: row.login,
+            verifiedAt: row.verifiedAt.toISOString(),
+            accountCreatedAt: row.accountCreatedAt.toISOString(),
+          },
+    decision: row.decision,
+    decidedAt: row.decidedAt?.toISOString() ?? null,
+  };
+}
+
+/**
  * The join requests of a workspace in the approvers' view: the answer of
  * `GET /workspaces/:workspaceId/join-requests`. Only the owner and admins.
  * It holds the pending requests, then the blocked requests whose block is in
@@ -533,23 +586,9 @@ export async function listJoinRequests(
         ),
       );
     const rows = await db
-      .select({
-        ...ownColumns,
-        decision: workspaceJoinRequests.decision,
-        decidedAt: workspaceJoinRequests.decidedAt,
-        provider: userIdentities.identityProvider,
-        login: userIdentities.login,
-        verifiedAt: userIdentities.lastSignInAt,
-        accountCreatedAt: userIdentities.accountCreatedAt,
-      })
+      .select(approverColumns)
       .from(workspaceJoinRequests)
-      .leftJoin(
-        userIdentities,
-        and(
-          eq(userIdentities.userId, workspaceJoinRequests.requesterUserId),
-          eq(userIdentities.identityProvider, "github"),
-        ),
-      )
+      .leftJoin(userIdentities, withRequester)
       .where(
         and(
           eq(workspaceJoinRequests.workspaceId, input.workspaceId),
@@ -572,26 +611,68 @@ export async function listJoinRequests(
         desc(workspaceJoinRequests.id),
       )
       .limit(MAX_ANSWER_LIST_ITEMS);
-    return {
-      listed: true,
-      joinRequests: rows.map((row) => ({
-        ...toOwn(row),
-        requester:
-          row.provider === null ||
-          row.login === null ||
-          row.verifiedAt === null ||
-          row.accountCreatedAt === null
-            ? null
-            : {
-                provider: row.provider,
-                login: row.login,
-                verifiedAt: row.verifiedAt.toISOString(),
-                accountCreatedAt: row.accountCreatedAt.toISOString(),
-              },
-        decision: row.decision,
-        decidedAt: row.decidedAt?.toISOString() ?? null,
-      })),
-    };
+    return { listed: true, joinRequests: rows.map(toApproverView) };
+  });
+}
+
+export type JoinRequestOfWorkspaceInput = Readonly<{
+  workspaceId: WorkspaceId;
+  joinRequestId: JoinRequestId;
+}>;
+
+/**
+ * One join request of the workspace as the owner and admins see it, the
+ * item of `listJoinRequests` (#210), or undefined when the workspace has no
+ * request with this ID. It reads the request in whatever state it is and
+ * checks no role: the API calls it inside the transaction that created the
+ * request, for the event `workspace.join_request.created`, which goes only
+ * to the owner and admins (`joinRequestApprovers`).
+ */
+export async function joinRequestForApprovers(
+  db: Database,
+  input: JoinRequestOfWorkspaceInput,
+): Promise<JoinRequest | undefined> {
+  return withDatabaseErrors(async () => {
+    const [row] = await db
+      .select(approverColumns)
+      .from(workspaceJoinRequests)
+      .leftJoin(userIdentities, withRequester)
+      .where(
+        and(
+          eq(workspaceJoinRequests.id, input.joinRequestId),
+          eq(workspaceJoinRequests.workspaceId, input.workspaceId),
+        ),
+      );
+    return row === undefined ? undefined : toApproverView(row);
+  });
+}
+
+/**
+ * The people who see and decide the workspace's join requests: its active
+ * owner and admins, in the order of their IDs (#210). The API sends the join
+ * request events only to the connections subscribed to the workspace as one
+ * of them, and reads them inside the transaction of the change that the
+ * event reports. It locks nothing, so it never waits for a role change and
+ * cannot deadlock with one: a demotion or a removal that committed before
+ * the read leaves the person out, and one that commits later does not.
+ */
+export async function joinRequestApprovers(
+  db: Database,
+  workspaceId: WorkspaceId,
+): Promise<MemberId[]> {
+  return withDatabaseErrors(async () => {
+    const rows = await db
+      .select({ id: workspaceMembers.id })
+      .from(workspaceMembers)
+      .where(
+        and(
+          eq(workspaceMembers.workspaceId, workspaceId),
+          isNull(workspaceMembers.removedAt),
+          inArray(workspaceMembers.role, ["owner", "admin"]),
+        ),
+      )
+      .orderBy(workspaceMembers.id);
+    return rows.map((row) => row.id);
   });
 }
 
