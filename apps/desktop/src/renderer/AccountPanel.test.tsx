@@ -14,12 +14,16 @@ import {
   DEVICE_KEY_PROBLEM_MESSAGES,
   DEVICE_STATE_MESSAGES,
   SIGN_IN_OUTCOME_MESSAGES,
+  SIGN_IN_RENEWAL_MESSAGES,
+  signInEndFormat,
   signInTimeFormat,
 } from "./account-view.ts";
 
-/** The panel's clock in the tests, and a time format that does not depend on the machine. */
+/** The panel's clock in the tests, and time formats that do not depend on the machine. */
 const NOW = Date.parse("2026-11-06T10:00:00.000Z");
 const UTC_TIME = signInTimeFormat({ locale: "en-GB", timeZone: "UTC" });
+const UTC_DATE = signInEndFormat({ locale: "en-GB", timeZone: "UTC" });
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 const AUTHORIZE_URL =
   "https://api.mymandev.example/auth/github/authorize?code_challenge=abc&state=def";
@@ -44,6 +48,7 @@ const SIGNED_IN: AccountStatus = {
     login: "octocat",
     displayName: "The Octocat",
     deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
   },
   device: "signed_in",
 };
@@ -83,6 +88,7 @@ function props(
     onRemoveDevice: record("onRemoveDevice"),
     now: NOW,
     timeFormat: UTC_TIME,
+    endFormat: UTC_DATE,
     ...overrides,
   };
 }
@@ -324,16 +330,17 @@ test("in another browser, the URL is shown with the warning for copying, and ano
 });
 
 const SIGNED_IN_BUTTONS = [
+  ["Renew the sign-in", ["onStartSignIn"]],
   ["Sign out", ["onSignOut"]],
   ["Remove this device", ["onRemoveDevice"]],
   ["This is not me", ["onForget"]],
 ];
 
-test("signed in, the panel shows the login and the name with the device's actions and This is not me", () => {
+test("signed in, the panel shows the login, the name, and the end of the sign-in with the device's actions and This is not me", () => {
   const html = render({ view: { kind: "known", status: SIGNED_IN } });
 
   expect(html).toContain(
-    '<dl class="account-facts"><dt>GitHub login</dt><dd>octocat</dd><dt>Name</dt><dd>The Octocat</dd></dl>',
+    '<dl class="account-facts"><dt>GitHub login</dt><dd>octocat</dd><dt>Name</dt><dd>The Octocat</dd><dt>Signed in until</dt><dd><time dateTime="2026-12-02T10:00:00.000Z">2 December 2026</time></dd></dl>',
   );
   expect(html).not.toContain("0192f2a0");
   expect(html).not.toContain("Sign in with GitHub");
@@ -616,6 +623,7 @@ test("logins, names, URLs, and warnings are rendered as text, not as markup, and
           login: "octocat",
           displayName: "<b>name</b>",
           deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+          signInExpiresAt: "2026-12-02T10:00:00.000Z",
         },
         signIn: {
           kind: "waiting",
@@ -671,6 +679,7 @@ test("each state of the device offers its actions", () => {
 
   // The account's devices are listed beside the panel, without a button.
   expect(labels(SIGNED_IN)).toEqual([
+    "Renew the sign-in",
     "Sign out",
     "Remove this device",
     "This is not me",
@@ -709,11 +718,141 @@ test("each state of the device offers its actions", () => {
     view: { kind: "known", status: SIGNED_IN },
     busy: true,
   });
-  for (const label of ["Sign out", "Remove this device"]) {
+  for (const label of ["Renew the sign-in", "Sign out", "Remove this device"]) {
     expect(busy).toContain(
       `<button type="button" class="panel-action" disabled="">${label}</button>`,
     );
   }
   expect(busy).not.toContain("Show devices");
   expect(busy).not.toContain("devices-title");
+});
+
+type SignedInAccount = Extract<AccountStatus["account"], { kind: "signed_in" }>;
+
+/** The signed-in status whose sign-in ends at `endsAt`. */
+function endingAt(endsAt: number, base: AccountStatus = SIGNED_IN) {
+  return {
+    ...base,
+    account: {
+      ...(base.account as SignedInAccount),
+      signInExpiresAt: new Date(endsAt).toISOString(),
+    },
+  } satisfies AccountStatus;
+}
+
+test("before the last 5 days, the end of the sign-in shows and the renewal is offered without a prompt (D4)", () => {
+  for (const left of [29 * DAY_MS, 6 * DAY_MS, 5 * DAY_MS + 1]) {
+    const view = { kind: "known", status: endingAt(NOW + left) } as const;
+    const html = render({ view });
+
+    expect(html, String(left)).toContain("<dt>Signed in until</dt>");
+    expect(html, String(left)).toContain(
+      '<div class="account-actions"><button type="button" class="panel-action">Renew the sign-in</button><button type="button" class="panel-action">Sign out</button>',
+    );
+    expect(html, String(left)).not.toContain("sign-in-renewal");
+    expect(html, String(left)).not.toContain("Renew it");
+    expect(clickEveryButton({ view })[0]).toEqual([
+      "Renew the sign-in",
+      ["onStartSignIn"],
+    ]);
+  }
+});
+
+test("from 5 days before the end, a fixed sentence asks to renew the sign-in and describes its button; after the end it says that the sign-in ended (D4)", () => {
+  for (const [left, sentence] of [
+    [5 * DAY_MS, SIGN_IN_RENEWAL_MESSAGES.due],
+    [DAY_MS, SIGN_IN_RENEWAL_MESSAGES.due],
+    [1, SIGN_IN_RENEWAL_MESSAGES.due],
+    [0, SIGN_IN_RENEWAL_MESSAGES.ended],
+    [-DAY_MS, SIGN_IN_RENEWAL_MESSAGES.ended],
+  ] as const) {
+    const view = { kind: "known", status: endingAt(NOW + left) } as const;
+
+    expect(render({ view }), String(left)).toContain(
+      `<p class="account-warning" id="sign-in-renewal">${sentence}</p><div class="account-actions"><button type="button" class="panel-action" aria-describedby="sign-in-renewal">Renew the sign-in</button>`,
+    );
+    expect(clickEveryButton({ view })[0]).toEqual([
+      "Renew the sign-in",
+      ["onStartSignIn"],
+    ]);
+    expect(render({ view, busy: true })).toContain(
+      '<button type="button" class="panel-action" disabled="" aria-describedby="sign-in-renewal">Renew the sign-in</button>',
+    );
+  }
+  // The date in the person's locale and time zone: an end at 23:30 UTC is
+  // the next day in Istanbul.
+  expect(
+    render({
+      view: {
+        kind: "known",
+        status: endingAt(Date.parse("2026-12-09T23:30:00.000Z")),
+      },
+      endFormat: signInEndFormat({
+        locale: "en-US",
+        timeZone: "Europe/Istanbul",
+      }),
+    }),
+  ).toContain(
+    '<dt>Signed in until</dt><dd><time dateTime="2026-12-09T23:30:00.000Z">December 10, 2026</time></dd>',
+  );
+});
+
+test("the end of the sign-in and its renewal show only while the device is signed in; once the server asks for a sign-in, the panel offers Sign in with GitHub instead (D4)", () => {
+  const due = endingAt(NOW + 2 * DAY_MS);
+  for (const device of [
+    "starting",
+    "signed_out",
+    "sign_out_report_pending",
+    "sign_in_required",
+    "auth_failed",
+    "account_mismatch",
+    "key_lost",
+    "key_not_loaded",
+    "unavailable",
+    "removal_pending",
+  ] as const) {
+    const html = render({
+      view: { kind: "known", status: { ...due, device } },
+    });
+    expect(html, device).not.toContain("Signed in until");
+    expect(html, device).not.toContain("Renew");
+    expect(html, device).not.toContain("sign-in-renewal");
+  }
+  // After the end, the server refuses the device with sign_in_required: the
+  // panel says so and offers a GitHub sign-in.
+  const required = render({
+    view: {
+      kind: "known",
+      status: { ...endingAt(NOW - DAY_MS), device: "sign_in_required" },
+    },
+  });
+  expect(required).toContain(DEVICE_STATE_MESSAGES.sign_in_required);
+  expect(required).toContain(">Sign in with GitHub</button>");
+  // While a sign-in runs, a renewal too, the panel shows its progress and
+  // no prompt; without a usable key or server address no renewal is
+  // offered.
+  for (const status of [
+    { ...due, signIn: { kind: "starting" } },
+    { ...due, signIn: { kind: "completing" } },
+    {
+      ...due,
+      signIn: { kind: "waiting", pairingCode: "042137", opened: true },
+    },
+    { ...due, deviceKey: "corrupt" },
+    { ...due, apiOrigin: "unset" },
+    { ...due, apiOrigin: "invalid" },
+  ] satisfies AccountStatus[]) {
+    const html = render({ view: { kind: "known", status } });
+    expect(html, JSON.stringify(status)).not.toContain("Renew");
+    expect(html, JSON.stringify(status)).not.toContain("sign-in-renewal");
+  }
+  // A hidden account names no end (#195).
+  expect(
+    render({
+      view: {
+        kind: "known",
+        status: { ...due, account: { kind: "hidden" }, device: "signed_out" },
+      },
+    }),
+  ).not.toContain("Signed in until");
 });

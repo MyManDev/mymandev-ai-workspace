@@ -606,6 +606,7 @@ const SIGNED_IN = Object.freeze({
     login: "octocat",
     displayName: "Octo Cat",
     deviceId: "019a5b2c-3d4e-7f60-8a1b-2c3d4e5f6a70",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
   }),
   signIn: Object.freeze({ kind: "idle" }),
   lastOutcome: null,

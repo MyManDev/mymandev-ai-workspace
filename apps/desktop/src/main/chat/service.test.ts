@@ -90,6 +90,7 @@ function accountStatus(deviceId: string = DEVICE_ID): AccountStatus {
       login: "octocat",
       displayName: "The Octocat",
       deviceId,
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
     }),
     signIn: Object.freeze({ kind: "idle" }),
     lastOutcome: null,
@@ -871,6 +872,43 @@ test("a lost connection turns sending messages back to waiting, and they go out 
   expect(h.sentIds()).toEqual([eventId, eventId]);
   expect(h.sent[1]).toEqual(h.sent[0]);
   expect(h.pendingStatuses()).toEqual(["sending"]);
+});
+
+test("a renewal of the sign-in keeps the waiting messages: they go out again with the same event ID after the reconnect with the new key (D4)", async () => {
+  const h = await withChat();
+  const result = h.service.send("Hello from the composer");
+  const eventId = result.kind === "accepted" ? result.eventId : undefined;
+  expect(h.pendingStatuses()).toEqual(["sending"]);
+
+  // The renewal is a sign-in of the same device: the status shows it run
+  // and then names a new end of the sign-in, for the same device.
+  const renewing = accountStatus();
+  for (const kind of ["starting", "completing"] as const) {
+    h.setAccount({ ...renewing, signIn: { kind } });
+  }
+  h.setAccount({
+    ...renewing,
+    account: {
+      ...(renewing.account as Extract<
+        AccountStatus["account"],
+        { kind: "signed_in" }
+      >),
+      signInExpiresAt: "2026-12-09T10:00:00.000Z",
+    },
+    lastOutcome: { code: "signed_in" },
+  });
+  expect(h.pendingStatuses()).toEqual(["sending"]);
+
+  // The API closed the connection that used the replaced key, and the
+  // client connected again with the new key.
+  h.disconnect();
+  expect(h.pendingStatuses()).toEqual(["waiting"]);
+  h.advance(CHAT_RESEND_INTERVAL_MS);
+  h.setConnection("connected");
+  h.receive(subscribed());
+  h.workspaces.setLive(WS_A, true);
+  expect(h.sentIds()).toEqual([eventId, eventId]);
+  expect(h.state.projectId).toBe(PROJECT_1);
 });
 
 test("not_found and conflict show as not sent at once, and retry sends again with the same event ID", async () => {

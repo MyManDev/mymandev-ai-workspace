@@ -587,15 +587,26 @@ export function signInOutcomeView(outcome: SignInOutcome): SignInOutcomeView {
   }
 }
 
-/** Only the parts of the account that the renderer may see. */
+/**
+ * Only the parts of the account that the renderer may see. The sign-in
+ * expiry comes from the device record or from the sign-in's answer, which
+ * both hold it only in the protocol's form (`UtcTimestampSchema`): the record
+ * store reads a record with any other value as corrupt, and the flow does
+ * not accept such an answer. So it reaches the status only when it is valid
+ * (D4 on #95), and the contract checks it again.
+ */
 function signedIn(
-  account: Pick<SignedInAccount, "login" | "displayName" | "deviceId">,
+  account: Pick<
+    SignedInAccount,
+    "login" | "displayName" | "deviceId" | "signInExpiresAt"
+  >,
 ): Account {
   return Object.freeze({
     kind: "signed_in",
     login: account.login,
     displayName: account.displayName,
     deviceId: account.deviceId,
+    signInExpiresAt: account.signInExpiresAt,
   });
 }
 

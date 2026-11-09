@@ -717,6 +717,7 @@ const SIGNED_IN_STATUS: AccountStatus = {
     login: "octocat",
     displayName: "The Octocat",
     deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
   },
   device: "signed_in",
 };

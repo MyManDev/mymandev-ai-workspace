@@ -545,7 +545,7 @@ test("before the key is loaded, the status says so and every action waits", asyn
   expect(h.log).toEqual([]);
 });
 
-test("initialize loads the key once, then reads the record, and shows only the login, the name, and the device ID", async () => {
+test("initialize loads the key once, then reads the record, and shows only the login, the name, the device ID, and the sign-in expiry", async () => {
   const h = harness();
 
   await Promise.all([h.service.initialize(), h.service.initialize()]);
@@ -565,6 +565,8 @@ test("initialize loads the key once, then reads the record, and shows only the l
       login: "octocat",
       displayName: "The Octocat",
       deviceId: DEVICE_ID,
+      // D4 on #95: the end of the sign-in, from the record.
+      signInExpiresAt: RECORD.signInExpiresAt,
     },
     signIn: { kind: "idle" },
     lastOutcome: null,
@@ -574,7 +576,7 @@ test("initialize loads the key once, then reads the record, and shows only the l
     device: "signed_in",
   });
   expect(JSON.stringify(h.service.status())).not.toMatch(
-    new RegExp(`${USER_ID}|${PUBLIC_KEY}|signInExpiresAt`),
+    new RegExp(`${USER_ID}|${PUBLIC_KEY}|userId|publicKey`),
   );
   expect(Object.isFrozen(h.service.status())).toBe(true);
   expect(AccountStatusSchema.parse(h.service.status())).toEqual(
@@ -1755,34 +1757,38 @@ test("a session that cannot be created is reported, and its actions are refused"
   });
 });
 
-test("every state of the session reaches the status as its code, without the account's user ID or sign-in expiry", async () => {
+test("every state of the session reaches the status as its code, without the session's account", async () => {
   const h = harness();
   await h.service.initialize();
+  // The status takes the account from the record, also its sign-in expiry
+  // (D4 on #95), and never the session's account.
+  const sessionAccount = Object.freeze({
+    ...SESSION_ACCOUNT,
+    signInExpiresAt: "2026-12-05T10:00:00.000Z",
+  });
+  const sessionSignedIn: DeviceSessionState = Object.freeze({
+    kind: "signed_in",
+    account: sessionAccount,
+  });
   const states: [DeviceSessionState, string][] = [
     [{ kind: "starting" }, "starting"],
     [{ kind: "no_device" }, "no_device"],
-    [{ kind: "key_lost", account: SESSION_ACCOUNT }, "key_lost"],
+    [{ kind: "key_lost", account: sessionAccount }, "key_lost"],
     [{ kind: "unavailable", reason: "record_unreadable" }, "unavailable"],
-    [{ kind: "key_not_loaded", account: SESSION_ACCOUNT }, "key_not_loaded"],
-    [SESSION_SIGNED_IN, "signed_in"],
+    [{ kind: "key_not_loaded", account: sessionAccount }, "key_not_loaded"],
+    [sessionSignedIn, "signed_in"],
     [
-      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: false },
+      { kind: "signed_out", account: sessionAccount, reportPending: false },
       "signed_out",
     ],
     [
-      { kind: "signed_out", account: SESSION_ACCOUNT, reportPending: true },
+      { kind: "signed_out", account: sessionAccount, reportPending: true },
       "sign_out_report_pending",
     ],
-    [
-      { kind: "sign_in_required", account: SESSION_ACCOUNT },
-      "sign_in_required",
-    ],
-    [{ kind: "auth_failed", account: SESSION_ACCOUNT }, "auth_failed"],
-    [
-      { kind: "account_mismatch", account: SESSION_ACCOUNT },
-      "account_mismatch",
-    ],
-    [{ kind: "removal_pending", account: SESSION_ACCOUNT }, "removal_pending"],
+    [{ kind: "sign_in_required", account: sessionAccount }, "sign_in_required"],
+    [{ kind: "auth_failed", account: sessionAccount }, "auth_failed"],
+    [{ kind: "account_mismatch", account: sessionAccount }, "account_mismatch"],
+    [{ kind: "removal_pending", account: sessionAccount }, "removal_pending"],
     [{ kind: "removed" }, "removed"],
     [{ kind: "revoked" }, "revoked"],
   ];
@@ -1796,7 +1802,8 @@ test("every state of the session reaches the status as its code, without the acc
   await settle();
   const sent = JSON.stringify(h.statuses);
   expect(sent).not.toContain(USER_ID);
-  expect(sent).not.toContain("2026-12-02T10:00:00.000Z");
+  expect(sent).not.toContain(sessionAccount.signInExpiresAt);
+  expect(sent).toContain(RECORD.signInExpiresAt);
   expect(sent).not.toContain(PUBLIC_KEY);
 });
 
@@ -1918,6 +1925,87 @@ test("the session's state after a sign-in reaches the status", async () => {
     device: "signed_in",
     lastOutcome: { code: "signed_in" },
   });
+});
+
+test("a renewal is a GitHub sign-in of the signed-in device: it starts without a sign-out, the device and its account stay signed in, and the status names the new end (D4)", async () => {
+  const h = harness();
+  await h.service.initialize();
+  expect(h.service.status()).toMatchObject({
+    account: {
+      kind: "signed_in",
+      deviceId: DEVICE_ID,
+      signInExpiresAt: RECORD.signInExpiresAt,
+    },
+    device: "signed_in",
+  });
+  const attempt = startedSignIn();
+  h.start = async () => attempt.start;
+  const before = h.statuses.length;
+
+  // The panel's "Renew the sign-in" starts the same sign-in.
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+  h.callback?.();
+  expect(h.service.status().signIn).toEqual({ kind: "completing" });
+
+  // The flow replaced the key of the same device and wrote its record with
+  // the end that the API answered: 30 days after this sign-in.
+  const renewed = Object.freeze({
+    ...RECORD,
+    signInExpiresAt: "2026-12-09T10:00:00.000Z",
+  });
+  h.record = { kind: "record", record: renewed };
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  attempt.settle({
+    kind: "signed_in",
+    account: Object.freeze({
+      userId: USER_ID,
+      login: "octocat",
+      displayName: "The Octocat",
+      deviceId: DEVICE_ID,
+      signInExpiresAt: renewed.signInExpiresAt,
+    }),
+    newDevice: false,
+    login: "octocat",
+  });
+
+  expect(await done).toEqual({
+    revision: expect.any(Number) as number,
+    account: {
+      kind: "signed_in",
+      login: "octocat",
+      displayName: "The Octocat",
+      deviceId: DEVICE_ID,
+      signInExpiresAt: "2026-12-09T10:00:00.000Z",
+    },
+    signIn: { kind: "idle" },
+    lastOutcome: { code: "signed_in" },
+    deviceKey: "ready",
+    replacementPending: false,
+    apiOrigin: "set",
+    device: "signed_in",
+  });
+  // No status of the renewal hid the account, named another device, or
+  // left the signed-in state, so the connection, the workspaces, and the
+  // waiting chat messages, which follow the device, are kept.
+  const during = h.statuses.slice(before);
+  expect(during.map((status) => status.signIn.kind)).toEqual([
+    "starting",
+    "waiting",
+    "completing",
+    "idle",
+  ]);
+  for (const status of during) {
+    expect(status.device).toBe("signed_in");
+    expect(status.account).toMatchObject({
+      kind: "signed_in",
+      deviceId: DEVICE_ID,
+    });
+  }
+  expect(h.log).not.toContain("session signOut");
+  expect(h.log).toContain("session signInStarted");
+  expect(h.log).toContain("session signInFinished signed_in");
 });
 
 const REPLACEMENT_PENDING: SignInStart = Object.freeze({

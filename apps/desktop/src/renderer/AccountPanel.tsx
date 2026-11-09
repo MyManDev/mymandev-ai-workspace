@@ -21,12 +21,17 @@ import {
   DEVICE_KEY_PROBLEM_MESSAGES,
   describeDeviceState,
   describeOutcome,
+  describeSignInExpiry,
   followAccountStatus,
   forgetMessage,
   initialAccountView,
+  nextSignInExpiryChange,
   offersForget,
+  offersRenewal,
   offersSignIn,
   removeDeviceMessage,
+  RENEW_SIGN_IN_LABEL,
+  signInEndFormat,
   signInRetryAt,
   signInRetryNote,
   signInRetryReading,
@@ -37,7 +42,11 @@ import {
   waitingPairingCode,
   watchSignInRetry,
   type AccountView,
+  type SignInExpiry,
 } from "./account-view.ts";
+
+/** The ID of the sentence that asks to renew the sign-in, which describes its button. */
+const RENEWAL_PROMPT_ID = "sign-in-renewal";
 
 /**
  * The account of this installation: sign in with GitHub, in the default
@@ -45,9 +54,11 @@ import {
  * open, the GitHub login after a sign-in with "This is not me" (#149) and no
  * account while the device is signed out (#195), the passphrase of a device
  * key that needs one, and the state of the device with sign-out and
- * removing this device. The main process runs the sign-in and the device
- * session; the panel never sees a sign-in code, a key, or a token. The
- * account's devices are listed beside it (`DevicesSection.tsx`).
+ * removing this device. While the device is signed in, it shows when the
+ * sign-in ends and offers to renew it, and from 5 days before the end it
+ * asks the person to (D4 on #95). The main process runs the sign-in and the
+ * device session; the panel never sees a sign-in code, a key, or a token.
+ * The account's devices are listed beside it (`DevicesSection.tsx`).
  */
 export function AccountPanel({
   account,
@@ -93,11 +104,15 @@ export interface AccountPanelContentProps {
   /**
    * The renderer's clock in milliseconds. The panel reads it again when the
    * wait after a start refused during the grace period of an uncertain
-   * sign-in ends, so that its note goes away (#199).
+   * sign-in ends, so that its note goes away (#199), when the last 5 days of
+   * the sign-in begin or the sign-in ends (D4 on #95), and when the window
+   * gets the focus or becomes visible again.
    */
   readonly now: number;
   /** The format of that note's local time; the system's by default. */
   readonly timeFormat?: Intl.DateTimeFormat | undefined;
+  /** The format of the end of the sign-in, a date; the system's by default. */
+  readonly endFormat?: Intl.DateTimeFormat | undefined;
 }
 
 export function AccountPanelContent(props: AccountPanelContentProps) {
@@ -136,9 +151,14 @@ function AccountBody(props: AccountPanelContentProps) {
     status.signIn.kind === "idle"
       ? describeDeviceState(status.device)
       : undefined;
+  const expiry = describeSignInExpiry(status, props.now);
   return (
     <>
-      <AccountSummary status={status} />
+      <AccountSummary
+        status={status}
+        expiry={expiry}
+        endFormat={props.endFormat ?? signInEndFormat()}
+      />
       {deviceState === undefined ? null : (
         <p
           className={
@@ -150,7 +170,7 @@ function AccountBody(props: AccountPanelContentProps) {
         </p>
       )}
       <DeviceKeyNotice {...props} status={status} />
-      <SignInActions {...props} status={status} />
+      <SignInActions {...props} status={status} expiry={expiry} />
       {outcome === undefined ? null : (
         <p
           className={
@@ -189,7 +209,15 @@ function AccountBody(props: AccountPanelContentProps) {
   );
 }
 
-function AccountSummary({ status }: { readonly status: AccountStatus }) {
+function AccountSummary({
+  status,
+  expiry,
+  endFormat,
+}: {
+  readonly status: AccountStatus;
+  readonly expiry: SignInExpiry | undefined;
+  readonly endFormat: Intl.DateTimeFormat;
+}) {
   if (status.account.kind === "hidden" && status.device === "starting") {
     // The main process does not know yet whether the person signed out
     // (#195); "Checking this device." says what happens.
@@ -206,6 +234,16 @@ function AccountSummary({ status }: { readonly status: AccountStatus }) {
       <dd>{status.account.login}</dd>
       <dt>Name</dt>
       <dd>{status.account.displayName}</dd>
+      {expiry === undefined ? null : (
+        <>
+          <dt>Signed in until</dt>
+          <dd>
+            <time dateTime={expiry.endsAt}>
+              {endFormat.format(new Date(expiry.endsAt))}
+            </time>
+          </dd>
+        </>
+      )}
     </dl>
   );
 }
@@ -287,7 +325,10 @@ function UnlockForm({
 }
 
 function SignInActions(
-  props: AccountPanelContentProps & { readonly status: AccountStatus },
+  props: AccountPanelContentProps & {
+    readonly status: AccountStatus;
+    readonly expiry: SignInExpiry | undefined;
+  },
 ) {
   const { status, busy } = props;
   const { signIn } = status;
@@ -313,9 +354,32 @@ function SignInActions(
   const signInDisabled = busy || !canStartSignIn(status);
   const signInDescription =
     originProblem === undefined ? undefined : "sign-in-unavailable";
+  // D4 on #95: a renewal can start at any time while the device is signed
+  // in; from 5 days before the end a sentence asks for it and describes the
+  // button.
+  const renewal = offersRenewal(status);
+  const renewalPrompt = renewal ? props.expiry?.prompt : undefined;
   return (
     <>
+      {renewalPrompt === undefined ? null : (
+        <p className="account-warning" id={RENEWAL_PROMPT_ID}>
+          {renewalPrompt}
+        </p>
+      )}
       <div className="account-actions">
+        {renewal ? (
+          <button
+            type="button"
+            className="panel-action"
+            disabled={busy}
+            aria-describedby={
+              renewalPrompt === undefined ? undefined : RENEWAL_PROMPT_ID
+            }
+            onClick={props.onStartSignIn}
+          >
+            {RENEW_SIGN_IN_LABEL}
+          </button>
+        ) : null}
         {canSignIn ? (
           <>
             <button
@@ -570,6 +634,33 @@ function useAccountPanel(
       ),
     [retryAt, now],
   );
+  // D4 on #95: the clock is read again when the last 5 days of the sign-in
+  // begin and when it ends (`nextSignInExpiryChange`), with the same watch
+  // as the note above, which reads the clock again when its timer fires,
+  // and whenever the window gets the focus or becomes visible again,
+  // because a timer can fire late after the computer slept. So the prompt
+  // to renew appears without a restart while the screen stays open.
+  const expiryChange =
+    view.kind === "known"
+      ? nextSignInExpiryChange(view.status, now)
+      : undefined;
+  useEffect(
+    () =>
+      watchSignInRetry(expiryChange, now, (later) =>
+        setReading(Object.freeze({ retryAt, now: later })),
+      ),
+    [expiryChange, now, retryAt],
+  );
+  useEffect(() => {
+    const readAgain = () =>
+      setReading((last) => Object.freeze({ ...last, now: Date.now() }));
+    window.addEventListener("focus", readAgain);
+    document.addEventListener("visibilitychange", readAgain);
+    return () => {
+      window.removeEventListener("focus", readAgain);
+      document.removeEventListener("visibilitychange", readAgain);
+    };
+  }, []);
 
   /** Runs one action at a time and shows the message that its result names. */
   const run = useCallback(

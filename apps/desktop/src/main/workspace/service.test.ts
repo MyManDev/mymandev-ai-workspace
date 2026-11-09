@@ -87,6 +87,7 @@ function accountStatus(
       login: "octocat",
       displayName: "The Octocat",
       deviceId,
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
     }),
     signIn: Object.freeze({ kind: "idle" }),
     lastOutcome: null,
@@ -1258,6 +1259,34 @@ test("another device resets the state and loads again once connected", async () 
   const revision = h.state.revision;
   h.setAccount(accountStatus({ revision: 7 }, OTHER_DEVICE_ID));
   expect(h.state.revision).toBe(revision);
+});
+
+test("a renewal of the sign-in keeps the workspaces, the selection, the subscription, and the open project (D4)", async () => {
+  const h = await withLiveWorkspace();
+  h.service.openProject(PROJECT_1);
+  const before = h.state;
+  const reads = h.reads.length;
+
+  // The renewal is a sign-in of the same device: the status shows it run
+  // and then names a new end of the sign-in, for the same device.
+  h.setAccount(accountStatus({ signIn: { kind: "starting" } }));
+  h.setAccount(accountStatus({ signIn: { kind: "completing" } }));
+  const renewed = accountStatus().account as Extract<
+    AccountStatus["account"],
+    { kind: "signed_in" }
+  >;
+  h.setAccount(
+    accountStatus({
+      account: { ...renewed, signInExpiresAt: "2026-12-09T10:00:00.000Z" },
+      lastOutcome: { code: "signed_in" },
+    }),
+  );
+
+  expect(h.state).toBe(before);
+  expect(h.state.openProjectId).toBe(PROJECT_1);
+  expect([...h.requested]).toEqual([WS_A]);
+  expect(h.service.gateLive(WS_A)).toBe(true);
+  expect(h.reads.length).toBe(reads);
 });
 
 test("another device while a list load is open and connected loads a fresh list for it", async () => {

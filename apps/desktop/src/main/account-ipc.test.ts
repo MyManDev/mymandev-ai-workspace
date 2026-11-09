@@ -1033,6 +1033,8 @@ function deviceApi() {
     } | null,
     /** The end of the registration lock, or null without one. */
     lockedUntil: null as string | null,
+    /** The sign-in expiry that the next sign-in answers (D4). */
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
     /**
      * Answers a route that needs a token in place of the API when it
      * returns a response; for example an uncertain answer.
@@ -1065,12 +1067,14 @@ function deviceApi() {
       }
       api.publicKey = request.device.publicKey;
       api.signedOut = false;
+      // The API drops the device's earlier tokens when it replaces the key.
+      api.tokens.clear();
       return json(200, {
         userId: USER_ID,
         deviceId: DEVICE_ID,
         displayName: "The Octocat",
         login: "octocat",
-        signInExpiresAt: "2026-12-02T10:00:00.000Z",
+        signInExpiresAt: api.signInExpiresAt,
       });
     }
     if (route === "POST /auth/challenge") {
@@ -1565,6 +1569,162 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   // The user ID that the API answered never reaches the renderer either.
   expect(sent).not.toContain(USER_ID);
 }, 20_000);
+
+test("renew the sign-in of a signed-in device through IPC with the real flow and session: the same device with a new key and a new end, no sign-out, and the API asked with the new key afterwards (D4)", async () => {
+  const folder = path.join(root, "MyManDev");
+  const keyStore = createDeviceKeyStore({
+    folder,
+    platform: "win32",
+    systemProtection: {
+      isAsyncEncryptionAvailable: () => Promise.resolve(true),
+      getSelectedStorageBackend: () => "unknown",
+      encryptStringAsync: (plainText) =>
+        Promise.resolve(Buffer.from(`fake:${plainText}`, "utf8")),
+      decryptStringAsync: (ciphertext) =>
+        Promise.resolve({
+          shouldReEncrypt: false,
+          result: ciphertext.toString("utf8").slice("fake:".length),
+        }),
+    },
+  });
+  const records = createDeviceRecordStore({ folder, platform: "win32" });
+  const { api, fetch } = deviceApi();
+  const opened: string[] = [];
+  const errors: string[] = [];
+  let clock = 0;
+  const markers = () =>
+    createRegistrationMarkerStore({ folder, platform: "win32" });
+  const service = createAccountService({
+    apiOrigin: { ok: true, origin: API_ORIGIN },
+    openSystem: () => ({
+      keyStore,
+      deviceRecords: records,
+      registrationMarkers: markers(),
+      createFlow: () =>
+        createSignInFlow({
+          apiOrigin: { ok: true, origin: API_ORIGIN },
+          keyStore,
+          deviceRecords: records,
+          registrationMarkers: markers(),
+          openExternal: async (url) => {
+            opened.push(url);
+            return true;
+          },
+          fetch,
+          platform: "win32",
+          scheduleTimer: () => () => undefined,
+          listenerConnectionTimeoutMs: 2_000,
+          onError: (message) => errors.push(message),
+        }),
+      createSession: () => sessionOver(folder, keyStore, records, fetch),
+    }),
+    focusWindow: () => undefined,
+    confirmForget: async () => false,
+    confirmRemoveDevice: async () => false,
+    confirmRevokeDevice: async () => false,
+    confirmLiftRegistrationLock: async () => false,
+    now: () => clock,
+    onError: (message) => errors.push(message),
+  });
+  const { call } = register(service);
+  const subscriber = receiver();
+  const app = () => event(frame(DEV_URL), subscriber);
+  const signIn = async (code: string) => {
+    clock += SIGN_IN_START_COOLDOWN_MS;
+    const before = service.status().revision;
+    await expect(
+      call(INVOKE_CHANNELS.startSignIn, app()) as Promise<unknown>,
+    ).resolves.toEqual({ outcome: "started" });
+    const authorize = new URL(opened.at(-1) ?? "");
+    const done = idleWithOutcome(service, before);
+    expect(
+      await postForm(
+        authorize.searchParams.get("redirect_uri") ?? "",
+        new URLSearchParams({
+          code,
+          state: authorize.searchParams.get("state") ?? "",
+        }).toString(),
+      ),
+    ).toBe(200);
+    return { authorize, status: await done };
+  };
+
+  call(INVOKE_CHANNELS.subscribeAccountStatus, app());
+  await service.initialize();
+  const first = await signIn(SIGN_IN_CODE);
+  expect(first.status).toMatchObject({
+    account: {
+      kind: "signed_in",
+      deviceId: DEVICE_ID,
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    },
+    device: "signed_in",
+    lastOutcome: { code: "signed_in" },
+  });
+  // A read mints a token with the first key.
+  await expect(service.readDeviceList()).resolves.toMatchObject({ ok: true });
+  const firstKey = api.publicKey;
+  const sentBefore = subscriber.sent.length;
+
+  // "Renew the sign-in" starts the same sign-in while the device is signed
+  // in. It names the device's login in the browser, and the API replaces
+  // the key and answers 30 days from now.
+  api.signInExpiresAt = "2026-12-09T10:00:00.000Z";
+  const renewal = await signIn(SECOND_CODE);
+  expect(renewal.authorize.searchParams.get("login")).toBe("octocat");
+  expect(renewal.status).toMatchObject({
+    account: {
+      kind: "signed_in",
+      login: "octocat",
+      deviceId: DEVICE_ID,
+      signInExpiresAt: "2026-12-09T10:00:00.000Z",
+    },
+    device: "signed_in",
+    replacementPending: false,
+    lastOutcome: { code: "signed_in" },
+  });
+  const request = SignInRequestSchema.parse(
+    JSON.parse(api.signInBodies.at(-1) ?? ""),
+  );
+  expect(request.device).toMatchObject({
+    kind: "existing",
+    deviceId: DEVICE_ID,
+  });
+  expect(api.publicKey).not.toBe(firstKey);
+  expect(api.publicKey).toBe(request.device.publicKey);
+  await expect(records.read()).resolves.toMatchObject({
+    kind: "record",
+    record: {
+      deviceId: DEVICE_ID,
+      publicKey: api.publicKey,
+      signInExpiresAt: "2026-12-09T10:00:00.000Z",
+    },
+  });
+  await expect(keyStore.status()).resolves.toMatchObject({
+    replacementPending: false,
+  });
+  // Every status of the renewal kept the device signed in and named it, so
+  // nothing that follows the device dropped it, and no sign-out was sent.
+  const during = subscriber.sent
+    .slice(sentBefore)
+    .map(([, status]) => status as AccountStatus);
+  expect(during.length).toBeGreaterThanOrEqual(3);
+  for (const status of during) {
+    expect(status.device).toBe("signed_in");
+    expect(status.account).toMatchObject({
+      kind: "signed_in",
+      deviceId: DEVICE_ID,
+    });
+  }
+  expect(api.routes).not.toContain("POST /auth/sign-out");
+
+  // The API dropped the earlier tokens; the next read mints one with the
+  // new key, which the API verifies against the key that it now holds.
+  const tokensBefore = api.issued.length;
+  await expect(service.readDeviceList()).resolves.toMatchObject({ ok: true });
+  expect(api.issued.length).toBe(tokensBefore + 1);
+  expect(errors).toEqual([]);
+});
 
 test("revoke another device as lost and lift the registration lock through IPC with the real session: confirmed in the main process, sent once, and the list loads again after each", async () => {
   const folder = path.join(root, "MyManDev");
