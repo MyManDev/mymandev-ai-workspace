@@ -15,9 +15,8 @@ export const API_REQUEST_TIMEOUT_MS = 30_000;
 
 /**
  * By default, an answer body larger than this many bytes is not read as an
- * answer of the API. The device list may hold up to 1,000 devices, so this is
- * larger than the limit of the sign-in flow. A read whose answer can be
- * larger names its own cap (`maxAnswerBytes`).
+ * answer of the API. A read whose answer can be larger names its own cap
+ * (`maxAnswerBytes`), as the device list and the workspace reads do.
  */
 export const MAX_API_ANSWER_BYTES = 512 * 1024;
 
