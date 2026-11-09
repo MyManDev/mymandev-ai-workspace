@@ -1036,15 +1036,16 @@ test("a removal that waits for the server names the Account screen, and becomes 
   );
 });
 
-test("a removal that the server refused names the removal and keeps its message while the device is signed in again and connects", async () => {
-  const { answers, show, click } = removalSequence();
+test("a removal that the server refused names the removal and keeps its message next to connection_replaced and both buttons once the device is signed in again", async () => {
+  const { answers, reconnects, show, click } = removalSequence();
   click(REPLACED, SIGNED_IN_ACCOUNT, REMOVE_LABEL);
   expect(buttonsOf(show(REPLACED, REMOVAL_PENDING_ACCOUNT))).toEqual([]);
   expect(show(OFFLINE, REMOVAL_PENDING_ACCOUNT)).toBe(
     offlineIndicator(NOT_READY_DETAIL),
   );
   // For example `conflict`: the session ends the removal, and the device is
-  // signed in again with the same ID, so the client connects again.
+  // signed in again with the same ID. The client brings connection_replaced
+  // back instead of connecting (#217).
   answers[0]?.({ outcome: "failed", reason: "refused" });
   await settle();
   const refused =
@@ -1052,6 +1053,13 @@ test("a removal that the server refused names the removal and keeps its message 
   expect(`${REMOVAL_NOT_DONE} ${DEVICE_ACTION_FAILURE_MESSAGES.refused}`).toBe(
     refused,
   );
+  const restored = show(REPLACED, SIGNED_IN_ACCOUNT);
+  expect(buttonsOf(restored)).toEqual([RECONNECT_LABEL, REMOVE_LABEL]);
+  expect(restored).toContain(
+    `<span class="connection-status-detail">${refused}</span></p>`,
+  );
+
+  // A connection alone does not end the message either.
   for (const [state, label] of [
     ["connecting", "Connecting"],
     ["authenticating", "Authenticating"],
@@ -1065,6 +1073,16 @@ test("a removal that the server refused names the removal and keeps its message 
       `Cloud: ${label}<span class="connection-status-detail">${refused}</span></p></div>`,
     );
   }
+
+  // "Reconnect here once" ends it.
+  click(REPLACED, SIGNED_IN_ACCOUNT, RECONNECT_LABEL);
+  expect(reconnects()).toBe(1);
+  expect(
+    show(
+      { kind: "known", status: { state: "connected", revision: 7 } },
+      SIGNED_IN_ACCOUNT,
+    ),
+  ).not.toContain(refused);
 });
 
 test("a removal that the main process refused leaves both buttons usable, and Reconnect here once ends its message", async () => {
