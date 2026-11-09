@@ -674,6 +674,7 @@ test("the home screen asks for a sign-in on the Account screen only while the ac
     login: "octocat",
     displayName: "The Octocat",
     deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
   } as const;
   const cases: [string, AccountView, string][] = [
     ["idle sign-in offered", knownAccount({}), "sign_in"],

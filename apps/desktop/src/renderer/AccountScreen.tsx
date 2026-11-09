@@ -15,9 +15,9 @@ export const ACCOUNT_SCREEN_TITLE_ID = "account-screen-title";
 
 /**
  * The account screen: the sign-in of this installation and its device,
- * through the account panel, and the account's devices with their actions
- * beside it. The sign-in renewal and the other account screens of #95
- * follow here.
+ * with the end of the sign-in and its renewal, through the account panel,
+ * and the account's devices with their actions beside it. The other
+ * account screens of #95 follow here.
  */
 export function AccountScreen({
   account,

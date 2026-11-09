@@ -464,6 +464,8 @@ test("a mount result is mounted with an ID, cancelled, or refused with a known r
 });
 
 const DEVICE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3";
+/** The end of the device's sign-in, as the device record keeps it (D4). */
+const SIGN_IN_EXPIRES_AT = "2026-12-02T10:00:00.000Z";
 const AUTHORIZE_URL =
   "https://api.mymandev.example/auth/github/authorize?code_challenge=x&state=y";
 
@@ -475,6 +477,7 @@ function accountStatus(overrides: Partial<AccountStatus> = {}): AccountStatus {
       login: "octocat",
       displayName: "The Octocat",
       deviceId: DEVICE_ID,
+      signInExpiresAt: SIGN_IN_EXPIRES_AT,
     },
     signIn: { kind: "idle" },
     lastOutcome: null,
@@ -558,7 +561,7 @@ test("an account status keeps only the narrow fields", () => {
       deviceId: DEVICE_ID,
       userId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a4",
       publicKey: "ab".repeat(32),
-      signInExpiresAt: "2026-12-02T10:00:00.000Z",
+      signInExpiresAt: SIGN_IN_EXPIRES_AT,
     },
     lastOutcome: { code: "signed_in", account: { login: "octocat" } },
     code: "mmdc_secret",
@@ -566,14 +569,17 @@ test("an account status keeps only the narrow fields", () => {
     accessToken: "mmda_secret",
   });
 
+  // The sign-in expiry (D4 on #95) is the only time of the account.
   expect(Object.keys(parsed.account).sort()).toEqual([
     "deviceId",
     "displayName",
     "kind",
     "login",
+    "signInExpiresAt",
   ]);
+  expect(parsed.account).toMatchObject({ signInExpiresAt: SIGN_IN_EXPIRES_AT });
   expect(JSON.stringify(parsed)).not.toMatch(
-    /userId|publicKey|signInExpiresAt|mmdc_|verifier|mmda_|accessToken/,
+    /userId|publicKey|mmdc_|verifier|mmda_|accessToken/,
   );
 
   // The time after which a new sign-in can start (#199) comes alone.
@@ -656,6 +662,7 @@ test("an account status with a wrong value is refused", () => {
         login: "-".repeat(40),
         displayName: "x",
         deviceId: DEVICE_ID,
+        signInExpiresAt: SIGN_IN_EXPIRES_AT,
       },
     }),
     accountStatus({
@@ -664,6 +671,7 @@ test("an account status with a wrong value is refused", () => {
         login: "octocat",
         displayName: "",
         deviceId: DEVICE_ID,
+        signInExpiresAt: SIGN_IN_EXPIRES_AT,
       },
     }),
     accountStatus({
@@ -672,6 +680,7 @@ test("an account status with a wrong value is refused", () => {
         login: "octocat",
         displayName: "x".repeat(ACCOUNT_LIMITS.displayName + 1),
         deviceId: DEVICE_ID,
+        signInExpiresAt: SIGN_IN_EXPIRES_AT,
       },
     }),
     accountStatus({
@@ -680,8 +689,35 @@ test("an account status with a wrong value is refused", () => {
         login: "octocat",
         displayName: "x",
         deviceId: "not-a-uuid",
+        signInExpiresAt: SIGN_IN_EXPIRES_AT,
       },
     }),
+    // The sign-in expiry (D4 on #95) is required, in UTC with milliseconds,
+    // as the protocol and the device record write it, and a real time.
+    ...[
+      "2026-12-02T13:00:00.000+03:00",
+      "2026-12-02T10:00:00Z",
+      "2026-12-02T10:00:00.000000Z",
+      "2026-12-02T10:00:00.000",
+      "2026-02-30T10:00:00.000Z",
+      "2026-12-02",
+      `2026-12-02T10:00:00.000Z${" ".repeat(1000)}`,
+      "in 30 days",
+      "",
+      1_796_205_600_000,
+      null,
+      undefined,
+    ].map((signInExpiresAt) =>
+      accountStatus({
+        account: {
+          kind: "signed_in",
+          login: "octocat",
+          displayName: "The Octocat",
+          deviceId: DEVICE_ID,
+          signInExpiresAt: signInExpiresAt as never,
+        },
+      }),
+    ),
     accountStatus({ signIn: { ...waiting, pairingCode: "12345" } }),
     accountStatus({ signIn: { ...waiting, pairingCode: "abcdef" } }),
     accountStatus({

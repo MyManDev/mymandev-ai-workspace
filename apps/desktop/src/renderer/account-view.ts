@@ -410,6 +410,130 @@ export function deviceSignedIn(status: AccountStatus): boolean {
 }
 
 /**
+ * How long before the end of the device's sign-in the panel asks the person
+ * to renew it (D4 on #95): from day 25 of the 30 days (ADR 0014,
+ * "Lifetimes"). Day 25 begins after 24 days, so 6 days before the end (the
+ * Project Manager's decision of 2026-11-09).
+ */
+export const SIGN_IN_RENEWAL_WINDOW_MS = 6 * 24 * 60 * 60 * 1000;
+
+/** The label of the action that renews the sign-in (D4 on #95). */
+export const RENEW_SIGN_IN_LABEL = "Renew the sign-in";
+
+/**
+ * The fixed sentences that ask the person to renew the sign-in: from 6 days
+ * before its end (`due`), and after the end by the renderer's clock while
+ * the server still accepts the device (`ended`; an open connection may go
+ * on for up to 24 hours). Once the server refuses the device, its state
+ * becomes `sign_in_required`, and the panel asks for a GitHub sign-in
+ * instead.
+ */
+export const SIGN_IN_RENEWAL_MESSAGES = Object.freeze({
+  due: "The sign-in of this device ends soon. Renew it to keep using this device.",
+  ended:
+    "The sign-in of this device has ended. Renew it to keep using this device.",
+});
+
+/** The end of the device's sign-in as the panel shows it (D4 on #95). */
+export interface SignInExpiry {
+  /** The end in UTC, as the status names it. */
+  readonly endsAt: string;
+  /** The sentence that asks to renew it, or undefined before day 25. */
+  readonly prompt: string | undefined;
+}
+
+/**
+ * The account and the end of its sign-in in milliseconds, while this
+ * installation's device is signed in (`deviceSignedIn`); otherwise
+ * undefined, also while the status hides the account (#195).
+ */
+function signedInExpiry(
+  status: AccountStatus,
+): { readonly endsAt: string; readonly end: number } | undefined {
+  if (status.account.kind !== "signed_in" || status.device !== "signed_in") {
+    return undefined;
+  }
+  const endsAt = status.account.signInExpiresAt;
+  const end = Date.parse(endsAt);
+  return Number.isNaN(end) ? undefined : { endsAt, end };
+}
+
+/**
+ * When the sign-in of this device ends, and whether the panel asks to renew
+ * it by the clock `now` in milliseconds: from `SIGN_IN_RENEWAL_WINDOW_MS`
+ * before the end. Only while the device is signed in: in every other state
+ * the panel says what the device needs, for example a GitHub sign-in after
+ * `sign_in_required`.
+ */
+export function describeSignInExpiry(
+  status: AccountStatus,
+  now: number,
+): SignInExpiry | undefined {
+  const expiry = signedInExpiry(status);
+  if (expiry === undefined) {
+    return undefined;
+  }
+  let prompt: string | undefined;
+  if (now >= expiry.end) {
+    prompt = SIGN_IN_RENEWAL_MESSAGES.ended;
+  } else if (now >= expiry.end - SIGN_IN_RENEWAL_WINDOW_MS) {
+    prompt = SIGN_IN_RENEWAL_MESSAGES.due;
+  }
+  return { endsAt: expiry.endsAt, prompt };
+}
+
+/**
+ * The next time after `now`, in milliseconds, at which
+ * `describeSignInExpiry` says something else by the clock alone: the start
+ * of day 25, or the end. Undefined when nothing changes.
+ */
+export function nextSignInExpiryChange(
+  status: AccountStatus,
+  now: number,
+): number | undefined {
+  const expiry = signedInExpiry(status);
+  if (expiry === undefined) {
+    return undefined;
+  }
+  return [expiry.end - SIGN_IN_RENEWAL_WINDOW_MS, expiry.end].find(
+    (time) => time > now,
+  );
+}
+
+/**
+ * Whether the panel offers "Renew the sign-in" (D4 on #95): at any time
+ * while this device is signed in, no sign-in runs, the device key is ready,
+ * and the build has a usable server address. A renewal is the GitHub
+ * sign-in of the device that is signed in: the main process starts it like
+ * any other, replaces the device's key, and the API answers a new end 30
+ * days later.
+ */
+export function offersRenewal(status: AccountStatus): boolean {
+  return (
+    status.signIn.kind === "idle" &&
+    deviceSignedIn(status) &&
+    status.deviceKey === "ready" &&
+    apiOriginProblem(status.apiOrigin) === undefined
+  );
+}
+
+/**
+ * The format of the end of the sign-in: the date and the time of day, for
+ * example "9 December 2026 at 10:00", in the person's locale and time zone
+ * (the Project Manager's decision of 2026-11-09). The panel makes a new one
+ * for each render, like `signInTimeFormat`.
+ */
+export function signInEndFormat(
+  options: SignInTimeFormatOptions = {},
+): Intl.DateTimeFormat {
+  return new Intl.DateTimeFormat(options.locale, {
+    dateStyle: "long",
+    timeStyle: "short",
+    timeZone: options.timeZone,
+  });
+}
+
+/**
  * Whether the panel offers "This is not me": whenever the installation holds
  * an account, also while its device is signed out and the status names no
  * account (`hidden`, #195). The main process confirms it with the login.

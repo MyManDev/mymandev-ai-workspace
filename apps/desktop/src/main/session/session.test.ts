@@ -2214,6 +2214,81 @@ describe("device states", () => {
     expect(h.session.state().kind).toBe("account_mismatch");
   });
 
+  test("a device that was signed in when the sign-in started stays signed in after the API refused it for another GitHub account (D4)", async () => {
+    const h = harness();
+    const publicKey = await existingDevice(h);
+
+    // A renewal in a browser that holds another GitHub account: the flow
+    // replaced the key once the code arrived and abandoned the replacement
+    // after the API's certain refusal, which committed nothing.
+    h.session.signInStarted();
+    await h.keyStore.replace();
+    await h.keyStore.abandonReplacement();
+    const state = await h.session.signInFinished({
+      kind: "refused",
+      code: "device_account_mismatch",
+    });
+
+    expect(state).toEqual({
+      kind: "signed_in",
+      account: expect.objectContaining({
+        deviceId: DEVICE_ID,
+        login: "octocat",
+      }) as unknown,
+    });
+    expect(h.keyStore.keys()?.current.publicKey).toBe(publicKey);
+    expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
+    // The key still works: a token, a read, and the WebSocket's signature.
+    expect((await h.session.listDevices()).ok).toBe(true);
+    expect((await h.session.signWebSocketChallenge(challengeFrame())).ok).toBe(
+      true,
+    );
+    expect(h.session.state().kind).toBe("signed_in");
+  });
+
+  test("a device that was not signed in when the sign-in started moves to account_mismatch after such a refusal, also a signed-out one (#195)", async () => {
+    const MISMATCH = {
+      kind: "refused",
+      code: "device_account_mismatch",
+    } as const;
+
+    // Refused by the API before the sign-in.
+    const refused = harness();
+    await existingDevice(refused);
+    await refused.session.deviceRefused("sign_in_required", DEVICE_ID);
+    refused.session.signInStarted();
+    expect((await refused.session.signInFinished(MISMATCH)).kind).toBe(
+      "account_mismatch",
+    );
+
+    // Signed out on this device (#195): the state names the mismatch with
+    // `signedOut`, as before.
+    memory.removeFolder(folder);
+    const signedOut = harness();
+    await existingDevice(signedOut);
+    expect(await signedOut.session.signOut()).toEqual({
+      ok: true,
+      value: "reported",
+    });
+    signedOut.session.signInStarted();
+    expect(await signedOut.session.signInFinished(MISMATCH)).toMatchObject({
+      kind: "account_mismatch",
+      signedOut: true,
+    });
+
+    // A signed-in device whose sign-in ended before: the note of the
+    // earlier sign-in does not carry over.
+    memory.removeFolder(folder);
+    const later = harness();
+    await existingDevice(later);
+    later.session.signInStarted();
+    await later.session.signInFinished({ kind: "cancelled" });
+    await later.session.deviceRefused("sign_in_required", DEVICE_ID);
+    expect((await later.session.signInFinished(MISMATCH)).kind).toBe(
+      "account_mismatch",
+    );
+  });
+
   test("close reasons of the WebSocket apply to the state", async () => {
     const h = harness();
     await existingDevice(h);

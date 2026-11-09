@@ -25,14 +25,20 @@ import {
   DEVICE_STATE_MESSAGES,
   describeDeviceState,
   describeOutcome,
+  describeSignInExpiry,
   deviceSignedIn,
   followAccountStatus,
   forgetMessage,
   initialAccountView,
+  nextSignInExpiryChange,
   offersForget,
+  offersRenewal,
   offersSignIn,
   removeDeviceMessage,
   SIGN_IN_OUTCOME_MESSAGES,
+  SIGN_IN_RENEWAL_MESSAGES,
+  SIGN_IN_RENEWAL_WINDOW_MS,
+  signInEndFormat,
   signInRetryAt,
   signInRetryNote,
   signInRetryReading,
@@ -642,6 +648,7 @@ test("the sign-in is offered without an account and in every state that needs on
           login: "octocat",
           displayName: "The Octocat",
           deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+          signInExpiresAt: "2026-12-02T10:00:00.000Z",
         }
       : { kind: "signed_out" },
     signIn: { kind: "idle" },
@@ -681,6 +688,7 @@ test("a sign-in can start now only while it is offered and idle, with a ready ke
     login: "octocat",
     displayName: "The Octocat",
     deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
   } as const;
   const startable: AccountStatus = { ...IDLE, lastOutcome: null };
   expect(canStartSignIn(startable)).toBe(true);
@@ -731,6 +739,7 @@ test("the device is signed in only while the status names its account and the se
       login: "octocat",
       displayName: "The Octocat",
       deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
     },
     device: "signed_in",
   };
@@ -757,6 +766,7 @@ test("This is not me is offered whenever the installation holds an account, also
         login: "octocat",
         displayName: "The Octocat",
         deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+        signInExpiresAt: "2026-12-02T10:00:00.000Z",
       }),
     ),
   ).toBe(true);
@@ -829,4 +839,123 @@ test("the panel offers another browser for a waiting sign-in no sooner than the 
   expect(ANOTHER_BROWSER_DELAY_MS).toBeGreaterThanOrEqual(
     SIGN_IN_START_COOLDOWN_MS,
   );
+});
+
+const END = Date.parse("2026-12-09T10:00:00.000Z");
+
+/** A signed-in device whose sign-in ends at `END`, which can start a sign-in. */
+const RENEWABLE: AccountStatus = {
+  ...IDLE,
+  lastOutcome: null,
+  account: {
+    kind: "signed_in",
+    login: "octocat",
+    displayName: "The Octocat",
+    deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+    signInExpiresAt: "2026-12-09T10:00:00.000Z",
+  },
+  device: "signed_in",
+};
+
+test("the panel asks to renew the sign-in from day 25 of the 30 days, 6 days before its end, and says after the end that it ended (D4)", () => {
+  expect(SIGN_IN_RENEWAL_WINDOW_MS).toBe(6 * 24 * 60 * 60 * 1000);
+  const start = END - SIGN_IN_RENEWAL_WINDOW_MS;
+  for (const [now, prompt] of [
+    [END - 30 * 24 * 60 * 60 * 1000, undefined],
+    [start - 1, undefined],
+    [start, SIGN_IN_RENEWAL_MESSAGES.due],
+    [END - 1, SIGN_IN_RENEWAL_MESSAGES.due],
+    [END, SIGN_IN_RENEWAL_MESSAGES.ended],
+    [END + 24 * 60 * 60 * 1000, SIGN_IN_RENEWAL_MESSAGES.ended],
+  ] as const) {
+    expect(describeSignInExpiry(RENEWABLE, now), String(now)).toEqual({
+      endsAt: "2026-12-09T10:00:00.000Z",
+      prompt,
+    });
+  }
+  // Day 25 of the 30 days begins after 24 days, with the prompt; day 24
+  // ends without it.
+  const signedInAt = END - 30 * 24 * 60 * 60 * 1000;
+  const day25 = signedInAt + 24 * 24 * 60 * 60 * 1000;
+  expect(describeSignInExpiry(RENEWABLE, day25)?.prompt).toBe(
+    SIGN_IN_RENEWAL_MESSAGES.due,
+  );
+  expect(describeSignInExpiry(RENEWABLE, day25 - 1)?.prompt).toBe(undefined);
+});
+
+test("the end of the sign-in shows only while this device is signed in and the status names its account (D4)", () => {
+  expect(
+    DEVICE_STATES.filter(
+      (device) =>
+        describeSignInExpiry({ ...RENEWABLE, device }, END) !== undefined,
+    ),
+  ).toEqual(["signed_in"]);
+  for (const account of [{ kind: "signed_out" }, { kind: "hidden" }] as const) {
+    expect(describeSignInExpiry({ ...RENEWABLE, account }, END)).toBe(
+      undefined,
+    );
+    expect(nextSignInExpiryChange({ ...RENEWABLE, account }, 0)).toBe(
+      undefined,
+    );
+  }
+  expect(
+    nextSignInExpiryChange({ ...RENEWABLE, device: "sign_in_required" }, 0),
+  ).toBe(undefined);
+});
+
+test("the panel's clock is read again when the prompt begins and when the sign-in ends, and not after (D4)", () => {
+  const start = END - SIGN_IN_RENEWAL_WINDOW_MS;
+  expect(nextSignInExpiryChange(RENEWABLE, start - 1)).toBe(start);
+  expect(nextSignInExpiryChange(RENEWABLE, start)).toBe(END);
+  expect(nextSignInExpiryChange(RENEWABLE, END - 1)).toBe(END);
+  expect(nextSignInExpiryChange(RENEWABLE, END)).toBe(undefined);
+  expect(nextSignInExpiryChange(RENEWABLE, END + 1)).toBe(undefined);
+});
+
+test("the renewal is offered at any time while this device is signed in, no sign-in runs, the key is ready, and the build has a server address (D4)", () => {
+  expect(offersRenewal(RENEWABLE)).toBe(true);
+  // It does not compete with "Sign in with GitHub", which the panel offers
+  // only where the device needs a sign-in.
+  expect(offersSignIn(RENEWABLE)).toBe(false);
+  expect(
+    DEVICE_STATES.filter((device) => offersRenewal({ ...RENEWABLE, device })),
+  ).toEqual(["signed_in"]);
+  const blocked: [string, AccountStatus][] = [
+    ["signed out", { ...RENEWABLE, account: { kind: "signed_out" } }],
+    ["hidden", { ...RENEWABLE, account: { kind: "hidden" } }],
+    ["sign-in starting", { ...RENEWABLE, signIn: { kind: "starting" } }],
+    ["sign-in waiting", { ...RENEWABLE, signIn: WAITING.signIn }],
+    ["sign-in completing", { ...RENEWABLE, signIn: { kind: "completing" } }],
+    ["api origin unset", { ...RENEWABLE, apiOrigin: "unset" }],
+    ["api origin invalid", { ...RENEWABLE, apiOrigin: "invalid" }],
+    ...DEVICE_KEY_STATES.filter((deviceKey) => deviceKey !== "ready").map(
+      (deviceKey): [string, AccountStatus] => [
+        deviceKey,
+        { ...RENEWABLE, deviceKey },
+      ],
+    ),
+  ];
+  for (const [name, status] of blocked) {
+    expect(offersRenewal(status), name).toBe(false);
+  }
+});
+
+test("the end of the sign-in is a date and a time of day in the person's locale and time zone (D4)", () => {
+  const at = Date.parse("2026-12-09T22:30:00.000Z");
+  expect(signInEndFormat({ locale: "en-GB", timeZone: "UTC" }).format(at)).toBe(
+    "9 December 2026 at 22:30",
+  );
+  expect(
+    signInEndFormat({ locale: "en-GB", timeZone: "Asia/Tokyo" }).format(at),
+  ).toBe("10 December 2026 at 07:30");
+  expect(
+    signInEndFormat({ locale: "tr-TR", timeZone: "Europe/Istanbul" }).format(
+      at,
+    ),
+  ).toBe("10 Aral\u0131k 2026 01:30");
+  // The defaults are the system's time zone and the person's locale.
+  const system = new Intl.DateTimeFormat().resolvedOptions();
+  const defaults = signInEndFormat().resolvedOptions();
+  expect(defaults.timeZone).toBe(system.timeZone);
+  expect(defaults.locale).toBe(system.locale);
 });

@@ -339,14 +339,17 @@ export interface DeviceSession {
   /**
    * Call before `start` of the sign-in flow. Until `signInFinished`, a
    * pending key replacement is not resolved, because the sign-in may still
-   * register the new key.
+   * register the new key. It also notes whether the device is signed in
+   * now, for `signInFinished`.
    */
   readonly signInStarted: () => void;
   /**
    * Call with every outcome of the sign-in flow, also one that did not
    * start. `signed_in` ends a sign-out; `refused` with
-   * `device_account_mismatch` moves to `account_mismatch`; `refused` with
-   * `device_revoked` moves to `revoked`. After every other outcome, for
+   * `device_account_mismatch` moves to `account_mismatch`, unless the
+   * device was signed in when the sign-in started (a renewal in a browser
+   * that holds another GitHub account, D4 on #95), which stays signed in;
+   * `refused` with `device_revoked` moves to `revoked`. After every other outcome, for
    * example `failed` with `uncertain_refusal`, `no_answer`, or
    * `record_not_saved`, whether the sign-in committed is unknown: a pending
    * replacement then starts its grace period (`REPLACEMENT_GRACE_MS`), and a
@@ -676,6 +679,11 @@ export function createDeviceSession(
   /** Set after `device_revoked` or a confirmed removal, until a sign-in. */
   let gone: "revoked" | "removed" | null = null;
   let signInsRunning = 0;
+  /**
+   * Whether the device was `signed_in` when the running sign-in started
+   * (`signInStarted`). The account service runs one sign-in at a time.
+   */
+  let signedInAtSignIn = false;
   /** A marker that could not be written; it holds until the process ends. */
   let unsavedMarker: SignOutMarker | null = null;
 
@@ -2222,12 +2230,15 @@ export function createDeviceSession(
 
   function signInStarted(): void {
     signInsRunning += 1;
+    signedInAtSignIn = current.kind === "signed_in";
   }
 
   async function signInFinished(
     outcome: FinishedSignIn,
   ): Promise<DeviceSessionState> {
     signInsRunning = Math.max(0, signInsRunning - 1);
+    const wasSignedIn = signedInAtSignIn;
+    signedInAtSignIn = false;
     forgetTokens();
     if (outcome.kind === "signed_in") {
       // A GitHub sign-in ends a refusal, a pending removal, and a removed or
@@ -2247,7 +2258,17 @@ export function createDeviceSession(
       }
     } else if (outcome.kind === "refused") {
       if (outcome.code === "device_account_mismatch") {
-        accountMismatch = true;
+        // The API refused the sign-in and committed nothing, and the flow
+        // kept the device's key. A device that was signed in, for example
+        // one whose sign-in the person renewed in a browser that holds
+        // another GitHub account, stays signed in, so that its connection,
+        // workspaces, and waiting chat messages stay (the Project Manager's
+        // decision of 2026-11-09 on #95); the outcome names the login. Any
+        // other device, also a signed-out one (#195), moves to
+        // `account_mismatch`.
+        if (!wasSignedIn) {
+          accountMismatch = true;
+        }
       } else if (outcome.code === "device_revoked") {
         // The flow deleted the key and the record already.
         await deviceGone("revoked");
