@@ -26,7 +26,10 @@ export function showAccountScreen(
  * in and ready, a fixed sentence about the sign-in and a way to the account
  * screen (`homeSignIn`). While the account panel offers a sign-in that can
  * start now, the screen offers "Sign in with GitHub" too (#219); the
- * sign-in then continues on the account screen.
+ * sign-in then continues on the account screen. While its start runs, the
+ * button stays focusable and does nothing (`aria-disabled`), like the
+ * buttons of the connection indicator, so that the focus stays on it when
+ * the start is refused or fails.
  */
 export function HomeScreen({
   signIn,
@@ -63,8 +66,8 @@ export function HomeScreen({
               <button
                 type="button"
                 className="panel-action"
-                disabled={start.running}
-                onClick={onStartSignIn}
+                aria-disabled={start.running ? "true" : undefined}
+                onClick={start.running ? undefined : onStartSignIn}
               >
                 Sign in with GitHub
               </button>

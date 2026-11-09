@@ -337,6 +337,28 @@ test("Go to Account on the home screen shows the account screen and moves the fo
   expect(focused).toEqual([]);
 });
 
+test("while its start runs, Sign in with GitHub on the home screen stays focusable and does nothing", () => {
+  const { dispatch, take } = recorder();
+  const started: string[] = [];
+  const home = HomeScreen({
+    signIn: "sign_in",
+    start: { running: true, message: undefined },
+    onStartSignIn: () => started.push("start"),
+    dispatch,
+    focusAfterShow: () => undefined,
+  });
+  const button = elementsOf(home).find(
+    (element) => textOf(element.props.children) === "Sign in with GitHub",
+  );
+  expect(button?.props).toMatchObject({ "aria-disabled": "true" });
+  expect(button?.props).not.toHaveProperty("disabled");
+  expect(clickEveryButton(home, take)).toEqual([
+    ["Sign in with GitHub", []],
+    ["Go to Account", [{ type: "show-screen", screen: "account" }]],
+  ]);
+  expect(started).toEqual([]);
+});
+
 test("the shell switch of a sign-in started on the home screen asks for the focus on the account screen's title first, and shows the account screen from the home screen", () => {
   const steps: string[] = [];
   let state = createShellState(PROJECTS);

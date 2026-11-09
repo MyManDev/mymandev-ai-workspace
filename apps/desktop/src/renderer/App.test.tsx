@@ -1486,12 +1486,12 @@ test("the home screen says the sentence of its case, with Go to Account whenever
   expect(renderHome("none")).toBe(`${HOME_HINT}</section>`);
 });
 
-test("the home screen's Sign in with GitHub is disabled while its start runs, and the message of a refused or failed start shows as an alert", () => {
+test("the home screen's Sign in with GitHub stays focusable and inert while its start runs, and the message of a refused or failed start shows as an alert", () => {
   expect(renderHome("sign_in", { running: true, message: undefined })).toBe(
     HOME_HINT +
       homeEnd(HOME_SIGN_IN_MESSAGES.sign_in, {
         signIn:
-          '<button type="button" class="panel-action" disabled="">Sign in with GitHub</button>',
+          '<button type="button" class="panel-action" aria-disabled="true">Sign in with GitHub</button>',
       }),
   );
   const alert = `<p class="panel-message" role="alert">${escaped(START_REFUSAL_MESSAGES.too_soon)}</p>`;

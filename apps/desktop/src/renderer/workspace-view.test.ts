@@ -899,3 +899,95 @@ test("a refused or failed start of the home screen keeps the home screen and sho
     expect(steps, name).not.toContain("show account");
   }
 });
+
+/** The account status of a sign-in that runs, for each kind but `starting`. */
+const OTHER_RUNNING_SIGN_INS: [string, AccountView][] = [
+  [
+    "waiting",
+    knownAccount({
+      signIn: { kind: "waiting", pairingCode: "042137", opened: true },
+    }),
+  ],
+  ["completing", knownAccount({ signIn: { kind: "completing" } })],
+];
+
+test.each(OTHER_RUNNING_SIGN_INS)(
+  "a %s sign-in as the first status of a running home screen start shows the account screen",
+  (_kind, running) => {
+    const { start, steps } = homeStartHarness();
+    start.start();
+    start.accountChanged(running);
+    expect(steps).toEqual([`view ${RUNNING}`, "show account"]);
+  },
+);
+
+test.each(OTHER_RUNNING_SIGN_INS)(
+  "a %s sign-in ends the message of a refused home screen start",
+  async (_kind, running) => {
+    const { start, starts, views } = homeStartHarness();
+    start.start();
+    starts[0]?.resolve({ outcome: "refused", reason: "too_soon" });
+    await settle();
+    expect(views.at(-1)).toEqual({
+      running: false,
+      message: START_REFUSAL_MESSAGES.too_soon,
+    });
+    start.accountChanged(running);
+    expect(views.at(-1)).toEqual({ running: false, message: undefined });
+  },
+);
+
+test("each start of the home screen shows the account screen once, by the status or by the answer", async () => {
+  const { start, starts, steps } = homeStartHarness();
+  start.start();
+  start.accountChanged(knownAccount({ signIn: { kind: "starting" } }));
+  starts[0]?.resolve({ outcome: "failed", code: "cancelled" });
+  await settle();
+  start.accountChanged(knownAccount({}));
+  // The second start gets no running status before its answer.
+  start.start();
+  starts[1]?.resolve({ outcome: "started" });
+  await settle();
+  expect(steps).toEqual([
+    `view ${RUNNING}`,
+    "show account",
+    `view ${IDLE}`,
+    `view ${RUNNING}`,
+    "show account",
+    `view ${IDLE}`,
+  ]);
+});
+
+test("the message of a refused home screen start shows only while the shell shows the home screen with the same case", async () => {
+  const refused = async () => {
+    const harness = homeStartHarness();
+    // The shell shows the home screen with a sign-in before the click.
+    harness.start.homeChanged("sign_in");
+    harness.start.start();
+    harness.starts[0]?.resolve({ outcome: "refused", reason: "key_not_ready" });
+    await settle();
+    const message = START_REFUSAL_MESSAGES.key_not_ready;
+    expect(harness.views.at(-1)).toEqual({ running: false, message });
+    // The same case keeps it.
+    harness.start.homeChanged("sign_in");
+    expect(harness.views.at(-1)).toEqual({ running: false, message });
+    return harness;
+  };
+  // Leaving the home screen ends it, so it is not announced again when the
+  // home screen is shown again.
+  const left = await refused();
+  left.start.homeChanged(undefined);
+  expect(left.views.at(-1)).toEqual({ running: false, message: undefined });
+  left.start.homeChanged("sign_in");
+  expect(left.views.at(-1)).toEqual({ running: false, message: undefined });
+  // Another answer of the account panel's rule ends it, also when the key
+  // becomes ready again and the button is enabled.
+  for (const next of ["not_ready", "none"] as const) {
+    const changed = await refused();
+    changed.start.homeChanged(next);
+    expect(changed.views.at(-1), next).toEqual({
+      running: false,
+      message: undefined,
+    });
+  }
+});

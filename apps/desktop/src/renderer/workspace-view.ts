@@ -128,6 +128,15 @@ export interface HomeSignInStart {
    * ends the message of the last start, which then no longer applies.
    */
   readonly accountChanged: (view: AccountView) => void;
+  /**
+   * Passes on what the home screen says about the sign-in (`homeSignIn`),
+   * or undefined while the shell shows another screen. Any change ends the
+   * message of the last start: it shows only on the home screen that
+   * refused the start, and only while the account panel's rule still gives
+   * the same answer, so it is never announced again when the home screen is
+   * shown again, nor left next to a button that a changed status enabled.
+   */
+  readonly homeChanged: (home: HomeSignIn | undefined) => void;
 }
 
 /**
@@ -138,7 +147,9 @@ export interface HomeSignInStart {
  * itself only when no such status came: once per start, for a start that
  * began or failed. A failure shows on the account screen with the status's
  * outcome. A refusal and a call that failed keep the home screen and show
- * the account panel's sentence there; `onView` gets every change.
+ * the account panel's sentence there, until the next start, a sign-in that
+ * runs, or a change of the home screen (`homeChanged`); `onView` gets every
+ * change.
  */
 export function createHomeSignInStart(
   account: Pick<AccountBridge, "startSignIn">,
@@ -148,7 +159,14 @@ export function createHomeSignInStart(
   let running = false;
   let shown = false;
   let message: string | undefined;
+  let home: HomeSignIn | undefined;
   const show = () => onView(Object.freeze({ running, message }));
+  const endMessage = () => {
+    if (message !== undefined) {
+      message = undefined;
+      show();
+    }
+  };
   const showAccountOnce = () => {
     if (!shown) {
       shown = true;
@@ -187,9 +205,14 @@ export function createHomeSignInStart(
       }
       if (running) {
         showAccountOnce();
-      } else if (message !== undefined) {
-        message = undefined;
-        show();
+      } else {
+        endMessage();
+      }
+    },
+    homeChanged: (next: HomeSignIn | undefined) => {
+      if (next !== home) {
+        home = next;
+        endMessage();
       }
     },
   });

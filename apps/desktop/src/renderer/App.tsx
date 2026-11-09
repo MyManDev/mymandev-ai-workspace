@@ -140,9 +140,11 @@ export function App({
     describeConnectionView(connectionView, accountView).actions,
   );
   const focusAfterShow = useFocusAfterShow(state.view);
+  const homeCase = homeSignIn(workspaceSidebar.view, accountView);
   const homeStart = useHomeSignInStart(
     account,
     accountView,
+    state.view.screen === "home" ? homeCase : undefined,
     dispatch,
     focusAfterShow,
   );
@@ -192,7 +194,7 @@ export function App({
           account={account}
           chat={chat}
           devices={devices}
-          homeSignIn={homeSignIn(workspaceSidebar.view, accountView)}
+          homeSignIn={homeCase}
           homeStart={homeStart.view}
           onStartSignIn={homeStart.onStart}
           dispatch={dispatch}
@@ -366,12 +368,14 @@ function useFocusAfterShow(view: ShellView): (id: string) => void {
  * "Sign in with GitHub" on the home screen (#219), through the account
  * bridge, while the shell is mounted. The logic is in
  * `createHomeSignInStart`; the account status shows the account screen
- * once the sign-in runs, and the start's message lives in the shell, so it
- * stays when the person leaves the home screen and comes back.
+ * once the sign-in runs, and the start's message ends when the shell
+ * leaves the home screen or the home screen's case changes (`home`,
+ * undefined on another screen).
  */
 function useHomeSignInStart(
   account: AccountBridge | undefined,
   accountView: AccountView,
+  home: HomeSignIn | undefined,
   dispatch: Dispatch<ShellAction>,
   focusAfterShow: (id: string) => void,
 ): {
@@ -391,6 +395,7 @@ function useHomeSignInStart(
     [account, dispatch, focusAfterShow],
   );
   useEffect(() => start?.accountChanged(accountView), [start, accountView]);
+  useEffect(() => start?.homeChanged(home), [start, home]);
   const onStart = useCallback(() => start?.start(), [start]);
   return { view, onStart };
 }
