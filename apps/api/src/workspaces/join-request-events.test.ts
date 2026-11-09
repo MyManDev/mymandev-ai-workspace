@@ -34,7 +34,10 @@ import {
   signInDevice,
 } from "../auth/device-test-support.ts";
 import { type Client, connected, settle } from "../gateway-test-support.ts";
-import { ConnectionRegistry } from "../gateway.ts";
+import {
+  type AuthenticatedConnectionContext,
+  ConnectionRegistry,
+} from "../gateway.ts";
 import {
   type ApproverEventHandler,
   deliverWorkspaceEvent,
@@ -313,12 +316,13 @@ async function drainPresence(...clients: Client[]) {
   }
 }
 
-test("a new join request reaches the connections subscribed as the owner or an admin as workspace.join_request.created, and no member, requester, unsubscribed connection, or other workspace", async (t) => {
+test("a new join request reaches every connection subscribed as the owner or an admin as workspace.join_request.created, and no member, requester, unsubscribed connection, or other workspace", async (t) => {
   const { account, delivered } = await instance(t);
   const ada = await account(3601);
-  // Both of the owner's devices sign in before either connects.
+  // The second devices sign in before any device connects.
   const adaPhone = await signInDevice(ada.app);
   const bob = await account(3602);
+  const bobPhone = await signInDevice(bob.app);
   const cleo = await account(3603);
   const dan = await account(3604);
   const eve = await account(3605);
@@ -334,6 +338,7 @@ test("a new join request reaches the connections subscribed as the owner or an a
   const adaLaptop = (await connected(t, ada.app, ada.device)).client;
   const adaPhoneClient = (await connected(t, ada.app, adaPhone)).client;
   const bobClient = (await connected(t, bob.app, bob.device)).client;
+  const bobPhoneClient = (await connected(t, bob.app, bobPhone)).client;
   const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
   const danClient = (await connected(t, dan.app, dan.device)).client;
   const eveClient = (await connected(t, eve.app, eve.device)).client;
@@ -341,11 +346,14 @@ test("a new join request reaches the connections subscribed as the owner or an a
     adaLaptop,
     adaPhoneClient,
     bobClient,
+    bobPhoneClient,
     cleoClient,
     danClient,
     eveClient,
   ];
+  // Both of the owner's connections subscribe; the admin's phone does not.
   await subscribed(adaLaptop, team.workspaceId);
+  await subscribed(adaPhoneClient, team.workspaceId);
   await subscribed(bobClient, team.workspaceId);
   await subscribed(cleoClient, team.workspaceId);
   await subscribed(danClient, other.workspaceId);
@@ -359,7 +367,7 @@ test("a new join request reaches the connections subscribed as the owner or an a
   assert.ok(shown.requester !== null);
   assert.equal(shown.requester.login, "user-3604");
   assert.equal(shown.requester.accountCreatedAt, "2015-06-01T10:00:00.000Z");
-  for (const client of [adaLaptop, bobClient]) {
+  for (const client of [adaLaptop, adaPhoneClient, bobClient]) {
     const event = await nextEvent(client);
     assert.ok(event.type === "workspace.join_request.created", event.type);
     assert.equal(event.workspaceId, team.workspaceId);
@@ -371,7 +379,7 @@ test("a new join request reaches the connections subscribed as the owner or an a
   }
   assert.equal(delivered.length, 1);
   assert.deepEqual(delivered[0]?.approvers, [team.ownerId, bobInTeam].sort());
-  // The owner's phone did not subscribe, Cleo is a member, Dan asked, and
+  // The admin's phone did not subscribe, Cleo is a member, Dan asked, and
   // Eve is an admin of another workspace.
   await quiet(...everyone);
 
@@ -765,7 +773,7 @@ async function lockWaiters(): Promise<number> {
 }
 
 test(
-  "a denial that waits for the request while a demotion commits reads the owner and admins after it, so the demoted admin does not get its event",
+  "every change reads the owner and admins after it waited for its locks: a demotion that commits while a new request, a withdrawal, an approval, a denial, a block, or denying all waits leaves the demoted admin out of its event",
   SERVER_ONLY,
   async (t) => {
     const url = testDatabase?.url;
@@ -774,57 +782,160 @@ test(
     const ada = await account(3641);
     const bob = await account(3642);
     const gus = await account(3643);
+    const ivy = await account(3644);
+    const jo = await account(3645);
+    const kim = await account(3646);
+    const lee = await account(3647);
     const team = await workspaceOf(ada, [[bob, "admin"]]);
     const [bobInTeam] = team.memberIds;
     assert.ok(bobInTeam !== undefined);
-    const pending = await asked(gus, team.workspaceId);
+    // The requests that the decisions need, before anyone subscribes.
+    const ivyRequest = await asked(ivy, team.workspaceId);
+    const joRequest = await asked(jo, team.workspaceId);
+    const kimRequest = await asked(kim, team.workspaceId);
+    const leeRequest = await asked(lee, team.workspaceId);
     const adaClient = (await connected(t, ada.app, ada.device)).client;
     const bobClient = (await connected(t, bob.app, bob.device)).client;
     await subscribed(adaClient, team.workspaceId);
     await subscribed(bobClient, team.workspaceId);
     await drainPresence(adaClient, bobClient);
 
-    // A second session demotes Bob and holds the request, so the denial
-    // waits inside its transaction until the demotion commits.
     const other = createDatabase(url, { max: 1 });
-    const holding = Promise.withResolvers<void>();
-    const release = Promise.withResolvers<void>();
-    const held = other.db.transaction(async (tx) => {
-      await tx
-        .update(workspaceMembers)
-        .set({ role: "member" })
-        .where(eq(workspaceMembers.id, bobInTeam));
-      await tx
+    t.after(() => other.close());
+
+    /**
+     * Runs `change` while a second session has demoted Bob and holds what
+     * `hold` locks, so that the change waits inside its transaction until
+     * the demotion commits.
+     */
+    const whileDemoting = async (
+      hold: (tx: Database) => Promise<unknown>,
+      change: () => Promise<{ statusCode: number; body: string }>,
+    ) => {
+      const holding = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const held = other.db.transaction(async (tx) => {
+        await tx
+          .update(workspaceMembers)
+          .set({ role: "member" })
+          .where(eq(workspaceMembers.id, bobInTeam));
+        await hold(tx);
+        holding.resolve();
+        await release.promise;
+      });
+      try {
+        await Promise.race([
+          holding.promise,
+          held.then(() => {
+            throw new Error("the holding transaction ended early");
+          }),
+        ]);
+        const running = change();
+        const deadline = Date.now() + 5_000;
+        while ((await lockWaiters()) < 1) {
+          assert.ok(Date.now() < deadline, "the change never waited");
+          await delay(10);
+        }
+        release.resolve();
+        await held;
+        return await running;
+      } finally {
+        release.resolve();
+        await held.catch(() => undefined);
+      }
+    };
+
+    const holdRequest = (id: JoinRequestId) => (tx: Database) =>
+      tx
         .select({ id: workspaceJoinRequests.id })
         .from(workspaceJoinRequests)
-        .where(eq(workspaceJoinRequests.id, pending.id))
+        .where(eq(workspaceJoinRequests.id, id))
         .for("update");
-      holding.resolve();
-      await release.promise;
-    });
-    try {
-      await Promise.race([
-        holding.promise,
-        held.then(() => {
-          throw new Error("the holding transaction ended early");
-        }),
-      ]);
-      const denying = decide(ada, team.workspaceId, pending.id, "deny");
-      while ((await lockWaiters()) < 1) {
-        await delay(10);
-      }
-      release.resolve();
-      await held;
-      const denied = await denying;
-      assert.equal(denied.statusCode, 204, denied.body);
-      const event = await nextEvent(adaClient);
-      assert.ok(event.type === "workspace.join_request.resolved", event.type);
-      assert.deepEqual(delivered.at(-1)?.approvers, [team.ownerId]);
-      await quiet(adaClient, bobClient);
-    } finally {
-      release.resolve();
-      await held.catch(() => undefined);
-      await other.close();
+    let gusRequest: JoinRequestId | undefined;
+    const cases = [
+      {
+        name: "a new request waits for the workspace row",
+        hold: (tx: Database) =>
+          tx
+            .select({ id: workspaces.id })
+            .from(workspaces)
+            .where(eq(workspaces.id, team.workspaceId))
+            .for("update"),
+        change: async () => {
+          const response = await post(gus, "/join-requests", {
+            workspaceId: team.workspaceId,
+            displayName: "Gus",
+          });
+          gusRequest = CreateJoinRequestResponseSchema.parse(response.json())
+            .joinRequest.id;
+          return response;
+        },
+        expected: "created",
+      },
+      {
+        name: "a withdrawal waits for the request",
+        hold: (tx: Database) => {
+          assert.ok(gusRequest !== undefined);
+          return holdRequest(gusRequest)(tx);
+        },
+        change: () => {
+          assert.ok(gusRequest !== undefined);
+          return post(gus, `/join-requests/${gusRequest}/withdraw`);
+        },
+        expected: "withdrawn",
+      },
+      {
+        name: "an approval waits for the request",
+        hold: holdRequest(ivyRequest.id),
+        change: () => decide(ada, team.workspaceId, ivyRequest.id, "approve"),
+        expected: "approved",
+      },
+      {
+        name: "a denial waits for the request",
+        hold: holdRequest(joRequest.id),
+        change: () => decide(ada, team.workspaceId, joRequest.id, "deny"),
+        expected: "denied",
+      },
+      {
+        name: "a block waits for the request",
+        hold: holdRequest(kimRequest.id),
+        change: () => decide(ada, team.workspaceId, kimRequest.id, "block"),
+        expected: "blocked",
+      },
+      {
+        name: "denying all waits for the pending request",
+        hold: holdRequest(leeRequest.id),
+        change: () => onAll(ada, team.workspaceId, "deny-all"),
+        expected: "denied",
+      },
+    ];
+    for (const { name, hold, change, expected } of cases) {
+      await t.test(name, async () => {
+        // Bob is an admin again before each change.
+        await database()
+          .update(workspaceMembers)
+          .set({ role: "admin" })
+          .where(eq(workspaceMembers.id, bobInTeam));
+        delivered.splice(0);
+        const response = await whileDemoting(hold, change);
+        assert.ok(
+          response.statusCode === 200 || response.statusCode === 204,
+          response.body,
+        );
+        assert.deepEqual(
+          delivered.map(({ event, approvers }) => [
+            event.type === "workspace.join_request.resolved"
+              ? event.payload.outcome
+              : "created",
+            approvers,
+          ]),
+          [[expected, [team.ownerId]]],
+        );
+        const joinRequestEvents = (types: string[]) =>
+          types.filter((type) => type.startsWith("workspace.join_request."));
+        assert.equal(joinRequestEvents(await drained(adaClient)).length, 1);
+        assert.deepEqual(joinRequestEvents(await drained(bobClient)), []);
+      });
     }
   },
 );
@@ -844,8 +955,16 @@ test("the type checker refuses a join request event where an event for every mem
     removed: Extract<WorkspaceEvent, { type: "workspace.member.removed" }>,
     run: AgentRunStateChangedEvent,
     registry: ConnectionRegistry,
+    context: AuthenticatedConnectionContext,
     log: FastifyBaseLogger,
   ) => {
+    // @ts-expect-error -- sendToWorkspace sends to every subscriber
+    registry.sendToWorkspace(created);
+    // @ts-expect-error -- sendEvent ignores the person's role
+    registry.sendEvent(context, resolved);
+    registry.sendToPeople(created, []);
+    registry.sendToWorkspace(removed);
+    registry.sendEvent(context, run);
     // @ts-expect-error -- a join request event goes to the owner and admins only
     void handler(created);
     // @ts-expect-error -- a join request event goes to the owner and admins only

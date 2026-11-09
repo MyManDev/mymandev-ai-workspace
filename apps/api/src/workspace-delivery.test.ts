@@ -1247,7 +1247,8 @@ test("a connection with more than 1 MiB waiting to be sent closes with 1013 and 
   registry.subscribe(slow.context, workspaceId, slow.memberId);
   assert.deepEqual(fast.sent, [presence(workspaceId, slow.memberId, "online")]);
   fast.sent.length = 0;
-  const event = (): ServerEvent => removedEvent(workspaceId, newId<MemberId>());
+  const event = (): WorkspaceEvent =>
+    removedEvent(workspaceId, newId<MemberId>());
 
   // Exactly 1 MiB still gets more.
   slow.socket.bufferedAmount = MAX_BUFFERED_BYTES;

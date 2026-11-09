@@ -446,6 +446,18 @@ function closeWith(socket: WebSocket, reason: WsCloseReason): void {
 export type AccountFrame = Extract<ServerFrame, { type: `account.${string}` }>;
 
 /**
+ * An event that the server sends to whoever is subscribed to its workspace,
+ * or to one connection: every `ServerEvent` except the join request events,
+ * which go only to the owner and admins through `sendToPeople` (#210). The
+ * type checker refuses a join request event in `sendToWorkspace` and
+ * `sendEvent`.
+ */
+export type SubscriberEvent = Exclude<
+  ServerEvent,
+  { type: `workspace.join_request.${string}` }
+>;
+
+/**
  * A connection's subscription to a workspace (#110): the connection, the
  * workspace, and the account's active person there when it subscribed. The
  * registry keeps one frozen record per connection and workspace and replaces
@@ -978,7 +990,7 @@ export class ConnectionRegistry {
    * instead. Returns how many connections it was sent to.
    */
   sendToWorkspace(
-    event: ServerEvent,
+    event: SubscriberEvent,
     sender?: AuthenticatedConnectionContext,
   ): number {
     const text = JSON.stringify(event);
@@ -1040,7 +1052,7 @@ export class ConnectionRegistry {
    */
   sendEvent(
     context: AuthenticatedConnectionContext,
-    event: ServerEvent,
+    event: SubscriberEvent,
   ): boolean {
     const live = this.#liveWith(
       context.identity.deviceId,
