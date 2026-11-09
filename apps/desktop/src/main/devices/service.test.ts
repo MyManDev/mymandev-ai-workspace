@@ -559,7 +559,9 @@ test("a failed load keeps what was loaded, shows its problem, and is retried wit
     RATE_LIMITED_RETRY_MS,
   ]);
 
-  // A lost connection cancels the retry; the next connection loads.
+  // Once the server's wait has passed, a lost connection cancels the retry;
+  // the next connection loads.
+  h.clock += RATE_LIMITED_RETRY_MS;
   h.setConnection("offline");
   expect(h.openTimers()).toEqual([]);
   h.deviceAction();
@@ -583,6 +585,124 @@ test("a failed load keeps what was loaded, shows its problem, and is retried wit
     WORKSPACE_RETRY_BASE_MS,
   ]);
   expect(h.logs).toContain("The device list did not load (unavailable).");
+});
+
+test("after rate_limited, no trigger loads before the server's wait has ended; a trigger meanwhile loads at its end", async () => {
+  const h = new Harness();
+  await h.loaded();
+  h.deviceAction();
+  await h.answer(failure("rate_limited"));
+  expect(h.sent).toBe(2);
+  const [wait] = h.openTimers();
+  expect(wait?.delayMs).toBe(RATE_LIMITED_RETRY_MS);
+
+  // A frame, a device action, the screen's request, and a reconnect during
+  // the wait send nothing and keep its retry.
+  h.clock += 10_000;
+  h.receive(registered());
+  h.receive(revoked(OTHER_DEVICE_ID));
+  h.deviceAction();
+  h.clock += DEVICE_LIST_LOAD_COOLDOWN_MS;
+  expect(h.service.load()).toEqual({ outcome: "loading" });
+  expect(h.sent).toBe(2);
+  expect(h.openTimers()).toEqual([wait]);
+  h.setConnection("offline");
+  expect(h.openTimers()).toEqual([]);
+  h.setConnection("connected");
+  expect(h.sent).toBe(2);
+  // The next retry waits for the rest of the wait, on the clock.
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([
+    RATE_LIMITED_RETRY_MS - 10_000 - DEVICE_LIST_LOAD_COOLDOWN_MS,
+  ]);
+
+  // At its end, one load goes.
+  h.clock += RATE_LIMITED_RETRY_MS;
+  h.fire();
+  expect(h.sent).toBe(3);
+  await h.answer(ok(OWN_LIST));
+  expect(h.service.state().status).toBe("ready");
+  // After a success, a trigger loads at once again.
+  h.deviceAction();
+  expect(h.sent).toBe(4);
+
+  // A timer that fires a moment early still ends the wait.
+  await h.answer(failure("rate_limited"));
+  h.fire();
+  expect(h.sent).toBe(5);
+
+  // A device change ends the wait with the rest of the state.
+  await h.answer(failure("rate_limited"));
+  h.setAccount(accountStatus({}, OTHER_DEVICE_ID));
+  expect(h.sent).toBe(6);
+});
+
+test("a request of the Account screen while no device is signed in counts: the list loads once a device is, and no cooldown starts", async () => {
+  for (const status of [
+    SIGNED_OUT,
+    accountStatus({ account: { kind: "signed_out" }, device: "no_device" }),
+    accountStatus({
+      deviceKey: "passphrase_required",
+      device: "key_not_loaded",
+    }),
+    accountStatus({ account: { kind: "hidden" }, device: "starting" }),
+  ]) {
+    const h = new Harness(status);
+    expect(h.service.load(), status.device).toEqual({
+      outcome: "refused",
+      reason: "not_signed_in",
+    });
+    expect(h.sent, status.device).toBe(0);
+
+    // A first sign-in, an unlock, or the end of the startup on the open
+    // screen: the list loads without another request.
+    h.setAccount(accountStatus({ signIn: { kind: "completing" } }));
+    expect(h.sent, status.device).toBe(0);
+    h.setAccount(accountStatus());
+    expect(h.sent, status.device).toBe(1);
+    await h.answer(ok(OWN_LIST));
+    expect(h.service.state().status, status.device).toBe("ready");
+    // The refusal started no cooldown.
+    expect(h.service.load(), status.device).toEqual({ outcome: "loading" });
+    expect(h.sent, status.device).toBe(2);
+  }
+});
+
+test("a frame received while no device is signed in makes no notice and reads nothing, also after a sign-in", () => {
+  const h = new Harness(SIGNED_OUT);
+  h.service.load();
+  h.receive(registered());
+  h.receive(revoked(OTHER_DEVICE_ID));
+  expect(h.service.state().newDevices).toEqual([]);
+  expect(h.sent).toBe(0);
+
+  h.setAccount(accountStatus());
+  expect(h.service.state().newDevices).toEqual([]);
+  // Only the sign-in loads.
+  expect(h.sent).toBe(1);
+});
+
+test("a dismissal ends only the notices that the screen showed, so a notice that arrived since stays", async () => {
+  const h = new Harness();
+  await h.loaded();
+  const second = "0192f0a0-7b3c-7d4e-8f50-000000000034";
+  h.receive(registered(NEW_DEVICE_ID));
+  const shown = h.service.state().newDevices.map((notice) => notice.id);
+  expect(shown).toEqual([NEW_DEVICE_ID]);
+  // A notice arrives after the screen showed the state.
+  h.receive(registered(second, "Second laptop"));
+
+  expect(h.service.dismissNewDevices(shown)).toBe(true);
+  expect(h.service.state().newDevices.map((notice) => notice.id)).toEqual([
+    second,
+  ]);
+  // IDs that name no notice, and no ID, end nothing.
+  expect(h.service.dismissNewDevices([NEW_DEVICE_ID, OTHER_DEVICE_ID])).toBe(
+    false,
+  );
+  expect(h.service.dismissNewDevices([])).toBe(false);
+  expect(h.service.state().newDevices).toHaveLength(1);
+  expect(h.service.dismissNewDevices([second])).toBe(true);
+  expect(h.service.state().newDevices).toEqual([]);
 });
 
 test("a read that rejects counts as unavailable", async () => {
@@ -652,9 +772,9 @@ test("a notice of a new device comes from the frame, never for this device, keep
   ]);
 
   // Dismissed.
-  expect(h.service.dismissNewDevices()).toBe(true);
+  expect(h.service.dismissNewDevices([NEW_DEVICE_ID])).toBe(true);
   expect(h.service.state().newDevices).toEqual([]);
-  expect(h.service.dismissNewDevices()).toBe(false);
+  expect(h.service.dismissNewDevices([NEW_DEVICE_ID])).toBe(false);
 
   // The 10 newest stay.
   const ids = Array.from(
@@ -697,7 +817,7 @@ test("a notice of a new device comes from the frame, never for this device, keep
   // A sign-out drops them.
   h.setAccount(SIGNED_OUT);
   expect(h.service.state().newDevices).toEqual([]);
-  expect(h.service.dismissNewDevices()).toBe(false);
+  expect(h.service.dismissNewDevices(ids)).toBe(false);
 });
 
 test("close stops listening and cancels the retry, and later calls change nothing", async () => {
@@ -719,7 +839,7 @@ test("close stops listening and cancels the retry, and later calls change nothin
     outcome: "refused",
     reason: "not_signed_in",
   });
-  expect(h.service.dismissNewDevices()).toBe(false);
+  expect(h.service.dismissNewDevices([NEW_DEVICE_ID])).toBe(false);
   expect(h.states).toHaveLength(before);
 });
 
@@ -734,7 +854,7 @@ test("a listener that throws is logged and the others still hear the state; no l
   h.receive(registered());
   await h.answer(failure("failed"));
   stop();
-  h.service.dismissNewDevices();
+  h.service.dismissNewDevices([NEW_DEVICE_ID]);
 
   expect(heard).toEqual(["ready", "ready", "unavailable"]);
   expect(h.logs).toContain("A device list state listener failed.");

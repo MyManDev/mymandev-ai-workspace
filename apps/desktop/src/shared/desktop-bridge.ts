@@ -334,8 +334,13 @@ export interface DeviceListBridge {
    */
   readonly load: () => Promise<DeviceListLoadResult>;
   /**
-   * Dismisses the notices of new devices. Resolves to false when none was
-   * shown.
+   * Dismisses the notices of new devices that the renderer showed, by the
+   * device IDs that they name; a notice that arrived since stays. The
+   * bridge passes on only a new array of the strings, and the main process
+   * accepts 1 to 10 lowercase UUIDv7s. Resolves to false when none of them
+   * was held.
    */
-  readonly dismissNewDevices: () => Promise<boolean>;
+  readonly dismissNewDevices: (
+    deviceIds: readonly string[],
+  ) => Promise<boolean>;
 }

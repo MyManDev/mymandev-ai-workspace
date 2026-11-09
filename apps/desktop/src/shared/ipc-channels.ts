@@ -147,7 +147,10 @@ export const INVOKE_CHANNELS = Object.freeze({
    * within a few seconds of the last time. The renderer sends nothing.
    */
   loadDeviceList: "devices:load",
-  /** Dismisses the notices of new devices of the account. */
+  /**
+   * Dismisses the notices of new devices that the renderer showed, by the
+   * device IDs that they name.
+   */
   dismissNewDevices: "devices:dismiss-new-devices",
 } as const);
 

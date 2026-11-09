@@ -106,8 +106,10 @@ function elementsOf(node: ReactNode): ReactElement<HostProps>[] {
 test("each state of the section has its fixed text in one status paragraph", () => {
   const status = (text: string) =>
     `<p class="account-message" role="status">${text}</p>`;
+  // The log region of the notices is always there, also empty, so that a
+  // screen reader announces the first notice that is added.
   expect(render({ view: { kind: "unavailable" } })).toBe(
-    `<section class="account-panel" aria-labelledby="devices-title"><h3 id="devices-title">Devices</h3>${status(DEVICE_LIST_MESSAGES.unavailable)}</section>`,
+    `<section class="account-panel" aria-labelledby="devices-title"><h3 id="devices-title">Devices</h3>${status(DEVICE_LIST_MESSAGES.unavailable)}<div class="device-notices" role="log" aria-label="New devices"></div></section>`,
   );
   for (const [view, text] of [
     [{ kind: "pending" }, DEVICE_LIST_MESSAGES.pending],
@@ -222,7 +224,13 @@ test("while the registration lock is in force, a line says until when new device
   expect(html).not.toContain("<button");
 });
 
-test("a notice of a new device names its label as text and its platform, and Dismiss asks the main process to end it", () => {
+test("the notices of new devices name each label as text and its platform in one log region, and the button dismisses the notices that are shown", () => {
+  const second = {
+    id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a6",
+    label: "Second laptop",
+    platform: "linux" as const,
+    createdAt: "2026-11-09T09:00:00.000Z",
+  };
   const view = known({
     newDevices: [
       {
@@ -231,29 +239,41 @@ test("a notice of a new device names its label as text and its platform, and Dis
         platform: "windows",
         createdAt: NEW_LAPTOP.createdAt,
       },
+      second,
     ],
   });
   const html = render({ view, onDismissNewDevices: () => undefined });
+  // One polite log region announces a notice that is added; no notice is an
+  // alert of its own, so the notices held when the screen opens are not all
+  // read out. The button stays outside the region and names what it ends.
   expect(html).toContain(
-    '<div class="device-notices"><p class="account-warning" role="alert">A new device was registered on this account: <span dir="auto">&lt;b&gt;Work&lt;/b&gt; laptop</span> (Windows), <time dateTime="2026-11-08T09:00:00.000Z">8 Nov 2026, 09:00</time>.</p><div class="account-actions"><button type="button" class="panel-action">Dismiss</button></div></div>',
+    '<div class="device-notices" role="log" aria-label="New devices"><p class="account-warning">A new device was registered on this account: <span dir="auto">&lt;b&gt;Work&lt;/b&gt; laptop</span> (Windows), <time dateTime="2026-11-08T09:00:00.000Z">8 Nov 2026, 09:00</time>.</p><p class="account-warning">A new device was registered on this account: <span dir="auto">Second laptop</span> (Linux), <time dateTime="2026-11-09T09:00:00.000Z">9 Nov 2026, 09:00</time>.</p></div><div class="account-actions"><button type="button" class="panel-action">Dismiss the notices</button></div>',
   );
+  expect(html).not.toContain('role="alert"');
+  expect(html.match(/role="log"/g)).toHaveLength(1);
 
-  let dismissed = 0;
+  const dismissed: (readonly string[])[] = [];
   const buttons = elementsOf(
     DevicesSectionContent(
       props({
         view,
-        onDismissNewDevices: () => {
-          dismissed += 1;
+        onDismissNewDevices: (deviceIds) => {
+          dismissed.push(deviceIds);
         },
       }),
     ),
   ).filter((element) => element.type === "button");
   expect(buttons).toHaveLength(1);
   buttons[0]?.props.onClick?.();
-  expect(dismissed).toBe(1);
+  // The IDs of the notices that the section shows, and no other.
+  expect(dismissed).toEqual([[NEW_LAPTOP.id, second.id]]);
 
-  // Without the bridge, no button; without a notice, no notice.
+  // Without the bridge, no button; without a notice, an empty region and no
+  // button.
   expect(render({ view })).not.toContain("<button");
-  expect(render()).not.toContain("device-notices");
+  const none = render({ onDismissNewDevices: () => undefined });
+  expect(none).toContain(
+    '<div class="device-notices" role="log" aria-label="New devices"></div>',
+  );
+  expect(none).not.toContain("<button");
 });

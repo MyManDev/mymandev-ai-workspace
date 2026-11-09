@@ -166,8 +166,8 @@ function fakeService(initial: DeviceListState = listState()) {
           calls.push("load");
           return loadAnswer;
         },
-        dismissNewDevices: () => {
-          calls.push("dismissNewDevices");
+        dismissNewDevices: (deviceIds: readonly string[]) => {
+          calls.push(`dismissNewDevices ${deviceIds.join(",")}`);
           return dismissAnswer;
         },
       },
@@ -225,12 +225,16 @@ function register(
     appUrl,
     fake.options,
   );
-  const call = (channel: string, sender: StatusReceiver = receiver()) => {
+  const call = (
+    channel: string,
+    sender: StatusReceiver = receiver(),
+    ...args: unknown[]
+  ) => {
     const handler = handlers.get(channel);
     if (handler === undefined) {
       throw new Error(`No handler for ${channel}.`);
     }
-    return handler(event(frame(appUrl), sender));
+    return handler(event(frame(appUrl), sender), ...args);
   };
   const view = (sender?: StatusReceiver) =>
     call(INVOKE_CHANNELS.getDeviceList, sender) as DeviceListView;
@@ -270,7 +274,7 @@ test("the device list channels are registered, and nothing else", () => {
   ).toEqual(DEVICE_CHANNELS);
 });
 
-test("every handler refuses a foreign sender and any argument, before the service is asked", () => {
+test("every handler refuses a foreign sender and arguments outside the contract, before the service is asked", () => {
   const fake = fakeService();
   const { handlers } = register(fake, APP_ENTRY_URL);
   for (const [channel, handler] of handlers) {
@@ -280,11 +284,32 @@ test("every handler refuses a foreign sender and any argument, before the servic
       frame(APP_ENTRY_URL, frame(APP_ENTRY_URL)),
       frame(DEV_URL),
     ]) {
-      expect(() => handler(event(sender)), channel).toThrow(
+      expect(() => handler(event(sender), [DEVICE]), channel).toThrow(
         `The call on ${channel} was refused: the sender is not the application.`,
       );
     }
-    for (const args of [[DEVICE], [{ force: true }], [undefined], [true, 1]]) {
+    const refused: unknown[][] =
+      channel === INVOKE_CHANNELS.dismissNewDevices
+        ? [
+            [],
+            [DEVICE],
+            [[]],
+            [[DEVICE], "extra"],
+            [[DEVICE.toUpperCase()]],
+            // A UUID of another version.
+            [["0192f0a0-7b3c-4d4e-8f50-0000000000d1"]],
+            [[`${DEVICE}x`]],
+            [[1]],
+            [{ 0: DEVICE, length: 1 }],
+            [
+              Array.from(
+                { length: DEVICE_LIST_LIMITS.newDevices + 1 },
+                (_, n) => id(0x8000 + n),
+              ),
+            ],
+          ]
+        : [[DEVICE], [{ force: true }], [undefined], [true, 1]];
+    for (const args of refused) {
       expect(
         () => handler(event(frame(APP_ENTRY_URL)), ...args),
         channel,
@@ -501,6 +526,16 @@ test("the contract's limits and platforms follow the protocol and the service", 
   expect([...DEVICE_PLATFORMS]).toEqual([...PROTOCOL_DEVICE_PLATFORMS]);
 });
 
+test("the dismissal passes the shown device IDs on, up to the most notices that cross", () => {
+  const fake = fakeService();
+  const { call } = register(fake);
+  const ids = Array.from({ length: DEVICE_LIST_LIMITS.newDevices }, (_, n) =>
+    id(0x9000 + n),
+  );
+  expect(call(INVOKE_CHANNELS.dismissNewDevices, receiver(), ids)).toBe(true);
+  expect(fake.calls).toEqual([`dismissNewDevices ${ids.join(",")}`]);
+});
+
 test("load and the dismissal go to the service and answer as it does", () => {
   const fake = fakeService();
   const { call } = register(fake);
@@ -516,15 +551,19 @@ test("load and the dismissal go to the service and answer as it does", () => {
     outcome: "refused",
     reason: "not_signed_in",
   });
-  expect(call(INVOKE_CHANNELS.dismissNewDevices)).toBe(true);
+  expect(
+    call(INVOKE_CHANNELS.dismissNewDevices, receiver(), [NEW_DEVICE, DEVICE]),
+  ).toBe(true);
   fake.answerDismiss(false);
-  expect(call(INVOKE_CHANNELS.dismissNewDevices)).toBe(false);
+  expect(
+    call(INVOKE_CHANNELS.dismissNewDevices, receiver(), [NEW_DEVICE]),
+  ).toBe(false);
   expect(fake.calls).toEqual([
     "load",
     "load",
     "load",
-    "dismissNewDevices",
-    "dismissNewDevices",
+    `dismissNewDevices ${NEW_DEVICE},${DEVICE}`,
+    `dismissNewDevices ${NEW_DEVICE}`,
   ]);
 });
 

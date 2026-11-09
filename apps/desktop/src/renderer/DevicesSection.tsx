@@ -33,10 +33,13 @@ export function DevicesSection({
 }) {
   const view = useDeviceSection(devices);
   const now = useDeviceListClock(view);
-  const onDismissNewDevices = useCallback(() => {
-    // The next state shows what changed; a failed call changes nothing.
-    devices?.dismissNewDevices().catch(() => undefined);
-  }, [devices]);
+  const onDismissNewDevices = useCallback(
+    (deviceIds: readonly string[]) => {
+      // The next state shows what changed; a failed call changes nothing.
+      devices?.dismissNewDevices(deviceIds).catch(() => undefined);
+    },
+    [devices],
+  );
   return (
     <DevicesSectionContent
       view={view}
@@ -60,16 +63,24 @@ export interface DevicesSectionContentProps {
    * for each render, in the person's locale and the system's time zone.
    */
   readonly timeFormat?: Intl.DateTimeFormat | undefined;
-  /** Ends the notices of new devices; undefined without the bridge. */
-  readonly onDismissNewDevices?: (() => void) | undefined;
+  /**
+   * Ends the notices of new devices that the section shows, by their device
+   * IDs; undefined without the bridge.
+   */
+  readonly onDismissNewDevices?:
+    ((deviceIds: readonly string[]) => void) | undefined;
 }
 
 /**
  * The section for a view, without state. The status paragraph is always
  * rendered, empty when there is nothing to say, so that a screen reader
- * announces a new text. Labels are text that people entered, so each one
- * is rendered as text and takes its direction from its own content
- * (`dir="auto"`). The marks of this device and of a new device are text.
+ * announces a new text. The notices of new devices sit in one polite log
+ * region (`role="log"`), which is always rendered too: a screen reader
+ * announces a notice that is added while the section is shown, and does not
+ * read the notices that were there when it opened. Labels are text that
+ * people entered, so each one is rendered as text and takes its direction
+ * from its own content (`dir="auto"`). The marks of this device and of a
+ * new device are text.
  */
 export function DevicesSectionContent({
   view,
@@ -86,13 +97,11 @@ export function DevicesSectionContent({
       <p className="account-message" role="status">
         {model.status}
       </p>
-      {model.newDevices.length === 0 ? null : (
-        <NewDeviceNotices
-          notices={model.newDevices}
-          format={format}
-          onDismiss={onDismissNewDevices}
-        />
-      )}
+      <NewDeviceNotices
+        notices={model.newDevices}
+        format={format}
+        onDismiss={onDismissNewDevices}
+      />
       {model.lockedUntil === null ? null : (
         <p className="account-warning">
           {"New devices cannot be registered on this account until "}
@@ -136,26 +145,38 @@ function NewDeviceNotices({
 }: {
   readonly notices: readonly NewDeviceRow[];
   readonly format: Intl.DateTimeFormat;
-  readonly onDismiss: (() => void) | undefined;
+  readonly onDismiss: ((deviceIds: readonly string[]) => void) | undefined;
 }) {
+  // The button stays outside the log, so that it is not announced as a new
+  // entry. It ends the notices that are shown, by their device IDs.
   return (
-    <div className="device-notices">
-      {notices.map((notice) => (
-        <p key={notice.id} className="account-warning" role="alert">
-          {"A new device was registered on this account: "}
-          <span dir="auto">{notice.label}</span>
-          {` (${notice.platformName}), `}
-          <Time timestamp={notice.createdAt} format={format} />.
-        </p>
-      ))}
-      {onDismiss === undefined ? null : (
+    <>
+      <div
+        className="device-notices"
+        role="log"
+        aria-label={DEVICE_LIST_MESSAGES.newDevicesLabel}
+      >
+        {notices.map((notice) => (
+          <p key={notice.id} className="account-warning">
+            {"A new device was registered on this account: "}
+            <span dir="auto">{notice.label}</span>
+            {` (${notice.platformName}), `}
+            <Time timestamp={notice.createdAt} format={format} />.
+          </p>
+        ))}
+      </div>
+      {onDismiss === undefined || notices.length === 0 ? null : (
         <div className="account-actions">
-          <button type="button" className="panel-action" onClick={onDismiss}>
+          <button
+            type="button"
+            className="panel-action"
+            onClick={() => onDismiss(notices.map((notice) => notice.id))}
+          >
             {DEVICE_LIST_MESSAGES.dismiss}
           </button>
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -267,8 +288,9 @@ function useDeviceSection(
 /**
  * The renderer's clock for the section: read again for every new view, which
  * is stored during the render so that React renders again at once with it,
- * and when a device stops counting as new or the registration lock ends
- * (`nextDeviceListChange`).
+ * when a device stops counting as new or the registration lock ends
+ * (`nextDeviceListChange`), and when the window gets the focus or becomes
+ * visible again, because a timer can fire late after the computer slept.
  */
 function useDeviceListClock(view: DeviceSectionView): number {
   const [reading, setReading] = useState(() => ({ view, now: Date.now() }));
@@ -289,5 +311,15 @@ function useDeviceListClock(view: DeviceSectionView): number {
     );
     return () => clearTimeout(timer);
   }, [at, now]);
+  useEffect(() => {
+    const readAgain = () =>
+      setReading((last) => ({ view: last.view, now: Date.now() }));
+    window.addEventListener("focus", readAgain);
+    document.addEventListener("visibilitychange", readAgain);
+    return () => {
+      window.removeEventListener("focus", readAgain);
+      document.removeEventListener("visibilitychange", readAgain);
+    };
+  }, []);
   return now;
 }

@@ -465,18 +465,19 @@ function deviceList(revision: number) {
   };
 }
 
-test("the device list functions call their channels and pass no argument from the renderer on", async () => {
+test("the device list functions call their channels and pass no argument from the renderer on, except a copy of the dismissed device IDs", async () => {
   const fake = fakeIpc();
   const devices = createDesktopBridge("44.9.1", fake.ipc)
     .devices as unknown as Record<
     string,
     (...args: unknown[]) => Promise<unknown>
   >;
+  const shown = ["0192f2a0", "0192f2a1"];
 
   const answers = [
     devices["getState"]?.("devices:dismiss-new-devices"),
     devices["load"]?.({ force: true }, "0192f2a0"),
-    devices["dismissNewDevices"]?.(["0192f2a0"]),
+    devices["dismissNewDevices"]?.(shown, "extra"),
   ];
   fake.answers[0]?.resolve(deviceList(1));
   fake.answers[1]?.resolve({ outcome: "loading" });
@@ -490,8 +491,30 @@ test("the device list functions call their channels and pass no argument from th
   expect(fake.invoked).toEqual([
     { channel: INVOKE_CHANNELS.getDeviceList, args: [] },
     { channel: INVOKE_CHANNELS.loadDeviceList, args: [] },
-    { channel: INVOKE_CHANNELS.dismissNewDevices, args: [] },
+    { channel: INVOKE_CHANNELS.dismissNewDevices, args: [shown] },
   ]);
+  // A new array goes on, not the renderer's own.
+  expect(fake.invoked[2]?.args[0]).not.toBe(shown);
+});
+
+test("dismissNewDevices refuses a value that is not an array of strings without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const dismiss = createDesktopBridge("44.9.1", fake.ipc).devices
+    .dismissNewDevices as (...args: unknown[]) => Promise<unknown>;
+
+  for (const value of [
+    "0192f2a0",
+    undefined,
+    null,
+    [1],
+    ["0192f2a0", { id: "0192f2a0" }],
+    { 0: "0192f2a0", length: 1 },
+  ]) {
+    await expect(dismiss(value)).rejects.toThrow(
+      "dismissNewDevices needs an array of ID strings.",
+    );
+  }
+  expect(fake.invoked).toEqual([]);
 });
 
 test("startSignIn passes on only its own fixed option, and only when the renderer asks for another browser", async () => {

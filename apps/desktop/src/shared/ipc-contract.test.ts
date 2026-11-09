@@ -170,7 +170,7 @@ test("a runtime status with a wrong state or revision is refused", () => {
   }
 });
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, and the chat's send, retry, and discard take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, and the dismissal of new devices take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -180,9 +180,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.openProject &&
       channel !== INVOKE_CHANNELS.sendChatMessage &&
       channel !== INVOKE_CHANNELS.retryChatMessage &&
-      channel !== INVOKE_CHANNELS.discardChatMessage,
+      channel !== INVOKE_CHANNELS.discardChatMessage &&
+      channel !== INVOKE_CHANNELS.dismissNewDevices,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 8);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 9);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -815,20 +816,43 @@ test("the results of sign-out and removal hold only fixed values", () => {
   }
 });
 
-test("sign-out, removal, and every device list channel take no argument", () => {
+test("sign-out, removal, and the device list's reads and load take no argument", () => {
   for (const channel of [
     INVOKE_CHANNELS.signOut,
     INVOKE_CHANNELS.removeDevice,
     INVOKE_CHANNELS.getDeviceList,
     INVOKE_CHANNELS.subscribeDeviceList,
     INVOKE_CHANNELS.loadDeviceList,
-    INVOKE_CHANNELS.dismissNewDevices,
   ]) {
     const { args } = INVOKE_CONTRACT[channel];
     expect(args.parse([])).toEqual([]);
     for (const value of [[undefined], [true], [{ deviceId: DEVICE_ID }]]) {
       expect(args.safeParse(value).success).toBe(false);
     }
+  }
+});
+
+test("the dismissal of new devices takes 1 to 10 device IDs, each a lowercase UUIDv7", () => {
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.dismissNewDevices];
+  const most = Array.from(
+    { length: DEVICE_LIST_LIMITS.newDevices },
+    (_, n) =>
+      `0192f2a0-7c3e-7a1b-8c4d-5e6f7081${n.toString(16).padStart(4, "0")}`,
+  );
+  expect(args.parse([[DEVICE_ID]])).toEqual([[DEVICE_ID]]);
+  expect(args.parse([most])).toEqual([most]);
+  for (const value of [
+    [],
+    [[]],
+    [DEVICE_ID],
+    [[DEVICE_ID], [DEVICE_ID]],
+    [[DEVICE_ID.toUpperCase()]],
+    [["0192f2a0-7c3e-4a1b-8c4d-5e6f708192a3"]],
+    [[`${DEVICE_ID} `]],
+    [[null]],
+    [[...most, DEVICE_ID]],
+  ]) {
+    expect(args.safeParse(value).success, JSON.stringify(value)).toBe(false);
   }
 });
 

@@ -1377,6 +1377,17 @@ export const DEVICE_LIST_LOAD_REFUSALS = Object.freeze([
   "too_soon",
 ] as const);
 
+/**
+ * The devices whose notices the renderer showed and the person dismissed
+ * (the Project Manager's decision of 2026-11-09): 1 to `newDevices` device
+ * IDs, each a lowercase UUIDv7. A notice that arrived after the last state
+ * that the renderer showed is not named, so it stays.
+ */
+export const DismissedDevicesSchema = z
+  .array(ProtocolIdSchema)
+  .min(1)
+  .max(DEVICE_LIST_LIMITS.newDevices);
+
 /** The result of `devices:load`: `loading`, or `refused` with a reason. */
 export const DeviceListLoadResultSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("loading") }),
@@ -1533,8 +1544,9 @@ export const INVOKE_CONTRACT = Object.freeze({
     result: DeviceListLoadResultSchema,
   }),
   [INVOKE_CHANNELS.dismissNewDevices]: Object.freeze({
-    args: NoArgumentsSchema,
-    /** True when a notice was shown. */
+    /** The device IDs of the notices that the renderer showed. */
+    args: z.tuple([DismissedDevicesSchema]),
+    /** True when a notice of them was held and ended. */
     result: z.boolean(),
   }),
 });

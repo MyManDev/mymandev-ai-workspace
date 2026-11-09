@@ -4,13 +4,15 @@
 // (`GET /devices`), and the notices of new devices from the live
 // `account.device_registered` frame.
 //
-// - The list loads once the Account screen asked for it (`load`). From then
-//   on, while the application runs, it loads again when a device becomes
-//   signed in, when the connection reaches `connected` (account frames sent
-//   while it was offline are lost), when `account.device_registered` or
-//   `account.device_revoked` arrives, and after a device action of the
-//   person (the account service's `onDeviceAction`). The screen's request is
-//   refused within `DEVICE_LIST_LOAD_COOLDOWN_MS` of the last one, so that a
+// - The list loads once the Account screen asked for it (`load`), also when
+//   it asked while no device was signed in: the open screen then sees the
+//   list after the sign-in. From then on, while the application runs, it
+//   loads again when a device becomes signed in, when the connection reaches
+//   `connected` (account frames sent while it was offline are lost), when
+//   `account.device_registered` or `account.device_revoked` arrives, and
+//   after a device action of the person (the account service's
+//   `onDeviceAction`). The screen's request is refused within
+//   `DEVICE_LIST_LOAD_COOLDOWN_MS` of the last one that loaded, so that a
 //   renderer that misbehaves cannot read the API in a loop.
 // - One load runs at a time, and none while a sign-in runs, which the
 //   account service answers `unavailable` while the status may already show
@@ -18,12 +20,16 @@
 //   one is on its way drops that answer and loads again, so only an answer
 //   that was asked for after the last trigger applies. A failed load is
 //   retried with the workspace service's backoff while connected; offline,
-//   the next `connected` loads.
+//   the next `connected` loads. After `rate_limited`, nothing loads until
+//   its wait has ended: a trigger meanwhile loads at the end of the wait.
 // - A notice of a new device stays until the person dismisses it, the
 //   device is revoked (its `account.device_revoked`, or a list that shows it
-//   revoked), or the list is dropped. The reloads that the frame itself, the
-//   connection, or the Account screen start do not end it, so that the
-//   person sees it also when the Account screen opens later.
+//   revoked), or the list is dropped (the Project Manager's decision of
+//   2026-11-09). The reloads that the frame itself, the connection, or the
+//   Account screen start do not end it, so that the person sees it also
+//   when the Account screen opens later. A dismissal names the notices that
+//   the screen showed, and ends only those, so that a notice that arrived
+//   after the last published state is not dismissed unseen.
 // - A sign-out, another account, or another device drops the list, the
 //   lock, and the notices, and the answers on their way.
 //
@@ -135,12 +141,19 @@ export interface DeviceListService {
   readonly onChange: (listener: (state: DeviceListState) => void) => () => void;
   /**
    * The Account screen asks for the list: it loads now, and from then on
-   * after every trigger. Refused without a signed-in device, and within
-   * `DEVICE_LIST_LOAD_COOLDOWN_MS` of the last accepted request.
+   * after every trigger. Without a signed-in device it is refused as
+   * `not_signed_in`, but it still counts as the screen's request, so the
+   * list loads once a device is signed in; such a refusal starts no
+   * cooldown. With a device, it is refused as `too_soon` within
+   * `DEVICE_LIST_LOAD_COOLDOWN_MS` of the last request that loaded.
    */
   readonly load: () => DeviceListLoadOutcome;
-  /** Ends the notices of new devices; false when there was none. */
-  readonly dismissNewDevices: () => boolean;
+  /**
+   * Ends the notices of the devices that `deviceIds` names, the ones that
+   * the screen showed; a notice of another device stays. False when none of
+   * them was held.
+   */
+  readonly dismissNewDevices: (deviceIds: readonly string[]) => boolean;
   /** Stops listening and cancels the retry, for the quit. */
   readonly close: () => void;
 }
@@ -238,6 +251,11 @@ export function createDeviceListService(
   /** The failed loads in a row, for the backoff. */
   let attempt = 0;
   let cancelRetry: (() => void) | null = null;
+  /**
+   * When the wait after `rate_limited` ends, on the monotonic clock, or
+   * null. Until then nothing loads; a trigger loads at its end.
+   */
+  let rateLimitedUntil: number | null = null;
 
   let revision = 0;
   let dirty = false;
@@ -316,17 +334,41 @@ export function createDeviceListService(
     problem = null;
     notices = NO_NOTICES;
     attempt = 0;
+    rateLimitedUntil = null;
     touch();
+  }
+
+  /** How long the wait after `rate_limited` still runs; 0 when it ended. */
+  function rateLimitWait(): number {
+    if (rateLimitedUntil === null) {
+      return 0;
+    }
+    const left = rateLimitedUntil - now();
+    if (left <= 0) {
+      rateLimitedUntil = null;
+      return 0;
+    }
+    return left;
   }
 
   /**
    * Loads the list, once the Account screen asked for it, for the device
-   * that is signed in. While a sign-in runs, the load waits for it to end.
+   * that is signed in. During the wait after `rate_limited`, the load goes
+   * when the wait ends. While a sign-in runs, the load waits for it to end.
    * While a load is on its way, its answer is dropped and the list loads
    * again after it.
    */
   function reload(): void {
     if (closed || device === null || !requested) {
+      return;
+    }
+    const wait = rateLimitWait();
+    if (wait > 0) {
+      // The server asked to wait: the retry at the end of the wait loads,
+      // after every trigger that came meanwhile.
+      if (cancelRetry === null) {
+        scheduleRetry(wait);
+      }
       return;
     }
     stopRetry();
@@ -377,6 +419,7 @@ export function createDeviceListService(
     list = result.value;
     problem = null;
     attempt = 0;
+    rateLimitedUntil = null;
     const revoked = new Set<string>(
       result.value.devices
         .filter((item) => item.revokedAt !== null)
@@ -390,9 +433,14 @@ export function createDeviceListService(
     problem = reason;
     touch();
     log(`The device list did not load (${reason}).`);
-    // Offline, the next `connected` loads anyway.
+    const delayMs = workspaceRetryDelayMs(attempt, reason);
+    if (reason === "rate_limited") {
+      rateLimitedUntil = now() + delayMs;
+    }
+    // Offline, the next `connected` loads anyway, once a wait after
+    // `rate_limited` has ended.
     if (connected) {
-      scheduleRetry(workspaceRetryDelayMs(attempt, reason));
+      scheduleRetry(delayMs);
     }
     attempt += 1;
   }
@@ -402,6 +450,10 @@ export function createDeviceListService(
     cancelRetry = schedule(() => {
       run(() => {
         cancelRetry = null;
+        // The only retry that runs during a wait after `rate_limited` is
+        // the one at its end; a timer that fires a moment early on the
+        // monotonic clock must not wait again.
+        rateLimitedUntil = null;
         reload();
       });
     }, delayMs);
@@ -484,7 +536,14 @@ export function createDeviceListService(
   }
 
   function load(): DeviceListLoadOutcome {
-    if (closed || device === null) {
+    if (closed) {
+      return NOT_SIGNED_IN;
+    }
+    // The screen asked, also when it opened before a device was signed in
+    // (a first sign-in, an unlock, or the startup): the list then loads
+    // once a device is. The refusal sends nothing and starts no cooldown.
+    requested = true;
+    if (device === null) {
       return NOT_SIGNED_IN;
     }
     const at = now();
@@ -495,18 +554,18 @@ export function createDeviceListService(
       return TOO_SOON;
     }
     lastRequest = at;
-    requested = true;
     reload();
     return LOADING;
   }
 
-  function dismissNewDevices(): boolean {
-    if (closed || notices.length === 0) {
+  function dismissNewDevices(deviceIds: readonly string[]): boolean {
+    if (closed) {
       return false;
     }
-    notices = NO_NOTICES;
-    touch();
-    return true;
+    const shown = new Set<string>(deviceIds);
+    const before = notices;
+    dropNotices((notice) => shown.has(notice.id));
+    return notices !== before;
   }
 
   const removers = [
@@ -533,7 +592,8 @@ export function createDeviceListService(
       };
     },
     load: () => run(load),
-    dismissNewDevices: () => run(dismissNewDevices),
+    dismissNewDevices: (deviceIds: readonly string[]) =>
+      run(() => dismissNewDevices(deviceIds)),
     close: () => {
       if (closed) {
         return;

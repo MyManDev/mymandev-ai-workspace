@@ -540,7 +540,8 @@ code {
   color: var(--color-text-muted);
 }
 
-.device-notices {
+/* The log region of the notices is always rendered, also empty. */
+.device-notices:not(:empty) {
   margin-block: var(--space-2);
 }
 

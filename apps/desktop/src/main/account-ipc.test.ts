@@ -1251,6 +1251,8 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
   answers.push(callDevices(INVOKE_CHANNELS.subscribeDeviceList, app()));
   await service.initialize();
   expect(await device()).toBe("no_device");
+  // The Account screen opens before the sign-in and asks once, as the
+  // section does when it opens; the request is refused but counts.
   await expect(invoke(INVOKE_CHANNELS.loadDeviceList)).resolves.toEqual({
     outcome: "refused",
     reason: "not_signed_in",
@@ -1259,15 +1261,13 @@ test("sign in, list the devices, sign out, sign in again, and remove this device
     status: "signed_out",
     devices: [],
   });
+  expect(listRequests()).toBe(0);
 
-  // Sign in: a new device. The Account screen asks for the list.
+  // Sign in on the open screen: a new device. The list loads on its own,
+  // without another request of the screen.
   await signIn(SIGN_IN_CODE);
   expect(await device()).toBe("signed_in");
-  const loaded = deviceListWhen(devices, (state) => state.status === "ready");
-  await expect(invoke(INVOKE_CHANNELS.loadDeviceList)).resolves.toEqual({
-    outcome: "loading",
-  });
-  await loaded;
+  await deviceListWhen(devices, (state) => state.status === "ready");
   await expect(invoke(INVOKE_CHANNELS.getDeviceList)).resolves.toEqual({
     status: "ready",
     revision: expect.any(Number),

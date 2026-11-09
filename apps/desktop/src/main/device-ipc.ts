@@ -147,15 +147,18 @@ export interface DeviceIpc {
 
 /**
  * Registers the handlers of the device list channels and sends the device
- * list to the frames that subscribed (#95, D4 and D5b). The channels take
- * no argument. Every handler checks the sender and the arguments first
- * (`createInvokeHandler`) and answers with a value parsed by the contract
- * (`deviceListView`), so only device IDs, labels, platforms, times, and
- * fixed codes reach the renderer, never a user ID or a token.
+ * list to the frames that subscribed (#95, D4 and D5b). Every handler
+ * checks the sender and the arguments first (`createInvokeHandler`) and
+ * answers with a value parsed by the contract (`deviceListView`), so only
+ * device IDs, labels, platforms, times, and fixed codes reach the renderer,
+ * never a user ID or a token.
  *
- * `devices:load` asks the service to load the list; the service refuses it
- * within a few seconds of the last request. `devices:dismiss-new-devices`
- * ends the notices of new devices. A change of the service raises the
+ * `devices:load` takes no argument and asks the service to load the list;
+ * the service refuses it within a few seconds of the last request.
+ * `devices:dismiss-new-devices` takes the device IDs of the notices that the
+ * renderer showed, 1 to 10 lowercase UUIDv7s, and ends only those, so that
+ * a notice that arrived after the last published view stays (the Project
+ * Manager's decision of 2026-11-09). A change of the service raises the
  * view's revision at once and publishes the latest view after
  * `DEVICE_PUBLISH_INTERVAL_MS`, so at most one view goes out in each
  * interval and the last change of a burst is always sent. Call it before
@@ -230,8 +233,12 @@ export function registerDeviceIpc(
   );
   ipc.handle(
     INVOKE_CHANNELS.dismissNewDevices,
-    createInvokeHandler(INVOKE_CHANNELS.dismissNewDevices, appUrl, () =>
-      devices.dismissNewDevices(),
+    createInvokeHandler(
+      INVOKE_CHANNELS.dismissNewDevices,
+      appUrl,
+      // The contract checked each ID as a lowercase UUIDv7; the service
+      // ends only the notices that they name.
+      (_event, [deviceIds]) => devices.dismissNewDevices(deviceIds),
     ),
   );
   const remove = devices.onChange(changed);

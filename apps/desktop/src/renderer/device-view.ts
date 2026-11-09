@@ -52,7 +52,10 @@ export const DEVICE_LIST_MESSAGES = Object.freeze({
   thisDevice: "This device",
   newDevice: "New",
   neverConnected: "Never connected",
-  dismiss: "Dismiss",
+  /** The name of the region that holds the notices of new devices. */
+  newDevicesLabel: "New devices",
+  /** The button that ends the notices that are shown. */
+  dismiss: "Dismiss the notices",
 });
 
 /**
