@@ -967,7 +967,7 @@ test("the sentence of a confirmed leave stays through the switch that the leave 
   expect(unknown.last().message).toBeUndefined();
 });
 
-test("a confirmed leave whose answer arrives after the switch keeps its sentence, but not through the next switch", async () => {
+test("a confirmed leave whose answer arrives after the switch keeps its sentence, but not through the next switch, and lets the focus move", async () => {
   const { answer, resolve } = pending();
   const { actions, last } = controllerWith(
     answer,
@@ -977,13 +977,105 @@ test("a confirmed leave whose answer arrives after the switch keeps its sentence
   const done = actions.confirm();
   actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), NOW);
   resolve({ outcome: "ok" });
-  // The leave's control is gone with the old workspace: no focus moves.
-  await expect(done).resolves.toBe(false);
+  // The leave's control went with its workspace, so the focus may move to
+  // the title if it was left on that control or on the page.
+  await expect(done).resolves.toBe(true);
   expect(last().message).toBe("You left the workspace.");
   // The switch that the leave brought has happened: a later one, by the
   // person, ends the sentence.
   actions.listChanged(known({ workspaceId: WORKSPACE }), NOW);
   expect(last().message).toBeUndefined();
+});
+
+test("a confirmed leave whose answer arrives after a sign-out shows no sentence, also once the next session is signed in", async () => {
+  for (const after of [
+    [known({ status: "signed_out", workspaceId: null })],
+    [
+      known({ status: "signed_out", workspaceId: null }),
+      known({ status: "no_workspace", workspaceId: null }),
+    ],
+    [
+      known({ status: "signed_out", workspaceId: null }),
+      known({ workspaceId: OTHER_WORKSPACE }),
+    ],
+  ]) {
+    const { answer, resolve } = pending();
+    const { actions, last } = controllerWith(
+      answer,
+      known({ ownMemberId: MEMBER }),
+    );
+    await actions.start({ kind: "leave", ...IN_WORKSPACE });
+    const done = actions.confirm();
+    for (const view of after) {
+      actions.listChanged(view, NOW);
+    }
+    resolve({ outcome: "ok" });
+    await expect(done).resolves.toBe(true);
+    expect(last().message, String(after.length)).toBeUndefined();
+  }
+  // Without a sign-out, the leave's own switch to no workspace keeps it.
+  const { answer, resolve } = pending();
+  const { actions, last } = controllerWith(
+    answer,
+    known({ ownMemberId: MEMBER }),
+  );
+  await actions.start({ kind: "leave", ...IN_WORKSPACE });
+  const done = actions.confirm();
+  actions.listChanged(
+    known({ status: "no_workspace", workspaceId: null }),
+    NOW,
+  );
+  resolve({ outcome: "ok" });
+  await done;
+  expect(last().message).toBe("You left the workspace.");
+});
+
+test("an answer after a switch away and back to its workspace counts as after a switch", async () => {
+  const { answer, resolve } = pending();
+  const { actions, last } = controllerWith(answer);
+  actions.editDefineDraft("Grace");
+  const defined = actions.define(WORKSPACE);
+  actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), NOW);
+  actions.listChanged(known(), NOW);
+  actions.editDefineDraft("Edsger");
+  resolve({ outcome: "ok", memberId: UNCLAIMED });
+  await defined;
+  expect(last()).toMatchObject({ message: undefined, defineDraft: "Edsger" });
+
+  const promotion = pending();
+  const other = controllerWith(promotion.answer);
+  const promoted = other.actions.start({ kind: "promote", ...TARGET });
+  other.actions.listChanged(
+    known({ status: "signed_out", workspaceId: null }),
+    NOW,
+  );
+  other.actions.listChanged(known(), NOW);
+  promotion.resolve({ outcome: "ok" });
+  await expect(promoted).resolves.toBe(false);
+  expect(other.last().message).toBeUndefined();
+});
+
+test("editing a name ends the problem of the name as it was", async () => {
+  const { actions, last } = controllerWith(() =>
+    Promise.resolve({ outcome: "ok" }),
+  );
+  actions.editDefineDraft(" ");
+  await actions.define(WORKSPACE);
+  expect(last().defineProblem).toBe("Enter a name.");
+  actions.editDefineDraft("G");
+  expect(last()).toMatchObject({ defineDraft: "G", defineProblem: undefined });
+
+  await actions.start({
+    kind: "rename",
+    workspaceId: WORKSPACE,
+    memberId: UNCLAIMED,
+    name: "Margaret",
+  });
+  actions.editDialogDraft("");
+  await actions.confirm();
+  expect(last().dialog?.problem).toBe("Enter a name.");
+  actions.editDialogDraft("M");
+  expect(last().dialog).toMatchObject({ draft: "M", problem: undefined });
 });
 
 test("a sign-out always ends the question, the field, and the sentence, also after no workspace was selected", async () => {
@@ -1170,23 +1262,29 @@ test("the clock waits until the change, never less than nothing, and at most the
   expect(MAX_CLOCK_WAIT_MS).toBe(2_147_483_647);
 });
 
-test("the clock is read again when the window gets the focus or the visibility changes, and not after the watch ends", () => {
+test("the clock is read again when the window gets the focus or the document's visibility changes, each on its own target, and not after the watch ends", () => {
   const win = new EventTarget();
   const doc = new EventTarget();
-  let reads = 0;
+  const reads: string[] = [];
   const stop = watchClockReads(win, doc, () => {
-    reads += 1;
+    reads.push("read");
   });
-  win.dispatchEvent(new Event("focus"));
-  doc.dispatchEvent(new Event("visibilitychange"));
-  // Other events do not read it.
-  win.dispatchEvent(new Event("visibilitychange"));
-  doc.dispatchEvent(new Event("focus"));
-  expect(reads).toBe(2);
+  const fire = (target: EventTarget, type: string) => {
+    reads.length = 0;
+    target.dispatchEvent(new Event(type));
+    return reads.length;
+  };
+  expect(fire(win, "focus"), "window focus").toBe(1);
+  expect(fire(doc, "visibilitychange"), "document visibility").toBe(1);
+  // Each event reads it only on its own target.
+  expect(fire(win, "visibilitychange"), "window visibility").toBe(0);
+  expect(fire(doc, "focus"), "document focus").toBe(0);
   stop();
-  win.dispatchEvent(new Event("focus"));
-  doc.dispatchEvent(new Event("visibilitychange"));
-  expect(reads).toBe(2);
+  for (const target of [win, doc]) {
+    for (const type of ["focus", "visibilitychange"]) {
+      expect(fire(target, type), `${type} after the end`).toBe(0);
+    }
+  }
 });
 
 test("the people never change from an answer: the controller holds no people", async () => {

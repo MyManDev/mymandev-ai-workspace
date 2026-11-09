@@ -667,6 +667,9 @@ export const IDLE_PEOPLE_ACTIONS: PeopleActionsView = Object.freeze({
  * The actions after which the action's control leaves the page with the
  * next people, once the API confirmed them: the person, the role's button,
  * or the offer's line goes away. A rename and a definition keep theirs.
+ * Only a leave's control also goes with its workspace, so only a leave
+ * counts after a switch (`run`); an acceptance's line goes because the
+ * offer ends, and after a switch it is not this screen's any more.
  */
 const LEAVING_ACTIONS: ReadonlySet<PeopleActionKind> = new Set([
   "remove",
@@ -693,9 +696,9 @@ export interface PeopleActions {
   readonly confirm: () => Promise<boolean>;
   /** Closes the open question without the action. */
   readonly cancel: () => void;
-  /** Changes the name in the field of an open rename. */
+  /** Changes the name in the field of an open rename, and ends its problem. */
   readonly editDialogDraft: (text: string) => void;
-  /** Changes the name in the field of a definition. */
+  /** Changes the name in the field of a definition, and ends its problem. */
   readonly editDefineDraft: (text: string) => void;
   /**
    * Defines a person in `workspaceId` with the trimmed name of the field,
@@ -737,6 +740,17 @@ export function createPeopleActions(
   let latest: PeopleView | undefined;
   /** The selected workspace of the latest view; undefined before one. */
   let selected: string | null | undefined;
+  /**
+   * Grows with every switch of the selected workspace, a drop of it, and a
+   * sign-out, so that an answer counts for its workspace only when nothing
+   * of the kind happened while it was on its way, also a switch away and
+   * back.
+   */
+  let selection = 0;
+  /** Grows with every sign-out, so that nothing outlives the account's session. */
+  let session = 0;
+  /** Whether the latest view is `signed_out`, so that a session ends once. */
+  let signedOut = false;
   /** Whether the sentence of a confirmed leave stays through the next switch. */
   let keepThroughSwitch = false;
   const show = () =>
@@ -746,11 +760,17 @@ export function createPeopleActions(
 
   /**
    * Runs an action on `workspaceId` and says how it went, but only while
-   * that workspace is still the selected one: an answer that arrives after
-   * a switch or a sign-out shows no sentence, moves no focus, and leaves a
-   * name typed since then alone. A confirmed leave keeps its sentence, and
-   * it stays through the next switch only while the leave's workspace is
-   * still selected, because that switch is the one that the leave brings.
+   * that workspace has stayed selected since the action started: an answer
+   * that arrives after a switch, also one away and back, or after a
+   * sign-out, shows no sentence, moves no focus, and leaves a name typed
+   * since then alone.
+   *
+   * A confirmed leave is apart, because its membership event can switch
+   * the workspace before its answer arrives: it keeps its sentence while
+   * the same session is signed in, and it resolves to true, because its
+   * control goes with its workspace in any case. Its sentence stays through
+   * the next switch only while nothing switched yet, because that switch is
+   * the one that the leave brings.
    */
   async function run(
     kind: PeopleActionKind,
@@ -762,6 +782,8 @@ export function createPeopleActions(
     dialog = undefined;
     keepThroughSwitch = false;
     show();
+    const startSelection = selection;
+    const startSession = session;
     let ok = false;
     let sentence: string;
     try {
@@ -774,17 +796,20 @@ export function createPeopleActions(
     } catch {
       sentence = `${PEOPLE_ACTION_NOT_DONE_MESSAGES[kind]} ${PEOPLE_ACTION_NOT_SENT}`;
     }
-    const still = selected === workspaceId;
-    if (still || (ok && kind === "leave")) {
+    const still = selection === startSelection && selected === workspaceId;
+    const left =
+      // A sign-out starts a new session, so no sentence outlives it.
+      ok && kind === "leave" && session === startSession;
+    if (still || left) {
       message = sentence;
     }
     if (still && ok && kind === "define") {
       defineDraft = "";
     }
-    keepThroughSwitch = still && ok && kind === "leave";
+    keepThroughSwitch = still && left;
     running = false;
     show();
-    return still && ok && LEAVING_ACTIONS.has(kind);
+    return ok && (kind === "leave" || (still && LEAVING_ACTIONS.has(kind)));
   }
 
   function send(
@@ -857,12 +882,14 @@ export function createPeopleActions(
     },
     editDialogDraft: (text: string) => {
       if (dialog !== undefined) {
-        dialog = Object.freeze({ ...dialog, draft: text });
+        // The problem was about the name as it was.
+        dialog = Object.freeze({ ...dialog, draft: text, problem: undefined });
         show();
       }
     },
     editDefineDraft: (text: string) => {
       defineDraft = text;
+      defineProblem = undefined;
       show();
     },
     define: async (workspaceId: string) => {
@@ -893,6 +920,11 @@ export function createPeopleActions(
         const before = selected;
         if (state.status === "signed_out") {
           // A sign-out ends everything, also after no workspace was selected.
+          if (!signedOut) {
+            signedOut = true;
+            session += 1;
+            selection += 1;
+          }
           selected = null;
           changed ||=
             dialog !== undefined ||
@@ -905,8 +937,10 @@ export function createPeopleActions(
           defineDraft = "";
           defineProblem = undefined;
         } else {
+          signedOut = false;
           selected = state.workspaceId;
           if (before !== undefined && before !== selected) {
+            selection += 1;
             dialog = undefined;
             defineDraft = "";
             defineProblem = undefined;

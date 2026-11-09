@@ -304,9 +304,10 @@ export function PeopleActionDialogBox(props: PeopleActionDialogProps) {
  * while no question is open, empty and closed, so that closing it can
  * return the focus. The person's or the workspace's name is text with
  * `dir="auto"`, and it describes the dialog before the sentence, so that a
- * screen reader says whom the question is about; its element ID is fixed. "Cancel" comes first, so that a destructive action is not
- * the default focus. A rename's problem shows in an alert inside the
- * dialog, because the page behind it is inert.
+ * screen reader says whom the question is about; its element ID is fixed.
+ * "Cancel" comes first, so that a destructive action is not the default
+ * focus. A rename's problem shows in an alert inside the dialog, because
+ * the page behind it is inert.
  */
 export function PeopleActionDialogContent({
   dialog,
