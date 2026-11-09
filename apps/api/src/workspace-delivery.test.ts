@@ -10,13 +10,16 @@ import {
 import {
   type AgentId,
   type AgentRunStateChangedEvent,
+  APPROVER_EVENT_TYPES,
   type ChatMessageCreatedEvent,
   type ConnectionId,
   type CorrelationId,
   decodeServerMessage,
   type DeviceId,
   DefineMemberResponseSchema,
+  type EventAudience,
   type EventId,
+  type JoinRequestId,
   MAX_ANSWER_LIST_ITEMS,
   type MemberId,
   type MemberRole,
@@ -25,7 +28,9 @@ import {
   type RepositoryId,
   type RunId,
   type RunState,
+  type SERVER_EVENT_AUDIENCES,
   type ServerEvent,
+  type ServerEventType,
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
@@ -61,10 +66,13 @@ import {
   MAX_BUFFERED_BYTES,
   MAX_SUBSCRIBE_RECHECKS,
   MAX_SUBSCRIPTIONS_PER_CONNECTION,
+  type SubscriberEvent,
   sweepConnections,
   type VerifiedEvent,
 } from "./gateway.ts";
 import {
+  type ApproverEvent,
+  type ApproverEventHandler,
   deliverWorkspaceEvent,
   serverEventHeader,
   type WorkspaceEvent,
@@ -1296,6 +1304,54 @@ function registryLog(): FastifyBaseLogger {
   return log as unknown as FastifyBaseLogger;
 }
 
+test("sendToWorkspace and sendEvent send an event of APPROVER_EVENT_TYPES to no one, also past the type checker, and log the refusal", () => {
+  const refused: Array<readonly [unknown, unknown]> = [];
+  const log = {
+    ...(registryLog() as unknown as Record<string, unknown>),
+    error: (object: unknown, message: unknown) => {
+      refused.push([object, message]);
+    },
+  } as unknown as FastifyBaseLogger;
+  const registry = new ConnectionRegistry({ log });
+  const workspaceId = newId<WorkspaceId>();
+  const approver = fakeConnection(registry);
+  const sender = fakeConnection(registry);
+  registry.subscribe(approver.context, workspaceId, approver.memberId);
+  for (const type of APPROVER_EVENT_TYPES) {
+    // Only a cast gets such an event past `SubscriberEvent`.
+    const event = {
+      ...serverEventHeader(workspaceId, new Date()),
+      type,
+      payload: { joinRequestId: newId<JoinRequestId>() },
+    } as unknown as SubscriberEvent;
+    assert.equal(registry.sendToWorkspace(event, sender.context), 0, type);
+    assert.equal(registry.sendEvent(sender.context, event), false, type);
+    assert.equal(registry.sendEvent(approver.context, event), false, type);
+    assert.equal(registry.sendToPeople(event, [approver.memberId]), 1, type);
+  }
+  assert.deepEqual(
+    approver.sent.map((frame) => frame["type"]),
+    APPROVER_EVENT_TYPES,
+    "only sendToPeople reached the approver",
+  );
+  assert.deepEqual(sender.sent, []);
+  assert.deepEqual(
+    refused,
+    APPROVER_EVENT_TYPES.flatMap((eventType) =>
+      Array.from({ length: 3 }, () => [
+        { eventType, workspaceId },
+        "approver event refused",
+      ]),
+    ),
+  );
+
+  // An event for every member still goes.
+  const removed = removedEvent(workspaceId, newId<MemberId>());
+  assert.equal(registry.sendToWorkspace(removed, sender.context), 2);
+  assert.equal(registry.sendEvent(sender.context, removed), true);
+  assert.equal(refused.length, 3 * APPROVER_EVENT_TYPES.length);
+});
+
 test("the heartbeat terminates only a connection that missed a ping, and answered pongs keep the others", () => {
   const registry = new ConnectionRegistry();
   const workspaceId = newId<WorkspaceId>();
@@ -1330,6 +1386,50 @@ test(`workspace.subscribed lists the subscriber's own person first, so a list cu
   assert.ok(online !== null);
   assert.equal(online.length, MAX_ANSWER_LIST_ITEMS);
   assert.equal(online[0], last.memberId);
+});
+
+/** The server event types that `SERVER_EVENT_AUDIENCES` gives to `audience`. */
+type TypesFor<Audience extends EventAudience> = {
+  [
+    Type in ServerEventType
+  ]: (typeof SERVER_EVENT_AUDIENCES)[Type] extends Audience ? Type : never;
+}[ServerEventType];
+
+test("the type checker takes the audience of an event from SERVER_EVENT_AUDIENCES, never from its name", () => {
+  const typeOnly = (
+    registry: ConnectionRegistry,
+    context: AuthenticatedConnectionContext,
+    approverHandler: ApproverEventHandler,
+    forApprovers: Extract<ServerEvent, { type: TypesFor<"approvers"> }>,
+    forMembers: Extract<ServerEvent, { type: TypesFor<"members"> }>,
+    approverType: ApproverEvent["type"],
+    approversType: TypesFor<"approvers">,
+    toSubscribers: Extract<SubscriberEvent["type"], TypesFor<"approvers">>,
+    toMembers: Extract<WorkspaceEvent["type"], TypesFor<"approvers">>,
+    log: FastifyBaseLogger,
+  ) => {
+    // No event for the approvers is a SubscriberEvent or a WorkspaceEvent.
+    const noSubscriberEvent: never = toSubscribers;
+    const noWorkspaceEvent: never = toMembers;
+    // ApproverEvent holds exactly the events for the approvers.
+    const declared: TypesFor<"approvers"> = approverType;
+    const derived: ApproverEvent["type"] = approversType;
+    // @ts-expect-error -- sendToWorkspace sends to every subscriber
+    registry.sendToWorkspace(forApprovers);
+    // @ts-expect-error -- sendEvent ignores the person's role
+    registry.sendEvent(context, forApprovers);
+    // @ts-expect-error -- deliverWorkspaceEvent sends to every subscriber
+    deliverWorkspaceEvent(registry, forApprovers, log);
+    registry.sendToPeople(forApprovers, []);
+    void approverHandler(forApprovers, []);
+    // Every event for the members still fits the paths for every member.
+    registry.sendToWorkspace(forMembers);
+    registry.sendEvent(context, forMembers);
+    // @ts-expect-error -- a membership event is not an approver event
+    void approverHandler(forMembers, []);
+    return [noSubscriberEvent, noWorkspaceEvent, declared, derived];
+  };
+  assert.equal(typeof typeOnly, "function");
 });
 
 test("the type checker refuses a chat or run event where only membership events are meant", () => {

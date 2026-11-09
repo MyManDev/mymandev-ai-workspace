@@ -39,9 +39,9 @@ import {
   ConnectionRegistry,
 } from "../gateway.ts";
 import {
+  type ApproverEvent,
   type ApproverEventHandler,
   deliverWorkspaceEvent,
-  type JoinRequestEvent,
   type WorkspaceEvent,
   type WorkspaceEventHandler,
 } from "./events.ts";
@@ -119,7 +119,7 @@ type Account = Readonly<{
 }>;
 
 type Delivered = Readonly<{
-  event: JoinRequestEvent;
+  event: ApproverEvent;
   approvers: readonly MemberId[];
 }>;
 
@@ -1144,16 +1144,13 @@ test("the type checker refuses a join request event where an event for every mem
   const typeOnly = (
     handler: WorkspaceEventHandler,
     approverHandler: ApproverEventHandler,
-    created: Extract<
-      JoinRequestEvent,
-      { type: "workspace.join_request.created" }
-    >,
+    created: Extract<ApproverEvent, { type: "workspace.join_request.created" }>,
     resolved: Extract<
-      JoinRequestEvent,
+      ApproverEvent,
       { type: "workspace.join_request.resolved" }
     >,
     unblocked: Extract<
-      JoinRequestEvent,
+      ApproverEvent,
       { type: "workspace.join_request.unblocked" }
     >,
     removed: Extract<WorkspaceEvent, { type: "workspace.member.removed" }>,

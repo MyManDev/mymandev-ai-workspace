@@ -2,9 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { decodeClientEvent, decodeEvent } from "./decode.ts";
 import {
+  APPROVER_EVENT_TYPES,
+  type ApproverEventType,
   CLIENT_ONLY_EVENT_TYPES,
+  type EventAudience,
   EVENT_TYPES,
+  isApproverEventType,
+  SERVER_EVENT_AUDIENCES,
   SERVER_ONLY_EVENT_TYPES,
+  type ServerEventType,
 } from "./envelope.ts";
 import {
   CLIENT_FRAME_TYPES,
@@ -366,6 +372,102 @@ test("a frame type has two parts and an event type three, so they never overlap"
     );
   }
   assert.ok(Object.isFrozen(CLIENT_ONLY_EVENT_TYPES));
+});
+
+test("every event type that the server sends has one audience, and only APPROVER_EVENT_TYPES go to the approvers", () => {
+  const serverEventTypes = EVENT_TYPES.filter(
+    (type) => !(CLIENT_ONLY_EVENT_TYPES as readonly string[]).includes(type),
+  );
+  assert.deepEqual(
+    Object.keys(SERVER_EVENT_AUDIENCES).sort(),
+    [...serverEventTypes].sort(),
+  );
+  assert.deepEqual(
+    Object.entries(SERVER_EVENT_AUDIENCES)
+      .filter(([, audience]) => audience === "approvers")
+      .map(([type]) => type)
+      .sort(),
+    [...APPROVER_EVENT_TYPES].sort(),
+  );
+  assert.deepEqual([...new Set(Object.values(SERVER_EVENT_AUDIENCES))].sort(), [
+    "approvers",
+    "members",
+  ]);
+  // Only the server originates an event for the approvers.
+  for (const type of APPROVER_EVENT_TYPES) {
+    assert.ok(
+      (SERVER_ONLY_EVENT_TYPES as readonly string[]).includes(type),
+      type,
+    );
+  }
+  // Today exactly the join request events go to the approvers.
+  assert.deepEqual(
+    [...APPROVER_EVENT_TYPES].sort(),
+    EVENT_TYPES.filter((type) =>
+      type.startsWith("workspace.join_request."),
+    ).sort(),
+  );
+  assert.ok(Object.isFrozen(APPROVER_EVENT_TYPES));
+  assert.ok(Object.isFrozen(SERVER_EVENT_AUDIENCES));
+});
+
+test("isApproverEventType holds for APPROVER_EVENT_TYPES only, never for a type by its name alone", () => {
+  for (const type of APPROVER_EVENT_TYPES) {
+    assert.equal(isApproverEventType(type), true, type);
+  }
+  for (const type of EVENT_TYPES) {
+    assert.equal(
+      isApproverEventType(type),
+      (APPROVER_EVENT_TYPES as readonly string[]).includes(type),
+      type,
+    );
+  }
+  for (const type of [
+    "workspace.join_request.",
+    "workspace.join_request.expired",
+    "workspace.join_requests.created",
+    "Workspace.join_request.created",
+    "workspace.join_request.created ",
+    "",
+  ]) {
+    assert.equal(isApproverEventType(type), false, JSON.stringify(type));
+  }
+});
+
+test("an audience is declared for every server event type and agrees with APPROVER_EVENT_TYPES (checked by tsc)", () => {
+  const audiences: Readonly<Record<ServerEventType, EventAudience>> =
+    SERVER_EVENT_AUDIENCES;
+  const { "workspace.project.renamed": renamed, ...withoutOne } =
+    SERVER_EVENT_AUDIENCES;
+  // @ts-expect-error A server event type without an audience.
+  const incomplete: Readonly<Record<ServerEventType, EventAudience>> =
+    withoutOne;
+  // @ts-expect-error A device's event has no audience on the server.
+  const sent: unknown = SERVER_EVENT_AUDIENCES["chat.message.send"];
+  // @ts-expect-error A join request event goes to the approvers only.
+  const created: "members" =
+    SERVER_EVENT_AUDIENCES["workspace.join_request.created"];
+  // @ts-expect-error A chat message goes to every member.
+  const message: "approvers" = SERVER_EVENT_AUDIENCES["chat.message.created"];
+  const unblocked: ApproverEventType = "workspace.join_request.unblocked";
+  // @ts-expect-error A membership event is not an approver event.
+  const removed: ApproverEventType = "workspace.member.removed";
+  // @ts-expect-error Only an event that the server originates is one.
+  const run: ApproverEventType = "agent.run.state_changed";
+  assert.equal(audiences, SERVER_EVENT_AUDIENCES);
+  assert.equal(renamed, "members");
+  assert.equal(incomplete, withoutOne);
+  assert.equal(sent, undefined);
+  assert.deepEqual(
+    [created, message, unblocked, removed, run],
+    [
+      "approvers",
+      "members",
+      "workspace.join_request.unblocked",
+      "workspace.member.removed",
+      "agent.run.state_changed",
+    ],
+  );
 });
 
 test("a device's auth.response decodes without unknown fields and fits the size limit", () => {

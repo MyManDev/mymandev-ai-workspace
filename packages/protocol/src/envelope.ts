@@ -438,6 +438,69 @@ export const CLIENT_ONLY_EVENT_TYPES = Object.freeze([
 ] as const satisfies readonly EventType[]);
 export type ClientOnlyEventType = (typeof CLIENT_ONLY_EVENT_TYPES)[number];
 
+/** Event types that the server sends: every type but `CLIENT_ONLY_EVENT_TYPES`. */
+export type ServerEventType = Exclude<EventType, ClientOnlyEventType>;
+
+/**
+ * Event types that only the owner and admins of the workspace may receive
+ * (#232): the join request events (#210, #227). The server sends them only
+ * to the connections subscribed to the workspace as one of those people,
+ * never to every subscriber and never to a single connection because it
+ * sent an event. A type belongs here because of what its events carry,
+ * whatever its name.
+ */
+export const APPROVER_EVENT_TYPES = Object.freeze([
+  "workspace.join_request.created",
+  "workspace.join_request.resolved",
+  "workspace.join_request.unblocked",
+] as const satisfies readonly ServerOnlyEventType[]);
+export type ApproverEventType = (typeof APPROVER_EVENT_TYPES)[number];
+
+/**
+ * Who may receive an event that the server sends: `members`, every
+ * connection subscribed to the event's workspace, or `approvers`, only the
+ * connections subscribed to it as its owner or an admin.
+ */
+export type EventAudience = "members" | "approvers";
+
+/**
+ * The audience of every event type that the server sends (#232). The type
+ * checker refuses a new server event type until it has an entry here, and
+ * refuses `approvers` for a type that is not in `APPROVER_EVENT_TYPES` and
+ * `members` for one that is, so that the two declarations cannot drift.
+ */
+export const SERVER_EVENT_AUDIENCES = Object.freeze({
+  "agent.run.state_changed": "members",
+  "workspace.member.defined": "members",
+  "workspace.member.claimed": "members",
+  "workspace.member.renamed": "members",
+  "workspace.member.removed": "members",
+  "workspace.member.role_changed": "members",
+  "workspace.ownership.transferred": "members",
+  "workspace.project.created": "members",
+  "workspace.project.renamed": "members",
+  "workspace.join_request.created": "approvers",
+  "workspace.join_request.resolved": "approvers",
+  "workspace.join_request.unblocked": "approvers",
+  "chat.message.created": "members",
+} as const satisfies {
+  readonly [Type in ServerEventType]: Type extends ApproverEventType
+    ? "approvers"
+    : "members";
+});
+
+const approverEventTypes: ReadonlySet<string> = new Set(APPROVER_EVENT_TYPES);
+
+/**
+ * Whether an event type goes only to the owner and admins of the workspace
+ * (`APPROVER_EVENT_TYPES`). The server checks it before it sends an event to
+ * every subscriber or to one connection, also where the type checker
+ * already refuses one.
+ */
+export function isApproverEventType(type: string): type is ApproverEventType {
+  return approverEventTypes.has(type);
+}
+
 /** The event types of this protocol version, taken from `ProtocolEventSchema`. */
 export const EVENT_TYPES: readonly EventType[] = Object.freeze(
   ProtocolEventSchema.options.map((schema) => schema.shape.type.value),
