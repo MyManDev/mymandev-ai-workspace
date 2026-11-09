@@ -88,7 +88,7 @@ function escaped(text: string): string {
 }
 
 const TITLE =
-  '<section aria-labelledby="people-title"><h2 id="people-title">People</h2>';
+  '<section aria-labelledby="people-title"><h2 id="people-title" tabindex="-1">People</h2>';
 const ACTIONS_LATER = `<p class="placeholder-note">${PEOPLE_MESSAGES.actionsLater}</p></section>`;
 const HINT = `<p class="people-hint">${PEOPLE_MESSAGES.adminHint}</p>`;
 /** The selected workspace's name below the heading. */
@@ -287,10 +287,12 @@ test("the screen with a bridge waits for the first people, and without one says 
     getState: () => new Promise<PeopleView>(() => undefined),
     subscribeState: () => () => undefined,
   };
-  expect(renderToString(<PeopleScreen people={people} />)).toContain(
-    status("Checking the people."),
-  );
-  expect(renderToString(<PeopleScreen people={undefined} />)).toContain(
-    status("People are not available."),
-  );
+  expect(
+    renderToString(<PeopleScreen people={people} peopleActions={undefined} />),
+  ).toContain(status("Checking the people."));
+  expect(
+    renderToString(
+      <PeopleScreen people={undefined} peopleActions={undefined} />,
+    ),
+  ).toContain(status("People are not available."));
 });

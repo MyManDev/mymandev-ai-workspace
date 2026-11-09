@@ -61,7 +61,7 @@ export const PEOPLE_MESSAGES = Object.freeze({
     "Only you can manage this workspace. Consider making someone you trust an admin, so they can also invite people and answer join requests.",
   /** What the screen does not offer yet. */
   actionsLater:
-    "Inviting people, answering join requests, and changing people and roles will be added here.",
+    "Inviting people and answering join requests will be added here.",
 });
 
 /**

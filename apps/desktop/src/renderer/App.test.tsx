@@ -7,6 +7,7 @@ import type {
   ChatBridge,
   ConnectionBridge,
   DeviceListBridge,
+  PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
   RuntimeBridge,
@@ -140,7 +141,7 @@ const SCREEN_CASES: readonly ScreenCase[] = [
   },
   {
     view: { screen: "people" },
-    title: '<h2 id="people-title">People</h2>',
+    title: '<h2 id="people-title" tabindex="-1">People</h2>',
     placeholder: "People are not available.",
     current: ["People (page)", "Workspace B (true)"],
   },
@@ -356,11 +357,42 @@ test("with the bridge, the people screen waits for the first people", () => {
   const html = render({ people, initialView: { screen: "people" } });
 
   expect(html).toContain(
-    '<main class="shell-main"><section aria-labelledby="people-title"><h2 id="people-title">People</h2><p class="people-status" role="status">Checking the people.</p>',
+    '<main class="shell-main"><section aria-labelledby="people-title"><h2 id="people-title" tabindex="-1">People</h2><p class="people-status" role="status">Checking the people.</p>',
   );
   expect(html).not.toContain("People are not available.");
   // Only the people screen follows the people.
   expect(render({ people })).not.toContain("people-status");
+});
+
+test("the people screen gets the people actions: with them, it has the paragraph of their sentence and the dialog", () => {
+  const people: PeopleBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const call = () => Promise.reject(new Error("not called"));
+  const peopleActions: PeopleActionsBridge = {
+    define: call,
+    rename: call,
+    remove: call,
+    promote: call,
+    demote: call,
+    leave: call,
+    offerOwnership: call,
+    withdrawOwnershipOffer: call,
+    acceptOwnershipOffer: call,
+  };
+  const html = render({
+    people,
+    peopleActions,
+    initialView: { screen: "people" },
+  });
+  expect(html).toContain(
+    '<p class="people-status" id="people-action-message" role="status"></p>',
+  );
+  expect(html).toContain('<dialog class="people-dialog"></dialog>');
+  expect(render({ people, initialView: { screen: "people" } })).not.toContain(
+    "people-action-message",
+  );
 });
 
 test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {
