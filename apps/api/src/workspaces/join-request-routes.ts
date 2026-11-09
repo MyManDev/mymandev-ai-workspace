@@ -56,11 +56,12 @@ export type JoinRequestRouteOptions = Readonly<{
   /** Receives `workspace.member.claimed` after an approval committed. */
   onWorkspaceEvent: WorkspaceEventHandler;
   /**
-   * Receives the join request events (#210) for the workspace's owner and
-   * admins after the change committed: `workspace.join_request.created`
-   * after a new request, and `workspace.join_request.resolved` after a
+   * Receives the join request events (#210, #227) for the workspace's owner
+   * and admins after the change committed: `workspace.join_request.created`
+   * after a new request, `workspace.join_request.resolved` after a
    * withdrawal, an approval, a denial, a block, and each request that
-   * denying all denied.
+   * denying all denied, and `workspace.join_request.unblocked` after a
+   * lifted block.
    */
   onApproverEvent: ApproverEventHandler;
   /**
@@ -156,7 +157,7 @@ type JoinRequestChange<T> = Readonly<{
  * reads the owner and admins of `announceIn` last (`joinRequestApprovers`),
  * after every lock that the change took, so that a demotion or a removal
  * that committed while the change waited for a lock leaves the person out.
- * A refused decision or withdrawal throws inside `change`, so the
+ * A refused decision, unblock, or withdrawal throws inside `change`, so the
  * transaction rolls back and nothing is read or sent; a refused new request
  * writes nothing and returns `announceIn: null`, so nothing is read or sent
  * either, and its route throws after the commit. Every route that sends a
@@ -321,7 +322,7 @@ export function registerOwnJoinRequestRoutes(
  * in one transaction that checks the account and the device again
  * (`lockActor`), then locks the caller's own person, then the request, the
  * pending requests in the order of their IDs, or the workspace row; a
- * decision then reads the workspace's owner and admins
+ * decision or an unblock then reads the workspace's owner and admins
  * (`changeThenReadApprovers`). After the commit, an approval sends
  * `workspace.member.claimed` with the new person through
  * `onWorkspaceEvent`; every decision sends
@@ -329,7 +330,9 @@ export function registerOwnJoinRequestRoutes(
  * `onApproverEvent`, and `account.join_request_decided` to the requester's
  * open connections through `onAccountFrame`, in this order. A block is
  * `blocked` in the event and `denied` in the frame, and denying all sends
- * one event and one frame per denied request. Unblocking, pausing, and
+ * one event and one frame per denied request. A lifted block sends
+ * `workspace.join_request.unblocked` to the owner and admins through
+ * `onApproverEvent`, and nothing to the requester (#227). Pausing and
  * resuming send nothing.
  */
 export function registerJoinRequestRoutes(
@@ -507,19 +510,36 @@ export function registerJoinRequestRoutes(
       const { workspaceId, joinRequestId } =
         request.params as JoinRequestParams;
       const now = new Date(options.now());
-      await database.transaction(async (tx) => {
-        await lockActor(tx, auth, now.getTime());
-        const result = await unblockJoinRequest(tx, {
-          workspaceId,
-          joinRequestId,
-          userId: auth.userId,
-          deviceId: auth.deviceId,
-          now,
-        });
-        if (!result.unblocked) {
-          throw refused(result.refusal);
-        }
-      });
+      const { approvers } = await changeThenReadApprovers(
+        database,
+        request,
+        now,
+        async (tx) => {
+          const result = await unblockJoinRequest(tx, {
+            workspaceId,
+            joinRequestId,
+            userId: auth.userId,
+            deviceId: auth.deviceId,
+            now,
+          });
+          if (!result.unblocked) {
+            throw refused(result.refusal);
+          }
+          return { result: undefined, announceIn: workspaceId };
+        },
+      );
+      // Only the owner and admins learn of it: the requester still sees a
+      // denial, as before the block was lifted.
+      sendApproverEvent(
+        request,
+        options.onApproverEvent,
+        {
+          ...serverEventHeader(workspaceId, now),
+          type: "workspace.join_request.unblocked",
+          payload: { joinRequestId },
+        },
+        approvers,
+      );
       return reply.code(204).send();
     },
   );

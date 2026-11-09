@@ -13,8 +13,9 @@ import type { FastifyBaseLogger, FastifyRequest } from "fastify";
 import type { AccountFrame, ConnectionRegistry } from "../gateway.ts";
 
 /**
- * A join request event (#210): `workspace.join_request.created` and
- * `workspace.join_request.resolved`. Only the server originates it, with a
+ * A join request event (#210, #227): `workspace.join_request.created`,
+ * `workspace.join_request.resolved`, and
+ * `workspace.join_request.unblocked`. Only the server originates it, with a
  * `system` actor and `deviceId: null`, and it goes only to the connections
  * subscribed to the workspace as its owner or an admin, never to every
  * member, so it is not a `WorkspaceEvent`.
