@@ -180,6 +180,7 @@ test("the checks read every renderer source and no test", () => {
     "./main.tsx",
     "./Navigation.tsx",
     "./PeopleScreen.tsx",
+    "./people-view.ts",
     "./ProjectPanel.tsx",
     "./ProjectScreens.tsx",
     "./WorkspaceScreens.tsx",

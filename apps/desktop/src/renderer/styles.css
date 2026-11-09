@@ -785,6 +785,65 @@ code {
   list-style: none;
 }
 
+/* People */
+
+/* The live region of the people screen stays in place and takes no room while empty. */
+.people-status:empty {
+  margin: 0;
+}
+
+.people-status,
+.people-note {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.people-hint {
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+}
+
+.people-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Long names wrap instead of widening the screen. */
+.person {
+  padding-block: var(--space-2);
+  border-block-end: var(--border-width) solid var(--color-border);
+  overflow-wrap: anywhere;
+}
+
+.person-name {
+  margin: 0;
+  font-weight: var(--font-weight-strong);
+}
+
+.person-you,
+.person-meta {
+  color: var(--color-text-muted);
+}
+
+.person-meta {
+  margin: var(--space-1) 0 0;
+  font-size: var(--font-size-small);
+}
+
+/* A login is shown in a monospace font, so that a display name cannot pass for it. */
+.person-login {
+  color: var(--color-text);
+  font-family: var(--font-family-mono);
+}
+
+.people-heading {
+  margin-block: var(--space-4) var(--space-1);
+  font-size: var(--font-size-base);
+}
+
 /* Agents and runs */
 
 /* The live region of the agent panel stays in place and takes no room while empty. */

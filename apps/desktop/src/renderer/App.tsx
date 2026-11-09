@@ -12,6 +12,7 @@ import type {
   AgentBridge,
   ChatBridge,
   ConnectionBridge,
+  PeopleBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -83,6 +84,8 @@ export interface AppProps {
   readonly connection?: ConnectionBridge | undefined;
   /** The account's workspaces from the preload script; undefined outside Electron. */
   readonly workspaces?: WorkspaceBridge | undefined;
+  /** The selected workspace's people from the preload script; undefined outside Electron. */
+  readonly people?: PeopleBridge | undefined;
   /** The open project's agent activity from the preload script; undefined outside Electron. */
   readonly agents?: AgentBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
@@ -103,6 +106,7 @@ export function App({
   account,
   connection,
   workspaces,
+  people,
   agents,
   chat,
   initialWorkspaceState,
@@ -167,6 +171,7 @@ export function App({
         <ScreenContent
           view={state.view}
           electronVersion={electronVersion}
+          people={people}
           account={account}
           chat={chat}
           homeSignIn={homeSignIn(workspaceSidebar.view, accountView)}
@@ -191,6 +196,7 @@ export function App({
 function ScreenContent({
   view,
   electronVersion,
+  people,
   account,
   chat,
   homeSignIn,
@@ -199,6 +205,7 @@ function ScreenContent({
 }: {
   readonly view: ShellView;
   readonly electronVersion: string | undefined;
+  readonly people: PeopleBridge | undefined;
   readonly account: AccountBridge | undefined;
   readonly chat: ChatBridge | undefined;
   /** What the home screen says about the sign-in. */
@@ -218,7 +225,7 @@ function ScreenContent({
     case "account":
       return <AccountScreen account={account} />;
     case "people":
-      return <PeopleScreen />;
+      return <PeopleScreen people={people} />;
     case "join":
       return <JoinScreen />;
     case "about":
