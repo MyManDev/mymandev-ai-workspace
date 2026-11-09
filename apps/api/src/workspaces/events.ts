@@ -1,6 +1,7 @@
 import type { CancelledRun } from "@mymandev/database";
 import {
   type AgentRunStateChangedEvent,
+  type ApproverEventType,
   type EventId,
   type MemberId,
   newId,
@@ -13,17 +14,15 @@ import type { FastifyBaseLogger, FastifyRequest } from "fastify";
 import type { AccountFrame, ConnectionRegistry } from "../gateway.ts";
 
 /**
- * A join request event (#210, #227): `workspace.join_request.created`,
- * `workspace.join_request.resolved`, and
- * `workspace.join_request.unblocked`. Only the server originates it, with a
- * `system` actor and `deviceId: null`, and it goes only to the connections
- * subscribed to the workspace as its owner or an admin, never to every
- * member, so it is not a `WorkspaceEvent`.
+ * An event whose audience is the workspace's owner and admins, one of
+ * `APPROVER_EVENT_TYPES` (#232): today the join request events (#210,
+ * #227), `workspace.join_request.created`, `workspace.join_request.resolved`,
+ * and `workspace.join_request.unblocked`. Only the server originates it,
+ * with a `system` actor and `deviceId: null`, and it goes only to the
+ * connections subscribed to the workspace as its owner or an admin, never to
+ * every member, so it is not a `WorkspaceEvent`, whatever its name.
  */
-export type JoinRequestEvent = Extract<
-  ProtocolEvent,
-  { type: `workspace.join_request.${string}` }
->;
+export type ApproverEvent = Extract<ProtocolEvent, { type: ApproverEventType }>;
 
 /**
  * A membership event: a change of the people that every member of the
@@ -33,11 +32,12 @@ export type JoinRequestEvent = Extract<
  * events `workspace.project.created` and `workspace.project.renamed` (#155)
  * share the type and its delivery. Other events that only the server
  * originates, such as `chat.message.created`, are not membership events, and
- * neither are the join request events, which only the owner and admins get.
+ * neither are the events of `APPROVER_EVENT_TYPES` (`ApproverEvent`), which
+ * only the owner and admins get.
  */
 export type WorkspaceEvent = Exclude<
   Extract<ProtocolEvent, { type: `workspace.${string}` }>,
-  JoinRequestEvent
+  ApproverEvent
 >;
 
 /**
@@ -79,7 +79,7 @@ export function deliverWorkspaceEvent(
  * wait for it.
  */
 export type ApproverEventHandler = (
-  event: JoinRequestEvent,
+  event: ApproverEvent,
   approvers: readonly MemberId[],
 ) => void | Promise<void>;
 
@@ -92,7 +92,7 @@ export type ApproverEventHandler = (
  */
 export function deliverApproverEvent(
   connections: ConnectionRegistry,
-  event: JoinRequestEvent,
+  event: ApproverEvent,
   approvers: readonly MemberId[],
   log: FastifyBaseLogger,
 ): void {
@@ -172,7 +172,7 @@ function deepFreeze<T>(value: T): T {
  * A deeply frozen copy of an event, so that the event handler shares no
  * object with the HTTP answer and cannot change it.
  */
-export function frozenCopy<T extends WorkspaceEvent | JoinRequestEvent>(
+export function frozenCopy<T extends WorkspaceEvent | ApproverEvent>(
   event: T,
 ): T {
   return deepFreeze(structuredClone(event));
@@ -216,7 +216,7 @@ export function sendWorkspaceEvent(
 export function sendApproverEvent(
   request: FastifyRequest,
   handler: ApproverEventHandler,
-  event: JoinRequestEvent,
+  event: ApproverEvent,
   approvers: readonly MemberId[],
 ): void {
   const copy = frozenCopy(event);

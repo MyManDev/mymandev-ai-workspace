@@ -10,6 +10,7 @@ import {
   writeConnectionAudit,
 } from "@mymandev/database";
 import {
+  type ApproverEventType,
   type AuthChallengeFrame,
   type AuthenticatedClientFrame,
   type AuthOkFrame,
@@ -19,6 +20,7 @@ import {
   decodeClientMessage,
   type DeviceId,
   type EventId,
+  isApproverEventType,
   MAX_ANSWER_LIST_ITEMS,
   MAX_AUTH_FRAME_BYTES,
   type MemberId,
@@ -447,15 +449,13 @@ export type AccountFrame = Extract<ServerFrame, { type: `account.${string}` }>;
 
 /**
  * An event that the server sends to whoever is subscribed to its workspace,
- * or to one connection: every `ServerEvent` except the join request events,
- * which go only to the owner and admins through `sendToPeople` (#210). The
- * type checker refuses a join request event in `sendToWorkspace` and
- * `sendEvent`.
+ * or to one connection: every `ServerEvent` whose audience is `members`.
+ * The events of `APPROVER_EVENT_TYPES`, such as the join request events, go
+ * only to the owner and admins through `sendToPeople` (#210, #232), whatever
+ * their name. The type checker refuses one in `sendToWorkspace` and
+ * `sendEvent`, and both send nothing if one still reaches them.
  */
-export type SubscriberEvent = Exclude<
-  ServerEvent,
-  { type: `workspace.join_request.${string}` }
->;
+export type SubscriberEvent = Exclude<ServerEvent, { type: ApproverEventType }>;
 
 /**
  * A connection's subscription to a workspace (#110): the connection, the
@@ -498,7 +498,10 @@ export type MembershipCheck = {
 };
 
 export type ConnectionRegistryOptions = Readonly<{
-  /** Logs the connections that the registry closes on its own, for backpressure. */
+  /**
+   * Logs the connections that the registry closes on its own, for
+   * backpressure, and an event that it refuses to send to every member.
+   */
   log?: FastifyBaseLogger;
 }>;
 
@@ -993,6 +996,9 @@ export class ConnectionRegistry {
     event: SubscriberEvent,
     sender?: AuthenticatedConnectionContext,
   ): number {
+    if (this.#refusesAudience(event)) {
+      return 0;
+    }
     const text = JSON.stringify(event);
     const targets = new Set(this.#subscribersOf(event.workspaceId));
     if (sender !== undefined) {
@@ -1054,11 +1060,31 @@ export class ConnectionRegistry {
     context: AuthenticatedConnectionContext,
     event: SubscriberEvent,
   ): boolean {
+    if (this.#refusesAudience(event)) {
+      return false;
+    }
     const live = this.#liveWith(
       context.identity.deviceId,
       context.connectionId,
     );
     return live !== undefined && this.#send(live, JSON.stringify(event));
+  }
+
+  /**
+   * Whether an event that `sendToWorkspace` or `sendEvent` got goes only to
+   * the owner and admins (`isApproverEventType`, #232), which only a cast
+   * past `SubscriberEvent` allows. Such an event is sent to no one and
+   * logged at error level with its type and workspace ID only.
+   */
+  #refusesAudience(event: ServerEvent): boolean {
+    if (!isApproverEventType(event.type)) {
+      return false;
+    }
+    this.#log?.error(
+      { eventType: event.type, workspaceId: event.workspaceId },
+      "approver event refused",
+    );
+    return true;
   }
 
   /** The subscribed live connections of a workspace at this moment. */
