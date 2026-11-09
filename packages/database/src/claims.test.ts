@@ -621,6 +621,6 @@ test("a person claimed both by an invitation and through an approved join reques
     (error: unknown) =>
       error instanceof Error &&
       !(error instanceof DatabaseError) &&
-      /^Invariant broken/.test(error.message),
+      /^Invariant broken: a person is claimed by both/.test(error.message),
   );
 });
