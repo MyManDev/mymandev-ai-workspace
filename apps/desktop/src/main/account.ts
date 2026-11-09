@@ -7,9 +7,9 @@
 // protects, signs out, removes this device, forgets the account for "This
 // is not me" (#149), and, for the device list of #95, revokes another
 // device of the account and lifts the registration lock. It also lends the
-// device session to the
-// connection client of #26 in the main process: the signature of the
-// WebSocket challenge and the close reasons that refuse the device. And it
+// device session to the connection client of #26 in the main process: the
+// signature of the WebSocket challenge and the close reasons that refuse
+// the device. And it
 // sends the reads of workspace, chat, and agent data of #27 and #28, of
 // invitations and join requests of #95 (`api-reads.ts`), and of the account's
 // devices for the device list service (`devices/service.ts`, #95), and the
@@ -339,9 +339,9 @@ export interface AccountService {
    * "This is not me", a device removal, or an unlock runs, it answers
    * `unavailable` (also while a revocation of another device or a lift of
    * the registration lock holds the lock), and the caller tries again
-   * later. It waits for the
-   * startup refresh and a background refresh to end, like an action, but
-   * actions do not wait for a read on its way. Its answer is dropped as
+   * later. It waits for the startup refresh and a background refresh to
+   * end, like an action, but actions do not wait for a read on its way.
+   * Its answer is dropped as
    * `not_signed_in` when no device is signed in any more, and as
    * `unavailable` when another device is. Data is also dropped as
    * `unavailable` when such an action began while it was on its way, also

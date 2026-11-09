@@ -167,14 +167,13 @@ export interface DeviceIpc {
  * a notice that arrived after the last published view stays (the Project
  * Manager's decision of 2026-11-09). `devices:revoke` takes one device ID,
  * a lowercase UUIDv7, and the reason `removed` or `lost`, and
- * `devices:lift-lock` takes nothing; the service accepts only
- * an active device of its list and a lock in force, the account service
- * asks the person in a native dialog, and the result is a fixed code. A
- * change of the service raises the
- * view's revision at once and publishes the latest view after
- * `DEVICE_PUBLISH_INTERVAL_MS`, so at most one view goes out in each
- * interval and the last change of a burst is always sent. Call it before
- * the first window loads.
+ * `devices:lift-lock` takes nothing; the service accepts only an active
+ * device of its list and a lock in force, the account service asks the
+ * person in a native dialog, and the result is a fixed code. A change of
+ * the service raises the view's revision at once and publishes the latest
+ * view after `DEVICE_PUBLISH_INTERVAL_MS`, so at most one view goes out in
+ * each interval and the last change of a burst is always sent. Call it
+ * before the first window loads.
  */
 export function registerDeviceIpc(
   ipc: IpcRegistry,
