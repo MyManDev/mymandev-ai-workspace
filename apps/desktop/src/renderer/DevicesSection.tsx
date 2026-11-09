@@ -47,8 +47,14 @@ export function DevicesSection({
       onDismissNewDevices={
         devices === undefined ? undefined : onDismissNewDevices
       }
+      onFocusTitle={focusTitle}
     />
   );
+}
+
+/** Moves the focus to the section's title, which takes it without a tab stop. */
+function focusTitle(): void {
+  document.getElementById(DEVICES_TITLE_ID)?.focus();
 }
 
 export interface DevicesSectionContentProps {
@@ -69,39 +75,54 @@ export interface DevicesSectionContentProps {
    */
   readonly onDismissNewDevices?:
     ((deviceIds: readonly string[]) => void) | undefined;
+  /**
+   * Moves the focus to the section's title. "Dismiss the notices" calls it,
+   * because the button goes away with the notices and the focus would drop
+   * to the page.
+   */
+  readonly onFocusTitle?: (() => void) | undefined;
 }
 
 /**
  * The section for a view, without state. The status paragraph is always
  * rendered, empty when there is nothing to say, so that a screen reader
  * announces a new text. The notices of new devices sit in one polite log
- * region (`role="log"`), which is always rendered too: a screen reader
- * announces a notice that is added while the section is shown, and does not
- * read the notices that were there when it opened. Labels are text that
- * people entered, so each one is rendered as text and takes its direction
- * from its own content (`dir="auto"`). The marks of this device and of a
- * new device are text.
+ * region (`role="log"`). The region is rendered only once the section has
+ * the first state of the main process, so it enters the page together with
+ * the notices that the state holds then: a live region announces changes
+ * to its content after it is in the page, not the content that it enters
+ * with, so those notices are not read out when the screen opens, and a
+ * notice that a later state adds is. Labels are text that people entered,
+ * so each one is rendered as text and takes its direction from its own
+ * content (`dir="auto"`). The marks of this device and of a new device are
+ * text. The title takes the focus without a tab stop (`tabIndex={-1}`).
  */
 export function DevicesSectionContent({
   view,
   now,
   timeFormat,
   onDismissNewDevices,
+  onFocusTitle,
 }: DevicesSectionContentProps) {
   const model = describeDeviceList(view, now);
   const format = timeFormat ?? deviceTimeFormat();
   const { lists } = model;
   return (
     <section className="account-panel" aria-labelledby={DEVICES_TITLE_ID}>
-      <h3 id={DEVICES_TITLE_ID}>Devices</h3>
+      <h3 id={DEVICES_TITLE_ID} tabIndex={-1}>
+        Devices
+      </h3>
       <p className="account-message" role="status">
         {model.status}
       </p>
-      <NewDeviceNotices
-        notices={model.newDevices}
-        format={format}
-        onDismiss={onDismissNewDevices}
-      />
+      {view.kind === "known" ? (
+        <NewDeviceNotices
+          notices={model.newDevices}
+          format={format}
+          onDismiss={onDismissNewDevices}
+          onFocusTitle={onFocusTitle}
+        />
+      ) : null}
       {model.lockedUntil === null ? null : (
         <p className="account-warning">
           {"New devices cannot be registered on this account until "}
@@ -142,13 +163,16 @@ function NewDeviceNotices({
   notices,
   format,
   onDismiss,
+  onFocusTitle,
 }: {
   readonly notices: readonly NewDeviceRow[];
   readonly format: Intl.DateTimeFormat;
   readonly onDismiss: ((deviceIds: readonly string[]) => void) | undefined;
+  readonly onFocusTitle: (() => void) | undefined;
 }) {
   // The button stays outside the log, so that it is not announced as a new
-  // entry. It ends the notices that are shown, by their device IDs.
+  // entry. It ends the notices that are shown, by their device IDs, and
+  // moves the focus to the section's title, because it goes away with them.
   return (
     <>
       <div
@@ -170,7 +194,10 @@ function NewDeviceNotices({
           <button
             type="button"
             className="panel-action"
-            onClick={() => onDismiss(notices.map((notice) => notice.id))}
+            onClick={() => {
+              onDismiss(notices.map((notice) => notice.id));
+              onFocusTitle?.();
+            }}
           >
             {DEVICE_LIST_MESSAGES.dismiss}
           </button>

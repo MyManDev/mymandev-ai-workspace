@@ -636,6 +636,43 @@ test("after rate_limited, no trigger loads before the server's wait has ended; a
   expect(h.sent).toBe(6);
 });
 
+test("a rate_limited answer of a load that a trigger overtook still makes the next load wait, unless it belongs to an earlier device", async () => {
+  const h = new Harness();
+  await h.loaded();
+  h.deviceAction();
+  expect(h.sent).toBe(2);
+  // A trigger overtakes the load on its way.
+  h.receive(revoked(OTHER_DEVICE_ID));
+  await h.answer(failure("rate_limited"));
+  // The answer is dropped, but the newer load waits for the server.
+  expect(h.sent).toBe(2);
+  expect(h.service.state().status).toBe("ready");
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([
+    RATE_LIMITED_RETRY_MS,
+  ]);
+  h.deviceAction();
+  expect(h.sent).toBe(2);
+  h.clock += RATE_LIMITED_RETRY_MS;
+  h.fire();
+  expect(h.sent).toBe(3);
+  await h.answer(ok(OWN_LIST));
+
+  // The answer of a load for an earlier device records no wait, also when
+  // it arrives after the new device's list loaded.
+  h.deviceAction();
+  expect(h.sent).toBe(4);
+  h.setAccount(SIGNED_OUT);
+  h.setAccount(accountStatus());
+  expect(h.sent).toBe(5);
+  const earlier = h.reads.shift();
+  await h.answer(ok(OWN_LIST));
+  earlier?.(failure("rate_limited"));
+  await settle();
+  h.deviceAction();
+  expect(h.sent).toBe(6);
+  expect(h.openTimers()).toEqual([]);
+});
+
 test("a request of the Account screen while no device is signed in counts: the list loads once a device is, and no cooldown starts", async () => {
   for (const status of [
     SIGNED_OUT,

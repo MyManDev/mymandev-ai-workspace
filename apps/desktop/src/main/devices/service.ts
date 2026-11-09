@@ -20,8 +20,10 @@
 //   one is on its way drops that answer and loads again, so only an answer
 //   that was asked for after the last trigger applies. A failed load is
 //   retried with the workspace service's backoff while connected; offline,
-//   the next `connected` loads. After `rate_limited`, nothing loads until
-//   its wait has ended: a trigger meanwhile loads at the end of the wait.
+//   the next `connected` loads. After `rate_limited`, also in the answer of
+//   a load that a later trigger overtook, nothing loads until its wait has
+//   ended: a trigger meanwhile loads at the end of the wait. An answer for
+//   an earlier account or device records no wait.
 // - A notice of a new device stays until the person dismisses it, the
 //   device is revoked (its `account.device_revoked`, or a list that shows it
 //   revoked), or the list is dropped (the Project Manager's decision of
@@ -407,8 +409,14 @@ export function createDeviceListService(
     inFlight = false;
     if (again) {
       // A trigger came after this load was sent: only a newer answer counts.
-      // A sign-in that began meanwhile makes it wait.
+      // A sign-in that began meanwhile makes it wait. The server's wait
+      // after `rate_limited` still holds for this account and device, so
+      // the newer load goes at its end.
       again = false;
+      if (!result.ok && result.reason === "rate_limited") {
+        rateLimitedUntil =
+          now() + workspaceRetryDelayMs(attempt, "rate_limited");
+      }
       reload();
       return;
     }

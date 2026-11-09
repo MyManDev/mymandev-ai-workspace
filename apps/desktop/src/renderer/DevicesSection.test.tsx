@@ -106,10 +106,9 @@ function elementsOf(node: ReactNode): ReactElement<HostProps>[] {
 test("each state of the section has its fixed text in one status paragraph", () => {
   const status = (text: string) =>
     `<p class="account-message" role="status">${text}</p>`;
-  // The log region of the notices is always there, also empty, so that a
-  // screen reader announces the first notice that is added.
+  // Without a state of the main process there is no log region of notices.
   expect(render({ view: { kind: "unavailable" } })).toBe(
-    `<section class="account-panel" aria-labelledby="devices-title"><h3 id="devices-title">Devices</h3>${status(DEVICE_LIST_MESSAGES.unavailable)}<div class="device-notices" role="log" aria-label="New devices"></div></section>`,
+    `<section class="account-panel" aria-labelledby="devices-title"><h3 id="devices-title" tabindex="-1">Devices</h3>${status(DEVICE_LIST_MESSAGES.unavailable)}</section>`,
   );
   for (const [view, text] of [
     [{ kind: "pending" }, DEVICE_LIST_MESSAGES.pending],
@@ -133,6 +132,39 @@ test("each state of the section has its fixed text in one status paragraph", () 
     loading: "Loading the devices.",
     empty: "No devices are listed.",
   });
+});
+
+test("the log region of the notices enters the page with the first state, together with the notices that it holds, and stays for every later state", () => {
+  const region =
+    '<div class="device-notices" role="log" aria-label="New devices">';
+  // Before the first state, and without the bridge, there is no region, so
+  // the notices of the first state are not added to a region in the page.
+  for (const view of [{ kind: "pending" }, { kind: "unavailable" }] as const) {
+    expect(render({ view }), view.kind).not.toContain('role="log"');
+  }
+  // With the first state, the region holds its notices at once.
+  const notice = {
+    id: NEW_LAPTOP.id,
+    label: "Work laptop",
+    platform: "windows" as const,
+    createdAt: NEW_LAPTOP.createdAt,
+  };
+  const first = render({ view: known({ newDevices: [notice] }) });
+  expect(first).toContain(
+    `${region}<p class="account-warning">A new device was registered on this account: <span dir="auto">Work laptop</span>`,
+  );
+  // Every state has the region, also empty, so that a notice that a later
+  // state adds is announced.
+  for (const state of [
+    { status: "signed_out", devices: [] },
+    { status: "loading", devices: [] },
+    { status: "unavailable", problem: "failed" },
+    {},
+  ] as Partial<DeviceListView>[]) {
+    expect(render({ view: known(state) }), JSON.stringify(state)).toContain(
+      `${region}</div>`,
+    );
+  }
 });
 
 test("an unavailable list shows its problem with what was loaded before", () => {
@@ -252,21 +284,30 @@ test("the notices of new devices name each label as text and its platform in one
   expect(html).not.toContain('role="alert"');
   expect(html.match(/role="log"/g)).toHaveLength(1);
 
-  const dismissed: (readonly string[])[] = [];
+  const calls: string[] = [];
   const buttons = elementsOf(
     DevicesSectionContent(
       props({
         view,
         onDismissNewDevices: (deviceIds) => {
-          dismissed.push(deviceIds);
+          calls.push(`dismiss ${deviceIds.join(" ")}`);
+        },
+        onFocusTitle: () => {
+          calls.push("focus the title");
         },
       }),
     ),
   ).filter((element) => element.type === "button");
   expect(buttons).toHaveLength(1);
   buttons[0]?.props.onClick?.();
-  // The IDs of the notices that the section shows, and no other.
-  expect(dismissed).toEqual([[NEW_LAPTOP.id, second.id]]);
+  // The IDs of the notices that the section shows, and no other; then the
+  // focus moves to the title, because the button goes away with them.
+  expect(calls).toEqual([
+    `dismiss ${NEW_LAPTOP.id} ${second.id}`,
+    "focus the title",
+  ]);
+  // The title takes the focus without a tab stop.
+  expect(html).toContain('<h3 id="devices-title" tabindex="-1">Devices</h3>');
 
   // Without the bridge, no button; without a notice, an empty region and no
   // button.
