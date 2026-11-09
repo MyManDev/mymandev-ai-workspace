@@ -7,6 +7,7 @@ import {
   type ClaimVia,
   type DeviceId,
   type InvitationId,
+  type JoinRequestId,
   type MemberId,
   newId,
   newUuidV7,
@@ -17,6 +18,7 @@ import {
 import { eq } from "drizzle-orm";
 import { listClaims } from "./claims.ts";
 import type { Database } from "./db.ts";
+import { DatabaseError } from "./errors.ts";
 import {
   acceptInvitation,
   createInvitation,
@@ -34,6 +36,7 @@ import {
   userIdentities,
   users,
   workspaceInvitations,
+  workspaceJoinRequests,
   workspaceMembers,
 } from "./schema/index.ts";
 import { createTestDatabase } from "./testing.ts";
@@ -577,5 +580,47 @@ test("the list holds the RECENT_CLAIMS most recent claims, whatever their age, t
   assert.equal(
     claims.some((item) => item.memberId === people[0]?.id),
     false,
+  );
+});
+
+test("a person claimed both by an invitation and through an approved join request breaks the invariant, and the list throws", async () => {
+  const [owner, ada] = await accounts(2);
+  assert.ok(owner && ada);
+  const { workspaceId } = await workspaceOf(owner);
+  const adaPerson = await claimedByInvitation(
+    owner,
+    workspaceId,
+    ada,
+    at(HOUR_MS),
+  );
+  assert.deepEqual(await claimsOf(workspaceId, owner), [
+    claim(workspaceId, adaPerson, ada, "invitation", at(HOUR_MS)),
+  ]);
+
+  // An approved join request for the same person, written directly, because
+  // no function writes one: an approved request creates a new person, and an
+  // invitation is only for an unclaimed one.
+  await database()
+    .insert(workspaceJoinRequests)
+    .values({
+      id: newId<JoinRequestId>(),
+      workspaceId,
+      requesterUserId: ada.userId,
+      requesterDeviceId: ada.deviceId,
+      requestedDisplayName: "Ada",
+      createdAt: NOW,
+      expiresAt: at(7 * DAY_MS),
+      decision: "approved",
+      decidedAt: at(HOUR_MS),
+      decidedByUserId: owner.userId,
+      memberId: adaPerson,
+    });
+
+  await assert.rejects(
+    list(workspaceId, owner),
+    (error: unknown) =>
+      error instanceof Error &&
+      !(error instanceof DatabaseError) &&
+      /^Invariant broken/.test(error.message),
   );
 });

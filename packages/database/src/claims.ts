@@ -50,10 +50,10 @@ export type ListClaimsResult =
  * it was last verified (`user_identities.last_sign_in_at`), and the creation
  * date of the GitHub account, or null after the account's data was erased,
  * and how the person was claimed: `invitation` or `join_request`. A person is
- * claimed by exactly one of the two, because an approved join request creates
+ * claimed by at most one of the two, because an approved join request creates
  * a new, claimed person, and an invitation is only for an unclaimed one; a
- * row with both or neither makes the whole list throw ("Invariant broken:
- * ...").
+ * listed person claimed both ways makes the whole list throw ("Invariant
+ * broken: ..."). People claimed neither way are no claims and are not listed.
  *
  * The role check and the list are read in one read-only `REPEATABLE READ`
  * transaction, from one snapshot, so that a demotion or a removal that
@@ -145,9 +145,10 @@ export async function listClaims(
         // `withDatabaseErrors`, so that the message reaches the log.
         throw new Error("Invariant broken: a claim has no claim time");
       }
-      if (row.byInvitation === row.byJoinRequest) {
+      if (row.byInvitation && row.byJoinRequest) {
+        // The query reads only people claimed at least one way.
         throw new Error(
-          "Invariant broken: a person is claimed by exactly one of an invitation and a join request",
+          "Invariant broken: a person is claimed by both an invitation and a join request",
         );
       }
       const via: ClaimVia = row.byInvitation ? "invitation" : "join_request";
