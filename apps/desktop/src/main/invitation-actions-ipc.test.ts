@@ -9,6 +9,7 @@ import {
   PreviewInvitationResponseSchema,
   type WorkspaceId,
 } from "@mymandev/protocol";
+import { inspect } from "node:util";
 import { afterEach, expect, test, vi } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import {
@@ -255,7 +256,8 @@ function register(
   appUrl: string = DEV_URL,
 ) {
   const handlers = new Map<string, IpcInvokeListener>();
-  const errors: string[] = [];
+  // Every argument of every report, so that an error passed on shows.
+  const errors: unknown[][] = [];
   registerInvitationActionsIpc(
     { handle: (channel, listener) => handlers.set(channel, listener) },
     appUrl,
@@ -263,7 +265,7 @@ function register(
       account: account.account,
       workspaces: workspaces.workspaces,
       invitations: invitations.invitations,
-      onError: (message) => errors.push(message),
+      onError: (...args: unknown[]) => errors.push(args),
     },
   );
   const call = (channel: string, ...args: unknown[]) => {
@@ -809,55 +811,78 @@ test("a confirmed revocation answers ok, a preview what the code claims, and an 
   expect(JSON.stringify([preview, accept])).not.toContain(PASTED);
 });
 
-test("an uncertain answer, also one that throws, is unknown and is never sent again; only a thrown answer is reported, with a fixed message", async () => {
-  const reports: Readonly<Record<string, string>> = {
-    createInvitation: "An invitation could not be created.",
-    revokeInvitation: "An invitation could not be revoked.",
-    previewInvitation: "An invitation could not be previewed.",
-    acceptInvitation: "An invitation could not be accepted.",
-  };
-  for (const entry of CASES) {
-    const thrown = [reports[entry.name]];
-    for (const [answer, reported] of [
-      [() => failed("unknown"), []],
-      // An error that holds the code is never reported as it is.
-      [() => Promise.reject(new Error(`${PASTED} ${CODE}`)), thrown],
-      [
-        () => {
-          throw new Error(`${PASTED} ${CODE}`);
-        },
-        thrown,
-      ],
-    ] as const) {
-      const account = fakeAccount(answer);
-      const { call, errors } = register(account);
-      await expect(call(entry.channel, ...entry.args)).resolves.toEqual({
-        outcome: "unknown",
-      });
-      // Nothing is sent again, not even later.
-      await new Promise((resolve) => setImmediate(resolve));
-      expect(account.sent, entry.name).toHaveLength(1);
-      expect(errors, entry.name).toEqual(reported);
-    }
-  }
-});
+/** A day in milliseconds: longer than any wait of a write. */
+const DAY_MS = 24 * 60 * 60 * 1_000;
 
-test("the budget's too_soon and the API's rate_limited pass through with their wait, without a second write", async () => {
-  for (const reason of ["too_soon", "rate_limited"] as const) {
-    const account = fakeAccount(() => ({
-      ok: false,
-      reason,
-      retryAfterMs: 42_000,
-    }));
-    const { call } = register(account);
+test("no answer is ever sent again on its own: after unknown, an answer that throws, too_soon, rate_limited, and unavailable, every timer runs and a day passes with one write per call", async () => {
+  vi.useFakeTimers();
+  try {
+    const reports: Readonly<Record<string, string>> = {
+      createInvitation: "An invitation could not be created.",
+      revokeInvitation: "An invitation could not be revoked.",
+      previewInvitation: "An invitation could not be previewed.",
+      acceptInvitation: "An invitation could not be accepted.",
+    };
+    // An error that holds both codes, also in its cause.
+    const holding = () =>
+      new Error(`${PASTED} ${CODE}`, { cause: { body: { code: PASTED } } });
+    const answers = [
+      ["unknown", () => failed("unknown"), { outcome: "unknown" }, false],
+      [
+        "rejects",
+        () => Promise.reject(holding()),
+        { outcome: "unknown" },
+        true,
+      ],
+      [
+        "throws",
+        () => {
+          throw holding();
+        },
+        { outcome: "unknown" },
+        true,
+      ],
+      [
+        "too_soon",
+        () => failed("too_soon"),
+        { outcome: "refused", reason: "too_soon", retryAfterMs: 1_500 },
+        false,
+      ],
+      [
+        "rate_limited",
+        () => failed("rate_limited"),
+        { outcome: "refused", reason: "rate_limited", retryAfterMs: 1_500 },
+        false,
+      ],
+      [
+        "unavailable",
+        () => failed("unavailable"),
+        { outcome: "refused", reason: "unavailable", retryAfterMs: null },
+        false,
+      ],
+    ] as const;
     for (const entry of CASES) {
-      await expect(call(entry.channel, ...entry.args)).resolves.toEqual({
-        outcome: "refused",
-        reason,
-        retryAfterMs: 42_000,
-      });
+      for (const [label, answer, expected, thrownReport] of answers) {
+        const account = fakeAccount(answer);
+        const { call, errors } = register(account);
+        await expect(call(entry.channel, ...entry.args)).resolves.toEqual(
+          expected,
+        );
+        // Nothing is sent again, not even after every timer and a day.
+        await vi.runAllTimersAsync();
+        await vi.advanceTimersByTimeAsync(DAY_MS);
+        await vi.runAllTimersAsync();
+        expect(account.called(), `${entry.name} ${label}`).toBe(1);
+        expect(account.sent, `${entry.name} ${label}`).toHaveLength(1);
+        // Only an answer that throws is reported: its fixed message alone,
+        // never the error.
+        expect(errors, `${entry.name} ${label}`).toEqual(
+          thrownReport ? [[reports[entry.name]]] : [],
+        );
+      }
     }
-    expect(account.sent).toHaveLength(CASES.length);
+  } finally {
+    vi.useRealTimers();
   }
 });
 
@@ -981,16 +1006,33 @@ async function settle(): Promise<void> {
   }
 }
 
-test("an invitation code appears in exactly one create answer, and never in a published state, a log line, a reported error, or a refusal", async () => {
-  // Every log of the main process, also the ones that a library writes.
+test("an invitation code appears in exactly one create answer, and never in a published state, a log line, the output, a reported error, or a refusal, with the reports of production", async () => {
+  // Every argument of every console call and every write to the output,
+  // also the ones that a library makes.
   const logged: unknown[][] = [];
-  for (const method of ["log", "info", "warn", "error", "debug"] as const) {
+  for (const method of [
+    "log",
+    "info",
+    "warn",
+    "error",
+    "debug",
+    "trace",
+    "dir",
+    "table",
+  ] as const) {
     vi.spyOn(console, method).mockImplementation((...args: unknown[]) => {
       logged.push(args);
     });
   }
-  const logs: string[] = [];
-  const log = (message: string) => logs.push(message);
+  const written: unknown[][] = [];
+  for (const stream of [process.stdout, process.stderr]) {
+    vi.spyOn(stream, "write").mockImplementation((...args: unknown[]) => {
+      written.push(args);
+      return true;
+    });
+  }
+  // The services log as in `index.ts`.
+  const log = (message: string) => console.info(message);
 
   // The real workspace and invitation services over a fake account, whose
   // invitations read never holds a code, and a fake connection.
@@ -1096,28 +1138,38 @@ test("an invitation code appears in exactly one create answer, and never in a pu
     handle: (channel: string, listener: IpcInvokeListener) =>
       handlers.set(channel, listener),
   };
+  // An error that holds both codes, in its message and its cause.
+  const holding = () =>
+    new Error(`${PASTED} ${CODE}`, {
+      cause: { body: { code: PASTED }, answer: { code: CODE } },
+    });
   const published: unknown[] = [];
+  let sends = 0;
   const subscriber: StatusReceiver = {
     mainFrame: frame(DEV_URL),
     isDestroyed: () => false,
     send: (channel, ...args) => {
+      sends += 1;
+      // The first publish fails with such an error.
+      if (sends === 1) {
+        throw holding();
+      }
       published.push([channel, ...args]);
     },
     once: () => undefined,
   };
-  const errors: unknown[] = [];
+  // Both IPC modules report as in production: no `onError` is given.
   const invitationIpc = registerInvitationIpc(ipc, DEV_URL, {
     invitations,
     workspaces,
     scheduleTimer: schedule,
     now: () => Date.parse(AT),
-    onError: (message, error) => errors.push(message, error),
   });
   const writes: (WorkspaceActionName | "throws")[] = [];
   const account = fakeAccount((name) => {
     const next = writes.shift() ?? name;
     if (next === "throws") {
-      return Promise.reject(new Error(`${PASTED} ${CODE}`));
+      return Promise.reject(holding());
     }
     return confirmed(next);
   });
@@ -1125,7 +1177,6 @@ test("an invitation code appears in exactly one create answer, and never in a pu
     account: account.account,
     workspaces,
     invitations,
-    onError: (message) => errors.push(message),
   });
   const call = (channel: string, ...args: unknown[]) =>
     handlers.get(channel)?.(
@@ -1138,7 +1189,7 @@ test("an invitation code appears in exactly one create answer, and never in a pu
     try {
       answers.push(await call(channel, ...args));
     } catch (error) {
-      refusals.push(String(error), error);
+      refusals.push(error);
     }
   };
   const runTimers = () => {
@@ -1215,9 +1266,17 @@ test("an invitation code appears in exactly one create answer, and never in a pu
     "previewInvitation",
     "acceptInvitation",
   ]);
-  expect(logs).toContain("The invitations did not load (unavailable).");
-  expect(errors.length).toBeGreaterThan(0);
-  expect(refusals).toHaveLength(12);
+  // The fixed reports of production, each alone.
+  for (const message of [
+    "The invitations did not load (unavailable).",
+    "Sending the invitations failed.",
+    "An invitation could not be created.",
+    "An invitation could not be previewed.",
+    "An invitation could not be accepted.",
+  ]) {
+    expect(logged, message).toContainEqual([message]);
+  }
+  expect(refusals).toHaveLength(6);
 
   // The code of the new invitation: in exactly one answer, once.
   const withCode = answers.filter((entry) =>
@@ -1232,20 +1291,26 @@ test("an invitation code appears in exactly one create answer, and never in a pu
     },
   ]);
   expect(JSON.stringify(answers).split(CODE)).toHaveLength(2);
-  // Neither code anywhere else.
-  const elsewhere = JSON.stringify([
-    published,
-    logs,
-    logged.map((args) => args.map(String)),
-    errors.map(String),
-    refusals.map(String),
-    invitations.state(),
-  ]);
+  // Neither code, nor its body after the prefix, anywhere else: every
+  // value in full, with hidden properties such as an error's message,
+  // stack, and cause.
+  const elsewhere = inspect(
+    [
+      answers.filter((entry) => !withCode.includes(entry)),
+      published,
+      logged,
+      written,
+      refusals,
+      invitations.state(),
+      workspaces.state(),
+      workspaces.people(),
+    ],
+    { depth: Infinity, showHidden: true, maxArrayLength: null },
+  );
   for (const code of [CODE, PASTED, PASTED.toUpperCase()]) {
     expect(elsewhere).not.toContain(code);
     expect(elsewhere).not.toContain(code.slice(5));
   }
-  expect(JSON.stringify(answers)).not.toContain(PASTED);
 
   invitationIpc.close();
   invitations.close();

@@ -29,6 +29,7 @@ const WORKSPACE = id(0xa1) as WorkspaceId;
 const OTHER_WORKSPACE = id(0xa2) as WorkspaceId;
 const OWN = id(0xc1) as MemberId;
 const INVITEE = id(0xc2) as MemberId;
+const OTHER = id(0xc3) as MemberId;
 const INVITATION = id(0xe1) as InvitationId;
 const OTHER_INVITATION = id(0xe2) as InvitationId;
 const AT = "2026-11-05T10:00:00.000Z";
@@ -58,6 +59,7 @@ function fakeWorkspaces() {
   let status: WorkspaceState["status"] = "ready";
   let selected: WorkspaceId | null = WORKSPACE;
   let people: readonly PersonState[] = [person(OWN, "owner")];
+  let own: MemberId | null = OWN;
   const listeners = new Set<(state: WorkspaceState) => void>();
   const state = (): WorkspaceState =>
     Object.freeze({
@@ -80,7 +82,7 @@ function fakeWorkspaces() {
       };
     },
     people: () => people,
-    ownMemberId: (workspaceId) => (workspaceId === selected ? OWN : null),
+    ownMemberId: (workspaceId) => (workspaceId === selected ? own : null),
   };
   const changed = () => {
     revision += 1;
@@ -95,10 +97,12 @@ function fakeWorkspaces() {
       status?: WorkspaceState["status"];
       selected?: WorkspaceId | null;
       people?: readonly PersonState[];
+      own?: MemberId | null;
     }) {
       status = next.status ?? status;
       selected = next.selected === undefined ? selected : next.selected;
       people = next.people ?? people;
+      own = next.own === undefined ? own : next.own;
       changed();
     },
   };
@@ -414,6 +418,86 @@ test("only the owner and the admins see the invitations: a member loads nothing,
   live.workspaces.set({ people: [person(OWN, "owner", AT)] });
   expect(live.service.state().status).toBe("not_allowed");
   expect(live.account.reads).toHaveLength(2);
+});
+
+test("the role is the account's own person's, not another person's: a member beside another owner sees nothing, and an admin beside another member loads", async () => {
+  const member = setup();
+  member.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+  });
+  expect(member.service.state().status).toBe("not_allowed");
+  expect(member.service.load()).toEqual({
+    outcome: "refused",
+    reason: "not_allowed",
+  });
+  member.connection.receive(subscribed());
+  member.connection.receive(claimed());
+  expect(member.service.reload(WORKSPACE)).toBe(false);
+  expect(member.account.reads).toEqual([]);
+
+  const admin = setup();
+  admin.workspaces.set({
+    people: [person(OTHER, "member"), person(OWN, "admin")],
+  });
+  expect(admin.service.load()).toEqual({ outcome: "loading" });
+  expect(admin.account.reads.map((read) => read.params)).toEqual([
+    { workspaceId: WORKSPACE },
+  ]);
+  admin.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+  expect(admin.service.state().status).toBe("ready");
+});
+
+test("with the people loaded but no own person known for the workspace, the role is not known: loading, and nothing is read", () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+    own: null,
+  });
+  expect(live.service.state().status).toBe("loading");
+  expect(live.service.load()).toEqual({ outcome: "loading" });
+  live.connection.receive(subscribed());
+  live.connection.receive(claimed());
+  expect(live.service.reload(WORKSPACE)).toBe(false);
+  expect(live.account.reads).toEqual([]);
+});
+
+test("the backoff starts again from its first wait after a successful load", async () => {
+  const live = setup();
+  live.service.load();
+  live.account.reads[0]?.resolve({ ok: false, reason: "unavailable" });
+  await settle();
+  live.timers.fire();
+  live.account.reads[1]?.resolve({ ok: false, reason: "unavailable" });
+  await settle();
+  expect(live.timers.pending().map((timer) => timer.delayMs)).toEqual([4_000]);
+  live.timers.fire();
+  live.account.reads[2]?.resolve(list(INVITATION));
+  await settle();
+
+  live.service.reload(WORKSPACE);
+  live.account.reads[3]?.resolve({ ok: false, reason: "unavailable" });
+  await settle();
+  expect(live.timers.pending().map((timer) => timer.delayMs)).toEqual([2_000]);
+});
+
+test("the backoff starts again from its first wait in another workspace", async () => {
+  const live = setup();
+  live.service.load();
+  live.account.reads[0]?.resolve({ ok: false, reason: "unavailable" });
+  await settle();
+  expect(live.timers.pending().map((timer) => timer.delayMs)).toEqual([2_000]);
+
+  // Another workspace, whose people load with the account's own admin.
+  live.workspaces.set({ selected: OTHER_WORKSPACE, people: [] });
+  expect(live.timers.pending()).toEqual([]);
+  live.workspaces.set({ people: [person(OWN, "admin")] });
+  expect(live.account.reads[1]?.params).toEqual({
+    workspaceId: OTHER_WORKSPACE,
+  });
+  live.account.reads[1]?.resolve({ ok: false, reason: "unavailable" });
+  await settle();
+  expect(live.timers.pending().map((timer) => timer.delayMs)).toEqual([2_000]);
 });
 
 test("while the role is not known, a request answers loading, and the list loads once the people show the owner's or an admin's role", async () => {

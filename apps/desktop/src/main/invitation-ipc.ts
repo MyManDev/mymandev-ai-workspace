@@ -124,8 +124,12 @@ export interface InvitationIpcOptions {
    * invitation. Defaults to `Date.now`.
    */
   readonly now?: () => number;
-  /** Defaults to `console.error`. */
-  readonly onError?: (message: string, error: unknown) => void;
+  /**
+   * Receives a fixed message when a publish fails, never the error, so that
+   * nothing that the error holds reaches a log. Defaults to
+   * `console.error`.
+   */
+  readonly onError?: (message: string) => void;
 }
 
 export interface InvitationIpc {
@@ -158,8 +162,7 @@ export function registerInvitationIpc(
   const schedule = options.scheduleTimer ?? scheduleWithSetTimeout;
   const now = options.now ?? Date.now;
   const onError =
-    options.onError ??
-    ((message: string, error: unknown) => console.error(message, error));
+    options.onError ?? ((message: string) => console.error(message));
   const publisher = createEventPublisher(
     EVENT_CHANNELS.invitationStateChanged,
     appUrl,
@@ -185,8 +188,10 @@ export function registerInvitationIpc(
     }
     try {
       publisher.publish(view());
-    } catch (error) {
-      onError("Sending the invitations failed.", error);
+    } catch {
+      // A fixed message: the view holds no code, and the error is not
+      // logged either, whatever it holds.
+      onError("Sending the invitations failed.");
     }
   }
 

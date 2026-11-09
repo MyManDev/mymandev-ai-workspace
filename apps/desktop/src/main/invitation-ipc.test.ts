@@ -7,7 +7,7 @@ import {
   type MemberId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import {
   INVITATION_LIMITS,
@@ -183,10 +183,15 @@ function fakeTimers() {
   };
 }
 
-function register(fake = fakeServices(), appUrl: string = DEV_URL) {
+function register(
+  fake = fakeServices(),
+  appUrl: string = DEV_URL,
+  reports: "recorded" | "default" = "recorded",
+) {
   const handlers = new Map<string, IpcInvokeListener>();
   const timers = fakeTimers();
-  const errors: string[] = [];
+  // Every argument of every report, so that an error passed on shows.
+  const errors: unknown[][] = [];
   const ipc = registerInvitationIpc(
     { handle: (channel, listener) => handlers.set(channel, listener) },
     appUrl,
@@ -195,7 +200,9 @@ function register(fake = fakeServices(), appUrl: string = DEV_URL) {
       workspaces: fake.workspaces,
       scheduleTimer: timers.schedule,
       now: () => NOW,
-      onError: (message) => errors.push(message),
+      ...(reports === "recorded"
+        ? { onError: (...args: unknown[]) => errors.push(args) }
+        : {}),
     },
   );
   const call = <T>(channel: string, caller = receiver(appUrl)): T => {
@@ -475,7 +482,11 @@ test("close cancels the waiting publish and stops listening", () => {
   expect(timers.pending()).toEqual([]);
 });
 
-test("a view that the contract refuses is reported with a fixed message, not sent", () => {
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+test("a view that the contract refuses is reported with a fixed message only, not sent, also by the default report", () => {
   const fake = fakeServices();
   const { call, timers, errors } = register(fake);
   const caller = receiver();
@@ -486,5 +497,20 @@ test("a view that the contract refuses is reported with a fixed message, not sen
   fake.fire();
   timers.fire();
   expect(caller.sent).toEqual([]);
-  expect(errors).toEqual(["Sending the invitations failed."]);
+  // The message alone: never the error.
+  expect(errors).toEqual([["Sending the invitations failed."]]);
+
+  const printed: unknown[][] = [];
+  vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+    printed.push(args);
+  });
+  const quiet = fakeServices();
+  const registered = register(quiet, DEV_URL, "default");
+  registered.call(INVOKE_CHANNELS.subscribeInvitationState, receiver());
+  quiet.set({
+    invitations: [{ ...invitation(FIRST, OWNER), id: "not-an-id" }],
+  } as unknown as Partial<InvitationListState>);
+  quiet.fire();
+  registered.timers.fire();
+  expect(printed).toEqual([["Sending the invitations failed."]]);
 });
