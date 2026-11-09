@@ -1165,6 +1165,16 @@ export function createDeviceSession(
     return false;
   }
 
+  /** Whether the key store still holds the keys that `facts` read. */
+  function keysUnchanged(facts: ReadyFacts): boolean {
+    const held = deps.keyStore.keys();
+    return (
+      held !== null &&
+      held.current.publicKey === facts.keys.current.publicKey &&
+      held.previous?.publicKey === facts.keys.previous?.publicKey
+    );
+  }
+
   /**
    * The API verified a signature by `key`, so it holds that key: resolves a
    * pending replacement. The new key is confirmed only after the record
@@ -1320,7 +1330,8 @@ export function createDeviceSession(
    * and `auth_failed` moves on to the next candidate. Resolves with
    * `all_refused` when every candidate got `auth_failed`. An answer that is
    * not certain (no answer, a `5xx`, an answer that is not the API's, or a
-   * refused challenge) changes nothing.
+   * refused challenge) changes nothing, and neither does `auth_failed` or
+   * `sign_in_required` when the key store changed meanwhile.
    */
   async function tryKeys(
     facts: ReadyFacts,
@@ -1356,6 +1367,16 @@ export function createDeviceSession(
         // The challenge was refused, for example `rate_limited`: nothing is
         // known about the key. Its `Retry-After` goes with the failure.
         return { kind: "failure", failure: refusedWithWait(answer) };
+      }
+      if (
+        (answer.code === "auth_failed" || answer.code === "sign_in_required") &&
+        !keysUnchanged(facts)
+      ) {
+        // The key store changed while the request was on its way, for
+        // example a renewal replaced the key once its code arrived (#233).
+        // The refusal is about a key that the device may no longer use, so
+        // it is not applied, as `keyHeld` applies no token then.
+        return { kind: "failure", failure: failure("no_device") };
       }
       switch (answer.code) {
         case "auth_failed":

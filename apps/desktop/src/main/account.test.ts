@@ -2626,6 +2626,8 @@ test("sign-out and removal are refused while busy and without an account, and th
       reason: "busy",
     });
   }
+  // A renewal pauses the reads from its code on (#233).
+  h.callback?.();
   await expect(h.service.readDeviceList()).resolves.toEqual(unavailable);
   const done = nextStatus(h, (status) => status.signIn.kind === "idle");
   attempt.settle({ kind: "cancelled" });
@@ -4771,6 +4773,8 @@ test("a write is unavailable during This is not me, a sign-out, a device removal
   await expect(h.service.startSignIn()).resolves.toMatchObject({
     outcome: "started",
   });
+  // A renewal pauses the writes from its code on (#233).
+  h.callback?.();
   await expect(leave()).resolves.toEqual({ ok: false, reason: "unavailable" });
   signIn.settle({ kind: "cancelled" });
 
@@ -5091,4 +5095,322 @@ test("after a write made while a key replacement was pending, the account and th
   ).resolves.toEqual({ ok: true, value: null });
   await tick();
   expect(h.service.status().replacementPending).toBe(false);
+});
+
+// ---- Reads and writes during a renewal (#233) ---------------------------
+
+/** The outcome of a renewal of this installation's device (D4 on #95). */
+const RENEWED_OUTCOME: SignInOutcome = Object.freeze({
+  kind: "signed_in",
+  account: Object.freeze({
+    userId: USER_ID,
+    login: "octocat",
+    displayName: "The Octocat",
+    deviceId: DEVICE_ID,
+    signInExpiresAt: "2027-01-01T10:00:00.000Z",
+  }),
+  newDevice: false,
+  login: "octocat",
+});
+
+const UNAVAILABLE = Object.freeze({ ok: false, reason: "unavailable" });
+const LISTED = Object.freeze({ ok: true, value: WORKSPACE_LIST });
+const LEFT = Object.freeze({ ok: true, value: null });
+
+/** The session's answers: the list for a read, nothing for a write. */
+function answerAll(h: Harness): void {
+  h.request = async (call) => ({
+    ok: true,
+    value: call.answer === "empty" ? null : WORKSPACE_LIST,
+  });
+}
+
+/** Makes only the session's next answer wait; the result settles it. */
+function holdOne(h: Harness) {
+  let finish: (result: SessionResult<unknown>) => void = () => undefined;
+  const after = h.request;
+  h.request = () => {
+    h.request = after;
+    return new Promise((resolve) => {
+      finish = resolve;
+    });
+  };
+  return (result: SessionResult<unknown>) => finish(result);
+}
+
+const readList = (h: Harness) =>
+  h.service.readWorkspaceData("listWorkspaces", {});
+const leave = (h: Harness) =>
+  h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE);
+
+/** A signed-in device whose renewal has opened the browser. */
+async function openRenewal(h: Harness) {
+  await h.service.initialize();
+  answerAll(h);
+  const attempt = startedSignIn();
+  h.start = async () => attempt.start;
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+  expect(h.service.status().signIn).toMatchObject({ kind: "waiting" });
+  return attempt;
+}
+
+test("during the browser part of a renewal reads and writes are answered, and during its start and from its code on they are unavailable", async () => {
+  const h = harness();
+  await h.service.initialize();
+  answerAll(h);
+  const attempt = startedSignIn();
+  let open: () => void = () => undefined;
+  h.start = () =>
+    new Promise((resolve) => {
+      open = () => resolve(attempt.start);
+    });
+
+  // The start may finish an earlier key replacement or write a record that
+  // the flow kept.
+  const starting = h.service.startSignIn();
+  await settle();
+  expect(h.service.status().signIn).toEqual({ kind: "starting" });
+  await expect(readList(h)).resolves.toEqual(UNAVAILABLE);
+  await expect(leave(h)).resolves.toEqual(UNAVAILABLE);
+  expect(h.requests).toEqual([]);
+
+  open();
+  await expect(starting).resolves.toEqual({ outcome: "started" });
+  expect(h.service.status().signIn).toMatchObject({ kind: "waiting" });
+  await expect(readList(h)).resolves.toEqual(LISTED);
+  await expect(h.service.readDeviceList()).resolves.toEqual({
+    ok: true,
+    value: DEVICE_LIST,
+  });
+  await expect(leave(h)).resolves.toEqual(LEFT);
+  expect(h.requests).toHaveLength(2);
+  // The person's actions still wait for the sign-in.
+  await expect(h.service.signOut()).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+
+  // The code arrived, and the flow replaces the key next.
+  h.callback?.();
+  expect(h.service.status().signIn).toEqual({ kind: "completing" });
+  await expect(readList(h)).resolves.toEqual(UNAVAILABLE);
+  await expect(h.service.readDeviceList()).resolves.toEqual(UNAVAILABLE);
+  await expect(leave(h)).resolves.toEqual(UNAVAILABLE);
+  expect(h.requests).toHaveLength(2);
+
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  attempt.settle(RENEWED_OUTCOME);
+  await done;
+  expect(h.service.status().account).toMatchObject({
+    deviceId: DEVICE_ID,
+    signInExpiresAt: RENEWED_OUTCOME.account.signInExpiresAt,
+  });
+  await expect(readList(h)).resolves.toEqual(LISTED);
+  await expect(leave(h)).resolves.toEqual(LEFT);
+});
+
+test("a renewal that the person cancels or that times out in the browser keeps reads and writes going, also their answers on the way", async () => {
+  for (const ending of ["cancelled", "timed_out"] as const) {
+    const h = harness();
+    const attempt = await openRenewal(h);
+    const finishRead = holdOne(h);
+    const reading = readList(h);
+    await tick();
+    const finishWrite = holdOne(h);
+    const writing = leave(h);
+    await tick();
+    expect(h.requests, ending).toHaveLength(2);
+
+    const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+    if (ending === "cancelled") {
+      expect(h.service.cancelSignIn()).toBe(true);
+    } else {
+      attempt.settle({ kind: "timed_out" });
+    }
+    // Also while the service records the outcome.
+    await expect(readList(h), ending).resolves.toEqual(LISTED);
+    await done;
+    expect(h.service.status().lastOutcome, ending).toEqual({ code: ending });
+
+    finishRead({ ok: true, value: WORKSPACE_LIST });
+    finishWrite({ ok: true, value: null });
+    await expect(reading, ending).resolves.toEqual(LISTED);
+    await expect(writing, ending).resolves.toEqual(LEFT);
+    await expect(readList(h), ending).resolves.toEqual(LISTED);
+    await expect(leave(h), ending).resolves.toEqual(LEFT);
+  }
+});
+
+test("a first sign-in, and any sign-in of a device that is not signed in, still pauses reads and writes for its whole length", async () => {
+  const cases: [string, (h: Harness) => void][] = [
+    [
+      "a new device",
+      (h) => {
+        h.record = { kind: "none" };
+      },
+    ],
+    [
+      "a signed-out device",
+      (h) => {
+        h.sessionState = {
+          kind: "signed_out",
+          account: SESSION_ACCOUNT,
+          reportPending: false,
+        };
+      },
+    ],
+    [
+      "a device whose key is lost",
+      (h) => {
+        h.sessionState = { kind: "key_lost", account: SESSION_ACCOUNT };
+      },
+    ],
+    [
+      "a device with a pending key replacement",
+      (h) => {
+        h.keyStatus = {
+          protection: "system",
+          loaded: true,
+          replacementPending: true,
+          passphraseRequired: false,
+        };
+      },
+    ],
+  ];
+  for (const [name, setUp] of cases) {
+    const h = harness();
+    setUp(h);
+    await h.service.initialize();
+    answerAll(h);
+    const attempt = startedSignIn();
+    h.start = async () => attempt.start;
+    await expect(h.service.startSignIn(), name).resolves.toEqual({
+      outcome: "started",
+    });
+
+    expect(h.service.status().signIn, name).toMatchObject({
+      kind: "waiting",
+    });
+    await expect(readList(h), name).resolves.toEqual(UNAVAILABLE);
+    await expect(h.service.readDeviceList(), name).resolves.toEqual(
+      UNAVAILABLE,
+    );
+    await expect(leave(h), name).resolves.toEqual(UNAVAILABLE);
+    h.callback?.();
+    await expect(readList(h), name).resolves.toEqual(UNAVAILABLE);
+    await expect(leave(h), name).resolves.toEqual(UNAVAILABLE);
+    expect(h.requests, name).toEqual([]);
+
+    const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+    attempt.settle(SIGNED_IN_OUTCOME);
+    await done;
+    await expect(readList(h), name).resolves.toEqual(LISTED);
+  }
+});
+
+test("a read or a write on its way when the code of a renewal arrives has its answer dropped", async () => {
+  const h = harness();
+  const attempt = await openRenewal(h);
+  // A read answered before the code keeps its answer.
+  await expect(readList(h)).resolves.toEqual(LISTED);
+  const finishRead = holdOne(h);
+  const reading = readList(h);
+  await tick();
+  const finishWrite = holdOne(h);
+  const writing = leave(h);
+  await tick();
+  expect(h.requests).toHaveLength(3);
+
+  // The code arrives while both are on their way, and their answers come
+  // before the flow has replaced the key or the sign-in has ended.
+  h.callback?.();
+  finishRead({ ok: true, value: WORKSPACE_LIST });
+  finishWrite({ ok: true, value: null });
+  await expect(reading).resolves.toEqual(UNAVAILABLE);
+  await expect(writing).resolves.toEqual({ ok: false, reason: "unknown" });
+  expect(h.service.status().account).toMatchObject({ deviceId: DEVICE_ID });
+
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  attempt.settle({ kind: "cancelled" });
+  await done;
+});
+
+test("the answer of a read or a write on its way across the key replacement of a renewal is dropped, also when the same device is signed in after it", async () => {
+  for (const [name, outcome] of [
+    ["signed in", RENEWED_OUTCOME],
+    ["no answer", { kind: "failed", reason: "no_answer" }],
+    ["refused", { kind: "refused", code: "device_account_mismatch" }],
+  ] as const) {
+    const h = harness();
+    const attempt = await openRenewal(h);
+    const finishRead = holdOne(h);
+    const reading = readList(h);
+    await tick();
+    const finishWrite = holdOne(h);
+    const writing = leave(h);
+    await tick();
+
+    h.callback?.();
+    const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+    attempt.settle(outcome);
+    await done;
+    expect(h.service.status().account, name).toMatchObject({
+      kind: "signed_in",
+      deviceId: DEVICE_ID,
+    });
+
+    finishRead({ ok: true, value: WORKSPACE_LIST });
+    finishWrite({ ok: true, value: null });
+    await expect(reading, name).resolves.toEqual(UNAVAILABLE);
+    await expect(writing, name).resolves.toEqual({
+      ok: false,
+      reason: "unknown",
+    });
+    await expect(readList(h), name).resolves.toEqual(LISTED);
+  }
+});
+
+test("an outcome of a renewal that came without its code still drops the answers on their way", async () => {
+  const h = harness();
+  const attempt = await openRenewal(h);
+  const finishRead = holdOne(h);
+  const reading = readList(h);
+  await tick();
+
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  attempt.settle({ kind: "failed", reason: "unexpected" });
+  await done;
+  finishRead({ ok: true, value: WORKSPACE_LIST });
+
+  await expect(reading).resolves.toEqual(UNAVAILABLE);
+  await expect(readList(h)).resolves.toEqual(LISTED);
+});
+
+test("a renewal whose browser posted before the start returned pauses reads at once, and a late callback of an old attempt does not", async () => {
+  const h = harness();
+  await h.service.initialize();
+  answerAll(h);
+  const first = startedSignIn();
+  h.start = async () => {
+    h.callback?.();
+    return first.start;
+  };
+  await h.service.startSignIn();
+  expect(h.service.status().signIn).toEqual({ kind: "completing" });
+  await expect(readList(h)).resolves.toEqual(UNAVAILABLE);
+  const oldCallback = h.callback;
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  first.settle({ kind: "timed_out" });
+  await done;
+
+  const second = startedSignIn();
+  h.start = async () => second.start;
+  h.clock += SIGN_IN_START_COOLDOWN_MS;
+  await h.service.startSignIn();
+  oldCallback?.();
+  expect(h.service.status().signIn).toMatchObject({ kind: "waiting" });
+  await expect(readList(h)).resolves.toEqual(LISTED);
+  second.settle({ kind: "cancelled" });
 });

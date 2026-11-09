@@ -346,13 +346,17 @@ export interface AccountService {
    * "This is not me", a device removal, or an unlock runs, it answers
    * `unavailable` (also while a revocation of another device or a lift of
    * the registration lock holds the lock), and the caller tries again
-   * later. It waits for the startup refresh and a background refresh to
-   * end, like an action, but actions do not wait for a read on its way.
+   * later. A renewal (D4 on #95) pauses it only during its start and from
+   * its code on: while the browser is open, and after a cancel or the
+   * timeout there, reads go on (#233). It waits for the startup refresh
+   * and a background refresh to end, like an action, but actions do not
+   * wait for a read on its way.
    * Its answer is dropped as
    * `not_signed_in` when no device is signed in any more, and as
    * `unavailable` when another device is. Data is also dropped as
    * `unavailable` when such an action began while it was on its way, also
-   * one that has ended since, or when the account or the device changed
+   * one that has ended since, or the code of a renewal arrived, or when
+   * the account or the device changed
    * meanwhile; a failure carries no data and is answered as it is, also when
    * its own refusal changed the device. Never rejects.
    */
@@ -367,8 +371,9 @@ export interface AccountService {
    * the device list service of the main process only; never for the
    * renderer. It is a read like `readWorkspaceData`, with the same rules:
    * no `operation` lock, `unavailable` while an action of the person or a
-   * sign-in runs or began while it was on its way, a wait for a background
-   * refresh, and an answer dropped when the account or the device changed.
+   * sign-in runs or began while it was on its way (but not during the
+   * browser part of a renewal), a wait for a background refresh, and an
+   * answer dropped when the account or the device changed.
    * Never rejects.
    */
   readonly readDeviceList: () => Promise<WorkspaceReadResult<DeviceList>>;
@@ -379,11 +384,13 @@ export interface AccountService {
    * first, and the answer is parsed with its schema. It takes no
    * `operation` lock and answers `unavailable` while a sign-in, a
    * sign-out, "This is not me", a device removal, or an unlock runs (also
-   * while a device action of the device list holds the lock), and it
-   * waits for the startup refresh and a background refresh, as a read does.
+   * while a device action of the device list holds the lock), but not
+   * during the browser part of a renewal (#233), as a read; and it waits
+   * for the startup refresh and a background refresh, as a read does.
    * It is sent once: an uncertain answer is never sent again and answers
    * `unknown`, as does a successful answer when the account or the device
-   * changed while it was on its way. Writes beyond `WORKSPACE_ACTION_BUDGET`
+   * changed while it was on its way, or when such an action or the code of
+   * a renewal came meanwhile. Writes beyond `WORKSPACE_ACTION_BUDGET`
    * answer `too_soon` without a request. An invitation code in the body or
    * the answer is never kept, logged, or published (D2). The body is
    * required for a write with one and not allowed for one without. Never
@@ -722,6 +729,13 @@ export function createAccountService(
   /** Whether the browser of the current attempt posted to the listener. */
   let callbackArrived = false;
   /**
+   * Whether reads and writes go on while the attempt is open (#233): during
+   * the browser part of a renewal, the sign-in of a device that is signed
+   * in, until the browser posts the code. The flow changes the key and the
+   * record only after that (`pauseReadsOfAttempt`).
+   */
+  let attemptKeepsReads = false;
+  /**
    * When the last start that opened the browser or offered its URL
    * returned, or null.
    */
@@ -751,10 +765,11 @@ export function createAccountService(
    * Counts the changes that may end what a workspace read is for: every
    * action of the person that may change the account or the device (a
    * sign-in, a sign-out, "This is not me", a device removal, an unlock)
-   * when it begins, and every published change of the account, the key's
-   * state, or the device, except a device that becomes signed in. A read
-   * takes it before its request and drops the answer when it changed, also
-   * when the action that changed it has ended meanwhile.
+   * when it begins, the code of a renewal whose reads went on until then
+   * (`pauseReadsOfAttempt`), and every published change of the account,
+   * the key's state, or the device, except a device that becomes signed
+   * in. A read takes it before its request and drops the answer when it
+   * changed, also when the action that changed it has ended meanwhile.
    */
   let accountChanges = 0;
   let revision = 0;
@@ -1029,6 +1044,8 @@ export function createAccountService(
       return;
     }
     callbackArrived = true;
+    // The flow calls this before it replaces the key.
+    pauseReadsOfAttempt();
     if (signIn.kind === "waiting") {
       signIn = COMPLETING;
       publish();
@@ -1037,6 +1054,37 @@ export function createAccountService(
       options.focusWindow();
     } catch {
       report("The window could not be brought to the front.");
+    }
+  }
+
+  /**
+   * Whether a sign-in whose attempt opens now renews the sign-in of the
+   * device that is signed in (D4 on #95): a signed-in account and device, a
+   * ready key, and no pending key replacement. Today no sign-in can start
+   * without a ready key (`key_not_ready`), and nothing changes the key's
+   * state while a sign-in runs, so a test cannot reach the key's clause. It
+   * stays so that a later change to the start does not turn such a sign-in
+   * into a renewal.
+   */
+  function renewing(): boolean {
+    return (
+      account.kind === "signed_in" &&
+      device === "signed_in" &&
+      deviceKey === "ready" &&
+      !replacementPending
+    );
+  }
+
+  /**
+   * Ends the reads and writes of the open attempt (#233), because the key
+   * and the record may change from now on: a later one answers
+   * `unavailable` until the outcome, and the answer of one on its way is
+   * dropped (`accountChanges`).
+   */
+  function pauseReadsOfAttempt(): void {
+    if (attemptKeepsReads) {
+      attemptKeepsReads = false;
+      accountChanges += 1;
     }
   }
 
@@ -1154,6 +1202,12 @@ export function createAccountService(
     held: AccountSession | null,
     outcome: SignInOutcome,
   ): Promise<void> {
+    // A cancel or the timeout of the browser part changed neither the key
+    // nor the record, so a renewal's reads go on; every other outcome
+    // pauses them, also one that came without the code (`callback`).
+    if (outcome.kind !== "cancelled" && outcome.kind !== "timed_out") {
+      pauseReadsOfAttempt();
+    }
     await sessionSignInFinished(held, outcome);
     accountReads += 1;
     const view = signInOutcomeView(outcome);
@@ -1166,6 +1220,7 @@ export function createAccountService(
     replacementPending = await readReplacementPending(opened);
     account = next;
     attempt = null;
+    attemptKeepsReads = false;
     signIn = IDLE;
     lastOutcome = view;
     publish();
@@ -1253,6 +1308,11 @@ export function createAccountService(
       // it, or the person asked for the URL.
       lastBrowserStart = now();
       attempt = Object.freeze({ cancel: started.cancel });
+      // #233: the reads and writes of a renewal go on while the browser is
+      // open, until the code arrives (`callback`), which can be before
+      // `start` returns. Every other sign-in, for example the first of a
+      // new device or one after a sign-out, pauses them until its outcome.
+      attemptKeepsReads = !callbackArrived && renewing();
       // The browser can post before `start` returns here.
       signIn = callbackArrived
         ? COMPLETING
@@ -1814,10 +1874,13 @@ export function createAccountService(
 
   /**
    * Whether an action of the person or a sign-in runs that may change or end
-   * the account: a read is then left out.
+   * the account: a read is then left out. The browser part of a renewal
+   * changes neither, so its reads go on (#233, `attemptKeepsReads`); its
+   * start still pauses them, because the flow may finish an earlier key
+   * replacement or write a record that it kept.
    */
   function readsPaused(): boolean {
-    return operation !== null || attempt !== null;
+    return operation !== null || (attempt !== null && !attemptKeepsReads);
   }
 
   /**
