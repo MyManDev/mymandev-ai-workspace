@@ -617,6 +617,147 @@ test("the sentence of the last action goes with a sign-out, a list that loads ag
   }
 });
 
+/** This device's list after a sign-in as another device. */
+const ANOTHER_THIS_DEVICE: DeviceView = {
+  ...THIS_DEVICE,
+  id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c1",
+};
+
+/** The notice of `NEW_LAPTOP`. */
+const NEW_LAPTOP_NOTICE = {
+  id: NEW_LAPTOP.id,
+  label: NEW_LAPTOP.label,
+  platform: NEW_LAPTOP.platform,
+  createdAt: NEW_LAPTOP.createdAt,
+};
+
+function stateOf(view: DeviceSectionView): DeviceListView {
+  if (view.kind !== "known") {
+    throw new Error("The view has no state.");
+  }
+  return view.state;
+}
+
+test("the list's first load for a device keeps the sentence of a notice's action that ran before it, also after a sign-in as another device", async () => {
+  const fake = actionBridge();
+  const views: DeviceActionsView[] = [];
+  const actions = createDeviceActions(fake.bridge, (view) => views.push(view));
+  const notMe = async () => {
+    const revoking = actions.revoke(NEW_LAPTOP.id, "lost");
+    fake.revoked({ outcome: "revoked", reason: "lost" });
+    await expect(revoking).resolves.toBe(true);
+    expect(views.at(-1)?.message).toBe(
+      DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost,
+    );
+  };
+  const loading = known({
+    status: "loading",
+    devices: [],
+    newDevices: [NEW_LAPTOP_NOTICE],
+  });
+  // The advice and the end of the notice come while the list still loads,
+  // and then the list itself.
+  const afterwards = (devices: DeviceView[]) => [
+    known({
+      status: "loading",
+      revision: 2,
+      devices: [],
+      lostDeviceAdvice: true,
+    }),
+    known({ revision: 3, devices, lostDeviceAdvice: true }),
+  ];
+
+  actions.listChanged(loading);
+  await notMe();
+  for (const view of afterwards([NEW_LAPTOP, THIS_DEVICE])) {
+    actions.listChanged(view);
+  }
+  expect(views.at(-1)?.message).toBe(
+    DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost,
+  );
+
+  // A sign-out, and a sign-in as another device, whose list has not loaded.
+  actions.listChanged(known({ status: "signed_out", devices: [] }));
+  expect(views.at(-1)?.message).toBeUndefined();
+  actions.listChanged(loading);
+  await notMe();
+  for (const view of afterwards([NEW_LAPTOP, ANOTHER_THIS_DEVICE])) {
+    actions.listChanged(view);
+  }
+  expect(views.at(-1)?.message).toBe(
+    DEVICE_ACTION_RESULT_MESSAGES.revokedAsLost,
+  );
+});
+
+test("an action whose answer comes after a sign-out, a drop of the list, or another device shows no sentence", async () => {
+  for (const [name, drop] of [
+    ["signed out", [known({ status: "signed_out", devices: [] })]],
+    ["loading after a drop", [known({ status: "loading", devices: [] })]],
+    [
+      "signed out and in as another device",
+      [
+        known({ status: "signed_out", devices: [] }),
+        known({ status: "loading", devices: [] }),
+        known({ devices: [NEW_LAPTOP, ANOTHER_THIS_DEVICE] }),
+      ],
+    ],
+    ["another device", [known({ devices: [ANOTHER_THIS_DEVICE] })]],
+  ] as const) {
+    const fake = actionBridge();
+    const views: DeviceActionsView[] = [];
+    const actions = createDeviceActions(fake.bridge, (view) =>
+      views.push(view),
+    );
+    actions.listChanged(known({}));
+    const removing = actions.revoke(NEW_LAPTOP.id, "removed");
+    for (const view of drop) {
+      actions.listChanged(view);
+    }
+    fake.revoked({ outcome: "revoked", reason: "removed" });
+    await expect(removing, name).resolves.toBe(true);
+    expect(views.at(-1), name).toEqual({ running: false, message: undefined });
+
+    // The next action on the same list says its sentence again.
+    const lifting = actions.lift();
+    fake.lifted({ outcome: "lifted" });
+    await lifting;
+    expect(views.at(-1)?.message, name).toBe(
+      DEVICE_ACTION_RESULT_MESSAGES.lifted,
+    );
+  }
+});
+
+test("following the device list with the device actions tells them each view first, in the same call, so the sentence goes in the same render as the list", async () => {
+  const log: string[] = [];
+  let deliver: (state: DeviceListView) => void = () => undefined;
+  const bridge: Pick<DeviceListBridge, "subscribeState" | "load"> = {
+    subscribeState: (listener) => {
+      deliver = listener;
+      return () => undefined;
+    },
+    load: () => Promise.resolve<DeviceListLoadResult>({ outcome: "loading" }),
+  };
+  const fake = actionBridge();
+  const actions = createDeviceActions(fake.bridge, (view) =>
+    log.push(`sentence ${view.message ?? "none"}`),
+  );
+  followDeviceList(
+    bridge,
+    (view) =>
+      log.push(`list ${view.kind === "known" ? view.state.status : view.kind}`),
+    actions,
+  );
+  deliver(stateOf(known({})));
+  const removing = actions.revoke(NEW_LAPTOP.id, "removed");
+  fake.revoked({ outcome: "revoked", reason: "removed" });
+  await removing;
+  expect(log.at(-1)).toBe(`sentence ${DEVICE_ACTION_RESULT_MESSAGES.removed}`);
+
+  log.length = 0;
+  deliver(stateOf(known({ status: "signed_out", devices: [] })));
+  expect(log).toEqual(["sentence none", "list signed_out"]);
+});
+
 test("the focus moves to the section's title only after an action whose button leaves the page, while the focus is still on that button or on the page", () => {
   expect(focusesTitleAfterAction(true, true)).toBe(true);
   expect(focusesTitleAfterAction(true, false)).toBe(false);

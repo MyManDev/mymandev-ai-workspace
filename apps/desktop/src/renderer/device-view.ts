@@ -31,16 +31,23 @@ export function initialDeviceSectionView(
  * the main process to load the list, as the Account screen does when it
  * opens. A refused subscription makes the view unavailable. The load's
  * answer shows in the states that follow, so a refusal (`too_soon`, or no
- * signed-in device) changes nothing here. Returns the function that ends
- * the subscription.
+ * signed-in device) changes nothing here. The device actions, when given,
+ * follow each view first, in the same call: the sentence of the last action
+ * goes in the same render as the list that ends it, and no view between two
+ * renders is missed. Returns the function that ends the subscription.
  */
 export function followDeviceList(
   devices: Pick<DeviceListBridge, "subscribeState" | "load">,
   onView: (view: DeviceSectionView) => void,
+  actions?: Pick<DeviceActions, "listChanged">,
 ): () => void {
+  const report = (view: DeviceSectionView) => {
+    actions?.listChanged(view);
+    onView(view);
+  };
   const stop = devices.subscribeState(
-    (state) => onView({ kind: "known", state }),
-    () => onView({ kind: "unavailable" }),
+    (state) => report({ kind: "known", state }),
+    () => report({ kind: "unavailable" }),
   );
   devices.load().catch(() => undefined);
   return stop;
@@ -269,9 +276,12 @@ export interface DeviceActions {
   /**
    * Follows the section's view: the sentence of the last action belongs to
    * the account and the device that it was about, so it goes when the list
-   * shows no signed-in device (`signed_out`), when it loads for a device
-   * again after a drop (`loading`), and when the list names another device
-   * as this one.
+   * is dropped: when it shows no signed-in device (`signed_out`), when it
+   * loads again after a list that had loaded or failed (`loading` after
+   * `ready` or `unavailable`), and when it names another device as this
+   * one. An action whose answer comes after such a drop shows no sentence.
+   * The list's first load for a device keeps the sentence of an action that
+   * ran before it, such as a notice's action.
    */
   readonly listChanged: (view: DeviceSectionView) => void;
 }
@@ -289,8 +299,15 @@ export function createDeviceActions(
 ): DeviceActions {
   let running = false;
   let message: string | undefined;
-  /** The device of this installation in the last list, or undefined. */
+  /**
+   * The device of this installation in the lists since the last drop, or
+   * undefined.
+   */
   let thisDevice: string | undefined;
+  /** The status of the last list, or undefined before the first one. */
+  let lastStatus: DeviceListView["status"] | undefined;
+  /** Grows by one with every drop of the list. */
+  let drops = 0;
   const show = () => onView(Object.freeze({ running, message }));
 
   async function act(
@@ -303,6 +320,7 @@ export function createDeviceActions(
     running = true;
     message = undefined;
     show();
+    const dropsBefore = drops;
     let done = false;
     try {
       const outcome = await call();
@@ -310,6 +328,10 @@ export function createDeviceActions(
       done = outcome.done;
     } catch {
       message = `${failed} ${DEVICE_ACTION_RESULT_MESSAGES.tryAgain}`;
+    }
+    if (drops !== dropsBefore) {
+      // The account or the device that the action was about is gone.
+      message = undefined;
     }
     running = false;
     show();
@@ -338,15 +360,22 @@ export function createDeviceActions(
       }
       const { state } = view;
       const named = state.devices.find((device) => device.current)?.id;
+      // `loading` follows `ready` or `unavailable` only after a drop; before
+      // a device's first load it follows nothing, `signed_out`, or another
+      // `loading`.
+      const dropped =
+        state.status === "signed_out" ||
+        (state.status === "loading" &&
+          (lastStatus === "ready" || lastStatus === "unavailable"));
       const other =
         named !== undefined && thisDevice !== undefined && named !== thisDevice;
-      if (named !== undefined) {
-        thisDevice = named;
+      lastStatus = state.status;
+      thisDevice = dropped ? undefined : (named ?? thisDevice);
+      if (!dropped && !other) {
+        return;
       }
-      if (
-        message !== undefined &&
-        (state.status === "signed_out" || state.status === "loading" || other)
-      ) {
+      drops += 1;
+      if (message !== undefined) {
         message = undefined;
         show();
       }
