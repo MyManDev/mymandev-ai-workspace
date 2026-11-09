@@ -204,6 +204,7 @@ Decided by the Project Manager on 2026-11-09 (#227), so that every approver's li
 - The requester is told nothing: their own list still shows `denied`, and no account frame goes out.
 - The event's `occurredAt` is the time that the server stores as `unblocked_at`. An unblock that is refused (`not_found`, `forbidden`, or `conflict`) or rolled back sends nothing.
 - The server reads the owner and admins as for the events above, after the unblock's locks, so the window of a role change is the same.
+- In theory a `workspace.join_request.unblocked` can arrive before the `workspace.join_request.resolved` with `blocked` of the same request, for the same reason as a `resolved` before its `created`: each is sent after its own commit. The desktop also remembers the IDs of unblocked requests for a short while, so that a late `resolved` with `blocked` does not bring back a stale block.
 
 ## Project routes
 
