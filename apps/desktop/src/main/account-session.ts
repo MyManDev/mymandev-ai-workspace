@@ -1,16 +1,16 @@
 // What the account service passes on from the device session (session/;
-// part 3 of #94) to the renderer: the device state as a fixed code, a
-// failure of the session as a fixed code, and the device list without
-// anything secret. Also the native confirmation of removing this device.
+// part 3 of #94) to the renderer: the device state as a fixed code and a
+// failure of the session as a fixed code. Also the native confirmation of
+// removing this device. The device list reaches the renderer through the
+// device list service instead (devices/service.ts, device-ipc.ts).
 //
 // The session's states and failures may carry the account of the record
 // and the API's code; only the fixed codes below reach the renderer. The
 // session never hands over a token, a signature, or a key.
-import type { ApiErrorCode, DeviceListItem } from "@mymandev/protocol";
+import type { ApiErrorCode } from "@mymandev/protocol";
 import type {
   DeviceActionFailure,
   DeviceState,
-  DeviceView,
 } from "../shared/ipc-contract.ts";
 import type { DeviceSessionState, SessionFailure } from "./session/session.ts";
 
@@ -95,24 +95,6 @@ export function deviceActionFailure(
       // `invalid_request`, or a reason that a later session adds.
       return "failed";
   }
-}
-
-/**
- * One device of the list as the renderer may see it: its ID, label,
- * platform, when it was last seen, when its sign-in ends, when it was
- * revoked, and whether it is the device that asked. A field that the
- * protocol adds later does not reach the renderer.
- */
-export function deviceViewOf(item: DeviceListItem): DeviceView {
-  return Object.freeze({
-    id: item.id,
-    label: item.label,
-    platform: item.platform,
-    lastSeenAt: item.lastSeenAt,
-    signInExpiresAt: item.signInExpiresAt,
-    revokedAt: item.revokedAt,
-    current: item.current,
-  });
 }
 
 /**

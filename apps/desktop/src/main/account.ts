@@ -4,21 +4,21 @@
 // reads the device record to learn whether the installation holds an
 // account, creates the device session and refreshes it, starts and cancels
 // the sign-in flow on the person's action, unlocks a key that a passphrase
-// protects, signs out, removes this device, lists the account's devices, and
-// forgets the account for "This is not me" (#149). It also lends the
-// device session to the connection client of #26 in the main process: the
-// signature of the WebSocket challenge and the close reasons that refuse the
-// device. And it sends the reads of workspace, chat, and agent data of #27
-// and #28 and of invitations and join requests of #95 (`api-reads.ts`), and
-// the writes of the screens of #95 (`api-actions.ts`), for the main process
-// only.
+// protects, signs out, removes this device, and forgets the account for
+// "This is not me" (#149). It also lends the device session to the
+// connection client of #26 in the main process: the signature of the
+// WebSocket challenge and the close reasons that refuse the device. And it
+// sends the reads of workspace, chat, and agent data of #27 and #28, of
+// invitations and join requests of #95 (`api-reads.ts`), and of the account's
+// devices for the device list service (`devices/service.ts`, #95), and the
+// writes of the screens of #95 (`api-actions.ts`), for the main process only.
 //
 // The renderer gets a narrow status only: the account's login, display name,
 // and device ID (none of them while the person is signed out or the device
 // is not read yet, #195), the pairing code, the authorize URL when the
-// browser did not open, the device list, and fixed codes. The sign-in code,
-// the verifier, signatures, keys, tokens, and the passphrase never reach the
-// status, a result, or a message.
+// browser did not open, and fixed codes. The sign-in code, the verifier,
+// signatures, keys, tokens, and the passphrase never reach the status, a
+// result, or a message.
 import type {
   ApiErrorCode,
   AuthChallengeFrame,
@@ -32,7 +32,6 @@ import type {
   DeviceKeyState,
   DeviceState,
   ForgetResult,
-  ListDevicesResult,
   RemoveDeviceResult,
   SignInOutcomeCode,
   SignInOutcomeView,
@@ -45,7 +44,6 @@ import type {
 import {
   deviceActionFailure,
   deviceStateOf,
-  deviceViewOf,
   signedOutOf,
 } from "./account-session.ts";
 import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
@@ -84,9 +82,11 @@ import type {
 import type { SignInListenerError } from "./sign-in/listener.ts";
 import type { RegistrationMarkerStore } from "./sign-in/registration-marker.ts";
 import type {
+  DeviceList,
   DeviceSession,
   DeviceSessionState,
   SessionFailure,
+  SessionResult,
 } from "./session/session.ts";
 
 /** The part of the device session that the service uses. */
@@ -248,8 +248,14 @@ export interface AccountService {
    * retries it. Never rejects.
    */
   readonly removeDevice: () => Promise<RemoveDeviceResult>;
-  /** The account's devices, without anything secret. Never rejects. */
-  readonly listDevices: () => Promise<ListDevicesResult>;
+  /**
+   * Calls `listener` after a device action of the person ended that may
+   * have changed the account's devices: a sign-out, a removal of this
+   * device, or "This is not me", with any result but a refusal before it
+   * began (`refused`) or a kept confirmation (`cancelled`). The device list
+   * service reloads then (#95). The result removes the listener.
+   */
+  readonly onDeviceAction: (listener: () => void) => () => void;
   /**
    * Signs the WebSocket `auth.challenge` with the device session, for the
    * connection client of the main process (#26); never for the renderer.
@@ -292,6 +298,17 @@ export interface AccountService {
     query?: WorkspaceReadQuery[N],
   ) => Promise<WorkspaceReadResult<WorkspaceReadAnswer[N]>>;
   /**
+   * Reads the account's devices and the end of a registration lock in force
+   * (`GET /devices`, the session's `listDevices`; D4 and D5b of #95), for
+   * the device list service of the main process only; never for the
+   * renderer. It is a read like `readWorkspaceData`, with the same rules:
+   * no `operation` lock, `unavailable` while an action of the person or a
+   * sign-in runs or began while it was on its way, a wait for a background
+   * refresh, and an answer dropped when the account or the device changed.
+   * Never rejects.
+   */
+  readonly readDeviceList: () => Promise<WorkspaceReadResult<DeviceList>>;
+  /**
    * Sends one write of the allowlist in `api-actions.ts` with the device
    * session, for the main process only (#95, D1); never for the renderer.
    * The path parameters and the body are checked with the entry's schemas
@@ -317,13 +334,6 @@ export interface AccountService {
 // The cooldown lives in a shared module, so that the renderer's delay for
 // "Use another browser" follows it.
 export { SIGN_IN_START_COOLDOWN_MS };
-
-/**
- * How long after a device list was asked for the next one is refused
- * (`too_soon`), so that even a renderer that misbehaves cannot ask the API
- * for the list in a loop.
- */
-export const LIST_DEVICES_COOLDOWN_MS = 2_000;
 
 /** The delay after the first wrong passphrase; it doubles with each one after. */
 export const UNLOCK_DELAY_FIRST_MS = 1_000;
@@ -600,6 +610,7 @@ export function createAccountService(
   const apiOrigin = apiOriginState(options.apiOrigin);
   const now = options.now ?? (() => performance.now());
   const listeners = new Set<(status: AccountStatus) => void>();
+  const deviceActionListeners = new Set<() => void>();
 
   let system: AccountSystem | null = null;
   let flow: Pick<SignInFlow, "start" | "reset"> | null = null;
@@ -612,7 +623,6 @@ export function createAccountService(
     | "forgetting"
     | "signing_out"
     | "removing"
-    | "listing"
     | null = null;
   /**
    * The work that runs in the background: the startup (from the key's load
@@ -622,8 +632,6 @@ export function createAccountService(
    * none runs (`backgroundSettled`). Each run never rejects.
    */
   const background = new Set<Promise<void>>();
-  /** When the last device list was asked for, or null. */
-  let lastList: number | null = null;
   let attempt: OpenAttempt | null = null;
   let cancelRequested = false;
   /** Counts the attempts, so that a late callback of an old one changes nothing. */
@@ -1265,7 +1273,33 @@ export function createAccountService(
     }
   }
 
+  /**
+   * Tells the listeners of `onDeviceAction` that a device action of the
+   * person ended that may have changed the account's devices: every result
+   * but a refusal before it began and a kept confirmation. It runs after the
+   * action released its lock, so that a read that a listener starts is not
+   * answered `unavailable` for the action itself.
+   */
+  function deviceActionEnded(outcome: string): void {
+    if (outcome === "refused" || outcome === "cancelled") {
+      return;
+    }
+    for (const listener of [...deviceActionListeners]) {
+      try {
+        listener();
+      } catch {
+        report("A device action listener failed.");
+      }
+    }
+  }
+
   async function forgetAccount(): Promise<ForgetResult> {
+    const result = await forgetAccountNow();
+    deviceActionEnded(result.outcome);
+    return result;
+  }
+
+  async function forgetAccountNow(): Promise<ForgetResult> {
     if (operation !== null || attempt !== null || deviceKey === "loading") {
       return Object.freeze({ outcome: "refused", reason: "busy" });
     }
@@ -1375,15 +1409,13 @@ export function createAccountService(
    * refusal here.
    */
   async function beginAction(
-    kind: "signing_out" | "removing" | "listing",
+    kind: "signing_out" | "removing",
   ): Promise<AccountSession | ActionRefusal> {
     if (operation !== null || attempt !== null || deviceKey === "loading") {
       return ACTION_BUSY;
     }
     operation = kind;
-    if (kind !== "listing") {
-      accountChanges += 1;
-    }
+    accountChanges += 1;
     await backgroundSettled();
     if (system === null || session === null || account.kind !== "signed_in") {
       return ACTION_NOT_SIGNED_IN;
@@ -1405,6 +1437,12 @@ export function createAccountService(
   }
 
   async function signOut(): Promise<SignOutResult> {
+    const result = await signOutNow();
+    deviceActionEnded(result.outcome);
+    return result;
+  }
+
+  async function signOutNow(): Promise<SignOutResult> {
     const held = await beginAction("signing_out");
     try {
       if (isRefusal(held)) {
@@ -1434,6 +1472,12 @@ export function createAccountService(
   }
 
   async function removeDevice(): Promise<RemoveDeviceResult> {
+    const result = await removeDeviceNow();
+    deviceActionEnded(result.outcome);
+    return result;
+  }
+
+  async function removeDeviceNow(): Promise<RemoveDeviceResult> {
     const held = await beginAction("removing");
     try {
       if (isRefusal(held)) {
@@ -1485,42 +1529,6 @@ export function createAccountService(
     }
   }
 
-  async function listDevices(): Promise<ListDevicesResult> {
-    const held = await beginAction("listing");
-    try {
-      if (isRefusal(held)) {
-        return held;
-      }
-      if (account.kind !== "signed_in") {
-        return ACTION_NOT_SIGNED_IN;
-      }
-      if (lastList !== null && now() - lastList < LIST_DEVICES_COOLDOWN_MS) {
-        return Object.freeze({ outcome: "refused", reason: "too_soon" });
-      }
-      const deviceId = account.deviceId;
-      lastList = now();
-      const result = await held.listDevices();
-      // The list belongs to the device that asked: when the account changed
-      // meanwhile (for example the session found the device revoked), it is
-      // dropped.
-      if (account.kind !== "signed_in" || account.deviceId !== deviceId) {
-        return ACTION_NOT_SIGNED_IN;
-      }
-      if (!result.ok) {
-        return actionFailed(result);
-      }
-      return Object.freeze({
-        outcome: "listed",
-        devices: result.value.map(deviceViewOf),
-      });
-    } catch {
-      report("The device list could not be read.");
-      return ACTION_FAILED;
-    } finally {
-      endAction(held);
-    }
-  }
-
   async function signWebSocketChallenge(
     challenge: AuthChallengeFrame,
   ): Promise<ChallengeAnswer> {
@@ -1564,10 +1572,70 @@ export function createAccountService(
 
   /**
    * Whether an action of the person or a sign-in runs that may change or end
-   * the account: a read is then left out. The device list changes nothing.
+   * the account: a read is then left out.
    */
   function readsPaused(): boolean {
-    return (operation !== null && operation !== "listing") || attempt !== null;
+    return operation !== null || attempt !== null;
+  }
+
+  /**
+   * Sends one read with the device session, by the rules of
+   * `readWorkspaceData`, which `readDeviceList` shares. It may reject when
+   * the session throws; each caller reports that with its own message.
+   */
+  async function readWith<T>(
+    send: (held: AccountSession) => Promise<SessionResult<T | null>>,
+  ): Promise<WorkspaceReadResult<T>> {
+    // Reads are not the person's actions: they take no `operation` lock
+    // and never make an action answer `busy`. They wait for a background
+    // refresh, which may report a sign-out or retry a removal with the
+    // key, so that they never overlap it.
+    if (readsPaused()) {
+      return workspaceReadFailed("unavailable");
+    }
+    await backgroundSettled();
+    if (readsPaused() || deviceKey === "loading") {
+      return workspaceReadFailed("unavailable");
+    }
+    const held = session;
+    if (system === null || held === null || account.kind !== "signed_in") {
+      return workspaceReadFailed("not_signed_in");
+    }
+    const deviceId = account.deviceId;
+    const changes = accountChanges;
+    const replacementWasPending = replacementPending;
+    const result = await send(held);
+    if (replacementWasPending) {
+      // A token may have confirmed or abandoned the key's replacement.
+      void refreshAccount().catch(() => {
+        report("The account could not be read.");
+      });
+    }
+    // The answer belongs to the device that asked: when no device or
+    // another one is signed in now, it is dropped.
+    if (account.kind !== "signed_in") {
+      return workspaceReadFailed("not_signed_in");
+    }
+    if (account.deviceId !== deviceId) {
+      return workspaceReadFailed("unavailable");
+    }
+    // A failure carries no data, so it is answered as it is, also when
+    // the request's own refusal (for example `sign_in_required`) changed
+    // the device meanwhile.
+    if (!result.ok) {
+      return workspaceReadFailed(workspaceReadFailureOf(result));
+    }
+    // Data is dropped when the account or the device changed meanwhile,
+    // or an action that may change them began, also one that has ended
+    // since (`accountChanges`). Actions do not wait for a read on its
+    // way; this check makes its answer harmless instead.
+    if (accountChanges !== changes) {
+      return workspaceReadFailed("unavailable");
+    }
+    if (result.value === null) {
+      return workspaceReadFailed("failed");
+    }
+    return Object.freeze({ ok: true, value: result.value });
   }
 
   async function readWorkspaceData<N extends WorkspaceReadName>(
@@ -1580,58 +1648,18 @@ export function createAccountService(
       if (call === null) {
         return workspaceReadFailed("failed");
       }
-      // Reads are not the person's actions: they take no `operation` lock
-      // and never make an action answer `busy`. They wait for a background
-      // refresh, which may report a sign-out or retry a removal with the
-      // key, so that they never overlap it.
-      if (readsPaused()) {
-        return workspaceReadFailed("unavailable");
-      }
-      await backgroundSettled();
-      if (readsPaused() || deviceKey === "loading") {
-        return workspaceReadFailed("unavailable");
-      }
-      const held = session;
-      if (system === null || held === null || account.kind !== "signed_in") {
-        return workspaceReadFailed("not_signed_in");
-      }
-      const deviceId = account.deviceId;
-      const changes = accountChanges;
-      const replacementWasPending = replacementPending;
-      const result = await held.request(call);
-      if (replacementWasPending) {
-        // A token may have confirmed or abandoned the key's replacement.
-        void refreshAccount().catch(() => {
-          report("The account could not be read.");
-        });
-      }
-      // The answer belongs to the device that asked: when no device or
-      // another one is signed in now, it is dropped.
-      if (account.kind !== "signed_in") {
-        return workspaceReadFailed("not_signed_in");
-      }
-      if (account.deviceId !== deviceId) {
-        return workspaceReadFailed("unavailable");
-      }
-      // A failure carries no data, so it is answered as it is, also when
-      // the request's own refusal (for example `sign_in_required`) changed
-      // the device meanwhile.
-      if (!result.ok) {
-        return workspaceReadFailed(workspaceReadFailureOf(result));
-      }
-      // Data is dropped when the account or the device changed meanwhile,
-      // or an action that may change them began, also one that has ended
-      // since (`accountChanges`). Actions do not wait for a read on its
-      // way; this check makes its answer harmless instead.
-      if (accountChanges !== changes) {
-        return workspaceReadFailed("unavailable");
-      }
-      if (result.value === null) {
-        return workspaceReadFailed("failed");
-      }
-      return Object.freeze({ ok: true, value: result.value });
+      return await readWith((held) => held.request(call));
     } catch {
       report("The workspace data could not be read.");
+      return workspaceReadFailed("unavailable");
+    }
+  }
+
+  async function readDeviceList(): Promise<WorkspaceReadResult<DeviceList>> {
+    try {
+      return await readWith((held) => held.listDevices());
+    } catch {
+      report("The device list could not be read.");
       return workspaceReadFailed("unavailable");
     }
   }
@@ -1784,10 +1812,17 @@ export function createAccountService(
     forgetAccount,
     signOut,
     removeDevice,
-    listDevices,
+    onDeviceAction: (listener: () => void) => {
+      const entry = () => listener();
+      deviceActionListeners.add(entry);
+      return () => {
+        deviceActionListeners.delete(entry);
+      };
+    },
     signWebSocketChallenge,
     deviceRefused,
     readWorkspaceData,
+    readDeviceList,
     sendWorkspaceAction,
   });
 }

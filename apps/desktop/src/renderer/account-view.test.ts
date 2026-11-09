@@ -25,12 +25,10 @@ import {
   DEVICE_STATE_MESSAGES,
   describeDeviceState,
   describeOutcome,
-  deviceDetail,
   deviceSignedIn,
   followAccountStatus,
   forgetMessage,
   initialAccountView,
-  listDevicesMessage,
   offersForget,
   offersSignIn,
   removeDeviceMessage,
@@ -776,28 +774,20 @@ test("every failure of a device action has its own message, and a success none",
     expect(removeDeviceMessage(failed)).toBe(
       DEVICE_ACTION_FAILURE_MESSAGES[reason],
     );
-    expect(listDevicesMessage(failed)).toBe(
-      DEVICE_ACTION_FAILURE_MESSAGES[reason],
-    );
   }
   for (const [reason, text] of [
     ["busy", DEVICE_ACTION_MESSAGES.busy],
     ["not_signed_in", DEVICE_ACTION_MESSAGES.notSignedIn],
-    ["too_soon", DEVICE_ACTION_MESSAGES.tooSoon],
   ] as const) {
     const refused = { outcome: "refused", reason } as const;
     expect(signOutMessage(refused)).toBe(text);
     expect(removeDeviceMessage(refused)).toBe(text);
-    expect(listDevicesMessage(refused)).toBe(text);
   }
   expect(signOutMessage({ outcome: "signed_out" })).toBeUndefined();
   expect(signOutMessage({ outcome: "pending" })).toBeUndefined();
   for (const outcome of ["removed", "pending", "cancelled"] as const) {
     expect(removeDeviceMessage({ outcome })).toBeUndefined();
   }
-  expect(
-    listDevicesMessage({ outcome: "listed", devices: [] }),
-  ).toBeUndefined();
 });
 
 test("This is not me says whether the server removed the device or it stays listed for that account, without an end of its sign-in (#198)", () => {
@@ -829,31 +819,6 @@ test("This is not me says whether the server removed the device or it stays list
   expect(forgetMessage({ outcome: "failed" })).toBe(
     ACTION_MESSAGES.forgetFailed,
   );
-});
-
-test("a device's detail names its platform and when it was last seen or removed", () => {
-  const device = {
-    id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
-    label: "Linux computer",
-    platform: "linux",
-    lastSeenAt: null,
-    signInExpiresAt: "2026-12-02T10:00:00.000Z",
-    revokedAt: null,
-    current: false,
-  } as const;
-
-  expect(deviceDetail(device)).toBe("Linux, not connected yet");
-  expect(
-    deviceDetail({ ...device, lastSeenAt: "2026-11-02T09:00:00.000Z" }),
-  ).toBe("Linux, last seen on 2026-11-02");
-  expect(
-    deviceDetail({
-      ...device,
-      platform: "windows",
-      lastSeenAt: "2026-11-02T09:00:00.000Z",
-      revokedAt: "2026-11-03T09:00:00.000Z",
-    }),
-  ).toBe("Windows, removed on 2026-11-03");
 });
 
 test("the panel offers another browser for a waiting sign-in no sooner than the cooldown allows a new start", () => {

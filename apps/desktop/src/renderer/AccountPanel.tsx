@@ -8,7 +8,6 @@ import {
 import type { AccountBridge } from "../shared/desktop-bridge.ts";
 import type {
   AccountStatus,
-  DeviceView,
   SignInState,
   UnlockResult,
 } from "../shared/ipc-contract.ts";
@@ -22,11 +21,9 @@ import {
   DEVICE_KEY_PROBLEM_MESSAGES,
   describeDeviceState,
   describeOutcome,
-  deviceDetail,
   followAccountStatus,
   forgetMessage,
   initialAccountView,
-  listDevicesMessage,
   offersForget,
   offersSignIn,
   removeDeviceMessage,
@@ -47,10 +44,10 @@ import {
  * browser or in another one (#175), the pairing code while the browser is
  * open, the GitHub login after a sign-in with "This is not me" (#149) and no
  * account while the device is signed out (#195), the passphrase of a device
- * key that needs one, the state of the device with sign-out, removing this
- * device, and a simple device list. The main process runs the sign-in and
- * the device session; the panel never sees a sign-in code, a key, or a
- * token. The screens of #95 replace it.
+ * key that needs one, and the state of the device with sign-out and
+ * removing this device. The main process runs the sign-in and the device
+ * session; the panel never sees a sign-in code, a key, or a token. The
+ * account's devices are listed beside it (`DevicesSection.tsx`).
  */
 export function AccountPanel({
   account,
@@ -90,12 +87,9 @@ export interface AccountPanelContentProps {
    * dialog, the only confirmation, which the renderer cannot answer.
    */
   readonly onForget: () => void;
-  /** The account's devices after "Show devices", or undefined before. */
-  readonly devices: readonly DeviceView[] | undefined;
   readonly onSignOut: () => void;
   /** The main process confirms the removal in a native dialog. */
   readonly onRemoveDevice: () => void;
-  readonly onListDevices: () => void;
   /**
    * The renderer's clock in milliseconds. The panel reads it again when the
    * wait after a start refused during the grace period of an uncertain
@@ -157,11 +151,6 @@ function AccountBody(props: AccountPanelContentProps) {
       )}
       <DeviceKeyNotice {...props} status={status} />
       <SignInActions {...props} status={status} />
-      {props.devices === undefined ||
-      status.device !== "signed_in" ||
-      status.signIn.kind !== "idle" ? null : (
-        <DeviceList devices={props.devices} />
-      )}
       {outcome === undefined ? null : (
         <p
           className={
@@ -350,24 +339,14 @@ function SignInActions(
           </>
         ) : null}
         {usable ? (
-          <>
-            <button
-              type="button"
-              className="panel-action"
-              disabled={busy}
-              onClick={props.onListDevices}
-            >
-              Show devices
-            </button>
-            <button
-              type="button"
-              className="panel-action"
-              disabled={busy}
-              onClick={props.onSignOut}
-            >
-              Sign out
-            </button>
-          </>
+          <button
+            type="button"
+            className="panel-action"
+            disabled={busy}
+            onClick={props.onSignOut}
+          >
+            Sign out
+          </button>
         ) : null}
         {usable || (signedIn && status.device === "removal_pending") ? (
           <button
@@ -531,31 +510,6 @@ function AuthorizeUrl({
   );
 }
 
-/** The account's devices, with the device of this installation marked. */
-function DeviceList({ devices }: { readonly devices: readonly DeviceView[] }) {
-  return (
-    <section aria-labelledby="devices-title">
-      <h4 id="devices-title">Devices</h4>
-      {devices.length === 0 ? (
-        <p className="placeholder-note">No devices are listed.</p>
-      ) : (
-        <ul className="device-list">
-          {devices.map((device) => (
-            <li
-              key={device.id}
-              aria-current={device.current ? "true" : undefined}
-            >
-              {device.label}
-              {device.current ? " (this device)" : ""}
-              <span className="device-detail">{deviceDetail(device)}</span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </section>
-  );
-}
-
 /** Follows the account status while the panel is shown. */
 function useAccountPanel(
   bridge: AccountBridge | undefined,
@@ -565,9 +519,6 @@ function useAccountPanel(
   );
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | undefined>(undefined);
-  const [devices, setDevices] = useState<readonly DeviceView[] | undefined>(
-    undefined,
-  );
   const [anotherBrowser, setAnotherBrowser] = useState(false);
   const [idleWaits] = useState(createIdleWaits);
   /** The pairing code of a waiting sign-in that can be replaced now. */
@@ -684,12 +635,7 @@ function useAccountPanel(
   const onForget = useCallback(() => {
     run(
       (account) => account.forgetAccount(),
-      (result) => {
-        if (result.outcome === "forgotten") {
-          setDevices(undefined);
-        }
-        return forgetMessage(result);
-      },
+      forgetMessage,
       ACTION_MESSAGES.forgetFailed,
     );
   }, [run]);
@@ -697,10 +643,7 @@ function useAccountPanel(
   const onSignOut = useCallback(() => {
     run(
       (account) => account.signOut(),
-      (result) => {
-        setDevices(undefined);
-        return signOutMessage(result);
-      },
+      signOutMessage,
       DEVICE_ACTION_MESSAGES.signOutFailed,
     );
   }, [run]);
@@ -708,24 +651,8 @@ function useAccountPanel(
   const onRemoveDevice = useCallback(() => {
     run(
       (account) => account.removeDevice(),
-      (result) => {
-        if (result.outcome === "removed") {
-          setDevices(undefined);
-        }
-        return removeDeviceMessage(result);
-      },
+      removeDeviceMessage,
       DEVICE_ACTION_MESSAGES.removeFailed,
-    );
-  }, [run]);
-
-  const onListDevices = useCallback(() => {
-    run(
-      (account) => account.listDevices(),
-      (result) => {
-        setDevices(result.outcome === "listed" ? result.devices : undefined);
-        return listDevicesMessage(result);
-      },
-      DEVICE_ACTION_MESSAGES.listFailed,
     );
   }, [run]);
 
@@ -741,10 +668,8 @@ function useAccountPanel(
     onCancelSignIn,
     onUnlock,
     onForget,
-    devices,
     onSignOut,
     onRemoveDevice,
-    onListDevices,
   };
 }
 

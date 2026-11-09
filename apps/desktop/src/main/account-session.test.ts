@@ -1,19 +1,16 @@
 import {
   API_ERROR_CODES,
   type DeviceId,
-  type DeviceListItem,
   type UserId,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
 import {
   DEVICE_ACTION_FAILURES,
   DEVICE_STATES,
-  DeviceViewSchema,
 } from "../shared/ipc-contract.ts";
 import {
   deviceActionFailure,
   deviceStateOf,
-  deviceViewOf,
   REMOVE_DEVICE_CONFIRMATION,
   removeDeviceConfirmationMessage,
   removeDeviceConfirmed,
@@ -133,35 +130,6 @@ test("every failure of the session maps to a fixed code, an API code the screens
     const code = deviceActionFailure(failure as unknown as SessionFailure);
     expect(["refused", "failed"]).toContain(code);
   }
-});
-
-test("a device of the list keeps only the fields that the renderer may see", () => {
-  const item = {
-    id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
-    label: "Mac",
-    platform: "macos",
-    createdAt: "2026-10-01T10:00:00.000Z",
-    lastSeenAt: null,
-    lastSignInAt: "2026-11-01T10:00:00.000Z",
-    signInExpiresAt: "2026-12-01T10:00:00.000Z",
-    revokedAt: "2026-11-02T10:00:00.000Z",
-    current: false,
-    publicKey: "ab".repeat(32),
-  } as unknown as DeviceListItem;
-
-  const view = deviceViewOf(item);
-
-  expect(view).toEqual({
-    id: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
-    label: "Mac",
-    platform: "macos",
-    lastSeenAt: null,
-    signInExpiresAt: "2026-12-01T10:00:00.000Z",
-    revokedAt: "2026-11-02T10:00:00.000Z",
-    current: false,
-  });
-  expect(Object.isFrozen(view)).toBe(true);
-  expect(DeviceViewSchema.parse(view)).toEqual(view);
 });
 
 test("the confirmation of removing this device names the login, offers Keep as the default, and only the remove button confirms", () => {

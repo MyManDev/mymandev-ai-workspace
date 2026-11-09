@@ -4,6 +4,7 @@ import type {
   ChatBridge,
   ConnectionBridge,
   DesktopBridge,
+  DeviceListBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -21,8 +22,9 @@ import type {
   ChatSendResultView,
   ChatView,
   ConnectionStatus,
+  DeviceListLoadResult,
+  DeviceListView,
   ForgetResult,
-  ListDevicesResult,
   MountResult,
   ReconnectResult,
   RemoveDeviceResult,
@@ -243,8 +245,6 @@ export function createDesktopBridge(
       ipc.invoke(INVOKE_CHANNELS.signOut) as Promise<SignOutResult>,
     removeDevice: () =>
       ipc.invoke(INVOKE_CHANNELS.removeDevice) as Promise<RemoveDeviceResult>,
-    listDevices: () =>
-      ipc.invoke(INVOKE_CHANNELS.listDevices) as Promise<ListDevicesResult>,
   });
 
   const connection: ConnectionBridge = Object.freeze({
@@ -383,6 +383,30 @@ export function createDesktopBridge(
       ) as Promise<ChatLoadOlderResultView>,
   });
 
+  const devices: DeviceListBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(INVOKE_CHANNELS.getDeviceList) as Promise<DeviceListView>,
+    subscribeState: (
+      listener: (state: DeviceListView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeDeviceList,
+        EVENT_CHANNELS.deviceListChanged,
+        "A device list callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    load: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.loadDeviceList,
+      ) as Promise<DeviceListLoadResult>,
+    dismissNewDevices: () =>
+      ipc.invoke(INVOKE_CHANNELS.dismissNewDevices) as Promise<boolean>,
+  });
+
   return Object.freeze({
     electronVersion,
     runtime,
@@ -392,5 +416,6 @@ export function createDesktopBridge(
     workspaces,
     agents,
     chat,
+    devices,
   });
 }

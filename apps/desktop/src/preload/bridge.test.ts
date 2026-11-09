@@ -58,7 +58,7 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the agent, and the chat functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the agent, the chat, and the device list functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
@@ -66,6 +66,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "agents",
     "chat",
     "connection",
+    "devices",
     "electronVersion",
     "repositories",
     "runtime",
@@ -85,7 +86,6 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "cancelSignIn",
     "forgetAccount",
     "getStatus",
-    "listDevices",
     "removeDevice",
     "signOut",
     "startSignIn",
@@ -115,6 +115,12 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "send",
     "subscribeState",
   ]);
+  expect(Object.keys(bridge.devices).sort()).toEqual([
+    "dismissNewDevices",
+    "getState",
+    "load",
+    "subscribeState",
+  ]);
   expect(bridge.electronVersion).toBe("44.9.1");
   expect(Object.isFrozen(bridge)).toBe(true);
   expect(Object.isFrozen(bridge.runtime)).toBe(true);
@@ -124,6 +130,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   expect(Object.isFrozen(bridge.workspaces)).toBe(true);
   expect(Object.isFrozen(bridge.agents)).toBe(true);
   expect(Object.isFrozen(bridge.chat)).toBe(true);
+  expect(Object.isFrozen(bridge.devices)).toBe(true);
   for (const value of [
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
@@ -132,6 +139,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     ...Object.values(bridge.workspaces),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
+    ...Object.values(bridge.devices),
   ]) {
     expect(typeof value).toBe("function");
   }
@@ -420,7 +428,6 @@ test("the account functions call their channels and pass no argument from the re
     account["forgetAccount"]?.({ confirmed: false }),
     account["signOut"]?.({ keepKey: false }),
     account["removeDevice"]?.({ confirmed: true }, "0192f2a0"),
-    account["listDevices"]?.({ all: true }),
   ];
   fake.answers[0]?.resolve(accountStatus(1));
   fake.answers[1]?.resolve({ outcome: "started" });
@@ -428,7 +435,6 @@ test("the account functions call their channels and pass no argument from the re
   fake.answers[3]?.resolve({ outcome: "forgotten", removedAtServer: true });
   fake.answers[4]?.resolve({ outcome: "pending" });
   fake.answers[5]?.resolve({ outcome: "cancelled" });
-  fake.answers[6]?.resolve({ outcome: "listed", devices: [] });
 
   await expect(Promise.all(answers)).resolves.toEqual([
     accountStatus(1),
@@ -437,7 +443,6 @@ test("the account functions call their channels and pass no argument from the re
     { outcome: "forgotten", removedAtServer: true },
     { outcome: "pending" },
     { outcome: "cancelled" },
-    { outcome: "listed", devices: [] },
   ]);
   expect(fake.invoked).toEqual([
     { channel: INVOKE_CHANNELS.getAccountStatus, args: [] },
@@ -446,7 +451,46 @@ test("the account functions call their channels and pass no argument from the re
     { channel: INVOKE_CHANNELS.forgetAccount, args: [] },
     { channel: INVOKE_CHANNELS.signOut, args: [] },
     { channel: INVOKE_CHANNELS.removeDevice, args: [] },
-    { channel: INVOKE_CHANNELS.listDevices, args: [] },
+  ]);
+});
+
+/** A device list state with the revision `revision`. */
+function deviceList(revision: number) {
+  return {
+    status: "ready",
+    revision,
+    devices: [],
+    registrationLockedUntil: null,
+    newDevices: [],
+  };
+}
+
+test("the device list functions call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const devices = createDesktopBridge("44.9.1", fake.ipc)
+    .devices as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  const answers = [
+    devices["getState"]?.("devices:dismiss-new-devices"),
+    devices["load"]?.({ force: true }, "0192f2a0"),
+    devices["dismissNewDevices"]?.(["0192f2a0"]),
+  ];
+  fake.answers[0]?.resolve(deviceList(1));
+  fake.answers[1]?.resolve({ outcome: "loading" });
+  fake.answers[2]?.resolve(true);
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    deviceList(1),
+    { outcome: "loading" },
+    true,
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getDeviceList, args: [] },
+    { channel: INVOKE_CHANNELS.loadDeviceList, args: [] },
+    { channel: INVOKE_CHANNELS.dismissNewDevices, args: [] },
   ]);
 });
 
@@ -965,6 +1009,54 @@ test("the chat subscription delivers the state and every newer one, without the 
   );
   fake.emit(EVENT_CHANNELS.chatStateChanged, { status: "ready", revision: 5 });
   expect(reported).toEqual(["A chat state callback failed."]);
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+  expect(refused).toBe(1);
+});
+
+test("the device list subscription delivers the state and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const calls: unknown[][] = [];
+  const reported: string[] = [];
+  const unsubscribe = bridge.devices.subscribeState((...args) =>
+    calls.push(args),
+  );
+
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeDeviceList, args: [] },
+  ]);
+  fake.answers[0]?.resolve({ status: "loading", revision: 3 });
+  await settle();
+  fake.emit(EVENT_CHANNELS.deviceListChanged, { status: "ready", revision: 4 });
+  fake.emit(EVENT_CHANNELS.deviceListChanged, {
+    status: "loading",
+    revision: 2,
+  });
+  expect(calls).toEqual([
+    [{ status: "loading", revision: 3 }],
+    [{ status: "ready", revision: 4 }],
+  ]);
+  unsubscribe();
+  expect(fake.listenerCount(EVENT_CHANNELS.deviceListChanged)).toBe(0);
+
+  const failing = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  let refused = 0;
+  failing.devices.subscribeState(
+    () => {
+      throw new Error("broken");
+    },
+    () => {
+      refused += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.deviceListChanged, {
+    status: "ready",
+    revision: 5,
+  });
+  expect(reported).toEqual(["A device list callback failed."]);
   fake.answers[1]?.reject(new Error("refused"));
   await settle();
   expect(refused).toBe(1);

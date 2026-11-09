@@ -5,8 +5,9 @@ import type {
   ChatSendResultView,
   ChatView,
   ConnectionStatus,
+  DeviceListLoadResult,
+  DeviceListView,
   ForgetResult,
-  ListDevicesResult,
   MountResult,
   ReconnectResult,
   RemoveDeviceResult,
@@ -46,6 +47,8 @@ export interface DesktopBridge {
   readonly agents: AgentBridge;
   /** The chat of the open project. */
   readonly chat: ChatBridge;
+  /** The account's devices, the registration lock, and new devices. */
+  readonly devices: DeviceListBridge;
 }
 
 export interface RuntimeBridge {
@@ -91,9 +94,9 @@ export interface RepositoryBridge {
 
 /**
  * The sign-in and the device of this installation. The main process runs
- * them: the renderer gets the account, the pairing code, the device list,
- * and fixed codes, never a sign-in code, a verifier, a signature, a key, or
- * a token (ADR 0014).
+ * them: the renderer gets the account, the pairing code, and fixed codes,
+ * never a sign-in code, a verifier, a signature, a key, or a token
+ * (ADR 0014). The account's devices come through `DeviceListBridge`.
  */
 export interface AccountBridge {
   /** The current account status. */
@@ -145,8 +148,6 @@ export interface AccountBridge {
    * the API confirmed. Resolves to `pending` while the API has not answered.
    */
   readonly removeDevice: () => Promise<RemoveDeviceResult>;
-  /** The devices of the account; the device of this installation is marked. */
-  readonly listDevices: () => Promise<ListDevicesResult>;
 }
 
 /**
@@ -302,4 +303,39 @@ export interface ChatBridge {
    * the server asked to wait.
    */
   readonly loadOlder: () => Promise<ChatLoadOlderResultView>;
+}
+
+/**
+ * The account's devices, which the main process holds (#95, D4 and D5b):
+ * each device with its ID, label, platform, and times, the device of this
+ * installation marked, the end of a registration lock in force, and the
+ * notices of new devices. It never holds a user ID or a token.
+ */
+export interface DeviceListBridge {
+  /** The current device list state. */
+  readonly getState: () => Promise<DeviceListView>;
+  /**
+   * Calls `listener` with the current device list state and then after
+   * changes, at most once every 50 ms with the latest one. A state older
+   * than the last one delivered is dropped. `onError` is called when the
+   * main process refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: DeviceListView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Asks the main process to load the list, when the Account screen shows
+   * it. From then on the main process loads it again on its own after the
+   * account's device frames, a reconnect, and a device action. Resolves to
+   * `refused` without a signed-in device, and with `too_soon` within a few
+   * seconds of the last request. It passes nothing from the renderer on.
+   */
+  readonly load: () => Promise<DeviceListLoadResult>;
+  /**
+   * Dismisses the notices of new devices. Resolves to false when none was
+   * shown.
+   */
+  readonly dismissNewDevices: () => Promise<boolean>;
 }
