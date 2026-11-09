@@ -68,13 +68,15 @@ interface Sent {
   readonly params: unknown;
   readonly body: readonly unknown[];
   /** The session's request that the allowlist builds for the call. */
-  readonly request: AuthorizedRequest<unknown> | null;
+  readonly request: AuthorizedRequest<unknown>;
 }
 
 /**
- * The account service's `sendWorkspaceAction`, which records each call with
- * the request that the real allowlist builds for it, and answers with
- * `answer`, by default `ok` with the answer of a definition.
+ * The account service's `sendWorkspaceAction`: like the account service, it
+ * builds the request with the real allowlist and answers `invalid` without
+ * sending anything when the allowlist refuses the call. Otherwise it records
+ * the request as sent and answers with `answer`, by default `ok` with the
+ * answer of a definition.
  */
 function fakeAccount(
   answer: (name: WorkspaceActionName) => Answer | Promise<Answer> = (name) =>
@@ -86,12 +88,11 @@ function fakeAccount(
     params: unknown,
     ...body: unknown[]
   ) => {
-    sent.push({
-      name,
-      params,
-      body,
-      request: workspaceActionRequest(name, params, body[0]),
-    });
+    const request = workspaceActionRequest(name, params, body[0]);
+    if (request === null) {
+      return Promise.resolve({ ok: false, reason: "invalid" });
+    }
+    sent.push({ name, params, body, request });
     return Promise.resolve(answer(name));
   }) as AccountService["sendWorkspaceAction"];
   return { sent, account: { sendWorkspaceAction } };
@@ -425,6 +426,25 @@ test("the main process checks the IDs again with the protocol's ID schemas, and 
         expect(account.sent, `${entry.channel} ${index}`).toEqual([]);
       }
     }
+  }
+});
+
+test("a name that the protocol refuses, such as a blank one or one with a line feed, resolves invalid for define and rename, and nothing is sent", async () => {
+  for (const name of ["   ", "a\nb", "\u200b", "a\u202eb"]) {
+    const account = fakeAccount();
+    const { call } = register(account);
+    const refusedInvalid = {
+      outcome: "refused",
+      reason: "invalid",
+      retryAfterMs: null,
+    };
+    await expect(
+      call(INVOKE_CHANNELS.definePerson, WORKSPACE, name),
+    ).resolves.toEqual(refusedInvalid);
+    await expect(
+      call(INVOKE_CHANNELS.renamePerson, WORKSPACE, MEMBER, name),
+    ).resolves.toEqual(refusedInvalid);
+    expect(account.sent, JSON.stringify(name)).toEqual([]);
   }
 });
 

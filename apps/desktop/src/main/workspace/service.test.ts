@@ -1498,6 +1498,72 @@ test("while a failed reload waits out its backoff, also after rate_limited, aske
   expect(h.service.ownershipOffer()).toBeNull();
 });
 
+/** Overflows the buffer of the open reload with renames of a project. */
+function overflow(h: Harness): void {
+  for (let n = 0; n <= MAX_BUFFERED_EVENTS; n += 1) {
+    h.receive(
+      event("workspace.project.renamed", {
+        projectId: PROJECT_1,
+        name: "Project One Renamed",
+      }),
+    );
+  }
+  expect(h.logs).toContain(
+    "Too many workspace events waited; the workspace reloads.",
+  );
+}
+
+test("a reload asked while an overflow waits for its retry reads nothing, and the retry reads once", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  overflow(h);
+  // The reload that `workspace.subscribed` began is stale now.
+  await h.answerReload();
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([2_000]);
+
+  expect(h.service.reload(WS_A)).toBe(true);
+  h.receive(offerFrame("account.ownership_offered"));
+  expect(h.reads).toEqual([]);
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([2_000]);
+
+  h.fire(2_000);
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+  await h.answerReload(ok(offerView()));
+  expect(h.service.gateLive(WS_A)).toBe(true);
+  expect(h.service.ownershipOffer()?.memberId).toBe(MEMBER);
+  await settle();
+  expect(h.reads).toEqual([]);
+});
+
+test("a reload asked during an open reload that then overflows is taken by the overflow's retry, with no read before it", async () => {
+  const h = await withList();
+  h.receive(subscribed());
+  await h.answerReload();
+
+  expect(h.service.reload(WS_A)).toBe(true);
+  const open = [h.take("getWorkspace"), h.take("listProjects")];
+  // Merged into the open reload.
+  expect(h.service.reload(WS_A)).toBe(true);
+  overflow(h);
+  // The open reload's answer is stale and starts nothing.
+  for (const read of open) {
+    read.answer(
+      ok(read.name === "getWorkspace" ? offerView(null) : projectList([])),
+    );
+  }
+  await settle();
+  expect(h.reads).toEqual([]);
+  expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([2_000]);
+
+  // The retry reads the asked change, and nothing follows it.
+  h.fire(2_000);
+  expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
+  await h.answerReload(ok(offerView()));
+  expect(h.service.ownershipOffer()?.memberId).toBe(MEMBER);
+  await settle();
+  expect(h.reads).toEqual([]);
+});
+
 test("a removal of the offer's target that waited during a reload keeps a newer offer to another person", async () => {
   const h = await withList();
   h.receive(subscribed());
