@@ -1,0 +1,864 @@
+import {
+  createDatabase,
+  type Database,
+  workspaceJoinRequests,
+  workspaceMembers,
+  workspaces,
+} from "@mymandev/database";
+import {
+  createTestDatabase,
+  type TestDatabase,
+} from "@mymandev/database/testing";
+import {
+  type AgentRunStateChangedEvent,
+  CreateJoinRequestResponseSchema,
+  decodeServerMessage,
+  type JoinRequestId,
+  JoinRequestListResponseSchema,
+  type MemberId,
+  type MemberRole,
+  newId,
+  type OwnJoinRequest,
+  type UserId,
+  type WorkspaceId,
+} from "@mymandev/protocol";
+import { eq } from "drizzle-orm";
+import type { FastifyBaseLogger, FastifyInstance } from "fastify";
+import assert from "node:assert/strict";
+import { after, before, test, type TestContext } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  accessToken,
+  deviceApp,
+  type SignedInDevice,
+  signInDevice,
+} from "../auth/device-test-support.ts";
+import { type Client, connected, settle } from "../gateway-test-support.ts";
+import { ConnectionRegistry } from "../gateway.ts";
+import {
+  type ApproverEventHandler,
+  deliverWorkspaceEvent,
+  type JoinRequestEvent,
+  type WorkspaceEvent,
+  type WorkspaceEventHandler,
+} from "./events.ts";
+
+// The join request events (#210): a new request reaches the subscribed
+// connections of the workspace's owner and admins as
+// `workspace.join_request.created`, and every way a pending request ends
+// but an expiry as `workspace.join_request.resolved`. A member, the
+// requester, and another workspace's connections never get them. The relay
+// reads the owner and admins inside the transaction of each change, so a
+// role change counts from the next change on.
+
+let testDatabase: TestDatabase | undefined;
+
+before(async () => {
+  testDatabase = await createTestDatabase();
+});
+
+after(async () => {
+  await testDatabase?.close();
+});
+
+function database(): Database {
+  assert.ok(testDatabase, "the test database is created in before()");
+  return testDatabase.db;
+}
+
+type AnyFunction = (...args: unknown[]) => unknown;
+
+/**
+ * The test database, whose next transaction rolls back after its callback
+ * succeeded, as a commit that fails does: the change and the read of the
+ * owner and admins ran, and nothing committed.
+ */
+function failingCommits(target: Database) {
+  let failNext = false;
+  const proxy = new Proxy(target, {
+    get(object, property) {
+      const value: unknown = Reflect.get(object, property, object);
+      if (typeof value !== "function") {
+        return value;
+      }
+      const method = value as AnyFunction;
+      if (property !== "transaction") {
+        return method.bind(object);
+      }
+      return (run: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) =>
+        method.call(
+          object,
+          async (tx: unknown) => {
+            const result = await run(tx);
+            if (failNext) {
+              failNext = false;
+              throw new Error("the commit failed");
+            }
+            return result;
+          },
+          ...rest,
+        );
+    },
+  });
+  return {
+    database: proxy,
+    failNextCommit: () => {
+      failNext = true;
+    },
+  };
+}
+
+type Account = Readonly<{
+  app: FastifyInstance;
+  device: SignedInDevice;
+  token: string;
+}>;
+
+type Delivered = Readonly<{
+  event: JoinRequestEvent;
+  approvers: readonly MemberId[];
+}>;
+
+/**
+ * One API instance: each account signs in through its own app, and every app
+ * shares one registry of connections and one database, whose next commit can
+ * be made to fail. The join request events that went out are recorded with
+ * the owner and admins they went to.
+ */
+async function instance(t: TestContext) {
+  const connections = new ConnectionRegistry();
+  const commits = failingCommits(database());
+  const delivered: Delivered[] = [];
+  const onApproverEvent: ApproverEventHandler = (event, approvers) => {
+    delivered.push({ event, approvers });
+  };
+  const account = async (githubId: number): Promise<Account> => {
+    const app = await deviceApp(t, {
+      database: commits.database,
+      githubId,
+      connections,
+      onApproverEvent,
+    });
+    // injectWS never settles unless the app is ready.
+    await app.ready();
+    const device = await signInDevice(app);
+    return { app, device, token: await accessToken(app, device) };
+  };
+  return {
+    connections,
+    delivered,
+    account,
+    failNextCommit: commits.failNextCommit,
+  };
+}
+
+/** A workspace, written directly, with an owner and claimed people of the given roles. */
+async function workspaceOf(
+  owner: Account,
+  people: readonly (readonly [Account, MemberRole])[] = [],
+) {
+  const workspaceId = newId<WorkspaceId>();
+  await database().insert(workspaces).values({
+    id: workspaceId,
+    name: "Team",
+    createdByUserId: owner.device.userId,
+  });
+  const person = async (userId: UserId, role: MemberRole) => {
+    const id = newId<MemberId>();
+    await database().insert(workspaceMembers).values({
+      id,
+      workspaceId,
+      userId,
+      displayName: "Someone",
+      role,
+      addedByUserId: owner.device.userId,
+      claimedAt: new Date(),
+    });
+    return id;
+  };
+  const ownerId = await person(owner.device.userId, "owner");
+  const memberIds: MemberId[] = [];
+  for (const [account, role] of people) {
+    memberIds.push(await person(account.device.userId, role));
+  }
+  return { workspaceId, ownerId, memberIds };
+}
+
+function post(account: Account, url: string, payload?: object) {
+  return account.app.inject({
+    method: "POST",
+    url,
+    headers: { authorization: `Bearer ${account.token}` },
+    ...(payload === undefined ? {} : { payload }),
+  });
+}
+
+/** Asks to join and expects the request. */
+async function asked(
+  account: Account,
+  workspaceId: WorkspaceId,
+): Promise<OwnJoinRequest> {
+  const response = await post(account, "/join-requests", {
+    workspaceId,
+    displayName: "Guest",
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  return CreateJoinRequestResponseSchema.parse(response.json()).joinRequest;
+}
+
+/** The approvers' list of the workspace, as the owner or an admin reads it. */
+async function approversList(account: Account, workspaceId: WorkspaceId) {
+  const response = await account.app.inject({
+    method: "GET",
+    url: `/workspaces/${workspaceId}/join-requests`,
+    headers: { authorization: `Bearer ${account.token}` },
+  });
+  assert.equal(response.statusCode, 200, response.body);
+  return JoinRequestListResponseSchema.parse(response.json()).joinRequests;
+}
+
+/** A route of the approvers on one request, such as `deny`. */
+function decide(
+  account: Account,
+  workspaceId: WorkspaceId,
+  joinRequestId: JoinRequestId,
+  action: "approve" | "deny" | "block" | "unblock",
+) {
+  return post(
+    account,
+    `/workspaces/${workspaceId}/join-requests/${joinRequestId}/${action}`,
+    // An approval takes an optional display name in its body.
+    action === "approve" ? {} : undefined,
+  );
+}
+
+/** A route of the approvers on all requests of the workspace. */
+function onAll(
+  account: Account,
+  workspaceId: WorkspaceId,
+  action: "deny-all" | "pause" | "resume",
+) {
+  return post(account, `/workspaces/${workspaceId}/join-requests/${action}`);
+}
+
+/** How long a test waits for a message that the server sends at once. */
+const MESSAGE_TIMEOUT_MS = 2_000;
+
+/** The next message, which the device's decoder accepts, or a failure after `MESSAGE_TIMEOUT_MS`. */
+async function nextMessage(client: Client) {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`no message within ${MESSAGE_TIMEOUT_MS} ms`));
+    }, MESSAGE_TIMEOUT_MS);
+  });
+  try {
+    const decoded = decodeServerMessage(
+      await Promise.race([client.next(), timeout]),
+    );
+    assert.ok(decoded.ok, JSON.stringify(decoded));
+    return decoded;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function nextEvent(client: Client) {
+  const message = await nextMessage(client);
+  assert.ok(message.kind === "event", JSON.stringify(message));
+  return message.event;
+}
+
+/** Subscribes, skipping the presence frames of other subscribers. */
+async function subscribed(client: Client, workspaceId: WorkspaceId) {
+  client.send({ protocolVersion: 0, type: "workspace.subscribe", workspaceId });
+  for (;;) {
+    const message = await nextMessage(client);
+    assert.ok(message.kind === "frame", JSON.stringify(message));
+    if (message.frame.type === "workspace.subscribed") {
+      assert.equal(message.frame.workspaceId, workspaceId);
+      return;
+    }
+    assert.equal(message.frame.type, "presence.changed");
+  }
+}
+
+/** Lets pending messages arrive, then returns the types of all unread ones. */
+async function drained(client: Client): Promise<string[]> {
+  await settle();
+  const types: string[] = [];
+  while (client.unread() > 0) {
+    const message = await nextMessage(client);
+    types.push(
+      message.kind === "event" ? message.event.type : message.frame.type,
+    );
+  }
+  return types;
+}
+
+/** Lets pending messages arrive, then checks that none is left unread. */
+async function quiet(...clients: Client[]) {
+  await settle();
+  for (const client of clients) {
+    assert.equal(client.unread(), 0);
+  }
+}
+
+/** Reads the presence frames that the subscriptions caused. */
+async function drainPresence(...clients: Client[]) {
+  for (const client of clients) {
+    for (const type of await drained(client)) {
+      assert.equal(type, "presence.changed");
+    }
+  }
+}
+
+test("a new join request reaches the connections subscribed as the owner or an admin as workspace.join_request.created, and no member, requester, unsubscribed connection, or other workspace", async (t) => {
+  const { account, delivered } = await instance(t);
+  const ada = await account(3601);
+  // Both of the owner's devices sign in before either connects.
+  const adaPhone = await signInDevice(ada.app);
+  const bob = await account(3602);
+  const cleo = await account(3603);
+  const dan = await account(3604);
+  const eve = await account(3605);
+  const team = await workspaceOf(ada, [
+    [bob, "admin"],
+    [cleo, "member"],
+  ]);
+  const [bobInTeam] = team.memberIds;
+  assert.ok(bobInTeam !== undefined);
+  // The requester owns another workspace, with Eve as its admin.
+  const other = await workspaceOf(dan, [[eve, "admin"]]);
+
+  const adaLaptop = (await connected(t, ada.app, ada.device)).client;
+  const adaPhoneClient = (await connected(t, ada.app, adaPhone)).client;
+  const bobClient = (await connected(t, bob.app, bob.device)).client;
+  const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  const danClient = (await connected(t, dan.app, dan.device)).client;
+  const eveClient = (await connected(t, eve.app, eve.device)).client;
+  const everyone = [
+    adaLaptop,
+    adaPhoneClient,
+    bobClient,
+    cleoClient,
+    danClient,
+    eveClient,
+  ];
+  await subscribed(adaLaptop, team.workspaceId);
+  await subscribed(bobClient, team.workspaceId);
+  await subscribed(cleoClient, team.workspaceId);
+  await subscribed(danClient, other.workspaceId);
+  await subscribed(eveClient, other.workspaceId);
+  await drainPresence(...everyone);
+
+  const joinRequest = await asked(dan, team.workspaceId);
+  const [shown] = await approversList(ada, team.workspaceId);
+  assert.ok(shown !== undefined);
+  assert.equal(shown.id, joinRequest.id);
+  assert.ok(shown.requester !== null);
+  assert.equal(shown.requester.login, "user-3604");
+  assert.equal(shown.requester.accountCreatedAt, "2015-06-01T10:00:00.000Z");
+  for (const client of [adaLaptop, bobClient]) {
+    const event = await nextEvent(client);
+    assert.ok(event.type === "workspace.join_request.created", event.type);
+    assert.equal(event.workspaceId, team.workspaceId);
+    assert.deepEqual(event.actor, { kind: "system" });
+    assert.equal(event.deviceId, null);
+    assert.equal(event.occurredAt, joinRequest.createdAt);
+    // What the approvers' list shows, and nothing more.
+    assert.deepEqual(event.payload, { joinRequest: shown });
+  }
+  assert.equal(delivered.length, 1);
+  assert.deepEqual(delivered[0]?.approvers, [team.ownerId, bobInTeam].sort());
+  // The owner's phone did not subscribe, Cleo is a member, Dan asked, and
+  // Eve is an admin of another workspace.
+  await quiet(...everyone);
+
+  // Asking again returns the pending request and sends nothing.
+  assert.deepEqual(await asked(dan, team.workspaceId), joinRequest);
+  await quiet(...everyone);
+  assert.equal(delivered.length, 1);
+});
+
+test("approving, denying, blocking, withdrawing, and denying all reach the owner and admins as workspace.join_request.resolved, one event per request, and the requester only as its account frame", async (t) => {
+  const { account, delivered } = await instance(t);
+  const ada = await account(3611);
+  const bob = await account(3612);
+  const cleo = await account(3613);
+  const guests = [
+    await account(3614),
+    await account(3615),
+    await account(3616),
+    await account(3617),
+    await account(3618),
+    await account(3619),
+  ];
+  const [gus, hal, ivy, jo, kim, lee] = guests;
+  assert.ok(gus && hal && ivy && jo && kim && lee);
+  const team = await workspaceOf(ada, [
+    [bob, "admin"],
+    [cleo, "member"],
+  ]);
+  // The requests come before anyone subscribes, so their created events
+  // reach no connection.
+  const requests = new Map<Account, OwnJoinRequest>();
+  for (const guest of guests) {
+    requests.set(guest, await asked(guest, team.workspaceId));
+  }
+  const requestOf = (guest: Account) => {
+    const found = requests.get(guest);
+    assert.ok(found !== undefined);
+    return found.id;
+  };
+  assert.deepEqual(
+    delivered.splice(0).map(({ event }) => event.type),
+    guests.map(() => "workspace.join_request.created"),
+  );
+
+  const adaClient = (await connected(t, ada.app, ada.device)).client;
+  const bobClient = (await connected(t, bob.app, bob.device)).client;
+  const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  const guestClients = new Map<Account, Client>();
+  for (const guest of guests) {
+    guestClients.set(
+      guest,
+      (await connected(t, guest.app, guest.device)).client,
+    );
+  }
+  const clientOf = (guest: Account) => {
+    const client = guestClients.get(guest);
+    assert.ok(client !== undefined);
+    return client;
+  };
+  const everyone = [adaClient, bobClient, cleoClient, ...guestClients.values()];
+  await subscribed(adaClient, team.workspaceId);
+  await subscribed(bobClient, team.workspaceId);
+  await subscribed(cleoClient, team.workspaceId);
+  await drainPresence(...everyone);
+
+  /** The resolved event that the owner and the admin each get next. */
+  const expectResolved = async (
+    joinRequestId: JoinRequestId,
+    outcome: string,
+  ) => {
+    for (const client of [adaClient, bobClient]) {
+      const event = await nextEvent(client);
+      assert.ok(event.type === "workspace.join_request.resolved", event.type);
+      assert.equal(event.workspaceId, team.workspaceId);
+      assert.deepEqual(event.actor, { kind: "system" });
+      assert.equal(event.deviceId, null);
+      assert.deepEqual(event.payload, { joinRequestId, outcome });
+    }
+  };
+  /** The account frame that the requester gets next. */
+  const expectDecided = async (guest: Account, decision: string) => {
+    const message = await nextMessage(clientOf(guest));
+    assert.ok(
+      message.kind === "frame" &&
+        message.frame.type === "account.join_request_decided",
+      JSON.stringify(message),
+    );
+    assert.equal(message.frame.joinRequestId, requestOf(guest));
+    assert.equal(message.frame.decision, decision);
+  };
+
+  // An approval: everyone subscribed gets the new person, then the owner
+  // and the admin get the outcome.
+  const approved = await decide(
+    bob,
+    team.workspaceId,
+    requestOf(gus),
+    "approve",
+  );
+  assert.equal(approved.statusCode, 200, approved.body);
+  for (const client of [adaClient, bobClient, cleoClient]) {
+    assert.equal((await nextEvent(client)).type, "workspace.member.claimed");
+  }
+  await expectResolved(requestOf(gus), "approved");
+  await expectDecided(gus, "approved");
+  await quiet(...everyone);
+
+  const denied = await decide(ada, team.workspaceId, requestOf(hal), "deny");
+  assert.equal(denied.statusCode, 204, denied.body);
+  await expectResolved(requestOf(hal), "denied");
+  await expectDecided(hal, "denied");
+  await quiet(...everyone);
+
+  // The approvers see a block; the requester sees a denial.
+  const blocked = await decide(bob, team.workspaceId, requestOf(ivy), "block");
+  assert.equal(blocked.statusCode, 204, blocked.body);
+  await expectResolved(requestOf(ivy), "blocked");
+  await expectDecided(ivy, "denied");
+  await quiet(...everyone);
+  // The event's time is the decision's time that the list shows.
+  const block = (await approversList(ada, team.workspaceId)).find(
+    (shown) => shown.id === requestOf(ivy),
+  );
+  assert.equal(block?.decision, "blocked");
+  assert.equal(block.decidedAt, delivered.at(-1)?.event.occurredAt);
+
+  // A withdrawal tells the approvers and sends the requester nothing.
+  const withdrawn = await post(jo, `/join-requests/${requestOf(jo)}/withdraw`);
+  assert.equal(withdrawn.statusCode, 204, withdrawn.body);
+  await expectResolved(requestOf(jo), "withdrawn");
+  await quiet(...everyone);
+
+  // Denying all: one event for each request, in the order of their IDs.
+  const all = await onAll(ada, team.workspaceId, "deny-all");
+  assert.equal(all.statusCode, 204, all.body);
+  for (const guest of [kim, lee].sort((one, two) =>
+    requestOf(one) < requestOf(two) ? -1 : 1,
+  )) {
+    await expectResolved(requestOf(guest), "denied");
+  }
+  await expectDecided(kim, "denied");
+  await expectDecided(lee, "denied");
+  await quiet(...everyone);
+
+  // Nothing pending, a lifted block, a pause, and a resume send nothing.
+  for (const response of [
+    await onAll(bob, team.workspaceId, "deny-all"),
+    await decide(ada, team.workspaceId, requestOf(ivy), "unblock"),
+    await onAll(ada, team.workspaceId, "pause"),
+    await onAll(ada, team.workspaceId, "resume"),
+  ]) {
+    assert.equal(response.statusCode, 204, response.body);
+  }
+  await quiet(...everyone);
+
+  assert.deepEqual(
+    delivered.map(({ event }) =>
+      event.type === "workspace.join_request.resolved"
+        ? event.payload.outcome
+        : event.type,
+    ),
+    ["approved", "denied", "blocked", "withdrawn", "denied", "denied"],
+  );
+  assert.equal(
+    new Set(delivered.map(({ event }) => event.id)).size,
+    delivered.length,
+    "every event has its own ID",
+  );
+  for (const { approvers } of delivered) {
+    assert.deepEqual(approvers, [team.ownerId, team.memberIds[0]].sort());
+  }
+});
+
+test("the relay reads the owner and admins for each change: a demoted or removed admin gets the next join request event no more, and a new admin gets it at once", async (t) => {
+  const { account, connections } = await instance(t);
+  const ada = await account(3621);
+  const bob = await account(3622);
+  const cleo = await account(3623);
+  const dan = await account(3624);
+  const guests = [
+    await account(3625),
+    await account(3626),
+    await account(3627),
+  ];
+  const team = await workspaceOf(ada, [
+    [bob, "admin"],
+    [cleo, "admin"],
+    [dan, "member"],
+  ]);
+  const [bobInTeam, cleoInTeam, danInTeam] = team.memberIds;
+  assert.ok(bobInTeam && cleoInTeam && danInTeam);
+
+  const adaClient = (await connected(t, ada.app, ada.device)).client;
+  const bobClient = (await connected(t, bob.app, bob.device)).client;
+  const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  const danClient = (await connected(t, dan.app, dan.device)).client;
+  const named = [
+    ["ada", adaClient],
+    ["bob", bobClient],
+    ["cleo", cleoClient],
+    ["dan", danClient],
+  ] as const;
+  const everyone = named.map(([, client]) => client);
+  for (const client of everyone) {
+    await subscribed(client, team.workspaceId);
+  }
+  await drainPresence(...everyone);
+
+  /** Who of the subscribed people gets the created event of a new request. */
+  const createdReaches = async (guest: Account | undefined) => {
+    assert.ok(guest !== undefined);
+    await asked(guest, team.workspaceId);
+    const reached: string[] = [];
+    for (const [name, client] of named) {
+      const types = await drained(client);
+      if (types.includes("workspace.join_request.created")) {
+        assert.deepEqual(types, ["workspace.join_request.created"], name);
+        reached.push(name);
+      } else {
+        assert.deepEqual(types, [], name);
+      }
+    }
+    return reached;
+  };
+
+  assert.deepEqual(await createdReaches(guests[0]), ["ada", "bob", "cleo"]);
+
+  // The owner demotes Bob, who stays subscribed as a member.
+  const demoted = await post(
+    ada,
+    `/workspaces/${team.workspaceId}/members/${bobInTeam}/demote`,
+  );
+  assert.equal(demoted.statusCode, 204, demoted.body);
+  for (const client of everyone) {
+    assert.deepEqual(await drained(client), ["workspace.member.role_changed"]);
+  }
+  assert.ok(
+    connections
+      .subscriptions()
+      .some(({ context }) => context.identity.userId === bob.device.userId),
+  );
+  assert.deepEqual(await createdReaches(guests[1]), ["ada", "cleo"]);
+
+  // The owner removes Cleo, whose subscription ends.
+  const removed = await post(
+    ada,
+    `/workspaces/${team.workspaceId}/members/${cleoInTeam}/remove`,
+  );
+  assert.equal(removed.statusCode, 204, removed.body);
+  for (const client of everyone) {
+    const types = await drained(client);
+    assert.ok(
+      types.every((type) => !type.startsWith("workspace.join_request.")),
+      JSON.stringify(types),
+    );
+  }
+  // Dan becomes an admin without an event: the relay reads the role anyway.
+  await database()
+    .update(workspaceMembers)
+    .set({ role: "admin" })
+    .where(eq(workspaceMembers.id, danInTeam));
+  assert.deepEqual(await createdReaches(guests[2]), ["ada", "dan"]);
+
+  // A decision goes to the same people.
+  const [oldest] = (await approversList(ada, team.workspaceId)).slice(-1);
+  assert.ok(oldest !== undefined);
+  const denied = await decide(ada, team.workspaceId, oldest.id, "deny");
+  assert.equal(denied.statusCode, 204, denied.body);
+  for (const client of [adaClient, danClient]) {
+    const event = await nextEvent(client);
+    assert.ok(event.type === "workspace.join_request.resolved", event.type);
+    assert.deepEqual(event.payload, {
+      joinRequestId: oldest.id,
+      outcome: "denied",
+    });
+  }
+  await quiet(...everyone);
+});
+
+test("a refused or rolled-back change sends no join request event, and the same change sends one once it commits", async (t) => {
+  const { account, delivered, failNextCommit } = await instance(t);
+  const ada = await account(3631);
+  const cleo = await account(3632);
+  const gus = await account(3633);
+  const hal = await account(3634);
+  const team = await workspaceOf(ada, [[cleo, "member"]]);
+  const pending = await asked(gus, team.workspaceId);
+  // Its created event went out before anyone subscribed.
+  assert.equal(delivered.splice(0).length, 1);
+
+  const adaClient = (await connected(t, ada.app, ada.device)).client;
+  const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  const gusClient = (await connected(t, gus.app, gus.device)).client;
+  const halClient = (await connected(t, hal.app, hal.device)).client;
+  const everyone = [adaClient, cleoClient, gusClient, halClient];
+  await subscribed(adaClient, team.workspaceId);
+  await subscribed(cleoClient, team.workspaceId);
+  await drainPresence(...everyone);
+  const before = await approversList(ada, team.workspaceId);
+  const people = async () =>
+    database()
+      .select({ id: workspaceMembers.id })
+      .from(workspaceMembers)
+      .where(eq(workspaceMembers.workspaceId, team.workspaceId));
+  const peopleBefore = await people();
+
+  // Refused: a member decides, another account withdraws, an unknown
+  // request, and a request while requests are paused.
+  for (const [response, status] of [
+    [await decide(cleo, team.workspaceId, pending.id, "approve"), 403],
+    [await decide(cleo, team.workspaceId, pending.id, "deny"), 403],
+    [await decide(cleo, team.workspaceId, pending.id, "block"), 403],
+    [await onAll(cleo, team.workspaceId, "deny-all"), 403],
+    [await post(hal, `/join-requests/${pending.id}/withdraw`), 404],
+    [await decide(ada, team.workspaceId, newId<JoinRequestId>(), "deny"), 404],
+  ] as const) {
+    assert.equal(response.statusCode, status, response.body);
+  }
+  assert.equal((await onAll(ada, team.workspaceId, "pause")).statusCode, 204);
+  const closed = await post(hal, "/join-requests", {
+    workspaceId: team.workspaceId,
+    displayName: "Hal",
+  });
+  assert.equal(closed.statusCode, 403, closed.body);
+  assert.equal((await onAll(ada, team.workspaceId, "resume")).statusCode, 204);
+  await quiet(...everyone);
+
+  // Rolled back: each change ran to its end, and its commit failed.
+  const rolledBack = [
+    () => decide(ada, team.workspaceId, pending.id, "approve"),
+    () => decide(ada, team.workspaceId, pending.id, "deny"),
+    () => decide(ada, team.workspaceId, pending.id, "block"),
+    () => onAll(ada, team.workspaceId, "deny-all"),
+    () => post(gus, `/join-requests/${pending.id}/withdraw`),
+    () =>
+      post(hal, "/join-requests", {
+        workspaceId: team.workspaceId,
+        displayName: "Hal",
+      }),
+  ];
+  for (const change of rolledBack) {
+    failNextCommit();
+    const response = await change();
+    assert.equal(response.statusCode, 500, response.body);
+  }
+  assert.deepEqual(await approversList(ada, team.workspaceId), before);
+  assert.deepEqual(await people(), peopleBefore);
+  const halRequests = await database()
+    .select()
+    .from(workspaceJoinRequests)
+    .where(eq(workspaceJoinRequests.requesterUserId, hal.device.userId));
+  assert.deepEqual(halRequests, []);
+  await quiet(...everyone);
+  assert.deepEqual(delivered, []);
+
+  // Committed, the same changes send their events.
+  const denied = await decide(ada, team.workspaceId, pending.id, "deny");
+  assert.equal(denied.statusCode, 204, denied.body);
+  const resolved = await nextEvent(adaClient);
+  assert.ok(resolved.type === "workspace.join_request.resolved");
+  assert.deepEqual(resolved.payload, {
+    joinRequestId: pending.id,
+    outcome: "denied",
+  });
+  await asked(hal, team.workspaceId);
+  assert.equal(
+    (await nextEvent(adaClient)).type,
+    "workspace.join_request.created",
+  );
+  assert.equal(
+    (await nextMessage(gusClient)).kind === "frame",
+    true,
+    "the requester's decision",
+  );
+  await quiet(...everyone);
+});
+
+const SERVER_ONLY = {
+  skip:
+    process.env["DATABASE_TEST_URL"] === undefined &&
+    "needs DATABASE_TEST_URL; PGlite has a single session",
+};
+
+/** How many sessions of the test database wait for a lock. */
+async function lockWaiters(): Promise<number> {
+  assert.ok(testDatabase);
+  const { rows } = await testDatabase.client.query<{ waiting: number }>(
+    "select count(*)::int as waiting from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock'",
+  );
+  return rows[0]?.waiting ?? 0;
+}
+
+test(
+  "a denial that waits for the request while a demotion commits reads the owner and admins after it, so the demoted admin does not get its event",
+  SERVER_ONLY,
+  async (t) => {
+    const url = testDatabase?.url;
+    assert.ok(url, "the test database is on a server");
+    const { account, delivered } = await instance(t);
+    const ada = await account(3641);
+    const bob = await account(3642);
+    const gus = await account(3643);
+    const team = await workspaceOf(ada, [[bob, "admin"]]);
+    const [bobInTeam] = team.memberIds;
+    assert.ok(bobInTeam !== undefined);
+    const pending = await asked(gus, team.workspaceId);
+    const adaClient = (await connected(t, ada.app, ada.device)).client;
+    const bobClient = (await connected(t, bob.app, bob.device)).client;
+    await subscribed(adaClient, team.workspaceId);
+    await subscribed(bobClient, team.workspaceId);
+    await drainPresence(adaClient, bobClient);
+
+    // A second session demotes Bob and holds the request, so the denial
+    // waits inside its transaction until the demotion commits.
+    const other = createDatabase(url, { max: 1 });
+    const holding = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const held = other.db.transaction(async (tx) => {
+      await tx
+        .update(workspaceMembers)
+        .set({ role: "member" })
+        .where(eq(workspaceMembers.id, bobInTeam));
+      await tx
+        .select({ id: workspaceJoinRequests.id })
+        .from(workspaceJoinRequests)
+        .where(eq(workspaceJoinRequests.id, pending.id))
+        .for("update");
+      holding.resolve();
+      await release.promise;
+    });
+    try {
+      await Promise.race([
+        holding.promise,
+        held.then(() => {
+          throw new Error("the holding transaction ended early");
+        }),
+      ]);
+      const denying = decide(ada, team.workspaceId, pending.id, "deny");
+      while ((await lockWaiters()) < 1) {
+        await delay(10);
+      }
+      release.resolve();
+      await held;
+      const denied = await denying;
+      assert.equal(denied.statusCode, 204, denied.body);
+      const event = await nextEvent(adaClient);
+      assert.ok(event.type === "workspace.join_request.resolved", event.type);
+      assert.deepEqual(delivered.at(-1)?.approvers, [team.ownerId]);
+      await quiet(adaClient, bobClient);
+    } finally {
+      release.resolve();
+      await held.catch(() => undefined);
+      await other.close();
+    }
+  },
+);
+
+test("the type checker refuses a join request event where an event for every member is meant", () => {
+  const typeOnly = (
+    handler: WorkspaceEventHandler,
+    approverHandler: ApproverEventHandler,
+    created: Extract<
+      JoinRequestEvent,
+      { type: "workspace.join_request.created" }
+    >,
+    resolved: Extract<
+      JoinRequestEvent,
+      { type: "workspace.join_request.resolved" }
+    >,
+    removed: Extract<WorkspaceEvent, { type: "workspace.member.removed" }>,
+    run: AgentRunStateChangedEvent,
+    registry: ConnectionRegistry,
+    log: FastifyBaseLogger,
+  ) => {
+    // @ts-expect-error -- a join request event goes to the owner and admins only
+    void handler(created);
+    // @ts-expect-error -- a join request event goes to the owner and admins only
+    void handler(resolved);
+    // @ts-expect-error -- deliverWorkspaceEvent sends to every subscriber
+    deliverWorkspaceEvent(registry, resolved, log);
+    // @ts-expect-error -- a membership event is not a join request event
+    void approverHandler(removed, []);
+    // @ts-expect-error -- a run event is not a join request event
+    void approverHandler(run, []);
+    void approverHandler(created, []);
+    void approverHandler(resolved, []);
+    void handler(removed);
+  };
+  assert.equal(typeof typeOnly, "function");
+});

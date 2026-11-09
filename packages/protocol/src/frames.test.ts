@@ -636,12 +636,18 @@ test("membership events come only from the server, with a system actor and no de
       `${label} forged by a device`,
     );
   }
-  // The project events are tested in `project-api.test.ts`.
+  // The project events are tested in `project-api.test.ts`, and the join
+  // request events in `membership-api.test.ts`.
   assert.deepEqual(
     [...SERVER_ONLY_EVENT_TYPES].sort(),
     [...membershipEvents(), chatCreated()]
       .map((event) => String(event["type"]))
-      .concat(["workspace.project.created", "workspace.project.renamed"])
+      .concat([
+        "workspace.project.created",
+        "workspace.project.renamed",
+        "workspace.join_request.created",
+        "workspace.join_request.resolved",
+      ])
       .sort(),
   );
 });

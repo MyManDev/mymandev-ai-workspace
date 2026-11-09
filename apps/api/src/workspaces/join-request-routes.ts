@@ -5,6 +5,8 @@ import {
   type Database,
   denyAllJoinRequests,
   denyJoinRequest,
+  joinRequestApprovers,
+  joinRequestForApprovers,
   listJoinRequests,
   listOwnJoinRequests,
   pauseJoinRequests,
@@ -24,7 +26,9 @@ import {
   type JoinRequestId,
   JoinRequestIdSchema,
   type JoinRequestListResponse,
+  type JoinRequestOutcome,
   MEMBERSHIP_ROUTES,
+  type MemberId,
   type OwnJoinRequestListResponse,
   PROTOCOL_VERSION,
   type UserId,
@@ -37,7 +41,9 @@ import { ApiError } from "../errors.ts";
 import { WorkspaceParamsSchema } from "./access.ts";
 import {
   type AccountFrameHandler,
+  type ApproverEventHandler,
   sendAccountFrame,
+  sendApproverEvent,
   sendWorkspaceEvent,
   serverEventHeader,
   type WorkspaceEventHandler,
@@ -48,6 +54,14 @@ export type JoinRequestRouteOptions = Readonly<{
   now: () => number;
   /** Receives `workspace.member.claimed` after an approval committed. */
   onWorkspaceEvent: WorkspaceEventHandler;
+  /**
+   * Receives the join request events (#210) for the workspace's owner and
+   * admins after the change committed: `workspace.join_request.created`
+   * after a new request, and `workspace.join_request.resolved` after a
+   * withdrawal, an approval, a denial, a block, and each request that
+   * denying all denied.
+   */
+  onApproverEvent: ApproverEventHandler;
   /**
    * Receives `account.join_request_decided` for the requester after an
    * approval, a denial, a block, or denying all committed.
@@ -96,6 +110,36 @@ function sendDecision(
 }
 
 /**
+ * Tells the workspace's owner and admins, as the change's transaction read
+ * them, that a pending request is no longer pending.
+ */
+function sendResolved(
+  request: FastifyRequest,
+  options: JoinRequestRouteOptions,
+  resolved: Readonly<{
+    workspaceId: WorkspaceId;
+    joinRequestId: JoinRequestId;
+    outcome: JoinRequestOutcome;
+    now: Date;
+    approvers: readonly MemberId[];
+  }>,
+): void {
+  sendApproverEvent(
+    request,
+    options.onApproverEvent,
+    {
+      ...serverEventHeader(resolved.workspaceId, resolved.now),
+      type: "workspace.join_request.resolved",
+      payload: {
+        joinRequestId: resolved.joinRequestId,
+        outcome: resolved.outcome,
+      },
+    },
+    resolved.approvers,
+  );
+}
+
+/**
  * The requester's join request routes (ADR 0014, "Join requests", "Limits",
  * and "What a workspace ID allows"). Registered on a scope that needs an
  * access token, outside `/workspaces/:workspaceId`: a join request is the
@@ -103,7 +147,11 @@ function sendDecision(
  * its body. Its answers tell only whether a workspace with that ID exists
  * and accepts requests, and never show anything about the workspace. A
  * change runs in one transaction that checks the account and the device
- * again (`lockActor`) first.
+ * again (`lockActor`) first, and that reads the workspace's owner and
+ * admins last, after the change (`joinRequestApprovers`). After the commit,
+ * a new request goes to them as `workspace.join_request.created`, and a
+ * withdrawal as `workspace.join_request.resolved`, through
+ * `onApproverEvent`. A pending request returned again sends nothing.
  */
 export function registerOwnJoinRequestRoutes(
   scope: FastifyInstance,
@@ -119,17 +167,44 @@ export function registerOwnJoinRequestRoutes(
       const { workspaceId, displayName } =
         request.body as CreateJoinRequestRequest;
       const now = new Date(options.now());
-      const result = await database.transaction(async (tx) => {
+      const { result, created } = await database.transaction(async (tx) => {
         await lockActor(tx, auth, now.getTime());
-        return createJoinRequest(tx, {
+        const asked = await createJoinRequest(tx, {
           workspaceId,
           userId: auth.userId,
           deviceId: auth.deviceId,
           displayName,
           now,
         });
+        if (!asked.requested || !asked.created) {
+          return { result: asked, created: null };
+        }
+        // The new request as the approvers' list shows it, and who sees it.
+        // The list leaves out a request whose requester's identity was
+        // erased, and so does the event; a request just made has one.
+        const joinRequest = await joinRequestForApprovers(tx, {
+          workspaceId,
+          joinRequestId: asked.joinRequest.id,
+        });
+        if (joinRequest === undefined || joinRequest.requester === null) {
+          return { result: asked, created: null };
+        }
+        const approvers = await joinRequestApprovers(tx, workspaceId);
+        return { result: asked, created: { joinRequest, approvers } };
       });
       if (result.requested) {
+        if (created !== null) {
+          sendApproverEvent(
+            request,
+            options.onApproverEvent,
+            {
+              ...serverEventHeader(workspaceId, now),
+              type: "workspace.join_request.created",
+              payload: { joinRequest: created.joinRequest },
+            },
+            created.approvers,
+          );
+        }
         return { joinRequest: result.joinRequest };
       }
       throw result.refusal === "rate_limited"
@@ -162,7 +237,7 @@ export function registerOwnJoinRequestRoutes(
         joinRequestId: JoinRequestId;
       };
       const now = new Date(options.now());
-      await database.transaction(async (tx) => {
+      const withdrawn = await database.transaction(async (tx) => {
         await lockActor(tx, auth, now.getTime());
         const result = await withdrawJoinRequest(tx, {
           joinRequestId,
@@ -173,6 +248,16 @@ export function registerOwnJoinRequestRoutes(
         if (!result.withdrawn) {
           throw new ApiError(result.refusal);
         }
+        return {
+          workspaceId: result.workspaceId,
+          approvers: await joinRequestApprovers(tx, result.workspaceId),
+        };
+      });
+      sendResolved(request, options, {
+        ...withdrawn,
+        joinRequestId,
+        outcome: "withdrawn",
+        now,
       });
       return reply.code(204).send();
     },
@@ -186,12 +271,17 @@ export function registerOwnJoinRequestRoutes(
  * owner and admins only; a member gets `403` with `forbidden`. A change runs
  * in one transaction that checks the account and the device again
  * (`lockActor`), then locks the caller's own person, then the request, the
- * pending requests in the order of their IDs, or the workspace row. After
- * the commit, an approval sends `workspace.member.claimed` with the new
- * person through `onWorkspaceEvent`, and every decision sends
- * `account.join_request_decided` to the requester's open connections
- * through `onAccountFrame`: a block as `denied`, and denying all one frame
- * per denied request. Unblocking, pausing, and resuming send nothing.
+ * pending requests in the order of their IDs, or the workspace row; a
+ * decision then reads the workspace's owner and admins
+ * (`joinRequestApprovers`). After the commit, an approval sends
+ * `workspace.member.claimed` with the new person through
+ * `onWorkspaceEvent`; every decision sends
+ * `workspace.join_request.resolved` to the owner and admins through
+ * `onApproverEvent`, and `account.join_request_decided` to the requester's
+ * open connections through `onAccountFrame`, in this order. A block is
+ * `blocked` in the event and `denied` in the frame, and denying all sends
+ * one event and one frame per denied request. Unblocking, pausing, and
+ * resuming send nothing.
  */
 export function registerJoinRequestRoutes(
   workspace: FastifyInstance,
@@ -245,12 +335,22 @@ export function registerJoinRequestRoutes(
         if (!result.approved) {
           throw refused(result.refusal);
         }
-        return result;
+        return {
+          ...result,
+          approvers: await joinRequestApprovers(tx, workspaceId),
+        };
       });
       sendWorkspaceEvent(request, options.onWorkspaceEvent, {
         ...serverEventHeader(workspaceId, now),
         type: "workspace.member.claimed",
         payload: { member: approved.member },
+      });
+      sendResolved(request, options, {
+        workspaceId,
+        joinRequestId,
+        outcome: "approved",
+        now,
+        approvers: approved.approvers,
       });
       sendDecision(request, options, approved.requesterUserId, {
         joinRequestId,
@@ -270,7 +370,7 @@ export function registerJoinRequestRoutes(
       const { workspaceId, joinRequestId } =
         request.params as JoinRequestParams;
       const now = new Date(options.now());
-      const requesterUserId = await database.transaction(async (tx) => {
+      const denied = await database.transaction(async (tx) => {
         await lockActor(tx, auth, now.getTime());
         const result = await denyJoinRequest(tx, {
           workspaceId,
@@ -282,9 +382,19 @@ export function registerJoinRequestRoutes(
         if (!result.denied) {
           throw refused(result.refusal);
         }
-        return result.requesterUserId;
+        return {
+          requesterUserId: result.requesterUserId,
+          approvers: await joinRequestApprovers(tx, workspaceId),
+        };
       });
-      sendDecision(request, options, requesterUserId, {
+      sendResolved(request, options, {
+        workspaceId,
+        joinRequestId,
+        outcome: "denied",
+        now,
+        approvers: denied.approvers,
+      });
+      sendDecision(request, options, denied.requesterUserId, {
         joinRequestId,
         workspaceId,
         decision: "denied",
@@ -302,7 +412,7 @@ export function registerJoinRequestRoutes(
       const { workspaceId, joinRequestId } =
         request.params as JoinRequestParams;
       const now = new Date(options.now());
-      const requesterUserId = await database.transaction(async (tx) => {
+      const blocked = await database.transaction(async (tx) => {
         await lockActor(tx, auth, now.getTime());
         const result = await blockJoinRequest(tx, {
           workspaceId,
@@ -314,10 +424,20 @@ export function registerJoinRequestRoutes(
         if (!result.blocked) {
           throw refused(result.refusal);
         }
-        return result.requesterUserId;
+        return {
+          requesterUserId: result.requesterUserId,
+          approvers: await joinRequestApprovers(tx, workspaceId),
+        };
       });
-      // The requester sees a block as a denial.
-      sendDecision(request, options, requesterUserId, {
+      // The owner and admins see the block; the requester sees a denial.
+      sendResolved(request, options, {
+        workspaceId,
+        joinRequestId,
+        outcome: "blocked",
+        now,
+        approvers: blocked.approvers,
+      });
+      sendDecision(request, options, blocked.requesterUserId, {
         joinRequestId,
         workspaceId,
         decision: "denied",
@@ -370,9 +490,22 @@ export function registerJoinRequestRoutes(
         if (!result.denied) {
           throw refused(result.refusal);
         }
-        return result.joinRequests;
+        return {
+          joinRequests: result.joinRequests,
+          approvers:
+            result.joinRequests.length === 0
+              ? []
+              : await joinRequestApprovers(tx, workspaceId),
+        };
       });
-      for (const { joinRequestId, requesterUserId } of denied) {
+      for (const { joinRequestId, requesterUserId } of denied.joinRequests) {
+        sendResolved(request, options, {
+          workspaceId,
+          joinRequestId,
+          outcome: "denied",
+          now,
+          approvers: denied.approvers,
+        });
         sendDecision(request, options, requesterUserId, {
           joinRequestId,
           workspaceId,
