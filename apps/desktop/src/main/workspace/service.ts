@@ -731,14 +731,27 @@ export function createWorkspaceService(
    * Applies one event. Every event sets the state that it reports, so
    * applying one again changes nothing. False, with nothing changed, when it
    * names a person or a project that the workspace does not hold. A removed
-   * person stays as a former member with their name and role.
+   * person stays as a former member with their name and role. No event
+   * reports a new verification of a login, so a `defined` or `claimed`
+   * event applied after a reload may carry an older one than the reload's:
+   * a held identity is never replaced by one verified earlier.
    */
   function applyEvent(event: WorkspaceEvent): boolean {
     switch (event.type) {
       case "workspace.member.defined":
-      case "workspace.member.claimed":
-        setPerson(personState(event.payload.member));
+      case "workspace.member.claimed": {
+        const person = personState(event.payload.member);
+        const held = members.get(person.id)?.identity;
+        setPerson(
+          held !== undefined &&
+            held !== null &&
+            person.identity !== null &&
+            Date.parse(person.identity.verifiedAt) < Date.parse(held.verifiedAt)
+            ? Object.freeze({ ...person, identity: held })
+            : person,
+        );
         return true;
+      }
       case "workspace.member.renamed":
         return changePerson(event.payload.memberId, {
           displayName: event.payload.displayName,

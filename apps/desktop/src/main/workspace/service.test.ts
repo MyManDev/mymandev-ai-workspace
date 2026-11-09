@@ -739,6 +739,10 @@ test("a live event that names an unknown person or project reloads the workspace
       previousOwnerMemberId: OWNER,
       ownerMemberId: UNKNOWN_MEMBER,
     }),
+    event("workspace.ownership.transferred", {
+      previousOwnerMemberId: UNKNOWN_MEMBER,
+      ownerMemberId: MEMBER,
+    }),
   ]) {
     const h = await withLiveWorkspace();
     const people = h.service.people();
@@ -746,7 +750,7 @@ test("a live event that names an unknown person or project reloads the workspace
     expect(h.readNames()).toEqual(["getWorkspace", "listProjects"]);
     expect(h.service.gateLive(WS_A)).toBe(false);
     // Nothing of it applies, so a transfer to an unknown person demotes
-    // no owner.
+    // no owner, and a transfer from an unknown person promotes nobody.
     expect(h.service.people()).toBe(people);
     await h.answerReload();
     expect(h.service.gateLive(WS_A)).toBe(true);
@@ -1009,6 +1013,92 @@ test("membership events that arrive during a reload wait and apply after it, eac
     }),
   ]);
   expect(g.reads).toEqual([]);
+});
+
+test("a reload replaces the people with its answer, in its order, without the people held before", async () => {
+  const h = await withLiveWorkspace();
+  h.receive(
+    event("workspace.member.defined", {
+      member: memberOf(WS_A, NEW_MEMBER, "Linus Newcomer", "member", null),
+    }),
+  );
+  expect(h.service.people().map((entry) => entry.id)).toEqual([
+    OWNER,
+    MEMBER,
+    NEW_MEMBER,
+  ]);
+
+  // The next reload holds fewer people, in another order.
+  h.receive(subscribed());
+  await h.answerReload(
+    ok(
+      WorkspaceViewResponseSchema.parse({
+        workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
+        members: [
+          memberOf(WS_A, MEMBER, "Grace Member", "owner"),
+          memberOf(WS_A, OWNER, "Ada Owner", "admin", USER_ID),
+        ],
+        joinRequestsPausedAt: null,
+        maxUnclaimedMembers: 500,
+        ownershipOffer: null,
+      }),
+    ),
+  );
+  expect(h.service.people()).toEqual([
+    person(MEMBER, "Grace Member", { role: "owner" }),
+    person(OWNER, "Ada Owner", { role: "admin" }),
+  ]);
+  expect(h.service.memberName(NEW_MEMBER)).toBe(UNKNOWN_MEMBER_NAME);
+});
+
+test("a claimed event never brings back an older verification of the login, and a newer one or another login replaces it", async () => {
+  const EARLIER = "2026-11-04T08:00:00.000Z";
+  const claimed = (login: string, verifiedAt: string) =>
+    event("workspace.member.claimed", {
+      member: {
+        ...memberOf(WS_A, MEMBER, "Grace Member", "member"),
+        identity: { provider: "github", login, verifiedAt },
+      },
+    });
+  const identityOf = (h: Harness) =>
+    h.service.people().find((entry) => entry.id === MEMBER)?.identity;
+
+  // Live: the held identity was verified at AT.
+  const h = await withLiveWorkspace();
+  const people = h.service.people();
+  const revision = h.state.revision;
+  h.receive(claimed("octocat", EARLIER));
+  expect(h.service.people()).toBe(people);
+  expect(h.state.revision).toBe(revision);
+  // A later verification replaces it, and so does another login.
+  h.receive(claimed("octocat", LATER));
+  expect(identityOf(h)).toEqual({ login: "octocat", verifiedAt: LATER });
+  expect(h.state.revision).toBeGreaterThan(revision);
+  const afterLater = h.state.revision;
+  h.receive(claimed("grace-h", LATER));
+  expect(identityOf(h)).toEqual({ login: "grace-h", verifiedAt: LATER });
+  expect(h.state.revision).toBeGreaterThan(afterLater);
+
+  // Over a reload: the claim waited during the reload, whose answer holds
+  // a later verification of the same login.
+  const g = await withList();
+  g.receive(subscribed());
+  g.receive(claimed("octocat", AT));
+  await g.answerReload(
+    ok(
+      WorkspaceViewResponseSchema.parse({
+        workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
+        members: [
+          memberOf(WS_A, OWNER, "Ada Owner", "owner", USER_ID),
+          memberWithLogin(MEMBER, "Grace Member", "member", "octocat"),
+        ],
+        joinRequestsPausedAt: null,
+        maxUnclaimedMembers: 500,
+        ownershipOffer: null,
+      }),
+    ),
+  );
+  expect(identityOf(g)).toEqual({ login: "octocat", verifiedAt: LATER });
 });
 
 test("the people are dropped on a workspace switch, the end of the membership, a sign-out, and another device, and kept while offline", async () => {
