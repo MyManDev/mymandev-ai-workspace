@@ -589,13 +589,17 @@ test("a confirmed action answers ok, a definition with the new member ID only, a
 
 test("an uncertain answer, also one that throws, is unknown and is never sent again", async () => {
   for (const entry of CASES) {
-    for (const answer of [
-      () => failed("unknown"),
-      () => Promise.reject(new Error("Linus Newcomer")),
-      () => {
-        throw new Error("Linus Newcomer");
-      },
-    ]) {
+    const thrown = ["A people action could not be sent."];
+    for (const [answer, reported] of [
+      [() => failed("unknown"), []],
+      [() => Promise.reject(new Error("Linus Newcomer")), thrown],
+      [
+        () => {
+          throw new Error("Linus Newcomer");
+        },
+        thrown,
+      ],
+    ] as const) {
       const account = fakeAccount(answer);
       const { call, errors } = register(account);
       await expect(call(entry.channel, ...entry.args)).resolves.toEqual({
@@ -604,9 +608,8 @@ test("an uncertain answer, also one that throws, is unknown and is never sent ag
       // Nothing is sent again, not even later.
       await new Promise((resolve) => setImmediate(resolve));
       expect(account.sent, entry.channel).toHaveLength(1);
-      for (const message of errors) {
-        expect(message).toBe("A people action could not be sent.");
-      }
+      // Only an answer that throws is reported, with a fixed message.
+      expect(errors, entry.channel).toEqual(reported);
     }
   }
 });
@@ -659,6 +662,31 @@ test("only the offer actions reload the workspace: an offer and a withdrawal aft
           : reloadsOn.includes(answer);
       expect(workspaces.reloads, `${entry.name} ${String(answer)}`).toEqual(
         expected ? [WORKSPACE] : [],
+      );
+    }
+  }
+});
+
+test("an answer that throws reloads the workspace after the three offer actions only", async () => {
+  const offers: ReadonlySet<string> = new Set([
+    "offerOwnership",
+    "withdrawOwnershipOffer",
+    "acceptOwnershipOffer",
+  ]);
+  for (const entry of CASES) {
+    for (const answer of [
+      () => Promise.reject(new Error("no answer")),
+      () => {
+        throw new Error("no answer");
+      },
+    ]) {
+      const workspaces = fakeWorkspaces();
+      const { call } = register(fakeAccount(answer), workspaces);
+      await expect(call(entry.channel, ...entry.args)).resolves.toEqual({
+        outcome: "unknown",
+      });
+      expect(workspaces.reloads, entry.name).toEqual(
+        offers.has(entry.name) ? [WORKSPACE] : [],
       );
     }
   }

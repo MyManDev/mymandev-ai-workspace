@@ -267,9 +267,11 @@ export interface PeopleBridge {
  * The actions on the people of the selected workspace (#95, D1), each
  * through its own channel. Every function takes the selected workspace's ID
  * and, where it names a person, the member ID from the people view, and the
- * main process refuses another workspace as `not_selected`. A display name
- * is 1 to 64 characters; the main process also refuses a blank one and
- * control, format, and invisible characters (`invalid`). Each action is
+ * main process refuses another workspace as `not_selected`. An empty name,
+ * a name of more than 64 characters, or an ID that is not a lowercase
+ * UUIDv7 is refused by the contract, and the call rejects; the main process
+ * then refuses a blank name and control, format, and invisible characters
+ * with the result `invalid`. Each action is
  * sent once: `unknown` says that the answer does not show whether the API
  * acted, and nothing sends it again, so the screen asks the person to check
  * the list. `too_soon` and `rate_limited` come with `retryAfterMs`. The
@@ -279,8 +281,8 @@ export interface PeopleBridge {
 export interface PeopleActionsBridge {
   /**
    * Defines an unclaimed person. Resolves to `ok` with the new person's
-   * member ID. `rate_limited` also says that the workspace holds as many
-   * active unclaimed people as its limit (`maxUnclaimedMembers`).
+   * member ID. `rate_limited` can also mean that the workspace holds as
+   * many active unclaimed people as its limit (`maxUnclaimedMembers`).
    */
   readonly define: (
     workspaceId: string,

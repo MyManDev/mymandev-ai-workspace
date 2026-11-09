@@ -1004,9 +1004,10 @@ const PeopleViewFields = {
     .object({ memberId: ProtocolIdSchema, expiresAt: TimestampSchema })
     .nullable(),
   /**
-   * How many active unclaimed people the workspace may hold, only for the
-   * owner and the admins, who define them; null for a member and until the
-   * workspace loaded.
+   * How many active unclaimed people the workspace may hold, from its last
+   * reload, only for the owner and the admins, who define them; null for a
+   * member and until the workspace loaded. No event reports a change of the
+   * limit, so it can be out of date until the next reload.
    */
   maxUnclaimedMembers: z
     .int()
@@ -1064,15 +1065,16 @@ export const PersonNameSchema = z
  *   sent.
  * - `too_soon`: the installation's budget of writes is spent; nothing was
  *   sent. `retryAfterMs` says when the next write may go.
- * - `rate_limited`: the API's limit, with `retryAfterMs` from its answer. A
- *   definition also answers it while the workspace holds as many active
- *   unclaimed people as its limit (`maxUnclaimedMembers`).
+ * - `rate_limited`: the API's limit, with `retryAfterMs` from its answer.
+ *   For a definition, `rate_limited` can also mean that the workspace holds
+ *   as many active unclaimed people as its limit (`maxUnclaimedMembers`).
  * - `not_allowed`: the account's role does not allow the action
  *   (`forbidden`), for example the owner leaving.
- * - `not_found`: the API does not know the workspace, the person, or the
- *   offer for this account.
+ * - `not_found`: the API does not know the workspace or the person for
+ *   this account.
  * - `conflict`: the person or the offer is not in the state that the action
- *   needs, for example a removed person, or a second offer.
+ *   needs, for example a removed person, a second offer, or no live offer
+ *   to withdraw or accept.
  * - `device_too_new`: a promotion or an offer from a device younger than
  *   72 hours.
  * - `failed`: the API refused it otherwise.

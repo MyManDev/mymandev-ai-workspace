@@ -235,9 +235,12 @@ export interface WorkspaceService {
   /**
    * Reloads the selected workspace's view and projects through the resync
    * gate, for a change that no workspace event reports, such as an
-   * ownership offer or its withdrawal. False, with nothing read, for
-   * another workspace, and while it is not subscribed, because the next
-   * `workspace.subscribed` reloads it anyway.
+   * ownership offer or its withdrawal. Requests are merged: while a reload
+   * is open, one more follows when it answers, however often this is
+   * called, and while a retry waits out its backoff, the retry reads the
+   * change. True when the workspace is read again; false, with nothing
+   * read, for another workspace, and while it is not subscribed, because
+   * the next `workspace.subscribed` reloads it anyway.
    */
   readonly reload: (workspaceId: WorkspaceId) => boolean;
   /**
@@ -401,6 +404,11 @@ export function createWorkspaceService(
   let viewAttempt = 0;
   let cancelViewRetry: (() => void) | null = null;
   /**
+   * `reload` was asked while a reload was open, whose answer may be older
+   * than the change: one more reload follows that answer.
+   */
+  let reloadAgain = false;
+  /**
    * Each person of the selected workspace, former members included, in the
    * order of the last reload, with the people that events added since at
    * the end. Never a user ID.
@@ -511,6 +519,7 @@ export function createWorkspaceService(
   }
 
   function clearWorkspaceData(): void {
+    reloadAgain = false;
     viewLoaded = false;
     viewProblem = null;
     viewAttempt = 0;
@@ -637,6 +646,8 @@ export function createWorkspaceService(
       return;
     }
     stopViewRetry();
+    // This reload reads every change made so far.
+    reloadAgain = false;
     touch();
     const at = epoch;
     Promise.all([
@@ -718,6 +729,9 @@ export function createWorkspaceService(
     viewAttempt = 0;
     closeVanishedProject();
     touch();
+    if (reloadAgain) {
+      startReload(gate.begin("all").generation);
+    }
   }
 
   /** Begins a reload after `delayMs`, unless the workspace changed. */
@@ -791,9 +805,11 @@ export function createWorkspaceService(
    * person stays as a former member with their name and role.
    *
    * The removal of an offer's target and the transfer to it end the held
-   * offer: an offer names an active person who is not the owner, and a
-   * removed person never becomes active again, so a replay never ends a
-   * newer offer either.
+   * offer, because an offer names an active person who is not the owner. A
+   * removed person never becomes active again, so a replayed removal never
+   * ends a newer offer. A replayed transfer can: when the ownership went to
+   * the target and back, and the target got a new offer, all while one
+   * reload was open. The offer then shows again after the next reload.
    *
    * The replay rule: `defined` is the first event of a person's life, and a
    * claim happens once, so `defined` for a person that the service holds,
@@ -910,8 +926,19 @@ export function createWorkspaceService(
 
   /** Reloads the selected workspace while it is subscribed; see `reload`. */
   function reloadSelected(workspaceId: WorkspaceId): boolean {
-    if (workspaceId !== selected || gate.state() === "inactive") {
+    const state = gate.state();
+    if (workspaceId !== selected || state === "inactive") {
       return false;
+    }
+    if (state === "reloading") {
+      // The open reload may have read before the change.
+      reloadAgain = true;
+      return true;
+    }
+    if (cancelViewRetry !== null) {
+      // A failed reload or an overflow waits out its backoff, also the
+      // wait after `rate_limited`; the retry reads everything.
+      return true;
     }
     startReload(gate.begin("all").generation);
     return true;

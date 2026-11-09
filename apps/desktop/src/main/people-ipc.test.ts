@@ -396,6 +396,31 @@ test("the ownership offer crosses only to the owner and its target, before its e
   expect(PeopleViewSchema.safeParse(shown).success).toBe(true);
 });
 
+test("an offer to a plain member crosses to that member without the limit, and not to an admin who is not its target", () => {
+  const expiresAt = "2026-11-12T10:00:00.000Z";
+  const MEMBER = id(0xc5) as MemberId;
+  const people = [...PEOPLE, person(MEMBER, "Mary Member")];
+  const view = (own: MemberId) =>
+    peopleView(workspaceState(), people, own, {
+      ownershipOffer: Object.freeze({ memberId: MEMBER, expiresAt }),
+      unclaimedMemberLimit: 40,
+      now: Date.parse(expiresAt) - 1,
+    });
+
+  expect(view(MEMBER)).toMatchObject({
+    ownershipOffer: { memberId: MEMBER, expiresAt },
+    maxUnclaimedMembers: null,
+  });
+  expect(view(ADMIN)).toMatchObject({
+    ownershipOffer: null,
+    maxUnclaimedMembers: 40,
+  });
+  expect(view(OWNER)).toMatchObject({
+    ownershipOffer: { memberId: MEMBER, expiresAt },
+    maxUnclaimedMembers: 40,
+  });
+});
+
 test("the channels read the offer and the limit from the service, and the offer's expiry with the clock", () => {
   const expiresAt = "2026-11-12T10:00:00.000Z";
   const fake = fakeService();
