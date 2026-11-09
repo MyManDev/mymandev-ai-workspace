@@ -33,7 +33,11 @@ import {
 import { registerAgentRoutes } from "./agent-routes.ts";
 import { registerChatRoutes } from "./chat-routes.ts";
 import { registerClaimRoutes } from "./claim-routes.ts";
-import type { AccountFrameHandler, WorkspaceEventHandler } from "./events.ts";
+import type {
+  AccountFrameHandler,
+  ApproverEventHandler,
+  WorkspaceEventHandler,
+} from "./events.ts";
 import { registerInvitationCodeRoutes } from "./invitation-code-routes.ts";
 import { registerInvitationRoutes } from "./invitation-routes.ts";
 import {
@@ -54,6 +58,11 @@ export type WorkspaceRouteOptions = Readonly<{
    * request, and the project events of the project routes, after the commit.
    */
   onWorkspaceEvent: WorkspaceEventHandler;
+  /**
+   * Receives the join request events of the join request routes after the
+   * commit, with the workspace's owner and admins, who alone get them (#210).
+   */
+  onApproverEvent: ApproverEventHandler;
   /**
    * Receives the account frames after the commit, for the account's open
    * connections: a join request decision for the requester,
@@ -142,6 +151,7 @@ export async function registerWorkspaceRoutes(
       database,
       now: options.now,
       onWorkspaceEvent: options.onWorkspaceEvent,
+      onApproverEvent: options.onApproverEvent,
       onAccountFrame: options.onAccountFrame,
     };
     registerOwnJoinRequestRoutes(scope, joinRequests);

@@ -1,5 +1,9 @@
 import * as z from "zod";
-import { MemberRoleSchema, WorkspaceMemberSchema } from "./account.ts";
+import {
+  JoinRequestDecisionSchema,
+  MemberRoleSchema,
+  WorkspaceMemberSchema,
+} from "./account.ts";
 import {
   ChatMessageSchema,
   displayText,
@@ -12,6 +16,7 @@ import {
   CorrelationIdSchema,
   DeviceIdSchema,
   EventIdSchema,
+  JoinRequestIdSchema,
   MemberIdSchema,
   ProjectIdSchema,
   RepositoryIdSchema,
@@ -19,6 +24,7 @@ import {
   UserIdSchema,
   WorkspaceIdSchema,
 } from "./ids.ts";
+import { JoinRequestSchema } from "./membership-api.ts";
 import {
   canTransition,
   LIMITS,
@@ -258,6 +264,73 @@ export const WorkspaceProjectRenamedEventSchema = z.object({
   }),
 });
 
+// Join request events (#210): the pending join requests of a workspace,
+// which only its owner and admins see. Only the server originates them,
+// after the commit, with a `system` actor and `deviceId: null`, like the
+// membership events (see `actorAllowed`). The server sends them only to the
+// connections subscribed to the workspace as its owner or an admin, never
+// to the requester and never to members. An expiry sends no event: a
+// receiver drops a request at its `expiresAt`.
+
+/**
+ * An account asked to join the workspace. The payload is the new pending
+ * request as the approvers' list shows it (`JoinRequest`): the requested
+ * display name, the requester's GitHub login with the time it was last
+ * verified, the creation date of that GitHub account, and when the request
+ * was created and expires. Asking again while a request is pending returns
+ * that request and sends nothing.
+ */
+export const WorkspaceJoinRequestCreatedEventSchema = z
+  .object({
+    ...envelopeHeaderShape,
+    type: z.literal("workspace.join_request.created"),
+    payload: z.object({ joinRequest: JoinRequestSchema }),
+  })
+  .superRefine((event, ctx) => {
+    const { joinRequest } = event.payload;
+    if (joinRequest.workspaceId !== event.workspaceId) {
+      ctx.addIssue({
+        code: "custom",
+        message: "The request belongs to another workspace",
+        path: ["payload", "joinRequest", "workspaceId"],
+      });
+    }
+    // `JoinRequestSchema` requires the requester of a pending request.
+    if (joinRequest.decision !== null) {
+      ctx.addIssue({
+        code: "custom",
+        message: "A new request is pending",
+        path: ["payload", "joinRequest", "decision"],
+      });
+    }
+  });
+
+/**
+ * How a pending join request ended, as `workspace.join_request.resolved`
+ * reports it: `approved`, `denied`, or `blocked` by the owner or an admin,
+ * or `withdrawn` by the requester. Every decision of
+ * `JOIN_REQUEST_DECISIONS` except `expired`, which has no event.
+ */
+export const JoinRequestOutcomeSchema = JoinRequestDecisionSchema.exclude([
+  "expired",
+]);
+export type JoinRequestOutcome = z.infer<typeof JoinRequestOutcomeSchema>;
+
+/**
+ * A pending join request is no longer pending. Denying all sends one event
+ * for each request that it denied. An approval also sends
+ * `workspace.member.claimed` with the new person to every subscriber, and a
+ * blocked request stays in the approvers' list while its block is in force.
+ */
+export const WorkspaceJoinRequestResolvedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.join_request.resolved"),
+  payload: z.object({
+    joinRequestId: JoinRequestIdSchema,
+    outcome: JoinRequestOutcomeSchema,
+  }),
+});
+
 // Chat events (#110). A project's chat has one stream of messages; the
 // events name the project, and the server finds the conversation that holds
 // it. Storing messages and the history route belong to #27.
@@ -315,6 +388,8 @@ export const ProtocolEventSchema = z.discriminatedUnion("type", [
   WorkspaceOwnershipTransferredEventSchema,
   WorkspaceProjectCreatedEventSchema,
   WorkspaceProjectRenamedEventSchema,
+  WorkspaceJoinRequestCreatedEventSchema,
+  WorkspaceJoinRequestResolvedEventSchema,
   ChatMessageSendEventSchema,
   ChatMessageCreatedEventSchema,
 ]);
@@ -332,6 +407,8 @@ export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
   "workspace.ownership.transferred",
   "workspace.project.created",
   "workspace.project.renamed",
+  "workspace.join_request.created",
+  "workspace.join_request.resolved",
   "chat.message.created",
 ] as const satisfies readonly EventType[]);
 export type ServerOnlyEventType = (typeof SERVER_ONLY_EVENT_TYPES)[number];
@@ -370,8 +447,11 @@ export function actorAllowed(event: ProtocolEvent): boolean {
     case "workspace.ownership.transferred":
     case "workspace.project.created":
     case "workspace.project.renamed":
+    case "workspace.join_request.created":
+    case "workspace.join_request.resolved":
     case "chat.message.created":
-      // Only the server reports membership and project changes and stored messages.
+      // Only the server reports membership, project, and join request
+      // changes and stored messages.
       return event.actor.kind === "system" && event.deviceId === null;
     case "chat.message.send":
       // A person sends from one of their devices; identity binding checks both.

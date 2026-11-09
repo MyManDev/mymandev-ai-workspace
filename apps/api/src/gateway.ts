@@ -446,6 +446,18 @@ function closeWith(socket: WebSocket, reason: WsCloseReason): void {
 export type AccountFrame = Extract<ServerFrame, { type: `account.${string}` }>;
 
 /**
+ * An event that the server sends to whoever is subscribed to its workspace,
+ * or to one connection: every `ServerEvent` except the join request events,
+ * which go only to the owner and admins through `sendToPeople` (#210). The
+ * type checker refuses a join request event in `sendToWorkspace` and
+ * `sendEvent`.
+ */
+export type SubscriberEvent = Exclude<
+  ServerEvent,
+  { type: `workspace.join_request.${string}` }
+>;
+
+/**
  * A connection's subscription to a workspace (#110): the connection, the
  * workspace, and the account's active person there when it subscribed. The
  * registry keeps one frozen record per connection and workspace and replaces
@@ -978,7 +990,7 @@ export class ConnectionRegistry {
    * instead. Returns how many connections it was sent to.
    */
   sendToWorkspace(
-    event: ServerEvent,
+    event: SubscriberEvent,
     sender?: AuthenticatedConnectionContext,
   ): number {
     const text = JSON.stringify(event);
@@ -1002,6 +1014,37 @@ export class ConnectionRegistry {
   }
 
   /**
+   * Sends an event only to the connections that are subscribed to the
+   * event's workspace as one of `memberIds` and still open, such as the join
+   * request events, which go to the owner and admins only (#210). The caller
+   * reads the people from the database; the registry keeps no role. A
+   * connection subscribed as another person, also of the same account, and
+   * a connection that is not subscribed never get it. A connection that
+   * reads too slowly closes instead. Returns how many connections it was
+   * sent to.
+   */
+  sendToPeople(event: ServerEvent, memberIds: readonly MemberId[]): number {
+    const people = this.#workspaces.get(event.workspaceId);
+    if (people === undefined) {
+      return 0;
+    }
+    const targets = new Set<LiveConnection>();
+    for (const memberId of memberIds) {
+      for (const live of people.get(memberId) ?? []) {
+        targets.add(live);
+      }
+    }
+    const text = JSON.stringify(event);
+    let sent = 0;
+    for (const live of targets) {
+      if (this.#send(live, text)) {
+        sent += 1;
+      }
+    }
+    return sent;
+  }
+
+  /**
    * Sends an event to one live connection only, whether or not it is
    * subscribed to the event's workspace: the answer to an event that the
    * connection sent, such as the stored `chat.message.created` for a
@@ -1009,7 +1052,7 @@ export class ConnectionRegistry {
    */
   sendEvent(
     context: AuthenticatedConnectionContext,
-    event: ServerEvent,
+    event: SubscriberEvent,
   ): boolean {
     const live = this.#liveWith(
       context.identity.deviceId,

@@ -28,6 +28,8 @@ import {
   denyAllJoinRequests,
   type DenyAllJoinRequestsResult,
   denyJoinRequest,
+  joinRequestApprovers,
+  joinRequestForApprovers,
   listJoinRequests,
   listOwnJoinRequests,
   pauseJoinRequests,
@@ -990,6 +992,102 @@ test("the approvers' list shows the pending requests with the GitHub login and t
       })
     ).map((request) => [request.decision, request.decidedAt]),
     [["denied", decided.decidedAt.toISOString()]],
+  );
+});
+
+test("the approvers of a workspace are its active owner and admins in the order of their IDs, and a request reads as the approvers' list shows it, in any state, only in its own workspace", async () => {
+  const [owner, admin, member, removed, demoted, guest, other] =
+    await accounts(7);
+  assert.ok(owner && admin && member && removed && demoted && guest && other);
+  const { workspaceId, ownerPerson } = await workspaceOf(owner);
+  const adminPerson = await addClaimed(workspaceId, admin, owner, "admin");
+  await addClaimed(workspaceId, member, owner);
+  const removedPerson = await addClaimed(workspaceId, removed, owner, "admin");
+  const demotedPerson = await addClaimed(workspaceId, demoted, owner, "admin");
+  const defined = await defineMember(database(), {
+    workspaceId,
+    ...owner,
+    displayName: "Linus",
+    now: NOW,
+  });
+  assert.ok(defined.defined);
+  const otherWorkspace = await workspaceOf(other);
+  assert.deepEqual(
+    await joinRequestApprovers(database(), workspaceId),
+    [ownerPerson, adminPerson, removedPerson, demotedPerson].sort(),
+  );
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: NOW, removedByUserId: owner.userId })
+    .where(eq(workspaceMembers.id, removedPerson));
+  await database()
+    .update(workspaceMembers)
+    .set({ role: "member" })
+    .where(eq(workspaceMembers.id, demotedPerson));
+  assert.deepEqual(
+    await joinRequestApprovers(database(), workspaceId),
+    [ownerPerson, adminPerson].sort(),
+  );
+  assert.deepEqual(
+    await joinRequestApprovers(database(), otherWorkspace.workspaceId),
+    [otherWorkspace.ownerPerson],
+  );
+  assert.deepEqual(
+    await joinRequestApprovers(database(), newId<WorkspaceId>()),
+    [],
+  );
+
+  const pending = await requested(guest, workspaceId);
+  const listed = await listJoinRequests(database(), {
+    workspaceId,
+    userId: owner.userId,
+    now: NOW,
+  });
+  assert.ok(listed.listed);
+  const shown = await joinRequestForApprovers(database(), {
+    workspaceId,
+    joinRequestId: pending.id,
+  });
+  assert.deepEqual(shown, listed.joinRequests[0]);
+  assert.deepEqual(shown, {
+    ...pending,
+    requester: {
+      provider: "github",
+      login: await loginOf(guest),
+      verifiedAt: NOW.toISOString(),
+      accountCreatedAt: GITHUB_CREATED.toISOString(),
+    },
+    decision: null,
+    decidedAt: null,
+  });
+  assert.equal(
+    await joinRequestForApprovers(database(), {
+      workspaceId: otherWorkspace.workspaceId,
+      joinRequestId: pending.id,
+    }),
+    undefined,
+    "a request of another workspace",
+  );
+  assert.equal(
+    await joinRequestForApprovers(database(), {
+      workspaceId,
+      joinRequestId: newId<JoinRequestId>(),
+    }),
+    undefined,
+    "an unknown request",
+  );
+
+  const denial = await denyJoinRequest(
+    database(),
+    decision(admin, workspaceId, pending.id),
+  );
+  assert.ok(denial.denied);
+  assert.deepEqual(
+    await joinRequestForApprovers(database(), {
+      workspaceId,
+      joinRequestId: pending.id,
+    }),
+    { ...shown, decision: "denied", decidedAt: LATER.toISOString() },
   );
 });
 

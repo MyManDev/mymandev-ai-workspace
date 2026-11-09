@@ -4,6 +4,14 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import * as z from "zod";
 import { AUTH_ROUTES, routePath } from "./auth-api.ts";
+import { decodeClientEvent, decodeEvent } from "./decode.ts";
+import {
+  JoinRequestOutcomeSchema,
+  SERVER_ONLY_EVENT_TYPES,
+  WorkspaceJoinRequestCreatedEventSchema,
+  WorkspaceJoinRequestResolvedEventSchema,
+} from "./envelope.ts";
+import { decodeClientMessage, decodeServerMessage } from "./frames.ts";
 import {
   InvitationIdSchema,
   JoinRequestIdSchema,
@@ -44,6 +52,7 @@ import {
 import {
   API_ERROR_CODES,
   type ApiErrorCode,
+  JOIN_REQUEST_DECISIONS,
   MAX_ANSWER_LIST_ITEMS,
   UNCLAIMED_MEMBER_LIMIT,
 } from "./model.ts";
@@ -60,6 +69,8 @@ const OWNER_USER_ID = "0192f2a0-7c3e-7f00-a000-000000000001";
 const USER_ID = "0192f2a0-7c3e-7f00-a000-000000000002";
 const INVITATION_ID = "0192f2a0-7c3e-7b00-8000-000000000003";
 const JOIN_REQUEST_ID = "0192f2a0-7c3e-7c00-9000-000000000004";
+const EVENT_ID = "0192f2a0-7c3e-7e00-8000-000000000006";
+const DEVICE_ID = "0192f2a0-7c3e-7e00-8000-000000000007";
 const NOW = "2026-10-29T12:00:00.000Z";
 const LATER = "2026-11-05T12:00:00.000Z";
 const GITHUB_CREATED = "2011-01-25T18:44:36.000Z";
@@ -1119,6 +1130,228 @@ test("approvers see the requester's GitHub login and account creation date", () 
     request.requester !== null && "email" in request.requester,
     false,
   );
+});
+
+/** A pending request as the approvers' list shows it. */
+const pendingRequest = {
+  id: JOIN_REQUEST_ID,
+  workspaceId: WORKSPACE_ID,
+  requestedDisplayName: "Ada",
+  requester: {
+    provider: "github",
+    login: "ada-l",
+    verifiedAt: NOW,
+    accountCreatedAt: GITHUB_CREATED,
+  },
+  createdAt: NOW,
+  expiresAt: LATER,
+  decision: null,
+  decidedAt: null,
+};
+
+function joinRequestEvent(type: string, payload: unknown) {
+  return {
+    protocolVersion: 0,
+    id: EVENT_ID,
+    type,
+    occurredAt: NOW,
+    workspaceId: WORKSPACE_ID,
+    actor: { kind: "system" },
+    deviceId: null,
+    payload,
+  };
+}
+
+const created = (joinRequest: unknown) =>
+  joinRequestEvent("workspace.join_request.created", { joinRequest });
+
+const resolved = (payload: unknown) =>
+  joinRequestEvent("workspace.join_request.resolved", payload);
+
+test("a join request event comes only from the server, with a system actor and no device, and reaches a device", () => {
+  const events = [
+    created(pendingRequest),
+    ...["approved", "denied", "withdrawn", "blocked"].map((outcome) =>
+      resolved({ joinRequestId: JOIN_REQUEST_ID, outcome }),
+    ),
+  ];
+  for (const event of events) {
+    const label = `${event.type} ${JSON.stringify(event.payload)}`;
+    assert.deepEqual(decodeEvent(event), { ok: true, event }, label);
+    assert.deepEqual(
+      decodeServerMessage(event),
+      { ok: true, kind: "event", event },
+      `${label} reaches a device`,
+    );
+    assert.equal(
+      (SERVER_ONLY_EVENT_TYPES as readonly string[]).includes(event.type),
+      true,
+      label,
+    );
+    assert.deepEqual(
+      decodeEvent({ ...event, actor: { kind: "user", userId: USER_ID } }),
+      { ok: false, code: "invalid_actor" },
+      `${label} from a user`,
+    );
+    assert.deepEqual(
+      decodeEvent({ ...event, deviceId: DEVICE_ID }),
+      { ok: false, code: "invalid_actor" },
+      `${label} with a device`,
+    );
+    assert.deepEqual(
+      decodeServerMessage({ ...event, deviceId: DEVICE_ID }),
+      { ok: false, code: "invalid_actor" },
+      `${label} from the server with a device`,
+    );
+    assert.deepEqual(
+      decodeClientEvent(event),
+      { ok: false, code: "not_allowed_from_device" },
+      `${label} sent by a device`,
+    );
+    assert.deepEqual(
+      decodeClientMessage(event),
+      { ok: false, code: "not_allowed_from_device" },
+      `${label} sent by a device after authentication`,
+    );
+    // The forgery a device would try: its own user and device.
+    assert.equal(
+      decodeClientEvent({
+        ...event,
+        actor: { kind: "user", userId: USER_ID },
+        deviceId: DEVICE_ID,
+      }).ok,
+      false,
+      `${label} forged by a device`,
+    );
+  }
+});
+
+test("workspace.join_request.created carries the new pending request as the approvers' list shows it", () => {
+  const parsed = WorkspaceJoinRequestCreatedEventSchema.parse(
+    created({
+      ...pendingRequest,
+      requesterUserId: USER_ID,
+      requesterDeviceId: DEVICE_ID,
+      note: "hello",
+      requester: {
+        ...pendingRequest.requester,
+        email: "never@example.invalid",
+      },
+    }),
+  );
+  assert.deepEqual(parsed.payload.joinRequest, pendingRequest);
+  assert.deepEqual(Object.keys(parsed.payload), ["joinRequest"]);
+
+  const rejected: [label: string, value: unknown][] = [
+    [
+      "missing payload.joinRequest",
+      joinRequestEvent("workspace.join_request.created", {}),
+    ],
+    ["no payload", joinRequestEvent("workspace.join_request.created", null)],
+    ...withoutEach(pendingRequest, created, "joinRequest."),
+    ...withoutEach(
+      pendingRequest.requester,
+      (requester) => created({ ...pendingRequest, requester }),
+      "requester.",
+    ),
+    [
+      "a request of another workspace",
+      created({ ...pendingRequest, workspaceId: OTHER_WORKSPACE_ID }),
+    ],
+    ...["approved", "denied", "withdrawn", "blocked", "expired"].map(
+      (decision): [string, unknown] => [
+        `a ${decision} request`,
+        created({ ...pendingRequest, decision, decidedAt: NOW }),
+      ],
+    ),
+    [
+      "a pending request without its requester",
+      created({ ...pendingRequest, requester: null }),
+    ],
+    [
+      "a decision time without a decision",
+      created({ ...pendingRequest, decidedAt: NOW }),
+    ],
+    ["no request", created(null)],
+    ["an invalid request ID", created({ ...pendingRequest, id: "x" })],
+    [
+      "a requested name over 64",
+      created({ ...pendingRequest, requestedDisplayName: "a".repeat(65) }),
+    ],
+    [
+      "a requester with a bad login",
+      created({
+        ...pendingRequest,
+        requester: { ...pendingRequest.requester, login: "-".repeat(40) },
+      }),
+    ],
+    [
+      "an account creation date without milliseconds",
+      created({
+        ...pendingRequest,
+        requester: {
+          ...pendingRequest.requester,
+          accountCreatedAt: "2011-01-25T18:44:36Z",
+        },
+      }),
+    ],
+  ];
+  for (const [label, value] of rejected) {
+    assert.deepEqual(
+      decodeEvent(value),
+      { ok: false, code: "invalid_payload" },
+      label,
+    );
+  }
+});
+
+test("workspace.join_request.resolved carries the request ID and its outcome, never an expiry or an unknown outcome", () => {
+  assert.deepEqual(
+    [...JoinRequestOutcomeSchema.options].sort(),
+    JOIN_REQUEST_DECISIONS.filter((decision) => decision !== "expired").sort(),
+  );
+  assert.deepEqual([...JoinRequestOutcomeSchema.options].sort(), [
+    "approved",
+    "blocked",
+    "denied",
+    "withdrawn",
+  ]);
+  const valid = { joinRequestId: JOIN_REQUEST_ID, outcome: "approved" };
+  const parsed = WorkspaceJoinRequestResolvedEventSchema.parse(
+    resolved({
+      ...valid,
+      requesterUserId: USER_ID,
+      decidedBy: OWNER_USER_ID,
+      memberId: MEMBER_ID,
+    }),
+  );
+  assert.deepEqual(parsed.payload, valid);
+
+  const rejected: [label: string, value: unknown][] = [
+    ...withoutEach(valid, resolved, "payload."),
+    ["no payload", resolved(undefined)],
+    ...["expired", "ignored", "Approved", "pending", "", null, 1].map(
+      (outcome): [string, unknown] => [
+        `the outcome ${JSON.stringify(outcome)}`,
+        resolved({ ...valid, outcome }),
+      ],
+    ),
+    [
+      "an invalid request ID",
+      resolved({ ...valid, joinRequestId: JOIN_REQUEST_ID.toUpperCase() }),
+    ],
+    [
+      "a member ID instead",
+      resolved({ outcome: "approved", memberId: MEMBER_ID }),
+    ],
+  ];
+  for (const [label, value] of rejected) {
+    assert.deepEqual(
+      decodeEvent(value),
+      { ok: false, code: "invalid_payload" },
+      label,
+    );
+  }
 });
 
 test("the requester's own list shows how each request ended, a block as a denial, and nothing about the workspace", () => {
