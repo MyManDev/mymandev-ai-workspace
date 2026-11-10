@@ -8,6 +8,7 @@ import type {
   ConnectionBridge,
   DeviceListBridge,
   InvitationActionsBridge,
+  InvitationsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -431,6 +432,54 @@ test("the join screen gets the invitation actions and the workspace state: with 
   );
   // Only the join screen uses them.
   expect(render({ invitationActions })).not.toContain("join-code");
+});
+
+test("the people screen gets the invitations: with both bridges, it has the paragraph of their sentence and the two dialogs, and reads nothing while rendered", () => {
+  const people: PeopleBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const calls: string[] = [];
+  const call = (name: string) => () => {
+    calls.push(name);
+    return Promise.reject(new Error("not called"));
+  };
+  const invitations: InvitationsBridge = {
+    getState: call("getState"),
+    subscribeState: () => {
+      calls.push("subscribeState");
+      return () => undefined;
+    },
+    load: call("load"),
+  };
+  const invitationActions: InvitationActionsBridge = {
+    create: call("create"),
+    revoke: call("revoke"),
+    preview: call("preview"),
+    accept: call("accept"),
+  };
+  const html = render({
+    people,
+    invitations,
+    invitationActions,
+    initialView: { screen: "people" },
+  });
+  expect(html).toContain(
+    '<p class="people-status" id="invitation-action-message" role="status"></p>',
+  );
+  expect(html.match(/<dialog class="people-dialog"><\/dialog>/g)).toHaveLength(
+    2,
+  );
+  // The subscription and the load run in an effect, which a server render
+  // does not run; nothing else is called.
+  expect(calls).toEqual([]);
+  // Without the actions, or on another screen, nothing of it shows.
+  expect(
+    render({ people, invitations, initialView: { screen: "people" } }),
+  ).not.toContain("invitation-action-message");
+  expect(render({ people, invitations, invitationActions })).not.toContain(
+    "invitation-action-message",
+  );
 });
 
 test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {

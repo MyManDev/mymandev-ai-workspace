@@ -14,6 +14,7 @@ import {
   type OfferOwnershipRequest,
   OfferOwnershipRequestSchema,
   PROTOCOL_VERSION,
+  type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
 import type { FastifyInstance, FastifyRequest } from "fastify";
@@ -34,8 +35,9 @@ export type OwnershipRouteOptions = Readonly<{
   onWorkspaceEvent: WorkspaceEventHandler;
   /**
    * Receives `account.ownership_offered` and `account.ownership_offer_ended`
-   * for the target's account, and `account.ownership_transferred` for the
-   * previous and the new owner's accounts, after the commit.
+   * for the target's account and then for the owner's account, and
+   * `account.ownership_transferred` for the previous and the new owner's
+   * accounts, after the commit.
    */
   onAccountFrame: AccountFrameHandler;
 }>;
@@ -55,13 +57,15 @@ function refused(refusal: PersonRefusal | "device_too_new"): ApiError {
  * Each runs in one transaction that checks the account and the device again
  * (`lockActor`) and then decides on the locked people. After the commit, the
  * target's account gets `account.ownership_offered` or
- * `account.ownership_offer_ended` through `onAccountFrame`. A transfer
- * reaches the workspace's subscribers as `workspace.ownership.transferred`
- * through `onWorkspaceEvent`, and then every connection of the previous
- * owner's account and of the new owner's account as
- * `account.ownership_transferred` through `onAccountFrame`, in this order.
- * `buildApp` connects both handlers to the registry, which sends at once, so
- * the order holds.
+ * `account.ownership_offer_ended` through `onAccountFrame`, and then the
+ * owner's account gets the same frame (#241), so that every device of both
+ * people reads the offer again. No workspace event reports an offer, so no
+ * other member learns of it. A transfer reaches the workspace's subscribers
+ * as `workspace.ownership.transferred` through `onWorkspaceEvent`, and then
+ * every connection of the previous owner's account and of the new owner's
+ * account as `account.ownership_transferred` through `onAccountFrame`, in
+ * this order. `buildApp` connects both handlers to the registry, which sends
+ * at once, so the order holds.
  */
 export function registerOwnershipRoutes(
   workspace: FastifyInstance,
@@ -69,7 +73,23 @@ export function registerOwnershipRoutes(
 ): void {
   const { database } = options;
 
-  /** Tells every connection of the target's account that the offer ended. */
+  /**
+   * Hands an offer frame for every connection of the target's account and
+   * then of the owner's account (#241). They are two accounts: a person of
+   * the workspace belongs to one account, and the target is never the owner.
+   */
+  function sendOfferFrame(
+    request: FastifyRequest,
+    frame: AccountOwnershipOfferedFrame | AccountOwnershipOfferEndedFrame,
+    targetUserId: UserId,
+    ownerUserId: UserId,
+  ): void {
+    for (const userId of [targetUserId, ownerUserId]) {
+      sendAccountFrame(request, options.onAccountFrame, userId, frame);
+    }
+  }
+
+  /** Tells the target's and the owner's accounts that the offer ended. */
   function sendOfferEnded(
     request: FastifyRequest,
     workspaceId: WorkspaceId,
@@ -85,12 +105,12 @@ export function registerOwnershipRoutes(
       reason: ended.reason,
       endedAt: ended.endedAt.toISOString(),
     };
-    sendAccountFrame(request, options.onAccountFrame, ended.userId, frame);
+    sendOfferFrame(request, frame, ended.userId, ended.ownerUserId);
   }
 
-  // Only the owner offers, from a device older than 72 hours. An expired
-  // offer that the new one replaces ends with `expired` before the new one
-  // reaches its target.
+  // Only the owner offers, from a device older than 72 hours, so the caller
+  // is the owner. An expired offer that the new one replaces ends with
+  // `expired` before the new one reaches its target and the owner.
   workspace.post(
     MEMBERSHIP_ROUTES.offerOwnership.path,
     {
@@ -125,13 +145,15 @@ export function registerOwnershipRoutes(
         workspaceId,
         offer: result.offer,
       };
-      sendAccountFrame(request, options.onAccountFrame, result.userId, frame);
+      sendOfferFrame(request, frame, result.userId, auth.userId);
       return reply.code(204).send();
     },
   );
 
   // A refusal that cleared an expired offer commits it, so the transaction
-  // returns the refusal and the route answers it after the commit.
+  // returns the refusal and the route answers it after the commit. An
+  // acceptance sends no offer frame: `account.ownership_transferred` tells
+  // both accounts that the offer is gone.
   workspace.post(
     MEMBERSHIP_ROUTES.acceptOwnershipOffer.path,
     { schema: { params: WorkspaceParamsSchema } },

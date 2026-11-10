@@ -14,6 +14,7 @@ import type {
   ConnectionBridge,
   DeviceListBridge,
   InvitationActionsBridge,
+  InvitationsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -99,6 +100,8 @@ export interface AppProps {
   readonly people?: PeopleBridge | undefined;
   /** The people actions from the preload script; undefined outside Electron. */
   readonly peopleActions?: PeopleActionsBridge | undefined;
+  /** The selected workspace's live invitations from the preload script; undefined outside Electron. */
+  readonly invitations?: InvitationsBridge | undefined;
   /** The invitation actions from the preload script; undefined outside Electron. */
   readonly invitationActions?: InvitationActionsBridge | undefined;
   /** The open project's agent activity from the preload script; undefined outside Electron. */
@@ -125,6 +128,7 @@ export function App({
   workspaces,
   people,
   peopleActions,
+  invitations,
   invitationActions,
   agents,
   chat,
@@ -201,6 +205,7 @@ export function App({
           electronVersion={electronVersion}
           people={people}
           peopleActions={peopleActions}
+          invitations={invitations}
           invitationActions={invitationActions}
           workspaces={workspaceSidebar}
           account={account}
@@ -232,6 +237,7 @@ function ScreenContent({
   electronVersion,
   people,
   peopleActions,
+  invitations,
   invitationActions,
   workspaces,
   account,
@@ -247,6 +253,7 @@ function ScreenContent({
   readonly electronVersion: string | undefined;
   readonly people: PeopleBridge | undefined;
   readonly peopleActions: PeopleActionsBridge | undefined;
+  readonly invitations: InvitationsBridge | undefined;
   readonly invitationActions: InvitationActionsBridge | undefined;
   /** The workspace part of the sidebar, for the join screen. */
   readonly workspaces: WorkspaceSidebar;
@@ -275,7 +282,14 @@ function ScreenContent({
     case "account":
       return <AccountScreen account={account} devices={devices} />;
     case "people":
-      return <PeopleScreen people={people} peopleActions={peopleActions} />;
+      return (
+        <PeopleScreen
+          people={people}
+          peopleActions={peopleActions}
+          invitations={invitations}
+          invitationActions={invitationActions}
+        />
+      );
     case "join":
       return (
         <JoinScreen
