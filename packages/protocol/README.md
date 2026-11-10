@@ -160,6 +160,11 @@ Decided by the Project Manager on 2026-11-02 (#93), so that every device of both
 
 - The account frame `account.ownership_transferred` reaches every open connection of the previous owner's account and of the new owner's account, also one that subscribed to nothing. It carries the workspace ID, the two people (`previousOwnerMemberId`, now an admin, and `ownerMemberId`, now the owner), which are never the same, and `transferredAt`. The workspace's subscribers still get the `workspace.ownership.transferred` event. Like every account frame, it reaches only open connections, so the desktop reads the workspace view after `auth.ok`.
 
+Decided by the Project Manager on 2026-11-10 (#241), so that every device of the owner learns of an ownership offer and of its end, as every device of the target does:
+
+- The account frames `account.ownership_offered` and `account.ownership_offer_ended` reach every open connection of the target's account and of the owner's account, also one that subscribed to nothing, and no other member's. An offer and its end have no workspace event, so the offer stays out of every member's event stream. An acceptance sends neither frame: `account.ownership_transferred` reports it.
+- The frames are unchanged and carry no field for the side. `offer.memberId` names the target, so a device can tell from its own person whether it is the target's or the owner's; the desktop reads the workspace view again on both frames either way. Like every account frame, they reach only open connections, so the desktop reads the workspace view after `auth.ok`.
+
 Decided by the Project Manager on 2026-11-06 (#95, D5a), so that the owner and admins see every claim with the creation date of the claiming GitHub account (ADR 0014, "Invitations"): a route lets them read the recent claims, each with the GitHub login, the creation date of that GitHub account, and the time of the claim. The Project Manager decided two details on 2026-11-06 (#208):
 
 - "Recent" means the 50 most recent claims (`RECENT_CLAIMS`), whatever their age, with no time window and no cursor. A claim missed while offline stays readable until 50 newer claims exist, and an older claim cannot be read through this route. The schema accepts up to `MAX_ANSWER_LIST_ITEMS` claims, so raising the count never breaks an older client.

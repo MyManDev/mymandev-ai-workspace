@@ -1019,9 +1019,10 @@ export function createWorkspaceService(
         return;
       case "account.ownership_offered":
       case "account.ownership_offer_ended":
-        // Only the target's account gets them, and no workspace event
-        // follows. The view is read again rather than set from the frame,
-        // so that an older reload answer can never undo it.
+        // The target's account and the owner's account get them (#241),
+        // and no workspace event follows. Either side reads the view again
+        // rather than set it from the frame, so that an older reload answer
+        // can never undo it.
         reloadSelected(frame.workspaceId);
         return;
       default:

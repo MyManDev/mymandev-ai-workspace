@@ -520,6 +520,7 @@ test("an offer 7 days old is no offer: a new offer clears it, reports it as expi
     ended: {
       memberId: memberPerson,
       userId: member.userId,
+      ownerUserId: owner.userId,
       reason: "expired",
       endedAt: EXPIRY,
     },
@@ -544,6 +545,7 @@ test("an offer 7 days old is no offer: a new offer clears it, reports it as expi
   assert.deepEqual(renewed.ended, {
     memberId: adminPerson,
     userId: admin.userId,
+    ownerUserId: owner.userId,
     reason: "expired",
     endedAt: again,
   });
@@ -744,6 +746,7 @@ test("an accept of an offer 7 days old is a conflict: another person's leaves it
       ended: {
         memberId: memberPerson,
         userId: member.userId,
+        ownerUserId: owner.userId,
         reason: "expired",
         endedAt: EXPIRY,
       },
@@ -810,6 +813,7 @@ test("the owner withdraws a live offer from any device; anyone else is forbidden
     ended: {
       memberId: memberPerson,
       userId: member.userId,
+      ownerUserId: owner.userId,
       reason: "withdrawn",
       endedAt: LATER,
     },
@@ -829,6 +833,7 @@ test("the owner withdraws a live offer from any device; anyone else is forbidden
     ended: {
       memberId: memberPerson,
       userId: member.userId,
+      ownerUserId: owner.userId,
       reason: "expired",
       endedAt: EXPIRY,
     },
@@ -1211,6 +1216,7 @@ test(
       ended: {
         memberId: memberPerson,
         userId: member.userId,
+        ownerUserId: owner.userId,
         reason: "withdrawn",
         endedAt: LATER,
       },
@@ -1386,6 +1392,7 @@ test(
       const expired = {
         memberId: memberPerson,
         userId: member.userId,
+        ownerUserId: owner.userId,
         reason: "expired",
         endedAt: new Date(madeAt.getTime() + OWNERSHIP_OFFER_LIFETIME_MS),
       };

@@ -25,6 +25,7 @@ import { test, type TestContext } from "node:test";
 import {
   accessToken,
   deviceApp,
+  failingCommits,
   fakeClock,
   type FakeClock,
   type SignedInDevice,
@@ -43,11 +44,12 @@ import type { WorkspaceEvent } from "./events.ts";
 // Ownership offers (ADR 0014, "People and roles" and "Removal and
 // ownership"; #93): only the owner offers, from a device older than 72
 // hours, to an active, claimed person; the target accepts within 7 days, or
-// the owner withdraws. The target's account gets `account.ownership_offered`
-// and `account.ownership_offer_ended`, and a transfer reaches the workspace's
-// subscribers as `workspace.ownership.transferred` and both accounts, the
-// previous and the new owner's, as `account.ownership_transferred`. Every
-// message is decoded with the desktop's decoder.
+// the owner withdraws. The target's account and the owner's account (#241)
+// get `account.ownership_offered` and `account.ownership_offer_ended`, and no
+// other member is told; a transfer reaches the workspace's subscribers as
+// `workspace.ownership.transferred` and both accounts, the previous and the
+// new owner's, as `account.ownership_transferred`. Every message is decoded
+// with the desktop's decoder.
 
 const database = useTestDatabase();
 
@@ -62,15 +64,17 @@ type Account = Readonly<{
 /**
  * One API instance on a fake clock: each account signs in through its own
  * app, and every app shares the clock, one registry of connections, one
- * database, and the list of membership events that went out.
+ * database, whose next commit can be made to fail, and the list of
+ * membership events that went out.
  */
 async function instance(t: TestContext) {
   const clock = fakeClock();
   const connections = new ConnectionRegistry();
+  const commits = failingCommits(database());
   const events: WorkspaceEvent[] = [];
   const account = async (githubId: number): Promise<Account> => {
     const app = await deviceApp(t, {
-      database: database(),
+      database: commits.database,
       githubId,
       connections,
       now: clock.now,
@@ -83,7 +87,13 @@ async function instance(t: TestContext) {
     const device = await signInDevice(app);
     return { app, device, token: await accessToken(app, device) };
   };
-  return { clock, connections, events, account };
+  return {
+    clock,
+    connections,
+    events,
+    account,
+    failNextCommit: commits.failNextCommit,
+  };
 }
 
 /** The account with a fresh access token, which lives 15 minutes. */
@@ -276,43 +286,61 @@ function ownershipTransferred(
   };
 }
 
-test("the owner offers ownership with 204; only the target's connections get account.ownership_offered, and the view shows the offer", async (t) => {
+test("the owner offers ownership with 204; every connection of the target's and the owner's accounts gets account.ownership_offered, no other member's, and the view shows the offer", async (t) => {
   const { clock, events, account } = await instance(t);
   const ada = await account(3601);
+  const adasDesktop = await signInDevice(ada.app);
   const bob = await account(3602);
   const bobsDesktop = await signInDevice(bob.app);
   const cleo = await account(3603);
   const dan = await account(3604);
+  const eve = await account(3605);
   await established(clock, ada.device);
   const team = await workspaceOf(ada.device, [
     [bob.device, "member"],
     [cleo.device, "admin"],
+    [eve.device, "member"],
   ]);
   const [bobInTeam] = team.memberIds;
   assert.ok(bobInTeam !== undefined);
-  // Dan shares another workspace with Bob, where nothing changes.
+  // Dan owns another workspace, which Bob shares, where nothing changes.
   await workspaceOf(dan.device, [[bob.device, "member"]]);
 
   const adaClient = (await connected(t, ada.app, ada.device)).client;
+  const adasDesktopClient = (await connected(t, ada.app, adasDesktop)).client;
   const laptop = (await connected(t, bob.app, bob.device)).client;
   const desktop = (await connected(t, bob.app, bobsDesktop)).client;
   const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  const eveClient = (await connected(t, eve.app, eve.device)).client;
   const danClient = (await connected(t, dan.app, dan.device)).client;
+  const all = [
+    adaClient,
+    adasDesktopClient,
+    laptop,
+    desktop,
+    cleoClient,
+    eveClient,
+    danClient,
+  ];
   await subscribe(adaClient, team.workspaceId);
   await subscribe(laptop, team.workspaceId);
   await subscribe(cleoClient, team.workspaceId);
-  await drainPresence(adaClient, laptop, cleoClient);
+  await subscribe(eveClient, team.workspaceId);
+  await drainPresence(adaClient, laptop, cleoClient, eveClient);
 
   const start = clock.now();
   const response = await offer(ada, team.workspaceId, bobInTeam);
   assert.equal(response.statusCode, 204, response.body);
   assert.equal(response.body, "");
 
-  // Both of Bob's connections, the one that subscribed to nothing too.
+  // Both of Bob's connections and both of Ada's (#241), also the ones that
+  // subscribed to nothing, among them Ada's other device. The admin, the
+  // other member, and the other workspace's owner get nothing.
   const frame = offered(team.workspaceId, bobInTeam, start);
-  assert.deepEqual(await nextFrame(laptop), frame);
-  assert.deepEqual(await nextFrame(desktop), frame);
-  await quiet(adaClient, laptop, desktop, cleoClient, danClient);
+  for (const client of [laptop, desktop, adaClient, adasDesktopClient]) {
+    assert.deepEqual(await nextFrame(client), frame);
+  }
+  await quiet(...all);
   assert.deepEqual(events, [], "an offer is no membership event");
 
   assert.equal(frame.type, "account.ownership_offered");
@@ -458,9 +486,10 @@ test("only the owner offers, never to themselves, to an active, claimed person, 
   // One live offer per workspace: a second one, to anyone, is a conflict.
   const first = await offer(ada, workspaceId, bobInTeam);
   assert.equal(first.statusCode, 204, first.body);
-  const [, bobClient] = clients;
-  assert.ok(bobClient !== undefined);
+  const [adaClient, bobClient] = clients;
+  assert.ok(adaClient !== undefined && bobClient !== undefined);
   assert.equal((await nextFrame(bobClient)).type, "account.ownership_offered");
+  assert.equal((await nextFrame(adaClient)).type, "account.ownership_offered");
   for (const memberId of [bobInTeam, cleoInTeam]) {
     const second = await offer(ada, workspaceId, memberId);
     assert.equal(second.statusCode, 409, second.body);
@@ -515,8 +544,9 @@ test("the target accepts with 204: the owner becomes an admin and the target the
 
   const offeredResponse = await offer(ada, team.workspaceId, bobInTeam);
   assert.equal(offeredResponse.statusCode, 204, offeredResponse.body);
-  assert.equal((await nextFrame(laptop)).type, "account.ownership_offered");
-  assert.equal((await nextFrame(desktop)).type, "account.ownership_offered");
+  for (const client of [laptop, desktop, adaClient, adasDesktopClient]) {
+    assert.equal((await nextFrame(client)).type, "account.ownership_offered");
+  }
   await quiet(...all);
 
   // From Bob's desktop, a device that is not 72 hours old: an acceptance
@@ -555,8 +585,8 @@ test("the target accepts with 204: the owner becomes an admin and the target the
   for (const client of [adaClient, adasDesktopClient, laptop, desktop]) {
     assert.deepEqual(await nextFrame(client), frame);
   }
-  // No offer frame after a transfer, and nothing for Cleo's or Dan's
-  // account.
+  // No offer frame after a transfer, to either account, and nothing for
+  // Cleo's or Dan's account.
   await quiet(...all);
   assert.equal(events.length, 1);
   const [event] = events;
@@ -631,9 +661,11 @@ test("only the target accepts a live offer, and nobody accepts a withdrawn one; 
   assert.equal(errorCode(none), "conflict");
 
   assert.equal((await offer(ada, workspaceId, bobInTeam)).statusCode, 204);
-  const [, bobClient] = clients;
-  assert.ok(bobClient !== undefined);
-  assert.equal((await nextFrame(bobClient)).type, "account.ownership_offered");
+  const [adaClient, bobClient] = clients;
+  assert.ok(adaClient !== undefined && bobClient !== undefined);
+  for (const client of [bobClient, adaClient]) {
+    assert.equal((await nextFrame(client)).type, "account.ownership_offered");
+  }
   for (const [label, response, status, code] of [
     ["the owner accepts", await accept(ada, workspaceId), 403, "forbidden"],
     [
@@ -656,10 +688,12 @@ test("only the target accepts a live offer, and nobody accepts a withdrawn one; 
 
   const withdrawn = await withdraw(ada, workspaceId);
   assert.equal(withdrawn.statusCode, 204, withdrawn.body);
-  assert.equal(
-    (await nextFrame(bobClient)).type,
-    "account.ownership_offer_ended",
-  );
+  for (const client of [bobClient, adaClient]) {
+    assert.equal(
+      (await nextFrame(client)).type,
+      "account.ownership_offer_ended",
+    );
+  }
   const late = await accept(bob, workspaceId);
   assert.equal(late.statusCode, 409, late.body);
   assert.equal(errorCode(late), "conflict");
@@ -670,44 +704,62 @@ test("only the target accepts a live offer, and nobody accepts a withdrawn one; 
   assert.deepEqual(events, []);
 });
 
-test("the owner withdraws with 204 from any device and only the target's connections get account.ownership_offer_ended with withdrawn; anyone else is forbidden", async (t) => {
+test("the owner withdraws with 204 from any device and every connection of the target's and the owner's accounts gets account.ownership_offer_ended with withdrawn, no other member's; anyone else is forbidden", async (t) => {
   const { clock, events, account } = await instance(t);
   const ada = await account(3641);
   const adasDesktop = await signInDevice(ada.app);
   const bob = await account(3642);
   const bobsDesktop = await signInDevice(bob.app);
   const cleo = await account(3643);
+  const dan = await account(3644);
   await established(clock, ada.device);
   const team = await workspaceOf(ada.device, [
     [bob.device, "member"],
     [cleo.device, "admin"],
+    [dan.device, "member"],
   ]);
   const [bobInTeam] = team.memberIds;
   assert.ok(bobInTeam !== undefined);
   const adaClient = (await connected(t, ada.app, ada.device)).client;
+  const adasDesktopClient = (await connected(t, ada.app, adasDesktop)).client;
   const laptop = (await connected(t, bob.app, bob.device)).client;
   const desktop = (await connected(t, bob.app, bobsDesktop)).client;
   const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  const danClient = (await connected(t, dan.app, dan.device)).client;
+  const all = [
+    adaClient,
+    adasDesktopClient,
+    laptop,
+    desktop,
+    cleoClient,
+    danClient,
+  ];
+  // Every connection of the target's account and of the owner's account.
+  const told = [laptop, desktop, adaClient, adasDesktopClient];
   await subscribe(adaClient, team.workspaceId);
   await subscribe(cleoClient, team.workspaceId);
-  await drainPresence(adaClient, cleoClient);
+  await subscribe(danClient, team.workspaceId);
+  await drainPresence(adaClient, cleoClient, danClient);
   const { workspaceId } = team;
 
   const none = await withdraw(ada, workspaceId);
   assert.equal(none.statusCode, 409, none.body);
   assert.equal(errorCode(none), "conflict");
+  await quiet(...all);
   assert.equal((await offer(ada, workspaceId, bobInTeam)).statusCode, 204);
-  assert.equal((await nextFrame(laptop)).type, "account.ownership_offered");
-  assert.equal((await nextFrame(desktop)).type, "account.ownership_offered");
+  for (const client of told) {
+    assert.equal((await nextFrame(client)).type, "account.ownership_offered");
+  }
 
   for (const [label, response] of [
     ["the target", await withdraw(bob, workspaceId)],
     ["an admin", await withdraw(cleo, workspaceId)],
+    ["a member", await withdraw(dan, workspaceId)],
   ] as const) {
     assert.equal(response.statusCode, 403, `${label}: ${response.body}`);
     assert.equal(errorCode(response), "forbidden", label);
   }
-  await quiet(adaClient, laptop, desktop, cleoClient);
+  await quiet(...all);
 
   // Ada's desktop is not 72 hours old; a withdrawal needs no device age.
   clock.advance(SECOND_MS);
@@ -721,10 +773,13 @@ test("the owner withdraws with 204 from any device and only the target's connect
   );
   assert.equal(response.statusCode, 204, response.body);
   assert.equal(response.body, "");
+  // Both of Bob's connections and both of Ada's (#241), the withdrawing
+  // desktop, which subscribed to nothing, too. Cleo and Dan get nothing.
   const frame = offerEnded(workspaceId, "withdrawn", clock.now());
-  assert.deepEqual(await nextFrame(laptop), frame);
-  assert.deepEqual(await nextFrame(desktop), frame);
-  await quiet(adaClient, laptop, desktop, cleoClient);
+  for (const client of told) {
+    assert.deepEqual(await nextFrame(client), frame);
+  }
+  await quiet(...all);
   assert.equal((await view(ada, workspaceId)).ownershipOffer, null);
   assert.deepEqual(
     (await auditOf(workspaceId)).map((record) => [
@@ -740,11 +795,11 @@ test("the owner withdraws with 204 from any device and only the target's connect
 
   const again = await withdraw(ada, workspaceId);
   assert.equal(again.statusCode, 409, again.body);
-  await quiet(adaClient, laptop, desktop, cleoClient);
+  await quiet(...all);
   assert.deepEqual(events, []);
 });
 
-test("an offer 7 days old is no offer: the view hides it, and the next offer, acceptance, or withdrawal clears it and tells its target with expired", async (t) => {
+test("an offer 7 days old is no offer: the view hides it, and the next offer, acceptance, or withdrawal clears it and tells its target and the owner with expired", async (t) => {
   const { clock, account } = await instance(t);
   let ada = await account(3651);
   let bob = await account(3652);
@@ -765,10 +820,12 @@ test("an offer 7 days old is no offer: the view hides it, and the next offer, ac
   // An offer to Bob; a second before its expiry the view still shows it.
   const first = clock.now();
   assert.equal((await offer(ada, workspaceId, bobInTeam)).statusCode, 204);
-  assert.deepEqual(
-    await nextFrame(bobClient),
-    offered(workspaceId, bobInTeam, first),
-  );
+  for (const client of [bobClient, adaClient]) {
+    assert.deepEqual(
+      await nextFrame(client),
+      offered(workspaceId, bobInTeam, first),
+    );
+  }
   clock.advance(OWNERSHIP_OFFER_LIFETIME_MS - SECOND_MS);
   ada = await refreshed(ada);
   bob = await refreshed(bob);
@@ -783,19 +840,21 @@ test("an offer 7 days old is no offer: the view hides it, and the next offer, ac
   await quiet(...all);
 
   // A new offer to Cleo replaces it: Bob learns that his offer expired, at
-  // its expiry, before Cleo gets hers.
+  // its expiry, before Cleo gets hers, and Ada learns both in this order.
   clock.advance(SECOND_MS);
   const second = clock.now();
   const replaced = await offer(ada, workspaceId, cleoInTeam);
   assert.equal(replaced.statusCode, 204, replaced.body);
-  assert.deepEqual(
-    await nextFrame(bobClient),
-    offerEnded(workspaceId, "expired", first + OWNERSHIP_OFFER_LIFETIME_MS),
+  const firstEnded = offerEnded(
+    workspaceId,
+    "expired",
+    first + OWNERSHIP_OFFER_LIFETIME_MS,
   );
-  assert.deepEqual(
-    await nextFrame(cleoClient),
-    offered(workspaceId, cleoInTeam, second),
-  );
+  const toCleo = offered(workspaceId, cleoInTeam, second);
+  assert.deepEqual(await nextFrame(bobClient), firstEnded);
+  assert.deepEqual(await nextFrame(cleoClient), toCleo);
+  assert.deepEqual(await nextFrame(adaClient), firstEnded);
+  assert.deepEqual(await nextFrame(adaClient), toCleo);
   await quiet(...all);
 
   // Cleo's offer expires; the owner's withdrawal is a conflict that clears it.
@@ -804,19 +863,23 @@ test("an offer 7 days old is no offer: the view hides it, and the next offer, ac
   const withdrawn = await withdraw(ada, workspaceId);
   assert.equal(withdrawn.statusCode, 409, withdrawn.body);
   assert.equal(errorCode(withdrawn), "conflict");
-  assert.deepEqual(
-    await nextFrame(cleoClient),
-    offerEnded(workspaceId, "expired", second + OWNERSHIP_OFFER_LIFETIME_MS),
-  );
+  for (const client of [cleoClient, adaClient]) {
+    assert.deepEqual(
+      await nextFrame(client),
+      offerEnded(workspaceId, "expired", second + OWNERSHIP_OFFER_LIFETIME_MS),
+    );
+  }
   await quiet(...all);
 
   // A new offer to Bob expires too; his acceptance is a conflict that clears it.
   const third = clock.now();
   assert.equal((await offer(ada, workspaceId, bobInTeam)).statusCode, 204);
-  assert.deepEqual(
-    await nextFrame(bobClient),
-    offered(workspaceId, bobInTeam, third),
-  );
+  for (const client of [bobClient, adaClient]) {
+    assert.deepEqual(
+      await nextFrame(client),
+      offered(workspaceId, bobInTeam, third),
+    );
+  }
   clock.advance(OWNERSHIP_OFFER_LIFETIME_MS);
   ada = await refreshed(ada);
   bob = await refreshed(bob);
@@ -828,10 +891,13 @@ test("an offer 7 days old is no offer: the view hides it, and the next offer, ac
   const accepted = await accept(bob, workspaceId);
   assert.equal(accepted.statusCode, 409, accepted.body);
   assert.equal(errorCode(accepted), "conflict");
-  assert.deepEqual(
-    await nextFrame(bobClient),
-    offerEnded(workspaceId, "expired", third + OWNERSHIP_OFFER_LIFETIME_MS),
-  );
+  // The target acted, and the owner's account is told as well.
+  for (const client of [bobClient, adaClient]) {
+    assert.deepEqual(
+      await nextFrame(client),
+      offerEnded(workspaceId, "expired", third + OWNERSHIP_OFFER_LIFETIME_MS),
+    );
+  }
   const repeated = await accept(bob, workspaceId);
   assert.equal(repeated.statusCode, 409, repeated.body);
   await quiet(...all);
@@ -853,7 +919,7 @@ test("an offer 7 days old is no offer: the view hides it, and the next offer, ac
   );
 });
 
-test("removing the target ends the offer with account.removed_from_workspace and no offer frame", async (t) => {
+test("removing the target ends the offer with account.removed_from_workspace and no offer frame to either account", async (t) => {
   const { clock, account } = await instance(t);
   const ada = await account(3661);
   const bob = await account(3662);
@@ -861,9 +927,13 @@ test("removing the target ends the offer with account.removed_from_workspace and
   const team = await workspaceOf(ada.device, [[bob.device, "member"]]);
   const [bobInTeam] = team.memberIds;
   assert.ok(bobInTeam !== undefined);
+  // Ada's connection subscribed to nothing, so it gets no membership event.
+  const adaClient = (await connected(t, ada.app, ada.device)).client;
   const bobClient = (await connected(t, bob.app, bob.device)).client;
   assert.equal((await offer(ada, team.workspaceId, bobInTeam)).statusCode, 204);
-  assert.equal((await nextFrame(bobClient)).type, "account.ownership_offered");
+  for (const client of [bobClient, adaClient]) {
+    assert.equal((await nextFrame(client)).type, "account.ownership_offered");
+  }
 
   const removed = await post(
     ada,
@@ -874,9 +944,145 @@ test("removing the target ends the offer with account.removed_from_workspace and
     (await nextFrame(bobClient)).type,
     "account.removed_from_workspace",
   );
-  await quiet(bobClient);
+  await quiet(adaClient, bobClient);
   assert.equal((await view(ada, team.workspaceId)).ownershipOffer, null);
   const withdrawn = await withdraw(ada, team.workspaceId);
   assert.equal(withdrawn.statusCode, 409, withdrawn.body);
-  await quiet(bobClient);
+  await quiet(adaClient, bobClient);
+});
+
+test("a refused or rolled-back offer action sends no offer frame, and the same action, once it commits, reaches every connection of the target's and the owner's accounts and no other member's", async (t) => {
+  const { clock, events, account, failNextCommit } = await instance(t);
+  const ada = await account(3671);
+  const adasDesktop = await signInDevice(ada.app);
+  let bob = await account(3672);
+  const cleo = await account(3673);
+  const dan = await account(3674);
+  await established(clock, ada.device);
+  const team = await workspaceOf(ada.device, [
+    [bob.device, "member"],
+    [cleo.device, "admin"],
+    [dan.device, "member"],
+  ]);
+  const [bobInTeam] = team.memberIds;
+  assert.ok(bobInTeam !== undefined);
+  const adaClient = (await connected(t, ada.app, ada.device)).client;
+  const adasDesktopClient = (await connected(t, ada.app, adasDesktop)).client;
+  const bobClient = (await connected(t, bob.app, bob.device)).client;
+  const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  const danClient = (await connected(t, dan.app, dan.device)).client;
+  const all = [adaClient, adasDesktopClient, bobClient, cleoClient, danClient];
+  // Every connection of the target's account and of the owner's account.
+  const told = [bobClient, adaClient, adasDesktopClient];
+  for (const client of [adaClient, bobClient, cleoClient, danClient]) {
+    await subscribe(client, team.workspaceId);
+  }
+  await drainPresence(adaClient, bobClient, cleoClient, danClient);
+  const { workspaceId } = team;
+  const fromAdasDesktop = async () => ({
+    ...ada,
+    device: adasDesktop,
+    token: await accessToken(ada.app, adasDesktop),
+  });
+
+  // Refused: each writes nothing and sends nothing.
+  for (const [label, response, code] of [
+    [
+      "an offer from the owner's young device",
+      await offer(await fromAdasDesktop(), workspaceId, bobInTeam),
+      "device_too_new",
+    ],
+    [
+      "an admin's offer",
+      await offer(cleo, workspaceId, bobInTeam),
+      "forbidden",
+    ],
+    [
+      "a withdrawal without an offer",
+      await withdraw(ada, workspaceId),
+      "conflict",
+    ],
+    [
+      "an acceptance without an offer",
+      await accept(bob, workspaceId),
+      "conflict",
+    ],
+  ] as const) {
+    assert.equal(errorCode(response), code, `${label}: ${response.body}`);
+  }
+  await quiet(...all);
+
+  // Rolled back: the offer ran to its end, and its commit failed.
+  failNextCommit();
+  const offerRolledBack = await offer(ada, workspaceId, bobInTeam);
+  assert.equal(offerRolledBack.statusCode, 500, offerRolledBack.body);
+  assert.equal((await view(ada, workspaceId)).ownershipOffer, null);
+  await quiet(...all);
+
+  // Committed, the same offer.
+  const offeredAt = clock.now();
+  const committed = await offer(ada, workspaceId, bobInTeam);
+  assert.equal(committed.statusCode, 204, committed.body);
+  for (const client of told) {
+    assert.deepEqual(
+      await nextFrame(client),
+      offered(workspaceId, bobInTeam, offeredAt),
+    );
+  }
+  await quiet(...all);
+
+  // A withdrawal that rolls back keeps the offer; committed, it ends it.
+  failNextCommit();
+  const withdrawRolledBack = await withdraw(
+    await fromAdasDesktop(),
+    workspaceId,
+  );
+  assert.equal(withdrawRolledBack.statusCode, 500, withdrawRolledBack.body);
+  assert.equal(
+    (await view(ada, workspaceId)).ownershipOffer?.memberId,
+    bobInTeam,
+  );
+  await quiet(...all);
+  clock.advance(SECOND_MS);
+  const withdrawnAt = clock.now();
+  const withdrawn = await withdraw(await fromAdasDesktop(), workspaceId);
+  assert.equal(withdrawn.statusCode, 204, withdrawn.body);
+  for (const client of told) {
+    assert.deepEqual(
+      await nextFrame(client),
+      offerEnded(workspaceId, "withdrawn", withdrawnAt),
+    );
+  }
+  await quiet(...all);
+
+  // The target's acceptance of an expired offer is a refusal that commits
+  // the clearing: rolled back, it sends nothing; committed, the expiry
+  // reaches both accounts once.
+  const againAt = clock.now();
+  assert.equal((await offer(ada, workspaceId, bobInTeam)).statusCode, 204);
+  for (const client of told) {
+    assert.deepEqual(
+      await nextFrame(client),
+      offered(workspaceId, bobInTeam, againAt),
+    );
+  }
+  clock.advance(OWNERSHIP_OFFER_LIFETIME_MS);
+  bob = await refreshed(bob);
+  failNextCommit();
+  const acceptRolledBack = await accept(bob, workspaceId);
+  assert.equal(acceptRolledBack.statusCode, 500, acceptRolledBack.body);
+  await quiet(...all);
+  const expired = await accept(bob, workspaceId);
+  assert.equal(errorCode(expired), "conflict", expired.body);
+  for (const client of told) {
+    assert.deepEqual(
+      await nextFrame(client),
+      offerEnded(workspaceId, "expired", againAt + OWNERSHIP_OFFER_LIFETIME_MS),
+    );
+  }
+  const repeated = await accept(bob, workspaceId);
+  assert.equal(errorCode(repeated), "conflict", repeated.body);
+  await quiet(...all);
+  await settle();
+  assert.deepEqual(events, [], "no offer action is a membership event");
 });

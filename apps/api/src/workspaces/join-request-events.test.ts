@@ -30,6 +30,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import {
   accessToken,
   deviceApp,
+  failingCommits,
   type SignedInDevice,
   signInDevice,
 } from "../auth/device-test-support.ts";
@@ -68,48 +69,6 @@ after(async () => {
 function database(): Database {
   assert.ok(testDatabase, "the test database is created in before()");
   return testDatabase.db;
-}
-
-type AnyFunction = (...args: unknown[]) => unknown;
-
-/**
- * The test database, whose next transaction rolls back after its callback
- * succeeded, as a commit that fails does: the change and the read of the
- * owner and admins ran, and nothing committed.
- */
-function failingCommits(target: Database) {
-  let failNext = false;
-  const proxy = new Proxy(target, {
-    get(object, property) {
-      const value: unknown = Reflect.get(object, property, object);
-      if (typeof value !== "function") {
-        return value;
-      }
-      const method = value as AnyFunction;
-      if (property !== "transaction") {
-        return method.bind(object);
-      }
-      return (run: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) =>
-        method.call(
-          object,
-          async (tx: unknown) => {
-            const result = await run(tx);
-            if (failNext) {
-              failNext = false;
-              throw new Error("the commit failed");
-            }
-            return result;
-          },
-          ...rest,
-        );
-    },
-  });
-  return {
-    database: proxy,
-    failNextCommit: () => {
-      failNext = true;
-    },
-  };
 }
 
 type Account = Readonly<{

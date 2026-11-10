@@ -59,6 +59,48 @@ export function useTestDatabase(): () => Database {
   };
 }
 
+type AnyFunction = (...args: unknown[]) => unknown;
+
+/**
+ * `target` behind a proxy whose next transaction, after `failNextCommit`,
+ * rolls back after its callback succeeded, as a commit that fails does: the
+ * change and every read in it ran, and nothing committed.
+ */
+export function failingCommits(target: Database) {
+  let failNext = false;
+  const proxy = new Proxy(target, {
+    get(object, property) {
+      const value: unknown = Reflect.get(object, property, object);
+      if (typeof value !== "function") {
+        return value;
+      }
+      const method = value as AnyFunction;
+      if (property !== "transaction") {
+        return method.bind(object);
+      }
+      return (run: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) =>
+        method.call(
+          object,
+          async (tx: unknown) => {
+            const result = await run(tx);
+            if (failNext) {
+              failNext = false;
+              throw new Error("the commit failed");
+            }
+            return result;
+          },
+          ...rest,
+        );
+    },
+  });
+  return {
+    database: proxy,
+    failNextCommit: () => {
+      failNext = true;
+    },
+  };
+}
+
 export type FakeClock = Readonly<{
   /** The current time, in milliseconds since the epoch. */
   now: () => number;
