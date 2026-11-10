@@ -3,6 +3,7 @@ import type { PeopleActionsBridge } from "../shared/desktop-bridge.ts";
 import {
   PEOPLE_LIMITS,
   PERSON_ACTION_REFUSALS,
+  PersonNameSchema,
   type DefinePersonResult,
   type PeopleView,
   type PersonActionRefusal,
@@ -838,16 +839,20 @@ test("a definition sends the trimmed name, empties the field once confirmed, and
   });
 });
 
-// 32 characters outside the Basic Multilingual Plane are 64 UTF-16 code
-// units: the most that the contract and the protocol's zod `.max` allow.
-const WIDE_NAME = "\u{1F600}".repeat(32);
+// 64 characters outside the Basic Multilingual Plane are 64 code points and
+// 128 UTF-16 code units: the most that the contract and the protocol's zod
+// `.max` allow, because zod counts a string's code points.
+const WIDE_NAME = "\u{1F600}".repeat(MAX_PERSON_NAME_LENGTH);
+const TOO_WIDE_NAME = "\u{1F600}".repeat(MAX_PERSON_NAME_LENGTH + 1);
 
-test("a name is counted in UTF-16 code units, as the contract and the protocol count it", async () => {
-  expect(WIDE_NAME).toHaveLength(MAX_PERSON_NAME_LENGTH);
+test("a name is counted in characters (code points), as the contract and the protocol count it", async () => {
+  expect(WIDE_NAME).toHaveLength(2 * MAX_PERSON_NAME_LENGTH);
+  expect(PersonNameSchema.safeParse(WIDE_NAME).success).toBe(true);
+  expect(PersonNameSchema.safeParse(TOO_WIDE_NAME).success).toBe(false);
   const { actions, calls, last } = controllerWith(() =>
     Promise.resolve({ outcome: "ok", memberId: UNCLAIMED }),
   );
-  actions.editDefineDraft(`${WIDE_NAME}a`);
+  actions.editDefineDraft(TOO_WIDE_NAME);
   await actions.define(WORKSPACE);
   expect(calls).toEqual([]);
   expect(last().defineProblem).toBe("A name has at most 64 characters.");
@@ -862,7 +867,7 @@ test("a name is counted in UTF-16 code units, as the contract and the protocol c
     memberId: UNCLAIMED,
     name: "Margaret",
   });
-  actions.editDialogDraft(`${WIDE_NAME}a`);
+  actions.editDialogDraft(TOO_WIDE_NAME);
   await actions.confirm();
   expect(calls).toEqual([]);
   expect(last().dialog?.problem).toBe("A name has at most 64 characters.");
@@ -871,6 +876,20 @@ test("a name is counted in UTF-16 code units, as the contract and the protocol c
   expect(calls).toEqual([
     { name: "rename", args: [WORKSPACE, UNCLAIMED, WIDE_NAME] },
   ]);
+
+  // A person who already has such a name can be renamed with it unchanged.
+  calls.length = 0;
+  await actions.start({
+    kind: "rename",
+    workspaceId: WORKSPACE,
+    memberId: UNCLAIMED,
+    name: WIDE_NAME,
+  });
+  await actions.confirm();
+  expect(calls).toEqual([
+    { name: "rename", args: [WORKSPACE, UNCLAIMED, WIDE_NAME] },
+  ]);
+  expect(last().dialog).toBeUndefined();
 });
 
 test("a refused definition keeps the name in the field", async () => {
