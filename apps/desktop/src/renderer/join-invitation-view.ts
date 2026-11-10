@@ -131,8 +131,18 @@ export const JOIN_REFUSAL_MESSAGES: Readonly<
  */
 const EDGE_CHARACTER = /^[\s\p{Cf}\u0085]$/u;
 
-function isEdge(character: string | undefined): boolean {
-  return character !== undefined && EDGE_CHARACTER.test(character);
+/** The character (code point) of `text` that starts at `index`. */
+function characterAt(text: string, index: number): string {
+  return String.fromCodePoint(text.codePointAt(index) ?? 0);
+}
+
+/** The character (code point) of `text` that ends before `end`. */
+function characterBefore(text: string, end: number): string {
+  const last = text.charCodeAt(end - 1);
+  const first = text.charCodeAt(end - 2);
+  const pair =
+    last >= 0xdc00 && last <= 0xdfff && first >= 0xd800 && first <= 0xdbff;
+  return text.slice(pair ? end - 2 : end - 1, end);
 }
 
 /**
@@ -140,19 +150,28 @@ function isEdge(character: string | undefined): boolean {
  * ends (`EDGE_CHARACTER`), as the screen sends it. Only the ends change, so
  * a text that is not a code never becomes one: the pattern is anchored and
  * accepts ASCII only, and a character inside the text stays where it is.
- * It walks the characters from both ends, so a long paste costs one pass.
+ * It walks inward from both ends by index, a character (code point) at a
+ * time, and stops at the first other character, so a long paste costs only
+ * the characters that it removes; it never copies the text into an array.
  */
 export function pastedCode(text: string): string {
-  const characters = Array.from(text);
   let start = 0;
-  let end = characters.length;
-  while (start < end && isEdge(characters[start])) {
-    start += 1;
+  let end = text.length;
+  while (start < end) {
+    const character = characterAt(text, start);
+    if (!EDGE_CHARACTER.test(character)) {
+      break;
+    }
+    start += character.length;
   }
-  while (end > start && isEdge(characters[end - 1])) {
-    end -= 1;
+  while (end > start) {
+    const character = characterBefore(text, end);
+    if (!EDGE_CHARACTER.test(character)) {
+      break;
+    }
+    end -= character.length;
   }
-  return characters.slice(start, end).join("");
+  return text.slice(start, end);
 }
 
 /**
@@ -197,14 +216,20 @@ export function previewExpired(
 /**
  * The time, in milliseconds, at which the screen reads the clock again
  * because it may offer something else: the expiry of the shown invitation,
- * while it is not marked expired and no request runs. It stays the same
- * once that time has passed, so that the timer fires at once and the
- * controller marks the invitation expired. Undefined when nothing changes.
+ * while the screen checks it by the clock (`checksExpiry`), it is not
+ * marked expired, and no request runs. It stays the same once that time
+ * has passed, so that the timer fires at once and the controller marks the
+ * invitation expired. Undefined when nothing changes.
  */
 export function nextJoinClockChange(
   view: JoinInvitationView,
 ): number | undefined {
-  if (view.preview === undefined || view.expired || view.running) {
+  if (
+    view.preview === undefined ||
+    !view.checksExpiry ||
+    view.expired ||
+    view.running
+  ) {
     return undefined;
   }
   const end = Date.parse(view.preview.expiresAt);
@@ -317,6 +342,13 @@ export interface JoinInvitationView {
   /** The invitation of the code in the field, or undefined. */
   readonly preview: InvitationPreview | undefined;
   /**
+   * Whether the screen ends the shown invitation by the renderer's clock.
+   * It does not when the clock had already passed the expiry as the
+   * server's preview arrived: the server found the invitation live then, so
+   * the clock runs ahead, and the server decides on the accept.
+   */
+  readonly checksExpiry: boolean;
+  /**
    * Whether the shown invitation has expired by the clock: the screen then
    * offers no "Join the workspace", and the question is closed.
    */
@@ -334,6 +366,7 @@ export const IDLE_JOIN_INVITATION: JoinInvitationView = Object.freeze({
   code: "",
   problem: undefined,
   preview: undefined,
+  checksExpiry: false,
   expired: false,
   asking: false,
   message: undefined,
@@ -416,6 +449,8 @@ export function createJoinInvitation(
   let code = "";
   let problem: string | undefined;
   let preview: InvitationPreview | undefined;
+  /** Whether the screen ends `preview` by the clock (`checksExpiry`). */
+  let checksExpiry = false;
   /** Whether `preview` has expired by the clock. */
   let expired = false;
   let asking = false;
@@ -442,6 +477,7 @@ export function createJoinInvitation(
         code,
         problem,
         preview,
+        checksExpiry,
         expired,
         asking,
         message,
@@ -455,7 +491,7 @@ export function createJoinInvitation(
    * preview says so; an accept's sentence stays.
    */
   function expiredNow(): boolean {
-    if (preview === undefined || expired || running) {
+    if (preview === undefined || !checksExpiry || expired || running) {
       return expired;
     }
     if (!previewExpired(preview, now())) {
@@ -475,6 +511,7 @@ export function createJoinInvitation(
     code = "";
     problem = undefined;
     preview = undefined;
+    checksExpiry = false;
     expired = false;
     asking = false;
   }
@@ -492,6 +529,7 @@ export function createJoinInvitation(
       code = text;
       problem = undefined;
       preview = undefined;
+      checksExpiry = false;
       expired = false;
       asking = false;
       show();
@@ -508,6 +546,7 @@ export function createJoinInvitation(
       }
       running = true;
       preview = undefined;
+      checksExpiry = false;
       expired = false;
       asking = false;
       joined = undefined;
@@ -539,12 +578,12 @@ export function createJoinInvitation(
       running = false;
       if (generation === startGeneration) {
         preview = shown;
-        // An invitation that has expired by the clock offers no join.
-        expired = shown !== undefined && previewExpired(shown, now());
-        setMessage(
-          expired ? JOIN_RESULT_MESSAGES.previewExpired : sentence,
-          false,
-        );
+        // The server found the invitation live as it answered. A clock
+        // already past the expiry runs ahead, so it ends nothing; the
+        // server decides on the accept.
+        checksExpiry = shown !== undefined && !previewExpired(shown, now());
+        expired = false;
+        setMessage(sentence, false);
       }
       show();
     },
@@ -600,6 +639,7 @@ export function createJoinInvitation(
       const counts = session === startSession;
       if (counts) {
         preview = undefined;
+        checksExpiry = false;
         expired = false;
         joined = joinedNow;
         setMessage(sentence, true);

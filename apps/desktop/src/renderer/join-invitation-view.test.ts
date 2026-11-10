@@ -277,6 +277,7 @@ test("editing the text ends its problem, its preview, and the question", async (
     code: OTHER_CODE,
     problem: undefined,
     preview: undefined,
+    checksExpiry: false,
     expired: false,
     asking: false,
   });
@@ -297,6 +298,7 @@ test("a preview shows the invitation's facts and a sentence, and keeps nothing e
     code: CODE,
     problem: undefined,
     preview: SHOWN,
+    checksExpiry: true,
     expired: false,
     asking: false,
     message: "The invitation is shown below. Check it before you join.",
@@ -431,6 +433,7 @@ test("the code leaves the field before the accept goes, and every accept's answe
       code: "",
       problem: undefined,
       preview: SHOWN,
+      checksExpiry: true,
       expired: false,
       asking: false,
       message: undefined,
@@ -465,6 +468,7 @@ test("a confirmed accept says so and keeps only the joined workspace's ID and na
     code: "",
     problem: undefined,
     preview: undefined,
+    checksExpiry: false,
     expired: false,
     asking: false,
     message: "You joined the workspace.",
@@ -551,6 +555,7 @@ test("Cancel drops the code, its problem, its preview, and the sentence, and kee
     code: "",
     problem: undefined,
     preview: undefined,
+    checksExpiry: false,
     expired: false,
     asking: false,
     message: undefined,
@@ -599,6 +604,7 @@ test("another selected workspace drops the code, its preview, the question, and 
     code: "",
     problem: undefined,
     preview: undefined,
+    checksExpiry: false,
     expired: false,
     asking: false,
     message: undefined,
@@ -897,6 +903,7 @@ test("once the clock passes the expiry, the question closes, the join goes, noth
     code: CODE,
     problem: undefined,
     preview: SHOWN,
+    checksExpiry: true,
     expired: true,
     asking: false,
     message:
@@ -936,16 +943,59 @@ test("an open question checks the clock before it sends, also when no timer fire
   expect(second.last()).toMatchObject({ asking: false, expired: true });
 });
 
-test("a preview that arrives already expired by the clock offers no join", async () => {
-  const { join, last, setNow } = controllerWith();
-  setNow(EXPIRES_AT + 1);
+test("a preview whose answer arrives with the clock past the expiry still offers the join, because the clock runs ahead and the server decides", async () => {
+  const { join, calls, last, setNow } = controllerWith();
+  setNow(EXPIRES_AT + 60 * 60 * 1000);
   join.editCode(CODE);
   await join.preview();
   expect(last()).toMatchObject({
     preview: SHOWN,
+    checksExpiry: false,
+    expired: false,
+    message: JOIN_RESULT_MESSAGES.previewShown,
+  });
+  // The clock ends nothing for this preview: no reading, no question
+  // refused, no accept held back.
+  expect(nextJoinClockChange(last())).toBeUndefined();
+  join.clockChanged();
+  setNow(EXPIRES_AT + 2 * 60 * 60 * 1000);
+  join.clockChanged();
+  join.ask();
+  expect(last()).toMatchObject({ asking: true, expired: false });
+  await expect(join.confirm()).resolves.toBe(true);
+  expect(calls).toEqual([
+    ["preview", CODE],
+    ["accept", CODE],
+  ]);
+  expect(last().message).toBe("You joined the workspace.");
+
+  // A new preview with a right clock checks its expiry again.
+  setNow(NOW);
+  join.editCode(CODE);
+  await join.preview();
+  expect(last()).toMatchObject({ checksExpiry: true, expired: false });
+});
+
+test("a preview whose answer arrives before the expiry by the clock still closes once the clock reaches it", async () => {
+  const { join, calls, last, setNow } = controllerWith();
+  setNow(EXPIRES_AT - 1);
+  join.editCode(CODE);
+  await join.preview();
+  join.ask();
+  expect(last()).toMatchObject({
+    checksExpiry: true,
+    expired: false,
+    asking: true,
+  });
+  setNow(EXPIRES_AT);
+  join.clockChanged();
+  expect(last()).toMatchObject({
     expired: true,
+    asking: false,
     message: JOIN_RESULT_MESSAGES.previewExpired,
   });
+  await expect(join.confirm()).resolves.toBe(false);
+  expect(calls).toEqual([["preview", CODE]]);
 });
 
 test("the clock changes nothing while an accept runs, and nothing of an accept's answer", async () => {
@@ -966,8 +1016,19 @@ test("the clock changes nothing while an accept runs, and nothing of an accept's
 });
 
 test("the clock is read again at the expiry of the shown invitation only, also once it has passed", () => {
-  const view = { ...IDLE_JOIN_INVITATION, preview: SHOWN };
+  // A system clock past the expiry, so that a reading of it inside the
+  // function would change the answer.
+  vi.useFakeTimers();
+  vi.setSystemTime(EXPIRES_AT + 60_000);
+  try {
+    expect(nextJoinClockChange(CHECKED)).toBe(EXPIRES_AT);
+  } finally {
+    vi.useRealTimers();
+  }
+  const view = CHECKED;
   expect(nextJoinClockChange(view)).toBe(EXPIRES_AT);
+  // Not for a preview whose expiry the screen does not check.
+  expect(nextJoinClockChange({ ...view, checksExpiry: false })).toBeUndefined();
   expect(nextJoinClockChange({ ...view, expired: true })).toBeUndefined();
   // While a request runs, the preview is about to go.
   expect(nextJoinClockChange({ ...view, running: true })).toBeUndefined();
@@ -978,4 +1039,34 @@ test("the clock is read again at the expiry of the shown invitation only, also o
       preview: { ...SHOWN, expiresAt: "not a time" },
     }),
   ).toBeUndefined();
+});
+
+/** The view of SHOWN, whose expiry the screen checks by the clock. */
+const CHECKED: JoinInvitationView = {
+  ...IDLE_JOIN_INVITATION,
+  preview: SHOWN,
+  checksExpiry: true,
+};
+
+test("the trim walks the ends of a huge paste by index, without an array of the text, and the paste is refused", () => {
+  const huge = `\u200b ${"x".repeat(5_000_000)}\u{1f600}\u2060\n`;
+  // Only the two calls run while the spy counts.
+  const from = vi.spyOn(Array, "from");
+  const trimmed = pastedCode(huge);
+  const problem = codeProblem(huge);
+  const arrays = from.mock.calls.length;
+  from.mockRestore();
+  expect(arrays).toBe(0);
+  expect(trimmed).toHaveLength(huge.length - 4);
+  expect(trimmed.endsWith("x\u{1f600}")).toBe(true);
+  expect(problem).toBe(JOIN_MESSAGES.notACode);
+});
+
+test("the trim takes a pair of surrogates as one character at either end, and keeps a lone one", () => {
+  // An astral format character, a tag, at both ends.
+  expect(pastedCode(`\u{e0041}${CODE}\u{e0041}`)).toBe(CODE);
+  // A lone surrogate is no format character, so it stays.
+  expect(pastedCode(`${CODE}\udc00`)).toBe(`${CODE}\udc00`);
+  expect(pastedCode(`\ud800${CODE}`)).toBe(`\ud800${CODE}`);
+  expect(pastedCode(" ")).toBe("");
 });
