@@ -178,6 +178,8 @@ test("the checks read every renderer source and no test", () => {
     "./connection-status.ts",
     "./device-view.ts",
     "./DevicesSection.tsx",
+    "./InvitationActions.tsx",
+    "./invitations-view.ts",
     "./JoinScreen.tsx",
     "./main.tsx",
     "./Navigation.tsx",

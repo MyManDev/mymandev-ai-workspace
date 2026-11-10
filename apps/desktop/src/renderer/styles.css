@@ -963,6 +963,23 @@ code {
   margin-block-start: var(--space-2);
 }
 
+/* The open invitations, below the people. */
+.invitations {
+  margin-block-start: var(--space-4);
+}
+
+/* The dialog with a new invitation's code. */
+.invitation-code-content {
+  display: grid;
+  gap: var(--space-2);
+}
+
+/* The code: monospace, so that similar characters stay apart; the field spans the dialog. */
+.invitation-code {
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-small);
+}
+
 /* Agents and runs */
 
 /* The live region of the agent panel stays in place and takes no room while empty. */
