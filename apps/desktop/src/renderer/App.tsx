@@ -207,6 +207,7 @@ export function App({
           peopleActions={peopleActions}
           invitations={invitations}
           invitationActions={invitationActions}
+          workspaces={workspaceSidebar}
           account={account}
           chat={chat}
           devices={devices}
@@ -238,6 +239,7 @@ function ScreenContent({
   peopleActions,
   invitations,
   invitationActions,
+  workspaces,
   account,
   chat,
   devices,
@@ -253,6 +255,8 @@ function ScreenContent({
   readonly peopleActions: PeopleActionsBridge | undefined;
   readonly invitations: InvitationsBridge | undefined;
   readonly invitationActions: InvitationActionsBridge | undefined;
+  /** The workspace part of the sidebar, for the join screen. */
+  readonly workspaces: WorkspaceSidebar;
   readonly account: AccountBridge | undefined;
   readonly chat: ChatBridge | undefined;
   readonly devices: DeviceListBridge | undefined;
@@ -287,7 +291,13 @@ function ScreenContent({
         />
       );
     case "join":
-      return <JoinScreen />;
+      return (
+        <JoinScreen
+          invitationActions={invitationActions}
+          workspaces={workspaces.view}
+          onOpenWorkspace={workspaces.onSelect}
+        />
+      );
     case "about":
       return <AboutScreen electronVersion={electronVersion} />;
     case "chat":
