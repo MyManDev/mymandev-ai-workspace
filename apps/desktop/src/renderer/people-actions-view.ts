@@ -516,7 +516,7 @@ export const PEOPLE_ACTION_REFUSAL_MESSAGES: Readonly<
   rateLimited: (wait: string) =>
     `The server asked to wait. Try again in ${wait}.`,
   unclaimed_limit:
-    "The workspace already has as many unclaimed people as it allows. Remove one, or invite one: once they join, they no longer count.",
+    "The workspace already has as many unclaimed people as it allows. Remove one, or invite one of them: once they join, they no longer count.",
   not_allowed: "Your role in this workspace does not allow it.",
   not_found:
     "The server does not know this workspace or this person for your account. Check the list.",

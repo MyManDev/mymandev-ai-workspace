@@ -471,7 +471,7 @@ test("each refusal has its own fixed text after the action's start, and the wait
       "This device sent many changes in a short time. Try again in 30 seconds.",
     rate_limited: "The server asked to wait. Try again in 2 minutes.",
     unclaimed_limit:
-      "The workspace already has as many unclaimed people as it allows. Remove one, or invite one: once they join, they no longer count.",
+      "The workspace already has as many unclaimed people as it allows. Remove one, or invite one of them: once they join, they no longer count.",
     not_allowed: "Your role in this workspace does not allow it.",
     not_found:
       "The server does not know this workspace or this person for your account. Check the list.",
@@ -526,7 +526,7 @@ test("a wait is said in seconds, minutes, or hours, rounded up", () => {
 
 test("a definition at the limit of unclaimed people says to remove or invite one and names no wait, and a definition's rate limit always says to wait (#242)", () => {
   const atLimit =
-    "The person could not be added. The workspace already has as many unclaimed people as it allows. Remove one, or invite one: once they join, they no longer count.";
+    "The person could not be added. The workspace already has as many unclaimed people as it allows. Remove one, or invite one of them: once they join, they no longer count.";
   expect(describePeopleActionResult("define", refused("unclaimed_limit"))).toBe(
     atLimit,
   );
@@ -764,7 +764,7 @@ test("a definition's sentence follows the refusal's code, never the people's cou
   actions.editDefineDraft("Grace");
   await actions.define(WORKSPACE);
   expect(last().message).toBe(
-    "The person could not be added. The workspace already has as many unclaimed people as it allows. Remove one, or invite one: once they join, they no longer count.",
+    "The person could not be added. The workspace already has as many unclaimed people as it allows. Remove one, or invite one of them: once they join, they no longer count.",
   );
   expect(last().defineDraft).toBe("Grace");
   // The people show the limit reached: a rate limit is still a wait.
