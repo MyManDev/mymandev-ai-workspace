@@ -1843,6 +1843,29 @@ test("account.removed_from_workspace drops the workspace and reloads the list", 
   expect(h.readNames()).toEqual(["listWorkspaces"]);
 });
 
+test("reloadList loads the list again, merged with a load on its way, keeps the selection, and reads nothing without a device or after close", async () => {
+  const h = await withLiveWorkspace([WS_A]);
+  expect(h.service.reloadList()).toBe(true);
+  expect(h.readNames()).toEqual(["listWorkspaces"]);
+  // A second request while the load is on its way drops its answer.
+  expect(h.service.reloadList()).toBe(true);
+  expect(h.readNames()).toEqual(["listWorkspaces"]);
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.readNames()).toEqual(["listWorkspaces"]);
+  // The newer answer holds the workspace that an accepted invitation joined.
+  await h.answer("listWorkspaces", ok(workspaceList(WS_B, WS_A)));
+  expect(h.state.workspaces.map((w) => w.id)).toEqual([WS_B, WS_A]);
+  expect(h.state.selectedWorkspaceId).toBe(WS_A);
+  expect(h.service.gateLive(WS_A)).toBe(true);
+  expect(h.reads).toEqual([]);
+
+  h.setAccount(SIGNED_OUT);
+  expect(h.service.reloadList()).toBe(false);
+  h.service.close();
+  expect(h.service.reloadList()).toBe(false);
+  expect(h.reads).toEqual([]);
+});
+
 test("ownMemberId gives the account's own person of each listed workspace", async () => {
   const h = new Harness();
   expect(h.service.ownMemberId(WS_A)).toBeNull();

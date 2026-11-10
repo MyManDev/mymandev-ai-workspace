@@ -55,6 +55,9 @@ import {
 } from "./guards.ts";
 import { registerRuntimeIpc } from "./ipc.ts";
 import { isAppNavigation, resolveRendererUrl } from "./navigation.ts";
+import { registerInvitationActionsIpc } from "./invitation-actions-ipc.ts";
+import { registerInvitationIpc } from "./invitation-ipc.ts";
+import { createInvitationService } from "./invitations/service.ts";
 import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
@@ -345,6 +348,36 @@ function start(): void {
   // the selected workspace; its membership event then changes the people,
   // and the offer actions reload the workspace.
   registerPeopleActionsIpc(ipcMain, rendererUrl, { account, workspaces });
+
+  // The selected workspace's live invitations (#95, D3), for its owner and
+  // admins only, read over HTTP once the screen asked and again after
+  // `workspace.subscribed`, a claim, and an invitation action. The API's
+  // list holds no invitation code. They reach the renderer with their
+  // creators' names resolved in the main process, at most one publish every
+  // 50 ms. The logs are fixed text with a failure code at most.
+  const invitations = createInvitationService({
+    account,
+    connection,
+    workspaces,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => invitations.close());
+  const invitationIpc = registerInvitationIpc(ipcMain, rendererUrl, {
+    invitations,
+    workspaces,
+  });
+  app.on("will-quit", () => invitationIpc.close());
+  // The invitation actions (#95, D1 and D2) have one strict channel each,
+  // and each is sent once. The code of a new invitation goes to the
+  // renderer once, in the answer of the create, and a pasted code goes on
+  // in the body of a preview or an accept only: the main process never
+  // keeps, logs, or publishes either. An accept loads the workspace list
+  // again.
+  registerInvitationActionsIpc(ipcMain, rendererUrl, {
+    account,
+    workspaces,
+    invitations,
+  });
 
   // The chat reaches the renderer with the authors' names resolved in the
   // main process, within the view's limits and text budget, at most one

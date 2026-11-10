@@ -58,7 +58,7 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the people action, the agent, the chat, and the device list functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the agent, the chat, and the device list functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
@@ -68,6 +68,8 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "connection",
     "devices",
     "electronVersion",
+    "invitationActions",
+    "invitations",
     "people",
     "peopleActions",
     "repositories",
@@ -120,6 +122,17 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "rename",
     "withdrawOwnershipOffer",
   ]);
+  expect(Object.keys(bridge.invitations).sort()).toEqual([
+    "getState",
+    "load",
+    "subscribeState",
+  ]);
+  expect(Object.keys(bridge.invitationActions).sort()).toEqual([
+    "accept",
+    "create",
+    "preview",
+    "revoke",
+  ]);
   expect(Object.keys(bridge.agents).sort()).toEqual([
     "getState",
     "subscribeState",
@@ -150,6 +163,8 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   expect(Object.isFrozen(bridge.workspaces)).toBe(true);
   expect(Object.isFrozen(bridge.people)).toBe(true);
   expect(Object.isFrozen(bridge.peopleActions)).toBe(true);
+  expect(Object.isFrozen(bridge.invitations)).toBe(true);
+  expect(Object.isFrozen(bridge.invitationActions)).toBe(true);
   expect(Object.isFrozen(bridge.agents)).toBe(true);
   expect(Object.isFrozen(bridge.chat)).toBe(true);
   expect(Object.isFrozen(bridge.devices)).toBe(true);
@@ -161,6 +176,8 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     ...Object.values(bridge.workspaces),
     ...Object.values(bridge.people),
     ...Object.values(bridge.peopleActions),
+    ...Object.values(bridge.invitations),
+    ...Object.values(bridge.invitationActions),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
@@ -181,6 +198,8 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.workspaces),
     ...Object.values(bridge.people),
     ...Object.values(bridge.peopleActions),
+    ...Object.values(bridge.invitations),
+    ...Object.values(bridge.invitationActions),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
@@ -1080,6 +1099,177 @@ test("each people action refuses a value that is not a string without calling th
         await expect(result, name).rejects.toThrow(TypeError);
         await result?.catch((error: unknown) => {
           expect(String(error)).not.toContain("secret-value");
+        });
+      }
+    }
+    await expect(actions[name]?.(), name).rejects.toThrow(TypeError);
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("the invitation functions call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const invitations = createDesktopBridge("44.9.1", fake.ipc)
+    .invitations as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const empty = { status: "signed_out", revision: 0 };
+
+  const state = invitations["getState"]?.("invitations:create", WORKSPACE_ID);
+  const load = invitations["load"]?.(WORKSPACE_ID, { force: true });
+  fake.answers[0]?.resolve(empty);
+  fake.answers[1]?.resolve({ outcome: "loading" });
+
+  await expect(state).resolves.toEqual(empty);
+  await expect(load).resolves.toEqual({ outcome: "loading" });
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getInvitationState, args: [] },
+    { channel: INVOKE_CHANNELS.loadInvitations, args: [] },
+  ]);
+});
+
+test("the invitation subscription delivers the state and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const calls: unknown[][] = [];
+  const reported: string[] = [];
+  const unsubscribe = bridge.invitations.subscribeState((...args) =>
+    calls.push(args),
+  );
+
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeInvitationState, args: [] },
+  ]);
+  fake.answers[0]?.resolve({ status: "loading", revision: 3 });
+  await settle();
+  fake.emit(EVENT_CHANNELS.invitationStateChanged, {
+    status: "ready",
+    revision: 4,
+  });
+  fake.emit(EVENT_CHANNELS.invitationStateChanged, {
+    status: "loading",
+    revision: 2,
+  });
+  expect(calls).toEqual([
+    [{ status: "loading", revision: 3 }],
+    [{ status: "ready", revision: 4 }],
+  ]);
+  unsubscribe();
+  expect(fake.listenerCount(EVENT_CHANNELS.invitationStateChanged)).toBe(0);
+
+  const failing = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  let refused = 0;
+  failing.invitations.subscribeState(
+    () => {
+      throw new Error("broken");
+    },
+    () => {
+      refused += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.invitationStateChanged, {
+    status: "ready",
+    revision: 5,
+  });
+  expect(reported).toEqual(["An invitation state callback failed."]);
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+  expect(refused).toBe(1);
+});
+
+const INVITATION_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000e1";
+const INVITATION_CODE = `mmdi_${"Br1dgeC0de-_".repeat(4).slice(0, 42)}g`;
+
+/** Each invitation action, its channel, and the values it takes. */
+const INVITATION_ACTIONS = [
+  [
+    "create",
+    INVOKE_CHANNELS.createInvitation,
+    [WORKSPACE_ID, MEMBER_ID, 3_600],
+  ],
+  ["create", INVOKE_CHANNELS.createInvitation, [WORKSPACE_ID, MEMBER_ID, null]],
+  ["revoke", INVOKE_CHANNELS.revokeInvitation, [WORKSPACE_ID, INVITATION_ID]],
+  ["preview", INVOKE_CHANNELS.previewInvitation, [INVITATION_CODE]],
+  ["accept", INVOKE_CHANNELS.acceptInvitation, [INVITATION_CODE]],
+] as const;
+
+test("each invitation action calls its own channel with only its values, and passes the answer through", async () => {
+  const fake = fakeIpc();
+  const actions = createDesktopBridge("44.9.1", fake.ipc)
+    .invitationActions as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  const answers = INVITATION_ACTIONS.map(([name, , args]) =>
+    // An extra argument is not passed on.
+    actions[name]?.(...args, { force: true }, "people:remove"),
+  );
+  // A create without a lifetime, or with undefined, passes on null.
+  answers.push(actions["create"]?.(WORKSPACE_ID, MEMBER_ID));
+  answers.push(actions["create"]?.(WORKSPACE_ID, MEMBER_ID, undefined));
+  const created = {
+    outcome: "ok",
+    invitationId: INVITATION_ID,
+    code: INVITATION_CODE,
+    expiresAt: "2026-11-12T10:00:00.000Z",
+  };
+  for (const [index, answer] of fake.answers.entries()) {
+    answer.resolve(index === 0 ? created : { outcome: "unknown" });
+  }
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    created,
+    ...Array.from({ length: answers.length - 1 }, () => ({
+      outcome: "unknown",
+    })),
+  ]);
+  expect(fake.invoked).toEqual([
+    ...INVITATION_ACTIONS.map(([, channel, args]) => ({
+      channel,
+      args: [...args],
+    })),
+    {
+      channel: INVOKE_CHANNELS.createInvitation,
+      args: [WORKSPACE_ID, MEMBER_ID, null],
+    },
+    {
+      channel: INVOKE_CHANNELS.createInvitation,
+      args: [WORKSPACE_ID, MEMBER_ID, null],
+    },
+  ]);
+});
+
+test("each invitation action refuses a value of another type without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const actions = createDesktopBridge("44.9.1", fake.ipc)
+    .invitationActions as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  for (const [name, , args] of INVITATION_ACTIONS) {
+    for (const [index, arg] of args.entries()) {
+      const values =
+        arg === null || typeof arg === "number"
+          ? ["3600", 3_600.5, Number.NaN, Infinity, { valueOf: () => 3_600 }]
+          : [
+              undefined,
+              null,
+              1,
+              [INVITATION_CODE],
+              { toString: () => INVITATION_CODE },
+            ];
+      for (const value of values) {
+        const call = args.map((entry, at) => (at === index ? value : entry));
+        const result = actions[name]?.(...call);
+        await expect(result, name).rejects.toThrow(TypeError);
+        await result?.catch((error: unknown) => {
+          expect(String(error)).not.toContain(INVITATION_CODE);
+          expect(String(error)).not.toContain(INVITATION_CODE.slice(5));
         });
       }
     }

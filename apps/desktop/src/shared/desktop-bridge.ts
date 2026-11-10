@@ -1,21 +1,27 @@
 import type {
+  AcceptInvitationResult,
   AccountStatus,
   AgentActivityView,
   ChatLoadOlderResultView,
   ChatSendResultView,
   ChatView,
   ConnectionStatus,
+  CreateInvitationResult,
   DefinePersonResult,
   DeviceListLoadResult,
   DeviceListView,
   ForgetResult,
+  InvitationLoadResult,
+  InvitationsView,
   LiftRegistrationLockResult,
   MountResult,
   OtherDeviceRevocation,
   PeopleView,
   PersonActionResult,
+  PreviewInvitationResult,
   ReconnectResult,
   RemoveDeviceResult,
+  RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
   RuntimeStatus,
@@ -53,6 +59,10 @@ export interface DesktopBridge {
   readonly people: PeopleBridge;
   /** The actions on the people of the selected workspace. */
   readonly peopleActions: PeopleActionsBridge;
+  /** The live invitations of the selected workspace, read-only. */
+  readonly invitations: InvitationsBridge;
+  /** Creating and revoking invitations, and joining with a pasted code. */
+  readonly invitationActions: InvitationActionsBridge;
   /** The agent activity of the open project, read-only. */
   readonly agents: AgentBridge;
   /** The chat of the open project. */
@@ -327,6 +337,82 @@ export interface PeopleActionsBridge {
   readonly acceptOwnershipOffer: (
     workspaceId: string,
   ) => Promise<PersonActionResult>;
+}
+
+/**
+ * The live invitations of the selected workspace, which the main process
+ * holds for its owner and admins (#95, D3): each invitation's ID, the
+ * member ID of the unclaimed person that it claims, its creator's display
+ * name, and its times. No invitation code and no user ID cross.
+ */
+export interface InvitationsBridge {
+  /** The current live invitations. */
+  readonly getState: () => Promise<InvitationsView>;
+  /**
+   * Calls `listener` with the current live invitations and then after
+   * changes, at most once every 50 ms with the latest ones. A state older
+   * than the last one delivered is dropped. `onError` is called when the
+   * main process refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: InvitationsView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Asks the main process to load the live invitations, when the screen
+   * opens and on the person's refresh. From then on the main process loads
+   * them again on its own after `workspace.subscribed`, a claim, and an
+   * invitation action. Resolves to `refused` without a signed-in device, a
+   * selected workspace, or the role of the owner or an admin, and with
+   * `too_soon` within a few seconds of the last request. It passes nothing
+   * from the renderer on.
+   */
+  readonly load: () => Promise<InvitationLoadResult>;
+}
+
+/**
+ * The invitation actions (#95, D1 and D2), each through its own channel.
+ * `create` and `revoke` take the selected workspace's ID, and the main
+ * process refuses another workspace as `not_selected`. `preview` and
+ * `accept` take the text that the person pasted, which must be an
+ * invitation code exactly: the contract refuses any other text, and the
+ * call rejects without repeating it. Each action is sent once: `unknown`
+ * says that the answer does not show whether the API acted, and nothing
+ * sends it again. `too_soon` and `rate_limited` come with `retryAfterMs`.
+ * The bridge passes on only strings, and for `create` a whole number or
+ * null, and refuses any other value without a call.
+ */
+export interface InvitationActionsBridge {
+  /**
+   * Creates an invitation for an unclaimed person, by its member ID, with a
+   * lifetime of 1 hour to 7 days in seconds, or the API's 7 days when it is
+   * left out or null. It revokes the person's previous live invitation.
+   * Resolves to `ok` with the invitation's ID, its code, and when it
+   * expires: the only time that the code is shown. Keep it only in the open
+   * dialog; no channel returns it again.
+   */
+  readonly create: (
+    workspaceId: string,
+    memberId: string,
+    lifetimeSeconds?: number | null,
+  ) => Promise<CreateInvitationResult>;
+  /** Revokes a live invitation, by its ID. */
+  readonly revoke: (
+    workspaceId: string,
+    invitationId: string,
+  ) => Promise<RevokeInvitationResult>;
+  /**
+   * Shows what a pasted code claims, without consuming it: the workspace's
+   * name, the person's display name, the inviter's name and GitHub login,
+   * and the expiry.
+   */
+  readonly preview: (code: string) => Promise<PreviewInvitationResult>;
+  /**
+   * Accepts a pasted code and claims its person. Resolves to `ok` with the
+   * joined workspace's ID and name; the workspace list then loads again.
+   */
+  readonly accept: (code: string) => Promise<AcceptInvitationResult>;
 }
 
 /**
