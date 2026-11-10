@@ -130,30 +130,41 @@ function isLive(holder: OfferHolder, now: Date): boolean {
 /**
  * An ownership offer that ended without a transfer, for the
  * `account.ownership_offer_ended` frame that the server sends to the
- * target's account after the commit.
+ * target's account and to the owner's account after the commit (#241).
  */
 export type EndedOwnershipOffer = Readonly<{
   /** The person that the offer named. */
   memberId: MemberId;
   /** The account that claimed that person. */
   userId: UserId;
+  /** The account of the workspace's owner, who made the offer. */
+  ownerUserId: UserId;
   reason: OwnershipOfferEndReason;
   /** When the owner withdrew the offer (`now`), or when it expired. */
   endedAt: Date;
 }>;
 
 /**
- * Clears the offer that `holder` holds, at `now`, and reports how it ended.
- * The CHECK on `workspace_members` allows an offer only on a claimed person.
+ * Clears the offer that `holder` holds, at `now`, and reports how it ended,
+ * with `owner`, the workspace's active owner. The CHECK on
+ * `workspace_members` allows an offer only on a claimed person who is not
+ * the owner, and keeps an unclaimed person a `member`; a workspace that
+ * holds an offer has an active owner, because the owner is never removed and
+ * only an archived workspace, which holds no active, claimed person, lacks
+ * one.
  */
 async function endOffer(
   tx: Database,
   holder: OfferHolder,
+  owner: OfferParty | undefined,
   reason: OwnershipOfferEndReason,
   now: Date,
 ): Promise<EndedOwnershipOffer> {
   if (holder.userId === null) {
     throw new Error("An ownership offer names a claimed person");
+  }
+  if (owner === undefined || owner.userId === null) {
+    throw new Error("A workspace with an ownership offer has a claimed owner");
   }
   await tx
     .update(workspaceMembers)
@@ -162,6 +173,7 @@ async function endOffer(
   return Object.freeze({
     memberId: holder.id,
     userId: holder.userId,
+    ownerUserId: owner.userId,
     reason,
     endedAt: reason === "expired" ? expiryOf(holder.ownershipOfferedAt) : now,
   });
@@ -247,7 +259,7 @@ export async function offerOwnership(
       const ended =
         offered === undefined
           ? null
-          : await endOffer(tx, offered, "expired", input.now);
+          : await endOffer(tx, offered, actor, "expired", input.now);
       await tx
         .update(workspaceMembers)
         .set({ ownershipOfferedAt: input.now, updatedAt: input.now })
@@ -326,7 +338,7 @@ export async function acceptOwnershipOffer(
       if (!isLive(offered, input.now)) {
         const ended =
           offered.id === actor.id
-            ? await endOffer(tx, offered, "expired", input.now)
+            ? await endOffer(tx, offered, owner, "expired", input.now)
             : null;
         return { accepted: false, refusal: "conflict", ended };
       }
@@ -412,10 +424,10 @@ export async function withdrawOwnershipOffer(
         return { withdrawn: false, refusal: "conflict", ended: null };
       }
       if (!isLive(offered, input.now)) {
-        const ended = await endOffer(tx, offered, "expired", input.now);
+        const ended = await endOffer(tx, offered, actor, "expired", input.now);
         return { withdrawn: false, refusal: "conflict", ended };
       }
-      const ended = await endOffer(tx, offered, "withdrawn", input.now);
+      const ended = await endOffer(tx, offered, actor, "withdrawn", input.now);
       await audit(tx, input, "ownership.offer_withdrawn", offered.id);
       return { withdrawn: true, ended };
     }),

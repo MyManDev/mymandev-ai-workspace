@@ -155,7 +155,13 @@ export type AccountRemovedFromWorkspaceFrame = z.infer<
   typeof AccountRemovedFromWorkspaceFrameSchema
 >;
 
-/** The owner of a workspace offered its ownership to the account's person. */
+/**
+ * The owner of a workspace offered its ownership to a person. Both accounts
+ * get it, the target's and the owner's (#241), on every open connection, also
+ * one that subscribed to nothing; no other member does. `offer.memberId`
+ * names the target, so a device tells from its own person which side it is
+ * on.
+ */
 export const AccountOwnershipOfferedFrameSchema = z.object({
   ...frameHeaderShape,
   type: z.literal("account.ownership_offered"),
@@ -167,8 +173,9 @@ export type AccountOwnershipOfferedFrame = z.infer<
 >;
 
 /**
- * The ownership offer to the account's person ended without a transfer, so
- * the desktop stops showing it. A transfer is reported by
+ * An ownership offer ended without a transfer, so the desktop stops showing
+ * it. It reaches the same accounts as `account.ownership_offered`, the
+ * target's and the owner's (#241). A transfer is reported by
  * `account.ownership_transferred` instead.
  */
 export const AccountOwnershipOfferEndedFrameSchema = z.object({

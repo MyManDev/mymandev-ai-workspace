@@ -68,8 +68,9 @@ export type WorkspaceRouteOptions = Readonly<{
    * connections: a join request decision for the requester,
    * `account.removed_from_workspace` after a removal or a departure,
    * `account.ownership_offered` and `account.ownership_offer_ended` for the
-   * target of an ownership offer, and `account.ownership_transferred` for
-   * the previous and the new owner after a transfer.
+   * target of an ownership offer and for the owner, and
+   * `account.ownership_transferred` for the previous and the new owner after
+   * a transfer.
    */
   onAccountFrame: AccountFrameHandler;
   /**
