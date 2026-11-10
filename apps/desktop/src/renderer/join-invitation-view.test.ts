@@ -21,6 +21,9 @@ import {
   JOIN_REFUSAL_MESSAGES,
   JOIN_RESULT_MESSAGES,
   joinAvailability,
+  nextJoinClockChange,
+  pastedCode,
+  previewExpired,
   type JoinInvitationView,
 } from "./join-invitation-view.ts";
 import type { WorkspacePanelView } from "./workspace-view.ts";
@@ -46,6 +49,10 @@ const ACCEPTED: AcceptInvitationResult = {
   workspaceId: JOINED,
   workspaceName: "Team",
 };
+
+/** The renderer's clock in the tests: three days before the expiry. */
+const NOW = Date.parse("2026-11-09T12:00:00.000Z");
+const EXPIRES_AT = Date.parse("2026-11-12T12:00:00.000Z");
 
 const SHOWN = {
   workspaceName: "Team",
@@ -130,10 +137,18 @@ function controllerWith(
     },
   };
   const views: JoinInvitationView[] = [];
-  const join = createJoinInvitation(bridge, (view) => views.push(view));
+  let now = NOW;
+  const join = createJoinInvitation(
+    bridge,
+    (view) => views.push(view),
+    () => now,
+  );
   join.workspacesChanged(first);
   const last = () => views.at(-1) ?? IDLE_JOIN_INVITATION;
-  return { join, calls, views, last };
+  const setNow = (time: number) => {
+    now = time;
+  };
+  return { join, calls, views, last, setNow };
 }
 
 /** A controller that shows the preview of CODE and asks the question. */
@@ -185,6 +200,15 @@ test("a pasted code is trimmed before it is sent, also a paste with a trailing n
     `\t${CODE}\t`,
     // A no-break space and a byte order mark, which `trim` removes too.
     `\u00a0${CODE}\ufeff`,
+    // Characters that chat applications add, which `trim` keeps: a
+    // zero-width space, joiner, and non-joiner, a word joiner, a next line,
+    // and the marks of the text's direction.
+    `${CODE}\u200b`,
+    `\ufeff${CODE}`,
+    `${CODE}\u2060`,
+    `\u200c\u200d${CODE}\u200d`,
+    `${CODE}\u0085`,
+    `\u200e\u2066${CODE}\u2069\u200f\n`,
   ];
   for (const paste of pastes) {
     const { join, calls, last } = controllerWith();
@@ -213,7 +237,9 @@ test("a text that is not a code once trimmed is not sent, and the field's own pr
     [`${CODE.slice(0, -1)}h`, JOIN_MESSAGES.notACode],
     [`${CODE.slice(0, 20)} ${CODE.slice(21)}`, JOIN_MESSAGES.notACode],
     [`https://example.invalid/join?code=${CODE}`, JOIN_MESSAGES.notACode],
-    [`${CODE}\u200b`, JOIN_MESSAGES.notACode],
+    [`${CODE.slice(0, 20)}\u200b${CODE.slice(20)}`, JOIN_MESSAGES.notACode],
+    [`${CODE.slice(0, 20)}\u2060${CODE.slice(21)}`, JOIN_MESSAGES.notACode],
+    [`\u200b\u200b`, JOIN_MESSAGES.codeMissing],
   ];
   for (const [text, problem] of cases) {
     expect(codeProblem(text), JSON.stringify(text)).toBe(problem);
@@ -251,6 +277,7 @@ test("editing the text ends its problem, its preview, and the question", async (
     code: OTHER_CODE,
     problem: undefined,
     preview: undefined,
+    expired: false,
     asking: false,
   });
 });
@@ -270,6 +297,7 @@ test("a preview shows the invitation's facts and a sentence, and keeps nothing e
     code: CODE,
     problem: undefined,
     preview: SHOWN,
+    expired: false,
     asking: false,
     message: "The invitation is shown below. Check it before you join.",
     joined: undefined,
@@ -403,6 +431,7 @@ test("the code leaves the field before the accept goes, and every accept's answe
       code: "",
       problem: undefined,
       preview: SHOWN,
+      expired: false,
       asking: false,
       message: undefined,
       joined: undefined,
@@ -436,6 +465,7 @@ test("a confirmed accept says so and keeps only the joined workspace's ID and na
     code: "",
     problem: undefined,
     preview: undefined,
+    expired: false,
     asking: false,
     message: "You joined the workspace.",
     joined: { workspaceId: JOINED, workspaceName: "Team" },
@@ -521,6 +551,7 @@ test("Cancel drops the code, its problem, its preview, and the sentence, and kee
     code: "",
     problem: undefined,
     preview: undefined,
+    expired: false,
     asking: false,
     message: undefined,
     joined: { workspaceId: JOINED, workspaceName: "Team" },
@@ -568,6 +599,7 @@ test("another selected workspace drops the code, its preview, the question, and 
     code: "",
     problem: undefined,
     preview: undefined,
+    expired: false,
     asking: false,
     message: undefined,
     joined: undefined,
@@ -786,4 +818,164 @@ test("the code appears only in the field's text and in the requests, never in a 
   for (const sink of sinks) {
     expect(sink).not.toHaveBeenCalled();
   }
+});
+
+test("only the ends of a paste are trimmed, so a text that is not a code never becomes one", () => {
+  expect(pastedCode(`\u200b \u2060${CODE}\u0085\ufeff`)).toBe(CODE);
+  // Characters inside stay where they are.
+  const inside = `${CODE.slice(0, 10)}\u200b \u0085${CODE.slice(10)}`;
+  expect(pastedCode(` ${inside} `)).toBe(inside);
+  expect(codeProblem(inside)).toBe(JOIN_MESSAGES.notACode);
+  // Characters outside ASCII that are not format or white space stay.
+  expect(pastedCode(`\u00e9${CODE}`)).toBe(`\u00e9${CODE}`);
+  // An astral format character, a tag, goes as one character.
+  expect(pastedCode(`${CODE}\u{e0041}`)).toBe(CODE);
+  expect(pastedCode("")).toBe("");
+  // A long paste with a long run of spaces inside is one pass.
+  const long = `a${" ".repeat(200_000)}b`;
+  expect(pastedCode(long)).toBe(long);
+});
+
+test("the first selection after none is no switch: the code, its preview, and a preview's answer on its way stay", async () => {
+  const loading = known({
+    status: "loading",
+    workspaces: [],
+    selectedWorkspaceId: null,
+  });
+  const { join, last } = controllerWith(undefined, undefined, loading);
+  join.editCode(CODE);
+  await join.preview();
+  join.ask();
+  // The service selects the default workspace once the list loads.
+  join.workspacesChanged(known());
+  expect(last()).toMatchObject({
+    code: CODE,
+    preview: SHOWN,
+    asking: true,
+    message: JOIN_RESULT_MESSAGES.previewShown,
+  });
+  // A change away from it is a switch.
+  join.workspacesChanged(known({ selectedWorkspaceId: WORKSPACE_B }));
+  expect(last()).toMatchObject({
+    code: "",
+    preview: undefined,
+    asking: false,
+    message: undefined,
+  });
+
+  // A preview on its way while the first workspace is selected still counts.
+  const pending = pendingAnswer<PreviewInvitationResult>();
+  const second = controllerWith(() => pending.promise, undefined, loading);
+  second.join.editCode(CODE);
+  const done = second.join.preview();
+  second.join.workspacesChanged(known());
+  pending.resolve(PREVIEW);
+  await done;
+  expect(second.last()).toMatchObject({ code: CODE, preview: SHOWN });
+});
+
+test("an invitation is expired once the clock reaches its expiry", () => {
+  expect(previewExpired(SHOWN, EXPIRES_AT - 1)).toBe(false);
+  expect(previewExpired(SHOWN, EXPIRES_AT)).toBe(true);
+  expect(
+    previewExpired({ ...SHOWN, expiresAt: "not a time" }, EXPIRES_AT),
+  ).toBe(false);
+});
+
+test("once the clock passes the expiry, the question closes, the join goes, nothing is sent, and the sentence says so", async () => {
+  const { join, calls, last, setNow } = await asking(() =>
+    Promise.resolve(ACCEPTED),
+  );
+  setNow(EXPIRES_AT - 1);
+  join.clockChanged();
+  expect(last()).toMatchObject({ asking: true, expired: false });
+
+  setNow(EXPIRES_AT);
+  join.clockChanged();
+  expect(last()).toEqual({
+    running: false,
+    code: CODE,
+    problem: undefined,
+    preview: SHOWN,
+    expired: true,
+    asking: false,
+    message:
+      "The invitation has expired. Ask the person who sent it for a new one.",
+    joined: undefined,
+  });
+  join.ask();
+  expect(last().asking).toBe(false);
+  await expect(join.confirm()).resolves.toBe(false);
+  expect(calls).toEqual([["preview", CODE]]);
+
+  // Editing the text, or Cancel, ends it.
+  join.editCode(`${CODE} `);
+  expect(last()).toMatchObject({ preview: undefined, expired: false });
+});
+
+test("an open question checks the clock before it sends, also when no timer fired", async () => {
+  const { join, calls, last, setNow } = await asking(() =>
+    Promise.resolve(ACCEPTED),
+  );
+  setNow(EXPIRES_AT + 60_000);
+  await expect(join.confirm()).resolves.toBe(false);
+  expect(calls).toEqual([["preview", CODE]]);
+  expect(last()).toMatchObject({
+    expired: true,
+    asking: false,
+    code: CODE,
+    message: JOIN_RESULT_MESSAGES.previewExpired,
+  });
+
+  // And Join the workspace does not open the question.
+  const second = controllerWith();
+  second.join.editCode(CODE);
+  await second.join.preview();
+  second.setNow(EXPIRES_AT);
+  second.join.ask();
+  expect(second.last()).toMatchObject({ asking: false, expired: true });
+});
+
+test("a preview that arrives already expired by the clock offers no join", async () => {
+  const { join, last, setNow } = controllerWith();
+  setNow(EXPIRES_AT + 1);
+  join.editCode(CODE);
+  await join.preview();
+  expect(last()).toMatchObject({
+    preview: SHOWN,
+    expired: true,
+    message: JOIN_RESULT_MESSAGES.previewExpired,
+  });
+});
+
+test("the clock changes nothing while an accept runs, and nothing of an accept's answer", async () => {
+  const pending = pendingAnswer<AcceptInvitationResult>();
+  const { join, last, setNow } = await asking(() => pending.promise);
+  const done = join.confirm();
+  setNow(EXPIRES_AT);
+  join.clockChanged();
+  expect(last()).toMatchObject({ running: true, expired: false });
+  pending.resolve(ACCEPTED);
+  await done;
+  join.clockChanged();
+  expect(last()).toMatchObject({
+    expired: false,
+    message: "You joined the workspace.",
+    joined: { workspaceId: JOINED, workspaceName: "Team" },
+  });
+});
+
+test("the clock is read again at the expiry of the shown invitation only, also once it has passed", () => {
+  const view = { ...IDLE_JOIN_INVITATION, preview: SHOWN };
+  expect(nextJoinClockChange(view)).toBe(EXPIRES_AT);
+  expect(nextJoinClockChange({ ...view, expired: true })).toBeUndefined();
+  // While a request runs, the preview is about to go.
+  expect(nextJoinClockChange({ ...view, running: true })).toBeUndefined();
+  expect(nextJoinClockChange(IDLE_JOIN_INVITATION)).toBeUndefined();
+  expect(
+    nextJoinClockChange({
+      ...view,
+      preview: { ...SHOWN, expiresAt: "not a time" },
+    }),
+  ).toBeUndefined();
 });

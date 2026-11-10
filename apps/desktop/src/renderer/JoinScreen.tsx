@@ -13,10 +13,12 @@ import {
   JOIN_MESSAGES,
   JOIN_QUESTION,
   joinAvailability,
+  nextJoinClockChange,
   type InvitationPreview,
   type JoinInvitationView,
   type JoinedWorkspace,
 } from "./join-invitation-view.ts";
+import { clockDelay, watchClockReads } from "./people-actions-view.ts";
 import { formatPeopleDate, peopleDateFormat } from "./people-view.ts";
 import type { WorkspacePanelView } from "./workspace-view.ts";
 
@@ -138,6 +140,7 @@ export function JoinScreenContent({
             {view.preview === undefined ? null : (
               <InvitationPreviewFacts
                 preview={view.preview}
+                expired={view.expired}
                 inert={view.running}
                 onAsk={handlers.onAsk}
                 dateFormat={dateFormat ?? peopleDateFormat()}
@@ -257,16 +260,20 @@ function timeOf(timestamp: string, format: Intl.DateTimeFormat) {
  * What a preview shows: the workspace's name, the person whom the account
  * will be, the inviter's name and GitHub login with the date it was last
  * verified, and the expiry, with "Join the workspace", which the facts
- * describe.
+ * describe. Once the invitation has expired by the clock, the facts stay
+ * and the join goes; the status paragraph says why.
  */
 export function InvitationPreviewFacts({
   preview,
+  expired,
   inert,
   onAsk,
   dateFormat,
   timeFormat,
 }: {
   readonly preview: InvitationPreview;
+  /** Whether the invitation has expired by the clock. */
+  readonly expired: boolean;
   readonly inert: boolean;
   readonly onAsk: JoinInvitationHandlers["onAsk"];
   readonly dateFormat: Intl.DateTimeFormat;
@@ -298,18 +305,22 @@ export function InvitationPreviewFacts({
         <dt>{JOIN_MESSAGES.expires}</dt>
         <dd>{timeOf(preview.expiresAt, timeFormat)}</dd>
       </dl>
-      <p>{JOIN_MESSAGES.loginCheck}</p>
-      <div className="account-actions">
-        <button
-          type="button"
-          className="panel-action"
-          aria-describedby="join-preview"
-          aria-disabled={inert ? "true" : undefined}
-          onClick={inert ? undefined : onAsk}
-        >
-          {JOIN_MESSAGES.join}
-        </button>
-      </div>
+      {expired ? null : (
+        <>
+          <p>{JOIN_MESSAGES.loginCheck}</p>
+          <div className="account-actions">
+            <button
+              type="button"
+              className="panel-action"
+              aria-describedby="join-preview"
+              aria-disabled={inert ? "true" : undefined}
+              onClick={inert ? undefined : onAsk}
+            >
+              {JOIN_MESSAGES.join}
+            </button>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -465,9 +476,14 @@ function focusOnButtonOrPage(button: Element | null): boolean {
  * The focus moves to the screen's title when the control that had it
  * leaves the page: "Cancel" after a click, while the focus is still on it
  * or on the page; "Join the workspace" when the preview ends with an
- * accept's answer, a switch, or a sign-out, and "Open this workspace" once
- * the joined workspace is selected, both while the focus fell to the page.
- * The question's dialog returns the focus to "Join the workspace" first.
+ * accept's answer, a switch, or a sign-out, or the invitation expires, and
+ * "Open this workspace" once the joined workspace is selected, both while
+ * the focus fell to the page. The question's dialog returns the focus to
+ * "Join the workspace" first.
+ *
+ * The controller reads the clock again at the shown invitation's expiry
+ * (`nextJoinClockChange`) and when the window gets the focus or becomes
+ * visible, because a timer can fire late after the computer slept.
  */
 export function useJoinInvitation(
   bridge: InvitationActionsBridge | undefined,
@@ -487,20 +503,44 @@ export function useJoinInvitation(
     () => controller?.workspacesChanged(workspaces),
     [controller, workspaces],
   );
-  const previewShown = view.preview !== undefined;
-  const wasShown = useRef(previewShown);
+  // A timer that fired before the change, after a change of the system's
+  // clock, sets another one.
+  const [reads, setReads] = useState(0);
+  const at = nextJoinClockChange(view);
+  useEffect(() => {
+    if (controller === undefined || at === undefined) {
+      return undefined;
+    }
+    const timer = setTimeout(
+      () => {
+        controller.clockChanged();
+        setReads((count) => count + 1);
+      },
+      clockDelay(at, Date.now()),
+    );
+    return () => clearTimeout(timer);
+  }, [controller, at, reads]);
+  useEffect(
+    () =>
+      controller === undefined
+        ? undefined
+        : watchClockReads(window, document, controller.clockChanged),
+    [controller],
+  );
+  const joinOffered = view.preview !== undefined && !view.expired;
+  const wasShown = useRef(joinOffered);
   useEffect(() => {
     if (
       focusesTitleAfterLeave(
         wasShown.current,
-        previewShown,
+        joinOffered,
         focusOnButtonOrPage(null),
       )
     ) {
       focusTitle();
     }
-    wasShown.current = previewShown;
-  }, [previewShown]);
+    wasShown.current = joinOffered;
+  }, [joinOffered]);
   const offersOpen =
     view.joined !== undefined &&
     describeJoined(view.joined, workspaces) === "open";

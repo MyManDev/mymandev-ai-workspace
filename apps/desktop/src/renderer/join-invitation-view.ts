@@ -91,6 +91,9 @@ export const JOIN_RESULT_MESSAGES = Object.freeze({
   previewNotSent: "It was not sent. Try again.",
   /** The end of the sentence after an accept whose call failed on its way. */
   acceptNotSent: "It was not sent. Paste the code again to try again.",
+  /** Once the clock passes the shown invitation's expiry. */
+  previewExpired:
+    "The invitation has expired. Ask the person who sent it for a new one.",
 });
 
 /**
@@ -120,12 +123,45 @@ export const JOIN_REFUSAL_MESSAGES: Readonly<
 });
 
 /**
+ * A character that a paste may carry around a code: white space and line
+ * ends as `trim` removes them, the next line character U+0085, and the
+ * format characters (`\p{Cf}`), such as a zero-width space or joiner, a
+ * word joiner, a byte order mark, and the marks of the text's direction,
+ * which chat applications add.
+ */
+const EDGE_CHARACTER = /^[\s\p{Cf}\u0085]$/u;
+
+function isEdge(character: string | undefined): boolean {
+  return character !== undefined && EDGE_CHARACTER.test(character);
+}
+
+/**
+ * The pasted text without the characters that a paste may carry at its
+ * ends (`EDGE_CHARACTER`), as the screen sends it. Only the ends change, so
+ * a text that is not a code never becomes one: the pattern is anchored and
+ * accepts ASCII only, and a character inside the text stays where it is.
+ * It walks the characters from both ends, so a long paste costs one pass.
+ */
+export function pastedCode(text: string): string {
+  const characters = Array.from(text);
+  let start = 0;
+  let end = characters.length;
+  while (start < end && isEdge(characters[start])) {
+    start += 1;
+  }
+  while (end > start && isEdge(characters[end - 1])) {
+    end -= 1;
+  }
+  return characters.slice(start, end).join("");
+}
+
+/**
  * The problem of the pasted text before a preview, or undefined: nothing
- * once trimmed, or not an invitation code. The main process refuses both,
- * and the call rejects for them.
+ * once trimmed (`pastedCode`), or not an invitation code. The main process
+ * refuses both, and the call rejects for them.
  */
 export function codeProblem(text: string): string | undefined {
-  const code = text.trim();
+  const code = pastedCode(text);
   if (code === "") {
     return JOIN_MESSAGES.codeMissing;
   }
@@ -143,6 +179,36 @@ export interface InvitationPreview {
   readonly inviterLogin: string;
   readonly inviterVerifiedAt: string;
   readonly expiresAt: string;
+}
+
+/**
+ * Whether the invitation of `preview` has expired by the clock `now` in
+ * milliseconds: its `expiresAt` is not later than now. The API refuses an
+ * expired code in any case (`invitation_invalid`).
+ */
+export function previewExpired(
+  preview: InvitationPreview,
+  now: number,
+): boolean {
+  const end = Date.parse(preview.expiresAt);
+  return !Number.isNaN(end) && end <= now;
+}
+
+/**
+ * The time, in milliseconds, at which the screen reads the clock again
+ * because it may offer something else: the expiry of the shown invitation,
+ * while it is not marked expired and no request runs. It stays the same
+ * once that time has passed, so that the timer fires at once and the
+ * controller marks the invitation expired. Undefined when nothing changes.
+ */
+export function nextJoinClockChange(
+  view: JoinInvitationView,
+): number | undefined {
+  if (view.preview === undefined || view.expired || view.running) {
+    return undefined;
+  }
+  const end = Date.parse(view.preview.expiresAt);
+  return Number.isNaN(end) ? undefined : end;
 }
 
 /** The workspace that an accept joined: its ID, to select it, and its name. */
@@ -250,6 +316,11 @@ export interface JoinInvitationView {
   readonly problem: string | undefined;
   /** The invitation of the code in the field, or undefined. */
   readonly preview: InvitationPreview | undefined;
+  /**
+   * Whether the shown invitation has expired by the clock: the screen then
+   * offers no "Join the workspace", and the question is closed.
+   */
+  readonly expired: boolean;
   /** Whether the question before an accept is open. */
   readonly asking: boolean;
   /** A fixed sentence about the last preview or accept, or undefined. */
@@ -263,6 +334,7 @@ export const IDLE_JOIN_INVITATION: JoinInvitationView = Object.freeze({
   code: "",
   problem: undefined,
   preview: undefined,
+  expired: false,
   asking: false,
   message: undefined,
   joined: undefined,
@@ -283,12 +355,16 @@ export interface JoinInvitation {
    * while a request runs. Resolves when the answer counted or was dropped.
    */
   readonly preview: () => Promise<void>;
-  /** Opens the question before an accept, while a preview shows. */
+  /**
+   * Opens the question before an accept, while a preview shows that has
+   * not expired by the clock.
+   */
   readonly ask: () => void;
   /** Closes the question and keeps the code and its preview. */
   readonly back: () => void;
   /**
-   * Accepts the previewed code, once the question is open. The field and
+   * Accepts the previewed code, once the question is open and the
+   * invitation has not expired by the clock. The field and
    * the controller drop the code before the request goes, so that it lives
    * only in the request; the preview goes with the answer. Resolves to true
    * when the answer counted, because "Join the workspace" then leaves the
@@ -313,6 +389,12 @@ export interface JoinInvitation {
    * answer that is still on its way.
    */
   readonly workspacesChanged: (workspaces: WorkspacePanelView) => void;
+  /**
+   * Reads the clock again, at the shown invitation's expiry and when the
+   * window gets the focus or becomes visible: once it has expired, the
+   * question closes, "Join the workspace" goes, and the sentence says so.
+   */
+  readonly clockChanged: () => void;
 }
 
 /**
@@ -323,16 +405,19 @@ export interface JoinInvitation {
  * Manager's decision of 2026-11-06). The code lives only in the field's
  * text and in a request on its way: no sentence, problem, preview, or log
  * holds it. Only the joined workspace's ID and name are kept of an
- * accept's answer.
+ * accept's answer. `now` is the renderer's clock in milliseconds.
  */
 export function createJoinInvitation(
   bridge: Pick<InvitationActionsBridge, "preview" | "accept">,
   onView: (view: JoinInvitationView) => void,
+  now: () => number = Date.now,
 ): JoinInvitation {
   let running = false;
   let code = "";
   let problem: string | undefined;
   let preview: InvitationPreview | undefined;
+  /** Whether `preview` has expired by the clock. */
+  let expired = false;
   let asking = false;
   let message: string | undefined;
   /** Whether the sentence is about an accept, which a switch keeps. */
@@ -357,17 +442,40 @@ export function createJoinInvitation(
         code,
         problem,
         preview,
+        expired,
         asking,
         message,
         joined,
       }),
     );
 
+  /**
+   * Whether the shown invitation has expired by the clock now. The first
+   * time, outside a request, the question closes and the sentence of the
+   * preview says so; an accept's sentence stays.
+   */
+  function expiredNow(): boolean {
+    if (preview === undefined || expired || running) {
+      return expired;
+    }
+    if (!previewExpired(preview, now())) {
+      return false;
+    }
+    expired = true;
+    asking = false;
+    if (!messageOfAccept) {
+      setMessage(JOIN_RESULT_MESSAGES.previewExpired, false);
+    }
+    show();
+    return true;
+  }
+
   /** Drops the code with everything that is about it. */
   function dropCode(): void {
     code = "";
     problem = undefined;
     preview = undefined;
+    expired = false;
     asking = false;
   }
 
@@ -384,6 +492,7 @@ export function createJoinInvitation(
       code = text;
       problem = undefined;
       preview = undefined;
+      expired = false;
       asking = false;
       show();
     },
@@ -391,7 +500,7 @@ export function createJoinInvitation(
       if (running) {
         return;
       }
-      const sent = code.trim();
+      const sent = pastedCode(code);
       problem = codeProblem(code);
       if (problem !== undefined) {
         show();
@@ -399,6 +508,7 @@ export function createJoinInvitation(
       }
       running = true;
       preview = undefined;
+      expired = false;
       asking = false;
       joined = undefined;
       setMessage(undefined, false);
@@ -429,12 +539,17 @@ export function createJoinInvitation(
       running = false;
       if (generation === startGeneration) {
         preview = shown;
-        setMessage(sentence, false);
+        // An invitation that has expired by the clock offers no join.
+        expired = shown !== undefined && previewExpired(shown, now());
+        setMessage(
+          expired ? JOIN_RESULT_MESSAGES.previewExpired : sentence,
+          false,
+        );
       }
       show();
     },
     ask: () => {
-      if (!running && preview !== undefined && !asking) {
+      if (!running && preview !== undefined && !asking && !expiredNow()) {
         asking = true;
         show();
       }
@@ -446,11 +561,12 @@ export function createJoinInvitation(
       }
     },
     confirm: async () => {
-      const sent = code.trim();
+      const sent = pastedCode(code);
       if (
         running ||
         !asking ||
         preview === undefined ||
+        expiredNow() ||
         !INVITATION_CODE_PATTERN.test(sent)
       ) {
         return false;
@@ -484,6 +600,7 @@ export function createJoinInvitation(
       const counts = session === startSession;
       if (counts) {
         preview = undefined;
+        expired = false;
         joined = joinedNow;
         setMessage(sentence, true);
       }
@@ -534,7 +651,10 @@ export function createJoinInvitation(
       signedOut = false;
       const before = selected;
       selected = state.selectedWorkspaceId;
-      if (before !== undefined && before !== selected) {
+      // The first selection after none, such as the default workspace that
+      // the service selects once the list loads, is no switch: a preview
+      // and an accept are not tied to the selected workspace.
+      if (before !== undefined && before !== null && before !== selected) {
         generation += 1;
         dropCode();
         if (!messageOfAccept) {
@@ -542,6 +662,9 @@ export function createJoinInvitation(
         }
         show();
       }
+    },
+    clockChanged: () => {
+      expiredNow();
     },
   });
 }

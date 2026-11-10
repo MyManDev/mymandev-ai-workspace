@@ -278,6 +278,27 @@ test("a preview shows the workspace, the person, the inviter with the login in t
   expect(marked).not.toContain("<img");
 });
 
+test("an expired invitation keeps its facts, offers no join, and the status paragraph says why", () => {
+  const html = render({
+    view: {
+      code: CODE,
+      preview: PREVIEW,
+      expired: true,
+      message:
+        "The invitation has expired. Ask the person who sent it for a new one.",
+    },
+  });
+  expect(html).toContain(
+    '<p class="people-status" id="join-message" role="status">The invitation has expired. Ask the person who sent it for a new one.</p><div class="people-offer"><dl class="account-facts" id="join-preview">',
+  );
+  expect(html).toContain(
+    '<dt>Valid until</dt><dd><time dateTime="2026-11-12T12:00:00.000Z">12 Nov 2026, 15:00</time></dd></dl></div>',
+  );
+  expect(html).not.toContain("Join the workspace");
+  expect(html).not.toContain("Check the inviter");
+  expect(buttonLabels(html)).toEqual(["Preview", "Cancel"]);
+});
+
 test("Join the workspace opens the question", () => {
   const { calls, handlers } = recorder();
   elements({ view: { code: CODE, preview: PREVIEW }, handlers })
