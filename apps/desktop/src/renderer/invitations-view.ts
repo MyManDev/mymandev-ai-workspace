@@ -61,7 +61,8 @@ export function followInvitations(
  * The most live invitations that a workspace holds (ADR 0014, "Limits").
  * The API refuses another create with `rate_limited` and the wait until the
  * soonest of them ends; the person's own live invitation, which the new one
- * replaces, does not count.
+ * replaces, does not count. The protocol does not export it yet; the
+ * follow-up issue #252 adds it there, and this copy then checks against it.
  */
 export const MAX_LIVE_INVITATIONS = 50;
 
@@ -402,6 +403,15 @@ export const INVITATION_ACTION_UNKNOWN_MESSAGES: Readonly<
 });
 
 /**
+ * The sentence after a create that the API confirmed while another
+ * workspace was selected (the Project Manager's decision of 2026-11-10):
+ * its code was dropped unseen (D2), so the workspace of the action says so
+ * once it is shown again. It never holds the code.
+ */
+export const INVITATION_CREATED_UNSEEN_MESSAGE =
+  "An invitation was created, but its code could not be shown. Invite the person again for a new code.";
+
+/**
  * Why an invitation action was refused, after its start. `too_soon` and
  * `rate_limited` say how long to wait (`describeWait`); a create's
  * `rate_limited` can also mean the limit of live invitations.
@@ -609,6 +619,8 @@ export interface InvitationActions {
    * - the question, the code, and the sentence of the last action belong to
    *   the workspace that they were about, so they go when another workspace
    *   or none is selected, and always with a sign-out;
+   * - the workspace of a create whose code was dropped after a switch says
+   *   so when it is selected again (`INVITATION_CREATED_UNSEEN_MESSAGE`);
    * - the refresh's sentence ends with the next state of the invitations.
    */
   readonly listChanged: (
@@ -624,7 +636,9 @@ export interface InvitationActions {
  * changes only with the state that the main process sends after it loads
  * the invitations again, never from the answer. The code of a confirmed
  * create goes into the view of its dialog only, and only while the
- * workspace of the action is still selected; otherwise it is dropped.
+ * workspace of the action is still selected; otherwise it is dropped, and
+ * that workspace says so once it is shown again
+ * (`INVITATION_CREATED_UNSEEN_MESSAGE`), unless the session ended.
  */
 export function createInvitationActions(
   bridge: Pick<InvitationActionsBridge, "create" | "revoke">,
@@ -647,6 +661,8 @@ export function createInvitationActions(
    * happened while it was on its way, also a switch away and back.
    */
   let selection = 0;
+  /** Grows with every sign-out, so that nothing outlives the account's session. */
+  let session = 0;
   /** Whether the latest people are `signed_out`, so that a session ends once. */
   let signedOut = false;
   /**
@@ -654,6 +670,13 @@ export function createInvitationActions(
    * its sentence shows; a later state ends the sentence.
    */
   let refreshedAt: number | undefined;
+  /**
+   * The workspace whose confirmed create answered while another one was
+   * selected, until it is shown again: it then says that the code could not
+   * be shown. Only its ID is kept, never the code. The next action, a
+   * refresh, and a sign-out end it.
+   */
+  let unseenIn: string | undefined;
   const show = () =>
     onView(Object.freeze({ running, message, question, code }));
 
@@ -665,8 +688,10 @@ export function createInvitationActions(
     message = undefined;
     question = undefined;
     refreshedAt = undefined;
+    unseenIn = undefined;
     show();
     const startSelection = selection;
+    const startSession = session;
     let ok = false;
     let sentence: string;
     let created: InvitationCodeView | undefined;
@@ -701,6 +726,16 @@ export function createInvitationActions(
     if (still) {
       message = sentence;
       code = created;
+    } else if (created !== undefined && session === startSession) {
+      // A created invitation whose code was dropped: its workspace says so
+      // at once when it is shown again already (a switch away and back), or
+      // when it is selected next. A sign-out ends the session, and with it
+      // the sentence.
+      if (selected === request.workspaceId) {
+        message = INVITATION_CREATED_UNSEEN_MESSAGE;
+      } else {
+        unseenIn = request.workspaceId;
+      }
     }
     running = false;
     show();
@@ -750,6 +785,9 @@ export function createInvitationActions(
       if (running) {
         return;
       }
+      // A refresh ends the sentence of a create whose code was not shown,
+      // also before its workspace is shown again.
+      unseenIn = undefined;
       const startSelection = selection;
       let sentence: string;
       let loading = false;
@@ -808,6 +846,7 @@ export function createInvitationActions(
           if (!signedOut) {
             signedOut = true;
             selection += 1;
+            session += 1;
           }
           selected = null;
           changed ||=
@@ -818,6 +857,7 @@ export function createInvitationActions(
           message = undefined;
           code = undefined;
           refreshedAt = undefined;
+          unseenIn = undefined;
         } else {
           signedOut = false;
           selected = state.workspaceId;
@@ -827,6 +867,12 @@ export function createInvitationActions(
             message = undefined;
             code = undefined;
             refreshedAt = undefined;
+            if (unseenIn !== undefined && unseenIn === selected) {
+              // The workspace of a create whose code was dropped is shown
+              // again; only it says so.
+              message = INVITATION_CREATED_UNSEEN_MESSAGE;
+              unseenIn = undefined;
+            }
             changed = true;
           }
         }

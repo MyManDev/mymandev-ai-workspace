@@ -25,6 +25,7 @@ import {
   INVITATION_ACTION_DONE_MESSAGES,
   INVITATION_ACTION_NOT_DONE_MESSAGES,
   INVITATION_ACTION_UNKNOWN_MESSAGES,
+  INVITATION_CREATED_UNSEEN_MESSAGE,
   INVITATION_MESSAGES,
   INVITATION_PROBLEM_MESSAGES,
   INVITATION_REFRESH_MESSAGES,
@@ -863,13 +864,23 @@ test("D2: a switch or a sign-out while the code shows drops it", async () => {
   }
 });
 
-test("D2: an answer after a switch, a switch away and back, or a sign-out shows no sentence, and the code of a create is dropped unseen", async () => {
-  const scenarios: PeopleScreenView[][] = [
-    [known({ workspaceId: OTHER_WORKSPACE })],
-    [known({ workspaceId: OTHER_WORKSPACE }), known()],
-    [known({ status: "signed_out", workspaceId: null }), known()],
+test("D2: an answer after a switch, a switch away and back, or a sign-out never shows the code, and shows the create's result only as the fixed sentence of its workspace", async () => {
+  const unseen: InvitationActionsView = {
+    ...IDLE_INVITATION_ACTIONS,
+    message: INVITATION_CREATED_UNSEEN_MESSAGE,
+  };
+  const scenarios: [PeopleScreenView[], InvitationActionsView][] = [
+    // Another workspace is shown: it says nothing.
+    [[known({ workspaceId: OTHER_WORKSPACE })], IDLE_INVITATION_ACTIONS],
+    // The action's workspace is shown again: it says so at once.
+    [[known({ workspaceId: OTHER_WORKSPACE }), known()], unseen],
+    // A sign-out ends the session: nothing, also after a new sign-in.
+    [
+      [known({ status: "signed_out", workspaceId: null }), known()],
+      IDLE_INVITATION_ACTIONS,
+    ],
   ];
-  for (const steps of scenarios) {
+  for (const [steps, expected] of scenarios) {
     const create = pending<CreateInvitationResult>();
     const { actions, views, last } = controllerWith({ create: create.answer });
     actions.start(INVITE);
@@ -879,8 +890,9 @@ test("D2: an answer after a switch, a switch away and back, or a sign-out shows 
     }
     create.resolve(CREATED);
     expect(await done).toBe(false);
-    expect(last()).toEqual(IDLE_INVITATION_ACTIONS);
+    expect(last()).toEqual(expected);
     expect(serialized(views)).not.toContain(CODE);
+    expect(serialized(views)).not.toContain(CODE.slice(5, 30));
   }
   // A revocation's answer after a switch shows nothing either.
   const revoke = pending<RevokeInvitationResult>();
@@ -890,6 +902,144 @@ test("D2: an answer after a switch, a switch away and back, or a sign-out shows 
   actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), listed(), NOW);
   revoke.resolve({ outcome: "ok" });
   expect(await done).toBe(false);
+  expect(last().message).toBeUndefined();
+});
+
+/**
+ * A controller whose create answered with the code while another workspace
+ * was shown, with `steps` the views that the screen showed in between.
+ */
+async function createdAway(steps: PeopleScreenView[], answers: Answers = {}) {
+  const create = pending<CreateInvitationResult>();
+  const controller = controllerWith({ ...answers, create: create.answer });
+  controller.actions.start(INVITE);
+  const done = controller.actions.confirm();
+  for (const step of steps) {
+    controller.actions.listChanged(step, listed(), NOW);
+  }
+  create.resolve(CREATED);
+  await done;
+  return controller;
+}
+
+const THIRD_WORKSPACE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a5";
+
+test("a create confirmed after a switch away says, on its own workspace only, once it is shown again, that the code could not be shown, and never holds the code", async () => {
+  expect(INVITATION_CREATED_UNSEEN_MESSAGE).toBe(
+    "An invitation was created, but its code could not be shown. Invite the person again for a new code.",
+  );
+  expect(INVITATION_CREATED_UNSEEN_MESSAGE).not.toContain("mmdi_");
+  const { actions, views, last } = await createdAway([
+    known({ workspaceId: OTHER_WORKSPACE }),
+  ]);
+  // Not in the workspace shown when the answer came, nor in another one.
+  expect(last().message).toBeUndefined();
+  actions.listChanged(known({ workspaceId: THIRD_WORKSPACE }), listed(), NOW);
+  expect(last().message).toBeUndefined();
+  actions.listChanged(
+    known({ workspaceId: null, status: "no_workspace" }),
+    listed(),
+    NOW,
+  );
+  expect(last().message).toBeUndefined();
+  // The action's workspace shown again says it, without a code or a dialog.
+  actions.listChanged(known(), listed(), NOW);
+  expect(last()).toEqual({
+    ...IDLE_INVITATION_ACTIONS,
+    message: INVITATION_CREATED_UNSEEN_MESSAGE,
+  });
+  // It stays through later states of the same workspace.
+  actions.listChanged(known(), listed({ revision: 12 }), NOW + 1);
+  expect(last().message).toBe(INVITATION_CREATED_UNSEEN_MESSAGE);
+  // Like every sentence, a switch ends it, and it never comes back.
+  actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), listed(), NOW);
+  expect(last().message).toBeUndefined();
+  actions.listChanged(known(), listed(), NOW);
+  expect(last().message).toBeUndefined();
+  expect(serialized(views)).not.toContain(CODE);
+  expect(serialized(views)).not.toContain(CODE.slice(5, 30));
+});
+
+test("the sentence of a code that could not be shown ends with the next action or a refresh, and with a sign-out before its workspace shows again", async () => {
+  // The next action, also in another workspace, ends it before it shows.
+  const next = await createdAway([known({ workspaceId: OTHER_WORKSPACE })], {
+    revoke: () => Promise.resolve({ outcome: "unknown" }),
+  });
+  next.actions.listChanged(
+    known({ workspaceId: OTHER_WORKSPACE }),
+    listed({ workspaceId: OTHER_WORKSPACE }),
+    NOW,
+  );
+  next.actions.start({ ...REVOKE, workspaceId: OTHER_WORKSPACE });
+  await next.actions.confirm();
+  next.actions.listChanged(known(), listed(), NOW);
+  expect(next.last().message).toBeUndefined();
+
+  // A refresh ends it before it shows.
+  const refreshed = await createdAway(
+    [known({ workspaceId: OTHER_WORKSPACE })],
+    { load: () => Promise.resolve({ outcome: "refused", reason: "too_soon" }) },
+  );
+  await refreshed.actions.refresh();
+  refreshed.actions.listChanged(known(), listed(), NOW);
+  expect(refreshed.last().message).toBeUndefined();
+
+  // A sign-out ends it before it shows.
+  const signedOut = await createdAway([
+    known({ workspaceId: OTHER_WORKSPACE }),
+  ]);
+  signedOut.actions.listChanged(
+    known({ status: "signed_out", workspaceId: null }),
+    listed(),
+    NOW,
+  );
+  signedOut.actions.listChanged(known(), listed(), NOW);
+  expect(signedOut.last().message).toBeUndefined();
+
+  // Once shown, the next action and a refresh replace it.
+  const shown = await createdAway([known({ workspaceId: OTHER_WORKSPACE })], {
+    revoke: () => Promise.resolve({ outcome: "ok" }),
+    load: () => Promise.resolve({ outcome: "refused", reason: "too_soon" }),
+  });
+  shown.actions.listChanged(known(), listed(), NOW);
+  expect(shown.last().message).toBe(INVITATION_CREATED_UNSEEN_MESSAGE);
+  await shown.actions.refresh();
+  expect(shown.last().message).toBe(INVITATION_REFRESH_MESSAGES.too_soon);
+  const again = await createdAway([known({ workspaceId: OTHER_WORKSPACE })], {
+    revoke: () => Promise.resolve({ outcome: "ok" }),
+  });
+  again.actions.listChanged(known(), listed(), NOW);
+  again.actions.start(REVOKE);
+  expect(again.last().message).toBe(INVITATION_CREATED_UNSEEN_MESSAGE);
+  await again.actions.confirm();
+  expect(again.last().message).toBe(INVITATION_ACTION_DONE_MESSAGES.revoke);
+});
+
+test("only a confirmed create says that its code could not be shown: an unknown or refused create, a failed call, and a revocation answered after a switch say nothing", async () => {
+  const answers: (() => Promise<CreateInvitationResult>)[] = [
+    () => Promise.resolve({ outcome: "unknown" }),
+    () => Promise.resolve(refused("conflict")),
+    () => Promise.reject(new Error("lost")),
+  ];
+  for (const answer of answers) {
+    const create = pending<CreateInvitationResult>();
+    const { actions, last } = controllerWith({ create: create.answer });
+    actions.start(INVITE);
+    const done = actions.confirm();
+    actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), listed(), NOW);
+    answer().then(create.resolve, create.reject);
+    await done;
+    actions.listChanged(known(), listed(), NOW);
+    expect(last().message).toBeUndefined();
+  }
+  const revoke = pending<RevokeInvitationResult>();
+  const { actions, last } = controllerWith({ revoke: revoke.answer });
+  actions.start(REVOKE);
+  const done = actions.confirm();
+  actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), listed(), NOW);
+  revoke.resolve({ outcome: "ok" });
+  await done;
+  actions.listChanged(known(), listed(), NOW);
   expect(last().message).toBeUndefined();
 });
 

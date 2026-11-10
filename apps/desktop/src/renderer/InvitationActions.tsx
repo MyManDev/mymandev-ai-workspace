@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -349,14 +350,41 @@ export interface InvitationCodeProps {
 }
 
 /**
+ * Puts `code` into the field as its `value` property, never as an
+ * attribute, and returns the function that empties the field again; does
+ * nothing without a field or a code. The code's dialog calls it in a layout
+ * effect when it opens, so the code is in the field before the dialog
+ * shows, and its cleanup runs when the dialog closes or the code changes.
+ */
+export function showCodeInField(
+  field: { value: string } | null,
+  code: string | undefined,
+): () => void {
+  if (field === null || code === undefined) {
+    return () => undefined;
+  }
+  field.value = code;
+  return () => {
+    field.value = "";
+  };
+}
+
+/**
  * The code of a new invitation, once (D2), as a modal dialog of the page.
- * "Select the code" selects the field's text and nothing else. Closing,
- * also with Escape, drops the code: the dialog is then empty, and nothing
- * in the page holds the code.
+ * The code reaches the read-only field only as its `value` property, set
+ * through a reference (`showCodeInField`): a controlled `value` would also
+ * write it into the element's `value` attribute. "Select the code" selects
+ * the field's text and nothing else. Closing, also with Escape, drops the
+ * code: the field is emptied, the dialog is then empty, and nothing in the
+ * page holds the code.
  */
 export function InvitationCodeBox(props: InvitationCodeProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const fieldRef = useRef<HTMLInputElement>(null);
+  const shown = props.code?.code;
+  // The field's reference is set before this effect runs, and the cleanup
+  // empties the same element even after React has detached the reference.
+  useLayoutEffect(() => showCodeInField(fieldRef.current, shown), [shown]);
   useModal(dialogRef, props.code !== undefined);
   return (
     <InvitationCodeContent
@@ -370,11 +398,13 @@ export function InvitationCodeBox(props: InvitationCodeProps) {
 
 /**
  * The code's dialog, without state. The element stays in the page while no
- * code is shown, empty and closed. The code is the value of a read-only
- * field in a monospace font, without a name, so that no form sends it, and
- * it appears nowhere else: not in a status paragraph, a label, or an
- * attribute. The person's name is text with `dir="auto"`. The buttons are
- * not in a form, so that Enter in the field closes nothing.
+ * code is shown, empty and closed. The code goes into a read-only field in
+ * a monospace font, without a name, so that no form sends it; this markup
+ * never holds the code itself, which `InvitationCodeBox` sets as the
+ * field's `value` property. It appears nowhere else: not in a status
+ * paragraph, a label, or an attribute. The person's name is text with
+ * `dir="auto"`. The buttons are not in a form, so that Enter in the field
+ * closes nothing.
  */
 export function InvitationCodeContent({
   code,
@@ -424,7 +454,6 @@ export function InvitationCodeContent({
           readOnly
           autoComplete="off"
           spellCheck={false}
-          value={code.code}
           aria-describedby="invitation-code-expiry"
         />
         <p id="invitation-code-expiry">

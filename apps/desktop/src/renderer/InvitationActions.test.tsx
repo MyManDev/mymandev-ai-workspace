@@ -23,6 +23,7 @@ import {
   InvitationCodeContent,
   InvitationQuestionContent,
   selectCode,
+  showCodeInField,
   type InvitationActionHandlers,
 } from "./InvitationActions.tsx";
 import {
@@ -551,24 +552,33 @@ function codeDialog(code: InvitationCodeView | undefined) {
   return { content, handlers, selections: () => selected };
 }
 
-test("D2: the code's dialog shows the code in a read-only field, says that it shows only now and must be passed on privately, gives the end, and has Select the code and Close", () => {
+test("D2: the code's dialog has a read-only field for the code, says that it shows only now and must be passed on privately, gives the end, and has Select the code and Close; its markup never holds the code", () => {
   const end = TIME_FORMAT.format(new Date(CREATED_ENDS_AT));
-  expect(renderToString(codeDialog(SHOWN).content)).toBe(
-    `<dialog class="people-dialog" aria-labelledby="invitation-code-title" aria-describedby="invitation-code-name invitation-code-text"><div class="invitation-code-content"><h2 id="invitation-code-title">Invitation code</h2><p class="people-dialog-name" id="invitation-code-name"><span dir="auto">Margaret</span></p><p id="invitation-code-text">This code is shown only now. Once you close this, it cannot be shown again. Pass it on privately, only to this person, for example in a direct message: anyone who has the code can claim this person.</p><label class="account-label" for="invitation-code-field">Code</label><input id="invitation-code-field" class="account-input invitation-code" type="text" dir="ltr" translate="no" readOnly="" autoComplete="off" spellCheck="false" aria-describedby="invitation-code-expiry" value="${CODE}"/><p id="invitation-code-expiry">It can be used once, until <time dateTime="${CREATED_ENDS_AT}">${end}</time>.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Select the code</button><button type="button" class="panel-action">Close</button></div></div></dialog>`,
+  const html = renderToString(codeDialog(SHOWN).content);
+  expect(html).toBe(
+    `<dialog class="people-dialog" aria-labelledby="invitation-code-title" aria-describedby="invitation-code-name invitation-code-text"><div class="invitation-code-content"><h2 id="invitation-code-title">Invitation code</h2><p class="people-dialog-name" id="invitation-code-name"><span dir="auto">Margaret</span></p><p id="invitation-code-text">This code is shown only now. Once you close this, it cannot be shown again. Pass it on privately, only to this person, for example in a direct message: anyone who has the code can claim this person.</p><label class="account-label" for="invitation-code-field">Code</label><input id="invitation-code-field" class="account-input invitation-code" type="text" dir="ltr" translate="no" readOnly="" autoComplete="off" spellCheck="false" aria-describedby="invitation-code-expiry"/><p id="invitation-code-expiry">It can be used once, until <time dateTime="${CREATED_ENDS_AT}">${end}</time>.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Select the code</button><button type="button" class="panel-action">Close</button></div></div></dialog>`,
   );
+  // The code reaches the field only through `showCodeInField`.
+  expect(html).not.toContain(CODE);
+  expect(html).not.toContain("value=");
   // Closed, the dialog stays in the page, empty.
   expect(renderToString(codeDialog(undefined).content)).toBe(
     '<dialog class="people-dialog"></dialog>',
   );
 });
 
-test("D2: the code's field has no name and sits in no form, so nothing sends it, and Enter in it closes nothing", () => {
+test("D2: the code's field has no name, no value or default value, and sits in no form, so nothing sends it, and Enter in it closes nothing", () => {
   const elements = elementsOf(codeDialog(SHOWN).content);
   expect(elements.some((element) => element.type === "form")).toBe(false);
   const field = elements.find((element) => element.type === "input");
   expect(field?.props.readOnly).toBe(true);
-  expect(field?.props.value).toBe(CODE);
-  expect(Object.keys(field?.props ?? {})).not.toContain("name");
+  const keys = Object.keys(field?.props ?? {});
+  for (const key of ["name", "value", "defaultValue"]) {
+    expect(keys, key).not.toContain(key);
+  }
+  expect(
+    JSON.stringify(elements.map((element) => element.props)),
+  ).not.toContain(CODE);
   expect(
     elements.filter(
       (element) => element.type === "button" && element.props.type !== "button",
@@ -624,6 +634,40 @@ test("D2: selecting the code only focuses and selects the field, and touches not
   expect(() => selectCode(null)).not.toThrow();
 });
 
+test("D2: the dialog's effect puts the code into the field's value property only, and its cleanup empties the same field", () => {
+  const touched: string[] = [];
+  let value = "";
+  const field = new Proxy(
+    { value: "" },
+    {
+      get(_target, key) {
+        touched.push(`get ${String(key)}`);
+        return key === "value" ? value : undefined;
+      },
+      set(_target, key, next: unknown) {
+        touched.push(
+          `set ${String(key)} ${next === CODE ? "the code" : JSON.stringify(next)}`,
+        );
+        if (key === "value") {
+          value = String(next);
+        }
+        return true;
+      },
+    },
+  );
+  const clear = showCodeInField(field, CODE);
+  expect(touched).toEqual(["set value the code"]);
+  expect(value).toBe(CODE);
+  clear();
+  expect(touched).toEqual(["set value the code", 'set value ""']);
+  expect(value).toBe("");
+  // Without a field, or without a code, nothing is touched.
+  touched.length = 0;
+  showCodeInField(null, CODE)();
+  showCodeInField(field, undefined)();
+  expect(touched).toEqual([]);
+});
+
 /** How often `text` appears in `html`. */
 function count(html: string, text: string): number {
   return html.split(text).length - 1;
@@ -663,15 +707,15 @@ function createdController() {
   };
 }
 
-test("D2: while the dialog is open, the screen holds the code exactly once, as the field's value, and in no status paragraph; once it closes, nothing rendered holds it", async () => {
+test("D2: while the dialog is open, the rendered screen holds the code nowhere, the field's value property being the only place for it, and no status paragraph holds it; once it closes, nothing rendered holds it", async () => {
   const { actions, views, last } = createdController();
   actions.start(INVITE);
   await actions.confirm();
+  expect(last().code?.code).toBe(CODE);
   const open = render({ invitationActions: last() });
-  expect(count(open, CODE)).toBe(1);
-  expect(open).toContain(
-    `aria-describedby="invitation-code-expiry" value="${CODE}"/>`,
-  );
+  expect(open).toContain('<input id="invitation-code-field"');
+  expect(count(open, CODE)).toBe(0);
+  expect(count(open, CODE.slice(5, 30))).toBe(0);
   expect(statusTexts(open)).toContain("The invitation was created.");
   for (const text of statusTexts(open)) {
     expect(text).not.toContain(CODE);
