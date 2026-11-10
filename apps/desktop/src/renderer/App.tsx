@@ -13,6 +13,8 @@ import type {
   ChatBridge,
   ConnectionBridge,
   DeviceListBridge,
+  InvitationActionsBridge,
+  InvitationsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -98,6 +100,10 @@ export interface AppProps {
   readonly people?: PeopleBridge | undefined;
   /** The people actions from the preload script; undefined outside Electron. */
   readonly peopleActions?: PeopleActionsBridge | undefined;
+  /** The selected workspace's live invitations from the preload script; undefined outside Electron. */
+  readonly invitations?: InvitationsBridge | undefined;
+  /** The invitation actions from the preload script; undefined outside Electron. */
+  readonly invitationActions?: InvitationActionsBridge | undefined;
   /** The open project's agent activity from the preload script; undefined outside Electron. */
   readonly agents?: AgentBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
@@ -122,6 +128,8 @@ export function App({
   workspaces,
   people,
   peopleActions,
+  invitations,
+  invitationActions,
   agents,
   chat,
   devices,
@@ -197,6 +205,8 @@ export function App({
           electronVersion={electronVersion}
           people={people}
           peopleActions={peopleActions}
+          invitations={invitations}
+          invitationActions={invitationActions}
           account={account}
           chat={chat}
           devices={devices}
@@ -226,6 +236,8 @@ function ScreenContent({
   electronVersion,
   people,
   peopleActions,
+  invitations,
+  invitationActions,
   account,
   chat,
   devices,
@@ -239,6 +251,8 @@ function ScreenContent({
   readonly electronVersion: string | undefined;
   readonly people: PeopleBridge | undefined;
   readonly peopleActions: PeopleActionsBridge | undefined;
+  readonly invitations: InvitationsBridge | undefined;
+  readonly invitationActions: InvitationActionsBridge | undefined;
   readonly account: AccountBridge | undefined;
   readonly chat: ChatBridge | undefined;
   readonly devices: DeviceListBridge | undefined;
@@ -264,7 +278,14 @@ function ScreenContent({
     case "account":
       return <AccountScreen account={account} devices={devices} />;
     case "people":
-      return <PeopleScreen people={people} peopleActions={peopleActions} />;
+      return (
+        <PeopleScreen
+          people={people}
+          peopleActions={peopleActions}
+          invitations={invitations}
+          invitationActions={invitationActions}
+        />
+      );
     case "join":
       return <JoinScreen />;
     case "about":

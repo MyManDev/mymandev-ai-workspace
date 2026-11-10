@@ -1,8 +1,29 @@
 import { useEffect, useState } from "react";
 import type {
+  InvitationActionsBridge,
+  InvitationsBridge,
   PeopleActionsBridge,
   PeopleBridge,
 } from "../shared/desktop-bridge.ts";
+import {
+  INVITATION_ACTION_MESSAGE_ID,
+  InvitationCodeBox,
+  InvitationQuestionBox,
+  InvitationsPart,
+  InviteButton,
+  useInvitationActions,
+  useInvitationsClock,
+  useInvitationsScreen,
+  type InvitationActionHandlers,
+} from "./InvitationActions.tsx";
+import {
+  describeInvitations,
+  IDLE_INVITATION_ACTIONS,
+  isInvitationOffered,
+  type InvitationActionRequest,
+  type InvitationActionsView,
+  type InvitationsScreenView,
+} from "./invitations-view.ts";
 import {
   DefinePersonForm,
   LeaveWorkspace,
@@ -41,26 +62,49 @@ import {
  * marked, and the former members apart. The main process keeps them
  * current with the membership events. The screen offers the people
  * actions that the account's role allows (#95, D1); the list changes only
- * with the people that the main process sends.
+ * with the people that the main process sends. The owner and the admins
+ * also see the open invitations, invite each unclaimed person, and revoke
+ * invitations (#95, D2 and D3).
  */
 export function PeopleScreen({
   people,
   peopleActions,
+  invitations,
+  invitationActions,
 }: {
   /** The people functions from the preload script; undefined outside Electron. */
   readonly people: PeopleBridge | undefined;
   /** The people actions from the preload script; undefined outside Electron. */
   readonly peopleActions: PeopleActionsBridge | undefined;
+  /** The live invitations from the preload script; undefined outside Electron. */
+  readonly invitations?: InvitationsBridge | undefined;
+  /** The invitation actions from the preload script; undefined outside Electron. */
+  readonly invitationActions?: InvitationActionsBridge | undefined;
 }) {
   const view = usePeopleScreen(people);
-  const now = usePeopleClock(view);
+  const invitationsView = useInvitationsScreen(invitations);
+  const peopleNow = usePeopleClock(view);
+  const invitationsNow = useInvitationsClock(invitationsView);
+  // The later of the two readings, so that both the offer and the
+  // invitations end on time.
+  const now = Math.max(peopleNow, invitationsNow);
   const { actions, handlers } = usePeopleActions(peopleActions, view, now);
+  const invitationParts = useInvitationActions(
+    invitationActions,
+    invitations,
+    view,
+    invitationsView,
+    now,
+  );
   return (
     <PeopleScreenContent
       view={view}
       now={now}
       actions={actions}
       handlers={handlers}
+      invitations={invitationsView}
+      invitationActions={invitationParts.actions}
+      invitationHandlers={invitationParts.handlers}
     />
   );
 }
@@ -84,6 +128,15 @@ export interface PeopleScreenContentProps {
   readonly actions?: PeopleActionsView | undefined;
   /** The people actions' handlers; undefined without the bridge, with no action shown. */
   readonly handlers?: PeopleActionHandlers | undefined;
+  /** The live invitations; unavailable by default. */
+  readonly invitations?: InvitationsScreenView | undefined;
+  /** What the screen shows of its invitation actions; idle by default. */
+  readonly invitationActions?: InvitationActionsView | undefined;
+  /**
+   * The invitation actions' handlers; undefined without the bridges, with
+   * no invitations part, no "Invite", and no code's dialog.
+   */
+  readonly invitationHandlers?: InvitationActionHandlers | undefined;
 }
 
 /**
@@ -104,6 +157,13 @@ export interface PeopleScreenContentProps {
  * focusable and does nothing (`aria-disabled`). No ID is shown: each
  * person's buttons are described by the name, whose element ID is its
  * place in the list.
+ *
+ * With the invitation handlers, the owner and the admins also get "Invite"
+ * on each active unclaimed person and the open invitations below the
+ * people (`describeInvitations`); the sentence of the last invitation
+ * action sits in its own status paragraph next to the people actions' one.
+ * One action of either kind runs at a time: while one runs, every action's
+ * control of both kinds stays focusable and does nothing.
  */
 export function PeopleScreenContent({
   view,
@@ -112,16 +172,20 @@ export function PeopleScreenContent({
   now = Date.now(),
   actions = IDLE_PEOPLE_ACTIONS,
   handlers,
+  invitations = { kind: "unavailable" },
+  invitationActions = IDLE_INVITATION_ACTIONS,
+  invitationHandlers,
 }: PeopleScreenContentProps) {
   const { status, workspaceName, lists, adminHint } =
     describePeopleScreen(view);
   const format = dateFormat ?? peopleDateFormat();
+  const times = timeFormat ?? offerTimeFormat();
   const model =
     handlers === undefined ? undefined : describePeopleActions(view, now);
   const offer = model?.offer ?? null;
   const defineIn = model?.defineIn ?? null;
   const leave = model?.leave ?? null;
-  const inert = actions.running;
+  const inert = actions.running || invitationActions.running;
   const rowActions =
     model === undefined || handlers === undefined
       ? undefined
@@ -132,6 +196,23 @@ export function PeopleScreenContent({
     model !== undefined &&
     isOffered(model, actions.dialog.request)
       ? actions.dialog
+      : undefined;
+  const invitationModel =
+    invitationHandlers === undefined
+      ? null
+      : describeInvitations(view, invitations, now);
+  const invites =
+    invitationModel === null || invitationHandlers === undefined
+      ? undefined
+      : {
+          requests: invitationModel.invites,
+          inert,
+          onStart: invitationHandlers.onStart,
+        };
+  const invitationQuestion =
+    invitationActions.question !== undefined &&
+    isInvitationOffered(invitationModel, invitationActions.question)
+      ? invitationActions.question
       : undefined;
   return (
     <section aria-labelledby={PEOPLE_TITLE_ID}>
@@ -156,13 +237,22 @@ export function PeopleScreenContent({
           {actions.message ?? ""}
         </p>
       )}
+      {invitationHandlers === undefined ? null : (
+        <p
+          className="people-status"
+          id={INVITATION_ACTION_MESSAGE_ID}
+          role="status"
+        >
+          {invitationActions.message ?? ""}
+        </p>
+      )}
       {adminHint ? (
         <p className="people-hint">{PEOPLE_MESSAGES.adminHint}</p>
       ) : null}
       {offer === null || handlers === undefined ? null : (
         <OwnershipOffer
           offer={offer}
-          format={timeFormat ?? offerTimeFormat()}
+          format={times}
           inert={inert}
           onStart={handlers.onStart}
         />
@@ -174,6 +264,7 @@ export function PeopleScreenContent({
             labelledBy={PEOPLE_TITLE_ID}
             format={format}
             actions={rowActions}
+            invites={invites}
           />
           {defineIn === null || handlers === undefined ? null : (
             <DefinePersonForm
@@ -205,6 +296,15 @@ export function PeopleScreenContent({
           )}
         </>
       )}
+      {invitationModel === null || invitationHandlers === undefined ? null : (
+        <InvitationsPart
+          model={invitationModel}
+          format={times}
+          inert={inert}
+          onStart={invitationHandlers.onStart}
+          onRefresh={invitationHandlers.onRefresh}
+        />
+      )}
       {leave === null || handlers === undefined ? null : (
         <LeaveWorkspace
           request={leave}
@@ -221,6 +321,20 @@ export function PeopleScreenContent({
           onDraft={handlers.onDialogDraft}
         />
       )}
+      {invitationHandlers === undefined ? null : (
+        <>
+          <InvitationQuestionBox
+            question={invitationQuestion}
+            onConfirm={invitationHandlers.onConfirm}
+            onCancel={invitationHandlers.onCancel}
+          />
+          <InvitationCodeBox
+            code={invitationActions.code}
+            format={times}
+            onClose={invitationHandlers.onCloseCode}
+          />
+        </>
+      )}
     </section>
   );
 }
@@ -232,17 +346,27 @@ interface RowActions {
   readonly onStart: PeopleActionHandlers["onStart"];
 }
 
+/** "Invite" on the active unclaimed people of a list, by member ID. */
+interface RowInvites {
+  readonly requests: ReadonlyMap<string, InvitationActionRequest>;
+  readonly inert: boolean;
+  readonly onStart: InvitationActionHandlers["onStart"];
+}
+
 function PersonList({
   people,
   labelledBy,
   format,
   actions,
+  invites,
 }: {
   readonly people: readonly PersonRow[];
   readonly labelledBy: string;
   readonly format: Intl.DateTimeFormat;
   /** Undefined for the former members, and without the bridge. */
   readonly actions: RowActions | undefined;
+  /** Undefined for the former members, and without the invitation bridges. */
+  readonly invites?: RowInvites | undefined;
 }) {
   if (people.length === 0) {
     return null;
@@ -256,6 +380,7 @@ function PersonList({
           format={format}
           nameId={`${labelledBy}-person-${String(index)}`}
           actions={actions}
+          invites={invites}
         />
       ))}
     </ul>
@@ -267,20 +392,36 @@ function PersonItem({
   format,
   nameId,
   actions,
+  invites,
 }: {
   readonly person: PersonRow;
   readonly format: Intl.DateTimeFormat;
   /** The ID of the name, by the person's place in the list, for its buttons. */
   readonly nameId: string;
   readonly actions: RowActions | undefined;
+  readonly invites: RowInvites | undefined;
 }) {
   const { github } = person;
   const requests = actions?.requests.get(person.memberId);
   const acts = actions !== undefined && requests !== undefined;
+  const invite = invites?.requests.get(person.memberId);
+  // "Invite" comes first, in the same row as the people actions.
+  const inviteButton =
+    invites === undefined || invite === undefined ? null : (
+      <InviteButton
+        request={invite}
+        describedBy={nameId}
+        inert={invites.inert}
+        onStart={invites.onStart}
+      />
+    );
   return (
     <li className="person">
       <p className="person-name">
-        <span dir="auto" id={acts ? nameId : undefined}>
+        <span
+          dir="auto"
+          id={acts || inviteButton !== null ? nameId : undefined}
+        >
           {person.displayName}
         </span>
         {person.you ? (
@@ -304,13 +445,16 @@ function PersonItem({
           </time>
         </p>
       )}
-      {!acts ? null : (
+      {acts ? (
         <PersonActionButtons
           requests={requests}
           describedBy={nameId}
           inert={actions.inert}
           onStart={actions.onStart}
+          leading={inviteButton}
         />
+      ) : inviteButton === null ? null : (
+        <div className="account-actions">{inviteButton}</div>
       )}
     </li>
   );
