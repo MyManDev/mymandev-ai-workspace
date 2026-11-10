@@ -93,6 +93,7 @@ async function instance(t: TestContext) {
     events,
     account,
     failNextCommit: commits.failNextCommit,
+    failedCommits: commits.failedCommits,
   };
 }
 
@@ -952,7 +953,8 @@ test("removing the target ends the offer with account.removed_from_workspace and
 });
 
 test("a refused or rolled-back offer action sends no offer frame, and the same action, once it commits, reaches every connection of the target's and the owner's accounts and no other member's", async (t) => {
-  const { clock, events, account, failNextCommit } = await instance(t);
+  const { clock, events, account, failNextCommit, failedCommits } =
+    await instance(t);
   const ada = await account(3671);
   const adasDesktop = await signInDevice(ada.app);
   let bob = await account(3672);
@@ -1016,6 +1018,8 @@ test("a refused or rolled-back offer action sends no offer frame, and the same a
   failNextCommit();
   const offerRolledBack = await offer(ada, workspaceId, bobInTeam);
   assert.equal(offerRolledBack.statusCode, 500, offerRolledBack.body);
+  // The route's own transaction failed, not one that ran before it.
+  assert.deepEqual(failedCommits(), ["ownership-routes.ts"]);
   assert.equal((await view(ada, workspaceId)).ownershipOffer, null);
   await quiet(...all);
 
@@ -1038,6 +1042,7 @@ test("a refused or rolled-back offer action sends no offer frame, and the same a
     workspaceId,
   );
   assert.equal(withdrawRolledBack.statusCode, 500, withdrawRolledBack.body);
+  assert.deepEqual(failedCommits(), Array(2).fill("ownership-routes.ts"));
   assert.equal(
     (await view(ada, workspaceId)).ownershipOffer?.memberId,
     bobInTeam,
@@ -1071,6 +1076,7 @@ test("a refused or rolled-back offer action sends no offer frame, and the same a
   failNextCommit();
   const acceptRolledBack = await accept(bob, workspaceId);
   assert.equal(acceptRolledBack.statusCode, 500, acceptRolledBack.body);
+  assert.deepEqual(failedCommits(), Array(3).fill("ownership-routes.ts"));
   await quiet(...all);
   const expired = await accept(bob, workspaceId);
   assert.equal(errorCode(expired), "conflict", expired.body);

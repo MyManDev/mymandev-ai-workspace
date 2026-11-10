@@ -112,6 +112,7 @@ async function instance(t: TestContext) {
     delivered,
     account,
     failNextCommit: commits.failNextCommit,
+    failedCommits: commits.failedCommits,
   };
 }
 
@@ -620,7 +621,8 @@ test("the relay reads the owner and admins for each change: a demoted or removed
 });
 
 test("a refused or rolled-back change sends no join request event, and the same change sends one once it commits", async (t) => {
-  const { account, delivered, failNextCommit } = await instance(t);
+  const { account, delivered, failNextCommit, failedCommits } =
+    await instance(t);
   const ada = await account(3631);
   const cleo = await account(3632);
   const gus = await account(3633);
@@ -685,6 +687,11 @@ test("a refused or rolled-back change sends no join request event, and the same 
     const response = await change();
     assert.equal(response.statusCode, 500, response.body);
   }
+  // Each route's own transaction failed, not one that ran before it.
+  assert.deepEqual(
+    failedCommits(),
+    Array(rolledBack.length).fill("join-request-routes.ts"),
+  );
   assert.deepEqual(await approversList(ada, team.workspaceId), before);
   assert.deepEqual(await people(), peopleBefore);
   const halRequests = await database()
@@ -718,7 +725,8 @@ test("a refused or rolled-back change sends no join request event, and the same 
 });
 
 test("lifting a block reaches every connection subscribed as the owner or an admin as workspace.join_request.unblocked, and no member, blocked account, demoted admin, or other workspace; a refused or rolled-back unblock sends nothing", async (t) => {
-  const { account, delivered, failNextCommit } = await instance(t);
+  const { account, delivered, failNextCommit, failedCommits } =
+    await instance(t);
   const ada = await account(3651);
   // The second devices sign in before any device connects.
   const adaPhone = await signInDevice(ada.app);
@@ -836,6 +844,7 @@ test("lifting a block reaches every connection subscribed as the owner or an adm
     "unblock",
   );
   assert.equal(rolledBack.statusCode, 500, rolledBack.body);
+  assert.deepEqual(failedCommits(), ["join-request-routes.ts"]);
   assert.equal(await unblockedAt(ivyRequest.id), null);
   assert.deepEqual(await blocksShown(), bothBlocks);
   await quiet(...everyone);

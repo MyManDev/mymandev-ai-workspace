@@ -224,7 +224,8 @@ export interface WorkspaceService {
    * null: none, or not loaded yet. A transfer to its target and the
    * target's removal end it at once; an offer, its withdrawal, and its
    * expiry show after the next reload, which the account frames of the
-   * offer's target and `reload` begin. It may be past its `expiresAt`.
+   * offer (the target's and the owner's) and `reload` begin. It may be past
+   * its `expiresAt`.
    */
   readonly ownershipOffer: () => OwnershipOfferState | null;
   /**

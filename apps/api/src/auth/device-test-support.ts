@@ -62,12 +62,30 @@ export function useTestDatabase(): () => Database {
 type AnyFunction = (...args: unknown[]) => unknown;
 
 /**
+ * The base name of the source file that called the function whose stack
+ * this is: the first frame outside this file, or `unknown`.
+ */
+function callerFile(stack: string | undefined): string {
+  for (const line of (stack ?? "").split("\n").slice(1)) {
+    const file = /([^\\/\s(]+\.ts):\d+:\d+\)?$/.exec(line.trim())?.[1];
+    if (file !== undefined && file !== "device-test-support.ts") {
+      return file;
+    }
+  }
+  return "unknown";
+}
+
+/**
  * `target` behind a proxy whose next transaction, after `failNextCommit`,
  * rolls back after its callback succeeded, as a commit that fails does: the
- * change and every read in it ran, and nothing committed.
+ * change and every read in it ran, and nothing committed. `failedCommits`
+ * names, for each transaction that it failed, the source file that started
+ * it, so that a test can check that the route's own transaction rolled back
+ * and not another one that ran first, such as one of a middleware.
  */
 export function failingCommits(target: Database) {
   let failNext = false;
+  const failed: string[] = [];
   const proxy = new Proxy(target, {
     get(object, property) {
       const value: unknown = Reflect.get(object, property, object);
@@ -78,19 +96,22 @@ export function failingCommits(target: Database) {
       if (property !== "transaction") {
         return method.bind(object);
       }
-      return (run: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) =>
-        method.call(
+      return (run: (tx: unknown) => Promise<unknown>, ...rest: unknown[]) => {
+        const startedIn = callerFile(new Error().stack);
+        return method.call(
           object,
           async (tx: unknown) => {
             const result = await run(tx);
             if (failNext) {
               failNext = false;
+              failed.push(startedIn);
               throw new Error("the commit failed");
             }
             return result;
           },
           ...rest,
         );
+      };
     },
   });
   return {
@@ -98,6 +119,8 @@ export function failingCommits(target: Database) {
     failNextCommit: () => {
       failNext = true;
     },
+    /** The files that started the failed transactions, the oldest first. */
+    failedCommits: (): readonly string[] => [...failed],
   };
 }
 
