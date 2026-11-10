@@ -1374,6 +1374,9 @@ test("the account frames of an ownership offer reload the selected workspace, an
   const h = await withList();
   h.receive(subscribed());
   await h.answerReload(ok(offerView(null)));
+  // This device is the owner's, whose account gets the frames too (#241);
+  // the offer names another person, and the target's devices reload alike.
+  expect(h.service.ownMemberId(WS_A)).toBe(OWNER);
 
   h.receive(offerFrame("account.ownership_offered"));
   expect(h.readNames().sort()).toEqual(["getWorkspace", "listProjects"]);
