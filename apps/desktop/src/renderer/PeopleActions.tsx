@@ -14,7 +14,6 @@ import {
   describePeopleActionQuestion,
   focusesTitleAfterClose,
   IDLE_PEOPLE_ACTIONS,
-  MAX_PERSON_NAME_LENGTH,
   nextPeopleActionsChange,
   PEOPLE_ACTION_LABELS,
   PEOPLE_ACTION_MESSAGES,
@@ -178,7 +177,9 @@ function formatTime(timestamp: string, format: Intl.DateTimeFormat): string {
  * and "Add person". The field is described by its hint and by its own
  * alert, which says why a name was not sent; the results go to the status
  * paragraph of the actions. While an action runs, the field keeps its text
- * and the button does nothing.
+ * and the button does nothing. Neither name field has a `maxLength`: HTML
+ * counts it in UTF-16 code units, while the limit of a name counts
+ * characters (code points), so `namePrompt` alone checks the length.
  */
 export function DefinePersonForm({
   workspaceId,
@@ -223,7 +224,6 @@ export function DefinePersonForm({
         dir="auto"
         autoComplete="off"
         spellCheck={false}
-        maxLength={MAX_PERSON_NAME_LENGTH}
         value={draft}
         aria-invalid={problem === undefined ? undefined : "true"}
         aria-describedby="define-person-hint define-person-problem"
@@ -368,7 +368,6 @@ export function PeopleActionDialogContent({
               dir="auto"
               autoComplete="off"
               spellCheck={false}
-              maxLength={MAX_PERSON_NAME_LENGTH}
               value={dialog.draft}
               aria-invalid={dialog.problem === undefined ? undefined : "true"}
               aria-describedby="people-dialog-problem"
