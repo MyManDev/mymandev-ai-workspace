@@ -13,9 +13,14 @@
 //   invitations load again after each `workspace.subscribed` of the
 //   selected workspace, on each `workspace.member.claimed` of it (a claim
 //   consumes an invitation), and after an invitation action (`reload`), as
-//   D3 asks. The screen's request is refused within
-//   `INVITATION_LOAD_COOLDOWN_MS` of the last one that loaded, so that a
-//   renderer that misbehaves cannot read the API in a loop.
+//   D3 asks. The Project Manager's decision of 2026-11-10 adds the events
+//   of the selected workspace that revoke invitations on the server (ADR
+//   0014): `workspace.member.removed`, which a removal and a leave send,
+//   and `workspace.member.role_changed` to `member`, a demotion; never
+//   those of the account's own person, whose demotion drops the list and
+//   whose removal ends the membership. The screen's request is refused
+//   within `INVITATION_LOAD_COOLDOWN_MS` of the last one that loaded, so
+//   that a renderer that misbehaves cannot read the API in a loop.
 // - Reloads are merged like the workspace service's `reload`: while a load
 //   is on its way, one more follows its answer, which is dropped, however
 //   many triggers came; while a retry waits out its backoff, the retry
@@ -34,6 +39,7 @@ import type {
   InvitationId,
   InvitationListResponse,
   MemberId,
+  ReceivedServerEvent,
   WorkspaceId,
 } from "@mymandev/protocol";
 import type {
@@ -459,15 +465,47 @@ export function createInvitationService(
     }
   }
 
+  /**
+   * Whether an event of the selected workspace revokes or consumes some of
+   * its live invitations, so that they load again. An event about the
+   * account's own person counts for nothing: a demotion drops the list once
+   * the workspace service shows it (`follow`), and a removal ends the
+   * membership, so nothing is read for it, also before the workspace
+   * service applied the event.
+   */
+  function changesInvitations(event: ReceivedServerEvent): boolean {
+    switch (event.type) {
+      case "workspace.member.claimed":
+        // A claim consumes the person's invitation.
+        return true;
+      case "workspace.member.removed":
+        // A removal or a leave revokes the person's invitation and the
+        // invitations that the person created.
+        return !isOwnPerson(event.payload.memberId);
+      case "workspace.member.role_changed":
+        // A demotion revokes the invitations that the admin created; a
+        // promotion revokes nothing.
+        return (
+          event.payload.role === "member" &&
+          !isOwnPerson(event.payload.memberId)
+        );
+      default:
+        return false;
+    }
+  }
+
+  function isOwnPerson(memberId: MemberId): boolean {
+    return selected !== null && workspaces.ownMemberId(selected) === memberId;
+  }
+
   function messageReceived(message: ServerMessage): void {
     if (selected === null) {
       return;
     }
     if (message.kind === "event") {
-      // A claim consumes the person's invitation.
       if (
-        message.event.type === "workspace.member.claimed" &&
-        message.event.workspaceId === selected
+        message.event.workspaceId === selected &&
+        changesInvitations(message.event)
       ) {
         reloadSelected();
       }

@@ -351,10 +351,11 @@ function start(): void {
 
   // The selected workspace's live invitations (#95, D3), for its owner and
   // admins only, read over HTTP once the screen asked and again after
-  // `workspace.subscribed`, a claim, and an invitation action. The API's
-  // list holds no invitation code. They reach the renderer with their
-  // creators' names resolved in the main process, at most one publish every
-  // 50 ms. The logs are fixed text with a failure code at most.
+  // `workspace.subscribed`, a claim, a removal or a leave, a demotion to
+  // member, and an invitation action. The API's list holds no invitation
+  // code. They reach the renderer with their creators' names resolved in the
+  // main process, at most one publish every 50 ms. The logs are fixed text
+  // with a failure code at most.
   const invitations = createInvitationService({
     account,
     connection,
