@@ -238,6 +238,30 @@ function claimed(workspaceId: WorkspaceId = WORKSPACE): ServerMessage {
   );
 }
 
+/** A person was removed or left; the server sends the same event for both. */
+function removed(
+  memberId: MemberId,
+  workspaceId: WorkspaceId = WORKSPACE,
+): ServerMessage {
+  return membershipEvent(
+    "workspace.member.removed",
+    { memberId, removedAt: AT },
+    workspaceId,
+  );
+}
+
+function roleChanged(
+  memberId: MemberId,
+  role: "admin" | "member",
+  workspaceId: WorkspaceId = WORKSPACE,
+): ServerMessage {
+  return membershipEvent(
+    "workspace.member.role_changed",
+    { memberId, role },
+    workspaceId,
+  );
+}
+
 function list(...ids: readonly InvitationId[]): ListResult {
   return listIn(WORKSPACE, ...ids);
 }
@@ -549,11 +573,159 @@ test("after the screen asked, workspace.subscribed and a claim of the selected w
   expect(live.account.reads).toHaveLength(4);
 });
 
+test("a removal or a leave of another person in the selected workspace loads again, because it revokes the person's invitations", async () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OWN, "owner"), person(OTHER, "admin")],
+  });
+  live.service.load();
+  live.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+
+  live.connection.receive(removed(OTHER));
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list());
+  await settle();
+  expect(live.service.state()).toMatchObject({
+    status: "ready",
+    invitations: [],
+  });
+});
+
+test("a demotion of another admin in the selected workspace loads again, because it revokes the admin's invitations", async () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OWN, "owner"), person(OTHER, "admin")],
+  });
+  live.service.load();
+  live.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+
+  live.connection.receive(roleChanged(OTHER, "member"));
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list());
+  await settle();
+  expect(live.service.state()).toMatchObject({
+    status: "ready",
+    invitations: [],
+  });
+});
+
+test("a promotion to admin is no trigger: another person's reads nothing, and the account's own loads once, by its role", async () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OWN, "owner"), person(OTHER, "member")],
+  });
+  live.service.load();
+  live.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+  live.connection.receive(roleChanged(OTHER, "admin"));
+  await settle();
+  expect(live.account.reads).toHaveLength(1);
+
+  // The account's own promotion loads once its role shows, as before; the
+  // event that the workspace service applied adds no read.
+  const own = setup();
+  own.workspaces.set({ people: [person(OWN, "member")] });
+  own.service.load();
+  own.workspaces.set({ people: [person(OWN, "admin")] });
+  own.connection.receive(roleChanged(OWN, "admin"));
+  expect(own.account.reads).toHaveLength(1);
+  own.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+  expect(own.account.reads).toHaveLength(1);
+  expect(own.service.state().status).toBe("ready");
+});
+
+test("a removal or a demotion of another workspace reads nothing", async () => {
+  const live = setup();
+  live.service.load();
+  live.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+
+  live.connection.receive(removed(OTHER, OTHER_WORKSPACE));
+  live.connection.receive(roleChanged(OTHER, "member", OTHER_WORKSPACE));
+  await settle();
+  expect(live.account.reads).toHaveLength(1);
+});
+
+test("before the screen asked, a removal and a demotion read nothing", () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OWN, "owner"), person(OTHER, "admin")],
+  });
+  live.connection.receive(roleChanged(OTHER, "member"));
+  live.connection.receive(removed(OTHER));
+  expect(live.account.reads).toEqual([]);
+});
+
+test("the demotion of the account's own person drops the list and reads nothing, also when the event comes before the workspace service shows it", async () => {
+  // The event first, while the people still show the account's own admin,
+  // as when the workspace service holds events back during its reload.
+  const early = setup();
+  early.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+  });
+  early.service.load();
+  early.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+  early.connection.receive(roleChanged(OWN, "member"));
+  expect(early.account.reads).toHaveLength(1);
+  early.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+  });
+  expect(early.service.state()).toMatchObject({
+    status: "not_allowed",
+    invitations: [],
+  });
+  expect(early.account.reads).toHaveLength(1);
+
+  // The workspace service first, as it listens to the connection first.
+  const late = setup();
+  late.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+  });
+  late.service.load();
+  late.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+  late.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+  });
+  late.connection.receive(roleChanged(OWN, "member"));
+  expect(late.service.state()).toMatchObject({
+    status: "not_allowed",
+    invitations: [],
+  });
+  expect(late.account.reads).toHaveLength(1);
+});
+
+test("the removal of the account's own person reads nothing for the workspace it lost", async () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+  });
+  live.service.load();
+  live.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+  live.connection.receive(removed(OWN));
+  expect(live.account.reads).toHaveLength(1);
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin", AT)],
+  });
+  expect(live.service.state()).toMatchObject({
+    status: "not_allowed",
+    invitations: [],
+  });
+  expect(live.account.reads).toHaveLength(1);
+});
+
 test("triggers while a load is on its way merge into one more load, and the older answer is dropped", async () => {
   const live = setup();
   live.service.load();
   live.connection.receive(subscribed());
   live.connection.receive(claimed());
+  live.connection.receive(removed(OTHER));
+  live.connection.receive(roleChanged(INVITEE, "member"));
   expect(live.service.reload(WORKSPACE)).toBe(true);
   expect(live.account.reads).toHaveLength(1);
 
@@ -590,6 +762,8 @@ test("a failed load keeps what was loaded, shows the problem, and is retried wit
   // Triggers wait for the retry, which reads everything.
   live.connection.receive(subscribed());
   live.connection.receive(claimed());
+  live.connection.receive(removed(OTHER));
+  live.connection.receive(roleChanged(INVITEE, "member"));
   expect(live.service.reload(WORKSPACE)).toBe(true);
   expect(live.account.reads).toHaveLength(2);
 
