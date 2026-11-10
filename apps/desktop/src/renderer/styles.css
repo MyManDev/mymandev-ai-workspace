@@ -892,6 +892,77 @@ code {
   font-size: var(--font-size-base);
 }
 
+/* The live ownership offer; a long name wraps. */
+.people-offer {
+  margin-block: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-surface);
+  overflow-wrap: anywhere;
+}
+
+.people-offer p {
+  margin: 0;
+}
+
+.people-form {
+  display: grid;
+  gap: var(--space-2);
+  max-width: var(--size-dialog);
+  margin-block-start: var(--space-4);
+}
+
+.people-form h3,
+.people-form p {
+  margin: 0;
+}
+
+.people-leave {
+  margin-block-start: var(--space-4);
+}
+
+/* The question before a people action; a long name wraps. */
+.people-dialog {
+  max-width: var(--size-dialog);
+  padding: var(--space-4);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+  background: var(--color-background);
+  color: var(--color-text);
+  overflow-wrap: anywhere;
+}
+
+.people-dialog::backdrop {
+  background: var(--color-backdrop);
+}
+
+.people-dialog form {
+  display: grid;
+  gap: var(--space-2);
+}
+
+.people-dialog h2 {
+  margin: 0;
+  font-size: var(--font-size-heading);
+}
+
+.people-dialog p {
+  margin: 0;
+}
+
+.people-dialog-name {
+  font-weight: var(--font-weight-strong);
+}
+
+.people-dialog-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-block-start: var(--space-2);
+}
+
 /* Agents and runs */
 
 /* The live region of the agent panel stays in place and takes no room while empty. */
