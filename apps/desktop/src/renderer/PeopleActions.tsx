@@ -4,6 +4,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
   type RefObject,
 } from "react";
 import type { PeopleActionsBridge } from "../shared/desktop-bridge.ts";
@@ -84,21 +85,27 @@ function ActionButton({
   );
 }
 
-/** The actions on one person, each described by the person's name. */
+/**
+ * The actions on one person, each described by the person's name, after
+ * `leading`, the person's other buttons, such as "Invite".
+ */
 export function PersonActionButtons({
   requests,
   describedBy,
   inert,
   onStart,
+  leading,
 }: {
   readonly requests: readonly PeopleActionRequest[];
   /** The ID of the person's name. */
   readonly describedBy: string;
   readonly inert: boolean;
   readonly onStart: PeopleActionHandlers["onStart"];
+  readonly leading?: ReactNode;
 }) {
   return (
     <div className="account-actions">
+      {leading}
       {requests.map((request) => (
         <ActionButton
           key={request.kind}
