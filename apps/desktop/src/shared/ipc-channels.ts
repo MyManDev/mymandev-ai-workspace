@@ -138,6 +138,36 @@ export const INVOKE_CHANNELS = Object.freeze({
   /** Accepts the live ownership offer to the account's person, by the workspace ID. */
   acceptOwnershipOffer: "people:accept-offer",
   /**
+   * What the renderer may know of the selected workspace's live
+   * invitations, for its owner and admins only: each invitation's ID, its
+   * person's member ID, its creator's display name, and its times. Never an
+   * invitation code.
+   */
+  getInvitationState: "invitations:get-state",
+  /**
+   * The live invitations. The calling frame then receives every later state
+   * on `EVENT_CHANNELS.invitationStateChanged`.
+   */
+  subscribeInvitationState: "invitations:subscribe-state",
+  /**
+   * Loads the live invitations again, when the screen opens and on the
+   * person's refresh; not within a few seconds of the last time. The
+   * renderer sends nothing.
+   */
+  loadInvitations: "invitations:load",
+  /**
+   * Creates an invitation for an unclaimed person of the selected
+   * workspace, by the workspace ID, the person's member ID, and a lifetime
+   * or null. The answer carries the invitation code once.
+   */
+  createInvitation: "invitations:create",
+  /** Revokes a live invitation, by the workspace ID and the invitation ID. */
+  revokeInvitation: "invitations:revoke",
+  /** Shows what a pasted invitation code claims, without consuming it. */
+  previewInvitation: "invitations:preview",
+  /** Accepts a pasted invitation code and claims its person. */
+  acceptInvitation: "invitations:accept",
+  /**
    * What the renderer may know of the open project's agent activity: its
    * agents with their owners' names, and its newest runs. Read-only.
    */
@@ -226,6 +256,11 @@ export const EVENT_CHANNELS = Object.freeze({
    * 50 ms, to the frames that subscribed.
    */
   peopleStateChanged: "people:state-changed",
+  /**
+   * The live invitations of the selected workspace after changes, at most
+   * one every 50 ms, to the frames that subscribed.
+   */
+  invitationStateChanged: "invitations:state-changed",
   /**
    * The agent activity after changes, at most one every 50 ms, to the
    * frames that subscribed.

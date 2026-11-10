@@ -244,6 +244,14 @@ export interface WorkspaceService {
    */
   readonly reload: (workspaceId: WorkspaceId) => boolean;
   /**
+   * Loads the workspace list again, for a membership that no account frame
+   * reports, such as one that an accepted invitation began (#95). It is
+   * merged with the other triggers of the list: a load on its way drops its
+   * answer and loads again. False, with nothing read, without a signed-in
+   * device.
+   */
+  readonly reloadList: () => boolean;
+  /**
    * Whether `workspaceId` is the selected workspace, subscribed, and
    * reloaded since its last `workspace.subscribed`, with no reload open. The
    * chat and agent services and the development switch send events for a
@@ -1109,6 +1117,14 @@ export function createWorkspaceService(
     unclaimedMemberLimit: () => unclaimedMemberLimit,
     reload: (workspaceId: WorkspaceId) =>
       run(() => !closed && device !== null && reloadSelected(workspaceId)),
+    reloadList: () =>
+      run(() => {
+        if (closed || device === null) {
+          return false;
+        }
+        loadList();
+        return true;
+      }),
     memberName: (memberId: MemberId) =>
       members.get(memberId)?.displayName ?? UNKNOWN_MEMBER_NAME,
     people: () => {

@@ -34,13 +34,23 @@ import {
   DEVICE_LIST_STATUSES,
   DEVICE_PLATFORMS,
   DEVICE_STATES,
+  AcceptInvitationResultSchema,
+  CreateInvitationResultSchema,
   DefinePersonResultSchema,
   DeviceListLoadResultSchema,
   DeviceListViewSchema,
   EVENT_CONTRACT,
   FORGET_REFUSALS,
   ForgetResultSchema,
+  INVITATION_ACTION_REFUSALS,
+  INVITATION_LIMITS,
+  INVITATION_LOAD_REFUSALS,
+  INVITATION_STATUSES,
+  InvitationCodeTextSchema,
+  InvitationLoadResultSchema,
+  InvitationsViewSchema,
   INVOKE_CONTRACT,
+  JOIN_INVITATION_REFUSALS,
   LIFT_REGISTRATION_LOCK_REFUSALS,
   LiftRegistrationLockResultSchema,
   MAX_WAITING_CHAT_MESSAGES,
@@ -54,6 +64,7 @@ import {
   PERSON_ROLES,
   PersonActionResultSchema,
   PersonNameSchema,
+  PreviewInvitationResultSchema,
   ProtocolIdSchema,
   RECONNECT_REFUSALS,
   ReconnectResultSchema,
@@ -61,6 +72,7 @@ import {
   REPOSITORY_PROBLEMS,
   RemoveDeviceResultSchema,
   RepositoryListSchema,
+  RevokeInvitationResultSchema,
   REVOKE_DEVICE_REFUSALS,
   RevokeOtherDeviceResultSchema,
   RUNTIME_STATES,
@@ -137,6 +149,11 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     DEVICE_LIST_PROBLEMS,
     DEVICE_LIST_LOAD_REFUSALS,
     DEVICE_PLATFORMS,
+    INVITATION_LIMITS,
+    INVITATION_STATUSES,
+    INVITATION_LOAD_REFUSALS,
+    INVITATION_ACTION_REFUSALS,
+    JOIN_INVITATION_REFUSALS,
   ]) {
     expect(Object.isFrozen(list)).toBe(true);
   }
@@ -201,7 +218,15 @@ const PEOPLE_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.acceptOwnershipOffer,
 ]);
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, and the people actions take no arguments and refuse any", () => {
+/** The invitation action channels, which take IDs, a lifetime, or a code. */
+const INVITATION_ACTION_CHANNELS: ReadonlySet<string> = new Set([
+  INVOKE_CHANNELS.createInvitation,
+  INVOKE_CHANNELS.revokeInvitation,
+  INVOKE_CHANNELS.previewInvitation,
+  INVOKE_CHANNELS.acceptInvitation,
+]);
+
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, and the invitation actions take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -214,9 +239,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.discardChatMessage &&
       channel !== INVOKE_CHANNELS.dismissNewDevices &&
       channel !== INVOKE_CHANNELS.revokeDevice &&
-      !PEOPLE_ACTION_CHANNELS.has(channel),
+      !PEOPLE_ACTION_CHANNELS.has(channel) &&
+      !INVITATION_ACTION_CHANNELS.has(channel),
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 19);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 23);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -2412,4 +2438,344 @@ test("the results of send, retry, discard, and load-older hold only fixed values
     expect(result.parse(true)).toBe(true);
     expect(result.safeParse("true").success).toBe(false);
   }
+});
+
+// The invitations (#95).
+
+/** A valid invitation code of the protocol. */
+const INVITATION_CODE = `mmdi_${"Inv1tat10nC0de-_".repeat(3).slice(0, 42)}Q`;
+const INVITATION_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000e1";
+
+function invitationsView(overrides: Record<string, unknown> = {}) {
+  return {
+    status: "ready",
+    revision: 2,
+    workspaceId: WORKSPACE_ID,
+    invitations: [
+      {
+        invitationId: INVITATION_ID,
+        memberId: PERSON_ID,
+        creatorName: "Ada Owner",
+        createdAt: VERIFIED_AT,
+        expiresAt: VERIFIED_AT,
+      },
+    ],
+    ...overrides,
+  };
+}
+
+test("an invitations view with every status and problem is accepted and frozen, with a problem only while unavailable", () => {
+  for (const status of INVITATION_STATUSES) {
+    if (status === "unavailable") {
+      for (const problem of WORKSPACE_PROBLEMS) {
+        const value = invitationsView({ status, problem });
+        expect(InvitationsViewSchema.parse(value)).toEqual(value);
+      }
+      expect(
+        InvitationsViewSchema.safeParse(invitationsView({ status })).success,
+      ).toBe(false);
+    } else {
+      const value = invitationsView({ status });
+      expect(InvitationsViewSchema.parse(value), status).toEqual(value);
+      expect(
+        InvitationsViewSchema.safeParse(
+          invitationsView({ status, problem: "failed" }),
+        ).success,
+      ).toBe(true);
+    }
+  }
+  const parsed = InvitationsViewSchema.parse(invitationsView());
+  expect(Object.isFrozen(parsed.invitations)).toBe(true);
+});
+
+test("an invitations view drops unknown keys at every level, so no code, user ID, or creator's member ID crosses", () => {
+  const parsed = InvitationsViewSchema.parse(
+    invitationsView({
+      code: INVITATION_CODE,
+      userId: PERSON_USER_ID,
+      invitations: [
+        {
+          invitationId: INVITATION_ID,
+          memberId: PERSON_ID,
+          creatorName: "Ada Owner",
+          createdAt: VERIFIED_AT,
+          expiresAt: VERIFIED_AT,
+          code: INVITATION_CODE,
+          createdByMemberId: OTHER_PERSON_ID,
+          userId: PERSON_USER_ID,
+        },
+      ],
+    }),
+  );
+  expect(parsed).toEqual(invitationsView());
+  const text = JSON.stringify(parsed);
+  for (const hidden of [INVITATION_CODE, PERSON_USER_ID, OTHER_PERSON_ID]) {
+    expect(text).not.toContain(hidden);
+  }
+});
+
+test("an invitations view over the limits or with wrong values is refused", () => {
+  const item = invitationsView().invitations[0];
+  for (const value of [
+    invitationsView({ status: "busy" }),
+    invitationsView({ revision: -1 }),
+    invitationsView({ workspaceId: "workspace" }),
+    invitationsView({ invitations: null }),
+    invitationsView({
+      invitations: Array.from(
+        { length: INVITATION_LIMITS.invitations + 1 },
+        () => item,
+      ),
+    }),
+    invitationsView({ invitations: [{ ...item, invitationId: "x" }] }),
+    invitationsView({ invitations: [{ ...item, memberId: MOUNT_ID }] }),
+    invitationsView({ invitations: [{ ...item, creatorName: "" }] }),
+    invitationsView({
+      invitations: [
+        {
+          ...item,
+          creatorName: "a".repeat(INVITATION_LIMITS.displayName + 1),
+        },
+      ],
+    }),
+    invitationsView({ invitations: [{ ...item, createdAt: "yesterday" }] }),
+    invitationsView({ invitations: [{ ...item, expiresAt: null }] }),
+    invitationsView({ status: "unavailable", problem: "secret" }),
+  ]) {
+    expect(InvitationsViewSchema.safeParse(value).success).toBe(false);
+  }
+  expect(
+    InvitationsViewSchema.safeParse(
+      invitationsView({
+        invitations: Array.from(
+          { length: INVITATION_LIMITS.invitations },
+          () => item,
+        ),
+      }),
+    ).success,
+  ).toBe(true);
+});
+
+test("the invitations' get, subscribe, and load take no argument, and load answers loading or a fixed refusal", () => {
+  for (const channel of [
+    INVOKE_CHANNELS.getInvitationState,
+    INVOKE_CHANNELS.subscribeInvitationState,
+    INVOKE_CHANNELS.loadInvitations,
+  ]) {
+    expect(INVOKE_CONTRACT[channel].args.parse([])).toEqual([]);
+    expect(
+      INVOKE_CONTRACT[channel].args.safeParse([WORKSPACE_ID]).success,
+    ).toBe(false);
+  }
+  expect(INVOKE_CONTRACT[INVOKE_CHANNELS.loadInvitations].result).toBe(
+    InvitationLoadResultSchema,
+  );
+  expect(EVENT_CONTRACT[EVENT_CHANNELS.invitationStateChanged]).toBe(
+    InvitationsViewSchema,
+  );
+  expect(InvitationLoadResultSchema.parse({ outcome: "loading" })).toEqual({
+    outcome: "loading",
+  });
+  for (const reason of INVITATION_LOAD_REFUSALS) {
+    expect(
+      InvitationLoadResultSchema.parse({ outcome: "refused", reason }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const value of [
+    { outcome: "loaded" },
+    { outcome: "refused", reason: "busy" },
+    { outcome: "refused" },
+    null,
+  ]) {
+    expect(InvitationLoadResultSchema.safeParse(value).success).toBe(false);
+  }
+});
+
+test("create takes two IDs and a lifetime of 1 hour to 7 days or null, revoke two IDs, and preview and accept exactly one invitation code", () => {
+  const create = INVOKE_CONTRACT[INVOKE_CHANNELS.createInvitation].args;
+  const revoke = INVOKE_CONTRACT[INVOKE_CHANNELS.revokeInvitation].args;
+  for (const lifetime of [null, 3_600, 86_400, 604_800]) {
+    const valid = [WORKSPACE_ID, PERSON_ID, lifetime];
+    expect(create.parse(valid)).toEqual(valid);
+  }
+  for (const value of [
+    [WORKSPACE_ID, PERSON_ID],
+    [WORKSPACE_ID, PERSON_ID, undefined],
+    [WORKSPACE_ID, PERSON_ID, null, null],
+    [WORKSPACE_ID, PERSON_ID, 3_599],
+    [WORKSPACE_ID, PERSON_ID, 604_801],
+    [WORKSPACE_ID, PERSON_ID, 3_600.5],
+    [WORKSPACE_ID, PERSON_ID, "3600"],
+    [WORKSPACE_ID, "member", null],
+    [WORKSPACE_ID.toUpperCase(), PERSON_ID, null],
+    [],
+  ]) {
+    expect(create.safeParse(value).success, JSON.stringify(value)).toBe(false);
+  }
+  expect(revoke.parse([WORKSPACE_ID, INVITATION_ID])).toEqual([
+    WORKSPACE_ID,
+    INVITATION_ID,
+  ]);
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(revoke.safeParse([WORKSPACE_ID, value]).success).toBe(false);
+    expect(revoke.safeParse([value, INVITATION_ID]).success).toBe(false);
+  }
+  expect(
+    revoke.safeParse([WORKSPACE_ID, INVITATION_ID, INVITATION_ID]).success,
+  ).toBe(false);
+
+  for (const channel of [
+    INVOKE_CHANNELS.previewInvitation,
+    INVOKE_CHANNELS.acceptInvitation,
+  ]) {
+    const { args } = INVOKE_CONTRACT[channel];
+    expect(args.parse([INVITATION_CODE])).toEqual([INVITATION_CODE]);
+    for (const value of [
+      [],
+      [INVITATION_CODE, INVITATION_CODE],
+      [` ${INVITATION_CODE}`],
+      [`${INVITATION_CODE} `],
+      [INVITATION_CODE.toUpperCase()],
+      [INVITATION_CODE.slice(0, -1)],
+      [`${INVITATION_CODE.slice(0, -1)}R`],
+      [`mmdc_${INVITATION_CODE.slice(5)}`],
+      [""],
+      [1],
+      [null],
+      [{ code: INVITATION_CODE }],
+    ]) {
+      expect(args.safeParse(value).success, channel).toBe(false);
+    }
+  }
+});
+
+test("a refused code is not repeated in the error, and a long text is refused with one issue", () => {
+  for (const text of [
+    `${INVITATION_CODE} `,
+    INVITATION_CODE.toUpperCase(),
+    `${INVITATION_CODE}${"x".repeat(100_000)}`,
+  ]) {
+    const result = INVOKE_CONTRACT[
+      INVOKE_CHANNELS.acceptInvitation
+    ].args.safeParse([text]);
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result.error?.issues)).not.toContain(
+      INVITATION_CODE.slice(5, 20),
+    );
+    expect(JSON.stringify(result.error?.issues)).not.toContain(
+      INVITATION_CODE.toUpperCase().slice(5, 20),
+    );
+  }
+  const long = InvitationCodeTextSchema.safeParse("x".repeat(100_000));
+  expect(long.error?.issues).toHaveLength(1);
+});
+
+test("an invitation action answers ok with its own fields, refused with a known reason and a wait only for a wait, or unknown", () => {
+  const waits = new Set(["too_soon", "rate_limited"]);
+  const cases = [
+    [
+      INVOKE_CHANNELS.createInvitation,
+      CreateInvitationResultSchema,
+      INVITATION_ACTION_REFUSALS,
+      {
+        outcome: "ok",
+        invitationId: INVITATION_ID,
+        code: INVITATION_CODE,
+        expiresAt: VERIFIED_AT,
+      },
+    ],
+    [
+      INVOKE_CHANNELS.revokeInvitation,
+      RevokeInvitationResultSchema,
+      INVITATION_ACTION_REFUSALS,
+      { outcome: "ok" },
+    ],
+    [
+      INVOKE_CHANNELS.previewInvitation,
+      PreviewInvitationResultSchema,
+      JOIN_INVITATION_REFUSALS,
+      {
+        outcome: "ok",
+        workspaceName: "Workspace Alpha",
+        displayName: "Grace Invitee",
+        inviterName: "Ada Owner",
+        inviterLogin: "octocat",
+        inviterVerifiedAt: VERIFIED_AT,
+        expiresAt: VERIFIED_AT,
+      },
+    ],
+    [
+      INVOKE_CHANNELS.acceptInvitation,
+      AcceptInvitationResultSchema,
+      JOIN_INVITATION_REFUSALS,
+      {
+        outcome: "ok",
+        workspaceId: WORKSPACE_ID,
+        workspaceName: "Workspace Alpha",
+      },
+    ],
+  ] as const;
+  for (const [channel, schema, refusals, ok] of cases) {
+    expect(INVOKE_CONTRACT[channel].result).toBe(schema);
+    expect(schema.parse(ok)).toEqual(ok);
+    expect(schema.parse({ outcome: "unknown" })).toEqual({
+      outcome: "unknown",
+    });
+    for (const reason of refusals) {
+      const retryAfterMs = waits.has(reason) ? 1_500 : null;
+      const value = { outcome: "refused", reason, retryAfterMs };
+      expect(schema.parse(value), reason).toEqual(value);
+      expect(
+        schema.safeParse({
+          ...value,
+          retryAfterMs: retryAfterMs === null ? 1_500 : null,
+        }).success,
+        reason,
+      ).toBe(false);
+    }
+    for (const value of [
+      null,
+      {},
+      { outcome: "refused", reason: "busy", retryAfterMs: null },
+      { outcome: "refused", reason: "forbidden", retryAfterMs: null },
+      { outcome: "refused", reason: "too_soon", retryAfterMs: 0 },
+      { outcome: "failed" },
+    ]) {
+      expect(schema.safeParse(value).success, channel).toBe(false);
+    }
+    // Unknown keys are dropped, so no user ID or other value crosses.
+    expect(
+      schema.parse({
+        ...ok,
+        userId: PERSON_USER_ID,
+        member: { id: PERSON_ID },
+      }),
+    ).toEqual(ok);
+  }
+  // Only a create's answer holds a code, and only a valid one.
+  for (const code of [
+    undefined,
+    "",
+    `${INVITATION_CODE} `,
+    INVITATION_CODE.slice(0, -1),
+  ]) {
+    expect(
+      CreateInvitationResultSchema.safeParse({ ...cases[0][3], code }).success,
+    ).toBe(false);
+  }
+  expect(
+    PreviewInvitationResultSchema.parse({
+      ...cases[2][3],
+      code: INVITATION_CODE,
+    }),
+  ).toEqual(cases[2][3]);
+  // The refusals of a selected workspace's actions and of a join differ.
+  expect(JOIN_INVITATION_REFUSALS).not.toContain("not_selected");
+  expect(INVITATION_ACTION_REFUSALS).not.toContain("invitation_invalid");
+  expect(
+    PreviewInvitationResultSchema.safeParse({
+      ...cases[2][3],
+      inviterLogin: "not a login",
+    }).success,
+  ).toBe(false);
 });
