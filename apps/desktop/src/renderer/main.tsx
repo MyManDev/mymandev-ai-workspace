@@ -19,6 +19,7 @@ createRoot(container).render(
       workspaces={window.desktop?.workspaces}
       people={window.desktop?.people}
       peopleActions={window.desktop?.peopleActions}
+      invitationActions={window.desktop?.invitationActions}
       agents={window.desktop?.agents}
       chat={window.desktop?.chat}
       devices={window.desktop?.devices}

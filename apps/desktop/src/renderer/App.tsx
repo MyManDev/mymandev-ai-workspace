@@ -13,6 +13,7 @@ import type {
   ChatBridge,
   ConnectionBridge,
   DeviceListBridge,
+  InvitationActionsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -98,6 +99,8 @@ export interface AppProps {
   readonly people?: PeopleBridge | undefined;
   /** The people actions from the preload script; undefined outside Electron. */
   readonly peopleActions?: PeopleActionsBridge | undefined;
+  /** The invitation actions from the preload script; undefined outside Electron. */
+  readonly invitationActions?: InvitationActionsBridge | undefined;
   /** The open project's agent activity from the preload script; undefined outside Electron. */
   readonly agents?: AgentBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
@@ -122,6 +125,7 @@ export function App({
   workspaces,
   people,
   peopleActions,
+  invitationActions,
   agents,
   chat,
   devices,
@@ -197,6 +201,8 @@ export function App({
           electronVersion={electronVersion}
           people={people}
           peopleActions={peopleActions}
+          invitationActions={invitationActions}
+          workspaces={workspaceSidebar}
           account={account}
           chat={chat}
           devices={devices}
@@ -226,6 +232,8 @@ function ScreenContent({
   electronVersion,
   people,
   peopleActions,
+  invitationActions,
+  workspaces,
   account,
   chat,
   devices,
@@ -239,6 +247,9 @@ function ScreenContent({
   readonly electronVersion: string | undefined;
   readonly people: PeopleBridge | undefined;
   readonly peopleActions: PeopleActionsBridge | undefined;
+  readonly invitationActions: InvitationActionsBridge | undefined;
+  /** The workspace part of the sidebar, for the join screen. */
+  readonly workspaces: WorkspaceSidebar;
   readonly account: AccountBridge | undefined;
   readonly chat: ChatBridge | undefined;
   readonly devices: DeviceListBridge | undefined;
@@ -266,7 +277,13 @@ function ScreenContent({
     case "people":
       return <PeopleScreen people={people} peopleActions={peopleActions} />;
     case "join":
-      return <JoinScreen />;
+      return (
+        <JoinScreen
+          invitationActions={invitationActions}
+          workspaces={workspaces.view}
+          onOpenWorkspace={workspaces.onSelect}
+        />
+      );
     case "about":
       return <AboutScreen electronVersion={electronVersion} />;
     case "chat":

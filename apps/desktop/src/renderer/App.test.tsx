@@ -7,6 +7,7 @@ import type {
   ChatBridge,
   ConnectionBridge,
   DeviceListBridge,
+  InvitationActionsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -147,8 +148,8 @@ const SCREEN_CASES: readonly ScreenCase[] = [
   },
   {
     view: { screen: "join" },
-    title: '<h2 id="join-title">Join a workspace</h2>',
-    placeholder: "Joining is not available yet.",
+    title: '<h2 id="join-title" tabindex="-1">Join a workspace</h2>',
+    placeholder: "Joining with an invitation code is not available.",
     current: ["Join (page)", "Workspace B (true)"],
   },
   {
@@ -393,6 +394,43 @@ test("the people screen gets the people actions: with them, it has the paragraph
   expect(render({ people, initialView: { screen: "people" } })).not.toContain(
     "people-action-message",
   );
+});
+
+test("the join screen gets the invitation actions and the workspace state: with them, it offers the code field, its status paragraph, and the dialog", () => {
+  const call = () => Promise.reject(new Error("not called"));
+  const invitationActions: InvitationActionsBridge = {
+    create: call,
+    revoke: call,
+    preview: call,
+    accept: call,
+  };
+  const html = render({ invitationActions, initialView: { screen: "join" } });
+  expect(html).toContain(
+    '<label class="account-label" for="join-code">Invitation code</label>',
+  );
+  expect(html).toContain(
+    '<p class="people-status" id="join-message" role="status"></p>',
+  );
+  expect(html).toContain('<dialog class="people-dialog"></dialog>');
+  expect(html).not.toContain(
+    "Joining with an invitation code is not available.",
+  );
+  // While the workspace state is signed_out, the screen asks for a sign-in.
+  expect(
+    render({
+      invitationActions,
+      initialView: { screen: "join" },
+      initialWorkspaceState: workspaceState([], {
+        status: "signed_out",
+        workspaces: [],
+        selectedWorkspaceId: null,
+      }),
+    }),
+  ).toContain(
+    "<p>You can join a workspace once this device is signed in and ready.</p>",
+  );
+  // Only the join screen uses them.
+  expect(render({ invitationActions })).not.toContain("join-code");
 });
 
 test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {
