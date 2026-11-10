@@ -295,7 +295,7 @@ test("the definition is a name field with Add person, and submits the workspace'
     actions: { ...IDLE_PEOPLE_ACTIONS, defineDraft: "<b>Grace</b>" },
   });
   expect(html).toContain(
-    '<form class="people-form" aria-labelledby="define-person-title"><h3 class="people-heading" id="define-person-title">Add a person</h3><p class="person-meta" id="define-person-hint">Add someone by name before they join. They show as not claimed until they accept an invitation for this person.</p><label class="account-label" for="define-person-name">Name</label><input id="define-person-name" class="account-input" type="text" dir="auto" autoComplete="off" spellCheck="false" maxLength="64" aria-describedby="define-person-hint define-person-problem" value="&lt;b&gt;Grace&lt;/b&gt;"/><p class="panel-message" id="define-person-problem" role="alert"></p><div class="account-actions"><button type="submit" class="panel-action">Add person</button></div></form>',
+    '<form class="people-form" aria-labelledby="define-person-title"><h3 class="people-heading" id="define-person-title">Add a person</h3><p class="person-meta" id="define-person-hint">Add someone by name before they join. They show as not claimed until they accept an invitation for this person.</p><label class="account-label" for="define-person-name">Name</label><input id="define-person-name" class="account-input" type="text" dir="auto" autoComplete="off" spellCheck="false" aria-describedby="define-person-hint define-person-problem" value="&lt;b&gt;Grace&lt;/b&gt;"/><p class="panel-message" id="define-person-problem" role="alert"></p><div class="account-actions"><button type="submit" class="panel-action">Add person</button></div></form>',
   );
   // After the active people, before the former members.
   expect(html.indexOf("define-person-title")).toBeLessThan(
@@ -572,7 +572,7 @@ test("a rename's dialog has the name field with the draft and an alert for its p
     />
   );
   expect(renderToString(content)).toContain(
-    '<p id="people-dialog-text">Enter the new name. Everyone in the workspace sees it.</p><label class="account-label" for="people-dialog-field">Name</label><input id="people-dialog-field" class="account-input" type="text" dir="auto" autoComplete="off" spellCheck="false" maxLength="64" aria-invalid="true" aria-describedby="people-dialog-problem" value="Linus T."/><p class="panel-message" id="people-dialog-problem" role="alert">Enter a name.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Save</button></div>',
+    '<p id="people-dialog-text">Enter the new name. Everyone in the workspace sees it.</p><label class="account-label" for="people-dialog-field">Name</label><input id="people-dialog-field" class="account-input" type="text" dir="auto" autoComplete="off" spellCheck="false" aria-invalid="true" aria-describedby="people-dialog-problem" value="Linus T."/><p class="panel-message" id="people-dialog-problem" role="alert">Enter a name.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Save</button></div>',
   );
   elementsOf(content)
     .find((element) => element.props.id === "people-dialog-field")
@@ -589,7 +589,7 @@ test("a rename's dialog has the name field with the draft and an alert for its p
       />,
     ),
   ).toContain(
-    '<input id="people-dialog-field" class="account-input" type="text" dir="auto" autoComplete="off" spellCheck="false" maxLength="64" aria-describedby="people-dialog-problem" value="Linus T."/><p class="panel-message" id="people-dialog-problem" role="alert"></p>',
+    '<input id="people-dialog-field" class="account-input" type="text" dir="auto" autoComplete="off" spellCheck="false" aria-describedby="people-dialog-problem" value="Linus T."/><p class="panel-message" id="people-dialog-problem" role="alert"></p>',
   );
 });
 

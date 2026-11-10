@@ -10,9 +10,10 @@ import { MAX_CLOCK_WAIT_MS } from "./device-view.ts";
 import type { PeopleScreenView } from "./people-view.ts";
 
 /**
- * The longest display name in UTF-16 code units, as the contract and the
- * protocol count it (`PEOPLE_LIMITS.displayName`). The renderer imports no
- * value of the contract, so the tests check that the two match.
+ * The longest display name in characters (Unicode code points), as the
+ * contract and the protocol count it (`PEOPLE_LIMITS.displayName`; zod's
+ * `.max` counts a string's code points). The renderer imports no value of
+ * the contract, so the tests check that the two match.
  */
 export const MAX_PERSON_NAME_LENGTH = 64;
 
@@ -614,14 +615,18 @@ function refusalText(
 
 /**
  * The problem of a name before it is sent, or undefined: none after
- * trimming, or longer than the limit. The main process refuses both, and
- * the call rejects for an empty or a longer one.
+ * trimming, or longer than the limit in characters (code points), as the
+ * contract counts it. The main process refuses both, and the call rejects
+ * for an empty or a longer one. A character takes one or two UTF-16 code
+ * units, so the characters are counted only when the name is longer in
+ * code units.
  */
 export function namePrompt(name: string): string | undefined {
   if (name === "") {
     return PEOPLE_ACTION_MESSAGES.nameMissing;
   }
-  return name.length > MAX_PERSON_NAME_LENGTH
+  return name.length > MAX_PERSON_NAME_LENGTH &&
+    Array.from(name).length > MAX_PERSON_NAME_LENGTH
     ? PEOPLE_ACTION_MESSAGES.nameTooLong
     : undefined;
 }
