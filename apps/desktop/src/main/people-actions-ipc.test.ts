@@ -512,6 +512,12 @@ const EXPECTED: Readonly<Record<WorkspaceActionFailure, unknown>> = {
     reason: "device_too_new",
     retryAfterMs: null,
   },
+  // No wait: waiting does not free a place (#242).
+  unclaimed_limit: {
+    outcome: "refused",
+    reason: "unclaimed_limit",
+    retryAfterMs: null,
+  },
   rate_limited: {
     outcome: "refused",
     reason: "rate_limited",
@@ -553,6 +559,7 @@ test("each code that a person route of the protocol answers maps to its own refu
     not_found: "not_found",
     conflict: "conflict",
     device_too_new: "device_too_new",
+    unclaimed_limit: "unclaimed_limit",
     rate_limited: "rate_limited",
   };
   for (const entry of CASES) {

@@ -27,7 +27,6 @@ import {
   PEOPLE_ACTION_DONE_MESSAGES,
   PEOPLE_ACTION_NOT_DONE_MESSAGES,
   PEOPLE_ACTION_UNKNOWN_MESSAGES,
-  unclaimedLimitReached,
   watchClockReads,
   type PeopleActionKind,
   type PeopleActionRequest,
@@ -426,21 +425,17 @@ test("every destructive action, every role change except a promotion, and a rena
 
 test("a confirmed action and an unknown answer have a fixed sentence for each action, and an unknown one says to check and that nothing is sent again", () => {
   const done = ALL_KINDS.map((kind) =>
-    describePeopleActionResult(kind, { outcome: "ok" }, READY),
+    describePeopleActionResult(kind, { outcome: "ok" }),
   );
   expect(done).toEqual(
     ALL_KINDS.map((kind) => PEOPLE_ACTION_DONE_MESSAGES[kind]),
   );
   expect(new Set(done).size).toBe(ALL_KINDS.length);
   expect(
-    describePeopleActionResult(
-      "define",
-      { outcome: "ok", memberId: MEMBER },
-      READY,
-    ),
+    describePeopleActionResult("define", { outcome: "ok", memberId: MEMBER }),
   ).toBe("The person was added.");
   const unknown = ALL_KINDS.map((kind) =>
-    describePeopleActionResult(kind, { outcome: "unknown" }, READY),
+    describePeopleActionResult(kind, { outcome: "unknown" }),
   );
   expect(unknown).toEqual(
     ALL_KINDS.map((kind) => PEOPLE_ACTION_UNKNOWN_MESSAGES[kind]),
@@ -475,6 +470,8 @@ test("each refusal has its own fixed text after the action's start, and the wait
     too_soon:
       "This device sent many changes in a short time. Try again in 30 seconds.",
     rate_limited: "The server asked to wait. Try again in 2 minutes.",
+    unclaimed_limit:
+      "The workspace already has as many unclaimed people as it allows. Remove one, or invite one: once they join, they no longer count.",
     not_allowed: "Your role in this workspace does not allow it.",
     not_found:
       "The server does not know this workspace or this person for your account. Check the list.",
@@ -492,23 +489,22 @@ test("each refusal has its own fixed text after the action's start, and the wait
     too_soon: 30_000,
     rate_limited: 120_000,
   };
-  for (const kind of ALL_KINDS.filter((entry) => entry !== "define")) {
+  for (const kind of ALL_KINDS) {
     for (const reason of PERSON_ACTION_REFUSALS) {
       const text =
-        reason === "invalid" && kind === "rename"
+        reason === "invalid" && (kind === "rename" || kind === "define")
           ? "The name is not allowed. Use visible characters, without line breaks."
           : texts[reason];
       expect(
         describePeopleActionResult(
           kind,
           refused(reason, waits[reason] ?? null),
-          READY,
         ),
         `${kind} ${reason}`,
       ).toBe(`${PEOPLE_ACTION_NOT_DONE_MESSAGES[kind]} ${text}`);
     }
   }
-  expect(describePeopleActionResult("define", refused("invalid"), READY)).toBe(
+  expect(describePeopleActionResult("define", refused("invalid"))).toBe(
     "The person could not be added. The name is not allowed. Use visible characters, without line breaks.",
   );
   expect(new Set(Object.values(PEOPLE_ACTION_NOT_DONE_MESSAGES)).size).toBe(
@@ -528,47 +524,18 @@ test("a wait is said in seconds, minutes, or hours, rounded up", () => {
   expect(describeWait(3_600_001)).toBe("2 hours");
 });
 
-test("a definition's rate limit names the unclaimed limit only when the people show it reached", () => {
-  const limited = refused("rate_limited", 60_000);
-  const general =
-    "The person could not be added. The server asked to wait. Try again in 1 minute.";
-  // One unclaimed person.
-  expect(
-    describePeopleActionResult(
-      "define",
-      limited,
-      state({ maxUnclaimedMembers: 1 }),
-    ),
-  ).toBe(
-    "The person could not be added. The workspace already has as many unclaimed people as it allows (1). Remove one, or wait until someone claims one, then try again.",
+test("a definition at the limit of unclaimed people says to remove or invite one and names no wait, and a definition's rate limit always says to wait (#242)", () => {
+  const atLimit =
+    "The person could not be added. The workspace already has as many unclaimed people as it allows. Remove one, or invite one: once they join, they no longer count.";
+  expect(describePeopleActionResult("define", refused("unclaimed_limit"))).toBe(
+    atLimit,
   );
-  for (const people of [
-    state({ maxUnclaimedMembers: 2 }),
-    state({ maxUnclaimedMembers: null }),
-    undefined,
-  ]) {
-    expect(describePeopleActionResult("define", limited, people)).toBe(general);
-  }
-  // A former unclaimed person does not count.
-  const formerUnclaimed = state({
-    maxUnclaimedMembers: 1,
-    people: PEOPLE.map((entry) =>
-      entry.memberId === UNCLAIMED ? { ...entry, former: true } : entry,
-    ),
-  });
-  expect(unclaimedLimitReached(formerUnclaimed)).toBe(false);
-  expect(describePeopleActionResult("define", limited, formerUnclaimed)).toBe(
-    general,
-  );
-  // Only a definition: another action's rate limit is always a wait.
+  expect(atLimit).not.toMatch(/Try again in|wait/iu);
+  // The API's limit of requests is a wait, also for a definition.
   expect(
-    describePeopleActionResult(
-      "rename",
-      limited,
-      state({ maxUnclaimedMembers: 1 }),
-    ),
+    describePeopleActionResult("define", refused("rate_limited", 60_000)),
   ).toBe(
-    "The name could not be changed. The server asked to wait. Try again in 1 minute.",
+    "The person could not be added. The server asked to wait. Try again in 1 minute.",
   );
 });
 
@@ -789,15 +756,20 @@ test("a call that fails on its way says that nothing was sent", async () => {
   });
 });
 
-test("a refusal's sentence uses the latest people for the unclaimed limit", async () => {
-  const { actions, last } = controllerWith(() =>
-    Promise.resolve(refused("rate_limited", 5_000)),
-  );
-  actions.listChanged(known({ maxUnclaimedMembers: 1 }), NOW);
+test("a definition's sentence follows the refusal's code, never the people's count of unclaimed people (#242)", async () => {
+  let answer: PersonActionResult = refused("unclaimed_limit");
+  const { actions, last } = controllerWith(() => Promise.resolve(answer));
+  // The people show room for more unclaimed people.
+  actions.listChanged(known({ maxUnclaimedMembers: 500 }), NOW);
   actions.editDefineDraft("Grace");
   await actions.define(WORKSPACE);
-  expect(last().message).toContain("as many unclaimed people as it allows (1)");
-  actions.listChanged(known({ maxUnclaimedMembers: 3 }), NOW);
+  expect(last().message).toBe(
+    "The person could not be added. The workspace already has as many unclaimed people as it allows. Remove one, or invite one: once they join, they no longer count.",
+  );
+  expect(last().defineDraft).toBe("Grace");
+  // The people show the limit reached: a rate limit is still a wait.
+  answer = refused("rate_limited", 5_000);
+  actions.listChanged(known({ maxUnclaimedMembers: 1 }), NOW);
   await actions.define(WORKSPACE);
   expect(last().message).toBe(
     "The person could not be added. The server asked to wait. Try again in 5 seconds.",
@@ -1171,23 +1143,6 @@ test("an answer that arrives after another workspace was selected or after a sig
   resolve({ outcome: "ok", memberId: UNCLAIMED });
   await defined;
   expect(last()).toMatchObject({ message: undefined, defineDraft: "Edsger" });
-});
-
-test("a definition's rate limit names the unclaimed limit of its own workspace only while that limit is known", async () => {
-  const { answer, resolve } = pending();
-  const { actions, last } = controllerWith(
-    answer,
-    known({ maxUnclaimedMembers: 1 }),
-  );
-  actions.editDefineDraft("Grace");
-  const defined = actions.define(WORKSPACE);
-  // The same workspace reloads, and the limit is not known for now.
-  actions.listChanged(known({ revision: 5, maxUnclaimedMembers: null }), NOW);
-  resolve(refused("rate_limited", 5_000));
-  await defined;
-  expect(last().message).toBe(
-    "The person could not be added. The server asked to wait. Try again in 5 seconds.",
-  );
 });
 
 test("an open question that the screen stops offering ends in the controller, never comes back on its own, and sends nothing", async () => {

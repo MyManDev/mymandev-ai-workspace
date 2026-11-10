@@ -525,6 +525,7 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     already_member: "already_member",
     conflict: "conflict",
     sign_in_code_used: "failed",
+    unclaimed_limit: "unclaimed_limit",
     rate_limited: "rate_limited",
     // Defensive: only with a 5xx, which the session reads as
     // `server_error`, so it never comes as a refusal.
@@ -582,6 +583,15 @@ test("rate_limited waits as long as the API's Retry-After, or a fixed minute wit
       code: "conflict",
     }),
   ).toEqual({ ok: false, reason: "conflict" });
+  // The limit of unclaimed people is no wait (#242), even with a time.
+  expect(
+    workspaceActionFailedFor({
+      ok: false,
+      reason: "refused",
+      code: "unclaimed_limit",
+      retryAfterSeconds: 120,
+    }),
+  ).toEqual({ ok: false, reason: "unclaimed_limit" });
   expect(workspaceActionFailedFor({ ok: false, reason: "no_answer" })).toEqual({
     ok: false,
     reason: "unknown",

@@ -1,7 +1,6 @@
 import type { PeopleActionsBridge } from "../shared/desktop-bridge.ts";
 import type {
   DefinePersonResult,
-  PeopleView,
   PersonActionRefusal,
   PersonActionResult,
   PersonView,
@@ -493,7 +492,8 @@ export const PEOPLE_ACTION_UNKNOWN_MESSAGES: Readonly<
 /**
  * Why an action was refused, after its start. `invalid` for a definition or
  * a rename says that the name is not allowed; `too_soon` and `rate_limited`
- * say how long to wait (`describeWait`).
+ * say how long to wait (`describeWait`). `unclaimed_limit` names no wait,
+ * because none helps (#242).
  */
 export const PEOPLE_ACTION_REFUSAL_MESSAGES: Readonly<
   Record<Exclude<PersonActionRefusal, "too_soon" | "rate_limited">, string>
@@ -501,7 +501,6 @@ export const PEOPLE_ACTION_REFUSAL_MESSAGES: Readonly<
   readonly invalidName: string;
   readonly tooSoon: (wait: string) => string;
   readonly rateLimited: (wait: string) => string;
-  readonly unclaimedLimit: (limit: number) => string;
 } = Object.freeze({
   invalid: "The request was not valid.",
   invalidName:
@@ -516,8 +515,8 @@ export const PEOPLE_ACTION_REFUSAL_MESSAGES: Readonly<
     `This device sent many changes in a short time. Try again in ${wait}.`,
   rateLimited: (wait: string) =>
     `The server asked to wait. Try again in ${wait}.`,
-  unclaimedLimit: (limit: number) =>
-    `The workspace already has as many unclaimed people as it allows (${String(limit)}). Remove one, or wait until someone claims one, then try again.`,
+  unclaimed_limit:
+    "The workspace already has as many unclaimed people as it allows. Remove one, or invite one: once they join, they no longer count.",
   not_allowed: "Your role in this workspace does not allow it.",
   not_found:
     "The server does not know this workspace or this person for your account. Check the list.",
@@ -550,31 +549,13 @@ export function describeWait(ms: number): string {
 }
 
 /**
- * Whether the workspace holds as many active unclaimed people as its limit
- * (`maxUnclaimedMembers`, for the owner and the admins). Without a limit
- * the screen cannot tell. With people left out, the count is the least
- * that the workspace holds, so a count at the limit still shows it.
- */
-export function unclaimedLimitReached(state: PeopleView | undefined): boolean {
-  if (state === undefined || state.maxUnclaimedMembers === null) {
-    return false;
-  }
-  const unclaimed = state.people.filter(
-    (person) => !person.former && !person.claimed,
-  ).length;
-  return unclaimed >= state.maxUnclaimedMembers;
-}
-
-/**
- * The sentence after a result of `kind`. A definition's `rate_limited` can
- * also mean the limit of unclaimed people: when `state`, the latest people,
- * shows that the limit is reached, the sentence says so; otherwise it says
- * to wait, as for the other actions.
+ * The sentence after a result of `kind`. The limit of unclaimed people has
+ * its own refusal, `unclaimed_limit` (#242), so `rate_limited` always says
+ * to wait.
  */
 export function describePeopleActionResult(
   kind: PeopleActionKind,
   result: PersonActionResult | DefinePersonResult,
-  state: PeopleView | undefined,
 ): string {
   switch (result.outcome) {
     case "ok":
@@ -582,7 +563,7 @@ export function describePeopleActionResult(
     case "unknown":
       return PEOPLE_ACTION_UNKNOWN_MESSAGES[kind];
     case "refused":
-      return `${PEOPLE_ACTION_NOT_DONE_MESSAGES[kind]} ${refusalText(kind, result.reason, result.retryAfterMs, state)}`;
+      return `${PEOPLE_ACTION_NOT_DONE_MESSAGES[kind]} ${refusalText(kind, result.reason, result.retryAfterMs)}`;
   }
 }
 
@@ -590,7 +571,6 @@ function refusalText(
   kind: PeopleActionKind,
   reason: PersonActionRefusal,
   retryAfterMs: number | null,
-  state: PeopleView | undefined,
 ): string {
   const messages = PEOPLE_ACTION_REFUSAL_MESSAGES;
   const wait = describeWait(retryAfterMs ?? 0);
@@ -602,12 +582,7 @@ function refusalText(
     case "too_soon":
       return messages.tooSoon(wait);
     case "rate_limited":
-      return kind === "define" &&
-        state !== undefined &&
-        state.maxUnclaimedMembers !== null &&
-        unclaimedLimitReached(state)
-        ? messages.unclaimedLimit(state.maxUnclaimedMembers)
-        : messages.rateLimited(wait);
+      return messages.rateLimited(wait);
     default:
       return messages[reason];
   }
@@ -741,8 +716,6 @@ export function createPeopleActions(
   let dialog: PeopleActionDialog | undefined;
   let defineDraft = "";
   let defineProblem: string | undefined;
-  /** The latest people, for the limit of unclaimed people. */
-  let latest: PeopleView | undefined;
   /** The selected workspace of the latest view; undefined before one. */
   let selected: string | null | undefined;
   /**
@@ -795,10 +768,7 @@ export function createPeopleActions(
     try {
       const result = await call();
       ok = result.outcome === "ok";
-      // The sentence shows only while the action's workspace is still
-      // selected, so the latest people are that workspace's, with its limit
-      // of unclaimed people, or none while it is not known.
-      sentence = describePeopleActionResult(kind, result, latest);
+      sentence = describePeopleActionResult(kind, result);
     } catch {
       sentence = `${PEOPLE_ACTION_NOT_DONE_MESSAGES[kind]} ${PEOPLE_ACTION_NOT_SENT}`;
     }
@@ -922,7 +892,6 @@ export function createPeopleActions(
       }
       if (view.kind === "known") {
         const { state } = view;
-        latest = state;
         const before = selected;
         if (state.status === "signed_out") {
           // A sign-out ends everything, also after no workspace was selected.

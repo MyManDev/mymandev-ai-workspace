@@ -344,7 +344,7 @@ test("defining stops at the workspace's limit of active unclaimed people, and re
   for (const actor of [owner, admin]) {
     assert.deepEqual(await define(actor, "Grace"), {
       defined: false,
-      refusal: "rate_limited",
+      refusal: "unclaimed_limit",
     });
   }
   assert.equal(
@@ -394,7 +394,10 @@ test("a new workspace holds at most 500 active unclaimed people by default", asy
   const define = () =>
     defineMember(db, { workspaceId, ...owner, displayName: "Last", now: NOW });
   assert.ok((await define()).defined, "the 500th");
-  assert.deepEqual(await define(), { defined: false, refusal: "rate_limited" });
+  assert.deepEqual(await define(), {
+    defined: false,
+    refusal: "unclaimed_limit",
+  });
   assert.equal(await unclaimedCount(workspaceId), 500);
 });
 
@@ -2312,7 +2315,7 @@ test(
     ]);
     for (const result of results) {
       if (!result.defined) {
-        assert.equal(result.refusal, "rate_limited");
+        assert.equal(result.refusal, "unclaimed_limit");
       }
     }
     assert.equal(await unclaimedCount(workspaceId), 3);
@@ -2347,7 +2350,10 @@ test(
           now: LATER,
         }),
     );
-    assert.deepEqual(definition, { defined: false, refusal: "rate_limited" });
+    assert.deepEqual(definition, {
+      defined: false,
+      refusal: "unclaimed_limit",
+    });
     assert.equal(await limitOf(workspaceId), 1);
     assert.equal(await unclaimedCount(workspaceId), 1);
   },

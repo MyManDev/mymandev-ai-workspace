@@ -218,11 +218,11 @@ export type DefineMemberResult =
   | Readonly<{
       defined: false;
       /**
-       * `rate_limited`: the workspace holds as many active unclaimed people
-       * as its limit. Only removing or claiming one of them, or a higher
-       * limit, frees a place; no time does.
+       * `unclaimed_limit`: the workspace holds as many active unclaimed
+       * people as its limit. Only removing or claiming one of them, or a
+       * higher limit, frees a place; no time does (#242).
        */
-      refusal: "not_member" | "forbidden" | "rate_limited";
+      refusal: "not_member" | "forbidden" | "unclaimed_limit";
     }>;
 
 /**
@@ -232,10 +232,10 @@ export type DefineMemberResult =
  * `now`, and has the acting account as `added_by_user_id`. After the acting
  * person it locks the workspace row, so that concurrent definitions and
  * changes of the limit in one workspace are counted one after another, and
- * refuses with `rate_limited` when the workspace already holds as many active
- * unclaimed people as its limit (`workspaces.max_unclaimed_members`). Writes
- * a `member.defined` audit record. Inside another transaction it runs as a
- * savepoint.
+ * refuses with `unclaimed_limit` when the workspace already holds as many
+ * active unclaimed people as its limit (`workspaces.max_unclaimed_members`).
+ * Writes a `member.defined` audit record. Inside another transaction it runs
+ * as a savepoint.
  */
 export async function defineMember(
   db: Database,
@@ -256,7 +256,7 @@ export async function defineMember(
         throw new Error("The workspace of an active person is missing");
       }
       if (counted.unclaimed >= counted.limit) {
-        return { defined: false, refusal: "rate_limited" };
+        return { defined: false, refusal: "unclaimed_limit" };
       }
       const id = newId<MemberId>();
       await tx.insert(workspaceMembers).values({
