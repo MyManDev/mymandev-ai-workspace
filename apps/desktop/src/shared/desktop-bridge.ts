@@ -1,6 +1,7 @@
 import type {
   AcceptInvitationResult,
   AccountStatus,
+  ApproveJoinRequestResult,
   AgentActivityView,
   ChatLoadOlderResultView,
   ChatSendResultView,
@@ -15,6 +16,9 @@ import type {
   ForgetResult,
   InvitationLoadResult,
   InvitationsView,
+  JoinRequestActionResult,
+  JoinRequestLoadResult,
+  JoinRequestsView,
   LiftRegistrationLockResult,
   MountResult,
   OtherDeviceRevocation,
@@ -65,6 +69,10 @@ export interface DesktopBridge {
   readonly invitations: InvitationsBridge;
   /** Creating and revoking invitations, and joining with a pasted code. */
   readonly invitationActions: InvitationActionsBridge;
+  /** The join requests of the selected workspace, read-only. */
+  readonly joinRequests: JoinRequestsBridge;
+  /** Deciding on join requests, and pausing and resuming them. */
+  readonly joinRequestActions: JoinRequestActionsBridge;
   /** The agent activity of the open project, read-only. */
   readonly agents: AgentBridge;
   /** The chat of the open project. */
@@ -443,6 +451,91 @@ export interface InvitationActionsBridge {
    * joined workspace's ID and name; the workspace list then loads again.
    */
   readonly accept: (code: string) => Promise<AcceptInvitationResult>;
+}
+
+/**
+ * The join requests of the selected workspace, which the main process holds
+ * for its owner and admins (#95, D3): the pending requests and the blocks in
+ * force, each with its ID, the requested display name, the requester's
+ * GitHub login with its verification time and the creation date of that
+ * GitHub account, and its times, and when new requests were paused. No
+ * user ID crosses.
+ */
+export interface JoinRequestsBridge {
+  /** The current join requests. */
+  readonly getState: () => Promise<JoinRequestsView>;
+  /**
+   * Calls `listener` with the current join requests and then after changes,
+   * at most once every 50 ms with the latest ones. A state older than the
+   * last one delivered is dropped. `onError` is called when the main
+   * process refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: JoinRequestsView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Asks the main process to load the join requests, when the screen opens
+   * and on the person's refresh. From then on the main process keeps them
+   * current with the join request events and loads them again on its own
+   * after `workspace.subscribed`, a claim, a removal, and a decision.
+   * Resolves to `refused` without a signed-in device, a selected workspace,
+   * or the role of the owner or an admin, and with `too_soon` within a few
+   * seconds of the last request. It passes nothing from the renderer on.
+   */
+  readonly load: () => Promise<JoinRequestLoadResult>;
+}
+
+/**
+ * The join request actions of the owner and the admins (#95, D1), each
+ * through its own channel. Each takes the selected workspace's ID, and the
+ * main process refuses another workspace as `not_selected`. An ID that is
+ * not a lowercase UUIDv7, or a display name that is empty or longer than 64
+ * characters, is refused by the contract, and the call rejects; the main
+ * process then refuses a blank name and control, format, and invisible
+ * characters with the result `invalid`. Each action is sent once:
+ * `unknown` says that the answer does not show whether the API acted, and
+ * nothing sends it again, so the screen asks the person to check the list.
+ * `too_soon` and `rate_limited` come with `retryAfterMs`. The bridge
+ * passes on only strings, and for `approve` a string or null, and refuses
+ * any other value without a call.
+ */
+export interface JoinRequestActionsBridge {
+  /**
+   * Approves a pending request: the requester becomes a claimed member with
+   * the requested display name, or with `displayName` when it is given.
+   * Resolves to `ok` with the new person's member ID.
+   */
+  readonly approve: (
+    workspaceId: string,
+    joinRequestId: string,
+    displayName?: string | null,
+  ) => Promise<ApproveJoinRequestResult>;
+  /** Denies a pending request. */
+  readonly deny: (
+    workspaceId: string,
+    joinRequestId: string,
+  ) => Promise<JoinRequestActionResult>;
+  /** Denies every pending request of the workspace. */
+  readonly denyAll: (workspaceId: string) => Promise<JoinRequestActionResult>;
+  /**
+   * Denies a pending request and keeps its account from asking the
+   * workspace again until the block is lifted.
+   */
+  readonly block: (
+    workspaceId: string,
+    joinRequestId: string,
+  ) => Promise<JoinRequestActionResult>;
+  /** Lifts a block in force, by the blocked request's ID. */
+  readonly unblock: (
+    workspaceId: string,
+    joinRequestId: string,
+  ) => Promise<JoinRequestActionResult>;
+  /** Pauses new requests; the pending ones stay. */
+  readonly pause: (workspaceId: string) => Promise<JoinRequestActionResult>;
+  /** Accepts new requests again. */
+  readonly resume: (workspaceId: string) => Promise<JoinRequestActionResult>;
 }
 
 /**
