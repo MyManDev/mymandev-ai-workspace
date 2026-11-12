@@ -408,7 +408,7 @@ test("the main process checks the IDs again with the protocol's ID schemas, and 
 });
 
 test("a create's name that the protocol refuses, such as a blank one or one with a line feed, resolves invalid, and nothing is sent", async () => {
-  for (const name of ["   ", "a\nb", "​", "a‮b"]) {
+  for (const name of ["   ", "a\nb", "\u200b", "a\u202eb"]) {
     const account = fakeAccount();
     const { call } = register(account);
     await expect(
