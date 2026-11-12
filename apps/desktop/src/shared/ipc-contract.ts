@@ -1350,11 +1350,11 @@ export const JOIN_INVITATION_REFUSALS = Object.freeze([
 ] as const);
 export type JoinInvitationRefusal = (typeof JOIN_INVITATION_REFUSALS)[number];
 
-/** The refusals of an invitation action that say when the next write may go. */
-const INVITATION_ACTION_WAITS: ReadonlySet<string> = new Set([
-  "too_soon",
-  "rate_limited",
-]);
+/**
+ * The refusals of an invitation or a join request action that say when the
+ * next write may go.
+ */
+const ACTION_WAITS: ReadonlySet<string> = new Set(["too_soon", "rate_limited"]);
 
 /** A refusal of one of `reasons`, with `retryAfterMs` for a wait only. */
 function invitationRefusedSchema<const T extends readonly string[]>(
@@ -1372,8 +1372,7 @@ function invitationRefusedSchema<const T extends readonly string[]>(
     })
     .refine(
       (value) =>
-        INVITATION_ACTION_WAITS.has(value.reason) ===
-        (value.retryAfterMs !== null),
+        ACTION_WAITS.has(value.reason) === (value.retryAfterMs !== null),
       { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
     );
 }
@@ -1665,9 +1664,7 @@ const JoinRequestActionRefusedSchema = z
     retryAfterMs: z.int().positive().nullable(),
   })
   .refine(
-    (value) =>
-      INVITATION_ACTION_WAITS.has(value.reason) ===
-      (value.retryAfterMs !== null),
+    (value) => ACTION_WAITS.has(value.reason) === (value.retryAfterMs !== null),
     { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
   );
 
