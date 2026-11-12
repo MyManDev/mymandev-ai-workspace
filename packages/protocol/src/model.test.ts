@@ -16,6 +16,7 @@ import {
   GITHUB_LOGIN_PATTERN,
   IDENTITY_PROVIDERS,
   INITIAL_RUN_STATE,
+  INVITATION_COUNT_LIMITS,
   INVITATION_LIFETIME_SECONDS,
   isTerminalRunState,
   JOIN_REQUEST_DECISIONS,
@@ -148,6 +149,13 @@ test("the account vocabularies are exactly the values of ADR 0014", () => {
     max: 604_800,
     default: 604_800,
   });
+});
+
+test("a workspace has at most 50 live invitations and 100 new invitations within 24 hours (ADR 0014, Limits)", () => {
+  assert.deepEqual(INVITATION_COUNT_LIMITS, { live: 50, perDay: 100 });
+  // The list of live invitations holds at most MAX_ANSWER_LIST_ITEMS, so a
+  // desktop sees every live invitation of a workspace at the limit.
+  assert.ok(INVITATION_COUNT_LIMITS.live <= MAX_ANSWER_LIST_ITEMS);
 });
 
 test("the workspace connection vocabularies and the message limit are the values of #110", () => {
@@ -327,12 +335,13 @@ test("the exported constants are frozen, nested values included", () => {
     ["LIMITS", LIMITS],
     ["API_ERROR_STATUS", API_ERROR_STATUS],
     ["INVITATION_LIFETIME_SECONDS", INVITATION_LIFETIME_SECONDS],
+    ["INVITATION_COUNT_LIMITS", INVITATION_COUNT_LIMITS],
     ["UNCLAIMED_MEMBER_LIMIT", UNCLAIMED_MEMBER_LIMIT],
     ["CHAT_HISTORY_PAGE", CHAT_HISTORY_PAGE],
     ["WS_CLOSE_CODES", WS_CLOSE_CODES],
   ];
   assert.equal(arrays.length, 24);
-  assert.equal(objects.length, 7);
+  assert.equal(objects.length, 8);
 
   // Modules run in strict mode, so a write to a frozen value throws.
   for (const [label, value] of arrays) {

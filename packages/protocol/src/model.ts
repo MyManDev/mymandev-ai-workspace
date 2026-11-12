@@ -349,6 +349,20 @@ export const INVITATION_LIFETIME_SECONDS = Object.freeze({
 } as const);
 
 /**
+ * How many invitations a workspace may have (ADR 0014, "Limits"): at most
+ * 50 live invitations, those neither accepted, revoked, nor expired, and at
+ * most 100 new invitations within 24 hours. A creation over either limit
+ * answers `rate_limited` with `Retry-After`. The person's own live
+ * invitation, which a new invitation for that person replaces, does not
+ * count toward `live`. The API applies these values, and the desktop
+ * checks its copy of `live` against this one.
+ */
+export const INVITATION_COUNT_LIMITS = Object.freeze({
+  live: 50,
+  perDay: 100,
+} as const);
+
+/**
  * How many active unclaimed people a workspace may hold (Project Manager
  * decision of 2026-11-02): from 1 to 500, and 500 when the creator does not
  * choose. The owner may change it later within the same range, never below
