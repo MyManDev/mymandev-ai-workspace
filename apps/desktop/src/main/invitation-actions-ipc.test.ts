@@ -598,6 +598,7 @@ const MANAGE_EXPECTED: Readonly<Record<WorkspaceActionFailure, unknown>> = {
     retryAfterMs: null,
   },
   device_too_new: { outcome: "refused", reason: "failed", retryAfterMs: null },
+  unclaimed_limit: { outcome: "refused", reason: "failed", retryAfterMs: null },
   rate_limited: {
     outcome: "refused",
     reason: "rate_limited",
@@ -645,6 +646,7 @@ const JOIN_EXPECTED: Readonly<Record<WorkspaceActionFailure, unknown>> = {
     retryAfterMs: null,
   },
   device_too_new: { outcome: "refused", reason: "failed", retryAfterMs: null },
+  unclaimed_limit: { outcome: "refused", reason: "failed", retryAfterMs: null },
   rate_limited: {
     outcome: "refused",
     reason: "rate_limited",

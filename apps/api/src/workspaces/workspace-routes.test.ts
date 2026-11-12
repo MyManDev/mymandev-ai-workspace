@@ -548,6 +548,17 @@ test("the workspace routes, the project routes, and the device routes share the 
     assert.equal((limited.json() as { code: string }).code, "rate_limited");
     assert.match(String(limited.headers["retry-after"]), /^[0-9]+$/u);
   }
+  // A definition keeps `rate_limited` for this limit, which is a wait; only
+  // the limit of unclaimed people answers `unclaimed_limit` (#242).
+  const definition = await post(
+    app,
+    `/workspaces/${newId<WorkspaceId>()}/members`,
+    token,
+    { displayName: "Grace" },
+  );
+  assert.equal(definition.statusCode, 429);
+  assert.equal((definition.json() as { code: string }).code, "rate_limited");
+  assert.match(String(definition.headers["retry-after"]), /^[0-9]+$/u);
 });
 
 test("without a database, the workspace routes answer the generic 404", async (t) => {

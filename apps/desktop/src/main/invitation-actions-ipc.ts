@@ -35,8 +35,9 @@ import type { WorkspaceService } from "./workspace/service.ts";
  * the allowlist gains or loses a failure. The API answers the invitation
  * routes of a workspace (`MEMBERSHIP_ROUTE_ERRORS`) with `forbidden`,
  * `not_found`, and `conflict` beyond the common codes; the codes of a
- * pasted code, join requests, unknown workspaces, and young devices would
- * be refusals that the desktop does not expect, `failed`.
+ * pasted code, join requests, unknown workspaces, young devices, and the
+ * limit of unclaimed people would be refusals that the desktop does not
+ * expect, `failed`.
  */
 const MANAGE_OUTCOMES = {
   invalid: "invalid",
@@ -51,6 +52,7 @@ const MANAGE_OUTCOMES = {
   join_requests_closed: "failed",
   workspace_not_found: "failed",
   device_too_new: "failed",
+  unclaimed_limit: "failed",
   rate_limited: "rate_limited",
   unknown: "unknown",
   failed: "failed",
@@ -76,6 +78,7 @@ const JOIN_OUTCOMES = {
   join_requests_closed: "failed",
   workspace_not_found: "failed",
   device_too_new: "failed",
+  unclaimed_limit: "failed",
   rate_limited: "rate_limited",
   unknown: "unknown",
   failed: "failed",

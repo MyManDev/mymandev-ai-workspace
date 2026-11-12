@@ -1066,8 +1066,9 @@ export const PersonNameSchema = z
  * - `too_soon`: the installation's budget of writes is spent; nothing was
  *   sent. `retryAfterMs` says when the next write may go.
  * - `rate_limited`: the API's limit, with `retryAfterMs` from its answer.
- *   For a definition, `rate_limited` can also mean that the workspace holds
- *   as many active unclaimed people as its limit (`maxUnclaimedMembers`).
+ * - `unclaimed_limit`: a definition in a workspace that holds as many active
+ *   unclaimed people as its limit (#242). It carries no wait: only removing
+ *   an unclaimed person, or a claim of one, frees a place.
  * - `not_allowed`: the account's role does not allow the action
  *   (`forbidden`), for example the owner leaving.
  * - `not_found`: the API does not know the workspace or the person for
@@ -1086,6 +1087,7 @@ export const PERSON_ACTION_REFUSALS = Object.freeze([
   "unavailable",
   "too_soon",
   "rate_limited",
+  "unclaimed_limit",
   "not_allowed",
   "not_found",
   "conflict",

@@ -411,8 +411,10 @@ export const ACTION_RATE_LIMITED_WAIT_MS = 60_000;
  *   device record is not usable.
  * - `forbidden`, `not_found`, `conflict`, `already_member`,
  *   `invitation_invalid`, `join_requests_closed`, `workspace_not_found`,
- *   `device_too_new`: the API's refusal with that code
- *   (`MEMBERSHIP_ROUTE_ERRORS`, `PROJECT_ROUTE_ERRORS`).
+ *   `device_too_new`, `unclaimed_limit`: the API's refusal with that code
+ *   (`MEMBERSHIP_ROUTE_ERRORS`, `PROJECT_ROUTE_ERRORS`). `unclaimed_limit`
+ *   carries no wait: only removing an unclaimed person, or a claim of one,
+ *   frees a place for a definition (#242).
  * - `rate_limited`: the API's limit; `retryAfterMs` follows its
  *   `Retry-After`, or `ACTION_RATE_LIMITED_WAIT_MS` without one.
  * - `unknown`: whether the API acted is not known: it gave no answer, failed,
@@ -435,6 +437,7 @@ export const WORKSPACE_ACTION_FAILURES = Object.freeze([
   "join_requests_closed",
   "workspace_not_found",
   "device_too_new",
+  "unclaimed_limit",
   "rate_limited",
   "unknown",
   "failed",
@@ -574,6 +577,7 @@ const SHOWN_CODES: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
   "join_requests_closed",
   "workspace_not_found",
   "device_too_new",
+  "unclaimed_limit",
 ]);
 
 /** The closed failure of a write for a failure of the device session. */

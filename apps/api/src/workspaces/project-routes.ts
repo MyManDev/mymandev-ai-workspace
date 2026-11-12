@@ -47,7 +47,7 @@ type ProjectParams = Readonly<{
 /**
  * The `Retry-After` of a creation in a workspace that holds 100 projects
  * that are not archived. No time frees a place, only archiving a project
- * does; so, like the limit of unclaimed people, the answer asks again in a
+ * does; so, like the limit of 20 active devices, the answer asks again in a
  * day.
  */
 const PROJECT_LIMIT_RETRY_AFTER_SECONDS = 24 * 60 * 60;
