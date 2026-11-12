@@ -907,6 +907,133 @@ export const WorkspaceActionResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type WorkspaceActionResult = z.infer<typeof WorkspaceActionResultSchema>;
 
+// Creating a workspace and a project (#95, decisions D1 and D7): one strict
+// channel each.
+
+/**
+ * The name of a new workspace or project that the renderer sends: 1 to
+ * `WORKSPACE_LIMITS.name` (100) characters, counted as the protocol counts
+ * them (code points). A longer string is refused before anything else runs.
+ * The renderer trims it, and normalizes a project's name to NFC first, as
+ * the protocol does, so that it counts the characters that the protocol
+ * counts. The main process checks it with the protocol's request schema as
+ * well, which also refuses a blank name and control, format, and invisible
+ * characters.
+ */
+export const NewNameSchema = z
+  .string()
+  .min(1)
+  .max(WORKSPACE_LIMITS.name, { abort: true });
+
+/**
+ * Why creating a workspace was refused. Only the outcome `unknown` leaves
+ * open whether the API acted; after a refusal it did not.
+ *
+ * - `invalid`: the name is outside the protocol's rule. Nothing was sent.
+ * - `not_signed_in`: no device of this installation is signed in, or the API
+ *   refused its key or token.
+ * - `unavailable`: a sign-in, a sign-out, "This is not me", a device
+ *   removal, or an unlock runs, or the device cannot send now. Nothing was
+ *   sent.
+ * - `too_soon`: the installation's budget of writes is spent; nothing was
+ *   sent. `retryAfterMs` says when the next write may go.
+ * - `rate_limited`: the API's limit, with `retryAfterMs` from its answer,
+ *   also its limit of 10 new workspaces per account in 24 hours.
+ * - `failed`: the API refused it otherwise.
+ */
+export const CREATE_WORKSPACE_REFUSALS = Object.freeze([
+  "invalid",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "failed",
+] as const);
+export type CreateWorkspaceRefusal = (typeof CREATE_WORKSPACE_REFUSALS)[number];
+
+/**
+ * Why creating a project was refused, as for a workspace, and:
+ *
+ * - `not_selected`: the workspace is not the selected one, for example after
+ *   a switch. Nothing was sent.
+ * - `rate_limited`: also the limits of 100 projects that are not archived
+ *   per workspace and 20 new projects per account in 24 hours, which the API
+ *   answers as `rate_limited` today (#255).
+ * - `not_found`: the API does not know the workspace for this account.
+ * - `conflict`: a project of the workspace that is not archived has the
+ *   name, compared without regard to case.
+ */
+export const CREATE_PROJECT_REFUSALS = Object.freeze([
+  "invalid",
+  "not_selected",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "not_found",
+  "conflict",
+  "failed",
+] as const);
+export type CreateProjectRefusal = (typeof CREATE_PROJECT_REFUSALS)[number];
+
+/** The refusals of a create that say when the next write may go. */
+const CREATE_WAITS: ReadonlySet<string> = new Set(["too_soon", "rate_limited"]);
+
+/** A refusal of one of `reasons`, with `retryAfterMs` for a wait only. */
+function createRefusedSchema<const T extends readonly string[]>(reasons: T) {
+  return z
+    .object({
+      outcome: z.literal("refused"),
+      reason: z.enum(reasons),
+      /**
+       * How long to wait before the next try, in milliseconds, for
+       * `too_soon` and `rate_limited` only; null otherwise.
+       */
+      retryAfterMs: z.int().positive().nullable(),
+    })
+    .refine(
+      (value) =>
+        CREATE_WAITS.has(value.reason) === (value.retryAfterMs !== null),
+      { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
+    );
+}
+
+/**
+ * `unknown`: whether the API acted is not known. The create is never sent
+ * again on its own; the screen asks the person to check the list.
+ */
+const CreateUnknownSchema = z.object({ outcome: z.literal("unknown") });
+
+/**
+ * The result of creating a workspace: `ok` with the new workspace's ID and
+ * whether the main process selected it, `refused`, or `unknown`. The
+ * account's own person in it, the owner, stays in the main process, and no
+ * user ID crosses. It is not selected when chat messages wait to be sent or
+ * when another workspace was selected while the create was on its way.
+ */
+export const CreateWorkspaceResultSchema = z.discriminatedUnion("outcome", [
+  z.object({
+    outcome: z.literal("ok"),
+    workspaceId: ProtocolIdSchema,
+    selected: z.boolean(),
+  }),
+  createRefusedSchema(CREATE_WORKSPACE_REFUSALS),
+  CreateUnknownSchema,
+]);
+export type CreateWorkspaceResult = z.infer<typeof CreateWorkspaceResultSchema>;
+
+/**
+ * The result of creating a project: `ok` with the new project's ID,
+ * `refused`, or `unknown`. The project list shows the project once its
+ * server event arrives, or after the next reload of the workspace.
+ */
+export const CreateProjectResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok"), projectId: ProtocolIdSchema }),
+  createRefusedSchema(CREATE_PROJECT_REFUSALS),
+  CreateUnknownSchema,
+]);
+export type CreateProjectResult = z.infer<typeof CreateProjectResultSchema>;
+
 // The people of the selected workspace (#95, decision D3).
 
 /**
@@ -2420,6 +2547,16 @@ export const INVOKE_CONTRACT = Object.freeze({
       z.tuple([ProtocolIdSchema.nullable(), WorkspaceSwitchOptionsSchema]),
     ]),
     result: WorkspaceActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.createWorkspace]: Object.freeze({
+    /** The new workspace's name. */
+    args: z.tuple([NewNameSchema]),
+    result: CreateWorkspaceResultSchema,
+  }),
+  [INVOKE_CHANNELS.createProject]: Object.freeze({
+    /** The selected workspace's ID and the new project's name. */
+    args: z.tuple([ProtocolIdSchema, NewNameSchema]),
+    result: CreateProjectResultSchema,
   }),
   [INVOKE_CHANNELS.getPeopleState]: Object.freeze({
     args: NoArgumentsSchema,

@@ -100,6 +100,18 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   openProject: "workspaces:open-project",
   /**
+   * Creates a workspace by its name; the account's display name names the
+   * account's own person in it, its owner. The new workspace joins the list
+   * and is selected, unless chat messages wait to be sent or another
+   * workspace was selected meanwhile.
+   */
+  createWorkspace: "workspaces:create",
+  /**
+   * Creates a project in the selected workspace, by the workspace ID and
+   * the project's name. Its server event brings it to the project list.
+   */
+  createProject: "workspaces:create-project",
+  /**
    * What the renderer may know of the selected workspace's people: each
    * person's member ID, display name, role, GitHub login, and whether it is
    * claimed or a former member, and the account's own member ID. Read-only.

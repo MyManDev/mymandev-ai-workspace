@@ -27,6 +27,11 @@ import { AccountScreen } from "./AccountScreen.tsx";
 import { initialAccountView, type AccountView } from "./account-view.ts";
 import { ChatScreen } from "./ChatScreen.tsx";
 import {
+  CreateDialogBox,
+  useCreation,
+  type CreationControls,
+} from "./Creation.tsx";
+import {
   CONNECTION_ACTION_LABELS,
   CONNECTION_STATUS_TEXT_ID,
   createDeviceRemoval,
@@ -162,6 +167,11 @@ export function App({
     focusAfterShow,
   );
   const open = openProject(state);
+  const creation = useCreation(
+    workspaces,
+    workspaceSidebar.view,
+    state.view.screen === "home",
+  );
 
   return (
     <div className={open === undefined ? "shell" : "shell shell-project"}>
@@ -191,6 +201,7 @@ export function App({
         state={state}
         dispatch={dispatch}
         workspaces={workspaceSidebar}
+        creation={creation}
       />
       {open === undefined ? null : (
         <ProjectNav
@@ -216,6 +227,7 @@ export function App({
           onStartSignIn={homeStart.onStart}
           dispatch={dispatch}
           focusAfterShow={focusAfterShow}
+          creation={creation}
         />
       </main>
       {open === undefined ? null : (
@@ -228,6 +240,14 @@ export function App({
         />
       )}
       <SwitchQuestionDialog {...question} />
+      {creation === undefined ? null : (
+        <CreateDialogBox
+          dialog={creation.view.dialog}
+          onConfirm={creation.onConfirm}
+          onCancel={creation.onCancel}
+          onDraft={creation.onDialogDraft}
+        />
+      )}
     </div>
   );
 }
@@ -248,6 +268,7 @@ function ScreenContent({
   onStartSignIn,
   dispatch,
   focusAfterShow,
+  creation,
 }: {
   readonly view: ShellView;
   readonly electronVersion: string | undefined;
@@ -267,6 +288,8 @@ function ScreenContent({
   readonly onStartSignIn: () => void;
   readonly dispatch: Dispatch<ShellAction>;
   readonly focusAfterShow: (id: string) => void;
+  /** The creates, for the home screen's form; undefined without the bridge. */
+  readonly creation: CreationControls | undefined;
 }) {
   switch (view.screen) {
     case "home":
@@ -277,6 +300,7 @@ function ScreenContent({
           onStartSignIn={onStartSignIn}
           dispatch={dispatch}
           focusAfterShow={focusAfterShow}
+          creation={creation}
         />
       );
     case "account":

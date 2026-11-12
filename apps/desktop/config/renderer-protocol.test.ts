@@ -2,14 +2,23 @@
 // the Node.js types, because the renderer's own tests cannot import the
 // protocol package, whose device authentication uses Node.js.
 import {
+  CreateProjectRequestSchema,
+  CreateWorkspaceRequestSchema,
   INVITATION_CODE_PATTERN,
   INVITATION_COUNT_LIMITS,
   INVITATION_LIFETIME_SECONDS,
+  LIMITS,
   MEMBER_ROLES,
+  normalizeProjectName,
   RUN_CANCEL_REASONS,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
 import { RUN_CANCEL_MESSAGES } from "../src/renderer/agent-view.ts";
+import {
+  MAX_NEW_NAME_LENGTH,
+  nameToSend,
+  newNamePrompt,
+} from "../src/renderer/creation-view.ts";
 import {
   INVITATION_LIFETIME_DAYS,
   MAX_LIVE_INVITATIONS,
@@ -40,4 +49,40 @@ test("the question before an invitation names the protocol's default lifetime, w
 
 test("the sentence about a refused invitation names the protocol's limit of live invitations", () => {
   expect(MAX_LIVE_INVITATIONS).toBe(INVITATION_COUNT_LIMITS.live);
+});
+
+test("the creates count a name as the protocol does, up to its limit of a workspace's and a project's name", () => {
+  expect(MAX_NEW_NAME_LENGTH).toBe(LIMITS.name);
+  const longest = "\u{1F600}".repeat(LIMITS.name);
+  const checks = [
+    [
+      "workspace",
+      (name: string) =>
+        CreateWorkspaceRequestSchema.safeParse({ name, displayName: "Ada" })
+          .success,
+    ],
+    [
+      "project",
+      (name: string) => CreateProjectRequestSchema.safeParse({ name }).success,
+    ],
+  ] as const;
+  for (const [kind, accepts] of checks) {
+    for (const typed of [longest, longest + "a", "Team", " Team "]) {
+      const name = nameToSend(kind, typed);
+      expect(newNamePrompt(name) === undefined, `${kind} ${typed}`).toBe(
+        accepts(name),
+      );
+    }
+  }
+});
+
+test("the creates send a project's name as the protocol normalizes it", () => {
+  for (const typed of [
+    "  Cafe\u0301 ",
+    "e\u0301".repeat(LIMITS.name),
+    "\tLaunch Plan\u00a0",
+    "\u1100\u1161",
+  ]) {
+    expect(nameToSend("project", typed)).toBe(normalizeProjectName(typed));
+  }
 });

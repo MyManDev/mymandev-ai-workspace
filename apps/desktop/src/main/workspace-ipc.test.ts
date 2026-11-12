@@ -257,8 +257,15 @@ function register(
   return { handlers, errors, call };
 }
 
-const WORKSPACE_CHANNELS = Object.values(INVOKE_CHANNELS).filter((channel) =>
-  channel.startsWith("workspaces:"),
+/**
+ * The workspace channels of this module. The two creates share the prefix,
+ * and `creation-ipc.ts` registers them.
+ */
+const WORKSPACE_CHANNELS = Object.values(INVOKE_CHANNELS).filter(
+  (channel) =>
+    channel.startsWith("workspaces:") &&
+    channel !== INVOKE_CHANNELS.createWorkspace &&
+    channel !== INVOKE_CHANNELS.createProject,
 );
 
 test("the workspace channels are registered, and nothing else", () => {

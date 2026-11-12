@@ -8,6 +8,8 @@ import type {
   ConnectionStatus,
   CreateInvitationResult,
   CreateJoinRequestResult,
+  CreateProjectResult,
+  CreateWorkspaceResult,
   DefinePersonResult,
   DeviceListLoadResult,
   DeviceListView,
@@ -255,6 +257,34 @@ export interface WorkspaceBridge {
     projectId: string | null,
     options?: WorkspaceSwitchOptions,
   ) => Promise<WorkspaceActionResult>;
+  /**
+   * Creates a workspace with `name` (#95, D7); the account's own person in
+   * it is the owner and has the account's display name. Resolves to `ok`
+   * with the new workspace's ID and whether the main process selected it:
+   * the new workspace joins the list at once, and it is selected unless
+   * chat messages wait to be sent or another workspace was selected while
+   * the create was on its way. An empty name, or one of more than 100
+   * characters, is refused by the contract, and the call rejects; the main
+   * process then refuses a blank name and control, format, and invisible
+   * characters with `invalid`. It is sent once: `unknown` says that the
+   * answer does not show whether the API acted, and nothing sends it again.
+   * `too_soon` and `rate_limited` come with `retryAfterMs`. The bridge
+   * passes on only a string.
+   */
+  readonly create: (name: string) => Promise<CreateWorkspaceResult>;
+  /**
+   * Creates a project with `name` in the selected workspace, by its ID; any
+   * active member may. Another workspace is refused as `not_selected`, and
+   * `conflict` means that a project of the workspace has the name, compared
+   * without regard to case. The project list shows the new project once its
+   * server event arrives. The name is checked as for `create`, after the
+   * renderer normalized it to NFC and trimmed it, as the protocol does. It
+   * is sent once, as `create` is. The bridge passes on only strings.
+   */
+  readonly createProject: (
+    workspaceId: string,
+    name: string,
+  ) => Promise<CreateProjectResult>;
 }
 
 /**
