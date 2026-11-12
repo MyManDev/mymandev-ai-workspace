@@ -67,7 +67,7 @@ export const MEMBERSHIP_ROUTES = Object.freeze({
   /**
    * Defines an unclaimed person, who is always a `member`. Owner or admin.
    * A workspace that holds as many active unclaimed people as its limit
-   * answers `rate_limited`.
+   * answers `unclaimed_limit`.
    */
   defineMember: route("POST", "/workspaces/:workspaceId/members"),
   /**
@@ -255,18 +255,21 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  *   example a removed person, a request that is no longer pending, a second
  *   ownership offer, or a limit of unclaimed people below their number;
  * - `invitation_invalid`, `already_member`, `workspace_not_found`, and
- *   `join_requests_closed` as ADR 0014 defines them.
+ *   `join_requests_closed` as ADR 0014 defines them;
+ * - `unclaimed_limit`: a definition in a workspace that holds as many active
+ *   unclaimed people as its limit, without `Retry-After`, because no time
+ *   frees a place (#242).
  *
- * Limits answer `rate_limited`, also those that count live or pending items,
- * such as 50 live invitations or 50 pending join requests per workspace, and
- * the workspace's limit of active unclaimed people.
+ * The other limits answer `rate_limited`, also those that count live or
+ * pending items, such as 50 live invitations or 50 pending join requests per
+ * workspace.
  */
 export const MEMBERSHIP_ROUTE_ERRORS = Object.freeze({
   listWorkspaces: errors(),
   createWorkspace: errors(),
   getWorkspace: errors("not_found"),
   setUnclaimedMemberLimit: errors("not_found", "forbidden", "conflict"),
-  defineMember: errors("not_found", "forbidden"),
+  defineMember: errors("not_found", "forbidden", "unclaimed_limit"),
   renameMember: errors("not_found", "forbidden", "conflict"),
   removeMember: errors("not_found", "forbidden", "conflict"),
   promoteMember: errors("not_found", "forbidden", "device_too_new", "conflict"),

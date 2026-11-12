@@ -214,6 +214,7 @@ test("every API error code has its fixed HTTP status", () => {
     already_member: 409,
     conflict: 409,
     sign_in_code_used: 409,
+    unclaimed_limit: 409,
     rate_limited: 429,
     internal_error: 500,
     sign_in_unavailable: 503,

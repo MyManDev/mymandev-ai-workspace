@@ -286,6 +286,13 @@ export const API_ERROR_STATUS = Object.freeze({
    * after an API restart.
    */
   sign_in_code_used: 409,
+  /**
+   * A definition in a workspace that already holds as many active unclaimed
+   * people as its limit (#242). No time frees a place, only removing or
+   * claiming an unclaimed person or a higher limit does, so the answer
+   * carries no `Retry-After`.
+   */
+  unclaimed_limit: 409,
   /** A limit was reached; the answer carries `Retry-After`. */
   rate_limited: 429,
   /** An unexpected server error. */

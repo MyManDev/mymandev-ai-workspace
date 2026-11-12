@@ -5,6 +5,7 @@ import {
   workspaceMembers,
 } from "@mymandev/database";
 import {
+  ApiErrorBodySchema,
   CreateWorkspaceResponseSchema,
   decodeEvent,
   DefineMemberResponseSchema,
@@ -1029,7 +1030,7 @@ test("the people routes need a valid access token", async (t) => {
   }
 });
 
-test("defining a person in a workspace at its limit of unclaimed people answers 429 with rate_limited and a Retry-After of one day, and a removal frees a place", async (t) => {
+test("defining a person in a workspace at its limit of unclaimed people answers 409 with unclaimed_limit and no Retry-After, and a removal frees a place", async (t) => {
   const recorded = recorder();
   const owner = await signedIn(
     await workspaceApp(t, { githubId: 3140, ...recorded }),
@@ -1053,14 +1054,16 @@ test("defining a person in a workspace at its limit of unclaimed people answers 
     const refused = await define(session, workspace.id, {
       displayName: "Grace",
     });
-    assert.equal(refused.statusCode, 429);
+    // Its own code, not `rate_limited`: waiting does not help (#242).
+    assert.equal(refused.statusCode, 409);
     assert.deepEqual(refused.json(), {
-      statusCode: 429,
-      error: "Too Many Requests",
-      message: "Too Many Requests",
-      code: "rate_limited",
+      statusCode: 409,
+      error: "Conflict",
+      message: "Conflict",
+      code: "unclaimed_limit",
     });
-    assert.equal(refused.headers["retry-after"], String(24 * 60 * 60));
+    assert.equal(ApiErrorBodySchema.safeParse(refused.json()).success, true);
+    assert.equal(refused.headers["retry-after"], undefined);
   }
   assert.deepEqual(await view(owner, workspace.id), before, "nothing changed");
   assert.deepEqual(

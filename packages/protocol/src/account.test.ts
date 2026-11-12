@@ -288,6 +288,7 @@ test("the status of an error body fits its code", () => {
     [404, "invitation_invalid"],
     [409, "conflict"],
     [409, "sign_in_code_used"],
+    [409, "unclaimed_limit"],
     [429, "rate_limited"],
     [503, "sign_in_unavailable"],
     [400, "bad_request"],
@@ -308,6 +309,8 @@ test("the status of an error body fits its code", () => {
     [503, "rate_limited"],
     [500, "sign_in_unavailable"],
     [401, "sign_in_code_used"],
+    // The limit of unclaimed people is no wait (#242).
+    [429, "unclaimed_limit"],
     [500, "bad_request"],
     [404, "internal_error"],
   ] as const) {

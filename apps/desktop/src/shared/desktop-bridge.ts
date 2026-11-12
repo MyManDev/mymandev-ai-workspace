@@ -291,8 +291,8 @@ export interface PeopleBridge {
 export interface PeopleActionsBridge {
   /**
    * Defines an unclaimed person. Resolves to `ok` with the new person's
-   * member ID. `rate_limited` can also mean that the workspace holds as
-   * many active unclaimed people as its limit (`maxUnclaimedMembers`).
+   * member ID. `unclaimed_limit`, without a wait, means that the workspace
+   * holds as many active unclaimed people as its limit.
    */
   readonly define: (
     workspaceId: string,

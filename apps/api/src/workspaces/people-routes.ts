@@ -58,17 +58,11 @@ type MemberParams = Readonly<{ workspaceId: WorkspaceId; memberId: MemberId }>;
  * The answer to a refused action on a person. An account that stopped being
  * an active member after the membership check gets the check's `404`.
  */
-function refused(refusal: PersonRefusal | "device_too_new"): ApiError {
+function refused(
+  refusal: PersonRefusal | "device_too_new" | "unclaimed_limit",
+): ApiError {
   return new ApiError(refusal === "not_member" ? "not_found" : refusal);
 }
-
-/**
- * The `Retry-After` of a definition in a workspace that holds as many active
- * unclaimed people as its limit. No time frees a place: only removing or
- * claiming one of them, or a higher limit, does. So, like the limit of 20
- * active devices, the answer asks again in a day.
- */
-const UNCLAIMED_LIMIT_RETRY_AFTER_SECONDS = 24 * 60 * 60;
 
 /**
  * Defining, renaming, and removing people, leaving, and promoting and
@@ -125,7 +119,9 @@ export function registerPeopleRoutes(
 
   // A `role` in the body is stripped by the protocol schema: an unclaimed
   // person is always a `member`. A workspace that holds as many active
-  // unclaimed people as its limit answers `rate_limited`, as every limit does.
+  // unclaimed people as its limit answers `409` with `unclaimed_limit` and
+  // no `Retry-After`, because no time frees a place: only removing or
+  // claiming one of them, or a higher limit, does (#242).
   workspace.post(
     MEMBERSHIP_ROUTES.defineMember.path,
     {
@@ -149,11 +145,7 @@ export function registerPeopleRoutes(
           now,
         });
         if (!result.defined) {
-          throw result.refusal === "rate_limited"
-            ? new ApiError("rate_limited", {
-                retryAfterSeconds: UNCLAIMED_LIMIT_RETRY_AFTER_SECONDS,
-              })
-            : refused(result.refusal);
+          throw refused(result.refusal);
         }
         return result.member;
       });

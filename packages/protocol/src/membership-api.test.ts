@@ -323,7 +323,7 @@ test("each route answers only known error codes, the common ones included", () =
     createWorkspace: [],
     getWorkspace: ["not_found"],
     setUnclaimedMemberLimit: ["not_found", "forbidden", "conflict"],
-    defineMember: ["not_found", "forbidden"],
+    defineMember: ["not_found", "forbidden", "unclaimed_limit"],
     renameMember: ["not_found", "forbidden", "conflict"],
     removeMember: ["not_found", "forbidden", "conflict"],
     promoteMember: ["not_found", "forbidden", "device_too_new", "conflict"],
@@ -372,6 +372,8 @@ test("each route answers only known error codes, the common ones included", () =
     "promoteMember",
     "offerOwnership",
   ]);
+  // Only a definition counts the unclaimed people (#242).
+  assert.deepEqual(holders("unclaimed_limit"), ["defineMember"]);
   assert.deepEqual(holders("already_member"), [
     "previewInvitation",
     "acceptInvitation",
