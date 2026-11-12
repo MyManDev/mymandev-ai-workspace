@@ -6,11 +6,13 @@
 // - Each request names the workspace that it asks to join by its ID only.
 //   The API shows the requester nothing about the workspace before an
 //   approval (ADR 0014, "Join requests"), so no workspace name is held.
-// - A request is pending, or ended with `approved`, `denied`, or
-//   `withdrawn`; a block shows as `denied` (#92). A request past its
-//   expiry is dropped: the API's `expired` ones are left out, and a pending
-//   request leaves at its `expiresAt` by the system clock, through one
-//   timer for the soonest expiry.
+// - A request is pending, or ended with `approved`, `denied`,
+//   `withdrawn`, or `expired`; a block shows as `denied` (#92). A request
+//   past its expiry stays, as `expired` with its expiry as `decidedAt`, as
+//   the API lists it (the Project Manager's decision of 2026-11-12): a
+//   pending request becomes `expired` at its `expiresAt` by the system
+//   clock, through one timer for the soonest expiry, also before the API
+//   marks it. The approvers' list drops an expired request instead (#210).
 // - Nothing loads until the screen asked (`load`), when it opens and on the
 //   person's refresh. From then on, while the application runs, the
 //   requests load again when a device becomes signed in, when the
@@ -79,12 +81,11 @@ export type OwnJoinRequestListStatus =
 
 /**
  * How a request ended, as its requester sees it: the protocol's
- * `OWN_JOIN_REQUEST_DECISIONS` without `expired`, because an expired
- * request is dropped.
+ * `OWN_JOIN_REQUEST_DECISIONS`.
  */
 export type OwnJoinRequestOutcome = Exclude<
   OwnJoinRequestListItem["decision"],
-  null | "expired"
+  null
 >;
 
 /** One of the account's own requests as the service keeps it. */
@@ -111,8 +112,8 @@ export interface OwnJoinRequestListState {
   /** Only with `unavailable`. */
   readonly problem?: WorkspaceReadFailure;
   /**
-   * The requests in the API's order, the most recently created first,
-   * without the expired ones.
+   * The requests in the API's order, the most recently created first, with
+   * a pending one past its expiry as `expired`.
    */
   readonly requests: readonly OwnJoinRequestState[];
 }
@@ -221,13 +222,27 @@ function scheduleWithSetTimeout(
   return () => clearTimeout(handle);
 }
 
-/** A request of the API's answer as the service keeps it, or null when it expired. */
-function requestState(
-  request: OwnJoinRequestListItem,
-): OwnJoinRequestState | null {
-  if (request.decision === "expired") {
-    return null;
+/**
+ * `request` as of `now` (milliseconds since the epoch): a pending request
+ * whose `expiresAt` has passed is `expired`, decided at its expiry, as the
+ * API lists it once it is past; any other request is `request` itself.
+ */
+export function requestAsOf(
+  request: OwnJoinRequestState,
+  now: number,
+): OwnJoinRequestState {
+  if (request.decision !== null || Date.parse(request.expiresAt) > now) {
+    return request;
   }
+  return Object.freeze({
+    ...request,
+    decision: "expired",
+    decidedAt: request.expiresAt,
+  });
+}
+
+/** A request of the API's answer as the service keeps it. */
+function requestState(request: OwnJoinRequestListItem): OwnJoinRequestState {
   return Object.freeze({
     id: request.id,
     workspaceId: request.workspaceId,
@@ -377,16 +392,12 @@ export function createOwnJoinRequestService(
 
   // The expiry.
 
-  function expired(request: OwnJoinRequestState): boolean {
-    return (
-      request.decision === null && Date.parse(request.expiresAt) <= clock()
-    );
-  }
-
-  /** Drops the pending requests whose expiry has passed. */
-  function dropExpired(): void {
-    if (requests.some(expired)) {
-      requests = Object.freeze(requests.filter((request) => !expired(request)));
+  /** Makes the pending requests whose expiry has passed `expired`. */
+  function expireDue(): void {
+    const at = clock();
+    const next = requests.map((request) => requestAsOf(request, at));
+    if (next.some((request, index) => request !== requests[index])) {
+      requests = Object.freeze(next);
       touch();
     }
   }
@@ -422,7 +433,7 @@ export function createOwnJoinRequestService(
       run(() => {
         cancelExpiry = null;
         expiryAt = null;
-        dropExpired();
+        expireDue();
       });
     }, delayMs);
   }
@@ -519,14 +530,12 @@ export function createOwnJoinRequestService(
       loadFailed(result.reason);
       return;
     }
-    const held: OwnJoinRequestState[] = [];
-    for (const request of result.value.joinRequests) {
-      const state = requestState(request);
-      if (state !== null && !expired(state)) {
-        held.push(state);
-      }
-    }
-    requests = Object.freeze(held);
+    const at = clock();
+    requests = Object.freeze(
+      result.value.joinRequests.map((request) =>
+        requestAsOf(requestState(request), at),
+      ),
+    );
     loaded = true;
     problem = null;
     attempt = 0;

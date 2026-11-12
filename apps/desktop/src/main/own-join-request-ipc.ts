@@ -11,11 +11,12 @@ import {
   createInvokeHandler,
   type IpcRegistry,
 } from "./ipc.ts";
-import type {
-  OwnJoinRequestListState,
-  OwnJoinRequestListStatus,
-  OwnJoinRequestService,
-  OwnJoinRequestState,
+import {
+  requestAsOf,
+  type OwnJoinRequestListState,
+  type OwnJoinRequestListStatus,
+  type OwnJoinRequestService,
+  type OwnJoinRequestState,
 } from "./own-join-requests/service.ts";
 import type { ScheduleTimer } from "./runtime.ts";
 
@@ -66,8 +67,9 @@ function requestView(request: OwnJoinRequestState): OwnJoinRequestView {
  * as its revision. Each request crosses with its ID, the ID of the
  * workspace that it asks to join, the requested display name, its times,
  * and how it ended, or null twice while it is pending. A pending request
- * past its `expiresAt` at `now` (milliseconds since the epoch) is left out,
- * also before the service's expiry timer drops it. The list holds at most
+ * past its `expiresAt` at `now` (milliseconds since the epoch) crosses as
+ * `expired`, decided at its expiry, also before the service's expiry timer
+ * marks it. The list holds at most
  * `OWN_JOIN_REQUEST_LIMITS.requests`, the most recent first, and a longer
  * name is cut. No user ID crosses.
  */
@@ -80,12 +82,8 @@ export function ownJoinRequestsView(
     revision,
     requests: Object.freeze(
       state.requests
-        .filter(
-          (request) =>
-            request.decision !== null || Date.parse(request.expiresAt) > now,
-        )
         .slice(0, OWN_JOIN_REQUEST_LIMITS.requests)
-        .map(requestView),
+        .map((request) => requestView(requestAsOf(request, now))),
     ),
   };
   const status = STATUS_VIEWS[state.status];

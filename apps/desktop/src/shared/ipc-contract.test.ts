@@ -3004,6 +3004,7 @@ test("an own join requests view with every status, problem, and decision is acce
     "approved",
     "denied",
     "withdrawn",
+    "expired",
   ]);
   const parsed = OwnJoinRequestsViewSchema.parse(ownJoinRequestsView());
   expect(Object.isFrozen(parsed.requests)).toBe(true);
@@ -3058,10 +3059,7 @@ test("an own join requests view over the limits or with wrong values is refused"
     }),
     ownJoinRequestsView({ requests: [{ ...item, expiresAt: null }] }),
     ownJoinRequestsView({ requests: [{ ...item, createdAt: "yesterday" }] }),
-    // An expired request is left out, and a block shows as denied.
-    ownJoinRequestsView({
-      requests: [{ ...item, decision: "expired", decidedAt: DECIDED_AT }],
-    }),
+    // A block shows as denied.
     ownJoinRequestsView({
       requests: [{ ...item, decision: "blocked", decidedAt: DECIDED_AT }],
     }),
@@ -3250,16 +3248,29 @@ test("an own join request action answers ok, a create with its pending request o
   }
   for (const reason of [
     "invalid",
-    "name_required",
+    "not_signed_in",
     "already_member",
     "workspace_not_found",
     "join_requests_closed",
-    "device_too_new",
     "rate_limited",
     "not_found",
     "conflict",
     "failed",
   ]) {
     expect(OWN_JOIN_REQUEST_ACTION_REFUSALS).toContain(reason);
+  }
+  // A create without a name while signed out is `not_signed_in`, and
+  // `device_too_new` is `failed` (the decisions of 2026-11-12).
+  expect(OWN_JOIN_REQUEST_ACTION_REFUSALS).not.toContain("name_required");
+  expect(OWN_JOIN_REQUEST_ACTION_REFUSALS).not.toContain("device_too_new");
+  for (const reason of ["name_required", "device_too_new"]) {
+    expect(
+      CreateJoinRequestResultSchema.safeParse({
+        outcome: "refused",
+        reason,
+        retryAfterMs: null,
+      }).success,
+      reason,
+    ).toBe(false);
   }
 });

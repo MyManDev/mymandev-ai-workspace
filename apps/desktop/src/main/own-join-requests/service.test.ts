@@ -336,7 +336,7 @@ async function settle(): Promise<void> {
   }
 }
 
-test("nothing is read until the screen asks; then the state holds the requests in the API's order with their decisions, frozen, without the expired ones", async () => {
+test("nothing is read until the screen asks; then the state holds the requests in the API's order with their decisions, the expired ones too, frozen", async () => {
   const h = new Harness();
   expect(h.service.state()).toEqual({
     revision: 0,
@@ -389,6 +389,15 @@ test("nothing is read until the screen asks; then the state holds the requests i
         expiresAt: EXPIRES_AT,
         decision: "denied",
         decidedAt: DECIDED_AT,
+      },
+      {
+        id: THIRD,
+        workspaceId: WORKSPACE,
+        requestedDisplayName: "Linus Requester",
+        createdAt: CREATED_AT,
+        expiresAt: CREATED_AT,
+        decision: "expired",
+        decidedAt: CREATED_AT,
       },
       {
         id: FOURTH,
@@ -500,6 +509,19 @@ test("the account's own workspace.member.claimed and other frames are no trigger
     }),
   );
   expect(h.sent).toBe(1);
+});
+
+test("only a change of the connection to connected loads: not another status, and not the same status again", async () => {
+  const h = new Harness();
+  await h.loaded();
+  h.setConnection("connected");
+  h.setConnection("authenticating");
+  expect(h.sent).toBe(1);
+  h.setConnection("connected");
+  expect(h.sent).toBe(2);
+  await h.answer(ok(list([item(FIRST)])));
+  h.setConnection("connected");
+  expect(h.sent).toBe(2);
 });
 
 test("before the screen asked, a frame, a reconnect, a sign-in, and reload read nothing", () => {
@@ -674,8 +696,9 @@ test("a rate_limited answer of a load that a trigger overtook still makes the ne
   expect(h.service.state().status).toBe("ready");
 });
 
-test("a pending request leaves at its expiry by the system clock, one past it is never held, and an ended request never expires", async () => {
+test("a pending request becomes expired, decided at its expiry, when the system clock passes it, also one that the answer holds past it; an ended request never changes", async () => {
   const h = new Harness();
+  const PAST = "2026-11-06T09:59:59.999Z";
   await h.loaded(
     list([
       item(FIRST, { expiresAt: SOON }),
@@ -686,26 +709,55 @@ test("a pending request leaves at its expiry by the system clock, one past it is
         decidedAt: DECIDED_AT,
       }),
       // Past its expiry by this device's clock, before the API marked it.
-      item(FOURTH, { expiresAt: "2026-11-06T09:59:59.999Z" }),
+      item(FOURTH, { expiresAt: PAST }),
     ]),
   );
-  expect(h.ids()).toEqual([FIRST, SECOND, THIRD]);
+  const decisions = () =>
+    h.service
+      .state()
+      .requests.map((request) => [
+        request.id,
+        request.decision,
+        request.decidedAt,
+      ]);
+  expect(decisions()).toEqual([
+    [FIRST, null, null],
+    [SECOND, null, null],
+    [THIRD, "withdrawn", DECIDED_AT],
+    [FOURTH, "expired", PAST],
+  ]);
   // One timer, for the soonest expiry of a pending request.
   expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([SOON_MS]);
 
+  const before = h.service.state();
   h.wall += SOON_MS;
   h.fire(SOON_MS);
-  expect(h.ids()).toEqual([SECOND, THIRD]);
+  expect(decisions()).toEqual([
+    [FIRST, "expired", SOON],
+    [SECOND, null, null],
+    [THIRD, "withdrawn", DECIDED_AT],
+    [FOURTH, "expired", PAST],
+  ]);
+  const after = h.service.state();
+  expect(after.revision).toBe(before.revision + 1);
+  expect(Object.isFrozen(after.requests[0])).toBe(true);
+  // The requests that did not change are the same objects.
+  expect(after.requests[1]).toBe(before.requests[1]);
+  expect(after.requests[2]).toBe(before.requests[2]);
   // The next expiry is six days away; the timer waits at most a day.
   expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([
     OWN_JOIN_REQUEST_EXPIRY_CHECK_MAX_MS,
   ]);
   h.wall += OWN_JOIN_REQUEST_EXPIRY_CHECK_MAX_MS;
   h.fire();
-  expect(h.ids()).toEqual([SECOND, THIRD]);
+  expect(h.service.state().revision).toBe(after.revision);
+  expect(decisions()[1]).toEqual([SECOND, null, null]);
   expect(h.openTimers().map((timer) => timer.delayMs)).toEqual([
     OWN_JOIN_REQUEST_EXPIRY_CHECK_MAX_MS,
   ]);
+  h.wall = Date.parse(EXPIRES_AT);
+  h.fire();
+  expect(decisions()[1]).toEqual([SECOND, "expired", EXPIRES_AT]);
 
   // Without a pending request, no timer waits.
   h.setAccount(SIGNED_OUT);

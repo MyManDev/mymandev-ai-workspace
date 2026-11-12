@@ -458,8 +458,8 @@ export interface InvitationActionsBridge {
  * each with its ID, the ID of the workspace that it asks to join, the
  * requested display name, its times, and how it ended, a block shown as a
  * denial. The API shows the requester nothing else about the workspace, so
- * no workspace name comes. A request past its expiry is left out. No user
- * ID crosses.
+ * no workspace name comes. A pending request past its expiry comes as
+ * `expired`. No user ID crosses.
  */
 export interface OwnJoinRequestsBridge {
   /** The current own join requests. */
@@ -502,10 +502,10 @@ export interface OwnJoinRequestActionsBridge {
   /**
    * Asks to join the workspace with the ID that the person typed, as a new
    * person with `displayName`, or with the account's display name when it
-   * is left out or null; without one in the main process, it resolves to
-   * `refused` with `name_required`. Resolves to `ok` with the pending
-   * request: while one is pending for the workspace, the API answers with
-   * it instead of creating another.
+   * is left out or null; while no account is signed in, which would give
+   * that name, it resolves to `refused` with `not_signed_in`. Resolves to
+   * `ok` with the pending request: while one is pending for the workspace,
+   * the API answers with it instead of creating another.
    */
   readonly create: (
     workspaceId: string,

@@ -25,10 +25,11 @@ import type { OwnJoinRequestService } from "./own-join-requests/service.ts";
  * checks the fresh literal, so the record fails to compile when the
  * allowlist gains or loses a failure. The API answers a create
  * (`MEMBERSHIP_ROUTE_ERRORS`) with `workspace_not_found`,
- * `join_requests_closed`, and `already_member` beyond the common codes;
- * `device_too_new` passes through as well. The codes of a workspace's
- * people, invitations, and requests would be refusals that the desktop
- * does not expect, `failed`.
+ * `join_requests_closed`, and `already_member` beyond the common codes.
+ * The codes of a workspace's people, invitations, and requests, and
+ * `device_too_new`, which the protocol does not list for a create (the
+ * Project Manager's decision of 2026-11-12), would be refusals that the
+ * desktop does not expect, `failed`.
  */
 const CREATE_OUTCOMES = {
   invalid: "invalid",
@@ -42,7 +43,7 @@ const CREATE_OUTCOMES = {
   invitation_invalid: "failed",
   join_requests_closed: "join_requests_closed",
   workspace_not_found: "workspace_not_found",
-  device_too_new: "device_too_new",
+  device_too_new: "failed",
   unclaimed_limit: "failed",
   rate_limited: "rate_limited",
   unknown: "unknown",
@@ -170,8 +171,10 @@ export interface OwnJoinRequestActionsOptions {
  * of an own pending request. Each checks its ID with the protocol's ID
  * schemas, after the contract's own check, before anything is sent. A
  * create's display name defaults to the account's (`users.display_name`,
- * from the device record that the account status shows); without either it
- * is refused as `name_required`. The account service checks the name with
+ * from the device record that the account status shows). The status holds
+ * that name, at least one character, whenever an account is signed in, so
+ * a create without a name while none is answers `not_signed_in`, as the
+ * account service would. The account service checks the name with
  * the protocol's request schema. A write is sent once and never again on
  * its own: an uncertain answer is `unknown`. The account service's
  * refusals come through as they are, `too_soon` and `rate_limited` with
@@ -190,7 +193,12 @@ export function createOwnJoinRequestActions(
   const onError =
     options.onError ?? ((message: string) => console.error(message));
 
-  /** The account's display name from its status, or null without one. */
+  /**
+   * The account's display name from its status, or null while no account
+   * is signed in. A signed-in status always has one: it comes from the
+   * device record, which holds it by the protocol's rule (1 to 64
+   * characters, not blank), and the contract requires it as well.
+   */
   function accountDisplayName(): string | null {
     const shown = account.status().account;
     return shown.kind === "signed_in" ? shown.displayName : null;
@@ -240,7 +248,8 @@ export function createOwnJoinRequestActions(
       const workspaceId: WorkspaceId = parsed.data;
       const name = displayName ?? accountDisplayName();
       if (name === null) {
-        return refused("name_required");
+        // Only an account that is signed in has a name.
+        return refused("not_signed_in");
       }
       const result = await send(
         () =>

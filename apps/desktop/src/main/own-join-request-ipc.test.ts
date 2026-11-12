@@ -263,7 +263,7 @@ test("the view holds each request's ID, its workspace's ID, the requested name, 
   expect(Object.isFrozen(view.requests[0])).toBe(true);
 });
 
-test("a pending request past its expiry is left out, an ended one never is, a long name is cut in characters, and the list holds at most its limit", () => {
+test("a pending request past its expiry crosses as expired, decided at its expiry, an ended one as it is, a long name is cut in characters, and the list holds at most its limit", () => {
   const face = "\u{1F600}";
   const view = ownJoinRequestsView(
     listState({
@@ -285,11 +285,19 @@ test("a pending request past its expiry is left out, an ended one never is, a lo
     1,
     NOW,
   );
-  expect(view.requests.map((entry) => entry.joinRequestId)).toEqual([
-    FIRST,
-    SECOND,
-    ENDED,
+  expect(
+    view.requests.map((entry) => [
+      entry.joinRequestId,
+      entry.decision,
+      entry.decidedAt,
+    ]),
+  ).toEqual([
+    [FIRST, null, null],
+    [EXPIRED, "expired", new Date(NOW).toISOString()],
+    [SECOND, null, null],
+    [ENDED, "withdrawn", AT],
   ]);
+  expect(Object.isFrozen(view.requests[1])).toBe(true);
   expect(view.requests[0]?.requestedName).toBe(
     face.repeat(OWN_JOIN_REQUEST_LIMITS.displayName),
   );
@@ -336,12 +344,9 @@ test("every status of the service crosses as it is, with the problem only while 
   expect([...OWN_JOIN_REQUEST_LOAD_REFUSALS].sort()).toEqual(
     ["not_signed_in", "too_soon"].sort(),
   );
-  // The outcomes are the protocol's decisions of a requester without
-  // `expired`, which the service drops.
+  // The outcomes are the protocol's decisions of a requester.
   const outcomes: readonly OwnJoinRequestOutcome[] = OWN_JOIN_REQUEST_OUTCOMES;
-  expect([...outcomes, "expired"].sort()).toEqual(
-    [...OWN_JOIN_REQUEST_DECISIONS].sort(),
-  );
+  expect([...outcomes].sort()).toEqual([...OWN_JOIN_REQUEST_DECISIONS].sort());
   expect(OWN_JOIN_REQUEST_LIMITS.requests).toBe(MAX_ANSWER_LIST_ITEMS);
   expect(OWN_JOIN_REQUEST_LIMITS.displayName).toBe(LIMITS.displayName);
 });

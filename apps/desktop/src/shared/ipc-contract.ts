@@ -1611,14 +1611,15 @@ export const OWN_JOIN_REQUEST_LIMITS = Object.freeze({
 
 /**
  * How one of the account's own requests ended, as its requester sees it:
- * the protocol's `OWN_JOIN_REQUEST_DECISIONS` without `expired`, because
- * the main process leaves out a request past its expiry. A block shows as
- * `denied` (#92).
+ * the protocol's `OWN_JOIN_REQUEST_DECISIONS`. A block shows as `denied`
+ * (#92), and a request past its expiry as `expired`, with its expiry as
+ * the time of the decision, also before the API marked it.
  */
 export const OWN_JOIN_REQUEST_OUTCOMES = Object.freeze([
   "approved",
   "denied",
   "withdrawn",
+  "expired",
 ] as const);
 export type OwnJoinRequestOutcomeView =
   (typeof OWN_JOIN_REQUEST_OUTCOMES)[number];
@@ -1674,8 +1675,8 @@ const OwnJoinRequestsViewFields = {
   revision: z.int().nonnegative(),
   /**
    * The requests in the API's order, the most recently created first,
-   * without the ones past their expiry; empty unless the status is `ready`
-   * or `unavailable`.
+   * with a pending one past its expiry shown as `expired`; empty unless the
+   * status is `ready` or `unavailable`.
    */
   requests: z
     .array(OwnJoinRequestViewSchema)
@@ -1733,17 +1734,14 @@ export type OwnJoinRequestLoadResult = z.infer<
  *   `rate_limited` as for the people actions. `rate_limited` also covers
  *   the limits of ADR 0014: at most 5 pending requests and 10 new requests
  *   in 24 hours per account, 50 pending requests per workspace, and a wait
- *   of 24 hours after a denial; `retryAfterMs` says how long.
- * - `name_required`: a create without a display name, while the main
- *   process holds none of the account's. Nothing was sent.
+ *   of 24 hours after a denial; `retryAfterMs` says how long. A create
+ *   without a display name, while no account is signed in, whose display
+ *   name would be the default, is `not_signed_in`, and nothing is sent.
  * - `already_member`: the account is already an active member of the
  *   workspace.
  * - `workspace_not_found`: no workspace has the ID, or it is archived.
  * - `join_requests_closed`: the workspace pauses new requests, or it
  *   blocks the account; the API does not say which.
- * - `device_too_new`: the API refused the action because this device is
- *   too new. The protocol lists the code only for an ownership offer and a
- *   promotion today, so a create does not expect it.
  * - `not_found`: a withdrawal of a request that the account does not have.
  * - `conflict`: a withdrawal of a request that is no longer pending, also
  *   one past its expiry.
@@ -1751,7 +1749,6 @@ export type OwnJoinRequestLoadResult = z.infer<
  */
 export const OWN_JOIN_REQUEST_ACTION_REFUSALS = Object.freeze([
   "invalid",
-  "name_required",
   "not_signed_in",
   "unavailable",
   "too_soon",
@@ -1759,7 +1756,6 @@ export const OWN_JOIN_REQUEST_ACTION_REFUSALS = Object.freeze([
   "already_member",
   "workspace_not_found",
   "join_requests_closed",
-  "device_too_new",
   "not_found",
   "conflict",
   "failed",

@@ -356,7 +356,7 @@ test("a create without a name sends the account's display name, and a name of 64
   });
 });
 
-test("a create without a name, while the main process holds no display name of the account, is name_required, and nothing is sent", async () => {
+test("a create without a name while no account is signed in, which would give that name, is not_signed_in, and nothing is sent", async () => {
   for (const shown of [
     { kind: "hidden" } as const,
     { kind: "signed_out" } as const,
@@ -368,7 +368,7 @@ test("a create without a name, while the main process holds no display name of t
       call(INVOKE_CHANNELS.createJoinRequest, WORKSPACE, null),
     ).resolves.toEqual({
       outcome: "refused",
-      reason: "name_required",
+      reason: "not_signed_in",
       retryAfterMs: null,
     });
     expect(account.calls).toEqual([]);
@@ -445,7 +445,7 @@ const EXPECTED: Readonly<
     invitation_invalid: refusedWith("failed"),
     join_requests_closed: refusedWith("join_requests_closed"),
     workspace_not_found: refusedWith("workspace_not_found"),
-    device_too_new: refusedWith("device_too_new"),
+    device_too_new: refusedWith("failed"),
     unclaimed_limit: refusedWith("failed"),
     rate_limited: refusedWith("rate_limited", 1_500),
     unknown: { outcome: "unknown" },
@@ -472,7 +472,7 @@ const EXPECTED: Readonly<
 };
 
 test("every failure of every action maps to one fixed result, which the contract accepts", async () => {
-  const reasons = new Set<string>(["name_required"]);
+  const reasons = new Set<string>();
   for (const entry of CASES) {
     const expected = EXPECTED[entry.name];
     expect(Object.keys(expected).sort()).toEqual(
@@ -495,7 +495,7 @@ test("every failure of every action maps to one fixed result, which the contract
       }
     }
   }
-  // Every refusal of the contract comes from a failure or `name_required`.
+  // Every refusal of the contract comes from a failure.
   expect([...reasons].sort()).toEqual(
     [...OWN_JOIN_REQUEST_ACTION_REFUSALS].sort(),
   );
@@ -517,13 +517,13 @@ test("each code that the protocol lists for a create or a withdrawal maps to its
       ).toMatchObject({ reason: code });
     }
   }
-  // `device_too_new` passes through for a create, although the protocol
-  // does not list it there today.
+  // `device_too_new`, which the protocol does not list for a create, is
+  // `failed` (the Project Manager's decision of 2026-11-12).
   expect(MEMBERSHIP_ROUTE_ERRORS.createJoinRequest).not.toContain(
     "device_too_new",
   );
   expect(EXPECTED.createJoinRequest.device_too_new).toMatchObject({
-    reason: "device_too_new",
+    reason: "failed",
   });
 });
 
