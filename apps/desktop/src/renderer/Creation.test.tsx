@@ -9,12 +9,17 @@ import type { WorkspaceView } from "../shared/ipc-contract.ts";
 import {
   CreateButton,
   CreateDialogContent,
+  CreatedOpenButton,
+  focusAfterOpenLeaves,
+  HOME_TITLE_ID,
   HomeCreateWorkspace,
+  WORKSPACES_HEADING_ID,
   type CreationControls,
 } from "./Creation.tsx";
 import {
   CREATE_DONE_MESSAGES,
   CREATE_MESSAGES,
+  describeCreatedOffer,
   describeCreation,
   IDLE_CREATION,
   type CreateDialog,
@@ -94,6 +99,8 @@ function controls(
   const value: CreationControls = {
     view,
     offer: describeCreation({ kind: "known", state }),
+    created: describeCreatedOffer(view.message, { kind: "known", state }),
+    onOpenCreated: () => calls.push("open created"),
     onOpen: (place, button) => calls.push(`open ${place} ${String(button)}`),
     onHomeDraft: (text) => calls.push(`home draft ${text}`),
     onCreateFromHome: () => calls.push("create from home"),
@@ -141,10 +148,10 @@ test("the sidebar offers New workspace below the workspaces and New project belo
     CREATE_MESSAGES.newProject,
   ]);
   expect(html).toContain(
-    `</ul><p class="nav-empty nav-status" role="status"></p><div class="nav-create"><button type="button" class="panel-action">New workspace</button></div><p class="nav-empty nav-status" role="status"></p><h2 class="nav-heading" id="projects-heading">Projects</h2>`,
+    `</ul><p class="nav-empty nav-status" role="status"></p><div class="nav-create"><button type="button" class="panel-action">New workspace</button></div><p class="nav-empty nav-status" id="create-status-workspaces" role="status"></p><h2 class="nav-heading" id="projects-heading">Projects</h2>`,
   );
   expect(html).toContain(
-    `</ul><div class="nav-create"><button type="button" class="panel-action">New project</button></div><p class="nav-empty nav-status" role="status"></p></nav>`,
+    `</ul><div class="nav-create"><button type="button" class="panel-action">New project</button></div><p class="nav-empty nav-status" id="create-status-projects" role="status"></p></nav>`,
   );
   // The names are text, with their own direction.
   expect(html).toContain(
@@ -168,10 +175,10 @@ test("each sentence shows in the status paragraph of its own place only", () => 
       ),
     );
   expect(sidebar("workspaces")).toContain(
-    `<div class="nav-create"><button type="button" class="panel-action">New workspace</button></div><p class="nav-empty nav-status" role="status">${CREATE_DONE_MESSAGES.project}</p>`,
+    `<div class="nav-create"><button type="button" class="panel-action">New workspace</button></div><p class="nav-empty nav-status" id="create-status-workspaces" role="status">${CREATE_DONE_MESSAGES.project}</p>`,
   );
   expect(sidebar("projects")).toContain(
-    `New project</button></div><p class="nav-empty nav-status" role="status">${CREATE_DONE_MESSAGES.project}</p></nav>`,
+    `New project</button></div><p class="nav-empty nav-status" id="create-status-projects" role="status">${CREATE_DONE_MESSAGES.project}</p></nav>`,
   );
   expect(sidebar("home")).not.toContain(CREATE_DONE_MESSAGES.project);
   expect(
@@ -298,7 +305,7 @@ test("the home screen shows the form only while the account has no workspace, an
   expect(home(empty)).toContain('<form id="home-create"');
   expect(home(empty)).toContain('<h2 id="home-title" tabindex="-1">Home</h2>');
   expect(home(empty)).toMatch(
-    /<\/form><p class="account-message" role="status"><\/p><\/section>$/,
+    /<\/form><p class="account-message" id="create-status-home" role="status"><\/p><\/section>$/,
   );
   const listed = home(workspaceState(), {
     ...IDLE_CREATION,
@@ -307,7 +314,7 @@ test("the home screen shows the form only while the account has no workspace, an
   expect(listed).not.toContain("<form");
   expect(listed).toMatch(
     new RegExp(
-      `<p class="account-message" role="status">${CREATE_DONE_MESSAGES.workspaceSelected}</p></section>$`,
+      `<p class="account-message" id="create-status-home" role="status">${CREATE_DONE_MESSAGES.workspaceSelected}</p></section>$`,
     ),
   );
   // Another place's sentence does not show here.
@@ -431,4 +438,224 @@ test("the dialog's field, Create, Cancel, and Escape reach their handlers", () =
     "cancel",
     "cancel",
   ]);
+});
+
+// Opening a new workspace or project from its sentence (the Project
+// Manager's decision of 2026-11-12 on #95).
+
+const NEW_WORKSPACE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3";
+const NEW_PROJECT = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192e2";
+
+/** The list after the main process added the new workspace, not selected. */
+const WITH_NEW_WORKSPACE = workspaceState({
+  workspaces: [
+    { id: NEW_WORKSPACE, name: "Team Gamma" },
+    { id: WORKSPACE_A, name: MARKUP_NAME },
+    { id: WORKSPACE_B, name: "Team Beta" },
+  ],
+});
+
+/** The projects once `workspace.project.created` listed the new one. */
+const WITH_NEW_PROJECT = workspaceState({
+  projects: [
+    { id: PROJECT, name: "Launch Plan" },
+    { id: NEW_PROJECT, name: "Roadmap" },
+  ],
+});
+
+/** The sentence of a new workspace that the create did not select. */
+function notSelected(place: "home" | "workspaces"): CreationView {
+  return {
+    ...IDLE_CREATION,
+    message: {
+      place,
+      text: CREATE_DONE_MESSAGES.workspaceNotSelected,
+      created: { kind: "workspace", workspaceId: NEW_WORKSPACE },
+    },
+  };
+}
+
+/** The sentence of a new project in the selected workspace. */
+const NEW_PROJECT_SENTENCE: CreationView = {
+  ...IDLE_CREATION,
+  message: {
+    place: "projects",
+    text: CREATE_DONE_MESSAGES.project,
+    created: {
+      kind: "project",
+      workspaceId: WORKSPACE_A,
+      projectId: NEW_PROJECT,
+    },
+  },
+};
+
+function homeWith(creation: CreationControls): string {
+  return renderToString(
+    <HomeScreen
+      signIn="none"
+      start={{ running: false, message: undefined }}
+      onStartSignIn={() => undefined}
+      dispatch={() => undefined}
+      focusAfterShow={() => undefined}
+      creation={creation}
+    />,
+  );
+}
+
+test("Open this workspace follows the sentence of a new workspace that was not selected, described by it, in the sidebar and on the home screen", () => {
+  const sidebar = renderToString(
+    nav(
+      controls(notSelected("workspaces"), WITH_NEW_WORKSPACE).value,
+      WITH_NEW_WORKSPACE,
+    ),
+  );
+  expect(sidebar).toContain(
+    `<p class="nav-empty nav-status" id="create-status-workspaces" role="status">${CREATE_DONE_MESSAGES.workspaceNotSelected}</p><div class="nav-create"><button type="button" class="panel-action" aria-describedby="create-status-workspaces">${CREATE_MESSAGES.openWorkspace}</button></div><h2 class="nav-heading" id="projects-heading">`,
+  );
+  expect(buttonLabels(sidebar)).not.toContain(CREATE_MESSAGES.openProject);
+  expect(sidebar.split(CREATE_MESSAGES.openWorkspace)).toHaveLength(2);
+  // No ID appears in the markup.
+  for (const id of [NEW_WORKSPACE, WORKSPACE_A, WORKSPACE_B, PROJECT]) {
+    expect(sidebar).not.toContain(id);
+  }
+
+  const home = homeWith(
+    controls(notSelected("home"), WITH_NEW_WORKSPACE).value,
+  );
+  expect(home).toMatch(
+    new RegExp(
+      `<p class="account-message" id="create-status-home" role="status">${CREATE_DONE_MESSAGES.workspaceNotSelected}</p><div class="account-actions"><button type="button" class="panel-action" aria-describedby="create-status-home">${CREATE_MESSAGES.openWorkspace}</button></div></section>$`,
+    ),
+  );
+  expect(home).not.toContain(NEW_WORKSPACE);
+  // Each place shows only its own sentence's button.
+  expect(
+    renderToString(
+      nav(
+        controls(notSelected("home"), WITH_NEW_WORKSPACE).value,
+        WITH_NEW_WORKSPACE,
+      ),
+    ),
+  ).not.toContain(CREATE_MESSAGES.openWorkspace);
+  expect(
+    homeWith(controls(notSelected("workspaces"), WITH_NEW_WORKSPACE).value),
+  ).not.toContain(CREATE_MESSAGES.openWorkspace);
+});
+
+test("no Open this workspace before the list holds it, once it is selected, or after a create that selected it", () => {
+  const cases: [CreationView, WorkspaceView][] = [
+    [notSelected("workspaces"), workspaceState()],
+    [
+      notSelected("workspaces"),
+      { ...WITH_NEW_WORKSPACE, selectedWorkspaceId: NEW_WORKSPACE },
+    ],
+    [
+      {
+        ...IDLE_CREATION,
+        message: {
+          place: "workspaces",
+          text: CREATE_DONE_MESSAGES.workspaceSelected,
+        },
+      },
+      WITH_NEW_WORKSPACE,
+    ],
+  ];
+  for (const [view, state] of cases) {
+    const html = renderToString(nav(controls(view, state).value, state));
+    expect(buttonLabels(html)).not.toContain(CREATE_MESSAGES.openWorkspace);
+  }
+});
+
+test("Open this project follows the sentence of a new project once the list of projects holds it, while its workspace is selected and it is not open", () => {
+  const html = renderToString(
+    nav(
+      controls(NEW_PROJECT_SENTENCE, WITH_NEW_PROJECT).value,
+      WITH_NEW_PROJECT,
+    ),
+  );
+  expect(html).toContain(
+    `New project</button></div><p class="nav-empty nav-status" id="create-status-projects" role="status">${CREATE_DONE_MESSAGES.project}</p><div class="nav-create"><button type="button" class="panel-action" aria-describedby="create-status-projects">${CREATE_MESSAGES.openProject}</button></div></nav>`,
+  );
+  expect(buttonLabels(html)).not.toContain(CREATE_MESSAGES.openWorkspace);
+  for (const id of [NEW_PROJECT, PROJECT, WORKSPACE_A]) {
+    expect(html).not.toContain(id);
+  }
+  for (const state of [
+    workspaceState(),
+    { ...WITH_NEW_PROJECT, selectedWorkspaceId: WORKSPACE_B },
+    { ...WITH_NEW_PROJECT, openProjectId: NEW_PROJECT },
+  ]) {
+    const other = renderToString(
+      nav(controls(NEW_PROJECT_SENTENCE, state).value, state),
+    );
+    expect(buttonLabels(other)).not.toContain(CREATE_MESSAGES.openProject);
+  }
+});
+
+test("each button reaches its handler, and stays focusable and does nothing while a create runs", () => {
+  const cases: [CreationView, WorkspaceView, string][] = [
+    [
+      notSelected("workspaces"),
+      WITH_NEW_WORKSPACE,
+      CREATE_MESSAGES.openWorkspace,
+    ],
+    [NEW_PROJECT_SENTENCE, WITH_NEW_PROJECT, CREATE_MESSAGES.openProject],
+  ];
+  for (const [view, state, label] of cases) {
+    for (const running of [false, true]) {
+      const { calls, value } = controls({ ...view, running }, state);
+      const buttons = elementsOf(nav(value, state)).filter(
+        (element) =>
+          element.type === "button" && element.props.children === label,
+      );
+      expect(buttons, label).toHaveLength(1);
+      expect(buttons[0]?.props["aria-disabled"]).toBe(
+        running ? "true" : undefined,
+      );
+      buttons[0]?.props.onClick?.({ currentTarget: "the button" });
+      expect(calls).toEqual(running ? [] : ["open created"]);
+    }
+  }
+  expect(
+    renderToString(
+      <CreatedOpenButton
+        place="home"
+        created={{
+          kind: "workspace",
+          place: "home",
+          workspaceId: NEW_WORKSPACE,
+        }}
+        running
+        onOpen={() => undefined}
+        className="account-actions"
+      />,
+    ),
+  ).toBe(
+    `<div class="account-actions"><button type="button" class="panel-action" aria-describedby="create-status-home" aria-disabled="true">${CREATE_MESSAGES.openWorkspace}</button></div>`,
+  );
+});
+
+test("when a button leaves its place while the focus fell to the page, the focus moves to the home screen's title or the Workspaces heading, as after a create", () => {
+  expect(focusAfterOpenLeaves("workspaces", undefined, true)).toBe(
+    WORKSPACES_HEADING_ID,
+  );
+  expect(focusAfterOpenLeaves("projects", undefined, true)).toBe(
+    WORKSPACES_HEADING_ID,
+  );
+  expect(focusAfterOpenLeaves("home", undefined, true)).toBe(HOME_TITLE_ID);
+  expect(focusAfterOpenLeaves("home", "workspaces", true)).toBe(HOME_TITLE_ID);
+  // Not while it stays, before it showed, or when the person moved on.
+  expect(
+    focusAfterOpenLeaves("workspaces", "workspaces", true),
+  ).toBeUndefined();
+  expect(focusAfterOpenLeaves(undefined, "projects", true)).toBeUndefined();
+  expect(focusAfterOpenLeaves(undefined, undefined, true)).toBeUndefined();
+  expect(focusAfterOpenLeaves("projects", undefined, false)).toBeUndefined();
+  // Both targets take the focus without a tab stop.
+  expect(renderToString(nav(controls().value))).toContain(
+    `<h2 class="nav-heading" id="${WORKSPACES_HEADING_ID}" tabindex="-1">`,
+  );
+  expect(homeWith(controls().value)).toContain(
+    `<h2 id="${HOME_TITLE_ID}" tabindex="-1">`,
+  );
 });

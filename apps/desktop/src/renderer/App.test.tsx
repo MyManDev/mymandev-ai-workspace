@@ -666,7 +666,7 @@ test("each workspace state has its own fixed text in the sidebar, and no ID is s
     // With the bridge, the creates' own status paragraph follows; before
     // the first state, no create is offered.
     expect(workspacePart(props)).toBe(
-      `${WORKSPACES_HEADING}${text}${statusParagraph()}${props.workspaces === undefined ? "" : statusParagraph()}`,
+      `${WORKSPACES_HEADING}${text}${statusParagraph()}${props.workspaces === undefined ? "" : '<p class="nav-empty nav-status" id="create-status-workspaces" role="status"></p>'}`,
     );
   }
 

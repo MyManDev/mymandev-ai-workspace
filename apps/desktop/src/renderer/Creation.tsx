@@ -10,14 +10,18 @@ import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
 import {
   CREATE_MESSAGES,
   createCreation,
+  describeCreatedOffer,
   describeCreation,
   IDLE_CREATION,
   type CreateDialog,
+  type CreatedOffer,
+  type CreatedOpenPaths,
   type CreatePlace,
   type CreationOffer,
   type CreationView,
 } from "./creation-view.ts";
 import { focusesTitleAfterAction } from "./device-view.ts";
+import { focusesTitleAfterLeave } from "./join-invitation-view.ts";
 import { focusesTitleAfterClose } from "./people-actions-view.ts";
 import type { WorkspacePanelView } from "./workspace-view.ts";
 
@@ -33,10 +37,51 @@ export const HOME_FORM_ID = "home-create";
  */
 export const WORKSPACES_HEADING_ID = "workspaces-heading";
 
+/**
+ * The IDs of the status paragraphs of the creates, by place, which
+ * describe the button that a sentence offers.
+ */
+export const CREATE_STATUS_IDS: Readonly<Record<CreatePlace, string>> =
+  Object.freeze({
+    home: "create-status-home",
+    workspaces: "create-status-workspaces",
+    projects: "create-status-projects",
+  });
+
+/**
+ * The ID of the element that takes the focus as the button of a sentence
+ * ("Open this workspace" or "Open this project") changes from the place
+ * `before` to `after`, or undefined: only when it was shown, left its
+ * place, and the focus fell to the page (`focusesTitleAfterLeave`), as
+ * when the workspace is selected or the project open. The targets are the
+ * ones of the creates (#258): the home screen's title for the home screen,
+ * and the sidebar's "Workspaces" heading for the sidebar.
+ */
+export function focusAfterOpenLeaves(
+  before: CreatePlace | undefined,
+  after: CreatePlace | undefined,
+  focusOnPage: boolean,
+): string | undefined {
+  if (
+    before === undefined ||
+    !focusesTitleAfterLeave(true, after === before, focusOnPage)
+  ) {
+    return undefined;
+  }
+  return before === "home" ? HOME_TITLE_ID : WORKSPACES_HEADING_ID;
+}
+
 /** What the shell shows and does of its creates; see `useCreation`. */
 export interface CreationControls {
   readonly view: CreationView;
   readonly offer: CreationOffer;
+  /**
+   * The button that the sentence offers ("Open this workspace" or "Open
+   * this project"), or undefined.
+   */
+  readonly created: CreatedOffer | undefined;
+  /** Opens what the sentence offers, through the existing paths. */
+  readonly onOpenCreated: () => void;
   /**
    * Opens the sidebar's dialog for `place`; gets the button that was
    * clicked, and for a project the workspace that the button was shown for.
@@ -72,9 +117,50 @@ export function CreateStatus({
   readonly className: string;
 }) {
   return (
-    <p className={className} role="status">
+    <p className={className} id={CREATE_STATUS_IDS[place]} role="status">
       {message?.place === place ? message.text : ""}
     </p>
+  );
+}
+
+/**
+ * "Open this workspace" or "Open this project" after the status paragraph
+ * at `place`, while its sentence offers it (`describeCreatedOffer`),
+ * described by the sentence, like the join screen's "Open this workspace"
+ * (#249). While a create runs it stays focusable and does nothing
+ * (`aria-disabled`), like the other create controls. The button's text is
+ * fixed; no name or ID is in it.
+ */
+export function CreatedOpenButton({
+  place,
+  created,
+  running,
+  onOpen,
+  className,
+}: {
+  readonly place: CreatePlace;
+  readonly created: CreatedOffer | undefined;
+  readonly running: boolean;
+  readonly onOpen: () => void;
+  readonly className: string;
+}) {
+  if (created?.place !== place) {
+    return null;
+  }
+  return (
+    <div className={className}>
+      <button
+        type="button"
+        className="panel-action"
+        aria-describedby={CREATE_STATUS_IDS[place]}
+        aria-disabled={running ? "true" : undefined}
+        onClick={running ? undefined : onOpen}
+      >
+        {created.kind === "workspace"
+          ? CREATE_MESSAGES.openWorkspace
+          : CREATE_MESSAGES.openProject}
+      </button>
+    </div>
   );
 }
 
@@ -328,6 +414,12 @@ function focusOnPageOrIn(id: string): boolean {
   );
 }
 
+/** Whether the focus fell to the page. */
+function focusOnPage(): boolean {
+  const active = document.activeElement;
+  return active === null || active === document.body;
+}
+
 /**
  * The creates of the shell (`createCreation`) while it is mounted, which
  * follow every workspace state and whether the home screen is shown;
@@ -341,11 +433,17 @@ function focusOnPageOrIn(id: string): boolean {
  *   listed, so after a confirmed create there the focus moves to the home
  *   screen's title, while it is still in the form or on the page
  *   (`focusesTitleAfterAction`).
+ * - "Open this workspace" and "Open this project" go through `paths`
+ *   (`createdOpenPaths`). When one leaves the page while the focus fell to
+ *   the page, for example once the workspace is selected or the project
+ *   open, the focus moves to the home screen's title or the sidebar's
+ *   "Workspaces" heading (`focusAfterOpenLeaves`).
  */
 export function useCreation(
   bridge: Pick<WorkspaceBridge, "create" | "createProject"> | undefined,
   workspaces: WorkspacePanelView,
   homeShown: boolean,
+  paths: CreatedOpenPaths,
 ): CreationControls | undefined {
   const [view, setView] = useState(IDLE_CREATION);
   const controller = useMemo(
@@ -374,6 +472,26 @@ export function useCreation(
     }
     wasOpen.current = open;
   }, [open]);
+  const created = useMemo(
+    () => describeCreatedOffer(view.message, workspaces),
+    [view.message, workspaces],
+  );
+  const createdAt = created?.place;
+  const wasCreatedAt = useRef(createdAt);
+  useEffect(() => {
+    const target = focusAfterOpenLeaves(
+      wasCreatedAt.current,
+      createdAt,
+      focusOnPage(),
+    );
+    wasCreatedAt.current = createdAt;
+    if (target !== undefined) {
+      focusElement(target);
+    }
+  }, [createdAt]);
+  const onOpenCreated = useCallback(() => {
+    controller?.openCreated(paths);
+  }, [controller, paths]);
   const projectIn = offer.projectIn;
   const onOpen = useCallback(
     (place: "workspaces" | "projects", button: Element | null) => {
@@ -393,6 +511,8 @@ export function useCreation(
         : {
             view,
             offer,
+            created,
+            onOpenCreated,
             onOpen,
             onHomeDraft: controller.editHomeDraft,
             onCreateFromHome: () => {
@@ -410,6 +530,6 @@ export function useCreation(
             onCancel: controller.cancel,
             onDialogDraft: controller.editDialogDraft,
           },
-    [controller, view, offer, onOpen],
+    [controller, view, offer, created, onOpenCreated, onOpen],
   );
 }

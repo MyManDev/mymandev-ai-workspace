@@ -6,6 +6,7 @@ import type {
   CreateWorkspaceResult,
 } from "../shared/ipc-contract.ts";
 import { describeWait } from "./people-actions-view.ts";
+import type { ShellAction } from "./screens.ts";
 import type { WorkspacePanelView } from "./workspace-view.ts";
 
 /**
@@ -59,6 +60,10 @@ export const CREATE_MESSAGES = Object.freeze({
   nameMissing: "Enter a name.",
   /** Before a create with a longer name. */
   nameTooLong: `A name has at most ${String(MAX_NEW_NAME_LENGTH)} characters.`,
+  /** After the sentence of a new workspace that the create did not select. */
+  openWorkspace: "Open this workspace",
+  /** After the sentence of a new project, once the list of projects holds it. */
+  openProject: "Open this project",
 });
 
 /**
@@ -263,10 +268,143 @@ export interface CreateDialog {
   readonly problem: string | undefined;
 }
 
+/**
+ * What a confirmed create made that its sentence may offer to open (the
+ * Project Manager's decision of 2026-11-12 on #95): a new workspace that
+ * the create did not select, or a new project with the workspace that it
+ * was created in.
+ */
+export type CreatedItem =
+  | { readonly kind: "workspace"; readonly workspaceId: string }
+  | {
+      readonly kind: "project";
+      readonly workspaceId: string;
+      readonly projectId: string;
+    };
+
 /** The sentence of the last create and where it shows. */
 export interface CreateMessage {
   readonly place: CreatePlace;
   readonly text: string;
+  /** What the create made that the sentence may offer to open, or undefined. */
+  readonly created?: CreatedItem | undefined;
+}
+
+/** The button that a create's sentence offers, at the sentence's place. */
+export type CreatedOffer =
+  | {
+      readonly kind: "workspace";
+      readonly place: CreatePlace;
+      readonly workspaceId: string;
+    }
+  | {
+      readonly kind: "project";
+      readonly place: CreatePlace;
+      readonly projectId: string;
+    };
+
+/**
+ * The button that the sentence `message` offers by the workspace state
+ * `workspaces`, or undefined:
+ *
+ * - "Open this workspace" for a new workspace that the create did not
+ *   select, because chat messages wait to be sent or the selection changed
+ *   while the create was on its way, while the list holds it and it is not
+ *   the selected workspace, like the join screen's button (#249);
+ * - "Open this project" for a new project once the list of projects holds
+ *   it, which its `workspace.project.created` event brings, only while its
+ *   workspace is still the selected one, and not while it is the open
+ *   project. A new project never opens by itself.
+ *
+ * Nothing while no device is signed in and ready.
+ */
+export function describeCreatedOffer(
+  message: CreateMessage | undefined,
+  workspaces: WorkspacePanelView | undefined,
+): CreatedOffer | undefined {
+  const created = message?.created;
+  if (
+    message === undefined ||
+    created === undefined ||
+    workspaces?.kind !== "known" ||
+    workspaces.state.status === "signed_out"
+  ) {
+    return undefined;
+  }
+  const { state } = workspaces;
+  if (created.kind === "workspace") {
+    return state.selectedWorkspaceId !== created.workspaceId &&
+      state.workspaces.some((workspace) => workspace.id === created.workspaceId)
+      ? Object.freeze({
+          kind: "workspace",
+          place: message.place,
+          workspaceId: created.workspaceId,
+        })
+      : undefined;
+  }
+  return state.selectedWorkspaceId === created.workspaceId &&
+    state.openProjectId !== created.projectId &&
+    state.projects.some((project) => project.id === created.projectId)
+    ? Object.freeze({
+        kind: "project",
+        place: message.place,
+        projectId: created.projectId,
+      })
+    : undefined;
+}
+
+/** The existing paths that "Open this workspace" and "Open this project" take. */
+export interface CreatedOpenPaths {
+  /**
+   * The sidebar's switch (`WorkspaceSidebar.onSelect`), which asks before
+   * it drops chat messages that wait to be sent.
+   */
+  readonly selectWorkspace: (workspaceId: string) => void;
+  /**
+   * Opens a project as the sidebar's list of projects does: the main
+   * process then opens it through the chat service's switch, which asks
+   * first while chat messages wait to be sent.
+   */
+  readonly openProject: (projectId: string) => void;
+}
+
+/**
+ * The paths of the buttons: the sidebar's switch `selectWorkspace` as it
+ * is, and the shell's `open-project`, which `App` reports to the main
+ * process as for a click in the list of projects. Neither drops a waiting
+ * chat message: only the answer to the switch question does.
+ */
+export function createdOpenPaths(
+  selectWorkspace: (workspaceId: string) => void,
+  dispatch: (action: ShellAction) => void,
+): CreatedOpenPaths {
+  return Object.freeze({
+    selectWorkspace: (workspaceId: string) => selectWorkspace(workspaceId),
+    openProject: (projectId: string) =>
+      dispatch({ type: "open-project", projectId }),
+  });
+}
+
+/** What a create's result makes that its sentence may offer to open. */
+function createdItem(
+  workspaceId: string | null,
+  result: CreateWorkspaceResult | CreateProjectResult | undefined,
+): CreatedItem | undefined {
+  if (result?.outcome !== "ok") {
+    return undefined;
+  }
+  if ("selected" in result) {
+    return result.selected
+      ? undefined
+      : Object.freeze({ kind: "workspace", workspaceId: result.workspaceId });
+  }
+  return workspaceId === null
+    ? undefined
+    : Object.freeze({
+        kind: "project",
+        workspaceId,
+        projectId: result.projectId,
+      });
 }
 
 /** What the shell shows of its creates. */
@@ -345,6 +483,14 @@ export interface Creation {
    * name stays.
    */
   readonly homeShown: (shown: boolean) => void;
+  /**
+   * "Open this workspace" or "Open this project": opens what the sentence
+   * offers by the latest workspace state (`describeCreatedOffer`) through
+   * its existing path, once per call. Nothing while a create runs or when
+   * the sentence offers nothing. It never drops a waiting chat message:
+   * the path asks the switch question. Returns whether it went.
+   */
+  readonly openCreated: (paths: CreatedOpenPaths) => boolean;
 }
 
 /**
@@ -369,6 +515,8 @@ export function createCreation(
   let createdSelected: string | undefined;
   /** The selected workspace of the latest state; undefined before one. */
   let selected: string | null | undefined;
+  /** The latest workspace state, for the sentence's button; undefined before one. */
+  let latest: WorkspacePanelView | undefined;
   /**
    * Grows with every switch of the selected workspace and every sign-out,
    * so that a project's answer counts only when nothing of the kind
@@ -420,7 +568,11 @@ export function createCreation(
     // The home screen's sentence shows only on the home screen that
     // started it, never when the shell shows it again later.
     if (counts && (place !== "home" || home)) {
-      message = Object.freeze({ place, text: sentence });
+      message = Object.freeze({
+        place,
+        text: sentence,
+        created: createdItem(workspaceId, result),
+      });
     }
     if (ok && result !== undefined && "selected" in result) {
       createdSelected = result.selected ? result.workspaceId : undefined;
@@ -555,6 +707,7 @@ export function createCreation(
       return run("home", null, () => send("home", null, name));
     },
     viewChanged: (view: WorkspacePanelView) => {
+      latest = view;
       if (view.kind !== "known") {
         return;
       }
@@ -614,6 +767,18 @@ export function createCreation(
         homeProblem = undefined;
         show();
       }
+    },
+    openCreated: (paths: CreatedOpenPaths) => {
+      const offer = running ? undefined : describeCreatedOffer(message, latest);
+      if (offer === undefined) {
+        return false;
+      }
+      if (offer.kind === "workspace") {
+        paths.selectWorkspace(offer.workspaceId);
+      } else {
+        paths.openProject(offer.projectId);
+      }
+      return true;
     },
   });
 }

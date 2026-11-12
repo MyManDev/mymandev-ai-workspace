@@ -17,6 +17,8 @@ import {
   CREATE_REFUSAL_MESSAGES,
   CREATE_UNKNOWN_MESSAGES,
   createCreation,
+  createdOpenPaths,
+  describeCreatedOffer,
   describeCreateResult,
   describeCreation,
   IDLE_CREATION,
@@ -25,7 +27,18 @@ import {
   newNamePrompt,
   type CreationView,
 } from "./creation-view.ts";
-import type { WorkspacePanelView } from "./workspace-view.ts";
+import {
+  createShellState,
+  HOME_VIEW,
+  isProjectView,
+  shellReducer,
+  type ShellAction,
+} from "./screens.ts";
+import {
+  createWorkspaceSidebar,
+  type SwitchQuestion,
+  type WorkspacePanelView,
+} from "./workspace-view.ts";
 
 const WORKSPACE_A = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a1";
 const WORKSPACE_B = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a2";
@@ -397,6 +410,7 @@ test("the dialog of a workspace checks its name and stays open with the problem,
   expect(c.last().message).toEqual({
     place: "workspaces",
     text: CREATE_DONE_MESSAGES.workspaceNotSelected,
+    created: { kind: "workspace", workspaceId: NEW_WORKSPACE },
   });
   // A confirmed create empties the name for the next dialog.
   c.creation.open("workspaces");
@@ -440,6 +454,7 @@ test("the dialog of a project sends the workspace that the button was shown for 
   expect(c.last().message).toEqual({
     place: "projects",
     text: CREATE_DONE_MESSAGES.project,
+    created: { kind: "project", workspaceId: WORKSPACE_A, projectId: PROJECT },
   });
 
   // A switch away and back while it is on its way drops its answer.
@@ -547,4 +562,329 @@ test("a sign-out ends the dialog, the names, the problems, and the sentence, and
   expect(c.last().dialog?.draft).toBe("");
   c.creation.viewChanged(SIGNED_OUT);
   expect(c.last().dialog).toBeUndefined();
+});
+
+// Opening a new workspace or project (the Project Manager's decision of
+// 2026-11-12 on #95).
+
+const NEW_PROJECT = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192e2";
+
+/** The list after the main process added the new workspace. */
+const WITH_NEW_WORKSPACE: Partial<WorkspaceView> = {
+  workspaces: [
+    { id: NEW_WORKSPACE, name: "Team Gamma" },
+    { id: WORKSPACE_A, name: "Team Alpha" },
+    { id: WORKSPACE_B, name: "Team Beta" },
+  ],
+};
+
+/** The projects after `workspace.project.created` listed the new one. */
+const WITH_NEW_PROJECT: Partial<WorkspaceView> = {
+  projects: [
+    { id: PROJECT, name: "Launch Plan" },
+    { id: NEW_PROJECT, name: "Roadmap" },
+  ],
+};
+
+/** Paths that record each call as text. */
+function recordingPaths() {
+  const calls: string[] = [];
+  const paths = {
+    selectWorkspace: (...args: unknown[]) =>
+      calls.push(`select ${JSON.stringify(args)}`),
+    openProject: (...args: unknown[]) =>
+      calls.push(`open ${JSON.stringify(args)}`),
+  };
+  return { calls, paths };
+}
+
+/** Creates a workspace from the sidebar's dialog and answers it with `result`. */
+async function createWorkspace(
+  c: ReturnType<typeof controller>,
+  result: CreateWorkspaceResult,
+): Promise<void> {
+  c.creation.open("workspaces");
+  c.creation.editDialogDraft("Team Gamma");
+  const done = c.creation.confirm();
+  c.workspaces.at(-1)?.resolve(result);
+  await done;
+}
+
+/** Creates a project in Team Alpha and answers it with `result`. */
+async function createProject(
+  c: ReturnType<typeof controller>,
+  result: CreateProjectResult,
+): Promise<void> {
+  c.creation.open("projects", WORKSPACE_A, "Team Alpha");
+  c.creation.editDialogDraft("Roadmap");
+  const done = c.creation.confirm();
+  c.projects.at(-1)?.resolve(result);
+  await done;
+}
+
+test("a sentence keeps what it may offer to open: a new workspace only when the create did not select it, a new project with its workspace, and nothing after any other answer", async () => {
+  const c = controller();
+  await createWorkspace(c, { ...OK_SELECTED, selected: false });
+  expect(c.last().message).toEqual({
+    place: "workspaces",
+    text: CREATE_DONE_MESSAGES.workspaceNotSelected,
+    created: { kind: "workspace", workspaceId: NEW_WORKSPACE },
+  });
+  await createWorkspace(c, OK_SELECTED);
+  expect(c.last().message?.text).toBe(CREATE_DONE_MESSAGES.workspaceSelected);
+  expect(c.last().message?.created).toBeUndefined();
+  for (const result of [
+    { outcome: "unknown" },
+    { outcome: "refused", reason: "rate_limited", retryAfterMs: 1000 },
+  ] as const) {
+    await createWorkspace(c, result);
+    expect(c.last().message?.created).toBeUndefined();
+    await createProject(c, result);
+    expect(c.last().message?.created).toBeUndefined();
+  }
+  await createProject(c, { outcome: "ok", projectId: NEW_PROJECT });
+  expect(c.last().message?.created).toEqual({
+    kind: "project",
+    workspaceId: WORKSPACE_A,
+    projectId: NEW_PROJECT,
+  });
+  // The home screen's create keeps it too.
+  c.creation.homeShown(true);
+  c.creation.editHomeDraft("Team Delta");
+  const home = c.creation.createFromHome();
+  c.workspaces.at(-1)?.resolve({ ...OK_SELECTED, selected: false });
+  await home;
+  expect(c.last().message).toMatchObject({
+    place: "home",
+    created: { kind: "workspace", workspaceId: NEW_WORKSPACE },
+  });
+});
+
+test("Open this workspace is offered for a new workspace that was not selected, only while the list holds it and it is not the selected workspace", () => {
+  const message = {
+    place: "workspaces",
+    text: CREATE_DONE_MESSAGES.workspaceNotSelected,
+    created: { kind: "workspace", workspaceId: NEW_WORKSPACE },
+  } as const;
+  expect(describeCreatedOffer(message, known(WITH_NEW_WORKSPACE))).toEqual({
+    kind: "workspace",
+    place: "workspaces",
+    workspaceId: NEW_WORKSPACE,
+  });
+  // At the home screen's sentence, at its place.
+  expect(
+    describeCreatedOffer(
+      { ...message, place: "home" },
+      known({ ...WITH_NEW_WORKSPACE, status: "loading" }),
+    ),
+  ).toMatchObject({ kind: "workspace", place: "home" });
+  // Not before the list holds it, not once it is selected, not while no
+  // device is signed in, and not without a known state.
+  for (const view of [
+    known(),
+    known({ ...WITH_NEW_WORKSPACE, selectedWorkspaceId: NEW_WORKSPACE }),
+    known({ ...WITH_NEW_WORKSPACE, status: "signed_out" }),
+    { kind: "pending" } as const,
+    { kind: "unavailable" } as const,
+    undefined,
+  ]) {
+    expect(describeCreatedOffer(message, view)).toBeUndefined();
+  }
+  // Not for a sentence without it: a selected workspace, or another answer.
+  for (const other of [
+    { place: "workspaces", text: CREATE_DONE_MESSAGES.workspaceSelected },
+    { place: "workspaces", text: CREATE_UNKNOWN_MESSAGES.workspace },
+    undefined,
+  ] as const) {
+    expect(
+      describeCreatedOffer(other, known(WITH_NEW_WORKSPACE)),
+    ).toBeUndefined();
+  }
+});
+
+test("Open this project is offered once the list of projects holds the new project, only while its workspace is still selected and it is not the open project", () => {
+  const message = {
+    place: "projects",
+    text: CREATE_DONE_MESSAGES.project,
+    created: {
+      kind: "project",
+      workspaceId: WORKSPACE_A,
+      projectId: NEW_PROJECT,
+    },
+  } as const;
+  expect(describeCreatedOffer(message, known(WITH_NEW_PROJECT))).toEqual({
+    kind: "project",
+    place: "projects",
+    projectId: NEW_PROJECT,
+  });
+  for (const view of [
+    // Before its `workspace.project.created` event lists it.
+    known({ projects: [{ id: PROJECT, name: "Launch Plan" }] }),
+    // Another workspace is selected, even with the project in the list.
+    known({ ...WITH_NEW_PROJECT, selectedWorkspaceId: WORKSPACE_B }),
+    known({ ...WITH_NEW_PROJECT, selectedWorkspaceId: null }),
+    // It is the open project.
+    known({ ...WITH_NEW_PROJECT, openProjectId: NEW_PROJECT }),
+    known({ ...WITH_NEW_PROJECT, status: "signed_out" }),
+    { kind: "pending" } as const,
+  ]) {
+    expect(describeCreatedOffer(message, view)).toBeUndefined();
+  }
+  // Another project open still offers it.
+  expect(
+    describeCreatedOffer(
+      message,
+      known({ ...WITH_NEW_PROJECT, openProjectId: PROJECT }),
+    ),
+  ).toBeDefined();
+});
+
+test("Open this workspace goes through the sidebar's switch with the ID alone, and Open this project through the shell's open-project, once per click", async () => {
+  const c = controller();
+  const { calls, paths } = recordingPaths();
+  await createWorkspace(c, { ...OK_SELECTED, selected: false });
+  // Before the list holds it, nothing is offered and nothing goes.
+  expect(c.creation.openCreated(paths)).toBe(false);
+  c.creation.viewChanged(known(WITH_NEW_WORKSPACE));
+  expect(c.creation.openCreated(paths)).toBe(true);
+  expect(c.creation.openCreated(paths)).toBe(true);
+  expect(calls).toEqual([
+    `select ["${NEW_WORKSPACE}"]`,
+    `select ["${NEW_WORKSPACE}"]`,
+  ]);
+  // Once the switch selected it, its sentence ends, and nothing is offered.
+  c.creation.viewChanged(
+    known({ ...WITH_NEW_WORKSPACE, selectedWorkspaceId: NEW_WORKSPACE }),
+  );
+  expect(c.last().message).toBeUndefined();
+  expect(c.creation.openCreated(paths)).toBe(false);
+
+  // A new project in the selected workspace.
+  const p = controller();
+  const project = recordingPaths();
+  await createProject(p, { outcome: "ok", projectId: NEW_PROJECT });
+  expect(p.creation.openCreated(project.paths)).toBe(false);
+  p.creation.viewChanged(known(WITH_NEW_PROJECT));
+  expect(p.creation.openCreated(project.paths)).toBe(true);
+  expect(project.calls).toEqual([`open ["${NEW_PROJECT}"]`]);
+  // Once it is the open project, nothing is offered.
+  p.creation.viewChanged(
+    known({ ...WITH_NEW_PROJECT, openProjectId: NEW_PROJECT }),
+  );
+  expect(p.creation.openCreated(project.paths)).toBe(false);
+  expect(project.calls).toHaveLength(1);
+});
+
+test("one action at a time: a create that starts ends the offer, and nothing opens while it runs", async () => {
+  const c = controller();
+  const { calls, paths } = recordingPaths();
+  await createWorkspace(c, { ...OK_SELECTED, selected: false });
+  c.creation.viewChanged(known(WITH_NEW_WORKSPACE));
+  c.creation.open("workspaces");
+  c.creation.editDialogDraft("Team Delta");
+  const done = c.creation.confirm();
+  expect(c.last().running).toBe(true);
+  expect(c.creation.openCreated(paths)).toBe(false);
+  c.workspaces.at(-1)?.resolve({ ...OK_SELECTED, selected: false });
+  await done;
+  // The new answer offers its own workspace again.
+  expect(c.creation.openCreated(paths)).toBe(true);
+  expect(calls).toEqual([`select ["${NEW_WORKSPACE}"]`]);
+});
+
+test("the paths are the sidebar's switch as it is and the shell's open-project, the action of the list of projects", () => {
+  const calls: unknown[] = [];
+  const paths = createdOpenPaths(
+    (...args: unknown[]) => calls.push(["select", ...args]),
+    (action) => calls.push(action),
+  );
+  paths.selectWorkspace(NEW_WORKSPACE);
+  paths.openProject(NEW_PROJECT);
+  expect(calls).toEqual([
+    ["select", NEW_WORKSPACE],
+    { type: "open-project", projectId: NEW_PROJECT },
+  ]);
+});
+
+/**
+ * The shell's paths as `App` wires them: the sidebar's controller over a
+ * bridge whose switches answer `waiting`, and a dispatch that applies the
+ * shell's reducer and reports a changed open project, as `App`'s effect
+ * does.
+ */
+function shellWithWaitingMessages() {
+  const calls: string[] = [];
+  const questions: (SwitchQuestion | undefined)[] = [];
+  const bridge: Pick<
+    WorkspaceBridge,
+    "subscribeState" | "openProject" | "select"
+  > = {
+    subscribeState: () => () => undefined,
+    select: (...args: unknown[]) => {
+      calls.push(`select ${JSON.stringify(args)}`);
+      return Promise.resolve({ outcome: "waiting" as const, count: 2 });
+    },
+    openProject: (...args: unknown[]) => {
+      calls.push(`openProject ${JSON.stringify(args)}`);
+      return Promise.resolve({ outcome: "waiting" as const, count: 1 });
+    },
+  };
+  let shell = createShellState(
+    workspaceState(WITH_NEW_PROJECT).projects,
+    HOME_VIEW,
+  );
+  const openProjectId = () =>
+    isProjectView(shell.view) ? shell.view.projectId : null;
+  let reported: string | null = null;
+  const dispatch = (action: ShellAction) => {
+    shell = shellReducer(shell, action);
+    if (openProjectId() !== reported) {
+      reported = openProjectId();
+      sidebar.openProjectChanged(reported);
+    }
+  };
+  const sidebar = createWorkspaceSidebar(
+    bridge,
+    dispatch,
+    () => undefined,
+    () => undefined,
+    (question) => questions.push(question),
+  );
+  return {
+    calls,
+    questions,
+    sidebar,
+    paths: createdOpenPaths(sidebar.select, dispatch),
+    openProjectId,
+  };
+}
+
+test("neither button discards waiting chat messages: each asks the switch question, and only its answer discards them", async () => {
+  const shell = shellWithWaitingMessages();
+  const c = controller();
+  await createWorkspace(c, { ...OK_SELECTED, selected: false });
+  c.creation.viewChanged(known(WITH_NEW_WORKSPACE));
+  expect(c.creation.openCreated(shell.paths)).toBe(true);
+  await settle();
+  expect(shell.calls).toEqual([`select ["${NEW_WORKSPACE}"]`]);
+  expect(shell.questions.at(-1)).toEqual({ kind: "workspace", count: 2 });
+  // Keeping the messages sends nothing more.
+  shell.sidebar.keepWaiting();
+  await settle();
+  expect(shell.calls).toHaveLength(1);
+
+  const p = controller();
+  await createProject(p, { outcome: "ok", projectId: NEW_PROJECT });
+  p.creation.viewChanged(known(WITH_NEW_PROJECT));
+  expect(p.creation.openCreated(shell.paths)).toBe(true);
+  expect(shell.openProjectId()).toBe(NEW_PROJECT);
+  await settle();
+  expect(shell.calls.slice(1)).toEqual([`openProject ["${NEW_PROJECT}"]`]);
+  expect(shell.questions.at(-1)).toEqual({ kind: "project", count: 1 });
+  // Only the person's answer repeats the switch with the messages dropped.
+  shell.sidebar.discardWaiting();
+  await settle();
+  expect(shell.calls.slice(2)).toEqual([
+    `openProject ["${NEW_PROJECT}",{"discardWaiting":true}]`,
+  ]);
 });

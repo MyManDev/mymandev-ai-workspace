@@ -2,6 +2,7 @@ import type { Dispatch } from "react";
 import type { WorkspaceView } from "../shared/ipc-contract.ts";
 import {
   CreateButton,
+  CreatedOpenButton,
   CreateStatus,
   WORKSPACES_HEADING_ID,
   type CreationControls,
@@ -37,7 +38,9 @@ export interface WorkspaceSidebar {
  * `aria-current="true"`. Names are text that people entered, so each one
  * takes its direction from its own content (`dir="auto"`). Below each list,
  * "New workspace" and "New project" open the dialog that asks for the name
- * (#95, D7), and a status paragraph says how the last create there went.
+ * (#95, D7), and a status paragraph says how the last create there went,
+ * followed by "Open this workspace" or "Open this project" while its
+ * sentence offers it.
  */
 export function WorkspaceNav({
   state,
@@ -87,6 +90,13 @@ export function WorkspaceNav({
             place="workspaces"
             message={creation.view.message}
             className="nav-empty nav-status"
+          />
+          <CreatedOpenButton
+            place="workspaces"
+            created={creation.created}
+            running={creation.view.running}
+            onOpen={creation.onOpenCreated}
+            className="nav-create"
           />
         </>
       )}
@@ -268,6 +278,13 @@ function ProjectList({
             place="projects"
             message={creation.view.message}
             className="nav-empty nav-status"
+          />
+          <CreatedOpenButton
+            place="projects"
+            created={creation.created}
+            running={creation.view.running}
+            onOpen={creation.onOpenCreated}
+            className="nav-create"
           />
         </>
       )}
