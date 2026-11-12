@@ -58,7 +58,7 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the agent, the chat, and the device list functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the join request, the join request action, the agent, the chat, and the device list functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
@@ -70,6 +70,8 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "electronVersion",
     "invitationActions",
     "invitations",
+    "joinRequestActions",
+    "joinRequests",
     "people",
     "peopleActions",
     "repositories",
@@ -133,6 +135,20 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "preview",
     "revoke",
   ]);
+  expect(Object.keys(bridge.joinRequests).sort()).toEqual([
+    "getState",
+    "load",
+    "subscribeState",
+  ]);
+  expect(Object.keys(bridge.joinRequestActions).sort()).toEqual([
+    "approve",
+    "block",
+    "deny",
+    "denyAll",
+    "pause",
+    "resume",
+    "unblock",
+  ]);
   expect(Object.keys(bridge.agents).sort()).toEqual([
     "getState",
     "subscribeState",
@@ -165,6 +181,8 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   expect(Object.isFrozen(bridge.peopleActions)).toBe(true);
   expect(Object.isFrozen(bridge.invitations)).toBe(true);
   expect(Object.isFrozen(bridge.invitationActions)).toBe(true);
+  expect(Object.isFrozen(bridge.joinRequests)).toBe(true);
+  expect(Object.isFrozen(bridge.joinRequestActions)).toBe(true);
   expect(Object.isFrozen(bridge.agents)).toBe(true);
   expect(Object.isFrozen(bridge.chat)).toBe(true);
   expect(Object.isFrozen(bridge.devices)).toBe(true);
@@ -178,6 +196,8 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     ...Object.values(bridge.peopleActions),
     ...Object.values(bridge.invitations),
     ...Object.values(bridge.invitationActions),
+    ...Object.values(bridge.joinRequests),
+    ...Object.values(bridge.joinRequestActions),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
@@ -200,6 +220,8 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.peopleActions),
     ...Object.values(bridge.invitations),
     ...Object.values(bridge.invitationActions),
+    ...Object.values(bridge.joinRequests),
+    ...Object.values(bridge.joinRequestActions),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
@@ -1270,6 +1292,188 @@ test("each invitation action refuses a value of another type without calling the
         await result?.catch((error: unknown) => {
           expect(String(error)).not.toContain(INVITATION_CODE);
           expect(String(error)).not.toContain(INVITATION_CODE.slice(5));
+        });
+      }
+    }
+    await expect(actions[name]?.(), name).rejects.toThrow(TypeError);
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("the join request functions call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const joinRequests = createDesktopBridge("44.9.1", fake.ipc)
+    .joinRequests as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+  const empty = { status: "signed_out", revision: 0 };
+
+  const state = joinRequests["getState"]?.(
+    "join-requests:approve",
+    WORKSPACE_ID,
+  );
+  const load = joinRequests["load"]?.(WORKSPACE_ID, { force: true });
+  fake.answers[0]?.resolve(empty);
+  fake.answers[1]?.resolve({ outcome: "loading" });
+
+  await expect(state).resolves.toEqual(empty);
+  await expect(load).resolves.toEqual({ outcome: "loading" });
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getJoinRequestState, args: [] },
+    { channel: INVOKE_CHANNELS.loadJoinRequests, args: [] },
+  ]);
+});
+
+test("the join request subscription delivers the state and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const calls: unknown[][] = [];
+  const reported: string[] = [];
+  const unsubscribe = bridge.joinRequests.subscribeState((...args) =>
+    calls.push(args),
+  );
+
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeJoinRequestState, args: [] },
+  ]);
+  fake.answers[0]?.resolve({ status: "loading", revision: 3 });
+  await settle();
+  fake.emit(EVENT_CHANNELS.joinRequestStateChanged, {
+    status: "ready",
+    revision: 4,
+  });
+  fake.emit(EVENT_CHANNELS.joinRequestStateChanged, {
+    status: "loading",
+    revision: 2,
+  });
+  expect(calls).toEqual([
+    [{ status: "loading", revision: 3 }],
+    [{ status: "ready", revision: 4 }],
+  ]);
+  unsubscribe();
+  expect(fake.listenerCount(EVENT_CHANNELS.joinRequestStateChanged)).toBe(0);
+
+  const failing = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  let refused = 0;
+  failing.joinRequests.subscribeState(
+    () => {
+      throw new Error("broken");
+    },
+    () => {
+      refused += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.joinRequestStateChanged, {
+    status: "ready",
+    revision: 5,
+  });
+  expect(reported).toEqual(["A join request state callback failed."]);
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+  expect(refused).toBe(1);
+});
+
+const JOIN_REQUEST_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000f1";
+
+/** Each join request action, its channel, and the values it takes. */
+const JOIN_REQUEST_ACTIONS = [
+  [
+    "approve",
+    INVOKE_CHANNELS.approveJoinRequest,
+    [WORKSPACE_ID, JOIN_REQUEST_ID, "Linus Renamed"],
+  ],
+  [
+    "approve",
+    INVOKE_CHANNELS.approveJoinRequest,
+    [WORKSPACE_ID, JOIN_REQUEST_ID, null],
+  ],
+  ["deny", INVOKE_CHANNELS.denyJoinRequest, [WORKSPACE_ID, JOIN_REQUEST_ID]],
+  ["denyAll", INVOKE_CHANNELS.denyAllJoinRequests, [WORKSPACE_ID]],
+  ["block", INVOKE_CHANNELS.blockJoinRequest, [WORKSPACE_ID, JOIN_REQUEST_ID]],
+  [
+    "unblock",
+    INVOKE_CHANNELS.unblockJoinRequest,
+    [WORKSPACE_ID, JOIN_REQUEST_ID],
+  ],
+  ["pause", INVOKE_CHANNELS.pauseJoinRequests, [WORKSPACE_ID]],
+  ["resume", INVOKE_CHANNELS.resumeJoinRequests, [WORKSPACE_ID]],
+] as const;
+
+test("each join request action calls its own channel with only its values, and passes the answer through", async () => {
+  const fake = fakeIpc();
+  const actions = createDesktopBridge("44.9.1", fake.ipc)
+    .joinRequestActions as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  const answers = JOIN_REQUEST_ACTIONS.map(([name, , args]) =>
+    // An extra argument is not passed on.
+    actions[name]?.(...args, { force: true }, "people:remove"),
+  );
+  // An approval without a name, or with undefined, passes on null.
+  answers.push(actions["approve"]?.(WORKSPACE_ID, JOIN_REQUEST_ID));
+  answers.push(actions["approve"]?.(WORKSPACE_ID, JOIN_REQUEST_ID, undefined));
+  const approved = { outcome: "ok", memberId: MEMBER_ID };
+  for (const [index, answer] of fake.answers.entries()) {
+    answer.resolve(index === 0 ? approved : { outcome: "unknown" });
+  }
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    approved,
+    ...Array.from({ length: answers.length - 1 }, () => ({
+      outcome: "unknown",
+    })),
+  ]);
+  expect(fake.invoked).toEqual([
+    ...JOIN_REQUEST_ACTIONS.map(([, channel, args]) => ({
+      channel,
+      args: [...args],
+    })),
+    {
+      channel: INVOKE_CHANNELS.approveJoinRequest,
+      args: [WORKSPACE_ID, JOIN_REQUEST_ID, null],
+    },
+    {
+      channel: INVOKE_CHANNELS.approveJoinRequest,
+      args: [WORKSPACE_ID, JOIN_REQUEST_ID, null],
+    },
+  ]);
+});
+
+test("each join request action refuses a value of another type without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const actions = createDesktopBridge("44.9.1", fake.ipc)
+    .joinRequestActions as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  for (const [name, , args] of JOIN_REQUEST_ACTIONS) {
+    for (const [index, arg] of args.entries()) {
+      const isName = index === 2;
+      const values = isName
+        ? [1, ["Linus"], { toString: () => "Linus" }]
+        : [
+            undefined,
+            null,
+            1,
+            [JOIN_REQUEST_ID],
+            { toString: () => JOIN_REQUEST_ID },
+          ];
+      for (const value of values) {
+        if (value === arg) {
+          continue;
+        }
+        const call = args.map((entry, at) => (at === index ? value : entry));
+        const result = actions[name]?.(...call);
+        await expect(result, name).rejects.toThrow(TypeError);
+        await result?.catch((error: unknown) => {
+          expect(String(error)).not.toContain(JOIN_REQUEST_ID);
+          expect(String(error)).not.toContain(WORKSPACE_ID);
         });
       }
     }
