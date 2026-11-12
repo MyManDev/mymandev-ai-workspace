@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import type {
   InvitationActionsBridge,
   InvitationsBridge,
+  JoinRequestActionsBridge,
+  JoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
 } from "../shared/desktop-bridge.ts";
@@ -24,6 +26,21 @@ import {
   type InvitationActionsView,
   type InvitationsScreenView,
 } from "./invitations-view.ts";
+import {
+  JOIN_REQUEST_ACTION_MESSAGE_ID,
+  JoinRequestQuestionBox,
+  JoinRequestsPart,
+  useJoinRequestActions,
+  useJoinRequestsScreen,
+  type JoinRequestActionHandlers,
+} from "./JoinRequests.tsx";
+import {
+  describeJoinRequests,
+  IDLE_JOIN_REQUEST_ACTIONS,
+  isJoinRequestOffered,
+  type JoinRequestActionsView,
+  type JoinRequestsScreenView,
+} from "./join-requests-view.ts";
 import {
   DefinePersonForm,
   LeaveWorkspace,
@@ -64,13 +81,16 @@ import {
  * actions that the account's role allows (#95, D1); the list changes only
  * with the people that the main process sends. The owner and the admins
  * also see the open invitations, invite each unclaimed person, and revoke
- * invitations (#95, D2 and D3).
+ * invitations (#95, D2 and D3), and they see the pending join requests and
+ * the blocked accounts and decide on them (#95, D1 and D3).
  */
 export function PeopleScreen({
   people,
   peopleActions,
   invitations,
   invitationActions,
+  joinRequests,
+  joinRequestActions,
 }: {
   /** The people functions from the preload script; undefined outside Electron. */
   readonly people: PeopleBridge | undefined;
@@ -80,9 +100,14 @@ export function PeopleScreen({
   readonly invitations?: InvitationsBridge | undefined;
   /** The invitation actions from the preload script; undefined outside Electron. */
   readonly invitationActions?: InvitationActionsBridge | undefined;
+  /** The join requests from the preload script; undefined outside Electron. */
+  readonly joinRequests?: JoinRequestsBridge | undefined;
+  /** The join request actions from the preload script; undefined outside Electron. */
+  readonly joinRequestActions?: JoinRequestActionsBridge | undefined;
 }) {
   const view = usePeopleScreen(people);
   const invitationsView = useInvitationsScreen(invitations);
+  const joinRequestsView = useJoinRequestsScreen(joinRequests);
   const peopleNow = usePeopleClock(view);
   const invitationsNow = useInvitationsClock(invitationsView);
   // The later of the two readings, so that both the offer and the
@@ -96,6 +121,11 @@ export function PeopleScreen({
     invitationsView,
     now,
   );
+  const joinRequestParts = useJoinRequestActions(
+    { joinRequestActions, joinRequests, peopleActions, invitationActions },
+    view,
+    joinRequestsView,
+  );
   return (
     <PeopleScreenContent
       view={view}
@@ -105,6 +135,9 @@ export function PeopleScreen({
       invitations={invitationsView}
       invitationActions={invitationParts.actions}
       invitationHandlers={invitationParts.handlers}
+      joinRequests={joinRequestsView}
+      joinRequestActions={joinRequestParts.actions}
+      joinRequestHandlers={joinRequestParts.handlers}
     />
   );
 }
@@ -137,6 +170,15 @@ export interface PeopleScreenContentProps {
    * no invitations part, no "Invite", and no code's dialog.
    */
   readonly invitationHandlers?: InvitationActionHandlers | undefined;
+  /** The join requests; unavailable by default. */
+  readonly joinRequests?: JoinRequestsScreenView | undefined;
+  /** What the screen shows of its join request actions; idle by default. */
+  readonly joinRequestActions?: JoinRequestActionsView | undefined;
+  /**
+   * The join request actions' handlers; undefined without the bridges, with
+   * no join requests part, no question, and no code's dialog of its own.
+   */
+  readonly joinRequestHandlers?: JoinRequestActionHandlers | undefined;
 }
 
 /**
@@ -164,6 +206,14 @@ export interface PeopleScreenContentProps {
  * action sits in its own status paragraph next to the people actions' one.
  * One action of either kind runs at a time: while one runs, every action's
  * control of both kinds stays focusable and does nothing.
+ *
+ * With the join request handlers, the owner and the admins also see the
+ * join requests below the open invitations (`describeJoinRequests`), while
+ * the join requests do not say `not_allowed`; the sentence of the last join
+ * request action sits in its own status paragraph after the invitation
+ * actions' one. One action of any of the three kinds runs at a time, and
+ * "Deny and invite instead" shows its invitation's code in a code dialog of
+ * its own (D2).
  */
 export function PeopleScreenContent({
   view,
@@ -175,6 +225,9 @@ export function PeopleScreenContent({
   invitations = { kind: "unavailable" },
   invitationActions = IDLE_INVITATION_ACTIONS,
   invitationHandlers,
+  joinRequests = { kind: "unavailable" },
+  joinRequestActions = IDLE_JOIN_REQUEST_ACTIONS,
+  joinRequestHandlers,
 }: PeopleScreenContentProps) {
   const { status, workspaceName, lists, adminHint } =
     describePeopleScreen(view);
@@ -185,7 +238,8 @@ export function PeopleScreenContent({
   const offer = model?.offer ?? null;
   const defineIn = model?.defineIn ?? null;
   const leave = model?.leave ?? null;
-  const inert = actions.running || invitationActions.running;
+  const inert =
+    actions.running || invitationActions.running || joinRequestActions.running;
   const rowActions =
     model === undefined || handlers === undefined
       ? undefined
@@ -213,6 +267,16 @@ export function PeopleScreenContent({
     invitationActions.question !== undefined &&
     isInvitationOffered(invitationModel, invitationActions.question)
       ? invitationActions.question
+      : undefined;
+  const joinRequestModel =
+    joinRequestHandlers === undefined
+      ? null
+      : describeJoinRequests(view, joinRequests);
+  // A question whose action the screen no longer offers closes.
+  const joinRequestDialog =
+    joinRequestActions.dialog !== undefined &&
+    isJoinRequestOffered(joinRequestModel, joinRequestActions.dialog.request)
+      ? joinRequestActions.dialog
       : undefined;
   return (
     <section aria-labelledby={PEOPLE_TITLE_ID}>
@@ -244,6 +308,15 @@ export function PeopleScreenContent({
           role="status"
         >
           {invitationActions.message ?? ""}
+        </p>
+      )}
+      {joinRequestHandlers === undefined ? null : (
+        <p
+          className="people-status"
+          id={JOIN_REQUEST_ACTION_MESSAGE_ID}
+          role="status"
+        >
+          {joinRequestActions.message ?? ""}
         </p>
       )}
       {adminHint ? (
@@ -305,6 +378,16 @@ export function PeopleScreenContent({
           onRefresh={invitationHandlers.onRefresh}
         />
       )}
+      {joinRequestModel === null || joinRequestHandlers === undefined ? null : (
+        <JoinRequestsPart
+          model={joinRequestModel}
+          dateFormat={format}
+          timeFormat={times}
+          inert={inert}
+          onStart={joinRequestHandlers.onStart}
+          onRefresh={joinRequestHandlers.onRefresh}
+        />
+      )}
       {leave === null || handlers === undefined ? null : (
         <LeaveWorkspace
           request={leave}
@@ -312,7 +395,6 @@ export function PeopleScreenContent({
           onStart={handlers.onStart}
         />
       )}
-      <p className="placeholder-note">{PEOPLE_MESSAGES.actionsLater}</p>
       {handlers === undefined ? null : (
         <PeopleActionDialogBox
           dialog={dialog}
@@ -332,6 +414,23 @@ export function PeopleScreenContent({
             code={invitationActions.code}
             format={times}
             onClose={invitationHandlers.onCloseCode}
+          />
+        </>
+      )}
+      {joinRequestHandlers === undefined ? null : (
+        <>
+          <JoinRequestQuestionBox
+            dialog={joinRequestDialog}
+            options={joinRequestModel?.unclaimed ?? []}
+            onConfirm={joinRequestHandlers.onConfirm}
+            onCancel={joinRequestHandlers.onCancel}
+            onDraft={joinRequestHandlers.onDraft}
+            onChoose={joinRequestHandlers.onChoose}
+          />
+          <InvitationCodeBox
+            code={joinRequestActions.code}
+            format={times}
+            onClose={joinRequestHandlers.onCloseCode}
           />
         </>
       )}
