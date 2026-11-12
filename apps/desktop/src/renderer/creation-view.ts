@@ -486,9 +486,10 @@ export interface Creation {
   /**
    * "Open this workspace" or "Open this project": opens what the sentence
    * offers by the latest workspace state (`describeCreatedOffer`) through
-   * its existing path, once per call. Nothing while a create runs or when
-   * the sentence offers nothing. It never drops a waiting chat message:
-   * the path asks the switch question. Returns whether it went.
+   * its existing path, once per call. Nothing when the sentence offers
+   * nothing, also while a create runs, whose start ends the sentence. It
+   * never drops a waiting chat message: the path asks the switch question.
+   * Returns whether it went.
    */
   readonly openCreated: (paths: CreatedOpenPaths) => boolean;
 }
@@ -769,7 +770,9 @@ export function createCreation(
       }
     },
     openCreated: (paths: CreatedOpenPaths) => {
-      const offer = running ? undefined : describeCreatedOffer(message, latest);
+      // A create that starts ends the sentence (`run`), so nothing opens
+      // while it runs.
+      const offer = describeCreatedOffer(message, latest);
       if (offer === undefined) {
         return false;
       }
