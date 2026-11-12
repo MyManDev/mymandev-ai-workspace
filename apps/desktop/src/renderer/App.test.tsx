@@ -131,7 +131,7 @@ interface ScreenCase {
 const SCREEN_CASES: readonly ScreenCase[] = [
   {
     view: { screen: "home" },
-    title: '<h2 id="home-title">Home</h2>',
+    title: '<h2 id="home-title" tabindex="-1">Home</h2>',
     placeholder: "Open a project to see its chat",
     current: ["Home (page)", "Workspace B (true)"],
   },
@@ -233,7 +233,9 @@ test("the sidebar lists the workspace screens, every workspace with the selected
   expect(html).toMatch(
     /<button type="button" class="nav-item">About<\/button>/,
   );
-  expect(html).toContain('<h2 class="nav-heading" id="workspaces-heading">');
+  expect(html).toContain(
+    '<h2 class="nav-heading" id="workspaces-heading" tabindex="-1">',
+  );
   expect(html).toContain(
     '<ul class="nav-list" aria-labelledby="workspaces-heading"><li><button type="button" class="nav-item" dir="auto">Workspace A</button></li><li><button type="button" class="nav-item" dir="auto" aria-current="true">Workspace B</button></li></ul>',
   );
@@ -583,7 +585,7 @@ test("a workspace without projects says so, and the shell shows the home screen"
     `<h2 class="nav-heading" id="projects-heading">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.noProjects}</p></nav>`,
   );
   expect(html).not.toContain('aria-labelledby="projects-heading"');
-  expect(html).toContain('<h2 id="home-title">Home</h2>');
+  expect(html).toContain('<h2 id="home-title" tabindex="-1">Home</h2>');
   expect(currentItems(html)).toEqual(["Home (page)", "Workspace B (true)"]);
 });
 
@@ -596,19 +598,21 @@ function escaped(text: string): string {
 function workspacePart(props: Partial<AppProps>): string {
   const html = render(props);
   const start = html.indexOf(
-    '<h2 class="nav-heading" id="workspaces-heading">',
+    '<h2 class="nav-heading" id="workspaces-heading" tabindex="-1">',
   );
   return html.slice(start, html.indexOf("</nav>", start));
 }
 
 const WORKSPACES_HEADING =
-  '<h2 class="nav-heading" id="workspaces-heading">Workspaces</h2>';
+  '<h2 class="nav-heading" id="workspaces-heading" tabindex="-1">Workspaces</h2>';
 
 const pendingBridge: WorkspaceBridge = {
   getState: () => new Promise(() => undefined),
   subscribeState: () => () => undefined,
   select: () => Promise.resolve({ outcome: "ok" }),
   openProject: () => Promise.resolve({ outcome: "ok" }),
+  create: () => new Promise(() => undefined),
+  createProject: () => new Promise(() => undefined),
 };
 
 /** The always present live region of the workspaces, with this text. */
@@ -657,8 +661,10 @@ test("each workspace state has its own fixed text in the sidebar, and no ID is s
     ],
   ];
   for (const [props, text] of cases) {
+    // With the bridge, the creates' own status paragraph follows; before
+    // the first state, no create is offered.
     expect(workspacePart(props)).toBe(
-      `${WORKSPACES_HEADING}${text}${statusParagraph()}`,
+      `${WORKSPACES_HEADING}${text}${statusParagraph()}${props.workspaces === undefined ? "" : statusParagraph()}`,
     );
   }
 
@@ -1557,7 +1563,7 @@ test("the account screen holds the account panel under This device and the accou
 });
 
 const HOME_HINT =
-  '<section aria-labelledby="home-title"><h2 id="home-title">Home</h2><p>Open a project to see its chat, tasks, decisions, and permissions, and its agents and repositories.</p>';
+  '<section aria-labelledby="home-title"><h2 id="home-title" tabindex="-1">Home</h2><p>Open a project to see its chat, tasks, decisions, and permissions, and its agents and repositories.</p>';
 
 /** The end of the home screen with this sentence, its buttons, and a message. */
 function homeEnd(

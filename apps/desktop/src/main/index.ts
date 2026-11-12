@@ -46,6 +46,7 @@ import {
   followSystemResume,
 } from "./connection/system.ts";
 import { registerConnectionIpc } from "./connection-ipc.ts";
+import { registerCreationIpc } from "./creation-ipc.ts";
 import { claimDataFolder } from "./data-folder.ts";
 import { registerDeviceIpc } from "./device-ipc.ts";
 import { createDeviceListService } from "./devices/service.ts";
@@ -337,6 +338,16 @@ function start(): void {
   // which answer `waiting` while chat messages wait to be sent, so that the
   // person is asked first.
   registerWorkspaceIpc(ipcMain, rendererUrl, workspaces, chat);
+  // Creating a workspace and a project (#95, D7) has one strict channel
+  // each, and each sends one write of the allowlist with the account
+  // service, once. A new workspace joins the list at once and is selected
+  // through the chat service's switch, which never drops waiting messages;
+  // a new project comes with its workspace event.
+  registerCreationIpc(ipcMain, rendererUrl, {
+    account,
+    workspaces,
+    switcher: chat,
+  });
 
   // The selected workspace's people (#95, D3) reach the renderer read-only:
   // member IDs, names, roles, and logins, never a user ID, at most one

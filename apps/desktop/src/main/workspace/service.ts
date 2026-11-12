@@ -2,7 +2,9 @@
 // workspace with its people and projects, and the open project, in the main
 // process. It reads them over HTTP with the account service's
 // `readWorkspaceData` and keeps them current with the workspace's events.
-// Read-only: creating workspaces and projects stays with #95.
+// It sends no write: creating a workspace or a project goes through the
+// account service (`creation-ipc.ts`, #95, D7), which adds a new workspace
+// here with `addWorkspace`; a new project comes as `workspace.project.created`.
 //
 // - The list (`GET /workspaces`) loads whenever a signed-in device's
 //   connection reaches `connected`, because account frames sent while it was
@@ -252,6 +254,20 @@ export interface WorkspaceService {
    * device.
    */
   readonly reloadList: () => boolean;
+  /**
+   * Adds a workspace that the account created (#95, D7) to the list at
+   * once, from the API's confirmed answer, with the account's own person in
+   * it, and loads the list again, like `reloadList`. No account frame or
+   * workspace event reports a new workspace. It goes first, because the list
+   * holds the most recently claimed workspace first and the creator's person
+   * is claimed at the create; a list that holds it already keeps its place.
+   * The selection does not change. False, with nothing changed, without a
+   * signed-in device.
+   */
+  readonly addWorkspace: (
+    workspace: WorkspaceSummary,
+    ownMemberId: MemberId,
+  ) => boolean;
   /**
    * Whether `workspaceId` is the selected workspace, subscribed, and
    * reloaded since its last `workspace.subscribed`, with no reload open. The
@@ -1124,6 +1140,24 @@ export function createWorkspaceService(
         if (closed || device === null) {
           return false;
         }
+        loadList();
+        return true;
+      }),
+    addWorkspace: (workspace: WorkspaceSummary, ownMemberId: MemberId) =>
+      run(() => {
+        if (closed || device === null) {
+          return false;
+        }
+        if (!listed(workspace.id)) {
+          workspaces = Object.freeze([
+            Object.freeze({ id: workspace.id, name: workspace.name }),
+            ...workspaces,
+          ]);
+          touch();
+        }
+        ownMembers.set(workspace.id, ownMemberId);
+        // A load on its way may have read before the create: its answer is
+        // dropped, and the list loads again.
         loadList();
         return true;
       }),
