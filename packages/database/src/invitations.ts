@@ -1,5 +1,6 @@
 import {
   type DeviceId,
+  INVITATION_COUNT_LIMITS,
   INVITATION_LIFETIME_SECONDS,
   type Invitation,
   type InvitationId,
@@ -40,10 +41,6 @@ import {
 // person before it consumes the invitation, too.
 
 const DAY_MS = 24 * 60 * 60_000;
-/** ADR 0014, "Limits". */
-const MAX_LIVE_INVITATIONS = 50;
-/** ADR 0014, "Limits". */
-const MAX_NEW_INVITATIONS_PER_DAY = 100;
 
 /** An invitation that is neither accepted nor revoked nor expired at `now`. */
 function live(now: Date) {
@@ -56,12 +53,12 @@ function live(now: Date) {
 
 /**
  * How long a new invitation in the workspace must wait for the limits of
- * ADR 0014: at most 50 live invitations, not counting the one of `memberId`,
- * which the new invitation replaces, and at most 100 new invitations within
- * 24 hours before `now`. null when neither limit is reached. A live
- * invitation ends at the latest at its expiry, and a new one leaves the
- * window 24 hours after its creation; with both limits reached, the later
- * of the two times counts.
+ * ADR 0014 (the protocol's `INVITATION_COUNT_LIMITS`): at most 50 live
+ * invitations, not counting the one of `memberId`, which the new invitation
+ * replaces, and at most 100 new invitations within 24 hours before `now`.
+ * null when neither limit is reached. A live invitation ends at the latest
+ * at its expiry, and a new one leaves the window 24 hours after its
+ * creation; with both limits reached, the later of the two times counts.
  */
 async function limitWait(
   tx: Database,
@@ -90,11 +87,11 @@ async function limitWait(
       ),
     );
   const waits: number[] = [];
-  if ((liveCount?.n ?? 0) >= MAX_LIVE_INVITATIONS) {
+  if ((liveCount?.n ?? 0) >= INVITATION_COUNT_LIMITS.live) {
     const soonest = liveCount?.soonest ?? input.now;
     waits.push(soonest.getTime() - input.now.getTime());
   }
-  if ((recent?.n ?? 0) >= MAX_NEW_INVITATIONS_PER_DAY) {
+  if ((recent?.n ?? 0) >= INVITATION_COUNT_LIMITS.perDay) {
     const oldest = recent?.oldest ?? input.now;
     waits.push(oldest.getTime() + DAY_MS - input.now.getTime());
   }

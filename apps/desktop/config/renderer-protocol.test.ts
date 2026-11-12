@@ -3,13 +3,17 @@
 // protocol package, whose device authentication uses Node.js.
 import {
   INVITATION_CODE_PATTERN,
+  INVITATION_COUNT_LIMITS,
   INVITATION_LIFETIME_SECONDS,
   MEMBER_ROLES,
   RUN_CANCEL_REASONS,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
 import { RUN_CANCEL_MESSAGES } from "../src/renderer/agent-view.ts";
-import { INVITATION_LIFETIME_DAYS } from "../src/renderer/invitations-view.ts";
+import {
+  INVITATION_LIFETIME_DAYS,
+  MAX_LIVE_INVITATIONS,
+} from "../src/renderer/invitations-view.ts";
 import { INVITATION_CODE_PATTERN as JOIN_CODE_PATTERN } from "../src/renderer/join-invitation-view.ts";
 import { ROLE_LABELS } from "../src/renderer/people-view.ts";
 
@@ -32,4 +36,8 @@ test("the question before an invitation names the protocol's default lifetime, w
   expect(INVITATION_LIFETIME_DAYS * 24 * 60 * 60).toBe(
     INVITATION_LIFETIME_SECONDS.default,
   );
+});
+
+test("the sentence about a refused invitation names the protocol's limit of live invitations", () => {
+  expect(MAX_LIVE_INVITATIONS).toBe(INVITATION_COUNT_LIMITS.live);
 });

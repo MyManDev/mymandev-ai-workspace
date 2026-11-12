@@ -61,8 +61,10 @@ export function followInvitations(
  * The most live invitations that a workspace holds (ADR 0014, "Limits").
  * The API refuses another create with `rate_limited` and the wait until the
  * soonest of them ends; the person's own live invitation, which the new one
- * replaces, does not count. The protocol does not export it yet; the
- * follow-up issue #252 adds it there, and this copy then checks against it.
+ * replaces, does not count. A copy of the protocol's
+ * `INVITATION_COUNT_LIMITS.live`, because the renderer cannot import the
+ * protocol package; `config/renderer-protocol.test.ts` checks that the two
+ * match.
  */
 export const MAX_LIVE_INVITATIONS = 50;
 
