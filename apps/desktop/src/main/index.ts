@@ -429,9 +429,9 @@ function start(): void {
   // them: each with the ID of the workspace that it asks to join, the
   // requested name, its times, and how it ended, read over HTTP once the
   // screen asked and again after a sign-in, a reconnect,
-  // `account.join_request_decided`, and an action. A pending request leaves
-  // the list at its expiry. They reach the renderer at most once every
-  // 50 ms. The logs are fixed text with a failure code at most.
+  // `account.join_request_decided`, and an action. A pending request becomes
+  // `expired` at its expiry and stays. They reach the renderer at most once
+  // every 50 ms. The logs are fixed text with a failure code at most.
   const ownJoinRequests = createOwnJoinRequestService({
     account,
     connection,
