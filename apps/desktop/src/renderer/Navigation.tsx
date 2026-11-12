@@ -1,6 +1,12 @@
 import type { Dispatch } from "react";
 import type { WorkspaceView } from "../shared/ipc-contract.ts";
 import {
+  CreateButton,
+  CreateStatus,
+  WORKSPACES_HEADING_ID,
+  type CreationControls,
+} from "./Creation.tsx";
+import {
   isProjectView,
   PROJECT_SCREENS,
   WORKSPACE_SCREENS,
@@ -29,16 +35,21 @@ export interface WorkspaceSidebar {
  * selected workspace's projects. The shown screen is marked with
  * `aria-current="page"`, the selected workspace and the open project with
  * `aria-current="true"`. Names are text that people entered, so each one
- * takes its direction from its own content (`dir="auto"`).
+ * takes its direction from its own content (`dir="auto"`). Below each list,
+ * "New workspace" and "New project" open the dialog that asks for the name
+ * (#95, D7), and a status paragraph says how the last create there went.
  */
 export function WorkspaceNav({
   state,
   dispatch,
   workspaces,
+  creation,
 }: {
   readonly state: ShellState;
   readonly dispatch: Dispatch<ShellAction>;
   readonly workspaces: WorkspaceSidebar;
+  /** The creates; undefined without the bridge. */
+  readonly creation?: CreationControls | undefined;
 }) {
   const { view } = state;
   return (
@@ -59,14 +70,31 @@ export function WorkspaceNav({
           </li>
         ))}
       </ul>
-      <h2 className="nav-heading" id="workspaces-heading">
+      <h2 className="nav-heading" id={WORKSPACES_HEADING_ID} tabIndex={-1}>
         Workspaces
       </h2>
       <WorkspaceList {...workspaces} />
+      {creation === undefined ? null : (
+        <>
+          {creation.offer.workspace ? (
+            <CreateButton
+              place="workspaces"
+              running={creation.view.running}
+              onOpen={creation.onOpen}
+            />
+          ) : null}
+          <CreateStatus
+            place="workspaces"
+            message={creation.view.message}
+            className="nav-empty nav-status"
+          />
+        </>
+      )}
       <SelectedWorkspace
         view={workspaces.view}
         state={state}
         dispatch={dispatch}
+        creation={creation}
       />
     </nav>
   );
@@ -107,10 +135,12 @@ function SelectedWorkspace({
   view,
   state,
   dispatch,
+  creation,
 }: {
   readonly view: WorkspacePanelView;
   readonly state: ShellState;
   readonly dispatch: Dispatch<ShellAction>;
+  readonly creation: CreationControls | undefined;
 }) {
   if (view.kind !== "known" || view.state.status === "signed_out") {
     return null;
@@ -121,7 +151,12 @@ function SelectedWorkspace({
     );
   }
   return (
-    <ProjectList state={state} dispatch={dispatch} status={view.state.status} />
+    <ProjectList
+      state={state}
+      dispatch={dispatch}
+      status={view.state.status}
+      creation={creation}
+    />
   );
 }
 
@@ -170,15 +205,20 @@ function WorkspaceItems({
   );
 }
 
-/** The selected workspace's projects, with the open one marked. */
+/**
+ * The selected workspace's projects, with the open one marked, and "New
+ * project", which every active member of the workspace may use.
+ */
 function ProjectList({
   state,
   dispatch,
   status,
+  creation,
 }: {
   readonly state: ShellState;
   readonly dispatch: Dispatch<ShellAction>;
   readonly status: WorkspaceView["status"];
+  readonly creation: CreationControls | undefined;
 }) {
   const { view } = state;
   const openProjectId = isProjectView(view) ? view.projectId : undefined;
@@ -214,6 +254,22 @@ function ProjectList({
             </li>
           ))}
         </ul>
+      )}
+      {creation === undefined ? null : (
+        <>
+          {creation.offer.projectIn === null ? null : (
+            <CreateButton
+              place="projects"
+              running={creation.view.running}
+              onOpen={creation.onOpen}
+            />
+          )}
+          <CreateStatus
+            place="projects"
+            message={creation.view.message}
+            className="nav-empty nav-status"
+          />
+        </>
       )}
     </>
   );

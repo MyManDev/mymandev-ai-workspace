@@ -31,6 +31,8 @@ import type {
   ChatView,
   ConnectionStatus,
   CreateInvitationResult,
+  CreateProjectResult,
+  CreateWorkspaceResult,
   DefinePersonResult,
   DeviceListLoadResult,
   DeviceListView,
@@ -179,7 +181,8 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * calls one fixed channel of the IPC contract and passes no argument from
  * the renderer on to it, except the mount ID of `repositories.unmount`, the
  * passphrase of `account.unlockDeviceKey`, the IDs of `workspaces.select`
- * and `workspaces.openProject`, the text of `chat.send`, and the event IDs
+ * and `workspaces.openProject`, the name of `workspaces.create`, the ID and
+ * the name of `workspaces.createProject`, the text of `chat.send`, and the event IDs
  * of `chat.retry` and `chat.discard`, which must be strings (or null to
  * close a project) and which the main process validates, the device IDs
  * of `devices.dismissNewDevices`, an array of strings that it copies, the
@@ -361,6 +364,26 @@ export function createDesktopBridge(
               )) as Promise<WorkspaceActionResult>)
         : Promise.reject(
             new TypeError("openProject needs a project ID string or null."),
+          ),
+    // Only strings go on; the main process checks the ID and the name.
+    create: (name: string) =>
+      typeof name === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.createWorkspace,
+            name,
+          ) as Promise<CreateWorkspaceResult>)
+        : Promise.reject(new TypeError("create needs a name string.")),
+    createProject: (workspaceId: string, name: string) =>
+      typeof workspaceId === "string" && typeof name === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.createProject,
+            workspaceId,
+            name,
+          ) as Promise<CreateProjectResult>)
+        : Promise.reject(
+            new TypeError(
+              "createProject needs a workspace ID and a name string.",
+            ),
           ),
   });
 

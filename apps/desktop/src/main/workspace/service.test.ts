@@ -1903,6 +1903,88 @@ test("reloadList loads the list again, merged with a load on its way, keeps the 
   expect(h.reads).toEqual([]);
 });
 
+test("addWorkspace puts a created workspace first at once, with the account's own person, keeps the selection, and loads the list again", async () => {
+  const h = await withLiveWorkspace([WS_A]);
+  const revision = h.state.revision;
+  expect(
+    h.service.addWorkspace(
+      { id: WS_C, name: WORKSPACE_NAMES[WS_C] as string },
+      NEW_MEMBER,
+    ),
+  ).toBe(true);
+  // The list shows it before any read answered, the newest first.
+  expect(h.state.workspaces).toEqual([
+    { id: WS_C, name: "Workspace Gamma" },
+    { id: WS_A, name: "Workspace Alpha" },
+  ]);
+  expect(h.state.revision).toBeGreaterThan(revision);
+  expect(h.service.ownMemberId(WS_C)).toBe(NEW_MEMBER);
+  // Selecting is the caller's: nothing is subscribed or selected here.
+  expect(h.state.selectedWorkspaceId).toBe(WS_A);
+  expect(h.frames).toEqual([`subscribe ${WS_A}`]);
+  expect(h.readNames()).toEqual(["listWorkspaces"]);
+  // The created workspace can be selected at once.
+  expect(h.service.select(WS_C)).toBe(true);
+  expect(h.frames).toEqual([
+    `subscribe ${WS_A}`,
+    `unsubscribe ${WS_A}`,
+    `subscribe ${WS_C}`,
+  ]);
+  // The list's answer holds it in the server's order.
+  await h.answer("listWorkspaces", ok(workspaceList(WS_C, WS_A)));
+  expect(h.state.workspaces.map((w) => w.id)).toEqual([WS_C, WS_A]);
+  expect(h.state.selectedWorkspaceId).toBe(WS_C);
+  expect(h.reads.map((read) => read.name)).toEqual([]);
+  for (const name of NAMES) {
+    expect(h.logs.join("\n")).not.toContain(name);
+  }
+});
+
+test("addWorkspace drops the answer of a load that was on its way, because it may have read before the create, and keeps a listed workspace in its place", async () => {
+  const h = await withLiveWorkspace([WS_A, WS_B]);
+  expect(h.service.reloadList()).toBe(true);
+  expect(h.readNames()).toEqual(["listWorkspaces"]);
+  expect(
+    h.service.addWorkspace(
+      { id: WS_C, name: WORKSPACE_NAMES[WS_C] as string },
+      NEW_MEMBER,
+    ),
+  ).toBe(true);
+  expect(h.state.workspaces.map((w) => w.id)).toEqual([WS_C, WS_A, WS_B]);
+  // The older answer does not hold it; it is dropped, and the list loads
+  // again.
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A, WS_B)));
+  expect(h.state.workspaces.map((w) => w.id)).toEqual([WS_C, WS_A, WS_B]);
+  expect(h.readNames()).toEqual(["listWorkspaces"]);
+  await h.answer("listWorkspaces", ok(workspaceList(WS_C, WS_A, WS_B)));
+  expect(h.state.workspaces.map((w) => w.id)).toEqual([WS_C, WS_A, WS_B]);
+
+  // A workspace that the list holds already keeps its place.
+  expect(
+    h.service.addWorkspace({ id: WS_B, name: "Workspace Beta" }, MEMBER),
+  ).toBe(true);
+  expect(h.state.workspaces.map((w) => w.id)).toEqual([WS_C, WS_A, WS_B]);
+  expect(h.service.ownMemberId(WS_B)).toBe(MEMBER);
+  await h.answer("listWorkspaces", ok(workspaceList(WS_C, WS_A, WS_B)));
+  expect(h.reads).toEqual([]);
+});
+
+test("addWorkspace changes nothing and reads nothing without a signed-in device or after close", async () => {
+  const h = await withLiveWorkspace([WS_A]);
+  h.setAccount(SIGNED_OUT);
+  const state = h.state;
+  expect(
+    h.service.addWorkspace({ id: WS_C, name: "Workspace Gamma" }, NEW_MEMBER),
+  ).toBe(false);
+  expect(h.state).toBe(state);
+  expect(h.service.ownMemberId(WS_C)).toBeNull();
+  h.service.close();
+  expect(
+    h.service.addWorkspace({ id: WS_C, name: "Workspace Gamma" }, NEW_MEMBER),
+  ).toBe(false);
+  expect(h.reads).toEqual([]);
+});
+
 test("ownMemberId gives the account's own person of each listed workspace", async () => {
   const h = new Harness();
   expect(h.service.ownMemberId(WS_A)).toBeNull();

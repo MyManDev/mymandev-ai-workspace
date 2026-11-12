@@ -104,6 +104,8 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "subscribeStatus",
   ]);
   expect(Object.keys(bridge.workspaces).sort()).toEqual([
+    "create",
+    "createProject",
     "getState",
     "openProject",
     "select",
@@ -928,6 +930,63 @@ test("select and openProject refuse a value of another type without calling the 
   }
   await expect(workspaces["select"]?.(null)).rejects.toThrow(TypeError);
   await expect(workspaces["openProject"]?.()).rejects.toThrow(TypeError);
+  expect(fake.invoked).toEqual([]);
+});
+
+test("create passes only the name string on, and createProject only the workspace ID and the name strings", async () => {
+  const fake = fakeIpc();
+  const workspaces = createDesktopBridge("44.9.1", fake.ipc)
+    .workspaces as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  const answers = [
+    workspaces["create"]?.("Team Alpha", "extra", { force: true }),
+    workspaces["createProject"]?.(WORKSPACE_ID, "Launch Plan", "extra"),
+  ];
+  const created = {
+    outcome: "ok",
+    workspaceId: WORKSPACE_ID,
+    selected: true,
+  };
+  fake.answers[0]?.resolve(created);
+  fake.answers[1]?.resolve({ outcome: "ok", projectId: PROJECT_ID });
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    created,
+    { outcome: "ok", projectId: PROJECT_ID },
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.createWorkspace, args: ["Team Alpha"] },
+    {
+      channel: INVOKE_CHANNELS.createProject,
+      args: [WORKSPACE_ID, "Launch Plan"],
+    },
+  ]);
+});
+
+test("create and createProject refuse a value that is not a string without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const workspaces = createDesktopBridge("44.9.1", fake.ipc)
+    .workspaces as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  for (const value of [undefined, null, 1, { name: "Secret" }, ["Secret"]]) {
+    for (const call of [
+      () => workspaces["create"]?.(value),
+      () => workspaces["createProject"]?.(value, "Secret"),
+      () => workspaces["createProject"]?.(WORKSPACE_ID, value),
+    ]) {
+      const answer = call();
+      await expect(answer).rejects.toThrow(TypeError);
+      await answer?.catch((error: unknown) => {
+        expect(String(error)).not.toContain("Secret");
+      });
+    }
+  }
   expect(fake.invoked).toEqual([]);
 });
 

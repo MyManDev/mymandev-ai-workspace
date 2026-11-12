@@ -1,6 +1,12 @@
 import type { Dispatch } from "react";
 import { PRODUCT_NAME } from "../shared/product.ts";
 import { ACCOUNT_SCREEN_TITLE_ID } from "./AccountScreen.tsx";
+import {
+  CreateStatus,
+  HOME_TITLE_ID,
+  HomeCreateWorkspace,
+  type CreationControls,
+} from "./Creation.tsx";
 import type { ShellAction } from "./screens.ts";
 import {
   HOME_SIGN_IN_MESSAGES,
@@ -30,6 +36,12 @@ export function showAccountScreen(
  * button stays focusable and does nothing (`aria-disabled`), like the
  * buttons of the connection indicator, so that the focus stays on it when
  * the start is refused or fails.
+ *
+ * While a device is signed in and the account has no workspace, the screen
+ * offers to create one with a name field (#95, D7), and its status
+ * paragraph says how the last create there went. The form leaves the page
+ * once the new workspace is listed, so the title takes the focus without a
+ * tab stop (`tabIndex={-1}`).
  */
 export function HomeScreen({
   signIn,
@@ -37,6 +49,7 @@ export function HomeScreen({
   onStartSignIn,
   dispatch,
   focusAfterShow,
+  creation,
 }: {
   /** What the screen says about the sign-in (`homeSignIn`). */
   readonly signIn: HomeSignIn;
@@ -50,10 +63,14 @@ export function HomeScreen({
    * next view, because "Go to Account" leaves the page with this screen.
    */
   readonly focusAfterShow: (id: string) => void;
+  /** The creates; undefined without the bridge. */
+  readonly creation?: CreationControls | undefined;
 }) {
   return (
-    <section aria-labelledby="home-title">
-      <h2 id="home-title">Home</h2>
+    <section aria-labelledby={HOME_TITLE_ID}>
+      <h2 id={HOME_TITLE_ID} tabIndex={-1}>
+        Home
+      </h2>
       <p>
         Open a project to see its chat, tasks, decisions, and permissions, and
         its agents and repositories.
@@ -85,6 +102,24 @@ export function HomeScreen({
               {start.message}
             </p>
           )}
+        </>
+      )}
+      {creation === undefined ? null : (
+        <>
+          {creation.offer.home ? (
+            <HomeCreateWorkspace
+              draft={creation.view.homeDraft}
+              problem={creation.view.homeProblem}
+              running={creation.view.running}
+              onDraft={creation.onHomeDraft}
+              onCreate={creation.onCreateFromHome}
+            />
+          ) : null}
+          <CreateStatus
+            place="home"
+            message={creation.view.message}
+            className="account-message"
+          />
         </>
       )}
     </section>

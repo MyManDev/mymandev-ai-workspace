@@ -24,6 +24,10 @@ import {
   CONNECTION_STOP_REASONS,
   CONNECTION_WAITING_REASONS,
   ConnectionStatusSchema,
+  CREATE_PROJECT_REFUSALS,
+  CREATE_WORKSPACE_REFUSALS,
+  CreateProjectResultSchema,
+  CreateWorkspaceResultSchema,
   DEVICE_ACTION_FAILURES,
   DEVICE_ACTION_REFUSALS,
   DEVICE_KEY_STATES,
@@ -64,6 +68,7 @@ import {
   MAX_WAITING_CHAT_MESSAGES,
   MOUNT_REFUSALS,
   MountResultSchema,
+  NewNameSchema,
   OTHER_DEVICE_REVOCATIONS,
   PEOPLE_LIMITS,
   PEOPLE_STATUSES,
@@ -249,7 +254,7 @@ const JOIN_REQUEST_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.resumeJoinRequests,
 ]);
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, and the join request actions take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, and the join request actions take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -257,6 +262,8 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.startSignIn &&
       channel !== INVOKE_CHANNELS.selectWorkspace &&
       channel !== INVOKE_CHANNELS.openProject &&
+      channel !== INVOKE_CHANNELS.createWorkspace &&
+      channel !== INVOKE_CHANNELS.createProject &&
       channel !== INVOKE_CHANNELS.sendChatMessage &&
       channel !== INVOKE_CHANNELS.retryChatMessage &&
       channel !== INVOKE_CHANNELS.discardChatMessage &&
@@ -266,7 +273,7 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       !INVITATION_ACTION_CHANNELS.has(channel) &&
       !JOIN_REQUEST_ACTION_CHANNELS.has(channel),
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 30);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 32);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -2035,6 +2042,146 @@ function agentActivity(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
+
+// The creates.
+
+test("create takes exactly one name and createProject a lowercase UUIDv7 and a name, each name 1 to 100 characters, and refuse anything else", () => {
+  const name = "Team Alpha";
+  const cases = [
+    [INVOKE_CHANNELS.createWorkspace, [name]],
+    [INVOKE_CHANNELS.createProject, [WORKSPACE_ID, name]],
+  ] as const;
+  for (const [channel, valid] of cases) {
+    const { args } = INVOKE_CONTRACT[channel];
+    expect(args.parse(valid), channel).toEqual(valid);
+    for (const value of [
+      [],
+      valid.slice(0, -1),
+      [...valid, name],
+      [...valid, undefined],
+      undefined,
+      {},
+      name,
+    ]) {
+      expect(args.safeParse(value).success, channel).toBe(false);
+    }
+    const at = (index: number, value: unknown) =>
+      valid.map((v, i) => (i === index ? value : v));
+    const nameAt = valid.length - 1;
+    for (const value of [
+      "",
+      "a".repeat(WORKSPACE_LIMITS.name + 1),
+      "\u{1F600}".repeat(WORKSPACE_LIMITS.name + 1),
+      "x".repeat(1_000_000),
+      1,
+      null,
+      undefined,
+      [name],
+      { name },
+    ]) {
+      expect(args.safeParse(at(nameAt, value)).success, channel).toBe(false);
+    }
+    // At the limit, in characters, it is accepted.
+    expect(
+      args.safeParse(at(nameAt, "\u{1F600}".repeat(WORKSPACE_LIMITS.name)))
+        .success,
+      channel,
+    ).toBe(true);
+  }
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(
+      INVOKE_CONTRACT[INVOKE_CHANNELS.createProject].args.safeParse([
+        value,
+        name,
+      ]).success,
+    ).toBe(false);
+  }
+});
+
+test("a new name is checked by its length only, and a too long one is refused with one issue", () => {
+  // The protocol's text rule runs in the main process.
+  expect(NewNameSchema.parse(" ")).toBe(" ");
+  const result = NewNameSchema.safeParse("secret".repeat(1_000));
+  expect(result.success).toBe(false);
+  expect(result.error?.issues).toHaveLength(1);
+  expect(JSON.stringify(result.error?.issues)).not.toContain("secret");
+});
+
+test("a create answers ok with its own fields, refused with a known reason and a wait only for a wait, or unknown, and never a member ID or a user ID", () => {
+  const waits = new Set(["too_soon", "rate_limited"]);
+  const cases = [
+    [
+      CreateWorkspaceResultSchema,
+      CREATE_WORKSPACE_REFUSALS,
+      { outcome: "ok", workspaceId: WORKSPACE_ID, selected: true },
+      INVOKE_CHANNELS.createWorkspace,
+    ],
+    [
+      CreateProjectResultSchema,
+      CREATE_PROJECT_REFUSALS,
+      { outcome: "ok", projectId: PROJECT_ID },
+      INVOKE_CHANNELS.createProject,
+    ],
+  ] as const;
+  for (const [schema, refusals, ok, channel] of cases) {
+    expect(INVOKE_CONTRACT[channel].result).toBe(schema);
+    expect(schema.parse({ outcome: "unknown" })).toEqual({
+      outcome: "unknown",
+    });
+    expect(schema.parse(ok)).toEqual(ok);
+    // Unknown keys are dropped, so no member ID or user ID crosses.
+    expect(
+      schema.parse({ ...ok, memberId: PERSON_ID, userId: PERSON_USER_ID }),
+    ).toEqual(ok);
+    for (const reason of refusals) {
+      const retryAfterMs = waits.has(reason) ? 1_500 : null;
+      const value = { outcome: "refused", reason, retryAfterMs };
+      expect(schema.parse(value), reason).toEqual(value);
+      expect(
+        schema.safeParse({
+          ...value,
+          retryAfterMs: retryAfterMs === null ? 1_500 : null,
+        }).success,
+        reason,
+      ).toBe(false);
+    }
+    for (const value of [
+      undefined,
+      null,
+      "ok",
+      {},
+      { outcome: "ok" },
+      { outcome: "done" },
+      { outcome: "refused", reason: "busy", retryAfterMs: null },
+      { outcome: "refused", reason: "forbidden", retryAfterMs: null },
+      { outcome: "refused", reason: "too_soon", retryAfterMs: 0 },
+      { outcome: "refused", reason: "rate_limited", retryAfterMs: "60" },
+    ]) {
+      expect(schema.safeParse(value).success).toBe(false);
+    }
+  }
+  // A workspace create cannot be refused for a reason of a project.
+  for (const reason of ["not_selected", "not_found", "conflict"]) {
+    expect(
+      CreateWorkspaceResultSchema.safeParse({
+        outcome: "refused",
+        reason,
+        retryAfterMs: null,
+      }).success,
+    ).toBe(false);
+  }
+  for (const value of [
+    { outcome: "ok", workspaceId: WORKSPACE_ID },
+    { outcome: "ok", workspaceId: WORKSPACE_ID, selected: "yes" },
+    { outcome: "ok", workspaceId: MOUNT_ID, selected: true },
+  ]) {
+    expect(CreateWorkspaceResultSchema.safeParse(value).success).toBe(false);
+  }
+  expect(
+    CreateProjectResultSchema.safeParse({ outcome: "ok", projectId: "p" })
+      .success,
+  ).toBe(false);
+});
 
 test("a protocol ID that is too long is refused with one issue, before the pattern runs", () => {
   const result = ProtocolIdSchema.safeParse("x".repeat(10_000));
