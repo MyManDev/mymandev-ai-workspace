@@ -280,6 +280,11 @@ code {
   margin: 0;
 }
 
+/* "New workspace" and "New project", below their lists. */
+.nav-create {
+  margin: var(--space-1) var(--space-2);
+}
+
 .nav-item,
 .panel-tab {
   padding: var(--space-1) var(--space-2);
