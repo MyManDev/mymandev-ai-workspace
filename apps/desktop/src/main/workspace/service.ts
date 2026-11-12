@@ -20,10 +20,12 @@
 //   membership events (#95, decision D3): each person's display name, role,
 //   whether it is claimed, the GitHub login with the time it was last
 //   verified, and whether it was removed. The user IDs are never kept.
-// - The selected workspace's live ownership offer and its limit of unclaimed
-//   people come from its view (#95, D3). No workspace event reports an
-//   offer or its end, so the account frames of an offer, and the people
-//   actions after an offer or its withdrawal, reload the view.
+// - The selected workspace's live ownership offer, its limit of unclaimed
+//   people, and the time when its join requests were paused come from its
+//   view (#95, D3). No workspace event reports an offer or its end, or a
+//   pause or its end, so the account frames of an offer, and the people and
+//   join request actions after an offer, its withdrawal, a pause, or a
+//   resume, reload the view.
 // - When the membership ends or the subscription is refused, the
 //   subscription is dropped from the connection client, which would
 //   otherwise send it again after every `auth.ok`, the list is reloaded, and
@@ -236,6 +238,14 @@ export interface WorkspaceService {
    */
   readonly unclaimedMemberLimit: () => number | null;
   /**
+   * When new join requests to the selected workspace were paused, from its
+   * last reload, as an ISO 8601 time in UTC; null while they are accepted
+   * and until it loaded. No event reports a pause or its end, so it shows
+   * after the next reload, which the join request actions begin after a
+   * pause and a resume (`reload`).
+   */
+  readonly joinRequestsPausedAt: () => string | null;
+  /**
    * Reloads the selected workspace's view and projects through the resync
    * gate, for a change that no workspace event reports, such as an
    * ownership offer or its withdrawal. Requests are merged: while a reload
@@ -443,6 +453,7 @@ export function createWorkspaceService(
   let peopleList: readonly PersonState[] | null = NO_PEOPLE;
   let ownershipOffer: OwnershipOfferState | null = null;
   let unclaimedMemberLimit: number | null = null;
+  let joinRequestsPausedAt: string | null = null;
   let projects = NO_PROJECTS;
   let openProjectId: ProjectId | null = null;
 
@@ -552,6 +563,7 @@ export function createWorkspaceService(
     peopleList = NO_PEOPLE;
     ownershipOffer = null;
     unclaimedMemberLimit = null;
+    joinRequestsPausedAt = null;
     projects = NO_PROJECTS;
     openProjectId = null;
   }
@@ -742,6 +754,7 @@ export function createWorkspaceService(
             expiresAt: offer.expiresAt,
           });
     unclaimedMemberLimit = view.value.maxUnclaimedMembers;
+    joinRequestsPausedAt = view.value.joinRequestsPausedAt;
     projects = Object.freeze(list.value.projects.map(projectSummary));
     for (const event of events) {
       // The reload is newer than an event that it already holds, and an
@@ -1133,6 +1146,7 @@ export function createWorkspaceService(
       }),
     ownershipOffer: () => ownershipOffer,
     unclaimedMemberLimit: () => unclaimedMemberLimit,
+    joinRequestsPausedAt: () => joinRequestsPausedAt,
     reload: (workspaceId: WorkspaceId) =>
       run(() => !closed && device !== null && reloadSelected(workspaceId)),
     reloadList: () =>
