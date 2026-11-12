@@ -17,7 +17,9 @@ import {
   createJoinRequestService,
   JOIN_REQUEST_EXPIRY_CHECK_MAX_MS,
   JOIN_REQUEST_LOAD_COOLDOWN_MS,
+  JOIN_REQUEST_MEMORY_LIMIT,
   JOIN_REQUEST_MEMORY_MS,
+  MAX_HELD_JOIN_REQUESTS,
   MAX_REPLAYED_JOIN_REQUEST_EVENTS,
   type JoinRequestConnection,
   type JoinRequestServiceOptions,
@@ -39,6 +41,7 @@ const REQUESTER_USER_ID = id(0xb9);
 const AT = "2026-11-05T10:00:00.000Z";
 const BLOCKED_AT = "2026-11-05T11:00:00.000Z";
 const ACCOUNT_CREATED_AT = "2020-01-02T03:04:05.000Z";
+const PAUSED = "2026-11-05T12:00:00.000Z";
 /** The system clock of the tests. */
 const WALL = Date.parse("2026-11-06T10:00:00.000Z");
 /** Six days after `WALL`, so the expiry timer waits its longest. */
@@ -70,6 +73,7 @@ function fakeWorkspaces() {
   let people: readonly PersonState[] = [person(OWN, "owner")];
   let own: MemberId | null = OWN;
   let pausedAt: string | null = null;
+  let gateLive = true;
   const listeners = new Set<(state: WorkspaceState) => void>();
   const state = (): WorkspaceState =>
     Object.freeze({
@@ -82,7 +86,12 @@ function fakeWorkspaces() {
     });
   const workspaces: Pick<
     WorkspaceService,
-    "state" | "onChange" | "people" | "ownMemberId" | "joinRequestsPausedAt"
+    | "state"
+    | "onChange"
+    | "people"
+    | "ownMemberId"
+    | "joinRequestsPausedAt"
+    | "gateLive"
   > = {
     state,
     onChange: (listener) => {
@@ -94,6 +103,7 @@ function fakeWorkspaces() {
     people: () => people,
     ownMemberId: (workspaceId) => (workspaceId === selected ? own : null),
     joinRequestsPausedAt: () => pausedAt,
+    gateLive: (workspaceId) => workspaceId === selected && gateLive,
   };
   return {
     workspaces,
@@ -104,12 +114,14 @@ function fakeWorkspaces() {
       people?: readonly PersonState[];
       own?: MemberId | null;
       pausedAt?: string | null;
+      gateLive?: boolean;
     }) {
       status = next.status ?? status;
       selected = next.selected === undefined ? selected : next.selected;
       people = next.people ?? people;
       own = next.own === undefined ? own : next.own;
       pausedAt = next.pausedAt === undefined ? pausedAt : next.pausedAt;
+      gateLive = next.gateLive ?? gateLive;
       revision += 1;
       for (const listener of [...listeners]) {
         listener(state());
@@ -878,14 +890,19 @@ test("a read that rejects is unavailable; offline, a failure schedules no retry 
   expect(live.timers.pending()).toEqual([]);
 });
 
-test("a pending request leaves the list at its expiry by the system clock, and one past it is never added", async () => {
+test("a pending request leaves the list at its expiry by the system clock, a created event past it adds nothing, and a load's answer is not filtered by the system clock", async () => {
   const soon = new Date(WALL + 60_000).toISOString();
   const live = await loadedWith(
     request(FIRST, { expiresAt: soon }),
     request(SECOND),
     request(THIRD, { expiresAt: new Date(WALL).toISOString() }),
   );
-  // The answer leaves out the one that expired already.
+  // The server left out the requests past their expiry by its own clock:
+  // the answer holds all three, and the expiry timer follows the system
+  // clock from here on.
+  expect(live.ids().pending).toEqual([FIRST, SECOND, THIRD]);
+  expect(live.timers.pending().map((timer) => timer.delayMs)).toEqual([0]);
+  live.timers.fire();
   expect(live.ids().pending).toEqual([FIRST, SECOND]);
   expect(live.timers.pending().map((timer) => timer.delayMs)).toEqual([60_000]);
 
@@ -976,4 +993,191 @@ test("no log holds a name, a login, or an ID", async () => {
     expect(text).not.toContain(hidden);
   }
   expect(live.logs.length).toBeGreaterThan(0);
+});
+
+test("the demotion of the account's own person drops the list at once when its event comes while the workspace service's gate holds it, and nothing loads until the people show the role", async () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+    pausedAt: AT,
+  });
+  live.service.load();
+  live.account.reads[0]?.resolve(list(request(FIRST), block(SECOND)));
+  await settle();
+
+  // The workspace reloads, so its gate holds the event; the people still
+  // show the account's own person as an admin.
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state()).toMatchObject({
+    status: "not_allowed",
+    pending: [],
+    blocked: [],
+    pausedAt: null,
+  });
+  expect(live.service.load()).toEqual({
+    outcome: "refused",
+    reason: "not_allowed",
+  });
+
+  // Other changes of the workspace while the people still show the old
+  // role, events, and triggers read nothing.
+  live.workspaces.set({ pausedAt: PAUSED });
+  live.connection.receive(created(THIRD));
+  live.connection.receive(claimed());
+  live.connection.receive(subscribed());
+  expect(live.service.reload(WORKSPACE)).toBe(false);
+  expect(live.service.state()).toMatchObject({
+    status: "not_allowed",
+    pending: [],
+    pausedAt: null,
+  });
+
+  // The reload answers with the event applied.
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+    gateLive: true,
+  });
+  expect(live.service.state().status).toBe("not_allowed");
+  expect(live.account.reads).toHaveLength(1);
+});
+
+test("the demotion of the account's own person that the workspace service shows first reads nothing, and a later promotion that only its people show loads", async () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+  });
+  live.service.load();
+  live.account.reads[0]?.resolve(list(request(FIRST)));
+  await settle();
+
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+  });
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state()).toMatchObject({
+    status: "not_allowed",
+    pending: [],
+  });
+  expect(live.account.reads).toHaveLength(1);
+
+  // A promotion that only a reload shows, for example after a reconnect.
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+  });
+  expect(live.account.reads).toHaveLength(2);
+});
+
+test("a promotion event after a demotion event, while the gate holds both, lets the people decide again, and the load waits for the gate", async () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+  });
+  live.service.load();
+  live.account.reads[0]?.resolve(list(request(FIRST)));
+  await settle();
+
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state().status).toBe("not_allowed");
+  live.connection.receive(roleChanged(OWN, "admin"));
+  expect(live.service.state().status).toBe("loading");
+  expect(live.account.reads).toHaveLength(1);
+
+  live.workspaces.set({ gateLive: true });
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list(request(SECOND)));
+  await settle();
+  expect(live.ids().pending).toEqual([SECOND]);
+});
+
+test("a load waits until the workspace service's gate is live, so that a reconnect after a demotion reads nothing and drops the list", async () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+  });
+  live.service.load();
+  live.account.reads[0]?.resolve(list(request(FIRST)));
+  await settle();
+
+  // A reconnect: the workspace reloads after workspace.subscribed, and the
+  // demotion happened while the device was offline.
+  live.connection.setState("offline");
+  live.connection.setState("connected");
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(subscribed());
+  expect(live.account.reads).toHaveLength(1);
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+    gateLive: true,
+  });
+  expect(live.service.state()).toMatchObject({
+    status: "not_allowed",
+    pending: [],
+  });
+  expect(live.account.reads).toHaveLength(1);
+
+  // The screen's first request also waits for the gate.
+  const first = setup();
+  first.workspaces.set({ gateLive: false });
+  expect(first.service.load()).toEqual({ outcome: "loading" });
+  expect(first.account.reads).toEqual([]);
+  first.workspaces.set({ gateLive: true });
+  expect(first.account.reads).toHaveLength(1);
+});
+
+test("a created event that does not fit beside the held requests loads the list again, so that it shows once the server lists it", async () => {
+  const blocks = Array.from({ length: MAX_HELD_JOIN_REQUESTS }, (_, index) =>
+    block(id(0x20000 + index) as JoinRequestId),
+  );
+  const live = await loadedWith(...blocks);
+  expect(live.ids().blocked).toHaveLength(MAX_HELD_JOIN_REQUESTS);
+
+  live.connection.receive(created(FIRST));
+  expect(live.ids().pending).toEqual([]);
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list(request(FIRST), ...blocks.slice(1)));
+  await settle();
+  expect(live.ids().pending).toEqual([FIRST]);
+
+  // One that arrived during the first load, applied again on its answer,
+  // loads once more too.
+  const first = setup();
+  first.service.load();
+  first.connection.receive(created(SECOND));
+  first.account.reads[0]?.resolve(list(...blocks));
+  await settle();
+  expect(first.ids().pending).toEqual([]);
+  expect(first.account.reads).toHaveLength(2);
+});
+
+test("at most JOIN_REQUEST_MEMORY_LIMIT resolved IDs are remembered, the oldest going first", async () => {
+  const live = await loadedWith();
+  const others = Array.from(
+    { length: JOIN_REQUEST_MEMORY_LIMIT },
+    (_, index) => id(0x30000 + index) as JoinRequestId,
+  );
+  for (const joinRequestId of [FIRST, ...others]) {
+    live.connection.receive(resolved(joinRequestId, "denied"));
+  }
+  // FIRST, the oldest of 1,001, was forgotten; the others were not.
+  live.connection.receive(created(FIRST));
+  live.connection.receive(created(others[0] as JoinRequestId));
+  live.connection.receive(created(others.at(-1) as JoinRequestId));
+  expect(live.ids().pending).toEqual([FIRST]);
+});
+
+test("a resolved and an unblocked ID are remembered on arrival, also when the first load fails", async () => {
+  const live = setup();
+  live.service.load();
+  live.connection.receive(resolved(FIRST, "denied"));
+  live.connection.receive(unblocked(SECOND));
+  live.account.reads[0]?.resolve({ ok: false, reason: "unavailable" });
+  await settle();
+  live.timers.fire();
+  // An answer read before the events still shows them.
+  live.account.reads[1]?.resolve(list(request(FIRST), block(SECOND)));
+  await settle();
+  expect(live.ids()).toEqual({ pending: [], blocked: [] });
+  expect(live.service.state().status).toBe("ready");
 });

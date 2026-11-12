@@ -9,8 +9,13 @@
 //   so nothing loads, nothing is held, and the join request events are
 //   ignored while the account's own person in the selected workspace is a
 //   member, or while its role is not known yet because the workspace's
-//   people have not loaded. A demotion drops what was held at once; a
-//   promotion, or the role once it is known, loads.
+//   people have not loaded. A demotion drops what was held at once, also
+//   when its `workspace.member.role_changed` arrives before the workspace
+//   service shows it, for example while that service's resync gate holds
+//   the event during a reload; a promotion, or the role once it is known,
+//   loads. A load waits until the workspace service's gate is live
+//   (`gateLive`), so that it never reads with a role that a reload of the
+//   workspace is about to change.
 // - Nothing loads until the screen asked (`load`), when it opens and on the
 //   person's refresh. From then on, while the application runs, the requests
 //   load again after each `workspace.subscribed` of the selected workspace,
@@ -27,14 +32,20 @@
 //   `workspace.join_request.resolved` ends one (and `blocked` makes it a
 //   block, blocked at the event's time), and
 //   `workspace.join_request.unblocked` ends a block. A resolved and an
-//   unblocked request ID is remembered for `JOIN_REQUEST_MEMORY_MS`, so that
-//   a late `created`, or a late `resolved` with `blocked`, does not bring
-//   the request or the block back. The events that arrive while a load is
+//   unblocked request ID is remembered for `JOIN_REQUEST_MEMORY_MS` from
+//   its arrival, also before the first load answered, so that a late
+//   `created`, or a late `resolved` with `blocked`, does not bring the
+//   request or the block back. A `created` that does not fit beside
+//   `MAX_HELD_JOIN_REQUESTS` held requests loads the list again, so that the
+//   server decides which requests it shows. The events that arrive while a load is
 //   on its way apply again on top of its answer, so that an answer read
 //   before them does not undo them; an event that the answer already holds
 //   changes nothing.
 // - Expiry has no event: a pending request leaves the list at its
-//   `expiresAt` by the system clock, and a request past it is never added.
+//   `expiresAt` by the system clock, and a `created` past it adds nothing.
+//   A load's answer is not filtered by the system clock, because the server
+//   left out the requests past their expiry by its own; the expiry timer
+//   then follows the system clock.
 // - Reloads are merged like the invitation service's: while a load is on its
 //   way, one more follows its answer, which is dropped, however many
 //   triggers came; while a retry waits out its backoff, the retry reads the
@@ -201,7 +212,12 @@ export interface JoinRequestServiceOptions {
   readonly connection: JoinRequestConnection;
   readonly workspaces: Pick<
     WorkspaceService,
-    "state" | "onChange" | "people" | "ownMemberId" | "joinRequestsPausedAt"
+    | "state"
+    | "onChange"
+    | "people"
+    | "ownMemberId"
+    | "joinRequestsPausedAt"
+    | "gateLive"
   >;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
@@ -340,6 +356,18 @@ export function createJoinRequestService(
   let signedIn = false;
   let selected: WorkspaceId | null = null;
   let access: Access = "unknown";
+  /**
+   * The account's own person in the selected workspace was demoted to
+   * `member` by an event that the workspace service's people do not show
+   * yet: its access stays `not_allowed` until they show it, the workspace
+   * service's gate is live again, or an event promotes the person again.
+   */
+  let demoted = false;
+  /**
+   * A load waits until the workspace service's gate of the selected
+   * workspace is live, so that the role it reads with is current.
+   */
+  let gateWait = false;
   /**
    * Changes whenever what was loaded no longer applies: another workspace,
    * a sign-out, another device, or a role without access. An answer for an
@@ -480,6 +508,7 @@ export function createJoinRequestService(
     epoch += 1;
     inFlight = false;
     again = false;
+    gateWait = false;
     stopRetry();
     attempt = 0;
     replay = [];
@@ -595,9 +624,11 @@ export function createJoinRequestService(
   /**
    * Applies one event to the held requests. Every event sets the state that
    * it reports, so applying one again changes nothing; an event for a
-   * request that is not held changes nothing either.
+   * request that is not held changes nothing either. True when the list
+   * must load again: a new request that does not fit beside
+   * `MAX_HELD_JOIN_REQUESTS` held ones.
    */
-  function applyEvent(event: JoinRequestEvent): void {
+  function applyEvent(event: JoinRequestEvent): boolean {
     switch (event.type) {
       case "workspace.join_request.created": {
         const request = pendingState(event.payload.joinRequest);
@@ -606,21 +637,23 @@ export function createJoinRequestService(
           remembered(resolvedIds, request.id) ||
           pending.has(request.id) ||
           blocked.has(request.id) ||
-          expired(request.expiresAt) ||
-          pending.size + blocked.size >= MAX_HELD_JOIN_REQUESTS
+          expired(request.expiresAt)
         ) {
-          return;
+          return false;
+        }
+        if (pending.size + blocked.size >= MAX_HELD_JOIN_REQUESTS) {
+          // The server decides which requests one answer holds.
+          return true;
         }
         pending.set(request.id, request);
         changedPending();
-        return;
+        return false;
       }
       case "workspace.join_request.resolved": {
         const { joinRequestId, outcome } = event.payload;
-        remember(resolvedIds, joinRequestId);
         const held = pending.get(joinRequestId);
         if (held === undefined) {
-          return;
+          return false;
         }
         pending.delete(joinRequestId);
         changedPending();
@@ -639,21 +672,26 @@ export function createJoinRequestService(
           );
           changedBlocks();
         }
-        return;
+        return false;
       }
       case "workspace.join_request.unblocked": {
-        const { joinRequestId } = event.payload;
-        remember(unblockedIds, joinRequestId);
-        if (blocked.delete(joinRequestId)) {
+        if (blocked.delete(event.payload.joinRequestId)) {
           changedBlocks();
         }
-        return;
+        return false;
       }
     }
   }
 
   /** An event of the selected workspace, for the owner or an admin. */
   function joinRequestEvent(event: JoinRequestEvent): void {
+    // Remembered on arrival, also when nothing is held yet or the load on
+    // its way fails, so that a late event or answer brings nothing back.
+    if (event.type === "workspace.join_request.resolved") {
+      remember(resolvedIds, event.payload.joinRequestId);
+    } else if (event.type === "workspace.join_request.unblocked") {
+      remember(unblockedIds, event.payload.joinRequestId);
+    }
     if (inFlight) {
       if (replay.length >= MAX_REPLAYED_JOIN_REQUEST_EVENTS) {
         // The answer cannot be completed without the dropped events.
@@ -663,8 +701,8 @@ export function createJoinRequestService(
         replay.push(event);
       }
     }
-    if (loaded) {
-      applyEvent(event);
+    if (loaded && applyEvent(event)) {
+      reloadSelected();
     }
   }
 
@@ -709,6 +747,12 @@ export function createJoinRequestService(
     if (cancelRetry !== null) {
       // A failed load waits out its backoff, also the wait after
       // `rate_limited`; the retry reads everything.
+      return true;
+    }
+    if (selected !== null && !workspaces.gateLive(selected)) {
+      // The workspace reloads, and its people may change the role: the
+      // load follows once the gate is live (`follow`).
+      gateWait = true;
       return true;
     }
     send();
@@ -766,8 +810,10 @@ export function createJoinRequestService(
     blocked = new Map();
     for (const request of result.value.joinRequests) {
       if (request.decision === null) {
+        // The server left out the requests past their expiry by its own
+        // clock; the expiry timer follows the system clock from here on.
         const state = pendingState(request);
-        if (state !== null && !expired(state.expiresAt)) {
+        if (state !== null) {
           pending.set(state.id, state);
         }
       } else if (request.decision === "blocked" && request.decidedAt !== null) {
@@ -791,8 +837,9 @@ export function createJoinRequestService(
     changedBlocks();
     // The events that arrived after the load was sent may be newer than
     // the answer.
+    let full = false;
     for (const event of events) {
-      applyEvent(event);
+      full = applyEvent(event) || full;
     }
     // Then nothing that was resolved or unblocked comes back: a resolved
     // request is no longer pending, and a lifted block no longer in force.
@@ -810,6 +857,9 @@ export function createJoinRequestService(
     problem = null;
     attempt = 0;
     touch();
+    if (full) {
+      reloadSelected();
+    }
   }
 
   function loadFailed(reason: WorkspaceReadFailure): void {
@@ -841,10 +891,37 @@ export function createJoinRequestService(
       signedIn = nextSignedIn;
       selected = nextSelected;
       access = "unknown";
+      demoted = false;
       drop();
     }
-    const nextAccess: Access =
-      selected === null ? "unknown" : accessIn(selected);
+    let nextAccess: Access = selected === null ? "unknown" : accessIn(selected);
+    if (
+      demoted &&
+      (nextAccess !== "allowed" ||
+        (selected !== null && workspaces.gateLive(selected)))
+    ) {
+      // The people show the demotion, or the workspace reloaded with every
+      // event applied, so they hold the current role.
+      demoted = false;
+    }
+    if (demoted) {
+      // The people do not show the demotion yet.
+      nextAccess = "not_allowed";
+    }
+    changeAccess(nextAccess);
+    const nextPausedAt =
+      access === "allowed" ? workspaces.joinRequestsPausedAt() : null;
+    if (nextPausedAt !== pausedAt) {
+      pausedAt = nextPausedAt;
+      touch();
+    }
+    if (gateWait && selected !== null && workspaces.gateLive(selected)) {
+      gateWait = false;
+      reloadSelected();
+    }
+  }
+
+  function changeAccess(nextAccess: Access): void {
     if (nextAccess !== access) {
       access = nextAccess;
       touch();
@@ -855,11 +932,25 @@ export function createJoinRequestService(
         drop();
       }
     }
-    const nextPausedAt =
-      access === "allowed" ? workspaces.joinRequestsPausedAt() : null;
-    if (nextPausedAt !== pausedAt) {
-      pausedAt = nextPausedAt;
+  }
+
+  /**
+   * A role change of the account's own person in the selected workspace,
+   * at once, also while the workspace service's gate holds the event: a
+   * demotion to `member` drops what was held, and a promotion after it
+   * lets the people decide again.
+   */
+  function ownRoleChanged(role: string): void {
+    if (role === "member") {
+      // Only while the people still show the previous role; once the
+      // workspace service's gate is live they show every event.
+      demoted = selected !== null && accessIn(selected) === "allowed";
+      changeAccess("not_allowed");
+      pausedAt = null;
       touch();
+    } else if (demoted) {
+      demoted = false;
+      follow();
     }
   }
 
@@ -881,6 +972,14 @@ export function createJoinRequestService(
       return;
     }
     const event = message.event;
+    if (
+      event.workspaceId === selected &&
+      event.type === "workspace.member.role_changed" &&
+      isOwnPerson(event.payload.memberId)
+    ) {
+      ownRoleChanged(event.payload.role);
+      return;
+    }
     if (event.workspaceId !== selected || !live()) {
       // The role filter: a member's device ignores these events, and so
       // does a device whose role is not known yet.
