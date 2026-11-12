@@ -1324,6 +1324,40 @@ test("the view's ownership offer and limit of unclaimed people are kept, without
   expect(h.service.unclaimedMemberLimit()).toBeNull();
 });
 
+test("the view's pause of join requests is kept from each reload, cleared by a reload without one, and dropped with the workspace's data", async () => {
+  const h = await withList();
+  expect(h.service.joinRequestsPausedAt()).toBeNull();
+  h.receive(subscribed());
+  await h.answerReload(
+    ok(
+      WorkspaceViewResponseSchema.parse({
+        ...offerView(),
+        joinRequestsPausedAt: AT,
+      }),
+    ),
+  );
+  expect(h.service.joinRequestsPausedAt()).toBe(AT);
+  // Nothing about the pause reaches the state.
+  expect(JSON.stringify(h.state)).not.toContain(AT);
+
+  // A resume shows after the next reload.
+  expect(h.service.reload(WS_A)).toBe(true);
+  await h.answerReload(ok(offerView()));
+  expect(h.service.joinRequestsPausedAt()).toBeNull();
+
+  h.receive(subscribed());
+  await h.answerReload(
+    ok(
+      WorkspaceViewResponseSchema.parse({
+        ...offerView(),
+        joinRequestsPausedAt: AT,
+      }),
+    ),
+  );
+  expect(h.service.select(WS_B)).toBe(true);
+  expect(h.service.joinRequestsPausedAt()).toBeNull();
+});
+
 test("a transfer to the offer's target and the target's removal end the offer, live and after a reload, and other changes keep it", async () => {
   const h = await withList();
   h.receive(subscribed());

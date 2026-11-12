@@ -7,6 +7,8 @@ import type {
   DeviceListBridge,
   InvitationActionsBridge,
   InvitationsBridge,
+  JoinRequestActionsBridge,
+  JoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -23,6 +25,7 @@ import type {
   AcceptInvitationResult,
   AccountStatus,
   AgentActivityView,
+  ApproveJoinRequestResult,
   ChatLoadOlderResultView,
   ChatSendResultView,
   ChatView,
@@ -34,6 +37,9 @@ import type {
   ForgetResult,
   InvitationLoadResult,
   InvitationsView,
+  JoinRequestActionResult,
+  JoinRequestLoadResult,
+  JoinRequestsView,
   LiftRegistrationLockResult,
   MountResult,
   OtherDeviceRevocation,
@@ -181,7 +187,8 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * reasons, the workspace IDs, member IDs, and display names of the
  * `peopleActions`, each a string, and the IDs and pasted codes of the
  * `invitationActions`, each a string, with the lifetime of `create`, a
- * whole number or null.
+ * whole number or null, and the IDs of the `joinRequestActions`, each a
+ * string, with the display name of `approve`, a string or null.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -518,6 +525,85 @@ export function createDesktopBridge(
         : Promise.reject(new TypeError("accept needs a code string.")),
   });
 
+  const joinRequests: JoinRequestsBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.getJoinRequestState,
+      ) as Promise<JoinRequestsView>,
+    subscribeState: (
+      listener: (state: JoinRequestsView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeJoinRequestState,
+        EVENT_CHANNELS.joinRequestStateChanged,
+        "A join request state callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    load: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.loadJoinRequests,
+      ) as Promise<JoinRequestLoadResult>,
+  });
+
+  // Only strings, and for an approval a name or null, go on; the main
+  // process checks each ID and the name. Another value is refused here
+  // without naming it.
+  const ofRequest =
+    (channel: InvokeChannel, name: string) =>
+    (workspaceId: string, joinRequestId: string) =>
+      strings(workspaceId, joinRequestId)
+        ? (ipc.invoke(
+            channel,
+            workspaceId,
+            joinRequestId,
+          ) as Promise<JoinRequestActionResult>)
+        : Promise.reject(
+            new TypeError(
+              `${name} needs a workspace ID and a join request ID string.`,
+            ),
+          );
+  const ofJoinWorkspace =
+    (channel: InvokeChannel, name: string) => (workspaceId: string) =>
+      strings(workspaceId)
+        ? (ipc.invoke(channel, workspaceId) as Promise<JoinRequestActionResult>)
+        : Promise.reject(new TypeError(`${name} needs a workspace ID string.`));
+  const joinRequestActions: JoinRequestActionsBridge = Object.freeze({
+    approve: (
+      workspaceId: string,
+      joinRequestId: string,
+      displayName?: string | null,
+    ) => {
+      const name =
+        displayName === undefined || displayName === null
+          ? null
+          : typeof displayName === "string"
+            ? displayName
+            : undefined;
+      return strings(workspaceId, joinRequestId) && name !== undefined
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.approveJoinRequest,
+            workspaceId,
+            joinRequestId,
+            name,
+          ) as Promise<ApproveJoinRequestResult>)
+        : Promise.reject(
+            new TypeError(
+              "approve needs a workspace ID and a join request ID string, and a name string or null.",
+            ),
+          );
+    },
+    deny: ofRequest(INVOKE_CHANNELS.denyJoinRequest, "deny"),
+    denyAll: ofJoinWorkspace(INVOKE_CHANNELS.denyAllJoinRequests, "denyAll"),
+    block: ofRequest(INVOKE_CHANNELS.blockJoinRequest, "block"),
+    unblock: ofRequest(INVOKE_CHANNELS.unblockJoinRequest, "unblock"),
+    pause: ofJoinWorkspace(INVOKE_CHANNELS.pauseJoinRequests, "pause"),
+    resume: ofJoinWorkspace(INVOKE_CHANNELS.resumeJoinRequests, "resume"),
+  });
+
   const agents: AgentBridge = Object.freeze({
     getState: () =>
       ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
@@ -647,6 +733,8 @@ export function createDesktopBridge(
     peopleActions,
     invitations,
     invitationActions,
+    joinRequests,
+    joinRequestActions,
     agents,
     chat,
     devices,
