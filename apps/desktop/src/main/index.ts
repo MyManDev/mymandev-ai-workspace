@@ -59,6 +59,12 @@ import { isAppNavigation, resolveRendererUrl } from "./navigation.ts";
 import { registerInvitationActionsIpc } from "./invitation-actions-ipc.ts";
 import { registerInvitationIpc } from "./invitation-ipc.ts";
 import { createInvitationService } from "./invitations/service.ts";
+import { registerJoinRequestActionsIpc } from "./join-request-actions-ipc.ts";
+import { registerJoinRequestIpc } from "./join-request-ipc.ts";
+import { createJoinRequestService } from "./join-requests/service.ts";
+import { registerOwnJoinRequestActionsIpc } from "./own-join-request-actions-ipc.ts";
+import { registerOwnJoinRequestIpc } from "./own-join-request-ipc.ts";
+import { createOwnJoinRequestService } from "./own-join-requests/service.ts";
 import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
@@ -389,6 +395,59 @@ function start(): void {
     account,
     workspaces,
     invitations,
+  });
+
+  // The selected workspace's join requests (#95, D3), for its owner and
+  // admins only: the pending requests and the blocks in force, read over
+  // HTTP once the screen asked and again after `workspace.subscribed`, a
+  // claim, a removal or a leave, and a decision, and kept current with the
+  // join request events in between, which a member's device ignores. A
+  // pending request leaves the list at its expiry. They reach the renderer
+  // with the pause from the workspace's view, at most one publish every
+  // 50 ms. The logs are fixed text with a failure code at most.
+  const joinRequests = createJoinRequestService({
+    account,
+    connection,
+    workspaces,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => joinRequests.close());
+  const joinRequestIpc = registerJoinRequestIpc(ipcMain, rendererUrl, {
+    joinRequests,
+  });
+  app.on("will-quit", () => joinRequestIpc.close());
+  // The join request actions (#95, D1) have one strict channel each, and
+  // each is sent once, only for the selected workspace. A decision loads
+  // the join requests again, and a pause or a resume the workspace's view.
+  registerJoinRequestActionsIpc(ipcMain, rendererUrl, {
+    account,
+    workspaces,
+    joinRequests,
+  });
+
+  // The account's own join requests (#95, D3), as their requester sees
+  // them: each with the ID of the workspace that it asks to join, the
+  // requested name, its times, and how it ended, read over HTTP once the
+  // screen asked and again after a sign-in, a reconnect,
+  // `account.join_request_decided`, and an action. A pending request becomes
+  // `expired` at its expiry and stays. They reach the renderer at most once
+  // every 50 ms. The logs are fixed text with a failure code at most.
+  const ownJoinRequests = createOwnJoinRequestService({
+    account,
+    connection,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => ownJoinRequests.close());
+  const ownJoinRequestIpc = registerOwnJoinRequestIpc(ipcMain, rendererUrl, {
+    ownJoinRequests,
+  });
+  app.on("will-quit", () => ownJoinRequestIpc.close());
+  // The requester's actions (#95, D1) have one strict channel each, and
+  // each is sent once. A create takes the account's display name when the
+  // screen gives none. Both load the own join requests again.
+  registerOwnJoinRequestActionsIpc(ipcMain, rendererUrl, {
+    account,
+    ownJoinRequests,
   });
 
   // The chat reaches the renderer with the authors' names resolved in the

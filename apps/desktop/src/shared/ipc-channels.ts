@@ -180,6 +180,71 @@ export const INVOKE_CHANNELS = Object.freeze({
   /** Accepts a pasted invitation code and claims its person. */
   acceptInvitation: "invitations:accept",
   /**
+   * What the renderer may know of the selected workspace's join requests,
+   * for its owner and admins only: the pending requests and the blocks in
+   * force, each with its ID, the requested display name, the requester's
+   * GitHub login with its verification time and the creation date of that
+   * GitHub account, and its times, and when new requests were paused. Never
+   * a user ID.
+   */
+  getJoinRequestState: "join-requests:get-state",
+  /**
+   * The join requests. The calling frame then receives every later state on
+   * `EVENT_CHANNELS.joinRequestStateChanged`.
+   */
+  subscribeJoinRequestState: "join-requests:subscribe-state",
+  /**
+   * Loads the join requests again, when the screen opens and on the
+   * person's refresh; not within a few seconds of the last time. The
+   * renderer sends nothing.
+   */
+  loadJoinRequests: "join-requests:load",
+  /**
+   * Approves a pending join request, by the workspace ID, the request ID,
+   * and a display name that replaces the requested one, or null.
+   */
+  approveJoinRequest: "join-requests:approve",
+  /** Denies a pending join request, by the workspace ID and the request ID. */
+  denyJoinRequest: "join-requests:deny",
+  /** Denies every pending join request of the workspace, by its ID. */
+  denyAllJoinRequests: "join-requests:deny-all",
+  /**
+   * Denies a pending join request and blocks its account from asking again,
+   * by the workspace ID and the request ID.
+   */
+  blockJoinRequest: "join-requests:block",
+  /** Lifts a block in force, by the workspace ID and the request ID. */
+  unblockJoinRequest: "join-requests:unblock",
+  /** Pauses new join requests to the workspace, by its ID. */
+  pauseJoinRequests: "join-requests:pause",
+  /** Accepts new join requests to the workspace again, by its ID. */
+  resumeJoinRequests: "join-requests:resume",
+  /**
+   * What the renderer may know of the account's own join requests: each
+   * with its ID, the ID of the workspace that it asks to join, the
+   * requested display name, how it ended, and its times. Never a user ID,
+   * and nothing about the workspace but its ID.
+   */
+  getOwnJoinRequestState: "own-join-requests:get-state",
+  /**
+   * The own join requests. The calling frame then receives every later
+   * state on `EVENT_CHANNELS.ownJoinRequestStateChanged`.
+   */
+  subscribeOwnJoinRequestState: "own-join-requests:subscribe-state",
+  /**
+   * Loads the own join requests again, when the screen opens and on the
+   * person's refresh; not within a few seconds of the last time. The
+   * renderer sends nothing.
+   */
+  loadOwnJoinRequests: "own-join-requests:load",
+  /**
+   * Asks to join a workspace, by its ID and a requested display name, or
+   * null for the account's display name.
+   */
+  createJoinRequest: "own-join-requests:create",
+  /** Withdraws one of the account's own pending join requests, by its ID. */
+  withdrawJoinRequest: "own-join-requests:withdraw",
+  /**
    * What the renderer may know of the open project's agent activity: its
    * agents with their owners' names, and its newest runs. Read-only.
    */
@@ -273,6 +338,16 @@ export const EVENT_CHANNELS = Object.freeze({
    * one every 50 ms, to the frames that subscribed.
    */
   invitationStateChanged: "invitations:state-changed",
+  /**
+   * The join requests of the selected workspace after changes, at most one
+   * every 50 ms, to the frames that subscribed.
+   */
+  joinRequestStateChanged: "join-requests:state-changed",
+  /**
+   * The account's own join requests after changes, at most one every
+   * 50 ms, to the frames that subscribed.
+   */
+  ownJoinRequestStateChanged: "own-join-requests:state-changed",
   /**
    * The agent activity after changes, at most one every 50 ms, to the
    * frames that subscribed.

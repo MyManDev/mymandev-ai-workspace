@@ -1477,11 +1477,11 @@ export const JOIN_INVITATION_REFUSALS = Object.freeze([
 ] as const);
 export type JoinInvitationRefusal = (typeof JOIN_INVITATION_REFUSALS)[number];
 
-/** The refusals of an invitation action that say when the next write may go. */
-const INVITATION_ACTION_WAITS: ReadonlySet<string> = new Set([
-  "too_soon",
-  "rate_limited",
-]);
+/**
+ * The refusals of an invitation or a join request action that say when the
+ * next write may go.
+ */
+const ACTION_WAITS: ReadonlySet<string> = new Set(["too_soon", "rate_limited"]);
 
 /** A refusal of one of `reasons`, with `retryAfterMs` for a wait only. */
 function invitationRefusedSchema<const T extends readonly string[]>(
@@ -1499,8 +1499,7 @@ function invitationRefusedSchema<const T extends readonly string[]>(
     })
     .refine(
       (value) =>
-        INVITATION_ACTION_WAITS.has(value.reason) ===
-        (value.retryAfterMs !== null),
+        ACTION_WAITS.has(value.reason) === (value.retryAfterMs !== null),
       { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
     );
 }
@@ -1590,6 +1589,458 @@ export const AcceptInvitationResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type AcceptInvitationResult = z.infer<
   typeof AcceptInvitationResultSchema
+>;
+
+// The join requests of the selected workspace, for its owner and admins
+// (#95, decisions D1 and D3; ADR 0014, "Join requests").
+
+/**
+ * Limits of the join request messages: the number of pending requests and
+ * of blocks, each at most what one answer of the API holds (the protocol's
+ * `MAX_ANSWER_LIST_ITEMS`), and the length of a requested display name in
+ * characters (code points; the protocol's `LIMITS.displayName`). The main
+ * process cuts a longer name. The shared contract does not import the
+ * protocol package, so the main process's tests check that the values
+ * match.
+ */
+export const JOIN_REQUEST_LIMITS = Object.freeze({
+  requests: 1_000,
+  displayName: 64,
+});
+
+const RequestedNameSchema = z
+  .string()
+  .min(1)
+  .max(JOIN_REQUEST_LIMITS.displayName);
+
+/**
+ * A pending join request (ADR 0014, "Join requests"): its ID, the requested
+ * display name, the requester's GitHub login with the time it was last
+ * verified and the creation date of that GitHub account, which approvers
+ * always see next to the requested name, and when the request was created
+ * and expires. Never the requester's user ID.
+ */
+export const PendingJoinRequestViewSchema = z.object({
+  joinRequestId: ProtocolIdSchema,
+  requestedName: RequestedNameSchema,
+  login: LoginSchema,
+  verifiedAt: TimestampSchema,
+  accountCreatedAt: TimestampSchema,
+  createdAt: TimestampSchema,
+  expiresAt: TimestampSchema,
+});
+export type PendingJoinRequestView = z.infer<
+  typeof PendingJoinRequestViewSchema
+>;
+
+/**
+ * A block in force: the blocked request with when it was blocked. The
+ * login, its verification time, and the account's creation date are null
+ * only after the account's data was erased.
+ */
+export const BlockedJoinRequestViewSchema = z.object({
+  joinRequestId: ProtocolIdSchema,
+  requestedName: RequestedNameSchema,
+  login: LoginSchema.nullable(),
+  verifiedAt: TimestampSchema.nullable(),
+  accountCreatedAt: TimestampSchema.nullable(),
+  createdAt: TimestampSchema,
+  blockedAt: TimestampSchema,
+});
+export type BlockedJoinRequestView = z.infer<
+  typeof BlockedJoinRequestViewSchema
+>;
+
+/**
+ * The states of the join requests, as for the live invitations:
+ * `signed_out`, `no_workspace`, `not_allowed` when the account's own person
+ * is not the owner or an admin of the selected workspace, `loading` until
+ * they loaded once for it, `ready`, and `unavailable` after a failed load,
+ * until a load succeeds.
+ */
+export const JOIN_REQUEST_STATUSES = Object.freeze([
+  "signed_out",
+  "no_workspace",
+  "not_allowed",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type JoinRequestStatusView = (typeof JOIN_REQUEST_STATUSES)[number];
+
+const JoinRequestsViewFields = {
+  /**
+   * Grows with every change. A receiver keeps the state with the highest
+   * revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /** The selected workspace, or null. */
+  workspaceId: ProtocolIdSchema.nullable(),
+  /**
+   * The pending requests, in the API's order with the new ones at the end,
+   * without the ones past their `expiresAt`; empty unless the status is
+   * `ready` or `unavailable`.
+   */
+  pending: z
+    .array(PendingJoinRequestViewSchema)
+    .max(JOIN_REQUEST_LIMITS.requests)
+    .readonly(),
+  /** The blocks in force, in the API's order with the new ones at the end. */
+  blocked: z
+    .array(BlockedJoinRequestViewSchema)
+    .max(JOIN_REQUEST_LIMITS.requests)
+    .readonly(),
+  /**
+   * When new requests were paused, from the workspace's last reload, or
+   * null while they are accepted. Null as well for anyone but the owner and
+   * the admins.
+   */
+  pausedAt: TimestampSchema.nullable(),
+};
+
+/**
+ * What the renderer may know of the selected workspace's join requests:
+ * `{ revision, status, problem?, workspaceId, pending, blocked, pausedAt }`,
+ * with a problem only while `unavailable`. It holds IDs, names, logins, and
+ * times only: no user ID.
+ */
+export const JoinRequestsViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum([
+      "signed_out",
+      "no_workspace",
+      "not_allowed",
+      "loading",
+      "ready",
+    ]),
+    ...JoinRequestsViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(WORKSPACE_PROBLEMS),
+    ...JoinRequestsViewFields,
+  }),
+]);
+export type JoinRequestsView = z.infer<typeof JoinRequestsViewSchema>;
+
+/**
+ * Why a request to load the join requests was refused, as for the live
+ * invitations: `not_signed_in`, `no_workspace`, `not_allowed`, and
+ * `too_soon` within a few seconds of the last request that loaded.
+ */
+export const JOIN_REQUEST_LOAD_REFUSALS = Object.freeze([
+  "not_signed_in",
+  "no_workspace",
+  "not_allowed",
+  "too_soon",
+] as const);
+
+/**
+ * The answer to a request to load the join requests: `loading`, also while
+ * the workspace's people load and the role is not known yet, or `refused`
+ * with a reason.
+ */
+export const JoinRequestLoadResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("loading") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(JOIN_REQUEST_LOAD_REFUSALS),
+  }),
+]);
+export type JoinRequestLoadResult = z.infer<typeof JoinRequestLoadResultSchema>;
+
+/**
+ * Why a join request action was refused. Only the outcome `unknown` leaves
+ * open whether the API acted; after a refusal it did not.
+ *
+ * - `invalid`, `not_selected`, `not_signed_in`, `unavailable`, `too_soon`,
+ *   `rate_limited`, and `not_allowed` as for the people actions.
+ * - `not_found`: the API does not know the workspace or the request for
+ *   this account.
+ * - `conflict`: the request is not in the state that the action needs, for
+ *   example a request that is no longer pending, also one past its expiry,
+ *   or a block that was lifted.
+ * - `already_member`: an approval of a request whose account is already an
+ *   active member, for example after it joined with an invitation.
+ * - `failed`: the API refused it otherwise.
+ */
+export const JOIN_REQUEST_ACTION_REFUSALS = Object.freeze([
+  "invalid",
+  "not_selected",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "not_allowed",
+  "not_found",
+  "conflict",
+  "already_member",
+  "failed",
+] as const);
+export type JoinRequestActionRefusal =
+  (typeof JOIN_REQUEST_ACTION_REFUSALS)[number];
+
+const JoinRequestActionRefusedSchema = z
+  .object({
+    outcome: z.literal("refused"),
+    reason: z.enum(JOIN_REQUEST_ACTION_REFUSALS),
+    /**
+     * How long to wait before the next try, in milliseconds, for
+     * `too_soon` and `rate_limited` only; null otherwise.
+     */
+    retryAfterMs: z.int().positive().nullable(),
+  })
+  .refine(
+    (value) => ACTION_WAITS.has(value.reason) === (value.retryAfterMs !== null),
+    { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
+  );
+
+/**
+ * `unknown`: whether the API acted is not known. The action is never sent
+ * again on its own; the screen asks the person to check the list.
+ */
+const JoinRequestActionUnknownSchema = z.object({
+  outcome: z.literal("unknown"),
+});
+
+/**
+ * The result of an approval: `ok` with the new person's member ID, never
+ * its user ID, `refused`, or `unknown`. The people view shows the person
+ * once `workspace.member.claimed` arrives.
+ */
+export const ApproveJoinRequestResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok"), memberId: ProtocolIdSchema }),
+  JoinRequestActionRefusedSchema,
+  JoinRequestActionUnknownSchema,
+]);
+export type ApproveJoinRequestResult = z.infer<
+  typeof ApproveJoinRequestResultSchema
+>;
+
+/**
+ * The result of a denial, denying all, a block, an unblock, a pause, and a
+ * resume: `ok`, `refused`, or `unknown`.
+ */
+export const JoinRequestActionResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  JoinRequestActionRefusedSchema,
+  JoinRequestActionUnknownSchema,
+]);
+export type JoinRequestActionResult = z.infer<
+  typeof JoinRequestActionResultSchema
+>;
+
+// The account's own join requests, as their requester sees them (#95,
+// decisions D1 and D3; ADR 0014, "Join requests").
+
+/**
+ * Limits of the own join request messages: the number of requests, the
+ * most that one answer of the API holds (the protocol's
+ * `MAX_ANSWER_LIST_ITEMS`), and the length of a requested display name in
+ * characters (code points; the protocol's `LIMITS.displayName`). The main
+ * process cuts a longer name. The shared contract does not import the
+ * protocol package, so the main process's tests check that the values
+ * match.
+ */
+export const OWN_JOIN_REQUEST_LIMITS = Object.freeze({
+  requests: 1_000,
+  displayName: 64,
+});
+
+/**
+ * How one of the account's own requests ended, as its requester sees it:
+ * the protocol's `OWN_JOIN_REQUEST_DECISIONS`. A block shows as `denied`
+ * (#92), and a request past its expiry as `expired`, with its expiry as
+ * the time of the decision, also before the API marked it.
+ */
+export const OWN_JOIN_REQUEST_OUTCOMES = Object.freeze([
+  "approved",
+  "denied",
+  "withdrawn",
+  "expired",
+] as const);
+export type OwnJoinRequestOutcomeView =
+  (typeof OWN_JOIN_REQUEST_OUTCOMES)[number];
+
+const OwnRequestedNameSchema = z
+  .string()
+  .min(1)
+  .max(OWN_JOIN_REQUEST_LIMITS.displayName);
+
+/**
+ * One of the account's own join requests: its ID, the ID of the workspace
+ * that it asks to join, the requested display name, and its times, with
+ * `decision` and `decidedAt` both null while it is pending. Nothing else
+ * about the workspace, which the API shows the requester only after an
+ * approval, and never a user ID.
+ */
+export const OwnJoinRequestViewSchema = z
+  .object({
+    joinRequestId: ProtocolIdSchema,
+    workspaceId: ProtocolIdSchema,
+    requestedName: OwnRequestedNameSchema,
+    createdAt: TimestampSchema,
+    expiresAt: TimestampSchema,
+    decision: z.enum(OWN_JOIN_REQUEST_OUTCOMES).nullable(),
+    decidedAt: TimestampSchema.nullable(),
+  })
+  .refine((value) => (value.decision === null) === (value.decidedAt === null), {
+    message: "A decision has a time, and only a decision",
+    path: ["decidedAt"],
+  });
+export type OwnJoinRequestView = z.infer<typeof OwnJoinRequestViewSchema>;
+
+/**
+ * The states of the own join requests, as for the device list:
+ * `signed_out` without a signed-in device with a ready key, `loading` until
+ * they loaded once for the device, `ready`, and `unavailable` after a
+ * failed load, until a load succeeds.
+ */
+export const OWN_JOIN_REQUEST_STATUSES = Object.freeze([
+  "signed_out",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type OwnJoinRequestStatusView =
+  (typeof OWN_JOIN_REQUEST_STATUSES)[number];
+
+const OwnJoinRequestsViewFields = {
+  /**
+   * Grows with every change. A receiver keeps the state with the highest
+   * revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /**
+   * The requests in the API's order, the most recently created first,
+   * with a pending one past its expiry shown as `expired`; empty unless the
+   * status is `ready` or `unavailable`.
+   */
+  requests: z
+    .array(OwnJoinRequestViewSchema)
+    .max(OWN_JOIN_REQUEST_LIMITS.requests)
+    .readonly(),
+};
+
+/**
+ * What the renderer may know of the account's own join requests:
+ * `{ revision, status, problem?, requests }`, with a problem only while
+ * `unavailable`. It holds IDs, names, decisions, and times only: no user
+ * ID.
+ */
+export const OwnJoinRequestsViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum(["signed_out", "loading", "ready"]),
+    ...OwnJoinRequestsViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(WORKSPACE_PROBLEMS),
+    ...OwnJoinRequestsViewFields,
+  }),
+]);
+export type OwnJoinRequestsView = z.infer<typeof OwnJoinRequestsViewSchema>;
+
+/**
+ * Why a request to load the own join requests was refused, as for the
+ * device list: `not_signed_in`, and `too_soon` within a few seconds of the
+ * last request that loaded.
+ */
+export const OWN_JOIN_REQUEST_LOAD_REFUSALS = Object.freeze([
+  "not_signed_in",
+  "too_soon",
+] as const);
+
+/** The answer to a request to load the own join requests. */
+export const OwnJoinRequestLoadResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("loading") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(OWN_JOIN_REQUEST_LOAD_REFUSALS),
+  }),
+]);
+export type OwnJoinRequestLoadResult = z.infer<
+  typeof OwnJoinRequestLoadResultSchema
+>;
+
+/**
+ * Why a create or a withdrawal of an own join request was refused. Only
+ * the outcome `unknown` leaves open whether the API acted; after a refusal
+ * it did not.
+ *
+ * - `invalid`, `not_signed_in`, `unavailable`, `too_soon`, and
+ *   `rate_limited` as for the people actions. `rate_limited` also covers
+ *   the limits of ADR 0014: at most 5 pending requests and 10 new requests
+ *   in 24 hours per account, 50 pending requests per workspace, and a wait
+ *   of 24 hours after a denial; `retryAfterMs` says how long. A create
+ *   without a display name, while no account is signed in, whose display
+ *   name would be the default, is `not_signed_in`, and nothing is sent.
+ * - `already_member`: the account is already an active member of the
+ *   workspace.
+ * - `workspace_not_found`: no workspace has the ID, or it is archived.
+ * - `join_requests_closed`: the workspace pauses new requests, or it
+ *   blocks the account; the API does not say which.
+ * - `not_found`: a withdrawal of a request that the account does not have.
+ * - `conflict`: a withdrawal of a request that is no longer pending, also
+ *   one past its expiry.
+ * - `failed`: the API refused it otherwise.
+ */
+export const OWN_JOIN_REQUEST_ACTION_REFUSALS = Object.freeze([
+  "invalid",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "already_member",
+  "workspace_not_found",
+  "join_requests_closed",
+  "not_found",
+  "conflict",
+  "failed",
+] as const);
+export type OwnJoinRequestActionRefusal =
+  (typeof OWN_JOIN_REQUEST_ACTION_REFUSALS)[number];
+
+const OwnJoinRequestActionRefusedSchema = invitationRefusedSchema(
+  OWN_JOIN_REQUEST_ACTION_REFUSALS,
+);
+
+/**
+ * `unknown`: whether the API acted is not known. The action is never sent
+ * again on its own; the screen asks the person to check the list.
+ */
+const OwnJoinRequestUnknownSchema = z.object({ outcome: z.literal("unknown") });
+
+/**
+ * The result of a create: `ok` with the pending request, `refused`, or
+ * `unknown`. While the account has a pending request for the workspace,
+ * the API answers with that request instead of creating another, so its
+ * requested name may differ from the one sent.
+ */
+export const CreateJoinRequestResultSchema = z.discriminatedUnion("outcome", [
+  z.object({
+    outcome: z.literal("ok"),
+    joinRequestId: ProtocolIdSchema,
+    workspaceId: ProtocolIdSchema,
+    requestedName: OwnRequestedNameSchema,
+    createdAt: TimestampSchema,
+    expiresAt: TimestampSchema,
+  }),
+  OwnJoinRequestActionRefusedSchema,
+  OwnJoinRequestUnknownSchema,
+]);
+export type CreateJoinRequestResult = z.infer<
+  typeof CreateJoinRequestResultSchema
+>;
+
+/** The result of a withdrawal: `ok`, `refused`, or `unknown`. */
+export const WithdrawJoinRequestResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  OwnJoinRequestActionRefusedSchema,
+  OwnJoinRequestUnknownSchema,
+]);
+export type WithdrawJoinRequestResult = z.infer<
+  typeof WithdrawJoinRequestResultSchema
 >;
 
 // The agent activity of the open project (#28).
@@ -2429,6 +2880,81 @@ export const INVOKE_CONTRACT = Object.freeze({
     args: z.tuple([InvitationCodeTextSchema]),
     result: AcceptInvitationResultSchema,
   }),
+  [INVOKE_CHANNELS.getJoinRequestState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: JoinRequestsViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeJoinRequestState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: JoinRequestsViewSchema,
+  }),
+  [INVOKE_CHANNELS.loadJoinRequests]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: JoinRequestLoadResultSchema,
+  }),
+  [INVOKE_CHANNELS.approveJoinRequest]: Object.freeze({
+    /**
+     * The selected workspace's ID, the request's ID, and the display name
+     * of the new person, or null for the requested one.
+     */
+    args: z.tuple([
+      ProtocolIdSchema,
+      ProtocolIdSchema,
+      PersonNameSchema.nullable(),
+    ]),
+    result: ApproveJoinRequestResultSchema,
+  }),
+  [INVOKE_CHANNELS.denyJoinRequest]: Object.freeze({
+    /** The selected workspace's ID and the request's ID. */
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
+    result: JoinRequestActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.denyAllJoinRequests]: Object.freeze({
+    /** The selected workspace's ID. */
+    args: z.tuple([ProtocolIdSchema]),
+    result: JoinRequestActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.blockJoinRequest]: Object.freeze({
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
+    result: JoinRequestActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.unblockJoinRequest]: Object.freeze({
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
+    result: JoinRequestActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.pauseJoinRequests]: Object.freeze({
+    args: z.tuple([ProtocolIdSchema]),
+    result: JoinRequestActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.resumeJoinRequests]: Object.freeze({
+    args: z.tuple([ProtocolIdSchema]),
+    result: JoinRequestActionResultSchema,
+  }),
+  [INVOKE_CHANNELS.getOwnJoinRequestState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: OwnJoinRequestsViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeOwnJoinRequestState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: OwnJoinRequestsViewSchema,
+  }),
+  [INVOKE_CHANNELS.loadOwnJoinRequests]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: OwnJoinRequestLoadResultSchema,
+  }),
+  [INVOKE_CHANNELS.createJoinRequest]: Object.freeze({
+    /**
+     * The workspace's ID, as the person typed it, and the requested display
+     * name, or null for the account's display name.
+     */
+    args: z.tuple([ProtocolIdSchema, PersonNameSchema.nullable()]),
+    result: CreateJoinRequestResultSchema,
+  }),
+  [INVOKE_CHANNELS.withdrawJoinRequest]: Object.freeze({
+    /** The ID of the account's own pending request. */
+    args: z.tuple([ProtocolIdSchema]),
+    result: WithdrawJoinRequestResultSchema,
+  }),
   [INVOKE_CHANNELS.getAgentState]: Object.freeze({
     args: NoArgumentsSchema,
     result: AgentActivityViewSchema,
@@ -2508,6 +3034,8 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.workspaceStateChanged]: WorkspaceViewSchema,
   [EVENT_CHANNELS.peopleStateChanged]: PeopleViewSchema,
   [EVENT_CHANNELS.invitationStateChanged]: InvitationsViewSchema,
+  [EVENT_CHANNELS.joinRequestStateChanged]: JoinRequestsViewSchema,
+  [EVENT_CHANNELS.ownJoinRequestStateChanged]: OwnJoinRequestsViewSchema,
   [EVENT_CHANNELS.agentStateChanged]: AgentActivityViewSchema,
   [EVENT_CHANNELS.chatStateChanged]: ChatViewSchema,
   [EVENT_CHANNELS.deviceListChanged]: DeviceListViewSchema,

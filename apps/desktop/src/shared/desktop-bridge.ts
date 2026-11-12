@@ -1,12 +1,14 @@
 import type {
   AcceptInvitationResult,
   AccountStatus,
+  ApproveJoinRequestResult,
   AgentActivityView,
   ChatLoadOlderResultView,
   ChatSendResultView,
   ChatView,
   ConnectionStatus,
   CreateInvitationResult,
+  CreateJoinRequestResult,
   CreateProjectResult,
   CreateWorkspaceResult,
   DefinePersonResult,
@@ -15,9 +17,14 @@ import type {
   ForgetResult,
   InvitationLoadResult,
   InvitationsView,
+  JoinRequestActionResult,
+  JoinRequestLoadResult,
+  JoinRequestsView,
   LiftRegistrationLockResult,
   MountResult,
   OtherDeviceRevocation,
+  OwnJoinRequestLoadResult,
+  OwnJoinRequestsView,
   PeopleView,
   PersonActionResult,
   PreviewInvitationResult,
@@ -32,6 +39,7 @@ import type {
   StartSignInResult,
   UnlockResult,
   WorkspaceActionResult,
+  WithdrawJoinRequestResult,
   WorkspaceSwitchOptions,
   WorkspaceView,
 } from "./ipc-contract.ts";
@@ -65,6 +73,14 @@ export interface DesktopBridge {
   readonly invitations: InvitationsBridge;
   /** Creating and revoking invitations, and joining with a pasted code. */
   readonly invitationActions: InvitationActionsBridge;
+  /** The join requests of the selected workspace, read-only. */
+  readonly joinRequests: JoinRequestsBridge;
+  /** Deciding on join requests, and pausing and resuming them. */
+  readonly joinRequestActions: JoinRequestActionsBridge;
+  /** The account's own join requests, read-only. */
+  readonly ownJoinRequests: OwnJoinRequestsBridge;
+  /** Asking to join a workspace by its ID, and withdrawing a request. */
+  readonly ownJoinRequestActions: OwnJoinRequestActionsBridge;
   /** The agent activity of the open project, read-only. */
   readonly agents: AgentBridge;
   /** The chat of the open project. */
@@ -443,6 +459,155 @@ export interface InvitationActionsBridge {
    * joined workspace's ID and name; the workspace list then loads again.
    */
   readonly accept: (code: string) => Promise<AcceptInvitationResult>;
+}
+
+/**
+ * The join requests of the selected workspace, which the main process holds
+ * for its owner and admins (#95, D3): the pending requests and the blocks in
+ * force, each with its ID, the requested display name, the requester's
+ * GitHub login with its verification time and the creation date of that
+ * GitHub account, and its times, and when new requests were paused. No
+ * user ID crosses.
+ */
+export interface JoinRequestsBridge {
+  /** The current join requests. */
+  readonly getState: () => Promise<JoinRequestsView>;
+  /**
+   * Calls `listener` with the current join requests and then after changes,
+   * at most once every 50 ms with the latest ones. A state older than the
+   * last one delivered is dropped. `onError` is called when the main
+   * process refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: JoinRequestsView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Asks the main process to load the join requests, when the screen opens
+   * and on the person's refresh. From then on the main process keeps them
+   * current with the join request events and loads them again on its own
+   * after `workspace.subscribed`, a claim, a removal, and a decision.
+   * Resolves to `refused` without a signed-in device, a selected workspace,
+   * or the role of the owner or an admin, and with `too_soon` within a few
+   * seconds of the last request. It passes nothing from the renderer on.
+   */
+  readonly load: () => Promise<JoinRequestLoadResult>;
+}
+
+/**
+ * The join request actions of the owner and the admins (#95, D1), each
+ * through its own channel. Each takes the selected workspace's ID, and the
+ * main process refuses another workspace as `not_selected`. An ID that is
+ * not a lowercase UUIDv7, or a display name that is empty or longer than 64
+ * characters, is refused by the contract, and the call rejects; the main
+ * process then refuses a blank name and control, format, and invisible
+ * characters with the result `invalid`. Each action is sent once:
+ * `unknown` says that the answer does not show whether the API acted, and
+ * nothing sends it again, so the screen asks the person to check the list.
+ * `too_soon` and `rate_limited` come with `retryAfterMs`. The bridge
+ * passes on only strings, and for `approve` a string or null, and refuses
+ * any other value without a call.
+ */
+export interface JoinRequestActionsBridge {
+  /**
+   * Approves a pending request: the requester becomes a claimed member with
+   * the requested display name, or with `displayName` when it is given.
+   * Resolves to `ok` with the new person's member ID.
+   */
+  readonly approve: (
+    workspaceId: string,
+    joinRequestId: string,
+    displayName?: string | null,
+  ) => Promise<ApproveJoinRequestResult>;
+  /** Denies a pending request. */
+  readonly deny: (
+    workspaceId: string,
+    joinRequestId: string,
+  ) => Promise<JoinRequestActionResult>;
+  /** Denies every pending request of the workspace. */
+  readonly denyAll: (workspaceId: string) => Promise<JoinRequestActionResult>;
+  /**
+   * Denies a pending request and keeps its account from asking the
+   * workspace again until the block is lifted.
+   */
+  readonly block: (
+    workspaceId: string,
+    joinRequestId: string,
+  ) => Promise<JoinRequestActionResult>;
+  /** Lifts a block in force, by the blocked request's ID. */
+  readonly unblock: (
+    workspaceId: string,
+    joinRequestId: string,
+  ) => Promise<JoinRequestActionResult>;
+  /** Pauses new requests; the pending ones stay. */
+  readonly pause: (workspaceId: string) => Promise<JoinRequestActionResult>;
+  /** Accepts new requests again. */
+  readonly resume: (workspaceId: string) => Promise<JoinRequestActionResult>;
+}
+
+/**
+ * The account's own join requests, which the main process holds (#95, D3):
+ * each with its ID, the ID of the workspace that it asks to join, the
+ * requested display name, its times, and how it ended, a block shown as a
+ * denial. The API shows the requester nothing else about the workspace, so
+ * no workspace name comes. A pending request past its expiry comes as
+ * `expired`. No user ID crosses.
+ */
+export interface OwnJoinRequestsBridge {
+  /** The current own join requests. */
+  readonly getState: () => Promise<OwnJoinRequestsView>;
+  /**
+   * Calls `listener` with the current own join requests and then after
+   * changes, at most once every 50 ms with the latest ones. A state older
+   * than the last one delivered is dropped. `onError` is called when the
+   * main process refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: OwnJoinRequestsView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Asks the main process to load the own join requests, when the screen
+   * opens and on the person's refresh. From then on the main process loads
+   * them again on its own after a sign-in, a reconnect, a decision on one of
+   * them (`account.join_request_decided`), and an action. Resolves to
+   * `refused` without a signed-in device, and with `too_soon` within a few
+   * seconds of the last request. It passes nothing from the renderer on.
+   */
+  readonly load: () => Promise<OwnJoinRequestLoadResult>;
+}
+
+/**
+ * The requester's actions (#95, D1), each through its own channel. An ID
+ * that is not a lowercase UUIDv7, or a display name that is empty or longer
+ * than 64 characters, is refused by the contract, and the call rejects; the
+ * main process then refuses a blank name and control, format, and
+ * invisible characters with the result `invalid`. Each action is sent
+ * once: `unknown` says that the answer does not show whether the API
+ * acted, and nothing sends it again, so the screen asks the person to
+ * check the list. `too_soon` and `rate_limited` come with `retryAfterMs`.
+ * The bridge passes on only strings, and for `create` a name string or
+ * null, and refuses any other value without a call.
+ */
+export interface OwnJoinRequestActionsBridge {
+  /**
+   * Asks to join the workspace with the ID that the person typed, as a new
+   * person with `displayName`, or with the account's display name when it
+   * is left out or null; while no account is signed in, which would give
+   * that name, it resolves to `refused` with `not_signed_in`. Resolves to
+   * `ok` with the pending request: while one is pending for the workspace,
+   * the API answers with it instead of creating another.
+   */
+  readonly create: (
+    workspaceId: string,
+    displayName?: string | null,
+  ) => Promise<CreateJoinRequestResult>;
+  /** Withdraws one of the account's own pending requests, by its ID. */
+  readonly withdraw: (
+    joinRequestId: string,
+  ) => Promise<WithdrawJoinRequestResult>;
 }
 
 /**
