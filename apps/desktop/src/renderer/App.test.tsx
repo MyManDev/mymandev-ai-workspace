@@ -35,6 +35,8 @@ import {
   canStartSignIn,
   DEVICE_ACTION_FAILURE_MESSAGES,
   DEVICE_ACTION_MESSAGES,
+  signInEndFormat,
+  signInTimeFormat,
   START_REFUSAL_MESSAGES,
   type AccountView,
 } from "./account-view.ts";
@@ -1651,94 +1653,124 @@ function signInButtons(html: string): boolean[] {
   ].map(([, attributes]) => !(attributes ?? "").includes("disabled"));
 }
 
-test("the home screen offers Sign in with GitHub exactly when the account panel offers one that can start now, by one rule, in every signed-out state", () => {
-  const signedOut = {
-    kind: "known",
-    state: workspaceState([], {
-      status: "signed_out",
-      workspaces: [],
-      selectedWorkspaceId: null,
-    }),
-  } as const;
-  const accounts: AccountStatus["account"][] = [
-    { kind: "signed_out" },
-    { kind: "hidden" },
-    {
-      kind: "signed_in",
-      login: "octocat",
-      displayName: "The Octocat",
-      deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
-      signInExpiresAt: "2026-12-02T10:00:00.000Z",
-    },
-  ];
-  const signIns: AccountStatus["signIn"][] = [
-    { kind: "idle" },
-    { kind: "starting" },
-    { kind: "waiting", pairingCode: "042137", opened: true },
-    { kind: "completing" },
-  ];
-  let offered = 0;
-  let total = 0;
-  for (const account of accounts) {
-    for (const signIn of signIns) {
-      for (const deviceKey of DEVICE_KEY_STATES) {
-        for (const apiOrigin of API_ORIGIN_STATES) {
-          for (const device of DEVICE_STATES) {
-            const status: AccountStatus = {
-              revision: 1,
-              account,
-              signIn,
-              lastOutcome: null,
-              deviceKey,
-              replacementPending: false,
-              apiOrigin,
-              device,
-            };
-            const view: AccountView = { kind: "known", status };
-            const name = JSON.stringify(status);
-            const panel = signInButtons(
-              renderToString(
-                <AccountPanelContent
-                  view={view}
-                  busy={false}
-                  message={undefined}
-                  onStartSignIn={() => undefined}
-                  onUseAnotherBrowser={() => undefined}
-                  anotherBrowser={false}
-                  anotherBrowserReady
-                  onCancelSignIn={() => undefined}
-                  onUnlock={() => undefined}
-                  onForget={() => undefined}
-                  onSignOut={() => undefined}
-                  onRemoveDevice={() => undefined}
-                  now={Date.parse("2026-11-09T10:00:00.000Z")}
-                />,
-              ),
-            );
-            const panelOffers = panel.includes(true);
-            const home = signInButtons(renderHome(homeSignIn(signedOut, view)));
-            // The home screen's button is never disabled while it is idle.
-            expect(home, name).toEqual(panelOffers ? [true] : []);
-            expect(panelOffers, name).toBe(canStartSignIn(status));
-            total += 1;
-            offered += panelOffers ? 1 : 0;
-          }
-        }
-      }
-    }
-  }
-  // Both cases occur.
-  expect(total).toBe(3 * 4 * 8 * 3 * 14);
+/** The workspaces while no device is signed in. */
+const SIGNED_OUT_WORKSPACES = {
+  kind: "known",
+  state: workspaceState([], {
+    status: "signed_out",
+    workspaces: [],
+    selectedWorkspaceId: null,
+  }),
+} as const;
+
+const SIGN_IN_RULE_ACCOUNTS: readonly AccountStatus["account"][] = [
+  { kind: "signed_out" },
+  { kind: "hidden" },
+  {
+    kind: "signed_in",
+    login: "octocat",
+    displayName: "The Octocat",
+    deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+    signInExpiresAt: "2026-12-02T10:00:00.000Z",
+  },
+];
+
+const SIGN_IN_RULE_SIGN_INS: readonly AccountStatus["signIn"][] = [
+  { kind: "idle" },
+  { kind: "starting" },
+  { kind: "waiting", pairingCode: "042137", opened: true },
+  { kind: "completing" },
+];
+
+/**
+ * The account statuses that the home screen's sign-in rule is checked in,
+ * one case for each account and sign-in, with every device key, API origin,
+ * and device state in each, so that no case comes near the test timeout
+ * (#254).
+ */
+const SIGN_IN_RULE_CASES = SIGN_IN_RULE_ACCOUNTS.flatMap((account) =>
+  SIGN_IN_RULE_SIGN_INS.map((signIn) => ({
+    account,
+    signIn,
+    statuses: DEVICE_KEY_STATES.flatMap((deviceKey) =>
+      API_ORIGIN_STATES.flatMap((apiOrigin) =>
+        DEVICE_STATES.map((device): AccountStatus => ({
+          revision: 1,
+          account,
+          signIn,
+          lastOutcome: null,
+          deviceKey,
+          replacementPending: false,
+          apiOrigin,
+          device,
+        })),
+      ),
+    ),
+  })),
+);
+
+// The panel makes its two time formats again for each render, which took
+// most of this check's time. Made once here, they give the same HTML.
+const SIGN_IN_RULE_TIME_FORMAT = signInTimeFormat();
+const SIGN_IN_RULE_END_FORMAT = signInEndFormat();
+
+test("the home screen's sign-in rule is checked in every signed-out state, with and without a sign-in that can start now", () => {
+  const statuses = SIGN_IN_RULE_CASES.flatMap(({ statuses }) => statuses);
+  expect(SIGN_IN_RULE_CASES).toHaveLength(3 * 4);
+  expect(statuses).toHaveLength(3 * 4 * 8 * 3 * 14);
+  const offered = statuses.filter(canStartSignIn).length;
   expect(offered).toBeGreaterThan(0);
-  expect(offered).toBeLessThan(total);
-  // Without a known account status, the panel offers nothing, and neither
-  // does the home screen.
-  for (const view of [{ kind: "pending" }, { kind: "unavailable" }] as const) {
-    expect(renderHome(homeSignIn(signedOut, view)), view.kind).not.toContain(
+  expect(offered).toBeLessThan(statuses.length);
+});
+
+test.each(SIGN_IN_RULE_CASES)(
+  "the home screen offers Sign in with GitHub exactly when the account panel offers one that can start now, by one rule, while the account is $account.kind and the sign-in is $signIn.kind",
+  ({ statuses }) => {
+    for (const status of statuses) {
+      const view: AccountView = { kind: "known", status };
+      const name = JSON.stringify(status);
+      const panel = signInButtons(
+        renderToString(
+          <AccountPanelContent
+            view={view}
+            busy={false}
+            message={undefined}
+            onStartSignIn={() => undefined}
+            onUseAnotherBrowser={() => undefined}
+            anotherBrowser={false}
+            anotherBrowserReady
+            onCancelSignIn={() => undefined}
+            onUnlock={() => undefined}
+            onForget={() => undefined}
+            onSignOut={() => undefined}
+            onRemoveDevice={() => undefined}
+            now={Date.parse("2026-11-09T10:00:00.000Z")}
+            timeFormat={SIGN_IN_RULE_TIME_FORMAT}
+            endFormat={SIGN_IN_RULE_END_FORMAT}
+          />,
+        ),
+      );
+      const panelOffers = panel.includes(true);
+      const home = signInButtons(
+        renderHome(homeSignIn(SIGNED_OUT_WORKSPACES, view)),
+      );
+      // The home screen's button is never disabled while it is idle.
+      expect(home, name).toEqual(panelOffers ? [true] : []);
+      expect(panelOffers, name).toBe(canStartSignIn(status));
+    }
+  },
+);
+
+// Without a known account status, the panel offers nothing, and neither
+// does the home screen.
+test.each([{ kind: "pending" }, { kind: "unavailable" }] as const)(
+  "the home screen offers no Sign in with GitHub while the account status is $kind",
+  (view) => {
+    expect(renderHome(homeSignIn(SIGNED_OUT_WORKSPACES, view))).not.toContain(
       "Sign in with GitHub</button>",
     );
-  }
-});
+  },
+);
 
 test("the home screen offers Go to Account only while no device is signed in, with the neutral sentence until the account status is known", () => {
   const signedOut = workspaceState([], {
