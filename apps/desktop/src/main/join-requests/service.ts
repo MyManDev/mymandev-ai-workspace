@@ -942,9 +942,9 @@ export function createJoinRequestService(
    */
   function ownRoleChanged(role: string): void {
     if (role === "member") {
-      // Only while the people still show the previous role; once the
-      // workspace service's gate is live they show every event.
-      demoted = selected !== null && accessIn(selected) === "allowed";
+      // `follow` ends it once the people show the role or the workspace
+      // service's gate is live, when they show every event.
+      demoted = true;
       changeAccess("not_allowed");
       pausedAt = null;
       touch();
