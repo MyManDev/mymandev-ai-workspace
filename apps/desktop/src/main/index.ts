@@ -58,6 +58,9 @@ import { isAppNavigation, resolveRendererUrl } from "./navigation.ts";
 import { registerInvitationActionsIpc } from "./invitation-actions-ipc.ts";
 import { registerInvitationIpc } from "./invitation-ipc.ts";
 import { createInvitationService } from "./invitations/service.ts";
+import { registerOwnJoinRequestActionsIpc } from "./own-join-request-actions-ipc.ts";
+import { registerOwnJoinRequestIpc } from "./own-join-request-ipc.ts";
+import { createOwnJoinRequestService } from "./own-join-requests/service.ts";
 import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
@@ -378,6 +381,31 @@ function start(): void {
     account,
     workspaces,
     invitations,
+  });
+
+  // The account's own join requests (#95, D3), as their requester sees
+  // them: each with the ID of the workspace that it asks to join, the
+  // requested name, its times, and how it ended, read over HTTP once the
+  // screen asked and again after a sign-in, a reconnect,
+  // `account.join_request_decided`, and an action. A pending request leaves
+  // the list at its expiry. They reach the renderer at most once every
+  // 50 ms. The logs are fixed text with a failure code at most.
+  const ownJoinRequests = createOwnJoinRequestService({
+    account,
+    connection,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => ownJoinRequests.close());
+  const ownJoinRequestIpc = registerOwnJoinRequestIpc(ipcMain, rendererUrl, {
+    ownJoinRequests,
+  });
+  app.on("will-quit", () => ownJoinRequestIpc.close());
+  // The requester's actions (#95, D1) have one strict channel each, and
+  // each is sent once. A create takes the account's display name when the
+  // screen gives none. Both load the own join requests again.
+  registerOwnJoinRequestActionsIpc(ipcMain, rendererUrl, {
+    account,
+    ownJoinRequests,
   });
 
   // The chat reaches the renderer with the authors' names resolved in the

@@ -36,6 +36,7 @@ import {
   DEVICE_STATES,
   AcceptInvitationResultSchema,
   CreateInvitationResultSchema,
+  CreateJoinRequestResultSchema,
   DefinePersonResultSchema,
   DeviceListLoadResultSchema,
   DeviceListViewSchema,
@@ -57,6 +58,13 @@ import {
   MOUNT_REFUSALS,
   MountResultSchema,
   OTHER_DEVICE_REVOCATIONS,
+  OWN_JOIN_REQUEST_ACTION_REFUSALS,
+  OWN_JOIN_REQUEST_LIMITS,
+  OWN_JOIN_REQUEST_LOAD_REFUSALS,
+  OWN_JOIN_REQUEST_OUTCOMES,
+  OWN_JOIN_REQUEST_STATUSES,
+  OwnJoinRequestLoadResultSchema,
+  OwnJoinRequestsViewSchema,
   PEOPLE_LIMITS,
   PEOPLE_STATUSES,
   PeopleViewSchema,
@@ -85,6 +93,7 @@ import {
   StartSignInResultSchema,
   UNLOCK_REFUSALS,
   UnlockResultSchema,
+  WithdrawJoinRequestResultSchema,
   WORKSPACE_ACTION_REFUSALS,
   WORKSPACE_LIMITS,
   WORKSPACE_PROBLEMS,
@@ -154,6 +163,11 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     INVITATION_LOAD_REFUSALS,
     INVITATION_ACTION_REFUSALS,
     JOIN_INVITATION_REFUSALS,
+    OWN_JOIN_REQUEST_LIMITS,
+    OWN_JOIN_REQUEST_OUTCOMES,
+    OWN_JOIN_REQUEST_STATUSES,
+    OWN_JOIN_REQUEST_LOAD_REFUSALS,
+    OWN_JOIN_REQUEST_ACTION_REFUSALS,
   ]) {
     expect(Object.isFrozen(list)).toBe(true);
   }
@@ -226,7 +240,13 @@ const INVITATION_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.acceptInvitation,
 ]);
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, and the invitation actions take no arguments and refuse any", () => {
+/** The own join request action channels, which take IDs and a name. */
+const OWN_JOIN_REQUEST_ACTION_CHANNELS: ReadonlySet<string> = new Set([
+  INVOKE_CHANNELS.createJoinRequest,
+  INVOKE_CHANNELS.withdrawJoinRequest,
+]);
+
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, and the own join request actions take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -240,9 +260,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.dismissNewDevices &&
       channel !== INVOKE_CHANNELS.revokeDevice &&
       !PEOPLE_ACTION_CHANNELS.has(channel) &&
-      !INVITATION_ACTION_CHANNELS.has(channel),
+      !INVITATION_ACTION_CHANNELS.has(channel) &&
+      !OWN_JOIN_REQUEST_ACTION_CHANNELS.has(channel),
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 23);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 25);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -2778,4 +2799,320 @@ test("an invitation action answers ok with its own fields, refused with a known 
       inviterLogin: "not a login",
     }).success,
   ).toBe(false);
+});
+
+// The account's own join requests (#95).
+
+const OWN_JOIN_REQUEST_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000f2";
+const DECIDED_AT = "2026-11-06T10:00:00.000Z";
+
+function ownRequest(overrides: Record<string, unknown> = {}) {
+  return {
+    joinRequestId: OWN_JOIN_REQUEST_ID,
+    workspaceId: WORKSPACE_ID,
+    requestedName: "Linus Requester",
+    createdAt: VERIFIED_AT,
+    expiresAt: VERIFIED_AT,
+    decision: null,
+    decidedAt: null,
+    ...overrides,
+  };
+}
+
+function ownJoinRequestsView(overrides: Record<string, unknown> = {}) {
+  return {
+    status: "ready",
+    revision: 2,
+    requests: [
+      ownRequest(),
+      ownRequest({ decision: "denied", decidedAt: DECIDED_AT }),
+    ],
+    ...overrides,
+  };
+}
+
+test("an own join requests view with every status, problem, and decision is accepted and frozen, with a problem only while unavailable", () => {
+  for (const status of OWN_JOIN_REQUEST_STATUSES) {
+    if (status === "unavailable") {
+      for (const problem of WORKSPACE_PROBLEMS) {
+        const value = ownJoinRequestsView({ status, problem });
+        expect(OwnJoinRequestsViewSchema.parse(value)).toEqual(value);
+      }
+      expect(
+        OwnJoinRequestsViewSchema.safeParse(ownJoinRequestsView({ status }))
+          .success,
+      ).toBe(false);
+    } else {
+      const value = ownJoinRequestsView({ status });
+      expect(OwnJoinRequestsViewSchema.parse(value), status).toEqual(value);
+    }
+  }
+  for (const decision of OWN_JOIN_REQUEST_OUTCOMES) {
+    const value = ownJoinRequestsView({
+      requests: [ownRequest({ decision, decidedAt: DECIDED_AT })],
+    });
+    expect(OwnJoinRequestsViewSchema.parse(value), decision).toEqual(value);
+  }
+  expect(OWN_JOIN_REQUEST_OUTCOMES).toEqual([
+    "approved",
+    "denied",
+    "withdrawn",
+  ]);
+  const parsed = OwnJoinRequestsViewSchema.parse(ownJoinRequestsView());
+  expect(Object.isFrozen(parsed.requests)).toBe(true);
+});
+
+test("an own join requests view drops unknown keys at every level, so no user ID or workspace name crosses", () => {
+  const parsed = OwnJoinRequestsViewSchema.parse(
+    ownJoinRequestsView({
+      userId: PERSON_USER_ID,
+      requests: [
+        ownRequest({
+          userId: PERSON_USER_ID,
+          requesterUserId: PERSON_USER_ID,
+          workspaceName: "Hidden workspace",
+        }),
+        ownRequest({ decision: "denied", decidedAt: DECIDED_AT }),
+      ],
+    }),
+  );
+  expect(parsed).toEqual(ownJoinRequestsView());
+  const text = JSON.stringify(parsed);
+  expect(text).not.toContain(PERSON_USER_ID);
+  expect(text).not.toContain("Hidden workspace");
+});
+
+test("an own join requests view over the limits or with wrong values is refused", () => {
+  const item = ownRequest();
+  for (const value of [
+    ownJoinRequestsView({ status: "no_workspace" }),
+    ownJoinRequestsView({ status: "not_allowed" }),
+    ownJoinRequestsView({ revision: -1 }),
+    ownJoinRequestsView({ requests: null }),
+    ownJoinRequestsView({
+      requests: Array.from(
+        { length: OWN_JOIN_REQUEST_LIMITS.requests + 1 },
+        () => item,
+      ),
+    }),
+    ownJoinRequestsView({ requests: [{ ...item, joinRequestId: "x" }] }),
+    ownJoinRequestsView({
+      requests: [{ ...item, workspaceId: WORKSPACE_ID.toUpperCase() }],
+    }),
+    ownJoinRequestsView({ requests: [{ ...item, workspaceId: null }] }),
+    ownJoinRequestsView({ requests: [{ ...item, requestedName: "" }] }),
+    ownJoinRequestsView({
+      requests: [
+        {
+          ...item,
+          requestedName: "a".repeat(OWN_JOIN_REQUEST_LIMITS.displayName + 1),
+        },
+      ],
+    }),
+    ownJoinRequestsView({ requests: [{ ...item, expiresAt: null }] }),
+    ownJoinRequestsView({ requests: [{ ...item, createdAt: "yesterday" }] }),
+    // An expired request is left out, and a block shows as denied.
+    ownJoinRequestsView({
+      requests: [{ ...item, decision: "expired", decidedAt: DECIDED_AT }],
+    }),
+    ownJoinRequestsView({
+      requests: [{ ...item, decision: "blocked", decidedAt: DECIDED_AT }],
+    }),
+    // A decision has a time, and only a decision.
+    ownJoinRequestsView({ requests: [{ ...item, decision: "denied" }] }),
+    ownJoinRequestsView({ requests: [{ ...item, decidedAt: DECIDED_AT }] }),
+    ownJoinRequestsView({ requests: [{ ...item, decision: undefined }] }),
+    ownJoinRequestsView({ status: "unavailable", problem: "secret" }),
+  ]) {
+    expect(OwnJoinRequestsViewSchema.safeParse(value).success).toBe(false);
+  }
+  expect(
+    OwnJoinRequestsViewSchema.safeParse(
+      ownJoinRequestsView({
+        requests: Array.from(
+          { length: OWN_JOIN_REQUEST_LIMITS.requests },
+          () => item,
+        ),
+      }),
+    ).success,
+  ).toBe(true);
+  // The name's limit counts characters (code points).
+  expect(
+    OwnJoinRequestsViewSchema.safeParse(
+      ownJoinRequestsView({
+        requests: [
+          {
+            ...item,
+            requestedName: "\u{1F600}".repeat(
+              OWN_JOIN_REQUEST_LIMITS.displayName,
+            ),
+          },
+        ],
+      }),
+    ).success,
+  ).toBe(true);
+});
+
+test("the own join requests' get, subscribe, and load take no argument, and load answers loading or a fixed refusal", () => {
+  for (const channel of [
+    INVOKE_CHANNELS.getOwnJoinRequestState,
+    INVOKE_CHANNELS.subscribeOwnJoinRequestState,
+    INVOKE_CHANNELS.loadOwnJoinRequests,
+  ]) {
+    expect(INVOKE_CONTRACT[channel].args.parse([])).toEqual([]);
+    expect(
+      INVOKE_CONTRACT[channel].args.safeParse([WORKSPACE_ID]).success,
+    ).toBe(false);
+  }
+  expect(INVOKE_CONTRACT[INVOKE_CHANNELS.getOwnJoinRequestState].result).toBe(
+    OwnJoinRequestsViewSchema,
+  );
+  expect(
+    INVOKE_CONTRACT[INVOKE_CHANNELS.subscribeOwnJoinRequestState].result,
+  ).toBe(OwnJoinRequestsViewSchema);
+  expect(INVOKE_CONTRACT[INVOKE_CHANNELS.loadOwnJoinRequests].result).toBe(
+    OwnJoinRequestLoadResultSchema,
+  );
+  expect(EVENT_CONTRACT[EVENT_CHANNELS.ownJoinRequestStateChanged]).toBe(
+    OwnJoinRequestsViewSchema,
+  );
+  expect(OwnJoinRequestLoadResultSchema.parse({ outcome: "loading" })).toEqual({
+    outcome: "loading",
+  });
+  for (const reason of OWN_JOIN_REQUEST_LOAD_REFUSALS) {
+    expect(
+      OwnJoinRequestLoadResultSchema.parse({ outcome: "refused", reason }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const value of [
+    { outcome: "loaded" },
+    { outcome: "refused", reason: "no_workspace" },
+    { outcome: "refused", reason: "busy" },
+    null,
+  ]) {
+    expect(OwnJoinRequestLoadResultSchema.safeParse(value).success).toBe(false);
+  }
+});
+
+test("create takes a workspace ID and a display name of 1 to 64 characters or null; withdraw takes a request ID", () => {
+  const create = INVOKE_CONTRACT[INVOKE_CHANNELS.createJoinRequest].args;
+  for (const name of [
+    null,
+    "Linus",
+    "\u{1F600}".repeat(PEOPLE_LIMITS.displayName),
+  ]) {
+    const valid = [WORKSPACE_ID, name];
+    expect(create.parse(valid)).toEqual(valid);
+  }
+  for (const value of [
+    [WORKSPACE_ID],
+    [WORKSPACE_ID, undefined],
+    [WORKSPACE_ID, ""],
+    [WORKSPACE_ID, "a".repeat(PEOPLE_LIMITS.displayName + 1)],
+    [WORKSPACE_ID, "\u{1F600}".repeat(PEOPLE_LIMITS.displayName + 1)],
+    [WORKSPACE_ID, 1],
+    [WORKSPACE_ID, ["Linus"]],
+    [WORKSPACE_ID, null, null],
+    [null, "Linus"],
+    [],
+  ]) {
+    expect(create.safeParse(value).success, JSON.stringify(value)).toBe(false);
+  }
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(create.safeParse([value, null]).success).toBe(false);
+  }
+  const withdraw = INVOKE_CONTRACT[INVOKE_CHANNELS.withdrawJoinRequest].args;
+  expect(withdraw.parse([OWN_JOIN_REQUEST_ID])).toEqual([OWN_JOIN_REQUEST_ID]);
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(withdraw.safeParse([value]).success).toBe(false);
+  }
+  expect(withdraw.safeParse([OWN_JOIN_REQUEST_ID, WORKSPACE_ID]).success).toBe(
+    false,
+  );
+  expect(withdraw.safeParse([]).success).toBe(false);
+});
+
+test("an own join request action answers ok, a create with its pending request only, refused with a known reason and a wait only for a wait, or unknown", () => {
+  const waits = new Set(["too_soon", "rate_limited"]);
+  const created = {
+    outcome: "ok",
+    joinRequestId: OWN_JOIN_REQUEST_ID,
+    workspaceId: WORKSPACE_ID,
+    requestedName: "Linus Requester",
+    createdAt: VERIFIED_AT,
+    expiresAt: VERIFIED_AT,
+  };
+  const cases = [
+    [INVOKE_CHANNELS.createJoinRequest, CreateJoinRequestResultSchema, created],
+    [
+      INVOKE_CHANNELS.withdrawJoinRequest,
+      WithdrawJoinRequestResultSchema,
+      { outcome: "ok" },
+    ],
+  ] as const;
+  for (const [channel, schema, ok] of cases) {
+    expect(INVOKE_CONTRACT[channel].result, channel).toBe(schema);
+    expect(schema.parse(ok)).toEqual(ok);
+    expect(schema.parse({ outcome: "unknown" })).toEqual({
+      outcome: "unknown",
+    });
+    for (const reason of OWN_JOIN_REQUEST_ACTION_REFUSALS) {
+      const retryAfterMs = waits.has(reason) ? 1_500 : null;
+      const value = { outcome: "refused", reason, retryAfterMs };
+      expect(schema.parse(value), reason).toEqual(value);
+      expect(
+        schema.safeParse({
+          ...value,
+          retryAfterMs: retryAfterMs === null ? 1_500 : null,
+        }).success,
+        reason,
+      ).toBe(false);
+    }
+    for (const value of [
+      null,
+      {},
+      { outcome: "refused", reason: "busy", retryAfterMs: null },
+      { outcome: "refused", reason: "forbidden", retryAfterMs: null },
+      { outcome: "refused", reason: "not_selected", retryAfterMs: null },
+      { outcome: "refused", reason: "too_soon", retryAfterMs: 0 },
+      { outcome: "failed" },
+    ]) {
+      expect(schema.safeParse(value).success, channel).toBe(false);
+    }
+    // Unknown keys are dropped, so no user ID or other value crosses.
+    expect(
+      schema.parse({
+        ...ok,
+        userId: PERSON_USER_ID,
+        requesterDeviceId: PERSON_ID,
+        workspaceName: "Hidden workspace",
+      }),
+    ).toEqual(ok);
+  }
+  for (const wrong of [
+    { joinRequestId: "x" },
+    { workspaceId: null },
+    { requestedName: "" },
+    { requestedName: "a".repeat(OWN_JOIN_REQUEST_LIMITS.displayName + 1) },
+    { expiresAt: undefined },
+  ]) {
+    expect(
+      CreateJoinRequestResultSchema.safeParse({ ...created, ...wrong }).success,
+      JSON.stringify(wrong),
+    ).toBe(false);
+  }
+  for (const reason of [
+    "invalid",
+    "name_required",
+    "already_member",
+    "workspace_not_found",
+    "join_requests_closed",
+    "device_too_new",
+    "rate_limited",
+    "not_found",
+    "conflict",
+    "failed",
+  ]) {
+    expect(OWN_JOIN_REQUEST_ACTION_REFUSALS).toContain(reason);
+  }
 });
