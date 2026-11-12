@@ -760,6 +760,30 @@ test("the demotion of the account's own person that the workspace service shows 
   ]);
 });
 
+test("a demotion that the people never show ends once the gate is live: a promotion missed while offline loads", async () => {
+  const live = await loadedAsAdmin();
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state().status).toBe("not_allowed");
+
+  // The connection drops before the reload answers, and the person is
+  // promoted again meanwhile; the reload after the reconnect shows the
+  // account's own admin, and the gate is live.
+  live.connection.setState("offline");
+  live.connection.setState("connected");
+  live.connection.receive(subscribed());
+  expect(live.account.reads).toHaveLength(1);
+  live.workspaces.set({ gateLive: true });
+  expect(live.service.state().status).toBe("loading");
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list(OTHER_INVITATION));
+  await settle();
+  expect(live.service.state()).toMatchObject({
+    status: "ready",
+    invitations: [{ id: OTHER_INVITATION }],
+  });
+});
+
 test("once the people show the demotion, they decide again, also while another reload of the workspace holds the gate", async () => {
   const live = await loadedAsAdmin();
   live.workspaces.set({ gateLive: false });
@@ -925,6 +949,22 @@ test("a load waits until the workspace service's gate is live, so that a reconne
   first.account.reads[0]?.resolve(list(INVITATION));
   await settle();
   expect(first.service.state().status).toBe("ready");
+
+  // A load that waits for the gate ends with its workspace: another one
+  // whose gate is live reads once.
+  const moved = setup();
+  moved.workspaces.set({ gateLive: false });
+  moved.service.load();
+  moved.workspaces.set({ selected: OTHER_WORKSPACE, gateLive: true });
+  moved.account.reads[0]?.resolve(listIn(OTHER_WORKSPACE, OTHER_INVITATION));
+  await settle();
+  expect(moved.account.reads.map((read) => read.params)).toEqual([
+    { workspaceId: OTHER_WORKSPACE },
+  ]);
+  expect(moved.service.state()).toMatchObject({
+    status: "ready",
+    invitations: [{ id: OTHER_INVITATION }],
+  });
 });
 
 test("the removal of the account's own person reads nothing for the workspace it lost", async () => {
