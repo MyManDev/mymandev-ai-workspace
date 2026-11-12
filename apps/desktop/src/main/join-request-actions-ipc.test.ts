@@ -87,11 +87,14 @@ function fakeAccount(
     name === "approveJoinRequest" ? approved() : { ok: true, value: null },
 ) {
   const sent: Sent[] = [];
+  /** Every call, also one that the allowlist refuses. */
+  const calls: WorkspaceActionName[] = [];
   const sendWorkspaceAction = ((
     name: WorkspaceActionName,
     params: unknown,
     ...body: unknown[]
   ) => {
+    calls.push(name);
     const request = workspaceActionRequest(name, params, body[0]);
     if (request === null) {
       return Promise.resolve({ ok: false, reason: "invalid" });
@@ -99,7 +102,7 @@ function fakeAccount(
     sent.push({ name, params, body, request });
     return Promise.resolve(answer(name));
   }) as AccountService["sendWorkspaceAction"];
-  return { sent, account: { sendWorkspaceAction } };
+  return { sent, calls, account: { sendWorkspaceAction } };
 }
 
 function failed(reason: WorkspaceActionFailure): Answer {
@@ -403,7 +406,8 @@ test("the main process checks the IDs again with the protocol's ID schemas, and 
           reason: "invalid",
           retryAfterMs: null,
         });
-        expect(account.sent, `${entry.channel} ${index}`).toEqual([]);
+        // Refused before the account service is asked.
+        expect(account.calls, `${entry.channel} ${index}`).toEqual([]);
         expect(services.listReloads).toEqual([]);
       }
     }
