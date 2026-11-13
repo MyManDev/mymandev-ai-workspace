@@ -26,6 +26,7 @@ import {
   CLAIM_VIAS_VIEW,
   ClaimLoadResultSchema,
   ClaimMarkSeenResultSchema,
+  ClaimMarksViewSchema,
   ClaimsViewSchema,
   CONNECTION_OFFLINE_REASONS,
   CONNECTION_STATES,
@@ -3877,4 +3878,75 @@ test("the report of seen claims takes a workspace ID and 1 to 1,000 member IDs, 
   expect(
     ClaimMarkSeenResultSchema.parse({ outcome: "ok", seenAt: CLAIMED_AT }),
   ).toEqual({ outcome: "ok" });
+});
+
+// The claim marks of the other workspaces (#271).
+
+test("the claim marks' get and subscribe take no argument and answer the marks, which the event carries too", () => {
+  for (const channel of [
+    INVOKE_CHANNELS.getClaimMarks,
+    INVOKE_CHANNELS.subscribeClaimMarks,
+  ]) {
+    expect(INVOKE_CONTRACT[channel].args.parse([])).toEqual([]);
+    for (const args of [[WORKSPACE_ID], [[WORKSPACE_ID]], [undefined]]) {
+      expect(INVOKE_CONTRACT[channel].args.safeParse(args).success).toBe(false);
+    }
+    expect(INVOKE_CONTRACT[channel].result).toBe(ClaimMarksViewSchema);
+  }
+  expect(EVENT_CONTRACT[EVENT_CHANNELS.claimMarksChanged]).toBe(
+    ClaimMarksViewSchema,
+  );
+});
+
+test("a claim marks view holds a revision and workspace IDs only, frozen, and drops every other key, so no claim or user ID crosses", () => {
+  const value = { revision: 3, workspaceIds: [WORKSPACE_ID, PERSON_ID] };
+  expect(ClaimMarksViewSchema.parse(value)).toEqual(value);
+  expect(ClaimMarksViewSchema.parse({ revision: 0, workspaceIds: [] })).toEqual(
+    { revision: 0, workspaceIds: [] },
+  );
+  expect(Object.isFrozen(ClaimMarksViewSchema.parse(value).workspaceIds)).toBe(
+    true,
+  );
+  const parsed = ClaimMarksViewSchema.parse({
+    ...value,
+    userId: PERSON_USER_ID,
+    claims: [{ memberId: CLAIM_MEMBER_ID, login: "linus", unseen: true }],
+    unseen: { [WORKSPACE_ID]: [CLAIM_MEMBER_ID] },
+  });
+  expect(parsed).toEqual(value);
+  for (const hidden of [PERSON_USER_ID, CLAIM_MEMBER_ID, "linus"]) {
+    expect(JSON.stringify(parsed)).not.toContain(hidden);
+  }
+});
+
+test("a claim marks view over the limit of the workspace list or with wrong values is refused", () => {
+  const full = Array.from(
+    { length: WORKSPACE_LIMITS.workspaces },
+    () => WORKSPACE_ID,
+  );
+  expect(
+    ClaimMarksViewSchema.safeParse({ revision: 1, workspaceIds: full }).success,
+  ).toBe(true);
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(
+      ClaimMarksViewSchema.safeParse({ revision: 1, workspaceIds: [value] })
+        .success,
+    ).toBe(false);
+  }
+  for (const value of [
+    { revision: 1, workspaceIds: [...full, WORKSPACE_ID] },
+    { revision: -1, workspaceIds: [] },
+    { revision: 1.5, workspaceIds: [] },
+    { revision: 1 },
+    { workspaceIds: [] },
+    { revision: 1, workspaceIds: WORKSPACE_ID },
+    { revision: 1, workspaceIds: { [WORKSPACE_ID]: true } },
+    { revision: 1, workspaceIds: [{ id: WORKSPACE_ID, unseen: true }] },
+    null,
+  ]) {
+    expect(
+      ClaimMarksViewSchema.safeParse(value).success,
+      JSON.stringify(value)?.slice(0, 80),
+    ).toBe(false);
+  }
 });
