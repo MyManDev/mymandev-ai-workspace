@@ -840,13 +840,45 @@ code {
   margin: 0 0 var(--space-2);
 }
 
+.permission-statements {
+  margin: 0 0 var(--space-3);
+  padding-inline-start: var(--space-4);
+}
+
 .capability-list {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
   gap: var(--space-2);
   margin: 0 0 var(--space-2);
   padding: 0;
   list-style: none;
+}
+
+.capability {
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+/* The risk is always text; the mark only repeats it. */
+.capability[data-risk="highest"] {
+  border-inline-start: var(--mark-width) solid var(--color-status-failed);
+}
+
+.capability-name {
+  margin: 0 0 var(--space-1);
+  font-size: var(--font-size-base);
+}
+
+.permission-section .capability-risk {
+  font-weight: var(--font-weight-strong);
+}
+
+.capability[data-risk="highest"] .capability-risk {
+  color: var(--color-status-failed);
+}
+
+.permission-section .capability p:last-child {
+  margin-block-end: 0;
 }
 
 /* People */

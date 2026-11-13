@@ -188,7 +188,7 @@ const SCREEN_CASES: readonly ScreenCase[] = [
   {
     view: { screen: "permissions", projectId: "project-b", panel: "agents" },
     title: '<h2 id="permissions-title">Permissions</h2>',
-    placeholder: "Not available yet.",
+    placeholder: "Granting permissions is not available yet.",
     current: ["Workspace B (true)", "Project B (true)", "Permissions (page)"],
   },
 ];
@@ -760,7 +760,7 @@ test("with the bridge, the repository panel waits for the first list and offers 
   expect(html).not.toContain("Repositories are not available.");
 });
 
-test("the permission screen shell has a placeholder section for every capability of ADR 0015", () => {
+test("the permission screen shows every capability of ADR 0015 read-only, grouped by scope kind", () => {
   const html = render({
     initialView: {
       screen: "permissions",
@@ -769,14 +769,7 @@ test("the permission screen shell has a placeholder section for every capability
     },
   });
 
-  for (const title of [
-    "Agent",
-    "Repository files",
-    "Git",
-    "Terminal",
-    "AI provider",
-    "Granted permissions",
-  ]) {
+  for (const title of ["On one repository", "On one AI provider connection"]) {
     expect(html).toContain(
       `<section class="permission-section"><h3>${title}</h3>`,
     );
@@ -790,11 +783,19 @@ test("the permission screen shell has a placeholder section for every capability
     "provider.use",
   ]) {
     expect(
-      html.match(new RegExp(`<code>${capability}</code>`, "g")),
+      html.match(
+        new RegExp(
+          `<h4 class="capability-name"><code>${capability}</code></h4>`,
+          "g",
+        ),
+      ),
     ).toHaveLength(1);
   }
+  expect(html).toContain(
+    '<p class="placeholder-note">Granting permissions is not available yet. This screen shows what each permission allows and its risk.</p>',
+  );
   // One labelled region for the screen; the subsections add none.
-  expect(html.match(/<section class="permission-section">/g)).toHaveLength(6);
+  expect(html.match(/<section class="permission-section">/g)).toHaveLength(2);
   expect(html.match(/<section [^>]*aria-label/g)).toEqual([
     "<section aria-label",
   ]);

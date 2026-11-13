@@ -18,7 +18,24 @@ const RENDERER_DIRECTORY = "/app/src/renderer/";
 const SHARED_DIRECTORY = "/app/src/shared/";
 
 /** Packages that the renderer may import. */
-const ALLOWED_PACKAGES = new Set(["react", "react-dom/client"]);
+const ALLOWED_PACKAGES = new Set([
+  "react",
+  "react-dom/client",
+  "@mymandev/permissions",
+]);
+
+/**
+ * The values that the renderer may import from `@mymandev/permissions`: the
+ * presentation vocabulary of its capabilities module, which imports no value.
+ * Its schemas and checks would bring zod and `@mymandev/protocol` into the
+ * renderer bundle. Types may be imported.
+ */
+const PERMISSIONS_VALUES = new Set([
+  "CAPABILITY_RISK",
+  "CAPABILITY_RISKS",
+  "CAPABILITY_SCOPE",
+  "GRANT_SCOPE_KINDS",
+]);
 
 /**
  * Shared modules that the renderer may import values from. Every other shared
@@ -108,6 +125,40 @@ function sharedValueImports(imports: readonly ImportStatement[]): string[] {
     .map(({ file, specifier }) => `${file}: ${specifier}`);
 }
 
+/**
+ * Imports and re-exports of `@mymandev/permissions` that reach more than
+ * PERMISSIONS_VALUES: another value, a namespace, a star, or the module alone.
+ */
+function permissionsValueImports(file: string, source: string): string[] {
+  const found: string[] = [];
+  for (const [statement] of source.matchAll(/^(?:import|export)\b[^;]*;/gm)) {
+    if (
+      !/(?:\bfrom\s*|^import\s*)["']@mymandev\/permissions["']/.test(
+        statement,
+      ) ||
+      /^(?:import|export)\s+type\b/.test(statement)
+    ) {
+      continue;
+    }
+    const names = /^(?:import|export)\s*\{([^}]*)\}\s*from\b/.exec(statement);
+    if (names === null) {
+      found.push(`${file}: ${statement.split("\n")[0] ?? statement}`);
+      continue;
+    }
+    for (const entry of (names[1] ?? "").split(",")) {
+      const name = entry.trim().split(/\s+as\s+/)[0] ?? "";
+      if (
+        name !== "" &&
+        !/^type\s/.test(name) &&
+        !PERMISSIONS_VALUES.has(name)
+      ) {
+        found.push(`${file}: ${name}`);
+      }
+    }
+  }
+  return found;
+}
+
 function forbiddenApis(file: string, source: string): string[] {
   return FORBIDDEN_APIS.filter(([, pattern]) => pattern.test(source)).map(
     ([name]) => `${file}: ${name}`,
@@ -165,6 +216,31 @@ test("the checks find foreign imports, shared value imports, and forbidden APIs"
   ]);
 });
 
+test("the check finds permission imports beyond the presentation vocabulary", () => {
+  const sample = [
+    "import {",
+    "  CAPABILITY_RISK,",
+    "  CAPABILITY_SCOPE as SCOPES,",
+    "  hasGrant,",
+    "  type CapabilityRisk,",
+    '} from "@mymandev/permissions";',
+    'import type { PermissionGrant } from "@mymandev/permissions";',
+    'import * as permissions from "@mymandev/permissions";',
+    'import "@mymandev/permissions";',
+    'export { PermissionRequestSchema } from "@mymandev/permissions";',
+    'export * from "@mymandev/permissions";',
+    'import { GRANT_SCOPE_KINDS } from "@mymandev/permissions";',
+  ].join("\n");
+
+  expect(permissionsValueImports("./sample.ts", sample)).toEqual([
+    "./sample.ts: hasGrant",
+    './sample.ts: import * as permissions from "@mymandev/permissions";',
+    './sample.ts: import "@mymandev/permissions";',
+    "./sample.ts: PermissionRequestSchema",
+    './sample.ts: export * from "@mymandev/permissions";',
+  ]);
+});
+
 test("the checks read every renderer source and no test", () => {
   for (const file of [
     "./AccountPanel.tsx",
@@ -185,6 +261,7 @@ test("the checks read every renderer source and no test", () => {
     "./Navigation.tsx",
     "./PeopleScreen.tsx",
     "./people-view.ts",
+    "./permission-view.ts",
     "./ProjectPanel.tsx",
     "./ProjectScreens.tsx",
     "./WorkspaceScreens.tsx",
@@ -210,6 +287,12 @@ test("the checks read every renderer source and no test", () => {
     path: "/app/src/shared/desktop-bridge.ts",
     typeOnly: true,
   });
+  expect(IMPORTS).toContainEqual({
+    file: "./permission-view.ts",
+    specifier: "@mymandev/permissions",
+    path: undefined,
+    typeOnly: false,
+  });
 });
 
 test("no renderer module imports Node.js, Electron, a network package, or a file outside the renderer and the shared code", () => {
@@ -234,5 +317,11 @@ test("the renderer imports values only from shared modules that import nothing",
 test("no renderer module calls a network or Node.js API", () => {
   expect(
     FILES.flatMap((file) => forbiddenApis(file, SOURCES[file] ?? "")),
+  ).toEqual([]);
+});
+
+test("the renderer imports only the presentation vocabulary of the permissions package", () => {
+  expect(
+    FILES.flatMap((file) => permissionsValueImports(file, SOURCES[file] ?? "")),
   ).toEqual([]);
 });

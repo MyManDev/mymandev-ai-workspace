@@ -1,6 +1,13 @@
-// The other screens of the open project. They show placeholder content
-// only: tasks, decisions, and granting permissions come in later
-// milestones. The chat screen is in ChatScreen.tsx.
+import {
+  describePermissionScreen,
+  type CapabilityView,
+  type Statement,
+} from "./permission-view.ts";
+
+// The other screens of the open project. Tasks and decisions show
+// placeholder content only, and the permission screen shows what each
+// permission allows, read-only: tasks, decisions, and granting permissions
+// come in later milestones. The chat screen is in ChatScreen.tsx.
 
 export function TasksScreen() {
   return (
@@ -26,59 +33,42 @@ export function DecisionsScreen() {
   );
 }
 
-interface PermissionSection {
-  readonly id: string;
-  readonly title: string;
-  readonly text: string;
-  /** The capability names of ADR 0008 that the section will grant. */
-  readonly capabilities: readonly string[];
+/** A fixed statement, with capability names as code. */
+function StatementText({ statement }: { readonly statement: Statement }) {
+  return statement.map((part, index) =>
+    typeof part === "string" ? (
+      part
+    ) : (
+      <code key={index}>{part.capability}</code>
+    ),
+  );
+}
+
+function CapabilityItem({ view }: { readonly view: CapabilityView }) {
+  return (
+    <li className="capability" data-risk={view.risk}>
+      <h4 className="capability-name">
+        <code>{view.capability}</code>
+      </h4>
+      <p className="capability-risk">{view.riskLabel}</p>
+      <p>{view.meaning}</p>
+      {view.details.map((statement, index) => (
+        <p key={index}>
+          <StatementText statement={statement} />
+        </p>
+      ))}
+    </li>
+  );
 }
 
 /**
- * The sections of the permission screen, after the capability and permission
- * contract (ADR 0015). Granting, the presentation rules (#77), and reading the
- * risk labels from `@mymandev/permissions` come later.
+ * The permission screen after the capability and permission contract (ADR
+ * 0015) and its presentation rules (#77), read-only: it shows what each
+ * capability allows and its risk from `@mymandev/permissions`, and it has no
+ * control that grants. Granting comes later.
  */
-const PERMISSION_SECTIONS: readonly PermissionSection[] = [
-  {
-    id: "agent",
-    title: "Agent",
-    text: "Permissions belong to one agent of this project, and only the agent's owner grants them.",
-    capabilities: [],
-  },
-  {
-    id: "files",
-    title: "Repository files",
-    text: "Reading and changing the files of one repository.",
-    capabilities: ["repo.read", "repo.write"],
-  },
-  {
-    id: "git",
-    title: "Git",
-    text: "Committing and pushing in one repository.",
-    capabilities: ["git.commit", "git.push"],
-  },
-  {
-    id: "terminal",
-    title: "Terminal",
-    text: "Running a shell that starts in one repository. This is the highest-risk permission, and it is granted on its own.",
-    capabilities: ["terminal.execute"],
-  },
-  {
-    id: "provider",
-    title: "AI provider",
-    text: "Using one AI provider connection on the agent's device.",
-    capabilities: ["provider.use"],
-  },
-  {
-    id: "granted",
-    title: "Granted permissions",
-    text: "The agent's permissions, when they expire, and revoking them.",
-    capabilities: [],
-  },
-];
-
 export function PermissionsScreen() {
+  const view = describePermissionScreen();
   return (
     <section aria-labelledby="permissions-title">
       <h2 id="permissions-title">Permissions</h2>
@@ -86,21 +76,24 @@ export function PermissionsScreen() {
         An agent can do only what its owner grants: one capability on one
         repository or on one AI provider connection.
       </p>
+      <p className="placeholder-note">{view.unavailable}</p>
+      <ul className="permission-statements">
+        {view.statements.map((statement, index) => (
+          <li key={index}>
+            <StatementText statement={statement} />
+          </li>
+        ))}
+      </ul>
       {/* Subsections without a name, so that they add no landmark regions. */}
-      {PERMISSION_SECTIONS.map((section) => (
-        <section className="permission-section" key={section.id}>
-          <h3>{section.title}</h3>
-          <p>{section.text}</p>
-          {section.capabilities.length > 0 ? (
-            <ul className="capability-list" aria-label="Capabilities">
-              {section.capabilities.map((capability) => (
-                <li key={capability}>
-                  <code>{capability}</code>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-          <p className="placeholder-note">Not available yet.</p>
+      {view.groups.map((group) => (
+        <section className="permission-section" key={group.scope}>
+          <h3>{group.title}</h3>
+          <p>{group.text}</p>
+          <ul className="capability-list" aria-label="Capabilities">
+            {group.capabilities.map((capability) => (
+              <CapabilityItem key={capability.capability} view={capability} />
+            ))}
+          </ul>
         </section>
       ))}
     </section>
