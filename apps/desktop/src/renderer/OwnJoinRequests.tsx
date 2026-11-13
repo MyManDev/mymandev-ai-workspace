@@ -12,6 +12,7 @@ import type {
 } from "../shared/desktop-bridge.ts";
 import type { AccountView } from "./account-view.ts";
 import { focusesTitleAfterAction, formatDeviceTime } from "./device-view.ts";
+import { focusesTitleAfterLeave } from "./join-invitation-view.ts";
 import { focusOnButtonOrPage, syncModal } from "./JoinRequests.tsx";
 import {
   createOwnJoinRequestActions,
@@ -443,6 +444,29 @@ export function WithdrawQuestionContent({
   );
 }
 
+/**
+ * Whether the focus moves to the screen's title as a new list renders: no
+ * question is open, the "Withdraw" button that the person used last
+ * (`trigger`) has left the page, and the focus fell to the page. After a
+ * refused or uncertain withdrawal, the main process loads the list again,
+ * and a request that ended meanwhile leaves the pending requests with its
+ * button.
+ */
+export function focusesTitleAfterRowLeft(
+  questionOpen: boolean,
+  trigger: { readonly isConnected: boolean } | null,
+  focusOnPage: boolean,
+): boolean {
+  return (
+    !questionOpen &&
+    focusesTitleAfterLeave(
+      trigger !== null,
+      trigger?.isConnected === true,
+      focusOnPage,
+    )
+  );
+}
+
 /** Follows the account's own join requests while the screen is shown, and asks for them once. */
 export function useOwnJoinRequestsScreen(
   bridge: OwnJoinRequestsBridge | undefined,
@@ -469,8 +493,11 @@ export function useOwnJoinRequestsScreen(
  * The focus moves to the screen's title (`titleId`) when "Withdraw" leaves
  * the page: after a withdrawal that the API confirmed, while the focus is
  * still on that button, which the closed question gave it back to, or on
- * the page; and when the question ends because its request ended, once
- * that button left the page.
+ * the page; when the question ends because its request ended, once that
+ * button left the page; and when a later list no longer shows that button,
+ * for example after a refused or uncertain withdrawal whose request ended,
+ * while no question is open and the focus fell to the page
+ * (`focusesTitleAfterRowLeft`).
  */
 export function useOwnJoinRequestActions(
   bridges: {
@@ -517,6 +544,23 @@ export function useOwnJoinRequestActions(
     }
     wasOpen.current = open;
   }, [open, focusTitle]);
+  useEffect(() => {
+    const button = trigger.current;
+    if (open || button === null || button.isConnected) {
+      // An open question gives the focus back to its button as it closes.
+      return;
+    }
+    trigger.current = null;
+    if (
+      focusesTitleAfterRowLeft(
+        open,
+        button,
+        focusOnButtonOrPage(document.activeElement, document.body, null),
+      )
+    ) {
+      focusTitle();
+    }
+  }, [list, open, focusTitle]);
   const handlers = useMemo(
     (): OwnJoinRequestHandlers | undefined =>
       controller === undefined

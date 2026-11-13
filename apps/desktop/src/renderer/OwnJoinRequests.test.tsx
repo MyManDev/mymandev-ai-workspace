@@ -16,7 +16,12 @@ import type {
   WorkspaceView,
 } from "../shared/ipc-contract.ts";
 import { deviceTimeFormat } from "./device-view.ts";
-import { JoinScreen, JoinScreenContent } from "./JoinScreen.tsx";
+import {
+  followedOwnJoinRequests,
+  JoinScreen,
+  JoinScreenContent,
+  joinRequestPart,
+} from "./JoinScreen.tsx";
 import {
   IDLE_OWN_JOIN_REQUEST_ACTIONS,
   describeOwnJoinRequests,
@@ -25,6 +30,7 @@ import {
   type WithdrawRequest,
 } from "./own-join-requests-view.ts";
 import {
+  focusesTitleAfterRowLeft,
   WithdrawQuestionContent,
   type OwnJoinRequestHandlers,
 } from "./OwnJoinRequests.tsx";
@@ -627,4 +633,55 @@ test("the requester's part reads no clock: the main process marks a request past
       /Date\.now|new Date\(|performance\.now|setTimeout|setInterval/,
     );
   }
+});
+
+test("after a refused or uncertain withdrawal whose request ended, the focus moves to the title once the next list no longer shows Withdraw, while no question is open and the focus fell to the page", () => {
+  const gone = { isConnected: false };
+  const shown = { isConnected: true };
+  expect(focusesTitleAfterRowLeft(false, gone, true)).toBe(true);
+  // The button is still there, the focus is elsewhere, no button was used,
+  // or a question is open, which gives the focus back as it closes.
+  expect(focusesTitleAfterRowLeft(false, shown, true)).toBe(false);
+  expect(focusesTitleAfterRowLeft(false, gone, false)).toBe(false);
+  expect(focusesTitleAfterRowLeft(false, null, true)).toBe(false);
+  expect(focusesTitleAfterRowLeft(true, gone, true)).toBe(false);
+});
+
+test("the join screen subscribes to the own join requests only with both bridges", () => {
+  const ownJoinRequests: OwnJoinRequestsBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+    load: () => Promise.reject(new Error("not called")),
+  };
+  const ownJoinRequestActions: OwnJoinRequestActionsBridge = {
+    create: () => Promise.reject(new Error("not called")),
+    withdraw: () => Promise.reject(new Error("not called")),
+  };
+  expect(followedOwnJoinRequests(ownJoinRequests, ownJoinRequestActions)).toBe(
+    ownJoinRequests,
+  );
+  expect(followedOwnJoinRequests(ownJoinRequests, undefined)).toBeUndefined();
+  expect(
+    followedOwnJoinRequests(undefined, ownJoinRequestActions),
+  ).toBeUndefined();
+});
+
+test("the join screen gives the part the workspace state, so that a request shows the name of a workspace that the account's list holds, and no part without the handlers", () => {
+  const { handlers } = recorder();
+  const list = listed([PENDING, APPROVED]);
+  const holding = known({ workspaces: [{ id: JOINED, name: "Team" }] });
+  const part = joinRequestPart(list, holding, {
+    view: IDLE_OWN_JOIN_REQUEST_ACTIONS,
+    handlers,
+  });
+  expect(part?.model.ended[0]?.workspaceName).toBe("Team");
+  expect(part?.model).toEqual(describeOwnJoinRequests(list, holding));
+  expect(part?.view).toBe(IDLE_OWN_JOIN_REQUEST_ACTIONS);
+  expect(part?.handlers).toBe(handlers);
+  expect(
+    joinRequestPart(list, holding, {
+      view: IDLE_OWN_JOIN_REQUEST_ACTIONS,
+      handlers: undefined,
+    }),
+  ).toBeUndefined();
 });

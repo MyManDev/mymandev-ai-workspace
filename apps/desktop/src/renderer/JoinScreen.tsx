@@ -37,6 +37,7 @@ import {
   JOIN_REQUEST_FORM_MESSAGES,
   type OwnJoinRequestActionsView,
   type OwnJoinRequestsModel,
+  type OwnJoinRequestsScreenView,
 } from "./own-join-requests-view.ts";
 import { clockDelay, watchClockReads } from "./people-actions-view.ts";
 import { formatPeopleDate, peopleDateFormat } from "./people-view.ts";
@@ -103,9 +104,8 @@ export function JoinScreen({
     workspaces,
     onOpenWorkspace,
   );
-  // The list follows only with both bridges, as the part shows only then.
   const list = useOwnJoinRequestsScreen(
-    ownJoinRequestActions === undefined ? undefined : ownJoinRequests,
+    followedOwnJoinRequests(ownJoinRequests, ownJoinRequestActions),
   );
   const requests = useOwnJoinRequestActions(
     { ownJoinRequests, ownJoinRequestActions },
@@ -118,17 +118,43 @@ export function JoinScreen({
       workspaces={workspaces}
       view={view}
       handlers={handlers}
-      requests={
-        requests.handlers === undefined
-          ? undefined
-          : {
-              model: describeOwnJoinRequests(list, workspaces),
-              view: requests.view,
-              handlers: requests.handlers,
-            }
-      }
+      requests={joinRequestPart(list, workspaces, requests)}
     />
   );
+}
+
+/**
+ * The own join requests that the screen subscribes to: only with both
+ * bridges, because the part shows only then; otherwise none, and nothing
+ * is read.
+ */
+export function followedOwnJoinRequests(
+  ownJoinRequests: OwnJoinRequestsBridge | undefined,
+  ownJoinRequestActions: OwnJoinRequestActionsBridge | undefined,
+): OwnJoinRequestsBridge | undefined {
+  return ownJoinRequestActions === undefined ? undefined : ownJoinRequests;
+}
+
+/**
+ * What the screen shows of the join requests, or undefined without the
+ * handlers: the own join requests with the names of the workspaces that the
+ * workspace state lists, the actions' view, and their handlers.
+ */
+export function joinRequestPart(
+  list: OwnJoinRequestsScreenView,
+  workspaces: WorkspacePanelView,
+  actions: {
+    readonly view: OwnJoinRequestActionsView;
+    readonly handlers: OwnJoinRequestHandlers | undefined;
+  },
+): JoinRequestPartProps | undefined {
+  return actions.handlers === undefined
+    ? undefined
+    : {
+        model: describeOwnJoinRequests(list, workspaces),
+        view: actions.view,
+        handlers: actions.handlers,
+      };
 }
 
 /** What the screen shows of the join requests, with their handlers. */

@@ -98,7 +98,7 @@ export const JOIN_REQUEST_FORM_MESSAGES = Object.freeze({
   workspaceMissing: "Paste the ID of the workspace.",
   /** Before a request with a text that is not a workspace ID once trimmed. */
   notAnId:
-    "This is not a workspace ID. A workspace ID has 36 characters: digits and the letters a to f in five groups joined by hyphens. Paste all of it.",
+    "This is not a workspace ID. Check that you pasted all of the ID that the workspace's member gave you.",
 });
 
 /**
@@ -372,14 +372,33 @@ function pendingIds(view: OwnJoinRequestsScreenView): ReadonlySet<string> {
 }
 
 /**
+ * The limits of join requests of ADR 0014 ("Limits"), which the sentences
+ * name: no protocol constant holds them, so they live here once, for the
+ * sentence of a refused request and the question before a withdrawal.
+ */
+export const JOIN_REQUEST_POLICY_LIMITS = Object.freeze({
+  /** Pending requests per account. */
+  pendingPerAccount: 5,
+  /** New requests per account within `newRequestWindowHours`. */
+  newRequestsPerAccount: 10,
+  newRequestWindowHours: 24,
+  /** Pending requests per workspace. */
+  pendingPerWorkspace: 50,
+  /** The wait before an account asks a workspace again after a denial. */
+  hoursAfterDenial: 24,
+});
+
+const LIMITS = JOIN_REQUEST_POLICY_LIMITS;
+
+/**
  * The question before a withdrawal. A withdrawn request cannot come back:
  * a new request is refused while the workspace pauses new requests, which
- * leaves the pending ones open, and it counts toward the account's 10 new
- * requests in 24 hours (ADR 0014, "Limits").
+ * leaves the pending ones open, and it counts toward the account's new
+ * requests within a day (ADR 0014, "Limits").
  */
 export const WITHDRAW_QUESTION = Object.freeze({
   title: "Withdraw this request?",
-  text: "The request ends, and the owner and the admins of the workspace can no longer approve it. You can ask again with the workspace ID, but a new request is refused while the workspace pauses new requests, and it counts toward the 10 requests that an account can make in 24 hours.",
+  text: `The request ends, and the owner and the admins of the workspace can no longer approve it. You can ask again with the workspace ID, but a new request is refused while the workspace pauses new requests, and it counts toward the ${String(LIMITS.newRequestsPerAccount)} requests that an account can make in ${String(LIMITS.newRequestWindowHours)} hours.`,
   confirm: "Withdraw",
 });
 
@@ -393,6 +412,9 @@ export const OWN_JOIN_REQUEST_DONE_MESSAGES = Object.freeze({
   /**
    * The API answers with the account's pending request for the workspace
    * instead of creating another, so its name may differ from the one sent.
+   * The screen tells it apart on a best-effort basis
+   * (`describeCreateResult`); the list of own join requests is
+   * authoritative.
    */
   createPending:
     "You already have a pending request for this workspace, so no new one was made. It shows under Your join requests, with the name it was sent with.",
@@ -425,8 +447,9 @@ export const OWN_JOIN_REQUEST_UNKNOWN_MESSAGES: Readonly<
 /**
  * Why an action was refused, after its start. `too_soon` and
  * `rate_limited` say how long to wait (`describeWait`); a create's
- * `rate_limited` also names the limits of ADR 0014 ("Limits"), which the
- * API does not tell apart.
+ * `rate_limited` also names the limits of join requests of ADR 0014
+ * ("Limits") as possible causes, because the API does not tell them apart,
+ * and its own limit of requests per minute answers `rate_limited` too.
  */
 export const OWN_JOIN_REQUEST_REFUSAL_MESSAGES = Object.freeze({
   /** A create's `invalid`: the ID passed the screen's check, so the name. */
@@ -438,7 +461,7 @@ export const OWN_JOIN_REQUEST_REFUSAL_MESSAGES = Object.freeze({
   tooSoon: (wait: string) =>
     `This device sent many requests in a short time. Try again in ${wait}.`,
   createRateLimited: (wait: string) =>
-    `The server asked to wait: an account can have at most 5 pending join requests and make 10 in 24 hours, a workspace takes at most 50 pending requests, and after a denial the same workspace can be asked again after 24 hours. Try again in ${wait}.`,
+    `The server asked to wait. Join requests have limits: an account can have at most ${String(LIMITS.pendingPerAccount)} pending requests and make ${String(LIMITS.newRequestsPerAccount)} in ${String(LIMITS.newRequestWindowHours)} hours, a workspace takes at most ${String(LIMITS.pendingPerWorkspace)} pending requests, and after a denial the same workspace can be asked again after ${String(LIMITS.hoursAfterDenial)} hours. Try again in ${wait}.`,
   rateLimited: (wait: string) =>
     `The server asked to wait. Try again in ${wait}.`,
   already_member:
@@ -515,7 +538,10 @@ function refusalText(
  * The sentence after a create's answer. `sentName` is the name that went,
  * and `heldPending` the IDs of the pending requests that the screen listed
  * before it: an answer with one of them, or with another name, is the
- * pending request that the account already had for the workspace.
+ * pending request that the account already had for the workspace. This is
+ * best effort: a pending request with the same name that the list did not
+ * show yet reads as a new one. The list of own join requests, which the
+ * main process loads again after the answer, is authoritative.
  */
 export function describeCreateResult(
   result: CreateJoinRequestResult,
@@ -644,7 +670,9 @@ export interface OwnJoinRequestActions {
    * Follows the account status: the name field shows the account's display
    * name until the person edits it, and a sign-out or another account or
    * device ends the session, which drops both fields' texts and problems,
-   * the question, the sentence, and the answers on their way.
+   * the question, the sentence, and the answers on their way, and ends the
+   * running state at once, so that the new session can act before the
+   * answer of the old one arrives.
    */
   readonly accountChanged: (account: AccountView) => void;
   /**
@@ -683,8 +711,17 @@ export function createOwnJoinRequestActions(
   let withdrawal: WithdrawRequest | undefined;
   /** The signed-in account and device; undefined before the first status. */
   let identity: string | null | undefined;
-  /** Grows when a session ends, so that no answer outlives it. */
+  /**
+   * Grows when a session ends, so that no answer outlives it: an answer of
+   * an earlier session neither shows nor ends the running state, which the
+   * end of its session already ended.
+   */
   let session = 0;
+  /**
+   * Grows with every create and withdrawal that starts, so that a refresh's
+   * answer shows only when no action started after the refresh.
+   */
+  let actionCount = 0;
   /** The latest own join requests. */
   let latest: OwnJoinRequestsScreenView = { kind: "pending" };
   /**
@@ -709,6 +746,7 @@ export function createOwnJoinRequestActions(
   /** Starts an action: the last sentence and a refresh's wait end. */
   function begin(): void {
     running = true;
+    actionCount += 1;
     message = undefined;
     refreshedAt = undefined;
   }
@@ -763,13 +801,16 @@ export function createOwnJoinRequestActions(
         // A fixed text: never the error, which might name the call.
         sentence = `${OWN_JOIN_REQUEST_NOT_DONE_MESSAGES.create} ${PEOPLE_ACTION_NOT_SENT}`;
       }
+      // The end of its session already ended it, and an action of the new
+      // session may run now.
+      if (session !== startSession) {
+        return;
+      }
       running = false;
-      if (session === startSession) {
-        message = { text: sentence, place: "form" };
-        if (ok) {
-          workspaceText = "";
-          draft = undefined;
-        }
+      message = { text: sentence, place: "form" };
+      if (ok) {
+        workspaceText = "";
+        draft = undefined;
       }
       show();
     },
@@ -806,19 +847,21 @@ export function createOwnJoinRequestActions(
       } catch {
         sentence = `${OWN_JOIN_REQUEST_NOT_DONE_MESSAGES.withdraw} ${PEOPLE_ACTION_NOT_SENT}`;
       }
-      running = false;
-      const counts = session === startSession;
-      if (counts) {
-        message = { text: sentence, place: "list" };
+      // As for a create: an answer of an earlier session changes nothing.
+      if (session !== startSession) {
+        return false;
       }
+      running = false;
+      message = { text: sentence, place: "list" };
       show();
-      return counts && ok;
+      return ok;
     },
     refresh: async () => {
       if (running) {
         return;
       }
       const startSession = session;
+      const startAction = actionCount;
       let loading = false;
       let sentence: string;
       try {
@@ -831,8 +874,9 @@ export function createOwnJoinRequestActions(
       } catch {
         sentence = OWN_JOIN_REQUEST_REFRESH_MESSAGES.failed;
       }
-      // An action that started meanwhile has its own sentence.
-      if (session === startSession && !running) {
+      // An action that started meanwhile, also one that has ended since,
+      // has its own sentence.
+      if (session === startSession && actionCount === startAction) {
         message = { text: sentence, place: "list" };
         refreshedAt = loading
           ? latest.kind === "known"
@@ -856,6 +900,7 @@ export function createOwnJoinRequestActions(
       if (ended) {
         session += 1;
         changed ||=
+          running ||
           workspaceText !== "" ||
           draft !== undefined ||
           workspaceProblem !== undefined ||
@@ -869,6 +914,8 @@ export function createOwnJoinRequestActions(
         message = undefined;
         withdrawal = undefined;
         refreshedAt = undefined;
+        // The new session is not locked until the old answer arrives.
+        running = false;
       }
       if (changed) {
         show();

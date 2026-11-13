@@ -29,6 +29,7 @@ import {
   initialOwnJoinRequestsScreenView,
   isWithdrawalOffered,
   JOIN_REQUEST_FORM_MESSAGES,
+  JOIN_REQUEST_POLICY_LIMITS,
   OWN_JOIN_REQUEST_DONE_MESSAGES,
   OWN_JOIN_REQUEST_MESSAGES,
   OWN_JOIN_REQUEST_NOT_DONE_MESSAGES,
@@ -486,7 +487,7 @@ test("a pasted workspace ID is trimmed at its ends only and written small, and a
   ]) {
     expect(workspaceIdToSend(text), JSON.stringify(text)).toBeUndefined();
     expect(workspaceIdProblem(text)).toBe(
-      "This is not a workspace ID. A workspace ID has 36 characters: digits and the letters a to f in five groups joined by hyphens. Paste all of it.",
+      "This is not a workspace ID. Check that you pasted all of the ID that the workspace's member gave you.",
     );
   }
   for (const text of ["", " \n", "\u200b\ufeff"]) {
@@ -632,7 +633,7 @@ test("every result of a create has its fixed sentence, a refusal that a create n
     too_soon:
       "This device sent many requests in a short time. Try again in 3 seconds.",
     rate_limited:
-      "The server asked to wait: an account can have at most 5 pending join requests and make 10 in 24 hours, a workspace takes at most 50 pending requests, and after a denial the same workspace can be asked again after 24 hours. Try again in 3 hours.",
+      "The server asked to wait. Join requests have limits: an account can have at most 5 pending requests and make 10 in 24 hours, a workspace takes at most 50 pending requests, and after a denial the same workspace can be asked again after 24 hours. Try again in 3 hours.",
     already_member:
       "You are already a member of this workspace. It is in your list of workspaces.",
     workspace_not_found:
@@ -1098,4 +1099,123 @@ test("the texts of the form and the list are fixed", () => {
   expect(OWN_JOIN_REQUEST_DONE_MESSAGES.withdraw).toBe(
     "The request was withdrawn.",
   );
+});
+
+test("the limits of join requests live in one constant that both the refused request's sentence and the withdrawal's question name", () => {
+  expect(JOIN_REQUEST_POLICY_LIMITS).toEqual({
+    pendingPerAccount: 5,
+    newRequestsPerAccount: 10,
+    newRequestWindowHours: 24,
+    pendingPerWorkspace: 50,
+    hoursAfterDenial: 24,
+  });
+  // The sentence hedges: the API's own limit of requests per minute also
+  // answers rate_limited.
+  expect(OWN_JOIN_REQUEST_REFUSAL_MESSAGES.createRateLimited("1 minute")).toBe(
+    "The server asked to wait. Join requests have limits: an account can have at most 5 pending requests and make 10 in 24 hours, a workspace takes at most 50 pending requests, and after a denial the same workspace can be asked again after 24 hours. Try again in 1 minute.",
+  );
+  expect(WITHDRAW_QUESTION.text).toContain(
+    "it counts toward the 10 requests that an account can make in 24 hours.",
+  );
+});
+
+test("a sign-out ends the running state at once, so that the new session can act before the old answer arrives, which then changes nothing (the new answer first)", async () => {
+  const old = pending<CreateJoinRequestResult>();
+  const next = pending<CreateJoinRequestResult>();
+  const answers = [old.answer, next.answer];
+  const { actions, calls, last } = controllerWith({
+    create: () => (answers.shift() ?? NOT_CALLED)(),
+  });
+  actions.editWorkspaceId(WORKSPACE);
+  const first = actions.submit();
+  expect(last().running).toBe(true);
+  actions.accountChanged(SIGNED_OUT);
+  expect(last().running).toBe(false);
+  actions.accountChanged(signedIn({ login: "hubot", displayName: "Hubot" }));
+  actions.editWorkspaceId(OTHER_WORKSPACE);
+  const second = actions.submit();
+  expect(calls.map((call) => call.args)).toEqual([
+    [WORKSPACE, "The Octocat"],
+    [OTHER_WORKSPACE, "Hubot"],
+  ]);
+  expect(last().running).toBe(true);
+  next.resolve(refused("workspace_not_found"));
+  await second;
+  expect(last().running).toBe(false);
+  expect(last().formMessage).toContain("No workspace has this ID");
+  old.resolve(created("The Octocat"));
+  await first;
+  expect(last().running).toBe(false);
+  expect(last().formMessage).toContain("No workspace has this ID");
+  expect(last().workspaceId).toBe(OTHER_WORKSPACE);
+});
+
+test("an old session's answer that arrives while the new session's action runs neither unlocks it nor shows its sentence (the old answer first)", async () => {
+  const old = pending<WithdrawJoinRequestResult>();
+  const create = pending<CreateJoinRequestResult>();
+  const { actions, last } = controllerWith({
+    withdraw: old.answer,
+    create: create.answer,
+  });
+  actions.startWithdraw(WITHDRAW);
+  const withdrawn = actions.confirmWithdraw();
+  actions.accountChanged(signedIn({ deviceId: OTHER_DEVICE }));
+  expect(last().running).toBe(false);
+  actions.editWorkspaceId(WORKSPACE);
+  const submitted = actions.submit();
+  old.resolve({ outcome: "ok" });
+  // No focus move for the old withdrawal, and the create still runs.
+  expect(await withdrawn).toBe(false);
+  expect(last().running).toBe(true);
+  expect(last().listMessage).toBeUndefined();
+  // While it runs, nothing else starts.
+  actions.editWorkspaceId("changed");
+  expect(last().workspaceId).toBe(WORKSPACE);
+  create.resolve(created("The Octocat"));
+  await submitted;
+  expect(last().running).toBe(false);
+  expect(last().formMessage).toBe(OWN_JOIN_REQUEST_DONE_MESSAGES.create);
+});
+
+test("a sign-in after a sign-out keeps the new session: what was typed meanwhile and an answer on its way stay", async () => {
+  const answer = pending<CreateJoinRequestResult>();
+  const { actions, last } = controllerWith({ create: answer.answer });
+  actions.accountChanged(SIGNED_OUT);
+  actions.editWorkspaceId(WORKSPACE);
+  actions.editName("Katherine");
+  const done = actions.submit();
+  actions.accountChanged(account());
+  expect(last().running).toBe(true);
+  answer.resolve(refused("not_signed_in"));
+  await done;
+  expect(last().formMessage).toBe(
+    `${OWN_JOIN_REQUEST_NOT_DONE_MESSAGES.create} ${OWN_JOIN_REQUEST_REFUSAL_MESSAGES.not_signed_in}`,
+  );
+  expect(last().workspaceId).toBe(WORKSPACE);
+  expect(last().name).toBe("Katherine");
+});
+
+test("a refresh's answer that arrives after an action started and ended keeps that action's sentence", async () => {
+  const load = pending<OwnJoinRequestLoadResult>();
+  const { actions, last } = controllerWith({
+    load: load.answer,
+    create: () => Promise.resolve(refused("join_requests_closed")),
+  });
+  const refreshed = actions.refresh();
+  actions.editWorkspaceId(WORKSPACE);
+  await actions.submit();
+  expect(last().running).toBe(false);
+  const sentence = last().formMessage;
+  expect(sentence).toContain("No request to join was made.");
+  load.resolve({ outcome: "loading" });
+  await refreshed;
+  expect(last().formMessage).toBe(sentence);
+  expect(last().listMessage).toBeUndefined();
+  // A refresh with no action meanwhile shows its sentence.
+  const again = pending<OwnJoinRequestLoadResult>();
+  const second = controllerWith({ load: again.answer });
+  const done = second.actions.refresh();
+  again.resolve({ outcome: "loading" });
+  await done;
+  expect(second.last().listMessage).toBe("Loading your join requests again.");
 });
