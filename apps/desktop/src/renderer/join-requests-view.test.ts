@@ -1129,7 +1129,7 @@ test("Deny and invite instead stops at a switch: an answer after it sends no nex
   second.actions.listChanged(known(), listed());
   expect(second.last().message).toBe(INVITE_INSTEAD_MESSAGES.unseen);
   expect(INVITE_INSTEAD_MESSAGES.unseen).toBe(
-    "An invitation was created for the chosen person, but its code could not be shown, and the request was not denied. Deny and invite instead again for a new code.",
+    'An invitation was created for the chosen person, but its code could not be shown, and the request was not denied. Use "Deny and invite instead" again for a new code.',
   );
 
   // A sign-out during the create: nothing, also after a new sign-in.

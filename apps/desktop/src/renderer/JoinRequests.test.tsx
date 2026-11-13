@@ -615,6 +615,20 @@ test("the approval's question shows the creation date of the GitHub account and 
   }
 });
 
+test("the screen gives the open question the people's date format, so that the creation date of the GitHub account shows as a date", () => {
+  const html = render({
+    joinRequestActions: {
+      ...IDLE_JOIN_REQUEST_ACTIONS,
+      dialog: dialogOf({ kind: "approve", ...ON_REQUEST }, { draft: "K" }),
+    },
+  });
+  expect(html).toContain(ACCOUNT_LINE);
+  // The time format would add the time of day.
+  expect(TIME_FORMAT.format(new Date(ACCOUNT_CREATED_AT))).not.toBe(
+    "1 Oct 2026",
+  );
+});
+
 test("Deny and invite instead's question shows the creation date of the GitHub account and offers each unclaimed person, nobody checked until one is chosen, with an alert for its problem; it reports the choice", () => {
   const { content, handlers } = question(
     dialogOf({ kind: "invite", ...ON_REQUEST }),
@@ -864,22 +878,24 @@ test("the screen with the join requests shows no ID, its element IDs are unique,
   }
 });
 
-test("the screen has the join request actions only with all four bridges: the people actions, the invitation actions, the join requests, and their actions", () => {
+test("the screen has the join request actions only with the three bridges that they use: the invitation actions, the join requests, and their actions, and without the people actions", () => {
   const call = () => Promise.reject(new Error("not called"));
   const subscribeState = () => () => undefined;
+  const peopleActions = {
+    define: call,
+    rename: call,
+    remove: call,
+    promote: call,
+    demote: call,
+    leave: call,
+    offerOwnership: call,
+    withdrawOwnershipOffer: call,
+    acceptOwnershipOffer: call,
+  } satisfies PeopleActionsBridge;
+  // No people actions: "Deny and invite instead" never calls them.
   const bridges = {
     people: { getState: call, subscribeState } satisfies PeopleBridge,
-    peopleActions: {
-      define: call,
-      rename: call,
-      remove: call,
-      promote: call,
-      demote: call,
-      leave: call,
-      offerOwnership: call,
-      withdrawOwnershipOffer: call,
-      acceptOwnershipOffer: call,
-    } satisfies PeopleActionsBridge,
+    peopleActions: undefined,
     invitations: {
       getState: call,
       subscribeState,
@@ -910,17 +926,21 @@ test("the screen has the join request actions only with all four bridges: the pe
   // part itself follows the people, which a server render does not load.
   const paragraph =
     '<p class="people-status" id="join-request-action-message" role="status"></p>';
-  expect(renderToString(<PeopleScreen {...bridges} />)).toContain(paragraph);
+  const html = renderToString(<PeopleScreen {...bridges} />);
+  expect(html).toContain(paragraph);
+  expect(html).not.toContain("people-action-message");
+  expect(
+    renderToString(<PeopleScreen {...bridges} peopleActions={peopleActions} />),
+  ).toContain(paragraph);
   for (const name of [
-    "peopleActions",
     "invitationActions",
     "joinRequests",
     "joinRequestActions",
   ] as const) {
-    const html = renderToString(
+    const without = renderToString(
       <PeopleScreen {...bridges} {...{ [name]: undefined }} />,
     );
-    expect(html, name).not.toContain("join-request-action-message");
+    expect(without, name).not.toContain("join-request-action-message");
   }
   // Without the handlers, no part shows, also for the owner with requests.
   expect(render({ withJoinRequests: false })).not.toContain(

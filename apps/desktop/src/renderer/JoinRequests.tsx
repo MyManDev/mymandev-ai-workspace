@@ -11,7 +11,6 @@ import type {
   InvitationActionsBridge,
   JoinRequestActionsBridge,
   JoinRequestsBridge,
-  PeopleActionsBridge,
 } from "../shared/desktop-bridge.ts";
 import { focusesTitleAfterAction } from "./device-view.ts";
 import {
@@ -661,20 +660,18 @@ function focusAfterAction(done: boolean, button: Element | null): void {
 /**
  * The join request actions of the screen (`createJoinRequestActions`) while
  * it is shown, which follow every view of the people and the join requests;
- * undefined handlers unless all four bridges are there (the Project
- * Manager's decision of 2026-11-13): the people actions, whose "Add person"
- * adds the unclaimed people that "Deny and invite instead" invites, the
- * invitation actions, which create that invitation, the join requests, and
- * their actions. A question remembers the button that opened it, which the
- * dialogs give the focus back to; when the question or the code's dialog
- * closes after that button left the page (`joinRequestDialogsOpen`), the
- * focus moves to the screen's title.
+ * undefined handlers unless the three bridges that they use are there (the
+ * Project Manager's decision of 2026-11-13): the join requests, their
+ * actions, and the invitation actions, which create the invitation of "Deny
+ * and invite instead". A question remembers the button that opened it,
+ * which the dialogs give the focus back to; when the question or the code's
+ * dialog closes after that button left the page (`joinRequestDialogsOpen`),
+ * the focus moves to the screen's title.
  */
 export function useJoinRequestActions(
   bridges: {
     readonly joinRequestActions: JoinRequestActionsBridge | undefined;
     readonly joinRequests: JoinRequestsBridge | undefined;
-    readonly peopleActions: PeopleActionsBridge | undefined;
     readonly invitationActions: InvitationActionsBridge | undefined;
   },
   people: PeopleScreenView,
@@ -684,20 +681,18 @@ export function useJoinRequestActions(
   readonly handlers: JoinRequestActionHandlers | undefined;
 } {
   const [actions, setActions] = useState(IDLE_JOIN_REQUEST_ACTIONS);
-  const { joinRequestActions, joinRequests: list } = bridges;
-  const { peopleActions, invitationActions } = bridges;
+  const { joinRequestActions, joinRequests: list, invitationActions } = bridges;
   const controller = useMemo(
     () =>
       joinRequestActions === undefined ||
       list === undefined ||
-      peopleActions === undefined ||
       invitationActions === undefined
         ? undefined
         : createJoinRequestActions(
             { joinRequestActions, joinRequests: list, invitationActions },
             setActions,
           ),
-    [joinRequestActions, list, peopleActions, invitationActions],
+    [joinRequestActions, list, invitationActions],
   );
   useEffect(
     () => controller?.listChanged(people, joinRequests),

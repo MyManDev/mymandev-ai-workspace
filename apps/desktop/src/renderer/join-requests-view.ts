@@ -664,7 +664,7 @@ export const INVITE_INSTEAD_MESSAGES = Object.freeze({
    * code.
    */
   unseen:
-    "An invitation was created for the chosen person, but its code could not be shown, and the request was not denied. Deny and invite instead again for a new code.",
+    'An invitation was created for the chosen person, but its code could not be shown, and the request was not denied. Use "Deny and invite instead" again for a new code.',
 });
 
 /**

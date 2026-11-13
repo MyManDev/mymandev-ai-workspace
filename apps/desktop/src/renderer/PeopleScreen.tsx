@@ -122,7 +122,7 @@ export function PeopleScreen({
     now,
   );
   const joinRequestParts = useJoinRequestActions(
-    { joinRequestActions, joinRequests, peopleActions, invitationActions },
+    { joinRequestActions, joinRequests, invitationActions },
     view,
     joinRequestsView,
   );
