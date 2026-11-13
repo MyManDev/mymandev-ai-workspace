@@ -43,10 +43,12 @@ import {
   signInRetryNote,
   signInRetryReading,
   signInTimeFormat,
+  showsTwoFactorNote,
   signOutMessage,
   startInAnotherBrowser,
   startMessage,
   SYSTEM_RETRY_CLOCK,
+  TWO_FACTOR_NOTE,
   waitingPairingCode,
   watchSignInRetry,
   type AccountView,
@@ -967,4 +969,63 @@ test("the end of the sign-in is a date and a time of day in the person's locale 
   const defaults = signInEndFormat().resolvedOptions();
   expect(defaults.timeZone).toBe(system.timeZone);
   expect(defaults.locale).toBe(system.locale);
+});
+
+test("the note on two-factor authentication shows while no sign-in runs and the panel offers one or the device is signed in (D6)", () => {
+  const signedIn: AccountStatus = {
+    ...IDLE,
+    lastOutcome: null,
+    account: {
+      kind: "signed_in",
+      login: "octocat",
+      displayName: "The Octocat",
+      deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    },
+    device: "signed_in",
+  };
+  expect(showsTwoFactorNote(IDLE)).toBe(true);
+  expect(
+    DEVICE_STATES.filter((device) =>
+      showsTwoFactorNote({ ...signedIn, device }),
+    ),
+  ).toEqual([
+    "no_device",
+    "signed_in",
+    "signed_out",
+    "sign_out_report_pending",
+    "sign_in_required",
+    "auth_failed",
+    "account_mismatch",
+    "key_lost",
+    "removed",
+    "revoked",
+  ]);
+  // While the device is signed out, the main process names no account.
+  expect(
+    showsTwoFactorNote({
+      ...signedIn,
+      account: { kind: "hidden" },
+      device: "signed_out",
+    }),
+  ).toBe(true);
+  // Never while a sign-in runs, also when the device is signed in.
+  for (const signIn of [
+    { kind: "starting" },
+    WAITING.signIn,
+    { kind: "completing" },
+  ] as const) {
+    expect(showsTwoFactorNote({ ...IDLE, signIn }), signIn.kind).toBe(false);
+    expect(showsTwoFactorNote({ ...signedIn, signIn }), signIn.kind).toBe(
+      false,
+    );
+  }
+});
+
+test("the note on two-factor authentication is one fixed text without an address (D6)", () => {
+  expect(TWO_FACTOR_NOTE).toBe(
+    "Turn on two-factor authentication for the GitHub account that you sign in with. MyManDev has no password of its own: whoever can sign in to that GitHub account can use your MyManDev account.",
+  );
+  expect(TWO_FACTOR_NOTE).not.toMatch(/https?:|www\.|\.com\b|[<>{}]/);
+  expect(TWO_FACTOR_NOTE).toMatch(/^[\x20-\x7e]+$/);
 });

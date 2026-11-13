@@ -544,6 +544,32 @@ export function offersForget(status: AccountStatus): boolean {
   return status.account.kind !== "signed_out";
 }
 
+/**
+ * The fixed note that recommends two-factor authentication on the GitHub
+ * account that the person signs in with (decision D6 on #95). The account
+ * has no password of its own: the GitHub sign-in is its only protection.
+ * Plain text without a link, because D6 asks for none and the renderer
+ * opens no address.
+ */
+export const TWO_FACTOR_NOTE =
+  "Turn on two-factor authentication for the GitHub account that you sign in with. MyManDev has no password of its own: whoever can sign in to that GitHub account can use your MyManDev account.";
+
+/**
+ * Whether the panel shows `TWO_FACTOR_NOTE` (D6 on #95): while no sign-in
+ * runs, and the panel offers a GitHub sign-in or this device is signed in.
+ * So the person reads it before choosing the GitHub account to sign in
+ * with and while using it, but not next to the pairing code of a running
+ * sign-in, nor while the device of an account that the installation holds
+ * is checked, waits for its passphrase, or waits for its removal, when the
+ * panel asks for something else.
+ */
+export function showsTwoFactorNote(status: AccountStatus): boolean {
+  return (
+    status.signIn.kind === "idle" &&
+    (offersSignIn(status) || deviceSignedIn(status))
+  );
+}
+
 /** The message for a start that the main process refused, or none. */
 export function startMessage(
   result: StartSignInResult | undefined,
