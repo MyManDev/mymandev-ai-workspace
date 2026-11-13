@@ -895,7 +895,7 @@ code {
   font-family: var(--font-family-mono);
 }
 
-/* A workspace ID: monospace, so that similar characters stay apart; a long one wraps. */
+/* A workspace ID on the join and people screens: monospace, so that similar characters stay apart; a long one wraps. */
 .workspace-id {
   font-family: var(--font-family-mono);
   overflow-wrap: anywhere;

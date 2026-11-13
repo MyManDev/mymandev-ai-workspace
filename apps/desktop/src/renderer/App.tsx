@@ -17,6 +17,8 @@ import type {
   InvitationsBridge,
   JoinRequestActionsBridge,
   JoinRequestsBridge,
+  OwnJoinRequestActionsBridge,
+  OwnJoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -116,6 +118,10 @@ export interface AppProps {
   readonly joinRequests?: JoinRequestsBridge | undefined;
   /** The join request actions from the preload script; undefined outside Electron. */
   readonly joinRequestActions?: JoinRequestActionsBridge | undefined;
+  /** The account's own join requests from the preload script; undefined outside Electron. */
+  readonly ownJoinRequests?: OwnJoinRequestsBridge | undefined;
+  /** The own join request actions from the preload script; undefined outside Electron. */
+  readonly ownJoinRequestActions?: OwnJoinRequestActionsBridge | undefined;
   /** The open project's agent activity from the preload script; undefined outside Electron. */
   readonly agents?: AgentBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
@@ -144,6 +150,8 @@ export function App({
   invitationActions,
   joinRequests,
   joinRequestActions,
+  ownJoinRequests,
+  ownJoinRequestActions,
   agents,
   chat,
   devices,
@@ -238,8 +246,11 @@ export function App({
           invitationActions={invitationActions}
           joinRequests={joinRequests}
           joinRequestActions={joinRequestActions}
+          ownJoinRequests={ownJoinRequests}
+          ownJoinRequestActions={ownJoinRequestActions}
           workspaces={workspaceSidebar}
           account={account}
+          accountView={accountView}
           chat={chat}
           devices={devices}
           homeSignIn={homeCase}
@@ -282,8 +293,11 @@ function ScreenContent({
   invitationActions,
   joinRequests,
   joinRequestActions,
+  ownJoinRequests,
+  ownJoinRequestActions,
   workspaces,
   account,
+  accountView,
   chat,
   devices,
   homeSignIn,
@@ -303,9 +317,13 @@ function ScreenContent({
   readonly invitationActions: InvitationActionsBridge | undefined;
   readonly joinRequests: JoinRequestsBridge | undefined;
   readonly joinRequestActions: JoinRequestActionsBridge | undefined;
+  readonly ownJoinRequests: OwnJoinRequestsBridge | undefined;
+  readonly ownJoinRequestActions: OwnJoinRequestActionsBridge | undefined;
   /** The workspace part of the sidebar, for the join screen. */
   readonly workspaces: WorkspaceSidebar;
   readonly account: AccountBridge | undefined;
+  /** The account status that the shell follows, for the join screen. */
+  readonly accountView: AccountView;
   readonly chat: ChatBridge | undefined;
   readonly devices: DeviceListBridge | undefined;
   /** What the home screen says about the sign-in. */
@@ -348,6 +366,9 @@ function ScreenContent({
       return (
         <JoinScreen
           invitationActions={invitationActions}
+          ownJoinRequests={ownJoinRequests}
+          ownJoinRequestActions={ownJoinRequestActions}
+          account={accountView}
           workspaces={workspaces.view}
           onOpenWorkspace={workspaces.onSelect}
         />

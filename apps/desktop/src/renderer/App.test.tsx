@@ -11,6 +11,8 @@ import type {
   InvitationsBridge,
   JoinRequestActionsBridge,
   JoinRequestsBridge,
+  OwnJoinRequestActionsBridge,
+  OwnJoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -469,6 +471,79 @@ test("the join screen gets the invitation actions and the workspace state: with 
   );
   // Only the join screen uses them.
   expect(render({ invitationActions })).not.toContain("join-code");
+});
+
+test("the join screen gets the own join requests: with their two bridges, it has the request form, the paragraphs of their sentences, the list's state, and the withdrawal's dialog, and reads nothing while rendered", () => {
+  const calls: string[] = [];
+  const call = (name: string) => () => {
+    calls.push(name);
+    return Promise.reject(new Error("not called"));
+  };
+  const ownJoinRequests: OwnJoinRequestsBridge = {
+    getState: call("getState"),
+    subscribeState: () => {
+      calls.push("subscribeState");
+      return () => undefined;
+    },
+    load: call("load"),
+  };
+  const ownJoinRequestActions: OwnJoinRequestActionsBridge = {
+    create: call("create"),
+    withdraw: call("withdraw"),
+  };
+  const bridges = { ownJoinRequests, ownJoinRequestActions };
+  const html = render({ ...bridges, initialView: { screen: "join" } });
+  expect(html).toContain(
+    '<label class="account-label" for="join-request-workspace">Workspace ID</label>',
+  );
+  expect(html).toContain(
+    '<p class="people-status" id="join-request-message" role="status"></p>',
+  );
+  expect(html).toContain(
+    '<p class="people-status" role="status">Checking your join requests.</p>',
+  );
+  expect(html).toContain(
+    '<p class="people-status" id="own-join-request-action-message" role="status"></p>',
+  );
+  // Without the invitation actions, only the withdrawal's dialog waits.
+  expect(html.match(/<dialog class="people-dialog"><\/dialog>/g)).toHaveLength(
+    1,
+  );
+  expect(html).not.toContain(
+    "Asking to join with a workspace ID is not available.",
+  );
+  // The subscription and the load run in an effect, which a server render
+  // does not run; nothing else is called.
+  expect(calls).toEqual([]);
+  // Without either of the two, the part is not available.
+  for (const missing of ["ownJoinRequests", "ownJoinRequestActions"] as const) {
+    const without = render({
+      ...bridges,
+      [missing]: undefined,
+      initialView: { screen: "join" },
+    });
+    expect(without, missing).toContain(
+      "<p>Asking to join with a workspace ID is not available.</p>",
+    );
+    expect(without, missing).not.toContain("own-join-requests-heading");
+  }
+  // While the workspace state is signed_out, the part asks for a sign-in.
+  expect(
+    render({
+      ...bridges,
+      initialView: { screen: "join" },
+      initialWorkspaceState: workspaceState([], {
+        status: "signed_out",
+        workspaces: [],
+        selectedWorkspaceId: null,
+      }),
+    }),
+  ).toContain(
+    "<p>You can ask to join a workspace once this device is signed in and ready.</p>",
+  );
+  // Only the join screen uses them.
+  expect(render(bridges)).not.toContain("own-join-requests-heading");
+  expect(render(bridges)).not.toContain("join-request-workspace");
 });
 
 test("the people screen gets the invitations: with both bridges, it has the paragraph of their sentence and the two dialogs, and reads nothing while rendered", () => {
