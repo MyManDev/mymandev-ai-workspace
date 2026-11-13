@@ -2189,9 +2189,11 @@ export type AgentActivityView = z.infer<typeof AgentActivityViewSchema>;
  *   `LIMITS.messageBody` and `LIMITS.displayName`.
  * - `text`: the budget of body text in one view, in UTF-16 code units, the
  *   unit that IPC carries a string in (at most two bytes each), so one view
- *   holds at most about 1 MB of text. The waiting messages come first, in
- *   order, then the newest held messages; what does not fit is left out and
- *   counted.
+ *   holds at most about 1 MB of body text, whatever waits. The newest held
+ *   messages may take up to half of it first, then the waiting messages,
+ *   in order, which keep at least the other half, then more held messages;
+ *   so the newest held message and the first waiting message always show.
+ *   What does not fit is left out and counted.
  * - `sendText`: the length of a text that the renderer sends, in
  *   characters. The main process prepares the body with the protocol's
  *   rules and answers `too_long` above `body`; this limit only bounds the
