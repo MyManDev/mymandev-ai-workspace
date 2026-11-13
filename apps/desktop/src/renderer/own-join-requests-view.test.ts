@@ -39,6 +39,7 @@ import {
   OWN_JOIN_REQUEST_REFUSAL_MESSAGES,
   OWN_JOIN_REQUEST_UNKNOWN_MESSAGES,
   WITHDRAW_QUESTION,
+  withdrawOutcome,
   WORKSPACE_ID_PATTERN,
   workspaceIdProblem,
   workspaceIdToSend,
@@ -487,7 +488,7 @@ test("a pasted workspace ID is trimmed at its ends only and written small, and a
   ]) {
     expect(workspaceIdToSend(text), JSON.stringify(text)).toBeUndefined();
     expect(workspaceIdProblem(text)).toBe(
-      "This is not a workspace ID. Check that you pasted all of the ID that the workspace's member gave you.",
+      "This is not a workspace ID. Check that you pasted all of the ID that a member of the workspace gave you.",
     );
   }
   for (const text of ["", " \n", "\u200b\ufeff"]) {
@@ -727,7 +728,7 @@ test("every result of a withdrawal has its fixed sentence, and a refusal that a 
   );
 });
 
-test("a withdrawal asks first and sends nothing until confirmed, then once, and resolves to true once confirmed, because its button leaves the pending requests", async () => {
+test("a withdrawal asks first and sends nothing until confirmed, then once, and resolves to withdrawn once confirmed, because its button leaves the pending requests", async () => {
   const answer = pending<WithdrawJoinRequestResult>();
   const { actions, calls, last } = controllerWith({ withdraw: answer.answer });
   actions.startWithdraw(WITHDRAW);
@@ -740,12 +741,12 @@ test("a withdrawal asks first and sends nothing until confirmed, then once, and 
   expect(last().running).toBe(true);
   expect(calls).toEqual([{ name: "withdraw", args: [REQUEST] }]);
   answer.resolve({ outcome: "ok" });
-  expect(await done).toBe(true);
+  expect(await done).toBe("withdrawn");
   expect(last().listMessage).toBe("The request was withdrawn.");
   expect(last().formMessage).toBeUndefined();
   expect(last().running).toBe(false);
   // Confirming again sends nothing: the question is gone.
-  expect(await actions.confirmWithdraw()).toBe(false);
+  expect(await actions.confirmWithdraw()).toBe("none");
   expect(calls).toHaveLength(1);
   expect(WITHDRAW_QUESTION).toEqual({
     title: "Withdraw this request?",
@@ -757,30 +758,36 @@ test("a withdrawal asks first and sends nothing until confirmed, then once, and 
 test("cancelling the question sends nothing, also on a later confirmation", async () => {
   const { actions, calls, last } = controllerWith({});
   actions.startWithdraw(WITHDRAW);
-  actions.cancelWithdraw();
+  // A cancel says that it closed a question; the close of a dialog whose
+  // question had already ended, which calls it again, does not.
+  expect(actions.cancelWithdraw()).toBe(true);
   expect(last().withdrawal).toBeUndefined();
-  expect(await actions.confirmWithdraw()).toBe(false);
+  expect(actions.cancelWithdraw()).toBe(false);
+  expect(await actions.confirmWithdraw()).toBe("none");
   expect(calls).toEqual([]);
 });
 
-test("a withdrawal that is refused, uncertain, or fails on its way resolves to false and says so; an unknown answer is never sent again", async () => {
-  for (const [answer, sentence] of [
+test("a withdrawal that is refused, uncertain, or fails on its way says so and resolves to whether its row may still leave with the reloaded list; an unknown answer is never sent again", async () => {
+  for (const [answer, sentence, outcome] of [
     [
       () => Promise.resolve(refused("conflict")),
       `${OWN_JOIN_REQUEST_NOT_DONE_MESSAGES.withdraw} ${OWN_JOIN_REQUEST_REFUSAL_MESSAGES.conflict}`,
+      "may_leave",
     ],
     [
       () => Promise.resolve<WithdrawJoinRequestResult>({ outcome: "unknown" }),
       OWN_JOIN_REQUEST_UNKNOWN_MESSAGES.withdraw,
+      "may_leave",
     ],
     [
       () => Promise.reject(new Error("lost")),
       "The request could not be withdrawn. It was not sent. Try again.",
+      "stays",
     ],
   ] as const) {
     const { actions, calls, last } = controllerWith({ withdraw: answer });
     actions.startWithdraw(WITHDRAW);
-    expect(await actions.confirmWithdraw()).toBe(false);
+    expect(await actions.confirmWithdraw()).toBe(outcome);
     await settle();
     expect(last().listMessage).toBe(sentence);
     expect(calls).toHaveLength(1);
@@ -858,7 +865,7 @@ test("only a pending request that the latest list holds as it was asked can be w
     }),
   );
   expect(last().withdrawal).toBeUndefined();
-  expect(await actions.confirmWithdraw()).toBe(false);
+  expect(await actions.confirmWithdraw()).toBe("none");
   expect(calls).toEqual([]);
 });
 
@@ -894,7 +901,7 @@ test("one action runs at a time: while one runs, the fields keep their text and 
   await second.actions.submit();
   expect(second.calls.map((call) => call.name)).toEqual(["withdraw"]);
   withdrawal.resolve({ outcome: "ok" });
-  expect(await confirmed).toBe(true);
+  expect(await confirmed).toBe("withdrawn");
 });
 
 test("a new action ends the sentence of the last one, wherever it shows", async () => {
@@ -961,7 +968,7 @@ test("a withdrawal's answer after a sign-out shows nothing and moves no focus", 
   actions.accountChanged(SIGNED_OUT);
   actions.accountChanged(account());
   answer.resolve({ outcome: "ok" });
-  expect(await done).toBe(false);
+  expect(await done).toBe("none");
   expect(last().listMessage).toBeUndefined();
 });
 
@@ -1165,7 +1172,7 @@ test("an old session's answer that arrives while the new session's action runs n
   const submitted = actions.submit();
   old.resolve({ outcome: "ok" });
   // No focus move for the old withdrawal, and the create still runs.
-  expect(await withdrawn).toBe(false);
+  expect(await withdrawn).toBe("none");
   expect(last().running).toBe(true);
   expect(last().listMessage).toBeUndefined();
   // While it runs, nothing else starts.
@@ -1246,4 +1253,16 @@ test("an old session's create answer that arrives while the new session's create
   expect(last().running).toBe(false);
   expect(last().formMessage).toBe(OWN_JOIN_REQUEST_DONE_MESSAGES.create);
   expect(last().workspaceId).toBe("");
+});
+
+test("a withdrawal's row may still leave only after the answers after which the main process loads the list again: ok, unknown, not_found, and conflict", () => {
+  expect(withdrawOutcome({ outcome: "ok" })).toBe("withdrawn");
+  expect(withdrawOutcome({ outcome: "unknown" })).toBe("may_leave");
+  expect(withdrawOutcome(undefined)).toBe("stays");
+  for (const reason of OWN_JOIN_REQUEST_ACTION_REFUSALS) {
+    const waits = reason === "too_soon" || reason === "rate_limited";
+    expect(withdrawOutcome(refused(reason, waits ? 1_000 : null)), reason).toBe(
+      reason === "not_found" || reason === "conflict" ? "may_leave" : "stays",
+    );
+  }
 });

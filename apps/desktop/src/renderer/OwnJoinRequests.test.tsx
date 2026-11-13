@@ -31,6 +31,7 @@ import {
 } from "./own-join-requests-view.ts";
 import {
   focusesTitleAfterRowLeft,
+  keepsWithdrawTrigger,
   WithdrawQuestionContent,
   type OwnJoinRequestHandlers,
 } from "./OwnJoinRequests.tsx";
@@ -635,16 +636,29 @@ test("the requester's part reads no clock: the main process marks a request past
   }
 });
 
-test("after a refused or uncertain withdrawal whose request ended, the focus moves to the title once the next list no longer shows Withdraw, while no question is open and the focus fell to the page", () => {
+test("after a refused or uncertain withdrawal whose request ended, the focus moves to the title once the next list no longer shows Withdraw, only from the page, and never while a question is open or an action runs", () => {
   const gone = { isConnected: false };
   const shown = { isConnected: true };
-  expect(focusesTitleAfterRowLeft(false, gone, true)).toBe(true);
-  // The button is still there, the focus is elsewhere, no button was used,
-  // or a question is open, which gives the focus back as it closes.
-  expect(focusesTitleAfterRowLeft(false, shown, true)).toBe(false);
-  expect(focusesTitleAfterRowLeft(false, gone, false)).toBe(false);
-  expect(focusesTitleAfterRowLeft(false, null, true)).toBe(false);
-  expect(focusesTitleAfterRowLeft(true, gone, true)).toBe(false);
+  const body = { name: "body" } as unknown as Element;
+  const field = { name: "field" } as unknown as Element;
+  expect(focusesTitleAfterRowLeft(false, false, gone, body, body)).toBe(true);
+  expect(focusesTitleAfterRowLeft(false, false, gone, null, body)).toBe(true);
+  // Only from the page: the focus on another control stays.
+  expect(focusesTitleAfterRowLeft(false, false, gone, field, body)).toBe(false);
+  // The button is still there, or no button was used.
+  expect(focusesTitleAfterRowLeft(false, false, shown, body, body)).toBe(false);
+  expect(focusesTitleAfterRowLeft(false, false, null, body, body)).toBe(false);
+  // A question is open, which gives the focus back as it closes, or an
+  // action runs, whose answer decides first.
+  expect(focusesTitleAfterRowLeft(true, false, gone, body, body)).toBe(false);
+  expect(focusesTitleAfterRowLeft(false, true, gone, body, body)).toBe(false);
+});
+
+test("a new list keeps the Withdraw that was used only while its question is open or an action runs; otherwise the first list decides and the screen forgets it", () => {
+  expect(keepsWithdrawTrigger(true, false)).toBe(true);
+  expect(keepsWithdrawTrigger(false, true)).toBe(true);
+  expect(keepsWithdrawTrigger(true, true)).toBe(true);
+  expect(keepsWithdrawTrigger(false, false)).toBe(false);
 });
 
 test("the join screen subscribes to the own join requests only with both bridges", () => {

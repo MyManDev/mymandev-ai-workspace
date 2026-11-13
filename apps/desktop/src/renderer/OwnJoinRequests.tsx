@@ -445,24 +445,41 @@ export function WithdrawQuestionContent({
 }
 
 /**
+ * Whether a new list leaves the "Withdraw" that the person used last for a
+ * later list: while its question is open, which gives the focus back to it
+ * as it closes, and while an action runs, whose answer decides first.
+ * Otherwise the first list decides, once, and the screen forgets the
+ * button, so that the rule is never left armed.
+ */
+export function keepsWithdrawTrigger(
+  questionOpen: boolean,
+  running: boolean,
+): boolean {
+  return questionOpen || running;
+}
+
+/**
  * Whether the focus moves to the screen's title as a new list renders: no
- * question is open, the "Withdraw" button that the person used last
- * (`trigger`) has left the page, and the focus fell to the page. After a
+ * question is open and no action runs, the "Withdraw" button that the
+ * person used last (`trigger`) has left the page, and the focus is on the
+ * page (`active` is `body` or nothing), never on another control. After a
  * refused or uncertain withdrawal, the main process loads the list again,
  * and a request that ended meanwhile leaves the pending requests with its
  * button.
  */
 export function focusesTitleAfterRowLeft(
   questionOpen: boolean,
+  running: boolean,
   trigger: { readonly isConnected: boolean } | null,
-  focusOnPage: boolean,
+  active: Element | null,
+  body: Element | null,
 ): boolean {
   return (
-    !questionOpen &&
+    !keepsWithdrawTrigger(questionOpen, running) &&
     focusesTitleAfterLeave(
       trigger !== null,
       trigger?.isConnected === true,
-      focusOnPage,
+      focusOnButtonOrPage(active, body, null),
     )
   );
 }
@@ -494,10 +511,12 @@ export function useOwnJoinRequestsScreen(
  * the page: after a withdrawal that the API confirmed, while the focus is
  * still on that button, which the closed question gave it back to, or on
  * the page; when the question ends because its request ended, once that
- * button left the page; and when a later list no longer shows that button,
- * for example after a refused or uncertain withdrawal whose request ended,
- * while no question is open and the focus fell to the page
- * (`focusesTitleAfterRowLeft`).
+ * button left the page; and when the first list after a refused or
+ * uncertain withdrawal no longer shows that button, because its request
+ * ended, while the focus fell to the page (`focusesTitleAfterRowLeft`).
+ * The screen forgets the button once that list, the answer, or the
+ * person's cancel decided (`keepsWithdrawTrigger`, `WithdrawOutcome`), so
+ * a later list never moves the focus.
  */
 export function useOwnJoinRequestActions(
   bridges: {
@@ -540,27 +559,32 @@ export function useOwnJoinRequestActions(
         button !== null && !button.isConnected,
       )
     ) {
+      trigger.current = null;
       focusTitle();
     }
     wasOpen.current = open;
   }, [open, focusTitle]);
+  // Only a new list decides; the question and the running state are those
+  // of the render that shows it.
+  const { running } = view;
   useEffect(() => {
     const button = trigger.current;
-    if (open || button === null || button.isConnected) {
-      // An open question gives the focus back to its button as it closes.
+    if (keepsWithdrawTrigger(open, running)) {
       return;
     }
     trigger.current = null;
     if (
       focusesTitleAfterRowLeft(
         open,
+        running,
         button,
-        focusOnButtonOrPage(document.activeElement, document.body, null),
+        document.activeElement,
+        document.body,
       )
     ) {
       focusTitle();
     }
-  }, [list, open, focusTitle]);
+  }, [list, focusTitle]);
   const handlers = useMemo(
     (): OwnJoinRequestHandlers | undefined =>
       controller === undefined
@@ -576,14 +600,20 @@ export function useOwnJoinRequestActions(
               controller.startWithdraw(request);
             },
             onConfirmWithdraw: () => {
-              void controller.confirmWithdraw().then((done) => {
+              const button = trigger.current;
+              void controller.confirmWithdraw().then((outcome) => {
+                // Only a request whose list loads again may still take its
+                // button away; otherwise the answer decided.
+                if (outcome !== "may_leave" && trigger.current === button) {
+                  trigger.current = null;
+                }
                 if (
                   focusesTitleAfterAction(
-                    done,
+                    outcome === "withdrawn",
                     focusOnButtonOrPage(
                       document.activeElement,
                       document.body,
-                      trigger.current,
+                      button,
                     ),
                   )
                 ) {
@@ -591,7 +621,13 @@ export function useOwnJoinRequestActions(
                 }
               });
             },
-            onCancelWithdraw: controller.cancelWithdraw,
+            onCancelWithdraw: () => {
+              // The person's cancel ends the rule; the close of a dialog
+              // whose question had already ended does not.
+              if (controller.cancelWithdraw()) {
+                trigger.current = null;
+              }
+            },
             onRefresh: () => {
               void controller.refresh();
             },

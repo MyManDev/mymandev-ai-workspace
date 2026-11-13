@@ -98,7 +98,7 @@ export const JOIN_REQUEST_FORM_MESSAGES = Object.freeze({
   workspaceMissing: "Paste the ID of the workspace.",
   /** Before a request with a text that is not a workspace ID once trimmed. */
   notAnId:
-    "This is not a workspace ID. Check that you pasted all of the ID that the workspace's member gave you.",
+    "This is not a workspace ID. Check that you pasted all of the ID that a member of the workspace gave you.",
 });
 
 /**
@@ -561,6 +561,49 @@ export function describeCreateResult(
   }
 }
 
+/**
+ * How a withdrawal ended, for the focus of the screen:
+ *
+ * - `withdrawn`: the API confirmed it in the same session, so its row and
+ *   its button leave the pending requests with the next list;
+ * - `may_leave`: `unknown`, `not_found`, or `conflict` in the same session,
+ *   after which the main process loads the list again, so the row leaves
+ *   with that list when the request ended meanwhile;
+ * - `stays`: any other refusal, or a call that failed on its way, after
+ *   which nothing loads the list, so the row stays;
+ * - `none`: nothing was sent, or the answer came after its session ended.
+ */
+export type WithdrawOutcome = "withdrawn" | "may_leave" | "stays" | "none";
+
+/**
+ * The refusals of a withdrawal after which the main process loads the own
+ * join requests again (#260), as after `ok` and `unknown`.
+ */
+const RELOADING_WITHDRAW_REFUSALS: ReadonlySet<OwnJoinRequestActionRefusal> =
+  new Set(["not_found", "conflict"]);
+
+/**
+ * The outcome of a withdrawal's answer in its own session, or of a call
+ * that failed on its way (`undefined`).
+ */
+export function withdrawOutcome(
+  result: WithdrawJoinRequestResult | undefined,
+): Exclude<WithdrawOutcome, "none"> {
+  if (result === undefined) {
+    return "stays";
+  }
+  switch (result.outcome) {
+    case "ok":
+      return "withdrawn";
+    case "unknown":
+      return "may_leave";
+    case "refused":
+      return RELOADING_WITHDRAW_REFUSALS.has(result.reason)
+        ? "may_leave"
+        : "stays";
+  }
+}
+
 /** The sentence after a withdrawal's answer. */
 export function describeWithdrawResult(
   result: WithdrawJoinRequestResult,
@@ -656,14 +699,18 @@ export interface OwnJoinRequestActions {
   readonly submit: () => Promise<void>;
   /** Opens the question before withdrawing a request that the screen offers. */
   readonly startWithdraw: (request: WithdrawRequest) => void;
-  /** Closes the question without the withdrawal. */
-  readonly cancelWithdraw: () => void;
   /**
-   * Withdraws the request of the open question, once. Resolves to true when
-   * the API confirmed it in the same session, because its row and its
-   * button then leave the pending requests.
+   * Closes the question without the withdrawal. Returns true when a
+   * question was open, so that the screen tells the person's cancel apart
+   * from the close of a dialog whose question had already ended.
    */
-  readonly confirmWithdraw: () => Promise<boolean>;
+  readonly cancelWithdraw: () => boolean;
+  /**
+   * Withdraws the request of the open question, once. Resolves to how it
+   * ended (`WithdrawOutcome`), so that the screen knows whether its button
+   * leaves the page at once, may leave with the next list, or stays.
+   */
+  readonly confirmWithdraw: () => Promise<WithdrawOutcome>;
   /** Asks the main process to load the own join requests again; nothing while an action runs. */
   readonly refresh: () => Promise<void>;
   /**
@@ -822,39 +869,40 @@ export function createOwnJoinRequestActions(
       show();
     },
     cancelWithdraw: () => {
-      if (withdrawal !== undefined) {
-        withdrawal = undefined;
-        show();
+      if (withdrawal === undefined) {
+        return false;
       }
+      withdrawal = undefined;
+      show();
+      return true;
     },
     confirmWithdraw: async () => {
       const request = withdrawal;
       if (running || request === undefined) {
-        return false;
+        return "none";
       }
       withdrawal = undefined;
       begin();
       show();
       const startSession = session;
-      let ok = false;
+      let answer: WithdrawJoinRequestResult | undefined;
       let sentence: string;
       try {
-        const result = await bridges.ownJoinRequestActions.withdraw(
+        answer = await bridges.ownJoinRequestActions.withdraw(
           request.joinRequestId,
         );
-        ok = result.outcome === "ok";
-        sentence = describeWithdrawResult(result);
+        sentence = describeWithdrawResult(answer);
       } catch {
         sentence = `${OWN_JOIN_REQUEST_NOT_DONE_MESSAGES.withdraw} ${PEOPLE_ACTION_NOT_SENT}`;
       }
       // As for a create: an answer of an earlier session changes nothing.
       if (session !== startSession) {
-        return false;
+        return "none";
       }
       running = false;
       message = { text: sentence, place: "list" };
       show();
-      return ok;
+      return withdrawOutcome(answer);
     },
     refresh: async () => {
       if (running) {
