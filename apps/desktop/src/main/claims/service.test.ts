@@ -960,7 +960,21 @@ test("a claim that left the list leaves the seen claims at the next write, and a
   expect(live.seen.writes.at(-1)?.entries[0]?.seenMemberIds).toEqual(
     many.slice(0, MAX_SEEN_CLAIMS_PER_ENTRY),
   );
-  expect(live.unseen()).toEqual(many.slice(MAX_SEEN_CLAIMS_PER_ENTRY));
+  // The older claims, which the entry cannot hold, are not new either.
+  expect(live.unseen()).toEqual([]);
+});
+
+test("a claim behind the MAX_SEEN_CLAIMS_PER_ENTRY most recent ones of a list is never unseen, so a server that lists more leaves none new for good", async () => {
+  const many = Array.from(
+    { length: MAX_SEEN_CLAIMS_PER_ENTRY + 3 },
+    (_, index) => id(0x30000 + index) as MemberId,
+  );
+  const live = await loadedWith(...many.map((memberId) => claim(memberId, T1)));
+  expect(live.ids()).toEqual(many);
+  // Without seen claims, only the most recent ones can be new.
+  expect(live.unseen()).toEqual(many.slice(0, MAX_SEEN_CLAIMS_PER_ENTRY));
+  live.service.markSeen(WORKSPACE, many.slice(0, MAX_SEEN_CLAIMS_PER_ENTRY));
+  expect(live.unseen()).toEqual([]);
 });
 
 test("markSeen is refused before the claims loaded, without the role, without a workspace, and after close", async () => {

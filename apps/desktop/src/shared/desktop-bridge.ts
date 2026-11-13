@@ -654,8 +654,9 @@ export interface ClaimsBridge {
    * Reports that the screen showed the claims of the selected workspace
    * with `memberIds`, the member IDs of the claimed people: those claims
    * are seen from then on, also after a restart, and a claim that the
-   * screen did not report stays unseen. The main process counts only the
-   * claims that it holds. Resolves to `ok` or `refused` with a reason. The
+   * screen did not report stays unseen while it is one of the 50 most
+   * recent claims of the list. The main process counts only the claims
+   * that it holds. Resolves to `ok` or `refused` with a reason. The
    * bridge passes on a workspace ID string and a new array of the member ID
    * strings, and refuses any other value without a call.
    */

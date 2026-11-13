@@ -123,7 +123,8 @@ export interface ClaimState {
   readonly claimedAt: string;
   /**
    * Whether the account has not seen it yet: the screen never reported it
-   * as shown, and it is not the claim of the account's own person.
+   * as shown, it is not the claim of the account's own person, and it is
+   * one of the `MAX_SEEN_CLAIMS_PER_ENTRY` most recent claims of the list.
    */
   readonly unseen: boolean;
 }
@@ -208,8 +209,10 @@ export interface ClaimService {
    * The screen showed the claims of `workspaceId` with `memberIds`: they
    * count as seen from then on, and the change is written to the seen
    * claims file. Only the selected workspace is accepted, and only the
-   * member IDs of held claims count; the others are ignored. A claim never
-   * becomes unseen again while the list holds it.
+   * member IDs of held claims count; the others are ignored. A claim does
+   * not become unseen again while the list holds it, unless its entry is
+   * evicted, a write failed before the application quit, or an older
+   * roamed file replaces the file.
    */
   readonly markSeen: (
     workspaceId: WorkspaceId,
@@ -377,10 +380,18 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
   function buildState(): ClaimListState {
     const seenNow = seenIds();
     const list = Object.freeze(
-      claims.map((claim): ClaimState =>
+      claims.map((claim, index): ClaimState =>
         Object.freeze({
           ...claim,
-          unseen: claim.memberId !== own && !seenNow.has(claim.memberId),
+          // A claim behind the `MAX_SEEN_CLAIMS_PER_ENTRY` most recent
+          // ones has as many newer claims, so it did not commit late,
+          // and an entry could not hold it: it is never unseen. A server
+          // that lists more claims, which the protocol allows, then never
+          // leaves one new for good.
+          unseen:
+            index < MAX_SEEN_CLAIMS_PER_ENTRY &&
+            claim.memberId !== own &&
+            !seenNow.has(claim.memberId),
         }),
       ),
     );
