@@ -36,7 +36,7 @@ Each workspace has exactly one owner. Everyone else is an admin or a member.
 
 The screen offers only the actions that your role allows.
 
-If you are the owner and no one else is an admin, the screen suggests making someone you trust an admin, so that they can also invite people and answer join requests.
+If you are the owner, no one else is an admin, and someone else has joined, the screen suggests making someone you trust an admin, so that they can also invite people and answer join requests.
 
 "Make admin" and "Offer ownership" work only from a device that was registered at least 72 hours ago.
 

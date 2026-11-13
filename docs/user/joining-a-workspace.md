@@ -27,6 +27,8 @@ The screen then says "You joined the workspace.", and offers "Open this workspac
 
 ## Ask to join with a workspace ID
 
+Not yet: the application does not show a workspace's ID, so members cannot read it there to pass it on.
+
 1. Get the workspace's ID from a member of the workspace.
 2. Under "Ask to join with a workspace ID", paste it into "Workspace ID".
 3. "Your name in the workspace" starts with your account's name. Change it if you like; it has at most 64 characters.
@@ -34,12 +36,11 @@ The screen then says "You joined the workspace.", and offers "Open this workspac
 
 The owner and the admins of the workspace see the name, your GitHub login, and the creation date of your GitHub account, and decide. Until a request is approved, you see nothing of the workspace. Once it is approved, the workspace appears in your list of workspaces.
 
-Not yet: the application does not show a workspace's ID, so members cannot read it there to pass it on.
-
 ### Limits
 
 - You can have one pending request for each workspace. Asking again while one is pending does not make a second one.
 - You can have at most 5 pending requests in all, and make at most 10 requests in 24 hours.
+- A workspace takes at most 50 pending requests. When it has that many, you are asked to wait.
 - After a denial, you can ask the same workspace again after 24 hours.
 - A workspace can pause new requests, or block your account. Your request is then refused.
 

@@ -559,8 +559,9 @@ export const TWO_FACTOR_NOTE =
  * runs, and the panel offers a GitHub sign-in or this device is signed in.
  * So the person reads it before choosing the GitHub account to sign in
  * with and while using it, but not next to the pairing code of a running
- * sign-in, nor while the device is checked, waits for its passphrase, or
- * waits for its removal, when the panel asks for something else.
+ * sign-in, nor while the device of an account that the installation holds
+ * is checked, waits for its passphrase, or waits for its removal, when the
+ * panel asks for something else.
  */
 export function showsTwoFactorNote(status: AccountStatus): boolean {
   return (

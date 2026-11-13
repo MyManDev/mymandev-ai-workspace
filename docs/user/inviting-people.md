@@ -22,7 +22,7 @@ A code works once, within 7 days. A person has at most one open invitation.
 
 ### Open invitations
 
-"Open invitations" lists the invitations that have not been used yet, with the invited person, who created the invitation, and when it expires. "Revoke" ends an invitation at once; the person stays listed as not claimed, and you can invite them again. "Refresh the invitations" loads the list again.
+"Open invitations" lists the invitations that have not been used yet, with the invited person, who created the invitation, and when it expires. "Revoke" ends an invitation at once, after the application asks; the person stays listed as not claimed, and you can invite them again. "Refresh the invitations" loads the list again.
 
 A workspace can have at most 50 open invitations, and at most 100 new invitations in 24 hours. When an admin becomes a member, or a person is removed or leaves, the open invitations that they created are revoked.
 
@@ -49,11 +49,11 @@ Sometimes the person who asks to join is already listed, as someone who has not 
 2. Choose "Create the invitation, then deny".
 3. The invitation code shows once, as for "Invite". Pass it on privately, only to this account.
 
-The request is denied only after the invitation was created. If the invitation cannot be created, the request stays pending.
+The request is denied only after the invitation was created. If the invitation cannot be created, the request stays pending. If the invitation was created but the denial failed, the code is still shown once; pass it on, then deny the request on its own. If the chosen person already has an open invitation, it is replaced, and the earlier code stops working.
 
 ### Blocked accounts
 
-"Blocked accounts" lists the accounts that you blocked. "Unblock" lets the account ask to join again at once. The application asks first.
+"Blocked accounts" lists the accounts that the owner or an admin blocked in this workspace. "Unblock" lets the account ask to join again at once. The application asks first.
 
 ### Pause new requests
 
@@ -71,7 +71,7 @@ Check each GitHub login and the creation date of its account, not only the name.
 
 - A claim that you have not seen yet is marked "New".
 - A claim counts as seen once it was on your screen: at least three quarters of its row in view, while the application's window has the focus and no dialog covers it. It then keeps "New" until you leave the "People" screen.
-- Each of your devices remembers on its own which claims it showed you.
+- Each of your devices remembers on its own which claims it showed you. On a device that has not shown you this workspace's claims before, for example a new device or the first time after you became an admin, every recent claim is marked "New", also older ones. Your own claim is never marked "New".
 - While the selected workspace has a claim that you have not seen, the "People" item in the sidebar has a dot. Screen readers read it as "People, new claims".
 
 "Refresh the recent claims" loads the list again. The list holds at most the 50 most recent claims.

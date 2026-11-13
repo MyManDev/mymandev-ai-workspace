@@ -4,7 +4,7 @@ You sign in to MyManDev with your GitHub account. Each computer where you sign i
 
 ## Keep your GitHub account safe
 
-MyManDev has no password of its own: whoever can sign in to your GitHub account can use your MyManDev account. Turn on two-factor authentication for that GitHub account in GitHub's settings. The "Account" screen recommends it too, below the sign-in buttons.
+MyManDev has no password of its own: whoever can sign in to your GitHub account can use your MyManDev account. Turn on two-factor authentication for that GitHub account in GitHub's settings. The "Account" screen recommends it too, at the end of its "This device" part.
 
 ## Sign in with GitHub
 
@@ -41,7 +41,7 @@ A sign-in lasts 30 days. "Signed in until" shows when it ends.
 - You can choose "Renew the sign-in" at any time. It is a new GitHub sign-in in the browser, with the same pairing code check. Sign in with the same GitHub account as before.
 - From 6 days before the end, the screen asks you to renew the sign-in.
 - If a renewal uses another GitHub account, it is refused, and this device stays signed in to its own account.
-- After the end, the server asks for a new sign-in, and the screen offers "Sign in with GitHub" again.
+- After the end, the screen says that the sign-in has ended and asks you to renew it. Once the server refuses this device, the screen offers "Sign in with GitHub" instead. Either way, sign in with the same GitHub account.
 
 ## Sign out and remove this device
 
@@ -56,7 +56,7 @@ The "Devices" part lists the devices of your account. Active devices come first,
 
 Each device shows its name, its platform, when it was created, when it was last seen, when it last signed in, and when its sign-in expires. This computer is marked "This device". A device created in the last 7 days is marked "New".
 
-An account can have at most 20 active devices.
+An account can have at most 20 active devices, and can register at most 10 new devices in 24 hours.
 
 ### Remove or revoke another device
 
@@ -77,13 +77,13 @@ After "Revoke as lost", the screen shows "After a lost device":
 
 ### The registration lock
 
-After a device is revoked as lost, no new device can register on your account for 7 days. Your other devices keep working, and they can still renew their sign-in.
+After a device is revoked as lost, no new device can register on your account for 7 days. Your other devices keep working, and they can still renew their sign-in. A computer whose device key was lost also counts as a new device.
 
 While the lock is in force, the "Devices" part says until when, and offers "Lift the registration lock". Lift it only when you are about to sign in on a new device yourself.
 
 ### New-device notices
 
-When a new device registers on your account, your other devices show a notice under "Devices": "A new device was registered on this account", with its name, its platform, and when.
+When a new device registers on your account, your other devices that are open and connected at that moment show a notice under "Devices": "A new device was registered on this account", with its name, its platform, and when. A device that was closed or offline then shows no notice, so also check the device list for devices marked "New".
 
 - If it was you, choose "Dismiss the notices".
 - If it was not you, choose "This was not me: revoke as lost". This revokes that device as lost and starts the registration lock. Then follow the advice after a lost device.

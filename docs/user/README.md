@@ -21,6 +21,8 @@ The sidebar on the left lists the screens of the selected workspace: "Home", "Ac
 
 When you open a project, its screens appear: "Chat", "Tasks", "Decisions", and "Permissions". Only "Chat" has content today.
 
+A project also has a side panel with two tabs. "Agents" lists the project's agents and their runs; there are none yet. "Repositories" lists Git repositories on this computer: "Add a repository" adds one, and the panel shows its branch and its changes. It only reads them, and the list is not kept after the application restarts.
+
 ## Keep your GitHub account safe
 
 You sign in to MyManDev with your GitHub account. MyManDev has no password of its own: whoever can sign in to that GitHub account can use your MyManDev account. Turn on two-factor authentication for that GitHub account in GitHub's settings. The "Account" screen shows the same recommendation.
