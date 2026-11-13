@@ -1036,6 +1036,55 @@ test("an account has at most 20 active devices, answered with device_limit and n
   );
 });
 
+test("a new device at both device limits answers device_limit, not rate_limited: the limit of active devices is decided first (#255)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1022, "both-limits") });
+  const first = SignInResponseSchema.parse(
+    (
+      await postSignIn(app, newDeviceRequest(await signInCode(app), newKey()))
+    ).json(),
+  );
+  const add = async (n: number, createdAt: Date) => {
+    for (let index = 0; index < n; index += 1) {
+      await database().insert(devices).values({
+        id: newId<DeviceId>(),
+        userId: first.userId,
+        label: "Extra",
+        platform: "linux",
+        publicKey: newKey().publicKey,
+        keyAlgorithm: "ed25519",
+        createdAt,
+        lastSignInAt: createdAt,
+      });
+    }
+  };
+  // 20 active devices: the first and 9 more within the last 24 hours, which
+  // reach the limit of 10 new devices, and 10 created long ago.
+  await add(9, new Date());
+  await add(10, new Date(Date.now() - 3 * 24 * 60 * 60_000));
+  const before = await accountRows(first.userId);
+  assert.equal(before.devices.length, 20);
+
+  const refused = await postSignIn(
+    app,
+    newDeviceRequest(await signInCode(app), newKey()),
+  );
+  // A wait would not free a place, and the desktop would take `rate_limited`
+  // as an uncertain refusal.
+  assert.equal(refused.statusCode, 409);
+  assert.deepEqual(refused.json(), {
+    statusCode: 409,
+    error: "Conflict",
+    message: "Conflict",
+    code: "device_limit",
+  });
+  assert.equal(refused.headers["retry-after"], undefined);
+  assert.deepEqual(
+    await accountRows(first.userId),
+    before,
+    "the refusal registered nothing",
+  );
+});
+
 test("naming a previous device of the same account revokes it as replaced, also at the device limit; another account's device stays", async (t) => {
   const app = await signInApp(t, { user: githubUser(1010, "replacing") });
   const lost = SignInResponseSchema.parse(
@@ -1105,6 +1154,10 @@ test("naming a previous device of the same account revokes it as replaced, also 
     .update(devices)
     .set({ createdAt: old })
     .where(eq(devices.userId, lost.userId));
+  const before = {
+    own: await accountRows(lost.userId),
+    other: await accountRows(foreign.userId),
+  };
   const withForeign = await postSignIn(
     app,
     newDeviceRequest(await signInCode(app), newKey(), {
@@ -1113,6 +1166,14 @@ test("naming a previous device of the same account revokes it as replaced, also 
   );
   assert.equal(withForeign.statusCode, 409, "a foreign device frees no place");
   assert.equal(codeOf(withForeign), "device_limit");
+  assert.deepEqual(
+    {
+      own: await accountRows(lost.userId),
+      other: await accountRows(foreign.userId),
+    },
+    before,
+    "the refusal changed neither account",
+  );
   await database()
     .update(devices)
     .set({ revokedAt: new Date(), revocationReason: "removed" })

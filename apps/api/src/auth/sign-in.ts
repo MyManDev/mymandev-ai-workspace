@@ -439,7 +439,10 @@ async function signIn(
         throw new ApiError("device_registration_locked");
       }
       // The previous device that this sign-in replaces does not count: the
-      // recovery path keeps the number of active devices.
+      // recovery path keeps the number of active devices. This limit is
+      // decided before the limit of new devices per day, so a device at both
+      // gets `device_limit`, which no wait frees, and never `rate_limited`,
+      // which the desktop takes as an uncertain refusal (#255).
       const [active] = await tx
         .select({ n: count() })
         .from(devices)
