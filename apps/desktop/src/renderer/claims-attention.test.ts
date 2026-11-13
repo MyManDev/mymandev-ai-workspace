@@ -353,20 +353,107 @@ test("without an observer, no row is ever in view", () => {
   expect(views).toEqual([]);
 });
 
-test("the rows' observer reports every twentieth of a row, among them the three quarters", () => {
-  expect(ROW_THRESHOLDS).toEqual([
-    0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65,
-    0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1,
-  ]);
+test("the rows' observer reports at 0 and every power of the square root of three quarters down to 0.75 ** 20, among them the three quarters", () => {
+  expect(ROW_THRESHOLDS).toHaveLength(42);
+  expect(ROW_THRESHOLDS[0]).toBe(0);
+  expect(ROW_THRESHOLDS[1]).toBe(0.75 ** 20);
+  expect(ROW_THRESHOLDS.at(-1)).toBe(1);
   expect(ROW_THRESHOLDS).toContain(ROW_IN_VIEW_RATIO);
+  expect(ROW_THRESHOLDS).toContain(0.75 ** 2);
+  for (let index = 2; index < ROW_THRESHOLDS.length; index += 1) {
+    expect(
+      (ROW_THRESHOLDS[index - 1] ?? 0) / (ROW_THRESHOLDS[index] ?? 1),
+    ).toBeCloseTo(Math.sqrt(0.75), 12);
+  }
   expect(Object.isFrozen(ROW_THRESHOLDS)).toBe(true);
-  // A row five times the visible area's height fills three quarters of it
-  // from a fifth of itself times three quarters, 0.15, up to a fifth, 0.2:
-  // a threshold lies in between, so the observer reports it on its way.
-  const five = { low: 0.75 / 5, high: 1 / 5 };
-  expect(
-    ROW_THRESHOLDS.some((value) => value >= five.low && value <= five.high),
-  ).toBe(true);
+});
+
+/**
+ * The thresholds in `[low, high]`: a row is reported while its share of
+ * area in view moves through that range once a threshold lies in it.
+ */
+function thresholdsIn(low: number, high: number): number[] {
+  return ROW_THRESHOLDS.filter((value) => value >= low && value <= high);
+}
+
+test("a row taller than the visible area meets a threshold while it fills three quarters of the visible area's height, up to 315 times its height at full width", () => {
+  // A row k times the visible area's height, with a share w of its width
+  // in view, fills three quarters of the visible area's height while its
+  // share of area in view is between 0.75 * w / k and w / k.
+  for (let k = 1.5; k <= 315; k += 0.01) {
+    expect(thresholdsIn(0.75 / k, 1 / k), `k = ${String(k)}`).not.toHaveLength(
+      0,
+    );
+  }
+  // At three quarters of its width, up to 236 times.
+  for (let k = 1.5; k <= 236; k += 0.01) {
+    expect(
+      thresholdsIn(0.5625 / k, 0.75 / k),
+      `k = ${String(k)}`,
+    ).not.toHaveLength(0);
+  }
+  // Up to 236 times at full width, a threshold lies between the square root
+  // of three quarters of the share where it stops filling it and that
+  // share, so the row leaves the view by 0.75 ** 1.5 of the visible area.
+  for (let k = 1.5; k <= 236; k += 0.01) {
+    const stops = 0.75 / k;
+    expect(
+      thresholdsIn(Math.sqrt(0.75) * stops, stops),
+      `k = ${String(k)}`,
+    ).not.toHaveLength(0);
+  }
+});
+
+/**
+ * Scrolls a row `k` times the visible area's height, at the full width,
+ * through a visible area of 600 pixels, one pixel at a time, and reports an
+ * entry to the observer only when the threshold below its share or whether
+ * it intersects changes, as `IntersectionObserver` does. Returns whether
+ * the row was ever in view and the smallest visible height, as a share of
+ * the visible area, at which it still was while it filled less than three
+ * quarters of it.
+ */
+function scroll(k: number): { counted: boolean; lowest: number } {
+  const { made, create } = observers();
+  let inView = false;
+  let counted = false;
+  const rows = followRowsInView(create, (ids) => {
+    inView = ids.has(ADA);
+    counted ||= inView;
+  });
+  const ada = row("ada");
+  rows.refFor(ADA)(ada);
+  const report = made[0]!.callback;
+  const height = k * ROOT.height;
+  let last: string | undefined;
+  let lowest = 1;
+  for (let top = ROOT.height; top >= -height; top -= 1) {
+    const visible = Math.max(
+      0,
+      Math.min(ROOT.height, top + height) - Math.max(0, top),
+    );
+    const next = tallEntry(ada, height, visible);
+    const below = ROW_THRESHOLDS.filter(
+      (value) => value <= next.intersectionRatio,
+    ).length;
+    const key = `${String(next.isIntersecting)} ${String(below)}`;
+    if (key !== last) {
+      last = key;
+      report([next]);
+    }
+    if (inView && visible < 0.75 * ROOT.height) {
+      lowest = Math.min(lowest, visible / ROOT.height);
+    }
+  }
+  return { counted, lowest };
+}
+
+test("a tall row that scrolls through the visible area counts while it fills it, and leaves the view before less than 0.65 of the visible area shows it", () => {
+  for (const k of [1.5, 2, 3, 6.9, 7.2, 10, 11.5, 12.5, 13, 16, 18, 22, 30]) {
+    const { counted, lowest } = scroll(k);
+    expect(counted, `k = ${String(k)}`).toBe(true);
+    expect(lowest, `k = ${String(k)}`).toBeGreaterThanOrEqual(0.75 ** 1.5);
+  }
 });
 
 test("a row shorter than the visible area still needs three quarters of itself in view", () => {
@@ -381,6 +468,11 @@ test("a row shorter than the visible area still needs three quarters of itself i
   // A row almost as high, three quarters of the visible area in view but
   // less than three quarters of itself, cut off at a side.
   expect(isRowInView(tallEntry(ada, 590, 450, { visibleWidth: 480 }))).toBe(
+    false,
+  );
+  // A row exactly as high as the visible area, cut off at a side, is not
+  // taller than it: 500 of 600 pixels and 400 of 500 is 0.67 of the row.
+  expect(isRowInView(tallEntry(ada, 600, 500, { visibleWidth: 400 }))).toBe(
     false,
   );
 });
@@ -423,12 +515,29 @@ test("without the visible area's bounds, or with a visible area of no height, a 
       isIntersecting: true,
     }),
   ).toBe(false);
-  // A row of no width is never wide enough.
+});
+
+test("a row of no area has the share 1 whenever it intersects, as IntersectionObserver reports it, and so counts on any intersection", () => {
+  const ada = row("ada");
+  // A known limit at an extreme zoom, where a row could lose its width.
   expect(
     isRowInView({
-      ...tallEntry(ada, 1200, 600),
+      target: ada,
+      isIntersecting: true,
+      intersectionRatio: 1,
       boundingClientRect: { width: 0, height: 1200 },
-      intersectionRect: { width: 0, height: 600 },
+      intersectionRect: { width: 0, height: 1 },
+      rootBounds: ROOT,
+    }),
+  ).toBe(true);
+  expect(
+    isRowInView({
+      target: ada,
+      isIntersecting: false,
+      intersectionRatio: 0,
+      boundingClientRect: { width: 0, height: 1200 },
+      intersectionRect: { width: 0, height: 0 },
+      rootBounds: ROOT,
     }),
   ).toBe(false);
 });
