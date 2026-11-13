@@ -399,9 +399,10 @@ export interface CreateSentence {
  * The status paragraph is a polite, atomic live region (`role="status"`)
  * that shows `rest` as a text node of its own after `start`. The short
  * sentence is the start of the long one, so it shortens by removing that
- * node alone, which a screen reader does not announce (ARIA's default
- * `aria-relevant` is additions and text), and once short it never grows
- * back: the same create is announced once.
+ * node alone, which should not be announced under ARIA's default
+ * `aria-relevant` (additions and text; not checked with a screen reader),
+ * and once short it never grows back, so that the same create is
+ * announced once.
  */
 export function describeCreateSentence(
   message: CreateMessage,
