@@ -93,9 +93,46 @@ export function followWindowFocus(
 }
 
 /**
+ * Calls `onAttention` once with both first readings, the document's
+ * visibility (`followDocumentVisibility`) and the window's focus
+ * (`followWindowFocus`), and then with the whole attention on every change
+ * of either: a change of the visibility keeps the focus as it was last
+ * read, and a focus or a blur keeps the visibility. Returns the function
+ * that stops both.
+ */
+export function followPageAttention(
+  win: FocusWindow,
+  doc: VisibilityDocument & FocusDocument,
+  onAttention: (attention: PageAttention) => void,
+): () => void {
+  let attention = NO_PAGE_ATTENTION;
+  let started = false;
+  const change = (next: PageAttention) => {
+    attention = Object.freeze(next);
+    if (started) {
+      onAttention(attention);
+    }
+  };
+  const stopVisibility = followDocumentVisibility(doc, (documentShown) =>
+    change({ ...attention, documentShown }),
+  );
+  const stopFocus = followWindowFocus(win, doc, (windowFocused) =>
+    change({ ...attention, windowFocused }),
+  );
+  started = true;
+  onAttention(attention);
+  return () => {
+    stopVisibility();
+    stopFocus();
+  };
+}
+
+/**
  * The part of a row that must be in view for the row to count as shown:
  * three quarters, so that a row cut off at the edge of the screen does not
- * count. A row taller than the visible area never reaches it and stays new.
+ * count. A row taller than the visible area never reaches it and stays new,
+ * for example at a high page zoom, until the page is zoomed out or the
+ * window is made larger (#276).
  */
 export const ROW_IN_VIEW_RATIO = 0.75;
 

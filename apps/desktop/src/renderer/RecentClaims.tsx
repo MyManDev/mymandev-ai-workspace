@@ -2,9 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import type { ClaimsBridge } from "../shared/desktop-bridge.ts";
 import type { ClaimsView } from "../shared/ipc-contract.ts";
 import {
-  followDocumentVisibility,
+  followPageAttention,
   followRowsInView,
-  followWindowFocus,
   NO_PAGE_ATTENTION,
   pageRowObserver,
   type PageAttention,
@@ -236,27 +235,15 @@ export function useClaimsScreen(
 }
 
 /**
- * Whether the window shows the page and has the focus, read again on every
- * change of the document's visibility and every focus and blur of the
- * window. Neither until the first reading after the render
- * (`NO_PAGE_ATTENTION`), so that nothing counts as seen before it.
+ * Whether the window shows the page and has the focus
+ * (`followPageAttention`), read again on every change of the document's
+ * visibility and every focus and blur of the window. Neither until the
+ * first reading after the render (`NO_PAGE_ATTENTION`), so that nothing
+ * counts as seen before it.
  */
 export function usePageAttention(): PageAttention {
   const [attention, setAttention] = useState(NO_PAGE_ATTENTION);
-  useEffect(
-    () =>
-      followDocumentVisibility(document, (documentShown) =>
-        setAttention((last) => ({ ...last, documentShown })),
-      ),
-    [],
-  );
-  useEffect(
-    () =>
-      followWindowFocus(window, document, (windowFocused) =>
-        setAttention((last) => ({ ...last, windowFocused })),
-      ),
-    [],
-  );
+  useEffect(() => followPageAttention(window, document, setAttention), []);
   return attention;
 }
 

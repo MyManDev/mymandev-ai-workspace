@@ -4,7 +4,7 @@
 // returned elements, and invoke their event handlers. No DOM is used.
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToString } from "react-dom/server";
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import type {
   ClaimsBridge,
   PeopleActionsBridge,
@@ -721,6 +721,49 @@ test("while rendering, the page counts as hidden and without the focus, no row i
   expect(seen).toEqual(["false false 0 false false undefined undefined"]);
 });
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+/** A claims bridge whose calls fail; rendering calls none of them. */
+function idleClaims(): ClaimsBridge {
+  const fail = () => Promise.reject(new Error("not called"));
+  return {
+    getState: fail,
+    subscribeState: () => () => undefined,
+    load: fail,
+    markSeen: fail,
+  };
+}
+
+test("the rows' ref callbacks observe each row with the observer from the factory that the screen gets, and by default with the page's IntersectionObserver", () => {
+  const element = { name: "row" } as unknown as Element;
+  const observed: string[] = [];
+  function Probe({ withFactory }: { readonly withFactory: boolean }) {
+    const claims = withFactory
+      ? useRecentClaims(idleClaims(), () => ({
+          observe: () => observed.push("factory observe"),
+          unobserve: () => undefined,
+          disconnect: () => undefined,
+        }))
+      : useRecentClaims(idleClaims());
+    claims.handlers?.rowRef(MEMBER)(element);
+    return null;
+  }
+  renderToString(<Probe withFactory />);
+  expect(observed).toEqual(["factory observe"]);
+  class PageObserver {
+    observe(target: Element) {
+      observed.push(`page observe ${String(target === element)}`);
+    }
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("IntersectionObserver", PageObserver);
+  renderToString(<Probe withFactory={false} />);
+  expect(observed).toEqual(["factory observe", "page observe true"]);
+});
+
 // The wiring that runs only in effects and the commit, which the Node-only
 // tests cannot run, as text.
 const WIRING = import.meta.glob<string>(
@@ -756,11 +799,8 @@ test("the wiring that runs in effects passes the whole views: the People screen'
     /useEffect\(\s*\(\) => controller\?\.rendered\(people, claims, report\),[^\]]*\[controller, people, claims, key\],\s*\);/,
   );
   expect(part).toContain("useState(NO_PAGE_ATTENTION)");
-  expect(part).toMatch(
-    /useEffect\(\s*\(\) =>\s*followDocumentVisibility\(document, /,
-  );
-  expect(part).toMatch(
-    /useEffect\(\s*\(\) =>\s*followWindowFocus\(window, document, /,
+  expect(part).toContain(
+    "useEffect(() => followPageAttention(window, document, setAttention), []);",
   );
   expect(part).toContain("useEffect(() => () => rows.stop(), [rows]);");
   const app = WIRING["./App.tsx"] ?? "";

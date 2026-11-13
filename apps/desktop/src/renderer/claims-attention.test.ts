@@ -2,13 +2,16 @@
 // window's focus, and the rows in view, each followed through fakes of the
 // document, the window, and the observer (the Project Manager's decision of
 // 2026-11-13 on #273). No DOM is used.
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import {
   followDocumentVisibility,
+  followPageAttention,
   followRowsInView,
   followWindowFocus,
   NO_PAGE_ATTENTION,
+  pageRowObserver,
   ROW_IN_VIEW_RATIO,
+  type PageAttention,
   type RowEntry,
   type RowObserver,
   type RowObserverFactory,
@@ -92,6 +95,93 @@ test("the window's focus is read at once with hasFocus, and follows every focus 
   const again: boolean[] = [];
   followWindowFocus(target(), doc, (value) => again.push(value));
   expect(again).toEqual([true]);
+});
+
+test("the page's attention is read once with both readings, and each change keeps the other reading: a blur keeps the visibility, and a hidden page keeps the focus", () => {
+  const win = target();
+  const doc = {
+    ...target(),
+    visibilityState: "visible",
+    focused: true,
+    hasFocus() {
+      return this.focused;
+    },
+  };
+  const seen: PageAttention[] = [];
+  const stop = followPageAttention(win, doc, (attention) =>
+    seen.push(attention),
+  );
+  expect(seen).toEqual([{ documentShown: true, windowFocused: true }]);
+  win.fire("blur");
+  expect(seen.at(-1)).toEqual({ documentShown: true, windowFocused: false });
+  win.fire("focus");
+  expect(seen.at(-1)).toEqual({ documentShown: true, windowFocused: true });
+  doc.visibilityState = "hidden";
+  doc.fire("visibilitychange");
+  expect(seen.at(-1)).toEqual({ documentShown: false, windowFocused: true });
+  win.fire("blur");
+  expect(seen.at(-1)).toEqual({ documentShown: false, windowFocused: false });
+  doc.visibilityState = "visible";
+  doc.fire("visibilitychange");
+  expect(seen.at(-1)).toEqual({ documentShown: true, windowFocused: false });
+  win.fire("focus");
+  expect(seen.at(-1)).toEqual({ documentShown: true, windowFocused: true });
+  expect(seen).toHaveLength(7);
+  stop();
+  expect(win.count()).toBe(0);
+  expect(doc.count()).toBe(0);
+  win.fire("blur");
+  doc.fire("visibilitychange");
+  expect(seen).toHaveLength(7);
+  // The first readings as they are: a hidden page without the focus.
+  const first: PageAttention[] = [];
+  followPageAttention(
+    target(),
+    { ...target(), visibilityState: "hidden", hasFocus: () => false },
+    (attention) => first.push(attention),
+  );
+  expect(first).toEqual([{ documentShown: false, windowFocused: false }]);
+  const focusedHidden: PageAttention[] = [];
+  followPageAttention(
+    target(),
+    { ...target(), visibilityState: "hidden", hasFocus: () => true },
+    (attention) => focusedHidden.push(attention),
+  );
+  expect(focusedHidden).toEqual([
+    { documentShown: false, windowFocused: true },
+  ]);
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+test("the page's observer is an IntersectionObserver with the row's threshold that passes its entries on, and there is none without one", () => {
+  const made: { callback: (entries: unknown[]) => void; options: unknown }[] =
+    [];
+  class PageObserver {
+    constructor(callback: (entries: unknown[]) => void, options: unknown) {
+      made.push({ callback, options });
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  vi.stubGlobal("IntersectionObserver", PageObserver);
+  const received: (readonly RowEntry[])[] = [];
+  const observer = pageRowObserver((entries) => received.push(entries), {
+    threshold: [ROW_IN_VIEW_RATIO],
+  });
+  expect(observer).toBeInstanceOf(PageObserver);
+  expect(made).toHaveLength(1);
+  expect(made[0]?.options).toEqual({ threshold: [0.75] });
+  const entries = [entry(row("ada"), 1)];
+  made[0]?.callback(entries);
+  expect(received).toEqual([entries]);
+  vi.stubGlobal("IntersectionObserver", undefined);
+  expect(
+    pageRowObserver(() => undefined, { threshold: [ROW_IN_VIEW_RATIO] }),
+  ).toBeUndefined();
 });
 
 /** A fake observer factory that records what it was asked to do. */
