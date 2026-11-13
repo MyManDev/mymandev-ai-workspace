@@ -263,9 +263,9 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   loadClaims: "claims:load",
   /**
-   * Reports that the screen showed the claims of the selected workspace up
-   * to a time, by the workspace ID and the `claimedAt` of the newest claim
-   * shown: the claims up to it are seen from then on, also after a restart.
+   * Reports that the screen showed claims of the selected workspace, by the
+   * workspace ID and the member IDs of the claimed people: those claims are
+   * seen from then on, also after a restart.
    */
   markClaimsSeen: "claims:mark-seen",
   /**

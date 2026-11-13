@@ -2073,11 +2073,20 @@ export const CLAIM_VIAS_VIEW = Object.freeze([
 export type ClaimViaView = (typeof CLAIM_VIAS_VIEW)[number];
 
 /**
- * The time of a claim, in UTC with milliseconds, as the protocol writes it,
- * so that its text order is its time order. The fixed form bounds its
- * length.
+ * The time of a claim, in UTC with milliseconds, as the protocol writes it.
+ * The fixed form bounds its length.
  */
 const ClaimTimeSchema = z.iso.datetime({ precision: 3 });
+
+/**
+ * The member IDs of the claims that the screen showed: 1 to
+ * `CLAIM_LIMITS.claims` lowercase UUIDv7s, the most that a list holds. A
+ * longer array is refused before its items are checked.
+ */
+const ShownClaimsSchema = z
+  .array(ProtocolIdSchema)
+  .min(1)
+  .max(CLAIM_LIMITS.claims, { abort: true });
 
 /**
  * A claim (ADR 0014, "Invitations"): the member ID of the person that was
@@ -2191,10 +2200,12 @@ export type ClaimLoadResult = z.infer<typeof ClaimLoadResultSchema>;
 /**
  * Why the report of the claims that the screen showed was refused:
  *
- * - `invalid`: the protocol's schemas refuse the workspace ID or the time.
+ * - `invalid`: the protocol's schemas refuse the workspace ID or a member
+ *   ID.
  * - `not_selected`: the workspace is not the selected one.
  * - `not_allowed`: the account's own person is not the owner or an admin.
- * - `not_listed`: no claim that the main process holds has that time.
+ * - `not_listed`: no claim that the main process holds has any of the
+ *   member IDs. When some do, the others are ignored.
  */
 export const CLAIM_MARK_SEEN_REFUSALS = Object.freeze([
   "invalid",
@@ -2205,8 +2216,7 @@ export const CLAIM_MARK_SEEN_REFUSALS = Object.freeze([
 
 /**
  * The answer to the report of the claims that the screen showed: `ok`, also
- * when the mark was at that time or later already, or `refused` with a
- * reason.
+ * when they were all seen already, or `refused` with a reason.
  */
 export const ClaimMarkSeenResultSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("ok") }),
@@ -3143,10 +3153,10 @@ export const INVOKE_CONTRACT = Object.freeze({
   }),
   [INVOKE_CHANNELS.markClaimsSeen]: Object.freeze({
     /**
-     * The selected workspace's ID and the `claimedAt` of the newest claim
-     * that the screen showed.
+     * The selected workspace's ID and the member IDs of the claims that the
+     * screen showed.
      */
-    args: z.tuple([ProtocolIdSchema, ClaimTimeSchema]),
+    args: z.tuple([ProtocolIdSchema, ShownClaimsSchema]),
     result: ClaimMarkSeenResultSchema,
   }),
   [INVOKE_CHANNELS.getAgentState]: Object.freeze({

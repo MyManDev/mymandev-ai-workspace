@@ -1,4 +1,8 @@
-import { UtcTimestampSchema, WorkspaceIdSchema } from "@mymandev/protocol";
+import {
+  type MemberId,
+  MemberIdSchema,
+  WorkspaceIdSchema,
+} from "@mymandev/protocol";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import {
   CLAIM_LIMITS,
@@ -92,23 +96,30 @@ export function claimsView(
 }
 
 /**
- * The screen's report that it showed the claims of `workspaceId` up to
- * `claimedAt`, after the contract's check: the protocol's own schemas check
- * the workspace ID and the time again, as the API checks them, and refuse
- * them as `invalid` before the service is asked; the service then accepts
- * only the time of a held claim of the selected workspace.
+ * The screen's report of the claims of `workspaceId` that it showed, by
+ * their member IDs, after the contract's check: the protocol's own schemas
+ * check the workspace ID and every member ID again, as the API checks them,
+ * and refuse them as `invalid` before the service is asked; the service then
+ * counts only the member IDs of held claims of the selected workspace.
  */
 export function markClaimsSeen(
   claims: Pick<ClaimService, "markSeen">,
   workspaceId: string,
-  claimedAt: string,
+  memberIds: readonly string[],
 ): ClaimMarkSeenResult {
   const workspace = WorkspaceIdSchema.safeParse(workspaceId);
-  const time = UtcTimestampSchema.safeParse(claimedAt);
-  if (!workspace.success || !time.success) {
+  if (!workspace.success) {
     return INVALID;
   }
-  return claims.markSeen(workspace.data, time.data);
+  const checked: MemberId[] = [];
+  for (const memberId of memberIds) {
+    const parsed = MemberIdSchema.safeParse(memberId);
+    if (!parsed.success) {
+      return INVALID;
+    }
+    checked.push(parsed.data);
+  }
+  return claims.markSeen(workspace.data, checked);
 }
 
 function scheduleWithSetTimeout(
@@ -143,8 +154,9 @@ export interface ClaimIpc {
  * Registers the handlers of the claim channels and sends the selected
  * workspace's recent claims to the frames that subscribed (#95, decision
  * D8). The state channels and the load take no argument; the report of the
- * claims that the screen showed takes the workspace ID and a time, which
- * the protocol's schemas check again before the service is asked. Every
+ * claims that the screen showed takes the workspace ID and the claims'
+ * member IDs, which the protocol's schemas check again before the service is
+ * asked. Every
  * handler checks the sender and the arguments first (`createInvokeHandler`)
  * and answers with a value parsed by the contract, so only member IDs,
  * logins, times, and fixed codes reach the renderer, never a user ID.
@@ -226,8 +238,8 @@ export function registerClaimIpc(
     createInvokeHandler(
       INVOKE_CHANNELS.markClaimsSeen,
       appUrl,
-      (_event, [workspaceId, claimedAt]): ClaimMarkSeenResult =>
-        markClaimsSeen(claims, workspaceId, claimedAt),
+      (_event, [workspaceId, memberIds]): ClaimMarkSeenResult =>
+        markClaimsSeen(claims, workspaceId, memberIds),
     ),
   );
   const remove = claims.onChange(changed);

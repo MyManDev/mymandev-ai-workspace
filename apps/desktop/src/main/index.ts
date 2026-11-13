@@ -456,10 +456,10 @@ function start(): void {
   // The selected workspace's recent claims (#95, D8), for its owner and
   // admins only, read over HTTP once the role allows it and again after
   // `workspace.subscribed` and a claim, also while the people screen is
-  // closed, so that the sidebar marks unseen claims. The newest claim that
-  // the account has seen in each workspace is kept in the data folder, as
-  // IDs and times only, so that a claim made while the application was
-  // closed is new at the next start. They reach the renderer at most once
+  // closed, so that the sidebar marks unseen claims. The claims that the
+  // account has seen in each workspace are kept in the data folder, as IDs
+  // only, so that a claim made while the application was closed is new at
+  // the next start. They reach the renderer at most once
   // every 50 ms. The logs are fixed text with a failure code at most.
   const claims = createClaimService({
     account,

@@ -1982,9 +1982,9 @@ test("the device list subscription delivers the state and every newer one, witho
   expect(refused).toBe(1);
 });
 
-const CLAIMED_AT = "2026-11-05T11:00:00.000Z";
+const CLAIM_MEMBER_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000d1";
 
-test("the claim functions call their channels and pass no argument from the renderer on, except the two strings of markSeen", async () => {
+test("the claim functions call their channels and pass no argument from the renderer on, except the workspace ID and a copy of the member IDs of markSeen", async () => {
   const fake = fakeIpc();
   const claims = createDesktopBridge("44.9.1", fake.ipc)
     .claims as unknown as Record<
@@ -1995,10 +1995,11 @@ test("the claim functions call their channels and pass no argument from the rend
 
   const state = claims["getState"]?.("claims:mark-seen", WORKSPACE_ID);
   const load = claims["load"]?.(WORKSPACE_ID, { force: true });
+  const shown = [CLAIM_MEMBER_ID, MEMBER_ID];
   // An extra argument is not passed on.
   const marked = claims["markSeen"]?.(
     WORKSPACE_ID,
-    CLAIMED_AT,
+    shown,
     { force: true },
     "people:remove",
   );
@@ -2014,37 +2015,47 @@ test("the claim functions call their channels and pass no argument from the rend
     { channel: INVOKE_CHANNELS.loadClaims, args: [] },
     {
       channel: INVOKE_CHANNELS.markClaimsSeen,
-      args: [WORKSPACE_ID, CLAIMED_AT],
+      args: [WORKSPACE_ID, shown],
     },
   ]);
+  // A new array goes on, never the renderer's own.
+  expect(fake.invoked[2]?.args[1]).not.toBe(shown);
 });
 
-test("markSeen refuses a value that is not a string without calling the main process or naming it", async () => {
+test("markSeen refuses a workspace ID that is not a string and member IDs that are not an array of strings, without calling the main process or naming them", async () => {
   const fake = fakeIpc();
   const claims = createDesktopBridge("44.9.1", fake.ipc)
     .claims as unknown as Record<
     string,
     (...args: unknown[]) => Promise<unknown>
   >;
-  const args = [WORKSPACE_ID, CLAIMED_AT] as const;
-  for (const [index] of args.entries()) {
-    for (const value of [
+  const calls: unknown[][] = [
+    ...[
       undefined,
       null,
       1,
       [WORKSPACE_ID],
       { toString: () => WORKSPACE_ID },
-    ]) {
-      const call = args.map((entry, at) => (at === index ? value : entry));
-      const result = claims["markSeen"]?.(...call);
-      await expect(result).rejects.toThrow(TypeError);
-      await result?.catch((error: unknown) => {
-        expect(String(error)).not.toContain(WORKSPACE_ID);
-        expect(String(error)).not.toContain(CLAIMED_AT);
-      });
-    }
+    ].map((value) => [value, [CLAIM_MEMBER_ID]]),
+    ...[
+      undefined,
+      null,
+      CLAIM_MEMBER_ID,
+      [CLAIM_MEMBER_ID, 1],
+      [CLAIM_MEMBER_ID, null],
+      [{ toString: () => CLAIM_MEMBER_ID }],
+      { 0: CLAIM_MEMBER_ID, length: 1 },
+    ].map((value) => [WORKSPACE_ID, value]),
+    [],
+  ];
+  for (const call of calls) {
+    const result = claims["markSeen"]?.(...call);
+    await expect(result).rejects.toThrow(TypeError);
+    await result?.catch((error: unknown) => {
+      expect(String(error)).not.toContain(WORKSPACE_ID);
+      expect(String(error)).not.toContain(CLAIM_MEMBER_ID);
+    });
   }
-  await expect(claims["markSeen"]?.()).rejects.toThrow(TypeError);
   expect(fake.invoked).toEqual([]);
 });
 

@@ -204,7 +204,8 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * string, with the display name of `approve`, a string or null, and the
  * workspace ID and request ID of the `ownJoinRequestActions`, each a
  * string, with the display name of `create`, a string or null, and the
- * workspace ID and the time of `claims.markSeen`, each a string.
+ * workspace ID of `claims.markSeen`, a string, with its member IDs, an array
+ * of strings that it copies.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -716,18 +717,20 @@ export function createDesktopBridge(
       ),
     load: () =>
       ipc.invoke(INVOKE_CHANNELS.loadClaims) as Promise<ClaimLoadResult>,
-    // Only two strings go on; the main process checks the ID and accepts
-    // only the time of a claim that it holds. Another value is refused here
-    // without naming it.
-    markSeen: (workspaceId: string, claimedAt: string) =>
-      strings(workspaceId, claimedAt)
-        ? (ipc.invoke(
-            INVOKE_CHANNELS.markClaimsSeen,
-            workspaceId,
-            claimedAt,
-          ) as Promise<ClaimMarkSeenResult>)
+    // Only a string and a new array of strings go on; the main process
+    // checks each ID and counts only the claims that it holds. Another value
+    // is refused here without naming it.
+    markSeen: (workspaceId: string, memberIds: readonly string[]) =>
+      strings(workspaceId) &&
+      Array.isArray(memberIds) &&
+      memberIds.every((memberId) => typeof memberId === "string")
+        ? (ipc.invoke(INVOKE_CHANNELS.markClaimsSeen, workspaceId, [
+            ...memberIds,
+          ]) as Promise<ClaimMarkSeenResult>)
         : Promise.reject(
-            new TypeError("markSeen needs a workspace ID and a time string."),
+            new TypeError(
+              "markSeen needs a workspace ID string and an array of member ID strings.",
+            ),
           ),
   });
 

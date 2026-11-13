@@ -96,7 +96,7 @@ function fakeService() {
     { outcome: "refused", reason: "too_soon" },
   ];
   let loaded = 0;
-  const marked: [WorkspaceId, string][] = [];
+  const marked: [WorkspaceId, readonly MemberId[]][] = [];
   let markAnswer: ClaimMarkSeenOutcome = { outcome: "ok" };
   return {
     claims: {
@@ -108,8 +108,8 @@ function fakeService() {
         };
       },
       load: () => loads[loaded++] ?? { outcome: "loading" as const },
-      markSeen: (workspaceId: WorkspaceId, claimedAt: string) => {
-        marked.push([workspaceId, claimedAt]);
+      markSeen: (workspaceId: WorkspaceId, memberIds: readonly MemberId[]) => {
+        marked.push([workspaceId, memberIds]);
         return markAnswer;
       },
     },
@@ -229,7 +229,7 @@ test("every handler refuses a foreign sender and wrong arguments, before the ser
       frame(APP_ENTRY_URL, frame(APP_ENTRY_URL)),
     ]) {
       expect(() =>
-        handler(event(receiver(APP_ENTRY_URL), sender), WORKSPACE, AT),
+        handler(event(receiver(APP_ENTRY_URL), sender), WORKSPACE, [FIRST]),
       ).toThrow(
         `The call on ${channel} was refused: the sender is not the application.`,
       );
@@ -239,12 +239,19 @@ test("every handler refuses a foreign sender and wrong arguments, before the ser
         ? [
             [],
             [WORKSPACE],
-            [WORKSPACE, AT, AT],
-            [WORKSPACE.toUpperCase(), AT],
-            [WORKSPACE, "2026-11-05T10:00:00Z"],
-            [WORKSPACE, "2026-11-05T10:00:00.000+01:00"],
+            [WORKSPACE, [FIRST], [FIRST]],
+            [WORKSPACE.toUpperCase(), [FIRST]],
+            [WORKSPACE, FIRST],
+            [WORKSPACE, []],
+            [WORKSPACE, [FIRST.toUpperCase()]],
+            [WORKSPACE, [AT]],
+            [WORKSPACE, [FIRST, null]],
             [WORKSPACE, null],
-            [AT, WORKSPACE],
+            [[FIRST], WORKSPACE],
+            [
+              WORKSPACE,
+              Array.from({ length: CLAIM_LIMITS.claims + 1 }, () => FIRST),
+            ],
           ]
         : [[WORKSPACE], [undefined], [{}]];
     for (const args of wrong) {
@@ -393,7 +400,7 @@ test("load passes the service's answer through, and get answers without subscrib
   expect(caller.sent).toEqual([]);
 });
 
-test("markSeen checks the workspace ID and the time with the protocol's schemas again and passes the service's answer through", () => {
+test("markSeen checks the workspace ID and every member ID with the protocol's schemas again and passes the service's answer through", () => {
   const fake = fakeService();
   const { call } = register(fake);
   expect(
@@ -401,10 +408,10 @@ test("markSeen checks the workspace ID and the time with the protocol's schemas 
       INVOKE_CHANNELS.markClaimsSeen,
       receiver(),
       WORKSPACE,
-      LATER,
+      [SECOND, FIRST],
     ),
   ).toEqual({ outcome: "ok" });
-  expect(fake.marked).toEqual([[WORKSPACE, LATER]]);
+  expect(fake.marked).toEqual([[WORKSPACE, [SECOND, FIRST]]]);
   for (const reason of ["not_selected", "not_allowed", "not_listed"] as const) {
     fake.answerMark({ outcome: "refused", reason });
     expect(
@@ -412,7 +419,7 @@ test("markSeen checks the workspace ID and the time with the protocol's schemas 
         INVOKE_CHANNELS.markClaimsSeen,
         receiver(),
         WORKSPACE,
-        LATER,
+        [FIRST],
       ),
     ).toEqual({ outcome: "refused", reason });
   }
@@ -420,17 +427,17 @@ test("markSeen checks the workspace ID and the time with the protocol's schemas 
   // Behind the contract, the protocol's schemas refuse a value as invalid
   // before the service is asked.
   fake.marked.length = 0;
-  for (const [workspaceId, claimedAt] of [
-    ["not-an-id", LATER],
-    [WORKSPACE.toUpperCase(), LATER],
-    ["", LATER],
-    [WORKSPACE, "2026-11-05T11:00:00Z"],
-    [WORKSPACE, "2026-11-05T11:00:00.000+01:00"],
-    [WORKSPACE, "yesterday"],
-  ]) {
+  for (const [workspaceId, memberIds] of [
+    ["not-an-id", [FIRST]],
+    [WORKSPACE.toUpperCase(), [FIRST]],
+    ["", [FIRST]],
+    [WORKSPACE, ["not-an-id"]],
+    [WORKSPACE, [FIRST, FIRST.toUpperCase()]],
+    [WORKSPACE, [FIRST, ""]],
+  ] as const) {
     expect(
-      markClaimsSeen(fake.claims, workspaceId ?? "", claimedAt ?? ""),
-      `${workspaceId} ${claimedAt}`,
+      markClaimsSeen(fake.claims, workspaceId, memberIds),
+      `${workspaceId} ${memberIds.join(" ")}`,
     ).toEqual({ outcome: "refused", reason: "invalid" });
   }
   expect(fake.marked).toEqual([]);

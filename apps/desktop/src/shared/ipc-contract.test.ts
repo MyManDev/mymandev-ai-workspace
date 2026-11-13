@@ -3796,36 +3796,38 @@ test("the claims' get, subscribe, and load take no argument, and load answers lo
   }
 });
 
-test("the report of seen claims takes a workspace ID and a time in the protocol's form, and answers ok or a fixed refusal", () => {
+test("the report of seen claims takes a workspace ID and 1 to 1,000 member IDs, and answers ok or a fixed refusal", () => {
   const { args, result } = INVOKE_CONTRACT[INVOKE_CHANNELS.markClaimsSeen];
   expect(result).toBe(ClaimMarkSeenResultSchema);
-  expect(args.parse([WORKSPACE_ID, CLAIMED_AT])).toEqual([
-    WORKSPACE_ID,
-    CLAIMED_AT,
-  ]);
+  const shown = [CLAIM_MEMBER_ID, PERSON_ID];
+  expect(args.parse([WORKSPACE_ID, shown])).toEqual([WORKSPACE_ID, shown]);
+  const full = Array.from({ length: CLAIM_LIMITS.claims }, () => PERSON_ID);
+  expect(args.safeParse([WORKSPACE_ID, full]).success).toBe(true);
   for (const value of NOT_PROTOCOL_IDS) {
-    expect(args.safeParse([value, CLAIMED_AT]).success).toBe(false);
-  }
-  for (const time of [
-    "",
-    null,
-    1_700_000_000_000,
-    "yesterday",
-    "2026-11-05T11:00:00Z",
-    "2026-11-05T11:00:00.0000Z",
-    "2026-11-05T11:00:00.000+01:00",
-    "2026-11-05 11:00:00.000Z",
-    `${CLAIMED_AT}${"0".repeat(10_000)}`,
-  ]) {
-    expect(args.safeParse([WORKSPACE_ID, time]).success, String(time)).toBe(
+    expect(args.safeParse([value, shown]).success).toBe(false);
+    expect(args.safeParse([WORKSPACE_ID, [value]]).success).toBe(false);
+    expect(args.safeParse([WORKSPACE_ID, [PERSON_ID, value]]).success).toBe(
       false,
     );
+  }
+  for (const memberIds of [
+    [],
+    [...full, PERSON_ID],
+    PERSON_ID,
+    null,
+    { 0: PERSON_ID, length: 1 },
+    [CLAIMED_AT],
+  ]) {
+    expect(
+      args.safeParse([WORKSPACE_ID, memberIds]).success,
+      JSON.stringify(memberIds).slice(0, 80),
+    ).toBe(false);
   }
   for (const value of [
     [],
     [WORKSPACE_ID],
-    [CLAIMED_AT, WORKSPACE_ID],
-    [WORKSPACE_ID, CLAIMED_AT, CLAIMED_AT],
+    [shown, WORKSPACE_ID],
+    [WORKSPACE_ID, shown, shown],
   ]) {
     expect(args.safeParse(value).success, JSON.stringify(value)).toBe(false);
   }

@@ -12,8 +12,12 @@ import type {
   WorkspaceService,
   WorkspaceState,
 } from "../workspace/service.ts";
-import type { ClaimSeenMark, ClaimSeenRead } from "./seen-store.ts";
-import { MAX_CLAIM_SEEN_MARKS } from "./seen-store.ts";
+import {
+  type ClaimSeenEntry,
+  type ClaimSeenRead,
+  MAX_CLAIM_SEEN_ENTRIES,
+  MAX_SEEN_CLAIMS_PER_ENTRY,
+} from "./seen-store.ts";
 import {
   CLAIM_LOAD_COOLDOWN_MS,
   type ClaimConnection,
@@ -35,6 +39,10 @@ const NEXT_OWN = id(0xc4) as MemberId;
 const FIRST = id(0xd1) as MemberId;
 const SECOND = id(0xd2) as MemberId;
 const THIRD = id(0xd3) as MemberId;
+/** A claimed person that the list does not hold. */
+const OUTSIDER = id(0xd9) as MemberId;
+/** A claimed person whose claim left the list. */
+const GONE = id(0xd0) as MemberId;
 const CLAIMER_USER_ID = id(0xb9);
 const T1 = "2026-11-05T10:00:00.000Z";
 const T2 = "2026-11-05T11:00:00.000Z";
@@ -177,7 +185,7 @@ function fakeSeen(
   autoWrite = true,
 ) {
   const writes: {
-    readonly marks: readonly ClaimSeenMark[];
+    readonly entries: readonly ClaimSeenEntry[];
     readonly resolve: () => void;
     readonly reject: (error: unknown) => void;
   }[] = [];
@@ -196,9 +204,9 @@ function fakeSeen(
       }
       return Promise.resolve(read);
     },
-    write: (marks: readonly ClaimSeenMark[]) =>
+    write: (entries: readonly ClaimSeenEntry[]) =>
       new Promise<void>((resolve, reject) => {
-        writes.push({ marks, resolve, reject });
+        writes.push({ entries, resolve, reject });
         if (autoWrite) {
           resolve();
         }
@@ -546,7 +554,7 @@ test("the demotion of the account's own person drops the claims at once when its
     outcome: "refused",
     reason: "not_allowed",
   });
-  expect(live.service.markSeen(WORKSPACE, T1)).toEqual({
+  expect(live.service.markSeen(WORKSPACE, [FIRST])).toEqual({
     outcome: "refused",
     reason: "not_allowed",
   });
@@ -818,7 +826,7 @@ test("another workspace, a sign-out, and another device drop the claims and the 
   });
 });
 
-test("without a seen mark every claim is unseen, except the account's own claim", async () => {
+test("without seen claims every claim is unseen, except the account's own claim", async () => {
   const live = await loadedWith(
     claim(FIRST, T3),
     claim(OWN, T2, { via: "join_request" }),
@@ -828,75 +836,172 @@ test("without a seen mark every claim is unseen, except the account's own claim"
   expect(live.ids()).toEqual([FIRST, OWN, SECOND]);
 });
 
-test("markSeen moves the mark to a held claim's time only, never backwards, and the claims up to it are seen", async () => {
+test("markSeen counts the reported claims that the list holds and ignores the others; the entry keeps the seen claims of the latest list, the most recent first", async () => {
   const live = await loadedWith(
     claim(THIRD, T3),
     claim(SECOND, T2),
     claim(FIRST, T1),
   );
   const revision = live.service.state().revision;
-  expect(live.service.markSeen(WORKSPACE, T2)).toEqual({ outcome: "ok" });
-  expect(live.unseen()).toEqual([THIRD]);
+  expect(live.service.markSeen(WORKSPACE, [SECOND])).toEqual({ outcome: "ok" });
+  expect(live.unseen()).toEqual([THIRD, FIRST]);
   expect(live.service.state().revision).toBe(revision + 1);
   await settle();
-  expect(live.seen.writes.map((write) => write.marks)).toEqual([
-    [{ workspaceId: WORKSPACE, memberId: OWN, seenAt: T2 }],
+  expect(live.seen.writes.map((write) => write.entries)).toEqual([
+    [{ workspaceId: WORKSPACE, ownMemberId: OWN, seenMemberIds: [SECOND] }],
   ]);
 
-  // Not backwards, and nothing is written.
-  expect(live.service.markSeen(WORKSPACE, T1)).toEqual({ outcome: "ok" });
-  expect(live.service.markSeen(WORKSPACE, T2)).toEqual({ outcome: "ok" });
-  expect(live.unseen()).toEqual([THIRD]);
+  // Seen already: nothing changes, and nothing is written.
+  expect(live.service.markSeen(WORKSPACE, [SECOND, SECOND])).toEqual({
+    outcome: "ok",
+  });
   expect(live.service.state().revision).toBe(revision + 1);
   await settle();
   expect(live.seen.writes).toHaveLength(1);
 
-  // Only a time of a held claim of the selected workspace.
-  const between = "2026-11-05T11:30:00.000Z";
-  expect(live.service.markSeen(WORKSPACE, between)).toEqual({
+  // Only claims that the list holds, of the selected workspace.
+  expect(live.service.markSeen(WORKSPACE, [OUTSIDER])).toEqual({
     outcome: "refused",
     reason: "not_listed",
   });
-  expect(live.service.markSeen(OTHER_WORKSPACE, T3)).toEqual({
+  expect(live.service.markSeen(WORKSPACE, [])).toEqual({
+    outcome: "refused",
+    reason: "not_listed",
+  });
+  expect(live.service.markSeen(OTHER_WORKSPACE, [THIRD])).toEqual({
     outcome: "refused",
     reason: "not_selected",
   });
-  expect(live.unseen()).toEqual([THIRD]);
+  expect(live.unseen()).toEqual([THIRD, FIRST]);
 
-  expect(live.service.markSeen(WORKSPACE, T3)).toEqual({ outcome: "ok" });
+  // A claim that the list does not hold is ignored beside one that it does.
+  expect(live.service.markSeen(WORKSPACE, [OUTSIDER, FIRST])).toEqual({
+    outcome: "ok",
+  });
+  expect(live.unseen()).toEqual([THIRD]);
+  await settle();
+  expect(live.seen.writes.at(-1)?.entries).toEqual([
+    {
+      workspaceId: WORKSPACE,
+      ownMemberId: OWN,
+      seenMemberIds: [SECOND, FIRST],
+    },
+  ]);
+
+  expect(live.service.markSeen(WORKSPACE, [THIRD])).toEqual({ outcome: "ok" });
   expect(live.unseen()).toEqual([]);
   await settle();
-  expect(live.seen.writes.at(-1)?.marks).toEqual([
-    { workspaceId: WORKSPACE, memberId: OWN, seenAt: T3 },
+  expect(live.seen.writes.at(-1)?.entries).toEqual([
+    {
+      workspaceId: WORKSPACE,
+      ownMemberId: OWN,
+      seenMemberIds: [THIRD, SECOND, FIRST],
+    },
   ]);
 });
 
-test("markSeen is refused before the claims loaded, without a workspace, and after close", async () => {
+test("a claim that commits late with an earlier time stays unseen until the screen reports it", async () => {
+  const live = await loadedWith(claim(THIRD, T3), claim(FIRST, T1));
+  live.service.markSeen(WORKSPACE, [THIRD, FIRST]);
+  expect(live.unseen()).toEqual([]);
+
+  // The API took the time of this claim before the one of the newest, but
+  // committed it after.
+  live.connection.receive(claimedEvent(SECOND));
+  live.account.reads[1]?.resolve(
+    list(claim(THIRD, T3), claim(SECOND, T2), claim(FIRST, T1)),
+  );
+  await settle();
+  expect(live.unseen()).toEqual([SECOND]);
+  live.service.markSeen(WORKSPACE, [SECOND]);
+  expect(live.unseen()).toEqual([]);
+});
+
+test("a claim that left the list leaves the seen claims at the next write, and an entry holds at most the claims that the API lists", async () => {
+  const live = setup(
+    fakeSeen({
+      kind: "entries",
+      entries: [
+        {
+          workspaceId: WORKSPACE,
+          ownMemberId: OWN,
+          seenMemberIds: [GONE, FIRST],
+        },
+      ],
+    }),
+  );
+  await settle();
+  live.account.reads[0]?.resolve(list(claim(SECOND, T2), claim(FIRST, T1)));
+  await settle();
+  expect(live.unseen()).toEqual([SECOND]);
+  live.service.markSeen(WORKSPACE, [SECOND]);
+  await settle();
+  expect(live.seen.writes.at(-1)?.entries).toEqual([
+    {
+      workspaceId: WORKSPACE,
+      ownMemberId: OWN,
+      seenMemberIds: [SECOND, FIRST],
+    },
+  ]);
+
+  // A server that lists more claims than this desktop keeps: the most
+  // recent ones stay seen.
+  const many = Array.from(
+    { length: MAX_SEEN_CLAIMS_PER_ENTRY + 2 },
+    (_, index) => id(0x30000 + index) as MemberId,
+  );
+  live.connection.receive(claimedEvent());
+  live.account.reads[1]?.resolve(
+    list(...many.map((memberId) => claim(memberId, T1))),
+  );
+  await settle();
+  live.service.markSeen(WORKSPACE, many);
+  await settle();
+  expect(live.seen.writes.at(-1)?.entries[0]?.seenMemberIds).toEqual(
+    many.slice(0, MAX_SEEN_CLAIMS_PER_ENTRY),
+  );
+  expect(live.unseen()).toEqual(many.slice(MAX_SEEN_CLAIMS_PER_ENTRY));
+});
+
+test("markSeen is refused before the claims loaded, without the role, without a workspace, and after close", async () => {
   const live = setup();
   await settle();
-  expect(live.service.markSeen(WORKSPACE, T1)).toEqual({
+  expect(live.service.markSeen(WORKSPACE, [FIRST])).toEqual({
     outcome: "refused",
     reason: "not_listed",
   });
   live.account.reads[0]?.resolve(list(claim(FIRST, T1)));
   await settle();
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+  });
+  expect(live.service.markSeen(WORKSPACE, [FIRST])).toEqual({
+    outcome: "refused",
+    reason: "not_allowed",
+  });
   live.workspaces.set({ selected: null, people: [] });
-  expect(live.service.markSeen(WORKSPACE, T1)).toEqual({
+  expect(live.service.markSeen(WORKSPACE, [FIRST])).toEqual({
     outcome: "refused",
     reason: "not_selected",
   });
   live.service.close();
-  expect(live.service.markSeen(WORKSPACE, T1)).toEqual({
+  expect(live.service.markSeen(WORKSPACE, [FIRST])).toEqual({
     outcome: "refused",
     reason: "not_selected",
   });
   expect(live.seen.writes).toEqual([]);
 });
 
-test("a claim made while the application was closed is unseen at the next start, and the older ones stay seen", async () => {
+test("a claim made while the application was closed is unseen at the next start, and the seen ones stay seen", async () => {
   const seenFile = fakeSeen({
-    kind: "marks",
-    marks: [{ workspaceId: WORKSPACE, memberId: OWN, seenAt: T2 }],
+    kind: "entries",
+    entries: [
+      {
+        workspaceId: WORKSPACE,
+        ownMemberId: OWN,
+        seenMemberIds: [SECOND, FIRST],
+      },
+    ],
   });
   const live = setup(seenFile);
   await settle();
@@ -907,12 +1012,16 @@ test("a claim made while the application was closed is unseen at the next start,
   expect(live.unseen()).toEqual([THIRD]);
 });
 
-test("the marks are per workspace and per account: another workspace and another account's own person never use them", async () => {
+test("the seen claims are per workspace and per account: another workspace and another account's own person never use them", async () => {
   const seenFile = fakeSeen({
-    kind: "marks",
-    marks: [
-      { workspaceId: WORKSPACE, memberId: OWN, seenAt: T3 },
-      { workspaceId: OTHER_WORKSPACE, memberId: OWN, seenAt: T1 },
+    kind: "entries",
+    entries: [
+      { workspaceId: WORKSPACE, ownMemberId: OWN, seenMemberIds: [SECOND] },
+      {
+        workspaceId: OTHER_WORKSPACE,
+        ownMemberId: OWN,
+        seenMemberIds: [FIRST],
+      },
     ],
   });
   const live = setup(seenFile);
@@ -935,7 +1044,7 @@ test("the marks are per workspace and per account: another workspace and another
   expect(live.unseen()).toEqual([SECOND]);
 
   // Another account signs in on this device: its own person in the same
-  // workspace has another member ID, so the marks of the earlier account
+  // workspace has another member ID, so the earlier account's seen claims
   // do not apply.
   live.workspaces.set({ status: "signed_out", selected: null, people: [] });
   live.workspaces.set({
@@ -947,17 +1056,21 @@ test("the marks are per workspace and per account: another workspace and another
   live.account.reads[2]?.resolve(list(claim(SECOND, T2)));
   await settle();
   expect(live.unseen()).toEqual([SECOND]);
-  live.service.markSeen(WORKSPACE, T2);
+  live.service.markSeen(WORKSPACE, [SECOND]);
   await settle();
-  // The earlier account's mark stays as it was.
-  expect(live.seen.writes.at(-1)?.marks).toEqual([
-    { workspaceId: WORKSPACE, memberId: OWN, seenAt: T3 },
-    { workspaceId: OTHER_WORKSPACE, memberId: OWN, seenAt: T1 },
-    { workspaceId: WORKSPACE, memberId: NEXT_OWN, seenAt: T2 },
+  // The earlier account's entries stay as they were.
+  expect(live.seen.writes.at(-1)?.entries).toEqual([
+    { workspaceId: WORKSPACE, ownMemberId: OWN, seenMemberIds: [SECOND] },
+    { workspaceId: OTHER_WORKSPACE, ownMemberId: OWN, seenMemberIds: [FIRST] },
+    {
+      workspaceId: WORKSPACE,
+      ownMemberId: NEXT_OWN,
+      seenMemberIds: [SECOND],
+    },
   ]);
 });
 
-test("a missing, unreadable, or invalid seen claims file counts as no mark, is logged with fixed text, and the claims still load", async () => {
+test("a missing, unreadable, or invalid seen claims file counts as no entry, is logged with fixed text, and the claims still load", async () => {
   for (const [read, message] of [
     [{ kind: "none" }, null],
     [
@@ -976,8 +1089,10 @@ test("a missing, unreadable, or invalid seen claims file counts as no mark, is l
     await settle();
     expect(live.unseen()).toEqual([FIRST]);
     expect(live.logs).toEqual(message === null ? [] : [message]);
-    // A mark is written again over the file.
-    expect(live.service.markSeen(WORKSPACE, T1)).toEqual({ outcome: "ok" });
+    // The next change writes the file again.
+    expect(live.service.markSeen(WORKSPACE, [FIRST])).toEqual({
+      outcome: "ok",
+    });
     await settle();
     expect(live.seen.writes).toHaveLength(1);
   }
@@ -994,8 +1109,10 @@ test("nothing loads until the seen claims file was read", async () => {
   expect(live.service.state().status).toBe("loading");
 
   seenFile.finishRead({
-    kind: "marks",
-    marks: [{ workspaceId: WORKSPACE, memberId: OWN, seenAt: T1 }],
+    kind: "entries",
+    entries: [
+      { workspaceId: WORKSPACE, ownMemberId: OWN, seenMemberIds: [FIRST] },
+    ],
   });
   await settle();
   expect(live.account.reads).toHaveLength(1);
@@ -1004,7 +1121,7 @@ test("nothing loads until the seen claims file was read", async () => {
   expect(live.unseen()).toEqual([SECOND]);
 });
 
-test("the marks are written one at a time, the latest last; a failed write is logged and the mark stays", async () => {
+test("the seen claims are written one at a time, the latest last; a failed write is logged and the seen claims stay", async () => {
   const seenFile = fakeSeen({ kind: "none" }, false);
   const live = setup(seenFile);
   await settle();
@@ -1013,10 +1130,10 @@ test("the marks are written one at a time, the latest last; a failed write is lo
   );
   await settle();
 
-  live.service.markSeen(WORKSPACE, T1);
+  live.service.markSeen(WORKSPACE, [FIRST]);
   await settle();
-  live.service.markSeen(WORKSPACE, T2);
-  live.service.markSeen(WORKSPACE, T3);
+  live.service.markSeen(WORKSPACE, [SECOND]);
+  live.service.markSeen(WORKSPACE, [THIRD]);
   await settle();
   // The first write is on its way: the others wait for it.
   expect(seenFile.writes).toHaveLength(1);
@@ -1024,8 +1141,12 @@ test("the marks are written one at a time, the latest last; a failed write is lo
   await settle();
   expect(live.logs).toEqual(["The seen claims were not saved."]);
   expect(seenFile.writes).toHaveLength(2);
-  expect(seenFile.writes[1]?.marks).toEqual([
-    { workspaceId: WORKSPACE, memberId: OWN, seenAt: T3 },
+  expect(seenFile.writes[1]?.entries).toEqual([
+    {
+      workspaceId: WORKSPACE,
+      ownMemberId: OWN,
+      seenMemberIds: [THIRD, SECOND, FIRST],
+    },
   ]);
   seenFile.writes[1]?.resolve();
   await settle();
@@ -1033,25 +1154,162 @@ test("the marks are written one at a time, the latest last; a failed write is lo
   expect(live.unseen()).toEqual([]);
 });
 
-test("at most MAX_CLAIM_SEEN_MARKS marks are kept, the one that moved longest ago going first", async () => {
-  const marks = Array.from({ length: MAX_CLAIM_SEEN_MARKS }, (_, index) => ({
-    workspaceId: id(0x10000 + index) as WorkspaceId,
-    memberId: OWN,
-    seenAt: T1,
-  }));
-  const live = setup(fakeSeen({ kind: "marks", marks }));
+test("at most MAX_CLAIM_SEEN_ENTRIES entries are kept: a changed entry moves last, and the one that changed longest ago goes first", async () => {
+  const entries = [
+    { workspaceId: WORKSPACE, ownMemberId: OWN, seenMemberIds: [] },
+    ...Array.from({ length: MAX_CLAIM_SEEN_ENTRIES - 1 }, (_, index) => ({
+      workspaceId: id(0x10000 + index) as WorkspaceId,
+      ownMemberId: OWN,
+      seenMemberIds: [],
+    })),
+  ];
+  const live = setup(fakeSeen({ kind: "entries", entries }));
   await settle();
   live.account.reads[0]?.resolve(list(claim(FIRST, T1)));
   await settle();
-  live.service.markSeen(WORKSPACE, T1);
+  // The oldest entry changes: it moves last, and nothing is dropped.
+  live.service.markSeen(WORKSPACE, [FIRST]);
   await settle();
-  const written = live.seen.writes.at(-1)?.marks ?? [];
-  expect(written).toHaveLength(MAX_CLAIM_SEEN_MARKS);
+  let written = live.seen.writes.at(-1)?.entries ?? [];
+  expect(written).toHaveLength(MAX_CLAIM_SEEN_ENTRIES);
+  expect(written[0]?.workspaceId).toBe(id(0x10000));
+  expect(written.at(-1)?.workspaceId).toBe(WORKSPACE);
+
+  // A new entry drops the one that changed longest ago, not the one that
+  // changed last.
+  live.workspaces.set({
+    selected: OTHER_WORKSPACE,
+    people: [person(OWN, "admin")],
+  });
+  live.account.reads[1]?.resolve(
+    list(claim(SECOND, T2, { workspaceId: OTHER_WORKSPACE })),
+  );
+  await settle();
+  live.service.markSeen(OTHER_WORKSPACE, [SECOND]);
+  await settle();
+  written = live.seen.writes.at(-1)?.entries ?? [];
+  expect(written).toHaveLength(MAX_CLAIM_SEEN_ENTRIES);
   expect(written[0]?.workspaceId).toBe(id(0x10001));
-  expect(written.at(-1)).toEqual({
-    workspaceId: WORKSPACE,
-    memberId: OWN,
-    seenAt: T1,
+  expect(written.map((entry) => entry.workspaceId)).toContain(WORKSPACE);
+  expect(written.at(-1)?.workspaceId).toBe(OTHER_WORKSPACE);
+});
+
+test("an access that is no longer allowed for any reason drops the claims and the answer on its way", async () => {
+  const live = await loadedWith(claim(FIRST, T1));
+  live.connection.receive(claimedEvent());
+  expect(live.account.reads).toHaveLength(2);
+  // The own person is no longer in the people: the role is not known.
+  live.workspaces.set({ people: [] });
+  expect(live.service.state()).toMatchObject({
+    status: "loading",
+    claims: [],
+  });
+  live.account.reads[1]?.resolve(list(claim(SECOND, T2), claim(FIRST, T1)));
+  await settle();
+  expect(live.service.state()).toMatchObject({
+    status: "loading",
+    claims: [],
+  });
+  live.workspaces.set({ people: [person(OWN, "owner")] });
+  expect(live.account.reads).toHaveLength(3);
+});
+
+test("another own person in the same workspace drops the claims and the answer on its way, republishes, and does not use the earlier person's seen claims", async () => {
+  const live = setup(
+    fakeSeen({
+      kind: "entries",
+      entries: [
+        { workspaceId: WORKSPACE, ownMemberId: OWN, seenMemberIds: [FIRST] },
+      ],
+    }),
+  );
+  await settle();
+  live.account.reads[0]?.resolve(list(claim(FIRST, T1)));
+  await settle();
+  expect(live.unseen()).toEqual([]);
+  const states: { revision: number; claims: number }[] = [];
+  live.service.onChange((state) =>
+    states.push({ revision: state.revision, claims: state.claims.length }),
+  );
+
+  // Removed and claimed again while offline: the list names another own
+  // person in the same workspace, and the people show it as an admin.
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(claimedEvent());
+  live.workspaces.set({
+    own: NEXT_OWN,
+    people: [person(OWN, "admin", T2), person(NEXT_OWN, "admin")],
+  });
+  expect(states.at(-1)).toEqual({
+    revision: live.service.state().revision,
+    claims: 0,
+  });
+  expect(live.service.state()).toMatchObject({
+    status: "loading",
+    claims: [],
+  });
+  live.workspaces.set({ gateLive: true });
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list(claim(FIRST, T1)));
+  await settle();
+  expect(live.unseen()).toEqual([FIRST]);
+});
+
+test("a switch, a demotion, and a sign-out cancel a retry that waits", async () => {
+  for (const change of [
+    { selected: OTHER_WORKSPACE, people: [] },
+    { people: [person(OTHER, "owner"), person(OWN, "member")] },
+    { status: "signed_out" as const, selected: null, people: [] },
+  ]) {
+    const live = await loadedWith(claim(FIRST, T1));
+    live.connection.receive(claimedEvent());
+    live.account.reads[1]?.resolve({ ok: false, reason: "unavailable" });
+    await settle();
+    expect(live.timers.retries()).toEqual([2_000]);
+    live.workspaces.set(change);
+    expect(live.timers.pending()).toEqual([]);
+  }
+});
+
+test("a successful load starts the backoff again", async () => {
+  const live = await loadedWith(claim(FIRST, T1));
+  live.connection.receive(claimedEvent());
+  live.account.reads[1]?.resolve({ ok: false, reason: "unavailable" });
+  await settle();
+  live.timers.fire();
+  live.account.reads[2]?.resolve({ ok: false, reason: "unavailable" });
+  await settle();
+  expect(live.timers.retries()).toEqual([4_000]);
+  live.timers.fire();
+  live.account.reads[3]?.resolve(list(claim(FIRST, T1)));
+  await settle();
+  live.connection.receive(claimedEvent());
+  live.account.reads[4]?.resolve({ ok: false, reason: "unavailable" });
+  await settle();
+  expect(live.timers.retries()).toEqual([2_000]);
+});
+
+test("a drop ends a load that waits for the gate, so that the next workspace reads once", async () => {
+  const live = await loadedWith(claim(FIRST, T1));
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(claimedEvent());
+  expect(live.account.reads).toHaveLength(1);
+
+  live.workspaces.set({
+    selected: OTHER_WORKSPACE,
+    people: [person(OWN, "admin")],
+    gateLive: true,
+  });
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(
+    list(claim(SECOND, T2, { workspaceId: OTHER_WORKSPACE })),
+  );
+  await settle();
+  expect(live.account.reads).toHaveLength(2);
+  expect(live.service.state()).toMatchObject({
+    status: "ready",
+    workspaceId: OTHER_WORKSPACE,
+    claims: [{ memberId: SECOND }],
   });
 });
 

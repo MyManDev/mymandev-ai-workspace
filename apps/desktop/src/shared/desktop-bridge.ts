@@ -651,17 +651,17 @@ export interface ClaimsBridge {
    */
   readonly load: () => Promise<ClaimLoadResult>;
   /**
-   * Reports that the screen showed the claims of the selected workspace up
-   * to `claimedAt`, the time of the newest claim that it showed: the claims
-   * up to that time are seen from then on, also after a restart. The main
-   * process accepts only the time of a claim that it holds, and never moves
-   * the mark backwards. Resolves to `ok` or `refused` with a reason. The
-   * bridge passes on only two strings, and refuses any other value without
-   * a call.
+   * Reports that the screen showed the claims of the selected workspace
+   * with `memberIds`, the member IDs of the claimed people: those claims
+   * are seen from then on, also after a restart, and a claim that the
+   * screen did not report stays unseen. The main process counts only the
+   * claims that it holds. Resolves to `ok` or `refused` with a reason. The
+   * bridge passes on a workspace ID string and a new array of the member ID
+   * strings, and refuses any other value without a call.
    */
   readonly markSeen: (
     workspaceId: string,
-    claimedAt: string,
+    memberIds: readonly string[],
   ) => Promise<ClaimMarkSeenResult>;
 }
 

@@ -31,18 +31,25 @@
 //   triggers came; while a retry waits out its backoff, the retry reads the
 //   change. A failed load is retried with the workspace service's backoff
 //   while connected; offline, the next `workspace.subscribed` loads.
-// - Another selected workspace, a sign-out, or another device drops the
-//   claims and the answers on their way.
+// - Another selected workspace, a sign-out, another device, an access that
+//   is no longer `allowed` for any reason, and another own person in the
+//   same workspace drop the claims and the answers on their way.
 //
-// The seen mark (D8): the `claimedAt` of the newest claim that the account
-// has seen in a workspace, kept on this device in the seen claims file
-// (`seen-store.ts`), by the workspace and the account's own person in it. A
-// claim is unseen while it is newer than the mark, or while the workspace
-// has no mark; the account's own claim, which a list shows to an admin who
+// The seen claims (D8, and the Project Manager's decision of 2026-11-13 on
+// #270): the member IDs of the claims that the account has seen in a
+// workspace, kept on this device in the seen claims file (`seen-store.ts`),
+// by the workspace and the account's own person in it. A held claim is
+// unseen while its member ID is not among them, so without an entry every
+// claim is; the account's own claim, which a list shows to an admin who
 // joined with an invitation or a join request, never is. Only the screen
-// moves the mark (`markSeen`), to a `claimedAt` of the held list and never
-// backwards. Nothing loads until the file was read; a missing, unreadable,
-// or invalid file counts as no mark.
+// adds to them (`markSeen`), with the member IDs of the claims that it
+// showed, of which only held ones count; a write keeps only the claims of
+// the latest list, so a claim that left the list, which never comes back,
+// leaves them as well. A time would not do: `claimedAt` is the API's clock
+// at the start of its request, so claims can commit out of time order, and
+// a claim that commits late with an earlier time would count as seen
+// without ever being shown. Nothing loads until the file was read; a
+// missing, unreadable, or invalid file counts as no entry.
 //
 // The state holds member IDs, logins, and times only, never a user ID; the
 // logs are fixed text with a failure code at most.
@@ -64,10 +71,11 @@ import {
   type WorkspaceService,
 } from "../workspace/service.ts";
 import {
-  type ClaimSeenMark,
+  type ClaimSeenEntry,
   type ClaimSeenRead,
   type ClaimSeenStore,
-  MAX_CLAIM_SEEN_MARKS,
+  MAX_CLAIM_SEEN_ENTRIES,
+  MAX_SEEN_CLAIMS_PER_ENTRY,
 } from "./seen-store.ts";
 
 /**
@@ -114,9 +122,8 @@ export interface ClaimState {
   /** An ISO 8601 time in UTC, in the protocol's form. */
   readonly claimedAt: string;
   /**
-   * Whether the account has not seen it yet: it is newer than the seen mark
-   * of the workspace, or the workspace has none, and it is not the claim of
-   * the account's own person.
+   * Whether the account has not seen it yet: the screen never reported it
+   * as shown, and it is not the claim of the account's own person.
    */
   readonly unseen: boolean;
 }
@@ -144,11 +151,11 @@ export type ClaimLoadOutcome =
     };
 
 /**
- * The answer to the screen's report that it showed the claims up to a time:
- * `ok`, also when the mark is at that time or later already, or `refused`:
- * `not_selected` for a workspace that is not the selected one, `not_allowed`
- * without the owner's or an admin's role, and `not_listed` for a time that
- * no held claim has.
+ * The answer to the screen's report of the claims that it showed: `ok` when
+ * at least one of them is held, also when all of them were seen already, or
+ * `refused`: `not_selected` for a workspace that is not the selected one,
+ * `not_allowed` without the owner's or an admin's role, and `not_listed`
+ * when no held claim has any of the member IDs.
  */
 export type ClaimMarkSeenOutcome =
   | { readonly outcome: "ok" }
@@ -198,14 +205,15 @@ export interface ClaimService {
    */
   readonly load: () => ClaimLoadOutcome;
   /**
-   * The screen showed the claims of `workspaceId` up to `claimedAt`: the
-   * account's seen mark for the workspace moves to it, and the change is
-   * written to the seen claims file. Only a `claimedAt` of a held claim of
-   * the selected workspace is accepted, and the mark never moves backwards.
+   * The screen showed the claims of `workspaceId` with `memberIds`: they
+   * count as seen from then on, and the change is written to the seen
+   * claims file. Only the selected workspace is accepted, and only the
+   * member IDs of held claims count; the others are ignored. A claim never
+   * becomes unseen again while the list holds it.
    */
   readonly markSeen: (
     workspaceId: WorkspaceId,
-    claimedAt: string,
+    memberIds: readonly MemberId[],
   ) => ClaimMarkSeenOutcome;
   /** Stops listening and cancels the timers, for the quit. */
   readonly close: () => void;
@@ -213,7 +221,7 @@ export interface ClaimService {
 
 /**
  * A claim as the last answer holds it; whether it is unseen follows from the
- * mark when the state is built.
+ * seen claims when the state is built.
  */
 interface HeldClaim {
   readonly memberId: MemberId;
@@ -254,9 +262,9 @@ function scheduleWithSetTimeout(
   return () => clearTimeout(handle);
 }
 
-/** The key of a mark: the workspace and the account's own person in it. */
-function markKey(workspaceId: WorkspaceId, memberId: MemberId): string {
-  return `${workspaceId} ${memberId}`;
+/** The key of an entry: the workspace and the account's own person in it. */
+function entryKey(workspaceId: WorkspaceId, ownMemberId: MemberId): string {
+  return `${workspaceId} ${ownMemberId}`;
 }
 
 function heldClaim(claim: ClaimListResponse["claims"][number]): HeldClaim {
@@ -309,8 +317,8 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
   let gateWait = false;
   /**
    * Changes whenever what was loaded no longer applies: another workspace,
-   * a sign-out, another device, or a role without access. An answer for an
-   * earlier epoch is dropped.
+   * a sign-out, another device, another own person, or an access that is no
+   * longer `allowed`. An answer for an earlier epoch is dropped.
    */
   let epoch = 0;
   /** When the screen's last request was accepted, or null. */
@@ -328,13 +336,13 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
   let cancelRetry: (() => void) | null = null;
 
   /**
-   * The seen marks by `markKey`, the one that moved longest ago first; null
-   * until the seen claims file was read.
+   * The seen claims by `entryKey`, the entry that changed longest ago
+   * first; null until the seen claims file was read.
    */
-  let marks: Map<string, ClaimSeenMark> | null = null;
-  /** A write of the marks is on its way. */
+  let entries: Map<string, ClaimSeenEntry> | null = null;
+  /** A write of the entries is on its way. */
   let writing = false;
-  /** The marks changed during that write: one more follows it. */
+  /** The entries changed during that write: one more follows it. */
   let writeAgain = false;
 
   let revision = 0;
@@ -358,24 +366,21 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
     return loaded ? "ready" : "loading";
   }
 
-  /** The `claimedAt` of the newest claim seen in the selected workspace. */
-  function seenAt(): string | null {
-    if (marks === null || selected === null || own === null) {
-      return null;
+  /** The claims seen in the selected workspace, as the account's own person. */
+  function seenIds(): ReadonlySet<MemberId> {
+    if (entries === null || selected === null || own === null) {
+      return new Set();
     }
-    return marks.get(markKey(selected, own))?.seenAt ?? null;
+    return new Set(entries.get(entryKey(selected, own))?.seenMemberIds ?? []);
   }
 
   function buildState(): ClaimListState {
-    const mark = seenAt();
+    const seenNow = seenIds();
     const list = Object.freeze(
       claims.map((claim): ClaimState =>
         Object.freeze({
           ...claim,
-          // Every time is in the protocol's form, UTC with three
-          // fractional digits, so the text order is the time order.
-          unseen:
-            claim.memberId !== own && (mark === null || claim.claimedAt > mark),
+          unseen: claim.memberId !== own && !seenNow.has(claim.memberId),
         }),
       ),
     );
@@ -440,30 +445,30 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
     touch();
   }
 
-  // The seen marks.
+  // The seen claims.
 
-  function marksRead(read: ClaimSeenRead | null): void {
+  function seenRead(read: ClaimSeenRead | null): void {
     if (closed) {
       return;
     }
-    marks = new Map();
+    entries = new Map();
     if (read === null) {
       log("The seen claims could not be read; every claim counts as unseen.");
     } else if (read.kind === "corrupt") {
       log("The seen claims were not valid; every claim counts as unseen.");
-    } else if (read.kind === "marks") {
-      for (const mark of read.marks.slice(-MAX_CLAIM_SEEN_MARKS)) {
-        marks.set(markKey(mark.workspaceId, mark.memberId), mark);
+    } else if (read.kind === "entries") {
+      for (const entry of read.entries.slice(-MAX_CLAIM_SEEN_ENTRIES)) {
+        entries.set(entryKey(entry.workspaceId, entry.ownMemberId), entry);
       }
     }
     touch();
-    // The claims load once the marks are known.
+    // The claims load once the seen claims are known.
     reloadSelected();
   }
 
-  /** Writes the marks, one write at a time, the latest marks last. */
+  /** Writes the entries, one write at a time, the latest entries last. */
   function persist(): void {
-    if (marks === null) {
+    if (entries === null) {
       return;
     }
     if (writing) {
@@ -472,7 +477,7 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
     }
     writing = true;
     writeAgain = false;
-    const snapshot = Object.freeze([...marks.values()]);
+    const snapshot = Object.freeze([...entries.values()]);
     const written = () => {
       writing = false;
       if (writeAgain) {
@@ -489,7 +494,7 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
 
   function markSeen(
     workspaceId: WorkspaceId,
-    claimedAt: string,
+    memberIds: readonly MemberId[],
   ): ClaimMarkSeenOutcome {
     if (closed || selected === null || workspaceId !== selected) {
       return refusedMark("not_selected");
@@ -497,32 +502,42 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
     if (access !== "allowed" || own === null) {
       return refusedMark("not_allowed");
     }
+    const shown = new Set(memberIds);
     if (
-      marks === null ||
-      !claims.some((claim) => claim.claimedAt === claimedAt)
+      entries === null ||
+      !claims.some((claim) => shown.has(claim.memberId))
     ) {
       return refusedMark("not_listed");
     }
-    const key = markKey(selected, own);
-    const held = marks.get(key);
-    if (held !== undefined && held.seenAt >= claimedAt) {
-      // The mark never moves backwards.
+    const key = entryKey(selected, own);
+    const before = entries.get(key)?.seenMemberIds ?? [];
+    const seenBefore = new Set(before);
+    // Only the claims of the latest list stay, in its order, the most
+    // recent first: a claim that left the list never comes back.
+    const after = claims
+      .map((claim) => claim.memberId)
+      .filter((memberId) => seenBefore.has(memberId) || shown.has(memberId))
+      .slice(0, MAX_SEEN_CLAIMS_PER_ENTRY);
+    if (
+      after.length === before.length &&
+      after.every((memberId, index) => memberId === before[index])
+    ) {
       return MARKED;
     }
-    marks.delete(key);
-    marks.set(
+    entries.delete(key);
+    entries.set(
       key,
       Object.freeze({
         workspaceId: selected,
-        memberId: own,
-        seenAt: claimedAt,
+        ownMemberId: own,
+        seenMemberIds: Object.freeze(after),
       }),
     );
-    for (const oldest of marks.keys()) {
-      if (marks.size <= MAX_CLAIM_SEEN_MARKS) {
+    for (const oldest of entries.keys()) {
+      if (entries.size <= MAX_CLAIM_SEEN_ENTRIES) {
         break;
       }
-      marks.delete(oldest);
+      entries.delete(oldest);
     }
     touch();
     persist();
@@ -551,7 +566,7 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
   /** Whether the claim events and the triggers count now. */
   function live(): boolean {
     return (
-      !closed && marks !== null && selected !== null && access === "allowed"
+      !closed && entries !== null && selected !== null && access === "allowed"
     );
   }
 
@@ -664,9 +679,13 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
     }
     const nextOwn = selected === null ? null : workspaces.ownMemberId(selected);
     if (nextOwn !== own) {
-      // The mark that applies follows the account's own person.
+      // Another own person in the same workspace, for example after a
+      // removal and a new claim while offline: what was held, and its seen
+      // claims, belong to the other person.
       own = nextOwn;
-      touch();
+      access = "unknown";
+      demoted = false;
+      drop();
     }
     let nextAccess: Access = selected === null ? "unknown" : accessIn(selected);
     if (
@@ -695,8 +714,9 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
       touch();
       if (access === "allowed") {
         reloadSelected();
-      } else if (access === "not_allowed") {
-        // A demotion: what was loaded is no longer the person's to see.
+      } else {
+        // A demotion, or a role that is no longer known: what was loaded
+        // may no longer be the person's to see.
         drop();
       }
     }
@@ -801,8 +821,8 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
   void Promise.resolve()
     .then(() => seen.read())
     .then(
-      (read) => run(() => marksRead(read)),
-      () => run(() => marksRead(null)),
+      (read) => run(() => seenRead(read)),
+      () => run(() => seenRead(null)),
     );
 
   return Object.freeze({
@@ -815,8 +835,8 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
       };
     },
     load: () => run(load),
-    markSeen: (workspaceId: WorkspaceId, claimedAt: string) =>
-      run(() => markSeen(workspaceId, claimedAt)),
+    markSeen: (workspaceId: WorkspaceId, memberIds: readonly MemberId[]) =>
+      run(() => markSeen(workspaceId, memberIds)),
     close: () => {
       if (closed) {
         return;

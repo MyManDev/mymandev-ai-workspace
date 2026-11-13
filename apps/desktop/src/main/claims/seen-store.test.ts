@@ -1,8 +1,8 @@
 import {
   mkdir,
   mkdtemp,
-  readFile,
   readdir,
+  readFile,
   rm,
   stat,
   writeFile,
@@ -10,8 +10,8 @@ import {
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
-  MAX_ANSWER_LIST_ITEMS,
   type MemberId,
+  RECENT_CLAIMS,
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
@@ -21,11 +21,13 @@ import {
 } from "../device-key/atomic-file.ts";
 import {
   CLAIM_SEEN_FILE,
-  type ClaimSeenMark,
+  CLAIM_SEEN_VERSION,
+  type ClaimSeenEntry,
   createClaimSeenStore,
   decodeClaimSeen,
   encodeClaimSeen,
-  MAX_CLAIM_SEEN_MARKS,
+  MAX_CLAIM_SEEN_ENTRIES,
+  MAX_SEEN_CLAIMS_PER_ENTRY,
 } from "./seen-store.ts";
 
 /** A lowercase UUIDv7 that ends in `n`. */
@@ -36,15 +38,26 @@ function id(n: number): string {
 const WORKSPACE = id(0xa1) as WorkspaceId;
 const OTHER_WORKSPACE = id(0xa2) as WorkspaceId;
 const OWN = id(0xc1) as MemberId;
-const AT = "2026-11-05T10:00:00.000Z";
-const LATER = "2026-11-05T11:00:00.000Z";
+const FIRST = id(0xd1) as MemberId;
+const SECOND = id(0xd2) as MemberId;
 
-function mark(
+function entry(
   workspaceId: WorkspaceId,
-  seenAt: string,
-  memberId: MemberId = OWN,
-): ClaimSeenMark {
-  return { workspaceId, memberId, seenAt };
+  seenMemberIds: readonly MemberId[],
+  ownMemberId: MemberId = OWN,
+): ClaimSeenEntry {
+  return { workspaceId, ownMemberId, seenMemberIds };
+}
+
+/** A full entry: `MAX_SEEN_CLAIMS_PER_ENTRY` seen claims. */
+function fullEntry(workspaceId: WorkspaceId): ClaimSeenEntry {
+  return entry(
+    workspaceId,
+    Array.from(
+      { length: MAX_SEEN_CLAIMS_PER_ENTRY },
+      (_, index) => id(0x20000 + index) as MemberId,
+    ),
+  );
 }
 
 let root: string;
@@ -64,20 +77,25 @@ function bytes(value: unknown): Uint8Array {
 }
 
 describe("the seen claims file", () => {
-  test("round trip in the data folder, with IDs and times only, written atomically", async () => {
+  test("round trip in the data folder, with IDs only, written atomically", async () => {
     const store = createClaimSeenStore({ folder, platform: process.platform });
     expect(await store.read()).toEqual({ kind: "none" });
 
-    const marks = [mark(WORKSPACE, AT), mark(OTHER_WORKSPACE, LATER)];
-    await store.write(marks);
+    const entries = [
+      entry(WORKSPACE, [FIRST, SECOND]),
+      entry(OTHER_WORKSPACE, []),
+    ];
+    await store.write(entries);
     const read = await store.read();
-    expect(read).toEqual({ kind: "marks", marks });
-    if (read.kind === "marks") {
-      expect(Object.isFrozen(read.marks)).toBe(true);
-      expect(Object.isFrozen(read.marks[0])).toBe(true);
+    expect(read).toEqual({ kind: "entries", entries });
+    if (read.kind === "entries") {
+      expect(Object.isFrozen(read.entries)).toBe(true);
+      expect(Object.isFrozen(read.entries[0])).toBe(true);
+      expect(Object.isFrozen(read.entries[0]?.seenMemberIds)).toBe(true);
     }
     const text = await readFile(path.join(folder, CLAIM_SEEN_FILE), "utf8");
-    expect(JSON.parse(text)).toEqual({ version: 1, marks });
+    expect(JSON.parse(text)).toEqual({ version: 2, entries });
+    expect(CLAIM_SEEN_VERSION).toBe(2);
     // No temporary file stays behind.
     expect(await readdir(folder)).toEqual([CLAIM_SEEN_FILE]);
     if (process.platform !== "win32") {
@@ -85,91 +103,133 @@ describe("the seen claims file", () => {
       expect(mode & 0o777).toBe(0o600);
     }
 
-    await store.write([mark(WORKSPACE, LATER)]);
+    await store.write([entry(WORKSPACE, [SECOND])]);
     expect(await store.read()).toEqual({
-      kind: "marks",
-      marks: [mark(WORKSPACE, LATER)],
+      kind: "entries",
+      entries: [entry(WORKSPACE, [SECOND])],
     });
   });
 
-  test("a workspace and person named twice keep the later mark, in its place", () => {
+  test("a workspace and person named twice keep the later entry, in its place, and a member ID named twice counts once", () => {
     const decoded = decodeClaimSeen(
       bytes({
-        version: 1,
-        marks: [
-          mark(WORKSPACE, AT),
-          mark(OTHER_WORKSPACE, AT),
-          mark(WORKSPACE, LATER),
+        version: 2,
+        entries: [
+          entry(WORKSPACE, [FIRST]),
+          entry(OTHER_WORKSPACE, [FIRST, FIRST]),
+          entry(WORKSPACE, [SECOND]),
         ],
       }),
     );
     expect(decoded).toEqual([
-      mark(OTHER_WORKSPACE, AT),
-      mark(WORKSPACE, LATER),
+      entry(OTHER_WORKSPACE, [FIRST]),
+      entry(WORKSPACE, [SECOND]),
     ]);
   });
 
-  test("the limit of marks is the most workspaces that one answer lists", () => {
-    expect(MAX_CLAIM_SEEN_MARKS).toBe(MAX_ANSWER_LIST_ITEMS);
-    const full = Array.from({ length: MAX_CLAIM_SEEN_MARKS }, (_, index) =>
-      mark(id(0x10000 + index) as WorkspaceId, AT),
+  test("the limits: one entry holds the claims that the API lists, and a full file fits the size cap", () => {
+    expect(MAX_SEEN_CLAIMS_PER_ENTRY).toBe(RECENT_CLAIMS);
+    const full = Array.from({ length: MAX_CLAIM_SEEN_ENTRIES }, (_, index) =>
+      fullEntry(id(0x10000 + index) as WorkspaceId),
     );
-    expect(decodeClaimSeen(encodeClaimSeen(full))).toHaveLength(
-      MAX_CLAIM_SEEN_MARKS,
-    );
-    expect(() => encodeClaimSeen([...full, mark(WORKSPACE, AT)])).toThrow(
+    const encoded = encodeClaimSeen(full);
+    expect(encoded.length).toBeLessThan(512 * 1024);
+    expect(decodeClaimSeen(encoded)).toHaveLength(MAX_CLAIM_SEEN_ENTRIES);
+    expect(() => encodeClaimSeen([...full, entry(WORKSPACE, [])])).toThrow(
       TypeError,
     );
+    const over = fullEntry(WORKSPACE);
+    expect(() =>
+      encodeClaimSeen([entry(WORKSPACE, [...over.seenMemberIds, FIRST])]),
+    ).toThrow(TypeError);
   });
 
   test.each([
     ["not JSON", Buffer.from("{", "utf8")],
     ["not UTF-8", Buffer.from([0xff, 0xfe])],
-    ["another version", bytes({ version: 2, marks: [] })],
-    ["no marks", bytes({ version: 1 })],
-    ["an extra field", bytes({ version: 1, marks: [], login: "linus" })],
     [
-      "a mark with a login",
+      "a file of version 1, which kept a time and never shipped",
       bytes({
         version: 1,
-        marks: [{ ...mark(WORKSPACE, AT), login: "linus" }],
+        marks: [
+          {
+            workspaceId: WORKSPACE,
+            memberId: OWN,
+            seenAt: "2026-11-05T10:00:00.000Z",
+          },
+        ],
+      }),
+    ],
+    ["another version", bytes({ version: 3, entries: [] })],
+    ["no entries", bytes({ version: 2 })],
+    ["an extra field", bytes({ version: 2, entries: [], login: "linus" })],
+    [
+      "an entry with a login",
+      bytes({
+        version: 2,
+        entries: [{ ...entry(WORKSPACE, [FIRST]), login: "linus" }],
+      }),
+    ],
+    [
+      "an entry with a time",
+      bytes({
+        version: 2,
+        entries: [
+          { ...entry(WORKSPACE, [FIRST]), seenAt: "2026-11-05T10:00:00.000Z" },
+        ],
+      }),
+    ],
+    [
+      "an entry without its seen claims",
+      bytes({
+        version: 2,
+        entries: [{ workspaceId: WORKSPACE, ownMemberId: OWN }],
       }),
     ],
     [
       "a workspace ID outside the format",
-      bytes({ version: 1, marks: [mark("workspace" as WorkspaceId, AT)] }),
-    ],
-    [
-      "a person ID in capitals",
       bytes({
-        version: 1,
-        marks: [mark(WORKSPACE, AT, OWN.toUpperCase() as MemberId)],
+        version: 2,
+        entries: [entry("workspace" as WorkspaceId, [FIRST])],
       }),
     ],
     [
-      "a time without milliseconds",
-      bytes({ version: 1, marks: [mark(WORKSPACE, "2026-11-05T10:00:00Z")] }),
-    ],
-    [
-      "a time with an offset",
+      "an own member ID in capitals",
       bytes({
-        version: 1,
-        marks: [mark(WORKSPACE, "2026-11-05T10:00:00.000+01:00")],
+        version: 2,
+        entries: [entry(WORKSPACE, [FIRST], OWN.toUpperCase() as MemberId)],
       }),
     ],
     [
-      "too many marks",
+      "a seen member ID outside the format",
       bytes({
-        version: 1,
-        marks: Array.from({ length: MAX_CLAIM_SEEN_MARKS + 1 }, (_, index) =>
-          mark(id(0x10000 + index) as WorkspaceId, AT),
+        version: 2,
+        entries: [entry(WORKSPACE, ["linus" as MemberId])],
+      }),
+    ],
+    [
+      "too many seen claims in an entry",
+      bytes({
+        version: 2,
+        entries: [
+          entry(WORKSPACE, [...fullEntry(WORKSPACE).seenMemberIds, FIRST]),
+        ],
+      }),
+    ],
+    [
+      "too many entries",
+      bytes({
+        version: 2,
+        entries: Array.from(
+          { length: MAX_CLAIM_SEEN_ENTRIES + 1 },
+          (_, index) => entry(id(0x10000 + index) as WorkspaceId, []),
         ),
       }),
     ],
     [
       "a file too large, even of valid JSON",
       Buffer.from(
-        JSON.stringify({ version: 1, marks: [] }).padEnd(256 * 1024 + 1, " "),
+        JSON.stringify({ version: 2, entries: [] }).padEnd(512 * 1024 + 1, " "),
         "utf8",
       ),
     ],
@@ -196,10 +256,56 @@ describe("the seen claims file", () => {
     await mkdir(folder, { recursive: true });
     await writeFile(path.join(folder, CLAIM_SEEN_FILE), "{");
     expect(await store.read()).toEqual({ kind: "corrupt" });
-    await store.write([mark(WORKSPACE, AT)]);
+    await store.write([entry(WORKSPACE, [FIRST])]);
     expect(await store.read()).toEqual({
-      kind: "marks",
-      marks: [mark(WORKSPACE, AT)],
+      kind: "entries",
+      entries: [entry(WORKSPACE, [FIRST])],
+    });
+  });
+
+  test("a read deletes the temporary files that a stopped write left, and nothing else", async () => {
+    await mkdir(folder, { recursive: true });
+    const store = createClaimSeenStore({ folder, platform: process.platform });
+    await store.write([entry(WORKSPACE, [FIRST])]);
+    const left = [
+      `${CLAIM_SEEN_FILE}.0123456789abcdef.tmp`,
+      `${CLAIM_SEEN_FILE}.fedcba9876543210.tmp`,
+    ];
+    const kept = [
+      // Not a temporary file of this store's form.
+      `${CLAIM_SEEN_FILE}.0123.tmp`,
+      `${CLAIM_SEEN_FILE}.0123456789abcdeg.tmp`,
+      "device-key.json.0123456789abcdef.tmp",
+      "Preferences",
+    ];
+    for (const name of [...left, ...kept]) {
+      await writeFile(path.join(folder, name), "x");
+    }
+    expect(await store.read()).toEqual({
+      kind: "entries",
+      entries: [entry(WORKSPACE, [FIRST])],
+    });
+    expect((await readdir(folder)).sort()).toEqual(
+      [CLAIM_SEEN_FILE, ...kept].sort(),
+    );
+
+    // A folder that cannot be listed leaves the read as it is.
+    const missing = createClaimSeenStore({
+      folder: path.join(root, "missing"),
+      platform: process.platform,
+    });
+    expect(await missing.read()).toEqual({ kind: "none" });
+    const failing = createClaimSeenStore({
+      folder,
+      platform: process.platform,
+      fileSystem: {
+        ...nodeKeyFileSystem,
+        readdir: () => Promise.reject(new Error("EACCES")),
+      },
+    });
+    expect(await failing.read()).toEqual({
+      kind: "entries",
+      entries: [entry(WORKSPACE, [FIRST])],
     });
   });
 
@@ -232,7 +338,7 @@ describe("the seen claims file", () => {
       platform: "linux",
       fileSystem,
     });
-    await store.write([mark(WORKSPACE, AT)]);
+    await store.write([entry(WORKSPACE, [FIRST])]);
     const temporary = steps[0]?.split(" ")[1] ?? "";
     expect(temporary).toMatch(/^claims-seen\.json\.[0-9a-f]{16}\.tmp$/);
     expect(steps.slice(0, 5)).toEqual([
@@ -244,24 +350,24 @@ describe("the seen claims file", () => {
       "open MyManDev r",
     ]);
     expect(await store.read()).toEqual({
-      kind: "marks",
-      marks: [mark(WORKSPACE, AT)],
+      kind: "entries",
+      entries: [entry(WORKSPACE, [FIRST])],
     });
   });
 
-  test("marks outside the format are not written, and the error names no value", async () => {
+  test("entries outside the format are not written, and the error names no value", async () => {
     const store = createClaimSeenStore({
       folder,
       platform: process.platform,
       fileSystem: nodeKeyFileSystem,
     });
-    const value = "not-a-workspace-id";
-    const write = store.write([mark(value as WorkspaceId, AT)]);
+    const value = "not-a-member-id";
+    const write = store.write([entry(WORKSPACE, [value as MemberId])]);
     await expect(write).rejects.toThrow(
-      /^Invalid seen claims field marks\.0\.workspaceId$/,
+      /^Invalid seen claims field entries\.0\.seenMemberIds\.0$/,
     );
     await expect(
-      store.write([mark(value as WorkspaceId, AT)]),
+      store.write([entry(WORKSPACE, [value as MemberId])]),
     ).rejects.not.toThrow(value);
     expect(await store.read()).toEqual({ kind: "none" });
   });
