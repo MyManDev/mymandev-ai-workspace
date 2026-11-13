@@ -9,6 +9,8 @@ import type {
   DeviceListBridge,
   InvitationActionsBridge,
   InvitationsBridge,
+  JoinRequestActionsBridge,
+  JoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -484,6 +486,89 @@ test("the people screen gets the invitations: with both bridges, it has the para
   expect(render({ people, invitations, invitationActions })).not.toContain(
     "invitation-action-message",
   );
+});
+
+test("the people screen gets the join requests: with their two bridges, it has the paragraph of their sentence and the two dialogs, and reads nothing while rendered", () => {
+  const people: PeopleBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const calls: string[] = [];
+  const call = (name: string) => () => {
+    calls.push(name);
+    return Promise.reject(new Error("not called"));
+  };
+  const peopleActions: PeopleActionsBridge = {
+    define: call("define"),
+    rename: call("rename"),
+    remove: call("remove"),
+    promote: call("promote"),
+    demote: call("demote"),
+    leave: call("leave"),
+    offerOwnership: call("offerOwnership"),
+    withdrawOwnershipOffer: call("withdrawOwnershipOffer"),
+    acceptOwnershipOffer: call("acceptOwnershipOffer"),
+  };
+  const invitations: InvitationsBridge = {
+    getState: call("invitations getState"),
+    subscribeState: () => () => undefined,
+    load: call("invitations load"),
+  };
+  const invitationActions: InvitationActionsBridge = {
+    create: call("create"),
+    revoke: call("revoke"),
+    preview: call("preview"),
+    accept: call("accept"),
+  };
+  const joinRequests: JoinRequestsBridge = {
+    getState: call("getState"),
+    subscribeState: () => {
+      calls.push("subscribeState");
+      return () => undefined;
+    },
+    load: call("load"),
+  };
+  const joinRequestActions: JoinRequestActionsBridge = {
+    approve: call("approve"),
+    deny: call("deny"),
+    denyAll: call("denyAll"),
+    block: call("block"),
+    unblock: call("unblock"),
+    pause: call("pause"),
+    resume: call("resume"),
+  };
+  const bridges = {
+    people,
+    peopleActions,
+    invitations,
+    invitationActions,
+    joinRequests,
+    joinRequestActions,
+  };
+  const html = render({ ...bridges, initialView: { screen: "people" } });
+  expect(html).toContain(
+    '<p class="people-status" id="join-request-action-message" role="status"></p>',
+  );
+  // The people actions' dialog, the invitations' two, and the join
+  // requests' question and code dialogs.
+  expect(html.match(/<dialog class="people-dialog"><\/dialog>/g)).toHaveLength(
+    5,
+  );
+  // The subscription and the load run in an effect, which a server render
+  // does not run; nothing else is called.
+  expect(calls).toEqual([]);
+  // Without either of the two, or on another screen, nothing of it shows.
+  for (const missing of ["joinRequests", "joinRequestActions"] as const) {
+    expect(
+      render({
+        ...bridges,
+        [missing]: undefined,
+        initialView: { screen: "people" },
+      }),
+      missing,
+    ).not.toContain("join-request-action-message");
+  }
+  expect(render(bridges)).not.toContain("join-request-action-message");
 });
 
 test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {
