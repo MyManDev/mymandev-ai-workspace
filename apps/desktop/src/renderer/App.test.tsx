@@ -769,9 +769,15 @@ test("the permission screen shows every capability of ADR 0015 read-only, groupe
     },
   });
 
-  for (const title of ["On one repository", "On one AI provider connection"]) {
+  for (const [scope, title] of [
+    ["repository", "On one repository"],
+    ["provider_connection", "On one AI provider connection"],
+  ]) {
     expect(html).toContain(
-      `<section class="permission-section"><h3>${title}</h3>`,
+      `<section class="permission-section"><h3 id="permission-group-${scope}">${title}</h3>`,
+    );
+    expect(html).toContain(
+      `<ul class="capability-list" aria-labelledby="permission-group-${scope}">`,
     );
   }
   for (const capability of [

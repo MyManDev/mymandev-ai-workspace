@@ -1,3 +1,4 @@
+import ts from "typescript";
 import { expect, test } from "vitest";
 
 // The source files of the renderer and of the shared code, without the
@@ -17,18 +18,22 @@ const RENDERER_URL = "file:///app/src/renderer/";
 const RENDERER_DIRECTORY = "/app/src/renderer/";
 const SHARED_DIRECTORY = "/app/src/shared/";
 
-/** Packages that the renderer may import. */
+/**
+ * Packages that the renderer may import. From `@mymandev/permissions` only
+ * the subpath of its capabilities module, which imports no value: the main
+ * entry also evaluates the package's schemas and checks, and with them zod
+ * and `@mymandev/protocol`, wherever the code is not tree-shaken, as on the
+ * development server.
+ */
 const ALLOWED_PACKAGES = new Set([
   "react",
   "react-dom/client",
-  "@mymandev/permissions",
+  "@mymandev/permissions/capabilities",
 ]);
 
 /**
- * The values that the renderer may import from `@mymandev/permissions`: the
- * presentation vocabulary of its capabilities module, which imports no value.
- * Its schemas and checks would bring zod and `@mymandev/protocol` into the
- * renderer bundle. Types may be imported.
+ * The values that the renderer may import from `@mymandev/permissions`, under
+ * any specifier: the presentation vocabulary. Types may be imported.
  */
 const PERMISSIONS_VALUES = new Set([
   "CAPABILITY_RISK",
@@ -76,26 +81,105 @@ interface ImportStatement {
   readonly typeOnly: boolean;
 }
 
-/** The import and re-export statements of a Prettier-formatted module. */
-function importsOf(file: string, source: string): ImportStatement[] {
-  const statements: ImportStatement[] = [];
-  for (const [statement] of source.matchAll(/^(?:import|export)\b[^;]*;/gm)) {
-    const specifier =
-      /\bfrom\s*["']([^"']+)["']/.exec(statement)?.[1] ??
-      /^import\s*["']([^"']+)["']/.exec(statement)?.[1];
-    if (specifier !== undefined) {
-      statements.push({
-        file,
-        specifier,
-        path:
-          specifier.startsWith(".") || specifier.startsWith("/")
-            ? new URL(specifier, new URL(file, RENDERER_URL)).pathname
-            : undefined,
-        typeOnly: /^(?:import|export)\s+type\b/.test(statement),
+interface ModuleDeclaration {
+  readonly specifier: string;
+  /** `import type` or `export type`, which the build erases. */
+  readonly typeOnly: boolean;
+  /**
+   * The value names that the declaration imports or re-exports, or undefined
+   * when it reaches the whole module: the module alone, a namespace, or a
+   * star.
+   */
+  readonly values: readonly string[] | undefined;
+  /** The first line of the declaration, for messages. */
+  readonly text: string;
+}
+
+/**
+ * The import and re-export declarations of a module, from the TypeScript
+ * parser, so that comments and strings never hide or invent one.
+ */
+function declarationsOf(file: string, source: string): ModuleDeclaration[] {
+  const sourceFile = ts.createSourceFile(
+    file,
+    source,
+    ts.ScriptTarget.Latest,
+    false,
+    /x$/.test(file) ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+  const declarations: ModuleDeclaration[] = [];
+  for (const statement of sourceFile.statements) {
+    const text = statement.getText(sourceFile).split("\n")[0] ?? "";
+    if (
+      ts.isImportDeclaration(statement) &&
+      ts.isStringLiteral(statement.moduleSpecifier)
+    ) {
+      const clause = statement.importClause;
+      const bindings = clause?.namedBindings;
+      declarations.push({
+        specifier: statement.moduleSpecifier.text,
+        typeOnly: clause?.isTypeOnly === true,
+        values:
+          clause === undefined ||
+          (bindings !== undefined && ts.isNamespaceImport(bindings))
+            ? undefined
+            : [
+                ...(clause.name === undefined ? [] : ["default"]),
+                ...(bindings === undefined
+                  ? []
+                  : bindings.elements
+                      .filter((element) => !element.isTypeOnly)
+                      .map(
+                        (element) =>
+                          (element.propertyName ?? element.name).text,
+                      )),
+              ],
+        text,
+      });
+    } else if (
+      ts.isExportDeclaration(statement) &&
+      statement.moduleSpecifier !== undefined &&
+      ts.isStringLiteral(statement.moduleSpecifier)
+    ) {
+      const clause = statement.exportClause;
+      declarations.push({
+        specifier: statement.moduleSpecifier.text,
+        typeOnly: statement.isTypeOnly,
+        values:
+          clause === undefined || !ts.isNamedExports(clause)
+            ? undefined
+            : clause.elements
+                .filter((element) => !element.isTypeOnly)
+                .map((element) => (element.propertyName ?? element.name).text),
+        text,
+      });
+    } else if (
+      ts.isImportEqualsDeclaration(statement) &&
+      ts.isExternalModuleReference(statement.moduleReference) &&
+      ts.isStringLiteral(statement.moduleReference.expression)
+    ) {
+      declarations.push({
+        specifier: statement.moduleReference.expression.text,
+        typeOnly: statement.isTypeOnly,
+        values: undefined,
+        text,
       });
     }
   }
-  return statements;
+  return declarations;
+}
+
+/** The import and re-export statements of a module. */
+function importsOf(file: string, source: string): ImportStatement[] {
+  return declarationsOf(file, source).map(({ specifier, typeOnly }) => ({
+    file,
+    specifier,
+    path:
+      specifier.startsWith(".") || specifier.startsWith("/")
+        ? new URL(specifier, new URL(file, RENDERER_URL)).pathname
+        : undefined,
+    typeOnly,
+  }));
 }
 
 /**
@@ -126,37 +210,25 @@ function sharedValueImports(imports: readonly ImportStatement[]): string[] {
 }
 
 /**
- * Imports and re-exports of `@mymandev/permissions` that reach more than
- * PERMISSIONS_VALUES: another value, a namespace, a star, or the module alone.
+ * Imports and re-exports of `@mymandev/permissions`, under any specifier, that
+ * reach more than PERMISSIONS_VALUES: another value, a namespace, a star, or
+ * the module alone.
  */
 function permissionsValueImports(file: string, source: string): string[] {
-  const found: string[] = [];
-  for (const [statement] of source.matchAll(/^(?:import|export)\b[^;]*;/gm)) {
-    if (
-      !/(?:\bfrom\s*|^import\s*)["']@mymandev\/permissions["']/.test(
-        statement,
-      ) ||
-      /^(?:import|export)\s+type\b/.test(statement)
-    ) {
-      continue;
-    }
-    const names = /^(?:import|export)\s*\{([^}]*)\}\s*from\b/.exec(statement);
-    if (names === null) {
-      found.push(`${file}: ${statement.split("\n")[0] ?? statement}`);
-      continue;
-    }
-    for (const entry of (names[1] ?? "").split(",")) {
-      const name = entry.trim().split(/\s+as\s+/)[0] ?? "";
-      if (
-        name !== "" &&
-        !/^type\s/.test(name) &&
-        !PERMISSIONS_VALUES.has(name)
-      ) {
-        found.push(`${file}: ${name}`);
-      }
-    }
-  }
-  return found;
+  return declarationsOf(file, source)
+    .filter(
+      ({ specifier, typeOnly }) =>
+        !typeOnly &&
+        (specifier === "@mymandev/permissions" ||
+          specifier.startsWith("@mymandev/permissions/")),
+    )
+    .flatMap(({ values, text }) =>
+      values === undefined
+        ? [`${file}: ${text}`]
+        : values
+            .filter((name) => !PERMISSIONS_VALUES.has(name))
+            .map((name) => `${file}: ${name}`),
+    );
 }
 
 function forbiddenApis(file: string, source: string): string[] {
@@ -182,6 +254,12 @@ test("the checks find foreign imports, shared value imports, and forbidden APIs"
     '} from "../shared/ipc-contract.ts";',
     'import type { DesktopBridge } from "../shared/desktop-bridge.ts";',
     'export { PRODUCT_NAME } from "./../shared/product.ts";',
+    "import {",
+    "  spawn, // a child; never in the renderer",
+    '} from "node:child_process";',
+    'import { /* a; b */ shell } from "electron/main";',
+    "const text = \"import { x } from 'node:os';\";",
+    "/* import { y } from 'node:net'; */",
     'const socket = new WebSocket("wss://example.invalid");',
     'void fetch("https://example.invalid");',
     "const home = process.env.HOME;",
@@ -198,6 +276,8 @@ test("the checks find foreign imports, shared value imports, and forbidden APIs"
     "/app/src/shared/ipc-contract.ts",
     "/app/src/shared/desktop-bridge.ts",
     "/app/src/shared/product.ts",
+    "node:child_process",
+    "electron/main",
   ]);
   expect(foreignImports(imports)).toEqual([
     "./sample.ts: node:fs",
@@ -205,6 +285,8 @@ test("the checks find foreign imports, shared value imports, and forbidden APIs"
     "./sample.ts: ./../main/window.ts",
     "./sample.ts: ../shared/../main/ipc.ts",
     "./sample.ts: /app/src/preload/bridge.ts",
+    "./sample.ts: node:child_process",
+    "./sample.ts: electron/main",
   ]);
   expect(sharedValueImports(imports)).toEqual([
     "./sample.ts: ../shared/ipc-contract.ts",
@@ -230,6 +312,13 @@ test("the check finds permission imports beyond the presentation vocabulary", ()
     'export { PermissionRequestSchema } from "@mymandev/permissions";',
     'export * from "@mymandev/permissions";',
     'import { GRANT_SCOPE_KINDS } from "@mymandev/permissions";',
+    "import {",
+    "  CAPABILITY_RISK, // labels; presentation only",
+    "  isGrantActive,",
+    '} from "@mymandev/permissions/capabilities";',
+    'import { /* labels; presentation only */ PermissionGrantSchema } from "@mymandev/permissions/capabilities";',
+    'import { CAPABILITY_RISKS, type GrantScopeKind } from "@mymandev/permissions/capabilities";',
+    'import { CAPABILITY_SCOPE } from "@mymandev/permissions/src/capabilities.ts";',
   ].join("\n");
 
   expect(permissionsValueImports("./sample.ts", sample)).toEqual([
@@ -238,6 +327,14 @@ test("the check finds permission imports beyond the presentation vocabulary", ()
     './sample.ts: import "@mymandev/permissions";',
     "./sample.ts: PermissionRequestSchema",
     './sample.ts: export * from "@mymandev/permissions";',
+    "./sample.ts: isGrantActive",
+    "./sample.ts: PermissionGrantSchema",
+  ]);
+  // The comments hide nothing from the foreign-import rule either, and only
+  // the capabilities subpath of the package is allowed.
+  expect(foreignImports(importsOf("./sample.ts", sample))).toEqual([
+    ...Array.from({ length: 7 }, () => "./sample.ts: @mymandev/permissions"),
+    "./sample.ts: @mymandev/permissions/src/capabilities.ts",
   ]);
 });
 
@@ -289,7 +386,7 @@ test("the checks read every renderer source and no test", () => {
   });
   expect(IMPORTS).toContainEqual({
     file: "./permission-view.ts",
-    specifier: "@mymandev/permissions",
+    specifier: "@mymandev/permissions/capabilities",
     path: undefined,
     typeOnly: false,
   });

@@ -4,7 +4,7 @@ import {
   GRANT_SCOPE_KINDS,
   type CapabilityRisk,
   type GrantScopeKind,
-} from "@mymandev/permissions";
+} from "@mymandev/permissions/capabilities";
 
 // The presentation model of the permission screen, after the presentation
 // rules of ADR 0015 (P-70, P-71) and #77. It is built only from the
@@ -15,8 +15,9 @@ import {
 // what each capability means, and it never derives one capability from
 // another or from a risk label.
 //
-// Only presentation names are imported from the package, never a schema or
-// a check, so that the bundler leaves zod out of the renderer bundle.
+// It imports `@mymandev/permissions/capabilities`, which imports no value,
+// never the package's main entry, whose schemas and checks would bring zod
+// and `@mymandev/protocol` into the renderer, also on the development server.
 
 /** One capability name, as `@mymandev/permissions` classifies it. */
 export type PermissionCapability = keyof typeof CAPABILITY_RISK;
@@ -29,11 +30,13 @@ export type HighestRiskCapability = {
 }[PermissionCapability];
 
 /**
- * A part of a fixed statement: plain text, or a capability name that the
- * screen shows as code.
+ * A part of a fixed statement: plain text, or a capability name or a command
+ * that the screen shows as code.
  */
 export type StatementPart =
-  string | { readonly capability: PermissionCapability };
+  | string
+  | { readonly capability: PermissionCapability }
+  | { readonly command: string };
 
 /** A fixed statement of the screen, as parts. */
 export type Statement = readonly StatementPart[];
@@ -74,23 +77,29 @@ export const CAPABILITY_MEANINGS: Readonly<
 
 /**
  * What a shell can do (ADR 0015, P-70, and #77). The repository scope of
- * `terminal.execute` is where the shell starts, not a sandbox. The last
- * statement is the one that #77 requires while `terminal.execute` is granted
- * without `git.commit` or `git.push`; this read-only screen shows it always.
+ * `terminal.execute` is where the shell starts, not a sandbox. The end of the
+ * last statement is the one that #77 requires while `terminal.execute` is
+ * granted while `git.commit` or `git.push` is not; this read-only screen shows
+ * it always.
  */
 export const SHELL_STATEMENTS: readonly Statement[] = Object.freeze([
   [
     "A shell runs as the user of the agent's device. The repository is only where it starts: it is not a sandbox.",
   ],
   [
-    "A shell can read and change files outside the repository, use the network, run git commit and git push, and read the credentials stored for that user, including local AI provider credentials.",
-  ],
-  [
-    "So a shell can commit and push even when ",
-    { capability: "git.commit" },
+    "A shell can read and change files outside the repository, use the network, run ",
+    { command: "git commit" },
     " and ",
+    { command: "git push" },
+    ", and read the credentials stored for that user, including local AI provider credentials.",
+  ],
+  ["So a shell can send files and those credentials over the network."],
+  [
+    "A shell can commit and push even without ",
+    { capability: "git.commit" },
+    " or ",
     { capability: "git.push" },
-    " are not granted.",
+    ".",
   ],
 ]);
 
@@ -108,20 +117,21 @@ export const HIGHEST_RISK_CONFIRMATIONS: Readonly<
   Record<HighestRiskCapability, string>
 > = Object.freeze({
   "terminal.execute":
-    "Allow this agent to run a shell in this repository? The shell runs as the user of the agent's device and is not limited to the repository: it can change files anywhere, use the network, commit and push, and read stored credentials.",
+    "Allow this agent to run a shell in this repository? The shell runs as the user of the agent's device and is not limited to the repository: it can read and change files outside the repository, use the network, commit and push, and read the credentials stored for that user, including local AI provider credentials.",
 });
 
 /**
  * The statements for the whole screen (ADR 0008, ADR 0015, and #77). None of
  * them relates one capability to another for a check: they tell the person
- * what follows from a grant.
+ * what follows from a grant, including that a permission can allow more than
+ * its name says.
  */
 export const SCREEN_STATEMENTS: readonly Statement[] = Object.freeze([
   [
     "Permissions belong to one agent of this project, and only the agent's owner grants them.",
   ],
   [
-    "Each permission is checked on its own, and none includes another: ",
+    "Each permission is checked on its own: for a check, none includes another, so ",
     { capability: "repo.write" },
     " does not include ",
     { capability: "repo.read" },
@@ -129,6 +139,8 @@ export const SCREEN_STATEMENTS: readonly Statement[] = Object.freeze([
     { capability: "git.push" },
     " does not include ",
     { capability: "git.commit" },
+    ". A permission can still let the agent do more than its name says: see ",
+    { capability: "terminal.execute" },
     ".",
   ],
   [

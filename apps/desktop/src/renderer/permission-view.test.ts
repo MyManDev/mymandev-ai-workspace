@@ -3,7 +3,7 @@ import {
   CAPABILITY_RISKS,
   CAPABILITY_SCOPE,
   GRANT_SCOPE_KINDS,
-} from "@mymandev/permissions";
+} from "@mymandev/permissions/capabilities";
 import { CAPABILITIES } from "@mymandev/protocol";
 import { afterEach, expect, test, vi } from "vitest";
 import {
@@ -22,14 +22,20 @@ import {
 } from "./permission-view.ts";
 
 afterEach(() => {
-  vi.doUnmock("@mymandev/permissions");
+  vi.doUnmock("@mymandev/permissions/capabilities");
   vi.resetModules();
 });
 
 /** The text of a statement, with capability names as plain text. */
 function textOf(statement: Statement): string {
   return statement
-    .map((part) => (typeof part === "string" ? part : part.capability))
+    .map((part) =>
+      typeof part === "string"
+        ? part
+        : "capability" in part
+          ? part.capability
+          : part.command,
+    )
     .join("");
 }
 
@@ -120,9 +126,11 @@ test("each risk label is read from CAPABILITY_RISK, and terminal.execute alone i
 
 test("the screen follows CAPABILITY_RISK, not a list of its own", async () => {
   vi.resetModules();
-  vi.doMock("@mymandev/permissions", async (importOriginal) => {
+  vi.doMock("@mymandev/permissions/capabilities", async (importOriginal) => {
     const actual =
-      await importOriginal<typeof import("@mymandev/permissions")>();
+      await importOriginal<
+        typeof import("@mymandev/permissions/capabilities")
+      >();
     return {
       ...actual,
       CAPABILITY_RISK: Object.freeze({
@@ -185,7 +193,7 @@ test("terminal.execute has its own explicit confirmation, and no other capabilit
 
   expect(confirmation).toBe(HIGHEST_RISK_CONFIRMATIONS["terminal.execute"]);
   expect(confirmation).toBe(
-    "Allow this agent to run a shell in this repository? The shell runs as the user of the agent's device and is not limited to the repository: it can change files anywhere, use the network, commit and push, and read stored credentials.",
+    "Allow this agent to run a shell in this repository? The shell runs as the user of the agent's device and is not limited to the repository: it can read and change files outside the repository, use the network, commit and push, and read the credentials stored for that user, including local AI provider credentials.",
   );
   expect(
     allCapabilities()
@@ -195,17 +203,26 @@ test("terminal.execute has its own explicit confirmation, and no other capabilit
   expect(Object.keys(HIGHEST_RISK_CONFIRMATIONS)).toEqual(["terminal.execute"]);
 });
 
-test("terminal.execute says what a shell can do, and that it can commit and push without git.commit and git.push", () => {
+test("terminal.execute says what a shell can do, and that it can commit and push without git.commit or git.push", () => {
   const details = viewOf("terminal.execute").details;
 
   expect(details).toBe(SHELL_STATEMENTS);
   expect(details.map(textOf)).toEqual([
     "A shell runs as the user of the agent's device. The repository is only where it starts: it is not a sandbox.",
     "A shell can read and change files outside the repository, use the network, run git commit and git push, and read the credentials stored for that user, including local AI provider credentials.",
-    "So a shell can commit and push even when git.commit and git.push are not granted.",
+    "So a shell can send files and those credentials over the network.",
+    "A shell can commit and push even without git.commit or git.push.",
   ]);
-  expect(details[2]).toContainEqual({ capability: "git.commit" });
-  expect(details[2]).toContainEqual({ capability: "git.push" });
+  // The commands are code, like the capability names.
+  expect(details[1]).toContainEqual({ command: "git commit" });
+  expect(details[1]).toContainEqual({ command: "git push" });
+  expect(details[3]).toEqual([
+    "A shell can commit and push even without ",
+    { capability: "git.commit" },
+    " or ",
+    { capability: "git.push" },
+    ".",
+  ]);
   for (const view of allCapabilities()) {
     if (view.capability !== "terminal.execute") {
       expect(view.details).toEqual([]);
@@ -213,13 +230,13 @@ test("terminal.execute says what a shell can do, and that it can commit and push
   }
 });
 
-test("the screen says that repo.read with provider.use sends the repository's content to the provider, and that no permission includes another", () => {
+test("the screen says that repo.read with provider.use sends the repository's content to the provider, and that no permission includes another for a check but can allow more than its name", () => {
   const statements = describePermissionScreen().statements;
 
   expect(statements).toBe(SCREEN_STATEMENTS);
   expect(statements.map(textOf)).toEqual([
     "Permissions belong to one agent of this project, and only the agent's owner grants them.",
-    "Each permission is checked on its own, and none includes another: repo.write does not include repo.read, and git.push does not include git.commit.",
+    "Each permission is checked on its own: for a check, none includes another, so repo.write does not include repo.read, and git.push does not include git.commit. A permission can still let the agent do more than its name says: see terminal.execute.",
     "With repo.read on a repository and provider.use on an AI provider connection, the agent can send that repository's content to that connection's provider.",
   ]);
   expect(statements[2]).toEqual([

@@ -33,13 +33,15 @@ export function DecisionsScreen() {
   );
 }
 
-/** A fixed statement, with capability names as code. */
+/** A fixed statement, with capability names and commands as code. */
 function StatementText({ statement }: { readonly statement: Statement }) {
   return statement.map((part, index) =>
     typeof part === "string" ? (
       part
     ) : (
-      <code key={index}>{part.capability}</code>
+      <code key={index}>
+        {"capability" in part ? part.capability : part.command}
+      </code>
     ),
   );
 }
@@ -73,8 +75,8 @@ export function PermissionsScreen() {
     <section aria-labelledby="permissions-title">
       <h2 id="permissions-title">Permissions</h2>
       <p>
-        An agent can do only what its owner grants: one capability on one
-        repository or on one AI provider connection.
+        An agent gets only the permissions that its owner grants, each for one
+        capability on one repository or on one AI provider connection.
       </p>
       <p className="placeholder-note">{view.unavailable}</p>
       <ul className="permission-statements">
@@ -87,9 +89,12 @@ export function PermissionsScreen() {
       {/* Subsections without a name, so that they add no landmark regions. */}
       {view.groups.map((group) => (
         <section className="permission-section" key={group.scope}>
-          <h3>{group.title}</h3>
+          <h3 id={`permission-group-${group.scope}`}>{group.title}</h3>
           <p>{group.text}</p>
-          <ul className="capability-list" aria-label="Capabilities">
+          <ul
+            className="capability-list"
+            aria-labelledby={`permission-group-${group.scope}`}
+          >
             {group.capabilities.map((capability) => (
               <CapabilityItem key={capability.capability} view={capability} />
             ))}

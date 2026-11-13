@@ -6,15 +6,15 @@ The permission contract is a shared boundary. It changes only by agreement betwe
 
 ## Contents
 
-| Module                | Contents                                                                                                                                                                                                                                                        |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/capabilities.ts` | `GRANT_SCOPE_KINDS` and `GrantScopeKind`, `CAPABILITY_SCOPE` (the scope kind of every capability), the `RepositoryCapability` and `ProviderConnectionCapability` types, `CAPABILITY_RISKS` and `CapabilityRisk`, and `CAPABILITY_RISK` (for presentation only). |
-| `src/grant.ts`        | `PermissionGrantSchema`, `GrantFactsSchema`, `GrantRecordSchema`, `PermissionRequestSchema`, and their types.                                                                                                                                                   |
-| `src/check.ts`        | `isGrantActive` and `hasGrant`.                                                                                                                                                                                                                                 |
+| Module                | Contents                                                                                                                                                                                                                                                                                                               |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/capabilities.ts` | Also exported as `@mymandev/permissions/capabilities`. `GRANT_SCOPE_KINDS` and `GrantScopeKind`, `CAPABILITY_SCOPE` (the scope kind of every capability), the `RepositoryCapability` and `ProviderConnectionCapability` types, `CAPABILITY_RISKS` and `CapabilityRisk`, and `CAPABILITY_RISK` (for presentation only). |
+| `src/grant.ts`        | `PermissionGrantSchema`, `GrantFactsSchema`, `GrantRecordSchema`, `PermissionRequestSchema`, and their types.                                                                                                                                                                                                          |
+| `src/check.ts`        | `isGrantActive` and `hasGrant`.                                                                                                                                                                                                                                                                                        |
 
 ## Consumer rules
 
-- Import only from `@mymandev/permissions`. Never import a file path inside this package. Import capability names and ID kinds from `@mymandev/protocol`; this package does not re-export them.
+- Import only from `@mymandev/permissions`, or from `@mymandev/permissions/capabilities` for the presentation vocabulary alone (`GRANT_SCOPE_KINDS`, `CAPABILITY_SCOPE`, `CAPABILITY_RISKS`, `CAPABILITY_RISK`, and their types). The subpath imports no value, so it evaluates no schema, no check, no zod, and no `@mymandev/protocol`, also where nothing is tree-shaken; the desktop renderer imports only this subpath. Never import a file path inside this package. Import capability names and ID kinds from `@mymandev/protocol`; this package does not re-export them.
 - `hasGrant(records, request, now)` is the only authorization check. `isGrantActive(record, now)` is the only definition of an active grant; use it for display and listing.
 - No other code combines `revoked_at`, `expires_at`, the agent's `disabled_at`, the device's `revoked_at`, and the membership's `removed_at`. SQL selects candidate rows by `grantee_agent_id`, `capability`, and the scope ID only, never by a lifecycle column, and every decision goes through `hasGrant`.
 - Exact match only. Never build a set of capabilities from an agent's grants, and never add a helper that relates one capability to another.
@@ -31,7 +31,7 @@ The permission contract is a shared boundary. It changes only by agreement betwe
 - The checks never throw. `isGrantActive` returns false for a malformed record or an invalid `now`. `hasGrant` returns false for a malformed request, an invalid `now`, a list that is not an array, or a list whose length or elements cannot be read. It skips a malformed record, a hole, or an accessor in the list, which never grants and does not stop another record from granting. Treat false as a denial, and never retry with a looser request.
 - `CAPABILITY_RISK` is for presentation only. The permission screen presents `terminal.execute` as the highest-risk capability ([ADR 0015](../../docs/architecture/decisions/0015-capability-and-permission-contract-v0.md)).
 - A grant never carries a credential. A `ProviderConnectionId` names connection metadata only.
-- Under a strict Content Security Policy, the desktop renderer sets `z.config({ jitless: true })` before this package is evaluated, exactly as for `@mymandev/protocol` (see its README). This package creates its schemas when it is evaluated.
+- Under a strict Content Security Policy, a consumer that imports the main entry sets `z.config({ jitless: true })` before this package is evaluated, exactly as for `@mymandev/protocol` (see its README). The main entry creates its schemas when it is evaluated. The capabilities subpath creates none and needs no setting.
 
 ## Not included
 
