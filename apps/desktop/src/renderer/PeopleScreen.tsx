@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type {
+  ClaimsBridge,
   InvitationActionsBridge,
   InvitationsBridge,
   JoinRequestActionsBridge,
@@ -7,6 +8,13 @@ import type {
   PeopleActionsBridge,
   PeopleBridge,
 } from "../shared/desktop-bridge.ts";
+import {
+  claimsReport,
+  IDLE_RECENT_CLAIMS,
+  describeRecentClaims,
+  type ClaimsScreenView,
+  type RecentClaimsView,
+} from "./claims-view.ts";
 import {
   INVITATION_ACTION_MESSAGE_ID,
   InvitationCodeBox,
@@ -72,6 +80,14 @@ import {
   type PeopleScreenView,
   type PersonRow,
 } from "./people-view.ts";
+import {
+  CLAIM_ACTION_MESSAGE_ID,
+  RecentClaimsPart,
+  useClaimsRendered,
+  useClaimsScreen,
+  useRecentClaims,
+  type RecentClaimHandlers,
+} from "./RecentClaims.tsx";
 
 /**
  * The people of the selected workspace (#95, decision D3): the active
@@ -82,7 +98,9 @@ import {
  * with the people that the main process sends. The owner and the admins
  * also see the open invitations, invite each unclaimed person, and revoke
  * invitations (#95, D2 and D3), and they see the pending join requests and
- * the blocked accounts and decide on them (#95, D1 and D3).
+ * the blocked accounts and decide on them (#95, D1 and D3), and the recent
+ * claims, with "Remove" through the people actions' question (#95, D8 and
+ * D9).
  */
 export function PeopleScreen({
   people,
@@ -91,6 +109,8 @@ export function PeopleScreen({
   invitationActions,
   joinRequests,
   joinRequestActions,
+  claims,
+  shellDialogOpen = false,
 }: {
   /** The people functions from the preload script; undefined outside Electron. */
   readonly people: PeopleBridge | undefined;
@@ -104,10 +124,19 @@ export function PeopleScreen({
   readonly joinRequests?: JoinRequestsBridge | undefined;
   /** The join request actions from the preload script; undefined outside Electron. */
   readonly joinRequestActions?: JoinRequestActionsBridge | undefined;
+  /** The recent claims from the preload script; undefined outside Electron. */
+  readonly claims?: ClaimsBridge | undefined;
+  /**
+   * Whether a modal dialog of the shell is open, the question before a
+   * switch or the dialog of a create: the screen behind it is inert, so it
+   * reports no claim as shown meanwhile.
+   */
+  readonly shellDialogOpen?: boolean | undefined;
 }) {
   const view = usePeopleScreen(people);
   const invitationsView = useInvitationsScreen(invitations);
   const joinRequestsView = useJoinRequestsScreen(joinRequests);
+  const claimsView = useClaimsScreen(claims);
   const peopleNow = usePeopleClock(view);
   const invitationsNow = useInvitationsClock(invitationsView);
   // The later of the two readings, so that both the offer and the
@@ -126,6 +155,20 @@ export function PeopleScreen({
     view,
     joinRequestsView,
   );
+  const claimParts = useRecentClaims(claims);
+  // The claims that this render shows: each view goes in whole.
+  const claimsSeen = claimsReport({
+    people: view,
+    claims: claimsView,
+    marked: claimParts.view.marked,
+    attention: claimParts.attention,
+    rowsInView: claimParts.rowsInView,
+    shellDialogOpen: shellDialogOpen === true,
+    peopleActions: actions,
+    invitationActions: invitationParts.actions,
+    joinRequestActions: joinRequestParts.actions,
+  });
+  useClaimsRendered(claimParts.controller, view, claimsView, claimsSeen);
   return (
     <PeopleScreenContent
       view={view}
@@ -138,6 +181,9 @@ export function PeopleScreen({
       joinRequests={joinRequestsView}
       joinRequestActions={joinRequestParts.actions}
       joinRequestHandlers={joinRequestParts.handlers}
+      claims={claimsView}
+      claimActions={claimParts.view}
+      claimHandlers={claimParts.handlers}
     />
   );
 }
@@ -179,6 +225,15 @@ export interface PeopleScreenContentProps {
    * no join requests part, no question, and no code's dialog of its own.
    */
   readonly joinRequestHandlers?: JoinRequestActionHandlers | undefined;
+  /** The recent claims; unavailable by default. */
+  readonly claims?: ClaimsScreenView | undefined;
+  /** What the screen shows of its recent claims beyond their state; idle by default. */
+  readonly claimActions?: RecentClaimsView | undefined;
+  /**
+   * The recent claims' handlers; undefined without the bridge, with no
+   * recent claims section and no paragraph for the refresh's sentence.
+   */
+  readonly claimHandlers?: RecentClaimHandlers | undefined;
 }
 
 /**
@@ -214,6 +269,14 @@ export interface PeopleScreenContentProps {
  * actions' one. One action of any of the three kinds runs at a time, and
  * "Deny and invite instead" shows its invitation's code in a code dialog of
  * its own (D2).
+ *
+ * With the claim handlers, the owner and the admins also see the recent
+ * claims (`describeRecentClaims`; #95, D8) first, below the hint and the
+ * offer and above the people, so that the section is in view when the
+ * screen opens, while the claims do not say `not_allowed`; the sentence of
+ * the last refresh sits in its own status paragraph after the join request
+ * actions' one. "Remove" on a claim is the people list's own removal of the
+ * person, with the same question and the same focus afterwards (D9).
  */
 export function PeopleScreenContent({
   view,
@@ -228,6 +291,9 @@ export function PeopleScreenContent({
   joinRequests = { kind: "unavailable" },
   joinRequestActions = IDLE_JOIN_REQUEST_ACTIONS,
   joinRequestHandlers,
+  claims = { kind: "unavailable" },
+  claimActions = IDLE_RECENT_CLAIMS,
+  claimHandlers,
 }: PeopleScreenContentProps) {
   const { status, workspaceName, lists, adminHint } =
     describePeopleScreen(view);
@@ -278,6 +344,15 @@ export function PeopleScreenContent({
     isJoinRequestOffered(joinRequestModel, joinRequestActions.dialog.request)
       ? joinRequestActions.dialog
       : undefined;
+  const claimModel =
+    claimHandlers === undefined
+      ? null
+      : describeRecentClaims(
+          view,
+          claims,
+          claimActions.marked,
+          model?.personActions,
+        );
   return (
     <section aria-labelledby={PEOPLE_TITLE_ID}>
       <h2 id={PEOPLE_TITLE_ID} tabIndex={-1}>
@@ -319,6 +394,11 @@ export function PeopleScreenContent({
           {joinRequestActions.message ?? ""}
         </p>
       )}
+      {claimHandlers === undefined ? null : (
+        <p className="people-status" id={CLAIM_ACTION_MESSAGE_ID} role="status">
+          {claimActions.message ?? ""}
+        </p>
+      )}
       {adminHint ? (
         <p className="people-hint">{PEOPLE_MESSAGES.adminHint}</p>
       ) : null}
@@ -328,6 +408,17 @@ export function PeopleScreenContent({
           format={times}
           inert={inert}
           onStart={handlers.onStart}
+        />
+      )}
+      {claimModel === null || claimHandlers === undefined ? null : (
+        <RecentClaimsPart
+          model={claimModel}
+          dateFormat={format}
+          timeFormat={times}
+          inert={inert}
+          onStart={handlers?.onStart}
+          onRefresh={claimHandlers.onRefresh}
+          rowRef={claimHandlers.rowRef}
         />
       )}
       {lists === null ? null : (

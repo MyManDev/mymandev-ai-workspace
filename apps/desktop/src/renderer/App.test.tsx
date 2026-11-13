@@ -5,6 +5,7 @@ import type {
   AccountBridge,
   AgentBridge,
   ChatBridge,
+  ClaimsBridge,
   ConnectionBridge,
   DeviceListBridge,
   InvitationActionsBridge,
@@ -24,6 +25,7 @@ import {
   DEVICE_KEY_STATES,
   DEVICE_STATES,
   type AccountStatus,
+  type ClaimsView,
   type RemoveDeviceResult,
   type WorkspaceView,
 } from "../shared/ipc-contract.ts";
@@ -646,6 +648,93 @@ test("the people screen gets the join requests: with their two bridges, it has t
     ).not.toContain("join-request-action-message");
   }
   expect(render(bridges)).not.toContain("join-request-action-message");
+});
+
+test("the people screen gets the recent claims: with the bridge, it has the paragraph of the refresh's sentence, and nothing is read, loaded, or reported while rendered", () => {
+  const people: PeopleBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const calls: string[] = [];
+  const call = (name: string) => () => {
+    calls.push(name);
+    return Promise.reject(new Error("not called"));
+  };
+  const claims: ClaimsBridge = {
+    getState: call("getState"),
+    subscribeState: () => {
+      calls.push("subscribeState");
+      return () => undefined;
+    },
+    load: call("load"),
+    markSeen: call("markSeen"),
+  };
+  const paragraph =
+    '<p class="people-status" id="claim-action-message" role="status"></p>';
+  expect(
+    render({ people, claims, initialView: { screen: "people" } }),
+  ).toContain(paragraph);
+  // The subscriptions run in effects, which a server render does not run;
+  // nothing else is called.
+  expect(calls).toEqual([]);
+  // Without the bridge, or on another screen, nothing of it shows.
+  expect(render({ people, initialView: { screen: "people" } })).not.toContain(
+    "claim-action-message",
+  );
+  expect(render({ people, claims })).not.toContain("claim-action-message");
+});
+
+test("the sidebar's People item carries the marker while the selected workspace's claims hold an unseen one, on every screen", () => {
+  const claims: ClaimsBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+    load: () => Promise.reject(new Error("not called")),
+    markSeen: () => Promise.reject(new Error("not called")),
+  };
+  const unseen: ClaimsView = {
+    revision: 3,
+    status: "ready",
+    workspaceId: "workspace-b",
+    claims: [
+      {
+        memberId: "member-a",
+        login: "kjohnson",
+        verifiedAt: "2026-11-12T09:00:00.000Z",
+        accountCreatedAt: "2026-10-01T00:00:00.000Z",
+        via: "invitation",
+        claimedAt: "2026-11-12T09:30:00.000Z",
+        unseen: true,
+      },
+    ],
+  };
+  const marker =
+    '<button type="button" class="nav-item" aria-label="People, new claims">People<span class="nav-marker" aria-hidden="true"></span></button>';
+  for (const initialView of [
+    undefined,
+    { screen: "account" },
+    { screen: "chat", projectId: "project-a", panel: "agents" },
+  ] as const) {
+    expect(
+      render({ claims, initialClaimsState: unseen, initialView }),
+    ).toContain(marker);
+  }
+  // Seen claims, another workspace's claims, and no state yet mark nothing.
+  for (const props of [
+    {
+      initialClaimsState: {
+        ...unseen,
+        claims: unseen.claims.map((claim) => ({ ...claim, unseen: false })),
+      },
+    },
+    { initialClaimsState: { ...unseen, workspaceId: "workspace-a" } },
+    {},
+  ] satisfies Partial<AppProps>[]) {
+    const html = render({ claims, ...props });
+    expect(html).toContain(
+      '<button type="button" class="nav-item">People</button>',
+    );
+    expect(html).not.toContain("nav-marker");
+  }
 });
 
 test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {

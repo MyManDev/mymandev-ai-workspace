@@ -180,3 +180,12 @@ test("the selected navigation item and tab keep a mark in forced colors", () => 
     /@media \(forced-colors: active\) \{\s*\.nav-item\[aria-current\],\s*\.panel-tab\[aria-selected="true"\] \{\s*text-decoration: underline;/,
   );
 });
+
+test("the sidebar's dot of unseen claims has the accent color, and in forced colors the system color of a button's text", () => {
+  expect(rulesWith(".nav-marker")).toEqual([
+    expect.stringContaining("background: var(--color-accent);"),
+    expect.stringMatching(
+      /^\s*forced-color-adjust: none;\s*background: ButtonText;\s*$/,
+    ),
+  ]);
+});
