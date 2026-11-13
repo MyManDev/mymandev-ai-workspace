@@ -121,6 +121,7 @@ export function HomeScreen({
           <CreateStatus
             place="home"
             message={creation.view.message}
+            created={creation.created}
             className="account-message"
           />
           <CreatedOpenButton

@@ -151,13 +151,26 @@ export function describeCreation(view: WorkspacePanelView): CreationOffer {
   };
 }
 
-/** The sentence after a create that the API confirmed. */
+/**
+ * The short sentence after a confirmed create of a new workspace that was
+ * not selected or of a new project, while its button follows it
+ * (`describeCreateSentence`); each is the start of its long sentence.
+ */
+export const CREATE_DONE_SHORT_MESSAGES: Readonly<Record<CreateKind, string>> =
+  Object.freeze({
+    workspace: "The workspace was created.",
+    project: "The project was created.",
+  });
+
+/**
+ * The sentence after a create that the API confirmed. Without its button,
+ * the sentence of a new workspace that was not selected and of a new
+ * project ends with what to do instead.
+ */
 export const CREATE_DONE_MESSAGES = Object.freeze({
   workspaceSelected: "The workspace was created and selected.",
-  workspaceNotSelected:
-    "The workspace was created. Select it in the list of workspaces to open it.",
-  project:
-    "The project was created. It shows in the list of projects once the server reports it.",
+  workspaceNotSelected: `${CREATE_DONE_SHORT_MESSAGES.workspace} Select it in the list of workspaces to open it.`,
+  project: `${CREATE_DONE_SHORT_MESSAGES.project} It shows in the list of projects once the server reports it.`,
 });
 
 /** The start of the sentence after a create that did not happen. */
@@ -285,9 +298,16 @@ export type CreatedItem =
 /** The sentence of the last create and where it shows. */
 export interface CreateMessage {
   readonly place: CreatePlace;
+  /** The whole sentence; see `describeCreateSentence` for what shows. */
   readonly text: string;
   /** What the create made that the sentence may offer to open, or undefined. */
   readonly created?: CreatedItem | undefined;
+  /**
+   * True once the sentence's button has shown: from then on the sentence
+   * stays short (`describeCreateSentence`), also after the button left,
+   * as once the new project is open.
+   */
+  readonly offered?: boolean | undefined;
 }
 
 /** The button that a create's sentence offers, at the sentence's place. */
@@ -351,6 +371,56 @@ export function describeCreatedOffer(
         projectId: created.projectId,
       })
     : undefined;
+}
+
+/** The sentence of a create as its status paragraph shows it, in two parts. */
+export interface CreateSentence {
+  /** The start, which stays the same while the sentence lasts. */
+  readonly start: string;
+  /** The rest of the long sentence, or "" for a short or a one-part sentence. */
+  readonly rest: string;
+}
+
+/**
+ * The sentence `message` as its status paragraph shows it, with `created`,
+ * the button that it offers by the latest state (`describeCreatedOffer`),
+ * or undefined (the Project Manager's decision for #263):
+ *
+ * - while the button follows it, and from then on while the sentence
+ *   lasts (`offered`), the sentence of a new workspace or project is the
+ *   short one, "The workspace was created." or "The project was created.";
+ * - before the button shows, it is the long one, whose `rest` says what to
+ *   do without the button ("Select it in the list of workspaces to open
+ *   it." or "It shows in the list of projects once the server reports
+ *   it.");
+ * - every other sentence, such as "The workspace was created and
+ *   selected.", has no `rest`.
+ *
+ * The status paragraph is a polite, atomic live region (`role="status"`)
+ * that shows `rest` as a text node of its own after `start`. The short
+ * sentence is the start of the long one, so it shortens by removing that
+ * node alone, which a screen reader does not announce (ARIA's default
+ * `aria-relevant` is additions and text), and once short it never grows
+ * back: the same create is announced once.
+ */
+export function describeCreateSentence(
+  message: CreateMessage,
+  created: CreatedOffer | undefined,
+): CreateSentence {
+  const short =
+    message.created === undefined
+      ? undefined
+      : CREATE_DONE_SHORT_MESSAGES[message.created.kind];
+  if (short === undefined || !message.text.startsWith(short)) {
+    return { start: message.text, rest: "" };
+  }
+  return {
+    start: short,
+    rest:
+      created !== undefined || message.offered === true
+        ? ""
+        : message.text.slice(short.length),
+  };
 }
 
 /** The existing paths that "Open this workspace" and "Open this project" take. */
@@ -474,7 +544,9 @@ export interface Creation {
    * - a switch of the selected workspace ends a project's dialog, its name,
    *   and its sentence, which belong to the workspace that they were about;
    *   the sentence of a workspace's create stays through the switch to the
-   *   workspace that it selected, and ends with any other switch.
+   *   workspace that it selected, and ends with any other switch;
+   * - once a state offers the sentence's button, the sentence is marked
+   *   `offered`, so that it stays short (`describeCreateSentence`).
    */
   readonly viewChanged: (view: WorkspacePanelView) => void;
   /**
@@ -533,6 +605,56 @@ export function createCreation(
     onView(Object.freeze({ running, dialog, homeDraft, homeProblem, message }));
 
   /**
+   * Marks the sentence once the latest state offers its button, so that it
+   * stays short after the button leaves (`describeCreateSentence`).
+   * Returns whether it changed.
+   */
+  function markOffered(): boolean {
+    if (
+      message === undefined ||
+      message.offered === true ||
+      describeCreatedOffer(message, latest) === undefined
+    ) {
+      return false;
+    }
+    message = Object.freeze({ ...message, offered: true });
+    return true;
+  }
+
+  /**
+   * Follows the selected workspace `next`: a switch ends a project's
+   * dialog, its name, and its sentence; a workspace's sentence stays only
+   * through the switch to the workspace that its create selected. Returns
+   * whether the view changed.
+   */
+  function followSelection(next: string | null): boolean {
+    const before = selected;
+    selected = next;
+    if (before === undefined || before === selected) {
+      return false;
+    }
+    selection += 1;
+    let changed = false;
+    if (dialog?.place === "projects") {
+      dialog = undefined;
+      changed = true;
+    }
+    projectDraft = "";
+    projectDraftIn = null;
+    if (
+      message !== undefined &&
+      (message.place === "projects" || createdSelected !== selected)
+    ) {
+      message = undefined;
+      changed = true;
+    }
+    if (createdSelected !== selected) {
+      createdSelected = undefined;
+    }
+    return changed;
+  }
+
+  /**
    * Runs one create from `place` and says how it went there. A project's
    * answer counts only while its workspace has stayed selected since the
    * create started; a workspace's while the same session is signed in. An
@@ -574,6 +696,8 @@ export function createCreation(
         text: sentence,
         created: createdItem(workspaceId, result),
       });
+      // The state may list it before the answer comes.
+      markOffered();
     }
     if (ok && result !== undefined && "selected" in result) {
       createdSelected = result.selected ? result.workspaceId : undefined;
@@ -729,30 +853,9 @@ export function createCreation(
         return;
       }
       signedOut = false;
-      const before = selected;
-      selected = state.selectedWorkspaceId;
-      if (before === undefined || before === selected) {
-        return;
-      }
-      selection += 1;
-      let changed = false;
-      if (dialog?.place === "projects") {
-        dialog = undefined;
-        changed = true;
-      }
-      projectDraft = "";
-      projectDraftIn = null;
-      if (
-        message !== undefined &&
-        (message.place === "projects" || createdSelected !== selected)
-      ) {
-        message = undefined;
-        changed = true;
-      }
-      if (createdSelected !== selected) {
-        createdSelected = undefined;
-      }
-      if (changed) {
+      const switched = followSelection(state.selectedWorkspaceId);
+      const marked = markOffered();
+      if (switched || marked) {
         show();
       }
     },

@@ -90,6 +90,7 @@ export function WorkspaceNav({
           <CreateStatus
             place="workspaces"
             message={creation.view.message}
+            created={creation.created}
             className="nav-empty nav-status"
           />
           <CreatedOpenButton
@@ -280,6 +281,7 @@ function ProjectList({
           <CreateStatus
             place="projects"
             message={creation.view.message}
+            created={creation.created}
             className="nav-empty nav-status"
           />
           <CreatedOpenButton

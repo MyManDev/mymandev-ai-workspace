@@ -11,6 +11,7 @@ import {
   CREATE_MESSAGES,
   createCreation,
   describeCreatedOffer,
+  describeCreateSentence,
   describeCreation,
   IDLE_CREATION,
   type CreateDialog,
@@ -128,20 +129,31 @@ export interface CreationControls {
 /**
  * The status paragraph of the creates at `place`, always in the page while
  * its place is, empty when there is nothing to say, so that a screen
- * reader announces a new sentence. The sentence is fixed text.
+ * reader announces a new sentence. The sentence is fixed text, short while
+ * its button `created` follows it and from then on
+ * (`describeCreateSentence`). The rest of a long sentence is a text node
+ * of its own, so that the sentence shortens without the start changing and
+ * is not announced again.
  */
 export function CreateStatus({
   place,
   message,
+  created,
   className,
 }: {
   readonly place: CreatePlace;
   readonly message: CreationView["message"];
+  readonly created: CreatedOffer | undefined;
   readonly className: string;
 }) {
+  const sentence =
+    message?.place === place
+      ? describeCreateSentence(message, created)
+      : undefined;
   return (
     <p className={className} id={CREATE_STATUS_IDS[place]} role="status">
-      {message?.place === place ? message.text : ""}
+      {sentence?.start ?? ""}
+      {sentence === undefined || sentence.rest === "" ? null : sentence.rest}
     </p>
   );
 }

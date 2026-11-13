@@ -19,6 +19,7 @@ import {
 } from "./Creation.tsx";
 import {
   CREATE_DONE_MESSAGES,
+  CREATE_DONE_SHORT_MESSAGES,
   CREATE_MESSAGES,
   describeCreatedOffer,
   describeCreation,
@@ -511,7 +512,7 @@ test("Open this workspace follows the sentence of a new workspace that was not s
     ),
   );
   expect(sidebar).toContain(
-    `<p class="nav-empty nav-status" id="create-status-workspaces" role="status">${CREATE_DONE_MESSAGES.workspaceNotSelected}</p><div class="nav-create"><button type="button" class="panel-action" aria-describedby="create-status-workspaces">${CREATE_MESSAGES.openWorkspace}</button></div><h2 class="nav-heading" id="projects-heading" tabindex="-1">`,
+    `<p class="nav-empty nav-status" id="create-status-workspaces" role="status">${CREATE_DONE_SHORT_MESSAGES.workspace}</p><div class="nav-create"><button type="button" class="panel-action" aria-describedby="create-status-workspaces">${CREATE_MESSAGES.openWorkspace}</button></div><h2 class="nav-heading" id="projects-heading" tabindex="-1">`,
   );
   expect(buttonLabels(sidebar)).not.toContain(CREATE_MESSAGES.openProject);
   expect(sidebar.split(CREATE_MESSAGES.openWorkspace)).toHaveLength(2);
@@ -525,7 +526,7 @@ test("Open this workspace follows the sentence of a new workspace that was not s
   );
   expect(home).toMatch(
     new RegExp(
-      `<p class="account-message" id="create-status-home" role="status">${CREATE_DONE_MESSAGES.workspaceNotSelected}</p><div class="account-actions"><button type="button" class="panel-action" aria-describedby="create-status-home">${CREATE_MESSAGES.openWorkspace}</button></div></section>$`,
+      `<p class="account-message" id="create-status-home" role="status">${CREATE_DONE_SHORT_MESSAGES.workspace}</p><div class="account-actions"><button type="button" class="panel-action" aria-describedby="create-status-home">${CREATE_MESSAGES.openWorkspace}</button></div></section>$`,
     ),
   );
   expect(home).not.toContain(NEW_WORKSPACE);
@@ -575,7 +576,7 @@ test("Open this project follows the sentence of a new project once the list of p
     ),
   );
   expect(html).toContain(
-    `New project</button></div><p class="nav-empty nav-status" id="create-status-projects" role="status">${CREATE_DONE_MESSAGES.project}</p><div class="nav-create"><button type="button" class="panel-action" aria-describedby="create-status-projects">${CREATE_MESSAGES.openProject}</button></div></nav>`,
+    `New project</button></div><p class="nav-empty nav-status" id="create-status-projects" role="status">${CREATE_DONE_SHORT_MESSAGES.project}</p><div class="nav-create"><button type="button" class="panel-action" aria-describedby="create-status-projects">${CREATE_MESSAGES.openProject}</button></div></nav>`,
   );
   expect(buttonLabels(html)).not.toContain(CREATE_MESSAGES.openWorkspace);
   for (const id of [NEW_PROJECT, PROJECT, WORKSPACE_A]) {
@@ -590,6 +591,84 @@ test("Open this project follows the sentence of a new project once the list of p
       nav(controls(NEW_PROJECT_SENTENCE, state).value, state),
     );
     expect(buttonLabels(other)).not.toContain(CREATE_MESSAGES.openProject);
+  }
+});
+
+test("the sentence is the long one before its button shows, the short one while the button follows it, and stays short once the button showed, with the rest of the long one as a text node of its own", () => {
+  /** The status paragraph's content at `place`, rendered. */
+  const status = (html: string, place: "workspaces" | "projects") =>
+    new RegExp(`id="create-status-${place}" role="status">(.*?)</p>`).exec(
+      html,
+    )?.[1];
+  const cases = [
+    {
+      place: "workspaces",
+      view: notSelected("workspaces"),
+      before: workspaceState(),
+      offered: WITH_NEW_WORKSPACE,
+      // The workspace leaves the list without a switch.
+      after: workspaceState(),
+      short: CREATE_DONE_SHORT_MESSAGES.workspace,
+      long: CREATE_DONE_MESSAGES.workspaceNotSelected,
+      rest: " Select it in the list of workspaces to open it.",
+      label: CREATE_MESSAGES.openWorkspace,
+    },
+    {
+      place: "projects",
+      view: NEW_PROJECT_SENTENCE,
+      before: workspaceState(),
+      offered: WITH_NEW_PROJECT,
+      // The new project is open.
+      after: { ...WITH_NEW_PROJECT, openProjectId: NEW_PROJECT },
+      short: CREATE_DONE_SHORT_MESSAGES.project,
+      long: CREATE_DONE_MESSAGES.project,
+      rest: " It shows in the list of projects once the server reports it.",
+      label: CREATE_MESSAGES.openProject,
+    },
+  ] as const;
+  for (const c of cases) {
+    // The short sentence is the start of the long one.
+    expect(c.long).toBe(`${c.short}${c.rest}`);
+    const render = (view: CreationView, state: WorkspaceView) =>
+      renderToString(nav(controls(view, state).value, state));
+
+    const before = render(c.view, c.before);
+    expect(status(before, c.place), c.place).toBe(
+      `${c.short}<!-- -->${c.rest}`,
+    );
+    expect(buttonLabels(before)).not.toContain(c.label);
+
+    const offered = render(c.view, c.offered);
+    expect(status(offered, c.place), c.place).toBe(c.short);
+    expect(buttonLabels(offered)).toContain(c.label);
+
+    // Once the button showed, the sentence stays short after it left.
+    const message = c.view.message;
+    const after = render(
+      {
+        ...c.view,
+        message:
+          message === undefined ? undefined : { ...message, offered: true },
+      },
+      c.after,
+    );
+    expect(status(after, c.place), c.place).toBe(c.short);
+    expect(buttonLabels(after)).not.toContain(c.label);
+  }
+  // The other sentences have one part, also with the mark.
+  for (const text of [
+    CREATE_DONE_MESSAGES.workspaceSelected,
+    CREATE_DONE_MESSAGES.project,
+  ]) {
+    const html = renderToString(
+      nav(
+        controls({
+          ...IDLE_CREATION,
+          message: { place: "workspaces", text, offered: true },
+        }).value,
+      ),
+    );
+    expect(status(html, "workspaces")).toBe(text);
   }
 });
 

@@ -137,7 +137,12 @@ vi.mock("react", async (importOriginal) => {
 // `App` and its modules load afresh, with the stand-in.
 vi.resetModules();
 const { App } = await import("./App.tsx");
-const { CREATE_MESSAGES } = await import("./creation-view.ts");
+const {
+  CREATE_DONE_MESSAGES,
+  CREATE_DONE_SHORT_MESSAGES,
+  CREATE_MESSAGES,
+  describeCreateSentence,
+} = await import("./creation-view.ts");
 const { PROJECTS_HEADING_ID, WORKSPACES_HEADING_ID } =
   await import("./Creation.tsx");
 
@@ -289,13 +294,26 @@ function shell(bridge: WorkspaceBridge) {
     }
     return found;
   };
+  const creation = () =>
+    propsWith<{
+      creation: import("./Creation.tsx").CreationControls;
+    }>("creation").creation;
   render();
   return {
     render,
-    creation: () =>
-      propsWith<{
-        creation: import("./Creation.tsx").CreationControls;
-      }>("creation").creation,
+    creation,
+    /**
+     * The sentence that the status paragraph shows by the controls that
+     * `App` passes on, as one text.
+     */
+    sentence: () => {
+      const { view, created } = creation();
+      if (view.message === undefined) {
+        return undefined;
+      }
+      const { start, rest } = describeCreateSentence(view.message, created);
+      return `${start}${rest}`;
+    },
     question: () =>
       propsWith<{
         question: import("./workspace-view.ts").SwitchQuestion | undefined;
@@ -331,8 +349,9 @@ test("App offers Open this workspace for an unselected new workspace, selects it
   await settle();
   app.render();
   expect(fake.calls).toContain("create Team Gamma");
-  // Not before the list holds it.
+  // Not before the list holds it, and the long sentence says what to do.
   expect(app.creation().created).toBeUndefined();
+  expect(app.sentence()).toBe(CREATE_DONE_MESSAGES.workspaceNotSelected);
 
   const listed = [
     { id: NEW_WORKSPACE, name: "Team Gamma" },
@@ -347,6 +366,8 @@ test("App offers Open this workspace for an unselected new workspace, selects it
     workspaceId: NEW_WORKSPACE,
   });
   expect(CREATE_MESSAGES.openWorkspace).toBe("Open this workspace");
+  // Next to the button, the sentence is the short one.
+  expect(app.sentence()).toBe(CREATE_DONE_SHORT_MESSAGES.workspace);
 
   // No question is open before the click.
   expect(app.question().question).toBeUndefined();
@@ -402,6 +423,7 @@ test("App offers Open this project once its event lists it, and opens it through
   app.render();
   expect(fake.calls).toContain(`createProject ${WORKSPACE_A} Roadmap`);
   expect(app.creation().created).toBeUndefined();
+  expect(app.sentence()).toBe(CREATE_DONE_MESSAGES.project);
 
   // Its `workspace.project.created` event lists it.
   const projects = [
@@ -415,6 +437,7 @@ test("App offers Open this project once its event lists it, and opens it through
     place: "projects",
     projectId: NEW_PROJECT,
   });
+  expect(app.sentence()).toBe(CREATE_DONE_SHORT_MESSAGES.project);
 
   // No question is open before the click.
   expect(app.question().question).toBeUndefined();
@@ -450,6 +473,8 @@ test("App offers Open this project once its event lists it, and opens it through
   app.render();
   expect(app.creation().created).toBeUndefined();
   expect(focused).toEqual([PROJECTS_HEADING_ID]);
+  // The sentence stays short; it does not grow back.
+  expect(app.sentence()).toBe(CREATE_DONE_SHORT_MESSAGES.project);
 });
 
 test("App moves the focus to the Workspaces heading when Open this project leaves while the Projects heading is not on the page", async () => {

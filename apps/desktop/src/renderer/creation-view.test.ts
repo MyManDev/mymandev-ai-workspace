@@ -11,6 +11,7 @@ import {
 } from "../shared/ipc-contract.ts";
 import {
   CREATE_DONE_MESSAGES,
+  CREATE_DONE_SHORT_MESSAGES,
   CREATE_MESSAGES,
   CREATE_NOT_DONE_MESSAGES,
   CREATE_NOT_SENT,
@@ -20,11 +21,13 @@ import {
   createdOpenPaths,
   describeCreatedOffer,
   describeCreateResult,
+  describeCreateSentence,
   describeCreation,
   IDLE_CREATION,
   MAX_NEW_NAME_LENGTH,
   nameToSend,
   newNamePrompt,
+  type CreateMessage,
   type CreationView,
 } from "./creation-view.ts";
 import {
@@ -568,6 +571,7 @@ test("a sign-out ends the dialog, the names, the problems, and the sentence, and
 // 2026-11-12 on #95).
 
 const NEW_PROJECT = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192e2";
+const OTHER_PROJECT = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192e3";
 
 /** The list after the main process added the new workspace. */
 const WITH_NEW_WORKSPACE: Partial<WorkspaceView> = {
@@ -737,6 +741,145 @@ test("Open this project is offered once the list of projects holds the new proje
       known({ ...WITH_NEW_PROJECT, openProjectId: PROJECT }),
     ),
   ).toBeDefined();
+});
+
+test("next to its button, the sentence of a new workspace or project is the short one, the start of the long one, which shows before the button and never after it showed; every other sentence has one part", () => {
+  expect(CREATE_DONE_SHORT_MESSAGES).toEqual({
+    workspace: "The workspace was created.",
+    project: "The project was created.",
+  });
+  expect(CREATE_DONE_MESSAGES.workspaceSelected).toBe(
+    "The workspace was created and selected.",
+  );
+  const workspace: CreateMessage = {
+    place: "workspaces",
+    text: CREATE_DONE_MESSAGES.workspaceNotSelected,
+    created: { kind: "workspace", workspaceId: NEW_WORKSPACE },
+  };
+  const project: CreateMessage = {
+    place: "projects",
+    text: CREATE_DONE_MESSAGES.project,
+    created: {
+      kind: "project",
+      workspaceId: WORKSPACE_A,
+      projectId: NEW_PROJECT,
+    },
+  };
+  // Before the button shows: the long sentence, whose start is the short one.
+  expect(describeCreateSentence(workspace, undefined)).toEqual({
+    start: "The workspace was created.",
+    rest: " Select it in the list of workspaces to open it.",
+  });
+  expect(describeCreateSentence(project, undefined)).toEqual({
+    start: "The project was created.",
+    rest: " It shows in the list of projects once the server reports it.",
+  });
+  // While the button follows it: the short one alone.
+  expect(
+    describeCreateSentence(
+      workspace,
+      describeCreatedOffer(workspace, known(WITH_NEW_WORKSPACE)),
+    ),
+  ).toEqual({ start: CREATE_DONE_SHORT_MESSAGES.workspace, rest: "" });
+  expect(
+    describeCreateSentence(
+      project,
+      describeCreatedOffer(project, known(WITH_NEW_PROJECT)),
+    ),
+  ).toEqual({ start: CREATE_DONE_SHORT_MESSAGES.project, rest: "" });
+  // Once it showed, also after it left.
+  expect(
+    describeCreateSentence({ ...workspace, offered: true }, undefined),
+  ).toEqual({ start: CREATE_DONE_SHORT_MESSAGES.workspace, rest: "" });
+  expect(
+    describeCreateSentence({ ...project, offered: true }, undefined),
+  ).toEqual({
+    start: CREATE_DONE_SHORT_MESSAGES.project,
+    rest: "",
+  });
+  for (const text of [
+    CREATE_DONE_MESSAGES.workspaceSelected,
+    CREATE_UNKNOWN_MESSAGES.workspace,
+    CREATE_UNKNOWN_MESSAGES.project,
+    `${CREATE_NOT_DONE_MESSAGES.project} ${CREATE_NOT_SENT}`,
+  ]) {
+    for (const offered of [undefined, true]) {
+      expect(
+        describeCreateSentence(
+          { place: "workspaces", text, offered },
+          undefined,
+        ),
+      ).toEqual({ start: text, rest: "" });
+    }
+  }
+});
+
+/** The sentence that `c` shows by the workspace state `view`. */
+function sentenceOf(
+  c: ReturnType<typeof controller>,
+  view: WorkspacePanelView,
+) {
+  const message = c.last().message;
+  return message === undefined
+    ? undefined
+    : describeCreateSentence(message, describeCreatedOffer(message, view));
+}
+
+test("a sentence is marked once a state offers its button, also when the state came before the answer, and stays marked after the button leaves; a new create starts unmarked", async () => {
+  // A project whose event lists it after the answer.
+  const p = controller();
+  await createProject(p, { outcome: "ok", projectId: NEW_PROJECT });
+  expect(p.last().message?.offered).toBeUndefined();
+  expect(sentenceOf(p, known())).toEqual({
+    start: CREATE_DONE_SHORT_MESSAGES.project,
+    rest: " It shows in the list of projects once the server reports it.",
+  });
+  const shown = p.views.length;
+  const listed = known(WITH_NEW_PROJECT);
+  p.creation.viewChanged(listed);
+  expect(p.views).toHaveLength(shown + 1);
+  expect(p.last().message).toMatchObject({
+    text: CREATE_DONE_MESSAGES.project,
+    offered: true,
+  });
+  expect(sentenceOf(p, listed)).toEqual({
+    start: CREATE_DONE_SHORT_MESSAGES.project,
+    rest: "",
+  });
+  // The same state again shows nothing new.
+  p.creation.viewChanged(known(WITH_NEW_PROJECT));
+  expect(p.views).toHaveLength(shown + 1);
+  // Once it is open, the button leaves, and the sentence stays short.
+  const open = known({ ...WITH_NEW_PROJECT, openProjectId: NEW_PROJECT });
+  p.creation.viewChanged(open);
+  expect(describeCreatedOffer(p.last().message, open)).toBeUndefined();
+  expect(sentenceOf(p, open)).toEqual({
+    start: CREATE_DONE_SHORT_MESSAGES.project,
+    rest: "",
+  });
+  // A new create starts with the long sentence again.
+  await createProject(p, { outcome: "ok", projectId: OTHER_PROJECT });
+  expect(p.last().message?.offered).toBeUndefined();
+  expect(sentenceOf(p, open)?.rest).not.toBe("");
+
+  // A workspace that the list holds before the answer comes.
+  const c = controller();
+  c.creation.open("workspaces");
+  c.creation.editDialogDraft("Team Gamma");
+  const done = c.creation.confirm();
+  c.creation.viewChanged(known(WITH_NEW_WORKSPACE));
+  c.workspaces[0]?.resolve({ ...OK_SELECTED, selected: false });
+  await done;
+  expect(c.last().message).toMatchObject({
+    text: CREATE_DONE_MESSAGES.workspaceNotSelected,
+    offered: true,
+  });
+  // It leaves the list without a switch: the sentence stays short.
+  c.creation.viewChanged(known());
+  expect(sentenceOf(c, known())).toEqual({
+    start: CREATE_DONE_SHORT_MESSAGES.workspace,
+    rest: "",
+  });
 });
 
 test("Open this workspace goes through the sidebar's switch with the ID alone, and Open this project through the shell's open-project, once per click", async () => {
