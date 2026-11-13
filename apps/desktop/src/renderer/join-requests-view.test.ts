@@ -3,13 +3,11 @@ import type {
   InvitationActionsBridge,
   JoinRequestActionsBridge,
   JoinRequestsBridge,
-  PeopleActionsBridge,
 } from "../shared/desktop-bridge.ts";
 import type {
   ApproveJoinRequestResult,
   BlockedJoinRequestView,
   CreateInvitationResult,
-  DefinePersonResult,
   JoinRequestActionRefusal,
   JoinRequestActionResult,
   JoinRequestLoadResult,
@@ -21,6 +19,7 @@ import type {
 import {
   ASKING_JOIN_REQUEST_ACTIONS,
   createJoinRequestActions,
+  defaultInvitee,
   describeJoinRequestActionResult,
   describeJoinRequestQuestion,
   describeJoinRequests,
@@ -34,16 +33,15 @@ import {
   JOIN_REQUEST_ACTION_UNKNOWN_MESSAGES,
   JOIN_REQUEST_MESSAGES,
   JOIN_REQUEST_PROBLEM_MESSAGES,
+  JOIN_REQUEST_QUESTION_MESSAGES,
   JOIN_REQUEST_REFRESH_MESSAGES,
+  joinRequestDialogsOpen,
   type JoinRequestActionKind,
   type JoinRequestActionRequest,
   type JoinRequestActionsView,
   type JoinRequestsScreenView,
 } from "./join-requests-view.ts";
-import {
-  MAX_PERSON_NAME_LENGTH,
-  PEOPLE_ACTION_UNKNOWN_MESSAGES,
-} from "./people-actions-view.ts";
+import { MAX_PERSON_NAME_LENGTH } from "./people-actions-view.ts";
 import { INVITATION_ACTION_UNKNOWN_MESSAGES } from "./invitations-view.ts";
 import type { PeopleScreenView } from "./people-view.ts";
 
@@ -54,6 +52,8 @@ const ADMIN = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c2";
 const MEMBER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c3";
 const UNCLAIMED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c4";
 const FORMER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c5";
+const KATHERINE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c6";
+const OTHER_KATHERINE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c7";
 const NEW_PERSON = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c9";
 const REQUEST = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1";
 const SECOND_REQUEST = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d2";
@@ -158,6 +158,7 @@ const ON_REQUEST = {
   joinRequestId: REQUEST,
   name: "Katherine",
   login: "kjohnson",
+  accountCreatedAt: "2026-10-01T00:00:00.000Z",
 };
 const APPROVE: JoinRequestActionRequest = { kind: "approve", ...ON_REQUEST };
 const INVITE: JoinRequestActionRequest = { kind: "invite", ...ON_REQUEST };
@@ -274,6 +275,27 @@ test("the owner and the admins see each pending request with its actions in orde
   expect(empty?.blocked).toHaveLength(1);
 });
 
+test("Deny and invite instead is offered only while the workspace has an active unclaimed person", () => {
+  // A claimed person and a former unclaimed one do not count.
+  const withoutUnclaimed = known({
+    people: READY.people.filter((one) => one.memberId !== UNCLAIMED),
+  });
+  const model = describeJoinRequests(withoutUnclaimed, listed());
+  expect(model?.unclaimed).toEqual([]);
+  expect(model?.pending[0]?.actions).toEqual([APPROVE, DENY, BLOCK_REQUEST]);
+  expect(isJoinRequestOffered(model, INVITE)).toBe(false);
+  // With one, it is offered on every pending request.
+  const offered = describeJoinRequests(known(), listed());
+  for (const row of offered?.pending ?? []) {
+    expect(row.actions.map((action) => action.kind)).toEqual([
+      "approve",
+      "invite",
+      "deny",
+      "block",
+    ]);
+  }
+});
+
 test("members see no join requests part, and neither does anyone while the people are not ready, without an own active manager, or while the join requests say not_allowed", () => {
   const nothing: [PeopleScreenView, JoinRequestsScreenView][] = [
     [known({ ownMemberId: MEMBER }), listed()],
@@ -385,15 +407,16 @@ test("a question stays offered only as it was asked", () => {
   ).toBe(false);
 });
 
-test("deny, deny all, block, the approval, and Deny and invite instead ask first; an unblock, a pause, and a resume do not", () => {
+test("deny, deny all, block, the approval, Deny and invite instead, and an unblock ask first; a pause and a resume do not", () => {
   expect([...ASKING_JOIN_REQUEST_ACTIONS].sort()).toEqual([
     "approve",
     "block",
     "deny",
     "denyAll",
     "invite",
+    "unblock",
   ]);
-  for (const request of [UNBLOCK, PAUSE, RESUME]) {
+  for (const request of [PAUSE, RESUME]) {
     expect(describeJoinRequestQuestion(request)).toBeUndefined();
   }
   expect(describeJoinRequestQuestion(DENY)?.title).toBe("Deny this request?");
@@ -403,14 +426,28 @@ test("deny, deny all, block, the approval, and Deny and invite instead ask first
   expect(describeJoinRequestQuestion(BLOCK_REQUEST)?.text).toBe(
     "The request ends, and this account cannot ask to join this workspace again until it is unblocked.",
   );
-  // The composition's question says that the invitation comes first, and
-  // that the request stays pending when it cannot be created.
+  // An unblock asks as a block does (the decision of 2026-11-13).
+  expect(describeJoinRequestQuestion(UNBLOCK)).toEqual({
+    title: "Unblock this account?",
+    text: "The block ends, and this account can ask to join this workspace again at once.",
+    confirm: "Unblock",
+  });
+  // The composition's question asks for an unclaimed person, says that the
+  // invitation comes first, and that the request stays pending when it
+  // cannot be created.
   const invite = describeJoinRequestQuestion(INVITE)?.text ?? "";
-  expect(invite).toContain("First an invitation is created");
+  expect(invite).toContain(
+    "Choose the unclaimed person that this account should claim, and check the login and the creation date of the GitHub account, not only the name.",
+  );
+  expect(invite).toContain("First an invitation is created for that person");
   expect(invite).toContain("its code is shown once");
   expect(invite).toContain("Only then is the request denied.");
   expect(invite).toContain(
     "If the invitation cannot be created, the request stays pending.",
+  );
+  expect(invite).not.toContain("new person");
+  expect(describeJoinRequestQuestion(APPROVE)?.text).toContain(
+    "Check the login and the creation date of the GitHub account",
   );
 });
 
@@ -505,7 +542,6 @@ interface Answers {
   readonly pause?: () => Promise<JoinRequestActionResult>;
   readonly resume?: () => Promise<JoinRequestActionResult>;
   readonly load?: () => Promise<JoinRequestLoadResult>;
-  readonly define?: () => Promise<DefinePersonResult>;
   readonly create?: () => Promise<CreateInvitationResult>;
 }
 
@@ -548,9 +584,6 @@ function controllerWith(
       joinRequests: {
         load: record("load", answers.load ?? NOT_CALLED),
       } as unknown as Pick<JoinRequestsBridge, "load">,
-      peopleActions: {
-        define: record("define", answers.define ?? NOT_CALLED),
-      } as unknown as Pick<PeopleActionsBridge, "define">,
       invitationActions: {
         create: record("create", answers.create ?? NOT_CALLED),
       } as unknown as Pick<InvitationActionsBridge, "create">,
@@ -585,8 +618,6 @@ async function settle(): Promise<void> {
 const OK = () => Promise.resolve<JoinRequestActionResult>({ outcome: "ok" });
 const UNKNOWN = () =>
   Promise.resolve<JoinRequestActionResult>({ outcome: "unknown" });
-const DEFINED = () =>
-  Promise.resolve<DefinePersonResult>({ outcome: "ok", memberId: NEW_PERSON });
 const CREATED: CreateInvitationResult = {
   outcome: "ok",
   invitationId: NEW_INVITATION,
@@ -622,7 +653,14 @@ test("deny, deny all, and block ask first and send nothing until confirmed, then
 
 test("cancelling closes the question and sends nothing, also on a later confirmation", async () => {
   const { actions, calls, last } = controllerWith({});
-  for (const request of [DENY, DENY_ALL, BLOCK_REQUEST, APPROVE, INVITE]) {
+  for (const request of [
+    DENY,
+    DENY_ALL,
+    BLOCK_REQUEST,
+    APPROVE,
+    INVITE,
+    UNBLOCK,
+  ]) {
     await actions.start(request);
     actions.cancel();
     expect(last()).toEqual(IDLE_JOIN_REQUEST_ACTIONS);
@@ -631,21 +669,24 @@ test("cancelling closes the question and sends nothing, also on a later confirma
   expect(calls).toEqual([]);
 });
 
-test("an unblock, a pause, and a resume run at once, once, and resolve to true when confirmed", async () => {
-  const { actions, calls, last } = controllerWith({
-    unblock: OK,
-    pause: OK,
-    resume: OK,
-  });
-  expect(await actions.start(UNBLOCK)).toBe(true);
+test("an unblock asks first and sends nothing until confirmed, then once, and resolves to true, because its row leaves", async () => {
+  const { actions, calls, last } = controllerWith({ unblock: OK });
+  expect(await actions.start(UNBLOCK)).toBe(false);
+  expect(last().dialog?.request).toEqual(UNBLOCK);
+  expect(calls).toEqual([]);
+  expect(await actions.confirm()).toBe(true);
   expect(last().message).toBe("The account is no longer blocked.");
-  expect(await actions.start(PAUSE)).toBe(true);
+  expect(calls).toEqual([{ name: "unblock", args: [WORKSPACE, BLOCKED] }]);
+});
+
+test("a pause and a resume run at once, once, and resolve to false when confirmed, so that the focus stays on their button", async () => {
+  const { actions, calls, last } = controllerWith({ pause: OK, resume: OK });
+  expect(await actions.start(PAUSE)).toBe(false);
   expect(last().message).toBe("New join requests are paused.");
   actions.listChanged(known(), listed({ pausedAt: PAUSED_AT }));
-  expect(await actions.start(RESUME)).toBe(true);
+  expect(await actions.start(RESUME)).toBe(false);
   expect(last().message).toBe("New join requests are accepted again.");
   expect(calls).toEqual([
-    { name: "unblock", args: [WORKSPACE, BLOCKED] },
     { name: "pause", args: [WORKSPACE] },
     { name: "resume", args: [WORKSPACE] },
   ]);
@@ -663,8 +704,8 @@ test("an approval starts with the requested name, sends null for it unchanged an
   expect(last().dialog).toEqual({
     request: APPROVE,
     draft: "Katherine",
+    invitee: undefined,
     problem: undefined,
-    choice: { kind: "new" },
   });
   expect(await actions.confirm()).toBe(true);
   await actions.start(APPROVE);
@@ -819,13 +860,18 @@ test("an open question ends once the screen no longer offers it as it was asked,
     [UNBLOCK, known(), listed({ blocked: [] })],
     // The last pending request went.
     [DENY_ALL, known(), listed({ pending: [] })],
+    // The last active unclaimed person went, with nobody chosen.
+    [
+      INVITE,
+      known({
+        people: READY.people.filter((one) => one.memberId !== UNCLAIMED),
+      }),
+      listed(),
+    ],
   ];
   for (const [request, people, joinRequests] of cases) {
     const { actions, calls, last } = controllerWith({});
-    actions.start(request).catch(() => undefined);
-    if (!ASKING_JOIN_REQUEST_ACTIONS.has(request.kind)) {
-      continue;
-    }
+    await actions.start(request);
     expect(last().dialog?.request).toEqual(request);
     actions.listChanged(people, joinRequests);
     expect(last().dialog, request.kind).toBeUndefined();
@@ -867,7 +913,9 @@ test("refreshing asks the main process to load once, says so until the next stat
   expect(failing.last().message).toBe(JOIN_REQUEST_REFRESH_MESSAGES.failed);
 });
 
-// "Deny and invite instead": the invitation first, then the denial.
+/// "Deny and invite instead": the invitation for a chosen active unclaimed
+// person first, then the denial (the decisions of 2026-11-12 and
+// 2026-11-13).
 
 /** Every console method, spied on, so that a test sees any log. */
 function spyOnConsole() {
@@ -876,23 +924,52 @@ function spyOnConsole() {
   );
 }
 
-test("Deny and invite instead defines a new person with the requested name, creates the invitation, shows its code once, and only then denies", async () => {
+/** The owner's people with two unclaimed people of the requested name, after Margaret. */
+const NAMESAKES = known({
+  people: [
+    ...READY.people,
+    person(KATHERINE, "Katherine", unclaimed),
+    person(OTHER_KATHERINE, "Katherine", unclaimed),
+  ],
+});
+
+test("the person chosen at first is the first unclaimed person, in the people's order, whose name is the requested name, or nobody", () => {
+  const options = [
+    { memberId: UNCLAIMED, name: "Margaret" },
+    { memberId: KATHERINE, name: "Katherine" },
+    { memberId: OTHER_KATHERINE, name: "Katherine" },
+  ];
+  expect(defaultInvitee(options, "Katherine")).toBe(KATHERINE);
+  expect(defaultInvitee([...options].reverse(), "Katherine")).toBe(
+    OTHER_KATHERINE,
+  );
+  // Only the same name, and nobody else by default.
+  expect(defaultInvitee(options, "katherine")).toBeUndefined();
+  expect(defaultInvitee(options, "Katherine ")).toBeUndefined();
+  expect(defaultInvitee(options, "Dorothy")).toBeUndefined();
+  expect(defaultInvitee([], "Katherine")).toBeUndefined();
+});
+
+test("Deny and invite instead chooses the unclaimed person of the requested name, creates the invitation, shows its code once, and only then denies", async () => {
   const logs = spyOnConsole();
   const deny = pending<JoinRequestActionResult>();
-  const { actions, calls, views, last } = controllerWith({
-    define: DEFINED,
-    create: () => Promise.resolve(CREATED),
-    deny: deny.answer,
-  });
+  const { actions, calls, views, last } = controllerWith(
+    { create: () => Promise.resolve(CREATED), deny: deny.answer },
+    NAMESAKES,
+  );
   await actions.start(INVITE);
-  expect(last().dialog?.choice).toEqual({ kind: "new" });
+  expect(last().dialog).toEqual({
+    request: INVITE,
+    draft: "",
+    invitee: KATHERINE,
+    problem: undefined,
+  });
   expect(calls).toEqual([]);
   const done = actions.confirm();
   await settle();
   // The code shows before the denial answers, and the action still runs.
   expect(calls).toEqual([
-    { name: "define", args: [WORKSPACE, "Katherine"] },
-    { name: "create", args: [WORKSPACE, NEW_PERSON] },
+    { name: "create", args: [WORKSPACE, KATHERINE] },
     { name: "deny", args: [WORKSPACE, REQUEST] },
   ]);
   expect(last()).toEqual({
@@ -917,7 +994,7 @@ test("Deny and invite instead defines a new person with the requested name, crea
   const before = views.length;
   actions.closeCode();
   expect(last().code).toBeUndefined();
-  actions.listChanged(known(), listed({ revision: 20 }));
+  actions.listChanged(NAMESAKES, listed({ revision: 20 }));
   await actions.start(DENY);
   actions.cancel();
   expect(JSON.stringify(views.slice(before))).not.toContain(CODE);
@@ -927,19 +1004,31 @@ test("Deny and invite instead defines a new person with the requested name, crea
   }
 });
 
-test("Deny and invite instead invites a chosen unclaimed person without a definition", async () => {
+test("Deny and invite instead without an unclaimed person of the requested name chooses nobody: a confirmation sends nothing and asks to choose until a person is chosen", async () => {
   const { actions, calls, last } = controllerWith({
     create: () => Promise.resolve(CREATED),
     deny: OK,
   });
   await actions.start(INVITE);
-  // A person that the screen does not offer cannot be chosen.
-  actions.choose({ kind: "existing", memberId: MEMBER });
-  expect(last().dialog?.choice).toEqual({ kind: "new" });
-  actions.choose({ kind: "existing", memberId: UNCLAIMED });
-  expect(last().dialog?.choice).toEqual({
-    kind: "existing",
-    memberId: UNCLAIMED,
+  expect(last().dialog?.invitee).toBeUndefined();
+  expect(await actions.confirm()).toBe(false);
+  expect(last().dialog?.problem).toBe("Choose the person to invite.");
+  expect(last().running).toBe(false);
+  expect(calls).toEqual([]);
+  // A person that the screen does not offer cannot be chosen: a claimed
+  // one, a former one, or one that is not listed.
+  for (const memberId of [MEMBER, FORMER, NEW_PERSON]) {
+    actions.choose(memberId);
+    expect(last().dialog?.invitee).toBeUndefined();
+  }
+  expect(last().dialog?.problem).toBe(JOIN_REQUEST_QUESTION_MESSAGES.noInvitee);
+  // Choosing ends the problem.
+  actions.choose(UNCLAIMED);
+  expect(last().dialog).toEqual({
+    request: INVITE,
+    draft: "",
+    invitee: UNCLAIMED,
+    problem: undefined,
   });
   expect(await actions.confirm()).toBe(true);
   expect(calls).toEqual([
@@ -951,83 +1040,44 @@ test("Deny and invite instead invites a chosen unclaimed person without a defini
     code: CODE,
     expiresAt: CREATED_ENDS_AT,
   });
+  // Only the question of Deny and invite instead takes a person.
+  actions.closeCode();
+  await actions.start(DENY);
+  actions.choose(UNCLAIMED);
+  expect(last().dialog?.invitee).toBeUndefined();
 });
 
-test("Deny and invite instead: a definition that is refused, uncertain, or fails on its way creates nothing and denies nothing, and says so", async () => {
-  const cases: [() => Promise<DefinePersonResult>, string][] = [
+test("Deny and invite instead: a create that is refused, uncertain, or fails on its way denies nothing, shows no code, and says that the request was not denied", async () => {
+  const cases: [() => Promise<CreateInvitationResult>, string][] = [
     [
-      () =>
-        Promise.resolve({
-          outcome: "refused",
-          reason: "unclaimed_limit",
-          retryAfterMs: null,
-        }),
-      "The request was not denied. The person could not be added. The workspace already has as many unclaimed people as it allows. Remove one, or invite one of them: once they join, they no longer count.",
-    ],
-    [
-      () => Promise.resolve({ outcome: "unknown" }),
-      `The request was not denied. ${PEOPLE_ACTION_UNKNOWN_MESSAGES.define}`,
-    ],
-    [
-      () => Promise.reject(new Error("lost")),
-      "The request was not denied. The person could not be added. It was not sent. Try again.",
-    ],
-  ];
-  for (const [define, sentence] of cases) {
-    const { actions, calls, last } = controllerWith({ define });
-    await actions.start(INVITE);
-    expect(await actions.confirm()).toBe(false);
-    expect(calls.map((call) => call.name)).toEqual(["define"]);
-    expect(last()).toEqual({ ...IDLE_JOIN_REQUEST_ACTIONS, message: sentence });
-  }
-});
-
-test("Deny and invite instead: a create that is refused, uncertain, or fails on its way denies nothing, shows no code, and says whether the person was added", async () => {
-  const cases: [boolean, () => Promise<CreateInvitationResult>, string][] = [
-    [
-      true,
       () =>
         Promise.resolve({
           outcome: "refused",
           reason: "conflict",
           retryAfterMs: null,
         }),
-      "The request was not denied. The person was added. The invitation could not be created. The person was claimed or removed in the meantime. Check the list.",
+      "The request was not denied. The invitation could not be created. The person was claimed or removed in the meantime. Check the list.",
     ],
     [
-      true,
-      () => Promise.resolve({ outcome: "unknown" }),
-      `The request was not denied. The person was added. ${INVITATION_ACTION_UNKNOWN_MESSAGES.invite}`,
-    ],
-    [
-      false,
       () => Promise.resolve({ outcome: "unknown" }),
       `The request was not denied. ${INVITATION_ACTION_UNKNOWN_MESSAGES.invite}`,
     ],
     [
-      false,
       () => Promise.reject(new Error("lost")),
       "The request was not denied. The invitation could not be created. It was not sent. Try again.",
     ],
   ];
-  for (const [defining, create, sentence] of cases) {
-    const { actions, calls, last } = controllerWith({
-      define: DEFINED,
-      create,
-    });
+  for (const [create, sentence] of cases) {
+    const { actions, calls, last } = controllerWith({ create });
     await actions.start(INVITE);
-    if (!defining) {
-      actions.choose({ kind: "existing", memberId: UNCLAIMED });
-    }
+    actions.choose(UNCLAIMED);
     expect(await actions.confirm()).toBe(false);
-    expect(calls.map((call) => call.name)).toEqual(
-      defining ? ["define", "create"] : ["create"],
-    );
+    expect(calls.map((call) => call.name)).toEqual(["create"]);
     expect(last()).toEqual({ ...IDLE_JOIN_REQUEST_ACTIONS, message: sentence });
     // Nothing is sent again on its own.
     actions.listChanged(known(), listed({ revision: 30 }));
     await settle();
-    expect(calls).toHaveLength(defining ? 2 : 1);
+    expect(calls).toHaveLength(1);
   }
 });
 
@@ -1052,7 +1102,7 @@ test("Deny and invite instead: a denial that is refused, uncertain, or fails aft
       deny,
     });
     await actions.start(INVITE);
-    actions.choose({ kind: "existing", memberId: UNCLAIMED });
+    actions.choose(UNCLAIMED);
     expect(await actions.confirm()).toBe(false);
     expect(calls.map((call) => call.name)).toEqual(["create", "deny"]);
     expect(last().message).toBe(sentence);
@@ -1063,22 +1113,11 @@ test("Deny and invite instead: a denial that is refused, uncertain, or fails aft
 });
 
 test("Deny and invite instead stops at a switch: an answer after it sends no next step and shows no sentence, and a code created meanwhile is dropped unseen, which its workspace says once it is shown again", async () => {
-  // A switch during the definition: nothing more is sent.
-  const define = pending<DefinePersonResult>();
-  const first = controllerWith({ define: define.answer });
-  await first.actions.start(INVITE);
-  const defining = first.actions.confirm();
-  first.actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), listed());
-  define.resolve({ outcome: "ok", memberId: NEW_PERSON });
-  expect(await defining).toBe(false);
-  expect(first.calls.map((call) => call.name)).toEqual(["define"]);
-  expect(first.last()).toEqual(IDLE_JOIN_REQUEST_ACTIONS);
-
   // A switch during the create: the code is dropped, and nothing is denied.
   const create = pending<CreateInvitationResult>();
   const second = controllerWith({ create: create.answer });
   await second.actions.start(INVITE);
-  second.actions.choose({ kind: "existing", memberId: UNCLAIMED });
+  second.actions.choose(UNCLAIMED);
   const creating = second.actions.confirm();
   second.actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), listed());
   create.resolve(CREATED);
@@ -1090,14 +1129,14 @@ test("Deny and invite instead stops at a switch: an answer after it sends no nex
   second.actions.listChanged(known(), listed());
   expect(second.last().message).toBe(INVITE_INSTEAD_MESSAGES.unseen);
   expect(INVITE_INSTEAD_MESSAGES.unseen).toBe(
-    "An invitation was created, but its code could not be shown, and the request was not denied. Invite the person again for a new code.",
+    "An invitation was created for the chosen person, but its code could not be shown, and the request was not denied. Deny and invite instead again for a new code.",
   );
 
   // A sign-out during the create: nothing, also after a new sign-in.
   const lost = pending<CreateInvitationResult>();
   const third = controllerWith({ create: lost.answer });
   await third.actions.start(INVITE);
-  third.actions.choose({ kind: "existing", memberId: UNCLAIMED });
+  third.actions.choose(UNCLAIMED);
   const signedOut = third.actions.confirm();
   third.actions.listChanged(
     known({ status: "signed_out", workspaceId: null }),
@@ -1116,7 +1155,7 @@ test("Deny and invite instead stops at a switch: an answer after it sends no nex
     deny: deny.answer,
   });
   await fourth.actions.start(INVITE);
-  fourth.actions.choose({ kind: "existing", memberId: UNCLAIMED });
+  fourth.actions.choose(UNCLAIMED);
   const denying = fourth.actions.confirm();
   await settle();
   expect(fourth.last().code?.code).toBe(CODE);
@@ -1127,10 +1166,111 @@ test("Deny and invite instead stops at a switch: an answer after it sends no nex
   expect(fourth.last()).toEqual(IDLE_JOIN_REQUEST_ACTIONS);
 });
 
-test("Deny and invite instead's question ends when the chosen person is no longer an unclaimed person", async () => {
+test("a sign-out while the code of Deny and invite instead shows drops the code, also while the denial is on its way", async () => {
+  // While the denial is on its way: its answer after the sign-out shows nothing.
+  const deny = pending<JoinRequestActionResult>();
+  const during = controllerWith({
+    create: () => Promise.resolve(CREATED),
+    deny: deny.answer,
+  });
+  await during.actions.start(INVITE);
+  during.actions.choose(UNCLAIMED);
+  const denying = during.actions.confirm();
+  await settle();
+  expect(during.last().code?.code).toBe(CODE);
+  during.actions.listChanged(
+    known({ status: "signed_out", workspaceId: null }),
+    listed(),
+  );
+  expect(during.last().code).toBeUndefined();
+  deny.resolve({ outcome: "ok" });
+  expect(await denying).toBe(false);
+  expect(during.last()).toEqual(IDLE_JOIN_REQUEST_ACTIONS);
+
+  // After the denial: the code that still shows goes with the sentence.
+  const after = controllerWith({
+    create: () => Promise.resolve(CREATED),
+    deny: OK,
+  });
+  await after.actions.start(INVITE);
+  after.actions.choose(UNCLAIMED);
+  expect(await after.actions.confirm()).toBe(true);
+  expect(after.last().code?.code).toBe(CODE);
+  after.actions.listChanged(
+    known({ status: "signed_out", workspaceId: null }),
+    listed(),
+  );
+  expect(after.last()).toEqual(IDLE_JOIN_REQUEST_ACTIONS);
+  // A new sign-in brings nothing back.
+  after.actions.listChanged(known(), listed());
+  expect(after.last()).toEqual(IDLE_JOIN_REQUEST_ACTIONS);
+});
+
+test("the next action and a refresh end the sentence about a code that could not be shown, also before it shows", async () => {
+  /**
+   * A controller whose invitation was created after a switch away, so that
+   * its sentence waits for its workspace.
+   */
+  async function waiting() {
+    const create = pending<CreateInvitationResult>();
+    const setup = controllerWith({
+      create: create.answer,
+      pause: OK,
+      load: () =>
+        Promise.resolve<JoinRequestLoadResult>({ outcome: "loading" }),
+    });
+    await setup.actions.start(INVITE);
+    setup.actions.choose(UNCLAIMED);
+    const creating = setup.actions.confirm();
+    setup.actions.listChanged(
+      known({ workspaceId: OTHER_WORKSPACE }),
+      listed({ workspaceId: OTHER_WORKSPACE }),
+    );
+    create.resolve(CREATED);
+    await creating;
+    return setup;
+  }
+  const back = () => [known(), listed()] as const;
+
+  // Untouched, it shows once its workspace is selected again.
+  const untouched = await waiting();
+  untouched.actions.listChanged(...back());
+  expect(untouched.last().message).toBe(INVITE_INSTEAD_MESSAGES.unseen);
+
+  // A refresh in the other workspace ends it before it shows.
+  const refreshed = await waiting();
+  await refreshed.actions.refresh();
+  expect(refreshed.last().message).toBe(JOIN_REQUEST_REFRESH_MESSAGES.loading);
+  refreshed.actions.listChanged(...back());
+  expect(refreshed.last().message).toBeUndefined();
+
+  // The next action in the other workspace ends it before it shows.
+  const acted = await waiting();
+  expect(
+    await acted.actions.start({ kind: "pause", workspaceId: OTHER_WORKSPACE }),
+  ).toBe(false);
+  expect(acted.last().message).toBe(JOIN_REQUEST_ACTION_DONE_MESSAGES.pause);
+  acted.actions.listChanged(...back());
+  expect(acted.last().message).toBeUndefined();
+
+  // Once shown, a refresh and the next action end it as every sentence.
+  const shown = await waiting();
+  shown.actions.listChanged(...back());
+  await shown.actions.refresh();
+  expect(shown.last().message).toBe(JOIN_REQUEST_REFRESH_MESSAGES.loading);
+  shown.actions.listChanged(known(), listed({ revision: LISTED.revision + 1 }));
+  expect(shown.last().message).toBeUndefined();
+  const next = await waiting();
+  next.actions.listChanged(...back());
+  await next.actions.start(PAUSE);
+  expect(next.last().message).toBe(JOIN_REQUEST_ACTION_DONE_MESSAGES.pause);
+  expect(next.calls.map((call) => call.name)).toEqual(["create", "pause"]);
+});
+
+test("Deny and invite instead's question ends when the chosen person is no longer an unclaimed person, and a rename keeps it", async () => {
   const { actions, calls, last } = controllerWith({});
   await actions.start(INVITE);
-  actions.choose({ kind: "existing", memberId: UNCLAIMED });
+  actions.choose(UNCLAIMED);
   // A rename keeps the choice; the person is still offered.
   actions.listChanged(
     known({
@@ -1140,24 +1280,53 @@ test("Deny and invite instead's question ends when the chosen person is no longe
     }),
     listed(),
   );
-  expect(last().dialog?.choice).toEqual({
-    kind: "existing",
-    memberId: UNCLAIMED,
-  });
+  expect(last().dialog?.invitee).toBe(UNCLAIMED);
   // A claim ends the question.
   actions.listChanged(
     known({
-      people: READY.people.map((one) =>
-        one.memberId === UNCLAIMED
-          ? { ...one, claimed: true, login: "mhamilton" }
-          : one,
-      ),
+      people: [
+        ...READY.people.map((one) =>
+          one.memberId === UNCLAIMED
+            ? { ...one, claimed: true, login: "mhamilton" }
+            : one,
+        ),
+        // Another unclaimed person keeps the action offered.
+        person(KATHERINE, "Katherine", unclaimed),
+      ],
     }),
     listed(),
   );
   expect(last().dialog).toBeUndefined();
   expect(await actions.confirm()).toBe(false);
   expect(calls).toEqual([]);
+});
+
+test("the dialogs of the join request actions are open with a question and with the code alone, so that the focus returns once the code's dialog closes", () => {
+  expect(joinRequestDialogsOpen(IDLE_JOIN_REQUEST_ACTIONS)).toBe(false);
+  expect(
+    joinRequestDialogsOpen({
+      ...IDLE_JOIN_REQUEST_ACTIONS,
+      running: true,
+      message: JOIN_REQUEST_ACTION_DONE_MESSAGES.deny,
+    }),
+  ).toBe(false);
+  expect(
+    joinRequestDialogsOpen({
+      ...IDLE_JOIN_REQUEST_ACTIONS,
+      dialog: {
+        request: DENY,
+        draft: "",
+        invitee: undefined,
+        problem: undefined,
+      },
+    }),
+  ).toBe(true);
+  expect(
+    joinRequestDialogsOpen({
+      ...IDLE_JOIN_REQUEST_ACTIONS,
+      code: { name: "Margaret", code: CODE, expiresAt: CREATED_ENDS_AT },
+    }),
+  ).toBe(true);
 });
 
 test("the lists never change from an answer: the controller holds no requests", async () => {

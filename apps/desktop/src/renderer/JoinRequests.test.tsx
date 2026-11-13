@@ -6,6 +6,14 @@ import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type {
+  InvitationActionsBridge,
+  InvitationsBridge,
+  JoinRequestActionsBridge,
+  JoinRequestsBridge,
+  PeopleActionsBridge,
+  PeopleBridge,
+} from "../shared/desktop-bridge.ts";
+import type {
   BlockedJoinRequestView,
   JoinRequestsView,
   PeopleView,
@@ -18,19 +26,20 @@ import {
   type InvitationActionRequest,
 } from "./invitations-view.ts";
 import {
+  focusOnButtonOrPage,
   JoinRequestQuestionContent,
+  syncModal,
   type JoinRequestActionHandlers,
 } from "./JoinRequests.tsx";
 import {
   IDLE_JOIN_REQUEST_ACTIONS,
-  type InviteChoice,
   type JoinRequestActionRequest,
   type JoinRequestActionsView,
   type JoinRequestDialog,
   type JoinRequestsScreenView,
 } from "./join-requests-view.ts";
 import type { PeopleActionHandlers } from "./PeopleActions.tsx";
-import { PeopleScreenContent } from "./PeopleScreen.tsx";
+import { PeopleScreen, PeopleScreenContent } from "./PeopleScreen.tsx";
 import {
   IDLE_PEOPLE_ACTIONS,
   offerTimeFormat,
@@ -44,10 +53,20 @@ const OWNER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c1";
 const ADMIN = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c2";
 const MEMBER = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c3";
 const UNCLAIMED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c4";
+const OTHER_UNCLAIMED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c6";
 const REQUEST = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1";
 const BLOCKED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d3";
 const ERASED = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d4";
-const IDS = [WORKSPACE, OWNER, ADMIN, MEMBER, UNCLAIMED, REQUEST, BLOCKED];
+const IDS = [
+  WORKSPACE,
+  OWNER,
+  ADMIN,
+  MEMBER,
+  UNCLAIMED,
+  OTHER_UNCLAIMED,
+  REQUEST,
+  BLOCKED,
+];
 
 /** A code in the protocol's form (`mmdi_`, 48 characters). */
 const CODE = "mmdi_Zx9-_Qw8Zx9-_Qw8Zx9-_Qw8Zx9-_Qw8Zx9-_Qw8Kpw";
@@ -217,8 +236,7 @@ function recorder() {
     onConfirm: () => calls.push("confirm"),
     onCancel: () => calls.push("cancel"),
     onDraft: (text: string) => calls.push(`draft ${text}`),
-    onChoose: (choice: InviteChoice) =>
-      calls.push(`choose ${choice.kind === "new" ? "new" : choice.memberId}`),
+    onChoose: (memberId: string) => calls.push(`choose ${memberId}`),
     onCloseCode: () => calls.push("close code"),
     onRefresh: () => calls.push("refresh"),
   };
@@ -322,7 +340,7 @@ test("the pause shows its time and offers to accept new requests again; a blocke
   );
   const paused = TIME_FORMAT.format(new Date(PAUSED_AT));
   expect(html).toContain(
-    `<p id="join-requests-pause-line">New join requests are paused since <time dateTime="${PAUSED_AT}">${paused}</time>. The pending requests stay.</p><div class="account-actions"><button type="button" class="panel-action" aria-describedby="join-requests-pause-line">Accept new requests again</button></div>`,
+    `<p id="join-requests-pause-line">New join requests have been paused since <time dateTime="${PAUSED_AT}">${paused}</time>. Pending requests stay open.</p><div class="account-actions"><button type="button" class="panel-action" aria-describedby="join-requests-pause-line">Accept new requests again</button></div>`,
   );
   expect(paused).toBe("12 Nov 2026, 11:00");
   expect(html).toContain(
@@ -478,6 +496,7 @@ const ON_REQUEST = {
   joinRequestId: REQUEST,
   name: "Katherine",
   login: "kjohnson",
+  accountCreatedAt: ACCOUNT_CREATED_AT,
 };
 
 function dialogOf(
@@ -487,8 +506,8 @@ function dialogOf(
   return {
     request,
     draft: "",
+    invitee: undefined,
     problem: undefined,
-    choice: { kind: "new" },
     ...overrides,
   };
 }
@@ -498,7 +517,11 @@ function question(dialog: JoinRequestDialog | undefined) {
   const content = (
     <JoinRequestQuestionContent
       dialog={dialog}
-      options={[{ memberId: UNCLAIMED, name: "Margaret" }]}
+      options={[
+        { memberId: UNCLAIMED, name: "Margaret" },
+        { memberId: OTHER_UNCLAIMED, name: "Katherine" },
+      ]}
+      dateFormat={DATE_FORMAT}
       onConfirm={handlers.joinRequests.onConfirm}
       onCancel={handlers.joinRequests.onCancel}
       onDraft={handlers.joinRequests.onDraft}
@@ -508,7 +531,7 @@ function question(dialog: JoinRequestDialog | undefined) {
   return { content, handlers };
 }
 
-test("the questions of deny, deny all, and block are dialogs with the name and the login as text, their sentence, Cancel first, and their confirming button", () => {
+test("the questions of deny, deny all, block, and unblock are dialogs with the name and the login as text, their sentence, Cancel first, and their confirming button", () => {
   expect(
     renderToString(question(dialogOf({ kind: "deny", ...ON_REQUEST })).content),
   ).toBe(
@@ -526,18 +549,40 @@ test("the questions of deny, deny all, and block are dialogs with the name and t
       question(dialogOf({ kind: "block", ...ON_REQUEST })).content,
     ),
   ).toContain('<h2 id="join-request-dialog-title">Block this account?</h2>');
+  // An unblock asks too (the decision of 2026-11-13), also for an account
+  // whose data was erased, which has no login.
+  const unblock = {
+    kind: "unblock",
+    workspaceId: WORKSPACE,
+    joinRequestId: BLOCKED,
+    name: "Mallory",
+    login: "mallory",
+  } as const;
+  expect(renderToString(question(dialogOf(unblock)).content)).toBe(
+    '<dialog class="people-dialog" aria-labelledby="join-request-dialog-title" aria-describedby="join-request-dialog-name join-request-dialog-text"><form><h2 id="join-request-dialog-title">Unblock this account?</h2><p class="people-dialog-name" id="join-request-dialog-name"><span dir="auto">Mallory</span> <span class="person-login" translate="no">mallory</span></p><p id="join-request-dialog-text">The block ends, and this account can ask to join this workspace again at once.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Unblock</button></div></form></dialog>',
+  );
+  expect(
+    renderToString(question(dialogOf({ ...unblock, login: null })).content),
+  ).toContain(
+    '<p class="people-dialog-name" id="join-request-dialog-name"><span dir="auto">Mallory</span></p>',
+  );
   expect(renderToString(question(undefined).content)).toBe(
     '<dialog class="people-dialog"></dialog>',
   );
-  // An unblock, a pause, and a resume never ask.
-  expect(
-    renderToString(
-      question(dialogOf({ kind: "pause", workspaceId: WORKSPACE })).content,
-    ),
-  ).toBe('<dialog class="people-dialog"></dialog>');
+  // A pause and a resume never ask.
+  for (const kind of ["pause", "resume"] as const) {
+    expect(
+      renderToString(
+        question(dialogOf({ kind, workspaceId: WORKSPACE })).content,
+      ),
+    ).toBe('<dialog class="people-dialog"></dialog>');
+  }
 });
 
-test("the approval's question has a name field with the draft and an alert for its problem; editing it reports the text", () => {
+/** The creation date of the requester's GitHub account in a question. */
+const ACCOUNT_LINE = `<p class="person-meta" id="join-request-dialog-account">GitHub account created <time dateTime="${ACCOUNT_CREATED_AT}">1 Oct 2026</time></p>`;
+
+test("the approval's question shows the creation date of the GitHub account and has a name field with the draft and an alert for its problem; editing it reports the text", () => {
   const { content, handlers } = question(
     dialogOf(
       { kind: "approve", ...ON_REQUEST },
@@ -545,6 +590,12 @@ test("the approval's question has a name field with the draft and an alert for i
     ),
   );
   const html = renderToString(content);
+  // The question asks to check the date, so it shows it and describes the
+  // dialog with it, in the people's date format.
+  expect(html).toContain(
+    `<dialog class="people-dialog" aria-labelledby="join-request-dialog-title" aria-describedby="join-request-dialog-name join-request-dialog-account join-request-dialog-text"><form><h2 id="join-request-dialog-title">Approve this request?</h2><p class="people-dialog-name" id="join-request-dialog-name"><span dir="auto">Katherine</span> <span class="person-login" translate="no">kjohnson</span></p>${ACCOUNT_LINE}<p id="join-request-dialog-text">`,
+  );
+  expect(DATE_FORMAT.format(new Date(ACCOUNT_CREATED_AT))).toBe("1 Oct 2026");
   expect(html).toContain(
     '<label class="account-label" for="join-request-dialog-field">Name in this workspace</label><input id="join-request-dialog-field" class="account-input" type="text" dir="auto" autoComplete="off" spellCheck="false" aria-invalid="true" aria-describedby="join-request-dialog-problem" value="Kate"/><p class="panel-message" id="join-request-dialog-problem" role="alert">Enter a name.</p>',
   );
@@ -556,16 +607,28 @@ test("the approval's question has a name field with the draft and an alert for i
     .find((element) => element.type === "input")
     ?.props.onChange?.({ currentTarget: { value: "Kay" } });
   expect(handlers.calls).toEqual(["draft Kay"]);
+  // Deny, block, and unblock do not show the date.
+  for (const kind of ["deny", "block"] as const) {
+    expect(
+      renderToString(question(dialogOf({ kind, ...ON_REQUEST })).content),
+    ).not.toContain("join-request-dialog-account");
+  }
 });
 
-test("Deny and invite instead's question offers a new person with the requested name first, then each unclaimed person, and reports the choice", () => {
+test("Deny and invite instead's question shows the creation date of the GitHub account and offers each unclaimed person, nobody checked until one is chosen, with an alert for its problem; it reports the choice", () => {
   const { content, handlers } = question(
     dialogOf({ kind: "invite", ...ON_REQUEST }),
   );
   const html = renderToString(content);
   expect(html).toContain(
-    '<fieldset class="join-request-choice"><legend>Invite</legend><label class="join-request-option"><input type="radio" name="join-request-invite" checked=""/><span>A new person named <span dir="auto">Katherine</span></span></label><label class="join-request-option"><input type="radio" name="join-request-invite"/><span><span dir="auto">Margaret</span></span></label></fieldset>',
+    `aria-describedby="join-request-dialog-name join-request-dialog-account join-request-dialog-text"><form><h2 id="join-request-dialog-title">Deny and invite instead?</h2><p class="people-dialog-name" id="join-request-dialog-name"><span dir="auto">Katherine</span> <span class="person-login" translate="no">kjohnson</span></p>${ACCOUNT_LINE}<p id="join-request-dialog-text">`,
   );
+  expect(html).toContain(
+    '<fieldset class="join-request-choice" aria-describedby="join-request-dialog-problem"><legend>Person to invite</legend><label class="join-request-option"><input type="radio" name="join-request-invite"/><span><span dir="auto">Margaret</span></span></label><label class="join-request-option"><input type="radio" name="join-request-invite"/><span><span dir="auto">Katherine</span></span></label></fieldset><p class="panel-message" id="join-request-dialog-problem" role="alert"></p>',
+  );
+  // No new person is offered, and nobody is checked.
+  expect(html).not.toContain("new person");
+  expect(html).not.toContain("checked");
   expect(html).toContain(
     '<button type="submit" class="panel-action">Create the invitation, then deny</button>',
   );
@@ -575,19 +638,47 @@ test("Deny and invite instead's question offers a new person with the requested 
   for (const radio of radios) {
     radio.props.onChange?.({ currentTarget: { value: "on" } });
   }
-  expect(handlers.calls).toEqual(["choose new", `choose ${UNCLAIMED}`]);
-  // The chosen person is checked.
+  expect(handlers.calls).toEqual([
+    `choose ${UNCLAIMED}`,
+    `choose ${OTHER_UNCLAIMED}`,
+  ]);
+  // The chosen person is checked, and only that one.
+  const chosen = renderToString(
+    question(
+      dialogOf({ kind: "invite", ...ON_REQUEST }, { invitee: OTHER_UNCLAIMED }),
+    ).content,
+  );
+  expect(chosen).toContain(
+    '<input type="radio" name="join-request-invite"/><span><span dir="auto">Margaret</span></span></label><label class="join-request-option"><input type="radio" name="join-request-invite" checked=""/><span><span dir="auto">Katherine</span>',
+  );
+  // A confirmation without a person shows its problem in the alert.
   expect(
     renderToString(
       question(
         dialogOf(
           { kind: "invite", ...ON_REQUEST },
-          { choice: { kind: "existing", memberId: UNCLAIMED } },
+          { problem: "Choose the person to invite." },
         ),
       ).content,
     ),
   ).toContain(
-    '<input type="radio" name="join-request-invite" checked=""/><span><span dir="auto">Margaret</span>',
+    '<p class="panel-message" id="join-request-dialog-problem" role="alert">Choose the person to invite.</p>',
+  );
+});
+
+test("Deny and invite instead shows only while the workspace has an active unclaimed person", () => {
+  expect(partOf(render())).toContain(">Deny and invite instead<");
+  const html = partOf(
+    render({
+      view: known({
+        people: READY.people.filter((one) => one.memberId !== UNCLAIMED),
+      }),
+    }),
+  );
+  expect(html).toContain(">Approve<");
+  expect(html).not.toContain(">Deny and invite instead<");
+  expect(html).toContain(
+    '<button type="button" class="panel-action" aria-describedby="join-requests-heading-request-0">Approve</button><button type="button" class="panel-action" aria-describedby="join-requests-heading-request-0">Deny</button>',
   );
 });
 
@@ -692,10 +783,13 @@ test("names, logins, and choices are rendered as text with their own direction",
   expect(html).toContain(
     `<span dir="auto" id="blocked-accounts-heading-request-0">${escapedRtl}</span>`,
   );
+  // The question's name, and its choice of an unclaimed person.
   expect(html).toContain(
-    `<span>A new person named <span dir="auto">${escapedMarkup}</span></span>`,
+    `<p class="people-dialog-name" id="join-request-dialog-name"><span dir="auto">${escapedMarkup}</span> <span class="person-login" translate="no">kjohnson</span></p>`,
   );
-  expect(html).toContain(`<span><span dir="auto">${escapedRtl}</span></span>`);
+  expect(html).toContain(
+    `<input type="radio" name="join-request-invite"/><span><span dir="auto">${escapedRtl}</span></span>`,
+  );
   expect(html).not.toContain("<img");
   expect(html).not.toContain("<b>");
 });
@@ -719,7 +813,24 @@ test("the screen with the join requests shows no ID, its element IDs are unique,
     },
     {
       ...IDLE_JOIN_REQUEST_ACTIONS,
+      dialog: dialogOf(
+        { kind: "invite", ...ON_REQUEST },
+        { invitee: UNCLAIMED, problem: "Choose the person to invite." },
+      ),
+    },
+    {
+      ...IDLE_JOIN_REQUEST_ACTIONS,
       dialog: dialogOf({ kind: "denyAll", workspaceId: WORKSPACE }),
+    },
+    {
+      ...IDLE_JOIN_REQUEST_ACTIONS,
+      dialog: dialogOf({
+        kind: "unblock",
+        workspaceId: WORKSPACE,
+        joinRequestId: BLOCKED,
+        name: "Mallory",
+        login: "mallory",
+      }),
     },
     {
       ...IDLE_JOIN_REQUEST_ACTIONS,
@@ -733,6 +844,9 @@ test("the screen with the join requests shows no ID, its element IDs are unique,
         view: known({ ownMemberId: own }),
         joinRequestActions,
       });
+      if (joinRequestActions.dialog !== undefined) {
+        expect(html).toContain('id="join-request-dialog-title"');
+      }
       for (const id of IDS) {
         expect(html).not.toContain(id);
       }
@@ -748,6 +862,106 @@ test("the screen with the join requests shows no ID, its element IDs are unique,
       expect(html).not.toMatch(/\sstyle=/);
     }
   }
+});
+
+test("the screen has the join request actions only with all four bridges: the people actions, the invitation actions, the join requests, and their actions", () => {
+  const call = () => Promise.reject(new Error("not called"));
+  const subscribeState = () => () => undefined;
+  const bridges = {
+    people: { getState: call, subscribeState } satisfies PeopleBridge,
+    peopleActions: {
+      define: call,
+      rename: call,
+      remove: call,
+      promote: call,
+      demote: call,
+      leave: call,
+      offerOwnership: call,
+      withdrawOwnershipOffer: call,
+      acceptOwnershipOffer: call,
+    } satisfies PeopleActionsBridge,
+    invitations: {
+      getState: call,
+      subscribeState,
+      load: call,
+    } satisfies InvitationsBridge,
+    invitationActions: {
+      create: call,
+      revoke: call,
+      preview: call,
+      accept: call,
+    } satisfies InvitationActionsBridge,
+    joinRequests: {
+      getState: call,
+      subscribeState,
+      load: call,
+    } satisfies JoinRequestsBridge,
+    joinRequestActions: {
+      approve: call,
+      deny: call,
+      denyAll: call,
+      block: call,
+      unblock: call,
+      pause: call,
+      resume: call,
+    } satisfies JoinRequestActionsBridge,
+  };
+  // With the handlers, the paragraph of the actions' sentence is there; the
+  // part itself follows the people, which a server render does not load.
+  const paragraph =
+    '<p class="people-status" id="join-request-action-message" role="status"></p>';
+  expect(renderToString(<PeopleScreen {...bridges} />)).toContain(paragraph);
+  for (const name of [
+    "peopleActions",
+    "invitationActions",
+    "joinRequests",
+    "joinRequestActions",
+  ] as const) {
+    const html = renderToString(
+      <PeopleScreen {...bridges} {...{ [name]: undefined }} />,
+    );
+    expect(html, name).not.toContain("join-request-action-message");
+  }
+  // Without the handlers, no part shows, also for the owner with requests.
+  expect(render({ withJoinRequests: false })).not.toContain(
+    "join-requests-heading",
+  );
+});
+
+test("the question opens as a modal dialog of the page, never as a non-modal one, and closes with the question", () => {
+  const calls: string[] = [];
+  const dialog = {
+    open: false,
+    showModal() {
+      calls.push("showModal");
+      this.open = true;
+    },
+    show() {
+      calls.push("show");
+      this.open = true;
+    },
+    close() {
+      calls.push("close");
+      this.open = false;
+    },
+  };
+  syncModal(dialog, true);
+  syncModal(dialog, true);
+  syncModal(dialog, false);
+  syncModal(dialog, false);
+  syncModal(null, true);
+  expect(calls).toEqual(["showModal", "close"]);
+});
+
+test("after a confirmed action, the focus moves on only while it is on the action's button, which a closed question gives it back to, or on the page", () => {
+  const button = { name: "button" } as unknown as Element;
+  const body = { name: "body" } as unknown as Element;
+  const field = { name: "field" } as unknown as Element;
+  expect(focusOnButtonOrPage(button, body, button)).toBe(true);
+  expect(focusOnButtonOrPage(body, body, button)).toBe(true);
+  expect(focusOnButtonOrPage(null, body, button)).toBe(true);
+  expect(focusOnButtonOrPage(field, body, button)).toBe(false);
+  expect(focusOnButtonOrPage(field, body, null)).toBe(false);
 });
 
 // The sources of the join requests part, without the tests, as text.

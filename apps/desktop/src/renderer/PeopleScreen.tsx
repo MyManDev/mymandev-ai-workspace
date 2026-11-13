@@ -422,6 +422,7 @@ export function PeopleScreenContent({
           <JoinRequestQuestionBox
             dialog={joinRequestDialog}
             options={joinRequestModel?.unclaimed ?? []}
+            dateFormat={format}
             onConfirm={joinRequestHandlers.onConfirm}
             onCancel={joinRequestHandlers.onCancel}
             onDraft={joinRequestHandlers.onDraft}

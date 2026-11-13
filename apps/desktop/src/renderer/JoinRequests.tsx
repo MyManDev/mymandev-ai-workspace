@@ -23,8 +23,8 @@ import {
   JOIN_REQUEST_ACTION_LABELS,
   JOIN_REQUEST_MESSAGES,
   JOIN_REQUEST_QUESTION_MESSAGES,
+  joinRequestDialogsOpen,
   type BlockedRequestRow,
-  type InviteChoice,
   type InviteOption,
   type JoinRequestActionRequest,
   type JoinRequestActionsView,
@@ -62,8 +62,8 @@ export interface JoinRequestActionHandlers {
   readonly onCancel: () => void;
   /** Changes the name in the field of an open approval. */
   readonly onDraft: (text: string) => void;
-  /** Chooses whom an open "Deny and invite instead" invites. */
-  readonly onChoose: (choice: InviteChoice) => void;
+  /** Chooses the unclaimed person, by member ID, whom an open "Deny and invite instead" invites. */
+  readonly onChoose: (memberId: string) => void;
   /** Closes the code's dialog, which drops the code. */
   readonly onCloseCode: () => void;
   /** Asks the main process to load the join requests again. */
@@ -387,12 +387,37 @@ function BlockedItem({
 export interface JoinRequestQuestionProps {
   /** The open question, or undefined when none is open. */
   readonly dialog: JoinRequestDialog | undefined;
-  /** The people that "Deny and invite instead" may invite. */
+  /** The active unclaimed people whom "Deny and invite instead" may invite. */
   readonly options: readonly InviteOption[];
+  /** The format of the creation date of the requester's GitHub account. */
+  readonly dateFormat: Intl.DateTimeFormat;
   readonly onConfirm: () => void;
   readonly onCancel: () => void;
   readonly onDraft: (text: string) => void;
-  readonly onChoose: (choice: InviteChoice) => void;
+  readonly onChoose: (memberId: string) => void;
+}
+
+/** What `syncModal` uses of a dialog element. */
+export interface ModalElement {
+  readonly open: boolean;
+  readonly showModal: () => void;
+  readonly close: () => void;
+}
+
+/**
+ * Opens `dialog` as a modal dialog of the page (`showModal`, never the
+ * non-modal `show`, so that the rest of the page is inert) while `open`
+ * holds, and closes it afterwards.
+ */
+export function syncModal(dialog: ModalElement | null, open: boolean): void {
+  if (dialog === null) {
+    return;
+  }
+  if (open && !dialog.open) {
+    dialog.showModal();
+  } else if (!open && dialog.open) {
+    dialog.close();
+  }
 }
 
 /**
@@ -404,17 +429,7 @@ export interface JoinRequestQuestionProps {
 export function JoinRequestQuestionBox(props: JoinRequestQuestionProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const open = props.dialog !== undefined;
-  useEffect(() => {
-    const dialog = dialogRef.current;
-    if (dialog === null) {
-      return;
-    }
-    if (open && !dialog.open) {
-      dialog.showModal();
-    } else if (!open && dialog.open) {
-      dialog.close();
-    }
-  }, [open]);
+  useEffect(() => syncModal(dialogRef.current, open), [open]);
   return <JoinRequestQuestionContent {...props} dialogRef={dialogRef} />;
 }
 
@@ -422,16 +437,19 @@ export function JoinRequestQuestionBox(props: JoinRequestQuestionProps) {
  * The dialog for a question, without state. The element stays in the page
  * while no question is open, empty and closed. The requested name is text
  * with `dir="auto"`, followed by the requester's GitHub login in the
- * monospace font, and describes the dialog before the sentence. An approval
- * has a name field that starts with the requested name, with an alert for
- * its problem inside the dialog, because the page behind it is inert; like
- * the people actions' name fields, it has no `maxLength`. "Deny and invite
- * instead" has a group of choices: a new person with the requested name
- * first, then each active unclaimed person by name. "Cancel" comes first.
+ * monospace font, and describes the dialog before the sentence; the
+ * questions of an approval and of "Deny and invite instead" also show the
+ * creation date of that GitHub account, which they ask to check. An
+ * approval has a name field that starts with the requested name; "Deny and
+ * invite instead" has a group of choices, one for each active unclaimed
+ * person by name. Each has an alert for its problem inside the dialog,
+ * because the page behind it is inert; like the people actions' name
+ * fields, the name field has no `maxLength`. "Cancel" comes first.
  */
 export function JoinRequestQuestionContent({
   dialog,
   options,
+  dateFormat,
   onConfirm,
   onCancel,
   onDraft,
@@ -449,16 +467,21 @@ export function JoinRequestQuestionContent({
   }
   const { request } = dialog;
   const named = "name" in request;
+  const accountCreatedAt =
+    request.kind === "approve" || request.kind === "invite"
+      ? request.accountCreatedAt
+      : undefined;
+  const describedBy = [
+    named ? "join-request-dialog-name" : undefined,
+    accountCreatedAt === undefined ? undefined : "join-request-dialog-account",
+    "join-request-dialog-text",
+  ].filter((id) => id !== undefined);
   return (
     <dialog
       ref={dialogRef}
       className="people-dialog"
       aria-labelledby="join-request-dialog-title"
-      aria-describedby={
-        named
-          ? "join-request-dialog-name join-request-dialog-text"
-          : "join-request-dialog-text"
-      }
+      aria-describedby={describedBy.join(" ")}
       onCancel={(event) => {
         // Escape cancels; the dialog closes with the question.
         event.preventDefault();
@@ -485,6 +508,14 @@ export function JoinRequestQuestionContent({
             )}
           </p>
         ) : null}
+        {accountCreatedAt === undefined ? null : (
+          <p className="person-meta" id="join-request-dialog-account">
+            {JOIN_REQUEST_MESSAGES.accountCreated}
+            <time dateTime={accountCreatedAt}>
+              {formatPeopleDate(accountCreatedAt, dateFormat)}
+            </time>
+          </p>
+        )}
         <p id="join-request-dialog-text">{question.text}</p>
         {request.kind === "approve" ? (
           <>
@@ -516,30 +547,30 @@ export function JoinRequestQuestionContent({
           </>
         ) : null}
         {request.kind === "invite" ? (
-          <fieldset className="join-request-choice">
-            <legend>{JOIN_REQUEST_QUESTION_MESSAGES.inviteLegend}</legend>
-            <Choice
-              checked={dialog.choice.kind === "new"}
-              onChoose={() => onChoose({ kind: "new" })}
+          <>
+            <fieldset
+              className="join-request-choice"
+              aria-describedby="join-request-dialog-problem"
             >
-              {JOIN_REQUEST_QUESTION_MESSAGES.newPerson}
-              <span dir="auto">{request.name}</span>
-            </Choice>
-            {options.map((option) => (
-              <Choice
-                key={option.memberId}
-                checked={
-                  dialog.choice.kind === "existing" &&
-                  dialog.choice.memberId === option.memberId
-                }
-                onChoose={() =>
-                  onChoose({ kind: "existing", memberId: option.memberId })
-                }
-              >
-                <span dir="auto">{option.name}</span>
-              </Choice>
-            ))}
-          </fieldset>
+              <legend>{JOIN_REQUEST_QUESTION_MESSAGES.inviteLegend}</legend>
+              {options.map((option) => (
+                <Choice
+                  key={option.memberId}
+                  checked={dialog.invitee === option.memberId}
+                  onChoose={() => onChoose(option.memberId)}
+                >
+                  <span dir="auto">{option.name}</span>
+                </Choice>
+              ))}
+            </fieldset>
+            <p
+              className="panel-message"
+              id="join-request-dialog-problem"
+              role="alert"
+            >
+              {dialog.problem ?? ""}
+            </p>
+          </>
         ) : null}
         <div className="people-dialog-actions">
           <button type="button" className="panel-action" onClick={onCancel}>
@@ -598,16 +629,29 @@ function focusTitle(): void {
 }
 
 /**
+ * Whether the focus is still on the action's control or on the page: on
+ * `button`, on `body`, or nowhere. After a question, `button` is the one
+ * that opened it, which the closed dialog gave the focus back to.
+ */
+export function focusOnButtonOrPage(
+  active: Element | null,
+  body: Element | null,
+  button: Element | null,
+): boolean {
+  return active === null || active === body || active === button;
+}
+
+/**
  * Moves the focus to the screen's title once the action's control leaves
- * the page with the next list (a confirmed decision, unblock, pause, or
- * resume), while the focus is still on that control or on the page.
+ * the page with the next list (a confirmed decision or unblock), while the
+ * focus is still on that control or on the page. A pause and a resume
+ * keep the focus on their button, which stays.
  */
 function focusAfterAction(done: boolean, button: Element | null): void {
-  const active = document.activeElement;
   if (
     focusesTitleAfterAction(
       done,
-      active === null || active === document.body || active === button,
+      focusOnButtonOrPage(document.activeElement, document.body, button),
     )
   ) {
     focusTitle();
@@ -617,10 +661,14 @@ function focusAfterAction(done: boolean, button: Element | null): void {
 /**
  * The join request actions of the screen (`createJoinRequestActions`) while
  * it is shown, which follow every view of the people and the join requests;
- * undefined handlers without the bridges. A question remembers the button
- * that opened it, which the dialogs give the focus back to; when a dialog
- * closes after that button left the page, the focus moves to the screen's
- * title.
+ * undefined handlers unless all four bridges are there (the Project
+ * Manager's decision of 2026-11-13): the people actions, whose "Add person"
+ * adds the unclaimed people that "Deny and invite instead" invites, the
+ * invitation actions, which create that invitation, the join requests, and
+ * their actions. A question remembers the button that opened it, which the
+ * dialogs give the focus back to; when the question or the code's dialog
+ * closes after that button left the page (`joinRequestDialogsOpen`), the
+ * focus moves to the screen's title.
  */
 export function useJoinRequestActions(
   bridges: {
@@ -646,12 +694,7 @@ export function useJoinRequestActions(
       invitationActions === undefined
         ? undefined
         : createJoinRequestActions(
-            {
-              joinRequestActions,
-              joinRequests: list,
-              peopleActions,
-              invitationActions,
-            },
+            { joinRequestActions, joinRequests: list, invitationActions },
             setActions,
           ),
     [joinRequestActions, list, peopleActions, invitationActions],
@@ -662,7 +705,7 @@ export function useJoinRequestActions(
   );
   const trigger = useRef<Element | null>(null);
   const wasOpen = useRef(false);
-  const open = actions.dialog !== undefined || actions.code !== undefined;
+  const open = joinRequestDialogsOpen(actions);
   useEffect(() => {
     const button = trigger.current;
     if (

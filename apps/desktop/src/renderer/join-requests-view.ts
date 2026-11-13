@@ -2,12 +2,10 @@ import type {
   InvitationActionsBridge,
   JoinRequestActionsBridge,
   JoinRequestsBridge,
-  PeopleActionsBridge,
 } from "../shared/desktop-bridge.ts";
 import type {
   ApproveJoinRequestResult,
   CreateInvitationResult,
-  DefinePersonResult,
   JoinRequestActionRefusal,
   JoinRequestActionResult,
   JoinRequestLoadResult,
@@ -21,10 +19,8 @@ import {
   type InvitationCodeView,
 } from "./invitations-view.ts";
 import {
-  describePeopleActionResult,
   describeWait,
   namePrompt,
-  PEOPLE_ACTION_NOT_DONE_MESSAGES,
   PEOPLE_ACTION_NOT_SENT,
   PEOPLE_ACTION_REFUSAL_MESSAGES,
 } from "./people-actions-view.ts";
@@ -35,10 +31,11 @@ import type { PeopleScreenView } from "./people-view.ts";
 // pending join requests and blocked accounts for the owner and the admins,
 // the decisions on them, and the pause of new requests. "Deny and invite
 // instead" is composed here, the invitation first (the Project Manager's
-// decision of 2026-11-12): the person is defined when needed, an invitation
-// is created for that person and its code shown once (D2), and only then is
-// the request denied. When a step before the denial fails or is uncertain,
-// the request stays pending.
+// decisions of 2026-11-12 and 2026-11-13): it is offered only while the
+// workspace has active unclaimed people, the approver chooses one of them,
+// an invitation is created for that person and its code shown once (D2),
+// and only then is the request denied. When the invitation is not created
+// or it is uncertain, the request stays pending.
 
 /** What the screen knows of the selected workspace's join requests. */
 export type JoinRequestsScreenView =
@@ -97,9 +94,9 @@ export const JOIN_REQUEST_MESSAGES = Object.freeze({
   /** While new requests are accepted. */
   accepting: "New join requests are accepted.",
   /** Before the time of the pause. */
-  pausedSince: "New join requests are paused since ",
+  pausedSince: "New join requests have been paused since ",
   /** After the time of the pause. */
-  pausedAfter: ". The pending requests stay.",
+  pausedAfter: ". Pending requests stay open.",
   refresh: "Refresh the join requests",
 });
 
@@ -160,6 +157,11 @@ interface PendingRequestAction<K extends JoinRequestActionKind> {
   readonly name: string;
   /** The requester's GitHub login. */
   readonly login: string;
+  /**
+   * The creation date of the requester's GitHub account, which the
+   * questions of an approval and of "Deny and invite instead" show.
+   */
+  readonly accountCreatedAt: string;
 }
 
 /** An action on the workspace's join requests as a whole. */
@@ -185,11 +187,13 @@ export const JOIN_REQUEST_ACTION_LABELS: Readonly<
 /**
  * The actions that ask first: every destructive one (deny, deny all, and
  * block, as a removal asks in #244), the approval, which asks for the name,
- * and "Deny and invite instead", which asks for the person. An unblock, a
- * pause, and a resume run at once; each can be undone at once.
+ * "Deny and invite instead", which asks for the person, and an unblock,
+ * after which the account can ask to join again at once (the Project
+ * Manager's decision of 2026-11-13). A pause and a resume run at once; each
+ * can be undone at once.
  */
 export const ASKING_JOIN_REQUEST_ACTIONS: ReadonlySet<JoinRequestActionKind> =
-  new Set(["approve", "invite", "deny", "denyAll", "block"]);
+  new Set(["approve", "invite", "deny", "denyAll", "block", "unblock"]);
 
 /** The question of an action that asks first. */
 export interface JoinRequestQuestion {
@@ -203,15 +207,15 @@ export interface JoinRequestQuestion {
 export const JOIN_REQUEST_QUESTION_MESSAGES = Object.freeze({
   /** The label of the approval's name field. */
   nameLabel: "Name in this workspace",
-  /** The legend of the people that "Deny and invite instead" may invite. */
-  inviteLegend: "Invite",
-  /** Before the requested name, for a new person. */
-  newPerson: "A new person named ",
+  /** The legend of the unclaimed people that "Deny and invite instead" may invite. */
+  inviteLegend: "Person to invite",
+  /** Why "Deny and invite instead" was not sent: no person is chosen. */
+  noInvitee: "Choose the person to invite.",
 });
 
 /**
- * The question of each action that asks first, or undefined for an unblock,
- * a pause, and a resume, which never ask.
+ * The question of each action that asks first, or undefined for a pause
+ * and a resume, which never ask.
  */
 export function describeJoinRequestQuestion(
   request: JoinRequestActionRequest,
@@ -226,7 +230,7 @@ export function describeJoinRequestQuestion(
     case "invite":
       return {
         title: "Deny and invite instead?",
-        text: "First an invitation is created for the person you choose, and its code is shown once. Pass it on privately, only to this account. Only then is the request denied. If the invitation cannot be created, the request stays pending. A person who already has an open invitation gets a new one, and the earlier code stops working.",
+        text: "Choose the unclaimed person that this account should claim, and check the login and the creation date of the GitHub account, not only the name. First an invitation is created for that person, and its code is shown once. Pass it on privately, only to this account. Only then is the request denied. If the invitation cannot be created, the request stays pending. A person who already has an open invitation gets a new one, and the earlier code stops working.",
         confirm: "Create the invitation, then deny",
       };
     case "deny":
@@ -248,6 +252,11 @@ export function describeJoinRequestQuestion(
         confirm: "Block",
       };
     case "unblock":
+      return {
+        title: "Unblock this account?",
+        text: "The block ends, and this account can ask to join this workspace again at once.",
+        confirm: "Unblock",
+      };
     case "pause":
     case "resume":
       return undefined;
@@ -263,7 +272,10 @@ export interface PendingRequestRow {
   readonly verifiedAt: string;
   readonly accountCreatedAt: string;
   readonly expiresAt: string;
-  /** Approve, Deny and invite instead, Deny, and Block, in this order. */
+  /**
+   * Approve, Deny and invite instead (only while the workspace has active
+   * unclaimed people), Deny, and Block, in this order.
+   */
   readonly actions: readonly JoinRequestActionRequest[];
 }
 
@@ -304,7 +316,10 @@ export interface JoinRequestsModel {
     readonly pausedAt: string | null;
     readonly request: JoinRequestActionRequest;
   } | null;
-  /** The active unclaimed people, in the people's order. */
+  /**
+   * The active unclaimed people, in the people's order: whom "Deny and
+   * invite instead" may invite, and only while there is one.
+   */
   readonly unclaimed: readonly InviteOption[];
 }
 
@@ -345,7 +360,10 @@ function managedWorkspace(view: PeopleScreenView): {
  *   workspace's, each with its requested name, the requester's GitHub login
  *   with the date it was last verified, the creation date of that GitHub
  *   account, its end, and its actions. The main process drops a request at
- *   its end by the system clock (#257).
+ *   its end by the system clock (#257). "Deny and invite instead" is among
+ *   the actions only while the workspace has an active unclaimed person
+ *   (ADR 0014 and #95: when unclaimed people exist, a request can be denied
+ *   with an invitation for one of them instead).
  * - The blocks in force with "Unblock", "Deny all" while a request is
  *   pending, and the pause with its time, once the list loaded.
  * - A fixed status text: before the first state, while the main process
@@ -407,7 +425,15 @@ export function describeJoinRequests(
       joinRequestId: request.joinRequestId,
       name: request.requestedName,
       login: request.login,
+      accountCreatedAt: request.accountCreatedAt,
     };
+    const actions: JoinRequestActionRequest[] = [
+      { kind: "approve", ...target },
+    ];
+    if (unclaimed.length > 0) {
+      actions.push({ kind: "invite", ...target });
+    }
+    actions.push({ kind: "deny", ...target }, { kind: "block", ...target });
     return {
       joinRequestId: request.joinRequestId,
       requestedName: request.requestedName,
@@ -415,12 +441,7 @@ export function describeJoinRequests(
       verifiedAt: request.verifiedAt,
       accountCreatedAt: request.accountCreatedAt,
       expiresAt: request.expiresAt,
-      actions: [
-        { kind: "approve", ...target },
-        { kind: "invite", ...target },
-        { kind: "deny", ...target },
-        { kind: "block", ...target },
-      ],
+      actions,
     };
   });
   const blocked = state.blocked.map((request): BlockedRequestRow => ({
@@ -633,10 +654,8 @@ export function describeJoinRequestActionResult(
  * far it came: before the denial, the request stays pending.
  */
 export const INVITE_INSTEAD_MESSAGES = Object.freeze({
-  /** Before the sentence of a definition or a create that did not happen. */
+  /** Before the sentence of a create that did not happen. */
   notDenied: "The request was not denied.",
-  /** After `notDenied`, when the person was added before the create failed. */
-  added: "The person was added.",
   /** Before the sentence of a denial that did not happen. */
   invited: "The invitation was created.",
   /**
@@ -645,23 +664,39 @@ export const INVITE_INSTEAD_MESSAGES = Object.freeze({
    * code.
    */
   unseen:
-    "An invitation was created, but its code could not be shown, and the request was not denied. Invite the person again for a new code.",
+    "An invitation was created for the chosen person, but its code could not be shown, and the request was not denied. Deny and invite instead again for a new code.",
 });
 
-/** Who "Deny and invite instead" invites: a new person, or an active unclaimed one. */
-export type InviteChoice =
-  | { readonly kind: "new" }
-  | { readonly kind: "existing"; readonly memberId: string };
+/**
+ * The active unclaimed person that "Deny and invite instead" chooses at
+ * first: the first one, in the people's order, whose display name is the
+ * requested name, or none, so that the approver chooses (the Project
+ * Manager's decision of 2026-11-13). A person chosen by mistake would get a
+ * new invitation, which revokes that person's earlier one.
+ */
+export function defaultInvitee(
+  unclaimed: readonly InviteOption[],
+  requestedName: string,
+): string | undefined {
+  return unclaimed.find((person) => person.name === requestedName)?.memberId;
+}
 
 /** The open question of an action that asks first. */
 export interface JoinRequestDialog {
   readonly request: JoinRequestActionRequest;
   /** The name in the field of an approval; empty for the other actions. */
   readonly draft: string;
-  /** Why the name of an approval was not sent, or undefined. */
+  /**
+   * The member ID of the active unclaimed person whom "Deny and invite
+   * instead" invites, or undefined while none is chosen and for the other
+   * actions.
+   */
+  readonly invitee: string | undefined;
+  /**
+   * Why the confirmation sent nothing: the approval's name, or no person
+   * chosen for "Deny and invite instead"; undefined otherwise.
+   */
   readonly problem: string | undefined;
-  /** Whom "Deny and invite instead" invites; a new person by default. */
-  readonly choice: InviteChoice;
 }
 
 /** What the screen shows of its join request actions. */
@@ -690,6 +725,15 @@ export const IDLE_JOIN_REQUEST_ACTIONS: JoinRequestActionsView = Object.freeze({
   code: undefined,
 });
 
+/**
+ * Whether a dialog of the join request actions is open: a question, or the
+ * code of "Deny and invite instead". The focus returns to the screen's title
+ * when the last of them closes after its button left the page.
+ */
+export function joinRequestDialogsOpen(view: JoinRequestActionsView): boolean {
+  return view.dialog !== undefined || view.code !== undefined;
+}
+
 /** Why the main process refused to load the join requests on a refresh. */
 export type JoinRequestLoadRefusal = Extract<
   JoinRequestLoadResult,
@@ -712,27 +756,18 @@ export const JOIN_REQUEST_REFRESH_MESSAGES: Readonly<
 
 /**
  * The actions after which the action's control leaves the page with the
- * next list or view, once the API confirmed them: the request's row, the
- * block's row, "Deny all", or the pause's button goes away.
+ * next list, once the API confirmed them: the request's row, the block's
+ * row, or "Deny all" goes away. A pause and a resume are not among them:
+ * the pause's button stays and only changes its label, so the focus stays
+ * on it (the Project Manager's decision of 2026-11-13).
  */
 const LEAVING_JOIN_REQUEST_ACTIONS: ReadonlySet<JoinRequestActionKind> =
-  new Set([
-    "approve",
-    "invite",
-    "deny",
-    "denyAll",
-    "block",
-    "unblock",
-    "pause",
-    "resume",
-  ]);
+  new Set(["approve", "invite", "deny", "denyAll", "block", "unblock"]);
 
 /** The bridges' functions that the join request actions call. */
 export interface JoinRequestActionsBridges {
   readonly joinRequestActions: JoinRequestActionsBridge;
   readonly joinRequests: Pick<JoinRequestsBridge, "load">;
-  /** For "Deny and invite instead": the definition of a new person. */
-  readonly peopleActions: Pick<PeopleActionsBridge, "define">;
   /** For "Deny and invite instead": the create of the invitation. */
   readonly invitationActions: Pick<InvitationActionsBridge, "create">;
 }
@@ -740,23 +775,26 @@ export interface JoinRequestActionsBridges {
 export interface JoinRequestActions {
   /**
    * Starts an action that the screen offers: an action that asks first
-   * opens its question, and an unblock, a pause, and a resume run at once.
-   * While an action runs or a code shows, nothing starts. Resolves to true
-   * when the action ran and its control leaves the page with the next list.
+   * opens its question, and a pause and a resume run at once. While an
+   * action runs or a code shows, nothing starts. Resolves to true when the
+   * action ran and its control leaves the page with the next list.
    */
   readonly start: (request: JoinRequestActionRequest) => Promise<boolean>;
   /**
    * Runs the action of the open question, once; an approval first checks
-   * its name and keeps the question open with the problem. Resolves like
-   * `start`.
+   * its name, and "Deny and invite instead" that a person is chosen, and
+   * each keeps the question open with the problem. Resolves like `start`.
    */
   readonly confirm: () => Promise<boolean>;
   /** Closes the open question without the action. */
   readonly cancel: () => void;
   /** Changes the name in the field of an open approval, and ends its problem. */
   readonly editDraft: (text: string) => void;
-  /** Chooses whom an open "Deny and invite instead" invites. */
-  readonly choose: (choice: InviteChoice) => void;
+  /**
+   * Chooses the active unclaimed person, by member ID, whom an open "Deny
+   * and invite instead" invites, and ends its problem.
+   */
+  readonly choose: (memberId: string) => void;
   /** Closes the code's dialog and drops the code. */
   readonly closeCode: () => void;
   /** Asks the main process to load the join requests again; nothing while an action runs. */
@@ -765,9 +803,10 @@ export interface JoinRequestActions {
    * Follows the screen's views:
    *
    * - the open question ends once the screen no longer offers it as it is
-   *   (`isJoinRequestOffered`), or once the person chosen for "Deny and
-   *   invite instead" is no longer an active unclaimed person, so that it
-   *   never comes back on its own and a later `confirm` sends nothing;
+   *   (`isJoinRequestOffered`), also once the workspace has no active
+   *   unclaimed person left for "Deny and invite instead", or once the
+   *   person chosen for it is no longer one, so that it never comes back on
+   *   its own and a later `confirm` sends nothing;
    * - the question, the code, and the sentence of the last action belong to
    *   the workspace that they were about, so they go when another workspace
    *   or none is selected, and always with a sign-out;
@@ -787,13 +826,12 @@ export interface JoinRequestActions {
  * lists change only with the state that the main process sends, never from
  * the answer.
  *
- * "Deny and invite instead" sends its steps in order, each once, and each
- * only while the workspace of the action is still selected: the definition
- * of a new person with the requested name, when the approver chose one; the
- * create of the invitation, whose code goes into the view of its dialog
- * only (D2); and only then the denial. A step that is refused, uncertain,
- * or fails on its way ends it, and the sentence says how far it came; after
- * a step before the denial, the request stays pending.
+ * "Deny and invite instead" sends its two steps in order, each once, and
+ * each only while the workspace of the action is still selected: the create
+ * of the invitation for the chosen active unclaimed person, whose code goes
+ * into the view of its dialog only (D2), and only then the denial. A step
+ * that is refused, uncertain, or fails on its way ends it, and the sentence
+ * says how far it came; when the create ends it, the request stays pending.
  */
 export function createJoinRequestActions(
   bridges: JoinRequestActionsBridges,
@@ -804,7 +842,7 @@ export function createJoinRequestActions(
   let message: string | undefined;
   let dialog: JoinRequestDialog | undefined;
   let code: InvitationCodeView | undefined;
-  /** The latest model, for the people that "Deny and invite instead" may invite. */
+  /** The latest model, for the people whom "Deny and invite instead" may invite. */
   let model: JoinRequestsModel | null = null;
   /** The latest join requests' revision, for the refresh's sentence. */
   let latestRevision: number | undefined;
@@ -902,54 +940,21 @@ export function createJoinRequestActions(
   }
 
   /**
-   * "Deny and invite instead": the definition when needed, the create, and
-   * only then the denial, each once, and each only while the action's
-   * workspace stays selected. A step's answer after a switch or a sign-out
-   * shows no sentence and ends it; a created invitation's code is then
-   * dropped unseen, and its workspace says so once it is shown again.
+   * "Deny and invite instead": the create for the chosen person, and only
+   * then the denial, each once, and each only while the action's workspace
+   * stays selected. A step's answer after a switch or a sign-out shows no
+   * sentence and ends it; a created invitation's code is then dropped
+   * unseen, and its workspace says so once it is shown again.
    */
   async function inviteInstead(
     request: Extract<JoinRequestActionRequest, { readonly kind: "invite" }>,
-    target:
-      | { readonly kind: "new" }
-      | { readonly kind: "existing"; readonly memberId: string; name: string },
+    invitee: InviteOption,
   ): Promise<boolean> {
     begin();
     const { workspaceId } = request;
     const startSelection = selection;
     const startSession = session;
-    let memberId: string;
-    let name: string;
-    let added = false;
-    if (target.kind === "new") {
-      let defined: DefinePersonResult | undefined;
-      try {
-        defined = await bridges.peopleActions.define(workspaceId, request.name);
-      } catch {
-        defined = undefined;
-      }
-      if (!stillOn(workspaceId, startSelection)) {
-        end(undefined);
-        return false;
-      }
-      if (defined?.outcome !== "ok") {
-        const reason =
-          defined === undefined
-            ? `${PEOPLE_ACTION_NOT_DONE_MESSAGES.define} ${PEOPLE_ACTION_NOT_SENT}`
-            : describePeopleActionResult("define", defined);
-        end(`${INVITE_INSTEAD_MESSAGES.notDenied} ${reason}`);
-        return false;
-      }
-      memberId = defined.memberId;
-      name = request.name;
-      added = true;
-    } else {
-      memberId = target.memberId;
-      name = target.name;
-    }
-    const before = added
-      ? `${INVITE_INSTEAD_MESSAGES.notDenied} ${INVITE_INSTEAD_MESSAGES.added}`
-      : INVITE_INSTEAD_MESSAGES.notDenied;
+    const { memberId, name } = invitee;
     const invite = { kind: "invite", workspaceId, memberId, name } as const;
     let created: CreateInvitationResult | undefined;
     try {
@@ -976,7 +981,7 @@ export function createJoinRequestActions(
         created === undefined
           ? `${INVITATION_ACTION_NOT_DONE_MESSAGES.invite} ${PEOPLE_ACTION_NOT_SENT}`
           : describeInvitationActionResult(invite, created, undefined, 0);
-      end(`${before} ${reason}`);
+      end(`${INVITE_INSTEAD_MESSAGES.notDenied} ${reason}`);
       return false;
     }
     // The code shows at once, before the denial goes.
@@ -1008,22 +1013,9 @@ export function createJoinRequestActions(
     return false;
   }
 
-  /** The person that `choice` names, while the screen still offers it. */
-  function chosen(
-    choice: InviteChoice,
-  ):
-    | { readonly kind: "new" }
-    | { readonly kind: "existing"; readonly memberId: string; name: string }
-    | undefined {
-    if (choice.kind === "new") {
-      return choice;
-    }
-    const option = model?.unclaimed.find(
-      (person) => person.memberId === choice.memberId,
-    );
-    return option === undefined
-      ? undefined
-      : { kind: "existing", memberId: option.memberId, name: option.name };
+  /** The active unclaimed person with `memberId`, while the screen still offers it. */
+  function unclaimedPerson(memberId: string): InviteOption | undefined {
+    return model?.unclaimed.find((person) => person.memberId === memberId);
   }
 
   return Object.freeze({
@@ -1035,8 +1027,11 @@ export function createJoinRequestActions(
         dialog = Object.freeze({
           request,
           draft: request.kind === "approve" ? request.name : "",
+          invitee:
+            request.kind === "invite"
+              ? defaultInvitee(model?.unclaimed ?? [], request.name)
+              : undefined,
           problem: undefined,
-          choice: Object.freeze({ kind: "new" }),
         });
         show();
         return Promise.resolve(false);
@@ -1053,11 +1048,19 @@ export function createJoinRequestActions(
       }
       const { request } = open;
       if (request.kind === "invite") {
-        const target = chosen(open.choice);
-        if (target === undefined) {
+        if (open.invitee === undefined) {
+          dialog = Object.freeze({
+            ...open,
+            problem: JOIN_REQUEST_QUESTION_MESSAGES.noInvitee,
+          });
+          show();
           return Promise.resolve(false);
         }
-        return inviteInstead(request, target);
+        const invitee = unclaimedPerson(open.invitee);
+        if (invitee === undefined) {
+          return Promise.resolve(false);
+        }
+        return inviteInstead(request, invitee);
       }
       if (request.kind === "approve") {
         const name = open.draft.trim();
@@ -1085,9 +1088,17 @@ export function createJoinRequestActions(
         show();
       }
     },
-    choose: (choice: InviteChoice) => {
-      if (dialog?.request.kind === "invite" && chosen(choice) !== undefined) {
-        dialog = Object.freeze({ ...dialog, choice: Object.freeze(choice) });
+    choose: (memberId: string) => {
+      if (
+        dialog?.request.kind === "invite" &&
+        unclaimedPerson(memberId) !== undefined
+      ) {
+        // The problem was about no person being chosen.
+        dialog = Object.freeze({
+          ...dialog,
+          invitee: memberId,
+          problem: undefined,
+        });
         show();
       }
     },
@@ -1144,7 +1155,8 @@ export function createJoinRequestActions(
       if (
         dialog !== undefined &&
         (!isJoinRequestOffered(model, dialog.request) ||
-          chosen(dialog.choice) === undefined)
+          (dialog.invitee !== undefined &&
+            unclaimedPerson(dialog.invitee) === undefined))
       ) {
         dialog = undefined;
         changed = true;
