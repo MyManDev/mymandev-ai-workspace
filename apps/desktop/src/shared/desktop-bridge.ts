@@ -8,6 +8,7 @@ import type {
   ChatView,
   ClaimLoadResult,
   ClaimMarkSeenResult,
+  ClaimMarksView,
   ClaimsView,
   ConnectionStatus,
   CreateInvitationResult,
@@ -86,6 +87,8 @@ export interface DesktopBridge {
   readonly ownJoinRequestActions: OwnJoinRequestActionsBridge;
   /** The recent claims of the selected workspace, and which are unseen. */
   readonly claims: ClaimsBridge;
+  /** Which other workspaces hold a claim that the account has not seen. */
+  readonly claimMarks: ClaimMarksBridge;
   /** The agent activity of the open project, read-only. */
   readonly agents: AgentBridge;
   /** The chat of the open project. */
@@ -664,6 +667,31 @@ export interface ClaimsBridge {
     workspaceId: string,
     memberIds: readonly string[],
   ) => Promise<ClaimMarkSeenResult>;
+}
+
+/**
+ * Which workspaces of the list hold a claim that the account has not seen
+ * (#271), so that the sidebar can mark them: the main process reads the
+ * recent claims of the other workspaces where the account is the owner or
+ * an admin, one read a second at most, and compares them with the seen
+ * claims kept on this device. The selected workspace is named only until
+ * its claims have loaded or failed to, with the mark held for it before. Only the workspace IDs cross, never a claim or a user ID. Read
+ * only: it takes nothing from the renderer.
+ */
+export interface ClaimMarksBridge {
+  /** The current marks. */
+  readonly getState: () => Promise<ClaimMarksView>;
+  /**
+   * Calls `listener` with the current marks and then after changes, at
+   * most once every 50 ms with the latest ones. A state older than the last
+   * one delivered is dropped. `onError` is called when the main process
+   * refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: ClaimMarksView) => void,
+    onError?: () => void,
+  ) => () => void;
 }
 
 /**

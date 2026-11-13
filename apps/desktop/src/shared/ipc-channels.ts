@@ -269,6 +269,17 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   markClaimsSeen: "claims:mark-seen",
   /**
+   * Which workspaces of the list hold a claim that the account has not seen
+   * (#271): the other workspaces, and the selected one only while its claims
+   * load. Their workspace IDs only, never a claim or a user ID.
+   */
+  getClaimMarks: "claims:get-marks",
+  /**
+   * The claim marks. The calling frame then receives every later state on
+   * `EVENT_CHANNELS.claimMarksChanged`.
+   */
+  subscribeClaimMarks: "claims:subscribe-marks",
+  /**
    * What the renderer may know of the open project's agent activity: its
    * agents with their owners' names, and its newest runs. Read-only.
    */
@@ -377,6 +388,11 @@ export const EVENT_CHANNELS = Object.freeze({
    * every 50 ms, to the frames that subscribed.
    */
   claimStateChanged: "claims:state-changed",
+  /**
+   * The claim marks of the other workspaces after changes, at most one
+   * every 50 ms, to the frames that subscribed.
+   */
+  claimMarksChanged: "claims:marks-changed",
   /**
    * The agent activity after changes, at most one every 50 ms, to the
    * frames that subscribed.

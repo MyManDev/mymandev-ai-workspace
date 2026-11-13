@@ -42,6 +42,8 @@ import {
 import { registerChatIpc } from "./chat-ipc.ts";
 import { createChatService } from "./chat/service.ts";
 import { registerClaimIpc } from "./claim-ipc.ts";
+import { registerClaimMarksIpc } from "./claim-marks-ipc.ts";
+import { createClaimMarkService } from "./claims/marks.ts";
 import { createClaimService } from "./claims/service.ts";
 import { createSystemClaimSeenStore } from "./claims/system.ts";
 import {
@@ -471,6 +473,25 @@ function start(): void {
   app.on("will-quit", () => claims.close());
   const claimIpc = registerClaimIpc(ipcMain, rendererUrl, { claims });
   app.on("will-quit", () => claimIpc.close());
+
+  // The unseen claims of the other workspaces (#271): after each answer of
+  // the workspace list, the recent claims of each other workspace where the
+  // list names the account's own person as the owner or an admin are read
+  // once, one at a time and at most one a second, and compared with the
+  // seen claims of the claim service. Only the IDs of the workspaces with an unseen claim reach the
+  // renderer, at most once every 50 ms.
+  const claimMarks = createClaimMarkService({
+    account,
+    connection,
+    workspaces,
+    claims,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => claimMarks.close());
+  const claimMarksIpc = registerClaimMarksIpc(ipcMain, rendererUrl, {
+    marks: claimMarks,
+  });
+  app.on("will-quit", () => claimMarksIpc.close());
 
   // The chat reaches the renderer with the authors' names resolved in the
   // main process, within the view's limits and text budget, at most one

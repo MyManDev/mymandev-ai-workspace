@@ -78,20 +78,19 @@ export type CreateProjectResult =
        * `not_member`: the account is not an active member of the workspace,
        * also when the workspace does not exist; `conflict`: a project of the
        * workspace that is not archived has the name, compared without regard
-       * to case.
+       * to case; `project_limit`: the workspace holds 100 projects that are
+       * not archived, which no time changes (#268).
        */
-      refusal: "not_member" | "conflict";
+      refusal: "not_member" | "conflict" | "project_limit";
     }>
   /**
-   * A limit is reached. The account created 20 projects within 24 hours,
-   * the oldest of which leaves the window after `retryAfterMs`; or the
-   * workspace holds 100 projects that are not archived, which no time
-   * changes, and `retryAfterMs` is null.
+   * The account created 20 projects within 24 hours, the oldest of which
+   * leaves the window after `retryAfterMs`.
    */
   | Readonly<{
       created: false;
       refusal: "rate_limited";
-      retryAfterMs: number | null;
+      retryAfterMs: number;
     }>;
 
 /**
@@ -99,10 +98,11 @@ export type CreateProjectResult =
  * workspace. It locks the account's row, so that the creations of one
  * account are counted one after another, then the acting person, then the
  * workspace row, so that the creations of one workspace are counted one after
- * another. It refuses with `rate_limited` when the workspace holds
+ * another. It refuses with `project_limit` when the workspace holds
  * `MAX_ACTIVE_PROJECTS_PER_WORKSPACE` projects that are not archived, and
- * when the account created `MAX_NEW_PROJECTS_PER_DAY` projects, in any
- * workspace, whose `created_at` lies within 24 hours before `now`. It inserts
+ * then with `rate_limited` when the account created
+ * `MAX_NEW_PROJECTS_PER_DAY` projects, in any workspace, whose `created_at`
+ * lies within 24 hours before `now`. It inserts
  * the project with `name`, the account as `created_by_user_id`, and the time
  * `now`, and its `project` conversation, the project's chat, with the same
  * account and time and no title. A name that a project of the workspace that
@@ -141,11 +141,7 @@ export async function createProject(
             ),
           );
         if ((active?.n ?? 0) >= MAX_ACTIVE_PROJECTS_PER_WORKSPACE) {
-          return {
-            created: false,
-            refusal: "rate_limited",
-            retryAfterMs: null,
-          };
+          return { created: false, refusal: "project_limit" };
         }
         const [recent] = await tx
           .select({ n: count(), oldest: min(projects.createdAt) })

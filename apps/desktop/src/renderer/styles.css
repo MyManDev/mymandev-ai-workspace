@@ -331,7 +331,8 @@ code {
 
 /*
  * The dot after "People" while the selected workspace has a claim that the
- * account has not seen; the item's accessible name says so.
+ * account has not seen, and after the name of each workspace in the list
+ * that has one (#271); the item's accessible name says so.
  */
 .nav-marker {
   display: inline-block;

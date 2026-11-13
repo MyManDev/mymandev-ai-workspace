@@ -58,13 +58,14 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the join request, the join request action, the own join request, the own join request action, the claim, the agent, the chat, and the device list functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the join request, the join request action, the own join request, the own join request action, the claim, the claim mark, the agent, the chat, and the device list functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
     "account",
     "agents",
     "chat",
+    "claimMarks",
     "claims",
     "connection",
     "devices",
@@ -169,6 +170,10 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "markSeen",
     "subscribeState",
   ]);
+  expect(Object.keys(bridge.claimMarks).sort()).toEqual([
+    "getState",
+    "subscribeState",
+  ]);
   expect(Object.keys(bridge.agents).sort()).toEqual([
     "getState",
     "subscribeState",
@@ -206,6 +211,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   expect(Object.isFrozen(bridge.ownJoinRequests)).toBe(true);
   expect(Object.isFrozen(bridge.ownJoinRequestActions)).toBe(true);
   expect(Object.isFrozen(bridge.claims)).toBe(true);
+  expect(Object.isFrozen(bridge.claimMarks)).toBe(true);
   expect(Object.isFrozen(bridge.agents)).toBe(true);
   expect(Object.isFrozen(bridge.chat)).toBe(true);
   expect(Object.isFrozen(bridge.devices)).toBe(true);
@@ -224,6 +230,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     ...Object.values(bridge.ownJoinRequests),
     ...Object.values(bridge.ownJoinRequestActions),
     ...Object.values(bridge.claims),
+    ...Object.values(bridge.claimMarks),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
@@ -251,6 +258,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.ownJoinRequests),
     ...Object.values(bridge.ownJoinRequestActions),
     ...Object.values(bridge.claims),
+    ...Object.values(bridge.claimMarks),
     ...Object.values(bridge.agents),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
@@ -2105,6 +2113,75 @@ test("the claim subscription delivers the state and every newer one, without the
     revision: 5,
   });
   expect(reported).toEqual(["A claim state callback failed."]);
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+  expect(refused).toBe(1);
+});
+
+test("the claim mark functions call their channels and pass no argument from the renderer on", async () => {
+  const fake = fakeIpc();
+  const marks = createDesktopBridge("44.9.1", fake.ipc)
+    .claimMarks as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown> | (() => void)
+  >;
+  const empty = { revision: 0, workspaceIds: [] };
+  const state = marks["getState"]?.(WORKSPACE_ID, "claims:mark-seen");
+  marks["subscribeState"]?.(() => undefined, undefined, WORKSPACE_ID);
+  fake.answers[0]?.resolve(empty);
+  await expect(state).resolves.toEqual(empty);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getClaimMarks, args: [] },
+    { channel: INVOKE_CHANNELS.subscribeClaimMarks, args: [] },
+  ]);
+});
+
+test("the claim mark subscription delivers the marks and every newer state, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const calls: unknown[][] = [];
+  const reported: string[] = [];
+  const unsubscribe = bridge.claimMarks.subscribeState((...args) =>
+    calls.push(args),
+  );
+
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeClaimMarks, args: [] },
+  ]);
+  fake.answers[0]?.resolve({ revision: 3, workspaceIds: [] });
+  await settle();
+  fake.emit(EVENT_CHANNELS.claimMarksChanged, {
+    revision: 4,
+    workspaceIds: [WORKSPACE_ID],
+  });
+  fake.emit(EVENT_CHANNELS.claimMarksChanged, {
+    revision: 2,
+    workspaceIds: [],
+  });
+  expect(calls).toEqual([
+    [{ revision: 3, workspaceIds: [] }],
+    [{ revision: 4, workspaceIds: [WORKSPACE_ID] }],
+  ]);
+  unsubscribe();
+  expect(fake.listenerCount(EVENT_CHANNELS.claimMarksChanged)).toBe(0);
+
+  const failing = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  let refused = 0;
+  failing.claimMarks.subscribeState(
+    () => {
+      throw new Error("broken");
+    },
+    () => {
+      refused += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.claimMarksChanged, {
+    revision: 5,
+    workspaceIds: [],
+  });
+  expect(reported).toEqual(["A claim mark callback failed."]);
   fake.answers[1]?.reject(new Error("refused"));
   await settle();
   expect(refused).toBe(1);

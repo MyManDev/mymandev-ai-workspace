@@ -36,6 +36,7 @@ import {
   offersSignIn,
   removeDeviceMessage,
   SIGN_IN_OUTCOME_MESSAGES,
+  signInLimitedMessage,
   SIGN_IN_RENEWAL_MESSAGES,
   SIGN_IN_RENEWAL_WINDOW_MS,
   signInEndFormat,
@@ -53,6 +54,7 @@ import {
   watchSignInRetry,
   type AccountView,
 } from "./account-view.ts";
+import { describeWait } from "./people-actions-view.ts";
 
 const IDLE: AccountStatus = {
   revision: 3,
@@ -388,6 +390,44 @@ test("the account's limit of active devices says to remove a device on another d
     text: "This account already has as many active devices as it allows, so this device cannot be added. On another of your devices, remove a device that you no longer use in the Devices section of the Account screen, then sign in here again.",
   });
   expect(message.text).not.toMatch(/Try again|wait/iu);
+});
+
+test("an uncertain refusal with the wait of rate_limited says how long to wait, names both limits, and still does not say whether the sign-in was completed (#269)", () => {
+  expect(
+    describeOutcome({ code: "uncertain_refusal", retryAfterMs: 86_000_000 }),
+  ).toEqual({
+    role: "alert",
+    text: "The server is limiting sign-ins for now: too many came from this network, or this account has added as many new devices as it may in one day. Its answer does not show whether the sign-in was completed. Try again in about 24 hours; starting it again then is safe.",
+  });
+  // Rounded up, so that a start after the wait is not refused again.
+  const waits: [number, string][] = [
+    [600_000, "10 minutes"],
+    [3_600_000, "1 hour"],
+    [3_660_000, "2 hours"],
+    [90_000, "2 minutes"],
+    [30_000, "30 seconds"],
+  ];
+  for (const [retryAfterMs, wait] of waits) {
+    expect(signInLimitedMessage(retryAfterMs)).toContain(
+      `Try again in about ${wait};`,
+    );
+    expect(
+      describeOutcome({ code: "uncertain_refusal", retryAfterMs }).text,
+    ).toBe(signInLimitedMessage(retryAfterMs));
+  }
+  // The same words as the other screens' waits.
+  for (const retryAfterMs of [
+    1, 999, 1_000, 59_000, 60_000, 61_000, 3_599_000, 3_600_000, 3_601_000,
+    86_400_000, 604_800_000,
+  ]) {
+    expect(signInLimitedMessage(retryAfterMs)).toContain(
+      `Try again in about ${describeWait(retryAfterMs)};`,
+    );
+  }
+  // Without a wait, the message stays the one of every uncertain refusal.
+  expect(describeOutcome({ code: "uncertain_refusal" }).text).toBe(
+    SIGN_IN_OUTCOME_MESSAGES.uncertain_refusal,
+  );
 });
 
 test("an account mismatch names the installation's login when the main process sent it", () => {

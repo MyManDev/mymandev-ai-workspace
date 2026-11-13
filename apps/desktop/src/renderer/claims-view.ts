@@ -443,7 +443,8 @@ export function claimsCovered(dialogs: {
  * workspace that the sidebar shows as selected hold an unseen claim. A
  * state of another workspace, before the main process followed a switch,
  * never marks it, and neither does anything while no device is signed in.
- * Only the selected workspace counts; the other workspaces follow in #271.
+ * Only the selected workspace counts here; the sidebar's list of
+ * workspaces marks the others as well (`markedWorkspaces`, #271).
  */
 export function hasUnseenClaims(
   claims: ClaimsScreenView,
