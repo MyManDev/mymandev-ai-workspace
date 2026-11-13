@@ -7,6 +7,7 @@ import type {
 } from "../shared/ipc-contract.ts";
 import { MAX_CLOCK_WAIT_MS } from "./device-view.ts";
 import type { PeopleScreenView } from "./people-view.ts";
+import { describeWait } from "./wait-text.ts";
 
 /**
  * The longest display name in characters (Unicode code points), as the
@@ -530,23 +531,8 @@ export const PEOPLE_ACTION_REFUSAL_MESSAGES: Readonly<
 /** The end of the sentence after a call that failed on its way; nothing was sent. */
 export const PEOPLE_ACTION_NOT_SENT = "It was not sent. Try again.";
 
-/**
- * A wait of `ms` milliseconds in words, rounded up: seconds below a
- * minute, minutes below an hour, and hours above.
- */
-export function describeWait(ms: number): string {
-  const count = (value: number, unit: string) =>
-    `${String(value)} ${unit}${value === 1 ? "" : "s"}`;
-  const seconds = Math.max(1, Math.ceil(ms / 1000));
-  if (seconds < 60) {
-    return count(seconds, "second");
-  }
-  const minutes = Math.ceil(seconds / 60);
-  if (minutes < 60) {
-    return count(minutes, "minute");
-  }
-  return count(Math.ceil(minutes / 60), "hour");
-}
+/** The words for a wait, which the other screens import from here. */
+export { describeWait };
 
 /**
  * The sentence after a result of `kind`. The limit of unclaimed people has

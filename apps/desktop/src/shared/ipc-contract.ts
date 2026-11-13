@@ -307,6 +307,7 @@ export const SIGN_IN_OUTCOME_CODES = Object.freeze([
   "device_revoked",
   "device_registration_locked",
   "device_limit",
+  "device_daily_limit",
   "refused",
   "api_origin_unset",
   "api_origin_invalid",
@@ -330,6 +331,13 @@ export type SignInOutcomeCode = (typeof SIGN_IN_OUTCOME_CODES)[number];
 /** A time in UTC, as `Date.prototype.toISOString` writes it. */
 const TimestampSchema = z.iso.datetime();
 
+/** The outcome codes that can carry `retryAfter`; every other code cannot. */
+export const SIGN_IN_RETRY_CODES = Object.freeze([
+  "replacement_pending",
+  "device_daily_limit",
+  "uncertain_refusal",
+] as const satisfies readonly SignInOutcomeCode[]);
+
 export const SignInOutcomeSchema = z
   .object({
     code: z.enum(SIGN_IN_OUTCOME_CODES),
@@ -339,29 +347,28 @@ export const SignInOutcomeSchema = z
      */
     deviceLogin: LoginSchema.optional(),
     /**
-     * With `replacement_pending` only, while the grace period of an
-     * uncertain sign-in runs (#199): when it ends, in UTC. A new sign-in is
-     * not refused for it after this time. It names no key and no ID.
+     * A time in UTC after which the sign-in can be tried again, with the
+     * codes of `SIGN_IN_RETRY_CODES` only. It is a time, not a duration, so
+     * the renderer computes what is left of the wait from its own clock
+     * while the outcome stays on screen. It names no key and no ID.
+     *
+     * - `replacement_pending`, while the grace period of an uncertain
+     *   sign-in runs (#199): when it ends. A new sign-in is not refused for
+     *   it after this time.
+     * - `device_daily_limit` (#269): when the wait of the account's daily
+     *   limit of new devices ends, from the API's `Retry-After`. The
+     *   refusal is certain: nothing was registered.
+     * - `uncertain_refusal`, when the API answered `rate_limited` with a
+     *   usable `Retry-After` (#269): when the wait of its limit of requests
+     *   ends. Whether the sign-in was completed stays unknown.
      */
     retryAfter: TimestampSchema.optional(),
-    /**
-     * With `uncertain_refusal` only, when the API answered `rate_limited`
-     * with a usable `Retry-After` (#269): how long its limit lasts, in
-     * milliseconds. Whether the sign-in was completed stays unknown.
-     */
-    retryAfterMs: z.int().positive().optional(),
   })
   .refine(
     (outcome) =>
       outcome.retryAfter === undefined ||
-      outcome.code === "replacement_pending",
-    { message: "retryAfter belongs to replacement_pending only" },
-  )
-  .refine(
-    (outcome) =>
-      outcome.retryAfterMs === undefined ||
-      outcome.code === "uncertain_refusal",
-    { message: "retryAfterMs belongs to uncertain_refusal only" },
+      (SIGN_IN_RETRY_CODES as readonly string[]).includes(outcome.code),
+    { message: "retryAfter belongs to the codes of SIGN_IN_RETRY_CODES only" },
   );
 export type SignInOutcomeView = z.infer<typeof SignInOutcomeSchema>;
 

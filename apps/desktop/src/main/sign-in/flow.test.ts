@@ -1581,18 +1581,87 @@ describe("answers of the API", () => {
     expect(await h.records.read()).toEqual({ kind: "none" });
   }, 20_000);
 
-  test("takes rate_limited with a Retry-After as an uncertain refusal, keeps a new device's key and marker, and passes the wait on (#269)", async () => {
-    const h = harness();
-    // The daily limit of new devices and the route's limit per address both
-    // answer this, and only the first proves that nothing was committed.
-    h.answer = () => withRetryAfter(errorAnswer("rate_limited"), "86000");
+  /** The flow's wall clock in the tests of a limit's wait (#269). */
+  const ANSWERED = Date.parse("2026-11-14T10:00:00.000Z");
+  /** The end of a wait of `seconds` that starts at `ANSWERED`, in UTC. */
+  const waitEnd = (seconds: number) =>
+    new Date(ANSWERED + seconds * 1000).toISOString();
+  /** Every `Retry-After` that names no usable wait. */
+  const UNUSABLE_RETRY_AFTER: [label: string, value: string | null][] = [
+    ["missing", null],
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["fractional", "1.5"],
+    ["date", "Fri, 13 Nov 2026 10:00:00 GMT"],
+    ["empty", ""],
+    ["too long", "12345678901"],
+  ];
+
+  test("takes the account's daily limit of new devices as a certain refusal: deletes the new key and its marker, and passes the end of the wait on (#269)", async () => {
+    const h = harness({ wallClock: () => ANSWERED });
+    let during: unknown;
+    h.answer = async () => {
+      during = await h.markers.read();
+      return withRetryAfter(errorAnswer("device_daily_limit"), "86000");
+    };
+    const { outcome } = await signIn(h);
+    // The API refuses it before its transaction commits, and a copy of a
+    // request that committed never gets it.
+    expect(UNCERTAIN_REFUSAL_CODES).not.toContain("device_daily_limit");
+    expect(outcome).toEqual({
+      kind: "refused",
+      code: "device_daily_limit",
+      retryAfter: waitEnd(86_000),
+    });
+    // The request went out with a key and its marker; both are gone.
+    expect(during).toMatchObject({
+      kind: "marker",
+      marker: { publicKey: h.requests[0]?.body.device.publicKey },
+    });
+    expect(await h.keyStore.hasKey()).toBe(false);
+    expect(await h.markers.read()).toEqual({ kind: "none" });
+    expect(await h.records.read()).toEqual({ kind: "none" });
+  }, 20_000);
+
+  test("after the daily limit refused, the next attempt registers a new key, not the refused one (#269)", async () => {
+    const h = harness({ wallClock: () => ANSWERED });
+    h.answer = () => withRetryAfter(errorAnswer("device_daily_limit"), "86000");
+    await signIn(h);
+    h.answer = () => json(200, ANSWER);
+    expect((await signIn(h)).outcome).toMatchObject({ kind: "signed_in" });
+    expect(h.requests).toHaveLength(2);
+    expect(h.requests[1]?.body.device.publicKey).not.toBe(
+      h.requests[0]?.body.device.publicKey,
+    );
+  }, 30_000);
+
+  test.each(UNUSABLE_RETRY_AFTER)(
+    "takes the daily limit with a %s Retry-After as the same certain refusal, without a wait: the code decides, not the header (#269)",
+    async (_label, value) => {
+      const h = harness({ wallClock: () => ANSWERED });
+      const answer = errorAnswer("device_daily_limit");
+      h.answer = () =>
+        value === null ? answer : withRetryAfter(answer, value);
+      const { outcome } = await signIn(h);
+      expect(outcome).toEqual({ kind: "refused", code: "device_daily_limit" });
+      expect(await h.keyStore.hasKey()).toBe(false);
+      expect(await h.markers.read()).toEqual({ kind: "none" });
+    },
+    20_000,
+  );
+
+  test("takes rate_limited with a Retry-After as an uncertain refusal, keeps a new device's key and marker, and passes the end of the wait on (#269)", async () => {
+    const h = harness({ wallClock: () => ANSWERED });
+    // Only the route's limit per address answers this, and it can answer a
+    // copy of a request that committed.
+    h.answer = () => withRetryAfter(errorAnswer("rate_limited"), "600");
     const { outcome } = await signIn(h);
     expect(UNCERTAIN_REFUSAL_CODES).toContain("rate_limited");
     expect(outcome).toEqual({
       kind: "failed",
       reason: "uncertain_refusal",
       apiError: "rate_limited",
-      retryAfterSeconds: 86_000,
+      retryAfter: waitEnd(600),
     });
     const sent = h.requests[0]?.body.device.publicKey;
     expect(h.keyStore.keys()?.current.publicKey).toBe(sent);
@@ -1603,8 +1672,8 @@ describe("answers of the API", () => {
     expect(await h.records.read()).toEqual({ kind: "none" });
   }, 20_000);
 
-  test("keeps the replacement pending on rate_limited with a Retry-After, and passes the wait on (#269)", async () => {
-    const h = harness();
+  test("keeps the replacement pending on rate_limited with a Retry-After, and passes the end of the wait on (#269)", async () => {
+    const h = harness({ wallClock: () => ANSWERED });
     const previousKey = await existingDevice(h);
     h.answer = () => withRetryAfter(errorAnswer("rate_limited"), "600");
     const { outcome } = await signIn(h);
@@ -1612,7 +1681,7 @@ describe("answers of the API", () => {
       kind: "failed",
       reason: "uncertain_refusal",
       apiError: "rate_limited",
-      retryAfterSeconds: 600,
+      retryAfter: waitEnd(600),
     });
     const keys = h.keyStore.keys();
     expect(keys?.previous?.publicKey).toBe(previousKey);
@@ -1623,18 +1692,10 @@ describe("answers of the API", () => {
     });
   }, 20_000);
 
-  test.each([
-    ["missing", null],
-    ["zero", "0"],
-    ["negative", "-1"],
-    ["fractional", "1.5"],
-    ["date", "Fri, 13 Nov 2026 10:00:00 GMT"],
-    ["empty", ""],
-    ["too long", "12345678901"],
-  ])(
-    "takes rate_limited with a %s Retry-After as an uncertain refusal without a wait (#269)",
+  test.each(UNUSABLE_RETRY_AFTER)(
+    "takes rate_limited with a %s Retry-After as an uncertain refusal without a wait, and keeps the key (#269)",
     async (_label, value) => {
-      const h = harness();
+      const h = harness({ wallClock: () => ANSWERED });
       const answer = errorAnswer("rate_limited");
       h.answer = () =>
         value === null ? answer : withRetryAfter(answer, value);
@@ -1651,18 +1712,27 @@ describe("answers of the API", () => {
     20_000,
   );
 
-  test("caps the wait of rate_limited at 7 days, and reads Retry-After for rate_limited only (#269)", async () => {
-    const capped = harness();
+  test("caps the wait of both limits at 7 days, and reads Retry-After for them only (#269)", async () => {
+    const capped = harness({ wallClock: () => ANSWERED });
     capped.answer = () =>
       withRetryAfter(errorAnswer("rate_limited"), "9999999999");
     expect((await signIn(capped)).outcome).toEqual({
       kind: "failed",
       reason: "uncertain_refusal",
       apiError: "rate_limited",
-      retryAfterSeconds: 604_800,
+      retryAfter: waitEnd(604_800),
     });
 
-    const used = harness();
+    const daily = harness({ wallClock: () => ANSWERED });
+    daily.answer = () =>
+      withRetryAfter(errorAnswer("device_daily_limit"), "9999999999");
+    expect((await signIn(daily)).outcome).toEqual({
+      kind: "refused",
+      code: "device_daily_limit",
+      retryAfter: waitEnd(604_800),
+    });
+
+    const used = harness({ wallClock: () => ANSWERED });
     used.answer = () => withRetryAfter(errorAnswer("sign_in_code_used"), "60");
     expect((await signIn(used)).outcome).toEqual({
       kind: "failed",
@@ -1670,13 +1740,35 @@ describe("answers of the API", () => {
       apiError: "sign_in_code_used",
     });
 
-    const locked = harness();
+    const locked = harness({ wallClock: () => ANSWERED });
     locked.answer = () =>
       withRetryAfter(errorAnswer("device_registration_locked"), "60");
     expect((await signIn(locked)).outcome).toEqual({
       kind: "refused",
       code: "device_registration_locked",
     });
+  }, 30_000);
+
+  test("a wall clock that gives no time leaves both limits without a wait and changes nothing else (#269)", async () => {
+    const daily = harness({ wallClock: () => Number.NaN });
+    daily.answer = () =>
+      withRetryAfter(errorAnswer("device_daily_limit"), "60");
+    expect((await signIn(daily)).outcome).toEqual({
+      kind: "refused",
+      code: "device_daily_limit",
+    });
+    expect(await daily.keyStore.hasKey()).toBe(false);
+
+    const route = harness({ wallClock: () => Number.NaN });
+    route.answer = () => withRetryAfter(errorAnswer("rate_limited"), "60");
+    expect((await signIn(route)).outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "rate_limited",
+    });
+    expect(route.keyStore.keys()?.current.publicKey).toBe(
+      route.requests[0]?.body.device.publicKey,
+    );
   }, 30_000);
 
   test("does not trust a 200 answer outside the format", async () => {

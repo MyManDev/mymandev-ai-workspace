@@ -26,6 +26,7 @@ import {
   forgetMessage,
   initialAccountView,
   nextSignInExpiryChange,
+  nextSignInWaitChange,
   offersForget,
   offersRenewal,
   offersSignIn,
@@ -109,8 +110,9 @@ export interface AccountPanelContentProps {
    * The renderer's clock in milliseconds. The panel reads it again when the
    * wait after a start refused during the grace period of an uncertain
    * sign-in ends, so that its note goes away (#199), when day 25 of the
-   * sign-in begins or the sign-in ends (D4 on #95), and when the window gets
-   * the focus or becomes visible again.
+   * sign-in begins or the sign-in ends (D4 on #95), when the wait of a
+   * sign-in that a limit ended reads differently (#269), and when the window
+   * gets the focus or becomes visible again.
    */
   readonly now: number;
   /** The format of that note's local time; the system's by default. */
@@ -145,7 +147,7 @@ function AccountBody(props: AccountPanelContentProps) {
   const outcome =
     status.lastOutcome === null || status.signIn.kind !== "idle"
       ? undefined
-      : describeOutcome(status.lastOutcome);
+      : describeOutcome(status.lastOutcome, props.now);
   const retryNote = signInRetryNote(
     status,
     props.now,
@@ -657,6 +659,19 @@ function useAccountPanel(
         setReading(Object.freeze({ retryAt, now: later })),
       ),
     [expiryChange, now, retryAt],
+  );
+  // #269: and again each time the wait in the message of a sign-in that a
+  // limit of the server ended reads differently (`nextSignInWaitChange`),
+  // down to its end, so that the wait does not go stale while the message
+  // stays on screen.
+  const waitChange =
+    view.kind === "known" ? nextSignInWaitChange(view.status, now) : undefined;
+  useEffect(
+    () =>
+      watchSignInRetry(waitChange, now, (later) =>
+        setReading(Object.freeze({ retryAt, now: later })),
+      ),
+    [waitChange, now, retryAt],
   );
   useEffect(() => {
     const readAgain = () =>
