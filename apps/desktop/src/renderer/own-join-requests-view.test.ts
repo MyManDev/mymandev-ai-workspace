@@ -1219,3 +1219,31 @@ test("a refresh's answer that arrives after an action started and ended keeps th
   await done;
   expect(second.last().listMessage).toBe("Loading your join requests again.");
 });
+
+test("an old session's create answer that arrives while the new session's create runs neither unlocks it nor shows its sentence (the old answer first)", async () => {
+  const old = pending<CreateJoinRequestResult>();
+  const next = pending<CreateJoinRequestResult>();
+  const answers = [old.answer, next.answer];
+  const { actions, last } = controllerWith({
+    create: () => (answers.shift() ?? NOT_CALLED)(),
+  });
+  actions.editWorkspaceId(WORKSPACE);
+  const first = actions.submit();
+  actions.accountChanged(signedIn({ login: "hubot", displayName: "Hubot" }));
+  actions.editWorkspaceId(OTHER_WORKSPACE);
+  const second = actions.submit();
+  old.resolve(created("The Octocat"));
+  await first;
+  expect(last().running).toBe(true);
+  expect(last().formMessage).toBeUndefined();
+  expect(last().workspaceId).toBe(OTHER_WORKSPACE);
+  // Still locked: the field keeps its text, and nothing else is sent.
+  actions.editWorkspaceId("changed");
+  await actions.submit();
+  expect(last().workspaceId).toBe(OTHER_WORKSPACE);
+  next.resolve(created("Hubot"));
+  await second;
+  expect(last().running).toBe(false);
+  expect(last().formMessage).toBe(OWN_JOIN_REQUEST_DONE_MESSAGES.create);
+  expect(last().workspaceId).toBe("");
+});
