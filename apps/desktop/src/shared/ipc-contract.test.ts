@@ -32,6 +32,8 @@ import {
   CONNECTION_STOP_REASONS,
   CONNECTION_WAITING_REASONS,
   ConnectionStatusSchema,
+  COPY_WORKSPACE_ID_REFUSALS,
+  CopyWorkspaceIdResultSchema,
   CREATE_PROJECT_REFUSALS,
   CREATE_WORKSPACE_REFUSALS,
   CreateProjectResultSchema,
@@ -166,6 +168,7 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     WORKSPACE_STATUSES,
     WORKSPACE_PROBLEMS,
     WORKSPACE_ACTION_REFUSALS,
+    COPY_WORKSPACE_ID_REFUSALS,
     PEOPLE_LIMITS,
     PEOPLE_STATUSES,
     PERSON_ROLES,
@@ -287,7 +290,7 @@ const OWN_JOIN_REQUEST_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.withdrawJoinRequest,
 ]);
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, and the report of seen claims take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the copy of the workspace ID, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, and the report of seen claims take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -297,6 +300,7 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.openProject &&
       channel !== INVOKE_CHANNELS.createWorkspace &&
       channel !== INVOKE_CHANNELS.createProject &&
+      channel !== INVOKE_CHANNELS.copyWorkspaceId &&
       channel !== INVOKE_CHANNELS.sendChatMessage &&
       channel !== INVOKE_CHANNELS.retryChatMessage &&
       channel !== INVOKE_CHANNELS.discardChatMessage &&
@@ -308,7 +312,7 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       !JOIN_REQUEST_ACTION_CHANNELS.has(channel) &&
       !OWN_JOIN_REQUEST_ACTION_CHANNELS.has(channel),
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 35);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 36);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -1674,6 +1678,70 @@ test("a workspace action result is ok or refused with a known reason, without an
     "ok",
   ]) {
     expect(WorkspaceActionResultSchema.safeParse(value).success).toBe(false);
+  }
+});
+
+test("copying the workspace ID takes exactly one lowercase UUIDv7 and refuses anything else, without repeating it", () => {
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.copyWorkspaceId];
+
+  expect(INVOKE_CHANNELS.copyWorkspaceId).toBe("workspaces:copy-id");
+  expect(args.parse([WORKSPACE_ID])).toEqual([WORKSPACE_ID]);
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(args.safeParse([value]).success, String(value)).toBe(false);
+  }
+  for (const value of [
+    [],
+    [null],
+    [WORKSPACE_ID, WORKSPACE_ID],
+    [WORKSPACE_ID, undefined],
+    [WORKSPACE_ID, "text for the clipboard"],
+    [WORKSPACE_ID, { text: "text for the clipboard" }],
+    WORKSPACE_ID,
+    undefined,
+  ]) {
+    expect(args.safeParse(value).success).toBe(false);
+  }
+  const refused = args.safeParse(["secret-text-for-the-clipboard"]);
+  expect(refused.success).toBe(false);
+  expect(JSON.stringify(refused.error?.issues)).not.toContain("secret");
+});
+
+test("the copy of the workspace ID answers ok, refused with a known reason, or failed, without anything else", () => {
+  expect(COPY_WORKSPACE_ID_REFUSALS).toEqual(["invalid", "not_found"]);
+  const { result } = INVOKE_CONTRACT[INVOKE_CHANNELS.copyWorkspaceId];
+  expect(result).toBe(CopyWorkspaceIdResultSchema);
+  // Unknown keys are dropped, so not even the ID goes back.
+  expect(
+    CopyWorkspaceIdResultSchema.parse({
+      outcome: "ok",
+      workspaceId: WORKSPACE_ID,
+      text: WORKSPACE_ID,
+    }),
+  ).toEqual({ outcome: "ok" });
+  expect(
+    CopyWorkspaceIdResultSchema.parse({ outcome: "failed", reason: "x" }),
+  ).toEqual({ outcome: "failed" });
+  for (const reason of COPY_WORKSPACE_ID_REFUSALS) {
+    expect(
+      CopyWorkspaceIdResultSchema.parse({
+        outcome: "refused",
+        reason,
+        workspaceId: WORKSPACE_ID,
+      }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const value of [
+    { outcome: "refused" },
+    { outcome: "refused", reason: "too_soon" },
+    { outcome: "refused", reason: "failed" },
+    { outcome: "copied" },
+    { outcome: "unknown" },
+    {},
+    true,
+    "ok",
+    null,
+  ]) {
+    expect(CopyWorkspaceIdResultSchema.safeParse(value).success).toBe(false);
   }
 });
 

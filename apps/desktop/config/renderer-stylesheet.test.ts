@@ -180,3 +180,13 @@ test("the selected navigation item and tab keep a mark in forced colors", () => 
     /@media \(forced-colors: active\) \{\s*\.nav-item\[aria-current\],\s*\.panel-tab\[aria-selected="true"\] \{\s*text-decoration: underline;/,
   );
 });
+
+test("the workspace ID on the people screen is shown in the monospace font in one rule, and a long one wraps", () => {
+  // So that similar characters stay apart when someone types the ID.
+  expect(rulesWith(".workspace-id")).toEqual([
+    expect.stringContaining("font-family: var(--font-family-mono);"),
+  ]);
+  expect(rule(".workspace-id")).toContain("overflow-wrap: anywhere;");
+  // Nothing keeps the person from selecting it.
+  expect(CSS).not.toMatch(/user-select:\s*none/);
+});
