@@ -518,6 +518,8 @@ const EXPECTED: Readonly<Record<WorkspaceActionFailure, unknown>> = {
     reason: "unclaimed_limit",
     retryAfterMs: null,
   },
+  // No person route answers the limit of projects (#255).
+  project_limit: { outcome: "refused", reason: "failed", retryAfterMs: null },
   rate_limited: {
     outcome: "refused",
     reason: "rate_limited",

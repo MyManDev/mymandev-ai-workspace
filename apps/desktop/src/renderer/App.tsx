@@ -33,6 +33,7 @@ import {
   useCreation,
   type CreationControls,
 } from "./Creation.tsx";
+import { createdOpenPaths } from "./creation-view.ts";
 import {
   CONNECTION_ACTION_LABELS,
   CONNECTION_STATUS_TEXT_ID,
@@ -175,10 +176,18 @@ export function App({
     focusAfterShow,
   );
   const open = openProject(state);
+  // "Open this workspace" and "Open this project" take the sidebar's own
+  // paths, which ask before a switch drops waiting chat messages.
+  const selectWorkspace = workspaceSidebar.onSelect;
+  const openPaths = useMemo(
+    () => createdOpenPaths(selectWorkspace, dispatch),
+    [selectWorkspace],
+  );
   const creation = useCreation(
     workspaces,
     workspaceSidebar.view,
     state.view.screen === "home",
+    openPaths,
   );
 
   return (

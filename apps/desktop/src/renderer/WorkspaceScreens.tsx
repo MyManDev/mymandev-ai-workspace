@@ -2,6 +2,7 @@ import type { Dispatch } from "react";
 import { PRODUCT_NAME } from "../shared/product.ts";
 import { ACCOUNT_SCREEN_TITLE_ID } from "./AccountScreen.tsx";
 import {
+  CreatedOpenButton,
   CreateStatus,
   HOME_TITLE_ID,
   HomeCreateWorkspace,
@@ -39,9 +40,11 @@ export function showAccountScreen(
  *
  * While a device is signed in and the account has no workspace, the screen
  * offers to create one with a name field (#95, D7), and its status
- * paragraph says how the last create there went. The form leaves the page
- * once the new workspace is listed, so the title takes the focus without a
- * tab stop (`tabIndex={-1}`).
+ * paragraph says how the last create there went, followed by "Open this
+ * workspace" while its sentence offers it. The form leaves the page once
+ * the new workspace is listed, and the button once the workspace is
+ * selected, so the title takes the focus without a tab stop
+ * (`tabIndex={-1}`).
  */
 export function HomeScreen({
   signIn,
@@ -118,7 +121,15 @@ export function HomeScreen({
           <CreateStatus
             place="home"
             message={creation.view.message}
+            created={creation.created}
             className="account-message"
+          />
+          <CreatedOpenButton
+            place="home"
+            created={creation.created}
+            running={creation.view.running}
+            onOpen={creation.onOpenCreated}
+            className="account-actions"
           />
         </>
       )}

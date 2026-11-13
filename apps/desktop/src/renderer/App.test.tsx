@@ -243,7 +243,9 @@ test("the sidebar lists the workspace screens, every workspace with the selected
   expect(html).toContain(
     '<ul class="nav-list" aria-labelledby="workspaces-heading"><li><button type="button" class="nav-item" dir="auto">Workspace A</button></li><li><button type="button" class="nav-item" dir="auto" aria-current="true">Workspace B</button></li></ul>',
   );
-  expect(html).toContain('<h2 class="nav-heading" id="projects-heading">');
+  expect(html).toContain(
+    '<h2 class="nav-heading" id="projects-heading" tabindex="-1">',
+  );
   expect(html).toContain(
     '<ul class="nav-list" aria-labelledby="projects-heading">',
   );
@@ -669,7 +671,7 @@ test("a workspace without projects says so, and the shell shows the home screen"
   });
 
   expect(html).toContain(
-    `<h2 class="nav-heading" id="projects-heading">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.noProjects}</p></nav>`,
+    `<h2 class="nav-heading" id="projects-heading" tabindex="-1">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.noProjects}</p></nav>`,
   );
   expect(html).not.toContain('aria-labelledby="projects-heading"');
   expect(html).toContain('<h2 id="home-title" tabindex="-1">Home</h2>');
@@ -751,7 +753,7 @@ test("each workspace state has its own fixed text in the sidebar, and no ID is s
     // With the bridge, the creates' own status paragraph follows; before
     // the first state, no create is offered.
     expect(workspacePart(props)).toBe(
-      `${WORKSPACES_HEADING}${text}${statusParagraph()}${props.workspaces === undefined ? "" : statusParagraph()}`,
+      `${WORKSPACES_HEADING}${text}${statusParagraph()}${props.workspaces === undefined ? "" : '<p class="nav-empty nav-status" id="create-status-workspaces" role="status"></p>'}`,
     );
   }
 
@@ -761,7 +763,7 @@ test("each workspace state has its own fixed text in the sidebar, and no ID is s
   });
   expect(loading).toContain('aria-current="true">Workspace B</button>');
   expect(loading).toContain(
-    `<h2 class="nav-heading" id="projects-heading">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.loadingProjects}</p>`,
+    `<h2 class="nav-heading" id="projects-heading" tabindex="-1">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.loadingProjects}</p>`,
   );
 
   // Workspaces are listed, but none is selected.
@@ -842,7 +844,7 @@ test("unavailable workspaces keep what was loaded and show the problem as a fixe
       }),
     });
     expect(kept).toContain(
-      `</ul>${statusParagraph(WORKSPACE_PROBLEM_MESSAGES[problem])}<h2 class="nav-heading" id="projects-heading">Projects</h2>`,
+      `</ul>${statusParagraph(WORKSPACE_PROBLEM_MESSAGES[problem])}<h2 class="nav-heading" id="projects-heading" tabindex="-1">Projects</h2>`,
     );
     expect(kept).toContain('dir="auto">Project A</button>');
 
@@ -854,7 +856,7 @@ test("unavailable workspaces keep what was loaded and show the problem as a fixe
       }),
     });
     expect(noProjects).toMatch(
-      /<h2 class="nav-heading" id="projects-heading">Projects<\/h2>$/,
+      /<h2 class="nav-heading" id="projects-heading" tabindex="-1">Projects<\/h2>$/,
     );
     expect(noProjects).not.toContain(WORKSPACE_MESSAGES.noProjects);
 

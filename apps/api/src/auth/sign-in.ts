@@ -439,7 +439,10 @@ async function signIn(
         throw new ApiError("device_registration_locked");
       }
       // The previous device that this sign-in replaces does not count: the
-      // recovery path keeps the number of active devices.
+      // recovery path keeps the number of active devices. This limit is
+      // decided before the limit of new devices per day, so a device at both
+      // gets `device_limit`, which no wait frees, and never `rate_limited`,
+      // which the desktop takes as an uncertain refusal (#255).
       const [active] = await tx
         .select({ n: count() })
         .from(devices)
@@ -453,10 +456,9 @@ async function signIn(
           ),
         );
       if ((active?.n ?? 0) >= MAX_ACTIVE_DEVICES) {
-        // Only removing a device frees a place; ask again in a day.
-        throw new ApiError("rate_limited", {
-          retryAfterSeconds: DAY_MS / 1000,
-        });
+        // Only revoking a device frees a place, no time does, so the answer
+        // is `device_limit` without `Retry-After`, not `rate_limited` (#255).
+        throw new ApiError("device_limit");
       }
       const [recent] = await tx
         .select({ n: count(), oldest: min(devices.createdAt) })

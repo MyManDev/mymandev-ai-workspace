@@ -526,6 +526,9 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     conflict: "conflict",
     sign_in_code_used: "failed",
     unclaimed_limit: "unclaimed_limit",
+    project_limit: "project_limit",
+    // Only the sign-in answers it, never a write (#255).
+    device_limit: "failed",
     rate_limited: "rate_limited",
     // Defensive: only with a 5xx, which the session reads as
     // `server_error`, so it never comes as a refusal.
@@ -592,6 +595,15 @@ test("rate_limited waits as long as the API's Retry-After, or a fixed minute wit
       retryAfterSeconds: 120,
     }),
   ).toEqual({ ok: false, reason: "unclaimed_limit" });
+  // Nor is the limit of projects in a workspace (#255).
+  expect(
+    workspaceActionFailedFor({
+      ok: false,
+      reason: "refused",
+      code: "project_limit",
+      retryAfterSeconds: 120,
+    }),
+  ).toEqual({ ok: false, reason: "project_limit" });
   expect(workspaceActionFailedFor({ ok: false, reason: "no_answer" })).toEqual({
     ok: false,
     reason: "unknown",

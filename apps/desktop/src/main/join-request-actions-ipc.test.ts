@@ -499,6 +499,11 @@ const EXPECTED: Readonly<Record<WorkspaceActionFailure, unknown>> = {
     reason: "failed",
     retryAfterMs: null,
   },
+  project_limit: {
+    outcome: "refused",
+    reason: "failed",
+    retryAfterMs: null,
+  },
   rate_limited: {
     outcome: "refused",
     reason: "rate_limited",

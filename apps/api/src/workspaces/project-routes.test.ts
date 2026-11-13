@@ -7,6 +7,7 @@ import {
   workspaceMembers,
 } from "@mymandev/database";
 import {
+  ApiErrorBodySchema,
   CreateProjectResponseSchema,
   CreateWorkspaceResponseSchema,
   decodeEvent,
@@ -422,8 +423,11 @@ test(`the ${MAX_NEW_PROJECTS_PER_DAY + 1}th project of an account within 24 hour
   assert.equal(next.headers["retry-after"], String(HOUR_MS / 1000));
 });
 
-test(`a workspace with ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects that are not archived answers 429 with a Retry-After of a day, and an archived project frees a place`, async (t) => {
-  const owner = await signedIn(await workspaceApp(t, { githubId: 3541 }));
+test(`a workspace with ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects that are not archived answers 409 with project_limit and no Retry-After, and an archived project frees a place`, async (t) => {
+  const recorded = recorder();
+  const owner = await signedIn(
+    await workspaceApp(t, { githubId: 3541, ...recorded }),
+  );
   const workspace = await createWorkspace(owner);
   const ids = Array.from({ length: MAX_ACTIVE_PROJECTS_PER_WORKSPACE }, () =>
     newId<ProjectId>(),
@@ -440,10 +444,26 @@ test(`a workspace with ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects that are no
       })),
     );
 
-  const refused = await create(owner, workspace.id, "One more");
-  assert.equal(refused.statusCode, 429, refused.body);
-  assert.equal(errorCode(refused), "rate_limited");
-  assert.equal(refused.headers["retry-after"], String(DAY_MS / 1000));
+  // Its own code, not `rate_limited`: waiting does not help (#255). The
+  // limit is decided before the name, so a name in use gets it too.
+  recorded.events.length = 0;
+  for (const name of ["One more", "Filler 0"]) {
+    const refused = await create(owner, workspace.id, name);
+    assert.equal(refused.statusCode, 409, refused.body);
+    assert.deepEqual(refused.json(), {
+      statusCode: 409,
+      error: "Conflict",
+      message: "Conflict",
+      code: "project_limit",
+    });
+    assert.equal(ApiErrorBodySchema.safeParse(refused.json()).success, true);
+    assert.equal(refused.headers["retry-after"], undefined);
+  }
+  assert.deepEqual(recorded.events, [], "a refusal sends no event");
+  assert.equal(
+    (await list(owner, workspace.id)).length,
+    MAX_ACTIVE_PROJECTS_PER_WORKSPACE,
+  );
 
   const [first] = ids;
   assert.ok(first !== undefined);
@@ -456,6 +476,45 @@ test(`a workspace with ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects that are no
     (await list(owner, workspace.id)).length,
     MAX_ACTIVE_PROJECTS_PER_WORKSPACE,
   );
+});
+
+test("a creation at both limits of projects answers project_limit, and the account's limit alone still answers 429 with rate_limited (#255)", async (t) => {
+  const clock = fakeClock();
+  const owner = await signedIn(
+    await workspaceApp(t, { githubId: 3542, now: clock.now }),
+  );
+  const workspace = await createWorkspace(owner);
+  // The account created all of them within the last hour.
+  const ids = Array.from({ length: MAX_ACTIVE_PROJECTS_PER_WORKSPACE }, () =>
+    newId<ProjectId>(),
+  );
+  await database()
+    .insert(projects)
+    .values(
+      ids.map((id, index) => ({
+        id,
+        workspaceId: workspace.id,
+        name: `Filler ${index}`,
+        createdByUserId: owner.device.userId,
+        createdAt: new Date(clock.now() - HOUR_MS),
+      })),
+    );
+
+  const both = await create(owner, workspace.id, "One more");
+  assert.equal(both.statusCode, 409, both.body);
+  assert.equal(errorCode(both), "project_limit");
+  assert.equal(both.headers["retry-after"], undefined);
+
+  const [first] = ids;
+  assert.ok(first !== undefined);
+  await database()
+    .update(projects)
+    .set({ archivedAt: new Date(clock.now()) })
+    .where(eq(projects.id, first));
+  const daily = await create(owner, workspace.id, "One more");
+  assert.equal(daily.statusCode, 429, daily.body);
+  assert.equal(errorCode(daily), "rate_limited");
+  assert.equal(daily.headers["retry-after"], String((DAY_MS - HOUR_MS) / 1000));
 });
 
 test("a non-member gets the 404 of an unknown workspace on every project route, and a removed member too", async (t) => {
