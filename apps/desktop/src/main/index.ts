@@ -41,6 +41,9 @@ import {
 } from "./app-protocol.ts";
 import { registerChatIpc } from "./chat-ipc.ts";
 import { createChatService } from "./chat/service.ts";
+import { registerClaimIpc } from "./claim-ipc.ts";
+import { createClaimService } from "./claims/service.ts";
+import { createSystemClaimSeenStore } from "./claims/system.ts";
 import {
   createSystemConnectionClient,
   followSystemResume,
@@ -449,6 +452,25 @@ function start(): void {
     account,
     ownJoinRequests,
   });
+
+  // The selected workspace's recent claims (#95, D8), for its owner and
+  // admins only, read over HTTP once the role allows it and again after
+  // `workspace.subscribed` and a claim, also while the people screen is
+  // closed, so that the sidebar marks unseen claims. The claims that the
+  // account has seen in each workspace are kept in the data folder, as IDs
+  // only, so that a claim made while the application was closed is new at
+  // the next start. They reach the renderer at most once
+  // every 50 ms. The logs are fixed text with a failure code at most.
+  const claims = createClaimService({
+    account,
+    connection,
+    workspaces,
+    seen: createSystemClaimSeenStore(),
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => claims.close());
+  const claimIpc = registerClaimIpc(ipcMain, rendererUrl, { claims });
+  app.on("will-quit", () => claimIpc.close());
 
   // The chat reaches the renderer with the authors' names resolved in the
   // main process, within the view's limits and text budget, at most one
