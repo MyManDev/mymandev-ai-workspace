@@ -231,6 +231,7 @@ export function App({
         <ScreenContent
           view={state.view}
           electronVersion={electronVersion}
+          workspaceBridge={workspaces}
           people={people}
           peopleActions={peopleActions}
           invitations={invitations}
@@ -274,6 +275,7 @@ export function App({
 function ScreenContent({
   view,
   electronVersion,
+  workspaceBridge,
   people,
   peopleActions,
   invitations,
@@ -293,6 +295,8 @@ function ScreenContent({
 }: {
   readonly view: ShellView;
   readonly electronVersion: string | undefined;
+  /** The workspace functions, for the copy of the workspace ID. */
+  readonly workspaceBridge: WorkspaceBridge | undefined;
   readonly people: PeopleBridge | undefined;
   readonly peopleActions: PeopleActionsBridge | undefined;
   readonly invitations: InvitationsBridge | undefined;
@@ -331,6 +335,7 @@ function ScreenContent({
     case "people":
       return (
         <PeopleScreen
+          workspaces={workspaceBridge}
           people={people}
           peopleActions={peopleActions}
           invitations={invitations}

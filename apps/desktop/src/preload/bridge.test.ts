@@ -107,6 +107,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "subscribeStatus",
   ]);
   expect(Object.keys(bridge.workspaces).sort()).toEqual([
+    "copyId",
     "create",
     "createProject",
     "getState",
@@ -1013,6 +1014,57 @@ test("create and createProject refuse a value that is not a string without calli
         expect(String(error)).not.toContain("Secret");
       });
     }
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("copyId passes only the workspace ID string on, and passes the answer through", async () => {
+  const fake = fakeIpc();
+  const workspaces = createDesktopBridge("44.9.1", fake.ipc)
+    .workspaces as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  const answers = [
+    workspaces["copyId"]?.(WORKSPACE_ID, "text for the clipboard", {
+      text: "x",
+    }),
+    workspaces["copyId"]?.(PROJECT_ID),
+  ];
+  fake.answers[0]?.resolve({ outcome: "ok" });
+  fake.answers[1]?.resolve({ outcome: "refused", reason: "not_found" });
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    { outcome: "ok" },
+    { outcome: "refused", reason: "not_found" },
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.copyWorkspaceId, args: [WORKSPACE_ID] },
+    { channel: INVOKE_CHANNELS.copyWorkspaceId, args: [PROJECT_ID] },
+  ]);
+});
+
+test("copyId refuses a value that is not a string without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const workspaces = createDesktopBridge("44.9.1", fake.ipc)
+    .workspaces as unknown as Record<
+    string,
+    (...args: unknown[]) => Promise<unknown>
+  >;
+
+  for (const value of [
+    undefined,
+    null,
+    1,
+    { toString: () => "Secret" },
+    ["Secret"],
+  ]) {
+    const answer = workspaces["copyId"]?.(value);
+    await expect(answer).rejects.toThrow(TypeError);
+    await answer?.catch((error: unknown) => {
+      expect(String(error)).not.toContain("Secret");
+    });
   }
   expect(fake.invoked).toEqual([]);
 });

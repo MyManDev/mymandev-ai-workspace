@@ -243,6 +243,10 @@ function fakeWorkspaces(createResult: CreateWorkspaceResult) {
         projectId: NEW_PROJECT,
       });
     },
+    copyId: (workspaceId) => {
+      calls.push(`copyId ${workspaceId}`);
+      return Promise.resolve({ outcome: "ok" as const });
+    },
   };
   return {
     bridge,

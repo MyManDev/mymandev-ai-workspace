@@ -1,6 +1,7 @@
 import {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   ipcMain,
   protocol,
@@ -80,6 +81,7 @@ import { createLocalRuntime } from "./runtime.ts";
 import { stopRuntimeOnQuit } from "./runtime-lifecycle.ts";
 import { createMainWindowOptions } from "./window.ts";
 import { createWorkspaceService } from "./workspace/service.ts";
+import { registerWorkspaceIdIpc } from "./workspace-id-ipc.ts";
 import {
   askBeforeClosingWithWaitingMessages,
   CLOSE_WITH_WAITING_CONFIRMATION,
@@ -357,6 +359,11 @@ function start(): void {
     workspaces,
     switcher: chat,
   });
+  // Copying the workspace ID (#95; the Project Manager's decision of
+  // 2026-11-13) is the only way to the clipboard: the session denies the
+  // renderer's clipboard permissions, and the main process writes the ID of
+  // a workspace of the account's list and nothing else.
+  registerWorkspaceIdIpc(ipcMain, rendererUrl, { workspaces, clipboard });
 
   // The selected workspace's people (#95, D3) reach the renderer read-only:
   // member IDs, names, roles, and logins, never a user ID, at most one

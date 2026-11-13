@@ -895,6 +895,12 @@ code {
   font-family: var(--font-family-mono);
 }
 
+/* A workspace ID: monospace, so that similar characters stay apart; a long one wraps. */
+.workspace-id {
+  font-family: var(--font-family-mono);
+  overflow-wrap: anywhere;
+}
+
 .people-heading {
   margin-block: var(--space-4) var(--space-1);
   font-size: var(--font-size-base);

@@ -405,6 +405,35 @@ test("the people screen gets the people actions: with them, it has the paragraph
   );
 });
 
+test("the people screen gets the workspace bridge for the copy of the workspace ID: with it, it has the paragraph of the copy's sentence first, and nothing is copied while rendered", () => {
+  const people: PeopleBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const copies: string[] = [];
+  const workspaces: WorkspaceBridge = {
+    ...pendingBridge,
+    copyId: (workspaceId) => {
+      copies.push(workspaceId);
+      return Promise.resolve({ outcome: "ok" });
+    },
+  };
+  const paragraph =
+    '<p class="people-status" id="workspace-id-message" role="status"></p>';
+
+  expect(
+    render({ people, workspaces, initialView: { screen: "people" } }),
+  ).toContain(
+    `<h2 id="people-title" tabindex="-1">People</h2>${paragraph}<p class="people-status" role="status">Checking the people.</p>`,
+  );
+  expect(copies).toEqual([]);
+  // Without the bridge, or on another screen, nothing of it shows.
+  expect(render({ people, initialView: { screen: "people" } })).not.toContain(
+    "workspace-id",
+  );
+  expect(render({ people, workspaces })).not.toContain("workspace-id");
+});
+
 test("the join screen gets the invitation actions and the workspace state: with them, it offers the code field, its status paragraph, and the dialog", () => {
   const call = () => Promise.reject(new Error("not called"));
   const invitationActions: InvitationActionsBridge = {
@@ -702,6 +731,7 @@ const pendingBridge: WorkspaceBridge = {
   openProject: () => Promise.resolve({ outcome: "ok" }),
   create: () => new Promise(() => undefined),
   createProject: () => new Promise(() => undefined),
+  copyId: () => new Promise(() => undefined),
 };
 
 /** The always present live region of the workspaces, with this text. */

@@ -6,6 +6,7 @@ import type {
   JoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
+  WorkspaceBridge,
 } from "../shared/desktop-bridge.ts";
 import {
   INVITATION_ACTION_MESSAGE_ID,
@@ -62,6 +63,11 @@ import {
   type PeopleActionsView,
 } from "./people-actions-view.ts";
 import {
+  useWorkspaceIdCopy,
+  WorkspaceIdPart,
+  type WorkspaceIdCopyControls,
+} from "./WorkspaceIdPart.tsx";
+import {
   describeMorePeople,
   describePeopleScreen,
   followPeople,
@@ -85,6 +91,7 @@ import {
  * the blocked accounts and decide on them (#95, D1 and D3).
  */
 export function PeopleScreen({
+  workspaces,
   people,
   peopleActions,
   invitations,
@@ -92,6 +99,11 @@ export function PeopleScreen({
   joinRequests,
   joinRequestActions,
 }: {
+  /**
+   * The workspace functions from the preload script, for the copy of the
+   * workspace ID; undefined outside Electron.
+   */
+  readonly workspaces?: Pick<WorkspaceBridge, "copyId"> | undefined;
   /** The people functions from the preload script; undefined outside Electron. */
   readonly people: PeopleBridge | undefined;
   /** The people actions from the preload script; undefined outside Electron. */
@@ -106,6 +118,7 @@ export function PeopleScreen({
   readonly joinRequestActions?: JoinRequestActionsBridge | undefined;
 }) {
   const view = usePeopleScreen(people);
+  const workspaceIdCopy = useWorkspaceIdCopy(workspaces);
   const invitationsView = useInvitationsScreen(invitations);
   const joinRequestsView = useJoinRequestsScreen(joinRequests);
   const peopleNow = usePeopleClock(view);
@@ -129,6 +142,7 @@ export function PeopleScreen({
   return (
     <PeopleScreenContent
       view={view}
+      workspaceIdCopy={workspaceIdCopy}
       now={now}
       actions={actions}
       handlers={handlers}
@@ -144,6 +158,11 @@ export function PeopleScreen({
 
 export interface PeopleScreenContentProps {
   readonly view: PeopleScreenView;
+  /**
+   * The copy of the workspace ID; undefined without the bridge, with no
+   * workspace ID and no paragraph for the copy's sentence.
+   */
+  readonly workspaceIdCopy?: WorkspaceIdCopyControls | undefined;
   /**
    * The format of the dates, for tests. By default, a new
    * `peopleDateFormat` for each render, in the person's locale and the
@@ -217,6 +236,7 @@ export interface PeopleScreenContentProps {
  */
 export function PeopleScreenContent({
   view,
+  workspaceIdCopy,
   dateFormat,
   timeFormat,
   now = Date.now(),
@@ -288,6 +308,9 @@ export function PeopleScreenContent({
           {"Workspace: "}
           <span dir="auto">{workspaceName}</span>
         </p>
+      )}
+      {workspaceIdCopy === undefined ? null : (
+        <WorkspaceIdPart view={view} copy={workspaceIdCopy} />
       )}
       <p className="people-status" role="status">
         {status}
