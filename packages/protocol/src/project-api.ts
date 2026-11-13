@@ -29,8 +29,9 @@ export const PROJECT_ROUTES = Object.freeze({
    * Creates a project and its project chat in one transaction. Any active
    * member. A name that a project of the workspace that is not archived
    * already has, compared without regard to case, answers `conflict`. A
-   * workspace with 100 projects that are not archived, and an account that
-   * created 20 projects within 24 hours, answer `rate_limited`.
+   * workspace with 100 projects that are not archived answers
+   * `project_limit`, and an account that created 20 projects within 24 hours
+   * answers `rate_limited`.
    */
   createProject: route("POST", "/workspaces/:workspaceId/projects"),
   /**
@@ -67,11 +68,17 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  * - `forbidden`: the caller neither created the project nor is the owner or
  *   an admin;
  * - `conflict`: a project of the workspace that is not archived has the name,
- *   compared without regard to case, or the project is archived.
+ *   compared without regard to case, or the project is archived;
+ * - `project_limit`: a creation in a workspace that holds 100 projects that
+ *   are not archived, without `Retry-After`, because no time frees a place
+ *   (#255).
+ *
+ * The limit of 20 new projects per account in 24 hours answers
+ * `rate_limited`, because its places come free with time.
  */
 export const PROJECT_ROUTE_ERRORS = Object.freeze({
   listProjects: errors("not_found"),
-  createProject: errors("not_found", "conflict"),
+  createProject: errors("not_found", "conflict", "project_limit"),
   renameProject: errors("not_found", "forbidden", "conflict"),
 } satisfies Record<ProjectRouteName, readonly ApiErrorCode[]>);
 

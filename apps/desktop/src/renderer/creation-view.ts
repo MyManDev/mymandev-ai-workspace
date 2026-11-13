@@ -178,8 +178,11 @@ export const CREATE_UNKNOWN_MESSAGES: Readonly<Record<CreateKind, string>> =
 /**
  * Why a create was refused, after its start. `too_soon` and `rate_limited`
  * say how long to wait (`describeWait`); `rate_limited` also names the
- * API's limits of the kind, because the API answers them with it (ADR 0014,
- * "Limits"; ADR 0005, #155; #255).
+ * API's limit of the kind that it answers with: 10 new workspaces or 20 new
+ * projects per account in 24 hours (ADR 0014, "Limits"; ADR 0005, #155).
+ * `project_limit` names no wait, because none helps: only archiving a
+ * project frees a place in the workspace, and no project can be removed yet
+ * (#255).
  */
 export const CREATE_REFUSAL_MESSAGES: Readonly<
   Record<
@@ -207,8 +210,10 @@ export const CREATE_REFUSAL_MESSAGES: Readonly<
     workspace: (wait: string) =>
       `The server asked to wait. Try again in ${wait}. An account creates at most 10 workspaces in 24 hours.`,
     project: (wait: string) =>
-      `The server asked to wait. Try again in ${wait}. A workspace holds at most 100 projects, and an account creates at most 20 projects in 24 hours.`,
+      `The server asked to wait. Try again in ${wait}. An account creates at most 20 projects in 24 hours.`,
   }),
+  project_limit:
+    "This workspace already has as many projects as it allows, and projects cannot be removed yet. Create the project in another workspace.",
   not_found:
     "The server does not know this workspace for your account. Check the list of workspaces.",
   conflict:
