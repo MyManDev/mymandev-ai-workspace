@@ -6,8 +6,13 @@
 // rendered; the tests read the props that `App` passes to its children.
 // This checks `App`'s wiring of the paths and the `useCreation` hook: the
 // button offered, the click, and the focus once the button leaves.
+//
+// The stand-in knows six hooks only: useState, useReducer, useMemo,
+// useCallback, useRef, and useEffect. Any other hook of React throws a clear
+// error here, so that a hook that `App` starts to use needs a stand-in
+// first instead of reaching React without a renderer.
 import type { ReactElement, ReactNode } from "react";
-import { beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
 import type {
   CreateProjectResult,
@@ -112,11 +117,25 @@ const hooks = vi.hoisted(() => {
   };
 });
 
-vi.mock("react", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("react")>()),
-  ...hooks.api,
-}));
+vi.mock("react", async (importOriginal) => {
+  const react = await importOriginal<typeof import("react")>();
+  const unknown = Object.fromEntries(
+    Object.keys(react)
+      .filter((name) => /^use([A-Z]|$)/.test(name) && !(name in hooks.api))
+      .map((name) => [
+        name,
+        () => {
+          throw new Error(
+            `The React stand-in of open-after-create.test.ts has no ${name}; add one to its hooks first.`,
+          );
+        },
+      ]),
+  );
+  return { ...react, ...unknown, ...hooks.api };
+});
 
+// `App` and its modules load afresh, with the stand-in.
+vi.resetModules();
 const { App } = await import("./App.tsx");
 const { CREATE_MESSAGES } = await import("./creation-view.ts");
 const { WORKSPACES_HEADING_ID } = await import("./Creation.tsx");
@@ -148,6 +167,10 @@ function workspaceState(overrides: Partial<WorkspaceView> = {}): WorkspaceView {
 /** The elements that the page would show, which take the focus. */
 const focused: string[] = [];
 
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
 beforeEach(() => {
   hooks.store.slots = [];
   hooks.store.effects = [];
@@ -165,8 +188,11 @@ beforeEach(() => {
 });
 
 /**
- * A workspace bridge whose creates confirm, and whose switches answer that
- * chat messages wait, recording every call with its arguments.
+ * A workspace bridge whose creates confirm, recording every call with its
+ * arguments, while chat messages wait to be sent: a switch answers
+ * `waiting` until it comes with `discardWaiting`, which answers `ok`. The
+ * report that no project is open, which `App` sends at the start, answers
+ * `ok` too, so that no question is open before a click, as in the app.
  */
 function fakeWorkspaces(createResult: CreateWorkspaceResult) {
   const calls: string[] = [];
@@ -177,13 +203,21 @@ function fakeWorkspaces(createResult: CreateWorkspaceResult) {
       listener = next;
       return () => undefined;
     },
-    select: (...args: unknown[]) => {
+    select: (...args: Parameters<WorkspaceBridge["select"]>) => {
       calls.push(`select ${JSON.stringify(args)}`);
-      return Promise.resolve({ outcome: "waiting" as const, count: 2 });
+      return Promise.resolve(
+        args[1]?.discardWaiting === true
+          ? { outcome: "ok" as const }
+          : { outcome: "waiting" as const, count: 2 },
+      );
     },
-    openProject: (...args: unknown[]) => {
+    openProject: (...args: Parameters<WorkspaceBridge["openProject"]>) => {
       calls.push(`openProject ${JSON.stringify(args)}`);
-      return Promise.resolve({ outcome: "waiting" as const, count: 1 });
+      return Promise.resolve(
+        args[0] === null || args[1]?.discardWaiting === true
+          ? { outcome: "ok" as const }
+          : { outcome: "waiting" as const, count: 1 },
+      );
     },
     create: (name) => {
       calls.push(`create ${name}`);
@@ -306,6 +340,8 @@ test("App offers Open this workspace for an unselected new workspace, selects it
   });
   expect(CREATE_MESSAGES.openWorkspace).toBe("Open this workspace");
 
+  // No question is open before the click.
+  expect(app.question().question).toBeUndefined();
   const before = fake.calls.length;
   app.creation().onOpenCreated();
   await settle();
@@ -323,6 +359,8 @@ test("App offers Open this workspace for an unselected new workspace, selects it
     `select ["${NEW_WORKSPACE}"]`,
     `select ["${NEW_WORKSPACE}",{"discardWaiting":true}]`,
   ]);
+  expect(app.question().question).toBeUndefined();
+  expect(focused).toEqual([]);
 
   // Once it is selected, the button leaves, and the focus, which fell to
   // the page, moves to the Workspaces heading.
@@ -338,7 +376,7 @@ test("App offers Open this workspace for an unselected new workspace, selects it
   expect(focused).toEqual([WORKSPACES_HEADING_ID]);
 });
 
-test("App offers Open this project once its event lists it, and opens it through the shell's open-project, which the main process gets without a discard", async () => {
+test("App offers Open this project once its event lists it, and opens it through the shell's open-project, which the main process gets without a discard until the person's answer", async () => {
   const fake = fakeWorkspaces({
     outcome: "ok",
     workspaceId: NEW_WORKSPACE,
@@ -370,6 +408,8 @@ test("App offers Open this project once its event lists it, and opens it through
     projectId: NEW_PROJECT,
   });
 
+  // No question is open before the click.
+  expect(app.question().question).toBeUndefined();
   const before = fake.calls.length;
   app.creation().onOpenCreated();
   app.render();
@@ -383,6 +423,17 @@ test("App offers Open this project once its event lists it, and opens it through
   // the shell asks.
   expect(fake.calls.slice(before)).toEqual([`openProject ["${NEW_PROJECT}"]`]);
   expect(app.question().question).toEqual({ kind: "project", count: 1 });
+  expect(focused).toEqual([]);
+
+  // Only the person's answer drops the waiting messages.
+  app.question().onDiscard();
+  await settle();
+  app.render();
+  expect(fake.calls.slice(before)).toEqual([
+    `openProject ["${NEW_PROJECT}"]`,
+    `openProject ["${NEW_PROJECT}",{"discardWaiting":true}]`,
+  ]);
+  expect(app.question().question).toBeUndefined();
   expect(focused).toEqual([]);
 
   // Once the main process opened it, the button leaves, and the focus
