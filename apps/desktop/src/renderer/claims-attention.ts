@@ -130,17 +130,114 @@ export function followPageAttention(
 /**
  * The part of a row that must be in view for the row to count as shown:
  * three quarters, so that a row cut off at the edge of the screen does not
- * count. A row taller than the visible area never reaches it and stays new,
- * for example at a high page zoom, until the page is zoomed out or the
- * window is made larger (#276).
+ * count. A row more than a third taller than the visible area can never
+ * reach it, for example at a high page zoom; a row taller than the visible
+ * area also counts while its visible part fills three quarters of the
+ * visible area's height and three quarters of the row's own width
+ * (`isRowInView`, #276).
  */
 export const ROW_IN_VIEW_RATIO = 0.75;
+
+/**
+ * The thresholds of the rows' observer: 0 and every power of the square root
+ * of three quarters from 1 down to `0.75 ** 20` (about 0.0032), 42 in all.
+ * The observer reports a row only when the share of its area in view
+ * crosses a threshold, or when the row starts or stops intersecting.
+ *
+ * - Every second power is a power of three quarters, so `ROW_IN_VIEW_RATIO`
+ *   is among them, and a row that is not taller than the visible area is
+ *   reported exactly when it crosses three quarters of itself.
+ * - A row `k` times the visible area's height, with a share `w` of its width
+ *   in view, fills three quarters of the visible area's height while the
+ *   share of its area in view is between `0.75 * w / k` and `w / k`, a range
+ *   whose ends differ by the factor 4/3. Neighboring thresholds differ by
+ *   the square root of 4/3, so every such range whose upper end is at least
+ *   the smallest threshold holds one: a row that comes to fill the visible
+ *   area is reported on its way while it fills three quarters of the
+ *   visible area's height, up to a `k` of 315 at its full width and 236 at
+ *   three quarters of it.
+ * - A row that stops filling three quarters of the visible area's height is
+ *   reported out once its share drops below the largest threshold at or
+ *   below the share at which it stopped, which is at least the square root
+ *   of three quarters times that share while that share is at least the
+ *   smallest threshold. At a steady share of its width, the row then leaves
+ *   the view at the latest when its visible part drops below `0.75 ** 1.5`
+ *   (about 0.65) of the visible area's height, up to a `k` of 236 at its full
+ *   width and 177 at three quarters of it. A taller row can stay in view until
+ *   it stops intersecting.
+ *
+ * A row that stops before it fills the visible area may stay new until a
+ * later report. Powers of three quarters alone would also put a threshold in
+ * every range, but sometimes only at one of its ends; the square root keeps
+ * one inside each range and the list short. The observer reports at most
+ * once per frame, so the list only changes how often a scroll is reported,
+ * and the callback handles only the rows whose share changed.
+ */
+export const ROW_THRESHOLDS: readonly number[] = Object.freeze([
+  0,
+  ...Array.from(
+    { length: 41 },
+    (_, index) => ROW_IN_VIEW_RATIO ** ((40 - index) / 2),
+  ),
+]);
+
+/** The size of a box, as a `DOMRectReadOnly` gives it. */
+export interface RowBox {
+  readonly width: number;
+  readonly height: number;
+}
 
 /** What the row observer reports of one row, as `IntersectionObserverEntry` does. */
 export interface RowEntry {
   readonly target: Element;
   readonly isIntersecting: boolean;
   readonly intersectionRatio: number;
+  /** The row's whole box. */
+  readonly boundingClientRect: RowBox;
+  /** The row's visible part, clipped by the visible area and every scrolling ancestor. */
+  readonly intersectionRect: RowBox;
+  /** The visible area, or null when the page may not know it, for example across origins. */
+  readonly rootBounds: RowBox | null;
+}
+
+/**
+ * Whether the row of an observer's entry is in view. Any row is while it
+ * intersects the visible area by at least `ROW_IN_VIEW_RATIO` of itself. A
+ * row taller than the visible area also is while its visible part is at
+ * least `ROW_IN_VIEW_RATIO` of the visible area's height and of the row's
+ * own width, also when it runs past both the top and the bottom edge, so
+ * that a row cut off at a side does not count. Without the visible area's
+ * bounds, or with a visible area of no height, the rule for a taller row
+ * does not apply; the first rule still does.
+ *
+ * The rule assumes that the document itself scrolls: with the page's
+ * observer (`pageRowObserver`), `rootBounds` is the viewport, while
+ * `intersectionRect` is also clipped by every scrolling ancestor. A
+ * scrolling or fixed ancestor of the rows would make the visible area
+ * smaller than `rootBounds`, so that a tall row could no longer fill three
+ * quarters of it; `config/renderer-stylesheet.test.ts` checks that the
+ * rows' ancestors set none.
+ *
+ * A row of no area has a share of 1 whenever it intersects the visible area,
+ * as `IntersectionObserver` reports it, and so counts on any intersection.
+ */
+export function isRowInView(entry: RowEntry): boolean {
+  if (!entry.isIntersecting) {
+    return false;
+  }
+  if (entry.intersectionRatio >= ROW_IN_VIEW_RATIO) {
+    return true;
+  }
+  const root = entry.rootBounds;
+  const row = entry.boundingClientRect;
+  const visible = entry.intersectionRect;
+  return (
+    root !== null &&
+    root.height > 0 &&
+    row.height > root.height &&
+    visible.height >= ROW_IN_VIEW_RATIO * root.height &&
+    visible.width >= ROW_IN_VIEW_RATIO * row.width
+  );
 }
 
 /** What `followRowsInView` uses of an observer, as `IntersectionObserver` offers it. */
@@ -161,7 +258,10 @@ export type RowObserverFactory = (
 
 /**
  * The page's own `IntersectionObserver`, against the viewport, which also
- * clips by every scrolling ancestor; undefined without one.
+ * clips by every scrolling ancestor; undefined without one. Its entries'
+ * `rootBounds` are the viewport, so `isRowInView` takes the visible area as
+ * the viewport, which holds while the document itself scrolls and no
+ * ancestor of the rows scrolls or is fixed.
  */
 export const pageRowObserver: RowObserverFactory = (callback, options) =>
   typeof IntersectionObserver === "undefined"
@@ -188,11 +288,11 @@ export interface RowsInView {
 
 /**
  * Follows the claims' rows with one observer from `create`, and calls
- * `onInView` with the member IDs of the rows in view whenever they change:
- * a row is in view while it intersects the visible area by at least
- * `ROW_IN_VIEW_RATIO`. The observer is made at the first row, so nothing
- * observes before a row is on the page; a row that leaves the page leaves
- * the view at once. Without an observer, no row is ever in view.
+ * `onInView` with the member IDs of the rows in view whenever they change,
+ * as `isRowInView` reads each entry, with the thresholds `ROW_THRESHOLDS`.
+ * The observer is made at the first row, so nothing observes before a row
+ * is on the page; a row that leaves the page leaves the view at once.
+ * Without an observer, no row is ever in view.
  */
 export function followRowsInView(
   create: RowObserverFactory,
@@ -222,10 +322,7 @@ export function followRowsInView(
       if (memberId === undefined) {
         continue;
       }
-      if (
-        entry.isIntersecting &&
-        entry.intersectionRatio >= ROW_IN_VIEW_RATIO
-      ) {
+      if (isRowInView(entry)) {
         next.add(memberId);
       } else {
         next.delete(memberId);
@@ -253,7 +350,7 @@ export function followRowsInView(
     }
     if (!made) {
       made = true;
-      observer = create(observed, { threshold: [ROW_IN_VIEW_RATIO] });
+      observer = create(observed, { threshold: ROW_THRESHOLDS });
     }
     if (observer === undefined) {
       return;
