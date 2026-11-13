@@ -39,6 +39,7 @@ import type {
   DeviceRecordStore,
 } from "../device-record.ts";
 import type { ScheduleTimer } from "../runtime.ts";
+import { retryAfterSecondsOf } from "../session/api-call.ts";
 import {
   type AuthorizeSignInKind,
   authorizeUrl,
@@ -171,12 +172,17 @@ export type SignInFailureReason = (typeof SIGN_IN_FAILURE_REASONS)[number];
  * keeps its record of the code, for a minute after the first copy ended
  * (#152). That record lives in API memory only: a copy that reaches a
  * restarted API gets `auth_failed`, because the API takes the sign-in code
- * before every other check. The route's limit can refuse a copy with
- * `rate_limited` before that. A copy of a request that committed cannot get
- * any other refusal: those answer a request that the API refused before its
- * transaction committed. The API's request timeout answers `408` with
- * `bad_request`, but only after 30 seconds, when the flow has stopped waiting
- * (`SIGN_IN_REQUEST_TIMEOUT_MS` must not exceed the API's request timeout).
+ * before every other check. The route's limit of requests per address can
+ * refuse a copy with `rate_limited` before that. The account's limit of new
+ * devices per day answers `rate_limited` too, before its transaction
+ * commits, so that answer alone would be certain; but both come with the
+ * same status, code, and `Retry-After`, so the flow cannot tell them apart
+ * and takes every `rate_limited` as uncertain (#269). A copy of a request
+ * that committed cannot get any other refusal: those answer a request that
+ * the API refused before its transaction committed. The API's request
+ * timeout answers `408` with `bad_request`, but only after 30 seconds, when
+ * the flow has stopped waiting (`SIGN_IN_REQUEST_TIMEOUT_MS` must not exceed
+ * the API's request timeout).
  * `auth_failed` stays in this list for the restarted API; whether it can
  * leave is a separate decision.
  */
@@ -236,6 +242,13 @@ export type SignInOutcome =
       readonly keyError?: DeviceKeyErrorCode;
       /** With `uncertain_refusal`: the API's error code. */
       readonly apiError?: UncertainRefusalCode;
+      /**
+       * With `uncertain_refusal` and `rate_limited` (#269): the answer's
+       * `Retry-After` in seconds, when it is a whole number from 1, capped
+       * at `MAX_RETRY_AFTER_SECONDS`. It says how long the limit lasts, not
+       * whether the sign-in was completed.
+       */
+      readonly retryAfterSeconds?: number;
     };
 
 interface StartedSignInBase {
@@ -405,7 +418,12 @@ type DevicePlan =
 /** What the API answered, read without trusting it. */
 type Answer =
   | { readonly kind: "signed_in"; readonly body: SignedInAccount }
-  | { readonly kind: "error"; readonly code: ApiErrorCode }
+  | {
+      readonly kind: "error";
+      readonly code: ApiErrorCode;
+      /** With `rate_limited`: the answer's `Retry-After`, when it is usable. */
+      readonly retryAfterSeconds?: number;
+    }
   | { readonly kind: "server_error" }
   | { readonly kind: "unexpected" };
 
@@ -488,7 +506,13 @@ async function readAnswer(response: Response): Promise<Answer> {
   if (response.status >= 400 && response.status <= 499) {
     const parsed = ApiErrorBodySchema.safeParse(value);
     if (parsed.success && parsed.data.statusCode === response.status) {
-      return { kind: "error", code: parsed.data.code };
+      const retryAfterSeconds =
+        parsed.data.code === "rate_limited"
+          ? retryAfterSecondsOf(response)
+          : undefined;
+      return retryAfterSeconds === undefined
+        ? { kind: "error", code: parsed.data.code }
+        : { kind: "error", code: parsed.data.code, retryAfterSeconds };
     }
   }
   return { kind: "unexpected" };
@@ -1145,12 +1169,17 @@ export function createSignInFlow(deps: SignInFlowDependencies): SignInFlow {
 
     if (answer.kind === "error" && isUncertainRefusal(answer.code)) {
       // A resent copy of a request that committed gets this answer too;
-      // nothing is undone (see `undoKey`).
+      // nothing is undone (see `undoKey`). A `Retry-After` of `rate_limited`
+      // only tells the person how long the limit lasts; it does not make
+      // the refusal certain (#269).
       report("The sign-in request got a refusal that may follow a commit.");
       return Object.freeze({
         kind: "failed",
         reason: "uncertain_refusal",
         apiError: answer.code,
+        ...(answer.retryAfterSeconds === undefined
+          ? {}
+          : { retryAfterSeconds: answer.retryAfterSeconds }),
       });
     }
 

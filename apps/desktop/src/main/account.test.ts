@@ -1145,6 +1145,67 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
   expect(view({ kind: "paused" })).toEqual({ code: "failed" });
 });
 
+test("an uncertain rate_limited passes its wait on, and no other outcome does (#269)", () => {
+  const view = (outcome: unknown) =>
+    signInOutcomeView(outcome as SignInOutcome);
+  expect(
+    view({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "rate_limited",
+      retryAfterSeconds: 86_000,
+    }),
+  ).toEqual({ code: "uncertain_refusal", retryAfterMs: 86_000_000 });
+  // Without a usable `Retry-After`, the flow passes no wait.
+  expect(
+    view({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "rate_limited",
+    }),
+  ).toEqual({ code: "uncertain_refusal" });
+  for (const outcome of [
+    {
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "sign_in_code_used",
+      retryAfterSeconds: 60,
+    },
+    {
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "auth_failed",
+      retryAfterSeconds: 60,
+    },
+    { kind: "failed", reason: "no_answer", retryAfterSeconds: 60 },
+    { kind: "refused", code: "rate_limited", retryAfterSeconds: 60 },
+  ]) {
+    expect(view(outcome)).not.toHaveProperty("retryAfterMs");
+  }
+});
+
+test("an uncertain rate_limited reaches the status with its wait (#269)", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const attempt = startedSignIn();
+  h.start = async () => attempt.start;
+  await h.service.startSignIn();
+
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  attempt.settle({
+    kind: "failed",
+    reason: "uncertain_refusal",
+    apiError: "rate_limited",
+    retryAfterSeconds: 3_600,
+  });
+
+  const expected = { code: "uncertain_refusal", retryAfterMs: 3_600_000 };
+  expect((await done).lastOutcome).toEqual(expected);
+  expect(AccountStatusSchema.parse(h.service.status()).lastOutcome).toEqual(
+    expected,
+  );
+});
+
 test("This is not me asks for confirmation, removes the device at the API, deletes the record and the registration marker, resets the flow, deletes the key, and signs out", async () => {
   const h = harness();
   await h.service.initialize();
