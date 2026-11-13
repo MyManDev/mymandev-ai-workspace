@@ -2,6 +2,7 @@ import {
   decodeClientMessage,
   decodeServerMessage,
   EVENT_REFUSAL_CODES,
+  LIMITS,
   RUN_CANCEL_REASONS,
   RUN_STATES,
   type AgentId,
@@ -95,6 +96,8 @@ class Harness {
   };
   /** What `sendAs` answers instead of sending, when set. */
   failSend: SendOutcome | null = null;
+  /** Called during a send that goes out, before `sendAs` returns. */
+  duringSend: (() => void) | null = null;
   connectionStatus: ConnectionStatus;
   readonly sent: AgentRunStateChangedEvent[] = [];
   readonly sentAt: number[] = [];
@@ -176,6 +179,7 @@ class Harness {
     }
     this.sent.push(checked.event);
     this.sentAt.push(this.time);
+    this.duringSend?.();
     return "sent";
   }
 
@@ -357,7 +361,7 @@ test("after a terminal acknowledgement, no transition is allowed", () => {
 
 // Reasons.
 
-test("the host may send any reason except the server's cancel reasons", () => {
+test("the host may send any reason within the protocol's limits except the server's cancel reasons", () => {
   // The server's codes (P-60, #201), written out as well, so that a change
   // of the protocol's list shows here.
   expect([...RUN_CANCEL_REASONS]).toEqual(["member_removed", "device_revoked"]);
@@ -390,6 +394,31 @@ test("the host may send any reason except the server's cancel reasons", () => {
   }
   const h = new Harness({ runState: "running" });
   expect(h.run.transition("awaiting_input", "Approve the push?")).toBe("sent");
+  // The longest reason that the protocol allows goes.
+  const g = new Harness({ runState: "running" });
+  expect(g.run.transition("failed", "a".repeat(LIMITS.runReason))).toBe("sent");
+});
+
+test("a reason beyond the protocol's limits is refused before the send, and the model stays ready", () => {
+  expect(LIMITS.runReason).toBe(500);
+  for (const reason of [
+    "",
+    "   ",
+    "a".repeat(LIMITS.runReason + 1),
+    "Two\nlines",
+    "A\ttab",
+    // A zero-width space and a right-to-left override, built from their
+    // code points.
+    `Hidden${String.fromCodePoint(0x200b)}text`,
+    `Turned${String.fromCodePoint(0x202e)}text`,
+  ]) {
+    const h = new Harness({ runState: "running" });
+    expect(h.run.transition("failed", reason)).toBe("invalid_reason");
+    expect(h.sent).toEqual([]);
+    expect(h.reports).toEqual([]);
+    expect(h.run.state().phase).toBe("idle");
+    expect(h.run.transition("failed", "The tests did not pass.")).toBe("sent");
+  }
 });
 
 // One in flight.
@@ -579,14 +608,68 @@ test("a refusal of its event stops the model; the server applied nothing", () =>
     expect(h.run.transition("running")).toBe("stopped");
     expect(h.sent).toHaveLength(1);
   }
-  // Also while the resend is due, and after it.
+  // Also while the resend is due: nothing was sent a second time.
   const h = new Harness();
   h.run.transition("running");
   h.advance(HOST_RUN_ACK_TIMEOUT_MS);
   h.refuse("conflict");
   expect(h.run.state().stop).toEqual({ cause: "refused", code: "conflict" });
+  expect(h.run.state().unacknowledged).toBeNull();
   expect(h.run.resend()).toBe("stopped");
   expect(h.sent).toHaveLength(1);
+});
+
+test("a refusal after the resend stops the model, but the first send may have been applied", () => {
+  // The server checks its limit before it looks for a recorded event ID, so
+  // a resend of an applied transition can get `rate_limited`; a late
+  // refusal of the first send can also arrive after the resend.
+  for (const code of EVENT_REFUSAL_CODES) {
+    const h = new Harness();
+    h.run.transition("running");
+    h.advance(HOST_RUN_ACK_TIMEOUT_MS);
+    expect(h.run.resend()).toBe("sent");
+    h.refuse(code);
+    expect(h.run.state()).toEqual({
+      phase: "stopped",
+      runState: "queued",
+      unacknowledged: {
+        previousState: "queued",
+        state: "running",
+        resent: true,
+      },
+      stop: { cause: "refused", code },
+    });
+    expect(h.released()).toBe(true);
+    expect(h.run.resend()).toBe("stopped");
+    expect(h.sent).toHaveLength(2);
+  }
+});
+
+test("a model that stops during its own send reports the stop, not the send", () => {
+  // The connection closes while `sendAs` sends, before it returns.
+  const h = new Harness();
+  h.duringSend = () => h.setConnection(waiting("connection_lost"));
+  expect(h.run.transition("running")).toBe("stopped");
+  expect(h.run.state().phase).toBe("stopped");
+  expect(h.run.state().stop).toEqual({
+    cause: "connection_closed",
+    code: "connection_lost",
+  });
+  expect(h.phases()).toEqual(["stopped"]);
+  // No timer of an acknowledgement is left behind.
+  expect(h.released()).toBe(true);
+  h.advance(2 * HOST_RUN_ACK_TIMEOUT_MS);
+  expect(h.sent).toHaveLength(1);
+  expect(h.phases()).toEqual(["stopped"]);
+
+  // The same during a resend.
+  const g = new Harness();
+  g.run.transition("running");
+  g.advance(HOST_RUN_ACK_TIMEOUT_MS);
+  g.duringSend = () => g.run.close();
+  expect(g.run.resend()).toBe("stopped");
+  expect(g.run.state().phase).toBe("closed");
+  expect(g.released()).toBe(true);
 });
 
 test("any close or loss of the open connection stops the model, whether a transition waits or not", () => {

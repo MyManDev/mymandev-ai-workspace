@@ -8,7 +8,9 @@
 // - Before a send, it checks the transition with the protocol's
 //   `canTransition` from the run's known state, and the reason with the
 //   protocol's `runReasonAllowed`: a code of `RUN_CANCEL_REASONS` comes only
-//   from the server, which would refuse it with `conflict`.
+//   from the server, which would refuse it with `conflict`. The whole payload
+//   must also pass the protocol's schema, so that a reason beyond its limits
+//   is refused before the send instead of stopping the model.
 // - One transition is in flight at a time. It waits for its acknowledgement,
 //   the relayed transition with the same event ID, workspace, agent, and
 //   run; the acknowledgement's payload is the run's state from then on.
@@ -28,6 +30,7 @@ import {
   canTransition,
   newId,
   PROTOCOL_VERSION,
+  AgentRunStateChangedPayloadSchema,
   runReasonAllowed,
   type AgentId,
   type AgentRunStateChangedEvent,
@@ -97,8 +100,12 @@ export interface HostRunState {
   /**
    * The transition that was sent and not acknowledged: in flight, due to be
    * sent again, or, after a stop or a close, one that the server may have
-   * applied. Null when nothing waits, and after a refusal, because the
-   * server applied nothing.
+   * applied. Null when nothing waits, and after a refusal of a transition
+   * that was sent once, because the server applied nothing. After a resend,
+   * a refusal keeps it: the first send may have been applied, and the server
+   * checks its limit before it looks for a recorded event ID, so a resend
+   * can be refused with `rate_limited`, and a late refusal of the first send
+   * can arrive after the resend.
    */
   readonly unacknowledged: HostRunUnacknowledged | null;
   /** Why it stopped; null unless `phase` is `stopped`. */
@@ -110,11 +117,18 @@ export interface HostRunState {
  * waits for its acknowledgement (or, for `resend`, when nothing is due);
  * `not_allowed` when `canTransition` refuses the transition from the run's
  * known state; `reserved_reason` for a reason that only the server gives;
+ * `invalid_reason` for a reason that the protocol's limits refuse (empty,
+ * blank, too long, or with control, format, or invisible characters);
  * `stopped` when the model is stopped or closed, also when this send made
- * it stop.
+ * it stop. Only `sent` and `stopped` change the model.
  */
 export type HostRunSendResult =
-  "sent" | "busy" | "not_allowed" | "reserved_reason" | "stopped";
+  | "sent"
+  | "busy"
+  | "not_allowed"
+  | "reserved_reason"
+  | "invalid_reason"
+  | "stopped";
 
 export interface HostRunOptions {
   readonly workspaceId: WorkspaceId;
@@ -237,8 +251,11 @@ export function createHostRun(options: HostRunOptions): HostRun {
     }
     phase = "stopped";
     stopReason = Object.freeze(reason);
-    if (reason.cause === "refused") {
-      // The server applied nothing.
+    if (reason.cause === "refused" && pending?.resent === false) {
+      // The server applied nothing. After a resend, the first send may have
+      // been applied: the refusal can be the resend's `rate_limited`, which
+      // the server answers before it looks for a recorded event ID, or a
+      // late refusal of the first send.
       pending = null;
     }
     release();
@@ -255,6 +272,11 @@ export function createHostRun(options: HostRunOptions): HostRun {
       }
       return { ...sent.transition, deviceId: identity.deviceId };
     });
+    if (ended()) {
+      // A listener of the connection stopped or closed the model during the
+      // send.
+      return "stopped";
+    }
     if (outcome !== "sent") {
       if (!sent.resent) {
         // The first send did not go out: nothing waits.
@@ -292,6 +314,10 @@ export function createHostRun(options: HostRunOptions): HostRun {
     });
     if (!runReasonAllowed({ actor, payload })) {
       return "reserved_reason";
+    }
+    if (!AgentRunStateChangedPayloadSchema.safeParse(payload).success) {
+      // The transition is allowed, so only the reason can fail the schema.
+      return "invalid_reason";
     }
     // The event gets its ID and its time only when it is sent.
     pending = {

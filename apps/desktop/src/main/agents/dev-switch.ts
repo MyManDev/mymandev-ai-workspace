@@ -35,8 +35,8 @@
 //   any 10 seconds and 1,800 in an hour).
 //
 // Every send goes through the connection client's `sendAs` with the agent
-// actor, from the model. It has no IPC channel, so a packaged build sends nothing. The logs
-// are fixed text with a code at most, never an ID.
+// actor, from the model. It has no IPC channel, so a packaged build sends
+// nothing. The logs are fixed text with a code at most, never an ID.
 import {
   AgentIdSchema,
   DeviceIdSchema,
@@ -589,6 +589,12 @@ export function createDevAgentSwitch(
 
   const removers = [
     account.onStatusChange(() => evaluate()),
+    // Registered before any run's model, so that the client, which calls
+    // its status listeners in the order they were added, tells the switch
+    // of a close before the model: the switch applies its own rule first
+    // (stop, or pause at a sign-out with nothing waiting) and closes the
+    // model. A model that heard first would lead to the same stop and the
+    // same log line through `runStopped`.
     connection.onStatusChange((status) => connectionChanged(status)),
     workspaces.onChange(() => evaluate()),
     agents.onChange(() => evaluate()),
