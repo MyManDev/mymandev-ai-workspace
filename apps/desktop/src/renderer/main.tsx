@@ -23,6 +23,7 @@ createRoot(container).render(
       invitationActions={window.desktop?.invitationActions}
       joinRequests={window.desktop?.joinRequests}
       joinRequestActions={window.desktop?.joinRequestActions}
+      claims={window.desktop?.claims}
       agents={window.desktop?.agents}
       chat={window.desktop?.chat}
       devices={window.desktop?.devices}

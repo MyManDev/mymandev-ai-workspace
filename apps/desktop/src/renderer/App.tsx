@@ -11,6 +11,7 @@ import type {
   AccountBridge,
   AgentBridge,
   ChatBridge,
+  ClaimsBridge,
   ConnectionBridge,
   DeviceListBridge,
   InvitationActionsBridge,
@@ -28,6 +29,7 @@ import { PRODUCT_NAME } from "../shared/product.ts";
 import { AccountScreen } from "./AccountScreen.tsx";
 import { initialAccountView, type AccountView } from "./account-view.ts";
 import { ChatScreen } from "./ChatScreen.tsx";
+import { hasUnseenClaims } from "./claims-view.ts";
 import {
   CreateDialogBox,
   useCreation,
@@ -54,6 +56,7 @@ import {
 } from "./Navigation.tsx";
 import { PeopleScreen } from "./PeopleScreen.tsx";
 import { ProjectPanel } from "./ProjectPanel.tsx";
+import { useClaimsScreen } from "./RecentClaims.tsx";
 import {
   DecisionsScreen,
   PermissionsScreen,
@@ -116,6 +119,8 @@ export interface AppProps {
   readonly joinRequests?: JoinRequestsBridge | undefined;
   /** The join request actions from the preload script; undefined outside Electron. */
   readonly joinRequestActions?: JoinRequestActionsBridge | undefined;
+  /** The selected workspace's recent claims from the preload script; undefined outside Electron. */
+  readonly claims?: ClaimsBridge | undefined;
   /** The open project's agent activity from the preload script; undefined outside Electron. */
   readonly agents?: AgentBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
@@ -144,6 +149,7 @@ export function App({
   invitationActions,
   joinRequests,
   joinRequestActions,
+  claims,
   agents,
   chat,
   devices,
@@ -189,6 +195,12 @@ export function App({
     state.view.screen === "home",
     openPaths,
   );
+  // The shell follows the claims for the sidebar's marker; the people
+  // screen follows them on its own while it is shown.
+  const claimsView = useClaimsScreen(claims);
+  const unseenClaims = hasUnseenClaims(claimsView, workspaceSidebar.view);
+  const shellDialogOpen =
+    question.question !== undefined || creation?.view.dialog !== undefined;
 
   return (
     <div className={open === undefined ? "shell" : "shell shell-project"}>
@@ -219,6 +231,7 @@ export function App({
         dispatch={dispatch}
         workspaces={workspaceSidebar}
         creation={creation}
+        unseenClaims={unseenClaims}
       />
       {open === undefined ? null : (
         <ProjectNav
@@ -237,6 +250,8 @@ export function App({
           invitationActions={invitationActions}
           joinRequests={joinRequests}
           joinRequestActions={joinRequestActions}
+          claims={claims}
+          shellDialogOpen={shellDialogOpen}
           workspaces={workspaceSidebar}
           account={account}
           chat={chat}
@@ -280,6 +295,8 @@ function ScreenContent({
   invitationActions,
   joinRequests,
   joinRequestActions,
+  claims,
+  shellDialogOpen,
   workspaces,
   account,
   chat,
@@ -299,6 +316,9 @@ function ScreenContent({
   readonly invitationActions: InvitationActionsBridge | undefined;
   readonly joinRequests: JoinRequestsBridge | undefined;
   readonly joinRequestActions: JoinRequestActionsBridge | undefined;
+  readonly claims: ClaimsBridge | undefined;
+  /** Whether a modal dialog of the shell is open, for the people screen. */
+  readonly shellDialogOpen: boolean;
   /** The workspace part of the sidebar, for the join screen. */
   readonly workspaces: WorkspaceSidebar;
   readonly account: AccountBridge | undefined;
@@ -337,6 +357,8 @@ function ScreenContent({
           invitationActions={invitationActions}
           joinRequests={joinRequests}
           joinRequestActions={joinRequestActions}
+          claims={claims}
+          shellDialogOpen={shellDialogOpen}
         />
       );
     case "join":

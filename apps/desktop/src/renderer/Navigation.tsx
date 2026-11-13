@@ -1,5 +1,6 @@
 import type { Dispatch } from "react";
 import type { WorkspaceView } from "../shared/ipc-contract.ts";
+import { CLAIM_MESSAGES } from "./claims-view.ts";
 import {
   CreateButton,
   CreatedOpenButton,
@@ -41,38 +42,53 @@ export interface WorkspaceSidebar {
  * "New workspace" and "New project" open the dialog that asks for the name
  * (#95, D7), and a status paragraph says how the last create there went,
  * followed by "Open this workspace" or "Open this project" while its
- * sentence offers it.
+ * sentence offers it. While the selected workspace has a claim that the
+ * account has not seen (#95, D8), the people item carries a dot, which is
+ * hidden from assistive technologies, and its accessible name says so
+ * ("People, new claims"), so that the marker is not only a color.
  */
 export function WorkspaceNav({
   state,
   dispatch,
   workspaces,
   creation,
+  unseenClaims = false,
 }: {
   readonly state: ShellState;
   readonly dispatch: Dispatch<ShellAction>;
   readonly workspaces: WorkspaceSidebar;
   /** The creates; undefined without the bridge. */
   readonly creation?: CreationControls | undefined;
+  /** Whether the selected workspace has a claim that the account has not seen. */
+  readonly unseenClaims?: boolean | undefined;
 }) {
   const { view } = state;
   return (
     <nav className="shell-nav" aria-label="Workspace">
       <ul className="nav-list">
-        {WORKSPACE_SCREENS.map((screen) => (
-          <li key={screen.id}>
-            <button
-              type="button"
-              className="nav-item"
-              aria-current={screen.id === view.screen ? "page" : undefined}
-              onClick={() =>
-                dispatch({ type: "show-screen", screen: screen.id })
-              }
-            >
-              {screen.label}
-            </button>
-          </li>
-        ))}
+        {WORKSPACE_SCREENS.map((screen) => {
+          const marked = unseenClaims && screen.id === "people";
+          return (
+            <li key={screen.id}>
+              <button
+                type="button"
+                className="nav-item"
+                aria-current={screen.id === view.screen ? "page" : undefined}
+                aria-label={
+                  marked ? CLAIM_MESSAGES.peopleWithNewClaims : undefined
+                }
+                onClick={() =>
+                  dispatch({ type: "show-screen", screen: screen.id })
+                }
+              >
+                {screen.label}
+                {marked ? (
+                  <span className="nav-marker" aria-hidden="true" />
+                ) : null}
+              </button>
+            </li>
+          );
+        })}
       </ul>
       <h2 className="nav-heading" id={WORKSPACES_HEADING_ID} tabIndex={-1}>
         Workspaces

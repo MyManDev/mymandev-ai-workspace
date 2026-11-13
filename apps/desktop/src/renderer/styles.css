@@ -329,6 +329,20 @@ code {
   box-shadow: inset 0 calc(-1 * var(--mark-width)) 0 var(--color-accent);
 }
 
+/*
+ * The dot after "People" while the selected workspace has a claim that the
+ * account has not seen; the item's accessible name says so.
+ */
+.nav-marker {
+  display: inline-block;
+  width: var(--space-2);
+  height: var(--space-2);
+  margin-inline-start: var(--space-2);
+  border-radius: var(--radius-round);
+  background: var(--color-accent);
+  vertical-align: middle;
+}
+
 .project-nav {
   grid-area: project-nav;
   display: flex;
@@ -971,6 +985,20 @@ code {
   margin-block-start: var(--space-2);
 }
 
+/* The recent claims, above the people. */
+.recent-claims {
+  margin-block-end: var(--space-4);
+}
+
+/* "New" on a claim: a word in a frame, not only a color. */
+.claim-new {
+  padding-inline: var(--space-1);
+  border: var(--border-width) solid var(--color-accent);
+  border-radius: var(--radius);
+  color: var(--color-accent);
+  font-size: var(--font-size-small);
+}
+
 /* The open invitations, below the people. */
 .invitations {
   margin-block-start: var(--space-4);
@@ -1129,5 +1157,11 @@ code {
     text-decoration: underline;
     text-decoration-thickness: var(--mark-width);
     text-underline-offset: var(--space-1);
+  }
+
+  /* Forced colors replace backgrounds, so the dot keeps the text's system color. */
+  .nav-marker {
+    forced-color-adjust: none;
+    background: CanvasText;
   }
 }
