@@ -17,6 +17,7 @@ import {
   SIGN_IN_RENEWAL_MESSAGES,
   signInEndFormat,
   signInTimeFormat,
+  TWO_FACTOR_NOTE,
 } from "./account-view.ts";
 
 /** The panel's clock in the tests, and time formats that do not depend on the machine. */
@@ -880,4 +881,78 @@ test("after a renewal that the API refused for another GitHub account, the devic
     "Remove this device",
     "This is not me",
   ]);
+});
+
+test("the note on two-factor authentication shows as plain text after the panel's actions while the panel offers a sign-in or the device is signed in, and not while a sign-in runs (D6)", () => {
+  const note = `<p class="placeholder-note">${TWO_FACTOR_NOTE}</p>`;
+  const signedOut = render();
+  const signedIn = render({ view: known(SIGNED_IN) });
+  expect(signedOut).toContain(note);
+  expect(signedIn).toContain(note);
+  // It is the panel's last paragraph, after the actions, and it holds no
+  // link and no style.
+  for (const html of [signedOut, signedIn]) {
+    expect(html.endsWith(`${note}</section>`)).toBe(true);
+    expect(html.indexOf("account-actions")).toBeLessThan(html.indexOf(note));
+    expect(html).not.toMatch(/<a[\s>]|\shref=|\sstyle=/);
+  }
+  // A renewal from day 25 and every device state that offers a sign-in keep it.
+  expect(render({ view: known(endingAt(NOW + DAY_MS)) })).toContain(note);
+  for (const device of [
+    "signed_out",
+    "sign_out_report_pending",
+    "sign_in_required",
+    "auth_failed",
+    "account_mismatch",
+    "key_lost",
+    "removed",
+    "revoked",
+  ] as const) {
+    expect(render({ view: known({ ...SIGNED_IN, device }) }), device).toContain(
+      note,
+    );
+  }
+  // Without a known status, while the device or its key is checked, while the
+  // key waits for its passphrase, and while a removal waits, it does not show.
+  for (const overrides of [
+    { view: { kind: "unavailable" } },
+    { view: { kind: "pending" } },
+    { view: known({ deviceKey: "loading" }) },
+    { view: known({ ...SIGNED_IN, device: "starting" }) },
+    { view: known({ ...SIGNED_IN, device: "unavailable" }) },
+    { view: known({ ...SIGNED_IN, device: "removal_pending" }) },
+    {
+      view: known({
+        ...SIGNED_IN,
+        deviceKey: "passphrase_required",
+        device: "key_not_loaded",
+      }),
+    },
+  ] as const) {
+    expect(render(overrides), JSON.stringify(overrides.view)).not.toContain(
+      TWO_FACTOR_NOTE,
+    );
+  }
+  // Nor next to the progress or the pairing code of a running sign-in.
+  for (const signIn of [
+    { kind: "starting" },
+    { kind: "waiting", pairingCode: "042137", opened: true },
+    {
+      kind: "waiting",
+      pairingCode: "042137",
+      opened: false,
+      authorizeUrl: AUTHORIZE_URL,
+      warning: WARNING,
+      browser: "other",
+    },
+    { kind: "completing" },
+  ] as const) {
+    expect(render({ view: known({ signIn }) }), signIn.kind).not.toContain(
+      TWO_FACTOR_NOTE,
+    );
+    expect(
+      render({ view: known({ ...SIGNED_IN, signIn }) }),
+      signIn.kind,
+    ).not.toContain(TWO_FACTOR_NOTE);
+  }
 });

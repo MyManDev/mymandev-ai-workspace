@@ -38,7 +38,9 @@ import {
   signInTimeFormat,
   signOutMessage,
   startInAnotherBrowser,
+  showsTwoFactorNote,
   startMessage,
+  TWO_FACTOR_NOTE,
   waitingPairingCode,
   watchSignInRetry,
   type AccountView,
@@ -56,7 +58,9 @@ const RENEWAL_PROMPT_ID = "sign-in-renewal";
  * key that needs one, and the state of the device with sign-out and
  * removing this device. While the device is signed in, it shows when the
  * sign-in ends and offers to renew it, and from day 25 of the 30 days (6
- * days before the end) it asks the person to (D4 on #95). The main process runs the sign-in and the
+ * days before the end) it asks the person to (D4 on #95). While no sign-in
+ * runs and the panel offers one or the device is signed in, a fixed note
+ * recommends two-factor authentication on GitHub (D6 on #95). The main process runs the sign-in and the
  * device session; the panel never sees a sign-in code, a key, or a token.
  * The account's devices are listed beside it (`DevicesSection.tsx`).
  */
@@ -204,6 +208,9 @@ function AccountBody(props: AccountPanelContentProps) {
         <p className="placeholder-note">
           The device key of the last sign-in is not confirmed yet.
         </p>
+      ) : null}
+      {showsTwoFactorNote(status) ? (
+        <p className="placeholder-note">{TWO_FACTOR_NOTE}</p>
       ) : null}
     </>
   );
