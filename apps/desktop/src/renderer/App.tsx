@@ -29,7 +29,7 @@ import { PRODUCT_NAME } from "../shared/product.ts";
 import { AccountScreen } from "./AccountScreen.tsx";
 import { initialAccountView, type AccountView } from "./account-view.ts";
 import { ChatScreen } from "./ChatScreen.tsx";
-import { hasUnseenClaims } from "./claims-view.ts";
+import { hasUnseenClaims, isShellDialogOpen } from "./claims-view.ts";
 import {
   CreateDialogBox,
   useCreation,
@@ -205,8 +205,7 @@ export function App({
   // screen follows them on its own while it is shown.
   const claimsView = useClaimsScreen(claims, initialClaimsState);
   const unseenClaims = hasUnseenClaims(claimsView, workspaceSidebar.view);
-  const shellDialogOpen =
-    question.question !== undefined || creation?.view.dialog !== undefined;
+  const shellDialogOpen = isShellDialogOpen(question.question, creation?.view);
 
   return (
     <div className={open === undefined ? "shell" : "shell shell-project"}>

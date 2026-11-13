@@ -18,18 +18,23 @@ import {
   CLAIM_VIA_MESSAGES,
   claimScope,
   claimsCovered,
+  claimsReport,
   createRecentClaims,
   describeRecentClaims,
   followClaims,
   hasUnseenClaims,
   IDLE_RECENT_CLAIMS,
   initialClaimsScreenView,
+  isShellDialogOpen,
   NO_MARKED_CLAIMS,
   shownClaims,
+  shownClaimsKey,
+  type ClaimsReportInput,
   type ClaimsScreenView,
   type RecentClaimsView,
   type ShownClaims,
 } from "./claims-view.ts";
+import { IDLE_CREATION } from "./creation-view.ts";
 import { IDLE_INVITATION_ACTIONS } from "./invitations-view.ts";
 import { IDLE_JOIN_REQUEST_ACTIONS } from "./join-requests-view.ts";
 import {
@@ -351,30 +356,49 @@ test("a claim stays marked New while the marked claims hold it for the same work
   expect(marked([MEMBER], null)).toEqual([]);
 });
 
-test("the claims to report are the rendered rows that the state marks unseen, only while the section is visible", () => {
+/** Every claim's member ID, as if every row were in view. */
+const ALL_IN_VIEW: ReadonlySet<string> = new Set(
+  CLAIMS.claims.map((one) => one.memberId),
+);
+
+test("the claims to report are the rendered rows that the state marks unseen and that are in view, only while the section is visible", () => {
   const model = describeRecentClaims(known(), listed());
-  expect(shownClaims(model, true)).toEqual({
+  expect(shownClaims(model, true, ALL_IN_VIEW)).toEqual({
     scope: SCOPE,
     workspaceId: WORKSPACE,
     memberIds: [MEMBER, OTHER_ADMIN],
   });
+  // Only the rows in view count; a row out of view stays new.
+  expect(shownClaims(model, true, new Set([OTHER_ADMIN, FORMER]))).toEqual({
+    scope: SCOPE,
+    workspaceId: WORKSPACE,
+    memberIds: [OTHER_ADMIN],
+  });
+  expect(shownClaims(model, true, new Set())).toBeNull();
+  expect(shownClaims(model, true, new Set([FORMER, ADMIN]))).toBeNull();
   // Not visible: nothing, whatever the state holds.
-  expect(shownClaims(model, false)).toBeNull();
+  expect(shownClaims(model, false, ALL_IN_VIEW)).toBeNull();
   // No section, no rows, or nothing unseen: nothing.
-  expect(shownClaims(null, true)).toBeNull();
+  expect(shownClaims(null, true, ALL_IN_VIEW)).toBeNull();
   expect(
-    shownClaims(describeRecentClaims(known(), { kind: "pending" }), true),
+    shownClaims(
+      describeRecentClaims(known(), { kind: "pending" }),
+      true,
+      ALL_IN_VIEW,
+    ),
   ).toBeNull();
   expect(
     shownClaims(
       describeRecentClaims(known(), listed({ workspaceId: OTHER_WORKSPACE })),
       true,
+      ALL_IN_VIEW,
     ),
   ).toBeNull();
   expect(
     shownClaims(
       describeRecentClaims(known({ ownMemberId: MEMBER }), listed()),
       true,
+      ALL_IN_VIEW,
     ),
   ).toBeNull();
   const seen = describeRecentClaims(
@@ -386,7 +410,140 @@ test("the claims to report are the rendered rows that the state marks unseen, on
   );
   // A row that stays marked New after the main process saw it is not reported again.
   expect(seen?.rows[0]?.marked).toBe(true);
-  expect(shownClaims(seen, true)).toBeNull();
+  expect(shownClaims(seen, true, ALL_IN_VIEW)).toBeNull();
+  // The key names the scope and the claims, and is empty without a report.
+  expect(shownClaimsKey(shownClaims(model, true, ALL_IN_VIEW))).toBe(
+    `${SCOPE} ${MEMBER} ${OTHER_ADMIN}`,
+  );
+  expect(shownClaimsKey(null)).toBe("");
+});
+
+/** The input of a report while everything lets the claims count as shown. */
+const SEEN_INPUT: ClaimsReportInput = {
+  people: known(),
+  claims: listed(),
+  marked: NO_MARKED_CLAIMS,
+  attention: { documentShown: true, windowFocused: true },
+  rowsInView: ALL_IN_VIEW,
+  shellDialogOpen: false,
+  peopleActions: IDLE_PEOPLE_ACTIONS,
+  invitationActions: IDLE_INVITATION_ACTIONS,
+  joinRequestActions: IDLE_JOIN_REQUEST_ACTIONS,
+};
+
+test("PM decision of 2026-11-13: the screen reports the unseen rows in view only while the window shows the page, has the focus, and no modal dialog covers the section", () => {
+  expect(claimsReport(SEEN_INPUT)).toEqual({
+    report: {
+      scope: SCOPE,
+      workspaceId: WORKSPACE,
+      memberIds: [MEMBER, OTHER_ADMIN],
+    },
+    key: `${SCOPE} ${MEMBER} ${OTHER_ADMIN}`,
+  });
+  expect(
+    claimsReport({ ...SEEN_INPUT, rowsInView: new Set([MEMBER]) }),
+  ).toEqual({
+    report: { scope: SCOPE, workspaceId: WORKSPACE, memberIds: [MEMBER] },
+    key: `${SCOPE} ${MEMBER}`,
+  });
+  const remove = {
+    kind: "remove",
+    workspaceId: WORKSPACE,
+    memberId: MEMBER,
+    name: "Linus",
+    claimed: true,
+  } as const;
+  const code = { name: "Ada", code: "code", expiresAt: "2026-11-20T00:00:00Z" };
+  const nothing: [string, Partial<ClaimsReportInput>][] = [
+    [
+      "hidden window",
+      { attention: { documentShown: false, windowFocused: true } },
+    ],
+    [
+      "window without the focus",
+      { attention: { documentShown: true, windowFocused: false } },
+    ],
+    ["no row in view", { rowsInView: new Set() }],
+    ["shell dialog", { shellDialogOpen: true }],
+    [
+      "people actions' question",
+      {
+        peopleActions: {
+          ...IDLE_PEOPLE_ACTIONS,
+          dialog: { request: remove, draft: "", problem: undefined },
+        },
+      },
+    ],
+    [
+      "invitation question",
+      {
+        invitationActions: {
+          ...IDLE_INVITATION_ACTIONS,
+          question: {
+            kind: "invite",
+            workspaceId: WORKSPACE,
+            memberId: MEMBER,
+            name: "Linus",
+          },
+        },
+      },
+    ],
+    [
+      "invitation code",
+      { invitationActions: { ...IDLE_INVITATION_ACTIONS, code } },
+    ],
+    [
+      "join request question",
+      {
+        joinRequestActions: {
+          ...IDLE_JOIN_REQUEST_ACTIONS,
+          dialog: {
+            request: { kind: "denyAll", workspaceId: WORKSPACE },
+            draft: "",
+            invitee: undefined,
+            problem: undefined,
+          },
+        },
+      },
+    ],
+    [
+      "join request code",
+      { joinRequestActions: { ...IDLE_JOIN_REQUEST_ACTIONS, code } },
+    ],
+    ["a member", { people: known({ ownMemberId: MEMBER }) }],
+    [
+      "another workspace's claims",
+      { claims: listed({ workspaceId: OTHER_WORKSPACE }) },
+    ],
+    [
+      "claims marked during the visit and seen since",
+      {
+        claims: listed({
+          claims: CLAIMS.claims.map((one) => ({ ...one, unseen: false })),
+        }),
+        marked: { scope: SCOPE, memberIds: new Set([MEMBER, OTHER_ADMIN]) },
+      },
+    ],
+  ];
+  for (const [name, change] of nothing) {
+    expect(claimsReport({ ...SEEN_INPUT, ...change }), name).toEqual({
+      report: null,
+      key: "",
+    });
+  }
+});
+
+test("a modal dialog of the shell is the question before a switch or the dialog of a create", () => {
+  const question = { kind: "workspace", count: 1 } as const;
+  expect(isShellDialogOpen(undefined, undefined)).toBe(false);
+  expect(isShellDialogOpen(undefined, IDLE_CREATION)).toBe(false);
+  expect(isShellDialogOpen(question, undefined)).toBe(true);
+  expect(isShellDialogOpen(question, IDLE_CREATION)).toBe(true);
+  expect(
+    isShellDialogOpen(undefined, {
+      dialog: {} as NonNullable<(typeof IDLE_CREATION)["dialog"]>,
+    }),
+  ).toBe(true);
 });
 
 test("a modal dialog of the shell or the people screen covers the claims", () => {
@@ -718,6 +875,56 @@ test("a switch, a switch away and back, or a sign-out drops the refresh's senten
     await refreshed;
     expect(late.last().message).toBeUndefined();
   }
+});
+
+test("after a render, the controller follows the views first, so that a report of the scope that the same render shows counts", () => {
+  const { claims, calls } = controllerWith();
+  claims.rendered(known(), listed(), null);
+  // A switch and the new scope's report in the same render.
+  const elsewhere = known({ workspaceId: OTHER_WORKSPACE });
+  const report: ShownClaims = {
+    scope: `${OTHER_WORKSPACE} ${OWNER}`,
+    workspaceId: OTHER_WORKSPACE,
+    memberIds: [MEMBER],
+  };
+  claims.rendered(elsewhere, listed({ workspaceId: OTHER_WORKSPACE }), report);
+  expect(calls).toEqual([
+    { name: "markSeen", args: [OTHER_WORKSPACE, [MEMBER]] },
+  ]);
+});
+
+test("after a render, a report is sent only when its key changed, so that nothing is retried on its own", async () => {
+  const answers: ClaimMarkSeenResult[] = [
+    { outcome: "refused", reason: "not_listed" },
+    { outcome: "ok" },
+  ];
+  const { claims, calls, last } = controllerWith({
+    markSeen: () => Promise.resolve(answers.shift() ?? { outcome: "ok" }),
+  });
+  const marks = () => calls.filter((call) => call.name === "markSeen");
+  claims.rendered(known(), listed(), REPORT);
+  expect(marks()).toHaveLength(1);
+  await settle();
+  // Refused: forgotten, but the same report again sends nothing.
+  expect(last().marked.memberIds.size).toBe(0);
+  claims.rendered(known(), listed(), REPORT);
+  claims.rendered(known(), listed(), { ...REPORT });
+  expect(marks()).toHaveLength(1);
+  // Once the report changes, for example when the section is covered and
+  // shown again, the claims go again.
+  claims.rendered(known(), listed(), null);
+  claims.rendered(known(), listed(), REPORT);
+  expect(marks()).toHaveLength(2);
+  await settle();
+  // Seen: a new key with the same claims sends nothing more.
+  claims.rendered(known(), listed(), null);
+  claims.rendered(known(), listed(), REPORT);
+  expect(marks()).toHaveLength(2);
+  // A render also follows the views, as listChanged does.
+  await claims.refresh();
+  expect(last().message).toBe(CLAIM_REFRESH_MESSAGES.loading);
+  claims.rendered(known(), listed({ revision: CLAIMS.revision + 1 }), REPORT);
+  expect(last().message).toBeUndefined();
 });
 
 test("the claims never change from an answer: the controller holds no claim", async () => {

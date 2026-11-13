@@ -2,20 +2,30 @@ import { useEffect, useMemo, useState } from "react";
 import type { ClaimsBridge } from "../shared/desktop-bridge.ts";
 import type { ClaimsView } from "../shared/ipc-contract.ts";
 import {
+  followDocumentVisibility,
+  followRowsInView,
+  followWindowFocus,
+  NO_PAGE_ATTENTION,
+  pageRowObserver,
+  type PageAttention,
+  type RowObserverFactory,
+} from "./claims-attention.ts";
+import {
   CLAIM_MESSAGES,
   CLAIM_VIA_MESSAGES,
   createRecentClaims,
-  describeRecentClaims,
   followClaims,
   IDLE_RECENT_CLAIMS,
   initialClaimsScreenView,
-  shownClaims,
   type ClaimRow,
   type ClaimsScreenView,
+  type RecentClaims,
   type RecentClaimsModel,
   type RecentClaimsView,
+  type ShownClaims,
 } from "./claims-view.ts";
 import {
+  ActionButton,
   PersonActionButtons,
   type PeopleActionHandlers,
 } from "./PeopleActions.tsx";
@@ -31,41 +41,17 @@ export const CLAIM_ACTION_MESSAGE_ID = "claim-action-message";
 /** The ID of the heading of the recent claims. */
 export const RECENT_CLAIMS_HEADING_ID = "recent-claims-heading";
 
+/** The ref callback of a claim's row, by the claim's member ID. */
+export type ClaimRowRef = (
+  memberId: string,
+) => (element: Element | null) => void;
+
 /** What the people screen does on its recent claims; undefined without the bridge. */
 export interface RecentClaimHandlers {
   /** Asks the main process to load the claims again. */
   readonly onRefresh: () => void;
-}
-
-/**
- * A button of the recent claims. While an action runs it stays focusable
- * and does nothing (`aria-disabled`), like the people actions' buttons.
- */
-function ActionButton({
-  label,
-  inert,
-  onClick,
-}: {
-  readonly label: string;
-  readonly inert: boolean;
-  readonly onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className="panel-action"
-      aria-disabled={inert ? "true" : undefined}
-      onClick={inert ? undefined : () => onClick()}
-    >
-      {label}
-    </button>
-  );
-}
-
-/** A time of the claims in `format`. A timestamp that is not a date stays as it is. */
-function formatTime(timestamp: string, format: Intl.DateTimeFormat): string {
-  const date = new Date(timestamp);
-  return Number.isNaN(date.getTime()) ? timestamp : format.format(date);
+  /** Follows each claim's row, to know which rows are in view. */
+  readonly rowRef: ClaimRowRef;
 }
 
 /**
@@ -80,7 +66,8 @@ function formatTime(timestamp: string, format: Intl.DateTimeFormat): string {
  * how and when the person joined; dates are in `dateFormat`, times in
  * `timeFormat`, the people screen's shared formats. "Remove" is the people
  * actions' own button, described by the name, whose element ID is the
- * claim's place in the list, never an ID.
+ * claim's place in the list, never an ID. Each row's element goes to
+ * `rowRef`, which follows which rows are in view.
  */
 export function RecentClaimsPart({
   model,
@@ -89,6 +76,7 @@ export function RecentClaimsPart({
   inert,
   onStart,
   onRefresh,
+  rowRef,
 }: {
   readonly model: RecentClaimsModel;
   readonly dateFormat: Intl.DateTimeFormat;
@@ -97,6 +85,8 @@ export function RecentClaimsPart({
   /** The people actions' start, for "Remove"; undefined without them. */
   readonly onStart: PeopleActionHandlers["onStart"] | undefined;
   readonly onRefresh: () => void;
+  /** Follows each row's element; undefined follows none, so none is in view. */
+  readonly rowRef?: ClaimRowRef | undefined;
 }) {
   return (
     <section
@@ -121,6 +111,7 @@ export function RecentClaimsPart({
               timeFormat={timeFormat}
               inert={inert}
               onStart={onStart}
+              rowRef={rowRef?.(row.memberId)}
             />
           ))}
         </ul>
@@ -128,8 +119,9 @@ export function RecentClaimsPart({
       <div className="account-actions">
         <ActionButton
           label={CLAIM_MESSAGES.refresh}
+          describedBy={undefined}
           inert={inert}
-          onClick={onRefresh}
+          onClick={() => onRefresh()}
         />
       </div>
     </section>
@@ -143,6 +135,7 @@ function ClaimItem({
   timeFormat,
   inert,
   onStart,
+  rowRef,
 }: {
   readonly row: ClaimRow;
   /** The ID of the name, by the claim's place in the list, for "Remove". */
@@ -151,10 +144,12 @@ function ClaimItem({
   readonly timeFormat: Intl.DateTimeFormat;
   readonly inert: boolean;
   readonly onStart: PeopleActionHandlers["onStart"] | undefined;
+  /** The row's ref callback, the same function on every render. */
+  readonly rowRef: ((element: Element | null) => void) | undefined;
 }) {
   const remove = onStart === undefined ? null : row.remove;
   return (
-    <li className="person">
+    <li className="person" ref={rowRef}>
       <p className="person-name">
         {row.name === null ? (
           <span>{CLAIM_MESSAGES.unlisted}</span>
@@ -205,7 +200,7 @@ function ClaimItem({
       <p className="person-meta">
         {`${CLAIM_VIA_MESSAGES[row.via]}${CLAIM_MESSAGES.on}`}
         <time dateTime={row.claimedAt}>
-          {formatTime(row.claimedAt, timeFormat)}
+          {formatPeopleDate(row.claimedAt, timeFormat)}
         </time>
       </p>
       {remove === null || onStart === undefined ? null : (
@@ -240,80 +235,65 @@ export function useClaimsScreen(
   return view;
 }
 
-/** What `isDocumentShown` reads of the document. */
-export interface DocumentVisibility {
-  readonly visibilityState: string;
-}
-
 /**
- * Whether the window shows the page: not while it is minimized or hidden
- * (`document.visibilityState` is "hidden"), so that a claim that arrives
- * meanwhile is not reported as shown.
+ * Whether the window shows the page and has the focus, read again on every
+ * change of the document's visibility and every focus and blur of the
+ * window. Neither until the first reading after the render
+ * (`NO_PAGE_ATTENTION`), so that nothing counts as seen before it.
  */
-export function isDocumentShown(doc: DocumentVisibility): boolean {
-  return doc.visibilityState !== "hidden";
+export function usePageAttention(): PageAttention {
+  const [attention, setAttention] = useState(NO_PAGE_ATTENTION);
+  useEffect(
+    () =>
+      followDocumentVisibility(document, (documentShown) =>
+        setAttention((last) => ({ ...last, documentShown })),
+      ),
+    [],
+  );
+  useEffect(
+    () =>
+      followWindowFocus(window, document, (windowFocused) =>
+        setAttention((last) => ({ ...last, windowFocused })),
+      ),
+    [],
+  );
+  return attention;
 }
 
 /**
- * Whether the window shows the page, read again whenever its visibility
- * changes. False until the first reading after the render, so that nothing
- * counts as shown before it.
- */
-function useDocumentShown(): boolean {
-  const [shown, setShown] = useState(false);
-  useEffect(() => {
-    const read = () => setShown(isDocumentShown(document));
-    read();
-    document.addEventListener("visibilitychange", read);
-    return () => document.removeEventListener("visibilitychange", read);
-  }, []);
-  return shown;
-}
-
-/**
- * The recent claims of the screen (`createRecentClaims`) while it is shown,
- * which follow every view of the people and the claims; undefined handlers
- * without the bridge, with no section.
- *
- * After each render, the claims that the section rendered and the latest
- * state marks unseen are reported as shown (`shownClaims`), only while the
- * section is visible: the people screen is open, the section is rendered
- * with its rows, `covered` (a modal dialog of the screen or the shell is
- * open) does not hold, and the window is not hidden. The rows are the same
- * as the section's, from the same views (`describeRecentClaims`).
+ * The recent claims of the screen (`createRecentClaims`) while it is
+ * shown, with the rows in view (`followRowsInView`, with the observer from
+ * `createObserver`) and the page's attention (`usePageAttention`);
+ * undefined handlers and controller without the bridge, with no section.
+ * The screen passes these into `claimsReport` and the result into
+ * `useClaimsRendered`.
  */
 export function useRecentClaims(
   bridge: ClaimsBridge | undefined,
-  people: PeopleScreenView,
-  claims: ClaimsScreenView,
-  covered: boolean,
+  createObserver: RowObserverFactory = pageRowObserver,
 ): {
   readonly view: RecentClaimsView;
   readonly handlers: RecentClaimHandlers | undefined;
+  readonly controller: RecentClaims | undefined;
+  readonly attention: PageAttention;
+  readonly rowsInView: ReadonlySet<string>;
 } {
   const [view, setView] = useState(IDLE_RECENT_CLAIMS);
+  const [rowsInView, setRowsInView] = useState<ReadonlySet<string>>(
+    () => new Set<string>(),
+  );
   const controller = useMemo(
     () =>
       bridge === undefined ? undefined : createRecentClaims(bridge, setView),
     [bridge],
   );
-  useEffect(
-    () => controller?.listChanged(people, claims),
-    [controller, people, claims],
+  // The observer is made at the first row, in the commit, never here.
+  const rows = useMemo(
+    () => followRowsInView(createObserver, setRowsInView),
+    [createObserver],
   );
-  const documentShown = useDocumentShown();
-  const report =
-    controller === undefined
-      ? null
-      : shownClaims(
-          describeRecentClaims(people, claims, view.marked),
-          documentShown && !covered,
-        );
-  // A report changes only with its scope and its claims: the effect runs
-  // with the render's report whenever either changes.
-  const key =
-    report === null ? "" : `${report.scope} ${report.memberIds.join(" ")}`;
-  useEffect(() => controller?.shown(report), [controller, key]);
+  useEffect(() => () => rows.stop(), [rows]);
+  const attention = usePageAttention();
   const handlers = useMemo(
     (): RecentClaimHandlers | undefined =>
       controller === undefined
@@ -322,8 +302,28 @@ export function useRecentClaims(
             onRefresh: () => {
               void controller.refresh();
             },
+            rowRef: rows.refFor,
           },
-    [controller],
+    [controller, rows],
   );
-  return { view, handlers };
+  return { view, handlers, controller, attention, rowsInView };
+}
+
+/**
+ * After each render of the screen, one effect passes the views and the
+ * render's report (`claimsReport`) to the controller (`rendered`), which
+ * follows the views first and reports only a report whose key changed.
+ */
+export function useClaimsRendered(
+  controller: RecentClaims | undefined,
+  people: PeopleScreenView,
+  claims: ClaimsScreenView,
+  result: { readonly report: ShownClaims | null; readonly key: string },
+): void {
+  const { report, key } = result;
+  useEffect(
+    () => controller?.rendered(people, claims, report),
+    // The report counts by its key; the controller compares it again.
+    [controller, people, claims, key],
+  );
 }

@@ -39,8 +39,9 @@ import {
 } from "./people-actions-view.ts";
 import { peopleDateFormat, type PeopleScreenView } from "./people-view.ts";
 import {
-  isDocumentShown,
   RecentClaimsPart,
+  usePageAttention,
+  useRecentClaims,
   type RecentClaimHandlers,
 } from "./RecentClaims.tsx";
 import { createShellState } from "./screens.ts";
@@ -139,6 +140,7 @@ interface HostProps {
   readonly "aria-describedby"?: string;
   readonly "aria-disabled"?: string;
   readonly "aria-label"?: string;
+  readonly ref?: unknown;
   readonly onClick?: (event: { readonly currentTarget: unknown }) => void;
 }
 
@@ -188,8 +190,17 @@ function recorder() {
     onDefineDraft: () => calls.push("define draft"),
     onDefine: () => calls.push("define"),
   };
+  const refs = new Map<string, (element: Element | null) => void>();
   const claims: RecentClaimHandlers = {
     onRefresh: () => calls.push("refresh"),
+    rowRef: (memberId: string) => {
+      let ref = refs.get(memberId);
+      if (ref === undefined) {
+        ref = () => calls.push(`ref ${memberId}`);
+        refs.set(memberId, ref);
+      }
+      return ref;
+    },
   };
   const other = () => calls.push("other");
   const invitations: InvitationActionHandlers = {
@@ -208,7 +219,7 @@ function recorder() {
     onCloseCode: other,
     onRefresh: other,
   };
-  return { calls, people, claims, invitations, joinRequests };
+  return { calls, refs, people, claims, invitations, joinRequests };
 }
 
 interface Props {
@@ -653,20 +664,73 @@ test("the sidebar's People item carries a dot hidden from assistive technologies
   }
 });
 
-test("the window shows the page unless its document is hidden", () => {
-  expect(isDocumentShown({ visibilityState: "visible" })).toBe(true);
-  expect(isDocumentShown({ visibilityState: "hidden" })).toBe(false);
+test("each claim's row gets the ref callback of its claim, which follows whether the row is in view", () => {
+  const handlers = recorder();
+  const rows = elementsOf(screen({ handlers })).filter(
+    (element) =>
+      element.type === "li" &&
+      handlers.refs.size > 0 &&
+      [...handlers.refs.values()].includes(
+        element.props.ref as (element: Element | null) => void,
+      ),
+  );
+  expect(rows).toHaveLength(CLAIMS.claims.length);
+  expect([...handlers.refs.keys()]).toEqual(
+    CLAIMS.claims.map((one) => one.memberId),
+  );
+  rows.forEach((element, index) => {
+    expect(element.props.ref).toBe(
+      handlers.refs.get(CLAIMS.claims[index]!.memberId),
+    );
+  });
+  // The section alone without rowRef follows no row.
+  const model = describeRecentClaims(known(), listed());
+  const alone =
+    model === null
+      ? []
+      : elementsOf(
+          <RecentClaimsPart
+            model={model}
+            dateFormat={DATE_FORMAT}
+            timeFormat={TIME_FORMAT}
+            inert={false}
+            onStart={undefined}
+            onRefresh={() => undefined}
+          />,
+        ).filter((element) => element.type === "li");
+  expect(alone).toHaveLength(CLAIMS.claims.length);
+  for (const element of alone) {
+    expect(element.props.ref).toBeUndefined();
+  }
+});
+
+test("while rendering, the page counts as hidden and without the focus, no row is in view, and no observer is made", () => {
+  const seen: string[] = [];
+  function Probe() {
+    const attention = usePageAttention();
+    const claims = useRecentClaims(undefined, () => {
+      seen.push("observer");
+      return undefined;
+    });
+    seen.push(
+      `${String(attention.documentShown)} ${String(attention.windowFocused)} ${String(claims.rowsInView.size)} ${String(claims.attention.documentShown)} ${String(claims.attention.windowFocused)} ${String(claims.handlers)} ${String(claims.controller)}`,
+    );
+    return null;
+  }
+  renderToString(<Probe />);
+  expect(seen).toEqual(["false false 0 false false undefined undefined"]);
 });
 
 // The sources of the recent claims, without the tests, as text.
 const SOURCES = import.meta.glob<string>(
-  ["./RecentClaims.tsx", "./claims-view.ts"],
+  ["./RecentClaims.tsx", "./claims-view.ts", "./claims-attention.ts"],
   { query: "?raw", import: "default", eager: true },
 );
 
 test("the recent claims read no clock of the renderer and nothing of the machine: the main process says which claims are unseen", () => {
   expect(Object.keys(SOURCES).sort()).toEqual([
     "./RecentClaims.tsx",
+    "./claims-attention.ts",
     "./claims-view.ts",
   ]);
   const forbidden: [string, RegExp][] = [

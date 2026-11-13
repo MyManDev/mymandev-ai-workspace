@@ -9,7 +9,7 @@ import type {
   PeopleBridge,
 } from "../shared/desktop-bridge.ts";
 import {
-  claimsCovered,
+  claimsReport,
   IDLE_RECENT_CLAIMS,
   describeRecentClaims,
   type ClaimsScreenView,
@@ -83,6 +83,7 @@ import {
 import {
   CLAIM_ACTION_MESSAGE_ID,
   RecentClaimsPart,
+  useClaimsRendered,
   useClaimsScreen,
   useRecentClaims,
   type RecentClaimHandlers,
@@ -154,13 +155,20 @@ export function PeopleScreen({
     view,
     joinRequestsView,
   );
-  const covered = claimsCovered({
-    shell: shellDialogOpen === true,
-    people: actions,
-    invitations: invitationParts.actions,
-    joinRequests: joinRequestParts.actions,
+  const claimParts = useRecentClaims(claims);
+  // The claims that this render shows: each view goes in whole.
+  const claimsSeen = claimsReport({
+    people: view,
+    claims: claimsView,
+    marked: claimParts.view.marked,
+    attention: claimParts.attention,
+    rowsInView: claimParts.rowsInView,
+    shellDialogOpen: shellDialogOpen === true,
+    peopleActions: actions,
+    invitationActions: invitationParts.actions,
+    joinRequestActions: joinRequestParts.actions,
   });
-  const claimParts = useRecentClaims(claims, view, claimsView, covered);
+  useClaimsRendered(claimParts.controller, view, claimsView, claimsSeen);
   return (
     <PeopleScreenContent
       view={view}
@@ -410,6 +418,7 @@ export function PeopleScreenContent({
           inert={inert}
           onStart={handlers?.onStart}
           onRefresh={claimHandlers.onRefresh}
+          rowRef={claimHandlers.rowRef}
         />
       )}
       {lists === null ? null : (

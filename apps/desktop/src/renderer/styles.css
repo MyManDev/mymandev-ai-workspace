@@ -1159,9 +1159,12 @@ code {
     text-underline-offset: var(--space-1);
   }
 
-  /* Forced colors replace backgrounds, so the dot keeps the text's system color. */
+  /*
+   * Forced colors replace the dot's background, so the dot opts out and
+   * takes the system color of a button's text, like the label beside it.
+   */
   .nav-marker {
     forced-color-adjust: none;
-    background: CanvasText;
+    background: ButtonText;
   }
 }

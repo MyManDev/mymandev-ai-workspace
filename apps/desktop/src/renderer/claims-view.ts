@@ -6,6 +6,8 @@ import type {
   PersonView,
   WorkspaceProblem,
 } from "../shared/ipc-contract.ts";
+import type { PageAttention } from "./claims-attention.ts";
+import type { CreationView } from "./creation-view.ts";
 import type { InvitationActionsView } from "./invitations-view.ts";
 import type { JoinRequestActionsView } from "./join-requests-view.ts";
 import type {
@@ -13,7 +15,7 @@ import type {
   PeopleActionsView,
 } from "./people-actions-view.ts";
 import type { PeopleScreenView } from "./people-view.ts";
-import type { WorkspacePanelView } from "./workspace-view.ts";
+import type { SwitchQuestion, WorkspacePanelView } from "./workspace-view.ts";
 
 // The screen part of the claim notices of #95 (ADR 0014, "Invitations": the
 // owner and the admins are notified of every claim, with the claimer's
@@ -322,27 +324,93 @@ export interface ShownClaims {
 }
 
 /**
- * The claims to report as shown (D8, and the note of #270 for the screen):
- * the rendered rows that the latest state marks unseen, only while the
- * section is `visible`, which the screen decides: the people screen is
- * open, the section is rendered with its rows, no modal dialog covers it,
- * and the window is not hidden. Null when there is nothing to report. A
- * claim reported as seen is never new again, also after a restart, so a
- * state that the person could not see is never reported.
+ * The claims to report as shown (D8, the note of #270 for the screen, and
+ * the Project Manager's decision of 2026-11-13 on #273): the rendered rows
+ * that the latest state marks unseen and that are in view (`rowsInView`,
+ * by member ID), only while the section is `visible`: the window shows the
+ * page and has the focus, and no modal dialog covers it (`claimsReport`).
+ * Null when there is nothing to report. A claim reported as seen is never
+ * new again, also after a restart, so a claim that the person could not see
+ * is never reported; when in doubt, it stays new.
  */
 export function shownClaims(
   model: RecentClaimsModel | null,
   visible: boolean,
+  rowsInView: ReadonlySet<string>,
 ): ShownClaims | null {
   if (model === null || !visible) {
     return null;
   }
   const memberIds = model.rows
-    .filter((row) => row.unseen)
+    .filter((row) => row.unseen && rowsInView.has(row.memberId))
     .map((row) => row.memberId);
   return memberIds.length === 0
     ? null
     : { scope: model.scope, workspaceId: model.workspaceId, memberIds };
+}
+
+/**
+ * The key of a report: its scope and its claims, or empty without one. A
+ * report counts again only once its key changed (`RecentClaims.rendered`).
+ */
+export function shownClaimsKey(report: ShownClaims | null): string {
+  return report === null ? "" : `${report.scope} ${report.memberIds.join(" ")}`;
+}
+
+/**
+ * Whether a modal dialog of the shell is open: the question before a
+ * switch, or the sidebar's dialog of a create.
+ */
+export function isShellDialogOpen(
+  question: SwitchQuestion | undefined,
+  creation: Pick<CreationView, "dialog"> | undefined,
+): boolean {
+  return question !== undefined || creation?.dialog !== undefined;
+}
+
+/** Everything that decides which claims the people screen reports as shown. */
+export interface ClaimsReportInput {
+  readonly people: PeopleScreenView;
+  readonly claims: ClaimsScreenView;
+  /** The claims marked "New" during the visit, from the screen's controller. */
+  readonly marked: MarkedClaims;
+  /** Whether the window shows the page and has the focus. */
+  readonly attention: PageAttention;
+  /** The member IDs of the claims whose rows are in view. */
+  readonly rowsInView: ReadonlySet<string>;
+  /** Whether a modal dialog of the shell is open (`isShellDialogOpen`). */
+  readonly shellDialogOpen: boolean;
+  readonly peopleActions: Pick<PeopleActionsView, "dialog">;
+  readonly invitationActions: Pick<InvitationActionsView, "question" | "code">;
+  readonly joinRequestActions: Pick<JoinRequestActionsView, "dialog" | "code">;
+}
+
+/**
+ * The claims that the people screen reports as shown after a render, with
+ * their key, from the screen's whole views: the rows that the section
+ * rendered for the selected workspace and the own person
+ * (`describeRecentClaims`), unseen and in view, while the window shows the
+ * page and has the focus and no modal dialog of the screen or the shell
+ * covers the section (`claimsCovered`).
+ */
+export function claimsReport(input: ClaimsReportInput): {
+  readonly report: ShownClaims | null;
+  readonly key: string;
+} {
+  const covered = claimsCovered({
+    shell: input.shellDialogOpen,
+    people: input.peopleActions,
+    invitations: input.invitationActions,
+    joinRequests: input.joinRequestActions,
+  });
+  const visible =
+    input.attention.documentShown && input.attention.windowFocused && !covered;
+  const report = shownClaims(
+    describeRecentClaims(input.people, input.claims, input.marked),
+    visible,
+    input.rowsInView,
+  );
+  return { report, key: shownClaimsKey(report) };
 }
 
 /**
@@ -435,8 +503,8 @@ export interface RecentClaims {
    * `claims.markSeen`, each once during the visit, and only for the scope
    * that the latest people name. A reported claim stays marked "New" until
    * the screen closes or the scope changes; a refused or failed report
-   * forgets it, so that the claim stays unseen and a later state reports it
-   * again.
+   * forgets it, so that the claim stays unseen and a later report sends it
+   * again (`rendered`).
    */
   readonly shown: (report: ShownClaims | null) => void;
   /**
@@ -452,6 +520,21 @@ export interface RecentClaims {
   readonly listChanged: (
     people: PeopleScreenView,
     claims: ClaimsScreenView,
+  ) => void;
+  /**
+   * After each render of the screen: follows the views (`listChanged`)
+   * first, so that a report belongs to the scope that the same render
+   * shows, and then reports the render's claims (`shown`), but only when
+   * the report's key changed since the last call. So a claim whose report
+   * was refused or failed is reported again only once the claims in the
+   * report change, for example when the section's visibility, the rows in
+   * view, or the scope change, or at the next visit; nothing is retried on
+   * its own.
+   */
+  readonly rendered: (
+    people: PeopleScreenView,
+    claims: ClaimsScreenView,
+    report: ShownClaims | null,
   ) => void;
 }
 
@@ -501,7 +584,10 @@ export function createRecentClaims(
     show();
   }
 
-  return Object.freeze({
+  /** The key of the last report that `rendered` passed on. */
+  let lastKey = "";
+
+  const controller: RecentClaims = {
     refresh: async () => {
       const at = generation;
       let sentence: string;
@@ -571,5 +657,18 @@ export function createRecentClaims(
         show();
       }
     },
-  });
+    rendered: (
+      people: PeopleScreenView,
+      claims: ClaimsScreenView,
+      report: ShownClaims | null,
+    ) => {
+      controller.listChanged(people, claims);
+      const key = shownClaimsKey(report);
+      if (key !== lastKey) {
+        lastKey = key;
+        controller.shown(report);
+      }
+    },
+  };
+  return Object.freeze(controller);
 }
