@@ -59,8 +59,6 @@ export const PEOPLE_MESSAGES = Object.freeze({
    */
   adminHint:
     "Only you can manage this workspace. Consider making someone you trust an admin, so they can also invite people and answer join requests.",
-  /** What the screen does not offer yet. */
-  actionsLater: "Answering join requests will be added here.",
 });
 
 /**

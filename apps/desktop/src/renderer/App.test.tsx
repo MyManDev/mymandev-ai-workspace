@@ -9,6 +9,8 @@ import type {
   DeviceListBridge,
   InvitationActionsBridge,
   InvitationsBridge,
+  JoinRequestActionsBridge,
+  JoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -241,7 +243,9 @@ test("the sidebar lists the workspace screens, every workspace with the selected
   expect(html).toContain(
     '<ul class="nav-list" aria-labelledby="workspaces-heading"><li><button type="button" class="nav-item" dir="auto">Workspace A</button></li><li><button type="button" class="nav-item" dir="auto" aria-current="true">Workspace B</button></li></ul>',
   );
-  expect(html).toContain('<h2 class="nav-heading" id="projects-heading">');
+  expect(html).toContain(
+    '<h2 class="nav-heading" id="projects-heading" tabindex="-1">',
+  );
   expect(html).toContain(
     '<ul class="nav-list" aria-labelledby="projects-heading">',
   );
@@ -486,6 +490,89 @@ test("the people screen gets the invitations: with both bridges, it has the para
   );
 });
 
+test("the people screen gets the join requests: with their two bridges, it has the paragraph of their sentence and the two dialogs, and reads nothing while rendered", () => {
+  const people: PeopleBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const calls: string[] = [];
+  const call = (name: string) => () => {
+    calls.push(name);
+    return Promise.reject(new Error("not called"));
+  };
+  const peopleActions: PeopleActionsBridge = {
+    define: call("define"),
+    rename: call("rename"),
+    remove: call("remove"),
+    promote: call("promote"),
+    demote: call("demote"),
+    leave: call("leave"),
+    offerOwnership: call("offerOwnership"),
+    withdrawOwnershipOffer: call("withdrawOwnershipOffer"),
+    acceptOwnershipOffer: call("acceptOwnershipOffer"),
+  };
+  const invitations: InvitationsBridge = {
+    getState: call("invitations getState"),
+    subscribeState: () => () => undefined,
+    load: call("invitations load"),
+  };
+  const invitationActions: InvitationActionsBridge = {
+    create: call("create"),
+    revoke: call("revoke"),
+    preview: call("preview"),
+    accept: call("accept"),
+  };
+  const joinRequests: JoinRequestsBridge = {
+    getState: call("getState"),
+    subscribeState: () => {
+      calls.push("subscribeState");
+      return () => undefined;
+    },
+    load: call("load"),
+  };
+  const joinRequestActions: JoinRequestActionsBridge = {
+    approve: call("approve"),
+    deny: call("deny"),
+    denyAll: call("denyAll"),
+    block: call("block"),
+    unblock: call("unblock"),
+    pause: call("pause"),
+    resume: call("resume"),
+  };
+  const bridges = {
+    people,
+    peopleActions,
+    invitations,
+    invitationActions,
+    joinRequests,
+    joinRequestActions,
+  };
+  const html = render({ ...bridges, initialView: { screen: "people" } });
+  expect(html).toContain(
+    '<p class="people-status" id="join-request-action-message" role="status"></p>',
+  );
+  // The people actions' dialog, the invitations' two, and the join
+  // requests' question and code dialogs.
+  expect(html.match(/<dialog class="people-dialog"><\/dialog>/g)).toHaveLength(
+    5,
+  );
+  // The subscription and the load run in an effect, which a server render
+  // does not run; nothing else is called.
+  expect(calls).toEqual([]);
+  // Without either of the two, or on another screen, nothing of it shows.
+  for (const missing of ["joinRequests", "joinRequestActions"] as const) {
+    expect(
+      render({
+        ...bridges,
+        [missing]: undefined,
+        initialView: { screen: "people" },
+      }),
+      missing,
+    ).not.toContain("join-request-action-message");
+  }
+  expect(render(bridges)).not.toContain("join-request-action-message");
+});
+
 test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {
   const repositories: RepositoryBridge = {
     list: () => Promise.resolve({ revision: 0, repositories: [] }),
@@ -584,7 +671,7 @@ test("a workspace without projects says so, and the shell shows the home screen"
   });
 
   expect(html).toContain(
-    `<h2 class="nav-heading" id="projects-heading">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.noProjects}</p></nav>`,
+    `<h2 class="nav-heading" id="projects-heading" tabindex="-1">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.noProjects}</p></nav>`,
   );
   expect(html).not.toContain('aria-labelledby="projects-heading"');
   expect(html).toContain('<h2 id="home-title" tabindex="-1">Home</h2>');
@@ -666,7 +753,7 @@ test("each workspace state has its own fixed text in the sidebar, and no ID is s
     // With the bridge, the creates' own status paragraph follows; before
     // the first state, no create is offered.
     expect(workspacePart(props)).toBe(
-      `${WORKSPACES_HEADING}${text}${statusParagraph()}${props.workspaces === undefined ? "" : statusParagraph()}`,
+      `${WORKSPACES_HEADING}${text}${statusParagraph()}${props.workspaces === undefined ? "" : '<p class="nav-empty nav-status" id="create-status-workspaces" role="status"></p>'}`,
     );
   }
 
@@ -676,7 +763,7 @@ test("each workspace state has its own fixed text in the sidebar, and no ID is s
   });
   expect(loading).toContain('aria-current="true">Workspace B</button>');
   expect(loading).toContain(
-    `<h2 class="nav-heading" id="projects-heading">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.loadingProjects}</p>`,
+    `<h2 class="nav-heading" id="projects-heading" tabindex="-1">Projects</h2><p class="nav-empty">${WORKSPACE_MESSAGES.loadingProjects}</p>`,
   );
 
   // Workspaces are listed, but none is selected.
@@ -757,7 +844,7 @@ test("unavailable workspaces keep what was loaded and show the problem as a fixe
       }),
     });
     expect(kept).toContain(
-      `</ul>${statusParagraph(WORKSPACE_PROBLEM_MESSAGES[problem])}<h2 class="nav-heading" id="projects-heading">Projects</h2>`,
+      `</ul>${statusParagraph(WORKSPACE_PROBLEM_MESSAGES[problem])}<h2 class="nav-heading" id="projects-heading" tabindex="-1">Projects</h2>`,
     );
     expect(kept).toContain('dir="auto">Project A</button>');
 
@@ -769,7 +856,7 @@ test("unavailable workspaces keep what was loaded and show the problem as a fixe
       }),
     });
     expect(noProjects).toMatch(
-      /<h2 class="nav-heading" id="projects-heading">Projects<\/h2>$/,
+      /<h2 class="nav-heading" id="projects-heading" tabindex="-1">Projects<\/h2>$/,
     );
     expect(noProjects).not.toContain(WORKSPACE_MESSAGES.noProjects);
 

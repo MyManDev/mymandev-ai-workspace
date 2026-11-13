@@ -15,6 +15,8 @@ import type {
   DeviceListBridge,
   InvitationActionsBridge,
   InvitationsBridge,
+  JoinRequestActionsBridge,
+  JoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -31,6 +33,7 @@ import {
   useCreation,
   type CreationControls,
 } from "./Creation.tsx";
+import { createdOpenPaths } from "./creation-view.ts";
 import {
   CONNECTION_ACTION_LABELS,
   CONNECTION_STATUS_TEXT_ID,
@@ -109,6 +112,10 @@ export interface AppProps {
   readonly invitations?: InvitationsBridge | undefined;
   /** The invitation actions from the preload script; undefined outside Electron. */
   readonly invitationActions?: InvitationActionsBridge | undefined;
+  /** The selected workspace's join requests from the preload script; undefined outside Electron. */
+  readonly joinRequests?: JoinRequestsBridge | undefined;
+  /** The join request actions from the preload script; undefined outside Electron. */
+  readonly joinRequestActions?: JoinRequestActionsBridge | undefined;
   /** The open project's agent activity from the preload script; undefined outside Electron. */
   readonly agents?: AgentBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
@@ -135,6 +142,8 @@ export function App({
   peopleActions,
   invitations,
   invitationActions,
+  joinRequests,
+  joinRequestActions,
   agents,
   chat,
   devices,
@@ -167,10 +176,18 @@ export function App({
     focusAfterShow,
   );
   const open = openProject(state);
+  // "Open this workspace" and "Open this project" take the sidebar's own
+  // paths, which ask before a switch drops waiting chat messages.
+  const selectWorkspace = workspaceSidebar.onSelect;
+  const openPaths = useMemo(
+    () => createdOpenPaths(selectWorkspace, dispatch),
+    [selectWorkspace],
+  );
   const creation = useCreation(
     workspaces,
     workspaceSidebar.view,
     state.view.screen === "home",
+    openPaths,
   );
 
   return (
@@ -218,6 +235,8 @@ export function App({
           peopleActions={peopleActions}
           invitations={invitations}
           invitationActions={invitationActions}
+          joinRequests={joinRequests}
+          joinRequestActions={joinRequestActions}
           workspaces={workspaceSidebar}
           account={account}
           chat={chat}
@@ -259,6 +278,8 @@ function ScreenContent({
   peopleActions,
   invitations,
   invitationActions,
+  joinRequests,
+  joinRequestActions,
   workspaces,
   account,
   chat,
@@ -276,6 +297,8 @@ function ScreenContent({
   readonly peopleActions: PeopleActionsBridge | undefined;
   readonly invitations: InvitationsBridge | undefined;
   readonly invitationActions: InvitationActionsBridge | undefined;
+  readonly joinRequests: JoinRequestsBridge | undefined;
+  readonly joinRequestActions: JoinRequestActionsBridge | undefined;
   /** The workspace part of the sidebar, for the join screen. */
   readonly workspaces: WorkspaceSidebar;
   readonly account: AccountBridge | undefined;
@@ -312,6 +335,8 @@ function ScreenContent({
           peopleActions={peopleActions}
           invitations={invitations}
           invitationActions={invitationActions}
+          joinRequests={joinRequests}
+          joinRequestActions={joinRequestActions}
         />
       );
     case "join":

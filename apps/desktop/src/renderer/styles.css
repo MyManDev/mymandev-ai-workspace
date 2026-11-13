@@ -280,7 +280,10 @@ code {
   margin: 0;
 }
 
-/* "New workspace" and "New project", below their lists. */
+/*
+ * "New workspace" and "New project", below their lists, and "Open this
+ * workspace" and "Open this project" after their sentences.
+ */
 .nav-create {
   margin: var(--space-1) var(--space-2);
 }
@@ -971,6 +974,26 @@ code {
 /* The open invitations, below the people. */
 .invitations {
   margin-block-start: var(--space-4);
+}
+
+/* The join requests, below the open invitations. */
+.join-requests {
+  margin-block-start: var(--space-4);
+}
+
+/* The people that "Deny and invite instead" may invite, one choice per line. */
+.join-request-choice {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.join-request-option {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
 }
 
 /* The dialog with a new invitation's code. */
