@@ -1,4 +1,8 @@
-import { CAPABILITIES, type Capability } from "@mymandev/protocol";
+import {
+  CAPABILITIES,
+  type Capability,
+  type RepositoryId,
+} from "@mymandev/protocol";
 import {
   CAPABILITY_SCOPE,
   type GrantRecord,
@@ -11,6 +15,7 @@ import {
   ENFORCEMENT_DENIAL_REASONS,
   type EnforcementDenialReason,
   type EnforcementRecord,
+  type EnforcementRecorder,
   type HeldRun,
   type PermissionEnforcementDependencies,
 } from "./enforcement.ts";
@@ -80,6 +85,10 @@ interface GrantOptions {
   expiresAt?: string | null;
   revoked?: boolean;
   id?: string;
+  /** The agent's host device in the facts; this device by default. */
+  hostDeviceId?: string;
+  /** The provider connection's host device; the agent's by default. */
+  connectionHostDeviceId?: string;
 }
 
 /** An active grant of `capability` on the run's scope, with its facts. */
@@ -88,6 +97,7 @@ function grant(
   options: GrantOptions = {},
 ): GrantRecord {
   const agentId = options.agentId ?? AGENT_ID;
+  const hostDeviceId = options.hostDeviceId ?? DEVICE_ID;
   const isRepository = CAPABILITY_SCOPE[capability] === "repository";
   const scopeId =
     options.scopeId ?? (isRepository ? REPOSITORY_ID : PROVIDER_CONNECTION_ID);
@@ -105,8 +115,8 @@ function grant(
       revokedByUserId: options.revoked === true ? USER_ID : null,
     },
     facts: {
-      agent: { id: agentId, hostDeviceId: DEVICE_ID, disabledAt: null },
-      hostDevice: { id: DEVICE_ID, revokedAt: null },
+      agent: { id: agentId, hostDeviceId, disabledAt: null },
+      hostDevice: { id: hostDeviceId, revokedAt: null },
       project: { id: PROJECT_ID, workspaceId: WORKSPACE_ID },
       grantorMembership: {
         workspaceId: WORKSPACE_ID,
@@ -115,7 +125,11 @@ function grant(
       },
       providerConnection: isRepository
         ? null
-        : { id: scopeId, hostDeviceId: DEVICE_ID, removedAt: null },
+        : {
+            id: scopeId,
+            hostDeviceId: options.connectionHostDeviceId ?? hostDeviceId,
+            removedAt: null,
+          },
     },
   });
 }
@@ -153,6 +167,8 @@ function setup(
     device: DEVICE_ID as unknown,
     deviceThrows: false,
     recorderThrows: false,
+    /** What the recorder returns after it kept the record. */
+    recorderResult: null as null | (() => unknown),
   };
   const calls = { clock: 0, store: 0, storeArgs: [] as unknown[][] };
   const records: EnforcementRecord[] = [];
@@ -189,6 +205,10 @@ function setup(
           throw new Error("recorder failed");
         }
         records.push(entry);
+        if (state.recorderResult !== null) {
+          return state.recorderResult() as never;
+        }
+        return undefined;
       },
     },
   };
@@ -825,4 +845,420 @@ test("takes the dependencies once, when it is created", () => {
     true,
   );
   expect(Object.isFrozen(harness.enforcement)).toBe(true);
+});
+
+/** The record of an allowed shell start of the run at `at`. */
+function shellStart(at: string = iso(NOW)): EnforcementRecord {
+  return {
+    kind: "shell_start_allowed",
+    runId: RUN.runId,
+    agentId: RUN.agentId,
+    repositoryId: RUN.repositoryId as RepositoryId,
+    at,
+  };
+}
+
+/** A copy of `value` without `key`. */
+function without(value: object, key: string): Record<string, unknown> {
+  const copy: Record<string, unknown> = { ...value };
+  delete copy[key];
+  return copy;
+}
+
+/**
+ * A proxy whose own data property `key` answers the next of `own` on every
+ * read of its descriptor (`Object.keys` reads it too), and `get` on every
+ * plain read. `gets` counts the plain reads.
+ */
+function changing(
+  target: object,
+  key: string,
+  values: { own: readonly unknown[]; get: unknown },
+) {
+  let ownReads = 0;
+  let gets = 0;
+  const proxy = new Proxy<Record<string, unknown>>(
+    { ...target },
+    {
+      get: (object, property, receiver) => {
+        if (property !== key) {
+          return Reflect.get(object, property, receiver);
+        }
+        gets += 1;
+        return values.get;
+      },
+      getOwnPropertyDescriptor: (object, property) => {
+        const descriptor = Reflect.getOwnPropertyDescriptor(object, property);
+        if (property !== key || descriptor === undefined) {
+          return descriptor;
+        }
+        const value = values.own[Math.min(ownReads, values.own.length - 1)];
+        ownReads += 1;
+        return { ...descriptor, value };
+      },
+    },
+  );
+  return { proxy, gets: () => gets };
+}
+
+function revokedProxy(): object {
+  const { proxy, revoke } = Proxy.revocable({}, {});
+  revoke();
+  return proxy;
+}
+
+function throwingKeys(target: object): object {
+  return new Proxy(
+    { ...target },
+    {
+      ownKeys: () => {
+        throw new Error("keys");
+      },
+    },
+  );
+}
+
+/** Runs `body` with `Object.prototype` polluted, and always cleans it up. */
+function withPollution(fields: Record<string, unknown>, body: () => void) {
+  const prototype = Object.prototype as Record<string, unknown>;
+  try {
+    for (const [key, value] of Object.entries(fields)) {
+      prototype[key] = value;
+    }
+    body();
+  } finally {
+    for (const key of Object.keys(fields)) {
+      delete prototype[key];
+    }
+  }
+}
+
+test("a recorder is synchronous", () => {
+  const recorder: EnforcementRecorder = {
+    // @ts-expect-error An async recorder is not a recorder.
+    async record() {},
+  };
+  expect(typeof recorder.record).toBe("function");
+});
+
+test("denies a shell start when the recorder answers with anything but undefined, and leaves no unhandled rejection", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => {
+    unhandled.push(reason);
+  };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const results: (() => unknown)[] = [
+      () => Promise.resolve(),
+      () => Promise.resolve(undefined),
+      () => Promise.reject(new Error("disk full")),
+      () => ({
+        then: (_: unknown, reject: (e: Error) => void) =>
+          reject(new Error("disk full")),
+      }),
+      () => true,
+      () => null,
+      () => 0,
+      // Stores the record, then fails.
+      () => {
+        throw new Error("disk full");
+      },
+    ];
+    for (const result of results) {
+      const harness = setup({ records: [grant("terminal.execute")] });
+      harness.state.recorderResult = result;
+      expect(
+        harness.enforcement.check(RUN, request("terminal.execute")),
+      ).toEqual({
+        allowed: false,
+        reason: "record_failed",
+      });
+      // The recorder kept both: the start, and the denial that followed it.
+      expect(harness.records).toEqual([
+        shellStart(),
+        denial("record_failed", "terminal.execute"),
+      ]);
+    }
+    // An async recorder, as the reviews tried it.
+    for (const record of [
+      async () => {
+        throw new Error("disk full");
+      },
+      async () => undefined,
+    ]) {
+      const harness = setup({ records: [grant("terminal.execute")] });
+      const enforcement = createPermissionEnforcement({
+        ...harness.dependencies,
+        recorder: { record } as unknown as EnforcementRecorder,
+      });
+      expect(enforcement.check(RUN, request("terminal.execute"))).toEqual({
+        allowed: false,
+        reason: "record_failed",
+      });
+      // A denial answered with a rejected promise still denies.
+      harness.state.usable = false;
+      expect(enforcement.check(RUN, request("terminal.execute"))).toEqual({
+        allowed: false,
+        reason: "store_unusable",
+      });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(unhandled).toEqual([]);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("reads the run as plain own data, also with a polluted Object.prototype", () => {
+  const harness = setup({
+    records: [
+      grant("repo.read", { scopeId: OTHER_REPOSITORY_ID }),
+      grant("provider.use", {
+        scopeId: OTHER_PROVIDER_CONNECTION_ID,
+        id: OTHER_GRANT_ID,
+      }),
+    ],
+  });
+  withPollution(
+    {
+      repositoryId: OTHER_REPOSITORY_ID,
+      providerConnectionId: OTHER_PROVIDER_CONNECTION_ID,
+    },
+    () => {
+      expectDenied(
+        harness,
+        without(RUN, "repositoryId") as unknown as HeldRun,
+        request("repo.read", { repositoryId: OTHER_REPOSITORY_ID }),
+        "run_invalid",
+      );
+      expectDenied(
+        harness,
+        without(RUN, "providerConnectionId") as unknown as HeldRun,
+        request("provider.use", {
+          providerConnectionId: OTHER_PROVIDER_CONNECTION_ID,
+        }),
+        "run_invalid",
+      );
+    },
+  );
+  const malformed: unknown[] = [
+    Object.create(RUN),
+    Object.assign(
+      Object.create({ repositoryId: REPOSITORY_ID }),
+      without(RUN, "repositoryId"),
+    ),
+    revokedProxy(),
+    throwingKeys(RUN),
+  ];
+  for (const value of malformed) {
+    expectDenied(
+      harness,
+      value as HeldRun,
+      request("repo.read"),
+      "run_invalid",
+    );
+    expect(harness.records.at(-1)).toEqual(
+      denial("run_invalid", null, iso(NOW), null),
+    );
+  }
+  expect(harness.calls.store).toBe(0);
+});
+
+test("uses only the parsed copy of the run", () => {
+  const harness = setup({ records: [grant("repo.read")] });
+  // Its own data names the run's repository; a plain read names another.
+  const { proxy, gets } = changing(RUN, "repositoryId", {
+    own: [REPOSITORY_ID],
+    get: OTHER_REPOSITORY_ID,
+  });
+  expect(
+    harness.enforcement.check(
+      proxy as unknown as HeldRun,
+      request("repo.read"),
+    ),
+  ).toEqual({
+    allowed: true,
+    request: {
+      agentId: AGENT_ID,
+      capability: "repo.read",
+      repositoryId: REPOSITORY_ID,
+    },
+  });
+  expect(gets()).toBe(0);
+});
+
+test("denies a request that cannot be read with one frozen denial", () => {
+  const harness = setup({ records: [grant("repo.read")] });
+  for (const value of [revokedProxy(), throwingKeys(request("repo.read"))]) {
+    expectDenied(harness, RUN, value, "request_invalid");
+    expect(harness.records.at(-1)).toEqual(denial("request_invalid", null));
+  }
+  expect(harness.records).toHaveLength(2);
+});
+
+test("reads the store's answer as plain own data, also with a polluted Object.prototype", () => {
+  const harness = setup();
+  const answers: (() => unknown)[] = [
+    () => Object.create({ usable: true, records: [grant("repo.read")] }),
+    () =>
+      Object.assign(Object.create({ usable: true }), {
+        records: [grant("repo.read")],
+      }),
+    () =>
+      Object.defineProperty({ records: [grant("repo.read")] }, "usable", {
+        enumerable: true,
+        get: () => true,
+      }),
+    () => ({ usable: true, records: Object.create([grant("repo.read")]) }),
+    () => ({ usable: true, records: { 0: grant("repo.read"), length: 1 } }),
+    () => revokedProxy(),
+    () => throwingKeys({ usable: true, records: [grant("repo.read")] }),
+  ];
+  for (const answer of answers) {
+    harness.state.read = answer;
+    expectDenied(harness, RUN, request("repo.read"), "store_unusable");
+  }
+  withPollution({ usable: true }, () => {
+    harness.state.read = () => ({ records: [grant("repo.read")] });
+    expectDenied(harness, RUN, request("repo.read"), "store_unusable");
+  });
+  expect(harness.records.at(-1)).toEqual(denial("store_unusable", "repo.read"));
+});
+
+test("reads the session state and its account once, as plain own data", () => {
+  const harness = setup({ records: [grant("repo.read")] });
+  const states: unknown[] = [
+    Object.create(signedIn()),
+    { kind: "signed_in", account: Object.create(ACCOUNT) },
+    {
+      kind: "signed_in",
+      account: Object.assign(
+        Object.create({ signInExpiresAt: SIGN_IN_EXPIRES_AT }),
+        without(ACCOUNT, "signInExpiresAt"),
+      ),
+    },
+    {
+      kind: "signed_in",
+      account: Object.defineProperty(without(ACCOUNT, "deviceId"), "deviceId", {
+        enumerable: true,
+        get: () => DEVICE_ID,
+      }),
+    },
+    { kind: "signed_in", account: revokedProxy() },
+    signedIn({ signInExpiresAt: revokedProxy() }),
+    revokedProxy(),
+    throwingKeys(signedIn()),
+  ];
+  for (const session of states) {
+    harness.state.session = session as DeviceSessionState;
+    expectDenied(harness, RUN, request("repo.read"), "sign_in_invalid");
+  }
+  withPollution({ signInExpiresAt: SIGN_IN_EXPIRES_AT }, () => {
+    harness.state.session = {
+      kind: "signed_in",
+      account: without(ACCOUNT, "signInExpiresAt"),
+    } as unknown as DeviceSessionState;
+    expectDenied(harness, RUN, request("repo.read"), "sign_in_invalid");
+  });
+  withPollution({ kind: "signed_in" }, () => {
+    harness.state.session = {
+      account: ACCOUNT,
+    } as unknown as DeviceSessionState;
+    expectDenied(harness, RUN, request("repo.read"), "sign_in_invalid");
+  });
+  // The account is read once: an ended sign-in is not replaced by a later
+  // read of a valid one.
+  const { proxy, gets } = changing(signedIn(), "account", {
+    own: [{ ...ACCOUNT, signInExpiresAt: iso(NOW) }],
+    get: ACCOUNT,
+  });
+  harness.state.session = proxy as unknown as DeviceSessionState;
+  expectDenied(harness, RUN, request("repo.read"), "sign_in_invalid");
+  expect(gets()).toBe(0);
+});
+
+test("counts only records whose facts put the agent and its provider connection on this device", () => {
+  const cases: [readonly GrantRecord[], Capability][] = [
+    [[grant("repo.read", { hostDeviceId: OTHER_DEVICE_ID })], "repo.read"],
+    [
+      [grant("terminal.execute", { hostDeviceId: OTHER_DEVICE_ID })],
+      "terminal.execute",
+    ],
+    [
+      [grant("provider.use", { hostDeviceId: OTHER_DEVICE_ID })],
+      "provider.use",
+    ],
+    [
+      [grant("provider.use", { connectionHostDeviceId: OTHER_DEVICE_ID })],
+      "provider.use",
+    ],
+  ];
+  for (const [records, capability] of cases) {
+    const harness = setup({ records });
+    expectDenied(harness, RUN, request(capability), "no_grant");
+    expect(harness.records).toEqual([denial("no_grant", capability)]);
+  }
+  // A record of another device is left out; another record still grants.
+  const mixed = setup({
+    records: [
+      grant("repo.read", { hostDeviceId: OTHER_DEVICE_ID }),
+      {} as GrantRecord,
+      // Plain, but its fields are only inherited: it never counts.
+      Object.create(grant("repo.read")) as GrantRecord,
+      grant("repo.read", { id: OTHER_GRANT_ID }),
+    ],
+  });
+  expect(mixed.enforcement.check(RUN, request("repo.read")).allowed).toBe(true);
+});
+
+test("denies the whole check when a record is not plain data", () => {
+  const plain = grant("repo.read");
+  const getter = {
+    ...plain,
+    facts: {
+      ...plain.facts,
+      agent: Object.defineProperty(
+        without(plain.facts.agent, "hostDeviceId"),
+        "hostDeviceId",
+        { enumerable: true, get: () => DEVICE_ID },
+      ),
+    },
+  };
+  const tooDeep = {
+    ...plain,
+    facts: {
+      ...plain.facts,
+      agent: { ...plain.facts.agent, extra: { nested: true } },
+    },
+  };
+  const lists: unknown[] = [
+    [getter, plain],
+    // A hole.
+    Object.assign(new Array(2), { 1: plain }),
+    [plain, revokedProxy()],
+    [plain, tooDeep],
+    Object.assign(Object.create(Array.prototype), { 0: plain, length: 1 }),
+    throwingKeys([plain]),
+  ];
+  const harness = setup();
+  for (const records of lists) {
+    harness.state.read = () => ({ usable: true, records });
+    expectDenied(harness, RUN, request("repo.read"), "store_unusable");
+  }
+});
+
+test("passes the plain copies of the records to the check, not the store's objects", () => {
+  const plain = grant("repo.read");
+  // The agent fact names this device while the enforcement point copies it
+  // (`Object.keys`, then the descriptor), and another device on every later
+  // read.
+  const { proxy } = changing(plain.facts.agent, "hostDeviceId", {
+    own: [DEVICE_ID, DEVICE_ID, OTHER_DEVICE_ID],
+    get: OTHER_DEVICE_ID,
+  });
+  const record = { ...plain, facts: { ...plain.facts, agent: proxy } };
+  const harness = setup({ records: [record as unknown as GrantRecord] });
+  expect(harness.enforcement.check(RUN, request("repo.read")).allowed).toBe(
+    true,
+  );
 });

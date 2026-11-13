@@ -42,7 +42,7 @@ import {
   PermissionRequestSchema,
 } from "@mymandev/permissions";
 import * as z from "zod";
-import type { DeviceSessionState, SessionAccount } from "../session/session.ts";
+import type { DeviceSessionState } from "../session/session.ts";
 
 /**
  * Why a check denied, a closed list:
@@ -154,9 +154,15 @@ export interface ShellStartRecord {
 /** What the check records: IDs, closed vocabularies, and times only. */
 export type EnforcementRecord = DenialRecord | ShellStartRecord;
 
-/** Receives every record. A record is frozen. */
+/**
+ * Receives every record. A record is frozen.
+ *
+ * `record` is synchronous: it returns `undefined` once it took the record,
+ * and throws when it cannot. Any other result, a promise among them, counts
+ * as not taken, so an allowed start of `terminal.execute` is then denied.
+ */
 export interface EnforcementRecorder {
-  record(entry: EnforcementRecord): void;
+  record(entry: EnforcementRecord): undefined;
 }
 
 export interface PermissionEnforcementDependencies {
@@ -199,29 +205,120 @@ function attempt<T>(fn: () => T): T | typeof INVALID {
   }
 }
 
+/** An object without a prototype that holds only plain own data. */
+type PlainObject = Record<string, unknown>;
+
 /**
- * A copy of the request's own enumerable data properties in an object
- * without a prototype, or `INVALID` when the request is not an object or
- * has an accessor. A missing field is then never filled from a prototype.
- * The request schema is flat, so one level is enough.
+ * A copy of the value's own enumerable data properties, each read once, in
+ * an object without a prototype, or `INVALID` when the value is not a
+ * non-array object, has an accessor, or cannot be read (a revoked proxy, a
+ * trap that throws). A missing field is then never filled from a prototype,
+ * and the copy is what is checked. One level only; it never throws.
  */
-function plainRequest(request: unknown): object | typeof INVALID {
-  if (
-    typeof request !== "object" ||
-    request === null ||
-    Array.isArray(request)
-  ) {
-    return INVALID;
-  }
-  const copy: Record<string, unknown> = Object.create(null);
-  for (const key of Object.keys(request)) {
-    const descriptor = Object.getOwnPropertyDescriptor(request, key);
-    if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+function plainObject(value: unknown): PlainObject | typeof INVALID {
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
       return INVALID;
     }
-    copy[key] = descriptor.value;
+    const copy: PlainObject = Object.create(null);
+    for (const key of Object.keys(value)) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+        return INVALID;
+      }
+      copy[key] = descriptor.value;
+    }
+    return copy;
+  } catch {
+    return INVALID;
+  }
+}
+
+/**
+ * The deepest object in a grant record: the record (0), the grant and the
+ * facts (1), and each fact (2).
+ */
+const MAX_RECORD_DEPTH = 2;
+
+/**
+ * A deep copy of plain own data, as `plainObject` at every level, or
+ * `INVALID` when any object in it is not plain data or is deeper than a
+ * grant record. The depth bound also stops a cycle.
+ */
+function plainRecord(value: unknown, depth = 0): unknown {
+  if (typeof value !== "object" || value === null) {
+    return value;
+  }
+  if (depth > MAX_RECORD_DEPTH) {
+    return INVALID;
+  }
+  const copy = plainObject(value);
+  if (copy === INVALID) {
+    return INVALID;
+  }
+  for (const key of Object.keys(copy)) {
+    const child = plainRecord(copy[key], depth + 1);
+    if (child === INVALID) {
+      return INVALID;
+    }
+    copy[key] = child;
   }
   return copy;
+}
+
+/**
+ * Plain copies of the records of a store read, or `INVALID` when the list
+ * is not an array, or its length or an element is not plain data, a hole
+ * included. It never throws.
+ */
+function plainRecords(list: unknown): unknown[] | typeof INVALID {
+  try {
+    if (!Array.isArray(list)) {
+      return INVALID;
+    }
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(list, "length");
+    const length: unknown = lengthDescriptor?.value;
+    if (typeof length !== "number" || !Number.isSafeInteger(length)) {
+      return INVALID;
+    }
+    const copies: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const element = Object.getOwnPropertyDescriptor(list, index);
+      if (element === undefined || !Object.hasOwn(element, "value")) {
+        return INVALID;
+      }
+      const copy = plainRecord(element.value);
+      if (copy === INVALID) {
+        return INVALID;
+      }
+      copies.push(copy);
+    }
+    return copies;
+  } catch {
+    return INVALID;
+  }
+}
+
+/** The value as a plain copy made by `plainRecord`, or null. */
+function asCopy(value: unknown): PlainObject | null {
+  return typeof value === "object" && value !== null
+    ? (value as PlainObject)
+    : null;
+}
+
+/**
+ * Whether a plain record's facts put its agent, and its provider
+ * connection if it has one, on this device. `hasGrant` only checks that the
+ * facts agree with each other; this binds them to this device.
+ */
+function hostedHere(record: unknown, device: DeviceId): boolean {
+  const facts = asCopy(asCopy(record)?.facts);
+  const agent = asCopy(facts?.agent);
+  if (facts === null || agent === null || agent.hostDeviceId !== device) {
+    return false;
+  }
+  const connection = facts.providerConnection;
+  return connection === null || asCopy(connection)?.hostDeviceId === device;
 }
 
 /** The time in milliseconds of a genuine, valid Date, or `INVALID`. */
@@ -239,14 +336,30 @@ function runRequest(
   run: HeldRun,
   capability: Capability,
 ): PermissionRequest | null {
-  const scope =
-    CAPABILITY_SCOPE[capability] === "repository"
-      ? run.repositoryId === null
-        ? null
-        : { repositoryId: run.repositoryId }
-      : run.providerConnectionId === null
-        ? null
-        : { providerConnectionId: run.providerConnectionId };
+  const kind = CAPABILITY_SCOPE[capability];
+  let scope:
+    | { repositoryId: RepositoryId }
+    | {
+        providerConnectionId: ProviderConnectionId;
+      }
+    | null;
+  switch (kind) {
+    case "repository":
+      scope =
+        run.repositoryId === null ? null : { repositoryId: run.repositoryId };
+      break;
+    case "provider_connection":
+      scope =
+        run.providerConnectionId === null
+          ? null
+          : { providerConnectionId: run.providerConnectionId };
+      break;
+    default: {
+      // A new scope kind does not compile until it is handled here.
+      const unknownKind: never = kind;
+      return unknownKind;
+    }
+  }
   if (scope === null) {
     return null;
   }
@@ -278,24 +391,48 @@ function sameRequest(
 }
 
 /**
- * The signed-in account of this device, or the denial reason. Only
- * `signed_in` for this device passes; the expiry is checked against the
- * clock later.
+ * The signed-in account of this device as a plain copy, or the denial
+ * reason. The state and the account are each read once, as plain own data.
+ * Only `signed_in` for this device passes; the expiry is checked against
+ * the clock later.
  */
 function signedInAccount(
-  state: DeviceSessionState,
+  state: unknown,
   device: DeviceId,
-): SessionAccount | EnforcementDenialReason {
-  if (
-    state.kind === "signed_out" ||
-    ("signedOut" in state && state.signedOut === true)
-  ) {
-    return "signed_out";
-  }
-  if (state.kind !== "signed_in" || state.account.deviceId !== device) {
+): PlainObject | EnforcementDenialReason {
+  const plainState = plainObject(state);
+  if (plainState === INVALID) {
     return "sign_in_invalid";
   }
-  return state.account;
+  if (plainState.kind === "signed_out" || plainState.signedOut === true) {
+    return "signed_out";
+  }
+  if (plainState.kind !== "signed_in") {
+    return "sign_in_invalid";
+  }
+  const account = plainObject(plainState.account);
+  if (account === INVALID || account.deviceId !== device) {
+    return "sign_in_invalid";
+  }
+  return account;
+}
+
+/**
+ * Handles the rejection of a thenable, so that a recorder that returned a
+ * promise leaves no unhandled rejection. It never throws.
+ */
+function settleQuietly(value: unknown): void {
+  attempt(() => {
+    if (
+      (typeof value === "object" && value !== null) ||
+      typeof value === "function"
+    ) {
+      const then: unknown = (value as { then?: unknown }).then;
+      if (typeof then === "function") {
+        then.call(value, undefined, () => undefined);
+      }
+    }
+  });
 }
 
 /**
@@ -307,9 +444,19 @@ export function createPermissionEnforcement(
 ): PermissionEnforcement {
   const { now, grantStore, sessionState, thisDevice, recorder } = dependencies;
 
-  /** Passes a frozen record to the recorder; true when it took it. */
+  /**
+   * Passes a frozen record to the recorder. True only when the recorder
+   * returned `undefined`; a promise or any other result is not taken.
+   */
   function record(entry: EnforcementRecord): boolean {
-    return attempt(() => recorder.record(Object.freeze(entry))) !== INVALID;
+    const result: unknown = attempt(() =>
+      recorder.record(Object.freeze(entry)),
+    );
+    if (result === undefined) {
+      return true;
+    }
+    settleQuietly(result);
+    return false;
   }
 
   /** The time as an ISO string, read from the clock now, or null. */
@@ -327,6 +474,7 @@ export function createPermissionEnforcement(
     let at: string | null | undefined;
 
     const deny = (reason: EnforcementDenialReason): EnforcementDecision => {
+      // A denial that the recorder does not take is dropped; it still denies.
       record({
         kind: "denied",
         reason,
@@ -343,13 +491,18 @@ export function createPermissionEnforcement(
     };
 
     try {
-      const parsedRun = attempt(() => HeldRunSchema.safeParse(heldRun));
+      // Only the parsed copy of the run is used from here on.
+      const plainRun = plainObject(heldRun);
+      const parsedRun =
+        plainRun === INVALID
+          ? INVALID
+          : attempt(() => HeldRunSchema.safeParse(plainRun));
       if (parsedRun === INVALID || !parsedRun.success) {
         return deny("run_invalid");
       }
       run = parsedRun.data;
 
-      const plain = plainRequest(request);
+      const plain = plainObject(request);
       const parsedRequest =
         plain === INVALID
           ? INVALID
@@ -379,11 +532,8 @@ export function createPermissionEnforcement(
       const state = attempt(sessionState);
       const account =
         state === INVALID
-          ? INVALID
-          : attempt(() => signedInAccount(state, device.data));
-      if (account === INVALID) {
-        return deny("sign_in_invalid");
-      }
+          ? "sign_in_invalid"
+          : signedInAccount(state, device.data);
       if (typeof account === "string") {
         return deny(account);
       }
@@ -391,15 +541,19 @@ export function createPermissionEnforcement(
         UtcTimestampSchema.safeParse(account.signInExpiresAt),
       );
 
-      // One read of the store per check.
-      const read = attempt(() => {
-        const answer = grantStore.read();
-        const { usable, records } = answer;
-        return { usable, records };
-      });
-      if (read === INVALID || read.usable !== true) {
+      // One read of the store per check, read as plain own data.
+      const answer = plainObject(attempt(() => grantStore.read()));
+      if (answer === INVALID || answer.usable !== true) {
         return deny("store_unusable");
       }
+      const records = plainRecords(answer.records);
+      if (records === INVALID) {
+        return deny("store_unusable");
+      }
+      // Only records whose facts put the agent on this device count.
+      const hostedRecords = records.filter((entry) =>
+        hostedHere(entry, device.data),
+      );
 
       // The clock, read immediately before `hasGrant`.
       const nowMs = validTime(attempt(now));
@@ -419,7 +573,14 @@ export function createPermissionEnforcement(
         return deny("sign_in_invalid");
       }
 
-      if (!hasGrant(read.records, checked, decisionTime)) {
+      // `hasGrant` parses every record; the copies are plain data.
+      if (
+        !hasGrant(
+          hostedRecords as readonly unknown[] as readonly GrantRecord[],
+          checked,
+          decisionTime,
+        )
+      ) {
         return deny("no_grant");
       }
 
@@ -440,6 +601,8 @@ export function createPermissionEnforcement(
         request: Object.freeze(checked),
       });
     } catch {
+      // Not reachable: every dependency call and every read of an input is
+      // wrapped above. It stays so that a future change fails closed.
       return deny("check_failed");
     }
   }
