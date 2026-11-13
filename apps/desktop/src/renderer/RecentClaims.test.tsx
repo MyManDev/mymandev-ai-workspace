@@ -17,7 +17,9 @@ import type {
   PersonView,
 } from "../shared/ipc-contract.ts";
 import {
+  describeRecentClaims,
   IDLE_RECENT_CLAIMS,
+  NO_MARKED_CLAIMS,
   type ClaimsScreenView,
   type RecentClaimsView,
 } from "./claims-view.ts";
@@ -29,13 +31,18 @@ import { WorkspaceNav } from "./Navigation.tsx";
 import type { PeopleActionHandlers } from "./PeopleActions.tsx";
 import { PeopleScreen, PeopleScreenContent } from "./PeopleScreen.tsx";
 import {
+  describePeopleActions,
   IDLE_PEOPLE_ACTIONS,
   offerTimeFormat,
   type PeopleActionRequest,
   type PeopleActionsView,
 } from "./people-actions-view.ts";
 import { peopleDateFormat, type PeopleScreenView } from "./people-view.ts";
-import { isDocumentShown, type RecentClaimHandlers } from "./RecentClaims.tsx";
+import {
+  isDocumentShown,
+  RecentClaimsPart,
+  type RecentClaimHandlers,
+} from "./RecentClaims.tsx";
 import { createShellState } from "./screens.ts";
 
 const WORKSPACE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3";
@@ -462,6 +469,30 @@ test("without the people actions, the claims show without Remove", () => {
   expect(html).not.toContain(">Remove<");
   expect(html).not.toContain("aria-describedby");
   expect(html).not.toContain('id="recent-claims-heading-claim-');
+  // The section alone never shows Remove without the people actions' start,
+  // also when its model offers it.
+  const model = describeRecentClaims(
+    known(),
+    listed(),
+    NO_MARKED_CLAIMS,
+    describePeopleActions(known(), NOW).personActions,
+  );
+  expect(model?.rows.filter((row) => row.remove !== null)).toHaveLength(2);
+  const alone = renderToString(
+    model === null ? null : (
+      <RecentClaimsPart
+        model={model}
+        dateFormat={DATE_FORMAT}
+        timeFormat={TIME_FORMAT}
+        inert={false}
+        onStart={undefined}
+        onRefresh={() => undefined}
+      />
+    ),
+  );
+  expect(alone).toContain("Linus");
+  expect(alone).not.toContain(">Remove<");
+  expect(alone).not.toContain('id="recent-claims-heading-claim-');
 });
 
 test("D9: Remove on a claim opens the same question as the people list's removal", () => {
