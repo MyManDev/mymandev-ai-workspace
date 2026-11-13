@@ -282,19 +282,25 @@ test("the workspace command reports the IDs, also of an existing workspace, and 
       message: `Refused: the account created ${MAX_NEW_PROJECTS_PER_DAY} projects within 24 hours. Nothing was changed. Try again in 1 minute.`,
     },
   );
+  // The limit of projects per workspace has its own refusal, without a
+  // wait; a daily limit always has one.
   assert.deepEqual(
-    devWorkspaceReport({
-      created: false,
-      refusal: "rate_limited",
-      limit: "projects",
-      retryAfterMs: null,
-    }),
+    devWorkspaceReport({ created: false, refusal: "project_limit" }),
     {
       exitCode: 1,
       message:
         "Refused: the workspace holds 100 projects that are not archived. Nothing was changed.",
     },
   );
+  const typeOnly = () =>
+    devWorkspaceReport({
+      created: false,
+      refusal: "rate_limited",
+      limit: "projects",
+      // @ts-expect-error -- a daily limit always has a wait
+      retryAfterMs: null,
+    });
+  assert.equal(typeof typeOnly, "function");
   for (const refusal of [
     "account_disabled",
     "invalid_name",

@@ -113,6 +113,13 @@ function errorAnswer(code: ApiErrorCode): Response {
   });
 }
 
+/** The same answer with a `Retry-After` header. */
+function withRetryAfter(answer: Response, value: string): Response {
+  const headers = new Headers(answer.headers);
+  headers.set("retry-after", value);
+  return new Response(answer.body, { status: answer.status, headers });
+}
+
 interface Harness {
   readonly keyStore: DeviceKeyStore;
   readonly records: DeviceRecordStore;
@@ -1573,6 +1580,104 @@ describe("answers of the API", () => {
     expect(await h.keyStore.hasKey()).toBe(false);
     expect(await h.records.read()).toEqual({ kind: "none" });
   }, 20_000);
+
+  test("takes rate_limited with a Retry-After as an uncertain refusal, keeps a new device's key and marker, and passes the wait on (#269)", async () => {
+    const h = harness();
+    // The daily limit of new devices and the route's limit per address both
+    // answer this, and only the first proves that nothing was committed.
+    h.answer = () => withRetryAfter(errorAnswer("rate_limited"), "86000");
+    const { outcome } = await signIn(h);
+    expect(UNCERTAIN_REFUSAL_CODES).toContain("rate_limited");
+    expect(outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "rate_limited",
+      retryAfterSeconds: 86_000,
+    });
+    const sent = h.requests[0]?.body.device.publicKey;
+    expect(h.keyStore.keys()?.current.publicKey).toBe(sent);
+    expect(await h.markers.read()).toMatchObject({
+      kind: "marker",
+      marker: { publicKey: sent },
+    });
+    expect(await h.records.read()).toEqual({ kind: "none" });
+  }, 20_000);
+
+  test("keeps the replacement pending on rate_limited with a Retry-After, and passes the wait on (#269)", async () => {
+    const h = harness();
+    const previousKey = await existingDevice(h);
+    h.answer = () => withRetryAfter(errorAnswer("rate_limited"), "600");
+    const { outcome } = await signIn(h);
+    expect(outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "rate_limited",
+      retryAfterSeconds: 600,
+    });
+    const keys = h.keyStore.keys();
+    expect(keys?.previous?.publicKey).toBe(previousKey);
+    expect(keys?.current.publicKey).toBe(h.requests[0]?.body.device.publicKey);
+    expect(await h.records.read()).toEqual({
+      kind: "record",
+      record: { ...RECORD, publicKey: previousKey },
+    });
+  }, 20_000);
+
+  test.each([
+    ["missing", null],
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["fractional", "1.5"],
+    ["date", "Fri, 13 Nov 2026 10:00:00 GMT"],
+    ["empty", ""],
+    ["too long", "12345678901"],
+  ])(
+    "takes rate_limited with a %s Retry-After as an uncertain refusal without a wait (#269)",
+    async (_label, value) => {
+      const h = harness();
+      const answer = errorAnswer("rate_limited");
+      h.answer = () =>
+        value === null ? answer : withRetryAfter(answer, value);
+      const { outcome } = await signIn(h);
+      expect(outcome).toEqual({
+        kind: "failed",
+        reason: "uncertain_refusal",
+        apiError: "rate_limited",
+      });
+      expect(h.keyStore.keys()?.current.publicKey).toBe(
+        h.requests[0]?.body.device.publicKey,
+      );
+    },
+    20_000,
+  );
+
+  test("caps the wait of rate_limited at 7 days, and reads Retry-After for rate_limited only (#269)", async () => {
+    const capped = harness();
+    capped.answer = () =>
+      withRetryAfter(errorAnswer("rate_limited"), "9999999999");
+    expect((await signIn(capped)).outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "rate_limited",
+      retryAfterSeconds: 604_800,
+    });
+
+    const used = harness();
+    used.answer = () => withRetryAfter(errorAnswer("sign_in_code_used"), "60");
+    expect((await signIn(used)).outcome).toEqual({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "sign_in_code_used",
+    });
+
+    const locked = harness();
+    locked.answer = () =>
+      withRetryAfter(errorAnswer("device_registration_locked"), "60");
+    expect((await signIn(locked)).outcome).toEqual({
+      kind: "refused",
+      code: "device_registration_locked",
+    });
+  }, 30_000);
 
   test("does not trust a 200 answer outside the format", async () => {
     const h = harness();

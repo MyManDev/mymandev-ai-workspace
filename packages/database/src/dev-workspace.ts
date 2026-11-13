@@ -60,16 +60,17 @@ export type CreateDevWorkspaceResult =
        * `account_disabled`: the device's account is disabled or erased;
        * `invalid_name`: the workspace name, the project name, or the
        * account's display name, which becomes the owner's person name, does
-       * not pass the API's request schemas; `not_member` and `conflict`:
-       * `createProject` refused the project in the new workspace, which
-       * holds no other project, so neither is expected.
+       * not pass the API's request schemas; `not_member`, `conflict`, and
+       * `project_limit`: `createProject` refused the project in the new
+       * workspace, which holds no other project, so none is expected.
        */
       refusal:
         | "device_not_found"
         | "account_disabled"
         | "invalid_name"
         | "not_member"
-        | "conflict";
+        | "conflict"
+        | "project_limit";
     }>
   /**
    * The account already owns a workspace that is not archived and has
@@ -86,7 +87,7 @@ export type CreateDevWorkspaceResult =
       projectId: ProjectId | null;
     }>
   /**
-   * A limit of `createWorkspace` (`limit: "workspaces"`) or of
+   * A daily limit of `createWorkspace` (`limit: "workspaces"`) or of
    * `createProject` (`limit: "projects"`) is reached; `retryAfterMs` as
    * they return it.
    */
@@ -94,7 +95,7 @@ export type CreateDevWorkspaceResult =
       created: false;
       refusal: "rate_limited";
       limit: "workspaces" | "projects";
-      retryAfterMs: number | null;
+      retryAfterMs: number;
     }>;
 
 type Refused = Extract<CreateDevWorkspaceResult, { created: false }>;

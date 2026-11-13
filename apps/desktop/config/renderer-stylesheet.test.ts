@@ -189,3 +189,94 @@ test("the sidebar's dot of unseen claims has the accent color, and in forced col
     ),
   ]);
 });
+
+/**
+ * The elements around a recent claim's row, from the root down to the row
+ * itself: html, body, the #root div, the shell's div (also with a project
+ * open), its main column, the People screen's section, the recent claims'
+ * section, their list, and the row.
+ */
+const CLAIM_ROW_ANCESTORS = {
+  tags: new Set(["html", "body", "div", "main", "section", "ul", "li"]),
+  classes: new Set([
+    "shell",
+    "shell-project",
+    "shell-main",
+    "recent-claims",
+    "people-list",
+    "person",
+  ]),
+  ids: new Set(["root"]),
+};
+
+/**
+ * Whether the last compound of a selector may match one of the row's
+ * ancestors: its type, classes, and ID all fit one of them. Attributes and
+ * pseudo-classes are ignored, so that the check errs toward a match.
+ */
+function mayMatchClaimRowAncestor(selector: string): boolean {
+  const compound =
+    selector
+      .trim()
+      .split(/\s*[\s>+~]\s*/)
+      .at(-1) ?? "";
+  if (compound.includes("::")) {
+    return false;
+  }
+  const tag = /^[a-z][\w-]*|^\*/i.exec(compound)?.[0];
+  const classes = [...compound.matchAll(/\.([\w-]+)/g)].map(
+    ([, name]) => name ?? "",
+  );
+  const ids = [...compound.matchAll(/#([\w-]+)/g)].map(
+    ([, name]) => name ?? "",
+  );
+  return (
+    (tag === undefined ||
+      tag === "*" ||
+      CLAIM_ROW_ANCESTORS.tags.has(tag.toLowerCase())) &&
+    classes.every((name) => CLAIM_ROW_ANCESTORS.classes.has(name)) &&
+    ids.every((name) => CLAIM_ROW_ANCESTORS.ids.has(name))
+  );
+}
+
+test("no element around a recent claim's row scrolls, clips, or is fixed or sticky, so that the viewport is the visible area that counts a tall row as seen (#276)", () => {
+  // isRowInView compares a row's visible part with the observer's
+  // rootBounds, the viewport; a scrolling or fixed ancestor would make the
+  // visible area smaller than that.
+  const rules = [...CSS.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
+    .map(([, selectors, declarations]) => ({
+      selectors: (selectors ?? "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => !item.startsWith("@")),
+      declarations: declarations ?? "",
+    }))
+    .map((found) => ({
+      ...found,
+      selectors: found.selectors.filter(mayMatchClaimRowAncestor),
+    }))
+    .filter((found) => found.selectors.length > 0);
+  const matched = new Set(rules.flatMap((found) => found.selectors));
+  for (const selector of [
+    "body",
+    ".shell",
+    ".shell-project",
+    ".shell-main",
+    ".recent-claims",
+    ".people-list",
+    ".person",
+  ]) {
+    expect(matched, selector).toContain(selector);
+  }
+  expect(mayMatchClaimRowAncestor(".shell-main h2")).toBe(false);
+  expect(mayMatchClaimRowAncestor(".recent-claims .person-meta")).toBe(false);
+  expect(mayMatchClaimRowAncestor("main.shell-main")).toBe(true);
+  for (const { selectors, declarations } of rules) {
+    expect(declarations, selectors.join(", ")).not.toMatch(
+      /(^|[;{\s])overflow(-x|-y|-block|-inline)?\s*:/,
+    );
+    expect(declarations, selectors.join(", ")).not.toMatch(
+      /position\s*:\s*(fixed|sticky)/,
+    );
+  }
+});

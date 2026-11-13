@@ -710,6 +710,18 @@ test("an account status keeps only the narrow fields", () => {
     retryAfter: "2026-11-06T10:10:00.000Z",
   });
 
+  // The wait of an uncertain `rate_limited` (#269) comes alone too.
+  expect(
+    AccountStatusSchema.parse({
+      ...accountStatus({}),
+      lastOutcome: {
+        code: "uncertain_refusal",
+        retryAfterMs: 86_000_000,
+        apiError: "rate_limited",
+      },
+    }).lastOutcome,
+  ).toEqual({ code: "uncertain_refusal", retryAfterMs: 86_000_000 });
+
   // A hidden account (#195) carries nothing but its kind.
   expect(
     AccountStatusSchema.parse({
@@ -765,6 +777,19 @@ test("an account status with a wrong value is refused", () => {
         lastOutcome: {
           code: "replacement_pending",
           retryAfter: retryAfter as never,
+        },
+      }),
+    ),
+    // `retryAfterMs` (#269) belongs to `uncertain_refusal` only, and is a
+    // whole number of milliseconds from 1.
+    ...SIGN_IN_OUTCOME_CODES.filter((code) => code !== "uncertain_refusal").map(
+      (code) => accountStatus({ lastOutcome: { code, retryAfterMs: 60_000 } }),
+    ),
+    ...[0, -1, 1.5, "60000", null].map((retryAfterMs) =>
+      accountStatus({
+        lastOutcome: {
+          code: "uncertain_refusal",
+          retryAfterMs: retryAfterMs as never,
         },
       }),
     ),

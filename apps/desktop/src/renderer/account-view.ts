@@ -80,6 +80,38 @@ export const SIGN_IN_OUTCOME_MESSAGES: Readonly<
   failed: "The sign-in failed.",
 });
 
+/**
+ * The message for an uncertain refusal that came with the wait of the API's
+ * `rate_limited` (#269). The route's limit of requests per address and the
+ * account's limit of new devices per day both answer it, and only the
+ * second one proves that nothing was committed, so the message names both
+ * and still does not say whether the sign-in was completed. The wait is
+ * rounded up, so a start after it is not refused again.
+ */
+export function signInLimitedMessage(retryAfterMs: number): string {
+  return `The server is limiting sign-ins for now: too many came from this network, or this account has added as many new devices as it may in one day. Its answer does not show whether the sign-in was completed. Try again in about ${waitText(retryAfterMs)}; starting it again then is safe.`;
+}
+
+/**
+ * A wait of `ms` milliseconds in words, rounded up: seconds below a
+ * minute, minutes below an hour, and hours above. The same words as
+ * `describeWait` of the other screens, which this module cannot import:
+ * `people-actions-view.ts` imports it through `device-view.ts`.
+ */
+function waitText(ms: number): string {
+  const count = (value: number, unit: string) =>
+    `${String(value)} ${unit}${value === 1 ? "" : "s"}`;
+  const seconds = Math.max(1, Math.ceil(ms / 1000));
+  if (seconds < 60) {
+    return count(seconds, "second");
+  }
+  const minutes = Math.ceil(seconds / 60);
+  if (minutes < 60) {
+    return count(minutes, "minute");
+  }
+  return count(Math.ceil(minutes / 60), "hour");
+}
+
 export interface OutcomeMessage {
   /** `status` is announced politely; `alert` at once. */
   readonly role: "status" | "alert";
@@ -238,13 +270,20 @@ export function watchSignInRetry(
   return () => stop();
 }
 
-/** The message for the last outcome; the installation's login after an account mismatch. */
+/**
+ * The message for the last outcome; the installation's login after an
+ * account mismatch, and the wait after an uncertain refusal that came with
+ * one (#269).
+ */
 export function describeOutcome(outcome: SignInOutcomeView): OutcomeMessage {
   const text =
     outcome.code === "device_account_mismatch" &&
     outcome.deviceLogin !== undefined
       ? `This installation belongs to the GitHub account ${outcome.deviceLogin}. Sign in with that account.`
-      : SIGN_IN_OUTCOME_MESSAGES[outcome.code];
+      : outcome.code === "uncertain_refusal" &&
+          outcome.retryAfterMs !== undefined
+        ? signInLimitedMessage(outcome.retryAfterMs)
+        : SIGN_IN_OUTCOME_MESSAGES[outcome.code];
   return {
     role:
       outcome.code === "signed_in" || outcome.code === "cancelled"
