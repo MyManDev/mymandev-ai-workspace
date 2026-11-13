@@ -4,6 +4,7 @@ import {
   CreateButton,
   CreatedOpenButton,
   CreateStatus,
+  PROJECTS_HEADING_ID,
   WORKSPACES_HEADING_ID,
   type CreationControls,
 } from "./Creation.tsx";
@@ -217,7 +218,9 @@ function WorkspaceItems({
 
 /**
  * The selected workspace's projects, with the open one marked, and "New
- * project", which every active member of the workspace may use.
+ * project", which every active member of the workspace may use. The
+ * heading takes the focus without a tab stop when "Open this project"
+ * leaves the page (`focusAfterOpenLeaves`).
  */
 function ProjectList({
   state,
@@ -234,7 +237,7 @@ function ProjectList({
   const openProjectId = isProjectView(view) ? view.projectId : undefined;
   return (
     <>
-      <h2 className="nav-heading" id="projects-heading">
+      <h2 className="nav-heading" id={PROJECTS_HEADING_ID} tabIndex={-1}>
         Projects
       </h2>
       {state.projects.length === 0 ? (
@@ -247,7 +250,7 @@ function ProjectList({
           </p>
         )
       ) : (
-        <ul className="nav-list" aria-labelledby="projects-heading">
+        <ul className="nav-list" aria-labelledby={PROJECTS_HEADING_ID}>
           {state.projects.map((project) => (
             <li key={project.id}>
               <button

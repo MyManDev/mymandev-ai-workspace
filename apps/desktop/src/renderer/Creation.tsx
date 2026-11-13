@@ -33,9 +33,16 @@ export const HOME_FORM_ID = "home-create";
 
 /**
  * The ID of the sidebar's "Workspaces" heading, which takes the focus when
- * the dialog closes after the button that opened it left the page.
+ * the dialog closes after the button that opened it left the page, and
+ * when "Open this workspace" leaves the sidebar.
  */
 export const WORKSPACES_HEADING_ID = "workspaces-heading";
+
+/**
+ * The ID of the sidebar's "Projects" heading, which takes the focus when
+ * "Open this project" leaves the page.
+ */
+export const PROJECTS_HEADING_ID = "projects-heading";
 
 /**
  * The IDs of the status paragraphs of the creates, by place, which
@@ -53,14 +60,23 @@ export const CREATE_STATUS_IDS: Readonly<Record<CreatePlace, string>> =
  * ("Open this workspace" or "Open this project") changes from the place
  * `before` to `after`, or undefined: only when it was shown, left its
  * place, and the focus fell to the page (`focusesTitleAfterLeave`), as
- * when the workspace is selected or the project open. The targets are the
- * ones of the creates (#258): the home screen's title for the home screen,
- * and the sidebar's "Workspaces" heading for the sidebar.
+ * when the workspace is selected or the project open. The target is the
+ * heading above the place:
+ *
+ * - the home screen's title for the home screen's "Open this workspace",
+ *   as after its create (#258);
+ * - the sidebar's "Workspaces" heading for the sidebar's "Open this
+ *   workspace";
+ * - the sidebar's "Projects" heading for "Open this project" (the Project
+ *   Manager's decision for #263), or the "Workspaces" heading while the
+ *   "Projects" heading is not on the page (`projectsHeadingShown`), as
+ *   once no workspace is selected.
  */
 export function focusAfterOpenLeaves(
   before: CreatePlace | undefined,
   after: CreatePlace | undefined,
   focusOnPage: boolean,
+  projectsHeadingShown: boolean,
 ): string | undefined {
   if (
     before === undefined ||
@@ -68,7 +84,14 @@ export function focusAfterOpenLeaves(
   ) {
     return undefined;
   }
-  return before === "home" ? HOME_TITLE_ID : WORKSPACES_HEADING_ID;
+  switch (before) {
+    case "home":
+      return HOME_TITLE_ID;
+    case "workspaces":
+      return WORKSPACES_HEADING_ID;
+    case "projects":
+      return projectsHeadingShown ? PROJECTS_HEADING_ID : WORKSPACES_HEADING_ID;
+  }
 }
 
 /** What the shell shows and does of its creates; see `useCreation`. */
@@ -420,6 +443,11 @@ function focusOnPage(): boolean {
   return active === null || active === document.body;
 }
 
+/** Whether the element with `id` is on the page. */
+function onPage(id: string): boolean {
+  return document.getElementById(id) !== null;
+}
+
 /**
  * The creates of the shell (`createCreation`) while it is mounted, which
  * follow every workspace state and whether the home screen is shown;
@@ -436,8 +464,10 @@ function focusOnPage(): boolean {
  * - "Open this workspace" and "Open this project" go through `paths`
  *   (`createdOpenPaths`). When one leaves the page while the focus fell to
  *   the page, for example once the workspace is selected or the project
- *   open, the focus moves to the home screen's title or the sidebar's
- *   "Workspaces" heading (`focusAfterOpenLeaves`).
+ *   open, the focus moves to the heading above its place: the home screen's
+ *   title, the sidebar's "Workspaces" heading, or, for "Open this project",
+ *   the sidebar's "Projects" heading, and the "Workspaces" heading while
+ *   that one is not on the page (`focusAfterOpenLeaves`).
  */
 export function useCreation(
   bridge: Pick<WorkspaceBridge, "create" | "createProject"> | undefined,
@@ -483,6 +513,7 @@ export function useCreation(
       wasCreatedAt.current,
       createdAt,
       focusOnPage(),
+      onPage(PROJECTS_HEADING_ID),
     );
     wasCreatedAt.current = createdAt;
     if (target !== undefined) {

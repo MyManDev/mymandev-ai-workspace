@@ -13,6 +13,7 @@ import {
   focusAfterOpenLeaves,
   HOME_TITLE_ID,
   HomeCreateWorkspace,
+  PROJECTS_HEADING_ID,
   WORKSPACES_HEADING_ID,
   type CreationControls,
 } from "./Creation.tsx";
@@ -148,7 +149,7 @@ test("the sidebar offers New workspace below the workspaces and New project belo
     CREATE_MESSAGES.newProject,
   ]);
   expect(html).toContain(
-    `</ul><p class="nav-empty nav-status" role="status"></p><div class="nav-create"><button type="button" class="panel-action">New workspace</button></div><p class="nav-empty nav-status" id="create-status-workspaces" role="status"></p><h2 class="nav-heading" id="projects-heading">Projects</h2>`,
+    `</ul><p class="nav-empty nav-status" role="status"></p><div class="nav-create"><button type="button" class="panel-action">New workspace</button></div><p class="nav-empty nav-status" id="create-status-workspaces" role="status"></p><h2 class="nav-heading" id="projects-heading" tabindex="-1">Projects</h2>`,
   );
   expect(html).toContain(
     `</ul><div class="nav-create"><button type="button" class="panel-action">New project</button></div><p class="nav-empty nav-status" id="create-status-projects" role="status"></p></nav>`,
@@ -510,7 +511,7 @@ test("Open this workspace follows the sentence of a new workspace that was not s
     ),
   );
   expect(sidebar).toContain(
-    `<p class="nav-empty nav-status" id="create-status-workspaces" role="status">${CREATE_DONE_MESSAGES.workspaceNotSelected}</p><div class="nav-create"><button type="button" class="panel-action" aria-describedby="create-status-workspaces">${CREATE_MESSAGES.openWorkspace}</button></div><h2 class="nav-heading" id="projects-heading">`,
+    `<p class="nav-empty nav-status" id="create-status-workspaces" role="status">${CREATE_DONE_MESSAGES.workspaceNotSelected}</p><div class="nav-create"><button type="button" class="panel-action" aria-describedby="create-status-workspaces">${CREATE_MESSAGES.openWorkspace}</button></div><h2 class="nav-heading" id="projects-heading" tabindex="-1">`,
   );
   expect(buttonLabels(sidebar)).not.toContain(CREATE_MESSAGES.openProject);
   expect(sidebar.split(CREATE_MESSAGES.openWorkspace)).toHaveLength(2);
@@ -635,25 +636,52 @@ test("each button reaches its handler, and stays focusable and does nothing whil
   );
 });
 
-test("when a button leaves its place while the focus fell to the page, the focus moves to the home screen's title or the Workspaces heading, as after a create", () => {
-  expect(focusAfterOpenLeaves("workspaces", undefined, true)).toBe(
+test("when a button leaves its place while the focus fell to the page, the focus moves to the heading above it: the home screen's title, the Workspaces heading, or the Projects heading for Open this project", () => {
+  for (const projectsHeadingShown of [true, false]) {
+    expect(
+      focusAfterOpenLeaves("workspaces", undefined, true, projectsHeadingShown),
+    ).toBe(WORKSPACES_HEADING_ID);
+    expect(
+      focusAfterOpenLeaves("home", undefined, true, projectsHeadingShown),
+    ).toBe(HOME_TITLE_ID);
+    expect(
+      focusAfterOpenLeaves("home", "workspaces", true, projectsHeadingShown),
+    ).toBe(HOME_TITLE_ID);
+  }
+  // Open this project: the Projects heading, and the Workspaces heading
+  // while the Projects heading is not on the page.
+  expect(focusAfterOpenLeaves("projects", undefined, true, true)).toBe(
+    PROJECTS_HEADING_ID,
+  );
+  expect(focusAfterOpenLeaves("projects", undefined, true, false)).toBe(
     WORKSPACES_HEADING_ID,
   );
-  expect(focusAfterOpenLeaves("projects", undefined, true)).toBe(
-    WORKSPACES_HEADING_ID,
-  );
-  expect(focusAfterOpenLeaves("home", undefined, true)).toBe(HOME_TITLE_ID);
-  expect(focusAfterOpenLeaves("home", "workspaces", true)).toBe(HOME_TITLE_ID);
   // Not while it stays, before it showed, or when the person moved on.
   expect(
-    focusAfterOpenLeaves("workspaces", "workspaces", true),
+    focusAfterOpenLeaves("workspaces", "workspaces", true, true),
   ).toBeUndefined();
-  expect(focusAfterOpenLeaves(undefined, "projects", true)).toBeUndefined();
-  expect(focusAfterOpenLeaves(undefined, undefined, true)).toBeUndefined();
-  expect(focusAfterOpenLeaves("projects", undefined, false)).toBeUndefined();
-  // Both targets take the focus without a tab stop.
-  expect(renderToString(nav(controls().value))).toContain(
-    `<h2 class="nav-heading" id="${WORKSPACES_HEADING_ID}" tabindex="-1">`,
+  expect(
+    focusAfterOpenLeaves("projects", "projects", true, true),
+  ).toBeUndefined();
+  expect(
+    focusAfterOpenLeaves(undefined, "projects", true, true),
+  ).toBeUndefined();
+  expect(
+    focusAfterOpenLeaves(undefined, undefined, true, true),
+  ).toBeUndefined();
+  expect(
+    focusAfterOpenLeaves("projects", undefined, false, true),
+  ).toBeUndefined();
+  // Every target takes the focus without a tab stop.
+  const sidebar = renderToString(nav(controls().value));
+  expect(sidebar).toContain(
+    `<h2 class="nav-heading" id="${WORKSPACES_HEADING_ID}" tabindex="-1">Workspaces</h2>`,
+  );
+  expect(sidebar).toContain(
+    `<h2 class="nav-heading" id="${PROJECTS_HEADING_ID}" tabindex="-1">Projects</h2>`,
+  );
+  expect(sidebar).toContain(
+    `<ul class="nav-list" aria-labelledby="${PROJECTS_HEADING_ID}">`,
   );
   expect(homeWith(controls().value)).toContain(
     `<h2 id="${HOME_TITLE_ID}" tabindex="-1">`,

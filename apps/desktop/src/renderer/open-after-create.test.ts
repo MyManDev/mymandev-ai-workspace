@@ -138,7 +138,8 @@ vi.mock("react", async (importOriginal) => {
 vi.resetModules();
 const { App } = await import("./App.tsx");
 const { CREATE_MESSAGES } = await import("./creation-view.ts");
-const { WORKSPACES_HEADING_ID } = await import("./Creation.tsx");
+const { PROJECTS_HEADING_ID, WORKSPACES_HEADING_ID } =
+  await import("./Creation.tsx");
 
 const WORKSPACE_A = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a1";
 const WORKSPACE_B = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a2";
@@ -164,8 +165,11 @@ function workspaceState(overrides: Partial<WorkspaceView> = {}): WorkspaceView {
   } as WorkspaceView;
 }
 
-/** The elements that the page would show, which take the focus. */
+/** The elements that took the focus, by ID. */
 const focused: string[] = [];
+
+/** The IDs of the elements that are not on the page; every other one is. */
+const missing = new Set<string>();
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -175,15 +179,19 @@ beforeEach(() => {
   hooks.store.slots = [];
   hooks.store.effects = [];
   focused.length = 0;
+  missing.clear();
   const body = { id: "body" };
   vi.stubGlobal("document", {
     body,
     activeElement: body,
-    getElementById: (id: string) => ({
-      isConnected: true,
-      contains: () => false,
-      focus: () => focused.push(id),
-    }),
+    getElementById: (id: string) =>
+      missing.has(id)
+        ? null
+        : {
+            isConnected: true,
+            contains: () => false,
+            focus: () => focused.push(id),
+          },
   });
 });
 
@@ -437,8 +445,50 @@ test("App offers Open this project once its event lists it, and opens it through
   expect(focused).toEqual([]);
 
   // Once the main process opened it, the button leaves, and the focus
-  // moves to the Workspaces heading.
+  // moves to the Projects heading.
   fake.publish(workspaceState({ projects, openProjectId: NEW_PROJECT }));
+  app.render();
+  expect(app.creation().created).toBeUndefined();
+  expect(focused).toEqual([PROJECTS_HEADING_ID]);
+});
+
+test("App moves the focus to the Workspaces heading when Open this project leaves while the Projects heading is not on the page", async () => {
+  const fake = fakeWorkspaces({
+    outcome: "ok",
+    workspaceId: NEW_WORKSPACE,
+    selected: true,
+  });
+  const app = shell(fake.bridge);
+  fake.publish(workspaceState());
+  app.render();
+  app.creation().onOpen("projects", null);
+  app.render();
+  app.creation().onDialogDraft("Roadmap");
+  app.render();
+  app.creation().onConfirm();
+  await settle();
+  app.render();
+  fake.publish(
+    workspaceState({
+      projects: [
+        { id: PROJECT, name: "Launch Plan" },
+        { id: NEW_PROJECT, name: "Roadmap" },
+      ],
+    }),
+  );
+  app.render();
+  expect(app.creation().created).toMatchObject({ place: "projects" });
+
+  // The workspace is no longer selected, so the projects and their heading
+  // leave the page with the button.
+  missing.add(PROJECTS_HEADING_ID);
+  fake.publish(
+    workspaceState({
+      workspaces: [{ id: WORKSPACE_B, name: "Team Beta" }],
+      selectedWorkspaceId: null,
+      projects: [],
+    }),
+  );
   app.render();
   expect(app.creation().created).toBeUndefined();
   expect(focused).toEqual([WORKSPACES_HEADING_ID]);
