@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ClaimsBridge } from "../shared/desktop-bridge.ts";
+import type { ClaimsView } from "../shared/ipc-contract.ts";
 import {
   CLAIM_MESSAGES,
   CLAIM_VIA_MESSAGES,
@@ -202,8 +203,7 @@ function ClaimItem({
         </p>
       )}
       <p className="person-meta">
-        {CLAIM_VIA_MESSAGES[row.via]}
-        {CLAIM_MESSAGES.on}
+        {`${CLAIM_VIA_MESSAGES[row.via]}${CLAIM_MESSAGES.on}`}
         <time dateTime={row.claimedAt}>
           {formatTime(row.claimedAt, timeFormat)}
         </time>
@@ -220,12 +220,18 @@ function ClaimItem({
   );
 }
 
-/** Follows the recent claims while the component that uses it is shown. */
+/**
+ * Follows the recent claims while the component that uses it is shown,
+ * starting with `initialState` when there is one, for tests and previews.
+ */
 export function useClaimsScreen(
   bridge: ClaimsBridge | undefined,
+  initialState?: ClaimsView | undefined,
 ): ClaimsScreenView {
-  const [view, setView] = useState(() =>
-    initialClaimsScreenView(bridge !== undefined),
+  const [view, setView] = useState((): ClaimsScreenView =>
+    initialState === undefined
+      ? initialClaimsScreenView(bridge !== undefined)
+      : { kind: "known", state: initialState },
   );
   useEffect(
     () => (bridge === undefined ? undefined : followClaims(bridge, setView)),

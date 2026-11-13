@@ -9,6 +9,7 @@ import type {
   PeopleBridge,
 } from "../shared/desktop-bridge.ts";
 import {
+  claimsCovered,
   IDLE_RECENT_CLAIMS,
   describeRecentClaims,
   type ClaimsScreenView,
@@ -45,7 +46,6 @@ import {
   describeJoinRequests,
   IDLE_JOIN_REQUEST_ACTIONS,
   isJoinRequestOffered,
-  joinRequestDialogsOpen,
   type JoinRequestActionsView,
   type JoinRequestsScreenView,
 } from "./join-requests-view.ts";
@@ -154,14 +154,12 @@ export function PeopleScreen({
     view,
     joinRequestsView,
   );
-  // A modal dialog makes the rest of the page inert, so the person sees
-  // the dialog rather than the claims behind it.
-  const covered =
-    shellDialogOpen === true ||
-    actions.dialog !== undefined ||
-    invitationParts.actions.question !== undefined ||
-    invitationParts.actions.code !== undefined ||
-    joinRequestDialogsOpen(joinRequestParts.actions);
+  const covered = claimsCovered({
+    shell: shellDialogOpen === true,
+    people: actions,
+    invitations: invitationParts.actions,
+    joinRequests: joinRequestParts.actions,
+  });
   const claimParts = useRecentClaims(claims, view, claimsView, covered);
   return (
     <PeopleScreenContent

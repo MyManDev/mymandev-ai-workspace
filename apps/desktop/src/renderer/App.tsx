@@ -24,7 +24,7 @@ import type {
   RuntimeBridge,
   WorkspaceBridge,
 } from "../shared/desktop-bridge.ts";
-import type { WorkspaceView } from "../shared/ipc-contract.ts";
+import type { ClaimsView, WorkspaceView } from "../shared/ipc-contract.ts";
 import { PRODUCT_NAME } from "../shared/product.ts";
 import { AccountScreen } from "./AccountScreen.tsx";
 import { initialAccountView, type AccountView } from "./account-view.ts";
@@ -132,6 +132,11 @@ export interface AppProps {
    * previews. Without it, the shell starts without projects.
    */
   readonly initialWorkspaceState?: WorkspaceView | undefined;
+  /**
+   * The claims shown until the bridge delivers them, for tests and
+   * previews. Without it, the sidebar waits for the first state.
+   */
+  readonly initialClaimsState?: ClaimsView | undefined;
   /** The view shown first. An invalid view shows the home screen. */
   readonly initialView?: ShellView;
 }
@@ -154,6 +159,7 @@ export function App({
   chat,
   devices,
   initialWorkspaceState,
+  initialClaimsState,
   initialView = HOME_VIEW,
 }: AppProps) {
   const [state, dispatch] = useReducer(shellReducer, initialView, (view) =>
@@ -197,7 +203,7 @@ export function App({
   );
   // The shell follows the claims for the sidebar's marker; the people
   // screen follows them on its own while it is shown.
-  const claimsView = useClaimsScreen(claims);
+  const claimsView = useClaimsScreen(claims, initialClaimsState);
   const unseenClaims = hasUnseenClaims(claimsView, workspaceSidebar.view);
   const shellDialogOpen =
     question.question !== undefined || creation?.view.dialog !== undefined;

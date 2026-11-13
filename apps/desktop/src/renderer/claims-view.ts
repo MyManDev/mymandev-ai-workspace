@@ -6,7 +6,12 @@ import type {
   PersonView,
   WorkspaceProblem,
 } from "../shared/ipc-contract.ts";
-import type { PeopleActionRequest } from "./people-actions-view.ts";
+import type { InvitationActionsView } from "./invitations-view.ts";
+import type { JoinRequestActionsView } from "./join-requests-view.ts";
+import type {
+  PeopleActionRequest,
+  PeopleActionsView,
+} from "./people-actions-view.ts";
 import type { PeopleScreenView } from "./people-view.ts";
 import type { WorkspacePanelView } from "./workspace-view.ts";
 
@@ -338,6 +343,31 @@ export function shownClaims(
   return memberIds.length === 0
     ? null
     : { scope: model.scope, workspaceId: model.workspaceId, memberIds };
+}
+
+/**
+ * Whether a modal dialog covers the recent claims: the shell's (the
+ * question before a switch, or the dialog of a create), or one of the
+ * people screen's (the people actions' question, the invitation actions'
+ * question or code, and the join request actions' question or code). A
+ * modal dialog makes the rest of the page inert, and the person looks at
+ * it rather than at the claims behind it, so nothing counts as shown
+ * meanwhile.
+ */
+export function claimsCovered(dialogs: {
+  readonly shell: boolean;
+  readonly people: Pick<PeopleActionsView, "dialog">;
+  readonly invitations: Pick<InvitationActionsView, "question" | "code">;
+  readonly joinRequests: Pick<JoinRequestActionsView, "dialog" | "code">;
+}): boolean {
+  return (
+    dialogs.shell ||
+    dialogs.people.dialog !== undefined ||
+    dialogs.invitations.question !== undefined ||
+    dialogs.invitations.code !== undefined ||
+    dialogs.joinRequests.dialog !== undefined ||
+    dialogs.joinRequests.code !== undefined
+  );
 }
 
 /**
