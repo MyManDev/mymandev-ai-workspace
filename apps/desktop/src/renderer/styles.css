@@ -280,7 +280,10 @@ code {
   margin: 0;
 }
 
-/* "New workspace" and "New project", below their lists. */
+/*
+ * "New workspace" and "New project", below their lists, and "Open this
+ * workspace" and "Open this project" after their sentences.
+ */
 .nav-create {
   margin: var(--space-1) var(--space-2);
 }
