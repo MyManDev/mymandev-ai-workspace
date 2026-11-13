@@ -53,9 +53,6 @@ export const JOIN_MESSAGES = Object.freeze({
   /** The workspace list does not hold the joined workspace yet. */
   joinedNotListed:
     "It appears in your list of workspaces once the list has loaded.",
-  /** The parts of the screen that come later (#95). */
-  later:
-    "Asking to join a workspace by its ID, and your own join requests with a way to withdraw them, will be added here.",
 });
 
 /**

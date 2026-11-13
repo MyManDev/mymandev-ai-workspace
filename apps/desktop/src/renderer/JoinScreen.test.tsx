@@ -151,13 +151,14 @@ const TITLE =
   '<section aria-labelledby="join-title"><h2 id="join-title" tabindex="-1">Join a workspace</h2><section aria-labelledby="join-code-title"><h3 class="people-heading" id="join-code-title">Join with an invitation code</h3>';
 const HINT =
   '<p id="join-code-hint">If a workspace already added you as a person, its owner or an admin can give you an invitation code for that person. Paste the code here: you see the workspace and the person before you join. The application takes a code only when you paste it here, never from a link.</p>';
-const LATER =
-  '<p class="placeholder-note">Asking to join a workspace by its ID, and your own join requests with a way to withdraw them, will be added here.</p>';
+/** The request to join by a workspace ID, without its two bridges. */
+const REQUESTS_UNAVAILABLE =
+  '<section aria-labelledby="join-request-title"><h3 class="people-heading" id="join-request-title">Ask to join with a workspace ID</h3><p>Asking to join with a workspace ID is not available.</p></section>';
 
 test("without the bridge, the screen says that joining is not available, with no form, status, or dialog", () => {
   const html = renderToString(<JoinScreenContent workspaces={known()} />);
   expect(html).toBe(
-    `${TITLE}<p>Joining with an invitation code is not available.</p></section>${LATER}</section>`,
+    `${TITLE}<p>Joining with an invitation code is not available.</p></section>${REQUESTS_UNAVAILABLE}</section>`,
   );
 });
 
@@ -170,14 +171,14 @@ test("while no device is signed in and ready, the screen says so instead of the 
     }),
   });
   expect(html).toBe(
-    `${TITLE}${HINT}<p>You can join a workspace once this device is signed in and ready.</p><p class="people-status" id="join-message" role="status"></p></section>${LATER}<dialog class="people-dialog"></dialog></section>`,
+    `${TITLE}${HINT}<p>You can join a workspace once this device is signed in and ready.</p><p class="people-status" id="join-message" role="status"></p></section>${REQUESTS_UNAVAILABLE}<dialog class="people-dialog"></dialog></section>`,
   );
 });
 
 test("the form is a labelled code field without spelling, completion, or translation, its own alert, and Preview", () => {
   const html = render({ view: { code: CODE } });
   expect(html).toContain(
-    `${TITLE}${HINT}<form class="account-form" aria-labelledby="join-code-title"><label class="account-label" for="join-code">Invitation code</label><input id="join-code" class="account-input" type="text" autoComplete="off" autoCapitalize="off" autoCorrect="off" spellCheck="false" translate="no" aria-describedby="join-code-hint join-code-problem" value="${CODE}"/><p class="panel-message" id="join-code-problem" role="alert"></p><div class="account-actions"><button type="submit" class="panel-action">Preview</button><button type="button" class="panel-action">Cancel</button></div></form><p class="people-status" id="join-message" role="status"></p></section>${LATER}`,
+    `${TITLE}${HINT}<form class="account-form" aria-labelledby="join-code-title"><label class="account-label" for="join-code">Invitation code</label><input id="join-code" class="account-input" type="text" autoComplete="off" autoCapitalize="off" autoCorrect="off" spellCheck="false" translate="no" aria-describedby="join-code-hint join-code-problem" value="${CODE}"/><p class="panel-message" id="join-code-problem" role="alert"></p><div class="account-actions"><button type="submit" class="panel-action">Preview</button><button type="button" class="panel-action">Cancel</button></div></form><p class="people-status" id="join-message" role="status"></p></section>${REQUESTS_UNAVAILABLE}`,
   );
   // Cancel shows only while there is something to drop.
   expect(buttonLabels(render())).toEqual(["Preview"]);
