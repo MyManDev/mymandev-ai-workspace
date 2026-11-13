@@ -89,7 +89,7 @@ function escaped(text: string): string {
 
 const TITLE =
   '<section aria-labelledby="people-title"><h2 id="people-title" tabindex="-1">People</h2>';
-const ACTIONS_LATER = `<p class="placeholder-note">${PEOPLE_MESSAGES.actionsLater}</p></section>`;
+const END = "</section>";
 const HINT = `<p class="people-hint">${PEOPLE_MESSAGES.adminHint}</p>`;
 /** The selected workspace's name below the heading. */
 const NAMED =
@@ -124,9 +124,7 @@ test("each state without people shows its text in the status paragraph, and no l
     [known({ people: [] }), "No people yet.", NAMED],
   ];
   for (const [view, text, name] of cases) {
-    expect(render(view), text).toBe(
-      TITLE + name + status(text) + ACTIONS_LATER,
-    );
+    expect(render(view), text).toBe(TITLE + name + status(text) + END);
   }
 });
 
@@ -166,7 +164,7 @@ test("a ready state lists each person with the name, the role, and the login wit
       '<p class="person-meta">Never claimed</p>' +
       "</li>" +
       "</ul>" +
-      ACTIONS_LATER,
+      END,
   );
 });
 
@@ -198,7 +196,7 @@ test("the hint to make someone an admin shows to the owner only, when someone co
 test("people left out are counted after the last list", () => {
   const html = render(known({ morePeople: 2 }));
   const note = `<p class="people-note">${new Intl.NumberFormat().format(2)} more people are not shown.</p>`;
-  expect(html).toContain(`</ul>${note}${ACTIONS_LATER}`);
+  expect(html).toContain(`</ul>${note}${END}`);
   expect(html.indexOf(note)).toBeGreaterThan(
     html.indexOf("former-people-heading"),
   );
@@ -237,7 +235,7 @@ test("an unavailable state shows its problem with the people loaded before, or a
       } as Partial<PeopleView>),
     );
     expect(alone).toBe(
-      TITLE + NAMED + status(PEOPLE_PROBLEM_MESSAGES[problem]) + ACTIONS_LATER,
+      TITLE + NAMED + status(PEOPLE_PROBLEM_MESSAGES[problem]) + END,
     );
   }
 });
