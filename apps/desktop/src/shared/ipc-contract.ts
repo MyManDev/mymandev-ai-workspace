@@ -306,6 +306,7 @@ export const SIGN_IN_OUTCOME_CODES = Object.freeze([
   "device_account_mismatch",
   "device_revoked",
   "device_registration_locked",
+  "device_limit",
   "refused",
   "api_origin_unset",
   "api_origin_invalid",
@@ -956,9 +957,10 @@ export type CreateWorkspaceRefusal = (typeof CREATE_WORKSPACE_REFUSALS)[number];
  *
  * - `not_selected`: the workspace is not the selected one, for example after
  *   a switch. Nothing was sent.
- * - `rate_limited`: also the limits of 100 projects that are not archived
- *   per workspace and 20 new projects per account in 24 hours, which the API
- *   answers as `rate_limited` today (#255).
+ * - `rate_limited`: also the limit of 20 new projects per account in 24
+ *   hours, with the time until the oldest of them leaves the window.
+ * - `project_limit`: the workspace holds 100 projects that are not archived
+ *   (#255). It carries no wait: only archiving a project frees a place.
  * - `not_found`: the API does not know the workspace for this account.
  * - `conflict`: a project of the workspace that is not archived has the
  *   name, compared without regard to case.
@@ -970,6 +972,7 @@ export const CREATE_PROJECT_REFUSALS = Object.freeze([
   "unavailable",
   "too_soon",
   "rate_limited",
+  "project_limit",
   "not_found",
   "conflict",
   "failed",

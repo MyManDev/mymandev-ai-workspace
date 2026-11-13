@@ -2789,6 +2789,7 @@ describe("outcomes of the sign-in flow", () => {
     { kind: "refused", code: "conflict" },
     { kind: "refused", code: "bad_request" },
     { kind: "refused", code: "device_registration_locked" },
+    { kind: "refused", code: "device_limit" },
     { kind: "refused", code: "unsupported_account" },
   ];
 

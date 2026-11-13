@@ -45,25 +45,23 @@ type ProjectParams = Readonly<{
 }>;
 
 /**
- * The `Retry-After` of a creation in a workspace that holds 100 projects
- * that are not archived. No time frees a place, only archiving a project
- * does; so, like the limit of 20 active devices, the answer asks again in a
- * day.
+ * The answer to a refused creation. A workspace that holds 100 projects that
+ * are not archived, the limit without a wait (`retryAfterMs` null), answers
+ * `409` with `project_limit` and no `Retry-After`, because no time frees a
+ * place, only archiving a project does (#255). The account's 20 creations in
+ * 24 hours answer `rate_limited` with the time until the oldest of them
+ * leaves the window.
  */
-const PROJECT_LIMIT_RETRY_AFTER_SECONDS = 24 * 60 * 60;
-
-/** The answer to a refused creation. */
 function refusedCreation(
   result: Extract<CreateProjectResult, { created: false }>,
 ): ApiError {
   switch (result.refusal) {
     case "rate_limited":
-      return new ApiError("rate_limited", {
-        retryAfterSeconds:
-          result.retryAfterMs === null
-            ? PROJECT_LIMIT_RETRY_AFTER_SECONDS
-            : result.retryAfterMs / 1000,
-      });
+      return result.retryAfterMs === null
+        ? new ApiError("project_limit")
+        : new ApiError("rate_limited", {
+            retryAfterSeconds: result.retryAfterMs / 1000,
+          });
     // An account that stopped being an active member after the membership
     // check gets the check's 404.
     case "not_member":

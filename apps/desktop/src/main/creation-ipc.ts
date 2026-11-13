@@ -41,6 +41,7 @@ const WORKSPACE_OUTCOMES = {
   workspace_not_found: "failed",
   device_too_new: "failed",
   unclaimed_limit: "failed",
+  project_limit: "failed",
   rate_limited: "rate_limited",
   unknown: "unknown",
   failed: "failed",
@@ -50,9 +51,11 @@ Object.freeze(WORKSPACE_OUTCOMES);
 /**
  * Each failure of a write and what the screen gets when it creates a
  * project. The API answers `POST /workspaces/:workspaceId/projects` with
- * `not_found` and `conflict` beyond the common codes
- * (`PROJECT_ROUTE_ERRORS`); its limits of projects answer `rate_limited`
- * today (#255) and pass through as they are.
+ * `not_found`, `conflict`, and `project_limit` beyond the common codes
+ * (`PROJECT_ROUTE_ERRORS`), and they pass through as they are:
+ * `project_limit`, without a wait, for a workspace that holds 100 projects
+ * that are not archived, and `rate_limited`, with its wait, for an account
+ * that created 20 projects in 24 hours (#255).
  */
 const PROJECT_OUTCOMES = {
   invalid: "invalid",
@@ -68,6 +71,7 @@ const PROJECT_OUTCOMES = {
   workspace_not_found: "failed",
   device_too_new: "failed",
   unclaimed_limit: "failed",
+  project_limit: "project_limit",
   rate_limited: "rate_limited",
   unknown: "unknown",
   failed: "failed",

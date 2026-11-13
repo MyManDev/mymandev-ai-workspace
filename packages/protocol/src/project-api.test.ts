@@ -167,9 +167,18 @@ test("each project route answers only known error codes, the common ones include
   }
   assert.deepEqual(specificCodes(), {
     listProjects: ["not_found"],
-    createProject: ["not_found", "conflict"],
+    createProject: ["not_found", "conflict", "project_limit"],
     renameProject: ["not_found", "forbidden", "conflict"],
   });
+  // Only a creation counts the projects of a workspace (#255), and no
+  // project route registers a device.
+  const holders = (code: ApiErrorCode) =>
+    Object.entries(PROJECT_ROUTE_ERRORS)
+      .filter(([, codes]) => codes.includes(code))
+      .map(([name]) => name);
+  assert.deepEqual(holders("project_limit"), ["createProject"]);
+  assert.deepEqual(holders("device_limit"), []);
+  assert.deepEqual(holders("unclaimed_limit"), []);
 });
 
 test("the README's project route table lists every project route with its codes", () => {
