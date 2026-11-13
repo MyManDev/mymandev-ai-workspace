@@ -257,8 +257,26 @@ test("every result of each create has one fixed sentence, with the wait and the 
     "The workspace could not be created. The server asked to wait. Try again in 24 hours. An account creates at most 10 workspaces in 24 hours.",
   );
   expect(limited("project")).toBe(
-    "The project could not be created. The server asked to wait. Try again in 24 hours. A workspace holds at most 100 projects, and an account creates at most 20 projects in 24 hours.",
+    "The project could not be created. The server asked to wait. Try again in 24 hours. An account creates at most 20 projects in 24 hours.",
   );
+  // The limit of projects in a workspace has its own code and names no wait,
+  // because none helps (#255).
+  const full = describeCreateResult("project", {
+    outcome: "refused",
+    reason: "project_limit",
+    retryAfterMs: null,
+  });
+  expect(full).toBe(
+    "The project could not be created. This workspace already holds as many projects as it can, and projects cannot be removed yet. Create the project in another workspace.",
+  );
+  expect(full).not.toMatch(/Try again|wait/iu);
+  expect(
+    describeCreateResult("project", {
+      outcome: "refused",
+      reason: "rate_limited",
+      retryAfterMs: 3_600_000,
+    }),
+  ).not.toContain("holds");
   expect(
     describeCreateResult("project", {
       outcome: "refused",
@@ -457,6 +475,27 @@ test("the dialog of a project sends the workspace that the button was shown for 
   await expect(later).resolves.toBe(false);
   expect(c.last().message).toBeUndefined();
   expect(c.last().running).toBe(false);
+});
+
+test("a project create at the workspace's limit of projects says so below New project, names no wait, and keeps the name (#255)", async () => {
+  const c = controller();
+  c.creation.open("projects", WORKSPACE_A, "Team Alpha");
+  c.creation.editDialogDraft("Roadmap");
+  const done = c.creation.confirm();
+  c.projects[0]?.resolve({
+    outcome: "refused",
+    reason: "project_limit",
+    retryAfterMs: null,
+  });
+  await expect(done).resolves.toBe(false);
+  expect(c.last().message).toEqual({
+    place: "projects",
+    text: `${CREATE_NOT_DONE_MESSAGES.project} ${CREATE_REFUSAL_MESSAGES.project_limit}`,
+  });
+  expect(c.last().message?.text).not.toMatch(/Try again|wait/iu);
+  expect(c.calls).toEqual([`project ${WORKSPACE_A} Roadmap`]);
+  c.creation.open("projects", WORKSPACE_A, "Team Alpha");
+  expect(c.last().dialog?.draft).toBe("Roadmap");
 });
 
 test("a switch of the selected workspace ends a project's dialog, its name, and its sentence", async () => {

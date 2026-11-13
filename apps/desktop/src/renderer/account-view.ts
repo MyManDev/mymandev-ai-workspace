@@ -48,6 +48,8 @@ export const SIGN_IN_OUTCOME_MESSAGES: Readonly<
     "This device was removed from its account, and its key was deleted. Sign in again to add it as a new device.",
   device_registration_locked:
     "No new device can be added to this account right now, because one of its devices was reported lost. Lift the lock from another of your devices.",
+  device_limit:
+    "This account already has as many active devices as it allows, so this device cannot be added. On another of your devices, remove a device that you no longer use in the Devices section of the Account screen, then sign in here again.",
   refused: "The server refused the sign-in.",
   api_origin_unset:
     "Sign-in is not available in this build, because no server address is set.",

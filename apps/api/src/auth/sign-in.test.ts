@@ -13,6 +13,7 @@ import {
   type TestDatabase,
 } from "@mymandev/database/testing";
 import {
+  ApiErrorBodySchema,
   deviceAuthInput,
   type DeviceAuthInput,
   type DeviceId,
@@ -942,7 +943,7 @@ test("without a recorded revocation, a sign-in works although its GitHub identit
   assert.equal(user?.signInRequiredAt, null);
 });
 
-test("an account has at most 20 active devices and 10 new devices in 24 hours, with Retry-After", async (t) => {
+test("an account has at most 20 active devices, answered with device_limit and no Retry-After, and 10 new devices in 24 hours, answered with rate_limited and Retry-After", async (t) => {
   const app = await signInApp(t, { user: githubUser(1009, "many-devices") });
   const firstKey = newKey();
   const first = SignInResponseSchema.parse(
@@ -989,9 +990,24 @@ test("an account has at most 20 active devices and 10 new devices in 24 hours, w
     .update(devices)
     .set({ createdAt: old })
     .where(eq(devices.userId, userId));
+  const before = await accountRows(userId);
   const twentyFirst = await signInNew();
-  assert.equal(codeOf(twentyFirst), "rate_limited");
-  assert.equal(twentyFirst.headers["retry-after"], String(24 * 3600));
+  // Its own code, not `rate_limited`: only revoking a device frees a place,
+  // so waiting does not help (#255).
+  assert.equal(twentyFirst.statusCode, 409);
+  assert.deepEqual(twentyFirst.json(), {
+    statusCode: 409,
+    error: "Conflict",
+    message: "Conflict",
+    code: "device_limit",
+  });
+  assert.equal(ApiErrorBodySchema.safeParse(twentyFirst.json()).success, true);
+  assert.equal(twentyFirst.headers["retry-after"], undefined);
+  assert.deepEqual(
+    await accountRows(userId),
+    before,
+    "the refusal registered nothing",
+  );
 
   // A repeated sign-in is not limited, and a revoked device frees a place.
   const repeated = await postSignIn(
@@ -1095,7 +1111,8 @@ test("naming a previous device of the same account revokes it as replaced, also 
       previousDeviceId: foreign.deviceId,
     }),
   );
-  assert.equal(withForeign.statusCode, 429, "a foreign device frees no place");
+  assert.equal(withForeign.statusCode, 409, "a foreign device frees no place");
+  assert.equal(codeOf(withForeign), "device_limit");
   await database()
     .update(devices)
     .set({ revokedAt: new Date(), revocationReason: "removed" })

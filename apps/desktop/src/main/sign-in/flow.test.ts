@@ -1562,6 +1562,18 @@ describe("answers of the API", () => {
     expect(await h.records.read()).toEqual({ kind: "none" });
   }, 20_000);
 
+  test("takes the account's limit of active devices as a certain refusal, not as an uncertain one, and deletes the new key (#255)", async () => {
+    const h = harness();
+    h.answer = () => errorAnswer("device_limit");
+    const { outcome } = await signIn(h);
+    // The API refuses it before its transaction commits, and a copy of a
+    // request that committed never gets it.
+    expect(UNCERTAIN_REFUSAL_CODES).not.toContain("device_limit");
+    expect(outcome).toEqual({ kind: "refused", code: "device_limit" });
+    expect(await h.keyStore.hasKey()).toBe(false);
+    expect(await h.records.read()).toEqual({ kind: "none" });
+  }, 20_000);
+
   test("does not trust a 200 answer outside the format", async () => {
     const h = harness();
     const previousKey = await existingDevice(h);
