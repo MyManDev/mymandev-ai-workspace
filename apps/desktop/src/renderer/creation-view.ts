@@ -213,7 +213,7 @@ export const CREATE_REFUSAL_MESSAGES: Readonly<
       `The server asked to wait. Try again in ${wait}. An account creates at most 20 projects in 24 hours.`,
   }),
   project_limit:
-    "This workspace already holds as many projects as it can, and projects cannot be removed yet. Create the project in another workspace.",
+    "This workspace already has as many projects as it allows, and projects cannot be removed yet. Create the project in another workspace.",
   not_found:
     "The server does not know this workspace for your account. Check the list of workspaces.",
   conflict:

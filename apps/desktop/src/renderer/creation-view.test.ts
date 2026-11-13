@@ -267,7 +267,7 @@ test("every result of each create has one fixed sentence, with the wait and the 
     retryAfterMs: null,
   });
   expect(full).toBe(
-    "The project could not be created. This workspace already holds as many projects as it can, and projects cannot be removed yet. Create the project in another workspace.",
+    "The project could not be created. This workspace already has as many projects as it allows, and projects cannot be removed yet. Create the project in another workspace.",
   );
   expect(full).not.toMatch(/Try again|wait/iu);
   expect(
@@ -276,7 +276,7 @@ test("every result of each create has one fixed sentence, with the wait and the 
       reason: "rate_limited",
       retryAfterMs: 3_600_000,
     }),
-  ).not.toContain("holds");
+  ).not.toContain("as many projects");
   expect(
     describeCreateResult("project", {
       outcome: "refused",
