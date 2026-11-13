@@ -1085,6 +1085,105 @@ test("a new device at both device limits answers device_limit, not rate_limited:
   );
 });
 
+test("the limit of 10 new devices in 24 hours refuses with rate_limited and Retry-After before anything is committed: no device, no key, no revocation, and no frame (#269)", async (t) => {
+  const connections = new ConnectionRegistry();
+  const app = await deviceApp(t, {
+    database: database(),
+    githubId: 1023,
+    connections,
+  });
+  const laptop = await signInDevice(app);
+  const laptopSocket = await connected(t, app, laptop);
+  // The laptop and 9 more devices within the last 24 hours reach the limit.
+  const now = new Date();
+  for (let index = 0; index < 9; index += 1) {
+    await database().insert(devices).values({
+      id: newId<DeviceId>(),
+      userId: laptop.userId,
+      label: "Extra",
+      platform: "linux",
+      publicKey: newKey().publicKey,
+      keyAlgorithm: "ed25519",
+      createdAt: now,
+      lastSignInAt: now,
+    });
+  }
+  const before = await accountRows(laptop.userId);
+  const key = newKey();
+
+  // Naming the laptop as the previous device shows that its revocation
+  // does not happen either.
+  const refused = await postNewDevice(
+    app,
+    await signInCode(app),
+    key,
+    laptop.deviceId,
+  );
+  assert.equal(refused.statusCode, 429);
+  assert.deepEqual(refused.json(), {
+    statusCode: 429,
+    error: "Too Many Requests",
+    message: "Too Many Requests",
+    code: "rate_limited",
+  });
+  const wait = Number(refused.headers["retry-after"]);
+  assert.ok(wait > 23 * 3600 && wait <= 24 * 3600, String(wait));
+  // The transaction refreshed the login before the limit refused; it was
+  // rolled back with the rest.
+  assert.deepEqual(
+    await accountRows(laptop.userId),
+    before,
+    "the refusal registered, revoked, and refreshed nothing",
+  );
+  assert.deepEqual(
+    await database()
+      .select({ id: devices.id })
+      .from(devices)
+      .where(eq(devices.publicKey, key.publicKey)),
+    [],
+    "no device holds the new key",
+  );
+  await settle();
+  assert.equal(laptopSocket.client.unread(), 0, "no frame");
+  assert.equal(
+    laptopSocket.client.ws.readyState,
+    laptopSocket.client.ws.OPEN,
+    "the named previous device stays connected",
+  );
+});
+
+test("the route's limit of 30 requests per address in 10 minutes answers rate_limited with a Retry-After of at most 10 minutes, also to a resent copy of a request that committed, so the desktop cannot take that answer as certain (#269)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1024, "busy-address") });
+  // The limit counts every request before its body is checked, so 29
+  // malformed requests leave the address one request.
+  for (let index = 0; index < 29; index += 1) {
+    assert.equal((await postSignIn(app, {})).statusCode, 400);
+  }
+  const key = newKey();
+  const request = newDeviceRequest(await signInCode(app), key);
+  const committed = await postSignIn(app, request);
+  assert.equal(committed.statusCode, 200, committed.body);
+
+  // A copy of the same request, as `net.fetch` or a proxy can send it after
+  // the connection broke (#152), gets the route's limit before the API
+  // looks at the code, so it does not get sign_in_code_used.
+  const copy = await postSignIn(app, request);
+  assert.equal(copy.statusCode, 429);
+  assert.equal(codeOf(copy), "rate_limited");
+  const wait = Number(copy.headers["retry-after"]);
+  assert.ok(wait >= 1 && wait <= 600, String(wait));
+  assert.equal(
+    (
+      await database()
+        .select({ id: devices.id })
+        .from(devices)
+        .where(eq(devices.publicKey, key.publicKey))
+    ).length,
+    1,
+    "the first copy registered the key",
+  );
+});
+
 test("naming a previous device of the same account revokes it as replaced, also at the device limit; another account's device stays", async (t) => {
   const app = await signInApp(t, { user: githubUser(1010, "replacing") });
   const lost = SignInResponseSchema.parse(

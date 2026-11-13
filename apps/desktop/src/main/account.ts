@@ -581,14 +581,23 @@ export function signInOutcomeView(outcome: SignInOutcome): SignInOutcomeView {
           : { code },
       );
     }
-    case "failed":
-      return Object.freeze({
-        code:
-          outcome.reason === "key_store_failed" &&
-          outcome.keyError === "system_protection_unavailable"
-            ? "system_protection_unavailable"
-            : codeOf(FAILURE_CODES, outcome.reason, "failed"),
-      });
+    case "failed": {
+      const code =
+        outcome.reason === "key_store_failed" &&
+        outcome.keyError === "system_protection_unavailable"
+          ? "system_protection_unavailable"
+          : codeOf(FAILURE_CODES, outcome.reason, "failed");
+      // The wait of an uncertain `rate_limited` (#269); the API's code is
+      // not passed on.
+      const seconds = outcome.retryAfterSeconds;
+      return Object.freeze(
+        code === "uncertain_refusal" &&
+          outcome.apiError === "rate_limited" &&
+          seconds !== undefined
+          ? { code, retryAfterMs: seconds * 1000 }
+          : { code },
+      );
+    }
     default:
       // An outcome that a later flow adds.
       return Object.freeze({ code: "failed" });

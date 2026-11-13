@@ -344,12 +344,24 @@ export const SignInOutcomeSchema = z
      * not refused for it after this time. It names no key and no ID.
      */
     retryAfter: TimestampSchema.optional(),
+    /**
+     * With `uncertain_refusal` only, when the API answered `rate_limited`
+     * with a usable `Retry-After` (#269): how long its limit lasts, in
+     * milliseconds. Whether the sign-in was completed stays unknown.
+     */
+    retryAfterMs: z.int().positive().optional(),
   })
   .refine(
     (outcome) =>
       outcome.retryAfter === undefined ||
       outcome.code === "replacement_pending",
     { message: "retryAfter belongs to replacement_pending only" },
+  )
+  .refine(
+    (outcome) =>
+      outcome.retryAfterMs === undefined ||
+      outcome.code === "uncertain_refusal",
+    { message: "retryAfterMs belongs to uncertain_refusal only" },
   );
 export type SignInOutcomeView = z.infer<typeof SignInOutcomeSchema>;
 

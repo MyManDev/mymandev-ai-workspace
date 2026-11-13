@@ -129,7 +129,7 @@ async function readBodyText(
  * The `Retry-After` of an answer in seconds, or undefined when it is not a
  * whole number of seconds from 1. The API sends seconds, never a date.
  */
-function retryAfterSecondsOf(response: Response): number | undefined {
+export function retryAfterSecondsOf(response: Response): number | undefined {
   const value = response.headers.get("retry-after");
   if (value === null || !/^[0-9]{1,10}$/u.test(value)) {
     return undefined;
