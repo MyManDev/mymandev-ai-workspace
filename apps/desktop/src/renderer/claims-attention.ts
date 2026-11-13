@@ -130,17 +130,78 @@ export function followPageAttention(
 /**
  * The part of a row that must be in view for the row to count as shown:
  * three quarters, so that a row cut off at the edge of the screen does not
- * count. A row taller than the visible area never reaches it and stays new,
- * for example at a high page zoom, until the page is zoomed out or the
- * window is made larger (#276).
+ * count. A row taller than the visible area can never reach it, for example
+ * at a high page zoom; such a row counts instead while its visible part
+ * fills three quarters of the visible area's height and three quarters of
+ * the row's own width (`isRowInView`, #276).
  */
 export const ROW_IN_VIEW_RATIO = 0.75;
+
+/**
+ * The thresholds of the rows' observer: every twentieth from 0 to 1, 21 in
+ * all, with `ROW_IN_VIEW_RATIO` among them, so that a row that is not taller
+ * than the visible area is reported exactly when it crosses three quarters.
+ * A row taller than the visible area counts at a part of itself that
+ * depends on its height, which no fixed threshold matches; the observer
+ * reports such a row at each twentieth of it in view. A row up to five
+ * times the visible area's height that comes to fill the visible area is
+ * then reported at least once on its way while it fills three quarters of
+ * it, and a row that stops filling it leaves the view at the latest once
+ * another twentieth of it has left the view. A taller row, or one that
+ * stops before it fills the visible area, may stay new until a later
+ * report. A finer list would report more often during a scroll for little
+ * gain; the observer reports at most once per frame.
+ */
+export const ROW_THRESHOLDS: readonly number[] = Object.freeze(
+  Array.from({ length: 21 }, (_, index) => index / 20),
+);
+
+/** The size of a box, as a `DOMRectReadOnly` gives it. */
+export interface RowBox {
+  readonly width: number;
+  readonly height: number;
+}
 
 /** What the row observer reports of one row, as `IntersectionObserverEntry` does. */
 export interface RowEntry {
   readonly target: Element;
   readonly isIntersecting: boolean;
   readonly intersectionRatio: number;
+  /** The row's whole box. */
+  readonly boundingClientRect: RowBox;
+  /** The row's visible part, clipped by the visible area and every scrolling ancestor. */
+  readonly intersectionRect: RowBox;
+  /** The visible area, or null when the page may not know it, for example across origins. */
+  readonly rootBounds: RowBox | null;
+}
+
+/**
+ * Whether the row of an observer's entry is in view. Any row is while it
+ * intersects the visible area by at least `ROW_IN_VIEW_RATIO` of itself. A
+ * row taller than the visible area also is while its visible part is at
+ * least `ROW_IN_VIEW_RATIO` of the visible area's height and of the row's
+ * own width, also when it runs past both the top and the bottom edge, so
+ * that a row cut off at a side does not count. Without the visible area's
+ * bounds, or with a visible area of no height, only the first rule applies.
+ */
+export function isRowInView(entry: RowEntry): boolean {
+  if (!entry.isIntersecting) {
+    return false;
+  }
+  if (entry.intersectionRatio >= ROW_IN_VIEW_RATIO) {
+    return true;
+  }
+  const root = entry.rootBounds;
+  const row = entry.boundingClientRect;
+  const visible = entry.intersectionRect;
+  return (
+    root !== null &&
+    root.height > 0 &&
+    row.height > root.height &&
+    visible.height >= ROW_IN_VIEW_RATIO * root.height &&
+    row.width > 0 &&
+    visible.width >= ROW_IN_VIEW_RATIO * row.width
+  );
 }
 
 /** What `followRowsInView` uses of an observer, as `IntersectionObserver` offers it. */
@@ -188,11 +249,11 @@ export interface RowsInView {
 
 /**
  * Follows the claims' rows with one observer from `create`, and calls
- * `onInView` with the member IDs of the rows in view whenever they change:
- * a row is in view while it intersects the visible area by at least
- * `ROW_IN_VIEW_RATIO`. The observer is made at the first row, so nothing
- * observes before a row is on the page; a row that leaves the page leaves
- * the view at once. Without an observer, no row is ever in view.
+ * `onInView` with the member IDs of the rows in view whenever they change,
+ * as `isRowInView` reads each entry, with the thresholds `ROW_THRESHOLDS`.
+ * The observer is made at the first row, so nothing observes before a row
+ * is on the page; a row that leaves the page leaves the view at once.
+ * Without an observer, no row is ever in view.
  */
 export function followRowsInView(
   create: RowObserverFactory,
@@ -222,10 +283,7 @@ export function followRowsInView(
       if (memberId === undefined) {
         continue;
       }
-      if (
-        entry.isIntersecting &&
-        entry.intersectionRatio >= ROW_IN_VIEW_RATIO
-      ) {
+      if (isRowInView(entry)) {
         next.add(memberId);
       } else {
         next.delete(memberId);
@@ -253,7 +311,7 @@ export function followRowsInView(
     }
     if (!made) {
       made = true;
-      observer = create(observed, { threshold: [ROW_IN_VIEW_RATIO] });
+      observer = create(observed, { threshold: ROW_THRESHOLDS });
     }
     if (observer === undefined) {
       return;

@@ -8,9 +8,11 @@ import {
   followPageAttention,
   followRowsInView,
   followWindowFocus,
+  isRowInView,
   NO_PAGE_ATTENTION,
   pageRowObserver,
   ROW_IN_VIEW_RATIO,
+  ROW_THRESHOLDS,
   type PageAttention,
   type RowEntry,
   type RowObserver,
@@ -156,7 +158,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test("the page's observer is an IntersectionObserver with the row's threshold that passes its entries on, and there is none without one", () => {
+test("the page's observer is an IntersectionObserver with the rows' thresholds that passes its entries on, and there is none without one", () => {
   const made: { callback: (entries: unknown[]) => void; options: unknown }[] =
     [];
   class PageObserver {
@@ -170,17 +172,17 @@ test("the page's observer is an IntersectionObserver with the row's threshold th
   vi.stubGlobal("IntersectionObserver", PageObserver);
   const received: (readonly RowEntry[])[] = [];
   const observer = pageRowObserver((entries) => received.push(entries), {
-    threshold: [ROW_IN_VIEW_RATIO],
+    threshold: ROW_THRESHOLDS,
   });
   expect(observer).toBeInstanceOf(PageObserver);
   expect(made).toHaveLength(1);
-  expect(made[0]?.options).toEqual({ threshold: [0.75] });
+  expect(made[0]?.options).toEqual({ threshold: [...ROW_THRESHOLDS] });
   const entries = [entry(row("ada"), 1)];
   made[0]?.callback(entries);
   expect(received).toEqual([entries]);
   vi.stubGlobal("IntersectionObserver", undefined);
   expect(
-    pageRowObserver(() => undefined, { threshold: [ROW_IN_VIEW_RATIO] }),
+    pageRowObserver(() => undefined, { threshold: ROW_THRESHOLDS }),
   ).toBeUndefined();
 });
 
@@ -209,12 +211,53 @@ function row(name: string): Element {
   return { toString: () => name } as unknown as Element;
 }
 
+/** The visible area of the entries: 600 pixels high, as a small window shows it. */
+const ROOT = { width: 800, height: 600 };
+
+/**
+ * An entry for a row 40 pixels high, shorter than the visible area, with
+ * `intersectionRatio` of its height in view.
+ */
 function entry(
   element: Element,
   intersectionRatio: number,
   isIntersecting = intersectionRatio > 0,
 ): RowEntry {
-  return { target: element, intersectionRatio, isIntersecting };
+  return {
+    target: element,
+    intersectionRatio,
+    isIntersecting,
+    boundingClientRect: { width: 500, height: 40 },
+    intersectionRect: { width: 500, height: 40 * intersectionRatio },
+    rootBounds: ROOT,
+  };
+}
+
+/**
+ * An entry for a row `height` pixels high and 500 wide, with `visible`
+ * pixels of its height and `visibleWidth` of its width in view, against
+ * `root`; the ratio is the visible part's share of the row's area.
+ */
+function tallEntry(
+  element: Element,
+  height: number,
+  visible: number,
+  {
+    visibleWidth = 500,
+    root = ROOT,
+  }: {
+    readonly visibleWidth?: number;
+    readonly root?: { readonly width: number; readonly height: number } | null;
+  } = {},
+): RowEntry {
+  return {
+    target: element,
+    intersectionRatio: (visible * visibleWidth) / (height * 500),
+    isIntersecting: visible > 0 && visibleWidth > 0,
+    boundingClientRect: { width: 500, height },
+    intersectionRect: { width: visibleWidth, height: visible },
+    rootBounds: root,
+  };
 }
 
 test("a row is in view only while most of it is: three quarters of it intersect the visible area", () => {
@@ -228,7 +271,7 @@ test("a row is in view only while most of it is: three quarters of it intersect 
   rows.refFor(ADA)(ada);
   rows.refFor(LINUS)(linus);
   expect(made).toHaveLength(1);
-  expect(made[0]?.threshold).toEqual([ROW_IN_VIEW_RATIO]);
+  expect(made[0]?.threshold).toBe(ROW_THRESHOLDS);
   expect(ROW_IN_VIEW_RATIO).toBe(0.75);
   expect(made[0]?.calls).toEqual(["observe ada", "observe linus"]);
   const report = made[0]!.callback;
@@ -308,4 +351,105 @@ test("without an observer, no row is ever in view", () => {
   rows.refFor(ADA)(null);
   expect(asked).toBe(1);
   expect(views).toEqual([]);
+});
+
+test("the rows' observer reports every twentieth of a row, among them the three quarters", () => {
+  expect(ROW_THRESHOLDS).toEqual([
+    0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65,
+    0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1,
+  ]);
+  expect(ROW_THRESHOLDS).toContain(ROW_IN_VIEW_RATIO);
+  expect(Object.isFrozen(ROW_THRESHOLDS)).toBe(true);
+  // A row five times the visible area's height fills three quarters of it
+  // from a fifth of itself times three quarters, 0.15, up to a fifth, 0.2:
+  // a threshold lies in between, so the observer reports it on its way.
+  const five = { low: 0.75 / 5, high: 1 / 5 };
+  expect(
+    ROW_THRESHOLDS.some((value) => value >= five.low && value <= five.high),
+  ).toBe(true);
+});
+
+test("a row shorter than the visible area still needs three quarters of itself in view", () => {
+  const ada = row("ada");
+  expect(isRowInView(entry(ada, 0.75))).toBe(true);
+  expect(isRowInView(entry(ada, 1))).toBe(true);
+  expect(isRowInView(entry(ada, 0.74))).toBe(false);
+  expect(isRowInView(entry(ada, 0.9, false))).toBe(false);
+  // A row as high as the visible area: three quarters of itself, of 600.
+  expect(isRowInView(tallEntry(ada, 600, 450))).toBe(true);
+  expect(isRowInView(tallEntry(ada, 600, 449))).toBe(false);
+  // A row almost as high, three quarters of the visible area in view but
+  // less than three quarters of itself, cut off at a side.
+  expect(isRowInView(tallEntry(ada, 590, 450, { visibleWidth: 480 }))).toBe(
+    false,
+  );
+});
+
+test("a row taller than the visible area is in view while its visible part fills three quarters of the visible area's height", () => {
+  const ada = row("ada");
+  // Twice the visible area: three quarters of it in view is 450 pixels,
+  // only 0.375 of the row.
+  expect(isRowInView(tallEntry(ada, 1200, 450))).toBe(true);
+  expect(isRowInView(tallEntry(ada, 1200, 449))).toBe(false);
+  expect(isRowInView(tallEntry(ada, 1200, 300))).toBe(false);
+  // Past both the top and the bottom edge, the row fills the visible area.
+  expect(isRowInView(tallEntry(ada, 1200, 600))).toBe(true);
+  expect(isRowInView(tallEntry(ada, 6000, 600))).toBe(true);
+  // A fraction of a pixel above the visible area's height is taller.
+  expect(isRowInView(tallEntry(ada, 600.5, 450))).toBe(true);
+  // Cut off at a side, the row needs three quarters of its width in view.
+  expect(isRowInView(tallEntry(ada, 1200, 600, { visibleWidth: 375 }))).toBe(
+    true,
+  );
+  expect(isRowInView(tallEntry(ada, 1200, 600, { visibleWidth: 374 }))).toBe(
+    false,
+  );
+  // Not intersecting, it never counts.
+  expect(
+    isRowInView({ ...tallEntry(ada, 1200, 600), isIntersecting: false }),
+  ).toBe(false);
+});
+
+test("without the visible area's bounds, or with a visible area of no height, a tall row never fills it", () => {
+  const ada = row("ada");
+  expect(isRowInView(tallEntry(ada, 1200, 600, { root: null }))).toBe(false);
+  expect(isRowInView(tallEntry(ada, 1200, 1000, { root: null }))).toBe(true);
+  expect(
+    isRowInView(tallEntry(ada, 1200, 0.5, { root: { width: 800, height: 0 } })),
+  ).toBe(false);
+  expect(
+    isRowInView({
+      ...tallEntry(ada, 1200, 0, { root: { width: 800, height: 0 } }),
+      isIntersecting: true,
+    }),
+  ).toBe(false);
+  // A row of no width is never wide enough.
+  expect(
+    isRowInView({
+      ...tallEntry(ada, 1200, 600),
+      boundingClientRect: { width: 0, height: 1200 },
+      intersectionRect: { width: 0, height: 600 },
+    }),
+  ).toBe(false);
+});
+
+test("the rows' observer follows a tall row into and out of view as it fills the visible area", () => {
+  const { made, create } = observers();
+  const views: string[][] = [];
+  const rows = followRowsInView(create, (ids) => views.push([...ids].sort()));
+  const ada = row("ada");
+  const linus = row("linus");
+  rows.refFor(ADA)(ada);
+  rows.refFor(LINUS)(linus);
+  const report = made[0]!.callback;
+  report([tallEntry(ada, 1800, 300), entry(linus, 0.5)]);
+  expect(views).toEqual([]);
+  report([tallEntry(ada, 1800, 450)]);
+  expect(views).toEqual([[ADA]]);
+  report([tallEntry(ada, 1800, 600), entry(linus, 1)]);
+  expect(views).toEqual([[ADA], [ADA, LINUS].sort()]);
+  report([tallEntry(ada, 1800, 400)]);
+  expect(views.at(-1)).toEqual([LINUS]);
+  report([tallEntry(ada, 1800, 600, { root: null })]);
+  expect(views).toHaveLength(3);
 });
