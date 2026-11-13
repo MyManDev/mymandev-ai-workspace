@@ -51,8 +51,8 @@ function person(
 }
 
 /**
- * The workspace service's state, people, and own person, which the test
- * changes and then reports with `changed`.
+ * The workspace service's state, people, own person, and whether its gate
+ * is live, which the test changes and then reports with `changed`.
  */
 function fakeWorkspaces() {
   let revision = 0;
@@ -60,6 +60,7 @@ function fakeWorkspaces() {
   let selected: WorkspaceId | null = WORKSPACE;
   let people: readonly PersonState[] = [person(OWN, "owner")];
   let own: MemberId | null = OWN;
+  let gateLive = true;
   const listeners = new Set<(state: WorkspaceState) => void>();
   const state = (): WorkspaceState =>
     Object.freeze({
@@ -72,7 +73,7 @@ function fakeWorkspaces() {
     });
   const workspaces: Pick<
     WorkspaceService,
-    "state" | "onChange" | "people" | "ownMemberId"
+    "state" | "onChange" | "people" | "ownMemberId" | "gateLive"
   > = {
     state,
     onChange: (listener) => {
@@ -83,6 +84,7 @@ function fakeWorkspaces() {
     },
     people: () => people,
     ownMemberId: (workspaceId) => (workspaceId === selected ? own : null),
+    gateLive: (workspaceId) => workspaceId === selected && gateLive,
   };
   const changed = () => {
     revision += 1;
@@ -98,11 +100,13 @@ function fakeWorkspaces() {
       selected?: WorkspaceId | null;
       people?: readonly PersonState[];
       own?: MemberId | null;
+      gateLive?: boolean;
     }) {
       status = next.status ?? status;
       selected = next.selected === undefined ? selected : next.selected;
       people = next.people ?? people;
       own = next.own === undefined ? own : next.own;
+      gateLive = next.gateLive ?? gateLive;
       changed();
     },
   };
@@ -659,44 +663,308 @@ test("before the screen asked, a removal and a demotion read nothing", () => {
   expect(live.account.reads).toEqual([]);
 });
 
-test("the demotion of the account's own person drops the list and reads nothing, also when the event comes before the workspace service shows it", async () => {
-  // The event first, while the people still show the account's own admin,
-  // as when the workspace service holds events back during its reload.
-  const early = setup();
-  early.workspaces.set({
+/** A setup whose account's own person is an admin, with `INVITATION` loaded. */
+async function loadedAsAdmin() {
+  const live = setup();
+  live.workspaces.set({
     people: [person(OTHER, "owner"), person(OWN, "admin")],
   });
-  early.service.load();
-  early.account.reads[0]?.resolve(list(INVITATION));
+  live.service.load();
+  live.account.reads[0]?.resolve(list(INVITATION));
   await settle();
-  early.connection.receive(roleChanged(OWN, "member"));
-  expect(early.account.reads).toHaveLength(1);
-  early.workspaces.set({
-    people: [person(OTHER, "owner"), person(OWN, "member")],
-  });
-  expect(early.service.state()).toMatchObject({
+  expect(live.service.state().status).toBe("ready");
+  return live;
+}
+
+test("the demotion of the account's own person drops the list at once when its event comes while the workspace service's gate holds it during a reload, and nothing loads until the people show the role", async () => {
+  const live = await loadedAsAdmin();
+
+  // A load is on its way when the workspace begins a reload, so its gate
+  // holds the event; the people still show the account's own admin.
+  live.service.reload(WORKSPACE);
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state()).toMatchObject({
     status: "not_allowed",
     invitations: [],
   });
-  expect(early.account.reads).toHaveLength(1);
+  expect(live.service.load()).toEqual({
+    outcome: "refused",
+    reason: "not_allowed",
+  });
+  // The answer on its way is dropped.
+  live.account.reads[1]?.resolve(list(INVITATION));
+  await settle();
+  expect(live.service.state()).toMatchObject({
+    status: "not_allowed",
+    invitations: [],
+  });
+
+  // Other changes of the workspace while its people still show the old
+  // role, and the triggers, read nothing.
+  live.workspaces.set({
+    people: [
+      person(OTHER, "owner"),
+      person(OWN, "admin"),
+      person(INVITEE, "admin"),
+    ],
+  });
+  live.connection.receive(subscribed());
+  live.connection.receive(claimed());
+  live.connection.receive(removed(INVITEE));
+  live.connection.receive(roleChanged(INVITEE, "member"));
+  expect(live.service.reload(WORKSPACE)).toBe(false);
+  expect(live.service.state()).toMatchObject({
+    status: "not_allowed",
+    invitations: [],
+  });
+
+  // The reload answers with the event applied.
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+    gateLive: true,
+  });
+  expect(live.service.state().status).toBe("not_allowed");
+  expect(live.account.reads).toHaveLength(2);
+});
+
+test("the demotion of the account's own person that the workspace service shows first reads nothing, and a later promotion that only its people show loads", async () => {
+  const live = await loadedAsAdmin();
 
   // The workspace service first, as it listens to the connection first.
-  const late = setup();
-  late.workspaces.set({
-    people: [person(OTHER, "owner"), person(OWN, "admin")],
-  });
-  late.service.load();
-  late.account.reads[0]?.resolve(list(INVITATION));
-  await settle();
-  late.workspaces.set({
+  live.workspaces.set({
     people: [person(OTHER, "owner"), person(OWN, "member")],
   });
-  late.connection.receive(roleChanged(OWN, "member"));
-  expect(late.service.state()).toMatchObject({
+  expect(live.service.state()).toMatchObject({
     status: "not_allowed",
     invitations: [],
   });
-  expect(late.account.reads).toHaveLength(1);
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state()).toMatchObject({
+    status: "not_allowed",
+    invitations: [],
+  });
+  expect(live.account.reads).toHaveLength(1);
+
+  // A promotion that only a reload shows, for example after a reconnect.
+  live.workspaces.set({ gateLive: false });
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+    gateLive: true,
+  });
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list(OTHER_INVITATION));
+  await settle();
+  expect(live.service.state().invitations.map((entry) => entry.id)).toEqual([
+    OTHER_INVITATION,
+  ]);
+});
+
+test("a demotion that the people never show ends once the gate is live: a promotion missed while offline loads", async () => {
+  const live = await loadedAsAdmin();
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state().status).toBe("not_allowed");
+
+  // The connection drops before the reload answers, and the person is
+  // promoted again meanwhile; the reload after the reconnect shows the
+  // account's own admin, and the gate is live.
+  live.connection.setState("offline");
+  live.connection.setState("connected");
+  live.connection.receive(subscribed());
+  expect(live.account.reads).toHaveLength(1);
+  live.workspaces.set({ gateLive: true });
+  expect(live.service.state().status).toBe("loading");
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list(OTHER_INVITATION));
+  await settle();
+  expect(live.service.state()).toMatchObject({
+    status: "ready",
+    invitations: [{ id: OTHER_INVITATION }],
+  });
+});
+
+test("once the people show the demotion, they decide again, also while another reload of the workspace holds the gate", async () => {
+  const live = await loadedAsAdmin();
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OWN, "member"));
+
+  // The reload answers with the demotion, and the workspace service begins
+  // one more reload at once, so its gate stays closed.
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+  });
+  expect(live.service.state().status).toBe("not_allowed");
+
+  // That reload shows a promotion, and one more reload begins.
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+  });
+  expect(live.service.state()).toMatchObject({
+    status: "loading",
+    invitations: [],
+  });
+  expect(live.account.reads).toHaveLength(1);
+  live.workspaces.set({ gateLive: true });
+  expect(live.account.reads).toHaveLength(2);
+});
+
+test("the demotion of another admin during a workspace reload drops nothing, and its load waits for the gate", async () => {
+  const live = setup();
+  live.workspaces.set({
+    people: [person(OWN, "owner"), person(OTHER, "admin")],
+  });
+  live.service.load();
+  live.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OTHER, "member"));
+  expect(live.service.state()).toMatchObject({
+    status: "ready",
+    invitations: [{ id: INVITATION }],
+  });
+  expect(live.account.reads).toHaveLength(1);
+
+  live.workspaces.set({
+    people: [person(OWN, "owner"), person(OTHER, "member")],
+    gateLive: true,
+  });
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list());
+  await settle();
+  expect(live.service.state()).toMatchObject({
+    status: "ready",
+    invitations: [],
+  });
+});
+
+test("a promotion event after a demotion event, while the gate holds both, lets the people decide again, and the load waits for the gate", async () => {
+  const live = await loadedAsAdmin();
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state().status).toBe("not_allowed");
+
+  live.connection.receive(roleChanged(OWN, "admin"));
+  expect(live.service.state()).toMatchObject({
+    status: "loading",
+    invitations: [],
+  });
+  expect(live.account.reads).toHaveLength(1);
+
+  live.workspaces.set({ gateLive: true });
+  expect(live.account.reads).toHaveLength(2);
+  live.account.reads[1]?.resolve(list(OTHER_INVITATION));
+  await settle();
+  expect(live.service.state()).toMatchObject({
+    status: "ready",
+    invitations: [{ id: OTHER_INVITATION }],
+  });
+});
+
+test("another selected workspace ends a demotion that the people do not show yet", async () => {
+  const live = await loadedAsAdmin();
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state().status).toBe("not_allowed");
+
+  // Another workspace, where the account's own person is an admin; its
+  // gate is not live yet.
+  live.workspaces.set({
+    selected: OTHER_WORKSPACE,
+    people: [person(OWN, "admin")],
+  });
+  expect(live.service.state()).toMatchObject({
+    status: "loading",
+    workspaceId: OTHER_WORKSPACE,
+    invitations: [],
+  });
+  expect(live.account.reads).toHaveLength(1);
+  live.workspaces.set({ gateLive: true });
+  expect(live.account.reads[1]?.params).toEqual({
+    workspaceId: OTHER_WORKSPACE,
+  });
+});
+
+test("a sign-out ends a demotion that the people do not show yet", async () => {
+  const live = await loadedAsAdmin();
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(roleChanged(OWN, "member"));
+  expect(live.service.state().status).toBe("not_allowed");
+
+  live.workspaces.set({ status: "signed_out", selected: null, people: [] });
+  expect(live.service.state()).toMatchObject({
+    status: "signed_out",
+    invitations: [],
+  });
+
+  // Signed in again, the people show the account's own admin before the
+  // gate is live.
+  live.workspaces.set({
+    status: "ready",
+    selected: WORKSPACE,
+    people: [person(OTHER, "owner"), person(OWN, "admin")],
+  });
+  expect(live.service.state().status).toBe("loading");
+  expect(live.account.reads).toHaveLength(1);
+  live.workspaces.set({ gateLive: true });
+  expect(live.account.reads).toHaveLength(2);
+});
+
+test("a load waits until the workspace service's gate is live, so that a reconnect after a demotion reads nothing and drops the list", async () => {
+  const live = await loadedAsAdmin();
+
+  // A reconnect: the workspace reloads after workspace.subscribed, and the
+  // demotion happened while the device was offline.
+  live.connection.setState("offline");
+  live.connection.setState("connected");
+  live.workspaces.set({ gateLive: false });
+  live.connection.receive(subscribed());
+  expect(live.account.reads).toHaveLength(1);
+  live.workspaces.set({
+    people: [person(OTHER, "owner"), person(OWN, "member")],
+    gateLive: true,
+  });
+  expect(live.service.state()).toMatchObject({
+    status: "not_allowed",
+    invitations: [],
+  });
+  expect(live.account.reads).toHaveLength(1);
+
+  // The screen's first request and an action's reload wait for the gate
+  // too, and the load follows once, when it is live.
+  const first = setup();
+  first.workspaces.set({ gateLive: false });
+  expect(first.service.load()).toEqual({ outcome: "loading" });
+  expect(first.service.reload(WORKSPACE)).toBe(true);
+  first.connection.receive(subscribed());
+  expect(first.account.reads).toEqual([]);
+  expect(first.service.state().status).toBe("loading");
+  first.workspaces.set({ gateLive: true });
+  expect(first.account.reads).toHaveLength(1);
+  first.workspaces.set({
+    people: [person(OWN, "owner"), person(INVITEE, "member")],
+  });
+  expect(first.account.reads).toHaveLength(1);
+  first.account.reads[0]?.resolve(list(INVITATION));
+  await settle();
+  expect(first.service.state().status).toBe("ready");
+
+  // A load that waits for the gate ends with its workspace: another one
+  // whose gate is live reads once.
+  const moved = setup();
+  moved.workspaces.set({ gateLive: false });
+  moved.service.load();
+  moved.workspaces.set({ selected: OTHER_WORKSPACE, gateLive: true });
+  moved.account.reads[0]?.resolve(listIn(OTHER_WORKSPACE, OTHER_INVITATION));
+  await settle();
+  expect(moved.account.reads.map((read) => read.params)).toEqual([
+    { workspaceId: OTHER_WORKSPACE },
+  ]);
+  expect(moved.service.state()).toMatchObject({
+    status: "ready",
+    invitations: [{ id: OTHER_INVITATION }],
+  });
 });
 
 test("the removal of the account's own person reads nothing for the workspace it lost", async () => {

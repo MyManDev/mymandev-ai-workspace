@@ -7,7 +7,12 @@
 //   so nothing loads, and nothing is held, while the account's own person
 //   in the selected workspace is a member, or while its role is not known
 //   yet because the workspace's people have not loaded. A demotion drops
-//   what was held at once; a promotion, or the role once it is known, loads.
+//   what was held at once, also when its `workspace.member.role_changed`
+//   arrives before the workspace service shows it, for example while that
+//   service's resync gate holds the event during a reload; a promotion, or
+//   the role once it is known, loads. A load waits until the workspace
+//   service's gate is live (`gateLive`), so that it never reads with a role
+//   that a reload of the workspace is about to change.
 // - Nothing loads until the screen asked (`load`), when it opens and on the
 //   person's refresh. From then on, while the application runs, the
 //   invitations load again after each `workspace.subscribed` of the
@@ -17,10 +22,11 @@
 //   of the selected workspace that revoke invitations on the server (ADR
 //   0014): `workspace.member.removed`, which a removal and a leave send,
 //   and `workspace.member.role_changed` to `member`, a demotion; never
-//   those of the account's own person, whose demotion drops the list and
-//   whose removal ends the membership. The screen's request is refused
-//   within `INVITATION_LOAD_COOLDOWN_MS` of the last one that loaded, so
-//   that a renderer that misbehaves cannot read the API in a loop.
+//   those of the account's own person, whose demotion drops the list as it
+//   arrives and whose removal ends the membership. The screen's request is
+//   refused within `INVITATION_LOAD_COOLDOWN_MS` of the last one that
+//   loaded, so that a renderer that misbehaves cannot read the API in a
+//   loop.
 // - Reloads are merged like the workspace service's `reload`: while a load
 //   is on its way, one more follows its answer, which is dropped, however
 //   many triggers came; while a retry waits out its backoff, the retry
@@ -124,7 +130,7 @@ export interface InvitationServiceOptions {
   readonly connection: InvitationConnection;
   readonly workspaces: Pick<
     WorkspaceService,
-    "state" | "onChange" | "people" | "ownMemberId"
+    "state" | "onChange" | "people" | "ownMemberId" | "gateLive"
   >;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
@@ -149,15 +155,17 @@ export interface InvitationService {
    * after every trigger. It still counts as the screen's request when it
    * is refused as `not_signed_in`, `no_workspace`, or `not_allowed`, which
    * start no cooldown, so the invitations load once they may. While the
-   * role is not known yet, it answers `loading`, and they load once it is.
-   * It is refused as `too_soon` within `INVITATION_LOAD_COOLDOWN_MS` of the
-   * last request that was not refused.
+   * role is not known yet, it answers `loading`, and they load once it is;
+   * while the workspace service's gate is not live, it answers `loading`,
+   * and they load once the gate is live. It is refused as `too_soon` within
+   * `INVITATION_LOAD_COOLDOWN_MS` of the last request that was not refused.
    */
   readonly load: () => InvitationLoadOutcome;
   /**
    * Loads the invitations of `workspaceId` again after an invitation
    * action, merged with the other triggers. True when they are read again,
-   * or a load or a retry on its way reads them; false, with nothing read,
+   * or a load or a retry on its way reads them, or a load waits for the
+   * workspace service's gate; false, with nothing read,
    * for a workspace that is not the selected one, without the owner's or
    * an admin's role, or before the screen asked.
    */
@@ -223,6 +231,18 @@ export function createInvitationService(
   let signedIn = false;
   let selected: WorkspaceId | null = null;
   let access: Access = "unknown";
+  /**
+   * The account's own person in the selected workspace was demoted to
+   * `member` by an event that the workspace service's people do not show
+   * yet: its access stays `not_allowed` until they show it, the workspace
+   * service's gate is live again, or an event promotes the person again.
+   */
+  let demoted = false;
+  /**
+   * A load waits until the workspace service's gate of the selected
+   * workspace is live, so that the role it reads with is current.
+   */
+  let gateWait = false;
   /**
    * Changes whenever what was loaded no longer applies: another workspace,
    * a sign-out, another device, or a role without access. An answer for an
@@ -321,6 +341,7 @@ export function createInvitationService(
     epoch += 1;
     inFlight = false;
     again = false;
+    gateWait = false;
     stopRetry();
     attempt = 0;
     invitations = NO_INVITATIONS;
@@ -363,6 +384,12 @@ export function createInvitationService(
     if (cancelRetry !== null) {
       // A failed load waits out its backoff, also the wait after
       // `rate_limited`; the retry reads everything.
+      return true;
+    }
+    if (!workspaces.gateLive(selected)) {
+      // The workspace reloads, and its people may change the role: the
+      // load follows once the gate is live (`follow`).
+      gateWait = true;
       return true;
     }
     send();
@@ -448,10 +475,31 @@ export function createInvitationService(
       signedIn = nextSignedIn;
       selected = nextSelected;
       access = "unknown";
+      demoted = false;
       drop();
     }
-    const nextAccess: Access =
-      selected === null ? "unknown" : accessIn(selected);
+    let nextAccess: Access = selected === null ? "unknown" : accessIn(selected);
+    if (
+      demoted &&
+      (nextAccess !== "allowed" ||
+        (selected !== null && workspaces.gateLive(selected)))
+    ) {
+      // The people show the demotion, or the workspace reloaded with every
+      // event applied, so they hold the current role.
+      demoted = false;
+    }
+    if (demoted) {
+      // The people do not show the demotion yet.
+      nextAccess = "not_allowed";
+    }
+    changeAccess(nextAccess);
+    if (gateWait && selected !== null && workspaces.gateLive(selected)) {
+      gateWait = false;
+      reloadSelected();
+    }
+  }
+
+  function changeAccess(nextAccess: Access): void {
     if (nextAccess === access) {
       return;
     }
@@ -466,12 +514,30 @@ export function createInvitationService(
   }
 
   /**
+   * A role change of the account's own person in the selected workspace,
+   * at once, also while the workspace service's gate holds the event: a
+   * demotion to `member` drops what was held, and a promotion after it
+   * lets the people decide again.
+   */
+  function ownRoleChanged(role: string): void {
+    if (role === "member") {
+      // `follow` ends it once the people show the role or the workspace
+      // service's gate is live, when they show every event.
+      demoted = true;
+      changeAccess("not_allowed");
+    } else if (demoted) {
+      demoted = false;
+      follow();
+    }
+  }
+
+  /**
    * Whether an event of the selected workspace revokes or consumes some of
    * its live invitations, so that they load again. An event about the
-   * account's own person counts for nothing: a demotion drops the list once
-   * the workspace service shows it (`follow`), and a removal ends the
-   * membership, so nothing is read for it, also before the workspace
-   * service applied the event.
+   * account's own person counts for nothing: its demotion drops the list as
+   * it arrives (`ownRoleChanged`), and its removal ends the membership, so
+   * nothing is read for it, also before the workspace service applied the
+   * event.
    */
   function changesInvitations(event: ReceivedServerEvent): boolean {
     switch (event.type) {
@@ -484,11 +550,9 @@ export function createInvitationService(
         return !isOwnPerson(event.payload.memberId);
       case "workspace.member.role_changed":
         // A demotion revokes the invitations that the admin created; a
-        // promotion revokes nothing.
-        return (
-          event.payload.role === "member" &&
-          !isOwnPerson(event.payload.memberId)
-        );
+        // promotion revokes nothing. The account's own role change does not
+        // come here (`ownRoleChanged`).
+        return event.payload.role === "member";
       default:
         return false;
     }
@@ -503,10 +567,18 @@ export function createInvitationService(
       return;
     }
     if (message.kind === "event") {
+      const event = message.event;
+      if (event.workspaceId !== selected) {
+        return;
+      }
       if (
-        message.event.workspaceId === selected &&
-        changesInvitations(message.event)
+        event.type === "workspace.member.role_changed" &&
+        isOwnPerson(event.payload.memberId)
       ) {
+        ownRoleChanged(event.payload.role);
+        return;
+      }
+      if (changesInvitations(event)) {
         reloadSelected();
       }
       return;

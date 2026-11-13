@@ -9,6 +9,8 @@ import type {
   InvitationsBridge,
   JoinRequestActionsBridge,
   JoinRequestsBridge,
+  OwnJoinRequestActionsBridge,
+  OwnJoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
   RepositoryBridge,
@@ -31,6 +33,7 @@ import type {
   ChatView,
   ConnectionStatus,
   CreateInvitationResult,
+  CreateJoinRequestResult,
   CreateProjectResult,
   CreateWorkspaceResult,
   DefinePersonResult,
@@ -45,6 +48,8 @@ import type {
   LiftRegistrationLockResult,
   MountResult,
   OtherDeviceRevocation,
+  OwnJoinRequestLoadResult,
+  OwnJoinRequestsView,
   PeopleView,
   PersonActionResult,
   PreviewInvitationResult,
@@ -58,6 +63,7 @@ import type {
   StartSignInOptions,
   StartSignInResult,
   UnlockResult,
+  WithdrawJoinRequestResult,
   WorkspaceActionResult,
   WorkspaceSwitchOptions,
   WorkspaceView,
@@ -190,8 +196,10 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * reasons, the workspace IDs, member IDs, and display names of the
  * `peopleActions`, each a string, and the IDs and pasted codes of the
  * `invitationActions`, each a string, with the lifetime of `create`, a
- * whole number or null, and the IDs of the `joinRequestActions`, each a
- * string, with the display name of `approve`, a string or null.
+ * whole number or null, the IDs of the `joinRequestActions`, each a
+ * string, with the display name of `approve`, a string or null, and the
+ * workspace ID and request ID of the `ownJoinRequestActions`, each a
+ * string, with the display name of `create`, a string or null.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -627,6 +635,64 @@ export function createDesktopBridge(
     resume: ofJoinWorkspace(INVOKE_CHANNELS.resumeJoinRequests, "resume"),
   });
 
+  const ownJoinRequests: OwnJoinRequestsBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.getOwnJoinRequestState,
+      ) as Promise<OwnJoinRequestsView>,
+    subscribeState: (
+      listener: (state: OwnJoinRequestsView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeOwnJoinRequestState,
+        EVENT_CHANNELS.ownJoinRequestStateChanged,
+        "An own join request state callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    load: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.loadOwnJoinRequests,
+      ) as Promise<OwnJoinRequestLoadResult>,
+  });
+
+  // Only strings, and for a create a name or null, go on; the main process
+  // checks each ID and the name. Another value is refused here without
+  // naming it.
+  const ownJoinRequestActions: OwnJoinRequestActionsBridge = Object.freeze({
+    create: (workspaceId: string, displayName?: string | null) => {
+      const name =
+        displayName === undefined || displayName === null
+          ? null
+          : typeof displayName === "string"
+            ? displayName
+            : undefined;
+      return strings(workspaceId) && name !== undefined
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.createJoinRequest,
+            workspaceId,
+            name,
+          ) as Promise<CreateJoinRequestResult>)
+        : Promise.reject(
+            new TypeError(
+              "create needs a workspace ID string, and a name string or null.",
+            ),
+          );
+    },
+    withdraw: (joinRequestId: string) =>
+      strings(joinRequestId)
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.withdrawJoinRequest,
+            joinRequestId,
+          ) as Promise<WithdrawJoinRequestResult>)
+        : Promise.reject(
+            new TypeError("withdraw needs a join request ID string."),
+          ),
+  });
+
   const agents: AgentBridge = Object.freeze({
     getState: () =>
       ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
@@ -758,6 +824,8 @@ export function createDesktopBridge(
     invitationActions,
     joinRequests,
     joinRequestActions,
+    ownJoinRequests,
+    ownJoinRequestActions,
     agents,
     chat,
     devices,
