@@ -2,6 +2,7 @@ import type {
   AccountBridge,
   AgentBridge,
   ChatBridge,
+  ClaimsBridge,
   ConnectionBridge,
   DesktopBridge,
   DeviceListBridge,
@@ -31,6 +32,9 @@ import type {
   ChatLoadOlderResultView,
   ChatSendResultView,
   ChatView,
+  ClaimLoadResult,
+  ClaimMarkSeenResult,
+  ClaimsView,
   ConnectionStatus,
   CreateInvitationResult,
   CreateJoinRequestResult,
@@ -199,7 +203,8 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * whole number or null, the IDs of the `joinRequestActions`, each a
  * string, with the display name of `approve`, a string or null, and the
  * workspace ID and request ID of the `ownJoinRequestActions`, each a
- * string, with the display name of `create`, a string or null.
+ * string, with the display name of `create`, a string or null, and the
+ * workspace ID and the time of `claims.markSeen`, each a string.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -693,6 +698,39 @@ export function createDesktopBridge(
           ),
   });
 
+  const claims: ClaimsBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(INVOKE_CHANNELS.getClaimState) as Promise<ClaimsView>,
+    subscribeState: (
+      listener: (state: ClaimsView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeClaimState,
+        EVENT_CHANNELS.claimStateChanged,
+        "A claim state callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    load: () =>
+      ipc.invoke(INVOKE_CHANNELS.loadClaims) as Promise<ClaimLoadResult>,
+    // Only two strings go on; the main process checks the ID and accepts
+    // only the time of a claim that it holds. Another value is refused here
+    // without naming it.
+    markSeen: (workspaceId: string, claimedAt: string) =>
+      strings(workspaceId, claimedAt)
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.markClaimsSeen,
+            workspaceId,
+            claimedAt,
+          ) as Promise<ClaimMarkSeenResult>)
+        : Promise.reject(
+            new TypeError("markSeen needs a workspace ID and a time string."),
+          ),
+  });
+
   const agents: AgentBridge = Object.freeze({
     getState: () =>
       ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
@@ -826,6 +864,7 @@ export function createDesktopBridge(
     joinRequestActions,
     ownJoinRequests,
     ownJoinRequestActions,
+    claims,
     agents,
     chat,
     devices,

@@ -245,6 +245,30 @@ export const INVOKE_CHANNELS = Object.freeze({
   /** Withdraws one of the account's own pending join requests, by its ID. */
   withdrawJoinRequest: "own-join-requests:withdraw",
   /**
+   * What the renderer may know of the selected workspace's recent claims,
+   * for its owner and admins only: each claimed person's member ID, the
+   * claimer's GitHub login with its verification time and the creation date
+   * of that GitHub account, how and when the person was claimed, and whether
+   * the account has not seen the claim yet. Never a user ID.
+   */
+  getClaimState: "claims:get-state",
+  /**
+   * The recent claims. The calling frame then receives every later state on
+   * `EVENT_CHANNELS.claimStateChanged`.
+   */
+  subscribeClaimState: "claims:subscribe-state",
+  /**
+   * Loads the recent claims again, on the person's refresh; not within a
+   * few seconds of the last time. The renderer sends nothing.
+   */
+  loadClaims: "claims:load",
+  /**
+   * Reports that the screen showed the claims of the selected workspace up
+   * to a time, by the workspace ID and the `claimedAt` of the newest claim
+   * shown: the claims up to it are seen from then on, also after a restart.
+   */
+  markClaimsSeen: "claims:mark-seen",
+  /**
    * What the renderer may know of the open project's agent activity: its
    * agents with their owners' names, and its newest runs. Read-only.
    */
@@ -348,6 +372,11 @@ export const EVENT_CHANNELS = Object.freeze({
    * 50 ms, to the frames that subscribed.
    */
   ownJoinRequestStateChanged: "own-join-requests:state-changed",
+  /**
+   * The recent claims of the selected workspace after changes, at most one
+   * every 50 ms, to the frames that subscribed.
+   */
+  claimStateChanged: "claims:state-changed",
   /**
    * The agent activity after changes, at most one every 50 ms, to the
    * frames that subscribed.

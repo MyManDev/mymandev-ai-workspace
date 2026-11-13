@@ -19,6 +19,14 @@ import {
   ChatLoadOlderResultSchema,
   ChatSendResultSchema,
   ChatViewSchema,
+  CLAIM_LIMITS,
+  CLAIM_LOAD_REFUSALS,
+  CLAIM_MARK_SEEN_REFUSALS,
+  CLAIM_STATUSES,
+  CLAIM_VIAS_VIEW,
+  ClaimLoadResultSchema,
+  ClaimMarkSeenResultSchema,
+  ClaimsViewSchema,
   CONNECTION_OFFLINE_REASONS,
   CONNECTION_STATES,
   CONNECTION_STOP_REASONS,
@@ -185,6 +193,11 @@ test("the channel names and the contract cannot be changed at runtime", () => {
     OWN_JOIN_REQUEST_STATUSES,
     OWN_JOIN_REQUEST_LOAD_REFUSALS,
     OWN_JOIN_REQUEST_ACTION_REFUSALS,
+    CLAIM_LIMITS,
+    CLAIM_VIAS_VIEW,
+    CLAIM_STATUSES,
+    CLAIM_LOAD_REFUSALS,
+    CLAIM_MARK_SEEN_REFUSALS,
   ]) {
     expect(Object.isFrozen(list)).toBe(true);
   }
@@ -274,7 +287,7 @@ const OWN_JOIN_REQUEST_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.withdrawJoinRequest,
 ]);
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, and the own join request actions take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, and the report of seen claims take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -289,12 +302,13 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.discardChatMessage &&
       channel !== INVOKE_CHANNELS.dismissNewDevices &&
       channel !== INVOKE_CHANNELS.revokeDevice &&
+      channel !== INVOKE_CHANNELS.markClaimsSeen &&
       !PEOPLE_ACTION_CHANNELS.has(channel) &&
       !INVITATION_ACTION_CHANNELS.has(channel) &&
       !JOIN_REQUEST_ACTION_CHANNELS.has(channel) &&
       !OWN_JOIN_REQUEST_ACTION_CHANNELS.has(channel),
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 34);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 35);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -3618,4 +3632,217 @@ test("an own join request action answers ok, a create with its pending request o
       reason,
     ).toBe(false);
   }
+});
+
+// The recent claims of the owner and the admins (#95, D8).
+
+const CLAIM_MEMBER_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000d1";
+const CLAIMED_AT = "2026-11-05T11:00:00.000Z";
+
+function claimItem(overrides: Record<string, unknown> = {}) {
+  return {
+    memberId: CLAIM_MEMBER_ID,
+    login: "linus",
+    verifiedAt: VERIFIED_AT,
+    accountCreatedAt: VERIFIED_AT,
+    via: "invitation",
+    claimedAt: CLAIMED_AT,
+    unseen: true,
+    ...overrides,
+  };
+}
+
+function claimsView(overrides: Record<string, unknown> = {}) {
+  return {
+    status: "ready",
+    revision: 2,
+    workspaceId: WORKSPACE_ID,
+    claims: [claimItem(), claimItem({ via: "join_request", unseen: false })],
+    ...overrides,
+  };
+}
+
+test("a claims view with every status and problem is accepted and frozen, with a problem only while unavailable, and a claim of an erased account", () => {
+  for (const status of CLAIM_STATUSES) {
+    if (status === "unavailable") {
+      for (const problem of WORKSPACE_PROBLEMS) {
+        const value = claimsView({ status, problem });
+        expect(ClaimsViewSchema.parse(value)).toEqual(value);
+      }
+      expect(ClaimsViewSchema.safeParse(claimsView({ status })).success).toBe(
+        false,
+      );
+    } else {
+      const value = claimsView({ status });
+      expect(ClaimsViewSchema.parse(value), status).toEqual(value);
+    }
+  }
+  expect([...CLAIM_STATUSES]).toEqual([...JOIN_REQUEST_STATUSES]);
+  const erased = claimsView({
+    claims: [
+      claimItem({ login: null, verifiedAt: null, accountCreatedAt: null }),
+    ],
+  });
+  expect(ClaimsViewSchema.parse(erased)).toEqual(erased);
+  for (const via of CLAIM_VIAS_VIEW) {
+    const value = claimsView({ claims: [claimItem({ via })] });
+    expect(ClaimsViewSchema.parse(value)).toEqual(value);
+  }
+  const parsed = ClaimsViewSchema.parse(claimsView());
+  expect(Object.isFrozen(parsed.claims)).toBe(true);
+});
+
+test("a claims view drops unknown keys at every level, so no user ID crosses", () => {
+  const parsed = ClaimsViewSchema.parse(
+    claimsView({
+      userId: PERSON_USER_ID,
+      claims: [
+        claimItem({
+          userId: PERSON_USER_ID,
+          claimer: { userId: PERSON_USER_ID },
+          workspaceId: WORKSPACE_ID,
+          seenAt: CLAIMED_AT,
+        }),
+        claimItem({ via: "join_request", unseen: false }),
+      ],
+    }),
+  );
+  expect(parsed).toEqual(claimsView());
+  expect(JSON.stringify(parsed)).not.toContain(PERSON_USER_ID);
+});
+
+test("a claims view over the limit or with wrong values is refused", () => {
+  const item = claimItem();
+  for (const value of [
+    claimsView({ status: "busy" }),
+    claimsView({ revision: -1 }),
+    claimsView({ workspaceId: "workspace" }),
+    claimsView({ claims: null }),
+    claimsView({
+      claims: Array.from({ length: CLAIM_LIMITS.claims + 1 }, () => item),
+    }),
+    claimsView({ claims: [{ ...item, memberId: "x" }] }),
+    claimsView({ claims: [{ ...item, memberId: PERSON_ID.toUpperCase() }] }),
+    claimsView({ claims: [{ ...item, login: "not a login" }] }),
+    claimsView({ claims: [{ ...item, via: "accepted" }] }),
+    claimsView({ claims: [{ ...item, via: null }] }),
+    claimsView({ claims: [{ ...item, unseen: "yes" }] }),
+    claimsView({ claims: [{ ...item, unseen: undefined }] }),
+    claimsView({ claims: [{ ...item, claimedAt: null }] }),
+    claimsView({ claims: [{ ...item, claimedAt: "2026-11-05T11:00:00Z" }] }),
+    // The login and its times come together.
+    claimsView({ claims: [{ ...item, login: null }] }),
+    claimsView({ claims: [{ ...item, accountCreatedAt: null }] }),
+    claimsView({ claims: [{ ...item, verifiedAt: null }] }),
+    claimsView({
+      claims: [{ ...item, login: null, accountCreatedAt: null }],
+    }),
+    claimsView({ claims: [{ ...item, login: null, verifiedAt: null }] }),
+    claimsView({ status: "unavailable", problem: "secret" }),
+  ]) {
+    expect(ClaimsViewSchema.safeParse(value).success).toBe(false);
+  }
+  expect(
+    ClaimsViewSchema.safeParse(
+      claimsView({
+        claims: Array.from({ length: CLAIM_LIMITS.claims }, () => item),
+      }),
+    ).success,
+  ).toBe(true);
+});
+
+test("the claims' get, subscribe, and load take no argument, and load answers loading or a fixed refusal", () => {
+  for (const channel of [
+    INVOKE_CHANNELS.getClaimState,
+    INVOKE_CHANNELS.subscribeClaimState,
+    INVOKE_CHANNELS.loadClaims,
+  ]) {
+    expect(INVOKE_CONTRACT[channel].args.parse([])).toEqual([]);
+    expect(
+      INVOKE_CONTRACT[channel].args.safeParse([WORKSPACE_ID]).success,
+    ).toBe(false);
+  }
+  expect(INVOKE_CONTRACT[INVOKE_CHANNELS.getClaimState].result).toBe(
+    ClaimsViewSchema,
+  );
+  expect(INVOKE_CONTRACT[INVOKE_CHANNELS.subscribeClaimState].result).toBe(
+    ClaimsViewSchema,
+  );
+  expect(INVOKE_CONTRACT[INVOKE_CHANNELS.loadClaims].result).toBe(
+    ClaimLoadResultSchema,
+  );
+  expect(EVENT_CONTRACT[EVENT_CHANNELS.claimStateChanged]).toBe(
+    ClaimsViewSchema,
+  );
+  expect(ClaimLoadResultSchema.parse({ outcome: "loading" })).toEqual({
+    outcome: "loading",
+  });
+  for (const reason of CLAIM_LOAD_REFUSALS) {
+    expect(ClaimLoadResultSchema.parse({ outcome: "refused", reason })).toEqual(
+      { outcome: "refused", reason },
+    );
+  }
+  for (const value of [
+    { outcome: "loaded" },
+    { outcome: "refused", reason: "busy" },
+    null,
+  ]) {
+    expect(ClaimLoadResultSchema.safeParse(value).success).toBe(false);
+  }
+});
+
+test("the report of seen claims takes a workspace ID and a time in the protocol's form, and answers ok or a fixed refusal", () => {
+  const { args, result } = INVOKE_CONTRACT[INVOKE_CHANNELS.markClaimsSeen];
+  expect(result).toBe(ClaimMarkSeenResultSchema);
+  expect(args.parse([WORKSPACE_ID, CLAIMED_AT])).toEqual([
+    WORKSPACE_ID,
+    CLAIMED_AT,
+  ]);
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(args.safeParse([value, CLAIMED_AT]).success).toBe(false);
+  }
+  for (const time of [
+    "",
+    null,
+    1_700_000_000_000,
+    "yesterday",
+    "2026-11-05T11:00:00Z",
+    "2026-11-05T11:00:00.0000Z",
+    "2026-11-05T11:00:00.000+01:00",
+    "2026-11-05 11:00:00.000Z",
+    `${CLAIMED_AT}${"0".repeat(10_000)}`,
+  ]) {
+    expect(args.safeParse([WORKSPACE_ID, time]).success, String(time)).toBe(
+      false,
+    );
+  }
+  for (const value of [
+    [],
+    [WORKSPACE_ID],
+    [CLAIMED_AT, WORKSPACE_ID],
+    [WORKSPACE_ID, CLAIMED_AT, CLAIMED_AT],
+  ]) {
+    expect(args.safeParse(value).success, JSON.stringify(value)).toBe(false);
+  }
+
+  expect(ClaimMarkSeenResultSchema.parse({ outcome: "ok" })).toEqual({
+    outcome: "ok",
+  });
+  for (const reason of CLAIM_MARK_SEEN_REFUSALS) {
+    expect(
+      ClaimMarkSeenResultSchema.parse({ outcome: "refused", reason }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const value of [
+    null,
+    {},
+    { outcome: "refused", reason: "busy" },
+    { outcome: "unknown" },
+  ]) {
+    expect(ClaimMarkSeenResultSchema.safeParse(value).success).toBe(false);
+  }
+  // Unknown keys are dropped, so no mark or other value crosses.
+  expect(
+    ClaimMarkSeenResultSchema.parse({ outcome: "ok", seenAt: CLAIMED_AT }),
+  ).toEqual({ outcome: "ok" });
 });
