@@ -2046,6 +2046,187 @@ export type WithdrawJoinRequestResult = z.infer<
   typeof WithdrawJoinRequestResultSchema
 >;
 
+// The recent claims of the selected workspace, for its owner and admins
+// (#95, decision D8 of 2026-11-13; ADR 0014, "Invitations").
+
+/**
+ * Limits of the claim messages: the number of claims, at most what one
+ * answer of the API holds (the protocol's `MAX_ANSWER_LIST_ITEMS`; the
+ * server sends its 50 most recent, `RECENT_CLAIMS`). The shared contract
+ * does not import the protocol package, so the main process's tests check
+ * that the value matches.
+ */
+export const CLAIM_LIMITS = Object.freeze({
+  claims: 1_000,
+});
+
+/**
+ * How the account claimed the person, the protocol's `CLAIM_VIAS`:
+ * `invitation` when it accepted an invitation code, which nobody vetted the
+ * account for, and `join_request` when an owner or admin approved its join
+ * request.
+ */
+export const CLAIM_VIAS_VIEW = Object.freeze([
+  "invitation",
+  "join_request",
+] as const);
+export type ClaimViaView = (typeof CLAIM_VIAS_VIEW)[number];
+
+/**
+ * The time of a claim, in UTC with milliseconds, as the protocol writes it.
+ * The fixed form bounds its length.
+ */
+const ClaimTimeSchema = z.iso.datetime({ precision: 3 });
+
+/**
+ * The member IDs of the claims that the screen showed: 1 to
+ * `CLAIM_LIMITS.claims` lowercase UUIDv7s, the most that a list holds. A
+ * longer array is refused before its items are checked.
+ */
+const ShownClaimsSchema = z
+  .array(ProtocolIdSchema)
+  .min(1)
+  .max(CLAIM_LIMITS.claims, { abort: true });
+
+/**
+ * A claim (ADR 0014, "Invitations"): the member ID of the person that was
+ * claimed, the claimer's GitHub login with the time it was last verified
+ * and the creation date of that GitHub account, how the person was claimed,
+ * when, and whether the account has not seen it yet. The login and its two
+ * times are null together, only after the account's data was erased. Never
+ * a user ID.
+ */
+export const ClaimViewSchema = z
+  .object({
+    memberId: ProtocolIdSchema,
+    login: LoginSchema.nullable(),
+    verifiedAt: TimestampSchema.nullable(),
+    accountCreatedAt: TimestampSchema.nullable(),
+    via: z.enum(CLAIM_VIAS_VIEW),
+    claimedAt: ClaimTimeSchema,
+    unseen: z.boolean(),
+  })
+  .refine(
+    (claim) =>
+      (claim.login === null) === (claim.verifiedAt === null) &&
+      (claim.login === null) === (claim.accountCreatedAt === null),
+    { message: "The login and its times come together", path: ["login"] },
+  );
+export type ClaimView = z.infer<typeof ClaimViewSchema>;
+
+/**
+ * The states of the claims, as for the join requests: `signed_out`,
+ * `no_workspace`, `not_allowed` when the account's own person is not the
+ * owner or an admin of the selected workspace, `loading` until they loaded
+ * once for it, `ready`, and `unavailable` after a failed load, until a load
+ * succeeds.
+ */
+export const CLAIM_STATUSES = Object.freeze([
+  "signed_out",
+  "no_workspace",
+  "not_allowed",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type ClaimStatusView = (typeof CLAIM_STATUSES)[number];
+
+const ClaimsViewFields = {
+  /**
+   * Grows with every change. A receiver keeps the state with the highest
+   * revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /** The selected workspace, or null. */
+  workspaceId: ProtocolIdSchema.nullable(),
+  /**
+   * The claims, in the API's order, the most recent first; empty unless the
+   * status is `ready` or `unavailable`.
+   */
+  claims: z.array(ClaimViewSchema).max(CLAIM_LIMITS.claims).readonly(),
+};
+
+/**
+ * What the renderer may know of the selected workspace's recent claims:
+ * `{ revision, status, problem?, workspaceId, claims }`, with a problem only
+ * while `unavailable`. It holds member IDs, logins, and times only: no user
+ * ID. Any claim with `unseen` marks the people item of the sidebar.
+ */
+export const ClaimsViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum([
+      "signed_out",
+      "no_workspace",
+      "not_allowed",
+      "loading",
+      "ready",
+    ]),
+    ...ClaimsViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(WORKSPACE_PROBLEMS),
+    ...ClaimsViewFields,
+  }),
+]);
+export type ClaimsView = z.infer<typeof ClaimsViewSchema>;
+
+/**
+ * Why a request to load the claims was refused, as for the join requests:
+ * `not_signed_in`, `no_workspace`, `not_allowed`, and `too_soon` within a
+ * few seconds of the last request that loaded.
+ */
+export const CLAIM_LOAD_REFUSALS = Object.freeze([
+  "not_signed_in",
+  "no_workspace",
+  "not_allowed",
+  "too_soon",
+] as const);
+
+/**
+ * The answer to a request to load the claims: `loading`, also while the
+ * workspace's people load and the role is not known yet, or `refused` with
+ * a reason.
+ */
+export const ClaimLoadResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("loading") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(CLAIM_LOAD_REFUSALS),
+  }),
+]);
+export type ClaimLoadResult = z.infer<typeof ClaimLoadResultSchema>;
+
+/**
+ * Why the report of the claims that the screen showed was refused:
+ *
+ * - `invalid`: the protocol's schemas refuse the workspace ID or a member
+ *   ID.
+ * - `not_selected`: the workspace is not the selected one.
+ * - `not_allowed`: the account's own person is not the owner or an admin.
+ * - `not_listed`: no claim that the main process holds has any of the
+ *   member IDs. When some do, the others are ignored.
+ */
+export const CLAIM_MARK_SEEN_REFUSALS = Object.freeze([
+  "invalid",
+  "not_selected",
+  "not_allowed",
+  "not_listed",
+] as const);
+
+/**
+ * The answer to the report of the claims that the screen showed: `ok`, also
+ * when they were all seen already, or `refused` with a reason.
+ */
+export const ClaimMarkSeenResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(CLAIM_MARK_SEEN_REFUSALS),
+  }),
+]);
+export type ClaimMarkSeenResult = z.infer<typeof ClaimMarkSeenResultSchema>;
+
 // The agent activity of the open project (#28).
 
 /**
@@ -2189,9 +2370,11 @@ export type AgentActivityView = z.infer<typeof AgentActivityViewSchema>;
  *   `LIMITS.messageBody` and `LIMITS.displayName`.
  * - `text`: the budget of body text in one view, in UTF-16 code units, the
  *   unit that IPC carries a string in (at most two bytes each), so one view
- *   holds at most about 1 MB of text. The waiting messages come first, in
- *   order, then the newest held messages; what does not fit is left out and
- *   counted.
+ *   holds at most about 1 MB of body text, whatever waits. The newest held
+ *   messages may take up to half of it first, then the waiting messages,
+ *   in order, which keep at least the other half, then more held messages;
+ *   so the newest held message and the first waiting message always show.
+ *   What does not fit is left out and counted.
  * - `sendText`: the length of a text that the renderer sends, in
  *   characters. The main process prepares the body with the protocol's
  *   rules and answers `too_long` above `body`; this limit only bounds the
@@ -2958,6 +3141,26 @@ export const INVOKE_CONTRACT = Object.freeze({
     args: z.tuple([ProtocolIdSchema]),
     result: WithdrawJoinRequestResultSchema,
   }),
+  [INVOKE_CHANNELS.getClaimState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ClaimsViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeClaimState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ClaimsViewSchema,
+  }),
+  [INVOKE_CHANNELS.loadClaims]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ClaimLoadResultSchema,
+  }),
+  [INVOKE_CHANNELS.markClaimsSeen]: Object.freeze({
+    /**
+     * The selected workspace's ID and the member IDs of the claims that the
+     * screen showed.
+     */
+    args: z.tuple([ProtocolIdSchema, ShownClaimsSchema]),
+    result: ClaimMarkSeenResultSchema,
+  }),
   [INVOKE_CHANNELS.getAgentState]: Object.freeze({
     args: NoArgumentsSchema,
     result: AgentActivityViewSchema,
@@ -3039,6 +3242,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.invitationStateChanged]: InvitationsViewSchema,
   [EVENT_CHANNELS.joinRequestStateChanged]: JoinRequestsViewSchema,
   [EVENT_CHANNELS.ownJoinRequestStateChanged]: OwnJoinRequestsViewSchema,
+  [EVENT_CHANNELS.claimStateChanged]: ClaimsViewSchema,
   [EVENT_CHANNELS.agentStateChanged]: AgentActivityViewSchema,
   [EVENT_CHANNELS.chatStateChanged]: ChatViewSchema,
   [EVENT_CHANNELS.deviceListChanged]: DeviceListViewSchema,

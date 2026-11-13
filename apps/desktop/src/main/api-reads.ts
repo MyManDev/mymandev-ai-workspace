@@ -1,10 +1,10 @@
 // The reads of workspace, chat, and agent data that the main process may
-// send to the API for #27 and #28, and the reads of invitations and join
-// requests for the screens of #95 (decision D1 of 2026-11-06): a frozen
-// allowlist of nine `GET` routes, each with the protocol's response schema
-// and a fixed cap on the size of its answer. The account service sends them
-// with the device session (`readWorkspaceData`); no IPC channel and no
-// bridge member reach them.
+// send to the API for #27 and #28, and the reads of invitations, join
+// requests, and claims for the screens of #95 (decision D1 of 2026-11-06,
+// and D8 of 2026-11-13): a frozen allowlist of ten `GET` routes, each with
+// the protocol's response schema and a fixed cap on the size of its answer.
+// The account service sends them with the device session
+// (`readWorkspaceData`); no IPC channel and no bridge member reach them.
 // Chat messages are sent over the connection, never here.
 import {
   AGENT_ROUTES,
@@ -18,6 +18,8 @@ import {
   type ChatHistoryResponse,
   ChatHistoryQuerySchema,
   ChatHistoryResponseSchema,
+  type ClaimListResponse,
+  ClaimListResponseSchema,
   type InvitationListResponse,
   InvitationListResponseSchema,
   type JoinRequestListResponse,
@@ -80,7 +82,9 @@ function read<T>(
  * The runs' cap holds up to about 900 finished runs; a server that sends
  * more needs a desktop with a larger cap. For #95, 1,000 live invitations
  * are about 0.29 MB, 1,000 join requests in the approver's view about
- * 0.69 MB, and 1,000 of the account's own join requests about 0.52 MB.
+ * 0.69 MB, and 1,000 of the account's own join requests about 0.52 MB. For
+ * the claim notices (D8), 1,000 claims are about 0.33 MB; the server sends
+ * 50.
  */
 export const WORKSPACE_READS = Object.freeze({
   /** `GET /workspaces`: the account's workspaces. */
@@ -149,6 +153,16 @@ export const WORKSPACE_READS = Object.freeze({
     OwnJoinRequestListResponseSchema,
     1 * MIB,
   ),
+  /**
+   * `GET /workspaces/:workspaceId/claims`: the workspace's most recent
+   * claims, for its owner and admins.
+   */
+  listClaims: read(
+    MEMBERSHIP_ROUTES.listClaims,
+    ["workspaceId"],
+    ClaimListResponseSchema,
+    512 * KIB,
+  ),
 });
 export type WorkspaceReadName = keyof typeof WORKSPACE_READS;
 
@@ -166,6 +180,7 @@ export interface WorkspaceReadParams {
   readonly listInvitations: { readonly workspaceId: WorkspaceId };
   readonly listJoinRequests: { readonly workspaceId: WorkspaceId };
   readonly listOwnJoinRequests: NoParams;
+  readonly listClaims: { readonly workspaceId: WorkspaceId };
 }
 
 /**
@@ -188,6 +203,7 @@ export interface WorkspaceReadQuery {
   readonly listInvitations: never;
   readonly listJoinRequests: never;
   readonly listOwnJoinRequests: never;
+  readonly listClaims: never;
 }
 
 /** The answer of each read, as its response schema parsed it. */
@@ -201,6 +217,7 @@ export interface WorkspaceReadAnswer {
   readonly listInvitations: InvitationListResponse;
   readonly listJoinRequests: JoinRequestListResponse;
   readonly listOwnJoinRequests: OwnJoinRequestListResponse;
+  readonly listClaims: ClaimListResponse;
 }
 
 /**

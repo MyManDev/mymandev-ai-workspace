@@ -6,6 +6,9 @@ import type {
   ChatLoadOlderResultView,
   ChatSendResultView,
   ChatView,
+  ClaimLoadResult,
+  ClaimMarkSeenResult,
+  ClaimsView,
   ConnectionStatus,
   CreateInvitationResult,
   CreateJoinRequestResult,
@@ -81,6 +84,8 @@ export interface DesktopBridge {
   readonly ownJoinRequests: OwnJoinRequestsBridge;
   /** Asking to join a workspace by its ID, and withdrawing a request. */
   readonly ownJoinRequestActions: OwnJoinRequestActionsBridge;
+  /** The recent claims of the selected workspace, and which are unseen. */
+  readonly claims: ClaimsBridge;
   /** The agent activity of the open project, read-only. */
   readonly agents: AgentBridge;
   /** The chat of the open project. */
@@ -610,6 +615,55 @@ export interface OwnJoinRequestActionsBridge {
   readonly withdraw: (
     joinRequestId: string,
   ) => Promise<WithdrawJoinRequestResult>;
+}
+
+/**
+ * The recent claims of the selected workspace, which the main process holds
+ * for its owner and admins (#95, decision D8; ADR 0014, "Invitations"):
+ * each with the claimed person's member ID, the claimer's GitHub login with
+ * its verification time and the creation date of that GitHub account, how
+ * the person was claimed, an invitation or a join request, when, and
+ * whether the account has not seen it yet. The main process loads them on
+ * its own, also while the people screen is closed, so that the sidebar can
+ * mark unseen claims. No user ID crosses.
+ */
+export interface ClaimsBridge {
+  /** The current claims. */
+  readonly getState: () => Promise<ClaimsView>;
+  /**
+   * Calls `listener` with the current claims and then after changes, at
+   * most once every 50 ms with the latest ones. A state older than the last
+   * one delivered is dropped. `onError` is called when the main process
+   * refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: ClaimsView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Asks the main process to load the claims again, on the person's
+   * refresh; it loads them on its own after `workspace.subscribed`, after
+   * a claim, and once the role allows it. Resolves to `refused` without a
+   * signed-in device, a selected workspace, or the role of the owner or an
+   * admin, and with `too_soon` within a few seconds of the last request. It
+   * passes nothing from the renderer on.
+   */
+  readonly load: () => Promise<ClaimLoadResult>;
+  /**
+   * Reports that the screen showed the claims of the selected workspace
+   * with `memberIds`, the member IDs of the claimed people: those claims
+   * are seen from then on, also after a restart, and a claim that the
+   * screen did not report stays unseen while it is one of the 50 most
+   * recent claims of the list. The main process counts only the claims
+   * that it holds. Resolves to `ok` or `refused` with a reason. The
+   * bridge passes on a workspace ID string and a new array of the member ID
+   * strings, and refuses any other value without a call.
+   */
+  readonly markSeen: (
+    workspaceId: string,
+    memberIds: readonly string[],
+  ) => Promise<ClaimMarkSeenResult>;
 }
 
 /**
