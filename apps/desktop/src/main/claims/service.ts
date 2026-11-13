@@ -218,6 +218,17 @@ export interface ClaimService {
     workspaceId: WorkspaceId,
     memberIds: readonly MemberId[],
   ) => ClaimMarkSeenOutcome;
+  /**
+   * The member IDs of the claims that the account's own person
+   * `ownMemberId` has seen in `workspaceId`, from the seen claims file and
+   * the reports since, in any workspace, not only the selected one; null
+   * until the file was read. The claim marks of the other workspaces (#271)
+   * compare their claims with it; `onChange` follows every change.
+   */
+  readonly seenMemberIds: (
+    workspaceId: WorkspaceId,
+    ownMemberId: MemberId,
+  ) => ReadonlySet<MemberId> | null;
   /** Stops listening and cancels the timers, for the quit. */
   readonly close: () => void;
 }
@@ -848,6 +859,13 @@ export function createClaimService(options: ClaimServiceOptions): ClaimService {
     load: () => run(load),
     markSeen: (workspaceId: WorkspaceId, memberIds: readonly MemberId[]) =>
       run(() => markSeen(workspaceId, memberIds)),
+    seenMemberIds: (workspaceId: WorkspaceId, ownMemberId: MemberId) =>
+      entries === null
+        ? null
+        : new Set(
+            entries.get(entryKey(workspaceId, ownMemberId))?.seenMemberIds ??
+              [],
+          ),
     close: () => {
       if (closed) {
         return;

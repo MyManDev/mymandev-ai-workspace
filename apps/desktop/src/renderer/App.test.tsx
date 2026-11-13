@@ -5,6 +5,7 @@ import type {
   AccountBridge,
   AgentBridge,
   ChatBridge,
+  ClaimMarksBridge,
   ClaimsBridge,
   ConnectionBridge,
   DeviceListBridge,
@@ -734,6 +735,102 @@ test("the sidebar's People item carries the marker while the selected workspace'
       '<button type="button" class="nav-item">People</button>',
     );
     expect(html).not.toContain("nav-marker");
+  }
+});
+
+test("the sidebar's workspace list marks each other workspace that the main process names, with the people item's dot and an accessible name, and the selected one by its own claims", () => {
+  const calls: string[] = [];
+  const claimMarks: ClaimMarksBridge = {
+    getState: () => {
+      calls.push("getState");
+      return Promise.reject(new Error("not called"));
+    },
+    subscribeState: () => {
+      calls.push("subscribeState");
+      return () => undefined;
+    },
+  };
+  const claims: ClaimsBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+    load: () => Promise.reject(new Error("not called")),
+    markSeen: () => Promise.reject(new Error("not called")),
+  };
+  const markedA =
+    '<button type="button" class="nav-item" dir="auto" aria-label="Workspace A, new claims">Workspace A<span class="nav-marker" aria-hidden="true"></span></button>';
+  const plainA =
+    '<button type="button" class="nav-item" dir="auto">Workspace A</button>';
+  const plainB =
+    '<button type="button" class="nav-item" dir="auto" aria-current="true">Workspace B</button>';
+  const html = render({
+    claimMarks,
+    initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-a"] },
+  });
+  expect(html).toContain(markedA);
+  expect(html).toContain(plainB);
+  // The people item follows the selected workspace's claims only.
+  expect(html).toContain(
+    '<button type="button" class="nav-item">People</button>',
+  );
+  // The subscription runs in an effect, which a server render does not run.
+  expect(calls).toEqual([]);
+
+  // The selected workspace is marked by its own claims, also when the
+  // marks name it, and not by the marks alone.
+  const unseen: ClaimsView = {
+    revision: 3,
+    status: "ready",
+    workspaceId: "workspace-b",
+    claims: [
+      {
+        memberId: "member-a",
+        login: "kjohnson",
+        verifiedAt: "2026-11-12T09:00:00.000Z",
+        accountCreatedAt: "2026-10-01T00:00:00.000Z",
+        via: "invitation",
+        claimedAt: "2026-11-12T09:30:00.000Z",
+        unseen: true,
+      },
+    ],
+  };
+  const both = render({
+    claims,
+    claimMarks,
+    initialClaimsState: unseen,
+    initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-b"] },
+  });
+  expect(both).toContain(plainA);
+  expect(both).toContain(
+    '<button type="button" class="nav-item" dir="auto" aria-current="true" aria-label="Workspace B, new claims">Workspace B<span class="nav-marker" aria-hidden="true"></span></button>',
+  );
+  const seenSelected = render({
+    claims,
+    claimMarks,
+    initialClaimsState: {
+      ...unseen,
+      claims: unseen.claims.map((claim) => ({ ...claim, unseen: false })),
+    },
+    initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-b"] },
+  });
+  expect(seenSelected).toContain(plainB);
+  expect(seenSelected).not.toContain("nav-marker");
+
+  // No marks, no state yet, and a signed-out device mark nothing.
+  for (const props of [
+    { claimMarks, initialClaimMarksState: { revision: 1, workspaceIds: [] } },
+    { claimMarks },
+    {},
+    {
+      claimMarks,
+      initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-a"] },
+      initialWorkspaceState: workspaceState(PROJECTS, {
+        status: "signed_out",
+      }),
+    },
+  ] satisfies Partial<AppProps>[]) {
+    const plain = render(props);
+    expect(plain).not.toContain("nav-marker");
+    expect(plain).not.toContain("new claims");
   }
 });
 

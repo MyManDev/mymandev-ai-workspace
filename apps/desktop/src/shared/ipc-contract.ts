@@ -2227,6 +2227,27 @@ export const ClaimMarkSeenResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type ClaimMarkSeenResult = z.infer<typeof ClaimMarkSeenResultSchema>;
 
+/**
+ * What the renderer may know of the other workspaces' claims (#271): the
+ * IDs of the workspaces of the list, other than the selected one, that hold
+ * a claim that the account has not seen, in the list's order, at most
+ * `WORKSPACE_LIMITS.workspaces`. Only whether a workspace has unseen claims
+ * crosses: no claim, member ID, login, time, or user ID. The selected
+ * workspace's mark follows its claims (`ClaimsViewSchema`).
+ */
+export const ClaimMarksViewSchema = z.object({
+  /**
+   * Grows with every change. A receiver keeps the state with the highest
+   * revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  workspaceIds: z
+    .array(ProtocolIdSchema)
+    .max(WORKSPACE_LIMITS.workspaces)
+    .readonly(),
+});
+export type ClaimMarksView = z.infer<typeof ClaimMarksViewSchema>;
+
 // The agent activity of the open project (#28).
 
 /**
@@ -3161,6 +3182,14 @@ export const INVOKE_CONTRACT = Object.freeze({
     args: z.tuple([ProtocolIdSchema, ShownClaimsSchema]),
     result: ClaimMarkSeenResultSchema,
   }),
+  [INVOKE_CHANNELS.getClaimMarks]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ClaimMarksViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeClaimMarks]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ClaimMarksViewSchema,
+  }),
   [INVOKE_CHANNELS.getAgentState]: Object.freeze({
     args: NoArgumentsSchema,
     result: AgentActivityViewSchema,
@@ -3243,6 +3272,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.joinRequestStateChanged]: JoinRequestsViewSchema,
   [EVENT_CHANNELS.ownJoinRequestStateChanged]: OwnJoinRequestsViewSchema,
   [EVENT_CHANNELS.claimStateChanged]: ClaimsViewSchema,
+  [EVENT_CHANNELS.claimMarksChanged]: ClaimMarksViewSchema,
   [EVENT_CHANNELS.agentStateChanged]: AgentActivityViewSchema,
   [EVENT_CHANNELS.chatStateChanged]: ChatViewSchema,
   [EVENT_CHANNELS.deviceListChanged]: DeviceListViewSchema,

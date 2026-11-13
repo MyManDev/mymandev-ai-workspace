@@ -1,5 +1,6 @@
 import type { Dispatch } from "react";
 import type { WorkspaceView } from "../shared/ipc-contract.ts";
+import { CLAIM_MARK_MESSAGES } from "./claim-marks-view.ts";
 import { CLAIM_MESSAGES } from "./claims-view.ts";
 import {
   CreateButton,
@@ -33,6 +34,8 @@ export interface WorkspaceSidebar {
   readonly onSelect: (workspaceId: string) => void;
 }
 
+const NO_MARKED_WORKSPACES: ReadonlySet<string> = new Set();
+
 /**
  * The sidebar: the workspace screens, the account's workspaces, and the
  * selected workspace's projects. The shown screen is marked with
@@ -45,7 +48,9 @@ export interface WorkspaceSidebar {
  * sentence offers it. While the selected workspace has a claim that the
  * account has not seen (#95, D8), the people item carries a dot, which is
  * hidden from assistive technologies, and its accessible name says so
- * ("People, new claims"), so that the marker is not only a color.
+ * ("People, new claims"), so that the marker is not only a color. Each
+ * workspace of the list that holds such a claim (#271) carries the same
+ * dot, and its accessible name is its name followed by ", new claims".
  */
 export function WorkspaceNav({
   state,
@@ -53,6 +58,7 @@ export function WorkspaceNav({
   workspaces,
   creation,
   unseenClaims = false,
+  markedWorkspaces = NO_MARKED_WORKSPACES,
 }: {
   readonly state: ShellState;
   readonly dispatch: Dispatch<ShellAction>;
@@ -61,6 +67,12 @@ export function WorkspaceNav({
   readonly creation?: CreationControls | undefined;
   /** Whether the selected workspace has a claim that the account has not seen. */
   readonly unseenClaims?: boolean | undefined;
+  /**
+   * The workspaces of the list that hold a claim that the account has not
+   * seen (`markedWorkspaces`): the selected one by its own claims, the
+   * others by the main process's marks.
+   */
+  readonly markedWorkspaces?: ReadonlySet<string> | undefined;
 }) {
   const { view } = state;
   return (
@@ -93,7 +105,7 @@ export function WorkspaceNav({
       <h2 className="nav-heading" id={WORKSPACES_HEADING_ID} tabIndex={-1}>
         Workspaces
       </h2>
-      <WorkspaceList {...workspaces} />
+      <WorkspaceList {...workspaces} marked={markedWorkspaces} />
       {creation === undefined ? null : (
         <>
           {creation.offer.workspace ? (
@@ -135,7 +147,12 @@ export function WorkspaceNav({
  * there is nothing to say, so that a screen reader announces a new text.
  * Selecting the selected workspace does nothing.
  */
-function WorkspaceList({ view, message, onSelect }: WorkspaceSidebar) {
+function WorkspaceList({
+  view,
+  message,
+  onSelect,
+  marked,
+}: WorkspaceSidebar & { readonly marked: ReadonlySet<string> }) {
   const status = view.kind === "known" ? view.state.status : undefined;
   const notices = [
     view.kind === "known" && view.state.status === "unavailable"
@@ -146,7 +163,7 @@ function WorkspaceList({ view, message, onSelect }: WorkspaceSidebar) {
   ].filter((notice) => notice !== undefined);
   return (
     <>
-      <WorkspaceItems view={view} onSelect={onSelect} />
+      <WorkspaceItems view={view} onSelect={onSelect} marked={marked} />
       <p className="nav-empty nav-status" role="status">
         {notices.join(" ")}
       </p>
@@ -191,7 +208,10 @@ function SelectedWorkspace({
 function WorkspaceItems({
   view,
   onSelect,
-}: Pick<WorkspaceSidebar, "view" | "onSelect">) {
+  marked,
+}: Pick<WorkspaceSidebar, "view" | "onSelect"> & {
+  readonly marked: ReadonlySet<string>;
+}) {
   switch (view.kind) {
     case "unavailable":
       return <p className="nav-empty">{WORKSPACE_MESSAGES.unavailable}</p>;
@@ -215,6 +235,7 @@ function WorkspaceItems({
     <ul className="nav-list" aria-labelledby="workspaces-heading">
       {workspaces.map((workspace) => {
         const selected = workspace.id === selectedWorkspaceId;
+        const hasNewClaims = marked.has(workspace.id);
         return (
           <li key={workspace.id}>
             <button
@@ -222,9 +243,17 @@ function WorkspaceItems({
               className="nav-item"
               dir="auto"
               aria-current={selected ? "true" : undefined}
+              aria-label={
+                hasNewClaims
+                  ? CLAIM_MARK_MESSAGES.workspaceWithNewClaims(workspace.name)
+                  : undefined
+              }
               onClick={selected ? undefined : () => onSelect(workspace.id)}
             >
               {workspace.name}
+              {hasNewClaims ? (
+                <span className="nav-marker" aria-hidden="true" />
+              ) : null}
             </button>
           </li>
         );
