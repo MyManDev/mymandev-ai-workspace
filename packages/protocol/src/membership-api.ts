@@ -260,9 +260,9 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  *   unclaimed people as its limit, without `Retry-After`, because no time
  *   frees a place (#242).
  *
- * The other limits answer `rate_limited`, also those that count live or
- * pending items, such as 50 live invitations or 50 pending join requests per
- * workspace.
+ * The other limits of these routes answer `rate_limited`, also those that
+ * count live or pending items, such as 50 live invitations or 50 pending join
+ * requests per workspace, because those items expire.
  */
 export const MEMBERSHIP_ROUTE_ERRORS = Object.freeze({
   listWorkspaces: errors(),

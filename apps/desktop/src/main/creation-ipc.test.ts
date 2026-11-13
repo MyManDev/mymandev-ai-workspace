@@ -553,7 +553,7 @@ const EXPECTED: Readonly<
     workspace_not_found: refused("failed"),
     device_too_new: refused("failed"),
     unclaimed_limit: refused("failed"),
-    // The limits pass through as the API answers them (#255).
+    // The limits pass through as the API answers them.
     rate_limited: refused("rate_limited", 1_500),
     unknown: { outcome: "unknown" },
     failed: refused("failed"),
@@ -563,11 +563,14 @@ const EXPECTED: Readonly<
       ...common,
       not_found: refused("failed"),
       conflict: refused("failed"),
+      project_limit: refused("failed"),
     },
     createProject: {
       ...common,
       not_found: refused("not_found"),
       conflict: refused("conflict"),
+      // Without a wait, because none frees a place (#255).
+      project_limit: refused("project_limit"),
     },
   };
 })();
@@ -619,6 +622,7 @@ test("each code that a create route of the protocol answers maps to its own refu
   const own: Readonly<Record<string, string>> = {
     not_found: "not_found",
     conflict: "conflict",
+    project_limit: "project_limit",
     rate_limited: "rate_limited",
   };
   const routeErrors = {

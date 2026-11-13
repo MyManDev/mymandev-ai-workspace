@@ -1068,6 +1068,7 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
     device_account_mismatch: "device_account_mismatch",
     device_revoked: "device_revoked",
     device_registration_locked: "device_registration_locked",
+    device_limit: "device_limit",
     unsupported_account: "unsupported_account",
     sign_in_unavailable: "sign_in_unavailable",
   };

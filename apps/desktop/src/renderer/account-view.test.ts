@@ -379,6 +379,15 @@ test("every outcome code has its own message, and only a success or a cancel is 
   }
 });
 
+test("the account's limit of active devices says to remove a device on another device, and names no wait (#255)", () => {
+  const message = describeOutcome({ code: "device_limit" });
+  expect(message).toEqual({
+    role: "alert",
+    text: "This account already has as many active devices as it allows, so this device cannot be added. On another of your devices, remove a device that you no longer use in the Devices section of the Account screen, then sign in here again.",
+  });
+  expect(message.text).not.toMatch(/Try again|wait/iu);
+});
+
 test("an account mismatch names the installation's login when the main process sent it", () => {
   expect(
     describeOutcome({ code: "device_account_mismatch", deviceLogin: "hubot" }),

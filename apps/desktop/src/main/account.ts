@@ -515,6 +515,7 @@ const REFUSAL_CODES: Readonly<
   device_account_mismatch: "device_account_mismatch",
   device_revoked: "device_revoked",
   device_registration_locked: "device_registration_locked",
+  device_limit: "device_limit",
   unsupported_account: "unsupported_account",
   sign_in_unavailable: "sign_in_unavailable",
 });

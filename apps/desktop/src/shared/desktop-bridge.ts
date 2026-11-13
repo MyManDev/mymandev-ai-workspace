@@ -289,7 +289,9 @@ export interface WorkspaceBridge {
    * Creates a project with `name` in the selected workspace, by its ID; any
    * active member may. Another workspace is refused as `not_selected`, and
    * `conflict` means that a project of the workspace has the name, compared
-   * without regard to case. The project list shows the new project once its
+   * without regard to case. `project_limit`, without a wait, means that the
+   * workspace holds 100 projects that are not archived, which no time
+   * changes (#255). The project list shows the new project once its
    * server event arrives. The name is checked as for `create`, after the
    * renderer normalized it to NFC and trimmed it, as the protocol does. It
    * is sent once, as `create` is. The bridge passes on only strings.

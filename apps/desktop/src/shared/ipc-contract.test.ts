@@ -2196,7 +2196,12 @@ test("a create answers ok with its own fields, refused with a known reason and a
     }
   }
   // A workspace create cannot be refused for a reason of a project.
-  for (const reason of ["not_selected", "not_found", "conflict"]) {
+  for (const reason of [
+    "not_selected",
+    "not_found",
+    "conflict",
+    "project_limit",
+  ]) {
     expect(
       CreateWorkspaceResultSchema.safeParse({
         outcome: "refused",
