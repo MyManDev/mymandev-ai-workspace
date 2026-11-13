@@ -547,14 +547,20 @@ test(`an account creates at most ${MAX_NEW_PROJECTS_PER_DAY} projects within 24 
 test("the type checker gives the daily limit a numeric wait and the limit of a workspace none (#268)", () => {
   const typeOnly = (
     refused: Extract<CreateProjectResult, { created: false }>,
-  ): number => {
+  ): unknown => {
     if (refused.refusal === "rate_limited") {
       // A wait of null would no longer be a number.
       const wait: number = refused.retryAfterMs;
       return wait;
     }
-    // @ts-expect-error -- only rate_limited has a wait
-    return refused.retryAfterMs;
+    if (refused.refusal === "project_limit") {
+      // Narrowed to the variants that can refuse with project_limit: none of
+      // them may have a wait, not even a null one.
+      const noWait: "retryAfterMs" extends keyof typeof refused ? never : true =
+        true;
+      return noWait;
+    }
+    return undefined;
   };
   assert.equal(typeof typeOnly, "function");
 });
