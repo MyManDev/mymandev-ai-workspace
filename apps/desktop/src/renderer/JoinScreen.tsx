@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import type { InvitationActionsBridge } from "../shared/desktop-bridge.ts";
+import type {
+  InvitationActionsBridge,
+  OwnJoinRequestActionsBridge,
+  OwnJoinRequestsBridge,
+} from "../shared/desktop-bridge.ts";
+import type { AccountView } from "./account-view.ts";
 import {
   deviceTimeFormat,
   focusesTitleAfterAction,
@@ -18,6 +23,21 @@ import {
   type JoinInvitationView,
   type JoinedWorkspace,
 } from "./join-invitation-view.ts";
+import {
+  JOIN_REQUEST_MESSAGE_ID,
+  JoinRequestForm,
+  OwnJoinRequestsPart,
+  useOwnJoinRequestActions,
+  useOwnJoinRequestsScreen,
+  WithdrawQuestionBox,
+  type OwnJoinRequestHandlers,
+} from "./OwnJoinRequests.tsx";
+import {
+  describeOwnJoinRequests,
+  JOIN_REQUEST_FORM_MESSAGES,
+  type OwnJoinRequestActionsView,
+  type OwnJoinRequestsModel,
+} from "./own-join-requests-view.ts";
 import { clockDelay, watchClockReads } from "./people-actions-view.ts";
 import { formatPeopleDate, peopleDateFormat } from "./people-view.ts";
 import type { WorkspacePanelView } from "./workspace-view.ts";
@@ -49,17 +69,30 @@ export interface JoinInvitationHandlers {
 /**
  * Joining a workspace (#95). A person whom a workspace already added
  * claims that person with an invitation code: the screen previews the
- * pasted code and then accepts it after a question (decision D2). The
- * request to join by a workspace ID and the account's own join requests
- * come later; a note says so.
+ * pasted code and then accepts it after a question (decision D2). Anyone
+ * else asks to join a workspace by its ID, as a new person with a
+ * requested display name, and sees the account's own join requests, with
+ * the withdrawal of a pending one (ADR 0014, "Join requests").
  */
 export function JoinScreen({
   invitationActions,
+  ownJoinRequests,
+  ownJoinRequestActions,
+  account,
   workspaces,
   onOpenWorkspace,
 }: {
   /** The invitation actions from the preload script; undefined outside Electron. */
   readonly invitationActions: InvitationActionsBridge | undefined;
+  /** The account's own join requests from the preload script; undefined outside Electron. */
+  readonly ownJoinRequests: OwnJoinRequestsBridge | undefined;
+  /** The own join request actions from the preload script; undefined outside Electron. */
+  readonly ownJoinRequestActions: OwnJoinRequestActionsBridge | undefined;
+  /**
+   * The account status that the shell follows, for the default name of a
+   * request and the end of a session.
+   */
+  readonly account: AccountView;
   /** The workspace state that the shell follows, for a switch and a sign-out. */
   readonly workspaces: WorkspacePanelView;
   /** Selects a workspace, as the sidebar does. */
@@ -70,13 +103,41 @@ export function JoinScreen({
     workspaces,
     onOpenWorkspace,
   );
+  // The list follows only with both bridges, as the part shows only then.
+  const list = useOwnJoinRequestsScreen(
+    ownJoinRequestActions === undefined ? undefined : ownJoinRequests,
+  );
+  const requests = useOwnJoinRequestActions(
+    { ownJoinRequests, ownJoinRequestActions },
+    list,
+    account,
+    JOIN_TITLE_ID,
+  );
   return (
     <JoinScreenContent
       workspaces={workspaces}
       view={view}
       handlers={handlers}
+      requests={
+        requests.handlers === undefined
+          ? undefined
+          : {
+              model: describeOwnJoinRequests(list, workspaces),
+              view: requests.view,
+              handlers: requests.handlers,
+            }
+      }
     />
   );
+}
+
+/** What the screen shows of the join requests, with their handlers. */
+export interface JoinRequestPartProps {
+  /** The account's own join requests. */
+  readonly model: OwnJoinRequestsModel;
+  /** The form, the question, and the sentences of the actions. */
+  readonly view: OwnJoinRequestActionsView;
+  readonly handlers: OwnJoinRequestHandlers;
 }
 
 export interface JoinScreenContentProps {
@@ -85,6 +146,11 @@ export interface JoinScreenContentProps {
   readonly view?: JoinInvitationView | undefined;
   /** The handlers; undefined without the bridge, with no form shown. */
   readonly handlers?: JoinInvitationHandlers | undefined;
+  /**
+   * The request to join by a workspace ID and the account's own join
+   * requests; undefined without their two bridges, with neither shown.
+   */
+  readonly requests?: JoinRequestPartProps | undefined;
   /**
    * The format of the inviter's verification date, for tests. By default, a
    * new `peopleDateFormat` for each render.
@@ -98,19 +164,22 @@ export interface JoinScreenContentProps {
 }
 
 /**
- * The screen for a view, without state. The status paragraph is always
+ * The screen for a view, without state. The status paragraphs are always
  * rendered with the handlers, empty when there is nothing to say, so that
- * a screen reader announces a new sentence; it never holds the code. Names
- * are text that people entered, so each one takes its direction from its
- * own content (`dir="auto"`), and the inviter's GitHub login is shown in a
- * monospace font, so that a name cannot pass for it. The title takes the
- * focus without a tab stop (`tabIndex={-1}`) after an action whose control
- * leaves the page.
+ * a screen reader announces a new sentence; none ever holds the code.
+ * Names are text that people entered, so each one takes its direction from
+ * its own content (`dir="auto"`), and the inviter's GitHub login is shown
+ * in a monospace font, so that a name cannot pass for it. The title takes
+ * the focus without a tab stop (`tabIndex={-1}`) after an action whose
+ * control leaves the page. Both ways of joining say that a person whom a
+ * workspace already added joins with an invitation code (ADR 0014, "Join
+ * requests").
  */
 export function JoinScreenContent({
   workspaces,
   view = IDLE_JOIN_INVITATION,
   handlers,
+  requests,
   dateFormat,
   timeFormat,
 }: JoinScreenContentProps) {
@@ -157,13 +226,77 @@ export function JoinScreenContent({
           </>
         )}
       </section>
-      <p className="placeholder-note">{JOIN_MESSAGES.later}</p>
+      <JoinRequestSection
+        availability={joinAvailability(requests !== undefined, workspaces)}
+        part={requests}
+      />
+      {requests === undefined ? null : (
+        <OwnJoinRequestsPart
+          model={requests.model}
+          view={requests.view}
+          handlers={requests.handlers}
+          timeFormat={timeFormat ?? deviceTimeFormat()}
+        />
+      )}
       {handlers === undefined ? null : (
         <JoinQuestionBox
           preview={view.asking ? view.preview : undefined}
           onConfirm={handlers.onConfirm}
           onBack={handlers.onBack}
         />
+      )}
+      {requests === undefined ? null : (
+        <WithdrawQuestionBox
+          request={requests.view.withdrawal}
+          onConfirm={requests.handlers.onConfirmWithdraw}
+          onCancel={requests.handlers.onCancelWithdraw}
+        />
+      )}
+    </section>
+  );
+}
+
+/**
+ * The request to join by a workspace ID: its heading, and without the two
+ * bridges only a sentence that it is not available. Otherwise a hint about
+ * what a request does, the sentence that a person whom the workspace
+ * already added joins with an invitation code instead, the form, or while
+ * no device is signed in and ready a sentence that asks for that, and the
+ * status paragraph with the sentence of the last request.
+ */
+export function JoinRequestSection({
+  availability,
+  part,
+}: {
+  readonly availability: ReturnType<typeof joinAvailability>;
+  readonly part: JoinRequestPartProps | undefined;
+}) {
+  return (
+    <section aria-labelledby="join-request-title">
+      <h3 className="people-heading" id="join-request-title">
+        {JOIN_REQUEST_FORM_MESSAGES.title}
+      </h3>
+      {availability === "unavailable" || part === undefined ? (
+        <p>{JOIN_REQUEST_FORM_MESSAGES.unavailable}</p>
+      ) : (
+        <>
+          <p id="join-request-hint">{JOIN_REQUEST_FORM_MESSAGES.hint}</p>
+          <p id="join-request-claim-hint">
+            {JOIN_REQUEST_FORM_MESSAGES.claimHint}
+          </p>
+          {availability === "signed_out" ? (
+            <p>{JOIN_REQUEST_FORM_MESSAGES.signedOut}</p>
+          ) : (
+            <JoinRequestForm view={part.view} handlers={part.handlers} />
+          )}
+          <p
+            className="people-status"
+            id={JOIN_REQUEST_MESSAGE_ID}
+            role="status"
+          >
+            {part.view.formMessage ?? ""}
+          </p>
+        </>
       )}
     </section>
   );
