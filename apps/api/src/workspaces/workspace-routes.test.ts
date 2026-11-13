@@ -559,6 +559,17 @@ test("the workspace routes, the project routes, and the device routes share the 
   assert.equal(definition.statusCode, 429);
   assert.equal((definition.json() as { code: string }).code, "rate_limited");
   assert.match(String(definition.headers["retry-after"]), /^[0-9]+$/u);
+  // So does a project creation; only the limit of 100 projects in a
+  // workspace answers `project_limit` (#255).
+  const creation = await post(
+    app,
+    `/workspaces/${newId<WorkspaceId>()}/projects`,
+    token,
+    { name: "App" },
+  );
+  assert.equal(creation.statusCode, 429);
+  assert.equal((creation.json() as { code: string }).code, "rate_limited");
+  assert.match(String(creation.headers["retry-after"]), /^[0-9]+$/u);
 });
 
 test("without a database, the workspace routes answer the generic 404", async (t) => {

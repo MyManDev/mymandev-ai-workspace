@@ -293,6 +293,19 @@ export const API_ERROR_STATUS = Object.freeze({
    * carries no `Retry-After`.
    */
   unclaimed_limit: 409,
+  /**
+   * A project creation in a workspace that already holds 100 projects that
+   * are not archived (#255). No time frees a place, only archiving a project
+   * does, so the answer carries no `Retry-After`. Only
+   * `POST /workspaces/:workspaceId/projects` answers it.
+   */
+  project_limit: 409,
+  /**
+   * A new device's sign-in on an account that already has 20 active devices
+   * (#255). No time frees a place, only revoking one of them does, so the
+   * answer carries no `Retry-After`. Only `POST /auth/sign-in` answers it.
+   */
+  device_limit: 409,
   /** A limit was reached; the answer carries `Retry-After`. */
   rate_limited: 429,
   /** An unexpected server error. */

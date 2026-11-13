@@ -36,8 +36,8 @@ import type { WorkspaceService } from "./workspace/service.ts";
  * routes of a workspace (`MEMBERSHIP_ROUTE_ERRORS`) with `forbidden`,
  * `not_found`, and `conflict` beyond the common codes; the codes of a
  * pasted code, join requests, unknown workspaces, young devices, and the
- * limit of unclaimed people would be refusals that the desktop does not
- * expect, `failed`.
+ * limits of unclaimed people and of projects would be refusals that the
+ * desktop does not expect, `failed`.
  */
 const MANAGE_OUTCOMES = {
   invalid: "invalid",
@@ -53,6 +53,7 @@ const MANAGE_OUTCOMES = {
   workspace_not_found: "failed",
   device_too_new: "failed",
   unclaimed_limit: "failed",
+  project_limit: "failed",
   rate_limited: "rate_limited",
   unknown: "unknown",
   failed: "failed",
@@ -79,6 +80,7 @@ const JOIN_OUTCOMES = {
   workspace_not_found: "failed",
   device_too_new: "failed",
   unclaimed_limit: "failed",
+  project_limit: "failed",
   rate_limited: "rate_limited",
   unknown: "unknown",
   failed: "failed",
