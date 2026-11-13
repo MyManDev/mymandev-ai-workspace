@@ -66,15 +66,15 @@ function cut(text: string, maxLength: number): string {
 }
 
 /**
- * The part of `CHAT_LIMITS.text` that the newest held messages take before
- * the waiting messages, in UTF-16 code units: the longest body, 16,000
- * characters (`CHAT_LIMITS.body`) of two code units each. So the newest
- * held message always shows, also while the waiting messages alone exceed
- * the budget (the Project Manager's decision of 2026-11-13 on #243). The
- * waiting messages keep the rest, at least 468,000 code units, so the first
- * of them always shows too.
+ * The part of `CHAT_LIMITS.text` that the newest held messages may take
+ * before the waiting messages, in UTF-16 code units: half the budget,
+ * 250,000, so that held and waiting messages may each use at least half
+ * (the Project Manager's decisions of 2026-11-13 on #243). A body is at
+ * most 32,000 code units, 16,000 characters (`CHAT_LIMITS.body`) of up to
+ * two each, so the newest held message and the first waiting message
+ * always show, also while the other side alone exceeds the budget.
  */
-export const CHAT_HELD_TEXT_RESERVE = 2 * CHAT_LIMITS.body;
+export const CHAT_HELD_TEXT_RESERVE = CHAT_LIMITS.text / 2;
 
 /**
  * What a view of `state` shows: the first `pending` waiting messages, and
@@ -83,21 +83,24 @@ export const CHAT_HELD_TEXT_RESERVE = 2 * CHAT_LIMITS.body;
  * within `CHAT_LIMITS.text`, taken in three steps:
  *
  * 1. the held messages from the newest back, while they fit
- *    `CHAT_HELD_TEXT_RESERVE`;
+ *    `CHAT_HELD_TEXT_RESERVE`, half the budget;
  * 2. the waiting messages, in order, while each fits what is left of the
- *    budget;
+ *    budget, at least the other half;
  * 3. the held messages again from where the first step stopped, while each
  *    fits what is left.
  *
  * The reserve is a part of the budget, never added to it, so a view holds
  * at most 500,000 code units of body text, whatever waits. It holds only
- * the held messages that exist: without them, the waiting messages may use
- * the whole budget. Held messages that fit the reserve all show, whatever
- * waits, so while they do, the waiting messages never take the older page
- * away (`olderState`). A body is measured in UTF-16 code units (`length`),
- * which costs nothing to read. Nothing after the first one that does not fit is shown in either
- * list, so the shown messages have no gap, and the waiting messages left
- * out are always the last ones, which `morePending` counts.
+ * the held messages that exist: what they leave of their half goes to the
+ * waiting messages, and without any held message the waiting messages may
+ * use the whole budget. So a new held message, or an older page, can push
+ * out waiting messages that were shown. While all held messages fit the
+ * reserve, they all show, whatever waits, so the waiting messages never
+ * take the older page away (`olderState`). A body is measured in UTF-16
+ * code units (`length`), which costs nothing to read. Nothing after the
+ * first one that does not fit is shown in either list, so the shown
+ * messages have no gap, and the waiting messages left out are always the
+ * last ones, which `morePending` counts.
  */
 function fitView(state: ChatState): {
   readonly pending: number;
@@ -105,7 +108,10 @@ function fitView(state: ChatState): {
 } {
   const { messages } = state;
   let firstMessage = messages.length;
-  /** Shows older held messages while each fits `room`; returns the text used. */
+  /**
+   * Shows older held messages while each fits `room`, and returns the text
+   * that they use.
+   */
   function showHeld(room: number): number {
     let used = 0;
     while (
@@ -186,8 +192,8 @@ function pendingView(copy: ChatPendingCopy): ChatPendingView {
  * with `authorName`, cut to `CHAT_LIMITS.authorName`; no member ID, agent
  * ID, user ID, or device ID crosses. The view holds the newest held
  * messages and the first waiting messages, within the counts and the text
- * budget of `CHAT_LIMITS`, with a reserve of the budget for the newest held
- * messages (see `fitView`), and counts what it leaves out: `moreMessages`
+ * budget of `CHAT_LIMITS`, of which held and waiting messages each keep at
+ * least half (see `fitView`), and counts what it leaves out: `moreMessages`
  * the oldest held messages, `morePending` the last waiting ones. The bodies
  * are the service's, which the protocol's rules checked, so none is cut. At
  * every limit at once, a view holds 500,000 code units of body text and

@@ -673,9 +673,18 @@ test("the view keeps the newest 1,000 held messages, the oldest first, with a co
   expect(getState().older).toBe("not_shown");
 });
 
-test("the text budget holds the newest held messages within the reserve, then the waiting messages, then more held messages, in UTF-16 code units", () => {
+/** The body text of a view's held and waiting messages, in code units. */
+function bodyText(view: ChatView): number {
+  return [...view.messages, ...view.pending].reduce(
+    (sum, item) => sum + item.body.length,
+    0,
+  );
+}
+
+test("the text budget holds the newest held messages within half of it, then the waiting messages, then more held messages, in UTF-16 code units", () => {
   const units = 16_000;
   const fit = Math.floor(CHAT_LIMITS.text / units);
+  const half = CHAT_LIMITS.text / 2;
   const held = Object.freeze(
     Array.from({ length: fit + 5 }, (_, index) => bigMessage(index + 1, units)),
   );
@@ -697,8 +706,8 @@ test("the text budget holds the newest held messages within the reserve, then th
   fake.setState(chatState({ messages: astral, pending: [] }));
   expect(getState().messages).toHaveLength(Math.floor(fit / 2));
 
-  // Waiting messages take their share before the held messages beyond the
-  // reserve, so fewer held messages fit.
+  // Waiting messages take their share before the held messages beyond their
+  // half, so fewer held messages fit.
   fake.setState(
     chatState({
       messages: held,
@@ -714,27 +723,64 @@ test("the text budget holds the newest held messages within the reserve, then th
   expect(withPending.messages).toHaveLength(fit - 2);
   expect(withPending.moreMessages).toBe(7);
 
-  // A body that fits neither what the newest message left of the reserve
-  // nor what the waiting messages left ends the list: no older message
+  // A body that fits neither what the newer held messages left of their
+  // half nor what the waiting messages left ends the list: no older message
   // skips it.
+  const inHalf = Math.floor(half / units);
+  const newer = (from: number) =>
+    Array.from({ length: inHalf }, (_, index) =>
+      bigMessage(from + index, units),
+    );
+  const waiting = (count: number) =>
+    Array.from({ length: count }, (_, index) =>
+      copy(id(0x4000 + index), "w".repeat(units)),
+    );
   fake.setState(
     chatState({
       messages: Object.freeze([
         message(1, "Small and old"),
         bigMessage(2, 2 * LIMITS.messageBody, "\u{1F600}"),
-        message(3, "Small and new"),
+        ...newer(3),
       ]),
-      pending: Object.freeze(
-        Array.from({ length: fit }, (_, index) =>
-          copy(id(0x4000 + index), "w".repeat(units)),
-        ),
-      ),
+      pending: Object.freeze(waiting(fit)),
     }),
   );
   const crowded = getState();
-  expect(crowded.pending).toHaveLength(fit);
-  expect(crowded.messages.map((item) => item.seq)).toEqual([3]);
+  expect(crowded.pending).toHaveLength(
+    Math.floor((CHAT_LIMITS.text - inHalf * units) / units),
+  );
+  expect(crowded.messages.map((item) => item.seq)).toEqual(
+    newer(3).map((item) => item.seq),
+  );
   expect(crowded.moreMessages).toBe(2);
+
+  // The held messages after the waiting messages fill the budget exactly,
+  // and no further: the waiting messages leave exactly the length of the
+  // next held message, and the oldest, of one code unit, no longer fits.
+  fake.setState(
+    chatState({
+      messages: Object.freeze([
+        message(1, "a"),
+        bigMessage(2, units),
+        ...newer(3),
+      ]),
+      pending: Object.freeze([
+        ...waiting(inHalf),
+        copy(
+          id(0x4100),
+          "v".repeat(CHAT_LIMITS.text - (2 * inHalf + 1) * units),
+        ),
+      ]),
+    }),
+  );
+  const exact = getState();
+  expect(exact.messages.map((item) => item.seq)).toEqual([
+    2,
+    ...newer(3).map((item) => item.seq),
+  ]);
+  expect(exact.moreMessages).toBe(1);
+  expect(exact.pending).toHaveLength(inHalf + 1);
+  expect(bodyText(exact)).toBe(CHAT_LIMITS.text);
 });
 
 test("waiting messages beyond the budget or the count are left out from the end and counted", () => {
@@ -753,10 +799,44 @@ test("waiting messages beyond the budget or the count are left out from the end 
     pending.slice(0, fit).map((item) => item.eventId),
   );
   expect(view.morePending).toBe(MAX_PENDING_CHAT_MESSAGES - fit);
-  // The held messages still show; they take only their own length of the
-  // reserve.
+  // The held messages still show; they take only their own length of their
+  // half.
   expect(view.messages).toHaveLength(3);
   expect(view.moreMessages).toBe(0);
+
+  // A waiting message that fills the budget exactly shows.
+  const exact = CHAT_LIMITS.text - fit * units;
+  fake.setState(
+    chatState({
+      messages: Object.freeze([]),
+      pending: Object.freeze([
+        ...pending.slice(0, fit),
+        copy(id(0x4100), "e".repeat(exact)),
+        copy(id(0x4101), "Hi"),
+      ]),
+    }),
+  );
+  const filled = getState();
+  expect(filled.pending).toHaveLength(fit + 1);
+  expect(filled.morePending).toBe(1);
+  expect(bodyText(filled)).toBe(CHAT_LIMITS.text);
+
+  // The first waiting message that does not fit ends the list, also before
+  // a shorter one that would fit.
+  fake.setState(
+    chatState({
+      messages: Object.freeze([]),
+      pending: Object.freeze([
+        ...pending.slice(0, fit + 1),
+        copy(id(0x4101), "Hi"),
+      ]),
+    }),
+  );
+  const blocked = getState();
+  expect(blocked.pending.map((item) => item.eventId)).toEqual(
+    pending.slice(0, fit).map((item) => item.eventId),
+  );
+  expect(blocked.morePending).toBe(2);
 
   // Small messages are capped by the count, which the service never
   // exceeds.
@@ -771,60 +851,56 @@ test("waiting messages beyond the budget or the count are left out from the end 
   expect(capped.morePending).toBe(2);
 });
 
-test("while the waiting messages alone exceed the budget, the newest held messages keep the reserve and the older page stays on offer", () => {
+test("while the waiting messages alone exceed the budget, the held messages keep half of it, so the newest held message and the older page still show", () => {
   const units = 16_000;
+  const half = CHAT_LIMITS.text / 2;
   const pending = Object.freeze(
     Array.from({ length: MAX_PENDING_CHAT_MESSAGES }, (_, index) =>
       copy(id(0x4000 + index), "p".repeat(units)),
     ),
   );
   expect(pending.length * units).toBeGreaterThan(CHAT_LIMITS.text);
-  const text = (view: ChatView) =>
-    [...view.messages, ...view.pending].reduce(
-      (sum, item) => sum + item.body.length,
-      0,
-    );
-  // The waiting messages keep the rest of the budget, the first ones in
-  // order; the later ones are counted, like those beyond the budget.
-  const kept = Math.floor((CHAT_LIMITS.text - CHAT_HELD_TEXT_RESERVE) / units);
-  const expectKept = (view: ChatView) => {
+  // The waiting messages keep what the held messages left, at least half,
+  // the first ones in order; the later ones are counted, like those beyond
+  // the budget.
+  const expectKept = (view: ChatView, held: number) => {
+    const kept = Math.floor((CHAT_LIMITS.text - held) / units);
     expect(view.pending.map((item) => item.eventId)).toEqual(
       pending.slice(0, kept).map((item) => item.eventId),
     );
     expect(view.morePending).toBe(MAX_PENDING_CHAT_MESSAGES - kept);
-    expect(text(view)).toBeLessThanOrEqual(CHAT_LIMITS.text);
+    expect(bodyText(view)).toBe(held + kept * units);
   };
 
-  // The newest held message shows even at its longest, astral characters;
-  // the older ones that fit neither the reserve nor what the waiting
-  // messages left are counted, and no older page is offered.
+  // Held messages beyond their half: the newest ones that fit it show, the
+  // newest at its longest, astral characters; the older ones are counted,
+  // and no older page is offered.
   const longestBody = 2 * LIMITS.messageBody;
+  const inHalf = Math.floor(half / longestBody);
+  const long = Object.freeze(
+    Array.from({ length: 20 }, (_, index) =>
+      bigMessage(index + 1, longestBody, "\u{1F600}"),
+    ),
+  );
   const fake = fakeServices(
-    chatState({
-      messages: Object.freeze([
-        bigMessage(1, units),
-        bigMessage(2, units),
-        bigMessage(3, longestBody, "\u{1F600}"),
-      ]),
-      pending,
-      hasOlder: true,
-    }),
+    chatState({ messages: long, pending, hasOlder: true }),
   );
   const { getState, invoke } = register(fake);
   const loadOlder = () => invoke(INVOKE_CHANNELS.loadOlderChatMessages);
-  const longest = getState();
-  expect(longest.messages.map((item) => item.seq)).toEqual([3]);
-  expect(longest.moreMessages).toBe(2);
-  expect(longest.older).toBe("not_shown");
+  const beyond = getState();
+  expect(beyond.messages.map((item) => item.seq)).toEqual(
+    long.slice(-inHalf).map((item) => item.seq),
+  );
+  expect(beyond.moreMessages).toBe(long.length - inHalf);
+  expect(beyond.older).toBe("not_shown");
   expect(loadOlder()).toBe("none");
-  expectKept(longest);
-  expect(text(longest)).toBe(longestBody + kept * units);
+  expectKept(beyond, inHalf * longestBody);
 
-  // Held messages that fit the reserve, here a full page, all show, and the
-  // older page stays on offer and loads.
+  // While all held messages fit their half, here a full page that fills it,
+  // they all show, and the older page stays on offer and loads.
   const page = Object.freeze(
     Array.from({ length: MESSAGE_PAGE_LIMIT }, (_, index) =>
-      bigMessage(index + 1, CHAT_HELD_TEXT_RESERVE / MESSAGE_PAGE_LIMIT),
+      bigMessage(index + 1, half / MESSAGE_PAGE_LIMIT),
     ),
   );
   fake.setState(chatState({ messages: page, pending, hasOlder: true }));
@@ -834,17 +910,28 @@ test("while the waiting messages alone exceed the budget, the newest held messag
   );
   expect(fitting.moreMessages).toBe(0);
   expect(fitting.older).toBe("available");
-  expectKept(fitting);
+  expectKept(fitting, half);
   expect(loadOlder()).toBe("started");
 
   // The reserve holds only held messages: without any, the waiting messages
   // use the whole budget.
   fake.setState(chatState({ messages: Object.freeze([]), pending }));
   const alone = getState();
-  const fit = Math.floor(CHAT_LIMITS.text / units);
   expect(alone.messages).toHaveLength(0);
-  expect(alone.pending).toHaveLength(fit);
-  expect(alone.morePending).toBe(MAX_PENDING_CHAT_MESSAGES - fit);
+  expectKept(alone, 0);
+
+  // So a new held message can push out waiting messages that were shown;
+  // they are counted.
+  fake.setState(
+    chatState({
+      messages: Object.freeze([long[0] as ChatMessage]),
+      pending,
+    }),
+  );
+  const pushed = getState();
+  expect(pushed.messages).toHaveLength(1);
+  expect(pushed.pending.length).toBeLessThan(alone.pending.length);
+  expectKept(pushed, longestBody);
 });
 
 test("a worst-case chat crosses within the budget and passes the contract", () => {
@@ -888,18 +975,26 @@ test("a worst-case chat crosses within the budget and passes the contract", () =
 
 test("a view at every limit at once holds 500,000 code units of body text and less than 1.5 MB in all", () => {
   // 1,000 held and 50 waiting messages, with bodies of a two-byte character
-  // that fill the budget: 640 held messages in the reserve, 50 waiting
-  // messages of 9,000 code units, and 360 more held messages. Every other
-  // string is at its longest: names of 64 astral characters, the longest
-  // status, problem, older state, and reason.
+  // that fill the budget: 1,000 held messages of 50 code units within their
+  // half, and 50 waiting messages of 9,000. Every other string is at its
+  // longest: names of 64 astral characters, the longest status, problem,
+  // older state, and reason; and every number is beyond the small integers
+  // that V8 writes in fewer bytes: the revision and each `seq` up to the
+  // largest safe integer.
+  const count = CHAT_LIMITS.messages + 200;
   const held = Object.freeze(
-    Array.from({ length: CHAT_LIMITS.messages + 200 }, (_, index) =>
-      bigMessage(index + 1, 50, "一"),
+    Array.from(
+      { length: count },
+      (_, index) =>
+        Object.freeze({
+          ...bigMessage(index + 1, 50, "\u4e00"),
+          seq: Number.MAX_SAFE_INTEGER - count + 1 + index,
+        }) as ChatMessage,
     ),
   );
   const pending = Object.freeze(
     Array.from({ length: MAX_PENDING_CHAT_MESSAGES }, (_, index) =>
-      notSent(id(0x4000 + index), "一".repeat(9_000), "not_sendable"),
+      notSent(id(0x4000 + index), "\u4e00".repeat(9_000), "not_sendable"),
     ),
   );
   const view = chatView(
@@ -915,6 +1010,7 @@ test("a view at every limit at once holds 500,000 code units of body text and le
     () => "\u{1F600}".repeat(CHAT_LIMITS.authorName),
   );
   expect(view.messages).toHaveLength(CHAT_LIMITS.messages);
+  expect(view.messages.at(-1)?.seq).toBe(Number.MAX_SAFE_INTEGER);
   expect(view.pending).toHaveLength(CHAT_LIMITS.pending);
   expect(ChatViewSchema.parse(view)).toEqual(view);
 
@@ -1233,14 +1329,10 @@ test("the contract's limits, problems, and reasons match the service and the pro
   expect(CHAT_LIMITS.messages).toBeGreaterThanOrEqual(MESSAGE_PAGE_LIMIT);
   // A body at the limit whose line breaks came as CR LF still crosses.
   expect(CHAT_LIMITS.sendText).toBeGreaterThanOrEqual(2 * LIMITS.messageBody);
-  // One body at the limit, even of astral characters, fits the budget, and
-  // both the reserve of the held messages and what it leaves the waiting
-  // messages.
-  expect(CHAT_LIMITS.text).toBeGreaterThanOrEqual(2 * LIMITS.messageBody);
-  expect(CHAT_HELD_TEXT_RESERVE).toBeGreaterThanOrEqual(2 * LIMITS.messageBody);
-  expect(CHAT_LIMITS.text - CHAT_HELD_TEXT_RESERVE).toBeGreaterThanOrEqual(
-    2 * LIMITS.messageBody,
-  );
+  // Held and waiting messages may each use at least half the budget, and
+  // one body at the limit, even of astral characters, fits half.
+  expect(CHAT_HELD_TEXT_RESERVE).toBe(CHAT_LIMITS.text / 2);
+  expect(CHAT_LIMITS.text / 2).toBeGreaterThanOrEqual(2 * LIMITS.messageBody);
   expect([...CHAT_PROBLEMS]).toEqual([...WORKSPACE_READ_FAILURES]);
   expect([...CHAT_NOT_SENT_REASONS]).toEqual([
     ...EVENT_REFUSAL_CODES,
