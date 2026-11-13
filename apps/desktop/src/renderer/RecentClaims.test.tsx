@@ -721,6 +721,55 @@ test("while rendering, the page counts as hidden and without the focus, no row i
   expect(seen).toEqual(["false false 0 false false undefined undefined"]);
 });
 
+// The wiring that runs only in effects and the commit, which the Node-only
+// tests cannot run, as text.
+const WIRING = import.meta.glob<string>(
+  ["./PeopleScreen.tsx", "./RecentClaims.tsx", "./App.tsx"],
+  { query: "?raw", import: "default", eager: true },
+);
+
+test("the wiring that runs in effects passes the whole views: the People screen's report, the one effect after each render, the page's attention, and the shell's dialogs", () => {
+  const people = WIRING["./PeopleScreen.tsx"] ?? "";
+  const call = /claimsReport\(\{([\s\S]*?)\}\);/.exec(people)?.[1] ?? "";
+  expect(call.split(",").filter((part) => part.trim() !== "")).toHaveLength(9);
+  for (const field of [
+    "people: view,",
+    "claims: claimsView,",
+    "marked: claimParts.view.marked,",
+    "attention: claimParts.attention,",
+    "rowsInView: claimParts.rowsInView,",
+    "shellDialogOpen: shellDialogOpen === true,",
+    "peopleActions: actions,",
+    "invitationActions: invitationParts.actions,",
+    "joinRequestActions: joinRequestParts.actions,",
+  ]) {
+    expect(call, field).toContain(field);
+  }
+  expect(people).toContain(
+    "useClaimsRendered(claimParts.controller, view, claimsView, claimsSeen);",
+  );
+  expect(people).toContain("rowRef={claimHandlers.rowRef}");
+  const part = WIRING["./RecentClaims.tsx"] ?? "";
+  // One effect: the controller follows the views first and compares the key.
+  expect(part.match(/controller\?\.rendered\(/g)).toHaveLength(1);
+  expect(part).toMatch(
+    /useEffect\(\s*\(\) => controller\?\.rendered\(people, claims, report\),[^\]]*\[controller, people, claims, key\],\s*\);/,
+  );
+  expect(part).toContain("useState(NO_PAGE_ATTENTION)");
+  expect(part).toMatch(
+    /useEffect\(\s*\(\) =>\s*followDocumentVisibility\(document, /,
+  );
+  expect(part).toMatch(
+    /useEffect\(\s*\(\) =>\s*followWindowFocus\(window, document, /,
+  );
+  expect(part).toContain("useEffect(() => () => rows.stop(), [rows]);");
+  const app = WIRING["./App.tsx"] ?? "";
+  expect(app).toContain(
+    "const shellDialogOpen = isShellDialogOpen(question.question, creation?.view);",
+  );
+  expect(app.match(/shellDialogOpen=\{shellDialogOpen\}/g)).toHaveLength(2);
+});
+
 // The sources of the recent claims, without the tests, as text.
 const SOURCES = import.meta.glob<string>(
   ["./RecentClaims.tsx", "./claims-view.ts", "./claims-attention.ts"],
