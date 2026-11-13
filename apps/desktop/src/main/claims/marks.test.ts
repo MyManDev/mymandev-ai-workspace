@@ -12,6 +12,7 @@ import {
   type WorkspaceState,
 } from "../workspace/service.ts";
 import {
+  CLAIM_MARK_READ_INTERVAL_MS,
   type ClaimMarkServiceOptions,
   type ClaimMarkState,
   createClaimMarkService,
@@ -326,7 +327,13 @@ async function settle(): Promise<void> {
   }
 }
 
-function setup() {
+function setup(
+  pace: {
+    readonly readIntervalMs?: number;
+    readonly now?: () => number;
+    readonly schedule?: ClaimMarkServiceOptions["scheduleTimer"];
+  } = {},
+) {
   const workspaces = fakeWorkspaces();
   const claims = fakeClaims();
   const account = fakeAccount();
@@ -339,7 +346,10 @@ function setup() {
     connection: connection.connection,
     workspaces: workspaces.workspaces,
     claims: claims.claims,
-    scheduleTimer: timers.schedule,
+    scheduleTimer: pace.schedule ?? timers.schedule,
+    // The other tests leave the pace out; its own tests set it.
+    readIntervalMs: pace.readIntervalMs ?? 0,
+    ...(pace.now === undefined ? {} : { now: pace.now }),
     log: (message) => logs.push(message),
   });
   service.onChange((state) => states.push(state));
@@ -468,23 +478,28 @@ test("the selected workspace is never read: also one selected while the reads ru
   expect(live.marked()).toEqual([]);
 });
 
-test("the selected workspace is never marked by the service, and its claims from the claim service carry its mark once it is not selected", async () => {
+test("the selected workspace keeps its held mark until the claim service has loaded it, and its claims from the claim service carry its mark once it is not selected", async () => {
   const live = setup();
   live.workspaces.set({ list: FOUR, selected: WS_A });
   await live.answer(0, list(WS_B, FIRST));
   await live.answer(1, list(WS_C));
   expect(live.marked()).toEqual([WS_B]);
 
-  // Selecting B: its mark follows the selected-workspace logic, outside
-  // this service.
+  // Selecting B: its held mark stays while the claim service has not
+  // loaded it, also while its state is still A's or loading.
   live.workspaces.set({ selected: WS_B });
-  expect(live.marked()).toEqual([]);
+  expect(live.marked()).toEqual([WS_B]);
+  live.claims.set({ status: "loading", workspaceId: WS_B, claims: [] });
+  expect(live.marked()).toEqual([WS_B]);
   // The claim service loads B, and the screen reports FIRST as seen.
   live.claims.set({
     status: "ready",
     workspaceId: WS_B,
     claims: [claimState(SECOND), claimState(FIRST)],
   });
+  // Once loaded, B's mark follows the claim service's claims, outside
+  // this service.
+  expect(live.marked()).toEqual([]);
   live.claims.see(WS_B, [FIRST]);
   // Back to A: B holds the claim service's claims, and SECOND is unseen.
   live.workspaces.set({ selected: WS_A });
@@ -788,4 +803,211 @@ test("close stops listening and cancels the retry, and a late answer changes not
   expect(live.marked()).toEqual([]);
   expect(live.readIds()).toEqual([WS_B, WS_B]);
   expect(live.timers.retries()).toEqual([]);
+});
+
+test("the selected workspace's held mark ends when the claim service's state of it is unavailable, and stays while it cannot load offline", async () => {
+  const live = setup();
+  live.workspaces.set({ list: FOUR, selected: WS_A });
+  await live.answer(0, list(WS_B, FIRST));
+  await live.answer(1, list(WS_C));
+  live.connection.setState("offline");
+  live.workspaces.set({ selected: WS_B });
+  // Offline, the claim service waits for the subscription: still loading.
+  live.claims.set({ status: "loading", workspaceId: WS_B, claims: [] });
+  expect(live.marked()).toEqual([WS_B]);
+  live.claims.set({
+    status: "unavailable",
+    problem: "unavailable",
+    workspaceId: WS_B,
+    claims: [],
+  });
+  expect(live.marked()).toEqual([]);
+  // What was held stays for when B is no longer selected.
+  live.workspaces.set({ selected: WS_A });
+  expect(live.marked()).toEqual([WS_B]);
+});
+
+test("any answer for a workspace that was selected while its read was on its way is ignored: a failure neither drops what the claim service gave nor retries", async () => {
+  for (const reason of ["not_found", "failed", "not_signed_in"] as const) {
+    const live = setup();
+    live.workspaces.set({ list: FOUR, selected: WS_A });
+    expect(live.readIds(), reason).toEqual([WS_B]);
+    live.workspaces.set({ selected: WS_B });
+    live.claims.set({
+      status: "ready",
+      workspaceId: WS_B,
+      claims: [claimState(SECOND), claimState(FIRST)],
+    });
+    live.claims.see(WS_B, [FIRST]);
+    await live.answer(0, { ok: false, reason });
+    expect(live.logs, reason).toEqual([]);
+    // C follows at once.
+    expect(live.readIds(), reason).toEqual([WS_B, WS_C]);
+    await live.answer(1, list(WS_C));
+    // Back to A: B keeps the claim service's claims, and SECOND is unseen.
+    live.workspaces.set({ selected: WS_A });
+    expect(live.marked(), reason).toEqual([WS_B]);
+  }
+});
+
+test("a retried failure for a workspace that was selected while its read was on its way schedules no retry, and the next read starts at once", async () => {
+  for (const reason of ["rate_limited", "unavailable"] as const) {
+    const live = setup();
+    live.workspaces.set({ list: FOUR, selected: WS_A });
+    live.workspaces.set({ selected: WS_B });
+    await live.answer(0, { ok: false, reason });
+    expect(live.timers.retries(), reason).toEqual([]);
+    expect(live.readIds(), reason).toEqual([WS_B, WS_C]);
+    // The backoff did not grow.
+    await live.answer(1, { ok: false, reason: "unavailable" });
+    expect(live.timers.retries(), reason).toEqual([WORKSPACE_RETRY_BASE_MS]);
+  }
+});
+
+test("a list that leaves nothing to read starts the backoff again: a failure, a sign-out, a sign-in, and a failure wait the base delay", async () => {
+  const live = setup();
+  live.workspaces.set({ list: FOUR, selected: WS_A });
+  await live.answer(0, { ok: false, reason: "unavailable" });
+  expect(live.timers.retries()).toEqual([WORKSPACE_RETRY_BASE_MS]);
+  live.workspaces.signOut();
+  expect(live.timers.retries()).toEqual([]);
+  live.workspaces.set({ status: "ready", list: FOUR, selected: WS_A });
+  expect(live.readIds()).toEqual([WS_B, WS_B]);
+  await live.answer(1, { ok: false, reason: "unavailable" });
+  expect(live.timers.retries()).toEqual([WORKSPACE_RETRY_BASE_MS]);
+});
+
+/** A clock and timers that fire when the clock reaches them. */
+function clockTimers() {
+  let clock = 0;
+  const timers: { due: number; callback: () => void; active: boolean }[] = [];
+  return {
+    now: () => clock,
+    schedule: (callback: () => void, delayMs: number) => {
+      const timer = { due: clock + delayMs, callback, active: true };
+      timers.push(timer);
+      return () => {
+        timer.active = false;
+      };
+    },
+    waits: () =>
+      timers.filter((timer) => timer.active).map((timer) => timer.due - clock),
+    /** Moves the clock on by `ms`, firing each timer that falls due. */
+    advance(ms: number) {
+      const end = clock + ms;
+      for (;;) {
+        const next = timers
+          .filter((timer) => timer.active && timer.due <= end)
+          .sort((left, right) => left.due - right.due)[0];
+        if (next === undefined) {
+          break;
+        }
+        clock = next.due;
+        next.active = false;
+        next.callback();
+      }
+      clock = end;
+    },
+  };
+}
+
+/** A setup with the real pace, its clock, and each read's start time. */
+function paced() {
+  const time = clockTimers();
+  const live = setup({
+    readIntervalMs: CLAIM_MARK_READ_INTERVAL_MS,
+    now: time.now,
+    schedule: time.schedule,
+  });
+  const starts: number[] = [];
+  const read = live.account.account.readWorkspaceData;
+  (live.account.account as { readWorkspaceData: unknown }).readWorkspaceData = (
+    ...args: Parameters<typeof read>
+  ) => {
+    starts.push(time.now());
+    return read(...args);
+  };
+  return { ...live, time, starts };
+}
+
+test("the reads are paced: a read starts at least a second after the start of the one before, so at most 60 start in a minute", async () => {
+  expect(CLAIM_MARK_READ_INTERVAL_MS).toBe(1_000);
+  const live = paced();
+  const many: Listed[] = Array.from({ length: 120 }, (_, index) => ({
+    id: id(0x3000 + index) as WorkspaceId,
+    role: "owner",
+    own: id(0x4000 + index) as MemberId,
+  }));
+  live.workspaces.set({ list: many, selected: null });
+  expect(live.starts).toEqual([0]);
+  // Each answer comes at once; the next read waits out the second.
+  for (let index = 0; index < 119; index += 1) {
+    const workspaceId = live.readIds()[index] as WorkspaceId;
+    await live.answer(index, list(workspaceId));
+    expect(live.account.reads).toHaveLength(index + 1);
+    live.time.advance(CLAIM_MARK_READ_INTERVAL_MS);
+  }
+  expect(live.account.reads).toHaveLength(120);
+  for (let index = 1; index < live.starts.length; index += 1) {
+    expect(
+      (live.starts[index] as number) - (live.starts[index - 1] as number),
+    ).toBeGreaterThanOrEqual(CLAIM_MARK_READ_INTERVAL_MS);
+  }
+  expect(
+    live.starts.filter((start) => start < 60_000).length,
+  ).toBeLessThanOrEqual(60);
+
+  // A read whose answer took longer than the pace is followed at once.
+  const slow = paced();
+  slow.workspaces.set({ list: FOUR, selected: WS_A });
+  slow.time.advance(1_500);
+  await slow.answer(0, list(WS_B));
+  expect(slow.starts).toEqual([0, 1_500]);
+});
+
+test("a new list during the pace's wait does not read sooner or start again from the top faster than the pace", async () => {
+  const live = paced();
+  live.workspaces.set({ list: FOUR, selected: WS_A });
+  await live.answer(0, list(WS_B, FIRST));
+  expect(live.time.waits()).toEqual([CLAIM_MARK_READ_INTERVAL_MS]);
+  // Reconnects, each with a new list, during the wait.
+  for (let count = 0; count < 3; count += 1) {
+    live.time.advance(100);
+    live.workspaces.set({ list: FOUR });
+    expect(live.readIds()).toEqual([WS_B]);
+  }
+  expect(live.time.waits()).toEqual([CLAIM_MARK_READ_INTERVAL_MS - 300]);
+  live.time.advance(CLAIM_MARK_READ_INTERVAL_MS - 300);
+  // The newest list reads from its top, a second after the last start.
+  expect(live.readIds()).toEqual([WS_B, WS_B]);
+  expect(live.starts).toEqual([0, CLAIM_MARK_READ_INTERVAL_MS]);
+
+  // A new list while a read is on its way: its answer is dropped, and the
+  // new list's first read still waits for the pace.
+  live.workspaces.set({ list: FOUR });
+  live.time.advance(200);
+  await live.answer(1, list(WS_B, FIRST));
+  expect(live.readIds()).toEqual([WS_B, WS_B]);
+  live.time.advance(CLAIM_MARK_READ_INTERVAL_MS - 200);
+  expect(live.starts).toEqual([0, 1_000, 2_000]);
+});
+
+test("the pace's wait reads the queue as it is when it ends, skips a workspace selected meanwhile, and ends with close", async () => {
+  const live = paced();
+  live.workspaces.set({ list: FOUR, selected: WS_A });
+  await live.answer(0, list(WS_B, FIRST));
+  live.workspaces.set({ selected: WS_C });
+  live.time.advance(CLAIM_MARK_READ_INTERVAL_MS);
+  // C is selected, D is a member's: nothing is left to read.
+  expect(live.readIds()).toEqual([WS_B]);
+  expect(live.time.waits()).toEqual([]);
+
+  const closing = paced();
+  closing.workspaces.set({ list: FOUR, selected: WS_A });
+  await closing.answer(0, list(WS_B, FIRST));
+  expect(closing.time.waits()).toEqual([CLAIM_MARK_READ_INTERVAL_MS]);
+  closing.service.close();
+  expect(closing.time.waits()).toEqual([]);
+  closing.time.advance(CLAIM_MARK_READ_INTERVAL_MS);
+  expect(closing.readIds()).toEqual([WS_B]);
 });

@@ -2229,11 +2229,12 @@ export type ClaimMarkSeenResult = z.infer<typeof ClaimMarkSeenResultSchema>;
 
 /**
  * What the renderer may know of the other workspaces' claims (#271): the
- * IDs of the workspaces of the list, other than the selected one, that hold
- * a claim that the account has not seen, in the list's order, at most
- * `WORKSPACE_LIMITS.workspaces`. Only whether a workspace has unseen claims
- * crosses: no claim, member ID, login, time, or user ID. The selected
- * workspace's mark follows its claims (`ClaimsViewSchema`).
+ * IDs of the workspaces of the list that hold a claim that the account has
+ * not seen, in the list's order, at most `WORKSPACE_LIMITS.workspaces`.
+ * Only whether a workspace has unseen claims crosses: no claim, member ID,
+ * login, time, or user ID. The selected workspace is named only while the
+ * claim service loads it; once its claims (`ClaimsViewSchema`) are `ready`
+ * or `unavailable`, its mark follows them.
  */
 export const ClaimMarksViewSchema = z.object({
   /**

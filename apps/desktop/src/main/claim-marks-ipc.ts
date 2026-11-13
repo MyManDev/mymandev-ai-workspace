@@ -14,8 +14,9 @@ import type { ScheduleTimer } from "./runtime.ts";
 
 /**
  * The frozen copy of the service's state that crosses IPC, with `revision`
- * as its revision: the IDs of the workspaces, other than the selected one,
- * that hold a claim that the account has not seen, at most
+ * as its revision: the IDs of the workspaces that hold a claim that the
+ * account has not seen (the selected one only while its claims load), at
+ * most
  * `WORKSPACE_LIMITS.workspaces`. Only whether a workspace has unseen claims
  * crosses, never a claim, a member ID, or a user ID.
  */

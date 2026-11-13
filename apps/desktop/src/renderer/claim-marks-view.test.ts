@@ -71,8 +71,8 @@ test("the other workspaces that the main process names are marked, and the selec
   expect([
     ...markedWorkspaces(marks(WORKSPACE_B), NO_CLAIMS, workspaces()),
   ]).toEqual([WORKSPACE_B]);
-  // The selected workspace's mark follows its claims, as the people item's
-  // does: named by a state from before a switch, it is not marked.
+  // Once its claims are ready, the selected workspace's mark follows them,
+  // as the people item's does, whatever the marks say.
   expect([
     ...markedWorkspaces(
       marks(WORKSPACE_A, WORKSPACE_C),
@@ -93,6 +93,52 @@ test("the other workspaces that the main process names are marked, and the selec
   expect([
     ...markedWorkspaces(marks(UNLISTED, WORKSPACE_B), NO_CLAIMS, workspaces()),
   ]).toEqual([WORKSPACE_B]);
+});
+
+test("the selected workspace keeps the mark that the main process names until its claims are ready or unavailable, and then follows them", () => {
+  // Pending, loading, or still the state of the workspace selected before:
+  // the marks decide.
+  const loading: ClaimsScreenView = {
+    kind: "known",
+    state: {
+      revision: 4,
+      status: "loading",
+      workspaceId: WORKSPACE_A,
+      claims: [],
+    },
+  };
+  for (const claimsView of [
+    NO_CLAIMS,
+    { kind: "unavailable" } as const,
+    loading,
+    claims(false, WORKSPACE_B),
+  ]) {
+    expect([
+      ...markedWorkspaces(marks(WORKSPACE_A), claimsView, workspaces()),
+    ]).toEqual([WORKSPACE_A]);
+    expect([...markedWorkspaces(marks(), claimsView, workspaces())]).toEqual(
+      [],
+    );
+  }
+  // Ready or unavailable for the selected workspace: its claims decide.
+  const failed: ClaimsScreenView = {
+    kind: "known",
+    state: {
+      revision: 4,
+      status: "unavailable",
+      problem: "unavailable",
+      workspaceId: WORKSPACE_A,
+      claims: [],
+    },
+  };
+  for (const claimsView of [claims(false), failed]) {
+    expect([
+      ...markedWorkspaces(marks(WORKSPACE_A), claimsView, workspaces()),
+    ]).toEqual([]);
+  }
+  expect([...markedWorkspaces(marks(), claims(true), workspaces())]).toEqual([
+    WORKSPACE_A,
+  ]);
 });
 
 test("nothing is marked while signed out, before the first state of the workspaces or of the marks, or without the subscription", () => {

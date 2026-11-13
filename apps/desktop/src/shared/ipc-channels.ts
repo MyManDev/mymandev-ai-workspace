@@ -269,9 +269,9 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   markClaimsSeen: "claims:mark-seen",
   /**
-   * Which workspaces of the list, other than the selected one, hold a claim
-   * that the account has not seen (#271): their workspace IDs only, never a
-   * claim or a user ID.
+   * Which workspaces of the list hold a claim that the account has not seen
+   * (#271): the other workspaces, and the selected one only while its claims
+   * load. Their workspace IDs only, never a claim or a user ID.
    */
   getClaimMarks: "claims:get-marks",
   /**

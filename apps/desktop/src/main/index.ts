@@ -477,8 +477,8 @@ function start(): void {
   // The unseen claims of the other workspaces (#271): after each answer of
   // the workspace list, the recent claims of each other workspace where the
   // list names the account's own person as the owner or an admin are read
-  // once, one at a time, and compared with the seen claims of the claim
-  // service. Only the IDs of the workspaces with an unseen claim reach the
+  // once, one at a time and at most one a second, and compared with the
+  // seen claims of the claim service. Only the IDs of the workspaces with an unseen claim reach the
   // renderer, at most once every 50 ms.
   const claimMarks = createClaimMarkService({
     account,

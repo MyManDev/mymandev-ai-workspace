@@ -1,10 +1,9 @@
 // The claim marks of the other workspaces (#271; decision D8 of 2026-11-13
-// on #95, and its update of the same day): which workspaces of the list,
-// other than the selected one, hold a claim that the account has not seen,
-// so that the sidebar can mark them. The claim service (`service.ts`) holds
-// the selected workspace's claims; this service holds only the member IDs
-// of the most recent claims of the others, and publishes only their
-// workspace IDs.
+// on #95, and its update of the same day): which workspaces of the list
+// hold a claim that the account has not seen, so that the sidebar can mark
+// them. The claim service (`service.ts`) holds the selected workspace's
+// claims; this service holds only the member IDs of the most recent claims
+// of the others, and publishes only their workspace IDs.
 //
 // - The role comes from the workspace list: `GET /workspaces` names the
 //   account's own person in each workspace with its role
@@ -17,6 +16,13 @@
 //   such workspace, one read at a time, in the list's order. The selected
 //   workspace is skipped: the claim service reads it. A newer answer of the
 //   list starts again with its own workspaces.
+// - The reads are paced: a read starts at least `CLAIM_MARK_READ_INTERVAL_MS`
+//   (1 second) after the start of the one before it, also across answers
+//   of the list, so the reads use at most 60 requests a minute of the
+//   account's shared limit on the API (300 a minute per user, across all
+//   its devices), however many workspaces it owns or administers and
+//   however often it reconnects. A newer answer of the list during the wait
+//   only replaces the workspaces still to read.
 // - A read that fails with `unavailable` or `rate_limited` is retried with
 //   the workspace service's backoff (`workspaceRetryDelayMs`, 60 seconds
 //   after `rate_limited`) while connected, and the reads after it wait for
@@ -24,13 +30,18 @@
 //   (`failed`, which a member's `forbidden` gives after a demotion that the
 //   list did not show yet, `not_found`, or `not_signed_in`) drops what was
 //   held for the workspace and is not retried until the list loads again.
-//   A successful read starts the backoff again. The claims route has no
-//   rate limit of its own on the API; one read at a time keeps the burst
-//   after a reconnect to one request.
+//   A successful read starts the backoff again. A waiting retry holds back
+//   the reads of a newer answer of the list as well. An answer of any kind
+//   for a workspace that was selected while its read was on its way is
+//   ignored: the claim service holds that workspace's claims.
 // - While a workspace is selected, the claim service's claims of it replace
 //   what was held, so that the mark that it has once it is no longer
 //   selected follows the claims as they were last loaded; its `not_allowed`
-//   drops them.
+//   drops them. The selected workspace keeps the mark that was held for it
+//   until the claim service's state of it is `ready` or `unavailable`, so
+//   that its mark does not go out and come back while the claim service
+//   loads it, or stay out while it cannot load offline; from then on the
+//   renderer marks it by the claim service's claims, as the people item.
 // - A workspace is marked while one of the claims held for it is unseen, by
 //   the claim service's rule: one of its `MAX_SEEN_CLAIMS_PER_ENTRY` most
 //   recent claims, not the claim of the account's own person, and not among
@@ -65,13 +76,21 @@ import {
 import { MAX_SEEN_CLAIMS_PER_ENTRY } from "./seen-store.ts";
 import type { ClaimService } from "./service.ts";
 
+/**
+ * The shortest time between the starts of two reads of the claims of the
+ * other workspaces, so that they use at most 60 requests a minute.
+ */
+export const CLAIM_MARK_READ_INTERVAL_MS = 1_000;
+
 /** The service's state. Every value is frozen. */
 export interface ClaimMarkState {
   /** Grows by one with every change. */
   readonly revision: number;
   /**
-   * The workspaces of the list, other than the selected one, that hold a
-   * claim that the account has not seen, in the list's order.
+   * The workspaces of the list that hold a claim that the account has not
+   * seen, in the list's order: the other workspaces, and the selected one
+   * by what was held for it only until the claim service's state of it is
+   * `ready` or `unavailable`.
    */
   readonly workspaceIds: readonly WorkspaceId[];
 }
@@ -86,6 +105,10 @@ export interface ClaimMarkServiceOptions {
   readonly claims: Pick<ClaimService, "state" | "onChange" | "seenMemberIds">;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
+  /** A monotonic clock in milliseconds; defaults to `performance.now`. */
+  readonly now?: () => number;
+  /** Defaults to `CLAIM_MARK_READ_INTERVAL_MS`; tests set another one. */
+  readonly readIntervalMs?: number;
   /**
    * Receives fixed messages with a failure code at most, never a login or
    * an ID. An error that it throws is ignored.
@@ -98,7 +121,7 @@ export interface ClaimMarkService {
   readonly state: () => ClaimMarkState;
   /** Calls `listener` after every change. The result removes the listener. */
   readonly onChange: (listener: (state: ClaimMarkState) => void) => () => void;
-  /** Stops listening and cancels the timer, for the quit. */
+  /** Stops listening and cancels the timers, for the quit. */
   readonly close: () => void;
 }
 
@@ -141,6 +164,8 @@ export function createClaimMarkService(
 ): ClaimMarkService {
   const { account, connection, workspaces, claims } = options;
   const schedule = options.scheduleTimer ?? scheduleWithSetTimeout;
+  const now = options.now ?? (() => performance.now());
+  const readIntervalMs = options.readIntervalMs ?? CLAIM_MARK_READ_INTERVAL_MS;
 
   function log(message: string): void {
     try {
@@ -168,6 +193,10 @@ export function createClaimMarkService(
   /** The failed reads in a row, for the backoff. */
   let attempt = 0;
   let cancelRetry: (() => void) | null = null;
+  /** When the last read started, for the pace, or null. */
+  let lastStart: number | null = null;
+  /** The wait for the pace before the next read, or null. */
+  let cancelPace: (() => void) | null = null;
   const held = new Map<WorkspaceId, HeldClaims>();
 
   let marked = NO_MARKS;
@@ -220,7 +249,19 @@ export function createClaimMarkService(
     }
   }
 
-  /** The workspaces other than the selected one with an unseen claim. */
+  /**
+   * Whether the claim service has loaded the selected workspace, or failed
+   * to: its mark then follows the claim service's claims.
+   */
+  function selectedLoaded(): boolean {
+    const state = claims.state();
+    return (
+      state.workspaceId === selected &&
+      (state.status === "ready" || state.status === "unavailable")
+    );
+  }
+
+  /** The workspaces with an unseen claim; see `ClaimMarkState`. */
   function marks(): WorkspaceId[] {
     const result: WorkspaceId[] = [];
     if (held.size === 0) {
@@ -229,7 +270,7 @@ export function createClaimMarkService(
     for (const { id } of workspaces.state().workspaces) {
       const claimsOf = held.get(id);
       if (
-        id === selected ||
+        (id === selected && selectedLoaded()) ||
         claimsOf === undefined ||
         workspaces.ownMemberId(id) !== claimsOf.ownMemberId
       ) {
@@ -288,20 +329,47 @@ export function createClaimMarkService(
 
   // The reads.
 
-  /** Reads the next workspace of the queue, one read at a time. */
+  /**
+   * Reads the next workspace of the queue, one read at a time, and not
+   * before `readIntervalMs` after the start of the last read.
+   */
   function pump(): void {
-    if (closed || inFlight !== null || cancelRetry !== null) {
+    if (
+      closed ||
+      inFlight !== null ||
+      cancelRetry !== null ||
+      cancelPace !== null
+    ) {
       return;
     }
-    let next = queue.shift();
-    while (next !== undefined) {
-      // The claim service reads the selected workspace.
-      if (next !== selected && mayRead(next)) {
-        send(next);
-        return;
-      }
-      next = queue.shift();
+    let next = queue[0];
+    // The claim service reads the selected workspace.
+    while (next !== undefined && (next === selected || !mayRead(next))) {
+      queue.shift();
+      next = queue[0];
     }
+    if (next === undefined) {
+      return;
+    }
+    const wait = lastStart === null ? 0 : lastStart + readIntervalMs - now();
+    if (wait > 0) {
+      // A newer answer of the list during the wait replaces the queue; the
+      // pace stays.
+      cancelPace = schedule(() => {
+        run(() => {
+          cancelPace = null;
+          pump();
+        });
+      }, wait);
+      return;
+    }
+    queue.shift();
+    send(next);
+  }
+
+  function stopPace(): void {
+    cancelPace?.();
+    cancelPace = null;
   }
 
   function send(workspaceId: WorkspaceId): void {
@@ -310,6 +378,7 @@ export function createClaimMarkService(
       return;
     }
     inFlight = workspaceId;
+    lastStart = now();
     const sent = epoch;
     void account
       .readWorkspaceData("listClaims", { workspaceId })
@@ -332,8 +401,10 @@ export function createClaimMarkService(
       return;
     }
     inFlight = null;
-    if (sent !== epoch) {
-      // A newer answer of the list came meanwhile: its own reads follow.
+    if (sent !== epoch || workspaceId === selected) {
+      // A newer answer of the list came meanwhile, and its own reads
+      // follow; or the workspace was selected meanwhile, and the claim
+      // service holds its claims: nothing is held, dropped, or retried.
       pump();
       return;
     }
@@ -345,10 +416,7 @@ export function createClaimMarkService(
       return;
     }
     attempt = 0;
-    if (
-      workspaceId !== selected &&
-      workspaces.ownMemberId(workspaceId) === ownMemberId
-    ) {
+    if (workspaces.ownMemberId(workspaceId) === ownMemberId) {
       hold(
         workspaceId,
         ownMemberId,
@@ -489,6 +557,7 @@ export function createClaimMarkService(
       }
       listeners.clear();
       stopRetry();
+      stopPace();
     },
   });
 }

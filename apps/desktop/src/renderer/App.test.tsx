@@ -738,7 +738,7 @@ test("the sidebar's People item carries the marker while the selected workspace'
   }
 });
 
-test("the sidebar's workspace list marks each other workspace that the main process names, with the people item's dot and an accessible name, and the selected one by its own claims", () => {
+test("the sidebar's workspace list marks each other workspace that the main process names, with the people item's dot and an accessible name, and the selected one by its own claims once they loaded", () => {
   const calls: string[] = [];
   const claimMarks: ClaimMarksBridge = {
     getState: () => {
@@ -814,6 +814,18 @@ test("the sidebar's workspace list marks each other workspace that the main proc
   });
   expect(seenSelected).toContain(plainB);
   expect(seenSelected).not.toContain("nav-marker");
+  // While the claims are still another workspace's, as before the main
+  // process followed a switch, the marks keep the selected workspace's dot.
+  const switching = render({
+    claims,
+    claimMarks,
+    initialClaimsState: { ...unseen, workspaceId: "workspace-a" },
+    initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-b"] },
+  });
+  expect(switching).toContain(
+    '<button type="button" class="nav-item" dir="auto" aria-current="true" aria-label="Workspace B, new claims">Workspace B<span class="nav-marker" aria-hidden="true"></span></button>',
+  );
+  expect(switching).toContain(plainA);
 
   // No marks, no state yet, and a signed-out device mark nothing.
   for (const props of [

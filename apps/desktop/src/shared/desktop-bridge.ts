@@ -670,11 +670,12 @@ export interface ClaimsBridge {
 }
 
 /**
- * Which workspaces of the list, other than the selected one, hold a claim
- * that the account has not seen (#271), so that the sidebar can mark them:
- * the main process reads their recent claims where the account is the
- * owner or an admin and compares them with the seen claims kept on this
- * device. Only the workspace IDs cross, never a claim or a user ID. Read
+ * Which workspaces of the list hold a claim that the account has not seen
+ * (#271), so that the sidebar can mark them: the main process reads the
+ * recent claims of the other workspaces where the account is the owner or
+ * an admin, one read a second at most, and compares them with the seen
+ * claims kept on this device. The selected workspace is named only until
+ * its claims have loaded or failed to, with the mark held for it before. Only the workspace IDs cross, never a claim or a user ID. Read
  * only: it takes nothing from the renderer.
  */
 export interface ClaimMarksBridge {
