@@ -177,6 +177,17 @@ export {
   type RenameProjectResult,
 } from "./projects.ts";
 export {
+  listRepositories,
+  type ListRepositoriesInput,
+  type ListRepositoriesResult,
+  registerRepository,
+  type RegisterRepositoryInput,
+  type RegisterRepositoryResult,
+  removeRepository,
+  type RemoveRepositoryInput,
+  type RemoveRepositoryResult,
+} from "./repositories.ts";
+export {
   listChatMessages,
   type ListChatMessagesInput,
   type ListChatMessagesResult,

@@ -389,6 +389,8 @@ test("each route answers only known error codes, the common ones included", () =
     "unsupported_account",
     "sign_in_unavailable",
     "sign_in_code_used",
+    // The limit of repositories in a project has its own route (#286).
+    "repository_limit",
     // The limits of projects and active devices have their own routes (#255).
     "project_limit",
     "device_limit",

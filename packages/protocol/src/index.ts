@@ -14,3 +14,4 @@ export * from "./grant-scope.ts";
 export * from "./grant.ts";
 export * from "./grant-api.ts";
 export * from "./project-api.ts";
+export * from "./repository-api.ts";
