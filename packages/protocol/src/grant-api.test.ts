@@ -394,10 +394,10 @@ test("the README's grant route table lists every grant route with its codes", ()
   }
   assert.deepEqual(Object.keys(table), Object.keys(GRANT_ROUTES));
   assert.deepEqual(table, specificCodes());
-  // The documentation says that the records are read in one transaction.
+  // The documentation says that the records are read from one snapshot.
   assert.equal(
     section.includes(
-      "- The records of one answer are read in one transaction, so the answer is one consistent read (P-76).",
+      "- The records of one answer are read from one snapshot (one statement, or a REPEATABLE READ transaction), so the answer is one consistent read (P-76).",
     ),
     true,
   );

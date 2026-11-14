@@ -35,10 +35,11 @@ export const GRANT_ROUTES = Object.freeze({
   /**
    * The grant records of the agents that the calling device hosts: every
    * grant of those agents that is not revoked, each with the facts that the
-   * check needs (`GrantRecord`), all read in one transaction, so that the
-   * answer is one consistent read (ADR 0015, P-76). Any signed-in device; a
-   * device that hosts no agent gets an empty list. The server never cuts
-   * this list (`GRANT_COUNT_LIMITS`).
+   * check needs (`GrantRecord`), all read from one snapshot (one statement,
+   * or a REPEATABLE READ transaction), so that the answer is one consistent
+   * read (ADR 0015, P-76). Any signed-in device; a device that hosts no
+   * agent gets an empty list. The server never cuts this list
+   * (`GRANT_COUNT_LIMITS`).
    */
   listGrantRecords: route("GET", "/grant-records"),
   /**
@@ -88,11 +89,12 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  *   not the agent's host. Every member already sees the project's agents,
  *   so the code tells nothing new.
  * - `conflict`: what the request names exists, but is not in the state that
- *   the action needs. For a grant: a disabled agent, a revoked host device,
- *   an archived repository, project, or workspace, a removed provider
+ *   the action needs. For a grant: a disabled agent, a revoked host device
+ *   (only if a device other than the host may grant; a revoked device cannot
+ *   call), an archived repository, project, or workspace, a removed provider
  *   connection, a grant of the same capability on the same scope that is
- *   neither revoked nor expired, or a count limit of `GRANT_COUNT_LIMITS`.
- *   For a revocation: a grant that is already revoked.
+ *   neither revoked nor expired, or a count limit of `GRANT_COUNT_LIMITS`. For
+ *   a revocation: a grant that is already revoked.
  *
  * Provisional (#75): the codes. No route adds a code to `API_ERROR_STATUS`;
  * a count limit answers `conflict` until a code of its own is decided.
@@ -198,7 +200,7 @@ export type GrantCapabilityResponse = z.infer<
 
 /**
  * The answer of `GET /grant-records`: the grant records of the agents that
- * the calling device hosts, read in one transaction (ADR 0015, P-76). The
+ * the calling device hosts, read from one snapshot (ADR 0015, P-76). The
  * enforcement point passes them to `hasGrant` of `@mymandev/permissions` as
  * they are, and never merges them with records of another read.
  *
@@ -208,12 +210,13 @@ export type GrantCapabilityResponse = z.infer<
  * - a grant is listed once;
  * - no listed grant is revoked, so `revokedByUserId` is always null;
  * - the answer names one device: every agent fact, host device fact, and
- *   provider connection fact carries the same device ID, the calling
- *   device's;
+ *   provider connection fact carries the same device ID;
  * - the answer names one account: every grant was granted by the same
  *   account, and every membership fact is that account's. Only the owner
- *   grants (P-44) and the host device is the owner's, so it is the caller's
- *   own account.
+ *   grants (P-44) and the host device is the owner's.
+ *
+ * The schema cannot know the caller. Whoever reads the answer compares that
+ * one device and that one account with its own session.
  *
  * Provisional (#75): revoked grants are left out. An expired grant stays
  * listed until it is revoked; the device's own clock decides expiry.
