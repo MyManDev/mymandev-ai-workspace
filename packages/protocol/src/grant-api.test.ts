@@ -25,6 +25,7 @@ import {
   GrantCapabilityResponseSchema,
   GrantRecordListResponseSchema,
   type GrantRouteName,
+  SHELL_GRANT_MAX_LIFETIME_SECONDS,
   WorkspaceGrantSchema,
 } from "./grant-api.ts";
 import { CAPABILITY_SCOPE } from "./grant-scope.ts";
@@ -403,9 +404,12 @@ test("the README's grant route table lists every grant route with its codes", ()
   );
 });
 
-test("a lifetime is 1 minute to 365 days, and the count limits keep the record list whole", () => {
+test("a lifetime is 1 minute to 365 days, at most 30 days for a shell, and the count limits keep the record list whole", () => {
   assert.deepEqual(GRANT_LIFETIME_SECONDS, { min: 60, max: 31_536_000 });
   assert.equal(GRANT_LIFETIME_SECONDS.max, 365 * 24 * 60 * 60);
+  assert.equal(SHELL_GRANT_MAX_LIFETIME_SECONDS, 30 * 24 * 60 * 60);
+  assert.ok(SHELL_GRANT_MAX_LIFETIME_SECONDS > GRANT_LIFETIME_SECONDS.min);
+  assert.ok(SHELL_GRANT_MAX_LIFETIME_SECONDS < GRANT_LIFETIME_SECONDS.max);
   assert.deepEqual(GRANT_COUNT_LIMITS, { perAgent: 100, perHostDevice: 1_000 });
   // Every grant of a device that is not revoked fits in one answer.
   assert.equal(GRANT_COUNT_LIMITS.perHostDevice, MAX_ANSWER_LIST_ITEMS);
@@ -417,7 +421,9 @@ test("a lifetime is 1 minute to 365 days, and the count limits keep the record l
 test("a grant takes one capability, exactly the scope of its kind, and a lifetime or an explicit null", () => {
   for (const capability of CAPABILITIES) {
     const [own, other] = scopeKeys(capability);
-    for (const lifetimeSeconds of [null, 60, 3_600, 31_536_000]) {
+    for (const lifetimeSeconds of capability === "terminal.execute"
+      ? [60, 3_600, SHELL_GRANT_MAX_LIFETIME_SECONDS]
+      : [null, 60, 3_600, 31_536_000]) {
       const input = body(capability, { lifetimeSeconds });
       assert.deepEqual(
         GrantCapabilityRequestSchema.safeParse(input).data,
@@ -500,15 +506,49 @@ test("a grant takes one capability, exactly the scope of its kind, and a lifetim
   }
 });
 
-test("no capability requires an expiry, terminal.execute included, but a grant without one says so (provisional, ADR 0015 P-71)", () => {
-  for (const capability of CAPABILITIES) {
+test("a grant of terminal.execute requires an expiry of at most 30 days, and the other capabilities may have none (#75, ADR 0015 P-71)", () => {
+  const shell = "terminal.execute";
+  const thirtyDays = 30 * 24 * 60 * 60;
+  assert.deepEqual(
+    GrantCapabilityRequestSchema.parse(
+      body(shell, { lifetimeSeconds: thirtyDays }),
+    ),
+    body(shell, { lifetimeSeconds: thirtyDays }),
+  );
+  for (const [label, input] of [
+    ["a null lifetime", body(shell, { lifetimeSeconds: null })],
+    ["no lifetime", without(body(shell), "lifetimeSeconds")],
+    ["an undefined lifetime", body(shell, { lifetimeSeconds: undefined })],
+    ["30 days and 1 second", body(shell, { lifetimeSeconds: thirtyDays + 1 })],
+    ["365 days", body(shell, { lifetimeSeconds: 31_536_000 })],
+  ] as const) {
+    const result = GrantCapabilityRequestSchema.safeParse(input);
+    assert.equal(result.success, false, label);
     assert.deepEqual(
-      GrantCapabilityRequestSchema.parse(
-        body(capability, { lifetimeSeconds: null }),
-      ),
-      body(capability, { lifetimeSeconds: null }),
-      capability,
+      result.error?.issues.map((issue) => issue.path),
+      [["lifetimeSeconds"]],
+      label,
     );
+  }
+  // A refused lifetime is not echoed: the issues name the bound only.
+  for (const lifetimeSeconds of [thirtyDays + 1, 987_654_321]) {
+    const result = GrantCapabilityRequestSchema.safeParse(
+      body(shell, { lifetimeSeconds }),
+    );
+    const text = `${result.error?.message ?? ""} ${JSON.stringify(result.error?.issues)}`;
+    assert.equal(result.success, false, String(lifetimeSeconds));
+    assert.equal(text.includes(String(lifetimeSeconds)), false, text);
+  }
+  for (const capability of CAPABILITIES.filter((name) => name !== shell)) {
+    for (const lifetimeSeconds of [null, thirtyDays + 1]) {
+      assert.deepEqual(
+        GrantCapabilityRequestSchema.parse(
+          body(capability, { lifetimeSeconds }),
+        ),
+        body(capability, { lifetimeSeconds }),
+        `${capability} for ${lifetimeSeconds}`,
+      );
+    }
     assert.equal(
       GrantCapabilityRequestSchema.safeParse(
         without(body(capability), "lifetimeSeconds"),

@@ -104,9 +104,12 @@ export const SHELL_STATEMENTS: readonly Statement[] = Object.freeze([
 ]);
 
 // OPEN QUESTION for the Project Manager (#77, ADR 0015 P-71): the default
-// expiry that the grant of `terminal.execute` proposes, which the person can
-// change or remove, is not decided. Neither this text nor the model holds one
-// yet.
+// expiry that the grant of `terminal.execute` proposes is not decided.
+// Neither this text nor the model holds one yet. Its bound is decided: since
+// the decision of 2026-11-14 (#75), a grant of `terminal.execute` requires an
+// expiry of at most 30 days (`SHELL_GRANT_MAX_LIFETIME_SECONDS` of
+// `@mymandev/protocol`), so the person can change the proposed expiry within
+// that bound but not remove it.
 
 /**
  * The confirmation that a highest-risk capability needs before it is granted
