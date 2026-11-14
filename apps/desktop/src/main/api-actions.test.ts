@@ -527,6 +527,9 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     sign_in_code_used: "failed",
     unclaimed_limit: "unclaimed_limit",
     project_limit: "project_limit",
+    // No write of the desktop creates a run yet (#35).
+    run_limit: "failed",
+    run_daily_limit: "failed",
     // No write of the desktop registers a repository yet (#286).
     repository_limit: "failed",
     // Only the sign-in answers it, never a write (#255).

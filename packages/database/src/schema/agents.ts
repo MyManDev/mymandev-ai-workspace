@@ -4,6 +4,7 @@ import type {
   CorrelationId,
   DeviceId,
   EventId,
+  MessageId,
   PermissionGrantId,
   ProjectId,
   ProviderConnectionId,
@@ -14,6 +15,7 @@ import type {
 } from "@mymandev/protocol";
 import { sql } from "drizzle-orm";
 import {
+  type AnyPgColumn,
   check,
   foreignKey,
   index,
@@ -24,6 +26,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import { createdAt, nullableTimestamp, updatedAt } from "./columns.ts";
+import { messages } from "./conversations.ts";
 import { devices, users } from "./identity.ts";
 import { providerConnections } from "./providers.ts";
 import { projects, repositories } from "./workspaces.ts";
@@ -73,6 +76,10 @@ export const agents = pgTable(
 /**
  * One run of an agent. The server creates runs; a retry is a new run linked
  * through `correlation_id`. The transition rules live in the protocol.
+ *
+ * A run that a request created (#35) names the provider connection that it
+ * uses and its input, a chat message; a run of the development seed has
+ * neither. No writer changes either column after the insert.
  */
 export const agentRuns = pgTable(
   "agent_runs",
@@ -99,6 +106,24 @@ export const agentRuns = pgTable(
     createdAt: createdAt(),
     startedAt: nullableTimestamp("started_at"),
     finishedAt: nullableTimestamp("finished_at"),
+    /** The provider connection that the run uses, a connection of its agent's host device (ADR 0015). */
+    providerConnectionId: uuid("provider_connection_id")
+      .$type<ProviderConnectionId>()
+      .references(() => providerConnections.id, { onDelete: "restrict" }),
+    /**
+     * The host device of the run's agent, recorded for composite foreign
+     * keys, exactly when the run names a provider connection.
+     */
+    hostDeviceId: uuid("host_device_id").$type<DeviceId>(),
+    /**
+     * The run's input: a chat message. That it is a message of the chat of
+     * the run's project is the writer's rule: a message records its
+     * conversation, not its project. The return type breaks the cycle of
+     * the two schema files, as `messages` names `agents`.
+     */
+    inputMessageId: uuid("input_message_id")
+      .$type<MessageId>()
+      .references((): AnyPgColumn => messages.id, { onDelete: "restrict" }),
   },
   (t) => [
     index("agent_runs_agent_id_created_at_idx").on(t.agentId, t.createdAt),
@@ -135,6 +160,27 @@ export const agentRuns = pgTable(
       name: "agent_runs_repository_project_fk",
       columns: [t.repositoryId, t.projectId],
       foreignColumns: [repositories.id, repositories.projectId],
+    }).onDelete("restrict"),
+    // The host device is recorded exactly when the run names a provider
+    // connection, so that the two foreign keys below always apply to one.
+    check(
+      "agent_runs_provider_connection_check",
+      sql`(${t.providerConnectionId} is null) = (${t.hostDeviceId} is null)`,
+    ),
+    // host_device_id is the host device of the run's agent.
+    foreignKey({
+      name: "agent_runs_agent_host_device_fk",
+      columns: [t.agentId, t.hostDeviceId],
+      foreignColumns: [agents.id, agents.hostDeviceId],
+    }).onDelete("restrict"),
+    // The provider connection, when set, is on the agent's host device.
+    foreignKey({
+      name: "agent_runs_provider_connection_device_fk",
+      columns: [t.providerConnectionId, t.hostDeviceId],
+      foreignColumns: [
+        providerConnections.id,
+        providerConnections.hostDeviceId,
+      ],
     }).onDelete("restrict"),
   ],
 );

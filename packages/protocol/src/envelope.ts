@@ -4,6 +4,7 @@ import {
   MemberRoleSchema,
   WorkspaceMemberSchema,
 } from "./account.ts";
+import { AgentRunListItemSchema } from "./agent-api.ts";
 import {
   ChatMessageSchema,
   displayText,
@@ -92,6 +93,13 @@ export const envelopeHeaderShape = Object.freeze({
  * `RUN_CANCEL_REASONS` comes only from the server (`runReasonAllowed`): a
  * transition from the agent with one gets `event.refused` with `conflict`,
  * also when it resends a recorded event ID.
+ *
+ * The event with which the server creates a run (#35) also carries `run`,
+ * the new run as the run list shows it to every member of the workspace:
+ * its project, its input message, and the time of its creation, which the
+ * other fields of the payload do not hold. No other event carries it, and
+ * it never names the run's provider connection, which only the account
+ * that owns the run's agent reads, from the run list.
  */
 export const AgentRunStateChangedPayloadSchema = z
   .object({
@@ -102,6 +110,8 @@ export const AgentRunStateChangedPayloadSchema = z
     previousState: RunStateSchema.nullable(),
     state: RunStateSchema,
     reason: displayText(LIMITS.runReason).optional(),
+    /** Only in a run's creation: the new run, as every member sees it. */
+    run: AgentRunListItemSchema.optional(),
   })
   .superRefine((payload, ctx) => {
     if (!canTransition(payload.previousState, payload.state)) {
@@ -109,6 +119,38 @@ export const AgentRunStateChangedPayloadSchema = z
         code: "custom",
         message: "Illegal run state transition",
         path: ["state"],
+      });
+    }
+    const { run } = payload;
+    if (run === undefined) {
+      return;
+    }
+    if (payload.previousState !== null) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Only a run's creation carries the run",
+        path: ["run"],
+      });
+      return;
+    }
+    if (
+      run.id !== payload.runId ||
+      run.agentId !== payload.agentId ||
+      run.state !== payload.state ||
+      (run.repositoryId ?? undefined) !== payload.repositoryId ||
+      (run.reason ?? undefined) !== payload.reason
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "The run differs from the event's payload",
+        path: ["run"],
+      });
+    }
+    if (run.providerConnectionId !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: "An event never names a run's provider connection",
+        path: ["run", "providerConnectionId"],
       });
     }
   });

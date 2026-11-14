@@ -224,10 +224,12 @@ test("every API error code has its fixed HTTP status", () => {
     sign_in_code_used: 409,
     unclaimed_limit: 409,
     project_limit: 409,
+    run_limit: 409,
     repository_limit: 409,
     device_limit: 409,
     device_daily_limit: 429,
     rate_limited: 429,
+    run_daily_limit: 429,
     internal_error: 500,
     sign_in_unavailable: 503,
   });
