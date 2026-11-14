@@ -12,6 +12,10 @@ import {
   UtcTimestampSchema,
 } from "./entities.ts";
 import {
+  AgentGrantCreatedPayloadSchema,
+  AgentGrantRevokedPayloadSchema,
+} from "./grant-api.ts";
+import {
   AgentIdSchema,
   CorrelationIdSchema,
   DeviceIdSchema,
@@ -345,6 +349,47 @@ export const WorkspaceJoinRequestUnblockedEventSchema = z.object({
   payload: z.object({ joinRequestId: JoinRequestIdSchema }),
 });
 
+// Grant events (#75; ADR 0015, P-80): the grants of the agents of a
+// workspace, which every member sees. Only the server originates them, after
+// the commit, with a `system` actor and `deviceId: null`, like the membership
+// events (see `actorAllowed`), and sends them to every connection subscribed
+// to the workspace. They name no account and no device data
+// (`WorkspaceGrantSchema`), and they never carry the facts of a grant
+// record, so a record is never built from an event: the agent's host device
+// takes its records from `GET /grant-records`.
+
+/**
+ * The agent's owner granted the agent a capability. The payload is the new
+ * grant as members see it. A grant that replaces an expired grant of the
+ * same capability and scope comes after the `agent.grant.revoked` of the
+ * expired one.
+ */
+export const AgentGrantCreatedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("agent.grant.created"),
+  payload: AgentGrantCreatedPayloadSchema,
+});
+export type AgentGrantCreatedEvent = z.infer<
+  typeof AgentGrantCreatedEventSchema
+>;
+
+/**
+ * A grant was revoked: by the agent's owner, or by a change that revokes
+ * the grants it affects in its own transaction (ADR 0015, P-77), such as a
+ * device revocation or the removal of a person. One event reports exactly
+ * one grant, so a change that revokes several grants sends one event for
+ * each of them. An expiry sends no event: a receiver drops a grant at its
+ * `expiresAt`.
+ */
+export const AgentGrantRevokedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("agent.grant.revoked"),
+  payload: AgentGrantRevokedPayloadSchema,
+});
+export type AgentGrantRevokedEvent = z.infer<
+  typeof AgentGrantRevokedEventSchema
+>;
+
 // Chat events (#110). A project's chat has one stream of messages; the
 // events name the project, and the server finds the conversation that holds
 // it. Storing messages and the history route belong to #27.
@@ -405,6 +450,8 @@ export const ProtocolEventSchema = z.discriminatedUnion("type", [
   WorkspaceJoinRequestCreatedEventSchema,
   WorkspaceJoinRequestResolvedEventSchema,
   WorkspaceJoinRequestUnblockedEventSchema,
+  AgentGrantCreatedEventSchema,
+  AgentGrantRevokedEventSchema,
   ChatMessageSendEventSchema,
   ChatMessageCreatedEventSchema,
 ]);
@@ -425,6 +472,8 @@ export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
   "workspace.join_request.created",
   "workspace.join_request.resolved",
   "workspace.join_request.unblocked",
+  "agent.grant.created",
+  "agent.grant.revoked",
   "chat.message.created",
 ] as const satisfies readonly EventType[]);
 export type ServerOnlyEventType = (typeof SERVER_ONLY_EVENT_TYPES)[number];
@@ -482,6 +531,8 @@ export const SERVER_EVENT_AUDIENCES = Object.freeze({
   "workspace.join_request.created": "approvers",
   "workspace.join_request.resolved": "approvers",
   "workspace.join_request.unblocked": "approvers",
+  "agent.grant.created": "members",
+  "agent.grant.revoked": "members",
   "chat.message.created": "members",
 } as const satisfies {
   readonly [Type in ServerEventType]: Type extends ApproverEventType
@@ -532,6 +583,10 @@ export function actorAllowed(event: ProtocolEvent): boolean {
     case "chat.message.created":
       // Only the server reports membership, project, and join request
       // changes and stored messages.
+      return event.actor.kind === "system" && event.deviceId === null;
+    case "agent.grant.created":
+    case "agent.grant.revoked":
+      // Only the server reports a grant and a revocation (#75).
       return event.actor.kind === "system" && event.deviceId === null;
     case "chat.message.send":
       // A person sends from one of their devices; identity binding checks both.
