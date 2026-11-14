@@ -896,3 +896,23 @@ test("D2: no source of the people screen reaches the clipboard, a log, storage, 
 function withoutComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
 }
+
+test("#274: the invitations keep the focus after an action whose button left the page with a later state: the shared hook gets their dialogs, their running state, the people, and the invitations", () => {
+  const code = withoutComments(SOURCES["./InvitationActions.tsx"] ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/,? \)/g, ")");
+  expect(code).toContain(
+    'import { useTitleFocusAfterAction } from "./JoinRequests.tsx";',
+  );
+  // The dialogs are the question and the code's dialog.
+  expect(code).toContain(
+    "const open = actions.question !== undefined || actions.code !== undefined;",
+  );
+  expect(code).toContain(
+    "useTitleFocusAfterAction(trigger, open, actions.running, people, invitations);",
+  );
+  // The same button that the dialogs give the focus back to.
+  expect(code).toContain("const trigger = useRef<Element | null>(null);");
+  expect(code).toContain("trigger.current = button;");
+});

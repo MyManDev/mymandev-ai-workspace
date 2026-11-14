@@ -26,9 +26,12 @@ import {
   type InvitationActionRequest,
 } from "./invitations-view.ts";
 import {
+  decideFocusAfterState,
   focusOnButtonOrPage,
   JoinRequestQuestionContent,
+  rememberRunningButton,
   syncModal,
+  type ActionButtonRef,
   type JoinRequestActionHandlers,
 } from "./JoinRequests.tsx";
 import {
@@ -984,11 +987,106 @@ test("after a confirmed action, the focus moves on only while it is on the actio
   expect(focusOnButtonOrPage(field, body, null)).toBe(false);
 });
 
+test("#274: only an action that runs remembers its button; a question that sent nothing does not", () => {
+  const button = { isConnected: true };
+  const acted: ActionButtonRef = { current: null };
+  // A question is open, or it was cancelled: nothing ran.
+  rememberRunningButton(acted, false, button);
+  expect(acted.current).toBeNull();
+  rememberRunningButton(acted, true, button);
+  expect(acted.current).toBe(button);
+  // The action ended: its button stays remembered for the next state.
+  rememberRunningButton(acted, false, null);
+  expect(acted.current).toBe(button);
+  // The next action that runs replaces it.
+  const next = { isConnected: true };
+  rememberRunningButton(acted, true, next);
+  expect(acted.current).toBe(next);
+});
+
+test("#274: after a refused or uncertain action, the first state moves the focus to the title when the action's button left the page and the focus fell to the page, and the button is then forgotten", () => {
+  const body = { name: "body" } as unknown as Element;
+  const field = { name: "field" } as unknown as Element;
+  const gone = () => ({ current: { isConnected: false } });
+  // The row left with this state, and the focus fell to the page or is nowhere.
+  for (const active of [body, null]) {
+    const acted: ActionButtonRef = gone();
+    expect(decideFocusAfterState(acted, false, false, active, body)).toBe(true);
+    // Once: a later state finds no button and moves nothing.
+    expect(acted.current).toBeNull();
+    expect(decideFocusAfterState(acted, false, false, active, body)).toBe(
+      false,
+    );
+  }
+  // Only from the page: the focus on another control stays, and the state
+  // has decided.
+  const elsewhere: ActionButtonRef = gone();
+  expect(decideFocusAfterState(elsewhere, false, false, field, body)).toBe(
+    false,
+  );
+  expect(elsewhere.current).toBeNull();
+  // The button is still on the page: the row stayed. The state has decided,
+  // so a later state that takes the row away moves nothing.
+  const button = { isConnected: true };
+  const stayed: ActionButtonRef = { current: button };
+  expect(decideFocusAfterState(stayed, false, false, body, body)).toBe(false);
+  expect(stayed.current).toBeNull();
+  button.isConnected = false;
+  expect(decideFocusAfterState(stayed, false, false, body, body)).toBe(false);
+  // No action ran.
+  expect(
+    decideFocusAfterState({ current: null }, false, false, body, body),
+  ).toBe(false);
+});
+
+test("#274: a state decides nothing while a dialog of the part is open or an action runs, and keeps the button for the state after it", () => {
+  const body = { name: "body" } as unknown as Element;
+  for (const [dialogOpen, running] of [
+    [true, false],
+    [false, true],
+    [true, true],
+  ] as const) {
+    const button = { isConnected: false };
+    const acted: ActionButtonRef = { current: button };
+    expect(decideFocusAfterState(acted, dialogOpen, running, body, body)).toBe(
+      false,
+    );
+    expect(acted.current).toBe(button);
+    // The dialog closed and the action ended: the next state decides.
+    expect(decideFocusAfterState(acted, false, false, body, body)).toBe(true);
+  }
+});
+
 // The sources of the join requests part, without the tests, as text.
 const SOURCES = import.meta.glob<string>(
   ["./JoinRequests.tsx", "./join-requests-view.ts"],
   { query: "?raw", import: "default", eager: true },
 );
+
+/** `source` without its comments, with every run of white space as one space and no space or comma inside a call's brackets. */
+function wiringOf(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/,? \)/g, ")");
+}
+
+test("#274: the hook remembers the button of the action that runs and lets only a new state of the people or of the list decide, and the join requests use it with their dialogs, their running state, and their two views", () => {
+  const code = wiringOf(SOURCES["./JoinRequests.tsx"] ?? "");
+  expect(code).toContain(
+    "export function useTitleFocusAfterAction(trigger: RefObject<Element | null>, dialogOpen: boolean, running: boolean, people: PeopleScreenView, list: unknown): void { const acted = useRef<Element | null>(null); useEffect(() => rememberRunningButton(acted, running, trigger.current), [running, trigger]); useEffect(() => { if (decideFocusAfterState(acted, dialogOpen, running, document.activeElement, document.body)) { focusTitle(); } }, [people, list]); }",
+  );
+  // The dialogs are the question and the code's dialog.
+  expect(code).toContain("const open = joinRequestDialogsOpen(actions);");
+  expect(code).toContain(
+    "useTitleFocusAfterAction(trigger, open, actions.running, people, joinRequests);",
+  );
+  // The same button that the dialogs give the focus back to.
+  expect(code).toContain("const trigger = useRef<Element | null>(null);");
+  expect(code).toContain("trigger.current = button;");
+});
 
 test("D2: no source of the join requests part reaches the clipboard, a log, storage, or another window, so the code goes nowhere but its field", () => {
   expect(Object.keys(SOURCES).sort()).toEqual([
