@@ -28,6 +28,7 @@ import {
   type InvitationsModel,
   type InvitationsScreenView,
 } from "./invitations-view.ts";
+import { useTitleFocusAfterAction } from "./JoinRequests.tsx";
 import { PEOPLE_TITLE_ID } from "./PeopleActions.tsx";
 import {
   clockDelay,
@@ -554,7 +555,11 @@ function focusAfterAction(done: boolean, button: Element | null): void {
  * every reading of the clock `now`; undefined handlers without both
  * bridges. A question remembers the button that opened it, which the
  * dialogs give the focus back to; when a dialog closes after that button
- * left the page, the focus moves to the screen's title.
+ * left the page, the focus moves to the screen's title. After an action
+ * that ran, also a refused or uncertain one, the focus moves there too once
+ * its button left the page, with a state of the people or of the
+ * invitations, and the focus fell to the page (`useTitleFocusAfterAction`,
+ * #274).
  */
 export function useInvitationActions(
   bridge: InvitationActionsBridge | undefined,
@@ -594,6 +599,7 @@ export function useInvitationActions(
     }
     wasOpen.current = open;
   }, [open]);
+  useTitleFocusAfterAction(trigger, open, actions.running, people, invitations);
   const onStart = useCallback(
     (request: InvitationActionRequest, button: Element | null) => {
       trigger.current = button;
