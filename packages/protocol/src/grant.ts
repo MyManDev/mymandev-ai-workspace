@@ -1,0 +1,163 @@
+// The shape of a permission grant and of a grant record (ADR 0015). Moved
+// here from `@mymandev/permissions` with #75, because whole grants and grant
+// records travel on the wire (`grant-api.ts`) and this package can never
+// import the permissions package. `@mymandev/permissions` re-exports these
+// schemas and types under the same names and still owns the only checks,
+// `isGrantActive` and `hasGrant`: this package exports no capability check.
+
+import * as z from "zod";
+import { CapabilitySchema, UtcTimestampSchema } from "./entities.ts";
+import {
+  CAPABILITY_SCOPE,
+  type ProviderConnectionCapability,
+  type RepositoryCapability,
+} from "./grant-scope.ts";
+import {
+  AgentIdSchema,
+  DeviceIdSchema,
+  PermissionGrantIdSchema,
+  ProjectIdSchema,
+  ProviderConnectionIdSchema,
+  RepositoryIdSchema,
+  UserIdSchema,
+  WorkspaceIdSchema,
+} from "./ids.ts";
+import { CAPABILITIES } from "./model.ts";
+
+// These lists stay private, so that the contract offers no ready-made bundle
+// of capabilities to grant together.
+const REPOSITORY_CAPABILITIES: readonly RepositoryCapability[] = Object.freeze(
+  CAPABILITIES.filter(
+    (capability): capability is RepositoryCapability =>
+      CAPABILITY_SCOPE[capability] === "repository",
+  ),
+);
+const PROVIDER_CONNECTION_CAPABILITIES: readonly ProviderConnectionCapability[] =
+  Object.freeze(
+    CAPABILITIES.filter(
+      (capability): capability is ProviderConnectionCapability =>
+        CAPABILITY_SCOPE[capability] === "provider_connection",
+    ),
+  );
+
+const RepositoryCapabilitySchema = CapabilitySchema.extract(
+  REPOSITORY_CAPABILITIES,
+);
+const ProviderConnectionCapabilitySchema = CapabilitySchema.extract(
+  PROVIDER_CONNECTION_CAPABILITIES,
+);
+
+// The fields of every grant except the capability and its scope. The names
+// equal the Drizzle property names of the permission_grants table.
+const grantHeaderShape = {
+  id: PermissionGrantIdSchema,
+  projectId: ProjectIdSchema,
+  granteeAgentId: AgentIdSchema,
+  grantedByUserId: UserIdSchema,
+  createdAt: UtcTimestampSchema,
+  /** null means that the grant does not expire. */
+  expiresAt: UtcTimestampSchema.nullable(),
+  revokedAt: UtcTimestampSchema.nullable(),
+  revokedByUserId: UserIdSchema.nullable(),
+};
+
+/**
+ * One grant gives one capability to one agent on exactly one scope: a
+ * repository, or a provider connection for `provider.use`. There is no
+ * wildcard, role or level. A grant never carries a credential.
+ *
+ * The refinement mirrors the database CHECK constraints: `revokedAt` and
+ * `revokedByUserId` are set together, and `expiresAt` is after `createdAt`.
+ * Unknown keys are stripped, so a grant that names both scopes keeps only the
+ * scope of its own capability.
+ *
+ * A whole grant names accounts (`grantedByUserId`, `revokedByUserId`). It
+ * travels only to the account that granted it: in the answer of the grant
+ * route and in the grant records of the calling device (`grant-api.ts`). The
+ * grant events carry `WorkspaceGrantSchema` instead.
+ */
+export const PermissionGrantSchema = z
+  .discriminatedUnion("capability", [
+    z.object({
+      ...grantHeaderShape,
+      capability: RepositoryCapabilitySchema,
+      repositoryId: RepositoryIdSchema,
+    }),
+    z.object({
+      ...grantHeaderShape,
+      capability: ProviderConnectionCapabilitySchema,
+      providerConnectionId: ProviderConnectionIdSchema,
+    }),
+  ])
+  .superRefine((grant, ctx) => {
+    if ((grant.revokedAt === null) !== (grant.revokedByUserId === null)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "revokedAt and revokedByUserId are set together",
+        path: ["revokedByUserId"],
+      });
+    }
+    if (
+      grant.expiresAt !== null &&
+      !(Date.parse(grant.expiresAt) > Date.parse(grant.createdAt))
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "expiresAt is after createdAt",
+        path: ["expiresAt"],
+      });
+    }
+  });
+export type PermissionGrant = z.infer<typeof PermissionGrantSchema>;
+
+/**
+ * The current state of the entities that decide whether a grant is active.
+ * Every fact names the entity it describes, so a fact about another entity
+ * makes the grant inactive.
+ *
+ * - `agent`: the grantee agent and its host device.
+ * - `hostDevice`: the agent's host device.
+ * - `project`: the grant's project and its workspace.
+ * - `grantorMembership`: the granting user's current membership in the
+ *   workspace of the grant's project, or null when there is none.
+ * - `providerConnection`: for a grant on a provider connection, that
+ *   connection and its host device (ADR 0015, P-82); null for a grant on a
+ *   repository.
+ */
+export const GrantFactsSchema = z.object({
+  agent: z.object({
+    id: AgentIdSchema,
+    hostDeviceId: DeviceIdSchema,
+    disabledAt: UtcTimestampSchema.nullable(),
+  }),
+  hostDevice: z.object({
+    id: DeviceIdSchema,
+    revokedAt: UtcTimestampSchema.nullable(),
+  }),
+  project: z.object({
+    id: ProjectIdSchema,
+    workspaceId: WorkspaceIdSchema,
+  }),
+  grantorMembership: z
+    .object({
+      workspaceId: WorkspaceIdSchema,
+      userId: UserIdSchema,
+      removedAt: UtcTimestampSchema.nullable(),
+    })
+    .nullable(),
+  providerConnection: z
+    .object({
+      id: ProviderConnectionIdSchema,
+      hostDeviceId: DeviceIdSchema,
+      removedAt: UtcTimestampSchema.nullable(),
+    })
+    .nullable(),
+});
+export type GrantFacts = z.infer<typeof GrantFactsSchema>;
+
+/** A grant together with the facts it is judged on, read together. */
+export const GrantRecordSchema = z.object({
+  grant: PermissionGrantSchema,
+  facts: GrantFactsSchema,
+});
+export type GrantRecord = z.infer<typeof GrantRecordSchema>;

@@ -750,6 +750,9 @@ test("membership events come only from the server, with a system actor and no de
         "workspace.join_request.created",
         "workspace.join_request.resolved",
         "workspace.join_request.unblocked",
+        // The grant events are tested in `grant-api.test.ts`.
+        "agent.grant.created",
+        "agent.grant.revoked",
       ])
       .sort(),
   );
