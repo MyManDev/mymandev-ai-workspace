@@ -6,11 +6,15 @@
 // is not an active member of both answer `404` and `not_found`, so that a
 // route never tells them apart.
 //
+// Decided by the Project Manager on 2026-11-14 (#75): only the agent's host
+// device may grant, a grant of `terminal.execute` expires within 30 days, the
+// record list leaves revoked grants out, and a record has no repository fact.
+//
 // Provisional (#75): the Project Manager's decisions leave open the paths,
-// the error codes, the limits, the lifetime field, which device may grant,
-// whether the list holds revoked grants, and the event payloads. Each such
-// choice below is the conservative one and is marked "Provisional"; the
-// README lists them with their alternatives under "Open decisions".
+// the error codes, the count limits, the bounds of a lifetime, and the event
+// payloads. Each such choice below is the conservative one and is marked
+// "Provisional"; the README lists them with their alternatives under "Open
+// decisions".
 
 import * as z from "zod";
 import type { ApiRoute } from "./auth-api.ts";
@@ -44,12 +48,13 @@ export const GRANT_ROUTES = Object.freeze({
   listGrantRecords: route("GET", "/grant-records"),
   /**
    * Grants one capability on one scope to an agent and answers the new
-   * grant. The agent's owner only (ADR 0013, P-44). Provisional (#75): from
-   * the agent's host device only, so that no other device of the account,
-   * for example one that a taken-over GitHub account registered, can grant a
-   * shell on this one. A grant of the same capability on the same scope
-   * that is neither revoked nor expired answers `conflict`; an expired one
-   * is revoked and replaced in the same transaction (ADR 0015, P-77).
+   * grant. The agent's owner only (ADR 0013, P-44), and only from the agent's
+   * host device (#75, decision of 2026-11-14), so that no other device of the
+   * account, for example one that a taken-over GitHub account registered,
+   * can grant a shell on this one. A grant of the same capability on the
+   * same scope that is neither revoked nor expired answers `conflict`; an
+   * expired one is revoked and replaced in the same transaction (ADR 0015,
+   * P-77).
    */
   grantCapability: route("POST", "/agents/:agentId/grants"),
   /**
@@ -89,12 +94,11 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  *   not the agent's host. Every member already sees the project's agents,
  *   so the code tells nothing new.
  * - `conflict`: what the request names exists, but is not in the state that
- *   the action needs. For a grant: a disabled agent, a revoked host device
- *   (only if a device other than the host may grant; a revoked device cannot
- *   call), an archived repository, project, or workspace, a removed provider
- *   connection, a grant of the same capability on the same scope that is
- *   neither revoked nor expired, or a count limit of `GRANT_COUNT_LIMITS`. For
- *   a revocation: a grant that is already revoked.
+ *   the action needs. For a grant: a disabled agent, an archived repository,
+ *   project, or workspace, a removed provider connection, a grant of the same
+ *   capability on the same scope that is neither revoked nor expired, or a
+ *   count limit of `GRANT_COUNT_LIMITS`. For a revocation: a grant that is
+ *   already revoked.
  *
  * Provisional (#75): the codes. No route adds a code to `API_ERROR_STATUS`;
  * a count limit answers `conflict` until a code of its own is decided.
@@ -107,15 +111,23 @@ export const GRANT_ROUTE_ERRORS = Object.freeze({
 
 /**
  * How long a grant with an expiry may live, in seconds: from 1 minute to 365
- * days. Provisional (#75): ADR 0015 (P-71) sets no maximum and requires no
- * expiry, also for `terminal.execute`; these bounds only keep a lifetime
- * that is sent sensible, and a grant that must live longer is granted
- * without an expiry.
+ * days. Provisional (#75): ADR 0015 (P-71) sets no maximum for the other
+ * capabilities; these bounds only keep a lifetime that is sent sensible, and
+ * a grant that must live longer is granted without an expiry.
+ * `terminal.execute` has its own maximum, `SHELL_GRANT_MAX_LIFETIME_SECONDS`.
  */
 export const GRANT_LIFETIME_SECONDS = Object.freeze({
   min: 60,
   max: 31_536_000,
 } as const);
+
+/**
+ * The longest lifetime of a grant of `terminal.execute`, in seconds: 30 days.
+ * Such a grant always has an expiry, from `GRANT_LIFETIME_SECONDS.min` to
+ * this value (#75, decision of 2026-11-14, which narrows ADR 0015, P-71, for
+ * the shell only). The database holds the same maximum with a CHECK.
+ */
+export const SHELL_GRANT_MAX_LIFETIME_SECONDS = 2_592_000;
 
 /**
  * How many grants that are not revoked may exist: at most 100 for one agent,
@@ -143,6 +155,14 @@ const grantLifetime = () =>
     .max(GRANT_LIFETIME_SECONDS.max)
     .nullable();
 
+/**
+ * The lifetime of a new grant of `terminal.execute`: an integer number of
+ * seconds from `GRANT_LIFETIME_SECONDS.min` to
+ * `SHELL_GRANT_MAX_LIFETIME_SECONDS`, never null.
+ */
+const shellGrantLifetime = () =>
+  z.int().min(GRANT_LIFETIME_SECONDS.min).max(SHELL_GRANT_MAX_LIFETIME_SECONDS);
+
 // The two forms of a grant, on a repository and on a provider connection.
 // The schemas below pick their fields from these, so that a field of a
 // request or of an event is always the grant's own field.
@@ -159,14 +179,26 @@ const [RepositoryGrantSchema, ProviderConnectionGrantSchema] =
  *
  * `lifetimeSeconds` is required and has no default: the server sets
  * `expiresAt` to its own time plus the lifetime, and null grants without an
- * expiry. Provisional (#75): no capability requires an expiry (ADR 0015,
- * P-71), but a grant without one is always an explicit null, never a
+ * expiry. A grant of `terminal.execute` requires an expiry of at most 30 days
+ * (`SHELL_GRANT_MAX_LIFETIME_SECONDS`; #75, decision of 2026-11-14, which
+ * narrows ADR 0015, P-71, for the shell only). The other capabilities need
+ * no expiry, but a grant without one is always an explicit null, never a
  * missing field. The lifetime is relative, so that the clock of the granting
- * device never sets a time on the grant.
+ * device never sets a time on the grant. A refused lifetime is not echoed:
+ * an issue names the bound, never the value that was sent.
  */
 export const GrantCapabilityRequestSchema = z.discriminatedUnion("capability", [
   RepositoryGrantSchema.pick({ capability: true, repositoryId: true }).extend({
+    capability: RepositoryGrantSchema.shape.capability.exclude([
+      "terminal.execute",
+    ]),
     lifetimeSeconds: grantLifetime(),
+  }),
+  RepositoryGrantSchema.pick({ capability: true, repositoryId: true }).extend({
+    capability: RepositoryGrantSchema.shape.capability.extract([
+      "terminal.execute",
+    ]),
+    lifetimeSeconds: shellGrantLifetime(),
   }),
   ProviderConnectionGrantSchema.pick({
     capability: true,
@@ -218,8 +250,11 @@ export type GrantCapabilityResponse = z.infer<
  * The schema cannot know the caller. Whoever reads the answer compares that
  * one device and that one account with its own session.
  *
- * Provisional (#75): revoked grants are left out. An expired grant stays
- * listed until it is revoked; the device's own clock decides expiry.
+ * Revoked grants are left out (#75, decision of 2026-11-14), the stated
+ * exception to the letter of ADR 0015, P-74. An expired grant stays listed
+ * until it is revoked; the device's own clock decides expiry. A record has
+ * no repository fact (same decision): the repository is the grant's scope,
+ * and archiving a repository revokes its grants (P-77).
  */
 export const GrantRecordListResponseSchema = z
   .object({
