@@ -128,6 +128,16 @@ export function signInWaitLeft(
   outcome: SignInOutcomeView,
   now: number,
 ): number | undefined {
+  const at = limitWaitEnd(outcome);
+  return at !== undefined && at > now ? at - now : undefined;
+}
+
+/**
+ * The `retryAfter` of an outcome that a limit of the API ended, in
+ * milliseconds; undefined with another code, without the time, and for a
+ * time that cannot be read.
+ */
+function limitWaitEnd(outcome: SignInOutcomeView): number | undefined {
   if (
     (outcome.code !== "device_daily_limit" &&
       outcome.code !== "uncertain_refusal") ||
@@ -136,7 +146,20 @@ export function signInWaitLeft(
     return undefined;
   }
   const at = Date.parse(outcome.retryAfter);
-  return at > now ? at - now : undefined;
+  return Number.isNaN(at) ? undefined : at;
+}
+
+/**
+ * When the wait in the message of the last outcome ends, in milliseconds
+ * (#269): the `retryAfter` of an outcome that a limit of the API ended,
+ * while no sign-in runs, which hides the outcome; otherwise undefined. It
+ * does not depend on the clock, so it also names a time that has passed.
+ */
+export function signInWaitEnd(status: AccountStatus): number | undefined {
+  const outcome = status.lastOutcome;
+  return status.signIn.kind !== "idle" || outcome === null
+    ? undefined
+    : limitWaitEnd(outcome);
 }
 
 /**
@@ -247,9 +270,22 @@ export const SYSTEM_RETRY_CLOCK: SignInRetryClock = Object.freeze({
   },
 });
 
-/** The panel's clock reading, and the time of the note that it was read for. */
+/**
+ * The time of the last outcome that the panel counts to, in milliseconds:
+ * the time of the note after a refused start (`signInRetryAt`, #199), or
+ * the end of the wait of a sign-in that a limit of the API ended
+ * (`signInWaitEnd`, #269). The two belong to different outcome codes, so
+ * at most one of them is set. The panel reads its clock again whenever
+ * this time changes (`signInRetryReading`), so a note or a wait never
+ * counts from a reading that was made before its outcome arrived.
+ */
+export function signInReadingTime(status: AccountStatus): number | undefined {
+  return signInRetryAt(status) ?? signInWaitEnd(status);
+}
+
+/** The panel's clock reading, and the time of the outcome that it was read for. */
 export interface SignInRetryReading {
-  /** The time of the note (`signInRetryAt`) when the clock was read. */
+  /** The time of the outcome (`signInReadingTime`) when the clock was read. */
   readonly retryAt: number | undefined;
   /** The clock's reading in milliseconds. */
   readonly now: number;
@@ -257,11 +293,14 @@ export interface SignInRetryReading {
 
 /**
  * The clock reading that the panel compares with the time of the note
- * (#204): `held` while it was read for the same `retryAt`, and a new
- * reading of the clock once `retryAt` changed, or without one. Otherwise
- * only `watchSignInRetry` reads the clock, when a note ends, so after the
- * clock was set back, a later note whose time lies before that reading
- * would never show.
+ * (#204) and of the wait of a limit (#269): `held` while it was read for
+ * the same `retryAt` (`signInReadingTime`), and a new reading of the clock
+ * once `retryAt` changed, or without one. Otherwise only
+ * `watchSignInRetry` reads the clock, when a note ends or a wait reads
+ * differently. So an older reading would lengthen or shorten the wait of
+ * an outcome that arrived after it, and after the clock was set back, a
+ * later note or wait whose time lies before that reading would never
+ * show, and no timer would run for it.
  */
 export function signInRetryReading(
   held: SignInRetryReading | undefined,

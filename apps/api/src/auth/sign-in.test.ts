@@ -1154,6 +1154,56 @@ test("the limit of 10 new devices in 24 hours refuses with device_daily_limit an
   );
 });
 
+test("the Retry-After of the daily limit of new devices is the time until the oldest device of the last 24 hours leaves them, and a revoked device counts (#269)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1025, "daily-wait") });
+  const first = SignInResponseSchema.parse(
+    (
+      await postSignIn(app, newDeviceRequest(await signInCode(app), newKey()))
+    ).json(),
+  );
+  const add = async (createdAt: Date, revokedAt: Date | null) =>
+    database()
+      .insert(devices)
+      .values({
+        id: newId<DeviceId>(),
+        userId: first.userId,
+        label: revokedAt === null ? "Extra" : "Oldest",
+        platform: "linux",
+        publicKey: newKey().publicKey,
+        keyAlgorithm: "ed25519",
+        createdAt,
+        lastSignInAt: createdAt,
+        ...(revokedAt === null
+          ? {}
+          : { revokedAt, revocationReason: "removed" as const }),
+      });
+  // 10 devices of the last 24 hours: the first, 8 created now, and one
+  // created 20 hours ago and revoked since. So only 9 of them are active.
+  const started = Date.now();
+  for (let index = 0; index < 8; index += 1) {
+    await add(new Date(started), null);
+  }
+  await add(new Date(started - 20 * 3_600_000), new Date(started));
+  const signInNew = async () =>
+    postSignIn(app, newDeviceRequest(await signInCode(app), newKey()));
+
+  // The revoked device still counts toward the day, and the wait is what
+  // is left of its 24 hours, about 4 hours, not a whole day.
+  const refused = await signInNew();
+  assert.equal(refused.statusCode, 429);
+  assert.equal(codeOf(refused), "device_daily_limit");
+  const wait = Number(refused.headers["retry-after"]);
+  assert.ok(wait > 4 * 3600 - 120 && wait <= 4 * 3600, String(wait));
+
+  // Once that device is older than 24 hours, 9 are left, and a new device
+  // is added.
+  await database()
+    .update(devices)
+    .set({ createdAt: new Date(started - 25 * 3_600_000) })
+    .where(and(eq(devices.userId, first.userId), eq(devices.label, "Oldest")));
+  assert.equal((await signInNew()).statusCode, 200, "the oldest left the day");
+});
+
 test("the route's limit of 30 requests per address in 10 minutes answers rate_limited with a Retry-After of at most 10 minutes, also to a resent copy of a request that committed, so the desktop cannot take that answer as certain (#269)", async (t) => {
   const app = await signInApp(t, { user: githubUser(1024, "busy-address") });
   // The limit counts every request before its body is checked, so 29
