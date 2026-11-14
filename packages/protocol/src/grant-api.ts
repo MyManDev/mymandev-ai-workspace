@@ -95,9 +95,10 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  *   so the code tells nothing new.
  * - `conflict`: what the request names exists, but is not in the state that
  *   the action needs. For a grant: a disabled agent, an archived repository,
- *   project, or workspace, a removed provider connection, a grant of the same capability on the same scope that is
- *   neither revoked nor expired, or a count limit of `GRANT_COUNT_LIMITS`. For
- *   a revocation: a grant that is already revoked.
+ *   project, or workspace, a removed provider connection, a grant of the same
+ *   capability on the same scope that is neither revoked nor expired, or a
+ *   count limit of `GRANT_COUNT_LIMITS`. For a revocation: a grant that is
+ *   already revoked.
  *
  * Provisional (#75): the codes. No route adds a code to `API_ERROR_STATUS`;
  * a count limit answers `conflict` until a code of its own is decided.
