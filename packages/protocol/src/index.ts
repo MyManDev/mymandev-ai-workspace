@@ -15,3 +15,4 @@ export * from "./grant.ts";
 export * from "./grant-api.ts";
 export * from "./run-api.ts";
 export * from "./project-api.ts";
+export * from "./repository-api.ts";

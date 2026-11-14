@@ -936,7 +936,7 @@ Vitest runs the tests in the Node.js environment, without DOM emulation. They co
 ## Not included yet
 
 - The content of the product screens: tasks, decisions, and granting permissions.
-- On the permission screen, the proposed default expiry of `terminal.execute`, which the person can change or remove (ADR 0015, P-71): its value is an open question for the Project Manager.
+- On the permission screen, the proposed default expiry of `terminal.execute`. The person can change the expiry within the 30-day maximum (`SHELL_GRANT_MAX_LIFETIME_SECONDS`; #75, decision of 2026-11-14) but cannot remove it; only the default value is still an open question for the Project Manager.
 - The visual design (#122).
 - Work for the local runtime, such as terminal and process execution and agent execution.
 - The [permission enforcement point](#permission-enforcement) beyond its core: its grant store, the freshness bound, its wiring, and stopping running work.

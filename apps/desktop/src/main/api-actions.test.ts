@@ -530,6 +530,8 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     // No write of the desktop creates a run yet (#35).
     run_limit: "failed",
     run_daily_limit: "failed",
+    // No write of the desktop registers a repository yet (#286).
+    repository_limit: "failed",
     // Only the sign-in answers it, never a write (#255).
     device_limit: "failed",
     // Nor this one: a write then fails without a wait, never as the

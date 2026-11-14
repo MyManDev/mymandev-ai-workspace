@@ -308,6 +308,14 @@ export const API_ERROR_STATUS = Object.freeze({
    */
   run_limit: 409,
   /**
+   * A registration in a project that already holds 20 repositories that are
+   * not removed (#286). No time frees a place, only removing a repository
+   * does, so the answer carries no `Retry-After`. Only
+   * `POST /projects/:projectId/repositories` answers it. Provisional
+   * (#286): the code and the limit await the Project Manager's confirmation.
+   */
+  repository_limit: 409,
+  /**
    * A new device's sign-in on an account that already has 20 active devices
    * (#255). No time frees a place, only revoking one of them does, so the
    * answer carries no `Retry-After`. Only `POST /auth/sign-in` answers it.
