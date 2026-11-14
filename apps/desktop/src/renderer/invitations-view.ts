@@ -21,7 +21,9 @@ import type { PeopleScreenView } from "./people-view.ts";
 // invitation, shown once. The code (D2) arrives in the answer of a create
 // and is held only in the view of the open code dialog: closing the dialog,
 // a switch, or a sign-out drops it, nothing logs it, and no status sentence
-// holds it. No channel returns it again.
+// holds it. No channel returns it again. A demotion of the account to a
+// member drops it from the open dialog as well, which then says that the
+// code no longer works (#266).
 
 /** What the screen knows of the selected workspace's live invitations. */
 export type InvitationsScreenView =
@@ -219,6 +221,42 @@ function managedWorkspace(view: PeopleScreenView): {
     return null;
   }
   return { workspaceId: state.workspaceId, people: state.people };
+}
+
+/**
+ * Whether the account's own person is no longer the owner or an admin of
+ * `workspaceId`, so that the server revoked the unaccepted invitations that
+ * the account created there (ADR 0014, "People and roles": a demotion
+ * revokes them in the same transaction). Either the people are `ready` for
+ * that workspace and list the account's own active person as a member, or
+ * `list`, the latest state of the invitations or of the join requests, says
+ * `not_allowed` for that workspace: the main process says so as soon as it
+ * applied the demotion, also before the people show it (#262). A state of
+ * another workspace says nothing about this one.
+ */
+export function isDemoted(
+  people: PeopleScreenView,
+  list:
+    | { readonly workspaceId: string | null; readonly status: string }
+    | undefined,
+  workspaceId: string,
+): boolean {
+  if (list?.workspaceId === workspaceId && list.status === "not_allowed") {
+    return true;
+  }
+  if (people.kind !== "known" || people.state.status !== "ready") {
+    return false;
+  }
+  const { state } = people;
+  return (
+    state.workspaceId === workspaceId &&
+    state.people.some(
+      (person) =>
+        !person.former &&
+        person.memberId === state.ownMemberId &&
+        person.role === "member",
+    )
+  );
 }
 
 /** Whether `expiresAt` is later than the clock `now` in milliseconds. */
@@ -568,10 +606,23 @@ export const INVITATION_REFRESH_MESSAGES: Readonly<
 export interface InvitationCodeView {
   /** The invited person's display name. */
   readonly name: string;
-  /** The invitation code, shown once. */
-  readonly code: string;
-  /** When the invitation ends. */
+  /**
+   * The invitation code, shown once. Null once the account was demoted to
+   * a member (`isDemoted`, #266): the server revoked the invitation, so the
+   * code no longer works, the view drops it at once, and the dialog says so
+   * until it closes. A later promotion never brings it back.
+   */
+  readonly code: string | null;
+  /** When the invitation ends; the dialog does not show it without the code. */
   readonly expiresAt: string;
+}
+
+/**
+ * `view` without its code, for the dialog of an invitation that the server
+ * revoked with the account's demotion (#266).
+ */
+export function withoutCode(view: InvitationCodeView): InvitationCodeView {
+  return Object.freeze({ ...view, code: null });
 }
 
 /** What the screen shows of its invitation actions. */
@@ -585,7 +636,10 @@ export interface InvitationActionsView {
   readonly message: string | undefined;
   /** The open question, or undefined. */
   readonly question: InvitationActionRequest | undefined;
-  /** The code of the invitation just created while its dialog is open, or undefined. */
+  /**
+   * The code of the invitation just created while its dialog is open, or
+   * undefined; without the code itself once the account was demoted.
+   */
   readonly code: InvitationCodeView | undefined;
 }
 
@@ -601,9 +655,10 @@ export interface InvitationActions {
   readonly start: (request: InvitationActionRequest) => void;
   /**
    * Runs the action of the open question, once. A confirmed create opens
-   * the code's dialog with the code from its answer. Resolves to true when
-   * the action ran and its control leaves the page with the next
-   * invitations: a confirmed revocation.
+   * the code's dialog with the code from its answer, or without the code
+   * when the account was demoted while the create was on its way (#266).
+   * Resolves to true when the action ran and its control leaves the page
+   * with the next invitations: a confirmed revocation.
    */
   readonly confirm: () => Promise<boolean>;
   /** Closes the open question without the action. */
@@ -623,6 +678,9 @@ export interface InvitationActions {
    *   or none is selected, and always with a sign-out;
    * - the workspace of a create whose code was dropped after a switch says
    *   so when it is selected again (`INVITATION_CREATED_UNSEEN_MESSAGE`);
+   * - the code of the open dialog goes, and the dialog stays open without
+   *   it, once the account is demoted to a member of the workspace
+   *   (`isDemoted`), because the server revoked the invitation (#266);
    * - the refresh's sentence ends with the next state of the invitations.
    */
   readonly listChanged: (
@@ -640,7 +698,9 @@ export interface InvitationActions {
  * create goes into the view of its dialog only, and only while the
  * workspace of the action is still selected; otherwise it is dropped, and
  * that workspace says so once it is shown again
- * (`INVITATION_CREATED_UNSEEN_MESSAGE`), unless the session ended.
+ * (`INVITATION_CREATED_UNSEEN_MESSAGE`), unless the session ended. A code
+ * whose invitation the server revoked with the account's demotion is never
+ * shown: the dialog opens, or stays open, without it (#266).
  */
 export function createInvitationActions(
   bridge: Pick<InvitationActionsBridge, "create" | "revoke">,
@@ -657,6 +717,18 @@ export function createInvitationActions(
   let latestNow = 0;
   /** The selected workspace of the latest people; undefined before any. */
   let selected: string | null | undefined;
+  /**
+   * Whether the latest views show the account demoted to a member of the
+   * selected workspace (`isDemoted`).
+   */
+  let demoted = false;
+  /**
+   * Grows with every demotion that the views show, so that the code of a
+   * create counts only when none arrived while the create was on its way,
+   * also none that a promotion followed: the demotion revoked the
+   * invitation, and a promotion does not bring it back.
+   */
+  let demotions = 0;
   /**
    * Grows with every switch of the selected workspace, a drop of it, and a
    * sign-out, so that an answer counts only when nothing of the kind
@@ -694,6 +766,7 @@ export function createInvitationActions(
     show();
     const startSelection = selection;
     const startSession = session;
+    const startDemotions = demotions;
     let ok = false;
     let sentence: string;
     let created: InvitationCodeView | undefined;
@@ -727,7 +800,12 @@ export function createInvitationActions(
       selection === startSelection && selected === request.workspaceId;
     if (still) {
       message = sentence;
-      code = created;
+      // A demotion that arrived first revoked the new invitation: its
+      // dialog opens without the code.
+      code =
+        created !== undefined && (demoted || demotions !== startDemotions)
+          ? withoutCode(created)
+          : created;
     } else if (created !== undefined && session === startSession) {
       // A created invitation whose code was dropped: its workspace says so
       // at once when it is shown again already (a switch away and back), or
@@ -878,6 +956,23 @@ export function createInvitationActions(
             changed = true;
           }
         }
+      }
+      const wasDemoted = demoted;
+      demoted =
+        typeof selected === "string" &&
+        isDemoted(
+          people,
+          invitations.kind === "known" ? invitations.state : undefined,
+          selected,
+        );
+      if (demoted && !wasDemoted) {
+        demotions += 1;
+      }
+      if (demoted && code !== undefined && code.code !== null) {
+        // The server revoked the invitation with the demotion: the code
+        // goes at once, and the open dialog says that it no longer works.
+        code = withoutCode(code);
+        changed = true;
       }
       if (changed) {
         show();

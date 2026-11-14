@@ -22,6 +22,7 @@ import {
   INVITATION_CODE_MESSAGES,
   InvitationCodeContent,
   InvitationQuestionContent,
+  keepFocusInDialog,
   selectCode,
   showCodeInField,
   type InvitationActionHandlers,
@@ -155,6 +156,8 @@ const TIME_FORMAT = offerTimeFormat(ISTANBUL);
 interface HostProps {
   readonly children?: ReactNode;
   readonly id?: string;
+  readonly className?: string;
+  readonly role?: string;
   readonly type?: string;
   readonly value?: string;
   readonly readOnly?: boolean;
@@ -556,7 +559,7 @@ test("D2: the code's dialog has a read-only field for the code, says that it sho
   const end = TIME_FORMAT.format(new Date(CREATED_ENDS_AT));
   const html = renderToString(codeDialog(SHOWN).content);
   expect(html).toBe(
-    `<dialog class="people-dialog" aria-labelledby="invitation-code-title" aria-describedby="invitation-code-name invitation-code-text"><div class="invitation-code-content"><h2 id="invitation-code-title">Invitation code</h2><p class="people-dialog-name" id="invitation-code-name"><span dir="auto">Margaret</span></p><p id="invitation-code-text">This code is shown only now. Once you close this, it cannot be shown again. Pass it on privately, only to this person, for example in a direct message: anyone who has the code can claim this person.</p><label class="account-label" for="invitation-code-field">Code</label><input id="invitation-code-field" class="account-input invitation-code" type="text" dir="ltr" translate="no" readOnly="" autoComplete="off" spellCheck="false" aria-describedby="invitation-code-expiry"/><p id="invitation-code-expiry">It can be used once, until <time dateTime="${CREATED_ENDS_AT}">${end}</time>.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Select the code</button><button type="button" class="panel-action">Close</button></div></div></dialog>`,
+    `<dialog class="people-dialog" aria-labelledby="invitation-code-title" aria-describedby="invitation-code-name invitation-code-text"><div class="invitation-code-content"><h2 id="invitation-code-title">Invitation code</h2><p class="people-dialog-name" id="invitation-code-name"><span dir="auto">Margaret</span></p><p id="invitation-code-text">This code is shown only now. Once you close this, it cannot be shown again. Pass it on privately, only to this person, for example in a direct message: anyone who has the code can claim this person.</p><label class="account-label" for="invitation-code-field">Code</label><input id="invitation-code-field" class="account-input invitation-code" type="text" dir="ltr" translate="no" readOnly="" autoComplete="off" spellCheck="false" aria-describedby="invitation-code-expiry"/><p id="invitation-code-expiry">It can be used once, until <time dateTime="${CREATED_ENDS_AT}">${end}</time>.</p><p class="panel-message" id="invitation-code-revoked" role="alert"></p><div class="people-dialog-actions"><button type="button" class="panel-action">Select the code</button><button type="button" class="panel-action">Close</button></div></div></dialog>`,
   );
   // The code reaches the field only through `showCodeInField`.
   expect(html).not.toContain(CODE);
@@ -680,8 +683,11 @@ function statusTexts(html: string): string[] {
   );
 }
 
-/** A controller over fake bridges whose create answers with `CODE`. */
-function createdController() {
+/**
+ * A controller over fake bridges whose create answers with `CODE`, after
+ * it has seen `people`, the owner's by default.
+ */
+function createdController(people: PeopleScreenView = known()) {
   const bridge = {
     create: () =>
       Promise.resolve<CreateInvitationResult>({
@@ -699,7 +705,7 @@ function createdController() {
   const actions = createInvitationActions(bridge, list, (view) =>
     views.push(view),
   );
-  actions.listChanged(known(), listed(), NOW);
+  actions.listChanged(people, listed(), NOW);
   return {
     actions,
     views,
@@ -753,6 +759,182 @@ test("D2: while the dialog is open, the rendered screen holds the code nowhere, 
   }
 });
 
+/** The view of the code's dialog once its code went with a demotion (#266). */
+const REVOKED: InvitationCodeView = { ...SHOWN, code: null };
+
+/** The people as the admin sees them, who created the invitation. */
+const AS_ADMIN = known({ ownMemberId: ADMIN });
+
+/** The people once they show that admin as a member. */
+const DEMOTED = known({
+  revision: 5,
+  ownMemberId: ADMIN,
+  people: READY.people.map((entry) =>
+    entry.memberId === ADMIN ? { ...entry, role: "member" } : entry,
+  ),
+});
+
+test("#266: without its code, the dialog says in an alert that the code no longer works, which describes it, and has no field, no end, and no Select the code, only Close", () => {
+  expect(INVITATION_CODE_MESSAGES.revoked).toBe(
+    "You are no longer an admin of this workspace, so this code no longer works. It is not shown.",
+  );
+  const html = renderToString(codeDialog(REVOKED).content);
+  expect(html).toBe(
+    '<dialog class="people-dialog" aria-labelledby="invitation-code-title" aria-describedby="invitation-code-name invitation-code-revoked"><div class="invitation-code-content"><h2 id="invitation-code-title">Invitation code</h2><p class="people-dialog-name" id="invitation-code-name"><span dir="auto">Margaret</span></p><p class="panel-message" id="invitation-code-revoked" role="alert">You are no longer an admin of this workspace, so this code no longer works. It is not shown.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Close</button></div></div></dialog>',
+  );
+  const elements = elementsOf(codeDialog(REVOKED).content);
+  expect(elements.some((element) => element.type === "input")).toBe(false);
+  expect(elements.some((element) => element.type === "time")).toBe(false);
+  // The alert is the same element in both dialogs, so the open dialog
+  // announces the sentence when it appears: the fourth child, after the
+  // title, the name, and the place of the code's part.
+  for (const view of [SHOWN, REVOKED]) {
+    const content = elementsOf(codeDialog(view).content).find(
+      (element) => element.props.className === "invitation-code-content",
+    );
+    const children = content?.props.children as ReactNode[];
+    expect(children).toHaveLength(5);
+    const alert = children[3] as ReactElement<HostProps>;
+    expect(alert.type).toBe("p");
+    expect(alert.props.role).toBe("alert");
+    expect(alert.props.id).toBe("invitation-code-revoked");
+    expect(alert.key).toBeNull();
+  }
+});
+
+test("#266: without its code, Close, Escape, and the browser's close still close the dialog, and nothing selects", () => {
+  const { content, handlers, selections } = codeDialog(REVOKED);
+  const elements = elementsOf(content);
+  const buttons = elements.filter((element) => element.type === "button");
+  expect(buttons.map((button) => button.props.children)).toEqual([
+    INVITATION_CODE_MESSAGES.close,
+  ]);
+  buttons[0]?.props.onClick?.({ currentTarget: null });
+  let prevented = 0;
+  const dialog = elements.find((element) => element.type === "dialog");
+  dialog?.props.onCancel?.({
+    preventDefault: () => {
+      prevented += 1;
+    },
+  });
+  dialog?.props.onClose?.();
+  expect(handlers.calls).toEqual(["close code", "close code", "close code"]);
+  expect(prevented).toBe(1);
+  expect(selections()).toBe(0);
+});
+
+test("#266: once the code went, the focus moves to Close only when it is no longer inside the open dialog, and a dialog that is not open is left alone", () => {
+  const inside = { name: "Close" } as unknown as Element;
+  const outside = { name: "body" } as unknown as Element;
+  const dialog = (open: boolean) => ({
+    open,
+    contains: (node: Element | null) => node === inside,
+  });
+  let focused = 0;
+  const close = {
+    focus: () => {
+      focused += 1;
+    },
+  };
+  // The field or Select the code had the focus and left the page: the
+  // focus fell to the page, or is nowhere.
+  keepFocusInDialog(dialog(true), close, outside);
+  keepFocusInDialog(dialog(true), close, null);
+  expect(focused).toBe(2);
+  // The focus is still inside, on Close: it stays.
+  keepFocusInDialog(dialog(true), close, inside);
+  // A dialog that is not open yet takes the focus by itself as it opens.
+  keepFocusInDialog(dialog(false), close, outside);
+  keepFocusInDialog(null, close, outside);
+  expect(focused).toBe(2);
+  // Before Close exists, nothing happens.
+  expect(() => keepFocusInDialog(dialog(true), null, outside)).not.toThrow();
+});
+
+test("#266: the dialog's box empties the field when the code goes and keeps the focus inside in a layout effect, with Close as the place for it", () => {
+  const code = withoutComments(SOURCES["./InvitationActions.tsx"] ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/,? \)/g, ")");
+  // A view without the code shows nothing in the field: the effect's
+  // cleanup empties it.
+  expect(code).toContain("const shown = props.code?.code ?? undefined;");
+  expect(code).toContain(
+    "useLayoutEffect(() => showCodeInField(fieldRef.current, shown), [shown]);",
+  );
+  expect(code).toContain(
+    "const revoked = props.code?.code === null; useLayoutEffect(() => { if (revoked) { keepFocusInDialog(dialogRef.current, closeRef.current, document.activeElement); } }, [revoked]);",
+  );
+  expect(code).toContain("closeRef={closeRef}");
+  expect(code).toMatch(
+    /<button ref=\{closeRef\} type="button" className="panel-action" onClick=\{onClose\} > \{INVITATION_CODE_MESSAGES\.close\} <\/button>/,
+  );
+  expect(code.match(/ref=\{closeRef\}/g)).toHaveLength(1);
+});
+
+test("#266: a demotion while the dialog is open leaves it open on the screen with the sentence and without the field, and a demotion before it opens it that way; the screen never holds the code", async () => {
+  const sentence = `<p class="panel-message" id="invitation-code-revoked" role="alert">${INVITATION_CODE_MESSAGES.revoked}</p>`;
+  // While the dialog is open.
+  const open = createdController(AS_ADMIN);
+  open.actions.start(INVITE);
+  await open.actions.confirm();
+  expect(render({ view: AS_ADMIN, invitationActions: open.last() })).toContain(
+    '<input id="invitation-code-field"',
+  );
+  const before = open.views.length;
+  open.actions.listChanged(DEMOTED, listed(), NOW);
+  // Before it opens: the demotion arrives while the create is on its way.
+  let answer: (result: CreateInvitationResult) => void = () => undefined;
+  const early: InvitationActionsView[] = [];
+  const actions = createInvitationActions(
+    {
+      create: () =>
+        new Promise<CreateInvitationResult>((done) => {
+          answer = done;
+        }),
+    } as unknown as Pick<InvitationActionsBridge, "create" | "revoke">,
+    {} as unknown as Pick<InvitationsBridge, "load">,
+    (view) => early.push(view),
+  );
+  actions.listChanged(AS_ADMIN, listed(), NOW);
+  actions.start(INVITE);
+  const done = actions.confirm();
+  actions.listChanged(DEMOTED, listed(), NOW);
+  answer({
+    outcome: "ok",
+    invitationId: NEW_INVITATION,
+    code: CODE,
+    expiresAt: CREATED_ENDS_AT,
+  });
+  await done;
+  for (const views of [open.views.slice(before), early]) {
+    const last = views.at(-1) ?? IDLE_INVITATION_ACTIONS;
+    expect(last.code).toEqual(REVOKED);
+    // The screen as the demoted account sees it: no Invite and no
+    // invitations part behind the dialog, which stays open.
+    const html = render({ view: DEMOTED, invitationActions: last });
+    expect(html).toContain(sentence);
+    expect(html).toContain(
+      'aria-describedby="invitation-code-name invitation-code-revoked"',
+    );
+    expect(html).not.toContain("invitation-code-field");
+    expect(html).not.toContain("invitation-code-text");
+    expect(html).not.toContain(">Select the code<");
+    expect(html).not.toContain(">Invite<");
+    expect(html).toContain(">Close<");
+    for (const view of views) {
+      const shown = render({ view: DEMOTED, invitationActions: view });
+      expect(count(shown, CODE)).toBe(0);
+      expect(count(shown, CODE.slice(5, 30))).toBe(0);
+    }
+  }
+  // Closing it leaves the dialog empty, as usual.
+  open.actions.closeCode();
+  expect(
+    render({ view: DEMOTED, invitationActions: open.last() }),
+  ).not.toContain("invitation-code-title");
+});
+
 test("names are rendered as text with their own direction in the rows, the questions, and the code's dialog", () => {
   const markup = '<img src="x" onerror="alert(1)">';
   const rtl = "שלום <b>";
@@ -803,6 +985,11 @@ test("the screen with the invitations shows no ID, its element IDs are unique, e
     {
       ...IDLE_INVITATION_ACTIONS,
       code: SHOWN,
+      message: "The invitation was created.",
+    },
+    {
+      ...IDLE_INVITATION_ACTIONS,
+      code: REVOKED,
       message: "The invitation was created.",
     },
   ];
