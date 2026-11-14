@@ -489,16 +489,16 @@ Decided by the Project Manager on 2026-11-14 (#35):
 
 The route (`RUN_ROUTES`, `RUN_ROUTE_ERRORS`):
 
-| Route                            | Who               | Body                                                                         | Answer                   | Codes beyond the common ones                                         |
-| -------------------------------- | ----------------- | ---------------------------------------------------------------------------- | ------------------------ | -------------------------------------------------------------------- |
-| `POST /projects/:projectId/runs` | the agent's owner | `agentId`, optional `repositoryId`, `providerConnectionId`, `inputMessageId` | the new run, in `queued` | `not_found`, `forbidden`, `conflict`, `run_limit`, `run_daily_limit` |
+| Route                            | Who                                   | Body                                                                         | Answer                   | Codes beyond the common ones                                         |
+| -------------------------------- | ------------------------------------- | ---------------------------------------------------------------------------- | ------------------------ | -------------------------------------------------------------------- |
+| `POST /projects/:projectId/runs` | the agent's owner, on its host device | `agentId`, optional `repositoryId`, `providerConnectionId`, `inputMessageId` | the new run, in `queued` | `not_found`, `forbidden`, `conflict`, `run_limit`, `run_daily_limit` |
 
 - It needs an access token and starts with the project, as the read routes do. A non-member, a project that does not exist, and a malformed project ID get the same `404` with `not_found` before the body is read.
-- The body holds IDs only (`CreateRunRequestSchema`): an agent of the project, a provider connection of that agent's host device, a message of the project's chat, and a repository of the project when the run has one. Unknown keys are stripped, so a text, a state, or a requester in the body changes nothing.
+- The body holds IDs only (`CreateRunRequestSchema`): an agent of the project, a provider connection of that agent's host device, a message that the caller wrote in the project's chat, and a repository of the project when the run has one. Unknown keys are stripped, so a text, a state, or a requester in the body changes nothing.
 - The server decides in this order, and writes nothing when it refuses:
   1. `not_found`: the project has no agent with this ID.
-  2. `forbidden`: the caller does not own the agent. It comes before every check of the other IDs, so that only an agent's owner learns anything about a repository, a provider connection, or a message.
-  3. `not_found`: the project has no repository with this ID, the agent's host device has no provider connection with this ID, or the project's chat has no message with this ID that is not deleted. An ID that exists elsewhere and one that exists nowhere answer alike, and the answer does not say which ID it was.
+  2. `forbidden`: the caller does not own the agent, or the calling device is not the agent's host device. It comes before every check of the other IDs, so that only an agent's owner, on the agent's host device, learns anything about a repository, a provider connection, or a message.
+  3. `not_found`: the project has no repository with this ID, the agent's host device has no provider connection with this ID, or the project's chat has no message with this ID that the caller wrote and that is not deleted. An ID that exists elsewhere, a message of another author, and an ID that exists nowhere answer alike, and the answer does not say which ID it was.
   4. `conflict`: the project or its workspace is archived, the agent is disabled, the repository is archived, or the provider connection is removed.
   5. `run_limit`, then `run_daily_limit` (below).
 - The answer is the new run as its agent's owner reads it in the run list (`CreateRunResponseSchema`): in `queued`, with its `inputMessageId` and its `providerConnectionId`. The schema cannot see the request, so the device checks that the run names the project of the path and the IDs that it sent.
@@ -521,11 +521,11 @@ The limits, with their own codes (`API_ERROR_STATUS`); the [API's README](../../
 - `run_daily_limit` (`429`, with `Retry-After`): the agent got as many new runs within 24 hours as the server allows. `Retry-After` is the time until the oldest of them leaves the 24 hours. The account's limit of requests on the route stays `rate_limited`.
 - An agent at both limits answers `run_limit`.
 
-Provisional (#35): applied as defaults until the Project Manager decides; each is a choice of the more careful option:
+Provisional (#35): applied as defaults until the Project Manager decides. Each choice of who may ask, what the input is, and who reads the provider connection is the narrower option, which a later decision can widen without breaking a client:
 
 - The route: `POST /projects/:projectId/runs`, beside the run list of the project (`GET /projects/:projectId/runs`), so that it starts with the project as the read routes do.
-- Who asks: the account that owns the agent, from any of its devices, not only from the agent's host device. A role gives no right: the workspace's owner cannot request a run of a member's agent.
-- Which message: any message of the project's chat that is not deleted, of any author, also another member's or an agent's. The alternative is only a message that the caller wrote.
+- Who asks: the account that owns the agent, and only from the agent's host device, as only that device grants (#75, Project Manager decision of 2026-11-14). Another device of the account, for example one that a taken-over GitHub account registered, gets `forbidden`, so that it cannot start a run with the grants that the agent already holds. The alternative is any of the owner's devices. A role gives no right: the workspace's owner cannot request a run of a member's agent.
+- Which message: only a message that the caller wrote in the project's chat and that is not deleted, so that the chat shows the instruction as the requester's own words, and another member cannot place a prompt in the owner's run. The alternative is any message of the chat, also another member's or an agent's.
 - Who sees the provider connection: only the account that owns the run's agent. The alternative is every member; widening it later is an additive change, and narrowing it would not be.
 - The event: the existing `agent.run.state_changed` with `run` added, not a new event type, so that ADR 0007's creation event stays and a desktop before #35 still shows the new run.
 - The limits and their values: 10 unfinished runs for each agent, and 100 new runs for each agent within 24 hours.

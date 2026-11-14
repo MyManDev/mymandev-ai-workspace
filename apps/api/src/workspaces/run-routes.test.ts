@@ -214,7 +214,7 @@ async function messageIn(
 /**
  * Ada owns a workspace that Bob is a member of, with a project, an agent
  * of Ada's hosted on her device, a provider connection of that device, and
- * a message of Bob's in the project's chat: everything a run needs.
+ * a message of Ada's in the project's chat: everything a run needs.
  */
 async function team(
   t: TestContext,
@@ -228,7 +228,7 @@ async function team(
   const projectId = await projectIn(workspaceId, ada.device);
   const agentId = await agentOf(projectId, ada.device);
   const providerConnectionId = await connectionOf(ada.device);
-  const inputMessageId = await messageIn(workspaceId, projectId, bob.device);
+  const inputMessageId = await messageIn(workspaceId, projectId, ada.device);
   const body = { agentId, providerConnectionId, inputMessageId };
   return {
     account,
@@ -514,29 +514,79 @@ test("a run with a repository names it in the answer and in the event, and the r
   });
 });
 
-test("the owner asks from another of their devices, and the run still takes a connection of the agent's host device", async (t) => {
-  const { ada, projectId, agentId, body } = await team(t, [4131, 4132]);
+test("only the agent's host device asks: another device of the owner is 403, whatever else the body names, and nothing is created or sent", async (t) => {
+  const { ada, workspaceId, projectId, agentId, body } = await team(
+    t,
+    [4131, 4132],
+  );
+  // A new device of Ada's, as one that a taken-over GitHub account
+  // registers, asks with the IDs of the agent's host device.
   const adasDesktop = await signInDevice(ada.app);
   const fromDesktop: Account = {
     app: ada.app,
     device: adasDesktop,
     token: await accessToken(ada.app, adasDesktop),
   };
-  // A connection of the asking device is not one of the agent's host device.
-  const own = await connectionOf(adasDesktop);
-  const refused = await post(fromDesktop, projectId, {
+  const adaConnection = await connected(t, ada.app, ada.device);
+  await subscribed(adaConnection.client, workspaceId);
+  const refused = await post(fromDesktop, projectId, body);
+  assert.equal(refused.statusCode, 403, refused.body);
+  assert.equal(errorCode(refused), "forbidden");
+  // With its own connection, or with IDs that do not exist, the answer is
+  // the same: the device learns nothing about them.
+  const answers = [
+    await post(fromDesktop, projectId, {
+      ...body,
+      providerConnectionId: await connectionOf(adasDesktop),
+    }),
+    await post(fromDesktop, projectId, {
+      agentId,
+      providerConnectionId: newId<ProviderConnectionId>(),
+      inputMessageId: newId<MessageId>(),
+      repositoryId: newId<RepositoryId>(),
+    }),
+  ];
+  for (const answer of answers) {
+    assert.equal(answer.statusCode, 403, answer.body);
+    assert.equal(answer.body, refused.body);
+  }
+  assert.equal(await runCount(agentId), 0);
+  await quiet(adaConnection.client);
+  // The agent's host device asks with the same body.
+  createdRun(await post(ada, projectId, body));
+  assert.equal(await runCount(agentId), 1);
+});
+
+test("only a message that the caller wrote is the input: another member's is the same 404 as an unknown one, and nothing is created or sent", async (t) => {
+  const { ada, bob, workspaceId, projectId, agentId, body } = await team(
+    t,
+    [4133, 4134],
+  );
+  const adaConnection = await connected(t, ada.app, ada.device);
+  await subscribed(adaConnection.client, workspaceId);
+  const bobsMessage = await messageIn(workspaceId, projectId, bob.device);
+  const refused = await post(ada, projectId, {
     ...body,
-    providerConnectionId: own,
+    inputMessageId: bobsMessage,
   });
   assert.equal(refused.statusCode, 404, refused.body);
   assert.equal(errorCode(refused), "not_found");
-  const run = createdRun(await post(fromDesktop, projectId, body));
-  const [row] = await database()
-    .select({ hostDeviceId: agentRuns.hostDeviceId })
-    .from(agentRuns)
-    .where(eq(agentRuns.id, run.id));
-  assert.equal(row?.hostDeviceId, ada.device.deviceId);
-  assert.equal(await runCount(agentId), 1);
+  const unknown = await post(ada, projectId, {
+    ...body,
+    inputMessageId: newId<MessageId>(),
+  });
+  assert.equal(refused.body, unknown.body);
+  assert.equal(await runCount(agentId), 0);
+  await quiet(adaConnection.client);
+  // Bob's message is the input of a run of Bob's own agent.
+  const run = createdRun(
+    await post(bob, projectId, {
+      agentId: await agentOf(projectId, bob.device),
+      providerConnectionId: await connectionOf(bob.device),
+      inputMessageId: bobsMessage,
+    }),
+  );
+  assert.equal(run.inputMessageId, bobsMessage);
 });
 
 test("a request without a token is 401, and a non-member, a removed member, and an unknown or malformed project get the same 404 before the body is read", async (t) => {
@@ -663,12 +713,12 @@ test("only the agent's owner creates its runs: another member is 403, also the w
   assert.equal(await runCount(agentId), 0);
   assert.equal(await runCount(bobsAgent), 0);
   await quiet(adaConnection.client);
-  // Bob's own agent with Bob's own connection is his to run.
+  // Bob's own agent with Bob's own connection and message is his to run.
   createdRun(
     await post(bob, projectId, {
-      ...body,
       agentId: bobsAgent,
       providerConnectionId: bobsConnection,
+      inputMessageId: await messageIn(workspaceId, projectId, bob.device),
     }),
   );
 });

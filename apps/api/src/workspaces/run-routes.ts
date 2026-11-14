@@ -107,7 +107,9 @@ export function createdRunEvent(
  * same `404` before the body is validated, and the account limit of every
  * authenticated route applies. The creation runs in one transaction that
  * checks the account and the device again (`lockActor`) and then decides in
- * the database (`createRun`): only the account that owns the agent asks.
+ * the database (`createRun`): only the account that owns the agent asks,
+ * only from the agent's host device (#75), and only with a message that
+ * the account wrote.
  * After the commit, the run goes to the connections subscribed to its
  * workspace as `agent.run.state_changed`, and to no one else; the asking
  * device reads it from the answer. It writes no audit record: a run is not
@@ -137,6 +139,7 @@ export function registerRunRoutes(
         await lockActor(tx, auth, now.getTime());
         const result = await createRun(tx, {
           userId: auth.userId,
+          deviceId: auth.deviceId,
           projectId,
           agentId,
           repositoryId,

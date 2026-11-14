@@ -1,6 +1,7 @@
 import {
   type AgentId,
   type AgentRunListItem,
+  type DeviceId,
   INITIAL_RUN_STATE,
   type MessageId,
   newId,
@@ -36,6 +37,10 @@ import {
 //   provider sharing (M5); the table can already hold such a run, and a
 //   removal cancels it (`src/people.ts`), so the rule lives here, not in a
 //   foreign key.
+// - Only from the agent's host device, as only that device grants (#75,
+//   Project Manager decision of 2026-11-14): another device of the account,
+//   for example one that a taken-over GitHub account registered, would
+//   otherwise start a run with the grants that the agent already holds.
 // - A run names one provider connection of its agent's host device. The
 //   table keeps the connection on that device with two composite foreign
 //   keys (`agent_runs_agent_host_device_fk` and
@@ -43,7 +48,10 @@ import {
 //   `provider.use` grant there, and no writer changes the column after the
 //   insert, so the enforcement point can take the scope of `provider.use`
 //   from the run (ADR 0015).
-// - A run's input is a chat message of its project. The run has no text.
+// - A run's input is a chat message of its project that the asking account
+//   wrote, so that the chat shows the instruction as the requester's own
+//   words, and no other member's or agent's text becomes the instruction of
+//   the owner's run. The run has no text.
 //
 // Lock order, the order of `src/people.ts`, `src/chat.ts`, and
 // `src/agent-activity.ts` extended: after the account and the device that
@@ -66,8 +74,10 @@ import {
 // (`provider_connections`), each `FOR SHARE`: a writer that archives a
 // repository or removes a connection locks its row `FOR NO KEY UPDATE`
 // first, and then either is seen by the creation or waits for it and sees
-// the new run. No such writer exists yet. The message is read without a
-// lock: a message never changes its conversation.
+// the new run. `removeRepository` (`src/repositories.ts`) locks the project
+// `FOR NO KEY UPDATE` before the repository, so a creation waits for it
+// already at the project; no writer removes a connection yet. The message
+// is read without a lock: a message never changes its conversation.
 
 const DAY_MS = 24 * 60 * 60_000;
 
@@ -98,6 +108,8 @@ export type CreateRunInput = Readonly<{
    * project's workspace asks.
    */
   userId: UserId;
+  /** The asking device of the account. It must be the agent's host device. */
+  deviceId: DeviceId;
   /** The project of the path; the agent must be an agent of it. */
   projectId: ProjectId;
   agentId: AgentId;
@@ -105,7 +117,7 @@ export type CreateRunInput = Readonly<{
   repositoryId?: RepositoryId | undefined;
   /** A provider connection of the agent's host device. */
   providerConnectionId: ProviderConnectionId;
-  /** A message of the project's chat: the run's input. */
+  /** A message of the asking account in the project's chat: the run's input. */
   inputMessageId: MessageId;
   /** The server's time: the run's `created_at`. */
   now: Date;
@@ -122,11 +134,15 @@ export type CreateRunRefusal =
    * The project has no agent with this ID; or, for the agent's owner, the
    * project has no repository with this ID, the agent's host device has no
    * provider connection with this ID, or the project's chat has no message
-   * with this ID that is not deleted. An ID that exists elsewhere and one
-   * that exists nowhere get the same answer.
+   * with this ID that the asking account wrote and that is not deleted. An ID
+   * that exists elsewhere, one of another author, and one that exists
+   * nowhere get the same answer.
    */
   | "not_found"
-  /** The account does not own the agent. */
+  /**
+   * The account does not own the agent, or the asking device is not the
+   * agent's host device.
+   */
   | "forbidden"
   /**
    * The project or its workspace is archived, the agent is disabled, the
@@ -168,14 +184,15 @@ export type CreateRunResult =
  * 2. It locks the project `FOR SHARE`, and then the agent
  *    `FOR NO KEY UPDATE`. An agent that the project does not have, also an
  *    agent of another project, is `not_found`.
- * 3. An agent that the account does not own is `forbidden`, before anything
- *    about the repository, the provider connection, or the message is
- *    read, so that only the owner learns anything about them.
+ * 3. An agent that the account does not own, or that the asking device does
+ *    not host, is `forbidden`, before anything about the repository, the
+ *    provider connection, or the message is read, so that only the owner,
+ *    on the agent's host device, learns anything about them.
  * 4. A `repositoryId` that is not a repository of the project, a
  *    `providerConnectionId` that is not a connection of the agent's host
- *    device, and an `inputMessageId` that is not a message of the
- *    project's chat or is deleted are `not_found`. The repository and the
- *    connection are locked `FOR SHARE`.
+ *    device, and an `inputMessageId` that is not a message of the asking
+ *    account in the project's chat or is deleted are `not_found`. The
+ *    repository and the connection are locked `FOR SHARE`.
  * 5. An archived project or workspace, a disabled agent, an archived
  *    repository, and a removed provider connection are `conflict`. A
  *    revoked host device needs no check of its own: a revocation disables
@@ -256,7 +273,11 @@ export async function createRun(
       if (agent === undefined) {
         return refused("not_found");
       }
-      if (agent.ownerUserId !== input.userId) {
+      // Only the owner, and only on the agent's host device (#75).
+      if (
+        agent.ownerUserId !== input.userId ||
+        agent.hostDeviceId !== input.deviceId
+      ) {
         return refused("forbidden");
       }
 
@@ -299,6 +320,9 @@ export async function createRun(
             eq(messages.id, input.inputMessageId),
             eq(conversations.projectId, input.projectId),
             eq(conversations.kind, "project"),
+            // Only the asking account's own words: an agent's message names
+            // no account, and another member's names theirs.
+            eq(messages.authorUserId, input.userId),
             isNull(messages.deletedAt),
           ),
         );

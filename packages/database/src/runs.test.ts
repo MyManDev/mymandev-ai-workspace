@@ -28,6 +28,7 @@ import { createWorkspace } from "./membership.ts";
 import { removeMember } from "./people.ts";
 import { createProject } from "./projects.ts";
 import { SERVER_ONLY, whileHeld } from "./race-testing.ts";
+import { removeRepository } from "./repositories.ts";
 import {
   createRun,
   type CreateRunInput,
@@ -234,6 +235,7 @@ async function setUp() {
   const inputMessageId = await messageOf(workspaceId, projectId, owner);
   const request: CreateRunInput = {
     userId: owner.userId,
+    deviceId: owner.deviceId,
     projectId,
     agentId,
     providerConnectionId,
@@ -248,6 +250,26 @@ async function setUp() {
     providerConnectionId,
     inputMessageId,
     request,
+  };
+}
+
+/**
+ * A request of `who` for an agent of theirs hosted on their device: that
+ * device asks, with a connection of it and a message of `who` in the
+ * project's chat.
+ */
+async function requestOf(
+  request: CreateRunInput,
+  workspaceId: WorkspaceId,
+  who: Account,
+  agentId: AgentId,
+): Promise<CreateRunInput> {
+  return {
+    ...request,
+    ...who,
+    agentId,
+    providerConnectionId: await connectionOf(who.deviceId),
+    inputMessageId: await messageOf(workspaceId, request.projectId, who),
   };
 }
 
@@ -374,15 +396,58 @@ test("a run with a repository of the project keeps it, and each creation is a ne
   assert.equal(await runCount(request.agentId), 2);
 });
 
-test("the input message may be another member's: any message of the project's chat that the owner can read", async () => {
-  const { workspaceId, projectId, request } = await setUp();
+test("the input message is the asking account's own: another member's and an agent's are not_found", async () => {
+  const { owner, workspaceId, projectId, agentId, request } = await setUp();
   const member = await account("Member");
   await join(workspaceId, member);
-  const inputMessageId = await messageOf(workspaceId, projectId, member);
-  const result = created(
-    await createRun(database(), { ...request, inputMessageId }),
+  const membersMessage = await messageOf(workspaceId, projectId, member);
+  assert.equal(
+    refusal(
+      await createRun(database(), {
+        ...request,
+        inputMessageId: membersMessage,
+      }),
+    ),
+    "not_found",
   );
-  assert.equal(result.run.inputMessageId, inputMessageId);
+  // A message of an agent of the project, written directly: no writer
+  // posts one yet.
+  const [chat] = await database()
+    .select({ conversationId: messages.conversationId, seq: messages.seq })
+    .from(messages)
+    .where(eq(messages.id, membersMessage));
+  assert.ok(chat !== undefined);
+  const agentsMessage = newId<MessageId>();
+  await database()
+    .insert(messages)
+    .values({
+      id: agentsMessage,
+      conversationId: chat.conversationId,
+      seq: chat.seq + 100,
+      authorAgentId: agentId,
+      senderDeviceId: owner.deviceId,
+      body: "Done",
+    });
+  assert.equal(
+    refusal(
+      await createRun(database(), {
+        ...request,
+        inputMessageId: agentsMessage,
+      }),
+    ),
+    "not_found",
+  );
+  // The member's message is the input of a run of the member's own agent.
+  const own = await requestOf(
+    request,
+    workspaceId,
+    member,
+    await agentOf(projectId, member),
+  );
+  created(
+    await createRun(database(), { ...own, inputMessageId: membersMessage }),
+  );
+  assert.equal(await runCount(agentId), 0);
 });
 
 test("a project that does not exist, an account that is not a member, and a removed member are not_member, and nothing is written", async () => {
@@ -408,12 +473,12 @@ test("a project that does not exist, an account that is not a member, and a remo
   const member = await account("Member");
   const person = await join(workspaceId, member);
   const memberAgent = await agentOf(projectId, member);
-  const memberRequest: CreateRunInput = {
-    ...request,
-    userId: member.userId,
-    agentId: memberAgent,
-    providerConnectionId: await connectionOf(member.deviceId),
-  };
+  const memberRequest = await requestOf(
+    request,
+    workspaceId,
+    member,
+    memberAgent,
+  );
   created(await createRun(database(), memberRequest));
   const removed = await removeMember(database(), {
     workspaceId,
@@ -495,13 +560,15 @@ test("only the agent's owner creates its runs: another member, also the workspac
   );
   assert.equal(await runCount(agentId), 0);
   assert.equal(await runCount(memberAgent), 0);
-  // The member's own agent, with the member's own connection, is theirs.
+  // The member's own agent, with the member's own connection and message,
+  // asked from the member's device, is theirs.
   const own = created(
     await createRun(database(), {
       ...request,
-      userId: member.userId,
+      ...member,
       agentId: memberAgent,
       providerConnectionId: memberConnection,
+      inputMessageId: await messageOf(workspaceId, projectId, member),
     }),
   );
   assert.equal((await runRow(own.run.id)).requestedByUserId, member.userId);
@@ -586,25 +653,68 @@ test("a provider connection that the agent's host device does not have is not_fo
   assert.equal(await runCount(agentId), 0);
 });
 
-test("an agent on the owner's second device takes a connection of that device, not of the device that asks", async () => {
+test("only the agent's host device asks: another device of the owner is forbidden, before anything else about the request is read", async () => {
+  const { owner, agentId, request } = await setUp();
+  // A new device of the owner, as one that a taken-over GitHub account
+  // registers, asks with the IDs of the agent's host device.
+  const secondDevice = await addDevice(owner.userId);
+  const fromSecond = { ...request, deviceId: secondDevice };
+  assert.equal(refusal(await createRun(database(), fromSecond)), "forbidden");
+  // With its own connection, or with IDs that do not exist, it learns
+  // nothing more.
+  assert.equal(
+    refusal(
+      await createRun(database(), {
+        ...fromSecond,
+        providerConnectionId: await connectionOf(secondDevice),
+      }),
+    ),
+    "forbidden",
+  );
+  assert.equal(
+    refusal(
+      await createRun(database(), {
+        ...fromSecond,
+        repositoryId: newId<RepositoryId>(),
+        providerConnectionId: newId<ProviderConnectionId>(),
+        inputMessageId: newId<MessageId>(),
+      }),
+    ),
+    "forbidden",
+  );
+  assert.equal(await runCount(agentId), 0);
+  created(await createRun(database(), request));
+});
+
+test("an agent on the owner's second device is asked for from that device, and takes a connection of it", async () => {
   const { owner, projectId, providerConnectionId, request } = await setUp();
   const secondDevice = await addDevice(owner.userId);
   const agentId = await agentOf(projectId, owner, secondDevice);
-  // The connection of the first device is not on this agent's host device.
+  const fromSecond = { ...request, deviceId: secondDevice, agentId };
+  // The first device does not host this agent.
   assert.equal(
-    refusal(await createRun(database(), { ...request, agentId })),
-    "not_found",
+    refusal(
+      await createRun(database(), {
+        ...request,
+        agentId,
+        providerConnectionId: await connectionOf(secondDevice),
+      }),
+    ),
+    "forbidden",
   );
+  // The connection of the first device is not on this agent's host device.
+  assert.equal(refusal(await createRun(database(), fromSecond)), "not_found");
   const result = created(
     await createRun(database(), {
-      ...request,
-      agentId,
+      ...fromSecond,
       providerConnectionId: await connectionOf(secondDevice),
     }),
   );
   const row = await runRow(result.run.id);
   assert.equal(row.hostDeviceId, secondDevice);
   assert.notEqual(row.providerConnectionId, providerConnectionId);
+  // The owner's message from the first device is still the owner's own.
+  assert.equal(row.inputMessageId, request.inputMessageId);
 });
 
 test("a message that the project's chat does not have is not_found: unknown, of another project, of another workspace, or deleted", async () => {
@@ -804,6 +914,16 @@ test("the refusals are decided in order: the membership, the agent, its owner, t
     ),
     "forbidden",
   );
+  // Another device of the owner, before anything about the other IDs.
+  assert.equal(
+    refusal(
+      await createRun(database(), {
+        ...unknownMessage,
+        deviceId: await addDevice(owner.userId),
+      }),
+    ),
+    "forbidden",
+  );
   // The unknown message comes before the disabled agent.
   assert.equal(
     refusal(await createRun(database(), unknownMessage)),
@@ -954,12 +1074,12 @@ test("a run's provider connection, host device, and input message never change: 
   const member = await account("Member");
   const person = await join(workspaceId, member);
   const memberAgent = await agentOf(projectId, member);
-  const memberRequest: CreateRunInput = {
-    ...request,
-    userId: member.userId,
-    agentId: memberAgent,
-    providerConnectionId: await connectionOf(member.deviceId),
-  };
+  const memberRequest = await requestOf(
+    request,
+    workspaceId,
+    member,
+    memberAgent,
+  );
   const moved = created(await createRun(database(), request)).run;
   const cancelled = created(await createRun(database(), memberRequest)).run;
   const kept = async (runId: RunId) => {
@@ -972,7 +1092,7 @@ test("a run's provider connection, host device, and input message never change: 
     [
       memberRequest.providerConnectionId,
       member.deviceId,
-      request.inputMessageId,
+      memberRequest.inputMessageId,
     ],
   ]);
 
@@ -1111,9 +1231,10 @@ test("the run list shows a run's input message to every member, and its provider
   const membersRun = created(
     await createRun(database(), {
       ...request,
-      userId: member.userId,
+      ...member,
       agentId: memberAgent,
       providerConnectionId: memberConnection,
+      inputMessageId: await messageOf(workspaceId, projectId, member),
       now: new Date(NOW.getTime() - 1),
     }),
   ).run;
@@ -1276,12 +1397,12 @@ test(
     const member = await account("Member");
     const person = await join(workspaceId, member);
     const agentId = await agentOf(projectId, member);
-    const memberRequest: CreateRunInput = {
-      ...request,
-      userId: member.userId,
+    const memberRequest = await requestOf(
+      request,
+      workspaceId,
+      member,
       agentId,
-      providerConnectionId: await connectionOf(member.deviceId),
-    };
+    );
     const { result, waitedOn } = await whileHeld(
       testDatabase,
       (tx) =>
@@ -1302,12 +1423,12 @@ test(
     const member = await account("Member");
     const person = await join(workspaceId, member);
     const agentId = await agentOf(projectId, member);
-    const memberRequest: CreateRunInput = {
-      ...request,
-      userId: member.userId,
+    const memberRequest = await requestOf(
+      request,
+      workspaceId,
+      member,
       agentId,
-      providerConnectionId: await connectionOf(member.deviceId),
-    };
+    );
     let runId: RunId | undefined;
     const { result, waitedOn } = await whileHeld(
       testDatabase,
@@ -1346,5 +1467,39 @@ test(
     assert.deepEqual(waitedOn, ["agents"]);
     assert.equal((await runRow(running)).state, "running");
     assert.equal(await runCount(agentId), 2);
+  },
+);
+
+test(
+  "a creation waits at the project for a removal of its repository by another person and is then a conflict",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId, projectId, request } = await setUp();
+    // The member asks and the owner removes, so that each locks another
+    // person and only the project row orders them before the repository.
+    const member = await account("Member");
+    await join(workspaceId, member);
+    const agentId = await agentOf(projectId, member);
+    const repositoryId = await repositoryOf(projectId, owner);
+    const memberRequest = {
+      ...(await requestOf(request, workspaceId, member, agentId)),
+      repositoryId,
+    };
+    const { result, waitedOn } = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        const removed = await removeRepository(tx, {
+          projectId,
+          repositoryId,
+          userId: owner.userId,
+          now: NOW,
+        });
+        assert.ok(removed.removed, JSON.stringify(removed));
+      },
+      () => createRun(database(), memberRequest),
+    );
+    assert.deepEqual(result, { created: false, refusal: "conflict" });
+    assert.deepEqual(waitedOn, ["projects"]);
+    assert.equal(await runCount(agentId), 0);
   },
 );

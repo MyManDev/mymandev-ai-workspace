@@ -10,19 +10,28 @@
 // - Only the agent's owner may ask in v0: a run that another member asked
 //   for would spend the owner's provider, which belongs to provider sharing
 //   (M5).
+// - Only from the agent's host device, as only that device grants (#75,
+//   Project Manager decision of 2026-11-14): another device of the account,
+//   for example one that a taken-over GitHub account registered, would
+//   otherwise start a run with the grants that the agent already holds.
 // - A run carries one provider connection of its agent's host device, which
 //   never changes after the creation, so that the enforcement point takes
 //   the scope of `provider.use` from the run that it holds (ADR 0015).
-// - A run's input is a chat message of its project, so that the instruction
-//   shows in the project's chat; a run has no text of its own.
+// - A run's input is a chat message of its project that the caller wrote,
+//   so that the instruction shows in the project's chat as the requester's
+//   own words, and no other member's or agent's text becomes the
+//   instruction of the owner's run; a run has no text of its own.
 //
-// Provisional (#35), each the more careful option until the Project Manager
-// decides: the path; that the owner asks from any of their devices; that
-// the message may be of any author; that only the agent's owner reads the
-// run's provider connection; that the creation's event is
+// Provisional (#35), applied as defaults until the Project Manager decides:
+// the path; that the owner asks only from the agent's host device, which
+// follows the decision for grants (#75); that the input is only a message
+// that the caller wrote; that only the agent's owner reads the run's
+// provider connection; that the creation's event is
 // `agent.run.state_changed` with an added `run`, not a new event type; the
 // two limits and their codes; and that the request carries no idempotency
-// key and no correlation ID.
+// key and no correlation ID. Each rule about who may ask, what the input
+// is, and who reads the connection is the narrower option; widening it
+// later is an additive change.
 
 import * as z from "zod";
 import { AgentRunListItemSchema } from "./agent-api.ts";
@@ -49,7 +58,7 @@ export const RUN_ROUTES = Object.freeze({
   /**
    * Creates a run of an agent of the project, in `queued`, and answers `200`
    * with it. Only the account that owns the agent, as an active member of
-   * the project's workspace.
+   * the project's workspace, and only from the agent's host device.
    */
   createRun: route("POST", "/projects/:projectId/runs"),
 });
@@ -75,14 +84,16 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  *
  * - `not_found`: a non-member, a project that does not exist, or an agent
  *   that the project does not have;
- * - `forbidden`: the caller does not own the agent. It comes before every
- *   check of the repository, the provider connection, and the message, so
- *   that only an agent's owner learns anything about them;
+ * - `forbidden`: the caller does not own the agent, or the calling device
+ *   is not the agent's host device. It comes before every check of the
+ *   repository, the provider connection, and the message, so that only an
+ *   agent's owner, on the agent's host device, learns anything about them;
  * - `not_found`: a repository that the project does not have, a provider
  *   connection that the agent's host device does not have, or a message
- *   that the project's chat does not have. Each answers alike whether the
- *   ID exists elsewhere or nowhere, so that an ID cannot be probed, and the
- *   answer does not say which of them it was;
+ *   that the project's chat does not have from the caller. Each answers
+ *   alike whether the ID exists elsewhere, is a message of another author,
+ *   or exists nowhere, so that an ID cannot be probed, and the answer does
+ *   not say which of them it was;
  * - `conflict`: all of them exist, but one is not in the state that a run
  *   needs: the project or its workspace is archived, the agent is disabled,
  *   the repository is archived, or the provider connection is removed;
@@ -118,8 +129,9 @@ export const RUN_ROUTE_ERRORS = Object.freeze({
  *   repository (ADR 0015).
  * - `providerConnectionId`: a provider connection of the agent's host
  *   device. The run keeps it for good.
- * - `inputMessageId`: a message of the project's chat, of any author, that
- *   the caller can read. It is the run's input; the request carries no text.
+ * - `inputMessageId`: a message that the caller wrote in the project's chat
+ *   and that is not deleted. It is the run's input; the request carries no
+ *   text.
  *
  * The request carries no idempotency key: the same request sent again
  * creates a second run, so the desktop never sends it again on its own.
