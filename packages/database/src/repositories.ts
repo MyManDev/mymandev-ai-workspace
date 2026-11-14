@@ -71,9 +71,10 @@ import {
 //
 // A writer that inserts a grant or a run that names a repository (#75, M3)
 // locks the repository's row `FOR SHARE` or stronger, after the people that
-// `src/people.ts` asks it to lock, and checks that the repository is not
-// removed. A removal holds the row `FOR NO KEY UPDATE`, which `FOR SHARE`
-// waits for and the `FOR KEY SHARE` of a foreign-key check does not; so
+// `src/people.ts` asks it to lock and, if it locks the project, after the
+// project, and checks that the repository is not removed. A removal holds
+// the row `FOR NO KEY UPDATE`, which `FOR SHARE` waits for and the
+// `FOR KEY SHARE` of a foreign-key check does not; so
 // either the removal commits first and the writer finds the repository
 // removed, or the insert commits first and the removal revokes the new
 // grant. Without this a removal could miss a grant that a concurrent insert
