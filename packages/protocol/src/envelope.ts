@@ -36,6 +36,7 @@ import {
   RUN_CANCEL_REASONS,
 } from "./model.ts";
 import { WorkspaceProjectSchema } from "./project-api.ts";
+import { ProjectRepositorySchema } from "./repository-api.ts";
 
 /**
  * Who caused an event. A client cannot choose its identity: the server binds
@@ -268,6 +269,37 @@ export const WorkspaceProjectRenamedEventSchema = z.object({
   }),
 });
 
+// Repository events (#286): the repositories of a project, which every
+// member of its workspace sees. Only the server originates them, after the
+// commit, with a `system` actor and `deviceId: null`, like the project events
+// (see `actorAllowed`). Neither carries a path or a remote URL: the cloud
+// holds none (ADR 0005, ADR 0013).
+
+/**
+ * A member registered a repository in a project of the workspace; the
+ * payload names the repository's project and who registered it.
+ */
+export const WorkspaceRepositoryRegisteredEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.repository.registered"),
+  payload: z.object({ repository: ProjectRepositorySchema }),
+});
+
+/**
+ * A repository was removed from its project. The removal revoked every
+ * grant scoped to the repository in the same transaction (ADR 0015, P-77),
+ * and nothing restores them. The event's `occurredAt` is the time that the
+ * server stores as the removal's.
+ */
+export const WorkspaceRepositoryRemovedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.repository.removed"),
+  payload: z.object({
+    projectId: ProjectIdSchema,
+    repositoryId: RepositoryIdSchema,
+  }),
+});
+
 // Join request events (#210, #227): the pending join requests and the
 // blocks in force of a workspace, which only its owner and admins see. Only
 // the server originates them, after the commit, with a `system` actor and
@@ -447,6 +479,8 @@ export const ProtocolEventSchema = z.discriminatedUnion("type", [
   WorkspaceOwnershipTransferredEventSchema,
   WorkspaceProjectCreatedEventSchema,
   WorkspaceProjectRenamedEventSchema,
+  WorkspaceRepositoryRegisteredEventSchema,
+  WorkspaceRepositoryRemovedEventSchema,
   WorkspaceJoinRequestCreatedEventSchema,
   WorkspaceJoinRequestResolvedEventSchema,
   WorkspaceJoinRequestUnblockedEventSchema,
@@ -469,6 +503,8 @@ export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
   "workspace.ownership.transferred",
   "workspace.project.created",
   "workspace.project.renamed",
+  "workspace.repository.registered",
+  "workspace.repository.removed",
   "workspace.join_request.created",
   "workspace.join_request.resolved",
   "workspace.join_request.unblocked",
@@ -528,6 +564,8 @@ export const SERVER_EVENT_AUDIENCES = Object.freeze({
   "workspace.ownership.transferred": "members",
   "workspace.project.created": "members",
   "workspace.project.renamed": "members",
+  "workspace.repository.registered": "members",
+  "workspace.repository.removed": "members",
   "workspace.join_request.created": "approvers",
   "workspace.join_request.resolved": "approvers",
   "workspace.join_request.unblocked": "approvers",
@@ -577,12 +615,14 @@ export function actorAllowed(event: ProtocolEvent): boolean {
     case "workspace.ownership.transferred":
     case "workspace.project.created":
     case "workspace.project.renamed":
+    case "workspace.repository.registered":
+    case "workspace.repository.removed":
     case "workspace.join_request.created":
     case "workspace.join_request.resolved":
     case "workspace.join_request.unblocked":
     case "chat.message.created":
-      // Only the server reports membership, project, and join request
-      // changes and stored messages.
+      // Only the server reports membership, project, repository, and join
+      // request changes and stored messages.
       return event.actor.kind === "system" && event.deviceId === null;
     case "agent.grant.created":
     case "agent.grant.revoked":
