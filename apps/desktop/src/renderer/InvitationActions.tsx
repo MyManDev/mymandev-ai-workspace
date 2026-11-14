@@ -54,6 +54,12 @@ export const INVITATION_CODE_MESSAGES = Object.freeze({
   until: "It can be used once, until ",
   select: "Select the code",
   close: "Close",
+  /**
+   * Instead of the code, once the account was demoted to a member (#266):
+   * the server revoked the invitation with the demotion.
+   */
+  revoked:
+    "You are no longer an admin of this workspace, so this code no longer works. It is not shown.",
 });
 
 /** What the people screen does on its invitation actions; undefined without the bridges. */
@@ -343,7 +349,10 @@ export function selectCode(
 }
 
 export interface InvitationCodeProps {
-  /** The code of the invitation just created, or undefined when no dialog is open. */
+  /**
+   * The code of the invitation just created, or undefined when no dialog is
+   * open; without the code itself once the account was demoted (#266).
+   */
   readonly code: InvitationCodeView | undefined;
   readonly format: Intl.DateTimeFormat;
   readonly onClose: () => void;
@@ -370,6 +379,28 @@ export function showCodeInField(
 }
 
 /**
+ * Keeps the focus inside the code's dialog once its code went with the
+ * account's demotion (#266): the field and "Select the code" leave the
+ * open dialog, and when the focus was on one of them, so that it is no
+ * longer inside the dialog (`active`), it moves to "Close". A focus that is
+ * still inside stays where it is. A dialog that is not open yet takes the
+ * focus by itself as it opens.
+ */
+export function keepFocusInDialog(
+  dialog: {
+    readonly open: boolean;
+    readonly contains: (node: Element | null) => boolean;
+  } | null,
+  close: { readonly focus: () => void } | null,
+  active: Element | null,
+): void {
+  if (dialog === null || !dialog.open || dialog.contains(active)) {
+    return;
+  }
+  close?.focus();
+}
+
+/**
  * The code of a new invitation, once (D2), as a modal dialog of the page.
  * The code reaches the read-only field only as its `value` property, set
  * through a reference (`showCodeInField`): a controlled `value` would also
@@ -377,14 +408,31 @@ export function showCodeInField(
  * the field's text and nothing else. Closing, also with Escape, drops the
  * code: the field is emptied, the dialog is then empty, and nothing in the
  * page holds the code.
+ *
+ * Once the account was demoted to a member, the view holds no code (#266):
+ * the field is emptied and leaves the dialog with "Select the code", the
+ * dialog says that the code no longer works, and the focus stays inside
+ * (`keepFocusInDialog`). The dialog stays open until the person closes it.
  */
 export function InvitationCodeBox(props: InvitationCodeProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const fieldRef = useRef<HTMLInputElement>(null);
-  const shown = props.code?.code;
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const shown = props.code?.code ?? undefined;
   // The field's reference is set before this effect runs, and the cleanup
   // empties the same element even after React has detached the reference.
   useLayoutEffect(() => showCodeInField(fieldRef.current, shown), [shown]);
+  const revoked = props.code?.code === null;
+  // After the commit that took the field away, before the browser paints.
+  useLayoutEffect(() => {
+    if (revoked) {
+      keepFocusInDialog(
+        dialogRef.current,
+        closeRef.current,
+        document.activeElement,
+      );
+    }
+  }, [revoked]);
   useModal(dialogRef, props.code !== undefined);
   return (
     <InvitationCodeContent
@@ -392,6 +440,7 @@ export function InvitationCodeBox(props: InvitationCodeProps) {
       onSelect={() => selectCode(fieldRef.current)}
       dialogRef={dialogRef}
       fieldRef={fieldRef}
+      closeRef={closeRef}
     />
   );
 }
@@ -405,6 +454,13 @@ export function InvitationCodeBox(props: InvitationCodeProps) {
  * paragraph, a label, or an attribute. The person's name is text with
  * `dir="auto"`. The buttons are not in a form, so that Enter in the field
  * closes nothing.
+ *
+ * A view without the code, after the account's demotion (#266), shows no
+ * field, no end, and no "Select the code": the title, the person's name,
+ * the sentence that the code no longer works, which then describes the
+ * dialog, and "Close". The sentence sits in an alert that is always
+ * rendered, empty while the code shows, so that a screen reader announces
+ * it when it appears in the open dialog; the page behind is inert.
  */
 export function InvitationCodeContent({
   code,
@@ -413,20 +469,27 @@ export function InvitationCodeContent({
   onSelect,
   dialogRef,
   fieldRef,
+  closeRef,
 }: InvitationCodeProps & {
   readonly onSelect: () => void;
   readonly dialogRef?: RefObject<HTMLDialogElement | null>;
   readonly fieldRef?: RefObject<HTMLInputElement | null>;
+  readonly closeRef?: RefObject<HTMLButtonElement | null>;
 }) {
   if (code === undefined) {
     return <dialog ref={dialogRef} className="people-dialog" />;
   }
+  const revoked = code.code === null;
   return (
     <dialog
       ref={dialogRef}
       className="people-dialog"
       aria-labelledby="invitation-code-title"
-      aria-describedby="invitation-code-name invitation-code-text"
+      aria-describedby={
+        revoked
+          ? "invitation-code-name invitation-code-revoked"
+          : "invitation-code-name invitation-code-text"
+      }
       onCancel={(event) => {
         // Escape closes; the dialog closes with the code.
         event.preventDefault();
@@ -440,34 +503,50 @@ export function InvitationCodeContent({
         <p className="people-dialog-name" id="invitation-code-name">
           <span dir="auto">{code.name}</span>
         </p>
-        <p id="invitation-code-text">{INVITATION_CODE_MESSAGES.shownOnce}</p>
-        <label className="account-label" htmlFor="invitation-code-field">
-          {INVITATION_CODE_MESSAGES.label}
-        </label>
-        <input
-          ref={fieldRef}
-          id="invitation-code-field"
-          className="account-input invitation-code"
-          type="text"
-          dir="ltr"
-          translate="no"
-          readOnly
-          autoComplete="off"
-          spellCheck={false}
-          aria-describedby="invitation-code-expiry"
-        />
-        <p id="invitation-code-expiry">
-          {INVITATION_CODE_MESSAGES.until}
-          <time dateTime={code.expiresAt}>
-            {formatTime(code.expiresAt, format)}
-          </time>
-          .
+        {revoked ? null : (
+          <>
+            <p id="invitation-code-text">
+              {INVITATION_CODE_MESSAGES.shownOnce}
+            </p>
+            <label className="account-label" htmlFor="invitation-code-field">
+              {INVITATION_CODE_MESSAGES.label}
+            </label>
+            <input
+              ref={fieldRef}
+              id="invitation-code-field"
+              className="account-input invitation-code"
+              type="text"
+              dir="ltr"
+              translate="no"
+              readOnly
+              autoComplete="off"
+              spellCheck={false}
+              aria-describedby="invitation-code-expiry"
+            />
+            <p id="invitation-code-expiry">
+              {INVITATION_CODE_MESSAGES.until}
+              <time dateTime={code.expiresAt}>
+                {formatTime(code.expiresAt, format)}
+              </time>
+              .
+            </p>
+          </>
+        )}
+        <p className="panel-message" id="invitation-code-revoked" role="alert">
+          {revoked ? INVITATION_CODE_MESSAGES.revoked : ""}
         </p>
         <div className="people-dialog-actions">
-          <button type="button" className="panel-action" onClick={onSelect}>
-            {INVITATION_CODE_MESSAGES.select}
-          </button>
-          <button type="button" className="panel-action" onClick={onClose}>
+          {revoked ? null : (
+            <button type="button" className="panel-action" onClick={onSelect}>
+              {INVITATION_CODE_MESSAGES.select}
+            </button>
+          )}
+          <button
+            ref={closeRef}
+            type="button"
+            className="panel-action"
+            onClick={onClose}
+          >
             {INVITATION_CODE_MESSAGES.close}
           </button>
         </div>

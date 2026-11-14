@@ -1206,6 +1206,219 @@ test("a sign-out while the code of Deny and invite instead shows drops the code,
   expect(after.last()).toEqual(IDLE_JOIN_REQUEST_ACTIONS);
 });
 
+/** The people as the admin sees them, who uses "Deny and invite instead". */
+const AS_ADMIN = known({ ownMemberId: ADMIN });
+
+/** The people with that admin as a member. */
+const DEMOTED_PEOPLE: readonly PersonView[] = READY.people.map((entry) =>
+  entry.memberId === ADMIN ? { ...entry, role: "member" } : entry,
+);
+
+/** The people once they show the demotion, with `overrides`. */
+function demoted(overrides: Partial<PeopleView> = {}): PeopleScreenView {
+  return known({
+    revision: 5,
+    ownMemberId: ADMIN,
+    people: DEMOTED_PEOPLE,
+    ...overrides,
+  });
+}
+
+const AS_DEMOTED = demoted();
+
+/** The join requests once the main process applied the demotion (#257). */
+const NOT_ALLOWED = listed({
+  revision: 8,
+  status: "not_allowed",
+  pending: [],
+  blocked: [],
+});
+
+/** The two ways a demotion shows: in the people, or in the join requests first. */
+const DEMOTIONS: [string, PeopleScreenView, JoinRequestsScreenView][] = [
+  ["the people show it", AS_DEMOTED, listed()],
+  ["the join requests say not_allowed first", AS_ADMIN, NOT_ALLOWED],
+];
+
+/** The view of the code's dialog once its code went with a demotion. */
+const WITHOUT_CODE = {
+  name: "Margaret",
+  code: null,
+  expiresAt: CREATED_ENDS_AT,
+};
+
+test("#266: a demotion while the code of Deny and invite instead shows drops the code at once and keeps the dialog open without it, while the denial is on its way and after it; a promotion never brings it back", async () => {
+  for (const [name, people, joinRequests] of DEMOTIONS) {
+    // While the denial is on its way: its answer keeps the dialog as it is.
+    const deny = pending<JoinRequestActionResult>();
+    const during = controllerWith(
+      { create: () => Promise.resolve(CREATED), deny: deny.answer },
+      AS_ADMIN,
+    );
+    await during.actions.start(INVITE);
+    during.actions.choose(UNCLAIMED);
+    const denying = during.actions.confirm();
+    await settle();
+    expect(during.last().code?.code, name).toBe(CODE);
+    const before = during.views.length;
+    during.actions.listChanged(people, joinRequests);
+    expect(during.views, name).toHaveLength(before + 1);
+    expect(during.last(), name).toEqual({
+      running: true,
+      message: undefined,
+      dialog: undefined,
+      code: WITHOUT_CODE,
+    });
+    deny.resolve(refused("not_allowed"));
+    expect(await denying, name).toBe(false);
+    expect(during.last(), name).toEqual({
+      running: false,
+      message:
+        "The invitation was created. The request could not be denied. Your role in this workspace does not allow it.",
+      dialog: undefined,
+      code: WITHOUT_CODE,
+    });
+    expect(JSON.stringify(during.views.slice(before)), name).not.toContain(
+      CODE,
+    );
+    during.actions.closeCode();
+    expect(during.last().code, name).toBeUndefined();
+
+    // After the denial: the open dialog loses the code as well.
+    const after = controllerWith(
+      { create: () => Promise.resolve(CREATED), deny: OK },
+      AS_ADMIN,
+    );
+    await after.actions.start(INVITE);
+    after.actions.choose(UNCLAIMED);
+    expect(await after.actions.confirm(), name).toBe(true);
+    expect(after.last().code?.code, name).toBe(CODE);
+    const shown = after.views.length;
+    after.actions.listChanged(people, joinRequests);
+    expect(after.last(), name).toEqual({
+      running: false,
+      message: "The invitation was created, and the request was denied.",
+      dialog: undefined,
+      code: WITHOUT_CODE,
+    });
+    // The dialog is still open: nothing else starts.
+    expect(await after.actions.start(PAUSE), name).toBe(false);
+    // The same views again, a promotion, and another demotion change nothing.
+    after.actions.listChanged(people, joinRequests);
+    after.actions.listChanged(AS_ADMIN, listed({ revision: 20 }));
+    after.actions.listChanged(AS_DEMOTED, NOT_ALLOWED);
+    expect(after.views, name).toHaveLength(shown + 1);
+    expect(after.last().code, name).toEqual(WITHOUT_CODE);
+    expect(JSON.stringify(after.views.slice(shown)), name).not.toContain(CODE);
+    expect(JSON.stringify(after.views.slice(shown)), name).not.toContain(
+      CODE.slice(5, 30),
+    );
+    after.actions.closeCode();
+    expect(after.last().code, name).toBeUndefined();
+  }
+});
+
+test("#266: a demotion that arrives while the invitation of Deny and invite instead is created opens the dialog without the code, also when a promotion follows it, and no view ever holds the code", async () => {
+  const scenarios: [string, [PeopleScreenView, JoinRequestsScreenView][]][] = [
+    ...DEMOTIONS.map(
+      ([name, people, joinRequests]): [
+        string,
+        [PeopleScreenView, JoinRequestsScreenView][],
+      ] => [name, [[people, joinRequests]]],
+    ),
+    // The demotion revoked the invitation; the promotion does not restore it.
+    [
+      "a demotion and then a promotion",
+      [
+        [AS_DEMOTED, NOT_ALLOWED],
+        [AS_ADMIN, listed({ revision: 20 })],
+      ],
+    ],
+  ];
+  for (const [name, steps] of scenarios) {
+    const create = pending<CreateInvitationResult>();
+    const deny = pending<JoinRequestActionResult>();
+    const { actions, calls, views, last } = controllerWith(
+      { create: create.answer, deny: deny.answer },
+      AS_ADMIN,
+    );
+    await actions.start(INVITE);
+    actions.choose(UNCLAIMED);
+    const done = actions.confirm();
+    for (const [people, joinRequests] of steps) {
+      actions.listChanged(people, joinRequests);
+    }
+    create.resolve(CREATED);
+    await settle();
+    expect(last(), name).toEqual({
+      running: true,
+      message: undefined,
+      dialog: undefined,
+      code: WITHOUT_CODE,
+    });
+    // The denial goes as before, once; the server decides on it.
+    expect(
+      calls.map((call) => call.name),
+      name,
+    ).toEqual(["create", "deny"]);
+    deny.resolve(refused("not_allowed"));
+    expect(await done, name).toBe(false);
+    expect(last().code, name).toEqual(WITHOUT_CODE);
+    expect(JSON.stringify(views), name).not.toContain(CODE);
+    expect(JSON.stringify(views), name).not.toContain(CODE.slice(5, 30));
+    actions.closeCode();
+    expect(last().code, name).toBeUndefined();
+  }
+  // A demotion before an earlier action does not count for the next one.
+  const { actions, last } = controllerWith(
+    { create: () => Promise.resolve(CREATED), deny: OK },
+    AS_ADMIN,
+  );
+  actions.listChanged(AS_DEMOTED, NOT_ALLOWED);
+  actions.listChanged(AS_ADMIN, listed({ revision: 20 }));
+  await actions.start(INVITE);
+  actions.choose(UNCLAIMED);
+  await actions.confirm();
+  expect(last().code?.code).toBe(CODE);
+});
+
+test("#266: the code of Deny and invite instead stays while the account keeps the owner's or an admin's role: another person's demotion, people that are not ready, and another workspace's not_allowed", async () => {
+  const others: [PeopleScreenView, PeopleScreenView, JoinRequestsScreenView][] =
+    [
+      // Another admin is demoted, as the owner sees it.
+      [known(), known({ people: DEMOTED_PEOPLE }), listed({ revision: 20 })],
+      // People that are not ready decide nothing, whatever role they list.
+      [
+        AS_ADMIN,
+        demoted({ status: "loading" }),
+        listed({ status: "loading", pending: [], blocked: [] }),
+      ],
+      [
+        AS_ADMIN,
+        AS_ADMIN,
+        listed({
+          workspaceId: OTHER_WORKSPACE,
+          status: "not_allowed",
+          pending: [],
+          blocked: [],
+        }),
+      ],
+    ];
+  for (const [shown, people, joinRequests] of others) {
+    const { actions, views, last } = controllerWith(
+      { create: () => Promise.resolve(CREATED), deny: OK },
+      shown,
+    );
+    await actions.start(INVITE);
+    actions.choose(UNCLAIMED);
+    await actions.confirm();
+    const before = views.length;
+    actions.listChanged(people, joinRequests);
+    expect(views).toHaveLength(before);
+    expect(last().code?.code).toBe(CODE);
+  }
+});
+
 test("the next action and a refresh end the sentence about a code that could not be shown, also before it shows", async () => {
   /**
    * A controller whose invitation was created after a switch away, so that

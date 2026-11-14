@@ -22,6 +22,7 @@ import {
   followInvitations,
   IDLE_INVITATION_ACTIONS,
   initialInvitationsScreenView,
+  isDemoted,
   INVITATION_ACTION_DONE_MESSAGES,
   INVITATION_ACTION_NOT_DONE_MESSAGES,
   INVITATION_ACTION_UNKNOWN_MESSAGES,
@@ -861,6 +862,283 @@ test("D2: a switch or a sign-out while the code shows drops it", async () => {
     actions.listChanged(next, listed(), NOW);
     expect(last()).toEqual(IDLE_INVITATION_ACTIONS);
     expect(serialized(views.slice(before))).not.toContain(CODE);
+  }
+});
+
+/** The people as the admin sees them, who created the invitation. */
+const AS_ADMIN = known({ ownMemberId: ADMIN });
+
+/** The people with that admin as a member. */
+const DEMOTED_PEOPLE: readonly PersonView[] = PEOPLE.map((entry) =>
+  entry.memberId === ADMIN ? { ...entry, role: "member" } : entry,
+);
+
+/** The people once they show the demotion, with `overrides`. */
+function demoted(overrides: Partial<PeopleView> = {}): PeopleScreenView {
+  return known({
+    revision: 5,
+    ownMemberId: ADMIN,
+    people: DEMOTED_PEOPLE,
+    ...overrides,
+  });
+}
+
+const AS_DEMOTED = demoted();
+
+/** The invitations once the main process applied the demotion (#262). */
+const NOT_ALLOWED = listed({
+  revision: 4,
+  status: "not_allowed",
+  invitations: [],
+});
+
+/** The two ways a demotion shows: in the people, or in the invitations first. */
+const DEMOTIONS: [string, PeopleScreenView, InvitationsScreenView][] = [
+  ["the people show it", AS_DEMOTED, listed()],
+  ["the invitations say not_allowed first", AS_ADMIN, NOT_ALLOWED],
+];
+
+/** The view of the code's dialog once its code went with a demotion. */
+const WITHOUT_CODE = {
+  name: "Margaret",
+  code: null,
+  expiresAt: CREATED_ENDS_AT,
+};
+
+test("#266: the account is demoted in a workspace when the ready people of it list its own active person as a member, or when the list says not_allowed for it", () => {
+  const list = (state: InvitationsScreenView) =>
+    state.kind === "known" ? state.state : undefined;
+  // The people decide: only a member's role of the own active person.
+  expect(isDemoted(AS_DEMOTED, list(listed()), WORKSPACE)).toBe(true);
+  expect(isDemoted(AS_DEMOTED, undefined, WORKSPACE)).toBe(true);
+  expect(isDemoted(known({ ownMemberId: MEMBER }), undefined, WORKSPACE)).toBe(
+    true,
+  );
+  for (const people of [
+    known(),
+    AS_ADMIN,
+    // An ownership transfer makes the owner an admin, who keeps the invitations.
+    known({
+      people: PEOPLE.map((entry) =>
+        entry.memberId === OWNER ? { ...entry, role: "admin" } : entry,
+      ),
+    }),
+    // A former member is not an active person, and nobody is the own person.
+    known({ ownMemberId: FORMER }),
+    known({ ownMemberId: null }),
+    known({ ownMemberId: UNLISTED }),
+    // The people are not ready, or not known at all.
+    demoted({ status: "loading" }),
+    demoted({
+      status: "unavailable",
+      problem: "failed",
+    } as Partial<PeopleView>),
+    { kind: "pending" },
+    { kind: "unavailable" },
+  ] as PeopleScreenView[]) {
+    expect(isDemoted(people, list(listed()), WORKSPACE)).toBe(false);
+  }
+  // Another workspace's people say nothing about this one.
+  expect(isDemoted(AS_DEMOTED, undefined, OTHER_WORKSPACE)).toBe(false);
+  // The list decides too, before the people show the demotion.
+  expect(isDemoted(AS_ADMIN, list(NOT_ALLOWED), WORKSPACE)).toBe(true);
+  expect(isDemoted({ kind: "pending" }, list(NOT_ALLOWED), WORKSPACE)).toBe(
+    true,
+  );
+  // Only its `not_allowed`, and only for this workspace.
+  for (const status of [
+    "signed_out",
+    "no_workspace",
+    "loading",
+    "ready",
+    "unavailable",
+  ] as const) {
+    expect(
+      isDemoted(AS_ADMIN, list(listed({ status, invitations: [] })), WORKSPACE),
+    ).toBe(false);
+  }
+  expect(isDemoted(AS_ADMIN, list(NOT_ALLOWED), OTHER_WORKSPACE)).toBe(false);
+  expect(
+    isDemoted(
+      AS_ADMIN,
+      list(
+        listed({
+          workspaceId: OTHER_WORKSPACE,
+          status: "not_allowed",
+          invitations: [],
+        }),
+      ),
+      WORKSPACE,
+    ),
+  ).toBe(false);
+  expect(isDemoted(AS_ADMIN, list({ kind: "pending" }), WORKSPACE)).toBe(false);
+});
+
+test("#266: a demotion while the code's dialog is open drops the code at once and keeps the dialog open without it; a promotion never brings it back, and the dialog closes as usual", async () => {
+  for (const [name, people, invitations] of DEMOTIONS) {
+    const { actions, views, last } = controllerWith(
+      { create: () => Promise.resolve(CREATED) },
+      AS_ADMIN,
+    );
+    actions.start(INVITE);
+    await actions.confirm();
+    expect(last().code?.code, name).toBe(CODE);
+    const before = views.length;
+    actions.listChanged(people, invitations, NOW);
+    expect(views, name).toHaveLength(before + 1);
+    expect(last(), name).toEqual({
+      running: false,
+      message: "The invitation was created.",
+      question: undefined,
+      code: WITHOUT_CODE,
+    });
+    // The dialog is still open: nothing else starts.
+    actions.start(INVITE);
+    expect(last().question, name).toBeUndefined();
+    // The same views again, a promotion, and another demotion change nothing.
+    actions.listChanged(people, invitations, NOW + 1);
+    actions.listChanged(AS_ADMIN, listed({ revision: 9 }), NOW + 2);
+    actions.listChanged(AS_DEMOTED, NOT_ALLOWED, NOW + 3);
+    expect(views, name).toHaveLength(before + 1);
+    expect(last().code, name).toEqual(WITHOUT_CODE);
+    expect(serialized(views.slice(before)), name).not.toContain(CODE);
+    expect(serialized(views.slice(before)), name).not.toContain(
+      CODE.slice(5, 30),
+    );
+    actions.closeCode();
+    expect(last(), name).toEqual({
+      running: false,
+      message: "The invitation was created.",
+      question: undefined,
+      code: undefined,
+    });
+  }
+});
+
+test("#266: a demotion that arrives while the create is on its way opens the dialog without the code, also when a promotion follows it, and no view ever holds the code", async () => {
+  const scenarios: [string, [PeopleScreenView, InvitationsScreenView][]][] = [
+    ...DEMOTIONS.map(
+      ([name, people, invitations]): [
+        string,
+        [PeopleScreenView, InvitationsScreenView][],
+      ] => [name, [[people, invitations]]],
+    ),
+    // The demotion revoked the invitation; the promotion does not restore it.
+    [
+      "a demotion and then a promotion",
+      [
+        [AS_DEMOTED, NOT_ALLOWED],
+        [AS_ADMIN, listed({ revision: 9 })],
+      ],
+    ],
+  ];
+  for (const [name, steps] of scenarios) {
+    const create = pending<CreateInvitationResult>();
+    const { actions, views, last } = controllerWith(
+      { create: create.answer },
+      AS_ADMIN,
+    );
+    actions.start(INVITE);
+    const done = actions.confirm();
+    for (const [people, invitations] of steps) {
+      actions.listChanged(people, invitations, NOW);
+    }
+    create.resolve(CREATED);
+    expect(await done, name).toBe(false);
+    expect(last(), name).toEqual({
+      running: false,
+      message: "The invitation was created.",
+      question: undefined,
+      code: WITHOUT_CODE,
+    });
+    expect(serialized(views), name).not.toContain(CODE);
+    expect(serialized(views), name).not.toContain(CODE.slice(5, 30));
+    actions.closeCode();
+    expect(last().code, name).toBeUndefined();
+  }
+  // A demotion before an earlier create does not count for the next one.
+  const { actions, last } = controllerWith(
+    { create: () => Promise.resolve(CREATED) },
+    AS_ADMIN,
+  );
+  actions.listChanged(AS_DEMOTED, NOT_ALLOWED, NOW);
+  actions.listChanged(AS_ADMIN, listed({ revision: 9 }), NOW);
+  actions.start(INVITE);
+  await actions.confirm();
+  expect(last().code?.code).toBe(CODE);
+});
+
+test("#266: a create that starts once the invitations already say not_allowed, while the people still show the admin's role and Invite is still offered, opens the dialog without the code", async () => {
+  // The people and the invitations come through their own channels: the
+  // main process applied the demotion, and the people do not show it yet.
+  expect(
+    describeInvitations(AS_ADMIN, NOT_ALLOWED, NOW)?.invites.get(UNCLAIMED),
+  ).toEqual(INVITE);
+  const { actions, calls, views, last } = controllerWith(
+    { create: () => Promise.resolve(CREATED) },
+    AS_ADMIN,
+    NOT_ALLOWED,
+  );
+  actions.start(INVITE);
+  expect(last().question).toEqual(INVITE);
+  // No demotion arrives while the create is on its way: the one that the
+  // views showed before it started decides.
+  expect(await actions.confirm()).toBe(false);
+  expect(calls.map((call) => call.name)).toEqual(["create"]);
+  expect(last()).toEqual({
+    running: false,
+    message: "The invitation was created.",
+    question: undefined,
+    code: WITHOUT_CODE,
+  });
+  expect(serialized(views)).not.toContain(CODE);
+  expect(serialized(views)).not.toContain(CODE.slice(5, 30));
+  actions.closeCode();
+  expect(last().code).toBeUndefined();
+});
+
+test("#266: the code stays while the account keeps the owner's or an admin's role: another person's demotion, an ownership transfer, people that are not ready, and another workspace's not_allowed", async () => {
+  const others: [PeopleScreenView, PeopleScreenView, InvitationsScreenView][] =
+    [
+      // Another admin is demoted, as the owner sees it.
+      [known(), known({ people: DEMOTED_PEOPLE }), listed({ revision: 9 })],
+      // The owner becomes an admin.
+      [
+        known(),
+        known({
+          people: PEOPLE.map((entry) =>
+            entry.memberId === OWNER ? { ...entry, role: "admin" } : entry,
+          ),
+        }),
+        listed(),
+      ],
+      // People that are not ready decide nothing, whatever role they list.
+      [
+        AS_ADMIN,
+        demoted({ status: "loading" }),
+        listed({ status: "loading", invitations: [] }),
+      ],
+      [
+        AS_ADMIN,
+        AS_ADMIN,
+        listed({
+          workspaceId: OTHER_WORKSPACE,
+          status: "not_allowed",
+          invitations: [],
+        }),
+      ],
+    ];
+  for (const [shown, people, invitations] of others) {
+    const { actions, views, last } = controllerWith(
+      { create: () => Promise.resolve(CREATED) },
+      shown,
+    );
+    actions.start(INVITE);
+    await actions.confirm();
+    const before = views.length;
+    actions.listChanged(people, invitations, NOW);
+    expect(views).toHaveLength(before);
+    expect(last().code?.code).toBe(CODE);
   }
 });
 
