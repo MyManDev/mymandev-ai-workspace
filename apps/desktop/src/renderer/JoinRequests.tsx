@@ -13,7 +13,6 @@ import type {
   JoinRequestsBridge,
 } from "../shared/desktop-bridge.ts";
 import { focusesTitleAfterAction } from "./device-view.ts";
-import { focusesTitleAfterLeave } from "./join-invitation-view.ts";
 import {
   createJoinRequestActions,
   describeJoinRequestQuestion,
@@ -659,8 +658,9 @@ function focusAfterAction(done: boolean, button: Element | null): void {
 }
 
 /**
- * The button that started the last action that ran, until the first state
- * after that action decided (`decideFocusAfterState`); null otherwise.
+ * The button that started the last action that ran, until it left the page
+ * and the focus was decided (`decideFocusAfterLeave`), or until the next
+ * action runs and replaces it; null otherwise.
  */
 export interface ActionButtonRef {
   current: { readonly isConnected: boolean } | null;
@@ -682,47 +682,46 @@ export function rememberRunningButton(
 }
 
 /**
- * Lets a new state of the people or of the part's list decide, once,
- * whether the focus moves to the screen's title (#274): the button of the
- * last action that ran has left the page, and the focus is on the page
- * (`active` is `body` or nothing), never on another control. After a
- * refused or uncertain action, the main process loads the list again or an
- * event changes the people, and a row that ended meanwhile leaves the page
- * with its button, as after a confirmed action.
+ * Decides, once the button of the last action that ran has left the page,
+ * whether the focus moves to the screen's title (#274): only while it is
+ * on the page (`active` is `body` or nothing), never on another control.
+ * After a refused or uncertain action, the main process loads the list
+ * again or an event changes the people, and a row that ended meanwhile
+ * leaves the page with its button, as after a confirmed action.
  *
  * While a dialog of the part is open, which gives the focus back as it
- * closes, and while an action runs, whose answer comes first, the state
- * decides nothing and the button stays remembered. Otherwise this state
- * decides and the button is forgotten, so that the rule is never left
- * armed for a later state.
+ * closes, and while an action runs, nothing is decided and the button
+ * stays remembered: the end of the dialog or of the action decides about a
+ * button that left meanwhile. A button that is still on the page stays
+ * remembered as well, also through a state that leaves it there, until a
+ * later state takes it away or the next action runs. The button is
+ * forgotten as its leaving is decided, so that happens once.
  */
-export function decideFocusAfterState(
+export function decideFocusAfterLeave(
   acted: ActionButtonRef,
   dialogOpen: boolean,
   running: boolean,
   active: Element | null,
   body: Element | null,
 ): boolean {
-  if (dialogOpen || running) {
+  const button = acted.current;
+  if (dialogOpen || running || button === null || button.isConnected) {
     return false;
   }
-  const button = acted.current;
   acted.current = null;
-  return focusesTitleAfterLeave(
-    button !== null,
-    button?.isConnected === true,
-    focusOnButtonOrPage(active, body, null),
-  );
+  return focusOnButtonOrPage(active, body, null);
 }
 
 /**
  * Keeps the focus after an action of a part of the people screen whose
- * button leaves the page with a later state (#274), as the confirmed
- * actions do at once: `trigger` holds the button that the person used last,
- * `dialogOpen` and `running` are the part's, and `people` and `list` are
- * the views that take a button away. The button of an action that runs is
- * remembered (`rememberRunningButton`), and the first state after it
- * decides (`decideFocusAfterState`).
+ * button leaves the page with a state that arrives while it runs or after
+ * it (#274), as the confirmed actions do at once: `trigger` holds the
+ * button that the person used last, `dialogOpen` and `running` are the
+ * part's, and `people` and `list` are the views that take a button away.
+ * The button of an action that runs is remembered
+ * (`rememberRunningButton`), and its leaving is decided
+ * (`decideFocusAfterLeave`) after every new state, and at the end of an
+ * action and of a dialog.
  */
 export function useTitleFocusAfterAction(
   trigger: RefObject<Element | null>,
@@ -736,11 +735,12 @@ export function useTitleFocusAfterAction(
     () => rememberRunningButton(acted, running, trigger.current),
     [running, trigger],
   );
-  // Only a new state decides; the dialogs and the running state are those
-  // of the render that shows it.
+  // A new state decides, and so does the end of an action or of a dialog,
+  // because no state may follow it: after `not_allowed`, the main process
+  // loads nothing again.
   useEffect(() => {
     if (
-      decideFocusAfterState(
+      decideFocusAfterLeave(
         acted,
         dialogOpen,
         running,
@@ -750,7 +750,7 @@ export function useTitleFocusAfterAction(
     ) {
       focusTitle();
     }
-  }, [people, list]);
+  }, [people, list, running, dialogOpen]);
 }
 
 /**
@@ -763,8 +763,8 @@ export function useTitleFocusAfterAction(
  * which the dialogs give the focus back to; when the question or the code's
  * dialog closes after that button left the page (`joinRequestDialogsOpen`),
  * the focus moves to the screen's title. After an action that ran, also a
- * refused or uncertain one, the first state of the people or of the join
- * requests moves the focus there too when its button left the page and the
+ * refused or uncertain one, the focus moves there too once its button left
+ * the page, with a state of the people or of the join requests, and the
  * focus fell to the page (`useTitleFocusAfterAction`, #274).
  */
 export function useJoinRequestActions(

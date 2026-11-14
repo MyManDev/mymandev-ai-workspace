@@ -556,9 +556,10 @@ function focusAfterAction(done: boolean, button: Element | null): void {
  * bridges. A question remembers the button that opened it, which the
  * dialogs give the focus back to; when a dialog closes after that button
  * left the page, the focus moves to the screen's title. After an action
- * that ran, also a refused or uncertain one, the first state of the people
- * or of the invitations moves the focus there too when its button left the
- * page and the focus fell to the page (`useTitleFocusAfterAction`, #274).
+ * that ran, also a refused or uncertain one, the focus moves there too once
+ * its button left the page, with a state of the people or of the
+ * invitations, and the focus fell to the page (`useTitleFocusAfterAction`,
+ * #274).
  */
 export function useInvitationActions(
   bridge: InvitationActionsBridge | undefined,
