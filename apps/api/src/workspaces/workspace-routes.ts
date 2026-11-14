@@ -47,6 +47,7 @@ import {
 import { registerOwnershipRoutes } from "./ownership-routes.ts";
 import { registerPeopleRoutes } from "./people-routes.ts";
 import { registerProjectRoutes } from "./project-routes.ts";
+import { registerRunRoutes } from "./run-routes.ts";
 
 export type WorkspaceRouteOptions = Readonly<{
   database: Database;
@@ -75,7 +76,8 @@ export type WorkspaceRouteOptions = Readonly<{
   onAccountFrame: AccountFrameHandler;
   /**
    * The open connections, to which the people routes send the runs that a
-   * removal or a departure cancelled, after the commit.
+   * removal or a departure cancelled, and the run route the run that it
+   * created (#35), after the commit.
    */
   connections: ConnectionRegistry;
 }>;
@@ -255,6 +257,12 @@ export async function registerWorkspaceRoutes(
       registerChatRoutes(project, { database });
 
       registerAgentRoutes(project, { database });
+
+      registerRunRoutes(project, {
+        database,
+        now: options.now,
+        connections: options.connections,
+      });
     });
   });
 }

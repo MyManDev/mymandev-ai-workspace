@@ -23,6 +23,7 @@ The protocol is a shared boundary. It changes only by agreement between the Proj
 | `src/grant-scope.ts`    | `GRANT_SCOPE_KINDS` and `GrantScopeKind`, `CAPABILITY_SCOPE` (the scope kind of every capability), and the `RepositoryCapability` and `ProviderConnectionCapability` types: plain constants, in a module that imports no value.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `src/grant.ts`          | `PermissionGrantSchema`, `GrantFactsSchema`, `GrantRecordSchema`, and their types: the shape of a permission grant and of a grant record. `@mymandev/permissions` re-exports them and owns the checks.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `src/grant-api.ts`      | `GRANT_ROUTES`, `GRANT_ROUTE_ERRORS`, `GRANT_LIFETIME_SECONDS`, `GRANT_COUNT_LIMITS`, the request and response schemas of the grant routes (granting, revoking, and the grant records of the calling device), `WorkspaceGrant` (a grant as members see it), and the payload schemas of the grant events `agent.grant.created` and `agent.grant.revoked`, which `src/envelope.ts` declares with `AgentGrantCreatedEventSchema` and `AgentGrantRevokedEventSchema`.                                                                                                                                                                                                                                                                                                                                                                  |
+| `src/run-api.ts`        | `RUN_ROUTES`, `RUN_ROUTE_ERRORS`, and the request and answer schemas of a run creation (#35).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `src/project-api.ts`    | `PROJECT_ROUTES`, `PROJECT_ROUTE_ERRORS`, `normalizeProjectName`, `WorkspaceProject` (a project with its creator), and the request and response schemas of the project routes: creating, listing, and renaming projects.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ## Consumer rules
@@ -437,6 +438,62 @@ Open decisions (#75). The six recommendations do not settle the points below. Un
 - **Revoked grants.** The record list leaves them out, so it stays bounded and never names the account that revoked a grant. It is the one read for a check that filters by a lifecycle column of a grant, which ADR 0015 (P-74) otherwise leaves to `hasGrant`: a revoked grant never grants and cancels no other grant, so every check gives the same result with or without it. The alternative lists them for the history, and then needs pages.
 - **No list for the other members.** Only the agent's host device has a list. Another device learns of grants from the events alone and cannot reload what it missed; a list of `WorkspaceGrant` items for every member is a later change.
 - **Operator commands.** They send no grant event until a shared notification exists (recommendation 5), so a device learns of such a revocation only when it reads the list again.
+
+## Run creation
+
+These rules follow the Project Manager's decision of 2026-11-14 on #35 ([ADR 0007](../../docs/architecture/decisions/0007-agent-run-lifecycle-v0.md), updates of 2026-11-14). Storing the run and serving the route belong to the database and API parts; the desktop does not use the route yet.
+
+Decided by the Project Manager on 2026-11-14 (#35):
+
+1. Only the agent's owner may request a run in v0. A run that another member requested would spend the owner's provider, which belongs to provider sharing (M5).
+2. A run carries one provider connection, which never changes after the creation, so that the enforcement point takes the scope of `provider.use` from the run that it holds (ADR 0015).
+3. A run's input is a link to a chat message, so that the instruction shows in the project's chat. A run has no text of its own.
+
+The route (`RUN_ROUTES`, `RUN_ROUTE_ERRORS`):
+
+| Route                            | Who               | Body                                                                         | Answer                   | Codes beyond the common ones                                         |
+| -------------------------------- | ----------------- | ---------------------------------------------------------------------------- | ------------------------ | -------------------------------------------------------------------- |
+| `POST /projects/:projectId/runs` | the agent's owner | `agentId`, optional `repositoryId`, `providerConnectionId`, `inputMessageId` | the new run, in `queued` | `not_found`, `forbidden`, `conflict`, `run_limit`, `run_daily_limit` |
+
+- It needs an access token and starts with the project, as the read routes do. A non-member, a project that does not exist, and a malformed project ID get the same `404` with `not_found` before the body is read.
+- The body holds IDs only (`CreateRunRequestSchema`): an agent of the project, a provider connection of that agent's host device, a message of the project's chat, and a repository of the project when the run has one. Unknown keys are stripped, so a text, a state, or a requester in the body changes nothing.
+- The server decides in this order, and writes nothing when it refuses:
+  1. `not_found`: the project has no agent with this ID.
+  2. `forbidden`: the caller does not own the agent. It comes before every check of the other IDs, so that only an agent's owner learns anything about a repository, a provider connection, or a message.
+  3. `not_found`: the project has no repository with this ID, the agent's host device has no provider connection with this ID, or the project's chat has no message with this ID that is not deleted. An ID that exists elsewhere and one that exists nowhere answer alike, and the answer does not say which ID it was.
+  4. `conflict`: the project or its workspace is archived, the agent is disabled, the repository is archived, or the provider connection is removed.
+  5. `run_limit`, then `run_daily_limit` (below).
+- The answer is the new run as its agent's owner reads it in the run list (`CreateRunResponseSchema`): in `queued`, with its `inputMessageId` and its `providerConnectionId`. The schema cannot see the request, so the device checks that the run names the project of the path and the IDs that it sent.
+
+What a run shows since #35 (`AgentRunListItemSchema`, `AgentRunSchema`), both fields optional, so that a run without them and an answer of a server before them still parse:
+
+- `inputMessageId`: the run's input, shown to every member, who can read the message in the history. A run of the development seed has none.
+- `providerConnectionId`: the provider connection that the run uses. It is device data, as the agent's host device is (#110), so only the account that owns the run's agent gets it, on any of its devices, in the run list and in the answer of the creation. For every other reader, and in every event, the field is absent.
+
+The event of a new run:
+
+- The server sends `agent.run.state_changed` from no state to `queued`, with a `system` actor and `deviceId: null`, after the commit, as ADR 0007 decided. It goes to every connection subscribed to the workspace (`SERVER_EVENT_AUDIENCES`: `members`) and to no one else; the asking device reads the run from the answer.
+- Its payload now also carries `run`: the new run as the run list shows it to every member, with its project, its `createdAt`, and its `inputMessageId`, which the other fields of the payload do not hold, and never with its provider connection. The payload's `runId`, `agentId`, `repositoryId`, `state`, and `reason` equal the run's.
+- Only a creation carries `run`: a transition or a cancellation with one is `invalid_payload`. `run` is optional in the schema, so that a creation without it still decodes, as before #35; the server always sends it.
+- A device never sends a creation, with or without `run` (`not_allowed_from_device`).
+
+The limits, with their own codes (`API_ERROR_STATUS`); the [API's README](../../apps/api/README.md#run-creation) records their values:
+
+- `run_limit` (`409`, no `Retry-After`): the agent already has as many unfinished runs as the server allows. No time frees a place; only a run of the agent that finishes does.
+- `run_daily_limit` (`429`, with `Retry-After`): the agent got as many new runs within 24 hours as the server allows. `Retry-After` is the time until the oldest of them leaves the 24 hours. The account's limit of requests on the route stays `rate_limited`.
+- An agent at both limits answers `run_limit`.
+
+Provisional (#35): applied as defaults until the Project Manager decides; each is a choice of the more careful option:
+
+- The route: `POST /projects/:projectId/runs`, beside the run list of the project (`GET /projects/:projectId/runs`), so that it starts with the project as the read routes do.
+- Who asks: the account that owns the agent, from any of its devices, not only from the agent's host device. A role gives no right: the workspace's owner cannot request a run of a member's agent.
+- Which message: any message of the project's chat that is not deleted, of any author, also another member's or an agent's. The alternative is only a message that the caller wrote.
+- Who sees the provider connection: only the account that owns the run's agent. The alternative is every member; widening it later is an additive change, and narrowing it would not be.
+- The event: the existing `agent.run.state_changed` with `run` added, not a new event type, so that ADR 0007's creation event stays and a desktop before #35 still shows the new run.
+- The limits and their values: 10 unfinished runs for each agent, and 100 new runs for each agent within 24 hours.
+- No idempotency key: the same request sent again creates a second run, so the desktop never sends it again on its own. No correlation ID either: linking a retry to its first run waits for the task that adds retries.
+
+Not possible in production yet: no route creates an agent, and no route registers a provider connection, so no account can name either in a request. Until both exist, only the development seed creates an agent, and its runs have neither a provider connection nor an input message.
 
 ## Scripts
 

@@ -13,7 +13,9 @@ import { displayText, RunStateSchema, UtcTimestampSchema } from "./entities.ts";
 import {
   AgentIdSchema,
   MemberIdSchema,
+  MessageIdSchema,
   ProjectIdSchema,
+  ProviderConnectionIdSchema,
   RepositoryIdSchema,
   RunIdSchema,
 } from "./ids.ts";
@@ -113,6 +115,20 @@ export type AgentListResponse = z.infer<typeof AgentListResponseSchema>;
 /**
  * A run as every member of its workspace sees it. `finishedAt` is set
  * exactly when the state is terminal, as the database requires.
+ *
+ * The two fields of #35 are optional, so that a run without them, and an
+ * answer of a server before them, still parse:
+ *
+ * - `inputMessageId`: the run's input, a message of its project's chat,
+ *   which every reader of the run can read in the history. A run that a
+ *   request created has one; a run that the development seed created has
+ *   none.
+ * - `providerConnectionId`: the provider connection that the run uses, a
+ *   connection of its agent's host device, which never changes after the
+ *   creation. It is device data, as the agent's host device is (#110): only
+ *   the account that owns the run's agent gets it, in the run list and in
+ *   the answer of the creation. It is absent for every other reader, in
+ *   every event, and for a run without one.
  */
 export const AgentRunListItemSchema = z
   .object({
@@ -125,6 +141,8 @@ export const AgentRunListItemSchema = z
     reason: displayText(LIMITS.runReason).nullable(),
     createdAt: UtcTimestampSchema,
     finishedAt: UtcTimestampSchema.nullable(),
+    inputMessageId: MessageIdSchema.optional(),
+    providerConnectionId: ProviderConnectionIdSchema.optional(),
   })
   .superRefine((run, ctx) => {
     if (isTerminalRunState(run.state) !== (run.finishedAt !== null)) {

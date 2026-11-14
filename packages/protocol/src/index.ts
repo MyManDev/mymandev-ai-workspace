@@ -13,4 +13,5 @@ export * from "./agent-api.ts";
 export * from "./grant-scope.ts";
 export * from "./grant.ts";
 export * from "./grant-api.ts";
+export * from "./run-api.ts";
 export * from "./project-api.ts";

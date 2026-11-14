@@ -6,6 +6,7 @@ import {
   MemberIdSchema,
   MessageIdSchema,
   ProjectIdSchema,
+  ProviderConnectionIdSchema,
   RepositoryIdSchema,
   RunIdSchema,
   UserIdSchema,
@@ -122,12 +123,20 @@ export const AgentSchema = z.object({
 });
 export type Agent = z.infer<typeof AgentSchema>;
 
-/** One run of an agent. A retry is a new run, linked through `correlationId`. */
+/**
+ * One run of an agent. A retry is a new run, linked through `correlationId`.
+ * A run that a request created (#35) carries the provider connection that it
+ * uses, a connection of its agent's host device that never changes after
+ * the creation, and its input, a chat message of its project: the run has
+ * no text of its own. A run that the development seed created has neither.
+ */
 export const AgentRunSchema = z.object({
   id: RunIdSchema,
   agentId: AgentIdSchema,
   projectId: ProjectIdSchema,
   repositoryId: RepositoryIdSchema.optional(),
+  providerConnectionId: ProviderConnectionIdSchema.optional(),
+  inputMessageId: MessageIdSchema.optional(),
   requestedBy: UserIdSchema,
   state: RunStateSchema,
   correlationId: CorrelationIdSchema.optional(),
