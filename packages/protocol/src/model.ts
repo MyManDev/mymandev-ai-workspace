@@ -306,6 +306,15 @@ export const API_ERROR_STATUS = Object.freeze({
    * answer carries no `Retry-After`. Only `POST /auth/sign-in` answers it.
    */
   device_limit: 409,
+  /**
+   * A new device's sign-in on an account that already registered 10 new
+   * devices in the last 24 hours (#269). Time frees a place, so the answer
+   * carries `Retry-After`: the time until the oldest of them leaves the 24
+   * hours. It has its own code, apart from `rate_limited`, because the API
+   * refuses before it commits anything, so the answer is certain: nothing was
+   * registered. Only `POST /auth/sign-in` answers it.
+   */
+  device_daily_limit: 429,
   /** A limit was reached; the answer carries `Retry-After`. */
   rate_limited: 429,
   /** An unexpected server error. */

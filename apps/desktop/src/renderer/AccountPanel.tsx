@@ -26,6 +26,7 @@ import {
   forgetMessage,
   initialAccountView,
   nextSignInExpiryChange,
+  nextSignInWaitChange,
   offersForget,
   offersRenewal,
   offersSignIn,
@@ -34,6 +35,7 @@ import {
   signInEndFormat,
   signInRetryAt,
   signInRetryNote,
+  signInReadingTime,
   signInRetryReading,
   signInTimeFormat,
   signOutMessage,
@@ -109,8 +111,9 @@ export interface AccountPanelContentProps {
    * The renderer's clock in milliseconds. The panel reads it again when the
    * wait after a start refused during the grace period of an uncertain
    * sign-in ends, so that its note goes away (#199), when day 25 of the
-   * sign-in begins or the sign-in ends (D4 on #95), and when the window gets
-   * the focus or becomes visible again.
+   * sign-in begins or the sign-in ends (D4 on #95), when the wait of a
+   * sign-in that a limit ended reads differently (#269), and when the window
+   * gets the focus or becomes visible again.
    */
   readonly now: number;
   /** The format of that note's local time; the system's by default. */
@@ -145,7 +148,7 @@ function AccountBody(props: AccountPanelContentProps) {
   const outcome =
     status.lastOutcome === null || status.signIn.kind !== "idle"
       ? undefined
-      : describeOutcome(status.lastOutcome);
+      : describeOutcome(status.lastOutcome, props.now);
   const retryNote = signInRetryNote(
     status,
     props.now,
@@ -622,14 +625,19 @@ function useAccountPanel(
   // panel's note goes away then (`watchSignInRetry`), and #204: whenever
   // the time of the note changes (`signInRetryReading`), so that a note
   // whose time lies before an earlier reading shows after the clock was
-  // set back. A new reading is stored during the render, and React renders
-  // again at once with it.
+  // set back. #269: the same holds for the end of the wait of a sign-in
+  // that a limit of the server ended, so the reading is held for either
+  // time (`signInReadingTime`): the wait of a new outcome never counts
+  // from a reading that was made before it arrived. A new reading is
+  // stored during the render, and React renders again at once with it.
   const retryAt =
     view.kind === "known" ? signInRetryAt(view.status) : undefined;
+  const readingTime =
+    view.kind === "known" ? signInReadingTime(view.status) : undefined;
   const [heldReading, setReading] = useState(() =>
-    signInRetryReading(undefined, retryAt),
+    signInRetryReading(undefined, readingTime),
   );
-  const reading = signInRetryReading(heldReading, retryAt);
+  const reading = signInRetryReading(heldReading, readingTime);
   if (reading !== heldReading) {
     setReading(reading);
   }
@@ -637,9 +645,9 @@ function useAccountPanel(
   useEffect(
     () =>
       watchSignInRetry(retryAt, now, (later) =>
-        setReading(Object.freeze({ retryAt, now: later })),
+        setReading(Object.freeze({ retryAt: readingTime, now: later })),
       ),
-    [retryAt, now],
+    [retryAt, now, readingTime],
   );
   // D4 on #95: the clock is read again when day 25 of the sign-in begins
   // and when it ends (`nextSignInExpiryChange`), with the same watch
@@ -654,9 +662,22 @@ function useAccountPanel(
   useEffect(
     () =>
       watchSignInRetry(expiryChange, now, (later) =>
-        setReading(Object.freeze({ retryAt, now: later })),
+        setReading(Object.freeze({ retryAt: readingTime, now: later })),
       ),
-    [expiryChange, now, retryAt],
+    [expiryChange, now, readingTime],
+  );
+  // #269: and again each time the wait in the message of a sign-in that a
+  // limit of the server ended reads differently (`nextSignInWaitChange`),
+  // down to its end, so that the wait does not go stale while the message
+  // stays on screen.
+  const waitChange =
+    view.kind === "known" ? nextSignInWaitChange(view.status, now) : undefined;
+  useEffect(
+    () =>
+      watchSignInRetry(waitChange, now, (later) =>
+        setReading(Object.freeze({ retryAt: readingTime, now: later })),
+      ),
+    [waitChange, now, readingTime],
   );
   useEffect(() => {
     const readAgain = () =>

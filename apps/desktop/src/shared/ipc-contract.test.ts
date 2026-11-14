@@ -108,6 +108,7 @@ import {
   RUNTIME_STATES,
   RuntimeStatusSchema,
   SIGN_IN_OUTCOME_CODES,
+  SIGN_IN_RETRY_CODES,
   SignOutResultSchema,
   SIGN_IN_BROWSERS,
   START_SIGN_IN_REFUSALS,
@@ -153,6 +154,7 @@ test("the channel names and the contract cannot be changed at runtime", () => {
   for (const list of [
     ACCOUNT_LIMITS,
     SIGN_IN_OUTCOME_CODES,
+    SIGN_IN_RETRY_CODES,
     DEVICE_KEY_STATES,
     API_ORIGIN_STATES,
     START_SIGN_IN_REFUSALS,
@@ -710,17 +712,35 @@ test("an account status keeps only the narrow fields", () => {
     retryAfter: "2026-11-06T10:10:00.000Z",
   });
 
-  // The wait of an uncertain `rate_limited` (#269) comes alone too.
-  expect(
-    AccountStatusSchema.parse({
-      ...accountStatus({}),
-      lastOutcome: {
-        code: "uncertain_refusal",
-        retryAfterMs: 86_000_000,
-        apiError: "rate_limited",
-      },
-    }).lastOutcome,
-  ).toEqual({ code: "uncertain_refusal", retryAfterMs: 86_000_000 });
+  // The end of the wait of an uncertain `rate_limited` and of the daily
+  // limit of new devices (#269) comes alone too: no API code, no header,
+  // and no duration, which would go stale on screen.
+  for (const code of ["uncertain_refusal", "device_daily_limit"] as const) {
+    expect(
+      AccountStatusSchema.parse({
+        ...accountStatus({}),
+        lastOutcome: {
+          code,
+          retryAfter: "2026-11-15T09:53:20.000Z",
+          retryAfterMs: 86_000_000,
+          retryAfterSeconds: 86_000,
+          apiError: "rate_limited",
+        },
+      }).lastOutcome,
+      code,
+    ).toEqual({ code, retryAfter: "2026-11-15T09:53:20.000Z" });
+    // Without a usable `Retry-After`, the code comes without a time.
+    expect(
+      AccountStatusSchema.parse(accountStatus({ lastOutcome: { code } }))
+        .lastOutcome,
+      code,
+    ).toEqual({ code });
+  }
+  expect(SIGN_IN_RETRY_CODES).toEqual([
+    "replacement_pending",
+    "device_daily_limit",
+    "uncertain_refusal",
+  ]);
 
   // A hidden account (#195) carries nothing but its kind.
   expect(
@@ -755,43 +775,42 @@ test("an account status with a wrong value is refused", () => {
     accountStatus({
       lastOutcome: { code: "device_account_mismatch", deviceLogin: "a b" },
     }),
-    // `retryAfter` (#199) belongs to `replacement_pending` only, and is a
-    // time in UTC.
+    // `retryAfter` belongs to `replacement_pending` (#199), to
+    // `device_daily_limit`, and to `uncertain_refusal` (#269) only. Every
+    // other code refuses it, among them `device_limit`, which no wait
+    // frees.
     ...SIGN_IN_OUTCOME_CODES.filter(
-      (code) => code !== "replacement_pending",
+      (code) =>
+        code !== "replacement_pending" &&
+        code !== "device_daily_limit" &&
+        code !== "uncertain_refusal",
     ).map((code) =>
       accountStatus({
         lastOutcome: { code, retryAfter: "2026-11-06T10:10:00.000Z" },
       }),
     ),
-    ...[
-      "2026-11-06T13:10:00.000+03:00",
-      "2026-11-06T10:10:00",
-      "2026-11-06",
-      "in 10 minutes",
-      "",
-      1_793_000_000_000,
-      null,
-    ].map((retryAfter) =>
-      accountStatus({
-        lastOutcome: {
-          code: "replacement_pending",
-          retryAfter: retryAfter as never,
-        },
-      }),
-    ),
-    // `retryAfterMs` (#269) belongs to `uncertain_refusal` only, and is a
-    // whole number of milliseconds from 1.
-    ...SIGN_IN_OUTCOME_CODES.filter((code) => code !== "uncertain_refusal").map(
-      (code) => accountStatus({ lastOutcome: { code, retryAfterMs: 60_000 } }),
-    ),
-    ...[0, -1, 1.5, "60000", null].map((retryAfterMs) =>
-      accountStatus({
-        lastOutcome: {
-          code: "uncertain_refusal",
-          retryAfterMs: retryAfterMs as never,
-        },
-      }),
+    // With each of the three, it is a time in UTC, never a duration.
+    ...(
+      [
+        "replacement_pending",
+        "device_daily_limit",
+        "uncertain_refusal",
+      ] as const
+    ).flatMap((code) =>
+      [
+        "2026-11-06T13:10:00.000+03:00",
+        "2026-11-06T10:10:00",
+        "2026-11-06",
+        "in 10 minutes",
+        "",
+        1_793_000_000_000,
+        86_000_000,
+        null,
+      ].map((retryAfter) =>
+        accountStatus({
+          lastOutcome: { code, retryAfter: retryAfter as never },
+        }),
+      ),
     ),
     accountStatus({
       account: {

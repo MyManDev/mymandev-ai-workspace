@@ -291,6 +291,8 @@ test("the status of an error body fits its code", () => {
     [409, "unclaimed_limit"],
     [409, "project_limit"],
     [409, "device_limit"],
+    // The daily limit of new devices is a wait with its own code (#269).
+    [429, "device_daily_limit"],
     [429, "rate_limited"],
     [503, "sign_in_unavailable"],
     [400, "bad_request"],
@@ -316,6 +318,8 @@ test("the status of an error body fits its code", () => {
     // Nor are the limits of projects and active devices (#255).
     [429, "project_limit"],
     [429, "device_limit"],
+    // The daily limit of new devices is a wait, not a conflict (#269).
+    [409, "device_daily_limit"],
     [500, "bad_request"],
     [404, "internal_error"],
   ] as const) {

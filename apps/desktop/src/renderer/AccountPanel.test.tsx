@@ -613,6 +613,70 @@ test("a start refused during the grace period of an uncertain sign-in shows when
   ).not.toContain("A new sign-in can start");
 });
 
+test("a sign-in that a limit of the server ended shows what is left of the wait by the panel's clock, and the sentence without a wait once it has ended (#269)", () => {
+  const alert = (text: string) =>
+    `<p class="panel-message" role="alert">${text.replaceAll("'", "&#x27;")}</p>`;
+  const retryAfter = "2026-11-06T10:10:00.000Z";
+
+  // The daily limit of new devices: a certain refusal.
+  const daily = known({
+    lastOutcome: { code: "device_daily_limit", retryAfter },
+  });
+  const dailyPlain =
+    "This account has added as many new devices as it may in one day.";
+  expect(render({ view: daily })).toContain(
+    alert(`${dailyPlain} Try again in about 10 minutes.`),
+  );
+  expect(render({ view: daily, now: NOW + 7 * 60_000 + 1 })).toContain(
+    alert(`${dailyPlain} Try again in about 3 minutes.`),
+  );
+  for (const now of [NOW + 10 * 60_000, NOW + 3_600_000]) {
+    expect(render({ view: daily, now })).toContain(alert(dailyPlain));
+  }
+  expect(
+    render({ view: known({ lastOutcome: { code: "device_daily_limit" } }) }),
+  ).toContain(alert(dailyPlain));
+  expect(
+    render({
+      view: known({
+        lastOutcome: {
+          code: "device_daily_limit",
+          retryAfter: "2026-11-07T09:53:20.000Z",
+        },
+      }),
+    }),
+  ).toContain(alert(`${dailyPlain} Try again in about 24 hours.`));
+
+  // The route's limit: an uncertain refusal, which names no device limit.
+  const route = known({
+    lastOutcome: { code: "uncertain_refusal", retryAfter },
+  });
+  const limitedText = (wait: string) =>
+    `The server is limiting sign-ins for now: too many sign-ins came from this network. Its answer does not show whether the sign-in was completed. Try again in about ${wait}; starting it again then is safe.`;
+  expect(render({ view: route })).toContain(alert(limitedText("10 minutes")));
+  expect(render({ view: route, now: NOW + 9 * 60_000 + 30_000 })).toContain(
+    alert(limitedText("1 minute")),
+  );
+  for (const now of [NOW + 10 * 60_000, NOW + 3_600_000]) {
+    const ended = render({ view: route, now });
+    expect(ended).toContain(alert(SIGN_IN_OUTCOME_MESSAGES.uncertain_refusal));
+    expect(ended).not.toContain("Try again in about");
+  }
+
+  // Neither shows the note of a pending replacement, or anything while a
+  // sign-in runs.
+  expect(render({ view: daily })).not.toContain("A new sign-in can start");
+  expect(render({ view: route })).not.toContain("A new sign-in can start");
+  expect(
+    render({
+      view: known({
+        signIn: { kind: "starting" },
+        lastOutcome: { code: "device_daily_limit", retryAfter },
+      }),
+    }),
+  ).not.toContain("Try again in about");
+});
+
 test("logins, names, URLs, and warnings are rendered as text, not as markup, and no style attribute is used", () => {
   const html = render({
     view: {

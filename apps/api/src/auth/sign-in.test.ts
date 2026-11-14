@@ -943,7 +943,7 @@ test("without a recorded revocation, a sign-in works although its GitHub identit
   assert.equal(user?.signInRequiredAt, null);
 });
 
-test("an account has at most 20 active devices, answered with device_limit and no Retry-After, and 10 new devices in 24 hours, answered with rate_limited and Retry-After", async (t) => {
+test("an account has at most 20 active devices, answered with device_limit and no Retry-After, and 10 new devices in 24 hours, answered with device_daily_limit and Retry-After", async (t) => {
   const app = await signInApp(t, { user: githubUser(1009, "many-devices") });
   const firstKey = newKey();
   const first = SignInResponseSchema.parse(
@@ -974,7 +974,8 @@ test("an account has at most 20 active devices, answered with device_limit and n
   assert.equal((await signInNew()).statusCode, 200, "the 10th new device");
   const eleventh = await signInNew();
   assert.equal(eleventh.statusCode, 429);
-  assert.equal(codeOf(eleventh), "rate_limited");
+  // Its own code, not `rate_limited`: the refusal is certain (#269).
+  assert.equal(codeOf(eleventh), "device_daily_limit");
   const wait = Number(eleventh.headers["retry-after"]);
   assert.ok(wait > 23 * 3600 && wait <= 24 * 3600, String(wait));
 
@@ -1036,7 +1037,7 @@ test("an account has at most 20 active devices, answered with device_limit and n
   );
 });
 
-test("a new device at both device limits answers device_limit, not rate_limited: the limit of active devices is decided first (#255)", async (t) => {
+test("a new device at both device limits answers device_limit, not device_daily_limit: the limit of active devices is decided first (#255)", async (t) => {
   const app = await signInApp(t, { user: githubUser(1022, "both-limits") });
   const first = SignInResponseSchema.parse(
     (
@@ -1068,8 +1069,8 @@ test("a new device at both device limits answers device_limit, not rate_limited:
     app,
     newDeviceRequest(await signInCode(app), newKey()),
   );
-  // A wait would not free a place, and the desktop would take `rate_limited`
-  // as an uncertain refusal.
+  // A wait would not free a place, so the answer is not the daily limit's
+  // `device_daily_limit`, which names one.
   assert.equal(refused.statusCode, 409);
   assert.deepEqual(refused.json(), {
     statusCode: 409,
@@ -1085,7 +1086,7 @@ test("a new device at both device limits answers device_limit, not rate_limited:
   );
 });
 
-test("the limit of 10 new devices in 24 hours refuses with rate_limited and Retry-After before anything is committed: no device, no key, no revocation, and no frame (#269)", async (t) => {
+test("the limit of 10 new devices in 24 hours refuses with device_daily_limit and Retry-After before anything is committed: no device, no key, no revocation, and no frame (#269)", async (t) => {
   const connections = new ConnectionRegistry();
   const app = await deviceApp(t, {
     database: database(),
@@ -1124,8 +1125,9 @@ test("the limit of 10 new devices in 24 hours refuses with rate_limited and Retr
     statusCode: 429,
     error: "Too Many Requests",
     message: "Too Many Requests",
-    code: "rate_limited",
+    code: "device_daily_limit",
   });
+  assert.equal(ApiErrorBodySchema.safeParse(refused.json()).success, true);
   const wait = Number(refused.headers["retry-after"]);
   assert.ok(wait > 23 * 3600 && wait <= 24 * 3600, String(wait));
   // The transaction refreshed the login before the limit refused; it was
@@ -1152,6 +1154,56 @@ test("the limit of 10 new devices in 24 hours refuses with rate_limited and Retr
   );
 });
 
+test("the Retry-After of the daily limit of new devices is the time until the oldest device of the last 24 hours leaves them, and a revoked device counts (#269)", async (t) => {
+  const app = await signInApp(t, { user: githubUser(1025, "daily-wait") });
+  const first = SignInResponseSchema.parse(
+    (
+      await postSignIn(app, newDeviceRequest(await signInCode(app), newKey()))
+    ).json(),
+  );
+  const add = async (createdAt: Date, revokedAt: Date | null) =>
+    database()
+      .insert(devices)
+      .values({
+        id: newId<DeviceId>(),
+        userId: first.userId,
+        label: revokedAt === null ? "Extra" : "Oldest",
+        platform: "linux",
+        publicKey: newKey().publicKey,
+        keyAlgorithm: "ed25519",
+        createdAt,
+        lastSignInAt: createdAt,
+        ...(revokedAt === null
+          ? {}
+          : { revokedAt, revocationReason: "removed" as const }),
+      });
+  // 10 devices of the last 24 hours: the first, 8 created now, and one
+  // created 20 hours ago and revoked since. So only 9 of them are active.
+  const started = Date.now();
+  for (let index = 0; index < 8; index += 1) {
+    await add(new Date(started), null);
+  }
+  await add(new Date(started - 20 * 3_600_000), new Date(started));
+  const signInNew = async () =>
+    postSignIn(app, newDeviceRequest(await signInCode(app), newKey()));
+
+  // The revoked device still counts toward the day, and the wait is what
+  // is left of its 24 hours, about 4 hours, not a whole day.
+  const refused = await signInNew();
+  assert.equal(refused.statusCode, 429);
+  assert.equal(codeOf(refused), "device_daily_limit");
+  const wait = Number(refused.headers["retry-after"]);
+  assert.ok(wait > 4 * 3600 - 120 && wait <= 4 * 3600, String(wait));
+
+  // Once that device is older than 24 hours, 9 are left, and a new device
+  // is added.
+  await database()
+    .update(devices)
+    .set({ createdAt: new Date(started - 25 * 3_600_000) })
+    .where(and(eq(devices.userId, first.userId), eq(devices.label, "Oldest")));
+  assert.equal((await signInNew()).statusCode, 200, "the oldest left the day");
+});
+
 test("the route's limit of 30 requests per address in 10 minutes answers rate_limited with a Retry-After of at most 10 minutes, also to a resent copy of a request that committed, so the desktop cannot take that answer as certain (#269)", async (t) => {
   const app = await signInApp(t, { user: githubUser(1024, "busy-address") });
   // The limit counts every request before its body is checked, so 29
@@ -1169,6 +1221,7 @@ test("the route's limit of 30 requests per address in 10 minutes answers rate_li
   // looks at the code, so it does not get sign_in_code_used.
   const copy = await postSignIn(app, request);
   assert.equal(copy.statusCode, 429);
+  // Not `device_daily_limit`: only this answer stays uncertain.
   assert.equal(codeOf(copy), "rate_limited");
   const wait = Number(copy.headers["retry-after"]);
   assert.ok(wait >= 1 && wait <= 600, String(wait));

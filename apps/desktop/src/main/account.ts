@@ -516,6 +516,7 @@ const REFUSAL_CODES: Readonly<
   device_revoked: "device_revoked",
   device_registration_locked: "device_registration_locked",
   device_limit: "device_limit",
+  device_daily_limit: "device_daily_limit",
   unsupported_account: "unsupported_account",
   sign_in_unavailable: "sign_in_unavailable",
 });
@@ -560,8 +561,9 @@ function codeOf(
 }
 
 /**
- * The outcome of the flow as the renderer may see it: a fixed code, and the
- * login of the installation's account after `device_account_mismatch`.
+ * The outcome of the flow as the renderer may see it: a fixed code, the
+ * login of the installation's account after `device_account_mismatch`, and
+ * the end of the wait of a limit (#269).
  */
 export function signInOutcomeView(outcome: SignInOutcome): SignInOutcomeView {
   switch (outcome.kind) {
@@ -575,6 +577,10 @@ export function signInOutcomeView(outcome: SignInOutcome): SignInOutcomeView {
       });
     case "refused": {
       const code = codeOf(REFUSAL_CODES, outcome.code, "refused");
+      if (code === "device_daily_limit" && outcome.retryAfter !== undefined) {
+        // The end of the wait of the daily limit of new devices (#269).
+        return Object.freeze({ code, retryAfter: outcome.retryAfter });
+      }
       return Object.freeze(
         code === "device_account_mismatch" && outcome.deviceLogin !== undefined
           ? { code, deviceLogin: outcome.deviceLogin }
@@ -587,14 +593,14 @@ export function signInOutcomeView(outcome: SignInOutcome): SignInOutcomeView {
         outcome.keyError === "system_protection_unavailable"
           ? "system_protection_unavailable"
           : codeOf(FAILURE_CODES, outcome.reason, "failed");
-      // The wait of an uncertain `rate_limited` (#269); the API's code is
-      // not passed on.
-      const seconds = outcome.retryAfterSeconds;
+      // The end of the wait of an uncertain `rate_limited` (#269); the
+      // API's code is not passed on.
+      const retryAfter = outcome.retryAfter;
       return Object.freeze(
         code === "uncertain_refusal" &&
           outcome.apiError === "rate_limited" &&
-          seconds !== undefined
-          ? { code, retryAfterMs: seconds * 1000 }
+          retryAfter !== undefined
+          ? { code, retryAfter }
           : { code },
       );
     }
