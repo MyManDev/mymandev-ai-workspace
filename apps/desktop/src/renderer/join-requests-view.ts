@@ -16,6 +16,8 @@ import type {
 import {
   describeInvitationActionResult,
   INVITATION_ACTION_NOT_DONE_MESSAGES,
+  isDemoted,
+  withoutCode,
   type InvitationCodeView,
 } from "./invitations-view.ts";
 import {
@@ -35,7 +37,9 @@ import type { PeopleScreenView } from "./people-view.ts";
 // workspace has active unclaimed people, the approver chooses one of them,
 // an invitation is created for that person and its code shown once (D2),
 // and only then is the request denied. When the invitation is not created
-// or it is uncertain, the request stays pending.
+// or it is uncertain, the request stays pending. A demotion of the account
+// to a member drops the code from the open dialog, which then says that the
+// code no longer works, as for the invitations (#266).
 
 /** What the screen knows of the selected workspace's join requests. */
 export type JoinRequestsScreenView =
@@ -713,7 +717,8 @@ export interface JoinRequestActionsView {
   readonly dialog: JoinRequestDialog | undefined;
   /**
    * The code of the invitation that "Deny and invite instead" created,
-   * while its dialog is open (D2), or undefined.
+   * while its dialog is open (D2), or undefined; without the code itself
+   * once the account was demoted (#266).
    */
   readonly code: InvitationCodeView | undefined;
 }
@@ -812,6 +817,9 @@ export interface JoinRequestActions {
    *   or none is selected, and always with a sign-out;
    * - the workspace of an invitation whose code was dropped after a switch
    *   says so when it is selected again (`INVITE_INSTEAD_MESSAGES.unseen`);
+   * - the code of the open dialog goes, and the dialog stays open without
+   *   it, once the account is demoted to a member of the workspace
+   *   (`isDemoted`), because the server revoked the invitation (#266);
    * - the refresh's sentence ends with the next state of the join requests.
    */
   readonly listChanged: (
@@ -832,6 +840,8 @@ export interface JoinRequestActions {
  * into the view of its dialog only (D2), and only then the denial. A step
  * that is refused, uncertain, or fails on its way ends it, and the sentence
  * says how far it came; when the create ends it, the request stays pending.
+ * A code whose invitation the server revoked with the account's demotion is
+ * never shown: the dialog opens, or stays open, without it (#266).
  */
 export function createJoinRequestActions(
   bridges: JoinRequestActionsBridges,
@@ -848,6 +858,18 @@ export function createJoinRequestActions(
   let latestRevision: number | undefined;
   /** The selected workspace of the latest people; undefined before any. */
   let selected: string | null | undefined;
+  /**
+   * Whether the latest views show the account demoted to a member of the
+   * selected workspace (`isDemoted`).
+   */
+  let demoted = false;
+  /**
+   * Grows with every demotion that the views show, so that the code of a
+   * create counts only when none arrived while the create was on its way,
+   * also none that a promotion followed: the demotion revoked the
+   * invitation, and a promotion does not bring it back.
+   */
+  let demotions = 0;
   /**
    * Grows with every switch of the selected workspace, a drop of it, and a
    * sign-out, so that an answer counts only when nothing of the kind
@@ -954,6 +976,7 @@ export function createJoinRequestActions(
     const { workspaceId } = request;
     const startSelection = selection;
     const startSession = session;
+    const startDemotions = demotions;
     const { memberId, name } = invitee;
     const invite = { kind: "invite", workspaceId, memberId, name } as const;
     let created: CreateInvitationResult | undefined;
@@ -984,10 +1007,12 @@ export function createJoinRequestActions(
       end(`${INVITE_INSTEAD_MESSAGES.notDenied} ${reason}`);
       return false;
     }
-    // The code shows at once, before the denial goes.
+    // The code shows at once, before the denial goes. A demotion that
+    // arrived first revoked the new invitation: its dialog opens without
+    // the code.
     code = Object.freeze({
       name,
-      code: created.code,
+      code: demoted || demotions !== startDemotions ? null : created.code,
       expiresAt: created.expiresAt,
     });
     show();
@@ -1195,6 +1220,23 @@ export function createJoinRequestActions(
             changed = true;
           }
         }
+      }
+      const wasDemoted = demoted;
+      demoted =
+        typeof selected === "string" &&
+        isDemoted(
+          people,
+          joinRequests.kind === "known" ? joinRequests.state : undefined,
+          selected,
+        );
+      if (demoted && !wasDemoted) {
+        demotions += 1;
+      }
+      if (demoted && code !== undefined && code.code !== null) {
+        // The server revoked the invitation with the demotion: the code
+        // goes at once, and the open dialog says that it no longer works.
+        code = withoutCode(code);
+        changed = true;
       }
       if (changed) {
         show();

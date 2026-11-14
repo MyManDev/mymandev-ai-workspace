@@ -765,6 +765,48 @@ test("D2: the code of Deny and invite instead shows in a code dialog of its own,
   expect(closed).not.toContain("invitation-code-title");
 });
 
+test("#266: once the account is demoted, the code dialog of Deny and invite instead stays open without the field and says that the code no longer works, also while the denial runs", () => {
+  // The people once they show the account's own person, an admin, as a member.
+  const demoted = known({
+    revision: 5,
+    ownMemberId: ADMIN,
+    people: READY.people.map((entry) =>
+      entry.memberId === ADMIN ? { ...entry, role: "member" } : entry,
+    ),
+  });
+  for (const running of [true, false]) {
+    const html = render({
+      view: demoted,
+      joinRequestActions: {
+        ...IDLE_JOIN_REQUEST_ACTIONS,
+        running,
+        code: { name: "Katherine", code: null, expiresAt: EXPIRES_AT },
+      },
+    });
+    expect(html).toContain(
+      '<dialog class="people-dialog" aria-labelledby="invitation-code-title" aria-describedby="invitation-code-name invitation-code-revoked">',
+    );
+    expect(html).toContain(
+      '<p class="people-dialog-name" id="invitation-code-name"><span dir="auto">Katherine</span></p><p class="panel-message" id="invitation-code-revoked" role="alert">You are no longer an admin of this workspace, so this code no longer works. It is not shown.</p><div class="people-dialog-actions"><button type="button" class="panel-action">Close</button></div>',
+    );
+    expect(html).not.toContain("invitation-code-field");
+    expect(html).not.toContain(">Select the code<");
+    // The member's screen behind the dialog has no join requests part.
+    expect(html).not.toContain("join-requests-heading");
+  }
+  // With the code, the alert is there and empty.
+  expect(
+    render({
+      joinRequestActions: {
+        ...IDLE_JOIN_REQUEST_ACTIONS,
+        code: { name: "Katherine", code: CODE, expiresAt: EXPIRES_AT },
+      },
+    }),
+  ).toContain(
+    '<p class="panel-message" id="invitation-code-revoked" role="alert"></p>',
+  );
+});
+
 test("names, logins, and choices are rendered as text with their own direction", () => {
   const markup = '<img src="x" onerror="alert(1)">';
   const rtl = "שלום <b>";
