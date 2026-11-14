@@ -529,6 +529,9 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     project_limit: "project_limit",
     // Only the sign-in answers it, never a write (#255).
     device_limit: "failed",
+    // Nor this one: a write then fails without a wait, never as the
+    // `rate_limited` of its own route (#269).
+    device_daily_limit: "failed",
     rate_limited: "rate_limited",
     // Defensive: only with a 5xx, which the session reads as
     // `server_error`, so it never comes as a refusal.

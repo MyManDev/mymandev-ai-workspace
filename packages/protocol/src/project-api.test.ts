@@ -178,6 +178,7 @@ test("each project route answers only known error codes, the common ones include
       .map(([name]) => name);
   assert.deepEqual(holders("project_limit"), ["createProject"]);
   assert.deepEqual(holders("device_limit"), []);
+  assert.deepEqual(holders("device_daily_limit"), []);
   assert.deepEqual(holders("unclaimed_limit"), []);
 });
 

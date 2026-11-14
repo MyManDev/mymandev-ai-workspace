@@ -25,18 +25,22 @@ import {
   DEVICE_STATE_MESSAGES,
   describeDeviceState,
   describeOutcome,
+  deviceDailyLimitMessage,
   describeSignInExpiry,
   deviceSignedIn,
   followAccountStatus,
   forgetMessage,
   initialAccountView,
   nextSignInExpiryChange,
+  nextSignInWaitChange,
   offersForget,
   offersRenewal,
   offersSignIn,
   removeDeviceMessage,
   SIGN_IN_OUTCOME_MESSAGES,
   signInLimitedMessage,
+  signInReadingTime,
+  signInWaitLeft,
   SIGN_IN_RENEWAL_MESSAGES,
   SIGN_IN_RENEWAL_WINDOW_MS,
   signInEndFormat,
@@ -44,6 +48,7 @@ import {
   signInRetryNote,
   signInRetryReading,
   signInTimeFormat,
+  signInWaitEnd,
   showsTwoFactorNote,
   signOutMessage,
   startInAnotherBrowser,
@@ -54,7 +59,8 @@ import {
   watchSignInRetry,
   type AccountView,
 } from "./account-view.ts";
-import { describeWait } from "./people-actions-view.ts";
+import { describeWait as peopleDescribeWait } from "./people-actions-view.ts";
+import { describeWait } from "./wait-text.ts";
 
 const IDLE: AccountStatus = {
   revision: 3,
@@ -373,18 +379,18 @@ test("every outcome code has its own message, and only a success or a cancel is 
     [...SIGN_IN_OUTCOME_CODES].sort(),
   );
   const texts = SIGN_IN_OUTCOME_CODES.map(
-    (code) => describeOutcome({ code }).text,
+    (code) => describeOutcome({ code }, 0).text,
   );
   expect(new Set(texts).size).toBe(texts.length);
   for (const code of SIGN_IN_OUTCOME_CODES) {
-    expect(describeOutcome({ code }).role, code).toBe(
+    expect(describeOutcome({ code }, 0).role, code).toBe(
       code === "signed_in" || code === "cancelled" ? "status" : "alert",
     );
   }
 });
 
 test("the account's limit of active devices says to remove a device on another device, and names no wait (#255)", () => {
-  const message = describeOutcome({ code: "device_limit" });
+  const message = describeOutcome({ code: "device_limit" }, 0);
   expect(message).toEqual({
     role: "alert",
     text: "This account already has as many active devices as it allows, so this device cannot be added. On another of your devices, remove a device that you no longer use in the Devices section of the Account screen, then sign in here again.",
@@ -392,52 +398,352 @@ test("the account's limit of active devices says to remove a device on another d
   expect(message.text).not.toMatch(/Try again|wait/iu);
 });
 
-test("an uncertain refusal with the wait of rate_limited says how long to wait, names both limits, and still does not say whether the sign-in was completed (#269)", () => {
-  expect(
-    describeOutcome({ code: "uncertain_refusal", retryAfterMs: 86_000_000 }),
-  ).toEqual({
+/** When the answer of the limit tests arrived, and the end of its wait. */
+const LIMITED_AT = Date.parse("2026-11-14T10:00:00.000Z");
+const limited = (
+  code: "device_daily_limit" | "uncertain_refusal",
+  ms: number,
+) => ({ code, retryAfter: new Date(LIMITED_AT + ms).toISOString() }) as const;
+
+test("the daily limit of new devices says how long to wait, from the clock, and says nothing uncertain (#269)", () => {
+  const outcome = limited("device_daily_limit", 86_000_000);
+  expect(describeOutcome(outcome, LIMITED_AT)).toEqual({
     role: "alert",
-    text: "The server is limiting sign-ins for now: too many came from this network, or this account has added as many new devices as it may in one day. Its answer does not show whether the sign-in was completed. Try again in about 24 hours; starting it again then is safe.",
+    text: "This account has added as many new devices as it may in one day. Try again in about 24 hours.",
   });
+  // The refusal is certain, so nothing about an unknown outcome, and the
+  // route's limit is not named.
+  expect(describeOutcome(outcome, LIMITED_AT).text).not.toMatch(
+    /does not show|safe|network/iu,
+  );
+  // What is left is counted from the clock, so the text does not go stale.
+  expect(describeOutcome(outcome, LIMITED_AT + 20 * 3_600_000).text).toBe(
+    "This account has added as many new devices as it may in one day. Try again in about 4 hours.",
+  );
+  expect(describeOutcome(outcome, LIMITED_AT + 85_400_000).text).toBe(
+    deviceDailyLimitMessage(600_000),
+  );
+  expect(deviceDailyLimitMessage(600_000)).toContain(
+    "Try again in about 10 minutes.",
+  );
+  // Once the time has come, and without a time, the sentence has no wait.
+  const plain =
+    "This account has added as many new devices as it may in one day.";
+  expect(SIGN_IN_OUTCOME_MESSAGES.device_daily_limit).toBe(plain);
+  for (const now of [LIMITED_AT + 86_000_000, LIMITED_AT + 90_000_000]) {
+    expect(describeOutcome(outcome, now)).toEqual({
+      role: "alert",
+      text: plain,
+    });
+  }
+  expect(describeOutcome(outcome, LIMITED_AT + 85_999_999).text).toBe(
+    `${plain} Try again in about 1 minute.`,
+  );
+  expect(describeOutcome({ code: "device_daily_limit" }, LIMITED_AT).text).toBe(
+    plain,
+  );
+});
+
+test("an uncertain refusal with the wait of rate_limited says how long to wait, names the route's limit only, and still does not say whether the sign-in was completed (#269)", () => {
+  const outcome = limited("uncertain_refusal", 600_000);
+  expect(describeOutcome(outcome, LIMITED_AT)).toEqual({
+    role: "alert",
+    text: "The server is limiting sign-ins for now: too many sign-ins came from this network. Its answer does not show whether the sign-in was completed. Try again in about 10 minutes; starting it again then is safe.",
+  });
+  // The daily limit of new devices has its own outcome now.
+  expect(describeOutcome(outcome, LIMITED_AT).text).not.toMatch(
+    /device|one day/iu,
+  );
+  // What is left is counted from the clock.
+  expect(describeOutcome(outcome, LIMITED_AT + 420_000).text).toBe(
+    signInLimitedMessage(180_000),
+  );
+  expect(signInLimitedMessage(180_000)).toContain(
+    "Try again in about 3 minutes;",
+  );
+  // Once the time has come, and without a time, the message is the one of
+  // every uncertain refusal.
+  for (const now of [LIMITED_AT + 600_000, LIMITED_AT + 3_600_000]) {
+    expect(describeOutcome(outcome, now).text).toBe(
+      SIGN_IN_OUTCOME_MESSAGES.uncertain_refusal,
+    );
+  }
+  expect(describeOutcome({ code: "uncertain_refusal" }, LIMITED_AT).text).toBe(
+    SIGN_IN_OUTCOME_MESSAGES.uncertain_refusal,
+  );
+});
+
+test("the wait of a limited sign-in is rounded up in the words of the other screens, and never counts seconds (#269)", () => {
   // Rounded up, so that a start after the wait is not refused again.
   const waits: [number, string][] = [
     [600_000, "10 minutes"],
     [3_600_000, "1 hour"],
     [3_660_000, "2 hours"],
     [90_000, "2 minutes"],
-    [30_000, "30 seconds"],
+    // Below a minute it stays a minute: the message is an alert, and a
+    // count of seconds would announce it again every second.
+    [60_000, "1 minute"],
+    [30_000, "1 minute"],
+    [1, "1 minute"],
   ];
-  for (const [retryAfterMs, wait] of waits) {
-    expect(signInLimitedMessage(retryAfterMs)).toContain(
-      `Try again in about ${wait};`,
+  for (const [ms, wait] of waits) {
+    expect(signInLimitedMessage(ms)).toContain(`Try again in about ${wait};`);
+    expect(deviceDailyLimitMessage(ms)).toContain(
+      `Try again in about ${wait}.`,
+    );
+  }
+  for (const ms of [
+    60_000, 61_000, 3_599_000, 3_600_000, 3_601_000, 86_400_000, 604_800_000,
+  ]) {
+    expect(signInLimitedMessage(ms)).toContain(
+      `Try again in about ${describeWait(ms)};`,
+    );
+  }
+  // One function for every screen: the People screen's is the same one.
+  expect(peopleDescribeWait).toBe(describeWait);
+});
+
+test("what is left of a limit's wait is read from the outcome's time, with the two limit codes only (#269)", () => {
+  const at = new Date(LIMITED_AT + 600_000).toISOString();
+  for (const code of ["device_daily_limit", "uncertain_refusal"] as const) {
+    expect(signInWaitLeft({ code, retryAfter: at }, LIMITED_AT)).toBe(600_000);
+    expect(signInWaitLeft({ code, retryAfter: at }, LIMITED_AT + 599_999)).toBe(
+      1,
     );
     expect(
-      describeOutcome({ code: "uncertain_refusal", retryAfterMs }).text,
-    ).toBe(signInLimitedMessage(retryAfterMs));
+      signInWaitLeft({ code, retryAfter: at }, LIMITED_AT + 600_000),
+    ).toBeUndefined();
+    expect(signInWaitLeft({ code }, LIMITED_AT)).toBeUndefined();
+    // A time that cannot be read names no wait.
+    expect(
+      signInWaitLeft({ code, retryAfter: "soon" }, LIMITED_AT),
+    ).toBeUndefined();
   }
-  // The same words as the other screens' waits.
-  for (const retryAfterMs of [
-    1, 999, 1_000, 59_000, 60_000, 61_000, 3_599_000, 3_600_000, 3_601_000,
-    86_400_000, 604_800_000,
-  ]) {
-    expect(signInLimitedMessage(retryAfterMs)).toContain(
-      `Try again in about ${describeWait(retryAfterMs)};`,
+  // The time of `replacement_pending` belongs to its own note (#199), and
+  // no other code carries one.
+  for (const code of SIGN_IN_OUTCOME_CODES) {
+    if (code === "device_daily_limit" || code === "uncertain_refusal") {
+      continue;
+    }
+    expect(signInWaitLeft({ code, retryAfter: at }, LIMITED_AT), code).toBe(
+      undefined,
+    );
+    expect(describeOutcome({ code, retryAfter: at }, LIMITED_AT).text).toBe(
+      SIGN_IN_OUTCOME_MESSAGES[code],
     );
   }
-  // Without a wait, the message stays the one of every uncertain refusal.
-  expect(describeOutcome({ code: "uncertain_refusal" }).text).toBe(
+});
+
+test("the clock is read again each time the wait of a limited sign-in reads differently, down to its end (#269)", () => {
+  for (const code of ["device_daily_limit", "uncertain_refusal"] as const) {
+    const status = (ms: number): AccountStatus => ({
+      ...IDLE,
+      lastOutcome: limited(code, ms),
+    });
+    // 9 minutes and 30 seconds read "10 minutes" until 9 minutes are left.
+    expect(nextSignInWaitChange(status(570_000), LIMITED_AT)).toBe(
+      LIMITED_AT + 30_000,
+    );
+    // At a whole minute, the next one.
+    expect(nextSignInWaitChange(status(600_000), LIMITED_AT)).toBe(
+      LIMITED_AT + 60_000,
+    );
+    // In the last minute, the end, where the message drops the wait.
+    expect(nextSignInWaitChange(status(600_000), LIMITED_AT + 540_000)).toBe(
+      LIMITED_AT + 600_000,
+    );
+    expect(nextSignInWaitChange(status(600_000), LIMITED_AT + 599_999)).toBe(
+      LIMITED_AT + 600_000,
+    );
+    // Nothing after the end, without a time, or while a sign-in runs.
+    expect(
+      nextSignInWaitChange(status(600_000), LIMITED_AT + 600_000),
+    ).toBeUndefined();
+    expect(
+      nextSignInWaitChange({ ...IDLE, lastOutcome: { code } }, LIMITED_AT),
+    ).toBeUndefined();
+    expect(
+      nextSignInWaitChange(
+        { ...status(600_000), signIn: { kind: "starting" } },
+        LIMITED_AT,
+      ),
+    ).toBeUndefined();
+  }
+  expect(
+    nextSignInWaitChange({ ...IDLE, lastOutcome: null }, LIMITED_AT),
+  ).toBeUndefined();
+
+  // Followed with the panel's watch, the text is never stale: every reading
+  // lies on a change of the text, and the last one is the end.
+  const status: AccountStatus = {
+    ...IDLE,
+    lastOutcome: limited("uncertain_refusal", 150_000),
+  };
+  const clock = fakeRetryClock(LIMITED_AT);
+  const texts: string[] = [];
+  let now = LIMITED_AT;
+  for (let step = 0; step < 10; step += 1) {
+    if (status.lastOutcome !== null) {
+      texts.push(describeOutcome(status.lastOutcome, now).text);
+    }
+    const change = nextSignInWaitChange(status, now);
+    if (change === undefined) {
+      break;
+    }
+    let later: number | undefined;
+    watchSignInRetry(change, now, (time) => (later = time), clock);
+    clock.time = change;
+    clock.fire();
+    expect(later).toBe(change);
+    now = change;
+  }
+  expect(texts).toEqual([
+    signInLimitedMessage(180_000),
+    signInLimitedMessage(120_000),
+    signInLimitedMessage(60_000),
     SIGN_IN_OUTCOME_MESSAGES.uncertain_refusal,
+  ]);
+});
+
+test("the panel holds its clock reading for the end of a limit's wait as for the time of the retry note (#269)", () => {
+  const end = LIMITED_AT + 600_000;
+  for (const code of ["device_daily_limit", "uncertain_refusal"] as const) {
+    const status: AccountStatus = {
+      ...IDLE,
+      lastOutcome: limited(code, 600_000),
+    };
+    expect(signInWaitEnd(status)).toBe(end);
+    expect(signInReadingTime(status)).toBe(end);
+    // The time does not depend on the clock: it stays after it has passed,
+    // so the reading is not made again and again then.
+    expect(signInRetryAt(status)).toBeUndefined();
+    // While a sign-in runs, the outcome is hidden.
+    for (const signIn of [
+      { kind: "starting" },
+      { kind: "completing" },
+      WAITING.signIn,
+    ] as const) {
+      expect(signInReadingTime({ ...status, signIn })).toBeUndefined();
+    }
+    // Without a time, and for a time that cannot be read: undefined, never
+    // NaN, which differs from itself and would read the clock at every
+    // render.
+    expect(
+      signInReadingTime({ ...IDLE, lastOutcome: { code } }),
+    ).toBeUndefined();
+    expect(
+      signInReadingTime({ ...IDLE, lastOutcome: { code, retryAfter: "soon" } }),
+    ).toBeUndefined();
+  }
+  expect(signInReadingTime({ ...IDLE, lastOutcome: null })).toBeUndefined();
+  expect(signInReadingTime(IDLE)).toBeUndefined();
+  // No other code's time is the end of a wait.
+  for (const code of SIGN_IN_OUTCOME_CODES) {
+    if (code === "device_daily_limit" || code === "uncertain_refusal") {
+      continue;
+    }
+    expect(
+      signInWaitEnd({
+        ...IDLE,
+        lastOutcome: { code, retryAfter: new Date(end).toISOString() },
+      }),
+      code,
+    ).toBeUndefined();
+  }
+  // The time of the retry note (#199) is still the reading's time.
+  const graced: AccountStatus = {
+    ...IDLE,
+    replacementPending: true,
+    lastOutcome: {
+      code: "replacement_pending",
+      retryAfter: new Date(end).toISOString(),
+    },
+  };
+  expect(signInRetryAt(graced)).toBe(end);
+  expect(signInWaitEnd(graced)).toBeUndefined();
+  expect(signInReadingTime(graced)).toBe(end);
+});
+
+test("a limit's wait never counts from a clock reading that was made before its outcome arrived, also after the clock was set back (#269)", () => {
+  // A reading two hours old, made while no outcome had a time.
+  const clock = fakeRetryClock(LIMITED_AT - 2 * 3_600_000);
+  const old = signInRetryReading(undefined, signInReadingTime(IDLE), clock);
+  expect(old).toEqual({ retryAt: undefined, now: LIMITED_AT - 2 * 3_600_000 });
+
+  // The daily limit refuses, with 23 hours left. From the old reading the
+  // text would say 25 hours.
+  clock.time = LIMITED_AT;
+  const daily: AccountStatus = {
+    ...IDLE,
+    lastOutcome: limited("device_daily_limit", 23 * 3_600_000),
+  };
+  expect(
+    describeOutcome(limited("device_daily_limit", 23 * 3_600_000), old.now)
+      .text,
+  ).toBe(deviceDailyLimitMessage(25 * 3_600_000));
+  const read = signInRetryReading(old, signInReadingTime(daily), clock);
+  expect(read).toEqual({
+    retryAt: LIMITED_AT + 23 * 3_600_000,
+    now: LIMITED_AT,
+  });
+  expect(
+    describeOutcome(limited("device_daily_limit", 23 * 3_600_000), read.now)
+      .text,
+  ).toBe(
+    "This account has added as many new devices as it may in one day. Try again in about 23 hours.",
   );
+  // Held for the same outcome: the clock is not read at every render.
+  clock.time = LIMITED_AT + 5_000;
+  expect(signInRetryReading(read, signInReadingTime(daily), clock)).toBe(read);
+  // While the next sign-in runs there is no time, and its outcome gets a
+  // reading of its own.
+  const none = signInRetryReading(
+    read,
+    signInReadingTime({ ...daily, signIn: { kind: "starting" } }),
+    clock,
+  );
+  expect(none).toEqual({ retryAt: undefined, now: LIMITED_AT + 5_000 });
+
+  // The clock was set back by a day after a reading, and then the route's
+  // limit refuses with 10 minutes left: the end lies before that reading.
+  const ahead = signInRetryReading(
+    undefined,
+    undefined,
+    fakeRetryClock(LIMITED_AT + 86_400_000),
+  );
+  const route: AccountStatus = {
+    ...IDLE,
+    lastOutcome: limited("uncertain_refusal", 600_000),
+  };
+  // From the earlier reading, the message has no wait, and no timer runs.
+  expect(
+    describeOutcome(limited("uncertain_refusal", 600_000), ahead.now).text,
+  ).toBe(SIGN_IN_OUTCOME_MESSAGES.uncertain_refusal);
+  expect(nextSignInWaitChange(route, ahead.now)).toBeUndefined();
+  // The new outcome's time reads the clock again, as #204 does for a note.
+  const back = signInRetryReading(
+    ahead,
+    signInReadingTime(route),
+    fakeRetryClock(LIMITED_AT),
+  );
+  expect(back).toEqual({ retryAt: LIMITED_AT + 600_000, now: LIMITED_AT });
+  expect(
+    describeOutcome(limited("uncertain_refusal", 600_000), back.now).text,
+  ).toBe(signInLimitedMessage(600_000));
+  expect(nextSignInWaitChange(route, back.now)).toBe(LIMITED_AT + 60_000);
 });
 
 test("an account mismatch names the installation's login when the main process sent it", () => {
   expect(
-    describeOutcome({ code: "device_account_mismatch", deviceLogin: "hubot" }),
+    describeOutcome(
+      { code: "device_account_mismatch", deviceLogin: "hubot" },
+      0,
+    ),
   ).toEqual({
     role: "alert",
     text: "This installation belongs to the GitHub account hubot. Sign in with that account.",
   });
-  expect(describeOutcome({ code: "device_account_mismatch" }).text).toBe(
+  expect(describeOutcome({ code: "device_account_mismatch" }, 0).text).toBe(
     SIGN_IN_OUTCOME_MESSAGES.device_account_mismatch,
   );
 });

@@ -392,6 +392,8 @@ test("each route answers only known error codes, the common ones included", () =
     // The limits of projects and active devices have their own routes (#255).
     "project_limit",
     "device_limit",
+    // So has the daily limit of new devices (#269).
+    "device_daily_limit",
   ] as const) {
     assert.deepEqual(holders(code), [], code);
   }

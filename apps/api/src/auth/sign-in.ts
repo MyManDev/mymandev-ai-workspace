@@ -441,8 +441,8 @@ async function signIn(
       // The previous device that this sign-in replaces does not count: the
       // recovery path keeps the number of active devices. This limit is
       // decided before the limit of new devices per day, so a device at both
-      // gets `device_limit`, which no wait frees, and never `rate_limited`,
-      // which the desktop takes as an uncertain refusal (#255).
+      // gets `device_limit`, which no wait frees, and never
+      // `device_daily_limit`, which says to wait (#255, #269).
       const [active] = await tx
         .select({ n: count() })
         .from(devices)
@@ -471,7 +471,11 @@ async function signIn(
         );
       if ((recent?.n ?? 0) >= MAX_NEW_DEVICES_PER_DAY) {
         const oldest = recent?.oldest ?? now;
-        throw new ApiError("rate_limited", {
+        // Its own code, not `rate_limited`: nothing is committed yet, so
+        // the refusal is certain and the desktop may delete the new key.
+        // The route's limit of requests, which answers `rate_limited`, can
+        // meet a copy of a request that committed (#269).
+        throw new ApiError("device_daily_limit", {
           retryAfterSeconds: (oldest.getTime() + DAY_MS - now.getTime()) / 1000,
         });
       }

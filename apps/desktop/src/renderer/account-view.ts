@@ -13,6 +13,7 @@ import type {
   SignInOutcomeView,
   SignOutResult,
 } from "../shared/ipc-contract.ts";
+import { describeWait } from "./wait-text.ts";
 
 /** What the account panel knows about the sign-in of this installation. */
 export type AccountView =
@@ -50,6 +51,8 @@ export const SIGN_IN_OUTCOME_MESSAGES: Readonly<
     "No new device can be added to this account right now, because one of its devices was reported lost. Lift the lock from another of your devices.",
   device_limit:
     "This account already has as many active devices as it allows, so this device cannot be added. On another of your devices, remove a device that you no longer use in the Devices section of the Account screen, then sign in here again.",
+  device_daily_limit:
+    "This account has added as many new devices as it may in one day.",
   refused: "The server refused the sign-in.",
   api_origin_unset:
     "Sign-in is not available in this build, because no server address is set.",
@@ -81,35 +84,103 @@ export const SIGN_IN_OUTCOME_MESSAGES: Readonly<
 });
 
 /**
- * The message for an uncertain refusal that came with the wait of the API's
- * `rate_limited` (#269). The route's limit of requests per address and the
- * account's limit of new devices per day both answer it, and only the
- * second one proves that nothing was committed, so the message names both
- * and still does not say whether the sign-in was completed. The wait is
- * rounded up, so a start after it is not refused again.
+ * A wait of a sign-in's limit in words, rounded up like `describeWait`, so
+ * that a start after it is not refused again, but never below a minute:
+ * the panel announces the outcome as an alert, and a count of seconds
+ * would change it, and announce it again, every second.
  */
-export function signInLimitedMessage(retryAfterMs: number): string {
-  return `The server is limiting sign-ins for now: too many came from this network, or this account has added as many new devices as it may in one day. Its answer does not show whether the sign-in was completed. Try again in about ${waitText(retryAfterMs)}; starting it again then is safe.`;
+function signInWaitText(waitMs: number): string {
+  return describeWait(Math.max(waitMs, 60_000));
 }
 
 /**
- * A wait of `ms` milliseconds in words, rounded up: seconds below a
- * minute, minutes below an hour, and hours above. The same words as
- * `describeWait` of the other screens, which this module cannot import:
- * `people-actions-view.ts` imports it through `device-view.ts`.
+ * The message for the daily limit of new devices while its wait runs
+ * (#269). The refusal is certain: nothing was registered, and the key of
+ * the sign-in was deleted. Without a wait, or after it, the message is
+ * `SIGN_IN_OUTCOME_MESSAGES.device_daily_limit`, its first sentence.
  */
-function waitText(ms: number): string {
-  const count = (value: number, unit: string) =>
-    `${String(value)} ${unit}${value === 1 ? "" : "s"}`;
-  const seconds = Math.max(1, Math.ceil(ms / 1000));
-  if (seconds < 60) {
-    return count(seconds, "second");
+export function deviceDailyLimitMessage(waitMs: number): string {
+  return `${SIGN_IN_OUTCOME_MESSAGES.device_daily_limit} Try again in about ${signInWaitText(waitMs)}.`;
+}
+
+/**
+ * The message for an uncertain refusal while the wait of the API's
+ * `rate_limited` runs (#269). Only the route's limit of requests per
+ * address answers it on a sign-in, and it can answer a copy of a request
+ * that committed, so the message still does not say whether the sign-in
+ * was completed. The account's daily limit of new devices has its own
+ * outcome, `device_daily_limit`.
+ */
+export function signInLimitedMessage(waitMs: number): string {
+  return `The server is limiting sign-ins for now: too many sign-ins came from this network. Its answer does not show whether the sign-in was completed. Try again in about ${signInWaitText(waitMs)}; starting it again then is safe.`;
+}
+
+/**
+ * What is left at `now` (milliseconds, as `Date.now()` reads it) of the
+ * wait of an outcome that a limit of the API ended (#269), in
+ * milliseconds: the outcome's `retryAfter` with `device_daily_limit` or
+ * `uncertain_refusal`. Undefined without that time and once it has come,
+ * so the message then names no wait. The main process fixed the time when
+ * the answer arrived, so the wait is counted from the clock and does not
+ * go stale while the outcome stays on screen.
+ */
+export function signInWaitLeft(
+  outcome: SignInOutcomeView,
+  now: number,
+): number | undefined {
+  const at = limitWaitEnd(outcome);
+  return at !== undefined && at > now ? at - now : undefined;
+}
+
+/**
+ * The `retryAfter` of an outcome that a limit of the API ended, in
+ * milliseconds; undefined with another code, without the time, and for a
+ * time that cannot be read.
+ */
+function limitWaitEnd(outcome: SignInOutcomeView): number | undefined {
+  if (
+    (outcome.code !== "device_daily_limit" &&
+      outcome.code !== "uncertain_refusal") ||
+    outcome.retryAfter === undefined
+  ) {
+    return undefined;
   }
-  const minutes = Math.ceil(seconds / 60);
-  if (minutes < 60) {
-    return count(minutes, "minute");
+  const at = Date.parse(outcome.retryAfter);
+  return Number.isNaN(at) ? undefined : at;
+}
+
+/**
+ * When the wait in the message of the last outcome ends, in milliseconds
+ * (#269): the `retryAfter` of an outcome that a limit of the API ended,
+ * while no sign-in runs, which hides the outcome; otherwise undefined. It
+ * does not depend on the clock, so it also names a time that has passed.
+ */
+export function signInWaitEnd(status: AccountStatus): number | undefined {
+  const outcome = status.lastOutcome;
+  return status.signIn.kind !== "idle" || outcome === null
+    ? undefined
+    : limitWaitEnd(outcome);
+}
+
+/**
+ * The next time after `now`, in milliseconds, at which the wait in the
+ * message of the last outcome can read differently by the clock alone
+ * (`describeOutcome`): when what is left of it reaches the next whole
+ * minute, and at last its end, when the message drops the wait. Undefined
+ * while a sign-in runs, which hides the outcome, and without a wait.
+ */
+export function nextSignInWaitChange(
+  status: AccountStatus,
+  now: number,
+): number | undefined {
+  const outcome = status.lastOutcome;
+  if (status.signIn.kind !== "idle" || outcome === null) {
+    return undefined;
   }
-  return count(Math.ceil(minutes / 60), "hour");
+  const left = signInWaitLeft(outcome, now);
+  return left === undefined
+    ? undefined
+    : now + left - (Math.ceil(left / 60_000) - 1) * 60_000;
 }
 
 export interface OutcomeMessage {
@@ -199,9 +270,22 @@ export const SYSTEM_RETRY_CLOCK: SignInRetryClock = Object.freeze({
   },
 });
 
-/** The panel's clock reading, and the time of the note that it was read for. */
+/**
+ * The time of the last outcome that the panel counts to, in milliseconds:
+ * the time of the note after a refused start (`signInRetryAt`, #199), or
+ * the end of the wait of a sign-in that a limit of the API ended
+ * (`signInWaitEnd`, #269). The two belong to different outcome codes, so
+ * at most one of them is set. The panel reads its clock again whenever
+ * this time changes (`signInRetryReading`), so a note or a wait never
+ * counts from a reading that was made before its outcome arrived.
+ */
+export function signInReadingTime(status: AccountStatus): number | undefined {
+  return signInRetryAt(status) ?? signInWaitEnd(status);
+}
+
+/** The panel's clock reading, and the time of the outcome that it was read for. */
 export interface SignInRetryReading {
-  /** The time of the note (`signInRetryAt`) when the clock was read. */
+  /** The time of the outcome (`signInReadingTime`) when the clock was read. */
   readonly retryAt: number | undefined;
   /** The clock's reading in milliseconds. */
   readonly now: number;
@@ -209,11 +293,14 @@ export interface SignInRetryReading {
 
 /**
  * The clock reading that the panel compares with the time of the note
- * (#204): `held` while it was read for the same `retryAt`, and a new
- * reading of the clock once `retryAt` changed, or without one. Otherwise
- * only `watchSignInRetry` reads the clock, when a note ends, so after the
- * clock was set back, a later note whose time lies before that reading
- * would never show.
+ * (#204) and of the wait of a limit (#269): `held` while it was read for
+ * the same `retryAt` (`signInReadingTime`), and a new reading of the clock
+ * once `retryAt` changed, or without one. Otherwise only
+ * `watchSignInRetry` reads the clock, when a note ends or a wait reads
+ * differently. So an older reading would lengthen or shorten the wait of
+ * an outcome that arrived after it, and after the clock was set back, a
+ * later note or wait whose time lies before that reading would never
+ * show, and no timer would run for it.
  */
 export function signInRetryReading(
   held: SignInRetryReading | undefined,
@@ -271,19 +358,26 @@ export function watchSignInRetry(
 }
 
 /**
- * The message for the last outcome; the installation's login after an
- * account mismatch, and the wait after an uncertain refusal that came with
- * one (#269).
+ * The message for the last outcome at `now` (milliseconds, as `Date.now()`
+ * reads it); the installation's login after an account mismatch, and what
+ * is left of the wait after the daily limit of new devices or after an
+ * uncertain refusal that came with one (#269). Once that wait has ended,
+ * the message is the one without a wait.
  */
-export function describeOutcome(outcome: SignInOutcomeView): OutcomeMessage {
+export function describeOutcome(
+  outcome: SignInOutcomeView,
+  now: number,
+): OutcomeMessage {
+  const waitLeft = signInWaitLeft(outcome, now);
   const text =
     outcome.code === "device_account_mismatch" &&
     outcome.deviceLogin !== undefined
       ? `This installation belongs to the GitHub account ${outcome.deviceLogin}. Sign in with that account.`
-      : outcome.code === "uncertain_refusal" &&
-          outcome.retryAfterMs !== undefined
-        ? signInLimitedMessage(outcome.retryAfterMs)
-        : SIGN_IN_OUTCOME_MESSAGES[outcome.code];
+      : waitLeft === undefined
+        ? SIGN_IN_OUTCOME_MESSAGES[outcome.code]
+        : outcome.code === "device_daily_limit"
+          ? deviceDailyLimitMessage(waitLeft)
+          : signInLimitedMessage(waitLeft);
   return {
     role:
       outcome.code === "signed_in" || outcome.code === "cancelled"

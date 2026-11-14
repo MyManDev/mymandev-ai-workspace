@@ -58,6 +58,8 @@ Each device shows its name, its platform, when it was created, when it was last 
 
 An account can have at most 20 active devices, and can register at most 10 new devices in 24 hours.
 
+When a sign-in would add the 11th new device in 24 hours, it ends with "This account has added as many new devices as it may in one day." and says in about how many minutes or hours you can try again. Nothing was added to your account. Sign in again after that time.
+
 ### Remove or revoke another device
 
 Each other active device has two actions. The application asks before each one.
