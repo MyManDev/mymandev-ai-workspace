@@ -951,6 +951,7 @@ test("#266: the account is demoted in a workspace when the ready people of it li
     "no_workspace",
     "loading",
     "ready",
+    "unavailable",
   ] as const) {
     expect(
       isDemoted(AS_ADMIN, list(listed({ status, invitations: [] })), WORKSPACE),
@@ -1065,6 +1066,35 @@ test("#266: a demotion that arrives while the create is on its way opens the dia
   actions.start(INVITE);
   await actions.confirm();
   expect(last().code?.code).toBe(CODE);
+});
+
+test("#266: a create that starts once the invitations already say not_allowed, while the people still show the admin's role and Invite is still offered, opens the dialog without the code", async () => {
+  // The people and the invitations come through their own channels: the
+  // main process applied the demotion, and the people do not show it yet.
+  expect(
+    describeInvitations(AS_ADMIN, NOT_ALLOWED, NOW)?.invites.get(UNCLAIMED),
+  ).toEqual(INVITE);
+  const { actions, calls, views, last } = controllerWith(
+    { create: () => Promise.resolve(CREATED) },
+    AS_ADMIN,
+    NOT_ALLOWED,
+  );
+  actions.start(INVITE);
+  expect(last().question).toEqual(INVITE);
+  // No demotion arrives while the create is on its way: the one that the
+  // views showed before it started decides.
+  expect(await actions.confirm()).toBe(false);
+  expect(calls.map((call) => call.name)).toEqual(["create"]);
+  expect(last()).toEqual({
+    running: false,
+    message: "The invitation was created.",
+    question: undefined,
+    code: WITHOUT_CODE,
+  });
+  expect(serialized(views)).not.toContain(CODE);
+  expect(serialized(views)).not.toContain(CODE.slice(5, 30));
+  actions.closeCode();
+  expect(last().code).toBeUndefined();
 });
 
 test("#266: the code stays while the account keeps the owner's or an admin's role: another person's demotion, an ownership transfer, people that are not ready, and another workspace's not_allowed", async () => {

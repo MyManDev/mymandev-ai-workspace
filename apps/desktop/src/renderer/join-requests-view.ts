@@ -841,7 +841,7 @@ export interface JoinRequestActions {
  * that is refused, uncertain, or fails on its way ends it, and the sentence
  * says how far it came; when the create ends it, the request stays pending.
  * A code whose invitation the server revoked with the account's demotion is
- * never shown: the dialog opens, or stays open, without it (#266).
+ * dropped at once: the dialog opens, or stays open, without it (#266).
  */
 export function createJoinRequestActions(
   bridges: JoinRequestActionsBridges,
