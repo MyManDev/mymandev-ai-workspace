@@ -343,7 +343,14 @@ test("the side panel shows the agents or the repositories, chosen with tabs of w
     '<div class="panel-tabs" role="tablist" aria-label="Side panel">' +
       tab("Agents", false) +
       tab("Repositories", true) +
-      '</div><div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2><p>Repositories are not available.</p>',
+      '</div><div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2>',
+  );
+  // Without the bridges, neither part of the panel is available.
+  expect(repositories).toContain(
+    '<p class="repository-status" role="status">The project&#x27;s repositories are not available.</p></section>',
+  );
+  expect(repositories).toContain(
+    '<h3 class="repository-section-title" id="device-repositories-title">On this device</h3><p>Repositories are not available.</p>',
   );
 });
 
@@ -893,7 +900,10 @@ test("with the bridge, the repository panel waits for the first list and offers 
 
   // The repository panel is the content of the repositories tab.
   expect(html).toContain(
-    '<div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2><button type="button" class="panel-action" disabled="">Add a repository</button><p>Reading the repositories.</p>',
+    '<div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2>',
+  );
+  expect(html).toContain(
+    '<h3 class="repository-section-title" id="device-repositories-title">On this device</h3><button type="button" class="panel-action" disabled="">Add a repository</button><p>Reading the repositories.</p>',
   );
   expect(html).not.toContain("Repositories are not available.");
 });

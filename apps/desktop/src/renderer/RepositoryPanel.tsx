@@ -1,10 +1,18 @@
-import { useCallback, useEffect, useState } from "react";
-import type { RepositoryBridge } from "../shared/desktop-bridge.ts";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
+import type {
+  ProjectRepositoriesBridge,
+  RepositoryBridge,
+} from "../shared/desktop-bridge.ts";
 import type {
   GitRemote,
   MountedRepository,
   RepositoryState,
 } from "../shared/ipc-contract.ts";
+import {
+  ProjectRepositoriesContent,
+  ProjectRepositoryDialogBox,
+  useProjectRepositories,
+} from "./ProjectRepositories.tsx";
 import {
   describeBranch,
   describeChanges,
@@ -15,17 +23,51 @@ import {
   type RepositoryPanelView,
 } from "./repository-view.ts";
 
+/** The element ID of the title of the repositories mounted on this device. */
+export const DEVICE_REPOSITORIES_TITLE_ID = "device-repositories-title";
+
 /**
- * The repositories of the side panel: the repositories mounted on this
- * device, with their branch, their changes, and their remotes, read-only.
- * The list follows the main process, which refreshes it after file changes.
+ * The repositories of the side panel: first the open project's registered
+ * repositories with their links to folders on this device (#286), then the
+ * repositories mounted on this device, with their branch, their changes,
+ * and their remotes, read-only. The mount list follows the main process,
+ * which refreshes it after file changes; it is the same for every project.
  */
 export function RepositoryPanel({
   repositories,
+  projectRepositories,
+  projectId,
 }: {
   readonly repositories: RepositoryBridge | undefined;
+  /** The project repository functions from the preload script; undefined outside Electron. */
+  readonly projectRepositories: ProjectRepositoriesBridge | undefined;
+  /** The open project. */
+  readonly projectId: string;
 }) {
-  return <RepositoryPanelContent {...useRepositoryPanel(repositories)} />;
+  const mounts = useRepositoryPanel(repositories);
+  const project = useProjectRepositories(
+    projectRepositories,
+    projectId,
+    mounts.view,
+  );
+  return (
+    <RepositoryPanelContent
+      {...mounts}
+      project={
+        <>
+          <ProjectRepositoriesContent {...project} />
+          {project.handlers === undefined ? null : (
+            <ProjectRepositoryDialogBox
+              dialog={project.actions.dialog}
+              onChoose={project.handlers.onChoose}
+              onConfirm={project.handlers.onConfirm}
+              onCancel={project.handlers.onCancel}
+            />
+          )}
+        </>
+      }
+    />
+  );
 }
 
 export interface RepositoryPanelContentProps {
@@ -36,6 +78,8 @@ export interface RepositoryPanelContentProps {
   readonly message: string | undefined;
   readonly onMount: () => void;
   readonly onUnmount: (mountId: string) => void;
+  /** The open project's registered repositories, above this device's. */
+  readonly project?: ReactNode;
 }
 
 export function RepositoryPanelContent({
@@ -44,40 +88,53 @@ export function RepositoryPanelContent({
   message,
   onMount,
   onUnmount,
+  project = null,
 }: RepositoryPanelContentProps) {
   return (
     <>
       <h2 id="panel-title">Repositories</h2>
-      {view.kind === "unavailable" ? (
-        <p>Repositories are not available.</p>
-      ) : (
-        <>
-          <button
-            type="button"
-            className="panel-action"
-            disabled={busy || view.kind === "pending"}
-            onClick={onMount}
-          >
-            Add a repository
-          </button>
-          {message === undefined ? null : (
-            <p className="panel-message" role="alert">
-              {message}
-            </p>
-          )}
-          {view.kind === "pending" ? (
-            <p>Reading the repositories.</p>
-          ) : (
-            <RepositoryList
-              repositories={view.list.repositories}
-              onUnmount={onUnmount}
-            />
-          )}
-        </>
-      )}
-      <p className="placeholder-note">
-        Repositories are only read: nothing in their folders is changed.
-      </p>
+      {project}
+      <section
+        className="repository-section"
+        aria-labelledby={DEVICE_REPOSITORIES_TITLE_ID}
+      >
+        <h3
+          className="repository-section-title"
+          id={DEVICE_REPOSITORIES_TITLE_ID}
+        >
+          On this device
+        </h3>
+        {view.kind === "unavailable" ? (
+          <p>Repositories are not available.</p>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="panel-action"
+              disabled={busy || view.kind === "pending"}
+              onClick={onMount}
+            >
+              Add a repository
+            </button>
+            {message === undefined ? null : (
+              <p className="panel-message" role="alert">
+                {message}
+              </p>
+            )}
+            {view.kind === "pending" ? (
+              <p>Reading the repositories.</p>
+            ) : (
+              <RepositoryList
+                repositories={view.list.repositories}
+                onUnmount={onUnmount}
+              />
+            )}
+          </>
+        )}
+        <p className="placeholder-note">
+          Repositories are only read: nothing in their folders is changed.
+        </p>
+      </section>
     </>
   );
 }
@@ -93,7 +150,10 @@ export function RepositoryList({
     return <p>No repositories yet.</p>;
   }
   return (
-    <ul className="repository-list" aria-labelledby="panel-title">
+    <ul
+      className="repository-list"
+      aria-labelledby={DEVICE_REPOSITORIES_TITLE_ID}
+    >
       {repositories.map((repository) => (
         <RepositoryItem
           key={repository.mountId}
@@ -114,7 +174,7 @@ function RepositoryItem({
 }) {
   return (
     <li className="repository">
-      <h3 className="repository-name">{repository.name}</h3>
+      <h4 className="repository-name">{repository.name}</h4>
       <p className="repository-path">
         <code>{repository.path}</code>
       </p>

@@ -1,6 +1,7 @@
 import type { Dispatch, KeyboardEvent } from "react";
 import type {
   AgentBridge,
+  ProjectRepositoriesBridge,
   RepositoryBridge,
 } from "../shared/desktop-bridge.ts";
 import { AgentPanel } from "./AgentPanel.tsx";
@@ -49,8 +50,9 @@ export function panelForKey(
  * repositories, chosen with tabs. Only the selected tab is in the tab order;
  * the arrow keys, Home, and End select another tab and move the focus to it.
  * The agents are the open project's agents and runs, read-only. The
- * repositories are the ones mounted on this device; a mount is not linked
- * to a project yet, so every project shows the same ones.
+ * repositories are the open project's registered repositories, with their
+ * links to folders on this device, and the repositories mounted on this
+ * device, which every project shows the same.
  */
 export function ProjectPanel({
   panel,
@@ -58,6 +60,7 @@ export function ProjectPanel({
   dispatch,
   agents,
   repositories,
+  projectRepositories,
 }: {
   readonly panel: PanelId;
   /** The open project. */
@@ -67,6 +70,8 @@ export function ProjectPanel({
   readonly agents?: AgentBridge | undefined;
   /** The repository functions from the preload script; undefined outside Electron. */
   readonly repositories?: RepositoryBridge | undefined;
+  /** The project repository functions from the preload script; undefined outside Electron. */
+  readonly projectRepositories?: ProjectRepositoriesBridge | undefined;
 }) {
   const selectWithKey = (event: KeyboardEvent<HTMLElement>) => {
     const next = panelForKey(panel, event.key);
@@ -117,7 +122,11 @@ export function ProjectPanel({
         {panel === "agents" ? (
           <AgentPanel agents={agents} projectId={projectId} />
         ) : (
-          <RepositoryPanel repositories={repositories} />
+          <RepositoryPanel
+            repositories={repositories}
+            projectRepositories={projectRepositories}
+            projectId={projectId}
+          />
         )}
       </div>
     </aside>
