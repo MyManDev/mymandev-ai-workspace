@@ -23,7 +23,11 @@ import {
   PreviewInvitationResponseSchema,
   PROJECT_ROUTE_ERRORS,
   PROJECT_ROUTES,
+  RegisterRepositoryRequestSchema,
+  RegisterRepositoryResponseSchema,
   RenameMemberRequestSchema,
+  REPOSITORY_ROUTE_ERRORS,
+  REPOSITORY_ROUTES,
   routePath,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
@@ -48,6 +52,10 @@ const WORKSPACE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1";
 const MEMBER_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f1";
 const INVITATION_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819301";
 const JOIN_REQUEST_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819311";
+const PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819321";
+const REPOSITORY_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819331";
+const IN_PROJECT = { projectId: PROJECT_ID };
+const OF_REPOSITORY = { projectId: PROJECT_ID, repositoryId: REPOSITORY_ID };
 /** An invitation code of the protocol's format, as a person pastes it. */
 const CODE = `mmdi_${"Q7x-_9kPz2".repeat(4)}Lmw`;
 
@@ -230,6 +238,21 @@ const ACTIONS: [
     `${W}/projects`,
     { name: "Café" },
   ],
+  [
+    "registerRepository",
+    IN_PROJECT,
+    // A label, sent as it is.
+    { name: " web app " },
+    `/projects/${PROJECT_ID}/repositories`,
+    { name: " web app " },
+  ],
+  [
+    "removeRepository",
+    OF_REPOSITORY,
+    undefined,
+    `/projects/${PROJECT_ID}/repositories/${REPOSITORY_ID}/remove`,
+    undefined,
+  ],
 ];
 
 /** The `:name` parameters of a route path, in order. */
@@ -239,7 +262,7 @@ function pathParams(path: string): string[] {
   );
 }
 
-test("the allowlist holds exactly the 24 POST writes of the screens, frozen, each the protocol's route with its path parameters", () => {
+test("the allowlist holds exactly the 26 POST writes of the screens and the repositories, frozen, each the protocol's route with its path parameters", () => {
   expect(Object.keys(WORKSPACE_ACTIONS)).toEqual(ACTIONS.map(([name]) => name));
   expect(Object.isFrozen(WORKSPACE_ACTIONS)).toBe(true);
   for (const [name, entry] of Object.entries(WORKSPACE_ACTIONS)) {
@@ -250,7 +273,9 @@ test("the allowlist holds exactly the 24 POST writes of the screens, frozen, eac
     const protocol =
       name === "createProject"
         ? PROJECT_ROUTES.createProject
-        : MEMBERSHIP_ROUTES[name as keyof typeof MEMBERSHIP_ROUTES];
+        : name === "registerRepository" || name === "removeRepository"
+          ? REPOSITORY_ROUTES[name]
+          : MEMBERSHIP_ROUTES[name as keyof typeof MEMBERSHIP_ROUTES];
     expect(entry.route, name).toBe(protocol);
   }
   // Left out: the owner's limit of unclaimed people and project renames,
@@ -336,6 +361,11 @@ test("each write's request and answer schemas are the protocol's", () => {
     pauseJoinRequests: [null, "empty"],
     resumeJoinRequests: [null, "empty"],
     createProject: [CreateProjectRequestSchema, CreateProjectResponseSchema],
+    registerRepository: [
+      RegisterRepositoryRequestSchema,
+      RegisterRepositoryResponseSchema,
+    ],
+    removeRepository: [null, "empty"],
   };
   expect(Object.keys(WORKSPACE_ACTIONS).sort()).toEqual(
     Object.keys(schemas).sort(),
@@ -417,6 +447,29 @@ test("a name off the allowlist, a missing, extra, or invalid path parameter, or 
     ["approveJoinRequest", OF_REQUEST, { displayName: "" }],
     ["createProject", IN_WORKSPACE, { name: " \t " }],
     ["createProject", IN_WORKSPACE, { name: "a".repeat(101) }],
+    // A repository: never a path, as a name or beside it (#286).
+    ["listRepositories", IN_PROJECT, undefined],
+    ["registerRepository", IN_PROJECT, { name: "/home/user/web" }],
+    ["registerRepository", IN_PROJECT, { name: "C:\\Users\\user\\web" }],
+    ["registerRepository", IN_PROJECT, { name: "web", path: "/home/web" }],
+    ["registerRepository", IN_PROJECT, { name: "" }],
+    ["registerRepository", IN_PROJECT, { name: "a".repeat(101) }],
+    ["registerRepository", IN_PROJECT, { name: "a\nb" }],
+    ["registerRepository", IN_PROJECT, undefined],
+    ["registerRepository", IN_WORKSPACE, { name: "web" }],
+    ["registerRepository", { projectId: upper }, { name: "web" }],
+    ["removeRepository", IN_PROJECT, undefined],
+    ["removeRepository", OF_REPOSITORY, {}],
+    [
+      "removeRepository",
+      { projectId: PROJECT_ID, repositoryId: v4 },
+      undefined,
+    ],
+    [
+      "removeRepository",
+      { ...OF_REPOSITORY, workspaceId: WORKSPACE_ID },
+      undefined,
+    ],
   ];
   for (const [name, params, body] of refused) {
     expect(
@@ -530,8 +583,8 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     // No write of the desktop creates a run yet (#35).
     run_limit: "failed",
     run_daily_limit: "failed",
-    // No write of the desktop registers a repository yet (#286).
-    repository_limit: "failed",
+    // A registration in a full project (#286, decision of 2026-11-14).
+    repository_limit: "repository_limit",
     // Only the sign-in answers it, never a write (#255).
     device_limit: "failed",
     // Nor this one: a write then fails without a wait, never as the
@@ -555,7 +608,12 @@ test("each code of the API maps to its fixed failure, and every code that a writ
   const routeErrors: Record<string, readonly ApiErrorCode[]> = {
     ...MEMBERSHIP_ROUTE_ERRORS,
     createProject: PROJECT_ROUTE_ERRORS.createProject,
+    registerRepository: REPOSITORY_ROUTE_ERRORS.registerRepository,
+    removeRepository: REPOSITORY_ROUTE_ERRORS.removeRepository,
   };
+  for (const name of Object.keys(WORKSPACE_ACTIONS)) {
+    expect(routeErrors[name], name).toBeDefined();
+  }
   for (const name of Object.keys(WORKSPACE_ACTIONS)) {
     for (const code of routeErrors[name] ?? []) {
       if (code !== "bad_request" && code !== "internal_error") {
@@ -612,6 +670,15 @@ test("rate_limited waits as long as the API's Retry-After, or a fixed minute wit
       retryAfterSeconds: 120,
     }),
   ).toEqual({ ok: false, reason: "project_limit" });
+  // Nor is the limit of repositories in a project (#286).
+  expect(
+    workspaceActionFailedFor({
+      ok: false,
+      reason: "refused",
+      code: "repository_limit",
+      retryAfterSeconds: 120,
+    }),
+  ).toEqual({ ok: false, reason: "repository_limit" });
   expect(workspaceActionFailedFor({ ok: false, reason: "no_answer" })).toEqual({
     ok: false,
     reason: "unknown",

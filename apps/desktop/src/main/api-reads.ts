@@ -1,8 +1,9 @@
 // The reads of workspace, chat, and agent data that the main process may
 // send to the API for #27 and #28, and the reads of invitations, join
 // requests, and claims for the screens of #95 (decision D1 of 2026-11-06,
-// and D8 of 2026-11-13): a frozen allowlist of ten `GET` routes, each with
-// the protocol's response schema and a fixed cap on the size of its answer.
+// and D8 of 2026-11-13), and of a project's registered repositories (#286):
+// a frozen allowlist of eleven `GET` routes, each with the protocol's
+// response schema and a fixed cap on the size of its answer.
 // The account service sends them with the device session
 // (`readWorkspaceData`); no IPC channel and no bridge member reach them.
 // Chat messages are sent over the connection, never here.
@@ -31,6 +32,9 @@ import {
   type ProjectId,
   type ProjectListResponse,
   ProjectListResponseSchema,
+  REPOSITORY_ROUTES,
+  type RepositoryListResponse,
+  RepositoryListResponseSchema,
   type WorkspaceId,
   type WorkspaceListResponse,
   WorkspaceListResponseSchema,
@@ -84,7 +88,8 @@ function read<T>(
  * are about 0.29 MB, 1,000 join requests in the approver's view about
  * 0.69 MB, and 1,000 of the account's own join requests about 0.52 MB. For
  * the claim notices (D8), 1,000 claims are about 0.33 MB; the server sends
- * 50.
+ * 50. For #286, 1,000 repositories with names of 100 four-byte characters
+ * are about 0.57 MB; a project holds 20.
  */
 export const WORKSPACE_READS = Object.freeze({
   /** `GET /workspaces`: the account's workspaces. */
@@ -163,6 +168,17 @@ export const WORKSPACE_READS = Object.freeze({
     ClaimListResponseSchema,
     512 * KIB,
   ),
+  /**
+   * `GET /projects/:projectId/repositories`: the project's registered
+   * repositories that are not removed, an identity and a name each, never a
+   * path (#286).
+   */
+  listRepositories: read(
+    REPOSITORY_ROUTES.listRepositories,
+    ["projectId"],
+    RepositoryListResponseSchema,
+    1 * MIB,
+  ),
 });
 export type WorkspaceReadName = keyof typeof WORKSPACE_READS;
 
@@ -181,6 +197,7 @@ export interface WorkspaceReadParams {
   readonly listJoinRequests: { readonly workspaceId: WorkspaceId };
   readonly listOwnJoinRequests: NoParams;
   readonly listClaims: { readonly workspaceId: WorkspaceId };
+  readonly listRepositories: { readonly projectId: ProjectId };
 }
 
 /**
@@ -204,6 +221,7 @@ export interface WorkspaceReadQuery {
   readonly listJoinRequests: never;
   readonly listOwnJoinRequests: never;
   readonly listClaims: never;
+  readonly listRepositories: never;
 }
 
 /** The answer of each read, as its response schema parsed it. */
@@ -218,6 +236,7 @@ export interface WorkspaceReadAnswer {
   readonly listJoinRequests: JoinRequestListResponse;
   readonly listOwnJoinRequests: OwnJoinRequestListResponse;
   readonly listClaims: ClaimListResponse;
+  readonly listRepositories: RepositoryListResponse;
 }
 
 /**

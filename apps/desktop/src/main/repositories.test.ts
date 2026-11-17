@@ -347,6 +347,78 @@ test("where paths ignore case, a repository in another case is the same", async 
   });
 });
 
+test("folderOf gives a mount's top-level and common Git folders as Git reported them, and mountOf finds the mount by its folder", async () => {
+  const { service } = setup({}, (folder) => ({
+    kind: "repository",
+    // A control character is replaced in the list, never in the folder.
+    location: {
+      topLevel: `${folder}\u0007`,
+      gitDir: "/home/user/main/.git/worktrees/project",
+      commonDir: "/home/user/main/.git",
+    },
+  }));
+  const result = await service.mount("/home/user/project");
+  const mountId = result.outcome === "mounted" ? result.mountId : "";
+
+  expect(service.folderOf(mountId)).toEqual({
+    topLevel: "/home/user/project\u0007",
+    commonDir: "/home/user/main/.git",
+    available: true,
+  });
+  expect(Object.isFrozen(service.folderOf(mountId))).toBe(true);
+  expect(service.list().repositories[0]?.path).toBe("/home/user/project\uFFFD");
+  expect(service.mountOf("/home/user/project\u0007")).toBe(mountId);
+  // Another case is another folder where paths keep case.
+  expect(service.mountOf("/home/user/Project\u0007")).toBeUndefined();
+  expect(service.mountOf("/home/user/project")).toBeUndefined();
+  expect(service.folderOf("0b9e2f7c-5d0a-4c8e-9f3b-000000000099")).toBe(
+    undefined,
+  );
+  expect(service.folderOf(7 as never)).toBeUndefined();
+  expect(service.mountOf(7 as never)).toBeUndefined();
+
+  service.unmount(mountId);
+  expect(service.folderOf(mountId)).toBeUndefined();
+  expect(service.mountOf("/home/user/project\u0007")).toBeUndefined();
+});
+
+test("where paths ignore case, mountOf finds a mount in another case", async () => {
+  const { service } = setup(
+    { caseInsensitivePaths: true, pathApi: path.win32 },
+    (folder) => ({
+      kind: "repository",
+      location: {
+        topLevel: folder,
+        gitDir: path.win32.join(folder, ".git"),
+        commonDir: path.win32.join(folder, ".git"),
+      },
+    }),
+  );
+  const result = await service.mount("C:\\Users\\user\\Project");
+  const mountId = result.outcome === "mounted" ? result.mountId : "";
+
+  expect(service.mountOf("c:\\users\\user\\project")).toBe(mountId);
+  expect(service.mountOf("C:\\USERS\\User\\PROJECT")).toBe(mountId);
+  expect(service.folderOf(mountId)?.topLevel).toBe("C:\\Users\\user\\Project");
+});
+
+test("folderOf reports a mount whose state is unavailable as not available, and available again after a read that succeeds", async () => {
+  const { service, inspections, watches } = setup();
+  const result = await service.mount("/home/user/project");
+  const mountId = result.outcome === "mounted" ? result.mountId : "";
+  // Loading counts as available: nothing failed yet.
+  expect(service.folderOf(mountId)?.available).toBe(true);
+
+  inspections[0]?.resolve({ kind: "unavailable", problem: "missing" });
+  await settle();
+  expect(service.folderOf(mountId)?.available).toBe(false);
+
+  watches[0]?.callbacks.onError(new Error("EPERM"));
+  inspections[1]?.resolve(ready(0));
+  await settle();
+  expect(service.folderOf(mountId)?.available).toBe(true);
+});
+
 test("no more than the limit of repositories is mounted", async () => {
   const { service } = setup();
 

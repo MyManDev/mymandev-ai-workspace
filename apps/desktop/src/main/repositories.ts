@@ -1,7 +1,9 @@
 // The repositories mounted on this device, in the main process. A mount is
 // read-only: the service reads the repository with Git and watches its
 // files, and nothing it does writes to the folder. Mounts live in memory
-// only; they are not stored and are gone after a restart.
+// only; they are not stored and are gone after a restart. A link from a
+// registered repository to a folder (#286) is kept by the repository link
+// service, by the folder, so it applies again once the folder is mounted.
 import type { PlatformPath } from "node:path";
 import {
   REPOSITORY_LIMITS,
@@ -55,6 +57,20 @@ export interface RepositoryServiceOptions {
   readonly onError?: (message: string, error: unknown) => void;
 }
 
+/**
+ * The folders of a mounted repository, for the main process only: the
+ * repository links (#286) keep the top-level folder on this device, and
+ * neither crosses IPC in this form.
+ */
+export interface MountedFolder {
+  /** The top-level folder of the working tree, as Git reported it. */
+  readonly topLevel: string;
+  /** The common Git folder, as Git reported it. */
+  readonly commonDir: string;
+  /** False while the mount's state is `unavailable`: its last read failed. */
+  readonly available: boolean;
+}
+
 export interface RepositoryService {
   /** The mounted repositories, in the order they were mounted. */
   list(): RepositoryList;
@@ -65,6 +81,18 @@ export interface RepositoryService {
   mount(folder: string): Promise<MountResult>;
   /** Unmounts a repository and stops watching it. False when it was not mounted. */
   unmount(mountId: string): boolean;
+  /**
+   * The folders of a mounted repository and whether its state is
+   * available, or undefined when nothing is mounted with this ID. For the
+   * main process only.
+   */
+  folderOf(mountId: string): MountedFolder | undefined;
+  /**
+   * The mount ID of the mounted repository whose top-level folder is
+   * `folder`, compared as a mount compares folders (without regard to case
+   * on Windows), or undefined when none is.
+   */
+  mountOf(folder: string): string | undefined;
   /** Calls `listener` with the list after every change. Returns a function that removes it. */
   onChange(listener: (list: RepositoryList) => void): () => void;
   /** Stops every watcher and cancels every running Git command, for the application's quit. */
@@ -294,6 +322,30 @@ export function createRepositoryService(
     return true;
   };
 
+  const folderOf = (mountId: string): MountedFolder | undefined => {
+    const entry = typeof mountId === "string" ? mounts.get(mountId) : undefined;
+    return entry === undefined
+      ? undefined
+      : Object.freeze({
+          topLevel: entry.location.topLevel,
+          commonDir: entry.location.commonDir,
+          available: entry.state.kind !== "unavailable",
+        });
+  };
+
+  const mountOf = (folder: string): string | undefined => {
+    if (typeof folder !== "string") {
+      return undefined;
+    }
+    const key = pathKey(folder);
+    for (const entry of mounts.values()) {
+      if (entry.key === key) {
+        return entry.id;
+      }
+    }
+    return undefined;
+  };
+
   const onChange = (listener: (list: RepositoryList) => void) => {
     listeners.add(listener);
     return () => {
@@ -311,5 +363,13 @@ export function createRepositoryService(
     listeners.clear();
   };
 
-  return Object.freeze({ list, mount, unmount, onChange, close });
+  return Object.freeze({
+    list,
+    mount,
+    unmount,
+    folderOf,
+    mountOf,
+    onChange,
+    close,
+  });
 }

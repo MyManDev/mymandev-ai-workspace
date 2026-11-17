@@ -73,7 +73,19 @@ import { registerOwnJoinRequestIpc } from "./own-join-request-ipc.ts";
 import { createOwnJoinRequestService } from "./own-join-requests/service.ts";
 import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
+import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
+import {
+  LINK_CONFIRMATION,
+  linkConfirmationMessage,
+  linkConfirmed,
+} from "./repository-links/confirmation.ts";
+import {
+  readFolderIdentity,
+  systemLstat,
+} from "./repository-links/identity.ts";
+import { createProjectRepositoryService } from "./repository-links/service.ts";
+import { createSystemRepositoryLinkStore } from "./repository-links/system.ts";
 import {
   createSystemRepositoryService,
   FOLDER_DIALOG_OPTIONS,
@@ -308,6 +320,52 @@ function start(): void {
     workspaces,
   });
   app.on("will-quit", () => agentIpc.close());
+
+  // The open project's registered repositories (#286), read over HTTP and
+  // kept current with the selected workspace's repository events through
+  // its own resync gate, and the account's links from them to the mounted
+  // folders. The links are kept in the local data folder of the device key,
+  // which never roams; no path leaves the main process. The resolution of a
+  // repository to its folder is for the enforcement point's callers in the
+  // main process and has no channel. The logs are fixed text with a failure
+  // code at most, never a name, an ID, or a path.
+  const projectRepositories = createProjectRepositoryService({
+    account,
+    connection,
+    workspaces,
+    mounts: repositories,
+    store: createSystemRepositoryLinkStore(),
+    // The identity of a linked folder and of its common Git folder, read
+    // with `lstat` when it is linked and at each resolution.
+    identify: (folders) => readFolderIdentity(systemLstat, folders),
+    // A link is confirmed in a native dialog of the main process on the
+    // main window, like the folder dialog of the repositories, so that the
+    // renderer alone cannot link a folder. The dialog names the registered
+    // repository and the folder; the path stays in the main process. The
+    // service's signal closes it as a Cancel when the main window closes
+    // (below), the device signs out or changes, or the service closes.
+    confirmLink: async (request, signal) => {
+      const options = {
+        ...LINK_CONFIRMATION,
+        buttons: [...LINK_CONFIRMATION.buttons],
+        message: linkConfirmationMessage(request),
+        signal,
+      };
+      return linkConfirmed(
+        mainWindow === undefined
+          ? await dialog.showMessageBox(options)
+          : await dialog.showMessageBox(mainWindow, options),
+      );
+    },
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => projectRepositories.close());
+  const projectRepositoryIpc = registerProjectRepositoryIpc(
+    ipcMain,
+    rendererUrl,
+    { service: projectRepositories },
+  );
+  app.on("will-quit", () => projectRepositoryIpc.close());
   // The development agent switch (#28): only in an unpackaged build, and
   // only when MYMANDEV_DEV_AGENT_SWITCH holds the agent ID that
   // `db:dev-seed` printed and MYMANDEV_DEV_AGENT_DEVICE the device ID that
@@ -553,6 +611,9 @@ function start(): void {
     );
     window.on("closed", () => {
       mainWindow = undefined;
+      // A link's confirmation belongs to this window: it ends as a Cancel,
+      // so that a dialog that never settles does not hold the next link.
+      projectRepositories.cancelConfirmation();
     });
     window.loadURL(rendererUrl).catch((error: unknown) => {
       console.error("The application window failed to load.", error);

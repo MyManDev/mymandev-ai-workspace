@@ -88,10 +88,11 @@ function refusedRegistration(
  * then decides on the locked person; a frozen copy of its workspace event
  * goes to `onWorkspaceEvent` after the commit, for the subscribers of the
  * project's workspace. Neither change writes an audit record: they are not
- * administrative actions of ADR 0014. Provisional (#286): who may register
- * and remove, the two limits, and what a removal does are settled with the
- * conservative option and await the Project Manager's confirmation
- * (protocol README, "Repository routes").
+ * administrative actions of ADR 0014. Who may register and remove, and the
+ * code `repository_limit`, follow the Project Manager's decisions of
+ * 2026-11-14 (#286). Provisional (#286): the two limits and what a removal
+ * does are settled with the conservative option and await the Project
+ * Manager's confirmation (protocol README, "Repository routes").
  */
 export function registerRepositoryRoutes(
   project: FastifyInstance,

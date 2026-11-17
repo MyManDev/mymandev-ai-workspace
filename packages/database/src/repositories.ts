@@ -30,12 +30,14 @@ import {
 // and these functions take and return none: the folder's path stays on the
 // device (ADR 0005, ADR 0013).
 //
+// Decided by the Project Manager on 2026-11-14 (#286): any active member of
+// the project's workspace registers a repository, and the account that
+// registered it, the owner, and the admins remove it.
+//
 // Provisional (#286): settled here with the conservative option, as the
 // project functions settle them, and awaiting the Project Manager's
 // confirmation:
 //
-// - Any active member of the project's workspace registers a repository. The
-//   account that registered it, the owner, and the admins remove it.
 // - A project holds `REPOSITORY_COUNT_LIMITS.perProject` repositories that
 //   are not removed, and an account registers
 //   `REPOSITORY_COUNT_LIMITS.perDay` repositories in 24 hours.

@@ -520,6 +520,11 @@ const EXPECTED: Readonly<Record<WorkspaceActionFailure, unknown>> = {
   },
   // No person route answers the limit of projects (#255).
   project_limit: { outcome: "refused", reason: "failed", retryAfterMs: null },
+  repository_limit: {
+    outcome: "refused",
+    reason: "failed",
+    retryAfterMs: null,
+  },
   rate_limited: {
     outcome: "refused",
     reason: "rate_limited",

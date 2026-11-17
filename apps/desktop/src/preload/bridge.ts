@@ -15,6 +15,7 @@ import type {
   OwnJoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
+  ProjectRepositoriesBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -53,6 +54,7 @@ import type {
   JoinRequestLoadResult,
   JoinRequestsView,
   LiftRegistrationLockResult,
+  LinkRepositoryResult,
   MountResult,
   OtherDeviceRevocation,
   OwnJoinRequestLoadResult,
@@ -60,8 +62,11 @@ import type {
   PeopleView,
   PersonActionResult,
   PreviewInvitationResult,
+  ProjectRepositoriesView,
   ReconnectResult,
+  RegisterRepositoryResult,
   RemoveDeviceResult,
+  RemoveRepositoryResult,
   RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
@@ -69,6 +74,7 @@ import type {
   SignOutResult,
   StartSignInOptions,
   StartSignInResult,
+  UnlinkRepositoryResult,
   UnlockResult,
   WithdrawJoinRequestResult,
   WorkspaceActionResult,
@@ -193,7 +199,9 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * The object the preload script exposes as `window.desktop`. Every function
  * calls one fixed channel of the IPC contract and passes no argument from
  * the renderer on to it, except the mount ID of `repositories.unmount`, the
- * passphrase of `account.unlockDeviceKey`, the IDs of `workspaces.select`
+ * project IDs, repository IDs, mount IDs, and names of the
+ * `projectRepositories`, each a string, the passphrase of
+ * `account.unlockDeviceKey`, the IDs of `workspaces.select`
  * and `workspaces.openProject`, the name of `workspaces.create`, the ID and
  * the name of `workspaces.createProject`, the ID of `workspaces.copyId`,
  * the text of `chat.send`, and the event IDs
@@ -266,6 +274,65 @@ export function createDesktopBridge(
             mountId,
           ) as Promise<boolean>)
         : Promise.reject(new TypeError("unmount needs a mount ID string.")),
+  });
+
+  // The IDs and the name go to the main process only, never a path; the
+  // errors name no value.
+  const projectRepositories: ProjectRepositoriesBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.getProjectRepositoryState,
+      ) as Promise<ProjectRepositoriesView>,
+    subscribeState: (
+      listener: (state: ProjectRepositoriesView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeProjectRepositoryState,
+        EVENT_CHANNELS.projectRepositoriesChanged,
+        "A project repository callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    register: (projectId: string, name: string) =>
+      typeof projectId === "string" && typeof name === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.registerRepository,
+            projectId,
+            name,
+          ) as Promise<RegisterRepositoryResult>)
+        : Promise.reject(
+            new TypeError("register needs a project ID and a name string."),
+          ),
+    remove: (projectId: string, repositoryId: string) =>
+      typeof projectId === "string" && typeof repositoryId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.removeRepository,
+            projectId,
+            repositoryId,
+          ) as Promise<RemoveRepositoryResult>)
+        : Promise.reject(
+            new TypeError("remove needs a project ID and a repository ID."),
+          ),
+    link: (repositoryId: string, mountId: string) =>
+      typeof repositoryId === "string" && typeof mountId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.linkRepository,
+            repositoryId,
+            mountId,
+          ) as Promise<LinkRepositoryResult>)
+        : Promise.reject(
+            new TypeError("link needs a repository ID and a mount ID string."),
+          ),
+    unlink: (repositoryId: string) =>
+      typeof repositoryId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.unlinkRepository,
+            repositoryId,
+          ) as Promise<UnlinkRepositoryResult>)
+        : Promise.reject(new TypeError("unlink needs a repository ID string.")),
   });
 
   const account: AccountBridge = Object.freeze({
@@ -887,6 +954,7 @@ export function createDesktopBridge(
     electronVersion,
     runtime,
     repositories,
+    projectRepositories,
     account,
     connection,
     workspaces,

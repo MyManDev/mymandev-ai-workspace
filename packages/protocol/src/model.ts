@@ -311,8 +311,9 @@ export const API_ERROR_STATUS = Object.freeze({
    * A registration in a project that already holds 20 repositories that are
    * not removed (#286). No time frees a place, only removing a repository
    * does, so the answer carries no `Retry-After`. Only
-   * `POST /projects/:projectId/repositories` answers it. Provisional
-   * (#286): the code and the limit await the Project Manager's confirmation.
+   * `POST /projects/:projectId/repositories` answers it. The Project
+   * Manager decided the code on 2026-11-14 (#286); the limit of 20 stays
+   * provisional.
    */
   repository_limit: 409,
   /**

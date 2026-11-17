@@ -1056,6 +1056,266 @@ export const CreateProjectResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type CreateProjectResult = z.infer<typeof CreateProjectResultSchema>;
 
+// The registered repositories of the open project, and their links to the
+// folders mounted on this device (#286).
+
+/**
+ * Limits of the project repositories message: the repositories of one
+ * project, the most that one answer of the API holds (the protocol's
+ * `MAX_ANSWER_LIST_ITEMS`), and the length of a name in characters (code
+ * points; the protocol's `LIMITS.name`). The shared contract does not import
+ * the protocol package, so the main process's tests check that the values
+ * match.
+ */
+export const PROJECT_REPOSITORY_LIMITS = Object.freeze({
+  repositories: 1_000,
+  name: 100,
+});
+
+/** Why the open project's repositories did not load, as for the agents. */
+export const PROJECT_REPOSITORY_PROBLEMS = Object.freeze([
+  "not_signed_in",
+  "not_found",
+  "rate_limited",
+  "unavailable",
+  "failed",
+] as const);
+export type ProjectRepositoryProblem =
+  (typeof PROJECT_REPOSITORY_PROBLEMS)[number];
+
+/**
+ * The state of this device's repository links: `loading` until the file was
+ * read once, `ready`, and `unavailable` when the file could not be read or
+ * its folder is not known; nothing is then linked, and nothing is written.
+ */
+export const REPOSITORY_LINK_STATES = Object.freeze([
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type RepositoryLinkState = (typeof REPOSITORY_LINK_STATES)[number];
+
+/**
+ * A registered repository of the open project as the renderer may know it:
+ * its ID and name, whether the signed-in account linked it to a folder on
+ * this device (`linked`), and the mount of that folder while it is mounted
+ * (`mountId`), else null. No path crosses here: the mount list shows the
+ * folder of a mount, and a linked folder that is not mounted is not named.
+ */
+export const ProjectRepositoryViewSchema = z
+  .object({
+    repositoryId: ProtocolIdSchema,
+    name: z.string().min(1).max(PROJECT_REPOSITORY_LIMITS.name),
+    linked: z.boolean(),
+    mountId: MountIdSchema.nullable(),
+  })
+  .refine((value) => value.linked || value.mountId === null, {
+    message: "Only a linked repository names a mount",
+    path: ["mountId"],
+  });
+export type ProjectRepositoryView = z.infer<typeof ProjectRepositoryViewSchema>;
+
+const ProjectRepositoriesViewFields = {
+  /**
+   * Grows by one with every change of the repositories, the links, the
+   * mounts, or the account. A receiver keeps the view with the highest
+   * revision, like the runtime status.
+   */
+  revision: z.int().nonnegative(),
+  /** The selected workspace while a project is open, else null. */
+  workspaceId: ProtocolIdSchema.nullable(),
+  projectId: ProtocolIdSchema.nullable(),
+  links: z.enum(REPOSITORY_LINK_STATES),
+  /** The open project's repositories that are not removed, the oldest first. */
+  repositories: z
+    .array(ProjectRepositoryViewSchema)
+    .max(PROJECT_REPOSITORY_LIMITS.repositories)
+    .readonly(),
+};
+
+/**
+ * What the renderer may know of the open project's registered repositories:
+ * `{ revision, status, problem?, workspaceId, projectId, links,
+ * repositories }`, with a problem only while `unavailable`. The status is
+ * the agents' status: `no_project`, `loading`, `ready`, or `unavailable`.
+ * It holds IDs, names, and mount IDs only: no path, no member ID, and no
+ * user ID.
+ */
+export const ProjectRepositoriesViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum(["no_project", "loading", "ready"]),
+    ...ProjectRepositoriesViewFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(PROJECT_REPOSITORY_PROBLEMS),
+    ...ProjectRepositoriesViewFields,
+  }),
+]);
+export type ProjectRepositoriesView = z.infer<
+  typeof ProjectRepositoriesViewSchema
+>;
+
+/**
+ * Why registering a repository was refused, as for a project, and:
+ *
+ * - `not_open`: the project is not the open one. Nothing was sent.
+ * - `repository_limit`: the project holds as many repositories as it may
+ *   (the Project Manager's decision of 2026-11-14 on #286). It carries no
+ *   wait: only removing a repository frees a place.
+ * - `rate_limited`: also the account's limit of registrations in 24 hours.
+ * - `not_found`: the API does not know the project for this account.
+ * - `conflict`: the project is archived.
+ */
+export const REGISTER_REPOSITORY_REFUSALS = Object.freeze([
+  "invalid",
+  "not_open",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "repository_limit",
+  "not_found",
+  "conflict",
+  "failed",
+] as const);
+export type RegisterRepositoryRefusal =
+  (typeof REGISTER_REPOSITORY_REFUSALS)[number];
+
+/**
+ * The result of registering a repository: `ok` with its ID, `refused`, or
+ * `unknown`. The list shows it once its server event arrives, or after the
+ * next reload.
+ */
+export const RegisterRepositoryResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok"), repositoryId: ProtocolIdSchema }),
+  createRefusedSchema(REGISTER_REPOSITORY_REFUSALS),
+  CreateUnknownSchema,
+]);
+export type RegisterRepositoryResult = z.infer<
+  typeof RegisterRepositoryResultSchema
+>;
+
+/**
+ * Why removing a repository was refused, as for registering one, and:
+ *
+ * - `forbidden`: the account neither registered it nor is the workspace's
+ *   owner or an admin (decision of 2026-11-14).
+ * - `not_found`: the project does not hold the repository for this account.
+ * - `conflict`: the repository is already removed, or the project is
+ *   archived.
+ */
+export const REMOVE_REPOSITORY_REFUSALS = Object.freeze([
+  "invalid",
+  "not_open",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "forbidden",
+  "not_found",
+  "conflict",
+  "failed",
+] as const);
+export type RemoveRepositoryRefusal =
+  (typeof REMOVE_REPOSITORY_REFUSALS)[number];
+
+/**
+ * The result of removing a repository: `ok`, `refused`, or `unknown`. After
+ * `ok`, its link on this device is dropped at once; every device drops its
+ * own when the server event arrives, or at the next reload of the project.
+ * After `conflict` or `not_found`, the main process reads the project's
+ * repositories again, which drops one that is removed already.
+ */
+export const RemoveRepositoryResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  createRefusedSchema(REMOVE_REPOSITORY_REFUSALS),
+  CreateUnknownSchema,
+]);
+export type RemoveRepositoryResult = z.infer<
+  typeof RemoveRepositoryResultSchema
+>;
+
+/**
+ * Why linking a repository to a mounted folder was refused. The main
+ * process asks the person to confirm each link in a native dialog that
+ * names the repository and the folder (the Project Manager's decision of
+ * 2026-11-17), so the renderer alone never links a folder.
+ *
+ * - `invalid`: an ID is outside its format.
+ * - `not_registered`: the open project's repositories, as loaded, do not
+ *   hold the repository, or it was removed.
+ * - `not_mounted`: nothing is mounted with the mount ID.
+ * - `folder_linked`: the account linked the folder to another repository;
+ *   unlink it first.
+ * - `symbolic_link`: the folder or its common Git folder is a symbolic link
+ *   or, on Windows, a junction, which cannot be linked.
+ * - `folder_missing`: the folder or its common Git folder could not be read
+ *   as a folder.
+ * - `busy`: the confirmation of another link is open; one at a time. Also
+ *   for a few seconds after a link answered `cancelled`.
+ * - `cancelled`: the person did not confirm the link, or the dialog was
+ *   closed because the main window closed or the device signed out or
+ *   changed; nothing changed.
+ * - `limit`: this device holds as many links as it keeps, and all of them
+ *   are the account's own. A link of another account or a former person
+ *   makes room first, the oldest first.
+ * - `unavailable`: no account is signed in, the account's own person in the
+ *   workspace is not known, or the links are not `ready`.
+ * - `failed`: the confirmation could not be shown, what was confirmed
+ *   changed before the write (also the folder's identity while the dialog
+ *   was open), or the link could not be written; nothing changed.
+ */
+export const LINK_REPOSITORY_REFUSALS = Object.freeze([
+  "invalid",
+  "not_registered",
+  "not_mounted",
+  "folder_linked",
+  "symbolic_link",
+  "folder_missing",
+  "busy",
+  "cancelled",
+  "limit",
+  "unavailable",
+  "failed",
+] as const);
+export type LinkRepositoryRefusal = (typeof LINK_REPOSITORY_REFUSALS)[number];
+
+/** The result of linking a repository to the folder of a mount. */
+export const LinkRepositoryResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("linked") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(LINK_REPOSITORY_REFUSALS),
+  }),
+]);
+export type LinkRepositoryResult = z.infer<typeof LinkRepositoryResultSchema>;
+
+/**
+ * Why unlinking a repository was refused: `invalid`, an ID outside its
+ * format; `not_linked`, the account holds no link of it; `unavailable`, as
+ * for linking.
+ */
+export const UNLINK_REPOSITORY_REFUSALS = Object.freeze([
+  "invalid",
+  "not_linked",
+  "unavailable",
+] as const);
+export type UnlinkRepositoryRefusal =
+  (typeof UNLINK_REPOSITORY_REFUSALS)[number];
+
+/** The result of unlinking a repository from its folder. */
+export const UnlinkRepositoryResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("unlinked") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(UNLINK_REPOSITORY_REFUSALS),
+  }),
+]);
+export type UnlinkRepositoryResult = z.infer<
+  typeof UnlinkRepositoryResultSchema
+>;
+
 // Copying the workspace ID (#95; the Project Manager's decision of
 // 2026-11-13): one strict channel, so that a member can pass the ID on to
 // someone who asks to join with it.
@@ -2975,6 +3235,41 @@ export const INVOKE_CONTRACT = Object.freeze({
     /** True when the repository was mounted. */
     result: z.boolean(),
   }),
+  [INVOKE_CHANNELS.getProjectRepositoryState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ProjectRepositoriesViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeProjectRepositoryState]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ProjectRepositoriesViewSchema,
+  }),
+  [INVOKE_CHANNELS.registerRepository]: Object.freeze({
+    /**
+     * The open project's ID and the name, 1 to 100 characters; the main
+     * process checks it with the protocol's rules, which refuse a slash and
+     * a backslash.
+     */
+    args: z.tuple([ProtocolIdSchema, NewNameSchema]),
+    result: RegisterRepositoryResultSchema,
+  }),
+  [INVOKE_CHANNELS.removeRepository]: Object.freeze({
+    /** The open project's ID and the repository's ID. */
+    args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
+    result: RemoveRepositoryResultSchema,
+  }),
+  [INVOKE_CHANNELS.linkRepository]: Object.freeze({
+    /**
+     * The repository's ID and the mount ID; never a path. The main process
+     * asks the person to confirm before it links anything.
+     */
+    args: z.tuple([ProtocolIdSchema, MountIdSchema]),
+    result: LinkRepositoryResultSchema,
+  }),
+  [INVOKE_CHANNELS.unlinkRepository]: Object.freeze({
+    /** The repository's ID. */
+    args: z.tuple([ProtocolIdSchema]),
+    result: UnlinkRepositoryResultSchema,
+  }),
   [INVOKE_CHANNELS.getAccountStatus]: Object.freeze({
     args: NoArgumentsSchema,
     result: AccountStatusSchema,
@@ -3325,6 +3620,7 @@ export const INVOKE_CONTRACT = Object.freeze({
 export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.runtimeStatusChanged]: RuntimeStatusSchema,
   [EVENT_CHANNELS.repositoriesChanged]: RepositoryListSchema,
+  [EVENT_CHANNELS.projectRepositoriesChanged]: ProjectRepositoriesViewSchema,
   [EVENT_CHANNELS.accountStatusChanged]: AccountStatusSchema,
   [EVENT_CHANNELS.connectionStatusChanged]: ConnectionStatusSchema,
   [EVENT_CHANNELS.workspaceStateChanged]: WorkspaceViewSchema,
