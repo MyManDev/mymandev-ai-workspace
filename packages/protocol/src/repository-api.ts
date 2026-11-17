@@ -10,12 +10,13 @@
 // both answer `404` and `not_found`, so that a route never tells them apart.
 //
 // The decision of 2026-11-14 settles the identity, the name, and that the
-// path stays on the device. Provisional (#286): who may register and remove,
-// the two limits and the code `repository_limit`, the rule of the name, the
-// paths, the event payloads, and what a removal does to grants and runs. Each
-// such choice below is the conservative one, as the project routes settle
-// them, and is marked "Provisional"; the README lists them with their
-// alternatives under "Repository routes".
+// path stays on the device. The Project Manager's decisions of 2026-11-14 on
+// #286 settle who may register and remove, and that a full project answers
+// with its own code, `repository_limit`. Provisional (#286): the two limits,
+// the rule of the name, the paths, the event payloads, and what a removal
+// does to grants and runs. Each such choice below is the conservative one, as
+// the project routes settle them, and is marked "Provisional"; the README
+// lists them with their alternatives under "Repository routes".
 
 import * as z from "zod";
 import type { ApiRoute } from "./auth-api.ts";
@@ -42,18 +43,20 @@ export const REPOSITORY_ROUTES = Object.freeze({
    */
   listRepositories: route("GET", "/projects/:projectId/repositories"),
   /**
-   * Registers a repository in the project: an identity and a name.
-   * Provisional (#286): any active member. An archived project answers `conflict`, a project with 20
-   * repositories that are not removed answers `repository_limit`, and an
-   * account that registered 20 repositories within 24 hours answers
-   * `rate_limited`.
+   * Registers a repository in the project: an identity and a name. Any
+   * active member (decision of 2026-11-14). An archived project answers
+   * `conflict`, a project at its limit of repositories that are not removed
+   * answers `repository_limit` (decision of 2026-11-14), and an account at
+   * its limit of registrations within 24 hours answers `rate_limited`.
+   * Provisional (#286): both limits are 20.
    */
   registerRepository: route("POST", "/projects/:projectId/repositories"),
   /**
-   * Removes a repository from the project. Provisional (#286): the account
-   * that registered it, the owner, or an admin. The removal revokes every grant scoped to the
-   * repository in the same transaction (ADR 0015, P-77). A repository that
-   * is already removed, or one of an archived project, answers `conflict`.
+   * Removes a repository from the project: the account that registered it,
+   * the owner, or an admin (decision of 2026-11-14). The removal revokes
+   * every grant scoped to the repository in the same transaction (ADR 0015,
+   * P-77). A repository that is already removed, or one of an archived
+   * project, answers `conflict`.
    */
   removeRepository: route(
     "POST",
