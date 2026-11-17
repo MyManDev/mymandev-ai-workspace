@@ -1168,6 +1168,40 @@ test("at the limit, a new link takes the place of the oldest link of another acc
   expect(harness.lastWritten()?.[0]).toEqual(others[1]);
 });
 
+test("when the link that makes room changes while the link is written, the file is written again with the links as they are", async () => {
+  // The account's own link in WS_B is the oldest; the next is another
+  // account's.
+  const ownInB = linkOf(REPO_3, "/home/octocat/secret-b", {
+    workspaceId: WS_B,
+    projectId: PROJECT_2,
+  });
+  const others = manyLinks(MAX_REPOSITORY_LINKS - 1);
+  const harness = new Harness({
+    read: () => Promise.resolve({ kind: "links", links: [ownInB, ...others] }),
+  });
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+  harness.holdWrite = deferred();
+  const hold = harness.holdWrite;
+
+  const answer = harness.service.link(REPO_1, MOUNT_1);
+  await settle();
+  expect(harness.written[0]).toEqual([
+    ownInB,
+    ...others.slice(1),
+    linkOf(REPO_1, FOLDER_1),
+  ]);
+  // WS_B leaves the account's list: its link is a former person's now, and
+  // the oldest one that makes room.
+  harness.ownMembers.delete(WS_B);
+  harness.holdWrite = null;
+  hold.resolve();
+  await expect(answer).resolves.toEqual({ outcome: "linked" });
+  await settle();
+  expect(harness.lastWritten()).toEqual([...others, linkOf(REPO_1, FOLDER_1)]);
+  expect(harness.stored).toEqual(harness.lastWritten());
+});
+
 test("at the limit with only the account's own links, a new link is refused and nothing is dropped", async () => {
   const own = manyLinks(MAX_REPOSITORY_LINKS, {
     ownMemberId: OWN as never,
@@ -1667,7 +1701,11 @@ test("a repository removed while its event waits for a reload cannot be linked, 
 
 test("a repository removed while offline and linked during the reconnect reload loses the link once the reload no longer lists it", async () => {
   const harness = new Harness();
-  await harness.ready(repository(REPO_1), repository(REPO_2));
+  await harness.ready(
+    repository(REPO_1),
+    repository(REPO_2),
+    repository(REPO_3),
+  );
   harness.mount(MOUNT_1, FOLDER_1);
   harness.mount(MOUNT_2, FOLDER_2);
   await harness.service.link(REPO_2, MOUNT_2);
@@ -1690,9 +1728,43 @@ test("a repository removed while offline and linked during the reconnect reload 
     reason: "not_linked",
   });
   expect(harness.lastWritten()).toEqual([linkOf(REPO_2, FOLDER_2)]);
-  // It never comes back, also with a stale event.
+  // Neither comes back, also with a stale event: REPO_3, removed while
+  // offline as well, had no link.
   harness.deliver(registeredEvent(repository(REPO_1)));
+  harness.deliver(registeredEvent(repository(REPO_3)));
   expect(harness.state.repositories).toHaveLength(1);
+  await expect(harness.service.link(REPO_3, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_registered",
+  });
+});
+
+test("a removal whose event waits for a reload while a link is written leaves the link out, although the list still holds the repository", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+  harness.deliver(subscribed());
+  harness.holdWrite = deferred();
+  const hold = harness.holdWrite;
+
+  const answer = harness.service.link(REPO_1, MOUNT_1);
+  await settle();
+  expect(harness.written).toHaveLength(1);
+  harness.deliver(removedEvent(REPO_1));
+  expect(harness.state.repositories).toHaveLength(1);
+  harness.holdWrite = null;
+  hold.resolve();
+
+  await expect(answer).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_registered",
+  });
+  await settle();
+  expect(harness.lastWritten()).toEqual([]);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "not_linked",
+  });
 });
 
 test("a repository registered during a reload is kept, although the reload's answer does not list it", async () => {
