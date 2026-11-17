@@ -312,8 +312,31 @@ export function ProjectRepositoryDialogBox(
 ) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const open = props.dialog !== undefined;
-  useEffect(() => syncModal(dialogRef.current, open), [open]);
+  useEffect(() => {
+    syncModal(dialogRef.current, open);
+    if (open) {
+      focusCheckedFolder(dialogRef.current);
+    }
+  }, [open]);
   return <ProjectRepositoryDialogContent {...props} dialogRef={dialogRef} />;
+}
+
+/**
+ * Moves the focus to the checked folder of a link's question, once the
+ * dialog is open. `autoFocus` cannot do it: React focuses an element when it
+ * mounts, while the dialog is still closed, and only `showModal` opens it
+ * afterwards, which then focuses its first control. Without a checked
+ * folder, and in a removal's question, the focus stays where `showModal`
+ * put it: on "Cancel" or the first folder.
+ */
+export function focusCheckedFolder(
+  dialog: Pick<ParentNode, "querySelector"> | null,
+): void {
+  dialog
+    ?.querySelector<HTMLInputElement>(
+      'input[name="project-repository-folder"]:checked',
+    )
+    ?.focus();
 }
 
 /**
@@ -325,9 +348,10 @@ export function ProjectRepositoryDialogBox(
  * its path from the mount list, and says that the main process asks again
  * in a dialog of its own; without a folder to choose, it says why and
  * offers only "Cancel". Its problem shows in an alert inside the dialog,
- * because the page behind it is inert. "Cancel" comes first. The checked
- * folder has `autoFocus`; the removal's question has none, so that its
- * first control, "Cancel", takes the focus.
+ * because the page behind it is inert. "Cancel" comes first, so that it
+ * takes the focus in a removal's question; in a link's question
+ * `focusCheckedFolder` moves the focus to the checked folder once the
+ * dialog is open.
  */
 export function ProjectRepositoryDialogContent({
   dialog,
@@ -395,7 +419,6 @@ export function ProjectRepositoryDialogContent({
                       type="radio"
                       name="project-repository-folder"
                       checked={checked}
-                      autoFocus={checked}
                       onChange={() => onChoose(choice.mountId)}
                     />
                     <span>

@@ -7,6 +7,7 @@ import type {
   ProjectRepositoryView,
 } from "../shared/ipc-contract.ts";
 import {
+  focusCheckedFolder,
   focusProjectRepositoriesTitle,
   PROJECT_REPOSITORIES_TITLE_ID,
   ProjectRepositoriesContent,
@@ -500,7 +501,7 @@ test("a link offers the folders with their names and paths, never translated, th
     `<p id="project-repository-dialog-text">${PROJECT_REPOSITORY_QUESTION_MESSAGES.linkText.replaceAll("'", "&#x27;")}</p>`,
   );
   expect(html).toContain(
-    '<fieldset class="repository-choice" aria-describedby="project-repository-dialog-problem"><legend>Folder</legend><label class="repository-option"><input type="radio" autofocus="" name="project-repository-folder" checked=""/><span><span dir="auto" translate="no">app</span><code class="repository-option-path" dir="ltr" translate="no">/home/ada/app</code></span></label><label class="repository-option"><input type="radio" name="project-repository-folder"/><span><span dir="auto" translate="no">docs</span><code class="repository-option-path" dir="ltr" translate="no">/home/ada/docs</code></span></label></fieldset><p class="panel-message" id="project-repository-dialog-problem" role="alert"></p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Continue</button></div>',
+    '<fieldset class="repository-choice" aria-describedby="project-repository-dialog-problem"><legend>Folder</legend><label class="repository-option"><input type="radio" name="project-repository-folder" checked=""/><span><span dir="auto" translate="no">app</span><code class="repository-option-path" dir="ltr" translate="no">/home/ada/app</code></span></label><label class="repository-option"><input type="radio" name="project-repository-folder"/><span><span dir="auto" translate="no">docs</span><code class="repository-option-path" dir="ltr" translate="no">/home/ada/docs</code></span></label></fieldset><p class="panel-message" id="project-repository-dialog-problem" role="alert"></p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Continue</button></div>',
   );
   expect(
     dialogHtml(linkDialog({ mountId: null, problem: "Choose a folder." })),
@@ -509,15 +510,30 @@ test("a link offers the folders with their names and paths, never translated, th
   );
 });
 
-test("the checked folder takes the focus as the link's question opens; without a checked one and in a removal's question, nothing has autofocus", () => {
-  const second = dialogHtml(linkDialog({ mountId: MOUNT_2 }));
-  expect(second.match(/autofocus/g)).toHaveLength(1);
-  expect(second).toContain(
-    '<input type="radio" autofocus="" name="project-repository-folder" checked=""/><span><span dir="auto" translate="no">docs</span>',
+test("the checked folder takes the focus once the link's question is open; without a checked one, and in a removal's question, the focus stays where the dialog put it", () => {
+  // No element has autofocus: React would focus it while the dialog is
+  // still closed, which does nothing.
+  expect(dialogHtml(linkDialog({ mountId: MOUNT_2 }))).not.toContain(
+    "autofocus",
   );
-  expect(dialogHtml(linkDialog({ mountId: null }))).not.toContain("autofocus");
-  // "Cancel" comes first in a removal's question and takes the focus.
   expect(dialogHtml(REMOVE)).not.toContain("autofocus");
+  const focused: string[] = [];
+  const selectors: string[] = [];
+  const dialog = (checked: { focus: () => void } | null) => ({
+    querySelector: (selector: string) => {
+      selectors.push(selector);
+      return checked as never;
+    },
+  });
+  focusCheckedFolder(dialog({ focus: () => focused.push("docs") }));
+  expect(selectors).toEqual([
+    'input[name="project-repository-folder"]:checked',
+  ]);
+  expect(focused).toEqual(["docs"]);
+  // Without a checked folder, or a removal's question: nothing moves.
+  focusCheckedFolder(dialog(null));
+  focusCheckedFolder(null);
+  expect(focused).toEqual(["docs"]);
 });
 
 test("a link with no folder to choose says why and offers only Cancel", () => {
@@ -758,6 +774,6 @@ test("the hook subscribes with the view's setter, gives the controller the actio
     "useEffect(() => { if (decideFocusAfterLeave(acted, open, running, document.activeElement, document.body)) { focusProjectRepositoriesTitle(document); } }, [model, running, open]);",
   );
   expect(code).toContain(
-    "useEffect(() => syncModal(dialogRef.current, open), [open]);",
+    "useEffect(() => { syncModal(dialogRef.current, open); if (open) { focusCheckedFolder(dialogRef.current); } }, [open]);",
   );
 });
