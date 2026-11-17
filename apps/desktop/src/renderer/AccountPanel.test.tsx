@@ -11,8 +11,10 @@ import {
   type AccountPanelContentProps,
 } from "./AccountPanel.tsx";
 import {
+  AUTH_FAILED_WAIT_MESSAGE,
   DEVICE_KEY_PROBLEM_MESSAGES,
   DEVICE_STATE_MESSAGES,
+  REPLACEMENT_PENDING_ENDED_MESSAGE,
   SIGN_IN_OUTCOME_MESSAGES,
   SIGN_IN_RENEWAL_MESSAGES,
   signInEndFormat,
@@ -567,11 +569,14 @@ test("a start refused during the grace period of an uncertain sign-in shows when
     note,
   );
 
-  // The note goes away when the period ends; the refusal stays.
+  // The note goes away when the period ends, and the refusal then says that
+  // a new sign-in can start (#303).
+  const endedRefusal = `<p class="account-message" role="status">${REPLACEMENT_PENDING_ENDED_MESSAGE}</p>`;
   for (const now of [Date.parse("2026-11-06T10:09:30.000Z"), NOW + 3_600_000]) {
     const ended = render({ view: graced, now });
-    expect(ended).toContain(refusal);
-    expect(ended).not.toContain("A new sign-in can start");
+    expect(ended).toContain(endedRefusal);
+    expect(ended).not.toContain(refusal);
+    expect(ended).not.toContain("A new sign-in can start after");
   }
 
   // No note without the time, or while a sign-in runs.
@@ -585,7 +590,8 @@ test("a start refused during the grace period of an uncertain sign-in shows when
   expect(plain).toContain(refusal);
   expect(plain).not.toContain("A new sign-in can start");
   // Nor once the replacement is no longer pending, for example when it was
-  // resolved before that time.
+  // resolved before that time; the refusal then says that a new sign-in can
+  // start (#303).
   const resolved = render({
     view: known({
       ...SIGNED_IN,
@@ -596,8 +602,8 @@ test("a start refused during the grace period of an uncertain sign-in shows when
       },
     }),
   });
-  expect(resolved).toContain(refusal);
-  expect(resolved).not.toContain("A new sign-in can start");
+  expect(resolved).toContain(endedRefusal);
+  expect(resolved).not.toContain("A new sign-in can start after");
   expect(
     render({
       view: known({
@@ -611,6 +617,83 @@ test("a start refused during the grace period of an uncertain sign-in shows when
       }),
     }),
   ).not.toContain("A new sign-in can start");
+});
+
+test("during the wait after a first refusal of both keys, the panel says when a new sign-in can start and asks for none before then, also after a refused start, and asks for it once that time has come (#303)", () => {
+  const html = (text: string) =>
+    text.replaceAll("'", "&#x27;").replaceAll('"', "&quot;");
+  const waitSentence = `<p class="panel-message" role="alert">${html(AUTH_FAILED_WAIT_MESSAGE)}</p>`;
+  const signInSentence = `<p class="panel-message" role="alert">${html(DEVICE_STATE_MESSAGES.auth_failed ?? "")}</p>`;
+  const note =
+    '<p class="account-message" role="status">A new sign-in can start after 10:10. Try again then.</p>';
+  const refusal = `<p class="panel-message" role="alert">${SIGN_IN_OUTCOME_MESSAGES.replacement_pending}</p>`;
+  const endedRefusal = `<p class="account-message" role="status">${REPLACEMENT_PENDING_ENDED_MESSAGE}</p>`;
+  const pendingNote =
+    '<p class="placeholder-note">The device key of the last sign-in is not confirmed yet.</p>';
+  const end = "2026-11-06T10:09:30.000Z";
+  const waiting = known({
+    ...SIGNED_IN,
+    device: "auth_failed",
+    replacementPending: true,
+    lostKeyWaitEnd: end,
+  });
+
+  // Before any start: what happened, when a new sign-in can start, and no
+  // sentence that asks for one now. The buttons stay; a start before the
+  // time is refused with the same time.
+  const before = render({ view: waiting });
+  expect(before).toContain(waitSentence);
+  expect(before).toContain(note);
+  expect(before).toContain(pendingNote);
+  expect(before).not.toContain(signInSentence);
+  expect(before).not.toContain("cannot start");
+  expect(before).not.toContain("Sign in with GitHub again");
+  expect(before).toContain("Sign in with GitHub</button>");
+  expect(before).toContain("This is not me</button>");
+  expect(before.indexOf(waitSentence)).toBeLessThan(before.indexOf(note));
+  expect(render({ view: waiting, now: NOW + 9 * 60_000 + 29_999 })).toContain(
+    note,
+  );
+
+  // A start during the wait: the refusal and the note agree.
+  const refused = known({
+    ...SIGNED_IN,
+    device: "auth_failed",
+    replacementPending: true,
+    lostKeyWaitEnd: end,
+    lastOutcome: { code: "replacement_pending", retryAfter: end },
+  });
+  const afterStart = render({ view: refused });
+  expect(afterStart).toContain(waitSentence);
+  expect(afterStart).toContain(refusal + note);
+  expect(afterStart).not.toContain(signInSentence);
+  expect(afterStart.match(/A new sign-in can start after/gu)).toHaveLength(1);
+
+  // Once the time has come, the panel asks for the sign-in, which now
+  // tries the keys once more, and nothing says that it cannot start.
+  for (const now of [Date.parse(end), NOW + 3_600_000]) {
+    for (const view of [waiting, refused]) {
+      const ended = render({ view, now });
+      expect(ended).toContain(signInSentence);
+      expect(ended).not.toContain(waitSentence);
+      expect(ended).not.toContain("A new sign-in can start after");
+      expect(ended).not.toContain("cannot start");
+    }
+    expect(render({ view: refused, now })).toContain(endedRefusal);
+  }
+
+  // While a sign-in runs, none of it shows.
+  const running = render({
+    view: known({
+      ...SIGNED_IN,
+      device: "auth_failed",
+      replacementPending: true,
+      lostKeyWaitEnd: end,
+      signIn: { kind: "starting" },
+    }),
+  });
+  expect(running).not.toContain(waitSentence);
+  expect(running).not.toContain("A new sign-in can start");
 });
 
 test("a sign-in that a limit of the server ended shows what is left of the wait by the panel's clock, and the sentence without a wait once it has ended (#269)", () => {

@@ -16,6 +16,7 @@ import {
   ACTION_MESSAGES,
   ANOTHER_BROWSER_DELAY_MS,
   apiOriginProblem,
+  AUTH_FAILED_WAIT_MESSAGE,
   canStartSignIn,
   createIdleWaits,
   START_REFUSAL_MESSAGES,
@@ -24,6 +25,8 @@ import {
   DEVICE_KEY_PROBLEM_MESSAGES,
   DEVICE_STATE_MESSAGES,
   describeDeviceState,
+  describeDeviceStatus,
+  describeLastOutcome,
   describeOutcome,
   deviceDailyLimitMessage,
   describeSignInExpiry,
@@ -37,6 +40,7 @@ import {
   offersRenewal,
   offersSignIn,
   removeDeviceMessage,
+  REPLACEMENT_PENDING_ENDED_MESSAGE,
   SIGN_IN_OUTCOME_MESSAGES,
   signInLimitedMessage,
   signInReadingTime,
@@ -152,6 +156,185 @@ test("a start refused during the grace period of an uncertain sign-in has a note
   const resolved = { ...status, replacementPending: false };
   expect(signInRetryAt(resolved)).toBeUndefined();
   expect(signInRetryNote(resolved, now, utc)).toBeUndefined();
+});
+
+/** A device whose keys the server refused once, during the wait for a second round (#303). */
+function waitingForSecondRound(
+  lostKeyWaitEnd: string | undefined,
+  lastOutcome: AccountStatus["lastOutcome"] = null,
+): AccountStatus {
+  return {
+    ...IDLE,
+    account: {
+      kind: "signed_in",
+      login: "octocat",
+      displayName: "The Octocat",
+      deviceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a3",
+      signInExpiresAt: "2026-12-02T10:00:00.000Z",
+    },
+    device: "auth_failed",
+    replacementPending: true,
+    lastOutcome,
+    ...(lostKeyWaitEnd === undefined ? {} : { lostKeyWaitEnd }),
+  };
+}
+
+test("during the wait after a first refusal of both keys, the note names its end also before any start, and the later time counts when a refused start names another (#303)", () => {
+  const utc = signInTimeFormat({ locale: "en-GB", timeZone: "UTC" });
+  const now = Date.parse("2026-11-06T10:00:00.000Z");
+  const waiting = waitingForSecondRound("2026-11-06T10:09:30.000Z");
+
+  expect(signInRetryAt(waiting)).toBe(Date.parse("2026-11-06T10:09:30.000Z"));
+  expect(signInReadingTime(waiting)).toBe(
+    Date.parse("2026-11-06T10:09:30.000Z"),
+  );
+  expect(signInRetryNote(waiting, now, utc)).toBe(
+    "A new sign-in can start after 10:10. Try again then.",
+  );
+  expect(
+    signInRetryNote(waiting, Date.parse("2026-11-06T10:09:30.000Z"), utc),
+  ).toBeUndefined();
+
+  // With a refused start, the later of the two times counts.
+  for (const [retryAfter, wait, later] of [
+    [
+      "2026-11-06T10:09:30.000Z",
+      "2026-11-06T10:12:00.000Z",
+      "2026-11-06T10:12:00.000Z",
+    ],
+    [
+      "2026-11-06T10:15:00.000Z",
+      "2026-11-06T10:12:00.000Z",
+      "2026-11-06T10:15:00.000Z",
+    ],
+  ] as const) {
+    expect(
+      signInRetryAt(
+        waitingForSecondRound(wait, {
+          code: "replacement_pending",
+          retryAfter,
+        }),
+      ),
+    ).toBe(Date.parse(later));
+  }
+  // The outcome of another code has no time for the note.
+  expect(
+    signInRetryAt(
+      waitingForSecondRound("2026-11-06T10:09:30.000Z", {
+        code: "uncertain_refusal",
+        retryAfter: "2026-11-06T10:30:00.000Z",
+      }),
+    ),
+  ).toBe(Date.parse("2026-11-06T10:09:30.000Z"));
+
+  // Not without the pending replacement, while a sign-in runs, or for a
+  // time that cannot be read.
+  expect(
+    signInRetryAt({ ...waiting, replacementPending: false }),
+  ).toBeUndefined();
+  expect(
+    signInRetryAt({ ...waiting, signIn: { kind: "starting" } }),
+  ).toBeUndefined();
+  expect(signInRetryAt(waitingForSecondRound(undefined))).toBeUndefined();
+  expect(signInRetryAt(waitingForSecondRound("later"))).toBeUndefined();
+});
+
+test("while the note names a time, the sentence of a refused key asks for no sign-in, and once it has come the sentence asks for one again (#303)", () => {
+  const now = Date.parse("2026-11-06T10:00:00.000Z");
+  const at = Date.parse("2026-11-06T10:09:30.000Z");
+  const waiting = waitingForSecondRound("2026-11-06T10:09:30.000Z");
+  const wait = { role: "alert", text: AUTH_FAILED_WAIT_MESSAGE };
+
+  expect(AUTH_FAILED_WAIT_MESSAGE).toBe(
+    "The server did not accept this device's key or the new key of the last sign-in. Both are kept and tried once more, in case the server was only briefly unavailable.",
+  );
+  expect(AUTH_FAILED_WAIT_MESSAGE).not.toMatch(/sign in/iu);
+  expect(DEVICE_STATE_MESSAGES.auth_failed).toMatch(/Sign in with GitHub/u);
+  expect(describeDeviceStatus(waiting, now)).toEqual(wait);
+  expect(describeDeviceStatus(waiting, at - 1)).toEqual(wait);
+  // With the time of a refused start too.
+  expect(
+    describeDeviceStatus(
+      waitingForSecondRound(undefined, {
+        code: "replacement_pending",
+        retryAfter: "2026-11-06T10:09:30.000Z",
+      }),
+      now,
+    ),
+  ).toEqual(wait);
+
+  // Once the time has come, without one, or once the replacement was
+  // resolved, the sentence of the state is the usual one.
+  for (const [status, time] of [
+    [waiting, at],
+    [waiting, at + 60_000],
+    [waitingForSecondRound(undefined), now],
+    [{ ...waiting, replacementPending: false }, now],
+  ] as const) {
+    expect(describeDeviceStatus(status, time)).toEqual(
+      describeDeviceState("auth_failed"),
+    );
+  }
+  // Every other state keeps its sentence, also with a time.
+  for (const device of DEVICE_STATES.filter(
+    (state) => state !== "auth_failed",
+  )) {
+    expect(describeDeviceStatus({ ...waiting, device }, now)).toEqual(
+      describeDeviceState(device),
+    );
+  }
+});
+
+test("a start refused with a time says that it cannot start until then, and that it can once the note shows no time any more (#303)", () => {
+  const now = Date.parse("2026-11-06T10:00:00.000Z");
+  const at = Date.parse("2026-11-06T10:09:30.000Z");
+  const refusal = {
+    role: "alert",
+    text: SIGN_IN_OUTCOME_MESSAGES.replacement_pending,
+  };
+  const ended = { role: "status", text: REPLACEMENT_PENDING_ENDED_MESSAGE };
+  const refused = waitingForSecondRound(undefined, {
+    code: "replacement_pending",
+    retryAfter: "2026-11-06T10:09:30.000Z",
+  });
+
+  expect(REPLACEMENT_PENDING_ENDED_MESSAGE).toBe(
+    "The sign-in did not start, because the device key of the last sign-in was not confirmed yet. A new sign-in can start now.",
+  );
+  expect(describeLastOutcome(refused, now)).toEqual(refusal);
+  expect(describeLastOutcome(refused, at - 1)).toEqual(refusal);
+  expect(describeLastOutcome(refused, at)).toEqual(ended);
+  expect(describeLastOutcome(refused, at + 60_000)).toEqual(ended);
+  // The note's time counts, which can be later than the outcome's own.
+  const later = { ...refused, lostKeyWaitEnd: "2026-11-06T10:12:00.000Z" };
+  expect(describeLastOutcome(later, at + 60_000)).toEqual(refusal);
+  expect(
+    describeLastOutcome(later, Date.parse("2026-11-06T10:12:00.000Z")),
+  ).toEqual(ended);
+  // Once the replacement was resolved, also before that time.
+  expect(
+    describeLastOutcome({ ...refused, replacementPending: false }, now),
+  ).toEqual(ended);
+
+  // Without a time the refusal stays, and every other outcome reads as
+  // `describeOutcome` says.
+  const plain = waitingForSecondRound(undefined, {
+    code: "replacement_pending",
+  });
+  expect(describeLastOutcome(plain, at + 60_000)).toEqual(refusal);
+  for (const code of SIGN_IN_OUTCOME_CODES) {
+    const outcome = { code };
+    expect(describeLastOutcome({ ...IDLE, lastOutcome: outcome }, now)).toEqual(
+      describeOutcome(outcome, now),
+    );
+  }
+  // Nothing before the first outcome or while a sign-in runs.
+  expect(describeLastOutcome({ ...IDLE, lastOutcome: null }, now)).toBe(
+    undefined,
+  );
+  expect(
+    describeLastOutcome({ ...refused, signIn: { kind: "starting" } }, now),
+  ).toBeUndefined();
 });
 
 /** A clock whose time the test sets and whose timers fire when the test says so. */

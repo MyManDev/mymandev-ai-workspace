@@ -1747,6 +1747,78 @@ describe("a pending key replacement", () => {
     expect(await keyFiles()).toEqual([DEVICE_RECORD_FILE]);
   });
 
+  test("while the wait after a first refusal of both keys runs, its end is named in UTC by the smaller age of both clocks, also after a restart, and naming it asks nothing and deletes nothing (#303)", async () => {
+    const plain = harness();
+    await existingDevice(plain);
+    expect(await plain.session.lostKeyWaitEnd()).toBeNull();
+    memory.removeFolder(folder);
+
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    // A pending replacement alone names no end.
+    expect(await h.session.lostKeyWaitEnd()).toBeNull();
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    const refused = wall.now;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    const end = new Date(refused + LOST_KEY_WAIT_MS).toISOString();
+    expect(await h.session.lostKeyWaitEnd()).toBe(end);
+
+    advance(LOST_KEY_WAIT_MS / 2);
+    expect(await h.session.lostKeyWaitEnd()).toBe(end);
+    const restarted = await restart(h);
+    expect(await restarted.session.lostKeyWaitEnd()).toBe(end);
+    // A wall clock that jumps forward ends no wait early, so the end moves
+    // with it.
+    wall.now += 60_000;
+    const asked = restarted.api.requests.length;
+    expect(await restarted.session.lostKeyWaitEnd()).toBe(
+      new Date(refused + LOST_KEY_WAIT_MS + 60_000).toISOString(),
+    );
+    expect(restarted.api.requests).toHaveLength(asked);
+    expect(heldKeys(restarted)).toEqual({ current, previous });
+
+    // Once the wait has ended by both clocks, no end is named, and only the
+    // next round that refuses both keys again deletes them.
+    advance(LOST_KEY_WAIT_MS / 2);
+    expect(await restarted.session.lostKeyWaitEnd()).toBeNull();
+    expect(heldKeys(restarted)).toEqual({ current, previous });
+    expect(await restarted.session.authenticate()).toEqual({
+      ok: false,
+      reason: "key_lost",
+    });
+    expect(await restarted.session.lostKeyWaitEnd()).toBeNull();
+  });
+
+  test("the end of the wait after a first refusal of both keys is rounded up, so it is never early (#303)", async () => {
+    const h = harness();
+    await pendingReplacement(h);
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    const refused = wall.now;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    // The monotonic clock counts fractions of a millisecond. Trailing the
+    // wall clock by a quarter of one, it ends the wait at
+    // `refused + LOST_KEY_WAIT_MS + 0.25`.
+    wall.now += 1;
+    mono.now += 0.75;
+
+    expect(await h.session.lostKeyWaitEnd()).toBe(
+      new Date(refused + LOST_KEY_WAIT_MS + 1).toISOString(),
+    );
+  });
+
+  test("no end of the wait is named once a key authenticated, which ends the first refusal (#303)", async () => {
+    const h = harness();
+    const { previous } = await pendingReplacement(h);
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(await h.session.lostKeyWaitEnd()).not.toBeNull();
+
+    h.api.publicKey = previous;
+    await h.session.refresh();
+    expect((await h.session.authenticate()).ok).toBe(true);
+    expect(await h.session.lostKeyWaitEnd()).toBeNull();
+  });
+
   test("both keys refused once and the new key accepted in a later round: confirmed, nothing deleted, the note dropped", async () => {
     const h = harness();
     const { current } = await pendingReplacement(h);
@@ -3266,6 +3338,61 @@ describe("note times", () => {
     expect(heldKeys(restarted)).toEqual({ current, previous });
     expect(await notesFile()).toMatchObject({
       keysRefused: { at: new Date(wall.now).toISOString() },
+    });
+  });
+
+  test("a first refusal older than a day names no end of the wait, and the round that starts the wait again names its end (#303)", async () => {
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    await writeNotes({
+      keysRefused: {
+        publicKeys: [current, previous],
+        at: new Date(wall.now - KEYS_REFUSED_MAX_AGE_MS).toISOString(),
+      },
+    });
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    const restarted = await restart(h);
+
+    expect(await restarted.session.lostKeyWaitEnd()).toBeNull();
+    expect(await restarted.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(await restarted.session.lostKeyWaitEnd()).toBe(
+      new Date(wall.now + LOST_KEY_WAIT_MS).toISOString(),
+    );
+  });
+
+  test("a first refusal during the grace period of an uncertain sign-in names the later end, the grace period's or the wait's, because a round deletes nothing before both ended (#303)", async () => {
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    const start = wall.now;
+    // The grace period began 5 minutes after the first refusal.
+    await writeNotes({
+      uncertainSignIn: {
+        publicKey: current,
+        at: new Date(start).toISOString(),
+      },
+      keysRefused: {
+        publicKeys: [current, previous],
+        at: new Date(start - LOST_KEY_WAIT_MS / 2).toISOString(),
+      },
+    });
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    const restarted = await restart(h);
+    const graceEnd = new Date(start + REPLACEMENT_GRACE_MS).toISOString();
+    expect(await restarted.session.lostKeyWaitEnd()).toBe(graceEnd);
+
+    // The wait alone has ended: a round deletes nothing yet.
+    advance(LOST_KEY_WAIT_MS / 2);
+    expect(await restarted.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(heldKeys(restarted)).toEqual({ current, previous });
+    expect(await restarted.session.lostKeyWaitEnd()).toBe(graceEnd);
+
+    // Both have ended: no end, and the next round that refuses both keys
+    // deletes them.
+    advance(REPLACEMENT_GRACE_MS - LOST_KEY_WAIT_MS / 2);
+    expect(await restarted.session.lostKeyWaitEnd()).toBeNull();
+    expect(await restarted.session.authenticate()).toEqual({
+      ok: false,
+      reason: "key_lost",
     });
   });
 
