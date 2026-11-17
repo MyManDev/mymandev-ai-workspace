@@ -11,6 +11,7 @@ import type {
   ClaimMarksView,
   ClaimsView,
   ConnectionStatus,
+  CopyWorkspaceIdResult,
   CreateInvitationResult,
   CreateJoinRequestResult,
   CreateProjectResult,
@@ -278,8 +279,8 @@ export interface ConnectionBridge {
 /**
  * The workspaces of the account, which the workspace service in the main
  * process holds. The renderer gets IDs, names, and fixed codes, and can
- * select a workspace or open a project; it never sees a member ID, a user
- * ID, or anything secret.
+ * select a workspace, open a project, and copy a workspace's ID; it never
+ * sees a member ID, a user ID, or anything secret.
  */
 export interface WorkspaceBridge {
   /** The current workspace state. */
@@ -355,6 +356,17 @@ export interface WorkspaceBridge {
     workspaceId: string,
     name: string,
   ) => Promise<CreateProjectResult>;
+  /**
+   * Copies the ID of a workspace of the list to the system clipboard (#95),
+   * so that a member can pass it on to someone who then asks to join with
+   * it. The main process writes that ID and nothing else, and only for a
+   * workspace that the account's list holds: another one is refused as
+   * `not_found`. The answer comes once the write settled: `ok` once the
+   * system clipboard took the ID, `failed` when the system refused it. An ID
+   * that is not a lowercase UUIDv7 is refused by the contract, and the call
+   * rejects. The bridge passes on only a string.
+   */
+  readonly copyId: (workspaceId: string) => Promise<CopyWorkspaceIdResult>;
 }
 
 /**

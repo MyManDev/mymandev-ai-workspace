@@ -39,6 +39,7 @@ import type {
   ClaimMarksView,
   ClaimsView,
   ConnectionStatus,
+  CopyWorkspaceIdResult,
   CreateInvitationResult,
   CreateJoinRequestResult,
   CreateProjectResult,
@@ -202,7 +203,8 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * `projectRepositories`, each a string, the passphrase of
  * `account.unlockDeviceKey`, the IDs of `workspaces.select`
  * and `workspaces.openProject`, the name of `workspaces.create`, the ID and
- * the name of `workspaces.createProject`, the text of `chat.send`, and the event IDs
+ * the name of `workspaces.createProject`, the ID of `workspaces.copyId`,
+ * the text of `chat.send`, and the event IDs
  * of `chat.retry` and `chat.discard`, which must be strings (or null to
  * close a project) and which the main process validates, the device IDs
  * of `devices.dismissNewDevices`, an array of strings that it copies, the
@@ -468,6 +470,15 @@ export function createDesktopBridge(
               "createProject needs a workspace ID and a name string.",
             ),
           ),
+    // Only a string goes on; the main process checks the ID against the
+    // account's workspace list.
+    copyId: (workspaceId: string) =>
+      typeof workspaceId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.copyWorkspaceId,
+            workspaceId,
+          ) as Promise<CopyWorkspaceIdResult>)
+        : Promise.reject(new TypeError("copyId needs a workspace ID string.")),
   });
 
   const people: PeopleBridge = Object.freeze({
