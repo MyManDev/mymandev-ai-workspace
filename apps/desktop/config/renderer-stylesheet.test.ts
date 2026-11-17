@@ -255,14 +255,17 @@ function mayMatchClaimRowAncestor(selector: string): boolean {
  * sticky `position`; `contain`, whose paint containment (`paint`,
  * `content`, `strict`) clips like `overflow: clip`, and whose other values
  * no element around a row needs; `content-visibility`, which applies paint
- * containment; and `clip-path` (#285).
+ * containment; `clip-path`, also with its `-webkit-` prefix; and the legacy
+ * `clip` (#285). Property names and keywords are matched in any case, as
+ * CSS reads them.
  */
 const CLIPPING_DECLARATIONS: readonly RegExp[] = [
-  /(^|[;{\s])overflow(-x|-y|-block|-inline)?\s*:/,
-  /position\s*:\s*(fixed|sticky)/,
-  /(^|[;{\s])contain\s*:/,
-  /(^|[;{\s])content-visibility\s*:/,
-  /(^|[;{\s])clip-path\s*:/,
+  /(^|[;{\s])overflow(-x|-y|-block|-inline)?\s*:/i,
+  /position\s*:\s*(-webkit-)?(fixed|sticky)/i,
+  /(^|[;{\s])contain\s*:/i,
+  /(^|[;{\s])content-visibility\s*:/i,
+  /(^|[;{\s])(-webkit-)?clip-path\s*:/i,
+  /(^|[;{\s])clip\s*:/i,
 ];
 
 test("the check of the elements around a claim's row finds every declaration that scrolls, clips, or is fixed or sticky, and no other", () => {
@@ -274,13 +277,23 @@ test("the check of the elements around a claim's row finds every declaration tha
     "overflow: auto;",
     "overflow-y: hidden;",
     "overflow-inline: clip;",
+    "Overflow: Hidden;",
     "position: fixed;",
     "position: sticky;",
+    "position: -webkit-sticky;",
+    "POSITION: STICKY;",
     "contain: paint;",
     "contain: content;",
     "contain: strict;",
+    "contain: layout;",
+    "contain: size;",
+    "CONTAIN: paint;",
     "content-visibility: auto;",
+    "content-visibility: hidden;",
     "clip-path: inset(0);",
+    "-webkit-clip-path: inset(0);",
+    "Clip-Path: inset(0);",
+    "clip: rect(0 0 0 0);",
   ]) {
     expect(found(declaration), declaration).toBe(true);
   }
@@ -290,9 +303,57 @@ test("the check of the elements around a claim's row finds every declaration tha
     "contain-intrinsic-size: auto 40px;",
     "--contain: paint;",
     "--clip-path: inset(0);",
+    "clip-rule: evenodd;",
+    "background-clip: text;",
+    "--clip: rect(0 0 0 0);",
   ]) {
     expect(found(declaration), declaration).toBe(false);
   }
+});
+
+/**
+ * The preludes of the rules nested in a style rule, at any depth: a style
+ * rule or an at-rule. The rule extraction of these checks reads a rule's
+ * declarations only up to its first brace, so a rule nested in another
+ * would hide the declarations of its parent. A rule inside an at-rule such
+ * as `@media` is not nested in this sense. A brace inside a string is not
+ * told apart; the stylesheet has none.
+ */
+function nestedRules(css: string): string[] {
+  const parents: string[] = [];
+  const nested: string[] = [];
+  let start = 0;
+  for (const { 0: mark, index } of css.matchAll(/[{};]/g)) {
+    if (mark === "{") {
+      const prelude = css.slice(start, index).trim();
+      if (parents.some((parent) => !parent.startsWith("@"))) {
+        nested.push(prelude);
+      }
+      parents.push(prelude);
+    } else if (mark === "}") {
+      parents.pop();
+    }
+    start = index + 1;
+  }
+  return nested;
+}
+
+test("no style rule of the stylesheet holds a nested rule, which the checks of the rules' declarations would read without the parent's declarations", () => {
+  expect(
+    nestedRules(".a { color: red; .b { color: blue; } overflow: auto; }"),
+  ).toEqual([".b"]);
+  expect(nestedRules(".a { &:hover { color: red; } }")).toEqual(["&:hover"]);
+  expect(
+    nestedRules(".a { @media (width < 10rem) { overflow: auto; } }"),
+  ).toEqual(["@media (width < 10rem)"]);
+  expect(
+    nestedRules("@media (forced-colors: active) { .a { color: red; } }"),
+  ).toEqual([]);
+  expect(
+    nestedRules("@media (x) { @supports (y) { .a { color: red; } } }"),
+  ).toEqual([]);
+  expect(CSS).toContain("@media");
+  expect(nestedRules(CSS)).toEqual([]);
 });
 
 test("no element around a recent claim's row scrolls, clips, or is fixed or sticky, so that the viewport is the visible area that counts a tall row as seen (#276)", () => {
