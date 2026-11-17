@@ -112,6 +112,13 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   createProject: "workspaces:create-project",
   /**
+   * Copies the ID of a workspace of the account's list to the system
+   * clipboard, by that ID, so that a member can pass it on to someone who
+   * then asks to join with it (#95). The main process writes that ID and
+   * nothing else; the renderer itself never uses the clipboard.
+   */
+  copyWorkspaceId: "workspaces:copy-id",
+  /**
    * What the renderer may know of the selected workspace's people: each
    * person's member ID, display name, role, GitHub login, and whether it is
    * claimed or a former member, and the account's own member ID. Read-only.

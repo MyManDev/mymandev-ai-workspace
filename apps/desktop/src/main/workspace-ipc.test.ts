@@ -259,13 +259,15 @@ function register(
 
 /**
  * The workspace channels of this module. The two creates share the prefix,
- * and `creation-ipc.ts` registers them.
+ * and `creation-ipc.ts` registers them; the copy of the workspace ID shares
+ * it too, and `workspace-id-ipc.ts` registers it.
  */
 const WORKSPACE_CHANNELS = Object.values(INVOKE_CHANNELS).filter(
   (channel) =>
     channel.startsWith("workspaces:") &&
     channel !== INVOKE_CHANNELS.createWorkspace &&
-    channel !== INVOKE_CHANNELS.createProject,
+    channel !== INVOKE_CHANNELS.createProject &&
+    channel !== INVOKE_CHANNELS.copyWorkspaceId,
 );
 
 test("the workspace channels are registered, and nothing else", () => {
