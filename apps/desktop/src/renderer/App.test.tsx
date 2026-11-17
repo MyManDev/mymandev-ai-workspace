@@ -62,6 +62,8 @@ import {
   type DeviceRemovalView,
 } from "./connection-status.ts";
 import { WorkspaceNav } from "./Navigation.tsx";
+import { ProjectPanel } from "./ProjectPanel.tsx";
+import { RepositoryPanel } from "./RepositoryPanel.tsx";
 import {
   createShellState,
   type ProjectSummary,
@@ -907,6 +909,50 @@ test("with the bridge, the repository panel waits for the first list and offers 
     '<h3 class="repository-section-title" id="device-repositories-title">On this device</h3><button type="button" class="panel-action" disabled="">Add a repository</button><p>Reading the repositories.</p>',
   );
   expect(html).not.toContain("Repositories are not available.");
+});
+
+test("the project panel gives the repository panel the open project and both repository bridges", () => {
+  const repositories: RepositoryBridge = {
+    list: () => Promise.resolve({ revision: 0, repositories: [] }),
+    subscribe: () => () => undefined,
+    mount: () => Promise.resolve({ outcome: "cancelled" }),
+    unmount: () => Promise.resolve(false),
+  };
+  const refuse = () => Promise.reject(new Error("not called"));
+  const projectRepositories: ProjectRepositoriesBridge = {
+    getState: refuse,
+    subscribeState: () => () => undefined,
+    register: refuse,
+    remove: refuse,
+    link: refuse,
+    unlink: refuse,
+  };
+  const tree = ProjectPanel({
+    panel: "repositories",
+    projectId: "project-b",
+    dispatch: () => undefined,
+    repositories,
+    projectRepositories,
+  });
+  // The repository panel uses hooks, so it stays an element here.
+  const found: unknown[] = [];
+  const visit = (node: ReactNode): void => {
+    if (Array.isArray(node)) {
+      node.forEach((child: ReactNode) => visit(child));
+      return;
+    }
+    if (!isValidElement<{ readonly children?: ReactNode }>(node)) {
+      return;
+    }
+    if (node.type === RepositoryPanel) {
+      found.push(node.props);
+    }
+    visit(node.props.children);
+  };
+  visit(tree);
+  expect(found).toEqual([
+    { repositories, projectRepositories, projectId: "project-b" },
+  ]);
 });
 
 // The entry point's source, to check what it passes from `window.desktop`.
