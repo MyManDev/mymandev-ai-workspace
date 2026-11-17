@@ -9,8 +9,7 @@ import type {
   RepositoryState,
 } from "../shared/ipc-contract.ts";
 import {
-  ProjectRepositoriesContent,
-  ProjectRepositoryDialogBox,
+  ProjectRepositoriesPart,
   useProjectRepositories,
 } from "./ProjectRepositories.tsx";
 import {
@@ -53,19 +52,7 @@ export function RepositoryPanel({
   return (
     <RepositoryPanelContent
       {...mounts}
-      project={
-        <>
-          <ProjectRepositoriesContent {...project} />
-          {project.handlers === undefined ? null : (
-            <ProjectRepositoryDialogBox
-              dialog={project.actions.dialog}
-              onChoose={project.handlers.onChoose}
-              onConfirm={project.handlers.onConfirm}
-              onCancel={project.handlers.onCancel}
-            />
-          )}
-        </>
-      }
+      project={<ProjectRepositoriesPart {...project} />}
     />
   );
 }

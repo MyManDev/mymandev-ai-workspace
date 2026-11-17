@@ -201,6 +201,28 @@ test("the open project's repositories come first, between the panel's title and 
   );
 });
 
+// The panel's wiring, which needs a DOM to run.
+
+const SOURCES = import.meta.glob<string>("./RepositoryPanel.tsx", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+test("the panel follows the open project's repositories for the shown project with this device's mount list, and shows their part with its dialog above this device's repositories", () => {
+  const code = (SOURCES["./RepositoryPanel.tsx"] ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/,? \)/g, ")");
+  expect(code).toContain("const mounts = useRepositoryPanel(repositories);");
+  expect(code).toContain(
+    "const project = useProjectRepositories(projectRepositories, projectId, mounts.view);",
+  );
+  expect(code).toContain(
+    "<RepositoryPanelContent {...mounts} project={<ProjectRepositoriesPart {...project} />} />",
+  );
+});
+
 test("names, paths, branches, and URLs are rendered as text, not as markup", () => {
   const ready = READY.state;
   if (ready.kind !== "ready") {

@@ -12,10 +12,11 @@ import {
   followProjectRepositories,
   IDLE_PROJECT_REPOSITORY_ACTIONS,
   initialProjectRepositoriesView,
-  linkOffered,
   PROJECT_REPOSITORY_MESSAGES,
   PROJECT_REPOSITORY_QUESTION_MESSAGES,
+  repositoryActions,
   type ProjectRepositoriesModel,
+  type ProjectRepositoryActions,
   type ProjectRepositoryActionsView,
   type ProjectRepositoryDialog,
   type RepositoryActionRequest,
@@ -63,12 +64,11 @@ export interface ProjectRepositoriesContentProps {
  * screen reader announces a new text, and with the bridge a second one for
  * the sentence of the last action. Each repository shows its name, as text
  * that a person entered, with `dir="auto"` and never translated, and while
- * this device's links are `ready`, where it is linked. While the list is
- * `ready`, each offers "Link to a folder", "Unlink" on a linked one, and
- * "Remove from the project", each described by the repository's name, and
- * below them a form registers a repository. While an action runs, every
- * action's button stays focusable and does nothing (`aria-disabled`), and
- * the field is read-only.
+ * this device's links are `ready`, where it is linked. Each offers the
+ * actions of `repositoryActions`, each described by the repository's name,
+ * and while the list is `ready`, a form below them registers a repository.
+ * While an action runs, every action's button stays focusable and does
+ * nothing (`aria-disabled`), and the field is read-only.
  */
 export function ProjectRepositoriesContent({
   model,
@@ -115,7 +115,6 @@ export function ProjectRepositoriesContent({
               key={row.repositoryId}
               row={row}
               index={index}
-              projectId={offered}
               model={model}
               running={actions.running}
               handlers={handlers}
@@ -134,63 +133,54 @@ export function ProjectRepositoriesContent({
   );
 }
 
+/** The label of each action's button. */
+const ACTION_LABELS: Readonly<Record<RepositoryActionRequest["kind"], string>> =
+  Object.freeze({
+    link: PROJECT_REPOSITORY_MESSAGES.link,
+    unlink: PROJECT_REPOSITORY_MESSAGES.unlink,
+    remove: PROJECT_REPOSITORY_MESSAGES.remove,
+  });
+
 function RepositoryItem({
   row,
   index,
-  projectId,
   model,
   running,
   handlers,
 }: {
   readonly row: RepositoryRow;
   readonly index: number;
-  /** The project to act on, or null when nothing is offered. */
-  readonly projectId: string | null;
   readonly model: ProjectRepositoriesModel;
   readonly running: boolean;
+  /** Undefined without the bridge: then nothing is offered. */
   readonly handlers: ProjectRepositoryHandlers | undefined;
 }) {
   const nameId = repositoryNameId(index);
-  const button = (kind: RepositoryActionRequest["kind"], label: string) =>
-    projectId === null || handlers === undefined ? null : (
-      <button
-        type="button"
-        className="panel-action"
-        aria-describedby={nameId}
-        aria-disabled={running ? "true" : undefined}
-        onClick={
-          running
-            ? undefined
-            : (event) =>
-                handlers.onStart(
-                  {
-                    kind,
-                    projectId,
-                    repositoryId: row.repositoryId,
-                    name: row.name,
-                  },
-                  event.currentTarget,
-                )
-        }
-      >
-        {label}
-      </button>
-    );
+  const offered = handlers === undefined ? [] : repositoryActions(model, row);
   return (
     <li className="repository">
       <h4 className="repository-name" id={nameId} dir="auto" translate="no">
         {row.name}
       </h4>
       {row.link === null ? null : <LinkLine link={row.link} />}
-      {projectId === null ? null : (
+      {handlers === undefined || offered.length === 0 ? null : (
         <div className="account-actions">
-          {linkOffered(model)
-            ? button("link", PROJECT_REPOSITORY_MESSAGES.link)
-            : null}
-          {model.linking && row.linked
-            ? button("unlink", PROJECT_REPOSITORY_MESSAGES.unlink)
-            : null}
-          {button("remove", PROJECT_REPOSITORY_MESSAGES.remove)}
+          {offered.map((request) => (
+            <button
+              key={request.kind}
+              type="button"
+              className="panel-action"
+              aria-describedby={nameId}
+              aria-disabled={running ? "true" : undefined}
+              onClick={
+                running
+                  ? undefined
+                  : (event) => handlers.onStart(request, event.currentTarget)
+              }
+            >
+              {ACTION_LABELS[request.kind]}
+            </button>
+          ))}
         </div>
       )}
     </li>
@@ -335,7 +325,9 @@ export function ProjectRepositoryDialogBox(
  * its path from the mount list, and says that the main process asks again
  * in a dialog of its own; without a folder to choose, it says why and
  * offers only "Cancel". Its problem shows in an alert inside the dialog,
- * because the page behind it is inert. "Cancel" comes first.
+ * because the page behind it is inert. "Cancel" comes first. The checked
+ * folder has `autoFocus`; the removal's question has none, so that its
+ * first control, "Cancel", takes the focus.
  */
 export function ProjectRepositoryDialogContent({
   dialog,
@@ -395,28 +387,32 @@ export function ProjectRepositoryDialogContent({
               aria-describedby="project-repository-dialog-problem"
             >
               <legend>{messages.linkLegend}</legend>
-              {link.choices.map((choice) => (
-                <label className="repository-option" key={choice.mountId}>
-                  <input
-                    type="radio"
-                    name="project-repository-folder"
-                    checked={link.mountId === choice.mountId}
-                    onChange={() => onChoose(choice.mountId)}
-                  />
-                  <span>
-                    <span dir="auto" translate="no">
-                      {choice.name}
+              {link.choices.map((choice) => {
+                const checked = link.mountId === choice.mountId;
+                return (
+                  <label className="repository-option" key={choice.mountId}>
+                    <input
+                      type="radio"
+                      name="project-repository-folder"
+                      checked={checked}
+                      autoFocus={checked}
+                      onChange={() => onChoose(choice.mountId)}
+                    />
+                    <span>
+                      <span dir="auto" translate="no">
+                        {choice.name}
+                      </span>
+                      <code
+                        className="repository-option-path"
+                        dir="ltr"
+                        translate="no"
+                      >
+                        {choice.path}
+                      </code>
                     </span>
-                    <code
-                      className="repository-option-path"
-                      dir="ltr"
-                      translate="no"
-                    >
-                      {choice.path}
-                    </code>
-                  </span>
-                </label>
-              ))}
+                  </label>
+                );
+              })}
             </fieldset>
             <p
               className="panel-message"
@@ -444,9 +440,14 @@ export function ProjectRepositoryDialogContent({
   );
 }
 
-/** Moves the focus to the part's title, which takes it without a tab stop. */
-function focusTitle(): void {
-  document.getElementById(PROJECT_REPOSITORIES_TITLE_ID)?.focus();
+/**
+ * Moves the focus to the part's title in `root`, the page's document, which
+ * takes it without a tab stop.
+ */
+export function focusProjectRepositoriesTitle(
+  root: Pick<Document, "getElementById">,
+): void {
+  root.getElementById(PROJECT_REPOSITORIES_TITLE_ID)?.focus();
 }
 
 /** What the repository panel needs of the project's repositories. */
@@ -457,11 +458,70 @@ export interface ProjectRepositoriesControls {
 }
 
 /**
+ * The part as the repository panel shows it, without state: the content,
+ * and with the bridge the dialog of its questions, which shows the
+ * controller's open question and passes a choice, "Continue", and a cancel
+ * on to the handlers.
+ */
+export function ProjectRepositoriesPart({
+  model,
+  actions,
+  handlers,
+}: ProjectRepositoriesControls) {
+  return (
+    <>
+      <ProjectRepositoriesContent
+        model={model}
+        actions={actions}
+        handlers={handlers}
+      />
+      {handlers === undefined ? null : (
+        <ProjectRepositoryDialogBox
+          dialog={actions.dialog}
+          onChoose={handlers.onChoose}
+          onConfirm={handlers.onConfirm}
+          onCancel={handlers.onCancel}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * The part's handlers on `controller`: each passes the person's input on.
+ * The start of an action remembers its button in `trigger`, which the
+ * dialog gives the focus back to and whose leaving the hook decides; a
+ * registration remembers none, because the form's button stays.
+ */
+export function projectRepositoryHandlers(
+  controller: ProjectRepositoryActions,
+  trigger: { current: Element | null },
+): ProjectRepositoryHandlers {
+  return {
+    onStart: (request, button) => {
+      trigger.current = button;
+      void controller.start(request);
+    },
+    onChoose: controller.choose,
+    onConfirm: () => {
+      void controller.confirm();
+    },
+    onCancel: controller.cancel,
+    onRegisterDraft: controller.editRegisterDraft,
+    onRegister: (projectId) => {
+      trigger.current = null;
+      void controller.register(projectId);
+    },
+  };
+}
+
+/**
  * Follows the open project's registered repositories while the panel is
  * shown, for the project that the shell shows (`projectId`) and the mount
  * list (`mounts`), and runs the part's actions
- * (`createProjectRepositoryActions`), which follow every model; undefined
- * handlers without the bridge.
+ * (`createProjectRepositoryActions`), which follow every model, with the
+ * handlers of `projectRepositoryHandlers`; undefined handlers without the
+ * bridge.
  *
  * The focus: a question remembers the button that opened it, which the
  * dialog gives the focus back to; when the question ends after that button
@@ -511,7 +571,7 @@ export function useProjectRepositories(
         button !== null && !button.isConnected,
       )
     ) {
-      focusTitle();
+      focusProjectRepositoriesTitle(document);
     }
     wasOpen.current = open;
   }, [open]);
@@ -531,30 +591,14 @@ export function useProjectRepositories(
         document.body,
       )
     ) {
-      focusTitle();
+      focusProjectRepositoriesTitle(document);
     }
   }, [model, running, open]);
   const handlers = useMemo(
-    (): ProjectRepositoryHandlers | undefined =>
+    () =>
       controller === undefined
         ? undefined
-        : {
-            onStart: (request, button) => {
-              trigger.current = button;
-              void controller.start(request);
-            },
-            onChoose: controller.choose,
-            onConfirm: () => {
-              void controller.confirm();
-            },
-            onCancel: controller.cancel,
-            onRegisterDraft: controller.editRegisterDraft,
-            onRegister: (projectId) => {
-              // The form's button stays, so no button is remembered.
-              trigger.current = null;
-              void controller.register(projectId);
-            },
-          },
+        : projectRepositoryHandlers(controller, trigger),
     [controller],
   );
   return { model, actions, handlers };

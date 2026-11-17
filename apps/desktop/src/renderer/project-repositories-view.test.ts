@@ -37,6 +37,7 @@ import {
   PROJECT_REPOSITORY_UNKNOWN_MESSAGES,
   REGISTER_REPOSITORY_REFUSAL_MESSAGES,
   REMOVE_REPOSITORY_REFUSAL_MESSAGES,
+  repositoryActions,
   repositoryNamePrompt,
   repositoryNameToSend,
   UNLINK_REPOSITORY_REFUSAL_MESSAGES,
@@ -267,7 +268,7 @@ test("a registration's answer: done, unknown, and each refusal after the start, 
   ).toBe(
     "The repository could not be registered. The server asked to wait. Try again in 2 hours. An account registers at most 20 repositories in 24 hours.",
   );
-  // A full project names its limit and no wait: only a removal helps.
+  // A full project names no wait, because only a removal helps, and no number.
   expect(
     describeRegisterResult({
       outcome: "refused",
@@ -275,7 +276,7 @@ test("a registration's answer: done, unknown, and each refusal after the start, 
       retryAfterMs: null,
     }),
   ).toBe(
-    "The repository could not be registered. This project already has 20 repositories, as many as it allows. Remove one first.",
+    "The repository could not be registered. This project already has as many repositories as it allows. A repository has to be removed first.",
   );
   expect(
     describeRegisterResult({
@@ -332,12 +333,12 @@ test("a removal's answer: done, unknown, and each refusal, with who may remove a
   ).toContain("The list is read again.");
 });
 
-test("a link's answer reads naturally after the person cancelled it and while another confirmation is open", () => {
+test("a link's answer reads naturally after the confirmation dialog was cancelled or closed and while another confirmation is open", () => {
   expect(describeLinkResult({ outcome: "linked" })).toBe(
     PROJECT_REPOSITORY_DONE_MESSAGES.link,
   );
   expect(describeLinkResult({ outcome: "refused", reason: "cancelled" })).toBe(
-    "The repository was not linked. You cancelled it in the confirmation dialog. Nothing changed.",
+    "The repository was not linked. The confirmation dialog was cancelled or closed. Nothing changed.",
   );
   expect(describeLinkResult({ outcome: "refused", reason: "busy" })).toBe(
     "The repository was not linked. A confirmation of another link is open, or one was cancelled a moment ago. Answer that dialog or wait a few seconds, then try again.",
@@ -418,7 +419,7 @@ test("without the bridge, before the first state, without a project, and for ano
       linksNote: "",
       rows: null,
       projectId: null,
-      linking: false,
+      linksProjectId: null,
       folders: shown.folders,
     });
   }
@@ -453,7 +454,7 @@ test("a ready list shows each repository and where it is linked, and offers the 
   expect(shown.status).toBe("");
   expect(shown.linksNote).toBe("");
   expect(shown.projectId).toBe(PROJECT);
-  expect(shown.linking).toBe(true);
+  expect(shown.linksProjectId).toBe(PROJECT);
   expect(linkOffered(shown)).toBe(true);
   expect(shown.rows?.map((row) => [row.name, row.link])).toEqual([
     [
@@ -474,6 +475,52 @@ test("a ready list shows each repository and where it is linked, and offers the 
     MOUNT_2,
     MOUNT_3,
   ]);
+});
+
+test("each row offers its actions: Link and Remove while the list is ready, Unlink on a linked repository while the links are ready, whatever the list's state", () => {
+  const linked = repository(REPOSITORY_A, "app", MOUNT_1);
+  const kindsOf = (shown: ProjectRepositoriesModel) =>
+    (shown.rows ?? []).map((row) =>
+      repositoryActions(shown, row).map(
+        (action) => `${action.kind} ${action.projectId} ${action.name}`,
+      ),
+    );
+  const repositories = [linked, B];
+  expect(kindsOf(model(known({ repositories })))).toEqual([
+    [`link ${PROJECT} app`, `unlink ${PROJECT} app`, `remove ${PROJECT} app`],
+    [`link ${PROJECT} docs`, `remove ${PROJECT} docs`],
+  ]);
+  // The repository's ID goes with each request.
+  const [first] = model(known({ repositories })).rows ?? [];
+  expect(
+    first === undefined
+      ? []
+      : repositoryActions(model(known({ repositories })), first).map(
+          (action) => action.repositoryId,
+        ),
+  ).toEqual([REPOSITORY_A, REPOSITORY_A, REPOSITORY_A]);
+  // Without the mount list, no link.
+  expect(kindsOf(model(known({ repositories }), { kind: "pending" }))).toEqual([
+    [`unlink ${PROJECT} app`, `remove ${PROJECT} app`],
+    [`remove ${PROJECT} docs`],
+  ]);
+  // An unavailable list keeps Unlink while the links are ready: the main
+  // process's unlink needs only the links.
+  for (const problem of PROJECT_REPOSITORY_PROBLEMS) {
+    const shown = model(
+      known({ status: "unavailable", problem, repositories }),
+    );
+    expect(shown.linksProjectId, problem).toBe(PROJECT);
+    expect(kindsOf(shown), problem).toEqual([[`unlink ${PROJECT} app`], []]);
+  }
+  // Without ready links, an unavailable list offers nothing.
+  for (const links of ["loading", "unavailable"] as const) {
+    const shown = model(
+      known({ status: "unavailable", problem: "failed", links, repositories }),
+    );
+    expect(shown.linksProjectId, links).toBeNull();
+    expect(kindsOf(shown), links).toEqual([[], []]);
+  }
 });
 
 test("an empty ready list says so and still offers the registration", () => {
@@ -498,10 +545,17 @@ test("while this device's links load or cannot be read, no link shows, a note sa
     );
     expect(shown.linksNote, links).toBe(note);
     expect(shown.rows?.[0]?.link, links).toBeNull();
-    expect(shown.linking, links).toBe(false);
+    expect(shown.linksProjectId, links).toBeNull();
     expect(linkOffered(shown), links).toBe(false);
     // Removing and registering stay offered.
     expect(shown.projectId, links).toBe(PROJECT);
+    const [row] = shown.rows ?? [];
+    expect(
+      row === undefined
+        ? []
+        : repositoryActions(shown, row).map((action) => action.kind),
+      links,
+    ).toEqual(["remove"]);
   }
 });
 
@@ -512,12 +566,12 @@ test("without the mount list, linking is not offered, but unlinking is", () => {
   ] as const) {
     const shown = model(known(), mountView);
     expect(shown.folders).toBeNull();
-    expect(shown.linking).toBe(true);
+    expect(shown.linksProjectId).toBe(PROJECT);
     expect(linkOffered(shown)).toBe(false);
   }
 });
 
-test("an unavailable list shows its problem with what was loaded before and offers nothing", () => {
+test("an unavailable list shows its problem with what was loaded before and offers nothing but Unlink", () => {
   for (const problem of PROJECT_REPOSITORY_PROBLEMS) {
     const shown = model(known({ status: "unavailable", problem }));
     expect(shown.status, problem).toBe(
@@ -528,7 +582,7 @@ test("an unavailable list shows its problem with what was loaded before and offe
       problem,
     ).toEqual(["app", "docs"]);
     expect(shown.projectId, problem).toBeNull();
-    expect(shown.linking, problem).toBe(false);
+    expect(linkOffered(shown), problem).toBe(false);
   }
   // Without anything loaded, only the problem shows.
   expect(
@@ -557,13 +611,16 @@ test("the folders to link: the mount list's, without one that another repository
   ).toEqual([]);
 });
 
-test("the folder chosen at first is the first one with the repository's name, else none", () => {
+test("the folder chosen at first is the only one with the repository's exact name, else none", () => {
   const choices = folderChoices(model(), REPOSITORY_A);
-  expect(initialFolderChoice("app", choices)).toBe(MOUNT_1);
   expect(initialFolderChoice("docs", choices)).toBe(MOUNT_2);
+  // Two folders are named "app": the person chooses.
+  expect(initialFolderChoice("app", choices)).toBeNull();
+  expect(initialFolderChoice("app", choices.slice(0, 2))).toBe(MOUNT_1);
   // Only the exact name.
-  expect(initialFolderChoice("App", choices)).toBeNull();
+  expect(initialFolderChoice("Docs", choices)).toBeNull();
   expect(initialFolderChoice("site", choices)).toBeNull();
+  expect(initialFolderChoice("app", [])).toBeNull();
 });
 
 test("the subscription reports every state and a refusal", () => {
@@ -637,9 +694,9 @@ test("a refused removal says why", async () => {
   );
 });
 
-test("a link asks for the folder first, among the folders of the latest model, with the one of the repository's name chosen", async () => {
+test("a link asks for the folder first, among the folders of the latest model, with the only one of the repository's name chosen", async () => {
   const { actions, calls, last } = controllerWith();
-  await actions.start(request("link"));
+  await actions.start(request("link", B));
   expect(calls).toEqual([]);
   const dialog = last().dialog;
   expect(dialog?.kind).toBe("link");
@@ -651,8 +708,40 @@ test("a link asks for the folder first, among the folders of the latest model, w
     MOUNT_2,
     MOUNT_3,
   ]);
-  expect(dialog.mountId).toBe(MOUNT_1);
+  expect(dialog.mountId).toBe(MOUNT_2);
   expect(dialog.problem).toBeUndefined();
+  // Two folders are named "app", so none is chosen for "app".
+  const twice = controllerWith();
+  await twice.actions.start(request("link"));
+  const asked = twice.last().dialog;
+  expect(asked?.kind === "link" ? asked.mountId : undefined).toBeNull();
+});
+
+test("the folder chosen at first is among the folders offered: a folder with the repository's name that another repository is linked to is not chosen", async () => {
+  const chosenFor = async (shown: ProjectRepositoriesModel) => {
+    const { actions, last } = controllerWith(shown);
+    await actions.start(request("link"));
+    const dialog = last().dialog;
+    return dialog?.kind === "link" ? dialog.mountId : undefined;
+  };
+  // "docs" is linked to the first "app" folder: the other one is the only
+  // one offered with the name.
+  const linkedToFirst = known({
+    repositories: [A, repository(REPOSITORY_B, "docs", MOUNT_1)],
+  });
+  expect(await chosenFor(model(linkedToFirst))).toBe(MOUNT_3);
+  // With one "app" folder, linked to "docs", none is chosen.
+  expect(
+    await chosenFor(
+      model(
+        linkedToFirst,
+        mounts(
+          mount(MOUNT_1, "app", "/home/ada/app"),
+          mount(MOUNT_2, "docs", "/home/ada/docs"),
+        ),
+      ),
+    ),
+  ).toBeNull();
 });
 
 test("a link without a chosen folder sends nothing and says to choose one, until a folder is chosen", async () => {
@@ -686,13 +775,12 @@ test("a confirmed link asks the main process, which asks the person in its own d
   expect(last()).toEqual({
     ...IDLE_PROJECT_REPOSITORY_ACTIONS,
     running: true,
-    message:
-      "Confirm or cancel the link in the dialog that this device opened.",
+    message: "This device asks you to confirm the link in a dialog of its own.",
   });
   answers.link.resolve({ outcome: "refused", reason: "cancelled" });
   await done;
   expect(last().message).toBe(
-    "The repository was not linked. You cancelled it in the confirmation dialog. Nothing changed.",
+    "The repository was not linked. The confirmation dialog was cancelled or closed. Nothing changed.",
   );
   expect(last().running).toBe(false);
 });
@@ -700,6 +788,7 @@ test("a confirmed link asks the main process, which asks the person in its own d
 test("a linked answer says so", async () => {
   const { actions, answers, last } = controllerWith();
   await actions.start(request("link"));
+  actions.choose(MOUNT_1);
   const done = actions.confirm();
   answers.link.resolve({ outcome: "linked" });
   await done;
@@ -725,6 +814,27 @@ test("an unlink runs at once and says how it ended", async () => {
   expect(refused.last().message).toBe(
     "The repository could not be unlinked. The repository is not linked on this device.",
   );
+});
+
+test("a new action ends the sentence of the last one, and a link says meanwhile that this device asks in its own dialog", async () => {
+  const { actions, answers, last } = controllerWith();
+  const unlinking = actions.start(request("unlink"));
+  answers.unlink.resolve({ outcome: "unlinked" });
+  await unlinking;
+  expect(last().message).toBe(PROJECT_REPOSITORY_DONE_MESSAGES.unlink);
+  actions.editRegisterDraft("site");
+  const registering = actions.register(PROJECT);
+  expect(last().running).toBe(true);
+  expect(last().message).toBeUndefined();
+  answers.register.resolve({ outcome: "unknown" });
+  await registering;
+  expect(last().message).toBe(PROJECT_REPOSITORY_UNKNOWN_MESSAGES.register);
+  await actions.start(request("link"));
+  actions.choose(MOUNT_1);
+  const linking = actions.confirm();
+  expect(last().message).toBe(PROJECT_REPOSITORY_MESSAGES.linkWaiting);
+  answers.link.resolve({ outcome: "linked" });
+  await linking;
 });
 
 test("a registration sends the trimmed name once, and empties the field only once the API confirmed it", async () => {
@@ -843,6 +953,8 @@ test("an answer that arrives after the shell showed another project shows no sen
   await done;
   expect(last().message).toBeUndefined();
   expect(last().registerDraft).toBe("docs");
+  // The action ended all the same.
+  expect(last().running).toBe(false);
 });
 
 test("an answer after a switch away and back, or after a sign-out and a sign-in, counts for nothing", async () => {
@@ -864,6 +976,7 @@ test("an answer after a switch away and back, or after a sign-out and a sign-in,
     answers.unlink.resolve({ outcome: "unlinked" });
     await done;
     expect(last().message, between.kind).toBeUndefined();
+    expect(last().running, between.kind).toBe(false);
   }
 });
 
@@ -883,6 +996,19 @@ test("a new scope ends the question, the name, its problem, and the sentence of 
   actions.follow(
     model(known({ workspaceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a9" })),
   );
+  expect(last()).toEqual(IDLE_PROJECT_REPOSITORY_ACTIONS);
+});
+
+test("a new scope reports the end of a name's problem alone", async () => {
+  const { actions, calls, last } = controllerWith();
+  // An empty field: its problem is all there is.
+  await actions.register(PROJECT);
+  expect(calls).toEqual([]);
+  expect(last()).toEqual({
+    ...IDLE_PROJECT_REPOSITORY_ACTIONS,
+    registerProblem: PROJECT_REPOSITORY_MESSAGES.nameMissing,
+  });
+  actions.follow(model(known(), MOUNTS, OTHER_PROJECT));
   expect(last()).toEqual(IDLE_PROJECT_REPOSITORY_ACTIONS);
 });
 
@@ -1022,5 +1148,10 @@ test("the question's text says that the main process asks again in its own dialo
   );
   expect(PROJECT_REPOSITORY_QUESTION_MESSAGES.removeText).toContain(
     "the permissions granted on it end",
+  );
+  // The view does not say who registered a repository, so the question
+  // says who may remove one.
+  expect(PROJECT_REPOSITORY_QUESTION_MESSAGES.removeText).toContain(
+    "Only the person who registered it, the workspace's owner, and its admins can remove it.",
   );
 });

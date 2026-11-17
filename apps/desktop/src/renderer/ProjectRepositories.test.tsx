@@ -7,10 +7,15 @@ import type {
   ProjectRepositoryView,
 } from "../shared/ipc-contract.ts";
 import {
+  focusProjectRepositoriesTitle,
   PROJECT_REPOSITORIES_TITLE_ID,
   ProjectRepositoriesContent,
+  ProjectRepositoriesPart,
+  ProjectRepositoryDialogBox,
   ProjectRepositoryDialogContent,
+  projectRepositoryHandlers,
   repositoryNameId,
+  type ProjectRepositoryDialogProps,
   type ProjectRepositoryHandlers,
 } from "./ProjectRepositories.tsx";
 import {
@@ -21,6 +26,7 @@ import {
   PROJECT_REPOSITORY_QUESTION_MESSAGES,
   type ProjectRepositoriesModel,
   type ProjectRepositoriesPanelView,
+  type ProjectRepositoryActions,
   type ProjectRepositoryActionsView,
   type ProjectRepositoryDialog,
   type RepositoryActionRequest,
@@ -342,16 +348,39 @@ test("without the mount list, Link to a folder is not offered", () => {
   expect(html).toContain("Linked to a folder on this device.");
 });
 
-test("an unavailable list shows its problem and what was loaded, without actions or the form", () => {
-  const html = render(
-    model(known({ status: "unavailable", problem: "unavailable" })),
+test("an unavailable list shows its problem and what was loaded, with Unlink on a linked repository while the links are ready, and without the other actions or the form", () => {
+  const unavailable = model(
+    known({ status: "unavailable", problem: "unavailable" }),
   );
+  const html = render(unavailable);
   expect(html).toContain(
     '<p class="repository-status" role="status">The server could not be reached. Trying again later.</p>',
   );
   expect(html).toContain(">app</h4>");
-  expect(html).not.toContain("<button");
+  expect(html.match(/<button/g)).toHaveLength(1);
+  expect(html).toContain(
+    '<div class="account-actions"><button type="button" class="panel-action" aria-describedby="project-repository-name-0">Unlink</button></div>',
+  );
   expect(html).not.toContain("<form");
+  const { calls, handlers } = recorder();
+  for (const button of buttons(
+    content(unavailable, IDLE_PROJECT_REPOSITORY_ACTIONS, handlers),
+  )) {
+    button.props.onClick?.({ currentTarget: "[Unlink]" });
+  }
+  expect(calls).toEqual([`unlink ${PROJECT} ${REPOSITORY_A} app [Unlink]`]);
+  // Without ready links, nothing is offered.
+  const loading = render(
+    model(
+      known({
+        status: "unavailable",
+        problem: "unavailable",
+        links: "loading",
+      }),
+    ),
+  );
+  expect(loading).not.toContain("<button");
+  expect(loading).not.toContain('class="account-actions"');
 });
 
 test("each fixed state shows its text alone", () => {
@@ -458,7 +487,7 @@ test("without a question, the dialog stays in the page, empty", () => {
 
 test("a removal asks first: its title, the repository's name as text that describes the dialog, what follows, Cancel first", () => {
   expect(dialogHtml(REMOVE)).toBe(
-    `<dialog class="people-dialog" aria-labelledby="project-repository-dialog-title" aria-describedby="project-repository-dialog-name project-repository-dialog-text"><form><h2 id="project-repository-dialog-title">Remove this repository from the project?</h2><p class="people-dialog-name" id="project-repository-dialog-name" dir="auto" translate="no">app</p><p id="project-repository-dialog-text">${PROJECT_REPOSITORY_QUESTION_MESSAGES.removeText}</p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Remove from the project</button></div></form></dialog>`,
+    `<dialog class="people-dialog" aria-labelledby="project-repository-dialog-title" aria-describedby="project-repository-dialog-name project-repository-dialog-text"><form><h2 id="project-repository-dialog-title">Remove this repository from the project?</h2><p class="people-dialog-name" id="project-repository-dialog-name" dir="auto" translate="no">app</p><p id="project-repository-dialog-text">${PROJECT_REPOSITORY_QUESTION_MESSAGES.removeText.replaceAll("'", "&#x27;")}</p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Remove from the project</button></div></form></dialog>`,
   );
 });
 
@@ -471,13 +500,24 @@ test("a link offers the folders with their names and paths, never translated, th
     `<p id="project-repository-dialog-text">${PROJECT_REPOSITORY_QUESTION_MESSAGES.linkText.replaceAll("'", "&#x27;")}</p>`,
   );
   expect(html).toContain(
-    '<fieldset class="repository-choice" aria-describedby="project-repository-dialog-problem"><legend>Folder</legend><label class="repository-option"><input type="radio" name="project-repository-folder" checked=""/><span><span dir="auto" translate="no">app</span><code class="repository-option-path" dir="ltr" translate="no">/home/ada/app</code></span></label><label class="repository-option"><input type="radio" name="project-repository-folder"/><span><span dir="auto" translate="no">docs</span><code class="repository-option-path" dir="ltr" translate="no">/home/ada/docs</code></span></label></fieldset><p class="panel-message" id="project-repository-dialog-problem" role="alert"></p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Continue</button></div>',
+    '<fieldset class="repository-choice" aria-describedby="project-repository-dialog-problem"><legend>Folder</legend><label class="repository-option"><input type="radio" autofocus="" name="project-repository-folder" checked=""/><span><span dir="auto" translate="no">app</span><code class="repository-option-path" dir="ltr" translate="no">/home/ada/app</code></span></label><label class="repository-option"><input type="radio" name="project-repository-folder"/><span><span dir="auto" translate="no">docs</span><code class="repository-option-path" dir="ltr" translate="no">/home/ada/docs</code></span></label></fieldset><p class="panel-message" id="project-repository-dialog-problem" role="alert"></p><div class="people-dialog-actions"><button type="button" class="panel-action">Cancel</button><button type="submit" class="panel-action">Continue</button></div>',
   );
   expect(
     dialogHtml(linkDialog({ mountId: null, problem: "Choose a folder." })),
   ).toContain(
     '<p class="panel-message" id="project-repository-dialog-problem" role="alert">Choose a folder.</p>',
   );
+});
+
+test("the checked folder takes the focus as the link's question opens; without a checked one and in a removal's question, nothing has autofocus", () => {
+  const second = dialogHtml(linkDialog({ mountId: MOUNT_2 }));
+  expect(second.match(/autofocus/g)).toHaveLength(1);
+  expect(second).toContain(
+    '<input type="radio" autofocus="" name="project-repository-folder" checked=""/><span><span dir="auto" translate="no">docs</span>',
+  );
+  expect(dialogHtml(linkDialog({ mountId: null }))).not.toContain("autofocus");
+  // "Cancel" comes first in a removal's question and takes the focus.
+  expect(dialogHtml(REMOVE)).not.toContain("autofocus");
 });
 
 test("a link with no folder to choose says why and offers only Cancel", () => {
@@ -534,6 +574,138 @@ test("the dialog renders the repository's name and the folders as text, not as m
   expect(html).toContain("/tmp/&lt;script&gt;");
 });
 
+// The wiring.
+
+/** A controller that records each call as text. */
+function fakeController() {
+  const calls: string[] = [];
+  const controller: ProjectRepositoryActions = {
+    start: (request) => {
+      calls.push(`start ${request.kind} ${request.repositoryId}`);
+      return Promise.resolve();
+    },
+    choose: (mountId) => {
+      calls.push(`choose ${mountId}`);
+    },
+    confirm: () => {
+      calls.push("confirm");
+      return Promise.resolve();
+    },
+    cancel: () => {
+      calls.push("cancel");
+    },
+    editRegisterDraft: (text) => {
+      calls.push(`draft ${text}`);
+    },
+    register: (projectId) => {
+      calls.push(`register ${projectId}`);
+      return Promise.resolve();
+    },
+    follow: () => {
+      calls.push("follow");
+    },
+  };
+  return { calls, controller };
+}
+
+test("the handlers pass each input on to the controller: a choice chooses, Continue confirms, Cancel and Escape cancel, and typing edits the name; an action's start remembers its button, a registration none", () => {
+  const { calls, controller } = fakeController();
+  const trigger: { current: Element | null } = { current: null };
+  const handlers = projectRepositoryHandlers(controller, trigger);
+  const button = { isConnected: true } as unknown as Element;
+  handlers.onStart(
+    {
+      kind: "remove",
+      projectId: PROJECT,
+      repositoryId: REPOSITORY_A,
+      name: "app",
+    },
+    button,
+  );
+  expect(trigger.current).toBe(button);
+  handlers.onChoose(MOUNT_2);
+  handlers.onConfirm();
+  handlers.onCancel();
+  handlers.onRegisterDraft("site");
+  expect(trigger.current).toBe(button);
+  handlers.onRegister(PROJECT);
+  expect(trigger.current).toBeNull();
+  expect(calls).toEqual([
+    `start remove ${REPOSITORY_A}`,
+    `choose ${MOUNT_2}`,
+    "confirm",
+    "cancel",
+    "draft site",
+    `register ${PROJECT}`,
+  ]);
+});
+
+test("the title takes the focus by its element ID", () => {
+  const asked: string[] = [];
+  const focused: string[] = [];
+  focusProjectRepositoriesTitle({
+    getElementById: (id: string) => {
+      asked.push(id);
+      return {
+        focus: () => {
+          focused.push(id);
+        },
+      } as unknown as HTMLElement;
+    },
+  });
+  expect(asked).toEqual([PROJECT_REPOSITORIES_TITLE_ID]);
+  expect(focused).toEqual([PROJECT_REPOSITORIES_TITLE_ID]);
+  // Without the title on the page, nothing happens.
+  expect(() => {
+    focusProjectRepositoriesTitle({ getElementById: () => null });
+  }).not.toThrow();
+});
+
+/** The children of the part's fragment. */
+function partOf(
+  controls: Parameters<typeof ProjectRepositoriesPart>[0],
+): (ReactElement<Record<string, unknown>> | null)[] {
+  const part: ReactNode = ProjectRepositoriesPart(controls);
+  if (!isValidElement<{ readonly children?: ReactNode }>(part)) {
+    return [];
+  }
+  const { children } = part.props;
+  return (Array.isArray(children) ? children : [children]) as (ReactElement<
+    Record<string, unknown>
+  > | null)[];
+}
+
+test("the part shows the content with the controller's view, and with the bridge the dialog of its question, whose choice, Continue, and cancel go to the handlers", () => {
+  const { handlers } = recorder();
+  const shown = model();
+  const actions = { ...IDLE_PROJECT_REPOSITORY_ACTIONS, dialog: REMOVE };
+  const [content, dialog] = partOf({ model: shown, actions, handlers });
+  expect(content?.type).toBe(ProjectRepositoriesContent);
+  expect(content?.props.model).toBe(shown);
+  expect(content?.props.actions).toBe(actions);
+  expect(content?.props.handlers).toBe(handlers);
+  expect(dialog?.type).toBe(ProjectRepositoryDialogBox);
+  const props = (dialog?.props ?? {}) as Partial<ProjectRepositoryDialogProps>;
+  expect(Object.keys(props).sort()).toEqual([
+    "dialog",
+    "onCancel",
+    "onChoose",
+    "onConfirm",
+  ]);
+  expect(props.dialog).toBe(REMOVE);
+  expect(props.onChoose).toBe(handlers.onChoose);
+  expect(props.onConfirm).toBe(handlers.onConfirm);
+  expect(props.onCancel).toBe(handlers.onCancel);
+  // Without the bridge, there is no dialog.
+  const [alone, none] = partOf({
+    model: shown,
+    actions: IDLE_PROJECT_REPOSITORY_ACTIONS,
+    handlers: undefined,
+  });
+  expect(alone?.props.handlers).toBeUndefined();
+  expect(none).toBeNull();
+});
+
 // The hook's wiring, which needs a DOM to run.
 
 const SOURCES = import.meta.glob<string>(["./ProjectRepositories.tsx"], {
@@ -552,8 +724,24 @@ function wiringOf(source: string): string {
     .replace(/,? \)/g, ")");
 }
 
-test("the hook follows every model, keeps the focus after a question and after an action whose button left (#274), and remembers no button for a registration", () => {
+test("the hook subscribes with the view's setter, gives the controller the actions' setter, follows every model, returns both views with the handlers, and keeps the focus after a question and after an action whose button left (#274)", () => {
   const code = wiringOf(SOURCES["./ProjectRepositories.tsx"] ?? "");
+  expect(code).toContain(
+    "const [view, setView] = useState(() => initialProjectRepositoriesView(bridge !== undefined));",
+  );
+  expect(code).toContain(
+    "useEffect(() => bridge === undefined ? undefined : followProjectRepositories(bridge, setView), [bridge]);",
+  );
+  expect(code).toContain(
+    "const [actions, setActions] = useState(IDLE_PROJECT_REPOSITORY_ACTIONS);",
+  );
+  expect(code).toContain(
+    "const controller = useMemo(() => bridge === undefined ? undefined : createProjectRepositoryActions(bridge, setActions), [bridge]);",
+  );
+  expect(code).toContain(
+    "const handlers = useMemo(() => controller === undefined ? undefined : projectRepositoryHandlers(controller, trigger), [controller]);",
+  );
+  expect(code).toContain("return { model, actions, handlers }; }");
   expect(code).toContain(
     "useEffect(() => controller?.follow(model), [controller, model]);",
   );
@@ -561,19 +749,13 @@ test("the hook follows every model, keeps the focus after a question and after a
     "const model = useMemo(() => describeProjectRepositories(view, mounts, projectId), [view, mounts, projectId]);",
   );
   expect(code).toContain(
-    "if (focusesTitleAfterClose(wasOpen.current, open, button !== null && !button.isConnected)) { focusTitle(); } wasOpen.current = open; }, [open]);",
+    "if (focusesTitleAfterClose(wasOpen.current, open, button !== null && !button.isConnected)) { focusProjectRepositoriesTitle(document); } wasOpen.current = open; }, [open]);",
   );
   expect(code).toContain(
     "useEffect(() => rememberRunningButton(acted, running, trigger.current), [running]);",
   );
   expect(code).toContain(
-    "useEffect(() => { if (decideFocusAfterLeave(acted, open, running, document.activeElement, document.body)) { focusTitle(); } }, [model, running, open]);",
-  );
-  expect(code).toContain(
-    "onStart: (request, button) => { trigger.current = button; void controller.start(request); },",
-  );
-  expect(code).toContain(
-    "onRegister: (projectId) => { trigger.current = null; void controller.register(projectId); },",
+    "useEffect(() => { if (decideFocusAfterLeave(acted, open, running, document.activeElement, document.body)) { focusProjectRepositoriesTitle(document); } }, [model, running, open]);",
   );
   expect(code).toContain(
     "useEffect(() => syncModal(dialogRef.current, open), [open]);",

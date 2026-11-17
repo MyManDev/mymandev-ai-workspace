@@ -30,12 +30,10 @@ import { describeWait } from "./wait-text.ts";
 export const MAX_REPOSITORY_NAME_LENGTH = 100;
 
 /**
- * The most repositories of one project that are not removed, and the most
- * new repositories of one account in 24 hours (the protocol's
- * `REPOSITORY_COUNT_LIMITS`), which the sentences of `repository_limit` and
- * `rate_limited` name. The tests check them against the protocol.
+ * The most new repositories of one account in 24 hours (the protocol's
+ * `REPOSITORY_COUNT_LIMITS.perDay`), which the sentence of a registration's
+ * `rate_limited` names. The tests check it against the protocol.
  */
-export const MAX_PROJECT_REPOSITORIES = 20;
 export const MAX_NEW_REPOSITORIES_PER_DAY = 20;
 
 /** What the panel knows about the open project's registered repositories. */
@@ -104,7 +102,7 @@ export const PROJECT_REPOSITORY_MESSAGES = Object.freeze({
    * dialog, which names the repository and shows the folder's full path.
    */
   linkWaiting:
-    "Confirm or cancel the link in the dialog that this device opened.",
+    "This device asks you to confirm the link in a dialog of its own.",
 });
 
 /** The texts of the questions that the panel asks first. */
@@ -114,10 +112,12 @@ export const PROJECT_REPOSITORY_QUESTION_MESSAGES = Object.freeze({
    * What a removal does (ADR 0005, update of 2026-11-14): the server keeps
    * the repository as removed and revokes the grants on it, and every
    * device drops its links when it learns of the removal. A removed
-   * repository never comes back.
+   * repository never comes back. Who may remove one is the decision of
+   * 2026-11-14: the view does not say who registered a repository, so the
+   * question says it before the server decides.
    */
   removeText:
-    "It is removed for everyone in the workspace, the permissions granted on it end, and every device drops its link to a folder. Nothing in any folder changes. A removed repository does not come back: registering the same name again makes a new repository, which each person links again.",
+    "It is removed for everyone in the workspace, the permissions granted on it end, and every device drops its link to a folder. Nothing in any folder changes. A removed repository does not come back: registering the same name again makes a new repository, which each person links again. Only the person who registered it, the workspace's owner, and its admins can remove it.",
   removeConfirm: "Remove from the project",
   linkTitle: "Link this repository to a folder?",
   /**
@@ -201,7 +201,8 @@ const TOO_SOON = (wait: string) =>
  * `rate_limited` say how long to wait (`describeWait`); `rate_limited` also
  * names the API's limit of new repositories of an account in 24 hours.
  * `repository_limit` names no wait, because none helps: only a removal
- * frees a place (the Project Manager's decision of 2026-11-14 on #286).
+ * frees a place (the Project Manager's decision of 2026-11-14 on #286); it
+ * names no number either.
  */
 export const REGISTER_REPOSITORY_REFUSAL_MESSAGES: Readonly<
   Record<
@@ -220,7 +221,8 @@ export const REGISTER_REPOSITORY_REFUSAL_MESSAGES: Readonly<
   tooSoon: TOO_SOON,
   rateLimited: (wait: string) =>
     `The server asked to wait. Try again in ${wait}. An account registers at most ${String(MAX_NEW_REPOSITORIES_PER_DAY)} repositories in 24 hours.`,
-  repository_limit: `This project already has ${String(MAX_PROJECT_REPOSITORIES)} repositories, as many as it allows. Remove one first.`,
+  repository_limit:
+    "This project already has as many repositories as it allows. A repository has to be removed first.",
   not_found: "The server does not know this project for your account.",
   conflict:
     "The project is archived, so no repository can be registered in it.",
@@ -256,8 +258,8 @@ export const REMOVE_REPOSITORY_REFUSAL_MESSAGES: Readonly<
 });
 
 /**
- * Why a link was refused. `cancelled` is the person's own answer in the
- * main process's dialog, and `busy` another link's dialog that is open or
+ * Why a link was refused. `cancelled` is the main process's dialog that
+ * was cancelled or closed, and `busy` another link's dialog that is open or
  * was cancelled a moment ago (the main process waits a few seconds after a
  * cancel). Nothing changed after any of them.
  */
@@ -275,7 +277,8 @@ export const LINK_REPOSITORY_REFUSAL_MESSAGES: Readonly<
   folder_missing:
     "The folder or its Git folder could not be read. Check that it still exists.",
   busy: "A confirmation of another link is open, or one was cancelled a moment ago. Answer that dialog or wait a few seconds, then try again.",
-  cancelled: "You cancelled it in the confirmation dialog. Nothing changed.",
+  cancelled:
+    "The confirmation dialog was cancelled or closed. Nothing changed.",
   limit:
     "This device keeps no more links, and all of them are yours. Unlink a repository first.",
   unavailable:
@@ -432,19 +435,22 @@ export interface ProjectRepositoriesModel {
   /** The repositories, in the main process's order, or null when none are known. */
   readonly rows: readonly RepositoryRow[] | null;
   /**
-   * The project that the actions act on: the shown project while its
-   * repositories are `ready`; null otherwise, and then no action is offered.
+   * The project that the list's actions act on, registering, linking, and
+   * removing: the shown project while its repositories are `ready`; null
+   * otherwise, and then none of them is offered.
    */
   readonly projectId: string | null;
   /**
-   * Whether "Unlink" is offered on a linked repository: the actions are
-   * offered and this device's links are `ready`.
+   * The project whose linked repositories offer "Unlink": the shown
+   * project while this device's links are `ready`, whatever the state of
+   * its list, because the main process's unlink needs only the links; null
+   * otherwise.
    */
-  readonly linking: boolean;
+  readonly linksProjectId: string | null;
   /**
    * The mounted folders, in the mount list's order, or null while the
-   * mount list is not known. "Link to a folder" is offered while `linking`
-   * and the folders are known.
+   * mount list is not known. "Link to a folder" is offered while
+   * `projectId` and `linksProjectId` are set and the folders are known.
    */
   readonly folders: readonly FolderChoice[] | null;
 }
@@ -506,7 +512,7 @@ function statusOnly(
     linksNote: "",
     rows: null,
     projectId: null,
-    linking: false,
+    linksProjectId: null,
     folders,
   };
 }
@@ -522,10 +528,11 @@ function statusOnly(
  *   that no other project's repositories appear here;
  * - when `ready`, the repositories with their links, and the actions;
  * - when `unavailable`, the problem as a fixed text, with what was loaded
- *   before and no action. Without any of it, only the problem shows.
+ *   before and no action but "Unlink". Without any of it, only the problem
+ *   shows.
  *
- * Where a repository is linked shows only while this device's links are
- * `ready`; otherwise a note says why not.
+ * Where a repository is linked, and "Unlink", show only while this
+ * device's links are `ready`; otherwise a note says why not.
  */
 export function describeProjectRepositories(
   view: ProjectRepositoriesPanelView,
@@ -558,6 +565,7 @@ export function describeProjectRepositories(
       : state.links === "unavailable"
         ? PROJECT_REPOSITORY_MESSAGES.linksUnavailable
         : "";
+  const linksProjectId = state.links === "ready" ? projectId : null;
   if (state.status === "unavailable") {
     return {
       scope,
@@ -565,7 +573,7 @@ export function describeProjectRepositories(
       linksNote,
       rows: state.repositories.length === 0 ? null : rowsOf(state, folders),
       projectId: null,
-      linking: false,
+      linksProjectId,
       folders,
     };
   }
@@ -576,14 +584,54 @@ export function describeProjectRepositories(
     linksNote,
     rows: rowsOf(state, folders),
     projectId,
-    linking: state.links === "ready",
+    linksProjectId,
     folders,
   };
 }
 
-/** Whether "Link to a folder" is offered: links are offered and the folders are known. */
+/**
+ * Whether "Link to a folder" is offered: the list is `ready`, this
+ * device's links are `ready`, and the folders are known.
+ */
 export function linkOffered(model: ProjectRepositoriesModel): boolean {
-  return model.linking && model.folders !== null;
+  return (
+    model.projectId !== null &&
+    model.linksProjectId !== null &&
+    model.folders !== null
+  );
+}
+
+/**
+ * The actions that a repository's row offers, in their order: "Link to a
+ * folder" while it is offered (`linkOffered`), "Unlink" on a linked
+ * repository while this device's links are `ready` for the shown project,
+ * whatever the state of its list, and "Remove from the project" while the
+ * list is `ready`. Each carries the project, the repository's ID, and its
+ * name.
+ */
+export function repositoryActions(
+  model: ProjectRepositoriesModel,
+  row: RepositoryRow,
+): readonly RepositoryActionRequest[] {
+  const { projectId, linksProjectId } = model;
+  const action = (
+    kind: RepositoryActionRequest["kind"],
+    target: string,
+  ): RepositoryActionRequest => ({
+    kind,
+    projectId: target,
+    repositoryId: row.repositoryId,
+    name: row.name,
+  });
+  return [
+    ...(projectId !== null && linkOffered(model)
+      ? [action("link", projectId)]
+      : []),
+    ...(linksProjectId !== null && row.linked
+      ? [action("unlink", linksProjectId)]
+      : []),
+    ...(projectId === null ? [] : [action("remove", projectId)]),
+  ];
 }
 
 /**
@@ -608,16 +656,17 @@ export function folderChoices(
 }
 
 /**
- * The folder chosen at first when a link's question opens: the first one
- * whose name is the repository's name, else none, so that the person
- * chooses. The main process's own dialog shows the full path before
- * anything is linked.
+ * The folder chosen at first when a link's question opens: the only one
+ * among `choices` whose name is the repository's name exactly; none when no
+ * folder or more than one has that name, so that the person chooses. The
+ * main process's own dialog shows the full path before anything is linked.
  */
 export function initialFolderChoice(
   name: string,
   choices: readonly FolderChoice[],
 ): string | null {
-  return choices.find((choice) => choice.name === name)?.mountId ?? null;
+  const named = choices.filter((choice) => choice.name === name);
+  return named.length === 1 ? (named[0]?.mountId ?? null) : null;
 }
 
 /**

@@ -37,7 +37,6 @@ import {
 import { ROLE_LABELS } from "../src/renderer/people-view.ts";
 import {
   MAX_NEW_REPOSITORIES_PER_DAY,
-  MAX_PROJECT_REPOSITORIES,
   MAX_REPOSITORY_NAME_LENGTH,
   repositoryNamePrompt,
   repositoryNameToSend,
@@ -131,9 +130,8 @@ test("the creates send a project's name as the protocol normalizes it", () => {
   }
 });
 
-test("the repository panel checks a repository's name as the protocol does, up to its limit, and names the protocol's limits of repositories", () => {
+test("the repository panel checks a repository's name as the protocol does, up to its limit, and names the protocol's limit of new repositories in 24 hours", () => {
   expect(MAX_REPOSITORY_NAME_LENGTH).toBe(LIMITS.name);
-  expect(MAX_PROJECT_REPOSITORIES).toBe(REPOSITORY_COUNT_LIMITS.perProject);
   expect(MAX_NEW_REPOSITORIES_PER_DAY).toBe(REPOSITORY_COUNT_LIMITS.perDay);
   const longest = "\u{1F600}".repeat(LIMITS.name);
   for (const typed of [
