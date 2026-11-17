@@ -1086,6 +1086,18 @@ test("a dialog that never settles ends as a Cancel when the main window closes, 
   // Without an open confirmation, the window's close changes nothing.
   harness.service.cancelConfirmation();
   expect(harness.timers).toEqual([]);
+  // Closed while the folder is read, before the dialog: no dialog shows.
+  const check = deferred<void>();
+  harness.holdFolderCheck = check;
+  const asked = harness.confirmations.length;
+  const whileRead = harness.service.link(REPO_1, MOUNT_1);
+  await settle();
+  harness.service.cancelConfirmation();
+  harness.holdFolderCheck = null;
+  check.resolve();
+  await expect(whileRead).resolves.toEqual(cancelled);
+  expect(harness.confirmations).toHaveLength(asked);
+  harness.runTimers();
 
   // A sign-out.
   await startLink(REPO_2, MOUNT_2);
