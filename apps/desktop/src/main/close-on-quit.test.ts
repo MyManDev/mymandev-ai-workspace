@@ -36,6 +36,15 @@ function noting(name: string, closed: string[]): Closable {
   return { close: () => void closed.push(name) };
 }
 
+/** A closable whose `close` throws `error`. */
+function throwing(error: Error): Closable {
+  return {
+    close: () => {
+      throw error;
+    },
+  };
+}
+
 test("one will-quit listener closes every closable once, in the reverse order of adding", () => {
   const app = fakeHost();
   const errors: unknown[] = [];
@@ -67,17 +76,9 @@ test("a close that throws is reported with fixed text and the rest still close",
   const first = new Error("first");
   const second = new Error("second");
   closables.add(noting("a", closed));
-  closables.add({
-    close: () => {
-      throw first;
-    },
-  });
+  closables.add(throwing(first));
   closables.add(noting("b", closed));
-  closables.add({
-    close: () => {
-      throw second;
-    },
-  });
+  closables.add(throwing(second));
   closables.add(noting("c", closed));
 
   app.emitWillQuit();
@@ -90,6 +91,50 @@ test("a close that throws is reported with fixed text and the rest still close",
   expect(CLOSE_FAILED_MESSAGE).toBe(
     "A service of the main process failed to close at quit.",
   );
+});
+
+test("a report that throws skips no other closable", () => {
+  const app = fakeHost();
+  const reported: unknown[] = [];
+  const closables = closeOnQuit(app.host, (_message, error) => {
+    reported.push(error);
+    throw new Error("The report failed.");
+  });
+  const closed: string[] = [];
+  const first = new Error("first");
+  const second = new Error("second");
+  closables.add(noting("a", closed));
+  closables.add(throwing(first));
+  closables.add(noting("b", closed));
+  closables.add(throwing(second));
+  closables.add(noting("c", closed));
+
+  expect(() => app.emitWillQuit()).not.toThrow();
+
+  expect(closed).toEqual(["c", "b", "a"]);
+  expect(reported).toEqual([second, first]);
+});
+
+test("a closable added after the first will-quit closes at once, and only once", () => {
+  const app = fakeHost();
+  const errors: [string, unknown][] = [];
+  const closables = closeOnQuit(app.host, (message, error) =>
+    errors.push([message, error]),
+  );
+  const closed: string[] = [];
+  closables.add(noting("before", closed));
+  app.emitWillQuit();
+  expect(closed).toEqual(["before"]);
+
+  closables.add(noting("after", closed));
+  expect(closed).toEqual(["before", "after"]);
+  const late = new Error("late");
+  expect(() => closables.add(throwing(late))).not.toThrow();
+  expect(errors).toEqual([[CLOSE_FAILED_MESSAGE, late]]);
+
+  app.emitWillQuit();
+  expect(closed).toEqual(["before", "after"]);
+  expect(errors).toHaveLength(1);
 });
 
 async function settle(): Promise<void> {
@@ -205,13 +250,18 @@ function importedFrom(name: string): string {
   throw new Error(`The entry point does not import ${name}.`);
 }
 
-/** The declared return type of the exported function `name` of `source`. */
+/**
+ * The declared return type of the exported function `name` of `source`, read
+ * from its own signature: the match stops at the first `{`, which opens the
+ * body. A function without a declared return type throws, and so does one
+ * with a `{` in its parameters, which needs a reader that skips them.
+ */
 function declaredReturnType(source: string, name: string): string {
   const match = new RegExp(
-    `export function ${name}\\b[\\s\\S]*?\\n\\): ([^\\n]+) \\{\\n`,
+    `export function ${name}\\b[^{]*?\\n\\): ([^\\n]+) \\{\\n`,
   ).exec(source);
   if (match === null) {
-    throw new Error(`No declaration of ${name}.`);
+    throw new Error(`No declared return type in the signature of ${name}.`);
   }
   return match[1] ?? "";
 }
@@ -253,9 +303,14 @@ test("the entry point registers no will-quit listener of its own and adds every 
   ).toBe("(session: GuardedSession) => void");
 
   // A creation or registration whose result is not kept returns nothing to
-  // close.
+  // close. This covers every `create…(` or `register…(` call that is not a
+  // method, not kept in a `const`, and not passed on as a value right after
+  // `(`, `,` or `:`, such as an argument or a property: at the start of a
+  // statement, after `void`, or anywhere else.
   const dropped = [
-    ...ENTRY.matchAll(/(?<=[;{}]\s*)\b((?:create|register)\w*)\(/g),
+    ...ENTRY.matchAll(
+      /(?<!\bconst \w+ = |[(,:.]\s*)\b((?:create|register)\w*)\(/g,
+    ),
   ].map((match) => match[1] ?? "");
   expect(dropped).toEqual(
     expect.arrayContaining(["registerRuntimeIpc", "registerWorkspaceIpc"]),
