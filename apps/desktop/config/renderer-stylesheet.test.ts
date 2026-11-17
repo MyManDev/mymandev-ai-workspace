@@ -239,10 +239,56 @@ function mayMatchClaimRowAncestor(selector: string): boolean {
   );
 }
 
+/**
+ * The declarations that make an element scroll, clip, or be fixed or
+ * sticky: `overflow` and its axes, but not `overflow-wrap`; a fixed or
+ * sticky `position`; `contain`, whose paint containment (`paint`,
+ * `content`, `strict`) clips like `overflow: clip`, and whose other values
+ * no element around a row needs; `content-visibility`, which applies paint
+ * containment; and `clip-path` (#285).
+ */
+const CLIPPING_DECLARATIONS: readonly RegExp[] = [
+  /(^|[;{\s])overflow(-x|-y|-block|-inline)?\s*:/,
+  /position\s*:\s*(fixed|sticky)/,
+  /(^|[;{\s])contain\s*:/,
+  /(^|[;{\s])content-visibility\s*:/,
+  /(^|[;{\s])clip-path\s*:/,
+];
+
+test("the check of the elements around a claim's row finds every declaration that scrolls, clips, or is fixed or sticky, and no other", () => {
+  const found = (declaration: string) =>
+    CLIPPING_DECLARATIONS.some((pattern) =>
+      pattern.test(`\n  display: block;\n  ${declaration}\n`),
+    );
+  for (const declaration of [
+    "overflow: auto;",
+    "overflow-y: hidden;",
+    "overflow-inline: clip;",
+    "position: fixed;",
+    "position: sticky;",
+    "contain: paint;",
+    "contain: content;",
+    "contain: strict;",
+    "content-visibility: auto;",
+    "clip-path: inset(0);",
+  ]) {
+    expect(found(declaration), declaration).toBe(true);
+  }
+  for (const declaration of [
+    "overflow-wrap: anywhere;",
+    "position: relative;",
+    "contain-intrinsic-size: auto 40px;",
+    "--contain: paint;",
+    "--clip-path: inset(0);",
+  ]) {
+    expect(found(declaration), declaration).toBe(false);
+  }
+});
+
 test("no element around a recent claim's row scrolls, clips, or is fixed or sticky, so that the viewport is the visible area that counts a tall row as seen (#276)", () => {
   // isRowInView compares a row's visible part with the observer's
-  // rootBounds, the viewport; a scrolling or fixed ancestor would make the
-  // visible area smaller than that.
+  // rootBounds, the viewport; a scrolling, clipping, or fixed ancestor would
+  // make the visible area smaller than that.
   const rules = [...CSS.matchAll(/([^{}]+)\{([^{}]*)\}/g)]
     .map(([, selectors, declarations]) => ({
       selectors: (selectors ?? "")
@@ -272,11 +318,8 @@ test("no element around a recent claim's row scrolls, clips, or is fixed or stic
   expect(mayMatchClaimRowAncestor(".recent-claims .person-meta")).toBe(false);
   expect(mayMatchClaimRowAncestor("main.shell-main")).toBe(true);
   for (const { selectors, declarations } of rules) {
-    expect(declarations, selectors.join(", ")).not.toMatch(
-      /(^|[;{\s])overflow(-x|-y|-block|-inline)?\s*:/,
-    );
-    expect(declarations, selectors.join(", ")).not.toMatch(
-      /position\s*:\s*(fixed|sticky)/,
-    );
+    for (const pattern of CLIPPING_DECLARATIONS) {
+      expect(declarations, selectors.join(", ")).not.toMatch(pattern);
+    }
   }
 });
