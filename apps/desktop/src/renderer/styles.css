@@ -468,6 +468,63 @@ code {
   display: block;
 }
 
+/* The two parts of the repository panel: the project's and this device's. */
+.repository-section {
+  margin-block-end: var(--space-4);
+}
+
+.repository-section-title {
+  margin: var(--space-3) 0 var(--space-2);
+  font-size: var(--font-size-base);
+}
+
+/* The live regions of the project's repositories take no room while empty. */
+.repository-status:empty {
+  margin: 0;
+}
+
+.repository-status,
+.repository-note {
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
+.repository-register {
+  display: grid;
+  gap: var(--space-2);
+  margin-block: var(--space-3);
+}
+
+.repository-register h4 {
+  margin: 0;
+  font-size: var(--font-size-base);
+}
+
+.repository-register p {
+  margin: 0;
+}
+
+/* The folders that a repository may be linked to, one choice per line. */
+.repository-choice {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.repository-option {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+
+.repository-option-path {
+  display: block;
+  color: var(--color-text-muted);
+  font-size: var(--font-size-small);
+}
+
 /* Account */
 
 .account-panel {

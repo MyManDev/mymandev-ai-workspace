@@ -23,6 +23,7 @@ import type {
   OwnJoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
+  ProjectRepositoriesBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -114,6 +115,11 @@ export interface AppProps {
   readonly runtime?: RuntimeBridge | undefined;
   /** The mounted repositories from the preload script; undefined outside Electron. */
   readonly repositories?: RepositoryBridge | undefined;
+  /**
+   * The open project's registered repositories and their links, from the
+   * preload script; undefined outside Electron.
+   */
+  readonly projectRepositories?: ProjectRepositoriesBridge | undefined;
   /** The sign-in of this installation from the preload script; undefined outside Electron. */
   readonly account?: AccountBridge | undefined;
   /** The connection to the cloud API from the preload script; undefined outside Electron. */
@@ -170,6 +176,7 @@ export function App({
   electronVersion,
   runtime,
   repositories,
+  projectRepositories,
   account,
   connection,
   workspaces,
@@ -318,6 +325,7 @@ export function App({
           dispatch={dispatch}
           agents={agents}
           repositories={repositories}
+          projectRepositories={projectRepositories}
         />
       )}
       <SwitchQuestionDialog {...question} />

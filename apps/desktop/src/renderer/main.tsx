@@ -14,6 +14,7 @@ createRoot(container).render(
       electronVersion={window.desktop?.electronVersion}
       runtime={window.desktop?.runtime}
       repositories={window.desktop?.repositories}
+      projectRepositories={window.desktop?.projectRepositories}
       account={window.desktop?.account}
       connection={window.desktop?.connection}
       workspaces={window.desktop?.workspaces}

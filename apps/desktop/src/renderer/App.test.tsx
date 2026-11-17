@@ -17,6 +17,7 @@ import type {
   OwnJoinRequestsBridge,
   PeopleActionsBridge,
   PeopleBridge,
+  ProjectRepositoriesBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -61,6 +62,8 @@ import {
   type DeviceRemovalView,
 } from "./connection-status.ts";
 import { WorkspaceNav } from "./Navigation.tsx";
+import { ProjectPanel } from "./ProjectPanel.tsx";
+import { RepositoryPanel } from "./RepositoryPanel.tsx";
 import {
   createShellState,
   type ProjectSummary,
@@ -343,7 +346,14 @@ test("the side panel shows the agents or the repositories, chosen with tabs of w
     '<div class="panel-tabs" role="tablist" aria-label="Side panel">' +
       tab("Agents", false) +
       tab("Repositories", true) +
-      '</div><div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2><p>Repositories are not available.</p>',
+      '</div><div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2>',
+  );
+  // Without the bridges, neither part of the panel is available.
+  expect(repositories).toContain(
+    '<p class="repository-status" role="status">The project&#x27;s repositories are not available.</p></section>',
+  );
+  expect(repositories).toContain(
+    '<h3 class="repository-section-title" id="device-repositories-title">On this device</h3><p>Repositories are not available.</p>',
   );
 });
 
@@ -893,9 +903,117 @@ test("with the bridge, the repository panel waits for the first list and offers 
 
   // The repository panel is the content of the repositories tab.
   expect(html).toContain(
-    '<div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2><button type="button" class="panel-action" disabled="">Add a repository</button><p>Reading the repositories.</p>',
+    '<div class="panel-content" role="tabpanel" id="panel-content" aria-labelledby="panel-tab-repositories" tabindex="0"><h2 id="panel-title">Repositories</h2>',
+  );
+  expect(html).toContain(
+    '<h3 class="repository-section-title" id="device-repositories-title">On this device</h3><button type="button" class="panel-action" disabled="">Add a repository</button><p>Reading the repositories.</p>',
   );
   expect(html).not.toContain("Repositories are not available.");
+});
+
+test("the project panel gives the repository panel the open project and both repository bridges", () => {
+  const repositories: RepositoryBridge = {
+    list: () => Promise.resolve({ revision: 0, repositories: [] }),
+    subscribe: () => () => undefined,
+    mount: () => Promise.resolve({ outcome: "cancelled" }),
+    unmount: () => Promise.resolve(false),
+  };
+  const refuse = () => Promise.reject(new Error("not called"));
+  const projectRepositories: ProjectRepositoriesBridge = {
+    getState: refuse,
+    subscribeState: () => () => undefined,
+    register: refuse,
+    remove: refuse,
+    link: refuse,
+    unlink: refuse,
+  };
+  const tree = ProjectPanel({
+    panel: "repositories",
+    projectId: "project-b",
+    dispatch: () => undefined,
+    repositories,
+    projectRepositories,
+  });
+  // The repository panel uses hooks, so it stays an element here.
+  const found: unknown[] = [];
+  const visit = (node: ReactNode): void => {
+    if (Array.isArray(node)) {
+      node.forEach((child: ReactNode) => visit(child));
+      return;
+    }
+    if (!isValidElement<{ readonly children?: ReactNode }>(node)) {
+      return;
+    }
+    if (node.type === RepositoryPanel) {
+      found.push(node.props);
+    }
+    visit(node.props.children);
+  };
+  visit(tree);
+  expect(found).toEqual([
+    { repositories, projectRepositories, projectId: "project-b" },
+  ]);
+});
+
+// The entry point's source, to check what it passes from `window.desktop`.
+const ENTRY_SOURCES = import.meta.glob<string>("./main.tsx", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+test("the repository panel gets the project's repositories: with the bridge, it waits for the first state with the paragraph of the actions' sentence and its dialog, and nothing is read, sent, or subscribed while rendered", () => {
+  const calls: string[] = [];
+  const call = (name: string) => () => {
+    calls.push(name);
+    return Promise.reject(new Error("not called"));
+  };
+  const projectRepositories: ProjectRepositoriesBridge = {
+    getState: call("getState"),
+    subscribeState: () => {
+      calls.push("subscribeState");
+      return () => undefined;
+    },
+    register: call("register"),
+    remove: call("remove"),
+    link: call("link"),
+    unlink: call("unlink"),
+  };
+  const view = {
+    screen: "chat",
+    projectId: "project-a",
+    panel: "repositories",
+  } as const;
+  const html = render({ projectRepositories, initialView: view });
+
+  // The project's part comes first, then this device's repositories.
+  expect(html).toContain(
+    '<h2 id="panel-title">Repositories</h2><section class="repository-section" aria-labelledby="project-repositories-title">',
+  );
+  expect(html).toContain(
+    '<p class="repository-status" role="status">Checking the project&#x27;s repositories.</p><p class="repository-status" id="project-repository-message" role="status"></p>',
+  );
+  expect(html.match(/<dialog class="people-dialog"><\/dialog>/g)).toHaveLength(
+    1,
+  );
+  // The subscription runs in an effect, which a server render does not run;
+  // nothing else is called.
+  expect(calls).toEqual([]);
+  // Without the bridge, the part says so and offers nothing.
+  const without = render({ initialView: view });
+  expect(without).toContain(
+    '<p class="repository-status" role="status">The project&#x27;s repositories are not available.</p></section>',
+  );
+  expect(without).not.toContain("project-repository-message");
+  expect(without).not.toContain('<dialog class="people-dialog">');
+  // On the agents tab, nothing of it shows.
+  expect(
+    render({ projectRepositories, initialView: { ...view, panel: "agents" } }),
+  ).not.toContain("project-repositories-title");
+  // The entry point passes the preload script's bridge.
+  expect(ENTRY_SOURCES["./main.tsx"]).toContain(
+    "projectRepositories={window.desktop?.projectRepositories}",
+  );
 });
 
 test("the permission screen shows every capability of ADR 0015 read-only, grouped by scope kind", () => {

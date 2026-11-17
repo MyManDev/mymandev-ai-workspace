@@ -57,9 +57,8 @@ function render(props: Partial<RepositoryPanelContentProps> = {}): string {
 test("an empty list says so and offers to add a repository", () => {
   const html = render();
 
-  expect(html).toContain('<h2 id="panel-title">Repositories</h2>');
   expect(html).toContain(
-    '<button type="button" class="panel-action">Add a repository</button>',
+    '<h2 id="panel-title">Repositories</h2><section class="repository-section" aria-labelledby="device-repositories-title"><h3 class="repository-section-title" id="device-repositories-title">On this device</h3><button type="button" class="panel-action">Add a repository</button>',
   );
   expect(html).toContain("<p>No repositories yet.</p>");
   expect(html).toContain("nothing in their folders is changed");
@@ -70,9 +69,9 @@ test("a mounted repository shows its path, branch, upstream, changes, and remote
   const html = render({ view: { kind: "known", list: listOf(READY) } });
 
   expect(html).toContain(
-    '<ul class="repository-list" aria-labelledby="panel-title">',
+    '<ul class="repository-list" aria-labelledby="device-repositories-title">',
   );
-  expect(html).toContain('<h3 class="repository-name">project</h3>');
+  expect(html).toContain('<h4 class="repository-name">project</h4>');
   expect(html).toContain("<code>/home/user/project</code>");
   expect(html).toContain("<dt>Branch</dt><dd>main</dd>");
   expect(html).toContain(
@@ -186,6 +185,42 @@ test("without the bridge, the panel says repositories are not available and offe
 
   expect(html).toContain("<p>Repositories are not available.</p>");
   expect(html).not.toContain("Add a repository");
+});
+
+test("the open project's repositories come first, between the panel's title and this device's repositories", () => {
+  const html = render({
+    project: <p id="project-part">The project's part</p>,
+  });
+
+  expect(html).toContain(
+    '<h2 id="panel-title">Repositories</h2><p id="project-part">The project&#x27;s part</p><section class="repository-section" aria-labelledby="device-repositories-title">',
+  );
+  // Without it, the panel goes on with this device's repositories.
+  expect(render()).toContain(
+    '<h2 id="panel-title">Repositories</h2><section class="repository-section"',
+  );
+});
+
+// The panel's wiring, which needs a DOM to run.
+
+const SOURCES = import.meta.glob<string>("./RepositoryPanel.tsx", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+test("the panel follows the open project's repositories for the shown project with this device's mount list, and shows their part with its dialog above this device's repositories", () => {
+  const code = (SOURCES["./RepositoryPanel.tsx"] ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/,? \)/g, ")");
+  expect(code).toContain("const mounts = useRepositoryPanel(repositories);");
+  expect(code).toContain(
+    "const project = useProjectRepositories(projectRepositories, projectId, mounts.view);",
+  );
+  expect(code).toContain(
+    "<RepositoryPanelContent {...mounts} project={<ProjectRepositoriesPart {...project} />} />",
+  );
 });
 
 test("names, paths, branches, and URLs are rendered as text, not as markup", () => {
