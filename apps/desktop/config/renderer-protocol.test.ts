@@ -11,6 +11,8 @@ import {
   MEMBER_ROLES,
   normalizeProjectName,
   OWN_JOIN_REQUEST_DECISIONS,
+  RegisterRepositoryRequestSchema,
+  REPOSITORY_COUNT_LIMITS,
   RUN_CANCEL_REASONS,
   UUIDV7_PATTERN,
   WorkspaceIdSchema,
@@ -33,6 +35,13 @@ import {
   workspaceIdToSend,
 } from "../src/renderer/own-join-requests-view.ts";
 import { ROLE_LABELS } from "../src/renderer/people-view.ts";
+import {
+  MAX_NEW_REPOSITORIES_PER_DAY,
+  MAX_PROJECT_REPOSITORIES,
+  MAX_REPOSITORY_NAME_LENGTH,
+  repositoryNamePrompt,
+  repositoryNameToSend,
+} from "../src/renderer/project-repositories-view.ts";
 
 test("the agent panel has its own text for every cancellation code of the protocol, and for no other", () => {
   expect(Object.keys(RUN_CANCEL_MESSAGES).sort()).toEqual(
@@ -119,5 +128,30 @@ test("the creates send a project's name as the protocol normalizes it", () => {
     "\u1100\u1161",
   ]) {
     expect(nameToSend("project", typed)).toBe(normalizeProjectName(typed));
+  }
+});
+
+test("the repository panel checks a repository's name as the protocol does, up to its limit, and names the protocol's limits of repositories", () => {
+  expect(MAX_REPOSITORY_NAME_LENGTH).toBe(LIMITS.name);
+  expect(MAX_PROJECT_REPOSITORIES).toBe(REPOSITORY_COUNT_LIMITS.perProject);
+  expect(MAX_NEW_REPOSITORIES_PER_DAY).toBe(REPOSITORY_COUNT_LIMITS.perDay);
+  const longest = "\u{1F600}".repeat(LIMITS.name);
+  for (const typed of [
+    longest,
+    longest + "a",
+    "app",
+    " app ",
+    "Cafe\u0301",
+    "C:\\work\\app",
+    "/home/ada/app",
+    "team/app",
+    "a\\b",
+    "   ",
+    "",
+  ]) {
+    const name = repositoryNameToSend(typed);
+    expect(repositoryNamePrompt(name) === undefined, typed).toBe(
+      RegisterRepositoryRequestSchema.safeParse({ name }).success,
+    );
   }
 });
