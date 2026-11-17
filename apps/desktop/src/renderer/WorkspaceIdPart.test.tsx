@@ -242,7 +242,7 @@ test("the hook gives no controls without the bridge, and with it a copy goes to 
   }: {
     readonly bridge: Pick<WorkspaceBridge, "copyId"> | undefined;
   }) {
-    given = useWorkspaceIdCopy(bridge);
+    given = useWorkspaceIdCopy(bridge, WORKSPACE);
     return null;
   }
 
@@ -269,6 +269,11 @@ const PART_SOURCES = import.meta.glob<string>(
   ["./WorkspaceIdPart.tsx", "./workspace-id-view.ts"],
   { query: "?raw", import: "default", eager: true },
 );
+const SCREEN_SOURCES = import.meta.glob<string>(["./PeopleScreen.tsx"], {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
 const RENDERER_SOURCES = import.meta.glob<string>(
   ["./**/*.{ts,tsx}", "!./**/*.test.*"],
   { query: "?raw", import: "default", eager: true },
@@ -337,4 +342,19 @@ test("no renderer module uses the clipboard itself: the session denies its permi
     expect(/clipboard/i.test(code), file).toBe(false);
     expect(/\bexecCommand\b/.test(code), file).toBe(false);
   }
+});
+
+test("the hook tells the controller every ID that the people screen shows, so that a change forgets the last copy", () => {
+  // Effects do not run in a server render, so the wiring is read from the
+  // sources; the controller's own tests show the forgetting.
+  const hook = withoutComments(PART_SOURCES["./WorkspaceIdPart.tsx"] ?? "");
+  expect(hook).toMatch(
+    /useEffect\(\(\) => controller\?\.shown\(workspaceId\), \[controller, workspaceId\]\);/,
+  );
+  const screen = withoutComments(SCREEN_SOURCES["./PeopleScreen.tsx"] ?? "");
+  expect(screen).toMatch(
+    /useWorkspaceIdCopy\(\s*workspaces,\s*describeWorkspaceId\(view\),?\s*\)/,
+  );
+  // The part shows the same ID that the screen passes to the hook.
+  expect(hook).toMatch(/const workspaceId = describeWorkspaceId\(view\);/);
 });

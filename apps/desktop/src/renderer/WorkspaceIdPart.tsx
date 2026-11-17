@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
 import type { PeopleScreenView } from "./people-view.ts";
 import {
@@ -78,10 +78,14 @@ export function WorkspaceIdPart({
 /**
  * The copy of the workspace ID through the bridge, while the people screen
  * is shown; undefined without the bridge, so that the screen shows no part
- * of it. The logic is in `createWorkspaceIdCopy`.
+ * of it. `workspaceId` is the ID that the screen shows
+ * (`describeWorkspaceId`), or null: as soon as it changes, the controller
+ * forgets the last copy, so that its sentence does not come back when the
+ * same ID shows again. The logic is in `createWorkspaceIdCopy`.
  */
 export function useWorkspaceIdCopy(
   bridge: Pick<WorkspaceBridge, "copyId"> | undefined,
+  workspaceId: string | null,
 ): WorkspaceIdCopyControls | undefined {
   const [view, setView] = useState(IDLE_WORKSPACE_ID_COPY);
   const controller = useMemo(
@@ -89,6 +93,7 @@ export function useWorkspaceIdCopy(
       bridge === undefined ? undefined : createWorkspaceIdCopy(bridge, setView),
     [bridge],
   );
+  useEffect(() => controller?.shown(workspaceId), [controller, workspaceId]);
   const onCopy = useCallback(
     (workspaceId: string) => {
       void controller?.copy(workspaceId);

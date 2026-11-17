@@ -44,7 +44,8 @@ export interface WorkspaceIdCopyView {
   /**
    * How the last copy ended, with the ID that it copied, so that its
    * sentence shows only while the screen shows that ID; undefined before
-   * the first copy and while one runs.
+   * the first copy, while one runs, and once the screen showed another ID
+   * or none.
    */
   readonly last:
     { readonly workspaceId: string; readonly copied: boolean } | undefined;
@@ -55,15 +56,11 @@ export const IDLE_WORKSPACE_ID_COPY: WorkspaceIdCopyView = Object.freeze({
   last: undefined,
 });
 
-const RUNNING: WorkspaceIdCopyView = Object.freeze({
-  running: true,
-  last: undefined,
-});
-
 /**
  * The sentence of the last copy for the ID that the screen shows, or ""
  * when there is nothing to say: also after a switch to a workspace whose ID
- * was not copied, so that the sentence never speaks of another ID.
+ * was not copied, before the controller forgot the last copy, so that the
+ * sentence never speaks of another ID.
  */
 export function describeWorkspaceIdCopy(
   view: WorkspaceIdCopyView,
@@ -81,9 +78,17 @@ export function describeWorkspaceIdCopy(
 export interface WorkspaceIdCopy {
   /**
    * Asks the main process to copy `workspaceId`, unless a copy runs.
-   * Resolves once the view shows how it ended.
+   * Resolves once the view shows how it ended; it never rejects.
    */
   readonly copy: (workspaceId: string) => Promise<void>;
+  /**
+   * Tells which ID the screen shows (`describeWorkspaceId`), or null. As
+   * soon as it changes, also to null, the last copy is forgotten, so that
+   * its sentence ends and does not come back, nor is announced again, when
+   * the same ID shows again: after a switch to another workspace and back,
+   * while the people are not ready, or after a sign-out and a sign-in.
+   */
+  readonly shown: (workspaceId: string | null) => void;
 }
 
 /**
@@ -92,37 +97,49 @@ export interface WorkspaceIdCopy {
  * its clipboard permissions. One copy runs at a time. Its start empties the
  * sentence, so that a screen reader announces the next one even when it is
  * the same; its end reports `copied` for `ok` only, and not copied for a
- * refusal, a failure, and a call that rejects. `onView` gets every view.
+ * refusal, a failure, a call that rejects, and an answer that is not a
+ * result, so that a copy always ends. `onView` gets every view.
  */
 export function createWorkspaceIdCopy(
   bridge: Pick<WorkspaceBridge, "copyId">,
   onView: (view: WorkspaceIdCopyView) => void,
 ): WorkspaceIdCopy {
   let running = false;
+  let last: WorkspaceIdCopyView["last"] = undefined;
+  // Undefined until the screen first tells which ID it shows.
+  let shownId: string | null | undefined;
+  const show = () => onView(Object.freeze({ running, last }));
   return Object.freeze({
     copy: (workspaceId: string) => {
       if (running) {
         return Promise.resolve();
       }
       running = true;
-      onView(RUNNING);
-      // A bridge that throws at once counts as a call that rejects.
+      last = undefined;
+      show();
+      // A bridge that throws at once counts as a call that rejects, and an
+      // answer without an outcome as not copied: the catch also takes an
+      // error of the check, so that the copy always ends.
       return new Promise<CopyWorkspaceIdResult>((resolve) => {
         resolve(bridge.copyId(workspaceId));
       })
-        .then(
-          (result) => result.outcome === "ok",
-          () => false,
-        )
+        .then((result) => result.outcome === "ok")
+        .catch(() => false)
         .then((copied) => {
           running = false;
-          onView(
-            Object.freeze({
-              running: false,
-              last: Object.freeze({ workspaceId, copied }),
-            }),
-          );
+          last = Object.freeze({ workspaceId, copied });
+          show();
         });
+    },
+    shown: (workspaceId: string | null) => {
+      if (workspaceId === shownId) {
+        return;
+      }
+      shownId = workspaceId;
+      if (last !== undefined) {
+        last = undefined;
+        show();
+      }
     },
   });
 }

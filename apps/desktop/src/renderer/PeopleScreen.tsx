@@ -67,6 +67,7 @@ import {
   WorkspaceIdPart,
   type WorkspaceIdCopyControls,
 } from "./WorkspaceIdPart.tsx";
+import { describeWorkspaceId } from "./workspace-id-view.ts";
 import {
   describeMorePeople,
   describePeopleScreen,
@@ -118,7 +119,10 @@ export function PeopleScreen({
   readonly joinRequestActions?: JoinRequestActionsBridge | undefined;
 }) {
   const view = usePeopleScreen(people);
-  const workspaceIdCopy = useWorkspaceIdCopy(workspaces);
+  const workspaceIdCopy = useWorkspaceIdCopy(
+    workspaces,
+    describeWorkspaceId(view),
+  );
   const invitationsView = useInvitationsScreen(invitations);
   const joinRequestsView = useJoinRequestsScreen(joinRequests);
   const peopleNow = usePeopleClock(view);

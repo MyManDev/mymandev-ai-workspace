@@ -217,3 +217,101 @@ test("one copy runs at a time: a click while one runs calls nothing, and the nex
     last: { workspaceId: OTHER_WORKSPACE, copied: true },
   });
 });
+
+test("an answer that is not a result reports not copied and ends the copy, so that the next one goes through", async () => {
+  for (const answer of [undefined, null]) {
+    const fake = fakeBridge();
+    const views: WorkspaceIdCopyView[] = [];
+    const copy = createWorkspaceIdCopy(fake.bridge, (view) => views.push(view));
+
+    const first = copy.copy(WORKSPACE);
+    fake.answers[0]?.resolve(answer as unknown as CopyWorkspaceIdResult);
+    await expect(first).resolves.toBeUndefined();
+    expect(views.at(-1), String(answer)).toEqual({
+      running: false,
+      last: { workspaceId: WORKSPACE, copied: false },
+    });
+
+    const second = copy.copy(WORKSPACE);
+    expect(fake.calls, String(answer)).toEqual([[WORKSPACE], [WORKSPACE]]);
+    fake.answers[1]?.resolve({ outcome: "ok" });
+    await second;
+    expect(views.at(-1), String(answer)).toEqual({
+      running: false,
+      last: { workspaceId: WORKSPACE, copied: true },
+    });
+  }
+});
+
+/** A copy of `workspaceId` that the bridge answers with `ok`. */
+async function copyOk(
+  copy: ReturnType<typeof createWorkspaceIdCopy>,
+  fake: ReturnType<typeof fakeBridge>,
+  workspaceId: string,
+): Promise<void> {
+  const done = copy.copy(workspaceId);
+  fake.answers.at(-1)?.resolve({ outcome: "ok" });
+  await done;
+}
+
+test("the last copy is forgotten as soon as the shown ID changes, also to none, so that its sentence does not come back when the same ID shows again", async () => {
+  // A switch to another workspace and back (A, B, A), and the people that
+  // are not ready for a while, or a sign-out and a sign-in (A, none, A).
+  for (const between of [OTHER_WORKSPACE, null]) {
+    const fake = fakeBridge();
+    const views: WorkspaceIdCopyView[] = [];
+    const copy = createWorkspaceIdCopy(fake.bridge, (view) => views.push(view));
+    const sentence = (workspaceId: string | null) =>
+      describeWorkspaceIdCopy(
+        views.at(-1) ?? IDLE_WORKSPACE_ID_COPY,
+        workspaceId,
+      );
+
+    copy.shown(WORKSPACE);
+    await copyOk(copy, fake, WORKSPACE);
+    expect(sentence(WORKSPACE), String(between)).toBe(
+      WORKSPACE_ID_MESSAGES.copied,
+    );
+    // The same ID again keeps the sentence and sends no view.
+    const count = views.length;
+    copy.shown(WORKSPACE);
+    expect(views, String(between)).toHaveLength(count);
+
+    copy.shown(between);
+    expect(views.at(-1), String(between)).toEqual(IDLE_WORKSPACE_ID_COPY);
+    copy.shown(WORKSPACE);
+    expect(sentence(WORKSPACE), String(between)).toBe("");
+    expect(views.at(-1), String(between)).toEqual(IDLE_WORKSPACE_ID_COPY);
+  }
+});
+
+test("a change of the shown ID while a copy runs keeps the copy running, and its end reports it for the ID that it copied", async () => {
+  const fake = fakeBridge();
+  const views: WorkspaceIdCopyView[] = [];
+  const copy = createWorkspaceIdCopy(fake.bridge, (view) => views.push(view));
+
+  copy.shown(WORKSPACE);
+  await copyOk(copy, fake, WORKSPACE);
+  const done = copy.copy(WORKSPACE);
+  copy.shown(OTHER_WORKSPACE);
+  // Nothing to forget while the copy runs: the start already did.
+  expect(views.at(-1)).toEqual({ running: true, last: undefined });
+  await copy.copy(OTHER_WORKSPACE);
+  expect(fake.calls).toEqual([[WORKSPACE], [WORKSPACE]]);
+  fake.answers[1]?.resolve({ outcome: "ok" });
+  await done;
+  expect(views.at(-1)).toEqual({
+    running: false,
+    last: { workspaceId: WORKSPACE, copied: true },
+  });
+  expect(
+    describeWorkspaceIdCopy(
+      views.at(-1) ?? IDLE_WORKSPACE_ID_COPY,
+      OTHER_WORKSPACE,
+    ),
+  ).toBe("");
+  // Back to the ID that it copied: a change of the shown ID like any other,
+  // so the sentence, which never showed, does not show now either.
+  copy.shown(WORKSPACE);
+  expect(views.at(-1)).toEqual(IDLE_WORKSPACE_ID_COPY);
+});
