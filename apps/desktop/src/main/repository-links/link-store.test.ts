@@ -151,10 +151,15 @@ test("a file that is not exactly this format is corrupt", () => {
   expect(decodeRepositoryLinks(Buffer.from([0xff, 0xfe, 0x7b]))).toEqual({
     kind: "corrupt",
   });
-  // More than 8 MiB is not read at all.
-  expect(
-    decodeRepositoryLinks(new Uint8Array(8 * 1024 * 1024 + 1).fill(0x20)),
-  ).toEqual({ kind: "corrupt" });
+  // More than 8 MiB is not read at all, also when it would parse.
+  const padded = Buffer.from(
+    `{"version":1,"links":[]}${" ".repeat(8 * 1024 * 1024)}`,
+  );
+  expect(JSON.parse(padded.toString("utf8"))).toEqual({
+    version: 1,
+    links: [],
+  });
+  expect(decodeRepositoryLinks(padded)).toEqual({ kind: "corrupt" });
 });
 
 test("a Windows folder is absolute where the store checks with Windows rules", () => {

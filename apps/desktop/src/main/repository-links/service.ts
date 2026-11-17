@@ -444,6 +444,8 @@ export function createProjectRepositoryService(
    * service's own person in its workspace.
    */
   function ownLink(link: RepositoryLink): boolean {
+    // Every entry point checks the device first; this keeps a later caller
+    // closed as well.
     if (device === null) {
       return false;
     }
@@ -563,6 +565,8 @@ export function createProjectRepositoryService(
       links.map((held) => held.link),
   ): Promise<boolean> {
     const next = writes.then(async () => {
+      // No caller writes before the links are ready; this keeps a later one
+      // from writing over a file that was not read.
       if (linkState !== "ready") {
         return false;
       }

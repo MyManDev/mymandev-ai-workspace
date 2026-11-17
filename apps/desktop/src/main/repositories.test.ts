@@ -389,6 +389,7 @@ test("where paths ignore case, mountOf finds a mount in another case", async () 
   const mountId = result.outcome === "mounted" ? result.mountId : "";
 
   expect(service.mountOf("c:\\users\\user\\project")).toBe(mountId);
+  expect(service.mountOf("C:\\USERS\\User\\PROJECT")).toBe(mountId);
   expect(service.folderOf(mountId)).toBe("C:\\Users\\user\\Project");
 });
 
