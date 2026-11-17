@@ -760,8 +760,17 @@ test("the rows' ref callbacks observe each row with the observer from the factor
     disconnect() {}
   }
   vi.stubGlobal("IntersectionObserver", PageObserver);
+  // The page's observer also follows the window's resize (#285).
+  vi.stubGlobal("window", {
+    addEventListener: (type: string) => observed.push(`window ${type}`),
+    removeEventListener: () => undefined,
+  });
   renderToString(<Probe withFactory={false} />);
-  expect(observed).toEqual(["factory observe", "page observe true"]);
+  expect(observed).toEqual([
+    "factory observe",
+    "window resize",
+    "page observe true",
+  ]);
 });
 
 // The wiring that runs only in effects and the commit, which the Node-only

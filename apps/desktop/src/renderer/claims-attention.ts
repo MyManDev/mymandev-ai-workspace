@@ -211,12 +211,16 @@ export interface RowEntry {
  * does not apply; the first rule still does.
  *
  * A row with no area, of no width or no height, is never in view, whatever
- * the entry says (the Project Manager's decision of 2026-11-17 on #285).
- * `IntersectionObserver` gives such a row the share 1 whenever it intersects
- * the visible area, even when none of it shows, as at an extreme page zoom
- * on a small window, when the main column loses its width. When in doubt, a
- * claim stays new; zooming out or enlarging the window gives the row its
- * area back.
+ * share and intersection its entry gives (the Project Manager's decision of
+ * 2026-11-17 on #285). `IntersectionObserver` gives such a row the share 1
+ * whenever it intersects the visible area, even when none of it shows, as
+ * at an extreme page zoom on a small window, when the main column loses its
+ * width. When in doubt, a claim stays new. The observer sends no new entry
+ * for a row whose share stays 1 while it loses its area, so
+ * `followRowsInView` observes every row again on each resize of the window,
+ * which a change of the page zoom also fires: the row then gets a new entry,
+ * both when it loses its area and when zooming out or enlarging the window
+ * gives it back.
  *
  * The rule assumes that the document itself scrolls: with the page's
  * observer (`pageRowObserver`), `rootBounds` is the viewport, while
@@ -252,13 +256,24 @@ export interface RowObserver {
   readonly disconnect: () => void;
 }
 
+/** What the factory of the rows' observer gets besides its callback. */
+export interface RowObserverOptions {
+  /** The observer's thresholds. */
+  readonly threshold: readonly number[];
+  /**
+   * To call on every resize of the window, which a change of the page zoom
+   * also fires, until the observer disconnects.
+   */
+  readonly onResize: () => void;
+}
+
 /**
- * Makes the observer of the rows with its callback and its thresholds, or
+ * Makes the observer of the rows with its callback and its options, or
  * returns undefined when the page has none, so that no row is ever in view.
  */
 export type RowObserverFactory = (
   callback: (entries: readonly RowEntry[]) => void,
-  options: { readonly threshold: readonly number[] },
+  options: RowObserverOptions,
 ) => RowObserver | undefined;
 
 /**
@@ -266,14 +281,27 @@ export type RowObserverFactory = (
  * clips by every scrolling ancestor; undefined without one. Its entries'
  * `rootBounds` are the viewport, so `isRowInView` takes the visible area as
  * the viewport, which holds while the document itself scrolls and no
- * ancestor of the rows scrolls or is fixed.
+ * ancestor of the rows scrolls or is fixed. It calls `onResize` on every
+ * `resize` event of the window, and stops when it disconnects.
  */
-export const pageRowObserver: RowObserverFactory = (callback, options) =>
-  typeof IntersectionObserver === "undefined"
-    ? undefined
-    : new IntersectionObserver((entries) => callback(entries), {
-        threshold: [...options.threshold],
-      });
+export const pageRowObserver: RowObserverFactory = (callback, options) => {
+  if (typeof IntersectionObserver === "undefined") {
+    return undefined;
+  }
+  const observer = new IntersectionObserver((entries) => callback(entries), {
+    threshold: [...options.threshold],
+  });
+  const resize = () => options.onResize();
+  window.addEventListener("resize", resize);
+  return {
+    observe: (target) => observer.observe(target),
+    unobserve: (target) => observer.unobserve(target),
+    disconnect: () => {
+      window.removeEventListener("resize", resize);
+      observer.disconnect();
+    },
+  };
+};
 
 /** The rows that `followRowsInView` follows. */
 export interface RowsInView {
@@ -298,6 +326,13 @@ export interface RowsInView {
  * The observer is made at the first row, so nothing observes before a row
  * is on the page; a row that leaves the page leaves the view at once.
  * Without an observer, no row is ever in view.
+ *
+ * On every resize of the window, as the factory reports it, every row is
+ * observed again, so that the observer sends a new entry for each: it
+ * sends one for every row it starts to observe, but otherwise only when a
+ * row's share crosses a threshold or the row starts or stops intersecting,
+ * and a row wholly in view keeps the share 1 when it loses its area. Until
+ * the new entry, a row keeps its place in or out of view.
  */
 export function followRowsInView(
   create: RowObserverFactory,
@@ -345,6 +380,13 @@ export function followRowsInView(
     }
   }
 
+  function observeAgain(): void {
+    for (const element of elements.values()) {
+      observer?.unobserve(element);
+      observer?.observe(element);
+    }
+  }
+
   function attach(memberId: string, element: Element | null): void {
     release(memberId);
     if (element === null) {
@@ -355,7 +397,10 @@ export function followRowsInView(
     }
     if (!made) {
       made = true;
-      observer = create(observed, { threshold: ROW_THRESHOLDS });
+      observer = create(observed, {
+        threshold: ROW_THRESHOLDS,
+        onResize: observeAgain,
+      });
     }
     if (observer === undefined) {
       return;

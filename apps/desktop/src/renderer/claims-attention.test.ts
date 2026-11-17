@@ -158,32 +158,67 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test("the page's observer is an IntersectionObserver with the rows' thresholds that passes its entries on, and there is none without one", () => {
-  const made: { callback: (entries: unknown[]) => void; options: unknown }[] =
-    [];
+test("the page's observer is an IntersectionObserver with the rows' thresholds that passes its entries on and calls onResize on each resize of the window until it disconnects, and there is none without one", () => {
+  const made: {
+    callback: (entries: unknown[]) => void;
+    options: unknown;
+    calls: string[];
+  }[] = [];
   class PageObserver {
+    readonly calls: string[] = [];
     constructor(callback: (entries: unknown[]) => void, options: unknown) {
-      made.push({ callback, options });
+      made.push({ callback, options, calls: this.calls });
     }
-    observe() {}
-    unobserve() {}
-    disconnect() {}
+    observe(element: Element) {
+      this.calls.push(`observe ${String(element)}`);
+    }
+    unobserve(element: Element) {
+      this.calls.push(`unobserve ${String(element)}`);
+    }
+    disconnect() {
+      this.calls.push("disconnect");
+    }
   }
+  const win = target();
   vi.stubGlobal("IntersectionObserver", PageObserver);
+  vi.stubGlobal("window", win);
   const received: (readonly RowEntry[])[] = [];
+  let resized = 0;
   const observer = pageRowObserver((entries) => received.push(entries), {
     threshold: ROW_THRESHOLDS,
+    onResize: () => {
+      resized += 1;
+    },
   });
-  expect(observer).toBeInstanceOf(PageObserver);
   expect(made).toHaveLength(1);
   expect(made[0]?.options).toEqual({ threshold: [...ROW_THRESHOLDS] });
   const entries = [entry(row("ada"), 1)];
   made[0]?.callback(entries);
   expect(received).toEqual([entries]);
+  observer?.observe(row("ada"));
+  observer?.unobserve(row("ada"));
+  // A resize of the window, which a change of the page zoom also fires.
+  expect(win.listeners.get("resize")?.size).toBe(1);
+  win.fire("resize");
+  win.fire("resize");
+  expect(resized).toBe(2);
+  observer?.disconnect();
+  expect(made[0]?.calls).toEqual([
+    "observe ada",
+    "unobserve ada",
+    "disconnect",
+  ]);
+  expect(win.count()).toBe(0);
+  win.fire("resize");
+  expect(resized).toBe(2);
   vi.stubGlobal("IntersectionObserver", undefined);
   expect(
-    pageRowObserver(() => undefined, { threshold: ROW_THRESHOLDS }),
+    pageRowObserver(() => undefined, {
+      threshold: ROW_THRESHOLDS,
+      onResize: () => undefined,
+    }),
   ).toBeUndefined();
+  expect(win.count()).toBe(0);
 });
 
 /** A fake observer factory that records what it was asked to do. */
@@ -191,11 +226,18 @@ function observers() {
   const made: {
     readonly callback: (entries: readonly RowEntry[]) => void;
     readonly threshold: readonly number[];
+    /** What the window's resize, as the page's observer follows it, calls. */
+    readonly onResize: () => void;
     readonly calls: string[];
   }[] = [];
   const create: RowObserverFactory = (callback, options) => {
     const calls: string[] = [];
-    made.push({ callback, threshold: options.threshold, calls });
+    made.push({
+      callback,
+      threshold: options.threshold,
+      onResize: options.onResize,
+      calls,
+    });
     const observer: RowObserver = {
       observe: (element) => calls.push(`observe ${String(element)}`),
       unobserve: (element) => calls.push(`unobserve ${String(element)}`),
@@ -555,6 +597,11 @@ test("a row of no area, of no width, no height, or neither, is never in view, th
   expect(
     isRowInView({ ...flatEntry(ada, 0, 40, 40), isIntersecting: false }),
   ).toBe(false);
+  // A size that is not a number, or a negative one, is no area either.
+  expect(isRowInView(flatEntry(ada, Number.NaN, 40, 40))).toBe(false);
+  expect(isRowInView(flatEntry(ada, 500, Number.NaN, 40))).toBe(false);
+  expect(isRowInView(flatEntry(ada, -1, 40, 40))).toBe(false);
+  expect(isRowInView(flatEntry(ada, -500, -40, -40))).toBe(false);
   // A row with any area keeps both rules: a normal row, a row taller than
   // the visible area that fills it (#279), and a row a fraction of a pixel
   // wide.
@@ -565,7 +612,7 @@ test("a row of no area, of no width, no height, or neither, is never in view, th
   expect(isRowInView(flatEntry(ada, 500, 0.25, 0.25))).toBe(true);
 });
 
-test("the rows' observer takes a row out of view once it loses its area, and back once it has it again", () => {
+test("on each resize of the window every row is observed again, so that a row wholly in view that loses its area gets a new entry and leaves the view, and comes back once it has its area again", () => {
   const { made, create } = observers();
   const views: string[][] = [];
   const rows = followRowsInView(create, (ids) => views.push([...ids].sort()));
@@ -573,13 +620,39 @@ test("the rows' observer takes a row out of view once it loses its area, and bac
   const linus = row("linus");
   rows.refFor(ADA)(ada);
   rows.refFor(LINUS)(linus);
-  const report = made[0]!.callback;
-  report([entry(ada, 1), flatEntry(linus, 0, 40, 40)]);
-  expect(views).toEqual([[ADA]]);
-  report([flatEntry(ada, 0, 40, 40), flatEntry(linus, 500, 0, 0)]);
-  expect(views).toEqual([[ADA], []]);
-  report([tallEntry(ada, 1200, 600), entry(linus, 1)]);
-  expect(views).toEqual([[ADA], [], [ADA, LINUS].sort()]);
+  const { callback: report, onResize, calls } = made[0]!;
+  // The first entries: both rows wholly in view.
+  report([entry(ada, 1), entry(linus, 1)]);
+  expect(views).toEqual([[ADA, LINUS].sort()]);
+  // A zoom takes the rows' width while they keep intersecting: their share
+  // stays 1, so the observer itself sends nothing. The window's resize has
+  // every row observed again, which brings a first entry for each.
+  calls.length = 0;
+  onResize();
+  expect(calls).toEqual([
+    "unobserve ada",
+    "observe ada",
+    "unobserve linus",
+    "observe linus",
+  ]);
+  expect(views).toHaveLength(1);
+  report([flatEntry(ada, 0, 40, 40), flatEntry(linus, 0, 40, 40)]);
+  expect(views).toEqual([[ADA, LINUS].sort(), []]);
+  // Zooming out gives the rows their width back: another resize, and a
+  // first entry for each again.
+  onResize();
+  report([entry(ada, 1), entry(linus, 0.5)]);
+  expect(views).toEqual([[ADA, LINUS].sort(), [], [ADA]]);
+  // A row that left the page is not observed again, and after the stop
+  // nothing is.
+  rows.refFor(LINUS)(null);
+  calls.length = 0;
+  onResize();
+  expect(calls).toEqual(["unobserve ada", "observe ada"]);
+  rows.stop();
+  calls.length = 0;
+  onResize();
+  expect(calls).toEqual([]);
 });
 
 test("the rows' observer follows a tall row into and out of view as it fills the visible area", () => {
