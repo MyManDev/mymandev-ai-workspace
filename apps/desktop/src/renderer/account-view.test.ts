@@ -121,14 +121,14 @@ test("a start refused during the grace period of an uncertain sign-in has a note
   const status = refused("2026-11-06T10:09:30.000Z");
   expect(signInRetryAt(status)).toBe(Date.parse("2026-11-06T10:09:30.000Z"));
   expect(signInRetryNote(status, now, utc)).toBe(
-    "A new sign-in can start after 10:10. Try again then.",
+    "A new sign-in can start after 10:10.",
   );
   // A time on the minute is shown as it is.
   expect(signInRetryNote(refused("2026-11-06T10:10:00.000Z"), now, utc)).toBe(
-    "A new sign-in can start after 10:10. Try again then.",
+    "A new sign-in can start after 10:10.",
   );
   expect(signInRetryNote(refused("2026-11-06T10:10:00.001Z"), now, utc)).toBe(
-    "A new sign-in can start after 10:11. Try again then.",
+    "A new sign-in can start after 10:11.",
   );
 
   // Until the time has come.
@@ -189,7 +189,7 @@ test("during the wait after a first refusal of both keys, the note names its end
     Date.parse("2026-11-06T10:09:30.000Z"),
   );
   expect(signInRetryNote(waiting, now, utc)).toBe(
-    "A new sign-in can start after 10:10. Try again then.",
+    "A new sign-in can start after 10:10.",
   );
   expect(
     signInRetryNote(waiting, Date.parse("2026-11-06T10:09:30.000Z"), utc),
@@ -285,6 +285,40 @@ test("while the note names a time, the sentence of a refused key asks for no sig
   }
 });
 
+test("the status's end of the wait counts only while the panel offers a sign-in, and the time of a refused start counts as before (#303)", () => {
+  const utc = signInTimeFormat({ locale: "en-GB", timeZone: "UTC" });
+  const now = Date.parse("2026-11-06T10:00:00.000Z");
+  // After a restart during the wait, the device can be signed in until its
+  // first round: the panel offers no sign-in, so no note names a time.
+  const signedIn: AccountStatus = {
+    ...waitingForSecondRound("2026-11-06T10:09:30.000Z"),
+    device: "signed_in",
+  };
+  expect(offersSignIn(signedIn)).toBe(false);
+  expect(signInRetryAt(signedIn)).toBeUndefined();
+  expect(signInRetryNote(signedIn, now, utc)).toBeUndefined();
+  for (const device of DEVICE_STATES) {
+    const status = { ...signedIn, device };
+    expect(signInRetryAt(status) !== undefined, device).toBe(
+      offersSignIn(status),
+    );
+  }
+
+  // A refused start's time counts whether the panel offers a sign-in or
+  // not, as for the grace period (#199).
+  const refused: AccountStatus = {
+    ...signedIn,
+    lastOutcome: {
+      code: "replacement_pending",
+      retryAfter: "2026-11-06T10:05:00.000Z",
+    },
+  };
+  expect(signInRetryAt(refused)).toBe(Date.parse("2026-11-06T10:05:00.000Z"));
+  expect(signInRetryNote(refused, now, utc)).toBe(
+    "A new sign-in can start after 10:05.",
+  );
+});
+
 test("a start refused with a time says that it cannot start until then, and that it can once the note shows no time any more (#303)", () => {
   const now = Date.parse("2026-11-06T10:00:00.000Z");
   const at = Date.parse("2026-11-06T10:09:30.000Z");
@@ -311,10 +345,20 @@ test("a start refused with a time says that it cannot start until then, and that
   expect(
     describeLastOutcome(later, Date.parse("2026-11-06T10:12:00.000Z")),
   ).toEqual(ended);
-  // Once the replacement was resolved, also before that time.
-  expect(
-    describeLastOutcome({ ...refused, replacementPending: false }, now),
-  ).toEqual(ended);
+  // Once the replacement was resolved, for example when a key authenticated
+  // and the device is signed in again, the refusal no longer holds and is
+  // not shown, before that time and after it.
+  for (const time of [now, at + 60_000]) {
+    expect(
+      describeLastOutcome(
+        { ...refused, device: "signed_in", replacementPending: false },
+        time,
+      ),
+    ).toBeUndefined();
+    expect(
+      describeLastOutcome({ ...later, replacementPending: false }, time),
+    ).toBeUndefined();
+  }
 
   // Without a time the refusal stays, and every other outcome reads as
   // `describeOutcome` says.
@@ -497,7 +541,7 @@ test("the panel's clock is read again whenever the time of the note changes, so 
   const again = signInRetryReading(ended, second, clock);
   expect(again).toEqual({ retryAt: second, now: clock.time });
   expect(signInRetryNote(refused(second), again.now, utc)).toBe(
-    "A new sign-in can start after 08:19. Try again then.",
+    "A new sign-in can start after 08:19.",
   );
 
   // Also when the time goes away, for example while a sign-in starts, and

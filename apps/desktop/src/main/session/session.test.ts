@@ -3428,6 +3428,47 @@ describe("note times", () => {
     });
   });
 
+  test("when the grace period ends later than the wait, a wall clock that jumps forward moves the end with it, because the grace period too ends only by both clocks (#303)", async () => {
+    const h = harness();
+    const { previous, current } = await pendingReplacement(h);
+    const start = wall.now;
+    // The grace period began 5 minutes after the first refusal.
+    await writeNotes({
+      uncertainSignIn: {
+        publicKey: current,
+        at: new Date(start).toISOString(),
+      },
+      keysRefused: {
+        publicKeys: [current, previous],
+        at: new Date(start - LOST_KEY_WAIT_MS / 2).toISOString(),
+      },
+    });
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    const restarted = await restart(h);
+    expect(await restarted.session.lostKeyWaitEnd()).toBe(
+      new Date(start + REPLACEMENT_GRACE_MS).toISOString(),
+    );
+
+    // The wall clock jumps a minute forward; the monotonic clock does not.
+    wall.now += 60_000;
+    const end = new Date(start + REPLACEMENT_GRACE_MS + 60_000).toISOString();
+    expect(await restarted.session.lostKeyWaitEnd()).toBe(end);
+
+    // A round a millisecond before that end deletes nothing, and the end
+    // stays; at the end no end is named, and the next round that refuses
+    // both keys deletes them.
+    advance(REPLACEMENT_GRACE_MS - 1);
+    expect(await restarted.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(heldKeys(restarted)).toEqual({ current, previous });
+    expect(await restarted.session.lostKeyWaitEnd()).toBe(end);
+    advance(1);
+    expect(await restarted.session.lostKeyWaitEnd()).toBeNull();
+    expect(await restarted.session.authenticate()).toEqual({
+      ok: false,
+      reason: "key_lost",
+    });
+  });
+
   test("a first refusal that the computer slept through for days is too old, also while the application runs", async () => {
     const h = harness();
     const { previous, current } = await pendingReplacement(h);

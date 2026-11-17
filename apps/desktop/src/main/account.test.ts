@@ -2528,6 +2528,115 @@ test("a read of the end of the wait that a later one overtook changes nothing (#
   expect(h.service.status().lostKeyWaitEnd).toBe("2026-11-06T10:20:00.000Z");
 });
 
+test("a read of the end of the wait that was on its way when the device was revoked or the account forgotten on this device changes nothing (#303)", async () => {
+  const WAIT_END = "2026-11-06T10:10:00.000Z";
+  /** A harness whose read of the end, started by a refusal of both keys, is held. */
+  async function heldRead() {
+    const h = harness();
+    await h.service.initialize();
+    await settle();
+    const answers: ((end: string | null) => void)[] = [];
+    h.lostKeyEnd = () =>
+      new Promise((resolve) => {
+        answers.push(resolve);
+      });
+    h.emit({ kind: "auth_failed", account: SESSION_ACCOUNT });
+    await settle();
+    expect(answers).toHaveLength(1);
+    return { h, answers };
+  }
+
+  const revoked = await heldRead();
+  revoked.h.record = { kind: "none" };
+  revoked.h.emit({ kind: "revoked" });
+  await settle();
+  revoked.answers[0]?.(WAIT_END);
+  await settle();
+  expect(revoked.answers).toHaveLength(1);
+  expect(revoked.h.service.status()).toMatchObject({ device: "revoked" });
+  expect(revoked.h.service.status()).not.toHaveProperty("lostKeyWaitEnd");
+
+  const forgotten = await heldRead();
+  await expect(forgotten.h.service.forgetAccount()).resolves.toMatchObject({
+    outcome: "forgotten",
+  });
+  forgotten.answers[0]?.(WAIT_END);
+  await settle();
+  expect(forgotten.answers).toHaveLength(1);
+  expect(forgotten.h.service.status().account).toEqual({ kind: "signed_out" });
+  expect(forgotten.h.service.status()).not.toHaveProperty("lostKeyWaitEnd");
+});
+
+test("a sign-in that finishes, or a start that is refused, with no replacement pending any more drops the end of the wait at once (#303)", async () => {
+  const WAIT_END = "2026-11-06T10:10:00.000Z";
+  /**
+   * A harness during the wait, whose later reads of the end never answer,
+   * so that only the service can drop it.
+   */
+  async function waiting() {
+    const h = harness();
+    await h.service.initialize();
+    await settle();
+    h.keyStatus = {
+      protection: "system",
+      loaded: true,
+      replacementPending: true,
+      passphraseRequired: false,
+    };
+    h.lostKeyEnd = async () => WAIT_END;
+    h.emit({ kind: "auth_failed", account: SESSION_ACCOUNT });
+    await settle();
+    expect(h.service.status()).toMatchObject({
+      replacementPending: true,
+      lostKeyWaitEnd: WAIT_END,
+    });
+    h.lostKeyEnd = () => new Promise(() => undefined);
+    return h;
+  }
+  const resolved: DeviceKeyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: false,
+    passphraseRequired: false,
+  };
+
+  // A sign-in that finishes: the flow resolved the replacement.
+  const finished = await waiting();
+  const attempt = startedSignIn();
+  finished.start = async () => attempt.start;
+  await expect(finished.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+  finished.keyStatus = resolved;
+  finished.sessionState = SESSION_SIGNED_IN;
+  const done = nextStatus(
+    finished,
+    (status) => status.lastOutcome?.code === "signed_in",
+  );
+  attempt.settle(SIGNED_IN_OUTCOME);
+  const signedIn = await done;
+  expect(signedIn).toMatchObject({ replacementPending: false });
+  expect(signedIn).not.toHaveProperty("lostKeyWaitEnd");
+
+  // A start that is refused, after its authentication resolved the
+  // replacement.
+  const refused = await waiting();
+  refused.start = async () => ({
+    started: false,
+    outcome: { kind: "failed", reason: "no_answer" },
+  });
+  refused.keyStatus = resolved;
+  await expect(refused.service.startSignIn()).resolves.toEqual({
+    outcome: "failed",
+    code: "no_answer",
+  });
+  expect(refused.service.status()).toMatchObject({
+    lastOutcome: { code: "no_answer" },
+    replacementPending: false,
+  });
+  expect(refused.service.status()).not.toHaveProperty("lostKeyWaitEnd");
+});
+
 test("a cancel while the pending replacement is resolved starts nothing more", async () => {
   const h = harness();
   await h.service.initialize();

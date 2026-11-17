@@ -218,10 +218,14 @@ export function signInTimeFormat(
  * as `replacement_pending` (during the grace period of an uncertain
  * sign-in, #199, or the wait after a first refusal of both keys, #303) and
  * the status's `lostKeyWaitEnd`, which names the end of that wait also
- * before any start (#303). Only while no sign-in runs and the status still
- * reports the pending replacement; otherwise undefined, also when the
- * replacement was resolved before that time. The main process computed
- * each time when it refused the start or read the session.
+ * before any start (#303). The status's time counts only while the panel
+ * offers a sign-in (`offersSignIn`): after a restart during the wait, the
+ * device can be `signed_in` until its first round, and a note about a
+ * sign-in that the panel does not offer would make no sense. Only while no
+ * sign-in runs and the status still reports the pending replacement;
+ * otherwise undefined, also when the replacement was resolved before that
+ * time. The main process computed each time when it refused the start or
+ * read the session.
  */
 export function signInRetryAt(status: AccountStatus): number | undefined {
   const outcome = status.lastOutcome;
@@ -230,7 +234,7 @@ export function signInRetryAt(status: AccountStatus): number | undefined {
   }
   const times = [
     outcome?.code === "replacement_pending" ? outcome.retryAfter : undefined,
-    status.lostKeyWaitEnd,
+    offersSignIn(status) ? status.lostKeyWaitEnd : undefined,
   ]
     .map((time) => (time === undefined ? Number.NaN : Date.parse(time)))
     .filter((at) => !Number.isNaN(at));
@@ -254,7 +258,7 @@ export function signInRetryNote(
     return undefined;
   }
   const shown = new Date(Math.ceil(at / 60_000) * 60_000);
-  return `A new sign-in can start after ${format.format(shown)}. Try again then.`;
+  return `A new sign-in can start after ${format.format(shown)}.`;
 }
 
 /** The clock and the timer of `watchSignInRetry`; the tests replace them. */
@@ -396,9 +400,9 @@ export function describeOutcome(
 
 /**
  * The message for a start refused as `replacement_pending` with a time
- * (#199, #303) once the panel no longer shows that time: the time has come,
- * or the status no longer reports the pending replacement. A new sign-in
- * can start then, so the message no longer says that it cannot (#303).
+ * (#199, #303) once that time has come while the status still reports the
+ * pending replacement. A new sign-in can start then, so the message no
+ * longer says that it cannot (#303).
  */
 export const REPLACEMENT_PENDING_ENDED_MESSAGE =
   "The sign-in did not start, because the device key of the last sign-in was not confirmed yet. A new sign-in can start now.";
@@ -407,11 +411,13 @@ export const REPLACEMENT_PENDING_ENDED_MESSAGE =
  * The message for the last outcome in the panel at `now` (milliseconds),
  * or undefined while a sign-in runs or before the first outcome:
  * `describeOutcome`, except for a start refused as `replacement_pending`
- * with a time once `signInRetryNote` shows no time any more, which reads
- * `REPLACEMENT_PENDING_ENDED_MESSAGE`, so that it does not contradict a
- * sentence that asks for a sign-in then (#303). Without a time, the main
- * process did not know when the replacement can be resolved, and the
- * refusal stays as it is.
+ * with a time. That refusal reads `REPLACEMENT_PENDING_ENDED_MESSAGE` once
+ * `signInRetryNote` shows no time any more, so that it does not contradict
+ * a sentence that asks for a sign-in then, and it is not shown once the
+ * status no longer reports the pending replacement, for example when a key
+ * authenticated and the device is signed in again (#303). Without a time,
+ * the main process did not know when the replacement can be resolved, and
+ * the refusal stays as it is.
  */
 export function describeLastOutcome(
   status: AccountStatus,
@@ -425,6 +431,9 @@ export function describeLastOutcome(
     outcome.code === "replacement_pending" &&
     outcome.retryAfter !== undefined
   ) {
+    if (!status.replacementPending) {
+      return undefined;
+    }
     const at = signInRetryAt(status);
     if (at === undefined || now >= at) {
       return { role: "status", text: REPLACEMENT_PENDING_ENDED_MESSAGE };
