@@ -52,7 +52,11 @@ const SHARED_VALUE_MODULES = new Set([
   `${SHARED_DIRECTORY}sign-in-timing.ts`,
 ]);
 
-/** Browser and Node.js APIs that reach the network or the machine. */
+/**
+ * Browser and Node.js APIs that reach the network or the machine. A dynamic
+ * `import()` is also forbidden; `dynamicImportsOf` finds it with the
+ * TypeScript parser.
+ */
 const FORBIDDEN_APIS: readonly [string, RegExp][] = [
   ["fetch", /\bfetch\s*\(/],
   ["WebSocket", /\bWebSocket\b/],
@@ -61,7 +65,6 @@ const FORBIDDEN_APIS: readonly [string, RegExp][] = [
   ["sendBeacon", /\bsendBeacon\b/],
   ["RTCPeerConnection", /\bRTCPeerConnection\b/],
   ["Worker", /\b(?:Shared)?Worker\s*\(/],
-  ["dynamic import", /\bimport\s*\(/],
   ["require", /\brequire\s*\(/],
   ["process", /\bprocess\.[A-Za-z_$]/],
   ["Buffer", /\bBuffer\b/],
@@ -95,18 +98,23 @@ interface ModuleDeclaration {
   readonly text: string;
 }
 
-/**
- * The import and re-export declarations of a module, from the TypeScript
- * parser, so that comments and strings never hide or invent one.
- */
-function declarationsOf(file: string, source: string): ModuleDeclaration[] {
-  const sourceFile = ts.createSourceFile(
+/** A module's syntax tree, from the TypeScript parser. */
+function parse(file: string, source: string): ts.SourceFile {
+  return ts.createSourceFile(
     file,
     source,
     ts.ScriptTarget.Latest,
     false,
     /x$/.test(file) ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
   );
+}
+
+/**
+ * The import and re-export declarations of a module, from the TypeScript
+ * parser, so that comments and strings never hide or invent one.
+ */
+function declarationsOf(file: string, source: string): ModuleDeclaration[] {
+  const sourceFile = parse(file, source);
   const declarations: ModuleDeclaration[] = [];
   for (const statement of sourceFile.statements) {
     const text = statement.getText(sourceFile).split("\n")[0] ?? "";
@@ -231,16 +239,44 @@ function permissionsValueImports(file: string, source: string): string[] {
     );
 }
 
+/**
+ * The dynamic imports of a module anywhere in it, as a call `import(...)`
+ * and as a type `import("...")`, each by its text on one line. They come
+ * from the TypeScript parser, as the import declarations do (#285), so that
+ * a comment between `import` and `(` hides none, and a comment or a string
+ * invents none. The renderer imports nothing dynamically, whatever the
+ * module.
+ */
+function dynamicImportsOf(file: string, source: string): string[] {
+  const sourceFile = parse(file, source);
+  const found: string[] = [];
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isCallExpression(node) &&
+        node.expression.kind === ts.SyntaxKind.ImportKeyword) ||
+      ts.isImportTypeNode(node)
+    ) {
+      found.push(node.getText(sourceFile).replace(/\s+/g, " "));
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return found;
+}
+
 function forbiddenApis(file: string, source: string): string[] {
-  return FORBIDDEN_APIS.filter(([, pattern]) => pattern.test(source)).map(
-    ([name]) => `${file}: ${name}`,
-  );
+  return [
+    ...FORBIDDEN_APIS.filter(([, pattern]) => pattern.test(source)).map(
+      ([name]) => `${file}: ${name}`,
+    ),
+    ...dynamicImportsOf(file, source).map((text) => `${file}: ${text}`),
+  ];
 }
 
 const FILES = Object.keys(SOURCES);
 const IMPORTS = FILES.flatMap((file) => importsOf(file, SOURCES[file] ?? ""));
 
-test("the checks find foreign imports, shared value imports, and forbidden APIs", () => {
+test("the checks find foreign imports, shared value imports, forbidden APIs, and dynamic imports", () => {
   const sample = [
     'import { readFileSync } from "node:fs";',
     'import { ipcRenderer } from "electron";',
@@ -263,6 +299,14 @@ test("the checks find foreign imports, shared value imports, and forbidden APIs"
     'const socket = new WebSocket("wss://example.invalid");',
     'void fetch("https://example.invalid");',
     "const home = process.env.HOME;",
+    'void import /* a comment */ ("node:fs");',
+    "void import(",
+    '  "./App.tsx"',
+    ");",
+    'type Bridge = typeof import("electron");',
+    "const note = \"import('node:os')\";",
+    '// import("node:net")',
+    "const meta = import.meta.url;",
   ].join("\n");
   const imports = importsOf("./sample.ts", sample);
 
@@ -291,10 +335,15 @@ test("the checks find foreign imports, shared value imports, and forbidden APIs"
   expect(sharedValueImports(imports)).toEqual([
     "./sample.ts: ../shared/ipc-contract.ts",
   ]);
+  // Every dynamic import, also with a comment before its parenthesis, over
+  // lines, or in a type; none in a string or a comment.
   expect(forbiddenApis("./sample.ts", sample)).toEqual([
     "./sample.ts: fetch",
     "./sample.ts: WebSocket",
     "./sample.ts: process",
+    './sample.ts: import /* a comment */ ("node:fs")',
+    './sample.ts: import( "./App.tsx" )',
+    './sample.ts: typeof import("electron")',
   ]);
 });
 
@@ -411,7 +460,7 @@ test("the renderer imports values only from shared modules that import nothing",
   }
 });
 
-test("no renderer module calls a network or Node.js API", () => {
+test("no renderer module calls a network or Node.js API or imports a module dynamically", () => {
   expect(
     FILES.flatMap((file) => forbiddenApis(file, SOURCES[file] ?? "")),
   ).toEqual([]);
