@@ -19,6 +19,8 @@ import {
 import type { WorkspaceReadResult } from "../api-reads.ts";
 import type { ServerMessage } from "../connection/client.ts";
 import type { WorkspaceState } from "../workspace/service.ts";
+import type { LinkConfirmationRequest } from "./confirmation.ts";
+import type { RepositoryFolderIdentity } from "./identity.ts";
 import {
   MAX_REPOSITORY_LINKS,
   type RepositoryLink,
@@ -26,6 +28,9 @@ import {
 } from "./link-store.ts";
 import {
   createProjectRepositoryService,
+  LINK_WRITE_RETRY_FIRST_MS,
+  LINK_WRITE_RETRY_MAX_MS,
+  linkWriteRetryDelayMs,
   type ProjectRepositoryAccount,
   type ProjectRepositoryService,
   type ProjectRepositoryState,
@@ -34,6 +39,7 @@ import {
 const DEVICE_ID = "0192f0a0-7b3c-7d4e-8f50-000000000004";
 const WS_A = "0192f0a0-7b3c-7d4e-8f50-0000000000a1" as WorkspaceId;
 const WS_B = "0192f0a0-7b3c-7d4e-8f50-0000000000a2" as WorkspaceId;
+const WS_GONE = "0192f0a0-7b3c-7d4e-8f50-0000000000a3" as WorkspaceId;
 const OWN = "0192f0a0-7b3c-7d4e-8f50-0000000000c1";
 const OTHER_OWN = "0192f0a0-7b3c-7d4e-8f50-0000000000c2";
 const PROJECT_1 = "0192f0a0-7b3c-7d4e-8f50-0000000000e1" as ProjectId;
@@ -59,7 +65,10 @@ const SECRETS = [
   OWN,
 ];
 
-function accountStatus(signedIn = true): AccountStatus {
+function accountStatus(
+  signedIn = true,
+  deviceKey: AccountStatus["deviceKey"] = "ready",
+): AccountStatus {
   return Object.freeze({
     revision: 1,
     account: signedIn
@@ -73,7 +82,7 @@ function accountStatus(signedIn = true): AccountStatus {
       : Object.freeze({ kind: "signed_out" }),
     signIn: Object.freeze({ kind: "idle" }),
     lastOutcome: null,
-    deviceKey: "ready",
+    deviceKey,
     replacementPending: false,
     apiOrigin: "set",
     device: signedIn ? "signed_in" : "signed_out",
@@ -92,6 +101,15 @@ function list(...repositories: ReturnType<typeof repository>[]) {
   return RepositoryListResponseSchema.parse({ repositories });
 }
 
+/** The identity of a folder in the fake file system, until a test changes it. */
+function identityOf(folder: string, generation = 0): RepositoryFolderIdentity {
+  const ino = [...folder].reduce((sum, char) => sum + char.charCodeAt(0), 0);
+  return {
+    folder: { dev: "2049", ino: String(ino * 10 + generation) },
+    commonDir: { dev: "2049", ino: String(ino * 10 + generation + 5) },
+  };
+}
+
 function linkOf(
   repositoryId: string,
   folder: string,
@@ -103,6 +121,7 @@ function linkOf(
     projectId: PROJECT_1,
     repositoryId,
     folder,
+    identity: identityOf(folder),
     ...overrides,
   } as RepositoryLink;
 }
@@ -180,7 +199,7 @@ function deferred<T>(): Deferred<T> {
 }
 
 async function settle(): Promise<void> {
-  for (let index = 0; index < 20; index += 1) {
+  for (let index = 0; index < 40; index += 1) {
     await Promise.resolve();
   }
 }
@@ -219,7 +238,12 @@ class Harness {
     [WS_B, OWN],
   ]);
   readonly mounts = new Map<string, string>();
+  /** Mounts whose state is `unavailable`. */
+  readonly unavailableMounts = new Set<string>();
+  /** The folders that exist; each top-level folder's `.git` with it. */
   readonly folders = new Set<string>([FOLDER_1, FOLDER_2]);
+  /** Identities that a test changed, or a folder that became a link. */
+  readonly identities = new Map<string, RepositoryFolderIdentity | "link">();
   readonly accountListeners = new Set<(status: AccountStatus) => void>();
   readonly connectionListeners = new Set<(status: ConnectionStatus) => void>();
   readonly messageListeners = new Set<(message: ServerMessage) => void>();
@@ -227,13 +251,20 @@ class Harness {
   readonly mountListeners = new Set<() => void>();
   readonly reads: Read[] = [];
   readonly writes: Write[] = [];
-  /** Each snapshot that the store wrote. */
+  /** Each snapshot that the store was asked to write, also a failed one. */
   readonly written: (readonly RepositoryLink[])[] = [];
+  /** What the file holds: the last snapshot that was written. */
+  stored: readonly RepositoryLink[] | null = null;
   failWrites = 0;
   /** Makes the account service's next write throw. */
   throwOnAction = false;
   holdWrite: Deferred<void> | null = null;
   holdFolderCheck: Deferred<void> | null = null;
+  /** Each confirmation that the service asked for. */
+  readonly confirmations: LinkConfirmationRequest[] = [];
+  confirmAnswer = true;
+  holdConfirm: Deferred<boolean> | null = null;
+  throwOnConfirm = false;
   readonly timers: { callback: () => void; delayMs: number }[] = [];
   readonly logs: string[] = [];
   readonly states: ProjectRepositoryState[] = [];
@@ -286,7 +317,16 @@ class Harness {
           (this.ownMembers.get(workspaceId) ?? null) as never,
       },
       mounts: {
-        folderOf: (mountId) => this.mounts.get(mountId),
+        folderOf: (mountId) => {
+          const folder = this.mounts.get(mountId);
+          return folder === undefined
+            ? undefined
+            : {
+                topLevel: folder,
+                commonDir: `${folder}/.git`,
+                available: !this.unavailableMounts.has(mountId),
+              };
+        },
         mountOf: (folder) => {
           for (const [mountId, mounted] of this.mounts) {
             if (key(mounted) === key(folder)) {
@@ -312,13 +352,31 @@ class Harness {
             this.failWrites -= 1;
             throw new Error(`write failed ${JSON.stringify(links)}`);
           }
+          this.stored = links;
         },
       },
-      isFolder: async (folder) => {
+      identify: async ({ topLevel, commonDir }) => {
         if (this.holdFolderCheck !== null) {
           await this.holdFolderCheck.promise;
         }
-        return this.folders.has(folder);
+        expect(commonDir).toBe(`${topLevel}/.git`);
+        if (!this.folders.has(topLevel)) {
+          return { ok: false, reason: "folder_missing" };
+        }
+        const identity = this.identities.get(topLevel) ?? identityOf(topLevel);
+        return identity === "link"
+          ? { ok: false, reason: "symbolic_link" }
+          : { ok: true, identity };
+      },
+      confirmLink: async (request) => {
+        this.confirmations.push(request);
+        if (this.throwOnConfirm) {
+          throw new Error(`web app ${FOLDER_1}`);
+        }
+        if (this.holdConfirm !== null) {
+          return this.holdConfirm.promise;
+        }
+        return this.confirmAnswer;
       },
       scheduleTimer: (callback, delayMs) => {
         const timer = { callback, delayMs };
@@ -360,6 +418,13 @@ class Harness {
 
   connect(): void {
     this.connectionStatus = { state: "connected", revision: 1 };
+    for (const listener of [...this.connectionListeners]) {
+      listener(this.connectionStatus);
+    }
+  }
+
+  disconnect(): void {
+    this.connectionStatus = { state: "offline", revision: 2 };
     for (const listener of [...this.connectionListeners]) {
       listener(this.connectionStatus);
     }
@@ -408,6 +473,15 @@ class Harness {
   /** The last links written. */
   lastWritten(): readonly RepositoryLink[] | undefined {
     return this.written.at(-1);
+  }
+
+  /** Runs the timers that wait now, the earliest first. */
+  runTimers(): void {
+    const due = [...this.timers].sort((a, b) => a.delayMs - b.delayMs);
+    this.timers.length = 0;
+    for (const timer of due) {
+      timer.callback();
+    }
   }
 }
 
@@ -538,6 +612,48 @@ test("a sign-out, another workspace, or another project clears the repositories 
   harness.reads[2]?.answer({ ok: true, value: list(repository(REPO_1)) });
   await settle();
   expect(harness.state.repositories).toEqual([]);
+});
+
+test("a device counts as signed in only with its key ready: until then nothing loads, links, or resolves", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+  await harness.service.link(REPO_1, MOUNT_1);
+  const reads = harness.reads.length;
+
+  for (const deviceKey of [
+    "loading",
+    "passphrase_required",
+    "unreadable",
+    "failed",
+  ] as const) {
+    harness.setAccount(accountStatus(true, deviceKey));
+    expect(harness.state, deviceKey).toMatchObject({
+      status: "no_project",
+      projectId: null,
+      repositories: [],
+    });
+    await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+      ok: false,
+      reason: "unavailable",
+    });
+    await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+      outcome: "refused",
+      reason: "unavailable",
+    });
+    await expect(harness.service.unlink(REPO_1)).resolves.toEqual({
+      outcome: "refused",
+      reason: "unavailable",
+    });
+  }
+  expect(harness.reads).toHaveLength(reads);
+
+  // With the key ready again, the project loads and the link resolves.
+  harness.setAccount(accountStatus(true, "ready"));
+  expect(harness.reads).toHaveLength(reads + 1);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toMatchObject({
+    ok: true,
+  });
 });
 
 // Registering and removing.
@@ -711,9 +827,56 @@ test("remove drops the repository and every link of it at once, and writes the l
   });
 });
 
+test("a removal answered conflict or not_found reads the list again, which drops a repository that is gone and its links; other refusals do not", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+  await harness.service.link(REPO_1, MOUNT_1);
+
+  for (const reason of ["forbidden", "unavailable", "failed"] as const) {
+    const reads = harness.reads.length;
+    const answer = harness.service.remove(PROJECT_1, REPO_1);
+    harness.writes.at(-1)?.answer(workspaceActionFailed(reason));
+    await answer;
+    await settle();
+    expect(harness.reads, reason).toHaveLength(reads);
+  }
+
+  for (const reason of ["conflict", "not_found"] as const) {
+    const reads = harness.reads.length;
+    const answer = harness.service.remove(PROJECT_1, REPO_2);
+    harness.writes.at(-1)?.answer(workspaceActionFailed(reason));
+    await expect(answer).resolves.toMatchObject({ reason });
+    await settle();
+    expect(harness.reads, reason).toHaveLength(reads + 1);
+    expect(harness.reads.at(-1)).toMatchObject({
+      name: "listRepositories",
+      params: { projectId: PROJECT_1 },
+    });
+    await harness.answerRead({
+      ok: true,
+      value: list(repository(REPO_1), repository(REPO_2)),
+    });
+  }
+
+  // Removed by someone else: the list no longer holds REPO_1.
+  const answer = harness.service.remove(PROJECT_1, REPO_1);
+  harness.writes.at(-1)?.answer(workspaceActionFailed("conflict"));
+  await answer;
+  await harness.answerRead({ ok: true, value: list(repository(REPO_2)) });
+  expect(harness.state.repositories.map((entry) => entry.repositoryId)).toEqual(
+    [REPO_2],
+  );
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "not_linked",
+  });
+  expect(harness.lastWritten()).toEqual([]);
+});
+
 // Linking.
 
-test("link keeps the folder of the mount on this device for the account, and the state shows the mount, never the path", async () => {
+test("link asks the person in the main process's dialog, naming the repository and the folder, and keeps the folder and its identity for the account; the state shows the mount, never the path", async () => {
   const harness = new Harness();
   await harness.ready(repository(REPO_1));
   harness.mount(MOUNT_1, FOLDER_1);
@@ -721,11 +884,18 @@ test("link keeps the folder of the mount on this device for the account, and the
   await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
     outcome: "linked",
   });
+  expect(harness.confirmations).toEqual([
+    { name: "web app", folder: FOLDER_1 },
+  ]);
   expect(harness.written).toEqual([[linkOf(REPO_1, FOLDER_1)]]);
+  expect(harness.lastWritten()?.[0]?.identity).toEqual(identityOf(FOLDER_1));
   expect(harness.state.repositories).toEqual([
     { repositoryId: REPO_1, name: "web app", linked: true, mountId: MOUNT_1 },
   ]);
   expect(JSON.stringify(harness.states)).not.toContain(FOLDER_1);
+  expect(JSON.stringify(harness.states)).not.toContain(
+    identityOf(FOLDER_1).folder.ino,
+  );
 
   // Unmounted, it stays linked without a mount; mounted again, it shows.
   harness.unmount(MOUNT_1);
@@ -736,14 +906,136 @@ test("link keeps the folder of the mount on this device for the account, and the
   harness.mount(MOUNT_2, FOLDER_1);
   expect(harness.state.repositories[0]).toMatchObject({ mountId: MOUNT_2 });
 
-  // Linking it to another folder replaces the link.
+  // Linking it to another folder replaces the link, after another question.
   harness.mount(MOUNT_1, FOLDER_2);
   await harness.service.link(REPO_1, MOUNT_1);
+  expect(harness.confirmations.at(-1)).toEqual({
+    name: "web app",
+    folder: FOLDER_2,
+  });
   expect(harness.lastWritten()).toEqual([linkOf(REPO_1, FOLDER_2)]);
   expect(harness.state.repositories[0]).toMatchObject({ mountId: MOUNT_1 });
 });
 
-test("link refuses a repository that the open project does not list, a mount that does not exist, a folder linked to another repository, and invalid IDs, without writing", async () => {
+test("a link that the person cancels, or whose dialog fails, links and writes nothing", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+
+  harness.confirmAnswer = false;
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "cancelled",
+  });
+  harness.confirmAnswer = true;
+  harness.throwOnConfirm = true;
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "failed",
+  });
+  expect(harness.confirmations).toHaveLength(2);
+  expect(harness.written).toEqual([]);
+  expect(harness.state.repositories[0]).toMatchObject({ linked: false });
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "not_linked",
+  });
+  expect(harness.logs).toEqual(["The link confirmation could not be shown."]);
+  expectNoSecretInLogs(harness);
+});
+
+test("one link is confirmed at a time: another link while the dialog is open is busy", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+  harness.mount(MOUNT_2, FOLDER_2);
+  harness.holdConfirm = deferred();
+  const hold = harness.holdConfirm;
+
+  const first = harness.service.link(REPO_1, MOUNT_1);
+  await settle();
+  await expect(harness.service.link(REPO_2, MOUNT_2)).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  expect(harness.confirmations).toHaveLength(1);
+  harness.holdConfirm = null;
+  hold.resolve(true);
+  await expect(first).resolves.toEqual({ outcome: "linked" });
+  await expect(harness.service.link(REPO_2, MOUNT_2)).resolves.toEqual({
+    outcome: "linked",
+  });
+});
+
+test("a folder that is a symbolic link or a junction, or that cannot be read, is refused before the person is asked", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+
+  harness.identities.set(FOLDER_1, "link");
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "symbolic_link",
+  });
+  harness.identities.delete(FOLDER_1);
+  harness.folders.delete(FOLDER_1);
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "folder_missing",
+  });
+  expect(harness.confirmations).toEqual([]);
+  expect(harness.written).toEqual([]);
+});
+
+test("what the person confirmed must still hold when the link is written: another account, a removal, or a sign-out during the dialog links nothing", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+
+  // Another account's person in the workspace while the dialog is open.
+  harness.holdConfirm = deferred();
+  let hold = harness.holdConfirm;
+  let answer = harness.service.link(REPO_1, MOUNT_1);
+  await settle();
+  harness.ownMembers.set(WS_A, OTHER_OWN);
+  harness.holdConfirm = null;
+  hold.resolve(true);
+  await expect(answer).resolves.toEqual({
+    outcome: "refused",
+    reason: "failed",
+  });
+  harness.ownMembers.set(WS_A, OWN);
+
+  // A removal while the dialog is open.
+  harness.holdConfirm = deferred();
+  hold = harness.holdConfirm;
+  answer = harness.service.link(REPO_1, MOUNT_1);
+  await settle();
+  harness.deliver(removedEvent(REPO_1));
+  harness.holdConfirm = null;
+  hold.resolve(true);
+  await expect(answer).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_registered",
+  });
+
+  // A sign-out while the dialog is open.
+  harness.holdConfirm = deferred();
+  hold = harness.holdConfirm;
+  harness.mount(MOUNT_2, FOLDER_2);
+  answer = harness.service.link(REPO_2, MOUNT_2);
+  await settle();
+  harness.setAccount(accountStatus(false));
+  harness.holdConfirm = null;
+  hold.resolve(true);
+  await expect(answer).resolves.toEqual({
+    outcome: "refused",
+    reason: "unavailable",
+  });
+  expect(harness.written).toEqual([]);
+});
+
+test("link refuses a repository that the open project does not list, a mount that does not exist, a folder linked to another repository, and invalid IDs, without asking or writing", async () => {
   const harness = new Harness();
   await harness.ready(repository(REPO_1), repository(REPO_2));
   harness.mount(MOUNT_1, FOLDER_1);
@@ -764,11 +1056,13 @@ test("link refuses a repository that the open project does not list, a mount tha
     ).resolves.toEqual({ outcome: "refused", reason });
   }
   expect(harness.written).toHaveLength(writes);
+  expect(harness.confirmations).toHaveLength(1);
 });
 
 test("where folders ignore case, a folder in another case is the same folder", async () => {
   const harness = new Harness({ caseInsensitive: true });
   await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.folders.add("C:\\Users\\octocat\\Web");
   harness.mount(MOUNT_1, "C:\\Users\\octocat\\Web");
   await harness.service.link(REPO_1, MOUNT_1);
   harness.unmount(MOUNT_1);
@@ -824,16 +1118,63 @@ test("link is unavailable while the links load, without the account's person, an
   expectNoSecretInLogs(harness);
 });
 
-test("no more links than the limit are kept on this device", async () => {
-  const many = Array.from({ length: MAX_REPOSITORY_LINKS }, (_, index) =>
+/** `count` links of OTHER_OWN in PROJECT_2, the oldest first. */
+function manyLinks(
+  count: number,
+  overrides: Partial<RepositoryLink> = {},
+): RepositoryLink[] {
+  return Array.from({ length: count }, (_, index) =>
     linkOf(
       `0192f0a0-7b3c-7d4e-8f50-${(0x10000 + index).toString(16).padStart(12, "0")}`,
       `/home/other/${index}`,
-      { ownMemberId: OTHER_OWN as never, projectId: PROJECT_2 },
+      { ownMemberId: OTHER_OWN as never, projectId: PROJECT_2, ...overrides },
     ),
   );
+}
+
+test("at the limit, a new link takes the place of the oldest link of another account or a former person, never of the account's own", async () => {
+  // A former person's link (a workspace that the list no longer holds)
+  // first, then other accounts' links.
+  const former = linkOf(REPO_3, "/home/former/web", {
+    workspaceId: WS_GONE,
+    projectId: PROJECT_2,
+  });
+  const others = manyLinks(MAX_REPOSITORY_LINKS - 1);
   const harness = new Harness({
-    read: () => Promise.resolve({ kind: "links", links: many }),
+    read: () => Promise.resolve({ kind: "links", links: [former, ...others] }),
+  });
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+  harness.mount(MOUNT_2, FOLDER_2);
+
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "linked",
+  });
+  expect(harness.lastWritten()).toEqual([...others, linkOf(REPO_1, FOLDER_1)]);
+  await expect(harness.service.link(REPO_2, MOUNT_2)).resolves.toEqual({
+    outcome: "linked",
+  });
+  expect(harness.lastWritten()).toEqual([
+    ...others.slice(1),
+    linkOf(REPO_1, FOLDER_1),
+    linkOf(REPO_2, FOLDER_2),
+  ]);
+  expect(harness.lastWritten()).toHaveLength(MAX_REPOSITORY_LINKS);
+  // Replacing the account's own link needs no room.
+  harness.unmount(MOUNT_2);
+  harness.mount(MOUNT_2, "/home/octocat/secret-api-2");
+  harness.folders.add("/home/octocat/secret-api-2");
+  await harness.service.link(REPO_2, MOUNT_2);
+  expect(harness.lastWritten()?.[0]).toEqual(others[1]);
+});
+
+test("at the limit with only the account's own links, a new link is refused and nothing is dropped", async () => {
+  const own = manyLinks(MAX_REPOSITORY_LINKS, {
+    ownMemberId: OWN as never,
+    workspaceId: WS_B,
+  });
+  const harness = new Harness({
+    read: () => Promise.resolve({ kind: "links", links: own }),
   });
   await harness.ready(repository(REPO_1));
   harness.mount(MOUNT_1, FOLDER_1);
@@ -842,6 +1183,8 @@ test("no more links than the limit are kept on this device", async () => {
     outcome: "refused",
     reason: "limit",
   });
+  expect(harness.confirmations).toEqual([]);
+  expect(harness.written).toEqual([]);
 });
 
 test("a removal while a link is written leaves it out, and the file is written again without it", async () => {
@@ -853,6 +1196,7 @@ test("a removal while a link is written leaves it out, and the file is written a
 
   const answer = harness.service.link(REPO_1, MOUNT_1);
   await settle();
+  expect(harness.written).toHaveLength(1);
   harness.deliver(removedEvent(REPO_1));
   harness.holdWrite = null;
   hold.resolve();
@@ -886,6 +1230,7 @@ test("a write waiting behind another one never puts back a link that a removal d
   // REPO_3 is removed.
   await harness.service.unlink(REPO_2);
   const answer = harness.service.link(REPO_1, MOUNT_1);
+  await settle();
   harness.deliver(removedEvent(REPO_3, PROJECT_2));
   harness.holdWrite = null;
   hold.resolve();
@@ -926,6 +1271,120 @@ test("unlink drops the account's link at once and writes the rest; another link 
   expect(harness.lastWritten()).toEqual([]);
   expect(harness.logs).toContain("The repository links could not be written.");
   expectNoSecretInLogs(harness);
+});
+
+test("unlink drops only the account's own link: another account's link of the same repository stays", async () => {
+  const stored = [
+    linkOf(REPO_1, FOLDER_2, { ownMemberId: OTHER_OWN as never }),
+    linkOf(REPO_1, FOLDER_1),
+  ];
+  const harness = new Harness({
+    read: () => Promise.resolve({ kind: "links", links: stored }),
+  });
+  await harness.ready(repository(REPO_1));
+
+  await expect(harness.service.unlink(REPO_1)).resolves.toEqual({
+    outcome: "unlinked",
+  });
+  await settle();
+  expect(harness.lastWritten()).toEqual([stored[0]]);
+
+  // The other account still finds its link.
+  harness.ownMembers.set(WS_A, OTHER_OWN);
+  harness.mount(MOUNT_2, FOLDER_2);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: true,
+    repositoryId: REPO_1,
+    folder: FOLDER_2,
+  });
+});
+
+// Writing the links again after a failure.
+
+test("a failed write of the links is tried again with a growing wait until it is written, so a dropped link does not come back after a restart", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+  await harness.service.link(REPO_1, MOUNT_1);
+  expect(harness.stored).toEqual([linkOf(REPO_1, FOLDER_1)]);
+
+  harness.failWrites = 3;
+  await harness.service.unlink(REPO_1);
+  await settle();
+  // The file still holds the link: after a restart it would come back.
+  expect(harness.stored).toEqual([linkOf(REPO_1, FOLDER_1)]);
+  const delays: number[] = [];
+  while (harness.timers.length > 0) {
+    delays.push(...harness.timers.map((timer) => timer.delayMs));
+    harness.runTimers();
+    await settle();
+  }
+  expect(delays).toEqual([1_000, 2_000, 4_000]);
+  expect(harness.stored).toEqual([]);
+  expect(harness.written.slice(-4)).toEqual([[], [], [], []]);
+  expect(harness.timers).toEqual([]);
+});
+
+test("the wait before the next try doubles from one second up to one minute", () => {
+  expect(LINK_WRITE_RETRY_FIRST_MS).toBe(1_000);
+  expect(LINK_WRITE_RETRY_MAX_MS).toBe(60_000);
+  expect(
+    [0, 1, 2, 3, 4, 5, 6, 7, 1_000].map((attempt) =>
+      linkWriteRetryDelayMs(attempt),
+    ),
+  ).toEqual([
+    1_000, 2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000,
+  ]);
+});
+
+test("a removal's failed save is tried again too, and the next change writes at once instead of waiting", async () => {
+  const stored = [
+    linkOf(REPO_2, FOLDER_2, { projectId: PROJECT_2 }),
+    linkOf(REPO_1, FOLDER_1),
+  ];
+  const harness = new Harness({
+    read: () => Promise.resolve({ kind: "links", links: stored }),
+  });
+  await harness.ready(repository(REPO_1));
+
+  harness.failWrites = 1;
+  harness.deliver(removedEvent(REPO_2, PROJECT_2));
+  await settle();
+  expect(harness.stored).toBeNull();
+  expect(harness.timers.map((timer) => timer.delayMs)).toEqual([1_000]);
+
+  // The next change does not wait for the timer: it writes every link as it
+  // is now, and the timer is cancelled.
+  await harness.service.unlink(REPO_1);
+  await settle();
+  expect(harness.stored).toEqual([]);
+  expect(harness.timers).toEqual([]);
+});
+
+test("close tries a failed save once more, and schedules nothing after", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+  await harness.service.link(REPO_1, MOUNT_1);
+
+  harness.failWrites = 1;
+  await harness.service.unlink(REPO_1);
+  await settle();
+  expect(harness.stored).toEqual([linkOf(REPO_1, FOLDER_1)]);
+  expect(harness.timers).toHaveLength(1);
+
+  harness.service.close();
+  expect(harness.timers).toEqual([]);
+  await settle();
+  expect(harness.stored).toEqual([]);
+  expect(harness.timers).toEqual([]);
+
+  // Nothing to write: close writes nothing.
+  const quiet = new Harness();
+  await quiet.ready(repository(REPO_1));
+  quiet.service.close();
+  await settle();
+  expect(quiet.written).toEqual([]);
 });
 
 // Resolving.
@@ -977,6 +1436,59 @@ test("a linked repository resolves to its folder while the folder is mounted and
   await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
     ok: false,
     reason: "unavailable",
+  });
+});
+
+test("a folder replaced at the same path, or turned into a symbolic link, fails closed with changed_folder until it is linked again", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+  await harness.service.link(REPO_1, MOUNT_1);
+
+  const linked = identityOf(FOLDER_1);
+  for (const identity of [
+    identityOf(FOLDER_1, 1),
+    { ...linked, folder: { ...linked.folder, dev: "2050" } },
+    { ...linked, commonDir: { ...linked.commonDir, ino: "7" } },
+    "link" as const,
+  ]) {
+    harness.identities.set(FOLDER_1, identity);
+    await expect(
+      harness.service.resolveFolder(REPO_1),
+      JSON.stringify(identity),
+    ).resolves.toEqual({ ok: false, reason: "changed_folder" });
+  }
+
+  // Linked again, the new folder resolves, and the old one no longer would.
+  harness.identities.set(FOLDER_1, identityOf(FOLDER_1, 1));
+  await harness.service.link(REPO_1, MOUNT_1);
+  expect(harness.lastWritten()).toEqual([
+    linkOf(REPO_1, FOLDER_1, { identity: identityOf(FOLDER_1, 1) }),
+  ]);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toMatchObject({
+    ok: true,
+  });
+  harness.identities.delete(FOLDER_1);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "changed_folder",
+  });
+});
+
+test("a mount whose state is unavailable does not resolve, and resolves again once it is available", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+  await harness.service.link(REPO_1, MOUNT_1);
+
+  harness.unavailableMounts.add(MOUNT_1);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "mount_unavailable",
+  });
+  harness.unavailableMounts.delete(MOUNT_1);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toMatchObject({
+    ok: true,
   });
 });
 
@@ -1106,33 +1618,163 @@ test("a removed event drops every link of the repository, of any project and any
   });
 });
 
-test("a reload that no longer lists a repository drops its links, but not a link made after the reload was sent", async () => {
-  const stored = [linkOf(REPO_1, FOLDER_1), linkOf(REPO_3, "/home/x/old")];
+test("a repository removed while its event waits for a reload cannot be linked, also once the reload answers, and nothing of it resolves", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+
+  // A reload after workspace.subscribed; the removed event waits in the gate,
+  // so the list still holds REPO_1.
+  harness.deliver(subscribed());
+  harness.deliver(removedEvent(REPO_1));
+  expect(harness.state.repositories.map((entry) => entry.repositoryId)).toEqual(
+    [REPO_1, REPO_2],
+  );
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_registered",
+  });
+
+  // The answer was read before the removal and still lists it; the event
+  // that waited drops it.
+  await harness.answerRead({
+    ok: true,
+    value: list(repository(REPO_1), repository(REPO_2)),
+  });
+  expect(harness.state.repositories.map((entry) => entry.repositoryId)).toEqual(
+    [REPO_2],
+  );
+  // A late registered event and a later answer never bring it back.
+  harness.deliver(registeredEvent(repository(REPO_1)));
+  harness.deliver(subscribed());
+  await harness.answerRead({
+    ok: true,
+    value: list(repository(REPO_1), repository(REPO_2)),
+  });
+  expect(harness.state.repositories.map((entry) => entry.repositoryId)).toEqual(
+    [REPO_2],
+  );
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "not_registered",
+  });
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "not_linked",
+  });
+  expect(harness.written).toEqual([]);
+});
+
+test("a repository removed while offline and linked during the reconnect reload loses the link once the reload no longer lists it", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+  harness.mount(MOUNT_2, FOLDER_2);
+  await harness.service.link(REPO_2, MOUNT_2);
+
+  // Offline, REPO_1 is removed; no event arrives. Back online, a reload is
+  // sent, and REPO_1, still listed, is linked meanwhile.
+  harness.disconnect();
+  harness.connect();
+  harness.deliver(subscribed());
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "linked",
+  });
+  await harness.answerRead({ ok: true, value: list(repository(REPO_2)) });
+
+  expect(harness.state.repositories.map((entry) => entry.repositoryId)).toEqual(
+    [REPO_2],
+  );
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "not_linked",
+  });
+  expect(harness.lastWritten()).toEqual([linkOf(REPO_2, FOLDER_2)]);
+  // It never comes back, also with a stale event.
+  harness.deliver(registeredEvent(repository(REPO_1)));
+  expect(harness.state.repositories).toHaveLength(1);
+});
+
+test("a repository registered during a reload is kept, although the reload's answer does not list it", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+
+  harness.deliver(subscribed());
+  harness.deliver(registeredEvent(repository(REPO_2)));
+  await harness.answerRead({ ok: true, value: list(repository(REPO_1)) });
+  expect(harness.state.repositories.map((entry) => entry.repositoryId)).toEqual(
+    [REPO_1, REPO_2],
+  );
+  await expect(harness.service.link(REPO_2, MOUNT_1)).resolves.toEqual({
+    outcome: "linked",
+  });
+  // The next reload lists it, and the link stays.
+  harness.deliver(subscribed());
+  await harness.answerRead({
+    ok: true,
+    value: list(repository(REPO_1), repository(REPO_2)),
+  });
+  await expect(harness.service.resolveFolder(REPO_2)).resolves.toMatchObject({
+    ok: true,
+  });
+});
+
+test("an answer read before this device's own removal does not list the repository again", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+
+  harness.deliver(subscribed());
+  const answer = harness.service.remove(PROJECT_1, REPO_1);
+  harness.writes.at(-1)?.answer({ ok: true, value: null });
+  await answer;
+  await harness.answerRead({
+    ok: true,
+    value: list(repository(REPO_1), repository(REPO_2)),
+  });
+  expect(harness.state.repositories.map((entry) => entry.repositoryId)).toEqual(
+    [REPO_2],
+  );
+});
+
+test("a reload that no longer lists a repository drops the links of it from the file, of every account, and only of that project", async () => {
+  const stored = [
+    linkOf(REPO_1, FOLDER_1),
+    linkOf(REPO_3, "/home/x/old"),
+    linkOf(REPO_3, "/home/x/old", { ownMemberId: OTHER_OWN as never }),
+    linkOf(REPO_2, FOLDER_2, { projectId: PROJECT_2 }),
+  ];
   const harness = new Harness({
     read: () => Promise.resolve({ kind: "links", links: stored }),
   });
   await harness.ready(repository(REPO_1), repository(REPO_3));
-  harness.deliver(registeredEvent(repository(REPO_2)));
-  harness.mount(MOUNT_2, FOLDER_2);
+  expect(harness.written).toEqual([]);
 
-  // A reload is sent, and REPO_2 is linked after it was sent.
   harness.deliver(subscribed());
-  await harness.service.link(REPO_2, MOUNT_2);
-  // Its answer no longer lists REPO_3, removed while offline, and does not
-  // list REPO_2.
   await harness.answerRead({ ok: true, value: list(repository(REPO_1)) });
+  expect(harness.lastWritten()).toEqual([stored[0], stored[3]]);
+});
 
-  expect(harness.lastWritten()).toEqual([
+test("links read after the open project's list loaded are checked against it: a link of a repository that it does not list goes", async () => {
+  const read = deferred<RepositoryLinkRead>();
+  const harness = new Harness({ read: () => read.promise });
+  await harness.ready(repository(REPO_1));
+  expect(harness.state.links).toBe("loading");
+
+  const stored = [
     linkOf(REPO_1, FOLDER_1),
-    linkOf(REPO_2, FOLDER_2),
-  ]);
-  await expect(harness.service.resolveFolder(REPO_2)).resolves.toMatchObject({
+    linkOf(REPO_3, "/home/x/old"),
+    // Another project's link is checked when that project loads.
+    linkOf(REPO_2, FOLDER_2, { projectId: PROJECT_2 }),
+  ];
+  read.resolve({ kind: "links", links: stored });
+  await settle();
+  expect(harness.state.links).toBe("ready");
+  expect(harness.lastWritten()).toEqual([stored[0], stored[2]]);
+  harness.mount(MOUNT_1, FOLDER_1);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toMatchObject({
     ok: true,
   });
-  // The next reload that does not list REPO_2 drops it as well.
-  harness.deliver(subscribed());
-  await harness.answerRead({ ok: true, value: list(repository(REPO_1)) });
-  expect(harness.lastWritten()).toEqual([linkOf(REPO_1, FOLDER_1)]);
 });
 
 test("a removal that comes while the links are read drops the link once they are read", async () => {
@@ -1151,16 +1793,23 @@ test("a removal that comes while the links are read drops the link once they are
 
 // The link file.
 
-test("a corrupt file counts as no link and is replaced by the next write; a newer one or one that cannot be read leaves the links unavailable and is never written", async () => {
-  const corrupt = new Harness({
-    read: () => Promise.resolve({ kind: "corrupt" }),
-  });
-  await corrupt.ready(repository(REPO_1));
-  expect(corrupt.state.links).toBe("ready");
-  expect(corrupt.written).toEqual([]);
-  corrupt.mount(MOUNT_1, FOLDER_1);
-  await corrupt.service.link(REPO_1, MOUNT_1);
-  expect(corrupt.written).toEqual([[linkOf(REPO_1, FOLDER_1)]]);
+test("a corrupt file or one of an earlier version counts as no link and is replaced by the next write; a newer one or one that cannot be read leaves the links unavailable and is never written", async () => {
+  for (const kind of ["corrupt", "older"] as const) {
+    const harness = new Harness({
+      read: () => Promise.resolve({ kind }),
+    });
+    await harness.ready(repository(REPO_1));
+    expect(harness.state.links).toBe("ready");
+    expect(harness.written).toEqual([]);
+    harness.mount(MOUNT_1, FOLDER_1);
+    await harness.service.link(REPO_1, MOUNT_1);
+    expect(harness.written).toEqual([[linkOf(REPO_1, FOLDER_1)]]);
+    expect(harness.logs).toEqual([
+      kind === "corrupt"
+        ? "The repository links file is not valid; it is replaced."
+        : "The repository links are of an earlier version and are not used; they are replaced.",
+    ]);
+  }
 
   for (const read of [
     () => Promise.resolve({ kind: "newer" } as const),
@@ -1179,6 +1828,8 @@ test("a corrupt file counts as no link and is replaced by the next write; a newe
       reason: "unavailable",
     });
     harness.deliver(removedEvent(REPO_1));
+    await settle();
+    harness.service.close();
     await settle();
     expect(harness.written).toEqual([]);
     expectNoSecretInLogs(harness);

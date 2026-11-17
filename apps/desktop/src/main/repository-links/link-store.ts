@@ -2,20 +2,28 @@
 // of 2026-11-14: the cloud registers a repository, an identity and a name,
 // and the folder's path stays on the device). Each link names a registered
 // repository, its project and workspace, the account's own person in that
-// workspace, and the folder of the repository on this device.
+// workspace, the folder of the repository on this device, and the identity
+// of that folder and of its common Git folder when it was linked.
 //
 // One small versioned JSON file in the local data folder of the device key
-// (`deviceKeyFolder`): `%LOCALAPPDATA%\MyManDev` on Windows, which a roaming
-// profile never copies to another machine, and the data folder on macOS and
-// Linux, which does not roam. The path never leaves the device (ADR 0013),
-// so it is not kept in `%APPDATA%`, which roams. The file is written
-// atomically like the device files, with mode 0600 on Linux and macOS.
+// (`repositoryLinkFolder`): `%LOCALAPPDATA%\MyManDev` on Windows, which a
+// roaming profile never copies to another machine, and the data folder on
+// macOS and Linux, which does not roam. The path never leaves the device
+// (ADR 0013), so it is not kept in `%APPDATA%`, which roams. The file is
+// written atomically like the device files, with mode 0600 on Linux and
+// macOS.
+//
+// The identity (identity.ts; the Project Manager's decision of 2026-11-17)
+// lets a resolution notice a folder that was replaced at the same path.
+// Version 2 of the file added it: a file of version 1 counts as no link and
+// is replaced at the next change, so each repository is linked again.
 //
 // The person names the account: a person belongs to one workspace and is
 // claimed by one account only, once, as for the seen claims. So another
 // account on this device never finds the links of an earlier one, and an
 // account that leaves and joins again starts without links in that
-// workspace. The file holds IDs and folders only, never a name or a secret.
+// workspace. The file holds IDs, folders, and device and file numbers only,
+// never a name or a secret.
 import path from "node:path";
 import {
   type MemberId,
@@ -38,17 +46,27 @@ import {
   removeFile,
   writeFileAtomic,
 } from "../device-key/atomic-file.ts";
+import {
+  type DeviceKeyFolderOptions,
+  deviceKeyFolder,
+} from "../device-key/key-folder.ts";
+import type { FileIdentity, RepositoryFolderIdentity } from "./identity.ts";
 
 /** The file of the links, in the local data folder. */
 export const REPOSITORY_LINK_FILE = "repository-links.json";
 
-/** The format version that this build writes and reads. */
-export const REPOSITORY_LINK_VERSION = 1;
+/**
+ * The format version that this build writes and reads. Version 2 added the
+ * identity of the folders; a file of version 1 counts as no link.
+ */
+export const REPOSITORY_LINK_VERSION = 2;
 
 /**
  * At most this many links are kept on this device, for every account
  * together. A project holds 20 repositories, and 16 can be mounted at once,
- * so this leaves room for many projects. A link over it is refused.
+ * so this leaves room for many projects. At the limit, a new link takes the
+ * place of the oldest link of another account or of a former person; when
+ * every link is the signed-in account's own, it is refused.
  */
 export const MAX_REPOSITORY_LINKS = 256;
 
@@ -58,6 +76,17 @@ export const MAX_REPOSITORY_LINKS = 256;
  */
 const MAX_REPOSITORY_LINK_BYTES = 8 * 1024 * 1024;
 
+/**
+ * The folder of the link file: the local data folder of the device key,
+ * `%LOCALAPPDATA%\MyManDev` on Windows and the data folder (`userData`) on
+ * macOS and Linux, which does not roam. On Windows it throws when
+ * `LOCALAPPDATA` is not set to an absolute folder with a drive: it never
+ * falls back to the roaming `%APPDATA%` or to `userData`, which is in it.
+ */
+export function repositoryLinkFolder(options: DeviceKeyFolderOptions): string {
+  return deviceKeyFolder(options);
+}
+
 /** A folder as a mount keeps it: absolute, without NUL, within the limit. */
 function folderSchema(isAbsolute: (folder: string) => boolean) {
   return z
@@ -66,6 +95,18 @@ function folderSchema(isAbsolute: (folder: string) => boolean) {
     .max(REPOSITORY_LIMITS.path, { abort: true })
     .refine((folder) => !folder.includes("\0") && isAbsolute(folder));
 }
+
+/**
+ * A device or file number of `lstat` with `bigint`, as decimal text: at most
+ * 20 digits without a leading zero, and a minus sign for a number that
+ * Node.js reports as a signed 64-bit value.
+ */
+const FileNumberSchema = z.string().regex(/^-?(?:0|[1-9][0-9]{0,19})$/u);
+
+const FileIdentitySchema = z.strictObject({
+  dev: FileNumberSchema,
+  ino: FileNumberSchema,
+});
 
 function fileSchema(isAbsolute: (folder: string) => boolean) {
   return z.strictObject({
@@ -78,6 +119,10 @@ function fileSchema(isAbsolute: (folder: string) => boolean) {
           projectId: ProjectIdSchema,
           repositoryId: RepositoryIdSchema,
           folder: folderSchema(isAbsolute),
+          identity: z.strictObject({
+            folder: FileIdentitySchema,
+            commonDir: FileIdentitySchema,
+          }),
         }),
       )
       .max(MAX_REPOSITORY_LINKS),
@@ -93,17 +138,21 @@ export interface RepositoryLink {
   readonly repositoryId: RepositoryId;
   /** The repository's top-level folder on this device, as Git reported it. */
   readonly folder: string;
+  /** The identity of the top-level folder and the common Git folder then. */
+  readonly identity: RepositoryFolderIdentity;
 }
 
 /**
  * What the folder holds: no file, the links, a file that is not one of this
- * format, or a file of a later format version, which this build neither
- * uses nor overwrites.
+ * format, a file of an earlier format version, which counts as no link and
+ * is replaced at the next change, or a file of a later format version,
+ * which this build neither uses nor overwrites.
  */
 export type RepositoryLinkRead =
   | { readonly kind: "none" }
   | { readonly kind: "links"; readonly links: readonly RepositoryLink[] }
   | { readonly kind: "corrupt" }
+  | { readonly kind: "older" }
   | { readonly kind: "newer" };
 
 export interface RepositoryLinkStore {
@@ -122,9 +171,9 @@ export interface RepositoryLinkStore {
 
 export interface RepositoryLinkStoreOptions {
   /**
-   * The local data folder (`deviceKeyFolder`). It may throw, for example on
-   * Windows without `LOCALAPPDATA`; every read and write then rejects, and
-   * nothing falls back to the roaming folder.
+   * The local data folder (`repositoryLinkFolder`). It may throw, for
+   * example on Windows without `LOCALAPPDATA`; every read and write then
+   * rejects, and nothing falls back to the roaming folder.
    */
   readonly folder: () => string;
   /** `process.platform`. */
@@ -135,6 +184,10 @@ export interface RepositoryLinkStoreOptions {
   readonly fileSystem?: KeyFileSystem;
 }
 
+function frozenIdentity(identity: FileIdentity): FileIdentity {
+  return Object.freeze({ dev: identity.dev, ino: identity.ino });
+}
+
 function frozenLinks(
   links: readonly {
     readonly workspaceId: string;
@@ -142,6 +195,7 @@ function frozenLinks(
     readonly projectId: string;
     readonly repositoryId: string;
     readonly folder: string;
+    readonly identity: RepositoryFolderIdentity;
   }[],
 ): readonly RepositoryLink[] {
   return Object.freeze(
@@ -152,21 +206,24 @@ function frozenLinks(
         projectId: link.projectId as ProjectId,
         repositoryId: link.repositoryId as RepositoryId,
         folder: link.folder,
+        identity: Object.freeze({
+          folder: frozenIdentity(link.identity.folder),
+          commonDir: frozenIdentity(link.identity.commonDir),
+        }),
       }),
     ),
   );
 }
 
-/** Whether the bytes hold JSON with a version above this build's. */
-function isNewerFormat(value: unknown): boolean {
-  return (
-    typeof value === "object" &&
+/** The whole format version of parsed JSON, or null when it has none. */
+function formatVersion(value: unknown): number | null {
+  return typeof value === "object" &&
     value !== null &&
     "version" in value &&
     typeof value.version === "number" &&
-    Number.isSafeInteger(value.version) &&
-    value.version > REPOSITORY_LINK_VERSION
-  );
+    Number.isSafeInteger(value.version)
+    ? value.version
+    : null;
 }
 
 /**
@@ -188,8 +245,13 @@ export function decodeRepositoryLinks(
   } catch {
     return Object.freeze({ kind: "corrupt" });
   }
-  if (isNewerFormat(value)) {
+  const version = formatVersion(value);
+  if (version !== null && version > REPOSITORY_LINK_VERSION) {
     return Object.freeze({ kind: "newer" });
+  }
+  // Version 1 holds no identity of the folders, so its links are not used.
+  if (version !== null && version >= 1 && version < REPOSITORY_LINK_VERSION) {
+    return Object.freeze({ kind: "older" });
   }
   const parsed = fileSchema(isAbsolute).safeParse(value);
   if (!parsed.success) {
@@ -214,7 +276,7 @@ export function encodeRepositoryLinks(
 ): Uint8Array {
   const parsed = fileSchema(isAbsolute).safeParse({
     version: REPOSITORY_LINK_VERSION,
-    links: frozenLinks(links),
+    links,
   });
   if (!parsed.success) {
     const field = parsed.error.issues[0]?.path.map(String).join(".") || "links";

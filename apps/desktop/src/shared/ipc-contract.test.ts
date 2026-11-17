@@ -2614,11 +2614,26 @@ test("register and remove answer ok, refused with a known reason and a wait only
     for (const value of [
       undefined,
       { outcome: "ok" },
-      { outcome: "refused", reason: "busy" },
+      { outcome: "refused", reason: "not_open" },
+      { outcome: "refused", reason: "changed_folder" },
       { outcome: "refused" },
     ]) {
       expect(schema.safeParse(value).success).toBe(false);
     }
+  }
+  // The person confirms each link in the main process: cancelling it, a
+  // second confirmation, and a folder that cannot be linked have their own
+  // refusals; unlinking needs none of them.
+  expect(LINK_REPOSITORY_REFUSALS).toEqual(
+    expect.arrayContaining([
+      "cancelled",
+      "busy",
+      "symbolic_link",
+      "folder_missing",
+    ]),
+  );
+  for (const reason of ["cancelled", "busy", "symbolic_link"]) {
+    expect(UNLINK_REPOSITORY_REFUSALS).not.toContain(reason);
   }
 });
 

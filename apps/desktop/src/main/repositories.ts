@@ -57,6 +57,20 @@ export interface RepositoryServiceOptions {
   readonly onError?: (message: string, error: unknown) => void;
 }
 
+/**
+ * The folders of a mounted repository, for the main process only: the
+ * repository links (#286) keep the top-level folder on this device, and
+ * neither crosses IPC in this form.
+ */
+export interface MountedFolder {
+  /** The top-level folder of the working tree, as Git reported it. */
+  readonly topLevel: string;
+  /** The common Git folder, as Git reported it. */
+  readonly commonDir: string;
+  /** False while the mount's state is `unavailable`: its last read failed. */
+  readonly available: boolean;
+}
+
 export interface RepositoryService {
   /** The mounted repositories, in the order they were mounted. */
   list(): RepositoryList;
@@ -68,12 +82,11 @@ export interface RepositoryService {
   /** Unmounts a repository and stops watching it. False when it was not mounted. */
   unmount(mountId: string): boolean;
   /**
-   * The top-level folder of a mounted repository, as Git reported it, or
-   * undefined when nothing is mounted with this ID. For the main process
-   * only: the repository links (#286) keep it on this device, and it never
-   * crosses IPC in this form.
+   * The folders of a mounted repository and whether its state is
+   * available, or undefined when nothing is mounted with this ID. For the
+   * main process only.
    */
-  folderOf(mountId: string): string | undefined;
+  folderOf(mountId: string): MountedFolder | undefined;
   /**
    * The mount ID of the mounted repository whose top-level folder is
    * `folder`, compared as a mount compares folders (without regard to case
@@ -309,10 +322,16 @@ export function createRepositoryService(
     return true;
   };
 
-  const folderOf = (mountId: string): string | undefined =>
-    typeof mountId === "string"
-      ? mounts.get(mountId)?.location.topLevel
-      : undefined;
+  const folderOf = (mountId: string): MountedFolder | undefined => {
+    const entry = typeof mountId === "string" ? mounts.get(mountId) : undefined;
+    return entry === undefined
+      ? undefined
+      : Object.freeze({
+          topLevel: entry.location.topLevel,
+          commonDir: entry.location.commonDir,
+          available: entry.state.kind !== "unavailable",
+        });
+  };
 
   const mountOf = (folder: string): string | undefined => {
     if (typeof folder !== "string") {

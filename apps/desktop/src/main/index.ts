@@ -75,12 +75,20 @@ import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
 import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
+import {
+  LINK_CONFIRMATION,
+  linkConfirmationMessage,
+  linkConfirmed,
+} from "./repository-links/confirmation.ts";
+import {
+  readFolderIdentity,
+  systemLstat,
+} from "./repository-links/identity.ts";
 import { createProjectRepositoryService } from "./repository-links/service.ts";
 import { createSystemRepositoryLinkStore } from "./repository-links/system.ts";
 import {
   createSystemRepositoryService,
   FOLDER_DIALOG_OPTIONS,
-  isDirectory,
   selectedFolder,
 } from "./repository-system.ts";
 import { createLocalRuntime } from "./runtime.ts";
@@ -327,7 +335,25 @@ function start(): void {
     workspaces,
     mounts: repositories,
     store: createSystemRepositoryLinkStore(),
-    isFolder: isDirectory,
+    // The identity of a linked folder and of its common Git folder, read
+    // with `lstat` when it is linked and at each resolution.
+    identify: (folders) => readFolderIdentity(systemLstat, folders),
+    // A link is confirmed in a native dialog of the main process on the
+    // main window, like the folder dialog of the repositories, so that the
+    // renderer alone cannot link a folder. The dialog names the registered
+    // repository and the folder; the path stays in the main process.
+    confirmLink: async (request) => {
+      const options = {
+        ...LINK_CONFIRMATION,
+        buttons: [...LINK_CONFIRMATION.buttons],
+        message: linkConfirmationMessage(request),
+      };
+      return linkConfirmed(
+        mainWindow === undefined
+          ? await dialog.showMessageBox(options)
+          : await dialog.showMessageBox(mainWindow, options),
+      );
+    },
     log: (message) => console.info(message),
   });
   app.on("will-quit", () => projectRepositories.close());

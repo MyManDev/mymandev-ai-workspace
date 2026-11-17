@@ -1224,6 +1224,8 @@ export type RemoveRepositoryRefusal =
  * The result of removing a repository: `ok`, `refused`, or `unknown`. After
  * `ok`, its link on this device is dropped at once; every device drops its
  * own when the server event arrives, or at the next reload of the project.
+ * After `conflict` or `not_found`, the main process reads the project's
+ * repositories again, which drops one that is removed already.
  */
 export const RemoveRepositoryResultSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("ok") }),
@@ -1235,24 +1237,41 @@ export type RemoveRepositoryResult = z.infer<
 >;
 
 /**
- * Why linking a repository to a mounted folder was refused:
+ * Why linking a repository to a mounted folder was refused. The main
+ * process asks the person to confirm each link in a native dialog that
+ * names the repository and the folder (the Project Manager's decision of
+ * 2026-11-17), so the renderer alone never links a folder.
  *
  * - `invalid`: an ID is outside its format.
  * - `not_registered`: the open project's repositories, as loaded, do not
- *   hold the repository.
+ *   hold the repository, or it was removed.
  * - `not_mounted`: nothing is mounted with the mount ID.
  * - `folder_linked`: the account linked the folder to another repository;
  *   unlink it first.
- * - `limit`: this device holds as many links as it keeps.
+ * - `symbolic_link`: the folder or its common Git folder is a symbolic link
+ *   or, on Windows, a junction, which cannot be linked.
+ * - `folder_missing`: the folder or its common Git folder could not be read
+ *   as a folder.
+ * - `busy`: the confirmation of another link is open; one at a time.
+ * - `cancelled`: the person did not confirm the link; nothing changed.
+ * - `limit`: this device holds as many links as it keeps, and all of them
+ *   are the account's own. A link of another account or a former person
+ *   makes room first, the oldest first.
  * - `unavailable`: no account is signed in, the account's own person in the
  *   workspace is not known, or the links are not `ready`.
- * - `failed`: the link could not be written; nothing changed.
+ * - `failed`: the confirmation could not be shown, what was confirmed
+ *   changed before the write, or the link could not be written; nothing
+ *   changed.
  */
 export const LINK_REPOSITORY_REFUSALS = Object.freeze([
   "invalid",
   "not_registered",
   "not_mounted",
   "folder_linked",
+  "symbolic_link",
+  "folder_missing",
+  "busy",
+  "cancelled",
   "limit",
   "unavailable",
   "failed",
@@ -3236,7 +3255,10 @@ export const INVOKE_CONTRACT = Object.freeze({
     result: RemoveRepositoryResultSchema,
   }),
   [INVOKE_CHANNELS.linkRepository]: Object.freeze({
-    /** The repository's ID and the mount ID; never a path. */
+    /**
+     * The repository's ID and the mount ID; never a path. The main process
+     * asks the person to confirm before it links anything.
+     */
     args: z.tuple([ProtocolIdSchema, MountIdSchema]),
     result: LinkRepositoryResultSchema,
   }),

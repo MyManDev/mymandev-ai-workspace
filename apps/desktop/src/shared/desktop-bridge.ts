@@ -182,7 +182,11 @@ export interface ProjectRepositoriesBridge {
     projectId: string,
     repositoryId: string,
   ) => Promise<RemoveRepositoryResult>;
-  /** Links a registered repository to the folder of a mounted repository. */
+  /**
+   * Links a registered repository to the folder of a mounted repository,
+   * once the person confirmed it in the main process's own dialog;
+   * `cancelled` when they did not.
+   */
   readonly link: (
     repositoryId: string,
     mountId: string,
