@@ -16,8 +16,11 @@
 //   sign-out, and a workspace that the list no longer holds see none.
 // - A link is made only after the person confirmed it in a native dialog of
 //   the main process (the Project Manager's decision of 2026-11-17), so the
-//   renderer alone can never link a folder. It records the identity of the
-//   folder and of its common Git folder (identity.ts), and a resolution
+//   renderer alone can never link a folder. One dialog is open at a time; a
+//   close of the main window, a sign-out, or another device ends it as a
+//   Cancel, and after a cancel another link waits a few seconds (`busy`).
+//   It records the identity of the folder and of its common Git folder
+//   (identity.ts), read again after the person confirmed, and a resolution
 //   fails closed when they changed.
 // - A removed repository never comes back. This run keeps the ID of every
 //   repository that it saw removed: this device's removal, a removed event,
@@ -180,6 +183,13 @@ export function linkWriteRetryDelayMs(attempt: number): number {
   );
 }
 
+/**
+ * The pause after a link answered `cancelled`: until it ends, another link
+ * answers `busy`, so that a renderer cannot ask again at once. It runs on
+ * the injected `scheduleTimer`.
+ */
+export const LINK_CANCEL_PAUSE_MS = 3_000;
+
 /** The part of the account service that this service uses. */
 export type ProjectRepositoryAccount = Pick<
   AccountService,
@@ -222,10 +232,17 @@ export interface ProjectRepositoryServiceOptions {
    * Asks the person, in a native dialog of the main process on the main
    * window, whether to link the named repository to the folder. Resolves to
    * true only for the link button (`LINK_CONFIRMATION` and
-   * `linkConfirmed`). A rejection links nothing (`failed`).
+   * `linkConfirmed`). A rejection links nothing (`failed`). `signal` aborts
+   * when the main window closes (`cancelConfirmation`), the device signs
+   * out or changes, or the service closes; the dialog then closes as a
+   * Cancel (Electron's `signal` option), and the link answers `cancelled`
+   * at once, also when the dialog never settles.
    */
-  readonly confirmLink: (request: LinkConfirmationRequest) => Promise<boolean>;
-  /** Defaults to `setTimeout`. */
+  readonly confirmLink: (
+    request: LinkConfirmationRequest,
+    signal: AbortSignal,
+  ) => Promise<boolean>;
+  /** Defaults to `setTimeout`. Also runs the pause after a cancel. */
   readonly scheduleTimer?: ScheduleTimer;
   /**
    * Receives fixed messages with a failure code at most, never a name, an
@@ -274,8 +291,15 @@ export interface ProjectRepositoryService {
     repositoryId: unknown,
   ) => Promise<RepositoryFolderResolution>;
   /**
+   * Ends the link confirmation that is open, if any, as a Cancel: its
+   * dialog closes and its link answers `cancelled`. For the close of the
+   * main window, which the dialog belongs to.
+   */
+  readonly cancelConfirmation: () => void;
+  /**
    * Stops listening and cancels the timers, for the quit. A write of the
-   * links that failed is tried once more, without waiting for it.
+   * links that failed is tried once more, without waiting for it. An open
+   * confirmation ends as a Cancel.
    */
   readonly close: () => void;
 }
@@ -424,6 +448,35 @@ function scheduleWithSetTimeout(
   return () => clearTimeout(handle);
 }
 
+/**
+ * The person's answer, or false as soon as `signal` aborts, so that a dialog
+ * that never settles does not hold the next link. A rejection before the
+ * abort passes through.
+ */
+function answerUnlessAborted(
+  answer: Promise<boolean>,
+  signal: AbortSignal,
+): Promise<boolean> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      resolve(false);
+      return;
+    }
+    const aborted = () => resolve(false);
+    signal.addEventListener("abort", aborted, { once: true });
+    answer.then(
+      (value) => {
+        signal.removeEventListener("abort", aborted);
+        resolve(value === true);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", aborted);
+        reject(error);
+      },
+    );
+  });
+}
+
 /** One reload that was sent, with what it was sent for. */
 interface ReloadRequest {
   readonly epoch: number;
@@ -542,6 +595,10 @@ export function createProjectRepositoryService(
   let cancelWriteRetry: (() => void) | null = null;
   /** Whether a link's identity read or confirmation runs; one at a time. */
   let confirming = false;
+  /** Aborts the open confirmation's dialog, while one runs. */
+  let confirmation: AbortController | null = null;
+  /** Ends the pause after a cancel, while it runs; another link is `busy`. */
+  let cancelPause: (() => void) | null = null;
 
   let revision = 0;
   let dirty = false;
@@ -819,6 +876,13 @@ export function createProjectRepositoryService(
       repositories.map((repository) => repository.id),
     );
     const gone = new Set<RepositoryId>();
+    // This relies on the server's rule that the resync gate assumes as well
+    // (workspace/resync.ts): a list is always read after the commits that it
+    // reflects, and an event is relayed only after its commit. A repository
+    // in `before` was listed by an earlier answer or added by an event before
+    // this reload began, so its registration was committed before this list
+    // was read; a list that leaves it out was read after its removal
+    // committed. A removal is final, so it is marked removed for the run.
     for (const repository of before ?? []) {
       if (!listed.has(repository.id)) {
         gone.add(repository.id);
@@ -1146,6 +1210,8 @@ export function createProjectRepositoryService(
     if (next === device) {
       return;
     }
+    // A sign-out or another device ends an open confirmation as a Cancel.
+    abortConfirmation();
     if (device !== null) {
       reset();
     }
@@ -1166,6 +1232,29 @@ export function createProjectRepositoryService(
   }
 
   // The actions.
+
+  /** Ends the open confirmation, if any: its dialog closes as a Cancel. */
+  function abortConfirmation(): void {
+    confirmation?.abort();
+  }
+
+  /** Starts the pause after a cancel, during which another link is `busy`. */
+  function pauseAfterCancel(): void {
+    cancelPause?.();
+    cancelPause = null;
+    if (closed) {
+      return;
+    }
+    cancelPause = schedule(() => {
+      cancelPause = null;
+    }, LINK_CANCEL_PAUSE_MS);
+  }
+
+  /** A link that answers `cancelled`, after which the pause runs. */
+  function linkCancelled(): LinkRepositoryResult {
+    pauseAfterCancel();
+    return linkRefused("cancelled");
+  }
 
   /** The open project, when `value` names it and a device is signed in. */
   function openProject(
@@ -1339,11 +1428,14 @@ export function createProjectRepositoryService(
     if (typeof first === "string") {
       return linkRefused(first);
     }
-    // One confirmation at a time: a renderer cannot stack dialogs.
-    if (confirming) {
+    // One confirmation at a time: a renderer cannot stack dialogs. After a
+    // cancel, it cannot ask again at once either.
+    if (confirming || cancelPause !== null) {
       return linkRefused("busy");
     }
     confirming = true;
+    const controller = new AbortController();
+    confirmation = controller;
     let added: RepositoryLink;
     try {
       // A folder that cannot be identified is refused before the person is
@@ -1352,23 +1444,40 @@ export function createProjectRepositoryService(
       if (!identity.ok) {
         return linkRefused(identity.reason);
       }
+      if (controller.signal.aborted) {
+        return linkCancelled();
+      }
       // The confirmation runs in the main process, so that the renderer
-      // alone cannot link a folder.
+      // alone cannot link a folder. An abort ends it at once as a Cancel,
+      // also when the dialog never settles.
       let confirmed: boolean;
       try {
-        confirmed =
-          (await options.confirmLink(
+        confirmed = await answerUnlessAborted(
+          options.confirmLink(
             Object.freeze({
               name: first.name,
               folder: first.mounted.topLevel,
             }),
-          )) === true;
+            controller.signal,
+          ),
+          controller.signal,
+        );
       } catch {
         log("The link confirmation could not be shown.");
         return linkRefused("failed");
       }
-      if (!confirmed) {
-        return linkRefused("cancelled");
+      if (!confirmed || controller.signal.aborted) {
+        return linkCancelled();
+      }
+      // The folder may have been replaced while the dialog was open: it is
+      // read again, so that the person is never told `linked` for a link
+      // that would not resolve.
+      const again = await identify(first.mounted);
+      if (!again.ok) {
+        return linkRefused(again.reason);
+      }
+      if (!sameFolderIdentity(again.identity, identity.identity)) {
+        return linkRefused("failed");
       }
       added = frozenLink({
         workspaceId: first.workspaceId,
@@ -1380,6 +1489,9 @@ export function createProjectRepositoryService(
       });
     } finally {
       confirming = false;
+      if (confirmation === controller) {
+        confirmation = null;
+      }
     }
     // Written with the links as they are when the write starts, without the
     // account's earlier link of the repository and the evicted one, and the
@@ -1569,17 +1681,21 @@ export function createProjectRepositoryService(
       link(repositoryValue, mountValue),
     unlink: (repositoryValue: string) => unlink(repositoryValue),
     resolveFolder: (value: unknown) => resolveFolder(value),
+    cancelConfirmation: () => abortConfirmation(),
     close: () => {
       if (closed) {
         return;
       }
       closed = true;
+      abortConfirmation();
       for (const remove of removers) {
         remove();
       }
       listeners.clear();
       stopRetry();
       stopWriteRetry();
+      cancelPause?.();
+      cancelPause = null;
       gate.end();
       // A save that waits or failed is tried once more, after the writes on
       // their way; the quit does not wait for it.

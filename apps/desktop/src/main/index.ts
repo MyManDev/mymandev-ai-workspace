@@ -341,12 +341,15 @@ function start(): void {
     // A link is confirmed in a native dialog of the main process on the
     // main window, like the folder dialog of the repositories, so that the
     // renderer alone cannot link a folder. The dialog names the registered
-    // repository and the folder; the path stays in the main process.
-    confirmLink: async (request) => {
+    // repository and the folder; the path stays in the main process. The
+    // service's signal closes it as a Cancel when the main window closes
+    // (below), the device signs out or changes, or the service closes.
+    confirmLink: async (request, signal) => {
       const options = {
         ...LINK_CONFIRMATION,
         buttons: [...LINK_CONFIRMATION.buttons],
         message: linkConfirmationMessage(request),
+        signal,
       };
       return linkConfirmed(
         mainWindow === undefined
@@ -608,6 +611,9 @@ function start(): void {
     );
     window.on("closed", () => {
       mainWindow = undefined;
+      // A link's confirmation belongs to this window: it ends as a Cancel,
+      // so that a dialog that never settles does not hold the next link.
+      projectRepositories.cancelConfirmation();
     });
     window.loadURL(rendererUrl).catch((error: unknown) => {
       console.error("The application window failed to load.", error);

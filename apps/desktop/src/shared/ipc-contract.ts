@@ -1252,16 +1252,19 @@ export type RemoveRepositoryResult = z.infer<
  *   or, on Windows, a junction, which cannot be linked.
  * - `folder_missing`: the folder or its common Git folder could not be read
  *   as a folder.
- * - `busy`: the confirmation of another link is open; one at a time.
- * - `cancelled`: the person did not confirm the link; nothing changed.
+ * - `busy`: the confirmation of another link is open; one at a time. Also
+ *   for a few seconds after a link answered `cancelled`.
+ * - `cancelled`: the person did not confirm the link, or the dialog was
+ *   closed because the main window closed or the device signed out or
+ *   changed; nothing changed.
  * - `limit`: this device holds as many links as it keeps, and all of them
  *   are the account's own. A link of another account or a former person
  *   makes room first, the oldest first.
  * - `unavailable`: no account is signed in, the account's own person in the
  *   workspace is not known, or the links are not `ready`.
  * - `failed`: the confirmation could not be shown, what was confirmed
- *   changed before the write, or the link could not be written; nothing
- *   changed.
+ *   changed before the write (also the folder's identity while the dialog
+ *   was open), or the link could not be written; nothing changed.
  */
 export const LINK_REPOSITORY_REFUSALS = Object.freeze([
   "invalid",

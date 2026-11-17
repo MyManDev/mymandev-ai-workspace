@@ -44,7 +44,7 @@ test("the message names the registered repository and the folder, with hiding an
   );
 });
 
-test("the entry point confirms a link with the main process's own dialog on the main window and identifies folders with lstat", () => {
+test("the entry point confirms a link with the main process's own dialog on the main window, closed by the service's signal and by the window's close, and identifies folders with lstat", () => {
   const entry = readFileSync(new URL("../index.ts", import.meta.url), "utf8")
     .split("\n")
     .filter((line) => !line.trim().startsWith("//"))
@@ -54,6 +54,9 @@ test("the entry point confirms a link with the main process's own dialog on the 
     /identify: \(folders\) => readFolderIdentity\(systemLstat, folders\),/u,
   );
   expect(entry).toMatch(
-    /confirmLink: async \(request\) => \{\s+const options = \{\s+\.\.\.LINK_CONFIRMATION,\s+buttons: \[\.\.\.LINK_CONFIRMATION\.buttons\],\s+message: linkConfirmationMessage\(request\),\s+\};\s+return linkConfirmed\(\s+mainWindow === undefined\s+\? await dialog\.showMessageBox\(options\)\s+: await dialog\.showMessageBox\(mainWindow, options\),\s+\);\s+\},/u,
+    /confirmLink: async \(request, signal\) => \{\s+const options = \{\s+\.\.\.LINK_CONFIRMATION,\s+buttons: \[\.\.\.LINK_CONFIRMATION\.buttons\],\s+message: linkConfirmationMessage\(request\),\s+signal,\s+\};\s+return linkConfirmed\(\s+mainWindow === undefined\s+\? await dialog\.showMessageBox\(options\)\s+: await dialog\.showMessageBox\(mainWindow, options\),\s+\);\s+\},/u,
+  );
+  expect(entry).toMatch(
+    /window\.on\("closed", \(\) => \{\s+mainWindow = undefined;\s+projectRepositories\.cancelConfirmation\(\);\s+\}\);/u,
   );
 });

@@ -28,6 +28,7 @@ import {
 } from "./link-store.ts";
 import {
   createProjectRepositoryService,
+  LINK_CANCEL_PAUSE_MS,
   LINK_WRITE_RETRY_FIRST_MS,
   LINK_WRITE_RETRY_MAX_MS,
   linkWriteRetryDelayMs,
@@ -262,6 +263,8 @@ class Harness {
   holdFolderCheck: Deferred<void> | null = null;
   /** Each confirmation that the service asked for. */
   readonly confirmations: LinkConfirmationRequest[] = [];
+  /** The signal that the service passed with each confirmation. */
+  readonly confirmSignals: AbortSignal[] = [];
   confirmAnswer = true;
   holdConfirm: Deferred<boolean> | null = null;
   throwOnConfirm = false;
@@ -368,8 +371,9 @@ class Harness {
           ? { ok: false, reason: "symbolic_link" }
           : { ok: true, identity };
       },
-      confirmLink: async (request) => {
+      confirmLink: async (request, signal) => {
         this.confirmations.push(request);
+        this.confirmSignals.push(signal);
         if (this.throwOnConfirm) {
           throw new Error(`web app ${FOLDER_1}`);
         }
@@ -927,6 +931,8 @@ test("a link that the person cancels, or whose dialog fails, links and writes no
     outcome: "refused",
     reason: "cancelled",
   });
+  // The pause after the cancel ends.
+  harness.runTimers();
   harness.confirmAnswer = true;
   harness.throwOnConfirm = true;
   await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
@@ -987,7 +993,7 @@ test("a folder that is a symbolic link or a junction, or that cannot be read, is
   expect(harness.written).toEqual([]);
 });
 
-test("what the person confirmed must still hold when the link is written: another account, a removal, or a sign-out during the dialog links nothing", async () => {
+test("what the person confirmed must still hold when the link is written: another account or a removal during the dialog, or a sign-out after it, links nothing", async () => {
   const harness = new Harness();
   await harness.ready(repository(REPO_1), repository(REPO_2));
   harness.mount(MOUNT_1, FOLDER_1);
@@ -1019,20 +1025,206 @@ test("what the person confirmed must still hold when the link is written: anothe
     reason: "not_registered",
   });
 
-  // A sign-out while the dialog is open.
+  // A sign-out after the person confirmed, while the folder is read again.
+  // (A sign-out while the dialog is open ends it as a Cancel; see below.)
   harness.holdConfirm = deferred();
   hold = harness.holdConfirm;
   harness.mount(MOUNT_2, FOLDER_2);
   answer = harness.service.link(REPO_2, MOUNT_2);
   await settle();
-  harness.setAccount(accountStatus(false));
+  const check = deferred<void>();
+  harness.holdFolderCheck = check;
   harness.holdConfirm = null;
   hold.resolve(true);
+  await settle();
+  harness.setAccount(accountStatus(false));
+  harness.holdFolderCheck = null;
+  check.resolve();
   await expect(answer).resolves.toEqual({
     outcome: "refused",
     reason: "unavailable",
   });
   expect(harness.written).toEqual([]);
+});
+
+test("a dialog that never settles ends as a Cancel when the main window closes, the device signs out or changes, or the service closes, and does not hold the next link", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+  harness.mount(MOUNT_2, FOLDER_2);
+  const outcomes: unknown[] = [];
+  /** Starts a link whose dialog never settles unless the test settles it. */
+  const startLink = async (repositoryId: string, mountId: string) => {
+    const hold = deferred<boolean>();
+    harness.holdConfirm = hold;
+    void harness.service
+      .link(repositoryId, mountId)
+      .then((outcome) => outcomes.push(outcome));
+    await settle();
+    harness.holdConfirm = null;
+    expect(harness.confirmSignals.at(-1)?.aborted).toBe(false);
+    return hold;
+  };
+  const cancelled = { outcome: "refused", reason: "cancelled" };
+
+  // The main window closes.
+  const late = await startLink(REPO_1, MOUNT_1);
+  harness.service.cancelConfirmation();
+  await settle();
+  expect(outcomes).toEqual([cancelled]);
+  expect(harness.confirmSignals.at(-1)?.aborted).toBe(true);
+  // The dialog answering Link after it was closed links nothing.
+  late.resolve(true);
+  await settle();
+  expect(outcomes).toEqual([cancelled]);
+  expect(harness.written).toEqual([]);
+  // The next link is not held, once the pause after the cancel ended.
+  harness.runTimers();
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "linked",
+  });
+  // Without an open confirmation, the window's close changes nothing.
+  harness.service.cancelConfirmation();
+  expect(harness.timers).toEqual([]);
+
+  // A sign-out.
+  await startLink(REPO_2, MOUNT_2);
+  harness.setAccount(accountStatus(false));
+  await settle();
+  expect(outcomes.at(-1)).toEqual(cancelled);
+  expect(harness.confirmSignals.at(-1)?.aborted).toBe(true);
+  harness.runTimers();
+  harness.setAccount(accountStatus());
+  await harness.answerRead({
+    ok: true,
+    value: list(repository(REPO_1), repository(REPO_2)),
+  });
+
+  // Another device.
+  await startLink(REPO_2, MOUNT_2);
+  const other = accountStatus();
+  harness.setAccount({
+    ...other,
+    account: {
+      ...other.account,
+      deviceId: "0192f0a0-7b3c-7d4e-8f50-000000000005",
+    },
+  } as AccountStatus);
+  await settle();
+  expect(outcomes.at(-1)).toEqual(cancelled);
+  expect(harness.confirmSignals.at(-1)?.aborted).toBe(true);
+  harness.runTimers();
+  await harness.answerRead({
+    ok: true,
+    value: list(repository(REPO_1), repository(REPO_2)),
+  });
+
+  // The service's close, which schedules no pause.
+  await startLink(REPO_2, MOUNT_2);
+  harness.service.close();
+  await settle();
+  expect(outcomes.at(-1)).toEqual(cancelled);
+  expect(harness.confirmSignals.at(-1)?.aborted).toBe(true);
+  expect(harness.timers).toEqual([]);
+  expect(harness.written).toHaveLength(1);
+});
+
+test("after a cancel, another link answers busy without asking until the pause ends; a dialog that fails or a refusal before it starts no pause", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+
+  harness.confirmAnswer = false;
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "cancelled",
+  });
+  expect(harness.timers.map((timer) => timer.delayMs)).toEqual([
+    LINK_CANCEL_PAUSE_MS,
+  ]);
+  expect(LINK_CANCEL_PAUSE_MS).toBe(3_000);
+  harness.confirmAnswer = true;
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+  });
+  expect(harness.confirmations).toHaveLength(1);
+  harness.runTimers();
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "linked",
+  });
+  expect(harness.confirmations).toHaveLength(2);
+
+  // A dialog that fails, and a folder refused before the dialog.
+  harness.throwOnConfirm = true;
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "failed",
+  });
+  harness.throwOnConfirm = false;
+  harness.identities.set(FOLDER_1, "link");
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "symbolic_link",
+  });
+  expect(harness.timers).toEqual([]);
+
+  // The close ends a pause that runs.
+  harness.identities.delete(FOLDER_1);
+  harness.confirmAnswer = false;
+  await harness.service.link(REPO_1, MOUNT_1);
+  expect(harness.timers).toHaveLength(1);
+  harness.service.close();
+  expect(harness.timers).toEqual([]);
+});
+
+test("a folder replaced, turned into a link, or gone while the dialog is open is read again after the person confirmed, and links nothing", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+  harness.mount(MOUNT_1, FOLDER_1);
+  const cases: [RepositoryFolderIdentity | "link" | "missing", string][] = [
+    [identityOf(FOLDER_1, 1), "failed"],
+    [
+      {
+        folder: identityOf(FOLDER_1).folder,
+        commonDir: identityOf(FOLDER_1, 1).commonDir,
+      },
+      "failed",
+    ],
+    ["link", "symbolic_link"],
+    ["missing", "folder_missing"],
+  ];
+  for (const [change, reason] of cases) {
+    const hold = deferred<boolean>();
+    harness.holdConfirm = hold;
+    const answer = harness.service.link(REPO_1, MOUNT_1);
+    await settle();
+    harness.holdConfirm = null;
+    if (change === "missing") {
+      harness.folders.delete(FOLDER_1);
+    } else {
+      harness.identities.set(FOLDER_1, change);
+    }
+    hold.resolve(true);
+    await expect(answer, reason).resolves.toEqual({
+      outcome: "refused",
+      reason,
+    });
+    harness.folders.add(FOLDER_1);
+    harness.identities.delete(FOLDER_1);
+  }
+  expect(harness.confirmations).toHaveLength(cases.length);
+  expect(harness.written).toEqual([]);
+  expect(harness.state.repositories[0]).toMatchObject({ linked: false });
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "not_linked",
+  });
+  // A folder that stayed the same links, with the identity it was read with.
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "linked",
+  });
+  expect(harness.lastWritten()).toEqual([linkOf(REPO_1, FOLDER_1)]);
 });
 
 test("link refuses a repository that the open project does not list, a mount that does not exist, a folder linked to another repository, and invalid IDs, without asking or writing", async () => {

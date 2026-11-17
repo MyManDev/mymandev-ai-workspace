@@ -185,7 +185,9 @@ export interface ProjectRepositoriesBridge {
   /**
    * Links a registered repository to the folder of a mounted repository,
    * once the person confirmed it in the main process's own dialog;
-   * `cancelled` when they did not.
+   * `cancelled` when they did not or the dialog was closed, and `busy`
+   * while another link's dialog is open and for a few seconds after a
+   * cancel.
    */
   readonly link: (
     repositoryId: string,
