@@ -46,12 +46,14 @@ const LINKED: ProjectRepositoryView = {
   name: "app",
   linked: true,
   mountId: MOUNT_1,
+  removable: true,
 };
 const PLAIN: ProjectRepositoryView = {
   repositoryId: REPOSITORY_B,
   name: "docs",
   linked: false,
   mountId: null,
+  removable: true,
 };
 
 function known(
@@ -200,12 +202,14 @@ test("each repository shows its name as text, never translated, and where it is 
             name: "site",
             linked: true,
             mountId: null,
+            removable: true,
           },
           {
             repositoryId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b4",
             name: "tools",
             linked: true,
             mountId: "0b9e2f7c-5d0a-4c8e-9f3b-2a1d6e4c8b7f",
+            removable: true,
           },
         ],
       }),
@@ -242,6 +246,19 @@ test("a ready list offers Link to a folder, Unlink on a linked repository, and R
     '<div class="account-actions"><button type="button" class="panel-action" aria-describedby="project-repository-name-1">Link to a folder</button><button type="button" class="panel-action" aria-describedby="project-repository-name-1">Remove from the project</button></div>',
   );
   expect(repositoryNameId(3)).toBe("project-repository-name-3");
+});
+
+test("a repository that the account may not remove offers no Remove from the project (#309)", () => {
+  const html = render(
+    model(known({ repositories: [LINKED, { ...PLAIN, removable: false }] })),
+  );
+  expect(html).toContain(
+    '<div class="account-actions"><button type="button" class="panel-action" aria-describedby="project-repository-name-0">Link to a folder</button><button type="button" class="panel-action" aria-describedby="project-repository-name-0">Unlink</button><button type="button" class="panel-action" aria-describedby="project-repository-name-0">Remove from the project</button></div>',
+  );
+  expect(html).toContain(
+    '<div class="account-actions"><button type="button" class="panel-action" aria-describedby="project-repository-name-1">Link to a folder</button></div>',
+  );
+  expect(html.match(/>Remove from the project</g)).toHaveLength(1);
 });
 
 test("each button starts its action with the shown project, the repository, and the button", () => {
