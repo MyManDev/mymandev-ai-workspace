@@ -362,8 +362,13 @@ function start(): void {
   // Copying the workspace ID (#95; the Project Manager's decision of
   // 2026-11-13) is the only way to the clipboard: the session denies the
   // renderer's clipboard permissions, and the main process writes the ID of
-  // a workspace of the account's list and nothing else.
-  registerWorkspaceIdIpc(ipcMain, rendererUrl, { workspaces, clipboard });
+  // a workspace of the account's list and nothing else. A refused write is
+  // reported with a fixed message that names no ID.
+  registerWorkspaceIdIpc(ipcMain, rendererUrl, {
+    workspaces,
+    clipboard,
+    onError: (message, error) => console.error(message, error),
+  });
 
   // The selected workspace's people (#95, D3) reach the renderer read-only:
   // member IDs, names, roles, and logins, never a user ID, at most one

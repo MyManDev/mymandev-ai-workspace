@@ -1056,9 +1056,12 @@ export type CopyWorkspaceIdRefusal =
   (typeof COPY_WORKSPACE_ID_REFUSALS)[number];
 
 /**
- * The result of copying a workspace ID: `ok` once the main process wrote
- * the ID to the system clipboard, `refused` before anything was written,
- * or `failed` when the system refused the write.
+ * The result of copying a workspace ID: `ok` once the system clipboard took
+ * the ID (Electron's `clipboard.writeText` returns a promise, and the
+ * answer waits for it), `refused` before anything was written, or `failed`
+ * when the system refused the write: the write threw or its promise
+ * rejected. The main process reports a failed write with a fixed message
+ * that names no ID.
  */
 export const CopyWorkspaceIdResultSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("ok") }),

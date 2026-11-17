@@ -15,9 +15,14 @@ const NOT_FOUND: CopyWorkspaceIdResult = Object.freeze({
 });
 const FAILED: CopyWorkspaceIdResult = Object.freeze({ outcome: "failed" });
 
-/** The part of Electron's `clipboard` that copying a workspace ID uses. */
+/**
+ * The part of Electron's `clipboard` that copying a workspace ID uses. Its
+ * `writeText` resolves once the text is on the clipboard and rejects when
+ * the system refuses it, for example while another application holds the
+ * clipboard on Windows.
+ */
 export interface WorkspaceIdClipboard {
-  readonly writeText: (text: string) => void;
+  readonly writeText: (text: string) => Promise<void>;
 }
 
 export interface WorkspaceIdCopyOptions {
@@ -26,7 +31,7 @@ export interface WorkspaceIdCopyOptions {
   /** Electron's `clipboard`, the only place that the ID is written to. */
   readonly clipboard: WorkspaceIdClipboard;
   /** Reports a write that the system refused, with a fixed message. */
-  readonly onError?: ((message: string, error: unknown) => void) | undefined;
+  readonly onError: (message: string, error: unknown) => void;
 }
 
 /**
@@ -41,14 +46,14 @@ export interface WorkspaceIdCopyOptions {
  * workspace that the workspace service's list does not hold as
  * `not_found`, also without a signed-in device, whose list is empty. Only
  * then does it write, and it writes the list's own ID and nothing else: no
- * other text of the renderer ever reaches the clipboard. A write that
- * throws is reported with a fixed message, which names no ID, and answers
- * `failed`.
+ * other text of the renderer ever reaches the clipboard. It answers `ok`
+ * only once the write resolved; a write that throws or rejects is reported
+ * with a fixed message, which names no ID, and answers `failed`.
  */
-export function copyWorkspaceId(
+export async function copyWorkspaceId(
   value: string,
   options: WorkspaceIdCopyOptions,
-): CopyWorkspaceIdResult {
+): Promise<CopyWorkspaceIdResult> {
   const parsed = WorkspaceIdSchema.safeParse(value);
   if (!parsed.success) {
     return INVALID;
@@ -60,12 +65,9 @@ export function copyWorkspaceId(
     return NOT_FOUND;
   }
   try {
-    options.clipboard.writeText(listed.id);
+    await options.clipboard.writeText(listed.id);
   } catch (error) {
-    (options.onError ?? ((message, cause) => console.error(message, cause)))(
-      "Copying the workspace ID failed.",
-      error,
-    );
+    options.onError("Copying the workspace ID failed.", error);
     return FAILED;
   }
   return OK;
@@ -74,8 +76,9 @@ export function copyWorkspaceId(
 /**
  * Registers the handler of the channel that copies a workspace ID. It
  * checks the sender and the arguments first (`createInvokeHandler`): one
- * workspace ID as a lowercase UUIDv7, with no other argument. The result
- * is parsed by the contract, so only a fixed outcome reaches the renderer.
+ * workspace ID as a lowercase UUIDv7, with no other argument. The answer
+ * waits for the write, and it is parsed by the contract, so only a fixed
+ * outcome reaches the renderer.
  * Call it before the first window loads.
  */
 export function registerWorkspaceIdIpc(

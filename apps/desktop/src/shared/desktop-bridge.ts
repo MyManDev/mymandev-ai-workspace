@@ -306,7 +306,8 @@ export interface WorkspaceBridge {
    * so that a member can pass it on to someone who then asks to join with
    * it. The main process writes that ID and nothing else, and only for a
    * workspace that the account's list holds: another one is refused as
-   * `not_found`, and `failed` says that the system refused the write. An ID
+   * `not_found`. The answer comes once the write settled: `ok` once the
+   * system clipboard took the ID, `failed` when the system refused it. An ID
    * that is not a lowercase UUIDv7 is refused by the contract, and the call
    * rejects. The bridge passes on only a string.
    */

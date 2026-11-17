@@ -83,15 +83,23 @@ function receiver(url: string = DEV_URL): StatusReceiver {
   };
 }
 
-/** A clipboard that records every write, or throws on each one. */
-function fakeClipboard(failure?: Error) {
+/**
+ * A clipboard like Electron's, whose `writeText` returns a promise: it
+ * records every write and resolves, rejects with `failure`, or, with
+ * `throws`, throws before it returns a promise.
+ */
+function fakeClipboard(failure?: Error, throws = false) {
   const written: string[] = [];
   const clipboard: WorkspaceIdClipboard = {
     writeText: (text) => {
       if (failure !== undefined) {
-        throw failure;
+        if (throws) {
+          throw failure;
+        }
+        return Promise.reject(failure);
       }
       written.push(text);
+      return Promise.resolve();
     },
   };
   return { clipboard, written };
@@ -118,12 +126,13 @@ function fakeWorkspaces(initial: WorkspaceState = STATE) {
 function register(
   options: {
     readonly state?: WorkspaceState;
+    readonly clipboard?: WorkspaceIdClipboard;
     readonly failure?: Error;
     readonly appUrl?: string;
   } = {},
 ) {
   const service = fakeWorkspaces(options.state);
-  const { clipboard, written } = fakeClipboard(options.failure);
+  const fake = fakeClipboard(options.failure);
   const errors: { message: string; error: unknown }[] = [];
   const handlers = new Map<string, IpcInvokeListener>();
   const appUrl = options.appUrl ?? DEV_URL;
@@ -132,7 +141,7 @@ function register(
     appUrl,
     {
       workspaces: service.workspaces,
-      clipboard,
+      clipboard: options.clipboard ?? fake.clipboard,
       onError: (message, error) => errors.push({ message, error }),
     },
   );
@@ -144,9 +153,30 @@ function register(
     return handler(
       { senderFrame: frame(appUrl), sender: receiver(appUrl) },
       ...args,
-    );
+    ) as Promise<unknown>;
   };
-  return { handlers, call, written, errors, service };
+  return { handlers, call, written: fake.written, errors, service };
+}
+
+/** The options of a direct call of the action, with a recording reporter. */
+function directOptions(clipboard: WorkspaceIdClipboard) {
+  const service = fakeWorkspaces();
+  const errors: string[] = [];
+  return {
+    service,
+    errors,
+    options: {
+      workspaces: service.workspaces,
+      clipboard,
+      onError: (message: string) => errors.push(message),
+    },
+  };
+}
+
+async function settle(): Promise<void> {
+  for (let index = 0; index < 10; index += 1) {
+    await Promise.resolve();
+  }
 }
 
 const REFUSED_ARGUMENTS = `The call on ${INVOKE_CHANNELS.copyWorkspaceId} was refused: the arguments do not match the contract.`;
@@ -203,7 +233,7 @@ test("a refused call does not repeat the argument", () => {
 
   let message = "";
   try {
-    call("secret-text-for-the-clipboard");
+    void call("secret-text-for-the-clipboard");
   } catch (error) {
     message = String(error);
   }
@@ -211,85 +241,139 @@ test("a refused call does not repeat the argument", () => {
   expect(message).not.toContain("secret");
 });
 
-test("the ID of every workspace of the list is written once, exactly, selected or not, and answers ok", () => {
+test("the ID of every workspace of the list is written once, exactly, selected or not, and answers ok", async () => {
   const { call, written } = register();
 
-  expect(call(WORKSPACE_ID)).toEqual({ outcome: "ok" });
-  expect(call(OTHER_WORKSPACE_ID)).toEqual({ outcome: "ok" });
+  await expect(call(WORKSPACE_ID)).resolves.toEqual({ outcome: "ok" });
+  await expect(call(OTHER_WORKSPACE_ID)).resolves.toEqual({ outcome: "ok" });
   expect(written).toEqual([WORKSPACE_ID, OTHER_WORKSPACE_ID]);
 });
 
-test("a workspace that the list does not hold is refused as not_found, and nothing is written", () => {
+test("the answer waits for the write: it stays open until the write resolves, and answers ok only then", async () => {
+  let finish: (() => void) | undefined;
+  const written: string[] = [];
+  const clipboard: WorkspaceIdClipboard = {
+    writeText: (text) => {
+      written.push(text);
+      return new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+    },
+  };
+  const { call } = register({ clipboard });
+
+  let answer: unknown = "open";
+  void call(WORKSPACE_ID).then((value) => {
+    answer = value;
+  });
+  await settle();
+  expect(written).toEqual([WORKSPACE_ID]);
+  expect(answer).toBe("open");
+  finish?.();
+  await settle();
+  expect(answer).toEqual({ outcome: "ok" });
+});
+
+test("a write that rejects later, or throws at once, answers failed and is reported with a fixed message that names no ID", async () => {
+  const failure = new Error("Another application holds the clipboard.");
+  let refuse: ((error: Error) => void) | undefined;
+  const pending: WorkspaceIdClipboard = {
+    writeText: () =>
+      new Promise<void>((_resolve, reject) => {
+        refuse = reject;
+      }),
+  };
+  const later = register({ clipboard: pending });
+
+  let answer: unknown = "open";
+  void later.call(WORKSPACE_ID).then((value) => {
+    answer = value;
+  });
+  await settle();
+  expect(answer).toBe("open");
+  expect(later.errors).toEqual([]);
+  refuse?.(failure);
+  await settle();
+  expect(answer).toEqual({ outcome: "failed" });
+  expect(later.errors).toEqual([
+    { message: "Copying the workspace ID failed.", error: failure },
+  ]);
+
+  const rejected = register({ failure });
+  await expect(rejected.call(WORKSPACE_ID)).resolves.toEqual({
+    outcome: "failed",
+  });
+  expect(rejected.errors).toEqual([
+    { message: "Copying the workspace ID failed.", error: failure },
+  ]);
+
+  const throwing = register({
+    clipboard: fakeClipboard(failure, true).clipboard,
+  });
+  await expect(throwing.call(WORKSPACE_ID)).resolves.toEqual({
+    outcome: "failed",
+  });
+  expect(throwing.errors).toEqual([
+    { message: "Copying the workspace ID failed.", error: failure },
+  ]);
+  for (const { message } of [...later.errors, ...throwing.errors]) {
+    expect(message).not.toContain(WORKSPACE_ID);
+  }
+});
+
+test("a workspace that the list does not hold is refused as not_found, and nothing is written", async () => {
   const { call, written, service } = register();
+  const notFound = { outcome: "refused", reason: "not_found" };
 
   // A project's ID, an unknown ID, and a workspace that left the list.
-  expect(call(PROJECT_ID)).toEqual({
-    outcome: "refused",
-    reason: "not_found",
-  });
-  expect(call(UNLISTED_ID)).toEqual({
-    outcome: "refused",
-    reason: "not_found",
-  });
+  await expect(call(PROJECT_ID)).resolves.toEqual(notFound);
+  await expect(call(UNLISTED_ID)).resolves.toEqual(notFound);
   service.set({ ...STATE, workspaces: STATE.workspaces.slice(1) });
-  expect(call(WORKSPACE_ID)).toEqual({
-    outcome: "refused",
-    reason: "not_found",
-  });
+  await expect(call(WORKSPACE_ID)).resolves.toEqual(notFound);
   expect(written).toEqual([]);
   // The list is read at each call, so a workspace that joins it can be copied.
   service.set(STATE);
-  expect(call(WORKSPACE_ID)).toEqual({ outcome: "ok" });
+  await expect(call(WORKSPACE_ID)).resolves.toEqual({ outcome: "ok" });
   expect(written).toEqual([WORKSPACE_ID]);
 });
 
-test("without a signed-in device the list is empty, so every ID is refused as not_found", () => {
+test("without a signed-in device the list is empty, so every ID is refused as not_found", async () => {
   const { call, written } = register({ state: SIGNED_OUT });
 
   for (const id of [WORKSPACE_ID, OTHER_WORKSPACE_ID]) {
-    expect(call(id)).toEqual({ outcome: "refused", reason: "not_found" });
+    await expect(call(id)).resolves.toEqual({
+      outcome: "refused",
+      reason: "not_found",
+    });
   }
   expect(written).toEqual([]);
 });
 
-test("the action checks the ID with the protocol's ID schema, also without the contract, before the list is read", () => {
-  const service = fakeWorkspaces();
+test("the action checks the ID with the protocol's ID schema, also without the contract, before the list is read", async () => {
   const { clipboard, written } = fakeClipboard();
+  const { service, options } = directOptions(clipboard);
 
   for (const value of NOT_PROTOCOL_IDS) {
-    expect(
-      copyWorkspaceId(value as string, {
-        workspaces: service.workspaces,
-        clipboard,
-      }),
+    await expect(
+      copyWorkspaceId(value as string, options),
       String(value),
-    ).toEqual({ outcome: "refused", reason: "invalid" });
+    ).resolves.toEqual({ outcome: "refused", reason: "invalid" });
   }
   expect(service.reads()).toBe(0);
   expect(written).toEqual([]);
 });
 
-test("a write that the system refuses answers failed and is reported with a fixed message that names no ID", () => {
-  const failure = new Error("The clipboard is not available.");
-  const { call, errors } = register({ failure });
-
-  expect(call(WORKSPACE_ID)).toEqual({ outcome: "failed" });
-  expect(errors).toEqual([
-    { message: "Copying the workspace ID failed.", error: failure },
-  ]);
-  expect(errors[0]?.message).not.toContain(WORKSPACE_ID);
-});
-
-test("every answer is a fixed outcome that the contract accepts, and the contract refuses any other", () => {
+test("every answer is a fixed outcome that the contract accepts, and the contract refuses any other", async () => {
   const { call } = register();
-  const answers = [call(WORKSPACE_ID), call(UNLISTED_ID)];
-  answers.push(register({ failure: new Error("no") }).call(WORKSPACE_ID));
-  answers.push(
-    copyWorkspaceId("x", {
-      workspaces: fakeWorkspaces().workspaces,
-      clipboard: fakeClipboard().clipboard,
-    }),
-  );
+  const answers = [
+    await call(WORKSPACE_ID),
+    await call(UNLISTED_ID),
+    await register({ failure: new Error("no") }).call(WORKSPACE_ID),
+    await copyWorkspaceId(
+      "x",
+      directOptions(fakeClipboard().clipboard).options,
+    ),
+  ];
 
   expect(answers).toEqual([
     { outcome: "ok" },
@@ -303,37 +387,68 @@ test("every answer is a fixed outcome that the contract accepts, and the contrac
   expect(COPY_WORKSPACE_ID_REFUSALS).toEqual(["invalid", "not_found"]);
 });
 
-// The main process's sources, without the tests, as text, by their path
-// in this folder with forward slashes.
-const MAIN_FOLDER = new URL("./", import.meta.url);
-const MAIN_SOURCES: Readonly<Record<string, string>> = Object.fromEntries(
-  readdirSync(MAIN_FOLDER, { recursive: true, encoding: "utf8" })
-    .map((file) => file.replaceAll("\\", "/"))
-    .filter((file) => file.endsWith(".ts") && !file.endsWith(".test.ts"))
-    .map((file) => [
-      `./${file}`,
-      readFileSync(new URL(file, MAIN_FOLDER), "utf8"),
-    ]),
-);
+/**
+ * The sources of a folder of `src`, without the tests, as text, by their
+ * path in that folder with forward slashes.
+ */
+function sourcesOf(folder: string): Readonly<Record<string, string>> {
+  const url = new URL(folder, import.meta.url);
+  return Object.fromEntries(
+    readdirSync(url, { recursive: true, encoding: "utf8" })
+      .map((file) => file.replaceAll("\\", "/"))
+      .filter(
+        (file) =>
+          /\.(?:ts|tsx|mts|cts)$/.test(file) && !/\.test\.[^/]+$/.test(file),
+      )
+      .map((file) => [`./${file}`, readFileSync(new URL(file, url), "utf8")]),
+  );
+}
+
+const MAIN_SOURCES = sourcesOf("./");
+const PRELOAD_SOURCES = sourcesOf("../preload/");
+const SHARED_SOURCES = sourcesOf("../shared/");
 
 /** `source` without its block and line comments. */
 function withoutComments(source: string): string {
   return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
 }
 
-test("the entry point registers the copy with Electron's clipboard, and no other module of the main process reaches the clipboard", () => {
-  expect(Object.keys(MAIN_SOURCES)).toContain("./workspace/service.ts");
-  expect(Object.keys(MAIN_SOURCES)).not.toContain("./workspace-id-ipc.test.ts");
-  const entry = withoutComments(MAIN_SOURCES["./index.ts"] ?? "");
-  expect(entry).toMatch(/import \{[^}]*\bclipboard,[^}]*\} from "electron";/);
-  expect(entry).toMatch(
-    /registerWorkspaceIdIpc\(ipcMain, rendererUrl, \{\s*workspaces,\s*clipboard,?\s*\}\);/,
-  );
-  const reaching = Object.entries(MAIN_SOURCES)
+/** The files of `sources` whose code, without comments, names the clipboard. */
+function namingTheClipboard(sources: Readonly<Record<string, string>>) {
+  return Object.entries(sources)
     .filter(([, source]) => /clipboard/i.test(withoutComments(source)))
     .map(([file]) => file)
     .sort();
-  expect(reaching).toEqual(["./index.ts", "./workspace-id-ipc.ts"]);
+}
+
+test("the entry point registers the copy with Electron's clipboard and its own reporter, and no other module of the main process, the preload script, or the shared code reaches the clipboard", () => {
+  expect(Object.keys(MAIN_SOURCES)).toContain("./workspace/service.ts");
+  expect(Object.keys(MAIN_SOURCES)).not.toContain("./workspace-id-ipc.test.ts");
+  expect(Object.keys(PRELOAD_SOURCES).sort()).toEqual([
+    "./bridge.ts",
+    "./index.ts",
+  ]);
+  expect(Object.keys(SHARED_SOURCES)).toContain("./ipc-contract.ts");
+  expect(Object.keys(SHARED_SOURCES)).toContain("./desktop-bridge.ts");
+  expect(Object.keys(SHARED_SOURCES)).not.toContain("./ipc-contract.test.ts");
+  const entry = withoutComments(MAIN_SOURCES["./index.ts"] ?? "");
+  expect(entry).toMatch(/import \{[^}]*\bclipboard,[^}]*\} from "electron";/);
+  expect(entry).toMatch(
+    /registerWorkspaceIdIpc\(ipcMain, rendererUrl, \{\s*workspaces,\s*clipboard,\s*onError: \(message, error\) => console\.error\(message, error\),?\s*\}\);/,
+  );
+  expect(namingTheClipboard(MAIN_SOURCES)).toEqual([
+    "./index.ts",
+    "./workspace-id-ipc.ts",
+  ]);
   // In the entry point, only the import and the registration name it.
   expect(entry.match(/\bclipboard\b/g)).toHaveLength(2);
+  expect(namingTheClipboard(PRELOAD_SOURCES)).toEqual([]);
+  expect(namingTheClipboard(SHARED_SOURCES)).toEqual([]);
+  // The check finds a use in code, but not in a comment.
+  expect(
+    namingTheClipboard({
+      "./comment.ts": "// The clipboard is named here only.\nexport {};\n",
+      "./code.ts": 'import { clipboard } from "electron";\n',
+    }),
+  ).toEqual(["./code.ts"]);
 });
