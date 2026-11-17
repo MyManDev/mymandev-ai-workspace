@@ -158,32 +158,67 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-test("the page's observer is an IntersectionObserver with the rows' thresholds that passes its entries on, and there is none without one", () => {
-  const made: { callback: (entries: unknown[]) => void; options: unknown }[] =
-    [];
+test("the page's observer is an IntersectionObserver with the rows' thresholds that passes its entries on and calls onResize on each resize of the window until it disconnects, and there is none without one", () => {
+  const made: {
+    callback: (entries: unknown[]) => void;
+    options: unknown;
+    calls: string[];
+  }[] = [];
   class PageObserver {
+    readonly calls: string[] = [];
     constructor(callback: (entries: unknown[]) => void, options: unknown) {
-      made.push({ callback, options });
+      made.push({ callback, options, calls: this.calls });
     }
-    observe() {}
-    unobserve() {}
-    disconnect() {}
+    observe(element: Element) {
+      this.calls.push(`observe ${String(element)}`);
+    }
+    unobserve(element: Element) {
+      this.calls.push(`unobserve ${String(element)}`);
+    }
+    disconnect() {
+      this.calls.push("disconnect");
+    }
   }
+  const win = target();
   vi.stubGlobal("IntersectionObserver", PageObserver);
+  vi.stubGlobal("window", win);
   const received: (readonly RowEntry[])[] = [];
+  let resized = 0;
   const observer = pageRowObserver((entries) => received.push(entries), {
     threshold: ROW_THRESHOLDS,
+    onResize: () => {
+      resized += 1;
+    },
   });
-  expect(observer).toBeInstanceOf(PageObserver);
   expect(made).toHaveLength(1);
   expect(made[0]?.options).toEqual({ threshold: [...ROW_THRESHOLDS] });
   const entries = [entry(row("ada"), 1)];
   made[0]?.callback(entries);
   expect(received).toEqual([entries]);
+  observer?.observe(row("ada"));
+  observer?.unobserve(row("ada"));
+  // A resize of the window, which a change of the page zoom also fires.
+  expect(win.listeners.get("resize")?.size).toBe(1);
+  win.fire("resize");
+  win.fire("resize");
+  expect(resized).toBe(2);
+  observer?.disconnect();
+  expect(made[0]?.calls).toEqual([
+    "observe ada",
+    "unobserve ada",
+    "disconnect",
+  ]);
+  expect(win.count()).toBe(0);
+  win.fire("resize");
+  expect(resized).toBe(2);
   vi.stubGlobal("IntersectionObserver", undefined);
   expect(
-    pageRowObserver(() => undefined, { threshold: ROW_THRESHOLDS }),
+    pageRowObserver(() => undefined, {
+      threshold: ROW_THRESHOLDS,
+      onResize: () => undefined,
+    }),
   ).toBeUndefined();
+  expect(win.count()).toBe(0);
 });
 
 /** A fake observer factory that records what it was asked to do. */
@@ -191,11 +226,18 @@ function observers() {
   const made: {
     readonly callback: (entries: readonly RowEntry[]) => void;
     readonly threshold: readonly number[];
+    /** What the window's resize, as the page's observer follows it, calls. */
+    readonly onResize: () => void;
     readonly calls: string[];
   }[] = [];
   const create: RowObserverFactory = (callback, options) => {
     const calls: string[] = [];
-    made.push({ callback, threshold: options.threshold, calls });
+    made.push({
+      callback,
+      threshold: options.threshold,
+      onResize: options.onResize,
+      calls,
+    });
     const observer: RowObserver = {
       observe: (element) => calls.push(`observe ${String(element)}`),
       unobserve: (element) => calls.push(`unobserve ${String(element)}`),
@@ -402,7 +444,9 @@ test("a row taller than the visible area meets a threshold while it fills three 
       `k = ${String(k)}`,
     ).not.toHaveLength(0);
   }
-});
+  // Tens of thousands of checks take a few seconds on their own and passed
+  // the default limit of 5 seconds on a loaded machine and in CI.
+}, 30_000);
 
 /**
  * Scrolls a row `k` times the visible area's height, at the full width,
@@ -517,29 +561,108 @@ test("without the visible area's bounds, or with a visible area of no height, a 
   ).toBe(false);
 });
 
-test("a row of no area has the share 1 whenever it intersects, as IntersectionObserver reports it, and so counts on any intersection", () => {
+/**
+ * An entry for a row of `width` by `height` pixels with `visible` of its
+ * height and all its width in view, that intersects the visible area with
+ * the share 1, as `IntersectionObserver` reports a row of no area.
+ */
+function flatEntry(
+  element: Element,
+  width: number,
+  height: number,
+  visible: number,
+  intersectionRatio = 1,
+): RowEntry {
+  return {
+    target: element,
+    isIntersecting: true,
+    intersectionRatio,
+    boundingClientRect: { width, height },
+    intersectionRect: { width, height: visible },
+    rootBounds: ROOT,
+  };
+}
+
+test("a row of no area, of no width, no height, or neither, is never in view, though IntersectionObserver gives it the share 1 whenever it intersects (#285)", () => {
   const ada = row("ada");
-  // A known limit at an extreme zoom, where a row could lose its width.
+  // No width, as at an extreme page zoom when the main column loses its
+  // width: a short row, and a row that overflows down the page.
+  expect(isRowInView(flatEntry(ada, 0, 40, 40))).toBe(false);
+  expect(isRowInView(flatEntry(ada, 0, 1200, 1))).toBe(false);
+  // No height, and neither.
+  expect(isRowInView(flatEntry(ada, 500, 0, 0))).toBe(false);
+  expect(isRowInView(flatEntry(ada, 0, 0, 0))).toBe(false);
+  // Whatever the share says: a row of no width taller than the visible area
+  // whose visible part fills it does not count by the rule for a taller row.
+  expect(isRowInView(flatEntry(ada, 0, 1200, 600, 0))).toBe(false);
+  expect(isRowInView(flatEntry(ada, 0, 1200, 600, 0.5))).toBe(false);
   expect(
-    isRowInView({
-      target: ada,
-      isIntersecting: true,
-      intersectionRatio: 1,
-      boundingClientRect: { width: 0, height: 1200 },
-      intersectionRect: { width: 0, height: 1 },
-      rootBounds: ROOT,
-    }),
-  ).toBe(true);
-  expect(
-    isRowInView({
-      target: ada,
-      isIntersecting: false,
-      intersectionRatio: 0,
-      boundingClientRect: { width: 0, height: 1200 },
-      intersectionRect: { width: 0, height: 0 },
-      rootBounds: ROOT,
-    }),
+    isRowInView({ ...flatEntry(ada, 0, 40, 40), isIntersecting: false }),
   ).toBe(false);
+  // A size that is not a number, or a negative one, is no area either.
+  expect(isRowInView(flatEntry(ada, Number.NaN, 40, 40))).toBe(false);
+  expect(isRowInView(flatEntry(ada, 500, Number.NaN, 40))).toBe(false);
+  expect(isRowInView(flatEntry(ada, -1, 40, 40))).toBe(false);
+  expect(isRowInView(flatEntry(ada, -500, -40, -40))).toBe(false);
+  // A row with any area keeps both rules: a normal row, a row taller than
+  // the visible area that fills it (#279), and a row a fraction of a pixel
+  // wide.
+  expect(isRowInView(entry(ada, 1))).toBe(true);
+  expect(isRowInView(tallEntry(ada, 1200, 600))).toBe(true);
+  expect(isRowInView(tallEntry(ada, 1200, 450))).toBe(true);
+  expect(isRowInView(flatEntry(ada, 0.25, 40, 40))).toBe(true);
+  expect(isRowInView(flatEntry(ada, 500, 0.25, 0.25))).toBe(true);
+});
+
+test("on each resize of the window every row is observed again, so that a row wholly in view that loses its area gets a new entry and leaves the view, and comes back once it has its area again", () => {
+  const { made, create } = observers();
+  const views: string[][] = [];
+  const rows = followRowsInView(create, (ids) => views.push([...ids].sort()));
+  const ada = row("ada");
+  const linus = row("linus");
+  rows.refFor(ADA)(ada);
+  rows.refFor(LINUS)(linus);
+  const { callback: report, onResize, calls } = made[0]!;
+  // The first entries: both rows wholly in view.
+  report([entry(ada, 1), entry(linus, 1)]);
+  expect(views).toEqual([[ADA, LINUS].sort()]);
+  // A zoom takes the rows' width while they keep intersecting: their share
+  // stays 1, so the observer itself sends nothing. The window's resize has
+  // every row observed again, which brings a first entry for each.
+  calls.length = 0;
+  onResize();
+  expect(calls).toEqual([
+    "unobserve ada",
+    "observe ada",
+    "unobserve linus",
+    "observe linus",
+  ]);
+  expect(views).toHaveLength(1);
+  report([flatEntry(ada, 0, 40, 40), flatEntry(linus, 0, 40, 40)]);
+  expect(views).toEqual([[ADA, LINUS].sort(), []]);
+  // Zooming out gives the rows their width back: another resize observes
+  // every row again, also the rows out of view, and a first entry for each
+  // comes again.
+  calls.length = 0;
+  onResize();
+  expect(calls).toEqual([
+    "unobserve ada",
+    "observe ada",
+    "unobserve linus",
+    "observe linus",
+  ]);
+  report([entry(ada, 1), entry(linus, 0.5)]);
+  expect(views).toEqual([[ADA, LINUS].sort(), [], [ADA]]);
+  // A row that left the page is not observed again, and after the stop
+  // nothing is.
+  rows.refFor(LINUS)(null);
+  calls.length = 0;
+  onResize();
+  expect(calls).toEqual(["unobserve ada", "observe ada"]);
+  rows.stop();
+  calls.length = 0;
+  onResize();
+  expect(calls).toEqual([]);
 });
 
 test("the rows' observer follows a tall row into and out of view as it fills the visible area", () => {
