@@ -444,7 +444,9 @@ test("a row taller than the visible area meets a threshold while it fills three 
       `k = ${String(k)}`,
     ).not.toHaveLength(0);
   }
-});
+  // Tens of thousands of checks take a few seconds on their own and passed
+  // the default limit of 5 seconds on a loaded machine and in CI.
+}, 30_000);
 
 /**
  * Scrolls a row `k` times the visible area's height, at the full width,
@@ -638,9 +640,17 @@ test("on each resize of the window every row is observed again, so that a row wh
   expect(views).toHaveLength(1);
   report([flatEntry(ada, 0, 40, 40), flatEntry(linus, 0, 40, 40)]);
   expect(views).toEqual([[ADA, LINUS].sort(), []]);
-  // Zooming out gives the rows their width back: another resize, and a
-  // first entry for each again.
+  // Zooming out gives the rows their width back: another resize observes
+  // every row again, also the rows out of view, and a first entry for each
+  // comes again.
+  calls.length = 0;
   onResize();
+  expect(calls).toEqual([
+    "unobserve ada",
+    "observe ada",
+    "unobserve linus",
+    "observe linus",
+  ]);
   report([entry(ada, 1), entry(linus, 0.5)]);
   expect(views).toEqual([[ADA, LINUS].sort(), [], [ADA]]);
   // A row that left the page is not observed again, and after the stop
