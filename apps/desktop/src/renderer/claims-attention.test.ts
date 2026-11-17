@@ -517,29 +517,69 @@ test("without the visible area's bounds, or with a visible area of no height, a 
   ).toBe(false);
 });
 
-test("a row of no area has the share 1 whenever it intersects, as IntersectionObserver reports it, and so counts on any intersection", () => {
+/**
+ * An entry for a row of `width` by `height` pixels with `visible` of its
+ * height and all its width in view, that intersects the visible area with
+ * the share 1, as `IntersectionObserver` reports a row of no area.
+ */
+function flatEntry(
+  element: Element,
+  width: number,
+  height: number,
+  visible: number,
+  intersectionRatio = 1,
+): RowEntry {
+  return {
+    target: element,
+    isIntersecting: true,
+    intersectionRatio,
+    boundingClientRect: { width, height },
+    intersectionRect: { width, height: visible },
+    rootBounds: ROOT,
+  };
+}
+
+test("a row of no area, of no width, no height, or neither, is never in view, though IntersectionObserver gives it the share 1 whenever it intersects (#285)", () => {
   const ada = row("ada");
-  // A known limit at an extreme zoom, where a row could lose its width.
+  // No width, as at an extreme page zoom when the main column loses its
+  // width: a short row, and a row that overflows down the page.
+  expect(isRowInView(flatEntry(ada, 0, 40, 40))).toBe(false);
+  expect(isRowInView(flatEntry(ada, 0, 1200, 1))).toBe(false);
+  // No height, and neither.
+  expect(isRowInView(flatEntry(ada, 500, 0, 0))).toBe(false);
+  expect(isRowInView(flatEntry(ada, 0, 0, 0))).toBe(false);
+  // Whatever the share says: a row of no width taller than the visible area
+  // whose visible part fills it does not count by the rule for a taller row.
+  expect(isRowInView(flatEntry(ada, 0, 1200, 600, 0))).toBe(false);
+  expect(isRowInView(flatEntry(ada, 0, 1200, 600, 0.5))).toBe(false);
   expect(
-    isRowInView({
-      target: ada,
-      isIntersecting: true,
-      intersectionRatio: 1,
-      boundingClientRect: { width: 0, height: 1200 },
-      intersectionRect: { width: 0, height: 1 },
-      rootBounds: ROOT,
-    }),
-  ).toBe(true);
-  expect(
-    isRowInView({
-      target: ada,
-      isIntersecting: false,
-      intersectionRatio: 0,
-      boundingClientRect: { width: 0, height: 1200 },
-      intersectionRect: { width: 0, height: 0 },
-      rootBounds: ROOT,
-    }),
+    isRowInView({ ...flatEntry(ada, 0, 40, 40), isIntersecting: false }),
   ).toBe(false);
+  // A row with any area keeps both rules: a normal row, a row taller than
+  // the visible area that fills it (#279), and a row a fraction of a pixel
+  // wide.
+  expect(isRowInView(entry(ada, 1))).toBe(true);
+  expect(isRowInView(tallEntry(ada, 1200, 600))).toBe(true);
+  expect(isRowInView(tallEntry(ada, 1200, 450))).toBe(true);
+  expect(isRowInView(flatEntry(ada, 0.25, 40, 40))).toBe(true);
+  expect(isRowInView(flatEntry(ada, 500, 0.25, 0.25))).toBe(true);
+});
+
+test("the rows' observer takes a row out of view once it loses its area, and back once it has it again", () => {
+  const { made, create } = observers();
+  const views: string[][] = [];
+  const rows = followRowsInView(create, (ids) => views.push([...ids].sort()));
+  const ada = row("ada");
+  const linus = row("linus");
+  rows.refFor(ADA)(ada);
+  rows.refFor(LINUS)(linus);
+  const report = made[0]!.callback;
+  report([entry(ada, 1), flatEntry(linus, 0, 40, 40)]);
+  expect(views).toEqual([[ADA]]);
+  report([flatEntry(ada, 0, 40, 40), flatEntry(linus, 500, 0, 0)]);
+  expect(views).toEqual([[ADA], []]);
+  report([tallEntry(ada, 1200, 600), entry(linus, 1)]);
+  expect(views).toEqual([[ADA], [], [ADA, LINUS].sort()]);
 });
 
 test("the rows' observer follows a tall row into and out of view as it fills the visible area", () => {

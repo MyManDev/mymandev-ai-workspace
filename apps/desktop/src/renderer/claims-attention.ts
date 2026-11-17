@@ -210,26 +210,31 @@ export interface RowEntry {
  * bounds, or with a visible area of no height, the rule for a taller row
  * does not apply; the first rule still does.
  *
+ * A row with no area, of no width or no height, is never in view, whatever
+ * the entry says (the Project Manager's decision of 2026-11-17 on #285).
+ * `IntersectionObserver` gives such a row the share 1 whenever it intersects
+ * the visible area, even when none of it shows, as at an extreme page zoom
+ * on a small window, when the main column loses its width. When in doubt, a
+ * claim stays new; zooming out or enlarging the window gives the row its
+ * area back.
+ *
  * The rule assumes that the document itself scrolls: with the page's
  * observer (`pageRowObserver`), `rootBounds` is the viewport, while
- * `intersectionRect` is also clipped by every scrolling ancestor. A
- * scrolling or fixed ancestor of the rows would make the visible area
- * smaller than `rootBounds`, so that a tall row could no longer fill three
- * quarters of it; `config/renderer-stylesheet.test.ts` checks that the
- * rows' ancestors set none.
- *
- * A row of no area has a share of 1 whenever it intersects the visible area,
- * as `IntersectionObserver` reports it, and so counts on any intersection.
+ * `intersectionRect` is also clipped by every ancestor that scrolls or
+ * clips. Such an ancestor of the rows, or a fixed one, would make the
+ * visible area smaller than `rootBounds`, so that a tall row could no longer
+ * fill three quarters of it; `config/renderer-stylesheet.test.ts` checks
+ * that the rows' ancestors set none.
  */
 export function isRowInView(entry: RowEntry): boolean {
-  if (!entry.isIntersecting) {
+  const row = entry.boundingClientRect;
+  if (!entry.isIntersecting || !(row.width > 0 && row.height > 0)) {
     return false;
   }
   if (entry.intersectionRatio >= ROW_IN_VIEW_RATIO) {
     return true;
   }
   const root = entry.rootBounds;
-  const row = entry.boundingClientRect;
   const visible = entry.intersectionRect;
   return (
     root !== null &&
