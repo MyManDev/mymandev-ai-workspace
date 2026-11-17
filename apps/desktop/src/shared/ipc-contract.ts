@@ -1056,6 +1056,42 @@ export const CreateProjectResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type CreateProjectResult = z.infer<typeof CreateProjectResultSchema>;
 
+// Copying the workspace ID (#95; the Project Manager's decision of
+// 2026-11-13): one strict channel, so that a member can pass the ID on to
+// someone who asks to join with it.
+
+/**
+ * Why copying a workspace ID was refused. Nothing was copied.
+ *
+ * - `invalid`: the ID is not one of the protocol's.
+ * - `not_found`: the account's workspace list does not hold the workspace,
+ *   also without a signed-in device, whose list is empty.
+ */
+export const COPY_WORKSPACE_ID_REFUSALS = Object.freeze([
+  "invalid",
+  "not_found",
+] as const);
+export type CopyWorkspaceIdRefusal =
+  (typeof COPY_WORKSPACE_ID_REFUSALS)[number];
+
+/**
+ * The result of copying a workspace ID: `ok` once the system clipboard took
+ * the ID (Electron's `clipboard.writeText` returns a promise, and the
+ * answer waits for it), `refused` before anything was written, or `failed`
+ * when the system refused the write: the write threw or its promise
+ * rejected. The main process reports a failed write with a fixed message
+ * that names no ID.
+ */
+export const CopyWorkspaceIdResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(COPY_WORKSPACE_ID_REFUSALS),
+  }),
+  z.object({ outcome: z.literal("failed") }),
+]);
+export type CopyWorkspaceIdResult = z.infer<typeof CopyWorkspaceIdResultSchema>;
+
 // The people of the selected workspace (#95, decision D3).
 
 /**
@@ -3018,6 +3054,11 @@ export const INVOKE_CONTRACT = Object.freeze({
     /** The selected workspace's ID and the new project's name. */
     args: z.tuple([ProtocolIdSchema, NewNameSchema]),
     result: CreateProjectResultSchema,
+  }),
+  [INVOKE_CHANNELS.copyWorkspaceId]: Object.freeze({
+    /** The ID of a workspace of the account's list. */
+    args: z.tuple([ProtocolIdSchema]),
+    result: CopyWorkspaceIdResultSchema,
   }),
   [INVOKE_CHANNELS.getPeopleState]: Object.freeze({
     args: NoArgumentsSchema,
