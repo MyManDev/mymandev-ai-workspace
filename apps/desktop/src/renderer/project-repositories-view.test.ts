@@ -592,9 +592,9 @@ test("the subscription reports every state and a refusal", () => {
 
 // The actions.
 
-test("a removal asks first, sends once after the confirmation, and its button leaves the page", async () => {
+test("a removal asks first and sends once after the confirmation", async () => {
   const { actions, calls, answers, last } = controllerWith();
-  expect(await actions.start(request("remove"))).toBe(false);
+  await actions.start(request("remove"));
   expect(calls).toEqual([]);
   expect(last().dialog).toEqual({ kind: "remove", request: request("remove") });
 
@@ -603,13 +603,13 @@ test("a removal asks first, sends once after the confirmation, and its button le
   expect(last().running).toBe(true);
   expect(calls).toEqual([`remove ${PROJECT} ${REPOSITORY_A}`]);
   answers.remove.resolve({ outcome: "ok" });
-  expect(await done).toBe(true);
+  await done;
   expect(last()).toEqual({
     ...IDLE_PROJECT_REPOSITORY_ACTIONS,
     message: "The repository was removed from the project.",
   });
   // A confirmation without a question sends nothing.
-  expect(await actions.confirm()).toBe(false);
+  await actions.confirm();
   expect(calls).toHaveLength(1);
 });
 
@@ -618,11 +618,11 @@ test("a cancelled question sends nothing", async () => {
   await actions.start(request("remove"));
   actions.cancel();
   expect(last().dialog).toBeUndefined();
-  expect(await actions.confirm()).toBe(false);
+  await actions.confirm();
   expect(calls).toEqual([]);
 });
 
-test("a refused removal keeps its button: it resolves to false with its sentence", async () => {
+test("a refused removal says why", async () => {
   const { actions, answers, last } = controllerWith();
   await actions.start(request("remove"));
   const done = actions.confirm();
@@ -631,7 +631,7 @@ test("a refused removal keeps its button: it resolves to false with its sentence
     reason: "forbidden",
     retryAfterMs: null,
   });
-  expect(await done).toBe(false);
+  await done;
   expect(last().message).toBe(
     "The repository could not be removed. Only the person who registered it, the workspace's owner, and its admins can remove it.",
   );
@@ -661,7 +661,7 @@ test("a link without a chosen folder sends nothing and says to choose one, until
   const opened = last().dialog;
   expect(opened?.kind === "link" ? opened.mountId : "no dialog").toBeNull();
 
-  expect(await actions.confirm()).toBe(false);
+  await actions.confirm();
   expect(calls).toEqual([]);
   const asked = last().dialog;
   expect(asked?.kind === "link" ? asked.problem : undefined).toBe(
@@ -677,7 +677,7 @@ test("a link without a chosen folder sends nothing and says to choose one, until
   ).toEqual([MOUNT_3, undefined]);
 });
 
-test("a confirmed link asks the main process, which asks the person in its own dialog meanwhile, and says how it ended; its button stays", async () => {
+test("a confirmed link asks the main process, which asks the person in its own dialog meanwhile, and says how it ended", async () => {
   const { actions, calls, answers, last } = controllerWith();
   await actions.start(request("link"));
   actions.choose(MOUNT_3);
@@ -690,7 +690,7 @@ test("a confirmed link asks the main process, which asks the person in its own d
       "Confirm or cancel the link in the dialog that this device opened.",
   });
   answers.link.resolve({ outcome: "refused", reason: "cancelled" });
-  expect(await done).toBe(false);
+  await done;
   expect(last().message).toBe(
     "The repository was not linked. You cancelled it in the confirmation dialog. Nothing changed.",
   );
@@ -702,26 +702,29 @@ test("a linked answer says so", async () => {
   await actions.start(request("link"));
   const done = actions.confirm();
   answers.link.resolve({ outcome: "linked" });
-  expect(await done).toBe(false);
+  await done;
   expect(last().message).toBe(
     "The repository was linked to the folder on this device.",
   );
 });
 
-test("an unlink runs at once, and its button leaves the page once it happened", async () => {
+test("an unlink runs at once and says how it ended", async () => {
   const { actions, calls, answers, last } = controllerWith();
   const done = actions.start(request("unlink"));
   expect(calls).toEqual([`unlink ${REPOSITORY_A}`]);
   expect(last().running).toBe(true);
   expect(last().message).toBeUndefined();
   answers.unlink.resolve({ outcome: "unlinked" });
-  expect(await done).toBe(true);
+  await done;
   expect(last().message).toBe(PROJECT_REPOSITORY_DONE_MESSAGES.unlink);
 
   const refused = controllerWith();
   const kept = refused.actions.start(request("unlink"));
   refused.answers.unlink.resolve({ outcome: "refused", reason: "not_linked" });
-  expect(await kept).toBe(false);
+  await kept;
+  expect(refused.last().message).toBe(
+    "The repository could not be unlinked. The repository is not linked on this device.",
+  );
 });
 
 test("a registration sends the trimmed name once, and empties the field only once the API confirmed it", async () => {
@@ -732,7 +735,7 @@ test("a registration sends the trimmed name once, and empties the field only onc
   expect(last().running).toBe(true);
   expect(last().registerDraft).toBe("  app  ");
   answers.register.resolve({ outcome: "ok", repositoryId: REPOSITORY_A });
-  expect(await done).toBe(false);
+  await done;
   expect(last().registerDraft).toBe("");
   expect(last().message).toBe(PROJECT_REPOSITORY_DONE_MESSAGES.register);
 });
@@ -760,7 +763,7 @@ test("a name that is empty, too long, or holds a slash or a backslash is not sen
   ] as const) {
     const { actions, calls, last } = controllerWith();
     actions.editRegisterDraft(typed);
-    expect(await actions.register(PROJECT)).toBe(false);
+    await actions.register(PROJECT);
     expect(calls, typed).toEqual([]);
     expect(last().registerProblem, typed).toBe(problem);
     actions.editRegisterDraft(`${typed}x`);
@@ -771,11 +774,11 @@ test("a name that is empty, too long, or holds a slash or a backslash is not sen
 test("one action at a time: while one runs, nothing else starts, opens, or is sent", async () => {
   const { actions, calls, answers, last } = controllerWith();
   const first = actions.start(request("unlink"));
-  expect(await actions.start(request("remove"))).toBe(false);
-  expect(await actions.start(request("link"))).toBe(false);
-  expect(await actions.start(request("unlink", B))).toBe(false);
+  await actions.start(request("remove"));
+  await actions.start(request("link"));
+  await actions.start(request("unlink", B));
   actions.editRegisterDraft("docs");
-  expect(await actions.register(PROJECT)).toBe(false);
+  await actions.register(PROJECT);
   expect(last().dialog).toBeUndefined();
   expect(calls).toEqual([`unlink ${REPOSITORY_A}`]);
   answers.unlink.resolve({ outcome: "unlinked" });
@@ -792,7 +795,7 @@ test("an action that starts while a question is open ends the question, which th
   const registering = actions.register(PROJECT);
   expect(last().running).toBe(true);
   expect(last().dialog).toBeUndefined();
-  expect(await actions.confirm()).toBe(false);
+  await actions.confirm();
   expect(calls).toEqual([`register ${PROJECT} docs`]);
   answers.register.resolve({ outcome: "unknown" });
   await registering;
@@ -802,7 +805,7 @@ test("a call that fails on its way, also one that throws at once, says that noth
   const { actions, answers, last } = controllerWith();
   const done = actions.start(request("unlink"));
   answers.unlink.reject(new Error("lost"));
-  expect(await done).toBe(false);
+  await done;
   expect(last().message).toBe(
     "The repository could not be unlinked. It was not sent. Try again.",
   );
@@ -837,7 +840,7 @@ test("an answer that arrives after the shell showed another project shows no sen
   actions.follow(model(known(), MOUNTS, OTHER_PROJECT));
   actions.editRegisterDraft("docs");
   answers.register.resolve({ outcome: "ok", repositoryId: REPOSITORY_A });
-  expect(await done).toBe(false);
+  await done;
   expect(last().message).toBeUndefined();
   expect(last().registerDraft).toBe("docs");
 });
@@ -859,7 +862,7 @@ test("an answer after a switch away and back, or after a sign-out and a sign-in,
     actions.follow(model(between));
     actions.follow(model());
     answers.unlink.resolve({ outcome: "unlinked" });
-    expect(await done, between.kind).toBe(false);
+    await done;
     expect(last().message, between.kind).toBeUndefined();
   }
 });
@@ -948,7 +951,7 @@ test("a question ends once the panel no longer offers it as it was asked, and a 
     expect(last().dialog, `${kind}: ${why}`).toBeUndefined();
     actions.follow(model());
     expect(last().dialog, `${kind}: ${why}`).toBeUndefined();
-    expect(await actions.confirm(), why).toBe(false);
+    await actions.confirm();
     expect(calls, why).toEqual([]);
   }
   // A removal's question stays while the links are not ready.
@@ -994,7 +997,7 @@ test("a link's folders follow the mount list: a new folder is offered, and a cho
   );
   dialog = last().dialog;
   expect(dialog?.kind === "link" ? dialog.mountId : undefined).toBeNull();
-  expect(await actions.confirm()).toBe(false);
+  await actions.confirm();
   expect(calls).toEqual([]);
 });
 
@@ -1003,7 +1006,7 @@ test("a link's question with no folder to choose stays open and sends nothing", 
   await actions.start(request("link"));
   const dialog = last().dialog;
   expect(dialog?.kind === "link" ? dialog.choices : undefined).toEqual([]);
-  expect(await actions.confirm()).toBe(false);
+  await actions.confirm();
   expect(calls).toEqual([]);
 });
 

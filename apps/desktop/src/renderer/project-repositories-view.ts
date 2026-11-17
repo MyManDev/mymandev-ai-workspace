@@ -676,16 +676,6 @@ export const IDLE_PROJECT_REPOSITORY_ACTIONS: ProjectRepositoryActionsView =
   });
 
 /**
- * The actions after which the action's button leaves the page once they
- * happened: a removed repository leaves the list, and "Unlink" leaves an
- * unlinked repository.
- */
-const LEAVING_ACTIONS: ReadonlySet<ProjectRepositoryActionKind> = new Set([
-  "remove",
-  "unlink",
-]);
-
-/**
  * Whether the panel still offers the question of `dialog` as it was asked:
  * the same project with its repositories `ready`, the repository listed
  * under the same name, and for a link, "Link to a folder" offered.
@@ -728,17 +718,17 @@ export interface ProjectRepositoryActions {
    * Starts an action that the panel offers: a removal and a link open
    * their question, a link with the folders of the latest model and the
    * one of `initialFolderChoice` chosen, and an unlink runs at once. While
-   * an action runs, nothing starts. Resolves to true when the action
-   * happened and its button leaves the page.
+   * an action runs, nothing starts. Resolves once the view shows how the
+   * action ended; it never rejects.
    */
-  readonly start: (request: RepositoryActionRequest) => Promise<boolean>;
+  readonly start: (request: RepositoryActionRequest) => Promise<void>;
   /** Chooses a folder of the open link's question, and ends its problem. */
   readonly choose: (mountId: string) => void;
   /**
    * Runs the action of the open question; a link without a chosen folder
    * keeps the question open with its problem. Resolves like `start`.
    */
-  readonly confirm: () => Promise<boolean>;
+  readonly confirm: () => Promise<void>;
   /** Closes the open question without the action. */
   readonly cancel: () => void;
   /** Changes the name in the field of a registration, and ends its problem. */
@@ -747,9 +737,9 @@ export interface ProjectRepositoryActions {
    * Registers a repository in `projectId` with the name of the field
    * (`repositoryNameToSend`), once it passes `repositoryNamePrompt`, and
    * keeps the problem otherwise; empties the field once the API confirmed
-   * it. Resolves to false: the field and its button stay.
+   * it. Resolves like `start`.
    */
-  readonly register: (projectId: string) => Promise<boolean>;
+  readonly register: (projectId: string) => Promise<void>;
   /**
    * Follows the panel's model, which the panel passes after every render:
    *
@@ -812,7 +802,7 @@ export function createProjectRepositoryActions(
     call: () => Promise<T>,
     describe: (result: T) => string,
     happened: (result: T) => boolean,
-  ): Promise<boolean> {
+  ): Promise<void> {
     running = true;
     message =
       kind === "link" ? PROJECT_REPOSITORY_MESSAGES.linkWaiting : undefined;
@@ -822,10 +812,8 @@ export function createProjectRepositoryActions(
     let sentence: string;
     let ok = false;
     try {
-      // A bridge that throws at once counts as a call that failed.
-      const result = await new Promise<T>((resolve) => {
-        resolve(call());
-      });
+      // A bridge that throws at once counts as a call that failed too.
+      const result = await call();
       ok = happened(result);
       sentence = describe(result);
     } catch {
@@ -838,13 +826,12 @@ export function createProjectRepositoryActions(
       registerDraft = "";
     }
     show();
-    return still && ok && LEAVING_ACTIONS.has(kind);
   }
 
   function send(
     request: RepositoryActionRequest,
     mountId: string,
-  ): Promise<boolean> {
+  ): Promise<void> {
     switch (request.kind) {
       case "remove":
         return run(
@@ -873,13 +860,13 @@ export function createProjectRepositoryActions(
   return Object.freeze({
     start: (request: RepositoryActionRequest) => {
       if (running) {
-        return Promise.resolve(false);
+        return Promise.resolve();
       }
       switch (request.kind) {
         case "remove":
           dialog = Object.freeze({ kind: "remove", request });
           show();
-          return Promise.resolve(false);
+          return Promise.resolve();
         case "link": {
           const choices =
             model === undefined
@@ -893,7 +880,7 @@ export function createProjectRepositoryActions(
             problem: undefined,
           });
           show();
-          return Promise.resolve(false);
+          return Promise.resolve();
         }
         case "unlink":
           return send(request, "");
@@ -911,7 +898,7 @@ export function createProjectRepositoryActions(
     confirm: () => {
       const open = dialog;
       if (running || open === undefined) {
-        return Promise.resolve(false);
+        return Promise.resolve();
       }
       if (open.kind === "remove") {
         return send(open.request, "");
@@ -922,7 +909,7 @@ export function createProjectRepositoryActions(
           problem: PROJECT_REPOSITORY_QUESTION_MESSAGES.chooseFolder,
         });
         show();
-        return Promise.resolve(false);
+        return Promise.resolve();
       }
       return send(open.request, open.mountId);
     },
@@ -938,23 +925,22 @@ export function createProjectRepositoryActions(
       registerProblem = undefined;
       show();
     },
-    register: async (projectId: string) => {
+    register: (projectId: string) => {
       if (running) {
-        return false;
+        return Promise.resolve();
       }
       const name = repositoryNameToSend(registerDraft);
       registerProblem = repositoryNamePrompt(name);
       if (registerProblem !== undefined) {
         show();
-        return false;
+        return Promise.resolve();
       }
-      await run(
+      return run(
         "register",
         () => bridge.register(projectId, name),
         describeRegisterResult,
         (result) => result.outcome === "ok",
       );
-      return false;
     },
     follow: (next: ProjectRepositoriesModel) => {
       let changed = false;
