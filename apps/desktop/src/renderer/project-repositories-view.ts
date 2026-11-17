@@ -231,9 +231,11 @@ export const REGISTER_REPOSITORY_REFUSAL_MESSAGES: Readonly<
 
 /**
  * Why a removal was refused, after its start. `forbidden` says who may
- * remove a repository (the decision of 2026-11-14): the panel cannot know
- * who registered it, so the server decides. After `not_found` and
- * `conflict`, the main process reads the list again.
+ * remove a repository (the decision of 2026-11-14): the panel offers the
+ * removal only where the main process said that the account may
+ * (`removable`, #309), but the server decides, so a role that changed
+ * meanwhile answers `forbidden`. After `not_found` and `conflict`, the main
+ * process reads the list again.
  */
 export const REMOVE_REPOSITORY_REFUSAL_MESSAGES: Readonly<
   Record<Exclude<RemoveRepositoryRefusal, "too_soon" | "rate_limited">, string>
@@ -417,6 +419,11 @@ export interface RepositoryRow {
   readonly mountId: string | null;
   /** Where it is linked, or null while this device's links are not `ready`. */
   readonly link: RepositoryLinkRow | null;
+  /**
+   * Whether the account may remove it, as the main process worked it out:
+   * the account registered it, or is the workspace's owner or an admin.
+   */
+  readonly removable: boolean;
 }
 
 /** What the panel shows of the open project's registered repositories. */
@@ -497,6 +504,7 @@ function rowsOf(
     link: linksReady
       ? linkRow(repository.linked, repository.mountId, folders)
       : null,
+    removable: repository.removable,
   }));
 }
 
@@ -606,8 +614,9 @@ export function linkOffered(model: ProjectRepositoriesModel): boolean {
  * folder" while it is offered (`linkOffered`), "Unlink" on a linked
  * repository while this device's links are `ready` for the shown project,
  * whatever the state of its list, and "Remove from the project" while the
- * list is `ready`. Each carries the project, the repository's ID, and its
- * name.
+ * list is `ready` on a repository that the account may remove
+ * (`removable`, #309). Each carries the project, the repository's ID, and
+ * its name.
  */
 export function repositoryActions(
   model: ProjectRepositoriesModel,
@@ -630,7 +639,9 @@ export function repositoryActions(
     ...(linksProjectId !== null && row.linked
       ? [action("unlink", linksProjectId)]
       : []),
-    ...(projectId === null ? [] : [action("remove", projectId)]),
+    ...(projectId !== null && row.removable
+      ? [action("remove", projectId)]
+      : []),
   ];
 }
 
@@ -727,7 +738,8 @@ export const IDLE_PROJECT_REPOSITORY_ACTIONS: ProjectRepositoryActionsView =
 /**
  * Whether the panel still offers the question of `dialog` as it was asked:
  * the same project with its repositories `ready`, the repository listed
- * under the same name, and for a link, "Link to a folder" offered.
+ * under the same name, for a removal, still one that the account may
+ * remove, and for a link, "Link to a folder" offered.
  */
 function isOffered(
   model: ProjectRepositoriesModel,
@@ -737,11 +749,15 @@ function isOffered(
   if (model.projectId !== request.projectId) {
     return false;
   }
-  const listed = model.rows?.some(
-    (row) =>
-      row.repositoryId === request.repositoryId && row.name === request.name,
+  const row = model.rows?.find(
+    (entry) =>
+      entry.repositoryId === request.repositoryId &&
+      entry.name === request.name,
   );
-  return listed === true && (dialog.kind === "remove" || linkOffered(model));
+  if (row === undefined) {
+    return false;
+  }
+  return dialog.kind === "remove" ? row.removable : linkOffered(model);
 }
 
 function sameChoices(
