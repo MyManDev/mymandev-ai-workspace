@@ -949,7 +949,8 @@ test("each repository says whether the account may remove it: a member one that 
   // A demotion, which a member event or a reload brings, takes it back at
   // once, and publishes the change.
   const published = harness.states.length;
-  harness.setPeople(person(OWN), person(OTHER_PERSON, "admin"));
+  // The account's own person counts, wherever the people hold it.
+  harness.setPeople(person(OTHER_PERSON, "admin"), person(OWN));
   expect(removableOf(harness)).toEqual([true, false, false]);
   expect(harness.states.length).toBe(published + 1);
   expect(

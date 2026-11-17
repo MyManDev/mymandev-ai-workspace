@@ -692,6 +692,8 @@ export function createProjectRepositoryService(
     readonly ownMemberId: MemberId;
     readonly administers: boolean;
   } | null {
+    // A state with repositories always has a device and a workspace; this
+    // keeps a later caller closed as well.
     if (device === null || workspaceId === null) {
       return null;
     }
