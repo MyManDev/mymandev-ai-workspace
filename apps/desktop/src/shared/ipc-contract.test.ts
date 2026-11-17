@@ -673,6 +673,12 @@ test("an account status with every sign-in state, outcome, and key state is acce
     ...DEVICE_KEY_STATES.map((deviceKey) => accountStatus({ deviceKey })),
     ...API_ORIGIN_STATES.map((apiOrigin) => accountStatus({ apiOrigin })),
     accountStatus({ replacementPending: true }),
+    // The end of the wait after a first refusal of both keys (#303).
+    accountStatus({
+      replacementPending: true,
+      device: "auth_failed",
+      lostKeyWaitEnd: "2026-11-06T10:10:00.000Z",
+    }),
     ...DEVICE_STATES.map((device) => accountStatus({ device })),
   ];
 
@@ -720,6 +726,12 @@ test("an account status keeps only the narrow fields", () => {
   expect(JSON.stringify(parsed)).not.toMatch(
     /userId|publicKey|mmdc_|verifier|mmda_|accessToken/,
   );
+
+  // The end of the wait after a first refusal of both keys (#303) is a
+  // time and nothing else, and it is absent without a wait.
+  expect(
+    Object.keys(AccountStatusSchema.parse(accountStatus({}))),
+  ).not.toContain("lostKeyWaitEnd");
 
   // The time after which a new sign-in can start (#199) comes alone.
   expect(
@@ -929,6 +941,18 @@ test("an account status with a wrong value is refused", () => {
     accountStatus({ signIn: { ...waiting, browser: "Other" as never } }),
     accountStatus({ signIn: { ...waiting, browser: undefined as never } }),
     accountStatus({ signIn: { kind: "open" } as never }),
+    // The end of the wait after a first refusal of both keys (#303) is a
+    // time in UTC too, never a duration.
+    ...[
+      "2026-11-06T13:10:00.000+03:00",
+      "2026-11-06T10:10:00",
+      "in 10 minutes",
+      "",
+      600_000,
+      null,
+    ].map((lostKeyWaitEnd) =>
+      accountStatus({ lostKeyWaitEnd: lostKeyWaitEnd as never }),
+    ),
   ]) {
     expect(AccountStatusSchema.safeParse(value).success).toBe(false);
   }

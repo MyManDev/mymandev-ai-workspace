@@ -354,7 +354,9 @@ export const SignInOutcomeSchema = z
      *
      * - `replacement_pending`, while the grace period of an uncertain
      *   sign-in runs (#199): when it ends. A new sign-in is not refused for
-     *   it after this time.
+     *   it after this time. While the server refused both keys of the
+     *   pending replacement once (#303): when the wait before they may be
+     *   treated as lost ends, as `lostKeyWaitEnd` in the status.
      * - `device_daily_limit` (#269): when the wait of the account's daily
      *   limit of new devices ends, from the API's `Retry-After`. The
      *   refusal is certain: nothing was registered.
@@ -462,6 +464,16 @@ export const AccountStatusSchema = z.object({
    * key is kept until the new one authenticates once.
    */
   replacementPending: z.boolean(),
+  /**
+   * While the server refused both keys of the pending replacement once and
+   * the main process waits before it may treat them as lost (#303): a time
+   * in UTC, by this device's clock, after which a new sign-in can start.
+   * Before it, the replacement stays pending and a start is refused as
+   * `replacement_pending`. Absent otherwise. It is the time of the last read
+   * of the device session, so it can lie in the past; the renderer compares
+   * it with its own clock. It names no key and no ID.
+   */
+  lostKeyWaitEnd: TimestampSchema.optional(),
   apiOrigin: z.enum(API_ORIGIN_STATES),
   /** The state of the device in the device session. */
   device: z.enum(DEVICE_STATES),

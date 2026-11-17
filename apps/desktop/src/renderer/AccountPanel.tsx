@@ -19,8 +19,8 @@ import {
   createIdleWaits,
   DEVICE_ACTION_MESSAGES,
   DEVICE_KEY_PROBLEM_MESSAGES,
-  describeDeviceState,
-  describeOutcome,
+  describeDeviceStatus,
+  describeLastOutcome,
   describeSignInExpiry,
   followAccountStatus,
   forgetMessage,
@@ -145,18 +145,17 @@ function AccountBody(props: AccountPanelContentProps) {
   if (status.deviceKey === "loading") {
     return <p role="status">Reading the device key.</p>;
   }
-  const outcome =
-    status.lastOutcome === null || status.signIn.kind !== "idle"
-      ? undefined
-      : describeOutcome(status.lastOutcome, props.now);
+  const outcome = describeLastOutcome(status, props.now);
   const retryNote = signInRetryNote(
     status,
     props.now,
     props.timeFormat ?? signInTimeFormat(),
   );
+  // #303: while the note says when a new sign-in can start, no sentence
+  // asks for one without that time.
   const deviceState =
     status.signIn.kind === "idle"
-      ? describeDeviceState(status.device)
+      ? describeDeviceStatus(status, props.now)
       : undefined;
   const expiry = describeSignInExpiry(status, props.now);
   return (

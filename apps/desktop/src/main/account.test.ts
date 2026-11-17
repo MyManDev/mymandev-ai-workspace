@@ -228,6 +228,10 @@ interface Harness {
   removalAsks: () => Promise<boolean>;
   /** What the session's `replacementGraceEnd` answers. */
   graceEnd: () => Promise<string | null>;
+  /** What the session's `lostKeyWaitEnd` answers. */
+  lostKeyEnd: () => Promise<string | null>;
+  /** How often the service asked the session's `lostKeyWaitEnd`. */
+  lostKeyAsks: number;
   /** When set, every read of the record waits for it. */
   readGate: Promise<void> | null;
   /** How often local execution was stopped. */
@@ -299,6 +303,8 @@ function harness(
     liftLock: async () => ({ ok: true, value: null }),
     removalAsks: async () => true,
     graceEnd: async () => null,
+    lostKeyEnd: async () => null,
+    lostKeyAsks: 0,
     readGate: null,
     stopped: 0,
     sessionState: SESSION_SIGNED_IN,
@@ -381,6 +387,12 @@ function harness(
       replacementGraceEnd: async () => {
         state.log.push("session replacementGraceEnd");
         return state.graceEnd();
+      },
+      // Not logged: the service reads it with the record after every
+      // change of the session (#303).
+      lostKeyWaitEnd: async () => {
+        state.lostKeyAsks += 1;
+        return state.lostKeyEnd();
       },
       signWebSocketChallenge: async () => {
         state.log.push("session signWebSocketChallenge");
@@ -2370,6 +2382,259 @@ test("a start refused during the grace period of an uncertain sign-in says when 
     code: "listener_unavailable",
   });
   expect(other.log).not.toContain("session replacementGraceEnd");
+});
+
+test("the status names the end of the wait after a first refusal of both keys, read again after each change of the session, and a start refused during it carries that end (#303)", async () => {
+  const WAIT_END = "2026-11-06T10:10:00.000Z";
+  const AUTH_FAILED_STATE: DeviceSessionState = {
+    kind: "auth_failed",
+    account: SESSION_ACCOUNT,
+  };
+  const h = harness();
+  await h.service.initialize();
+  await settle();
+  expect(h.service.status()).not.toHaveProperty("lostKeyWaitEnd");
+  h.keyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: true,
+    passphraseRequired: false,
+  };
+
+  // Both keys were refused once: the session's state changes, and the
+  // service reads the end of the wait on its own, without a start.
+  h.lostKeyEnd = async () => WAIT_END;
+  const asks = h.lostKeyAsks;
+  h.emit(AUTH_FAILED_STATE);
+  await settle();
+  expect(h.lostKeyAsks).toBe(asks + 1);
+  const status = h.service.status();
+  expect(status).toMatchObject({
+    device: "auth_failed",
+    replacementPending: true,
+    lostKeyWaitEnd: WAIT_END,
+  });
+  expect(AccountStatusSchema.parse(status)).toEqual(status);
+
+  // A start during the wait is refused with that end. The grace period
+  // names none then, and is asked first.
+  h.start = async () => REPLACEMENT_PENDING;
+  h.authenticate = async () => ({
+    ok: false,
+    reason: "refused",
+    code: "auth_failed",
+  });
+  h.log.length = 0;
+  await expect(h.service.startSignIn()).resolves.toEqual({
+    outcome: "failed",
+    code: "replacement_pending",
+  });
+  expect(h.log.filter((step) => step.startsWith("session "))).toEqual([
+    "session signInStarted",
+    "session signInFinished failed replacement_pending",
+    "session authenticate",
+    "session replacementGraceEnd",
+  ]);
+  expect(h.service.status()).toMatchObject({
+    lastOutcome: { code: "replacement_pending", retryAfter: WAIT_END },
+    lostKeyWaitEnd: WAIT_END,
+  });
+  expect(AccountStatusSchema.parse(h.service.status())).toEqual(
+    h.service.status(),
+  );
+  // The grace period's end comes first when the session names one.
+  h.graceEnd = async () => "2026-11-06T10:05:00.000Z";
+  await h.service.startSignIn();
+  expect(h.service.status().lastOutcome).toEqual({
+    code: "replacement_pending",
+    retryAfter: "2026-11-06T10:05:00.000Z",
+  });
+  h.graceEnd = async () => null;
+
+  // A start refused during the wait reads it again, also when the device's
+  // state stays the same: its authentication may have noted a new refusal.
+  h.lostKeyEnd = async () => "2026-11-06T10:20:00.000Z";
+  await h.service.startSignIn();
+  await settle();
+  expect(h.service.status()).toMatchObject({
+    lastOutcome: {
+      code: "replacement_pending",
+      retryAfter: "2026-11-06T10:20:00.000Z",
+    },
+    lostKeyWaitEnd: "2026-11-06T10:20:00.000Z",
+  });
+
+  // Once the session names no end, or fails, the status names none either.
+  for (const lostKeyEnd of [
+    async () => null,
+    () => Promise.reject(new Error("broken")),
+  ]) {
+    h.lostKeyEnd = async () => WAIT_END;
+    h.emit({ kind: "sign_in_required", account: SESSION_ACCOUNT });
+    await settle();
+    expect(h.service.status().lostKeyWaitEnd).toBe(WAIT_END);
+    h.lostKeyEnd = lostKeyEnd;
+    h.emit(AUTH_FAILED_STATE);
+    await settle();
+    expect(h.service.status()).not.toHaveProperty("lostKeyWaitEnd");
+  }
+
+  // A revoked device and "This is not me" drop it at once.
+  h.lostKeyEnd = async () => WAIT_END;
+  h.emit({ kind: "sign_in_required", account: SESSION_ACCOUNT });
+  await settle();
+  expect(h.service.status().lostKeyWaitEnd).toBe(WAIT_END);
+  h.record = { kind: "none" };
+  h.emit({ kind: "revoked" });
+  expect(h.service.status()).not.toHaveProperty("lostKeyWaitEnd");
+  await settle();
+  expect(h.service.status()).not.toHaveProperty("lostKeyWaitEnd");
+
+  const forgotten = harness();
+  await forgotten.service.initialize();
+  forgotten.lostKeyEnd = async () => WAIT_END;
+  forgotten.emit(AUTH_FAILED_STATE);
+  await settle();
+  expect(forgotten.service.status().lostKeyWaitEnd).toBe(WAIT_END);
+  forgotten.lostKeyEnd = async () => null;
+  let seen: AccountStatus | undefined;
+  forgotten.service.onStatusChange((next) => {
+    seen ??= next.account.kind === "signed_out" ? next : undefined;
+  });
+  await expect(forgotten.service.forgetAccount()).resolves.toMatchObject({
+    outcome: "forgotten",
+  });
+  expect(seen).toBeDefined();
+  expect(seen).not.toHaveProperty("lostKeyWaitEnd");
+});
+
+test("a read of the end of the wait that a later one overtook changes nothing (#303)", async () => {
+  const h = harness();
+  await h.service.initialize();
+  await settle();
+  const answers: ((end: string | null) => void)[] = [];
+  h.lostKeyEnd = () =>
+    new Promise((resolve) => {
+      answers.push(resolve);
+    });
+  h.emit({ kind: "auth_failed", account: SESSION_ACCOUNT });
+  h.emit({ kind: "sign_in_required", account: SESSION_ACCOUNT });
+  await settle();
+  expect(answers).toHaveLength(2);
+  answers[1]?.("2026-11-06T10:20:00.000Z");
+  await settle();
+  answers[0]?.("2026-11-06T10:10:00.000Z");
+  await settle();
+  expect(h.service.status().lostKeyWaitEnd).toBe("2026-11-06T10:20:00.000Z");
+});
+
+test("a read of the end of the wait that was on its way when the device was revoked or the account forgotten on this device changes nothing (#303)", async () => {
+  const WAIT_END = "2026-11-06T10:10:00.000Z";
+  /** A harness whose read of the end, started by a refusal of both keys, is held. */
+  async function heldRead() {
+    const h = harness();
+    await h.service.initialize();
+    await settle();
+    const answers: ((end: string | null) => void)[] = [];
+    h.lostKeyEnd = () =>
+      new Promise((resolve) => {
+        answers.push(resolve);
+      });
+    h.emit({ kind: "auth_failed", account: SESSION_ACCOUNT });
+    await settle();
+    expect(answers).toHaveLength(1);
+    return { h, answers };
+  }
+
+  const revoked = await heldRead();
+  revoked.h.record = { kind: "none" };
+  revoked.h.emit({ kind: "revoked" });
+  await settle();
+  revoked.answers[0]?.(WAIT_END);
+  await settle();
+  expect(revoked.answers).toHaveLength(1);
+  expect(revoked.h.service.status()).toMatchObject({ device: "revoked" });
+  expect(revoked.h.service.status()).not.toHaveProperty("lostKeyWaitEnd");
+
+  const forgotten = await heldRead();
+  await expect(forgotten.h.service.forgetAccount()).resolves.toMatchObject({
+    outcome: "forgotten",
+  });
+  forgotten.answers[0]?.(WAIT_END);
+  await settle();
+  expect(forgotten.answers).toHaveLength(1);
+  expect(forgotten.h.service.status().account).toEqual({ kind: "signed_out" });
+  expect(forgotten.h.service.status()).not.toHaveProperty("lostKeyWaitEnd");
+});
+
+test("a sign-in that finishes, or a start that is refused, with no replacement pending any more drops the end of the wait at once (#303)", async () => {
+  const WAIT_END = "2026-11-06T10:10:00.000Z";
+  /**
+   * A harness during the wait, whose later reads of the end never answer,
+   * so that only the service can drop it.
+   */
+  async function waiting() {
+    const h = harness();
+    await h.service.initialize();
+    await settle();
+    h.keyStatus = {
+      protection: "system",
+      loaded: true,
+      replacementPending: true,
+      passphraseRequired: false,
+    };
+    h.lostKeyEnd = async () => WAIT_END;
+    h.emit({ kind: "auth_failed", account: SESSION_ACCOUNT });
+    await settle();
+    expect(h.service.status()).toMatchObject({
+      replacementPending: true,
+      lostKeyWaitEnd: WAIT_END,
+    });
+    h.lostKeyEnd = () => new Promise(() => undefined);
+    return h;
+  }
+  const resolved: DeviceKeyStatus = {
+    protection: "system",
+    loaded: true,
+    replacementPending: false,
+    passphraseRequired: false,
+  };
+
+  // A sign-in that finishes: the flow resolved the replacement.
+  const finished = await waiting();
+  const attempt = startedSignIn();
+  finished.start = async () => attempt.start;
+  await expect(finished.service.startSignIn()).resolves.toEqual({
+    outcome: "started",
+  });
+  finished.keyStatus = resolved;
+  finished.sessionState = SESSION_SIGNED_IN;
+  const done = nextStatus(
+    finished,
+    (status) => status.lastOutcome?.code === "signed_in",
+  );
+  attempt.settle(SIGNED_IN_OUTCOME);
+  const signedIn = await done;
+  expect(signedIn).toMatchObject({ replacementPending: false });
+  expect(signedIn).not.toHaveProperty("lostKeyWaitEnd");
+
+  // A start that is refused, after its authentication resolved the
+  // replacement.
+  const refused = await waiting();
+  refused.start = async () => ({
+    started: false,
+    outcome: { kind: "failed", reason: "no_answer" },
+  });
+  refused.keyStatus = resolved;
+  await expect(refused.service.startSignIn()).resolves.toEqual({
+    outcome: "failed",
+    code: "no_answer",
+  });
+  expect(refused.service.status()).toMatchObject({
+    lastOutcome: { code: "no_answer" },
+    replacementPending: false,
+  });
+  expect(refused.service.status()).not.toHaveProperty("lostKeyWaitEnd");
 });
 
 test("a cancel while the pending replacement is resolved starts nothing more", async () => {

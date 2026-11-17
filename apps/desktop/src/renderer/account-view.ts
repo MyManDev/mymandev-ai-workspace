@@ -213,32 +213,40 @@ export function signInTimeFormat(
 }
 
 /**
- * When a start that was refused as `replacement_pending` during the grace
- * period of an uncertain sign-in can be tried again, in milliseconds
- * (#199): the outcome's `retryAfter`, while no sign-in runs and the status
- * still reports the pending replacement; otherwise undefined, also when
- * the replacement was resolved before that time. The main process computed
- * the time when it refused the start.
+ * When a new sign-in can start while the pending key replacement holds it
+ * back, in milliseconds: the later of the `retryAfter` of a start refused
+ * as `replacement_pending` (during the grace period of an uncertain
+ * sign-in, #199, or the wait after a first refusal of both keys, #303) and
+ * the status's `lostKeyWaitEnd`, which names the end of that wait also
+ * before any start (#303). The status's time counts only while the panel
+ * offers a sign-in (`offersSignIn`): after a restart during the wait, the
+ * device can be `signed_in` until its first round, and a note about a
+ * sign-in that the panel does not offer would make no sense. Only while no
+ * sign-in runs and the status still reports the pending replacement;
+ * otherwise undefined, also when the replacement was resolved before that
+ * time. The main process computed each time when it refused the start or
+ * read the session.
  */
 export function signInRetryAt(status: AccountStatus): number | undefined {
   const outcome = status.lastOutcome;
-  if (
-    status.signIn.kind !== "idle" ||
-    !status.replacementPending ||
-    outcome?.code !== "replacement_pending" ||
-    outcome.retryAfter === undefined
-  ) {
+  if (status.signIn.kind !== "idle" || !status.replacementPending) {
     return undefined;
   }
-  const at = Date.parse(outcome.retryAfter);
-  return Number.isNaN(at) ? undefined : at;
+  const times = [
+    outcome?.code === "replacement_pending" ? outcome.retryAfter : undefined,
+    offersSignIn(status) ? status.lostKeyWaitEnd : undefined,
+  ]
+    .map((time) => (time === undefined ? Number.NaN : Date.parse(time)))
+    .filter((at) => !Number.isNaN(at));
+  return times.length === 0 ? undefined : Math.max(...times);
 }
 
 /**
- * The note next to that refusal (#199): the local time after which a new
- * sign-in can start, rounded up to the minute so that a start at the shown
- * time is not refused, or undefined once that time has come (`now`, in
- * milliseconds) or without one.
+ * The note next to that refusal (#199), and during the wait after a first
+ * refusal of both keys also before any start (#303): the local time after
+ * which a new sign-in can start, rounded up to the minute so that a start
+ * at the shown time is not refused, or undefined once that time has come
+ * (`now`, in milliseconds) or without one.
  */
 export function signInRetryNote(
   status: AccountStatus,
@@ -250,7 +258,7 @@ export function signInRetryNote(
     return undefined;
   }
   const shown = new Date(Math.ceil(at / 60_000) * 60_000);
-  return `A new sign-in can start after ${format.format(shown)}. Try again then.`;
+  return `A new sign-in can start after ${format.format(shown)}.`;
 }
 
 /** The clock and the timer of `watchSignInRetry`; the tests replace them. */
@@ -272,10 +280,13 @@ export const SYSTEM_RETRY_CLOCK: SignInRetryClock = Object.freeze({
 
 /**
  * The time of the last outcome that the panel counts to, in milliseconds:
- * the time of the note after a refused start (`signInRetryAt`, #199), or
- * the end of the wait of a sign-in that a limit of the API ended
- * (`signInWaitEnd`, #269). The two belong to different outcome codes, so
- * at most one of them is set. The panel reads its clock again whenever
+ * the time of the note after a refused start or during the wait after a
+ * first refusal of both keys (`signInRetryAt`, #199 and #303), or the end
+ * of the wait of a sign-in that a limit of the API ended (`signInWaitEnd`,
+ * #269). The note's time counts when both are set: a pending replacement
+ * lets no sign-in start, so a sign-in that a limit ended ran before the
+ * note's time was set, and the reading for that time is never older than
+ * the limit's outcome. The panel reads its clock again whenever
  * this time changes (`signInRetryReading`), so a note or a wait never
  * counts from a reading that was made before its outcome arrived.
  */
@@ -387,6 +398,50 @@ export function describeOutcome(
   };
 }
 
+/**
+ * The message for a start refused as `replacement_pending` with a time
+ * (#199, #303) once that time has come while the status still reports the
+ * pending replacement. A new sign-in can start then, so the message no
+ * longer says that it cannot (#303).
+ */
+export const REPLACEMENT_PENDING_ENDED_MESSAGE =
+  "The sign-in did not start, because the device key of the last sign-in was not confirmed yet. A new sign-in can start now.";
+
+/**
+ * The message for the last outcome in the panel at `now` (milliseconds),
+ * or undefined while a sign-in runs or before the first outcome:
+ * `describeOutcome`, except for a start refused as `replacement_pending`
+ * with a time. That refusal reads `REPLACEMENT_PENDING_ENDED_MESSAGE` once
+ * `signInRetryNote` shows no time any more, so that it does not contradict
+ * a sentence that asks for a sign-in then, and it is not shown once the
+ * status no longer reports the pending replacement, for example when a key
+ * authenticated and the device is signed in again (#303). Without a time,
+ * the main process did not know when the replacement can be resolved, and
+ * the refusal stays as it is.
+ */
+export function describeLastOutcome(
+  status: AccountStatus,
+  now: number,
+): OutcomeMessage | undefined {
+  const outcome = status.lastOutcome;
+  if (outcome === null || status.signIn.kind !== "idle") {
+    return undefined;
+  }
+  if (
+    outcome.code === "replacement_pending" &&
+    outcome.retryAfter !== undefined
+  ) {
+    if (!status.replacementPending) {
+      return undefined;
+    }
+    const at = signInRetryAt(status);
+    if (at === undefined || now >= at) {
+      return { role: "status", text: REPLACEMENT_PENDING_ENDED_MESSAGE };
+    }
+  }
+  return describeOutcome(outcome, now);
+}
+
 /** The message for a device key that cannot be used. */
 export const DEVICE_KEY_PROBLEM_MESSAGES: Readonly<
   Record<
@@ -492,6 +547,33 @@ export function describeDeviceState(
   return text === undefined
     ? undefined
     : { role: DEVICE_STATE_ALERTS.has(state) ? "alert" : "status", text };
+}
+
+/**
+ * The sentence of `auth_failed` while the panel says when a new sign-in can
+ * start (`signInRetryNote`): the server refused both keys of the pending
+ * replacement once, and the main process keeps them until a round at least
+ * 10 minutes later refuses both again (#303). It asks for no sign-in, which
+ * cannot start before that time; the note says when it can.
+ */
+export const AUTH_FAILED_WAIT_MESSAGE =
+  "The server did not accept this device's key or the new key of the last sign-in. Both are kept and tried once more, in case the server was only briefly unavailable.";
+
+/**
+ * The message for the state of the device in the panel at `now`
+ * (milliseconds): `describeDeviceState`, except for `auth_failed` while
+ * the panel shows when a new sign-in can start (`signInRetryAt`), which
+ * reads `AUTH_FAILED_WAIT_MESSAGE` instead of asking for a sign-in that
+ * cannot start yet (#303).
+ */
+export function describeDeviceStatus(
+  status: AccountStatus,
+  now: number,
+): OutcomeMessage | undefined {
+  const at = signInRetryAt(status);
+  return status.device === "auth_failed" && at !== undefined && now < at
+    ? { role: "alert", text: AUTH_FAILED_WAIT_MESSAGE }
+    : describeDeviceState(status.device);
 }
 
 /** The device states in which the panel offers "Sign in with GitHub". */

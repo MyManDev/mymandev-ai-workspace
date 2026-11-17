@@ -113,6 +113,7 @@ export type AccountSession = Pick<
   | "removeDevice"
   | "removalAsksApi"
   | "replacementGraceEnd"
+  | "lostKeyWaitEnd"
   | "signWebSocketChallenge"
   | "deviceRefused"
   | "request"
@@ -765,6 +766,14 @@ export function createAccountService(
   let lastOutcome: SignInOutcomeView | null = null;
   let deviceKey: DeviceKeyState = "loading";
   let replacementPending = false;
+  /**
+   * The session's `lostKeyWaitEnd` at its last read (#303,
+   * `refreshLostKeyWait`), and null once no replacement is pending or the
+   * device or the account is gone.
+   */
+  let lostKeyWaitEnd: string | null = null;
+  /** Counts the reads of `lostKeyWaitEnd`, so that an overtaken one changes nothing. */
+  let lostKeyWaitReads = 0;
   let device: DeviceState = "starting";
   /**
    * Whether the person signed out on this device (P-65, `signedOutOf`), also
@@ -814,6 +823,7 @@ export function createAccountService(
       lastOutcome,
       deviceKey,
       replacementPending,
+      ...(lostKeyWaitEnd === null ? {} : { lostKeyWaitEnd }),
       apiOrigin,
       device,
     });
@@ -867,6 +877,23 @@ export function createAccountService(
   }
 
   /**
+   * When the wait after a first refusal of both keys of the pending
+   * replacement ends (#303), from the session; null without a session or
+   * when it fails.
+   */
+  async function readLostKeyWaitEnd(): Promise<string | null> {
+    const held = session;
+    if (held === null) {
+      return null;
+    }
+    try {
+      return await held.lostKeyWaitEnd();
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Forgets what the flow keeps of a device that is gone (an unsaved record
    * and an account mismatch), so that its next attempt does not bring the
    * device back. A flow that refuses, because an attempt runs, is dropped,
@@ -903,6 +930,31 @@ export function createAccountService(
     account = next;
     replacementPending = pending;
     publish();
+  }
+
+  /**
+   * Reads the end of the wait after a first refusal of both keys of the
+   * pending replacement again (#303), and publishes it when it changed. It
+   * runs on its own, after the session changed and after a start that the
+   * pending replacement refused: the session answers it after the use of
+   * the key that runs, which can wait for the API, so nothing else waits for
+   * it.
+   */
+  async function refreshLostKeyWait(): Promise<void> {
+    lostKeyWaitReads += 1;
+    const read = lostKeyWaitReads;
+    const end = await readLostKeyWaitEnd();
+    if (read !== lostKeyWaitReads || end === lostKeyWaitEnd) {
+      return;
+    }
+    lostKeyWaitEnd = end;
+    publish();
+  }
+
+  /** Forgets the end of the wait, and any read of it that is on its way. */
+  function dropLostKeyWait(): void {
+    lostKeyWaitReads += 1;
+    lostKeyWaitEnd = null;
   }
 
   function stopLocalExecution(): void {
@@ -942,6 +994,7 @@ export function createAccountService(
       accountReads += 1;
       account = SIGNED_OUT;
       replacementPending = false;
+      dropLostKeyWait();
       resetFlow();
       publish();
       return;
@@ -952,6 +1005,7 @@ export function createAccountService(
     void refreshAccount().catch(() => {
       report("The account could not be read.");
     });
+    void refreshLostKeyWait();
   }
 
   /**
@@ -1196,8 +1250,9 @@ export function createAccountService(
 
   /**
    * A `replacement_pending` view with the end of the grace period of an
-   * uncertain sign-in as `retryAfter`, while it runs (#199); the view as it
-   * is otherwise, also when the session fails.
+   * uncertain sign-in as `retryAfter`, while it runs (#199), or else with
+   * the end of the wait after a first refusal of both keys, while it runs
+   * (#303); the view as it is otherwise, also when the session fails.
    */
   async function withRetryAfter(
     view: SignInOutcomeView,
@@ -1205,7 +1260,9 @@ export function createAccountService(
   ): Promise<SignInOutcomeView> {
     let end: string | null;
     try {
-      end = await held.replacementGraceEnd();
+      // The grace period names no end while a first refusal is noted, so at
+      // most one of them is set.
+      end = (await held.replacementGraceEnd()) ?? (await held.lostKeyWaitEnd());
     } catch {
       end = null;
     }
@@ -1234,6 +1291,9 @@ export function createAccountService(
         ? signedIn(outcome.account)
         : await readAccount(opened);
     replacementPending = await readReplacementPending(opened);
+    if (!replacementPending) {
+      dropLostKeyWait();
+    }
     account = next;
     attempt = null;
     attemptKeepsReads = false;
@@ -1304,8 +1364,9 @@ export function createAccountService(
           started === null
             ? Object.freeze({ code: "failed" as const })
             : signInOutcomeView(started.outcome);
-        // #199: a start refused during the grace period of an uncertain
-        // sign-in says when a new sign-in can start.
+        // #199 and #303: a start refused during the grace period of an
+        // uncertain sign-in, or during the wait after a first refusal of
+        // both keys, says when a new sign-in can start.
         const view =
           refusedView.code === "replacement_pending" && held !== null
             ? await withRetryAfter(refusedView, held)
@@ -1315,9 +1376,17 @@ export function createAccountService(
         accountReads += 1;
         account = await readAccount(opened);
         replacementPending = await readReplacementPending(opened);
+        if (!replacementPending) {
+          dropLostKeyWait();
+        }
         signIn = IDLE;
         lastOutcome = view;
         publish();
+        // The authentication of this start may have noted a first refusal
+        // of both keys without a change of the device's state.
+        if (view.code === "replacement_pending") {
+          void refreshLostKeyWait();
+        }
         return Object.freeze({ outcome: "failed", code: view.code });
       }
       // The flow opened the browser, or offers the URL: it could not open
@@ -1538,6 +1607,7 @@ export function createAccountService(
       account = SIGNED_OUT;
       deviceKey = "ready";
       replacementPending = false;
+      dropLostKeyWait();
       lastOutcome = null;
       publish();
       // The session reads the files again; a removal that it noted for the

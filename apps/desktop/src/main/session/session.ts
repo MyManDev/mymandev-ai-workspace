@@ -438,10 +438,26 @@ export interface DeviceSession {
    * flow's `replacement_pending` cannot be resolved, so a new sign-in
    * cannot start (#199). Null also while a first refusal of both keys is
    * noted: the replacement then stays pending until the wait for a second
-   * round ends (`LOST_KEY_WAIT_MS`), which can be later. It sends no
-   * request and changes no rule of the grace period. Never rejects.
+   * round ends (`LOST_KEY_WAIT_MS`), which can be later (`lostKeyWaitEnd`).
+   * It sends no request and changes no rule of the grace period. Never
+   * rejects.
    */
   readonly replacementGraceEnd: () => Promise<string | null>;
+  /**
+   * While a first refusal of both keys of a pending replacement is noted:
+   * when a round may treat them as lost, in UTC, by this device's wall
+   * clock (#303). That is `LOST_KEY_WAIT_MS` after the first refusal, by
+   * the smaller age of both clocks, and not before the grace period of an
+   * uncertain sign-in ends. Until then the replacement stays pending, so a
+   * new sign-in cannot start; a round then deletes both keys only if it
+   * refuses both again. A first refusal that is older than
+   * `KEYS_REFUSED_MAX_AGE_MS` by the larger age, for example after the
+   * computer slept for days, still holds rounds back until this end, and
+   * the round after it starts the wait again with a new end. Null
+   * otherwise: without such a refusal, and once the wait has ended. It
+   * sends no request and changes no rule of the wait. Never rejects.
+   */
+  readonly lostKeyWaitEnd: () => Promise<string | null>;
   /**
    * Signs the WebSocket `auth.challenge` with the purpose `ws` and the
    * current key, and returns the `auth.response` frame for #26. It sends no
@@ -2163,6 +2179,45 @@ export function createDeviceSession(
     }
   }
 
+  async function lostKeyWaitEnd(): Promise<string | null> {
+    try {
+      return await exclusive(async () => {
+        if (gone !== null) {
+          return null;
+        }
+        const facts = await readFacts();
+        if (facts.kind !== "ready" || !replacementToResolve(facts)) {
+          return null;
+        }
+        const held = await loadNotes();
+        const first = keysRefusedNote(facts, held);
+        if (first === null) {
+          return null;
+        }
+        // Rounds wait until the wait has ended by both clocks
+        // (`mintBlocked`), and `mint` treats the keys as lost only after
+        // that and after the grace period, so what is left counts from the
+        // smaller ages, and the later end counts. A refusal that is too old
+        // by the larger age is held back the same way; the round after it
+        // starts a new wait.
+        const waitLeft =
+          LOST_KEY_WAIT_MS - noteAge("refused", first.at, "least");
+        const grace = held.uncertainSignIn;
+        const graceLeft =
+          grace !== null && graceActive(facts, held)
+            ? REPLACEMENT_GRACE_MS - noteAge("grace", grace.at, "least")
+            : 0;
+        const left = Math.max(waitLeft, graceLeft);
+        // Rounded up, like the end of the grace period: never early.
+        return left > 0
+          ? new Date(Math.ceil(wallClock() + left)).toISOString()
+          : null;
+      });
+    } catch {
+      return null;
+    }
+  }
+
   // ---- WebSocket ---------------------------------------------------------
 
   async function signWebSocketChallenge(
@@ -2345,6 +2400,7 @@ export function createDeviceSession(
     removeDevice,
     removalAsksApi,
     replacementGraceEnd,
+    lostKeyWaitEnd,
     signWebSocketChallenge,
     deviceRefused,
   });
