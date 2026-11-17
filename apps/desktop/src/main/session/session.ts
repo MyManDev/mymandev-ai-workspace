@@ -450,10 +450,12 @@ export interface DeviceSession {
    * the smaller age of both clocks, and not before the grace period of an
    * uncertain sign-in ends. Until then the replacement stays pending, so a
    * new sign-in cannot start; a round then deletes both keys only if it
-   * refuses both again. Null otherwise: without such a refusal, once the
-   * wait has ended, and for a refusal older than `KEYS_REFUSED_MAX_AGE_MS`,
-   * which the next round replaces. It sends no request and changes no rule
-   * of the wait. Never rejects.
+   * refuses both again. A first refusal that is older than
+   * `KEYS_REFUSED_MAX_AGE_MS` by the larger age, for example after the
+   * computer slept for days, still holds rounds back until this end, and
+   * the round after it starts the wait again with a new end. Null
+   * otherwise: without such a refusal, and once the wait has ended. It
+   * sends no request and changes no rule of the wait. Never rejects.
    */
   readonly lostKeyWaitEnd: () => Promise<string | null>;
   /**
@@ -2189,17 +2191,15 @@ export function createDeviceSession(
         }
         const held = await loadNotes();
         const first = keysRefusedNote(facts, held);
-        // A refusal that is too old starts a new wait at the next round
-        // (`mint`), whose end is not known before it.
-        if (
-          first === null ||
-          noteAge("refused", first.at, "most") >= KEYS_REFUSED_MAX_AGE_MS
-        ) {
+        if (first === null) {
           return null;
         }
-        // `mint` treats the keys as lost only once the wait has ended by
-        // both clocks and the grace period has ended, so what is left counts
-        // from the smaller ages, and the later of the two ends counts.
+        // Rounds wait until the wait has ended by both clocks
+        // (`mintBlocked`), and `mint` treats the keys as lost only after
+        // that and after the grace period, so what is left counts from the
+        // smaller ages, and the later end counts. A refusal that is too old
+        // by the larger age is held back the same way; the round after it
+        // starts a new wait.
         const waitLeft =
           LOST_KEY_WAIT_MS - noteAge("refused", first.at, "least");
         const grace = held.uncertainSignIn;

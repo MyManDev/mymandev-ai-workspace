@@ -3345,6 +3345,11 @@ describe("note times", () => {
     const h = harness();
     const { previous, current } = await pendingReplacement(h);
     await writeNotes({
+      // The grace period of the sign-in ended long ago.
+      uncertainSignIn: {
+        publicKey: current,
+        at: new Date(wall.now - REPLACEMENT_GRACE_MS).toISOString(),
+      },
       keysRefused: {
         publicKeys: [current, previous],
         at: new Date(wall.now - KEYS_REFUSED_MAX_AGE_MS).toISOString(),
@@ -3356,6 +3361,33 @@ describe("note times", () => {
     expect(await restarted.session.lostKeyWaitEnd()).toBeNull();
     expect(await restarted.session.authenticate()).toEqual(AUTH_FAILED);
     expect(await restarted.session.lostKeyWaitEnd()).toBe(
+      new Date(wall.now + LOST_KEY_WAIT_MS).toISOString(),
+    );
+  });
+
+  test("a first refusal that the computer slept through for days names the end of the rounds that it still holds back, and the round after it names the end of the new wait (#303)", async () => {
+    const h = harness();
+    await pendingReplacement(h);
+    h.api.publicKey = FOREIGN_PUBLIC_KEY;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+
+    // Three days of sleep: the wall clock runs, the monotonic clock stops,
+    // so the smaller age is still 0, and no round runs for 10 minutes.
+    wall.now += 3 * 24 * 60 * 60_000;
+    const held = new Date(wall.now + LOST_KEY_WAIT_MS).toISOString();
+    expect(await h.session.lostKeyWaitEnd()).toBe(held);
+    const asked = h.api.requests.length;
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(h.api.requests).toHaveLength(asked);
+    expect(await h.session.lostKeyWaitEnd()).toBe(held);
+
+    // Then a round runs; the refusal is too old, so it starts the wait
+    // again, with a new end.
+    advance(LOST_KEY_WAIT_MS);
+    expect(await h.session.lostKeyWaitEnd()).toBeNull();
+    expect(await h.session.authenticate()).toEqual(AUTH_FAILED);
+    expect(h.api.requests.length).toBeGreaterThan(asked);
+    expect(await h.session.lostKeyWaitEnd()).toBe(
       new Date(wall.now + LOST_KEY_WAIT_MS).toISOString(),
     );
   });
