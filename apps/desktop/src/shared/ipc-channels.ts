@@ -26,6 +26,33 @@ export const INVOKE_CHANNELS = Object.freeze({
   /** Unmounts a repository by its mount ID. Nothing in the folder changes. */
   unmountRepository: "repositories:unmount",
   /**
+   * What the renderer may know of the open project's registered
+   * repositories (#286): each one's ID and name, whether the account linked
+   * it to a folder on this device, and the mount of that folder. Never a
+   * path.
+   */
+  getProjectRepositoryState: "project-repositories:get-state",
+  /**
+   * The open project's registered repositories. The calling frame then
+   * receives every later state on `EVENT_CHANNELS.projectRepositoriesChanged`.
+   */
+  subscribeProjectRepositoryState: "project-repositories:subscribe",
+  /**
+   * Registers a repository in the open project, by the project ID and a
+   * name. Only the name goes to the cloud, never a path.
+   */
+  registerRepository: "project-repositories:register",
+  /** Removes a repository from the open project, by the project ID and its ID. */
+  removeRepository: "project-repositories:remove",
+  /**
+   * Links a registered repository of the open project to the folder of a
+   * mounted repository, by the repository ID and the mount ID. The renderer
+   * never sends a path, and the link stays on this device.
+   */
+  linkRepository: "project-repositories:link",
+  /** Ends the account's link of a repository, by the repository ID. */
+  unlinkRepository: "project-repositories:unlink",
+  /**
    * The account status: the account, an open sign-in, the device key, and
    * the state of the device.
    */
@@ -357,6 +384,11 @@ export const EVENT_CHANNELS = Object.freeze({
   runtimeStatusChanged: "runtime:status-changed",
   /** The mounted repositories after every change, to the frames that subscribed. */
   repositoriesChanged: "repositories:changed",
+  /**
+   * The open project's registered repositories after changes, at most one
+   * every 50 ms, to the frames that subscribed.
+   */
+  projectRepositoriesChanged: "project-repositories:changed",
   /** The account status after every change, to the frames that subscribed. */
   accountStatusChanged: "account:status-changed",
   /** The connection status after every change, to the frames that subscribed. */

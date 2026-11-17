@@ -1,7 +1,9 @@
 // The repositories mounted on this device, in the main process. A mount is
 // read-only: the service reads the repository with Git and watches its
 // files, and nothing it does writes to the folder. Mounts live in memory
-// only; they are not stored and are gone after a restart.
+// only; they are not stored and are gone after a restart. A link from a
+// registered repository to a folder (#286) is kept by the repository link
+// service, by the folder, so it applies again once the folder is mounted.
 import type { PlatformPath } from "node:path";
 import {
   REPOSITORY_LIMITS,
@@ -65,6 +67,19 @@ export interface RepositoryService {
   mount(folder: string): Promise<MountResult>;
   /** Unmounts a repository and stops watching it. False when it was not mounted. */
   unmount(mountId: string): boolean;
+  /**
+   * The top-level folder of a mounted repository, as Git reported it, or
+   * undefined when nothing is mounted with this ID. For the main process
+   * only: the repository links (#286) keep it on this device, and it never
+   * crosses IPC in this form.
+   */
+  folderOf(mountId: string): string | undefined;
+  /**
+   * The mount ID of the mounted repository whose top-level folder is
+   * `folder`, compared as a mount compares folders (without regard to case
+   * on Windows), or undefined when none is.
+   */
+  mountOf(folder: string): string | undefined;
   /** Calls `listener` with the list after every change. Returns a function that removes it. */
   onChange(listener: (list: RepositoryList) => void): () => void;
   /** Stops every watcher and cancels every running Git command, for the application's quit. */
@@ -294,6 +309,24 @@ export function createRepositoryService(
     return true;
   };
 
+  const folderOf = (mountId: string): string | undefined =>
+    typeof mountId === "string"
+      ? mounts.get(mountId)?.location.topLevel
+      : undefined;
+
+  const mountOf = (folder: string): string | undefined => {
+    if (typeof folder !== "string") {
+      return undefined;
+    }
+    const key = pathKey(folder);
+    for (const entry of mounts.values()) {
+      if (entry.key === key) {
+        return entry.id;
+      }
+    }
+    return undefined;
+  };
+
   const onChange = (listener: (list: RepositoryList) => void) => {
     listeners.add(listener);
     return () => {
@@ -311,5 +344,13 @@ export function createRepositoryService(
     listeners.clear();
   };
 
-  return Object.freeze({ list, mount, unmount, onChange, close });
+  return Object.freeze({
+    list,
+    mount,
+    unmount,
+    folderOf,
+    mountOf,
+    onChange,
+    close,
+  });
 }

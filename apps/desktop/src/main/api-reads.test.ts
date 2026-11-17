@@ -8,6 +8,7 @@ import {
   OwnJoinRequestListResponseSchema,
   ProjectListResponseSchema,
   type ProjectId,
+  RepositoryListResponseSchema,
   routePath,
   type WorkspaceId,
   WorkspaceListResponseSchema,
@@ -87,6 +88,12 @@ const READS: [WorkspaceReadName, Record<string, string>, string, number][] = [
     `/workspaces/${WORKSPACE_ID}/claims`,
     512 * KIB,
   ],
+  [
+    "listRepositories",
+    { projectId: PROJECT_ID },
+    `/projects/${PROJECT_ID}/repositories`,
+    1 * MIB,
+  ],
 ];
 
 /** Sends the request as the session does, with an answer of exactly `size` bytes. */
@@ -116,7 +123,7 @@ async function answerOfSize(
   return answer.kind;
 }
 
-test("the allowlist holds exactly ten GET reads, frozen", () => {
+test("the allowlist holds exactly eleven GET reads, frozen", () => {
   expect(Object.keys(WORKSPACE_READS)).toEqual(READS.map(([name]) => name));
   expect(Object.isFrozen(WORKSPACE_READS)).toBe(true);
   for (const entry of Object.values(WORKSPACE_READS)) {
@@ -190,6 +197,8 @@ test("a name off the allowlist, a wrong parameter, or a query of another read is
     ["listOwnJoinRequests", {}, { limit: 5 }],
     ["listClaims", {}, undefined],
     ["listClaims", { workspaceId: WORKSPACE_ID }, { limit: 50 }],
+    ["listRepositories", { workspaceId: WORKSPACE_ID }, undefined],
+    ["listRepositories", { projectId: PROJECT_ID }, { limit: 20 }],
   ];
   for (const [name, params, query] of refused) {
     expect(
@@ -223,6 +232,7 @@ test("each read's answer is checked with its response schema", () => {
     listJoinRequests: { joinRequests: [] },
     listOwnJoinRequests: { joinRequests: [] },
     listClaims: { claims: [] },
+    listRepositories: { repositories: [] },
   };
   for (const [name, params] of READS) {
     const request = workspaceReadRequest(name, params, undefined)!;
@@ -288,6 +298,7 @@ test("each read's answer schema is the protocol schema of its route", () => {
     listJoinRequests: JoinRequestListResponseSchema,
     listOwnJoinRequests: OwnJoinRequestListResponseSchema,
     listClaims: ClaimListResponseSchema,
+    listRepositories: RepositoryListResponseSchema,
   };
   expect(Object.keys(WORKSPACE_READS).sort()).toEqual(
     Object.keys(schemas).sort(),

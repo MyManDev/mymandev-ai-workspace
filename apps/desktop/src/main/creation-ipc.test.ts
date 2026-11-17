@@ -564,6 +564,7 @@ const EXPECTED: Readonly<
       not_found: refused("failed"),
       conflict: refused("failed"),
       project_limit: refused("failed"),
+      repository_limit: refused("failed"),
     },
     createProject: {
       ...common,
@@ -571,6 +572,7 @@ const EXPECTED: Readonly<
       conflict: refused("conflict"),
       // Without a wait, because none frees a place (#255).
       project_limit: refused("project_limit"),
+      repository_limit: refused("failed"),
     },
   };
 })();

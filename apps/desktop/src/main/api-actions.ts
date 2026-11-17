@@ -1,5 +1,6 @@
 // The writes of the workspace screens of #95 that the main process may send
-// to the API (the Project Manager's decision D1 of 2026-11-06): a frozen
+// to the API (the Project Manager's decision D1 of 2026-11-06), and the
+// registration and removal of a project's repositories (#286): a frozen
 // allowlist of `POST` routes, each with its path parameters, the protocol's
 // request schema or none, and the protocol's answer schema or `empty` for a
 // `204`. The account service sends them with the device session
@@ -55,9 +56,17 @@ import {
   PreviewInvitationRequestSchema,
   type PreviewInvitationResponse,
   PreviewInvitationResponseSchema,
+  type ProjectId,
+  ProjectIdSchema,
   PROJECT_ROUTES,
+  RegisterRepositoryRequestSchema,
+  type RegisterRepositoryResponse,
+  RegisterRepositoryResponseSchema,
   type RenameMemberRequest,
   RenameMemberRequestSchema,
+  REPOSITORY_ROUTES,
+  type RepositoryId,
+  RepositoryIdSchema,
   type WorkspaceId,
   WorkspaceIdSchema,
 } from "@mymandev/protocol";
@@ -73,6 +82,8 @@ const PATH_PARAMS = Object.freeze({
   memberId: MemberIdSchema,
   invitationId: InvitationIdSchema,
   joinRequestId: JoinRequestIdSchema,
+  projectId: ProjectIdSchema,
+  repositoryId: RepositoryIdSchema,
 });
 export type WorkspaceActionParam = keyof typeof PATH_PARAMS;
 
@@ -257,6 +268,25 @@ export const WORKSPACE_ACTIONS = Object.freeze({
     CreateProjectRequestSchema,
     CreateProjectResponseSchema,
   ),
+  /**
+   * Registers a repository in a project (#286): its name only. The body's
+   * schema refuses a name with a slash or a backslash, so a folder's path
+   * cannot travel as a name, and an extra field such as a path is refused
+   * here before anything is sent.
+   */
+  registerRepository: action(
+    REPOSITORY_ROUTES.registerRepository,
+    ["projectId"],
+    RegisterRepositoryRequestSchema,
+    RegisterRepositoryResponseSchema,
+  ),
+  /** Removes a repository from its project (#286). */
+  removeRepository: action(
+    REPOSITORY_ROUTES.removeRepository,
+    ["projectId", "repositoryId"],
+    null,
+    "empty",
+  ),
 });
 export type WorkspaceActionName = keyof typeof WORKSPACE_ACTIONS;
 
@@ -294,6 +324,11 @@ export interface WorkspaceActionParams {
   readonly pauseJoinRequests: InWorkspace;
   readonly resumeJoinRequests: InWorkspace;
   readonly createProject: InWorkspace;
+  readonly registerRepository: { readonly projectId: ProjectId };
+  readonly removeRepository: {
+    readonly projectId: ProjectId;
+    readonly repositoryId: RepositoryId;
+  };
 }
 
 /** The body of each write, as the caller passes it; `never` for none. */
@@ -325,6 +360,9 @@ export interface WorkspaceActionBody {
   readonly resumeJoinRequests: never;
   /** The name as typed; it is sent normalized (`normalizeProjectName`). */
   readonly createProject: z.input<typeof CreateProjectRequestSchema>;
+  /** The name as typed; it is sent as it is (a label, ADR 0005). */
+  readonly registerRepository: z.input<typeof RegisterRepositoryRequestSchema>;
+  readonly removeRepository: never;
 }
 
 /**
@@ -365,6 +403,8 @@ export interface WorkspaceActionAnswer {
   readonly pauseJoinRequests: null;
   readonly resumeJoinRequests: null;
   readonly createProject: CreateProjectResponse;
+  readonly registerRepository: RegisterRepositoryResponse;
+  readonly removeRepository: null;
 }
 
 /**
@@ -411,12 +451,14 @@ export const ACTION_RATE_LIMITED_WAIT_MS = 60_000;
  *   device record is not usable.
  * - `forbidden`, `not_found`, `conflict`, `already_member`,
  *   `invitation_invalid`, `join_requests_closed`, `workspace_not_found`,
- *   `device_too_new`, `unclaimed_limit`, `project_limit`: the API's refusal
- *   with that code (`MEMBERSHIP_ROUTE_ERRORS`, `PROJECT_ROUTE_ERRORS`).
- *   `unclaimed_limit` carries no wait: only removing an unclaimed person, or
- *   a claim of one, frees a place for a definition (#242). Neither does
- *   `project_limit`: only archiving a project frees a place for a creation
- *   (#255).
+ *   `device_too_new`, `unclaimed_limit`, `project_limit`,
+ *   `repository_limit`: the API's refusal with that code
+ *   (`MEMBERSHIP_ROUTE_ERRORS`, `PROJECT_ROUTE_ERRORS`,
+ *   `REPOSITORY_ROUTE_ERRORS`). `unclaimed_limit` carries no wait: only
+ *   removing an unclaimed person, or a claim of one, frees a place for a
+ *   definition (#242). Neither does `project_limit`: only archiving a
+ *   project frees a place for a creation (#255). Nor `repository_limit`:
+ *   only removing a repository frees a place for a registration (#286).
  * - `rate_limited`: the API's limit; `retryAfterMs` follows its
  *   `Retry-After`, or `ACTION_RATE_LIMITED_WAIT_MS` without one.
  * - `unknown`: whether the API acted is not known: it gave no answer, failed,
@@ -441,6 +483,7 @@ export const WORKSPACE_ACTION_FAILURES = Object.freeze([
   "device_too_new",
   "unclaimed_limit",
   "project_limit",
+  "repository_limit",
   "rate_limited",
   "unknown",
   "failed",
@@ -582,6 +625,7 @@ const SHOWN_CODES: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
   "device_too_new",
   "unclaimed_limit",
   "project_limit",
+  "repository_limit",
 ]);
 
 /** The closed failure of a write for a failure of the device session. */

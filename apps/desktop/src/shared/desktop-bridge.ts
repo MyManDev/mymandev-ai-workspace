@@ -25,6 +25,7 @@ import type {
   JoinRequestLoadResult,
   JoinRequestsView,
   LiftRegistrationLockResult,
+  LinkRepositoryResult,
   MountResult,
   OtherDeviceRevocation,
   OwnJoinRequestLoadResult,
@@ -32,8 +33,11 @@ import type {
   PeopleView,
   PersonActionResult,
   PreviewInvitationResult,
+  ProjectRepositoriesView,
   ReconnectResult,
+  RegisterRepositoryResult,
   RemoveDeviceResult,
+  RemoveRepositoryResult,
   RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
@@ -41,6 +45,7 @@ import type {
   SignOutResult,
   StartSignInOptions,
   StartSignInResult,
+  UnlinkRepositoryResult,
   UnlockResult,
   WorkspaceActionResult,
   WithdrawJoinRequestResult,
@@ -63,6 +68,11 @@ export interface DesktopBridge {
   readonly runtime: RuntimeBridge;
   /** The repositories mounted on this device, read-only. */
   readonly repositories: RepositoryBridge;
+  /**
+   * The open project's registered repositories, and their links to the
+   * folders mounted on this device.
+   */
+  readonly projectRepositories: ProjectRepositoriesBridge;
   /** The sign-in of this installation. */
   readonly account: AccountBridge;
   /** The status of the connection to the cloud API. */
@@ -136,6 +146,48 @@ export interface RepositoryBridge {
    * Nothing in the folder changes. Resolves to false when it was not mounted.
    */
   readonly unmount: (mountId: string) => Promise<boolean>;
+}
+
+/**
+ * The open project's registered repositories (#286), which the main process
+ * holds, and the account's links from them to the folders of mounted
+ * repositories. The renderer names a folder by its mount ID only; no path
+ * crosses, and none goes to the cloud. The links stay on this device.
+ */
+export interface ProjectRepositoriesBridge {
+  /** The current state. */
+  readonly getState: () => Promise<ProjectRepositoriesView>;
+  /**
+   * Calls `listener` with the current state and then after changes, at most
+   * once every 50 ms with the latest one. A state older than the last one
+   * delivered is dropped. `onError` is called when the main process refuses
+   * the subscription. Returns a function that ends the subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: ProjectRepositoriesView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Registers a repository in the open project by its name: 1 to 100
+   * characters without a slash or a backslash. `repository_limit`, without a
+   * wait, means that the project is full until a repository is removed.
+   */
+  readonly register: (
+    projectId: string,
+    name: string,
+  ) => Promise<RegisterRepositoryResult>;
+  /** Removes a repository from the open project. */
+  readonly remove: (
+    projectId: string,
+    repositoryId: string,
+  ) => Promise<RemoveRepositoryResult>;
+  /** Links a registered repository to the folder of a mounted repository. */
+  readonly link: (
+    repositoryId: string,
+    mountId: string,
+  ) => Promise<LinkRepositoryResult>;
+  /** Ends the account's link of a repository. */
+  readonly unlink: (repositoryId: string) => Promise<UnlinkRepositoryResult>;
 }
 
 /**

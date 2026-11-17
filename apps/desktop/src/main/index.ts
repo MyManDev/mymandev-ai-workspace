@@ -72,10 +72,14 @@ import { registerOwnJoinRequestIpc } from "./own-join-request-ipc.ts";
 import { createOwnJoinRequestService } from "./own-join-requests/service.ts";
 import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
+import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
+import { createProjectRepositoryService } from "./repository-links/service.ts";
+import { createSystemRepositoryLinkStore } from "./repository-links/system.ts";
 import {
   createSystemRepositoryService,
   FOLDER_DIALOG_OPTIONS,
+  isDirectory,
   selectedFolder,
 } from "./repository-system.ts";
 import { createLocalRuntime } from "./runtime.ts";
@@ -306,6 +310,31 @@ function start(): void {
     workspaces,
   });
   app.on("will-quit", () => agentIpc.close());
+
+  // The open project's registered repositories (#286), read over HTTP and
+  // kept current with the selected workspace's repository events through
+  // its own resync gate, and the account's links from them to the mounted
+  // folders. The links are kept in the local data folder of the device key,
+  // which never roams; no path leaves the main process. The resolution of a
+  // repository to its folder is for the enforcement point's callers in the
+  // main process and has no channel. The logs are fixed text with a failure
+  // code at most, never a name, an ID, or a path.
+  const projectRepositories = createProjectRepositoryService({
+    account,
+    connection,
+    workspaces,
+    mounts: repositories,
+    store: createSystemRepositoryLinkStore(),
+    isFolder: isDirectory,
+    log: (message) => console.info(message),
+  });
+  app.on("will-quit", () => projectRepositories.close());
+  const projectRepositoryIpc = registerProjectRepositoryIpc(
+    ipcMain,
+    rendererUrl,
+    { service: projectRepositories },
+  );
+  app.on("will-quit", () => projectRepositoryIpc.close());
   // The development agent switch (#28): only in an unpackaged build, and
   // only when MYMANDEV_DEV_AGENT_SWITCH holds the agent ID that
   // `db:dev-seed` printed and MYMANDEV_DEV_AGENT_DEVICE the device ID that

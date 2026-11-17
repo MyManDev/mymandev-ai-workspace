@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import type {
   AccountStatus,
+  ProjectRepositoriesView,
   RepositoryList,
   RuntimeStatus,
 } from "../shared/ipc-contract.ts";
@@ -58,7 +59,7 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the join request, the join request action, the own join request, the own join request action, the claim, the claim mark, the agent, the chat, and the device list functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the project repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the join request, the join request action, the own join request, the own join request action, the claim, the claim mark, the agent, the chat, and the device list functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
@@ -78,6 +79,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "ownJoinRequests",
     "people",
     "peopleActions",
+    "projectRepositories",
     "repositories",
     "runtime",
     "workspaces",
@@ -91,6 +93,14 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
     "mount",
     "subscribe",
     "unmount",
+  ]);
+  expect(Object.keys(bridge.projectRepositories).sort()).toEqual([
+    "getState",
+    "link",
+    "register",
+    "remove",
+    "subscribeState",
+    "unlink",
   ]);
   expect(Object.keys(bridge.account).sort()).toEqual([
     "cancelSignIn",
@@ -199,6 +209,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   expect(Object.isFrozen(bridge)).toBe(true);
   expect(Object.isFrozen(bridge.runtime)).toBe(true);
   expect(Object.isFrozen(bridge.repositories)).toBe(true);
+  expect(Object.isFrozen(bridge.projectRepositories)).toBe(true);
   expect(Object.isFrozen(bridge.account)).toBe(true);
   expect(Object.isFrozen(bridge.connection)).toBe(true);
   expect(Object.isFrozen(bridge.workspaces)).toBe(true);
@@ -218,6 +229,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the ac
   for (const value of [
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
+    ...Object.values(bridge.projectRepositories),
     ...Object.values(bridge.account),
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
@@ -246,6 +258,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge),
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
+    ...Object.values(bridge.projectRepositories),
     ...Object.values(bridge.account),
     ...Object.values(bridge.connection),
     ...Object.values(bridge.workspaces),
@@ -505,6 +518,124 @@ test("a refused repository subscription calls onError, and a throwing listener i
 
   expect(errors).toBe(1);
   expect(reported).toEqual(["A repository list callback failed."]);
+});
+
+const REPOSITORY_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819331";
+
+const projectRepositories = (revision: number): ProjectRepositoriesView => ({
+  revision,
+  status: "no_project",
+  workspaceId: null,
+  projectId: null,
+  links: "ready",
+  repositories: [],
+});
+
+test("each project repository function calls its own channel with only its strings, never a path, and passes the answer through", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const call = (name: keyof typeof bridge.projectRepositories) =>
+    bridge.projectRepositories[name] as (
+      ...args: unknown[]
+    ) => Promise<unknown>;
+
+  const answers = [
+    call("getState")("extra"),
+    call("register")(PROJECT_ID, "web", { path: "/home/web" }),
+    call("remove")(PROJECT_ID, REPOSITORY_ID, "extra"),
+    call("link")(REPOSITORY_ID, MOUNT_ID, "/home/web"),
+    call("unlink")(REPOSITORY_ID, "extra"),
+  ];
+  fake.answers.forEach((answer, index) => answer.resolve({ index }));
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    { index: 0 },
+    { index: 1 },
+    { index: 2 },
+    { index: 3 },
+    { index: 4 },
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getProjectRepositoryState, args: [] },
+    { channel: INVOKE_CHANNELS.registerRepository, args: [PROJECT_ID, "web"] },
+    {
+      channel: INVOKE_CHANNELS.removeRepository,
+      args: [PROJECT_ID, REPOSITORY_ID],
+    },
+    {
+      channel: INVOKE_CHANNELS.linkRepository,
+      args: [REPOSITORY_ID, MOUNT_ID],
+    },
+    { channel: INVOKE_CHANNELS.unlinkRepository, args: [REPOSITORY_ID] },
+  ]);
+});
+
+test("each project repository action refuses a value that is not a string without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const call = (name: keyof typeof bridge.projectRepositories) =>
+    bridge.projectRepositories[name] as (
+      ...args: unknown[]
+    ) => Promise<unknown>;
+  const secret = { path: "/home/user/secret-folder" };
+
+  for (const attempt of [
+    () => call("register")(PROJECT_ID, secret),
+    () => call("register")(secret, "web"),
+    () => call("remove")(PROJECT_ID, 7),
+    () => call("remove")(undefined, REPOSITORY_ID),
+    () => call("link")(REPOSITORY_ID, secret),
+    () => call("link")([REPOSITORY_ID], MOUNT_ID),
+    () => call("unlink")(secret),
+  ]) {
+    const error = await attempt().then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(TypeError);
+    expect(String(error)).not.toContain("secret-folder");
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("the project repository subscription delivers the state and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const reported: string[] = [];
+  const bridge = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  const calls: unknown[][] = [];
+
+  const end = bridge.projectRepositories.subscribeState((...args: unknown[]) =>
+    calls.push(args),
+  );
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeProjectRepositoryState, args: [] },
+  ]);
+  fake.emit(EVENT_CHANNELS.projectRepositoriesChanged, projectRepositories(3));
+  fake.answers[0]?.resolve(projectRepositories(2));
+  await settle();
+  fake.emit(EVENT_CHANNELS.projectRepositoriesChanged, projectRepositories(4));
+  end();
+  fake.emit(EVENT_CHANNELS.projectRepositoriesChanged, projectRepositories(5));
+
+  expect(calls).toEqual([[projectRepositories(3)], [projectRepositories(4)]]);
+  expect(fake.listenerCount(EVENT_CHANNELS.projectRepositoriesChanged)).toBe(0);
+
+  let errors = 0;
+  bridge.projectRepositories.subscribeState(
+    () => {
+      throw new Error("listener");
+    },
+    () => {
+      errors += 1;
+    },
+  );
+  fake.emit(EVENT_CHANNELS.projectRepositoriesChanged, projectRepositories(1));
+  fake.answers[1]?.reject(new Error("refused"));
+  await settle();
+  expect(errors).toBe(1);
+  expect(reported).toEqual(["A project repository callback failed."]);
 });
 
 const accountStatus = (revision: number): AccountStatus => ({

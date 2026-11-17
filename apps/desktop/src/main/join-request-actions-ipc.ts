@@ -45,6 +45,7 @@ const OUTCOMES = {
   device_too_new: "failed",
   unclaimed_limit: "failed",
   project_limit: "failed",
+  repository_limit: "failed",
   rate_limited: "rate_limited",
   unknown: "unknown",
   failed: "failed",

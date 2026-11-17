@@ -347,6 +347,51 @@ test("where paths ignore case, a repository in another case is the same", async 
   });
 });
 
+test("folderOf gives a mount's top-level folder as Git reported it, and mountOf finds the mount by its folder", async () => {
+  const { service } = setup({}, (folder) => ({
+    kind: "repository",
+    // A control character is replaced in the list, never in the folder.
+    location: locationOf(`${folder}\u0007`),
+  }));
+  const result = await service.mount("/home/user/project");
+  const mountId = result.outcome === "mounted" ? result.mountId : "";
+
+  expect(service.folderOf(mountId)).toBe("/home/user/project\u0007");
+  expect(service.list().repositories[0]?.path).toBe("/home/user/project\uFFFD");
+  expect(service.mountOf("/home/user/project\u0007")).toBe(mountId);
+  // Another case is another folder where paths keep case.
+  expect(service.mountOf("/home/user/Project\u0007")).toBeUndefined();
+  expect(service.mountOf("/home/user/project")).toBeUndefined();
+  expect(service.folderOf("0b9e2f7c-5d0a-4c8e-9f3b-000000000099")).toBe(
+    undefined,
+  );
+  expect(service.folderOf(7 as never)).toBeUndefined();
+  expect(service.mountOf(7 as never)).toBeUndefined();
+
+  service.unmount(mountId);
+  expect(service.folderOf(mountId)).toBeUndefined();
+  expect(service.mountOf("/home/user/project\u0007")).toBeUndefined();
+});
+
+test("where paths ignore case, mountOf finds a mount in another case", async () => {
+  const { service } = setup(
+    { caseInsensitivePaths: true, pathApi: path.win32 },
+    (folder) => ({
+      kind: "repository",
+      location: {
+        topLevel: folder,
+        gitDir: path.win32.join(folder, ".git"),
+        commonDir: path.win32.join(folder, ".git"),
+      },
+    }),
+  );
+  const result = await service.mount("C:\\Users\\user\\Project");
+  const mountId = result.outcome === "mounted" ? result.mountId : "";
+
+  expect(service.mountOf("c:\\users\\user\\project")).toBe(mountId);
+  expect(service.folderOf(mountId)).toBe("C:\\Users\\user\\Project");
+});
+
 test("no more than the limit of repositories is mounted", async () => {
   const { service } = setup();
 

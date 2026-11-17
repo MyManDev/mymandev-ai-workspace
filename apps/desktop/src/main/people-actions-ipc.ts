@@ -45,6 +45,7 @@ const OUTCOMES = {
   device_too_new: "device_too_new",
   unclaimed_limit: "unclaimed_limit",
   project_limit: "failed",
+  repository_limit: "failed",
   rate_limited: "rate_limited",
   unknown: "unknown",
   failed: "failed",

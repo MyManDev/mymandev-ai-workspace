@@ -87,6 +87,18 @@ import {
   OWN_JOIN_REQUEST_STATUSES,
   OwnJoinRequestLoadResultSchema,
   OwnJoinRequestsViewSchema,
+  LINK_REPOSITORY_REFUSALS,
+  LinkRepositoryResultSchema,
+  PROJECT_REPOSITORY_LIMITS,
+  PROJECT_REPOSITORY_PROBLEMS,
+  ProjectRepositoriesViewSchema,
+  REGISTER_REPOSITORY_REFUSALS,
+  RegisterRepositoryResultSchema,
+  REMOVE_REPOSITORY_REFUSALS,
+  RemoveRepositoryResultSchema,
+  REPOSITORY_LINK_STATES,
+  UNLINK_REPOSITORY_REFUSALS,
+  UnlinkRepositoryResultSchema,
   PEOPLE_LIMITS,
   PEOPLE_STATUSES,
   PeopleViewSchema,
@@ -290,7 +302,15 @@ const OWN_JOIN_REQUEST_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.withdrawJoinRequest,
 ]);
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, and the report of seen claims take no arguments and refuse any", () => {
+/** The project repository action channels, which take IDs and a name. */
+const PROJECT_REPOSITORY_ACTION_CHANNELS: ReadonlySet<string> = new Set([
+  INVOKE_CHANNELS.registerRepository,
+  INVOKE_CHANNELS.removeRepository,
+  INVOKE_CHANNELS.linkRepository,
+  INVOKE_CHANNELS.unlinkRepository,
+]);
+
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, the project repository actions, and the report of seen claims take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -309,9 +329,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       !PEOPLE_ACTION_CHANNELS.has(channel) &&
       !INVITATION_ACTION_CHANNELS.has(channel) &&
       !JOIN_REQUEST_ACTION_CHANNELS.has(channel) &&
-      !OWN_JOIN_REQUEST_ACTION_CHANNELS.has(channel),
+      !OWN_JOIN_REQUEST_ACTION_CHANNELS.has(channel) &&
+      !PROJECT_REPOSITORY_ACTION_CHANNELS.has(channel),
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 35);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 39);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -2266,6 +2287,271 @@ test("a create answers ok with its own fields, refused with a known reason and a
     CreateProjectResultSchema.safeParse({ outcome: "ok", projectId: "p" })
       .success,
   ).toBe(false);
+});
+
+// The open project's registered repositories and their links (#286).
+
+const REPOSITORY_ID = "019a5b2c-3d4e-7f60-8a1b-2c3d4e5f6a8d";
+
+const PROJECT_REPOSITORY = Object.freeze({
+  repositoryId: REPOSITORY_ID,
+  name: "web",
+  linked: true,
+  mountId: MOUNT_ID,
+});
+
+const PROJECT_REPOSITORIES = Object.freeze({
+  revision: 4,
+  status: "ready",
+  workspaceId: WORKSPACE_ID,
+  projectId: PROJECT_ID,
+  links: "ready",
+  repositories: [PROJECT_REPOSITORY],
+});
+
+test("a project repositories view with every status, problem, and link state is accepted, with a problem only while unavailable", () => {
+  expect(EVENT_CONTRACT[EVENT_CHANNELS.projectRepositoriesChanged]).toBe(
+    ProjectRepositoriesViewSchema,
+  );
+  for (const channel of [
+    INVOKE_CHANNELS.getProjectRepositoryState,
+    INVOKE_CHANNELS.subscribeProjectRepositoryState,
+  ]) {
+    expect(INVOKE_CONTRACT[channel].result).toBe(ProjectRepositoriesViewSchema);
+  }
+  for (const status of ["no_project", "loading", "ready"]) {
+    for (const links of REPOSITORY_LINK_STATES) {
+      const value = { ...PROJECT_REPOSITORIES, status, links };
+      expect(ProjectRepositoriesViewSchema.parse(value)).toEqual(value);
+      // A problem is dropped outside `unavailable`.
+      expect(
+        ProjectRepositoriesViewSchema.parse({ ...value, problem: "failed" }),
+      ).toEqual(value);
+    }
+  }
+  for (const problem of PROJECT_REPOSITORY_PROBLEMS) {
+    const value = { ...PROJECT_REPOSITORIES, status: "unavailable", problem };
+    expect(ProjectRepositoriesViewSchema.parse(value)).toEqual(value);
+  }
+  expect(
+    ProjectRepositoriesViewSchema.safeParse({
+      ...PROJECT_REPOSITORIES,
+      status: "unavailable",
+    }).success,
+  ).toBe(false);
+  // Linked, and linked without a mount; and not linked.
+  for (const repository of [
+    PROJECT_REPOSITORY,
+    { ...PROJECT_REPOSITORY, mountId: null },
+    { ...PROJECT_REPOSITORY, linked: false, mountId: null },
+  ]) {
+    expect(
+      ProjectRepositoriesViewSchema.safeParse({
+        ...PROJECT_REPOSITORIES,
+        repositories: [repository],
+      }).success,
+    ).toBe(true);
+  }
+});
+
+test("a project repositories view drops unknown keys at every level, so no path, member ID, or user ID crosses", () => {
+  const parsed = ProjectRepositoriesViewSchema.parse({
+    ...PROJECT_REPOSITORIES,
+    path: "/home/user/web",
+    userId: PERSON_USER_ID,
+    repositories: [
+      {
+        ...PROJECT_REPOSITORY,
+        folder: "/home/user/web",
+        path: "/home/user/web",
+        createdByMemberId: PERSON_ID,
+      },
+    ],
+  });
+  expect(parsed).toEqual(PROJECT_REPOSITORIES);
+  expect(JSON.stringify(parsed)).not.toContain("/home/user/web");
+});
+
+test("a project repositories view over the limits or with wrong values is refused", () => {
+  const repositories = (count: number) =>
+    Array.from({ length: count }, () => PROJECT_REPOSITORY);
+  expect(
+    ProjectRepositoriesViewSchema.safeParse({
+      ...PROJECT_REPOSITORIES,
+      repositories: repositories(PROJECT_REPOSITORY_LIMITS.repositories),
+    }).success,
+  ).toBe(true);
+  const invalid: Record<string, unknown>[] = [
+    { repositories: repositories(PROJECT_REPOSITORY_LIMITS.repositories + 1) },
+    { status: "done" },
+    { links: "broken" },
+    { revision: -1 },
+    { projectId: MOUNT_ID },
+    { workspaceId: "w" },
+    {
+      repositories: [
+        {
+          ...PROJECT_REPOSITORY,
+          name: "a".repeat(PROJECT_REPOSITORY_LIMITS.name + 1),
+        },
+      ],
+    },
+    { repositories: [{ ...PROJECT_REPOSITORY, name: "" }] },
+    { repositories: [{ ...PROJECT_REPOSITORY, repositoryId: MOUNT_ID }] },
+    {
+      repositories: [
+        { ...PROJECT_REPOSITORY, mountId: REPOSITORY_ID.slice(1) },
+      ],
+    },
+    // A repository that is not linked names no mount.
+    { repositories: [{ ...PROJECT_REPOSITORY, linked: false }] },
+    { repositories: [{ ...PROJECT_REPOSITORY, linked: "yes" }] },
+  ];
+  for (const change of invalid) {
+    expect(
+      ProjectRepositoriesViewSchema.safeParse({
+        ...PROJECT_REPOSITORIES,
+        ...change,
+      }).success,
+      JSON.stringify(Object.keys(change)),
+    ).toBe(false);
+  }
+  expect(PROJECT_REPOSITORY_LIMITS).toEqual({ repositories: 1_000, name: 100 });
+});
+
+test("register takes a project ID and a name, remove two IDs, link a repository ID and a mount ID, and unlink one ID, never a path", () => {
+  const cases = [
+    [INVOKE_CHANNELS.registerRepository, [PROJECT_ID, "web"]],
+    [INVOKE_CHANNELS.removeRepository, [PROJECT_ID, REPOSITORY_ID]],
+    [INVOKE_CHANNELS.linkRepository, [REPOSITORY_ID, MOUNT_ID]],
+    [INVOKE_CHANNELS.unlinkRepository, [REPOSITORY_ID]],
+  ] as const;
+  for (const [channel, valid] of cases) {
+    const { args } = INVOKE_CONTRACT[channel];
+    expect(args.parse(valid), channel).toEqual(valid);
+    for (const value of [
+      [],
+      valid.slice(0, -1),
+      [...valid, "/home/user/web"],
+      undefined,
+      {},
+    ]) {
+      expect(args.safeParse(value).success, channel).toBe(false);
+    }
+  }
+  const register = INVOKE_CONTRACT[INVOKE_CHANNELS.registerRepository].args;
+  const remove = INVOKE_CONTRACT[INVOKE_CHANNELS.removeRepository].args;
+  const link = INVOKE_CONTRACT[INVOKE_CHANNELS.linkRepository].args;
+  const unlink = INVOKE_CONTRACT[INVOKE_CHANNELS.unlinkRepository].args;
+  for (const value of NOT_PROTOCOL_IDS) {
+    expect(register.safeParse([value, "web"]).success).toBe(false);
+    expect(remove.safeParse([PROJECT_ID, value]).success).toBe(false);
+    expect(remove.safeParse([value, REPOSITORY_ID]).success).toBe(false);
+    expect(link.safeParse([value, MOUNT_ID]).success).toBe(false);
+    expect(unlink.safeParse([value]).success).toBe(false);
+  }
+  for (const value of ["/home/user/web", "C:\\Users\\web", "", 7, null]) {
+    expect(link.safeParse([REPOSITORY_ID, value]).success).toBe(false);
+  }
+  for (const value of ["", "a".repeat(WORKSPACE_LIMITS.name + 1), 7, null]) {
+    expect(register.safeParse([PROJECT_ID, value]).success).toBe(false);
+  }
+});
+
+test("register and remove answer ok, refused with a known reason and a wait only for a wait, or unknown; link and unlink answer their outcome or a known refusal", () => {
+  const waits = new Set(["too_soon", "rate_limited"]);
+  const writes = [
+    [
+      RegisterRepositoryResultSchema,
+      REGISTER_REPOSITORY_REFUSALS,
+      { outcome: "ok", repositoryId: REPOSITORY_ID },
+      INVOKE_CHANNELS.registerRepository,
+    ],
+    [
+      RemoveRepositoryResultSchema,
+      REMOVE_REPOSITORY_REFUSALS,
+      { outcome: "ok" },
+      INVOKE_CHANNELS.removeRepository,
+    ],
+  ] as const;
+  for (const [schema, refusals, ok, channel] of writes) {
+    expect(INVOKE_CONTRACT[channel].result).toBe(schema);
+    expect(schema.parse({ outcome: "unknown" })).toEqual({
+      outcome: "unknown",
+    });
+    expect(schema.parse({ ...ok, path: "/home/user/web" })).toEqual(ok);
+    for (const reason of refusals) {
+      const retryAfterMs = waits.has(reason) ? 1_500 : null;
+      const value = { outcome: "refused", reason, retryAfterMs };
+      expect(schema.parse(value), reason).toEqual(value);
+      expect(
+        schema.safeParse({
+          ...value,
+          retryAfterMs: retryAfterMs === null ? 1_500 : null,
+        }).success,
+        reason,
+      ).toBe(false);
+    }
+    expect(
+      schema.safeParse({
+        outcome: "refused",
+        reason: "busy",
+        retryAfterMs: null,
+      }).success,
+    ).toBe(false);
+  }
+  // The limit of a project has its own refusal, without a wait.
+  expect(REGISTER_REPOSITORY_REFUSALS).toContain("repository_limit");
+  expect(
+    RegisterRepositoryResultSchema.safeParse({
+      outcome: "refused",
+      reason: "repository_limit",
+      retryAfterMs: 1_000,
+    }).success,
+  ).toBe(false);
+  expect(REMOVE_REPOSITORY_REFUSALS).not.toContain("repository_limit");
+  expect(REGISTER_REPOSITORY_REFUSALS).not.toContain("forbidden");
+  expect(
+    RegisterRepositoryResultSchema.safeParse({
+      outcome: "ok",
+      repositoryId: "r",
+    }).success,
+  ).toBe(false);
+
+  const outcomes = [
+    [
+      LinkRepositoryResultSchema,
+      LINK_REPOSITORY_REFUSALS,
+      "linked",
+      INVOKE_CHANNELS.linkRepository,
+    ],
+    [
+      UnlinkRepositoryResultSchema,
+      UNLINK_REPOSITORY_REFUSALS,
+      "unlinked",
+      INVOKE_CHANNELS.unlinkRepository,
+    ],
+  ] as const;
+  for (const [schema, refusals, outcome, channel] of outcomes) {
+    expect(INVOKE_CONTRACT[channel].result).toBe(schema);
+    expect(schema.parse({ outcome, folder: "/home/user/web" })).toEqual({
+      outcome,
+    });
+    for (const reason of refusals) {
+      expect(schema.parse({ outcome: "refused", reason })).toEqual({
+        outcome: "refused",
+        reason,
+      });
+    }
+    for (const value of [
+      undefined,
+      { outcome: "ok" },
+      { outcome: "refused", reason: "busy" },
+      { outcome: "refused" },
+    ]) {
+      expect(schema.safeParse(value).success).toBe(false);
+    }
+  }
 });
 
 test("a protocol ID that is too long is refused with one issue, before the pattern runs", () => {
