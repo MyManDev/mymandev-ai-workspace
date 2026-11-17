@@ -2637,6 +2637,31 @@ test("register and remove answer ok, refused with a known reason and a wait only
   }
 });
 
+test("a link or unlink result drops unknown keys in every branch, so no path or identity crosses", () => {
+  const extra = {
+    folder: "/home/user/web",
+    path: "/home/user/web",
+    identity: { folder: { dev: "2049", ino: "77" } },
+    mountId: MOUNT_ID,
+  };
+  const outcomes = [
+    [LinkRepositoryResultSchema, LINK_REPOSITORY_REFUSALS, "linked"],
+    [UnlinkRepositoryResultSchema, UNLINK_REPOSITORY_REFUSALS, "unlinked"],
+  ] as const;
+  for (const [schema, refusals, outcome] of outcomes) {
+    const values = [
+      { outcome },
+      ...refusals.map((reason) => ({ outcome: "refused", reason })),
+    ];
+    for (const value of values) {
+      const parsed = schema.parse({ ...extra, ...value });
+      expect(parsed, JSON.stringify(value)).toEqual(value);
+      expect(JSON.stringify(parsed)).not.toContain("/home/user/web");
+      expect(JSON.stringify(parsed)).not.toContain("2049");
+    }
+  }
+});
+
 test("a protocol ID that is too long is refused with one issue, before the pattern runs", () => {
   const result = ProtocolIdSchema.safeParse("x".repeat(10_000));
 
