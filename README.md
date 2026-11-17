@@ -4,6 +4,10 @@ Local-first multi-agent development workspace for MyManDev.
 
 This project coordinates developers, repositories, AI agents, permissions, tasks, decisions, and real-time project activity.
 
+## User guide
+
+The [user guide](docs/user/README.md) explains how to use the desktop application: signing in, devices, workspaces, people, invitations, and join requests.
+
 ## Branches
 
 - `develop` is the integration branch.

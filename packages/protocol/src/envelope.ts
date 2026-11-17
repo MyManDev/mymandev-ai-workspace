@@ -4,6 +4,7 @@ import {
   MemberRoleSchema,
   WorkspaceMemberSchema,
 } from "./account.ts";
+import { AgentRunListItemSchema } from "./agent-api.ts";
 import {
   ChatMessageSchema,
   displayText,
@@ -11,6 +12,10 @@ import {
   RunStateSchema,
   UtcTimestampSchema,
 } from "./entities.ts";
+import {
+  AgentGrantCreatedPayloadSchema,
+  AgentGrantRevokedPayloadSchema,
+} from "./grant-api.ts";
 import {
   AgentIdSchema,
   CorrelationIdSchema,
@@ -32,6 +37,7 @@ import {
   RUN_CANCEL_REASONS,
 } from "./model.ts";
 import { WorkspaceProjectSchema } from "./project-api.ts";
+import { ProjectRepositorySchema } from "./repository-api.ts";
 
 /**
  * Who caused an event. A client cannot choose its identity: the server binds
@@ -87,6 +93,13 @@ export const envelopeHeaderShape = Object.freeze({
  * `RUN_CANCEL_REASONS` comes only from the server (`runReasonAllowed`): a
  * transition from the agent with one gets `event.refused` with `conflict`,
  * also when it resends a recorded event ID.
+ *
+ * The event with which the server creates a run (#35) also carries `run`,
+ * the new run as the run list shows it to every member of the workspace:
+ * its project, its input message, and the time of its creation, which the
+ * other fields of the payload do not hold. No other event carries it, and
+ * it never names the run's provider connection, which only the account
+ * that owns the run's agent reads, from the run list.
  */
 export const AgentRunStateChangedPayloadSchema = z
   .object({
@@ -97,6 +110,8 @@ export const AgentRunStateChangedPayloadSchema = z
     previousState: RunStateSchema.nullable(),
     state: RunStateSchema,
     reason: displayText(LIMITS.runReason).optional(),
+    /** Only in a run's creation: the new run, as every member sees it. */
+    run: AgentRunListItemSchema.optional(),
   })
   .superRefine((payload, ctx) => {
     if (!canTransition(payload.previousState, payload.state)) {
@@ -104,6 +119,38 @@ export const AgentRunStateChangedPayloadSchema = z
         code: "custom",
         message: "Illegal run state transition",
         path: ["state"],
+      });
+    }
+    const { run } = payload;
+    if (run === undefined) {
+      return;
+    }
+    if (payload.previousState !== null) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Only a run's creation carries the run",
+        path: ["run"],
+      });
+      return;
+    }
+    if (
+      run.id !== payload.runId ||
+      run.agentId !== payload.agentId ||
+      run.state !== payload.state ||
+      (run.repositoryId ?? undefined) !== payload.repositoryId ||
+      (run.reason ?? undefined) !== payload.reason
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "The run differs from the event's payload",
+        path: ["run"],
+      });
+    }
+    if (run.providerConnectionId !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        message: "An event never names a run's provider connection",
+        path: ["run", "providerConnectionId"],
       });
     }
   });
@@ -264,6 +311,37 @@ export const WorkspaceProjectRenamedEventSchema = z.object({
   }),
 });
 
+// Repository events (#286): the repositories of a project, which every
+// member of its workspace sees. Only the server originates them, after the
+// commit, with a `system` actor and `deviceId: null`, like the project events
+// (see `actorAllowed`). Neither carries a path or a remote URL: the cloud
+// holds none (ADR 0005, ADR 0013).
+
+/**
+ * A member registered a repository in a project of the workspace; the
+ * payload names the repository's project and who registered it.
+ */
+export const WorkspaceRepositoryRegisteredEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.repository.registered"),
+  payload: z.object({ repository: ProjectRepositorySchema }),
+});
+
+/**
+ * A repository was removed from its project. The removal revoked every
+ * grant scoped to the repository in the same transaction (ADR 0015, P-77),
+ * and nothing restores them. The event's `occurredAt` is the time that the
+ * server stores as the removal's.
+ */
+export const WorkspaceRepositoryRemovedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("workspace.repository.removed"),
+  payload: z.object({
+    projectId: ProjectIdSchema,
+    repositoryId: RepositoryIdSchema,
+  }),
+});
+
 // Join request events (#210, #227): the pending join requests and the
 // blocks in force of a workspace, which only its owner and admins see. Only
 // the server originates them, after the commit, with a `system` actor and
@@ -345,6 +423,47 @@ export const WorkspaceJoinRequestUnblockedEventSchema = z.object({
   payload: z.object({ joinRequestId: JoinRequestIdSchema }),
 });
 
+// Grant events (#75; ADR 0015, P-80): the grants of the agents of a
+// workspace, which every member sees. Only the server originates them, after
+// the commit, with a `system` actor and `deviceId: null`, like the membership
+// events (see `actorAllowed`), and sends them to every connection subscribed
+// to the workspace. They name no account and no device data
+// (`WorkspaceGrantSchema`), and they never carry the facts of a grant
+// record, so a record is never built from an event: the agent's host device
+// takes its records from `GET /grant-records`.
+
+/**
+ * The agent's owner granted the agent a capability. The payload is the new
+ * grant as members see it. A grant that replaces an expired grant of the
+ * same capability and scope comes after the `agent.grant.revoked` of the
+ * expired one.
+ */
+export const AgentGrantCreatedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("agent.grant.created"),
+  payload: AgentGrantCreatedPayloadSchema,
+});
+export type AgentGrantCreatedEvent = z.infer<
+  typeof AgentGrantCreatedEventSchema
+>;
+
+/**
+ * A grant was revoked: by the agent's owner, or by a change that revokes
+ * the grants it affects in its own transaction (ADR 0015, P-77), such as a
+ * device revocation or the removal of a person. One event reports exactly
+ * one grant, so a change that revokes several grants sends one event for
+ * each of them. An expiry sends no event: a receiver drops a grant at its
+ * `expiresAt`.
+ */
+export const AgentGrantRevokedEventSchema = z.object({
+  ...envelopeHeaderShape,
+  type: z.literal("agent.grant.revoked"),
+  payload: AgentGrantRevokedPayloadSchema,
+});
+export type AgentGrantRevokedEvent = z.infer<
+  typeof AgentGrantRevokedEventSchema
+>;
+
 // Chat events (#110). A project's chat has one stream of messages; the
 // events name the project, and the server finds the conversation that holds
 // it. Storing messages and the history route belong to #27.
@@ -402,9 +521,13 @@ export const ProtocolEventSchema = z.discriminatedUnion("type", [
   WorkspaceOwnershipTransferredEventSchema,
   WorkspaceProjectCreatedEventSchema,
   WorkspaceProjectRenamedEventSchema,
+  WorkspaceRepositoryRegisteredEventSchema,
+  WorkspaceRepositoryRemovedEventSchema,
   WorkspaceJoinRequestCreatedEventSchema,
   WorkspaceJoinRequestResolvedEventSchema,
   WorkspaceJoinRequestUnblockedEventSchema,
+  AgentGrantCreatedEventSchema,
+  AgentGrantRevokedEventSchema,
   ChatMessageSendEventSchema,
   ChatMessageCreatedEventSchema,
 ]);
@@ -422,9 +545,13 @@ export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
   "workspace.ownership.transferred",
   "workspace.project.created",
   "workspace.project.renamed",
+  "workspace.repository.registered",
+  "workspace.repository.removed",
   "workspace.join_request.created",
   "workspace.join_request.resolved",
   "workspace.join_request.unblocked",
+  "agent.grant.created",
+  "agent.grant.revoked",
   "chat.message.created",
 ] as const satisfies readonly EventType[]);
 export type ServerOnlyEventType = (typeof SERVER_ONLY_EVENT_TYPES)[number];
@@ -479,9 +606,13 @@ export const SERVER_EVENT_AUDIENCES = Object.freeze({
   "workspace.ownership.transferred": "members",
   "workspace.project.created": "members",
   "workspace.project.renamed": "members",
+  "workspace.repository.registered": "members",
+  "workspace.repository.removed": "members",
   "workspace.join_request.created": "approvers",
   "workspace.join_request.resolved": "approvers",
   "workspace.join_request.unblocked": "approvers",
+  "agent.grant.created": "members",
+  "agent.grant.revoked": "members",
   "chat.message.created": "members",
 } as const satisfies {
   readonly [Type in ServerEventType]: Type extends ApproverEventType
@@ -526,12 +657,18 @@ export function actorAllowed(event: ProtocolEvent): boolean {
     case "workspace.ownership.transferred":
     case "workspace.project.created":
     case "workspace.project.renamed":
+    case "workspace.repository.registered":
+    case "workspace.repository.removed":
     case "workspace.join_request.created":
     case "workspace.join_request.resolved":
     case "workspace.join_request.unblocked":
     case "chat.message.created":
-      // Only the server reports membership, project, and join request
-      // changes and stored messages.
+      // Only the server reports membership, project, repository, and join
+      // request changes and stored messages.
+      return event.actor.kind === "system" && event.deviceId === null;
+    case "agent.grant.created":
+    case "agent.grant.revoked":
+      // Only the server reports a grant and a revocation (#75).
       return event.actor.kind === "system" && event.deviceId === null;
     case "chat.message.send":
       // A person sends from one of their devices; identity binding checks both.

@@ -151,16 +151,10 @@ export function devWorkspaceReport(
     const reason =
       result.limit === "workspaces"
         ? "the account reached its limit of new workspaces within 24 hours"
-        : result.retryAfterMs === null
-          ? `the workspace holds ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects that are not archived`
-          : `the account created ${MAX_NEW_PROJECTS_PER_DAY} projects within 24 hours`;
-    const retry =
-      result.retryAfterMs === null
-        ? ""
-        : ` Try again in ${minutes(result.retryAfterMs)}.`;
+        : `the account created ${MAX_NEW_PROJECTS_PER_DAY} projects within 24 hours`;
     return {
       exitCode: 1,
-      message: `Refused: ${reason}. Nothing was changed.${retry}`,
+      message: `Refused: ${reason}. Nothing was changed. Try again in ${minutes(result.retryAfterMs)}.`,
     };
   }
   const reasons = {
@@ -171,6 +165,7 @@ export function devWorkspaceReport(
     not_member:
       "the device's account is not an active member of the new workspace",
     conflict: "a project of the new workspace already has that name",
+    project_limit: `the workspace holds ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects that are not archived`,
   } satisfies Record<typeof result.refusal, string>;
   return {
     exitCode: 1,

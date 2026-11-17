@@ -294,6 +294,23 @@ export interface WorkspaceService {
    * screen marks the account's own person.
    */
   readonly ownMemberId: (workspaceId: WorkspaceId) => MemberId | null;
+  /**
+   * The role of the account's own person in a workspace of the list, from
+   * the list's last answer, or null for a workspace that it does not hold,
+   * also one that `addWorkspace` added until the list holds it. It is the
+   * role when the list loaded: a role change in the selected workspace
+   * changes `people` and not this, and the other workspaces are not
+   * subscribed, so no event reaches them. The claim marks of the other
+   * workspaces (#271) read their claims with it.
+   */
+  readonly ownRole: (workspaceId: WorkspaceId) => MemberRole | null;
+  /**
+   * Grows by one with every answer of the list that loads, also one that
+   * holds the same workspaces, and with every sign-out and every other
+   * device, so that a reader knows when the list was read again: on every
+   * `connected` of a signed-in device, among others. 0 before the first.
+   */
+  readonly listGeneration: () => number;
   /** Stops listening and cancels the timers, for the quit. */
   readonly close: () => void;
 }
@@ -415,6 +432,10 @@ export function createWorkspaceService(
   let workspaces = NO_WORKSPACES;
   /** The account's own person in each listed workspace. */
   let ownMembers = new Map<WorkspaceId, MemberId>();
+  /** Its role in each listed workspace, from the list's last answer. */
+  let ownRoles = new Map<WorkspaceId, MemberRole>();
+  /** See `listGeneration`. */
+  let listGeneration = 0;
   let listLoaded = false;
   let listProblem: WorkspaceReadFailure | null = null;
   let listInFlight = false;
@@ -543,6 +564,8 @@ export function createWorkspaceService(
     gate.end();
     workspaces = NO_WORKSPACES;
     ownMembers = new Map();
+    ownRoles = new Map();
+    listGeneration += 1;
     listLoaded = false;
     listProblem = null;
     listInFlight = false;
@@ -660,6 +683,13 @@ export function createWorkspaceService(
         member.id,
       ]),
     );
+    ownRoles = new Map(
+      result.value.workspaces.map(({ workspace, member }) => [
+        workspace.id,
+        member.role,
+      ]),
+    );
+    listGeneration += 1;
     // A refused workspace that the list no longer holds is forgotten, so
     // that a later listing, a new membership, is selected by default again.
     // One that the list still holds stays refused, so that it is not
@@ -991,6 +1021,7 @@ export function createWorkspaceService(
   function membershipLost(workspaceId: WorkspaceId): void {
     connection.unsubscribeWorkspace(workspaceId);
     ownMembers.delete(workspaceId);
+    ownRoles.delete(workspaceId);
     if (listed(workspaceId)) {
       workspaces = Object.freeze(
         workspaces.filter((workspace) => workspace.id !== workspaceId),
@@ -1169,6 +1200,10 @@ export function createWorkspaceService(
           ]);
           touch();
         }
+        if (ownMembers.get(workspace.id) !== ownMemberId) {
+          // The role of the list's answer is another person's.
+          ownRoles.delete(workspace.id);
+        }
         ownMembers.set(workspace.id, ownMemberId);
         // A load on its way may have read before the create: its answer is
         // dropped, and the list loads again.
@@ -1186,6 +1221,9 @@ export function createWorkspaceService(
     selectedWorkspaceId: () => selected,
     ownMemberId: (workspaceId: WorkspaceId) =>
       closed ? null : (ownMembers.get(workspaceId) ?? null),
+    ownRole: (workspaceId: WorkspaceId) =>
+      closed ? null : (ownRoles.get(workspaceId) ?? null),
+    listGeneration: () => listGeneration,
     close: () => {
       if (closed) {
         return;

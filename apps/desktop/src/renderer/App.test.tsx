@@ -5,6 +5,8 @@ import type {
   AccountBridge,
   AgentBridge,
   ChatBridge,
+  ClaimMarksBridge,
+  ClaimsBridge,
   ConnectionBridge,
   DeviceListBridge,
   InvitationActionsBridge,
@@ -24,6 +26,7 @@ import {
   DEVICE_KEY_STATES,
   DEVICE_STATES,
   type AccountStatus,
+  type ClaimsView,
   type RemoveDeviceResult,
   type WorkspaceView,
 } from "../shared/ipc-contract.ts";
@@ -186,7 +189,7 @@ const SCREEN_CASES: readonly ScreenCase[] = [
   {
     view: { screen: "permissions", projectId: "project-b", panel: "agents" },
     title: '<h2 id="permissions-title">Permissions</h2>',
-    placeholder: "Not available yet.",
+    placeholder: "Granting permissions is not available yet.",
     current: ["Workspace B (true)", "Project B (true)", "Permissions (page)"],
   },
 ];
@@ -677,6 +680,201 @@ test("the people screen gets the join requests: with their two bridges, it has t
   expect(render(bridges)).not.toContain("join-request-action-message");
 });
 
+test("the people screen gets the recent claims: with the bridge, it has the paragraph of the refresh's sentence, and nothing is read, loaded, or reported while rendered", () => {
+  const people: PeopleBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const calls: string[] = [];
+  const call = (name: string) => () => {
+    calls.push(name);
+    return Promise.reject(new Error("not called"));
+  };
+  const claims: ClaimsBridge = {
+    getState: call("getState"),
+    subscribeState: () => {
+      calls.push("subscribeState");
+      return () => undefined;
+    },
+    load: call("load"),
+    markSeen: call("markSeen"),
+  };
+  const paragraph =
+    '<p class="people-status" id="claim-action-message" role="status"></p>';
+  expect(
+    render({ people, claims, initialView: { screen: "people" } }),
+  ).toContain(paragraph);
+  // The subscriptions run in effects, which a server render does not run;
+  // nothing else is called.
+  expect(calls).toEqual([]);
+  // Without the bridge, or on another screen, nothing of it shows.
+  expect(render({ people, initialView: { screen: "people" } })).not.toContain(
+    "claim-action-message",
+  );
+  expect(render({ people, claims })).not.toContain("claim-action-message");
+});
+
+test("the sidebar's People item carries the marker while the selected workspace's claims hold an unseen one, on every screen", () => {
+  const claims: ClaimsBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+    load: () => Promise.reject(new Error("not called")),
+    markSeen: () => Promise.reject(new Error("not called")),
+  };
+  const unseen: ClaimsView = {
+    revision: 3,
+    status: "ready",
+    workspaceId: "workspace-b",
+    claims: [
+      {
+        memberId: "member-a",
+        login: "kjohnson",
+        verifiedAt: "2026-11-12T09:00:00.000Z",
+        accountCreatedAt: "2026-10-01T00:00:00.000Z",
+        via: "invitation",
+        claimedAt: "2026-11-12T09:30:00.000Z",
+        unseen: true,
+      },
+    ],
+  };
+  const marker =
+    '<button type="button" class="nav-item" aria-label="People, new claims">People<span class="nav-marker" aria-hidden="true"></span></button>';
+  for (const initialView of [
+    undefined,
+    { screen: "account" },
+    { screen: "chat", projectId: "project-a", panel: "agents" },
+  ] as const) {
+    expect(
+      render({ claims, initialClaimsState: unseen, initialView }),
+    ).toContain(marker);
+  }
+  // Seen claims, another workspace's claims, and no state yet mark nothing.
+  for (const props of [
+    {
+      initialClaimsState: {
+        ...unseen,
+        claims: unseen.claims.map((claim) => ({ ...claim, unseen: false })),
+      },
+    },
+    { initialClaimsState: { ...unseen, workspaceId: "workspace-a" } },
+    {},
+  ] satisfies Partial<AppProps>[]) {
+    const html = render({ claims, ...props });
+    expect(html).toContain(
+      '<button type="button" class="nav-item">People</button>',
+    );
+    expect(html).not.toContain("nav-marker");
+  }
+});
+
+test("the sidebar's workspace list marks each other workspace that the main process names, with the people item's dot and an accessible name, and the selected one by its own claims once they loaded", () => {
+  const calls: string[] = [];
+  const claimMarks: ClaimMarksBridge = {
+    getState: () => {
+      calls.push("getState");
+      return Promise.reject(new Error("not called"));
+    },
+    subscribeState: () => {
+      calls.push("subscribeState");
+      return () => undefined;
+    },
+  };
+  const claims: ClaimsBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+    load: () => Promise.reject(new Error("not called")),
+    markSeen: () => Promise.reject(new Error("not called")),
+  };
+  const markedA =
+    '<button type="button" class="nav-item" dir="auto" aria-label="Workspace A, new claims">Workspace A<span class="nav-marker" aria-hidden="true"></span></button>';
+  const plainA =
+    '<button type="button" class="nav-item" dir="auto">Workspace A</button>';
+  const plainB =
+    '<button type="button" class="nav-item" dir="auto" aria-current="true">Workspace B</button>';
+  const html = render({
+    claimMarks,
+    initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-a"] },
+  });
+  expect(html).toContain(markedA);
+  expect(html).toContain(plainB);
+  // The people item follows the selected workspace's claims only.
+  expect(html).toContain(
+    '<button type="button" class="nav-item">People</button>',
+  );
+  // The subscription runs in an effect, which a server render does not run.
+  expect(calls).toEqual([]);
+
+  // The selected workspace is marked by its own claims, also when the
+  // marks name it, and not by the marks alone.
+  const unseen: ClaimsView = {
+    revision: 3,
+    status: "ready",
+    workspaceId: "workspace-b",
+    claims: [
+      {
+        memberId: "member-a",
+        login: "kjohnson",
+        verifiedAt: "2026-11-12T09:00:00.000Z",
+        accountCreatedAt: "2026-10-01T00:00:00.000Z",
+        via: "invitation",
+        claimedAt: "2026-11-12T09:30:00.000Z",
+        unseen: true,
+      },
+    ],
+  };
+  const both = render({
+    claims,
+    claimMarks,
+    initialClaimsState: unseen,
+    initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-b"] },
+  });
+  expect(both).toContain(plainA);
+  expect(both).toContain(
+    '<button type="button" class="nav-item" dir="auto" aria-current="true" aria-label="Workspace B, new claims">Workspace B<span class="nav-marker" aria-hidden="true"></span></button>',
+  );
+  const seenSelected = render({
+    claims,
+    claimMarks,
+    initialClaimsState: {
+      ...unseen,
+      claims: unseen.claims.map((claim) => ({ ...claim, unseen: false })),
+    },
+    initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-b"] },
+  });
+  expect(seenSelected).toContain(plainB);
+  expect(seenSelected).not.toContain("nav-marker");
+  // While the claims are still another workspace's, as before the main
+  // process followed a switch, the marks keep the selected workspace's dot.
+  const switching = render({
+    claims,
+    claimMarks,
+    initialClaimsState: { ...unseen, workspaceId: "workspace-a" },
+    initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-b"] },
+  });
+  expect(switching).toContain(
+    '<button type="button" class="nav-item" dir="auto" aria-current="true" aria-label="Workspace B, new claims">Workspace B<span class="nav-marker" aria-hidden="true"></span></button>',
+  );
+  expect(switching).toContain(plainA);
+
+  // No marks, no state yet, and a signed-out device mark nothing.
+  for (const props of [
+    { claimMarks, initialClaimMarksState: { revision: 1, workspaceIds: [] } },
+    { claimMarks },
+    {},
+    {
+      claimMarks,
+      initialClaimMarksState: { revision: 1, workspaceIds: ["workspace-a"] },
+      initialWorkspaceState: workspaceState(PROJECTS, {
+        status: "signed_out",
+      }),
+    },
+  ] satisfies Partial<AppProps>[]) {
+    const plain = render(props);
+    expect(plain).not.toContain("nav-marker");
+    expect(plain).not.toContain("new claims");
+  }
+});
+
 test("with the bridge, the repository panel waits for the first list and offers to add a repository", () => {
   const repositories: RepositoryBridge = {
     list: () => Promise.resolve({ revision: 0, repositories: [] }),
@@ -700,7 +898,7 @@ test("with the bridge, the repository panel waits for the first list and offers 
   expect(html).not.toContain("Repositories are not available.");
 });
 
-test("the permission screen shell has a placeholder section for every capability of ADR 0015", () => {
+test("the permission screen shows every capability of ADR 0015 read-only, grouped by scope kind", () => {
   const html = render({
     initialView: {
       screen: "permissions",
@@ -709,16 +907,15 @@ test("the permission screen shell has a placeholder section for every capability
     },
   });
 
-  for (const title of [
-    "Agent",
-    "Repository files",
-    "Git",
-    "Terminal",
-    "AI provider",
-    "Granted permissions",
+  for (const [scope, title] of [
+    ["repository", "On one repository"],
+    ["provider_connection", "On one AI provider connection"],
   ]) {
     expect(html).toContain(
-      `<section class="permission-section"><h3>${title}</h3>`,
+      `<section class="permission-section"><h3 id="permission-group-${scope}">${title}</h3>`,
+    );
+    expect(html).toContain(
+      `<ul class="capability-list" aria-labelledby="permission-group-${scope}">`,
     );
   }
   for (const capability of [
@@ -730,11 +927,19 @@ test("the permission screen shell has a placeholder section for every capability
     "provider.use",
   ]) {
     expect(
-      html.match(new RegExp(`<code>${capability}</code>`, "g")),
+      html.match(
+        new RegExp(
+          `<h4 class="capability-name"><code>${capability}</code></h4>`,
+          "g",
+        ),
+      ),
     ).toHaveLength(1);
   }
+  expect(html).toContain(
+    '<p class="placeholder-note">Granting permissions is not available yet. This screen shows what each permission allows and its risk.</p>',
+  );
   // One labelled region for the screen; the subsections add none.
-  expect(html.match(/<section class="permission-section">/g)).toHaveLength(6);
+  expect(html.match(/<section class="permission-section">/g)).toHaveLength(2);
   expect(html.match(/<section [^>]*aria-label/g)).toEqual([
     "<section aria-label",
   ]);

@@ -10,9 +10,11 @@ import {
   isTerminalRunState,
   MAX_ANSWER_LIST_ITEMS,
   type MemberId,
+  type MessageId,
   newUuidV7,
   type ProjectId,
   PROTOCOL_VERSION,
+  type ProviderConnectionId,
   RECENT_FINISHED_RUNS,
   type RepositoryId,
   type RunId,
@@ -566,16 +568,26 @@ export type ListProjectRunsResult =
     }>
   | NotFound;
 
-const runColumns = {
-  id: agentRuns.id,
-  agentId: agentRuns.agentId,
-  projectId: agentRuns.projectId,
-  repositoryId: agentRuns.repositoryId,
-  state: agentRuns.state,
-  reason: agentRuns.stateReason,
-  createdAt: agentRuns.createdAt,
-  finishedAt: agentRuns.finishedAt,
-};
+/**
+ * The columns of a run as `reader` sees it, in a query that joins the run's
+ * agent. The run's provider connection is device data, as the agent's host
+ * device is: only the account that owns the run's agent reads it (#35), and
+ * for every other reader the column is null.
+ */
+function runColumns(reader: UserId) {
+  return {
+    id: agentRuns.id,
+    agentId: agentRuns.agentId,
+    projectId: agentRuns.projectId,
+    repositoryId: agentRuns.repositoryId,
+    state: agentRuns.state,
+    reason: agentRuns.stateReason,
+    createdAt: agentRuns.createdAt,
+    finishedAt: agentRuns.finishedAt,
+    inputMessageId: agentRuns.inputMessageId,
+    providerConnectionId: sql<ProviderConnectionId | null>`case when ${eq(agents.ownerUserId, reader)} then ${agentRuns.providerConnectionId} end`,
+  };
+}
 
 type RunRow = Readonly<{
   id: RunId;
@@ -586,13 +598,23 @@ type RunRow = Readonly<{
   reason: string | null;
   createdAt: Date;
   finishedAt: Date | null;
+  inputMessageId: MessageId | null;
+  providerConnectionId: ProviderConnectionId | null;
 }>;
 
+/**
+ * A run in the protocol's form. A run without an input message or without a
+ * provider connection, and a run whose provider connection the reader may
+ * not see, leaves the field out.
+ */
 function toRunListItem(row: RunRow): AgentRunListItem {
+  const { inputMessageId, providerConnectionId, ...run } = row;
   return {
-    ...row,
+    ...run,
     createdAt: row.createdAt.toISOString(),
     finishedAt: row.finishedAt === null ? null : row.finishedAt.toISOString(),
+    ...(inputMessageId === null ? {} : { inputMessageId }),
+    ...(providerConnectionId === null ? {} : { providerConnectionId }),
   };
 }
 
@@ -604,8 +626,11 @@ function toRunListItem(row: RunRow): AgentRunListItem {
  * `RECENT_FINISHED_RUNS` (50) runs with the latest `finished_at`, the most
  * recently finished first. Ties go to the higher run ID, so a run is listed
  * once and in a fixed place. `reason` is the run's `state_reason`, the reason
- * given with its last state change. The same reader and the same `not_found`
- * as `listProjectAgents`. The membership check and both lists are read in
+ * given with its last state change. A run that a request created (#35) shows
+ * its input message to every reader, and its provider connection only to
+ * the account that owns its agent, on any of that account's devices; a run
+ * of the development seed has neither. The same reader and the same
+ * `not_found` as `listProjectAgents`. The membership check and both lists are read in
  * one read-only `REPEATABLE READ` transaction, from one snapshot, so that a
  * run that finishes while they are read is listed once, as the protocol's
  * answer requires.
@@ -622,9 +647,11 @@ function listRunsIn(input: ProjectActivityInput) {
     if (!(await readable(db, input))) {
       return NOT_FOUND;
     }
+    const columns = runColumns(input.actorUserId);
     const unfinished = await db
-      .select(runColumns)
+      .select(columns)
       .from(agentRuns)
+      .innerJoin(agents, eq(agents.id, agentRuns.agentId))
       .where(
         and(
           eq(agentRuns.projectId, input.projectId),
@@ -634,8 +661,9 @@ function listRunsIn(input: ProjectActivityInput) {
       .orderBy(desc(agentRuns.createdAt), desc(agentRuns.id))
       .limit(MAX_ANSWER_LIST_ITEMS);
     const finished = await db
-      .select(runColumns)
+      .select(columns)
       .from(agentRuns)
+      .innerJoin(agents, eq(agents.id, agentRuns.agentId))
       .where(
         and(
           eq(agentRuns.projectId, input.projectId),

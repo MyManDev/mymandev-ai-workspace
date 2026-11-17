@@ -301,13 +301,45 @@ export const API_ERROR_STATUS = Object.freeze({
    */
   project_limit: 409,
   /**
+   * A run creation for an agent that already has as many unfinished runs as
+   * the server allows (#35). No time frees a place, only a run of the agent
+   * that finishes does, so the answer carries no `Retry-After`. Only
+   * `POST /projects/:projectId/runs` answers it.
+   */
+  run_limit: 409,
+  /**
+   * A registration in a project that already holds 20 repositories that are
+   * not removed (#286). No time frees a place, only removing a repository
+   * does, so the answer carries no `Retry-After`. Only
+   * `POST /projects/:projectId/repositories` answers it. Provisional
+   * (#286): the code and the limit await the Project Manager's confirmation.
+   */
+  repository_limit: 409,
+  /**
    * A new device's sign-in on an account that already has 20 active devices
    * (#255). No time frees a place, only revoking one of them does, so the
    * answer carries no `Retry-After`. Only `POST /auth/sign-in` answers it.
    */
   device_limit: 409,
+  /**
+   * A new device's sign-in on an account that already registered 10 new
+   * devices in the last 24 hours (#269). Time frees a place, so the answer
+   * carries `Retry-After`: the time until the oldest of them leaves the 24
+   * hours. It has its own code, apart from `rate_limited`, because the API
+   * refuses before it commits anything, so the answer is certain: nothing was
+   * registered. Only `POST /auth/sign-in` answers it.
+   */
+  device_daily_limit: 429,
   /** A limit was reached; the answer carries `Retry-After`. */
   rate_limited: 429,
+  /**
+   * A run creation for an agent that got as many new runs within 24 hours
+   * as the server allows (#35). The answer carries `Retry-After`: the time
+   * until the oldest of those runs leaves the 24 hours. Only
+   * `POST /projects/:projectId/runs` answers it; the account's limit of
+   * requests on that route stays `rate_limited`.
+   */
+  run_daily_limit: 429,
   /** An unexpected server error. */
   internal_error: 500,
   /** GitHub sign-in is unavailable for now; the answer carries `Retry-After`. */

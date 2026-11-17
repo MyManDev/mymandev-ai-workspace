@@ -15,12 +15,14 @@
 //   and that the workspace service's and the agent activity service's gates
 //   are live. Otherwise it waits: closing the project pauses it, and opening
 //   it again resumes it; a sign-out pauses it the same way.
-// - It sends one transition at a time and waits for its acknowledgement, the
-//   relayed transition with the same event ID (D4). The run states come from
-//   the activity and from the acknowledgements, never from what was sent.
-//   Without an acknowledgement within `DEV_SWITCH_ACK_TIMEOUT_MS` while the
-//   connection stays open, it sends the same event once more, which the
-//   server never applies twice, and then stops.
+// - It sends through the model of a hosted run (`host-run.ts`, #35), one
+//   model for the run that it walks: one transition at a time, each waiting
+//   for its acknowledgement, the relayed transition with the same event ID
+//   (D4). The run states come from the activity and from the
+//   acknowledgements, never from what was sent. Without an acknowledgement
+//   within `DEV_SWITCH_ACK_TIMEOUT_MS` while the connection stays open, it
+//   sends the same event once more, which the server never applies twice,
+//   and then stops.
 // - It stops for good at the first refusal and at the first close or loss of
 //   the open connection (decided on 2026-11-05: "It stops at the first
 //   refusal or close"), and a reconnect does not resume it, so nothing is
@@ -33,16 +35,14 @@
 //   any 10 seconds and 1,800 in an hour).
 //
 // Every send goes through the connection client's `sendAs` with the agent
-// actor. It has no IPC channel, so a packaged build sends nothing. The logs
-// are fixed text with a code at most, never an ID.
+// actor, from the model. It has no IPC channel, so a packaged build sends
+// nothing. The logs are fixed text with a code at most, never an ID.
 import {
   AgentIdSchema,
   DeviceIdSchema,
   isTerminalRunState,
   newId,
-  PROTOCOL_VERSION,
   type AgentId,
-  type AgentRunStateChangedEvent,
   type DeviceId,
   type EventId,
   type RunId,
@@ -54,9 +54,16 @@ import type {
   ConnectionStatus,
 } from "../../shared/ipc-contract.ts";
 import type { AccountService } from "../account.ts";
-import type { ConnectionClient, ServerMessage } from "../connection/client.ts";
+import type { ConnectionClient } from "../connection/client.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 import type { WorkspaceService } from "../workspace/service.ts";
+import {
+  createHostRun,
+  HOST_RUN_ACK_TIMEOUT_MS,
+  type HostRun,
+  type HostRunSendResult,
+  type HostRunState,
+} from "./host-run.ts";
 import type { AgentActivityService, AgentActivityState } from "./service.ts";
 
 /** Holds the agent ID that `db:dev-seed` printed. */
@@ -67,7 +74,7 @@ export const DEV_AGENT_DEVICE_VARIABLE = "MYMANDEV_DEV_AGENT_DEVICE";
 /** The shortest time between two sends, resends included. */
 export const DEV_SWITCH_STEP_MS = 2_000;
 /** How long a send waits for its acknowledgement. */
-export const DEV_SWITCH_ACK_TIMEOUT_MS = 10_000;
+export const DEV_SWITCH_ACK_TIMEOUT_MS = HOST_RUN_ACK_TIMEOUT_MS;
 /**
  * The most sends in any hour: half of the account's 1,800, so that its
  * other devices keep room. One send every 2 seconds is at most 5 in any 10
@@ -165,16 +172,11 @@ export interface DevAgentSwitch {
   readonly close: () => void;
 }
 
-/** A transition that the agent's host device sends. */
-type Transition = Omit<AgentRunStateChangedEvent, "deviceId">;
-
-/** A sent transition that waits for its acknowledgement. */
-interface Pending {
-  readonly transition: Transition;
-  /** Whether it was sent a second time. */
-  resent: boolean;
-  /** Its acknowledgement timed out, and the resend waits for the guards. */
-  resendDue: boolean;
+/** The next transition of the walk. */
+interface Step {
+  readonly runId: RunId;
+  readonly previousState: RunState;
+  readonly state: RunState;
 }
 
 /** Why the switch does not send now. */
@@ -265,7 +267,11 @@ export function createDevAgentSwitch(
 
   let closed = false;
   let stopped = false;
-  let pending: Pending | null = null;
+  /** The model of the run that the switch walks, and its workspace. */
+  let current: {
+    readonly run: HostRun;
+    readonly workspaceId: WorkspaceId;
+  } | null = null;
   /** The run states that the acknowledgements reported. */
   const acknowledged = new Map<RunId, RunState>();
   /** The runs that an acknowledgement showed in `awaiting_input`. */
@@ -273,7 +279,6 @@ export function createDevAgentSwitch(
   /** The monotonic times of the sends of the last hour, the oldest first. */
   const sendTimes: number[] = [];
   let cancelStep: (() => void) | null = null;
-  let cancelAck: (() => void) | null = null;
   let lastNotice: Notice | null = null;
   /** Whether the connection's last status was `connected`. */
   let connected = connection.status().state === "connected";
@@ -285,16 +290,30 @@ export function createDevAgentSwitch(
     }
   }
 
+  /** The phase of the current run's model, or null without one. */
+  function phase(): HostRunState["phase"] | null {
+    return current?.run.state().phase ?? null;
+  }
+
+  /** Whether a sent transition waits for its acknowledgement. */
+  function waitsForAcknowledgement(): boolean {
+    const at = phase();
+    return at === "awaiting_ack" || at === "resend_due";
+  }
+
+  function releaseRun(): void {
+    current?.run.close();
+    current = null;
+  }
+
   function stopTimers(): void {
     cancelStep?.();
     cancelStep = null;
-    cancelAck?.();
-    cancelAck = null;
   }
 
   function stop(message: string): void {
     stopped = true;
-    pending = null;
+    releaseRun();
     stopTimers();
     removeListeners();
     log(message);
@@ -336,7 +355,7 @@ export function createDevAgentSwitch(
   }
 
   /** The next step of the agent's oldest unfinished run, or null. */
-  function nextStep(state: AgentActivityState): Transition["payload"] | null {
+  function nextStep(state: AgentActivityState): Step | null {
     // The unfinished runs come the most recently created first.
     const runs = state.unfinishedRuns.filter((run) => run.agentId === agentId);
     for (let index = runs.length - 1; index >= 0; index -= 1) {
@@ -349,14 +368,42 @@ export function createDevAgentSwitch(
       if (next === null) {
         continue;
       }
-      return Object.freeze({
-        runId: run.id,
-        agentId,
-        previousState,
-        state: next,
-      });
+      return { runId: run.id, previousState, state: next };
     }
     return null;
+  }
+
+  /**
+   * The model for the step's run: the current one while it is idle in the
+   * step's workspace with the step's state, otherwise a new one.
+   */
+  function runFor(workspaceId: WorkspaceId, step: Step): HostRun {
+    if (
+      current !== null &&
+      current.workspaceId === workspaceId &&
+      current.run.runId === step.runId
+    ) {
+      const state = current.run.state();
+      if (state.phase === "idle" && state.runState === step.previousState) {
+        return current.run;
+      }
+    }
+    releaseRun();
+    const run: HostRun = createHostRun({
+      workspaceId,
+      agentId,
+      hostDeviceId,
+      runId: step.runId,
+      runState: step.previousState,
+      connection,
+      ackTimeoutMs: DEV_SWITCH_ACK_TIMEOUT_MS,
+      scheduleTimer: schedule,
+      wallClock,
+      newEventId,
+      onChange: (state) => runChanged(run, state),
+    });
+    current = { run, workspaceId };
+    return run;
   }
 
   /** How long the next send must wait for the pace and the hourly budget. */
@@ -388,12 +435,26 @@ export function createDevAgentSwitch(
     return true;
   }
 
+  /** Counts a send, or stops the switch for one that the model refused. */
+  function sendResult(result: HostRunSendResult): void {
+    if (result === "sent") {
+      sendTimes.push(now());
+    } else if (result !== "stopped") {
+      // The walk only asks for allowed transitions without a reason, so
+      // this does not happen; the model's own stop has its report.
+      stop(
+        `The development agent switch stopped: a transition was not sent (${result}).`,
+      );
+    }
+  }
+
   /** Sends what is due, or waits for a guard, the pace, or the budget. */
   function evaluate(): void {
     if (closed || stopped) {
       return;
     }
-    if (pending !== null && !pending.resendDue) {
+    const due = phase();
+    if (due === "awaiting_ack") {
       // It waits for the acknowledgement.
       return;
     }
@@ -402,119 +463,96 @@ export function createDevAgentSwitch(
       notice(target);
       return;
     }
-    if (pending === null) {
-      const step = nextStep(target.state);
-      if (step === null) {
-        notice("no_runs");
-        return;
-      }
+    if (due === "resend_due" && current !== null) {
       notice("moving");
       if (mustWait()) {
         return;
       }
-      // The event gets its ID and its time only when it is sent.
-      pending = {
-        transition: Object.freeze({
-          protocolVersion: PROTOCOL_VERSION,
-          id: newEventId(),
-          type: "agent.run.state_changed",
-          occurredAt: new Date(wallClock()).toISOString(),
-          workspaceId: target.workspaceId,
-          actor: Object.freeze({ kind: "agent", agentId }),
-          payload: step,
-        }),
-        resent: false,
-        resendDue: false,
-      };
-    } else {
-      notice("moving");
-      if (mustWait()) {
+      sendResult(current.run.resend());
+      return;
+    }
+    const step = nextStep(target.state);
+    if (step === null) {
+      notice("no_runs");
+      return;
+    }
+    notice("moving");
+    if (mustWait()) {
+      return;
+    }
+    sendResult(runFor(target.workspaceId, step).transition(step.state));
+  }
+
+  /** What the model of the walked run reported. */
+  function runChanged(run: HostRun, state: HostRunState): void {
+    if (closed || stopped || current?.run !== run) {
+      return;
+    }
+    switch (state.phase) {
+      case "idle": {
+        // The acknowledgement: its payload is the run's state from now on.
+        acknowledged.set(run.runId, state.runState);
+        if (state.runState === "awaiting_input") {
+          awaited.add(run.runId);
+        } else if (isTerminalRunState(state.runState)) {
+          awaited.delete(run.runId);
+        }
+        evaluate();
         return;
       }
-      pending.resent = true;
-      pending.resendDue = false;
-    }
-    transmit(pending.transition);
-  }
-
-  function transmit(transition: Transition): void {
-    const outcome = connection.sendAs((identity) => {
-      // The server closes the connection for an agent that another device
-      // hosts, so the identity of the socket is checked as well.
-      if (identity.deviceId !== hostDeviceId) {
-        throw new Error("This device does not host the agent.");
-      }
-      return { ...transition, deviceId: identity.deviceId };
-    });
-    if (outcome !== "sent") {
-      stop(
-        `The development agent switch stopped: a transition was not sent (${outcome}).`,
-      );
-      return;
-    }
-    sendTimes.push(now());
-    cancelAck = schedule(() => {
-      cancelAck = null;
-      acknowledgementTimedOut();
-    }, DEV_SWITCH_ACK_TIMEOUT_MS);
-  }
-
-  function acknowledgementTimedOut(): void {
-    if (pending === null) {
-      return;
-    }
-    if (pending.resent) {
-      stop(
-        "The development agent switch stopped: a transition got no acknowledgement.",
-      );
-      return;
-    }
-    log(
-      "A transition got no acknowledgement; the development agent switch sends it once more.",
-    );
-    pending.resendDue = true;
-    evaluate();
-  }
-
-  function messageReceived(message: ServerMessage): void {
-    if (closed || stopped || pending === null) {
-      return;
-    }
-    const sent = pending.transition;
-    if (message.kind === "frame") {
-      if (
-        message.frame.type === "event.refused" &&
-        message.frame.eventId === sent.id
-      ) {
-        stop(
-          `The development agent switch stopped: a transition was refused (${message.frame.code}).`,
+      case "resend_due":
+        log(
+          "A transition got no acknowledgement; the development agent switch sends it once more.",
         );
-      }
+        evaluate();
+        return;
+      case "stopped":
+        runStopped(state);
+        return;
+      case "awaiting_ack":
+      case "closed":
+        return;
+    }
+  }
+
+  function runStopped(state: HostRunState): void {
+    const reason = state.stop;
+    if (reason === null) {
       return;
     }
-    const event = message.event;
-    if (
-      event.type !== "agent.run.state_changed" ||
-      event.id !== sent.id ||
-      event.workspaceId !== sent.workspaceId ||
-      event.actor.kind !== "agent" ||
-      event.actor.agentId !== agentId ||
-      event.payload.runId !== sent.payload.runId
-    ) {
-      return;
+    switch (reason.cause) {
+      case "refused":
+        stop(
+          `The development agent switch stopped: a transition was refused (${reason.code}).`,
+        );
+        return;
+      case "no_acknowledgement":
+        stop(
+          "The development agent switch stopped: a transition got no acknowledgement.",
+        );
+        return;
+      case "not_sent":
+        stop(
+          `The development agent switch stopped: a transition was not sent (${reason.code}).`,
+        );
+        return;
+      case "signed_out":
+        if (state.unacknowledged === null) {
+          // A sign-out with nothing waiting pauses the switch; the walk
+          // goes on with a new model once the guards hold again.
+          current = null;
+          return;
+        }
+        stop(
+          `The development agent switch stopped: the connection closed (${reason.code}).`,
+        );
+        return;
+      case "connection_closed":
+        stop(
+          `The development agent switch stopped: the connection closed (${reason.code}).`,
+        );
+        return;
     }
-    // The acknowledgement: its payload is the run's state from now on.
-    const { runId, state } = event.payload;
-    acknowledged.set(runId, state);
-    if (state === "awaiting_input") {
-      awaited.add(runId);
-    } else if (isTerminalRunState(state)) {
-      awaited.delete(runId);
-    }
-    pending = null;
-    cancelAck?.();
-    cancelAck = null;
-    evaluate();
   }
 
   /**
@@ -528,7 +566,8 @@ export function createDevAgentSwitch(
    * after a sign-out, a removal, or a key that is not ready, pauses the
    * switch like the account guard, unless a transition waits. A connection
    * that was not open yet, such as a first attempt that fails, changes
-   * nothing.
+   * nothing. The run's model stops on the same closes; whichever hears of
+   * a close first, the switch stops once.
    */
   function connectionChanged(status: ConnectionStatus): void {
     const wasConnected = connected;
@@ -536,7 +575,7 @@ export function createDevAgentSwitch(
     if (closed || stopped || !wasConnected || connected) {
       return;
     }
-    if (status.state === "offline" && pending === null) {
+    if (status.state === "offline" && !waitsForAcknowledgement()) {
       return;
     }
     const code =
@@ -550,10 +589,15 @@ export function createDevAgentSwitch(
 
   const removers = [
     account.onStatusChange(() => evaluate()),
+    // Registered before any run's model, so that the client, which calls
+    // its status listeners in the order they were added, tells the switch
+    // of a close before the model: the switch applies its own rule first
+    // (stop, or pause at a sign-out with nothing waiting) and closes the
+    // model. A model that heard first would lead to the same stop and the
+    // same log line through `runStopped`.
     connection.onStatusChange((status) => connectionChanged(status)),
     workspaces.onChange(() => evaluate()),
     agents.onChange(() => evaluate()),
-    connection.onMessage((message) => messageReceived(message)),
   ];
 
   function removeListeners(): void {
@@ -570,7 +614,7 @@ export function createDevAgentSwitch(
         return;
       }
       closed = true;
-      pending = null;
+      releaseRun();
       stopTimers();
       removeListeners();
     },

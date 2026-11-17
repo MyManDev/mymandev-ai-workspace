@@ -2033,6 +2033,113 @@ test("ownMemberId gives the account's own person of each listed workspace", asyn
   expect(g.service.ownMemberId(WS_A)).toBeNull();
 });
 
+test("ownRole gives the role of the account's own person in each listed workspace from the list, not another person's role or the selected workspace's events", async () => {
+  const h = new Harness();
+  expect(h.service.ownRole(WS_A)).toBeNull();
+  expect(h.service.listGeneration()).toBe(0);
+  h.setConnection("connected");
+  // The account's own person is a member of A, which another person owns,
+  // and an admin of B.
+  await h.answer(
+    "listWorkspaces",
+    ok(
+      WorkspaceListResponseSchema.parse({
+        workspaces: [
+          {
+            workspace: { id: WS_A, name: WORKSPACE_NAMES[WS_A] },
+            member: memberOf(WS_A, MEMBER, "Grace Member", "member", USER_ID),
+          },
+          {
+            workspace: { id: WS_B, name: WORKSPACE_NAMES[WS_B] },
+            member: memberOf(WS_B, MEMBER, "Grace Member", "admin", USER_ID),
+          },
+        ],
+      }),
+    ),
+  );
+  expect(h.service.listGeneration()).toBe(1);
+  expect(h.service.ownRole(WS_A)).toBe("member");
+  expect(h.service.ownRole(WS_B)).toBe("admin");
+  expect(h.service.ownRole(WS_C)).toBeNull();
+  // A's people name another person as its owner; the own role stays.
+  h.receive(subscribed());
+  await h.answerReload();
+  expect(h.service.people().find((person) => person.role === "owner")?.id).toBe(
+    OWNER,
+  );
+  expect(h.service.ownRole(WS_A)).toBe("member");
+  // An event of the selected workspace changes its people, not the list's
+  // role, which the next list gives.
+  h.receive(
+    event("workspace.member.role_changed", { memberId: MEMBER, role: "admin" }),
+  );
+  expect(h.service.ownRole(WS_A)).toBe("member");
+  expect(h.service.listGeneration()).toBe(1);
+
+  // An ended membership forgets it at once, and a create's workspace has
+  // none until the list holds it.
+  h.receive(
+    frame({
+      type: "account.removed_from_workspace",
+      workspaceId: WS_B,
+      removedAt: AT,
+    }),
+  );
+  expect(h.service.ownRole(WS_B)).toBeNull();
+  expect(h.service.listGeneration()).toBe(1);
+  // The list loads again after the removal.
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.service.listGeneration()).toBe(2);
+  expect(h.service.ownRole(WS_A)).toBe("owner");
+  expect(
+    h.service.addWorkspace({ id: WS_C, name: "Workspace Gamma" }, NEW_MEMBER),
+  ).toBe(true);
+  expect(h.service.ownRole(WS_C)).toBeNull();
+  // A create that names another own person in a listed workspace forgets
+  // the role of the list's person.
+  expect(
+    h.service.addWorkspace({ id: WS_A, name: "Workspace Alpha" }, NEW_MEMBER),
+  ).toBe(true);
+  expect(h.service.ownRole(WS_A)).toBeNull();
+  // The second create drops the answer of the first one's load.
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.service.ownRole(WS_A)).toBeNull();
+  await h.answer("listWorkspaces", ok(workspaceList(WS_C, WS_A)));
+  expect(h.service.ownRole(WS_C)).toBe("owner");
+  expect(h.service.ownRole(WS_A)).toBe("owner");
+  expect(h.service.listGeneration()).toBe(3);
+});
+
+test("listGeneration grows with every answer of the list that loads, also an equal one, and with every sign-out and every other device, but not with a failed load", async () => {
+  const h = await withList([WS_A]);
+  expect(h.service.listGeneration()).toBe(1);
+  expect(h.service.reloadList()).toBe(true);
+  await h.answer("listWorkspaces", failure("unavailable"));
+  expect(h.service.listGeneration()).toBe(1);
+  h.fire(WORKSPACE_RETRY_BASE_MS);
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.service.listGeneration()).toBe(2);
+  // A reconnect loads the list again.
+  h.setConnection("offline");
+  h.setConnection("connected");
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.service.listGeneration()).toBe(3);
+  // Another device resets the list and loads it again.
+  h.setAccount(accountStatus({}, OTHER_DEVICE_ID));
+  expect(h.service.listGeneration()).toBe(4);
+  expect(h.service.ownRole(WS_A)).toBeNull();
+  await h.answer("listWorkspaces", ok(workspaceList(WS_A)));
+  expect(h.service.listGeneration()).toBe(5);
+  expect(h.service.ownRole(WS_A)).toBe("owner");
+  // A sign-out forgets the roles; close answers no role.
+  h.setAccount(SIGNED_OUT);
+  expect(h.service.listGeneration()).toBe(6);
+  expect(h.service.ownRole(WS_A)).toBeNull();
+  const g = await withList([WS_A]);
+  g.service.close();
+  expect(g.service.ownRole(WS_A)).toBeNull();
+});
+
 test("a trigger during a list load drops its answer and loads again", async () => {
   const h = await withList([WS_A, WS_B]);
   h.receive(

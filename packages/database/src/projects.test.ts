@@ -26,6 +26,7 @@ import { activePersonOf, createWorkspace } from "./membership.ts";
 import { removeMember } from "./people.ts";
 import {
   createProject,
+  type CreateProjectResult,
   listProjects,
   MAX_ACTIVE_PROJECTS_PER_WORKSPACE,
   MAX_NEW_PROJECTS_PER_DAY,
@@ -444,7 +445,7 @@ test("inside another transaction, a refused creation or rename rolls back only i
   assert.deepEqual(await activeNames(workspaceId), ["App", "Docs", "Web"]);
 });
 
-test(`a workspace holds at most ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects that are not archived; the next is rate_limited without a wait, and an archived project frees a place`, async () => {
+test(`a workspace holds at most ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects that are not archived; the next is refused with project_limit, and an archived project frees a place`, async () => {
   const owner = await account("Owner");
   const member = await account("Member");
   const workspaceId = await workspaceOf(owner);
@@ -462,12 +463,8 @@ test(`a workspace holds at most ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects th
     name: "One more",
     now: LATER,
   });
-  assert.deepEqual(refused, {
-    created: false,
-    refusal: "rate_limited",
-    retryAfterMs: null,
-  });
-  // The limit comes before the name: a clashing name is rate_limited too.
+  assert.deepEqual(refused, { created: false, refusal: "project_limit" });
+  // The limit comes before the name: a clashing name is project_limit too.
   assert.deepEqual(
     await createProject(database(), {
       workspaceId,
@@ -475,7 +472,7 @@ test(`a workspace holds at most ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE} projects th
       name: "last",
       now: LATER,
     }),
-    { created: false, refusal: "rate_limited", retryAfterMs: null },
+    { created: false, refusal: "project_limit" },
   );
 
   const [first] = filled;
@@ -545,6 +542,27 @@ test(`an account creates at most ${MAX_NEW_PROJECTS_PER_DAY} projects within 24 
     refusal: "rate_limited",
     retryAfterMs: HOUR_MS,
   });
+});
+
+test("the type checker gives the daily limit a numeric wait and the limit of a workspace none (#268)", () => {
+  const typeOnly = (
+    refused: Extract<CreateProjectResult, { created: false }>,
+  ): unknown => {
+    if (refused.refusal === "rate_limited") {
+      // A wait of null would no longer be a number.
+      const wait: number = refused.retryAfterMs;
+      return wait;
+    }
+    if (refused.refusal === "project_limit") {
+      // Narrowed to the variants that can refuse with project_limit: none of
+      // them may have a wait, not even a null one.
+      const noWait: "retryAfterMs" extends keyof typeof refused ? never : true =
+        true;
+      return noWait;
+    }
+    return undefined;
+  };
+  assert.equal(typeof typeOnly, "function");
 });
 
 test("the creator, the owner, and an admin rename a project; another member is forbidden, and an unknown project or one of another workspace is not found", async () => {
@@ -974,7 +992,7 @@ test(
 );
 
 test(
-  `a creation waits at the workspace row for a concurrent creation by another person that reaches the limit of ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE}, and is then rate_limited`,
+  `a creation waits at the workspace row for a concurrent creation by another person that reaches the limit of ${MAX_ACTIVE_PROJECTS_PER_WORKSPACE}, and is then project_limit`,
   SERVER_ONLY,
   async () => {
     const owner = await account("Owner");
@@ -994,11 +1012,7 @@ test(
           now: NOW,
         }),
     );
-    assert.deepEqual(result, {
-      created: false,
-      refusal: "rate_limited",
-      retryAfterMs: null,
-    });
+    assert.deepEqual(result, { created: false, refusal: "project_limit" });
     assert.deepEqual(waitedOn, ["workspaces"]);
     assert.equal(
       (await listProjects(database(), workspaceId)).length,

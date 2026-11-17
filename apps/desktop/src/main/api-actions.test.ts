@@ -527,8 +527,16 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     sign_in_code_used: "failed",
     unclaimed_limit: "unclaimed_limit",
     project_limit: "project_limit",
+    // No write of the desktop creates a run yet (#35).
+    run_limit: "failed",
+    run_daily_limit: "failed",
+    // No write of the desktop registers a repository yet (#286).
+    repository_limit: "failed",
     // Only the sign-in answers it, never a write (#255).
     device_limit: "failed",
+    // Nor this one: a write then fails without a wait, never as the
+    // `rate_limited` of its own route (#269).
+    device_daily_limit: "failed",
     rate_limited: "rate_limited",
     // Defensive: only with a 5xx, which the session reads as
     // `server_error`, so it never comes as a refusal.

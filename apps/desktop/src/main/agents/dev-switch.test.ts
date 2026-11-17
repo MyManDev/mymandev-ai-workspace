@@ -1049,6 +1049,16 @@ test("a close also stops a paused switch and a resend that waits for the guards"
   expect(g.logs.at(-1)).toBe(
     "The development agent switch stopped: the connection closed (server_error).",
   );
+
+  // Paused before its first send, while no run's model listens yet.
+  const f = new Harness({ activity: NO_PROJECT });
+  f.setConnection(waiting("connection_lost"));
+  expect(f.logs.at(-1)).toBe(
+    "The development agent switch stopped: the connection closed (connection_lost).",
+  );
+  reconnect(f);
+  f.advance(60_000);
+  expect(f.sent).toEqual([]);
 });
 
 test("a sign-out pauses the switch, unless a transition waits for its acknowledgement", () => {

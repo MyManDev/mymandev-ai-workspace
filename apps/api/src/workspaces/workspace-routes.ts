@@ -47,6 +47,8 @@ import {
 import { registerOwnershipRoutes } from "./ownership-routes.ts";
 import { registerPeopleRoutes } from "./people-routes.ts";
 import { registerProjectRoutes } from "./project-routes.ts";
+import { registerRepositoryRoutes } from "./repository-routes.ts";
+import { registerRunRoutes } from "./run-routes.ts";
 
 export type WorkspaceRouteOptions = Readonly<{
   database: Database;
@@ -55,7 +57,8 @@ export type WorkspaceRouteOptions = Readonly<{
   /**
    * Receives the membership events of the people routes, of accepting an
    * ownership offer, of accepting an invitation, and of approving a join
-   * request, and the project events of the project routes, after the commit.
+   * request, the project events of the project routes, and the repository
+   * events of the repository routes, after the commit.
    */
   onWorkspaceEvent: WorkspaceEventHandler;
   /**
@@ -75,7 +78,8 @@ export type WorkspaceRouteOptions = Readonly<{
   onAccountFrame: AccountFrameHandler;
   /**
    * The open connections, to which the people routes send the runs that a
-   * removal or a departure cancelled, after the commit.
+   * removal or a departure cancelled, and the run route the run that it
+   * created (#35), after the commit.
    */
   connections: ConnectionRegistry;
 }>;
@@ -248,13 +252,25 @@ export async function registerWorkspaceRoutes(
     });
 
     // A project ID names its workspace, so these routes check the
-    // membership of the project's workspace (#27, #28).
+    // membership of the project's workspace (#27, #28, #286).
     await scope.register(async (project) => {
       requireProjectMember(project, database);
 
       registerChatRoutes(project, { database });
 
       registerAgentRoutes(project, { database });
+
+      registerRunRoutes(project, {
+        database,
+        now: options.now,
+        connections: options.connections,
+      });
+
+      registerRepositoryRoutes(project, {
+        database,
+        now: options.now,
+        onWorkspaceEvent: options.onWorkspaceEvent,
+      });
     });
   });
 }

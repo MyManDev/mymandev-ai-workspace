@@ -2,6 +2,7 @@ import type {
   AccountBridge,
   AgentBridge,
   ChatBridge,
+  ClaimMarksBridge,
   ClaimsBridge,
   ConnectionBridge,
   DesktopBridge,
@@ -34,6 +35,7 @@ import type {
   ChatView,
   ClaimLoadResult,
   ClaimMarkSeenResult,
+  ClaimMarksView,
   ClaimsView,
   ConnectionStatus,
   CopyWorkspaceIdResult,
@@ -745,6 +747,24 @@ export function createDesktopBridge(
           ),
   });
 
+  const claimMarks: ClaimMarksBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(INVOKE_CHANNELS.getClaimMarks) as Promise<ClaimMarksView>,
+    subscribeState: (
+      listener: (state: ClaimMarksView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeClaimMarks,
+        EVENT_CHANNELS.claimMarksChanged,
+        "A claim mark callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+  });
+
   const agents: AgentBridge = Object.freeze({
     getState: () =>
       ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
@@ -879,6 +899,7 @@ export function createDesktopBridge(
     ownJoinRequests,
     ownJoinRequestActions,
     claims,
+    claimMarks,
     agents,
     chat,
     devices,

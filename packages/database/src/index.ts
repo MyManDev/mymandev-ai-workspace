@@ -177,6 +177,17 @@ export {
   type RenameProjectResult,
 } from "./projects.ts";
 export {
+  listRepositories,
+  type ListRepositoriesInput,
+  type ListRepositoriesResult,
+  registerRepository,
+  type RegisterRepositoryInput,
+  type RegisterRepositoryResult,
+  removeRepository,
+  type RemoveRepositoryInput,
+  type RemoveRepositoryResult,
+} from "./repositories.ts";
+export {
   listChatMessages,
   type ListChatMessagesInput,
   type ListChatMessagesResult,
@@ -195,6 +206,14 @@ export {
   type RecordRunTransitionResult,
   type RunTransitionRefusal,
 } from "./agent-activity.ts";
+export {
+  createRun,
+  type CreateRunInput,
+  type CreateRunRefusal,
+  type CreateRunResult,
+  MAX_NEW_RUNS_PER_AGENT_PER_DAY,
+  MAX_UNFINISHED_RUNS_PER_AGENT,
+} from "./runs.ts";
 export {
   DatabaseError,
   toDatabaseError,

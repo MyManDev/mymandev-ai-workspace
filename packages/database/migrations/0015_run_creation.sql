@@ -1,0 +1,8 @@
+ALTER TABLE "agent_runs" ADD COLUMN "provider_connection_id" uuid;--> statement-breakpoint
+ALTER TABLE "agent_runs" ADD COLUMN "host_device_id" uuid;--> statement-breakpoint
+ALTER TABLE "agent_runs" ADD COLUMN "input_message_id" uuid;--> statement-breakpoint
+ALTER TABLE "agent_runs" ADD CONSTRAINT "agent_runs_provider_connection_id_provider_connections_id_fk" FOREIGN KEY ("provider_connection_id") REFERENCES "public"."provider_connections"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "agent_runs" ADD CONSTRAINT "agent_runs_input_message_id_messages_id_fk" FOREIGN KEY ("input_message_id") REFERENCES "public"."messages"("id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "agent_runs" ADD CONSTRAINT "agent_runs_agent_host_device_fk" FOREIGN KEY ("agent_id","host_device_id") REFERENCES "public"."agents"("id","host_device_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "agent_runs" ADD CONSTRAINT "agent_runs_provider_connection_device_fk" FOREIGN KEY ("provider_connection_id","host_device_id") REFERENCES "public"."provider_connections"("id","host_device_id") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
+ALTER TABLE "agent_runs" ADD CONSTRAINT "agent_runs_provider_connection_check" CHECK (("agent_runs"."provider_connection_id" is null) = ("agent_runs"."host_device_id" is null));

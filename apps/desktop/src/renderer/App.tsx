@@ -11,6 +11,8 @@ import type {
   AccountBridge,
   AgentBridge,
   ChatBridge,
+  ClaimMarksBridge,
+  ClaimsBridge,
   ConnectionBridge,
   DeviceListBridge,
   InvitationActionsBridge,
@@ -25,11 +27,22 @@ import type {
   RuntimeBridge,
   WorkspaceBridge,
 } from "../shared/desktop-bridge.ts";
-import type { WorkspaceView } from "../shared/ipc-contract.ts";
+import type {
+  ClaimMarksView,
+  ClaimsView,
+  WorkspaceView,
+} from "../shared/ipc-contract.ts";
 import { PRODUCT_NAME } from "../shared/product.ts";
 import { AccountScreen } from "./AccountScreen.tsx";
 import { initialAccountView, type AccountView } from "./account-view.ts";
 import { ChatScreen } from "./ChatScreen.tsx";
+import {
+  type ClaimMarksScreenView,
+  followClaimMarks,
+  initialClaimMarksView,
+  markedWorkspaces,
+} from "./claim-marks-view.ts";
+import { hasUnseenClaims, isShellDialogOpen } from "./claims-view.ts";
 import {
   CreateDialogBox,
   useCreation,
@@ -56,6 +69,7 @@ import {
 } from "./Navigation.tsx";
 import { PeopleScreen } from "./PeopleScreen.tsx";
 import { ProjectPanel } from "./ProjectPanel.tsx";
+import { useClaimsScreen } from "./RecentClaims.tsx";
 import {
   DecisionsScreen,
   PermissionsScreen,
@@ -118,6 +132,10 @@ export interface AppProps {
   readonly joinRequests?: JoinRequestsBridge | undefined;
   /** The join request actions from the preload script; undefined outside Electron. */
   readonly joinRequestActions?: JoinRequestActionsBridge | undefined;
+  /** The selected workspace's recent claims from the preload script; undefined outside Electron. */
+  readonly claims?: ClaimsBridge | undefined;
+  /** Which other workspaces hold an unseen claim, from the preload script; undefined outside Electron. */
+  readonly claimMarks?: ClaimMarksBridge | undefined;
   /** The account's own join requests from the preload script; undefined outside Electron. */
   readonly ownJoinRequests?: OwnJoinRequestsBridge | undefined;
   /** The own join request actions from the preload script; undefined outside Electron. */
@@ -133,6 +151,17 @@ export interface AppProps {
    * previews. Without it, the shell starts without projects.
    */
   readonly initialWorkspaceState?: WorkspaceView | undefined;
+  /**
+   * The claims shown until the bridge delivers them, for tests and
+   * previews. Without it, the sidebar waits for the first state.
+   */
+  readonly initialClaimsState?: ClaimsView | undefined;
+  /**
+   * The claim marks of the other workspaces shown until the bridge delivers
+   * them, for tests and previews. Without it, no other workspace is marked
+   * until the first state.
+   */
+  readonly initialClaimMarksState?: ClaimMarksView | undefined;
   /** The view shown first. An invalid view shows the home screen. */
   readonly initialView?: ShellView;
 }
@@ -150,12 +179,16 @@ export function App({
   invitationActions,
   joinRequests,
   joinRequestActions,
+  claims,
+  claimMarks,
   ownJoinRequests,
   ownJoinRequestActions,
   agents,
   chat,
   devices,
   initialWorkspaceState,
+  initialClaimsState,
+  initialClaimMarksState,
   initialView = HOME_VIEW,
 }: AppProps) {
   const [state, dispatch] = useReducer(shellReducer, initialView, (view) =>
@@ -197,6 +230,19 @@ export function App({
     state.view.screen === "home",
     openPaths,
   );
+  // The shell follows the claims for the sidebar's marker; the people
+  // screen follows them on its own while it is shown.
+  const claimsView = useClaimsScreen(claims, initialClaimsState);
+  const unseenClaims = hasUnseenClaims(claimsView, workspaceSidebar.view);
+  // The workspaces in the sidebar's list with an unseen claim (#271): the
+  // others from the main process, the selected one from its claims.
+  const claimMarksView = useClaimMarks(claimMarks, initialClaimMarksState);
+  const marked = markedWorkspaces(
+    claimMarksView,
+    claimsView,
+    workspaceSidebar.view,
+  );
+  const shellDialogOpen = isShellDialogOpen(question.question, creation?.view);
 
   return (
     <div className={open === undefined ? "shell" : "shell shell-project"}>
@@ -227,6 +273,8 @@ export function App({
         dispatch={dispatch}
         workspaces={workspaceSidebar}
         creation={creation}
+        unseenClaims={unseenClaims}
+        markedWorkspaces={marked}
       />
       {open === undefined ? null : (
         <ProjectNav
@@ -246,6 +294,8 @@ export function App({
           invitationActions={invitationActions}
           joinRequests={joinRequests}
           joinRequestActions={joinRequestActions}
+          claims={claims}
+          shellDialogOpen={shellDialogOpen}
           ownJoinRequests={ownJoinRequests}
           ownJoinRequestActions={ownJoinRequestActions}
           workspaces={workspaceSidebar}
@@ -293,6 +343,8 @@ function ScreenContent({
   invitationActions,
   joinRequests,
   joinRequestActions,
+  claims,
+  shellDialogOpen,
   ownJoinRequests,
   ownJoinRequestActions,
   workspaces,
@@ -317,6 +369,9 @@ function ScreenContent({
   readonly invitationActions: InvitationActionsBridge | undefined;
   readonly joinRequests: JoinRequestsBridge | undefined;
   readonly joinRequestActions: JoinRequestActionsBridge | undefined;
+  readonly claims: ClaimsBridge | undefined;
+  /** Whether a modal dialog of the shell is open, for the people screen. */
+  readonly shellDialogOpen: boolean;
   readonly ownJoinRequests: OwnJoinRequestsBridge | undefined;
   readonly ownJoinRequestActions: OwnJoinRequestActionsBridge | undefined;
   /** The workspace part of the sidebar, for the join screen. */
@@ -360,6 +415,8 @@ function ScreenContent({
           invitationActions={invitationActions}
           joinRequests={joinRequests}
           joinRequestActions={joinRequestActions}
+          claims={claims}
+          shellDialogOpen={shellDialogOpen}
         />
       );
     case "join":
@@ -532,6 +589,28 @@ function useAccountView(account: AccountBridge | undefined): AccountView {
       () => setView({ kind: "unavailable" }),
     );
   }, [account]);
+  return view;
+}
+
+/**
+ * Follows the claim marks of the other workspaces while the shell is
+ * mounted, starting with `initialState` when there is one, for tests and
+ * previews.
+ */
+function useClaimMarks(
+  bridge: ClaimMarksBridge | undefined,
+  initialState: ClaimMarksView | undefined,
+): ClaimMarksScreenView {
+  const [view, setView] = useState((): ClaimMarksScreenView =>
+    initialState === undefined
+      ? initialClaimMarksView(bridge !== undefined)
+      : { kind: "known", state: initialState },
+  );
+  useEffect(
+    () =>
+      bridge === undefined ? undefined : followClaimMarks(bridge, setView),
+    [bridge],
+  );
   return view;
 }
 

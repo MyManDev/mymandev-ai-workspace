@@ -2790,6 +2790,11 @@ describe("outcomes of the sign-in flow", () => {
     { kind: "refused", code: "bad_request" },
     { kind: "refused", code: "device_registration_locked" },
     { kind: "refused", code: "device_limit" },
+    {
+      kind: "refused",
+      code: "device_daily_limit",
+      retryAfter: "2026-11-15T09:53:20.000Z",
+    },
     { kind: "refused", code: "unsupported_account" },
   ];
 

@@ -52,11 +52,11 @@ export interface PeopleActionHandlers {
 }
 
 /**
- * A button of a people action. While an action runs it stays focusable and
- * does nothing (`aria-disabled`), like the device actions' buttons, so that
- * the focus stays on it.
+ * A button of a people action, also of the recent claims' refresh. While an
+ * action runs it stays focusable and does nothing (`aria-disabled`), like
+ * the device actions' buttons, so that the focus stays on it.
  */
-function ActionButton({
+export function ActionButton({
   label,
   describedBy,
   inert,

@@ -83,9 +83,9 @@ import {
 //    names, and the projects also for their archive. `src/projects.ts` locks
 //    a workspace row or a project only after the acting person: the
 //    account's own person, whose account the erasure holds first, or another
-//    claimed person, whom the erasure never locks. A future writer of
-//    repositories locks them after the people and the workspace row, a
-//    project before its repositories.
+//    claimed person, whom the erasure never locks. `src/repositories.ts`
+//    locks a project and then its repository after the acting person too,
+//    and no workspace row.
 // 6. Their invitations that are neither accepted nor revoked.
 //
 // Only then does the erasure read whether another active, claimed person

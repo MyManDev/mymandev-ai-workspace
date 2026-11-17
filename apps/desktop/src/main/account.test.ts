@@ -1069,6 +1069,7 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
     device_revoked: "device_revoked",
     device_registration_locked: "device_registration_locked",
     device_limit: "device_limit",
+    device_daily_limit: "device_daily_limit",
     unsupported_account: "unsupported_account",
     sign_in_unavailable: "sign_in_unavailable",
   };
@@ -1144,6 +1145,95 @@ test("every outcome of the flow maps to a fixed code, and an unknown one to a ge
   });
   expect(view({ kind: "paused" })).toEqual({ code: "failed" });
 });
+
+test("an uncertain rate_limited and the daily limit of new devices pass the end of their wait on, and no other outcome does (#269)", () => {
+  const view = (outcome: unknown) =>
+    signInOutcomeView(outcome as SignInOutcome);
+  const retryAfter = "2026-11-15T09:53:20.000Z";
+  // The API's code of the uncertain refusal is not passed on.
+  expect(
+    view({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "rate_limited",
+      retryAfter,
+    }),
+  ).toEqual({ code: "uncertain_refusal", retryAfter });
+  // The daily limit is a refusal with its own code: a certain one.
+  expect(
+    view({ kind: "refused", code: "device_daily_limit", retryAfter }),
+  ).toEqual({ code: "device_daily_limit", retryAfter });
+  // Without a usable `Retry-After`, the flow passes no time.
+  expect(
+    view({
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "rate_limited",
+    }),
+  ).toEqual({ code: "uncertain_refusal" });
+  expect(view({ kind: "refused", code: "device_daily_limit" })).toEqual({
+    code: "device_daily_limit",
+  });
+  for (const outcome of [
+    {
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "sign_in_code_used",
+      retryAfter,
+    },
+    {
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "auth_failed",
+      retryAfter,
+    },
+    { kind: "failed", reason: "no_answer", retryAfter },
+    { kind: "refused", code: "rate_limited", retryAfter },
+    { kind: "refused", code: "device_limit", retryAfter },
+    { kind: "refused", code: "device_account_mismatch", retryAfter },
+  ]) {
+    expect(view(outcome)).not.toHaveProperty("retryAfter");
+  }
+});
+
+test.each([
+  [
+    "an uncertain rate_limited",
+    {
+      kind: "failed",
+      reason: "uncertain_refusal",
+      apiError: "rate_limited",
+      retryAfter: "2026-11-14T10:10:00.000Z",
+    },
+    { code: "uncertain_refusal", retryAfter: "2026-11-14T10:10:00.000Z" },
+  ],
+  [
+    "the daily limit of new devices",
+    {
+      kind: "refused",
+      code: "device_daily_limit",
+      retryAfter: "2026-11-15T09:53:20.000Z",
+    },
+    { code: "device_daily_limit", retryAfter: "2026-11-15T09:53:20.000Z" },
+  ],
+] as const)(
+  "%s reaches the status with the end of its wait, which the contract accepts (#269)",
+  async (_label, outcome, expected) => {
+    const h = harness();
+    await h.service.initialize();
+    const attempt = startedSignIn();
+    h.start = async () => attempt.start;
+    await h.service.startSignIn();
+
+    const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+    attempt.settle(outcome);
+
+    expect((await done).lastOutcome).toEqual(expected);
+    expect(AccountStatusSchema.parse(h.service.status()).lastOutcome).toEqual(
+      expected,
+    );
+  },
+);
 
 test("This is not me asks for confirmation, removes the device at the API, deletes the record and the registration marker, resets the flow, deletes the key, and signs out", async () => {
   const h = harness();

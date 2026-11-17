@@ -1362,3 +1362,45 @@ test("no log holds a login or an ID", async () => {
   }
   expect(live.logs.length).toBeGreaterThan(1);
 });
+
+test("seenMemberIds gives the claims that an own person has seen in any workspace, null until the file was read, as a copy that follows markSeen", async () => {
+  const seenFile = fakeSeen("pending");
+  const live = setup(seenFile);
+  await settle();
+  expect(live.service.seenMemberIds(WORKSPACE, OWN)).toBeNull();
+  seenFile.finishRead({
+    kind: "entries",
+    entries: [
+      {
+        workspaceId: OTHER_WORKSPACE,
+        ownMemberId: OTHER,
+        seenMemberIds: [FIRST],
+      },
+    ],
+  });
+  await settle();
+  // Another workspace than the selected one, by the own person in it.
+  expect([
+    ...(live.service.seenMemberIds(OTHER_WORKSPACE, OTHER) ?? []),
+  ]).toEqual([FIRST]);
+  expect([...(live.service.seenMemberIds(OTHER_WORKSPACE, OWN) ?? [])]).toEqual(
+    [],
+  );
+  expect([...(live.service.seenMemberIds(WORKSPACE, OWN) ?? [])]).toEqual([]);
+
+  live.account.reads[0]?.resolve(list(claim(SECOND, T2), claim(FIRST, T1)));
+  await settle();
+  const changes: number[] = [];
+  live.service.onChange((state) => changes.push(state.revision));
+  expect(live.service.markSeen(WORKSPACE, [SECOND])).toEqual({
+    outcome: "ok",
+  });
+  expect(changes).toHaveLength(1);
+  const seenNow = live.service.seenMemberIds(WORKSPACE, OWN);
+  expect([...(seenNow ?? [])]).toEqual([SECOND]);
+  // A copy: changing it changes nothing.
+  (seenNow as Set<MemberId>).add(FIRST);
+  expect([...(live.service.seenMemberIds(WORKSPACE, OWN) ?? [])]).toEqual([
+    SECOND,
+  ]);
+});

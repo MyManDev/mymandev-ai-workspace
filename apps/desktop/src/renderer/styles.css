@@ -329,6 +329,21 @@ code {
   box-shadow: inset 0 calc(-1 * var(--mark-width)) 0 var(--color-accent);
 }
 
+/*
+ * The dot after "People" while the selected workspace has a claim that the
+ * account has not seen, and after the name of each workspace in the list
+ * that has one (#271); the item's accessible name says so.
+ */
+.nav-marker {
+  display: inline-block;
+  width: var(--space-2);
+  height: var(--space-2);
+  margin-inline-start: var(--space-2);
+  border-radius: var(--radius-round);
+  background: var(--color-accent);
+  vertical-align: middle;
+}
+
 .project-nav {
   grid-area: project-nav;
   display: flex;
@@ -826,13 +841,45 @@ code {
   margin: 0 0 var(--space-2);
 }
 
+.permission-statements {
+  margin: 0 0 var(--space-3);
+  padding-inline-start: var(--space-4);
+}
+
 .capability-list {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
   gap: var(--space-2);
   margin: 0 0 var(--space-2);
   padding: 0;
   list-style: none;
+}
+
+.capability {
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+/* The risk is always text; the mark only repeats it. */
+.capability[data-risk="highest"] {
+  border-inline-start: var(--mark-width) solid var(--color-status-failed);
+}
+
+.capability-name {
+  margin: 0 0 var(--space-1);
+  font-size: var(--font-size-base);
+}
+
+.permission-section .capability-risk {
+  font-weight: var(--font-weight-strong);
+}
+
+.capability[data-risk="highest"] .capability-risk {
+  color: var(--color-status-failed);
+}
+
+.permission-section .capability p:last-child {
+  margin-block-end: 0;
 }
 
 /* People */
@@ -975,6 +1022,20 @@ code {
   justify-content: flex-end;
   gap: var(--space-2);
   margin-block-start: var(--space-2);
+}
+
+/* The recent claims, above the people. */
+.recent-claims {
+  margin-block-end: var(--space-4);
+}
+
+/* "New" on a claim: a word in a frame, not only a color. */
+.claim-new {
+  padding-inline: var(--space-1);
+  border: var(--border-width) solid var(--color-accent);
+  border-radius: var(--radius);
+  color: var(--color-accent);
+  font-size: var(--font-size-small);
 }
 
 /* The open invitations, below the people. */
@@ -1135,5 +1196,14 @@ code {
     text-decoration: underline;
     text-decoration-thickness: var(--mark-width);
     text-underline-offset: var(--space-1);
+  }
+
+  /*
+   * Forced colors replace the dot's background, so the dot opts out and
+   * takes the system color of a button's text, like the label beside it.
+   */
+  .nav-marker {
+    forced-color-adjust: none;
+    background: ButtonText;
   }
 }

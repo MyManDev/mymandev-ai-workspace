@@ -46,28 +46,30 @@ type ProjectParams = Readonly<{
 
 /**
  * The answer to a refused creation. A workspace that holds 100 projects that
- * are not archived, the limit without a wait (`retryAfterMs` null), answers
- * `409` with `project_limit` and no `Retry-After`, because no time frees a
- * place, only archiving a project does (#255). The account's 20 creations in
- * 24 hours answer `rate_limited` with the time until the oldest of them
- * leaves the window.
+ * are not archived answers `409` with `project_limit` and no `Retry-After`,
+ * because no time frees a place, only archiving a project does (#255). The
+ * account's 20 creations in 24 hours answer `rate_limited` with the time
+ * until the oldest of them leaves the window. Each refusal of the database
+ * has its own case: one that it adds fails the type check here (#268).
  */
 function refusedCreation(
   result: Extract<CreateProjectResult, { created: false }>,
 ): ApiError {
   switch (result.refusal) {
+    case "project_limit":
+      return new ApiError("project_limit");
     case "rate_limited":
-      return result.retryAfterMs === null
-        ? new ApiError("project_limit")
-        : new ApiError("rate_limited", {
-            retryAfterSeconds: result.retryAfterMs / 1000,
-          });
+      return new ApiError("rate_limited", {
+        retryAfterSeconds: result.retryAfterMs / 1000,
+      });
     // An account that stopped being an active member after the membership
     // check gets the check's 404.
     case "not_member":
       return new ApiError("not_found");
     case "conflict":
       return new ApiError("conflict");
+    default:
+      return result satisfies never;
   }
 }
 
