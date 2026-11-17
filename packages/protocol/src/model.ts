@@ -312,8 +312,8 @@ export const API_ERROR_STATUS = Object.freeze({
    * not removed (#286). No time frees a place, only removing a repository
    * does, so the answer carries no `Retry-After`. Only
    * `POST /projects/:projectId/repositories` answers it. The Project
-   * Manager decided the code on 2026-11-14 (#286); the limit of 20 stays
-   * provisional.
+   * Manager decided the code on 2026-11-14 and the limit of 20 on
+   * 2026-11-17 (#286).
    */
   repository_limit: 409,
   /**
