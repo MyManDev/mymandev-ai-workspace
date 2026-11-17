@@ -47,6 +47,7 @@ import { registerClaimMarksIpc } from "./claim-marks-ipc.ts";
 import { createClaimMarkService } from "./claims/marks.ts";
 import { createClaimService } from "./claims/service.ts";
 import { createSystemClaimSeenStore } from "./claims/system.ts";
+import { closeOnQuit } from "./close-on-quit.ts";
 import {
   createSystemConnectionClient,
   followSystemResume,
@@ -141,6 +142,18 @@ function start(): void {
   registerRuntimeIpc(ipcMain, rendererUrl, runtime);
   stopRuntimeOnQuit(app, runtime);
 
+  // Every service and IPC registration below that ends at quit is added to
+  // this list right after it is created, and closes with the list's one
+  // `will-quit` listener in the reverse order (close-on-quit.ts): an IPC
+  // registration before its service, and a service before the services that
+  // it uses. The listener comes after the runtime's, which holds back the
+  // first quit until the runtime has stopped; the list closes in that first
+  // `will-quit`, once. A close that throws is reported with fixed text, and
+  // the rest still close.
+  const closables = closeOnQuit(app, (message, error) =>
+    console.error(message, error),
+  );
+
   // Mounted repositories: read with Git and watched, never written. The
   // folder comes from the dialog of the main process, never from the
   // renderer. Watchers stop and Git commands are cancelled at quit.
@@ -158,7 +171,7 @@ function start(): void {
         : await dialog.showOpenDialog(mainWindow, options),
     );
   });
-  app.on("will-quit", () => repositories.close());
+  closables.add(repositories);
 
   // The account: the device key, the sign-in, and the device session (ADR
   // 0014). This instance holds the single-instance lock, so no other
@@ -263,7 +276,7 @@ function start(): void {
     );
   });
   registerConnectionIpc(ipcMain, rendererUrl, connection);
-  app.on("will-quit", () => connection.close());
+  closables.add(connection);
 
   // The account's devices and the end of a registration lock in force (#95,
   // D4 and D5b), read over HTTP once the Account screen asked for them and
@@ -281,9 +294,9 @@ function start(): void {
     connection,
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => devices.close());
+  closables.add(devices);
   const deviceIpc = registerDeviceIpc(ipcMain, rendererUrl, { devices });
-  app.on("will-quit", () => deviceIpc.close());
+  closables.add(deviceIpc);
 
   // The account's workspaces and the selected one's people and projects
   // (#27, #28), read over HTTP and kept current with the workspace's events.
@@ -297,7 +310,7 @@ function start(): void {
     connection,
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => workspaces.close());
+  closables.add(workspaces);
 
   // The agents and runs of the open project (#28), read over HTTP and kept
   // current with the selected workspace's run events through its own resync
@@ -310,7 +323,7 @@ function start(): void {
     workspaces,
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => agents.close());
+  closables.add(agents);
 
   // The agent activity reaches the renderer read-only, with the owners'
   // names resolved in the main process and the newest runs only, at most
@@ -319,7 +332,7 @@ function start(): void {
     agents,
     workspaces,
   });
-  app.on("will-quit", () => agentIpc.close());
+  closables.add(agentIpc);
 
   // The open project's registered repositories (#286), read over HTTP and
   // kept current with the selected workspace's repository events through
@@ -359,13 +372,13 @@ function start(): void {
     },
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => projectRepositories.close());
+  closables.add(projectRepositories);
   const projectRepositoryIpc = registerProjectRepositoryIpc(
     ipcMain,
     rendererUrl,
     { service: projectRepositories },
   );
-  app.on("will-quit", () => projectRepositoryIpc.close());
+  closables.add(projectRepositoryIpc);
   // The development agent switch (#28): only in an unpackaged build, and
   // only when MYMANDEV_DEV_AGENT_SWITCH holds the agent ID that
   // `db:dev-seed` printed and MYMANDEV_DEV_AGENT_DEVICE the device ID that
@@ -387,7 +400,7 @@ function start(): void {
         agents,
         log: (message) => console.info(message),
       });
-      app.on("will-quit", () => devSwitch.close());
+      closables.add(devSwitch);
     }
   }
 
@@ -402,7 +415,7 @@ function start(): void {
     workspaces,
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => chat.close());
+  closables.add(chat);
 
   // Every switch of the project or the workspace that the renderer asks for
   // goes through the chat service's `switchProject` and `selectWorkspace`,
@@ -434,7 +447,7 @@ function start(): void {
   // member IDs, names, roles, and logins, never a user ID, at most one
   // publish every 50 ms. Its waiting publish is cancelled at quit.
   const peopleIpc = registerPeopleIpc(ipcMain, rendererUrl, { workspaces });
-  app.on("will-quit", () => peopleIpc.close());
+  closables.add(peopleIpc);
   // The people actions (#95, D1) have one strict channel each. Each sends
   // one write of the allowlist with the account service, once, and only for
   // the selected workspace; its membership event then changes the people,
@@ -454,12 +467,12 @@ function start(): void {
     workspaces,
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => invitations.close());
+  closables.add(invitations);
   const invitationIpc = registerInvitationIpc(ipcMain, rendererUrl, {
     invitations,
     workspaces,
   });
-  app.on("will-quit", () => invitationIpc.close());
+  closables.add(invitationIpc);
   // The invitation actions (#95, D1 and D2) have one strict channel each,
   // and each is sent once. The code of a new invitation goes to the
   // renderer once, in the answer of the create, and a pasted code goes on
@@ -486,11 +499,11 @@ function start(): void {
     workspaces,
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => joinRequests.close());
+  closables.add(joinRequests);
   const joinRequestIpc = registerJoinRequestIpc(ipcMain, rendererUrl, {
     joinRequests,
   });
-  app.on("will-quit", () => joinRequestIpc.close());
+  closables.add(joinRequestIpc);
   // The join request actions (#95, D1) have one strict channel each, and
   // each is sent once, only for the selected workspace. A decision loads
   // the join requests again, and a pause or a resume the workspace's view.
@@ -512,11 +525,11 @@ function start(): void {
     connection,
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => ownJoinRequests.close());
+  closables.add(ownJoinRequests);
   const ownJoinRequestIpc = registerOwnJoinRequestIpc(ipcMain, rendererUrl, {
     ownJoinRequests,
   });
-  app.on("will-quit", () => ownJoinRequestIpc.close());
+  closables.add(ownJoinRequestIpc);
   // The requester's actions (#95, D1) have one strict channel each, and
   // each is sent once. A create takes the account's display name when the
   // screen gives none. Both load the own join requests again.
@@ -540,9 +553,9 @@ function start(): void {
     seen: createSystemClaimSeenStore(),
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => claims.close());
+  closables.add(claims);
   const claimIpc = registerClaimIpc(ipcMain, rendererUrl, { claims });
-  app.on("will-quit", () => claimIpc.close());
+  closables.add(claimIpc);
 
   // The unseen claims of the other workspaces (#271): after each answer of
   // the workspace list, the recent claims of each other workspace where the
@@ -557,11 +570,11 @@ function start(): void {
     claims,
     log: (message) => console.info(message),
   });
-  app.on("will-quit", () => claimMarks.close());
+  closables.add(claimMarks);
   const claimMarksIpc = registerClaimMarksIpc(ipcMain, rendererUrl, {
     marks: claimMarks,
   });
-  app.on("will-quit", () => claimMarksIpc.close());
+  closables.add(claimMarksIpc);
 
   // The chat reaches the renderer with the authors' names resolved in the
   // main process, within the view's limits and text budget, at most one
@@ -570,7 +583,7 @@ function start(): void {
     chat,
     workspaces,
   });
-  app.on("will-quit", () => chatIpc.close());
+  closables.add(chatIpc);
 
   // A quit, for example with Cmd+Q on macOS, closes the window first. When
   // the person confirms closing it with waiting chat messages, the quit is
