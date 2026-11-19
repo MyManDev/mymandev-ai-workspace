@@ -317,6 +317,14 @@ export const API_ERROR_STATUS = Object.freeze({
    */
   repository_limit: 409,
   /**
+   * A grant over a count limit of `GRANT_COUNT_LIMITS` (#75): an agent that
+   * already holds 100 grants that are not revoked, or a host device whose
+   * agents hold 1,000. No time frees a place, only revoking a grant does, so
+   * the answer carries no `Retry-After` (Project Manager decision of
+   * 2026-11-14). Only `POST /agents/:agentId/grants` answers it.
+   */
+  grant_limit: 409,
+  /**
    * A new device's sign-in on an account that already has 20 active devices
    * (#255). No time frees a place, only revoking one of them does, so the
    * answer carries no `Retry-After`. Only `POST /auth/sign-in` answers it.
