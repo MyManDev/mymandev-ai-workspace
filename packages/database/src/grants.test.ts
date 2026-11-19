@@ -10,6 +10,7 @@ import {
   GrantRecordListResponseSchema,
   type MemberId,
   newId,
+  newUuidV7,
   type PermissionGrantId,
   type ProjectId,
   type ProviderConnectionId,
@@ -19,6 +20,8 @@ import {
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { eq } from "drizzle-orm";
+import { eraseAccount } from "./account-erasure.ts";
+import { disableAccount, enableAccount } from "./account-status.ts";
 import { revokeGrants } from "./cascade.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
@@ -41,6 +44,7 @@ import {
   projects,
   providerConnections,
   repositories,
+  userIdentities,
   users,
   workspaceMembers,
   workspaces,
@@ -448,6 +452,42 @@ test("a grant is refused in order: not_found for the agent or the person, forbid
   }
   assert.equal(await grantCount(), before);
   assert.deepEqual(await grantRowsOf(agentId), []);
+});
+
+test("a disabled account is forbidden before every other refusal, also without the API, and nothing is written; enabled again, it grants", async () => {
+  const { owner, repositoryId, agentId } = await world();
+  const first = await granted(agentId, owner, readRepository(repositoryId));
+  const disabled = await disableAccount(database(), {
+    userId: owner.userId,
+    now: NOW,
+  });
+  assert.deepEqual(disabled, { changed: true, revokedGrantIds: [first] });
+  const before = await grantCount();
+  const agentIds = [
+    ["its own agent", agentId],
+    ["an unknown agent", newId<AgentId>()],
+  ] as const;
+  for (const [label, agent] of agentIds) {
+    assert.deepEqual(
+      await grant(agent, owner, readRepository(repositoryId), LATER),
+      { granted: false, refusal: "forbidden" },
+      label,
+    );
+  }
+  assert.equal(await grantCount(), before);
+
+  const enabled = await enableAccount(database(), {
+    userId: owner.userId,
+    now: LATER,
+  });
+  assert.ok(enabled.changed);
+  const again = await grant(
+    agentId,
+    owner,
+    readRepository(repositoryId),
+    LATER,
+  );
+  assert.ok(again.granted, JSON.stringify(again));
 });
 
 test("a disabled agent, an archived workspace or project, and a removed repository or provider connection are each a conflict, after the refusals of the scope", async () => {
@@ -1268,6 +1308,148 @@ test(
     assert.deepEqual(result, { granted: false, refusal: "not_found" });
     assert.deepEqual(waitedOn, ["workspace_members"]);
     assert.deepEqual(await grantRowsOf(agentId), []);
+  },
+);
+
+test(
+  "a removal of the agent's owner waits at the person for a grant that holds it, and then revokes the new grant",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const alice = await account("Alice");
+    const workspaceId = await workspaceOf(owner);
+    const person = await join(workspaceId, alice);
+    const projectId = await projectIn(workspaceId, owner);
+    const [repositoryId] = await repositoriesIn(projectId, owner);
+    assert.ok(repositoryId);
+    const agentId = await agentOf(projectId, alice);
+    let grantId: PermissionGrantId | undefined;
+    const { result, waitedOn } = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        const created = await grant(
+          agentId,
+          alice,
+          readRepository(repositoryId),
+          NOW,
+          tx,
+        );
+        assert.ok(created.granted, JSON.stringify(created));
+        grantId = created.grant.id;
+      },
+      () =>
+        removeMember(database(), {
+          workspaceId,
+          ...owner,
+          memberId: person,
+          now: LATER,
+        }),
+    );
+    assert.ok(grantId);
+    assert.ok(result.removed, JSON.stringify(result));
+    assert.deepEqual(result.revokedGrantIds, [grantId]);
+    assert.deepEqual(waitedOn, ["workspace_members"]);
+  },
+);
+
+test(
+  "a grant waits for a concurrent disable of its account and is then forbidden; a disable waits for a grant that holds the account's row, and then revokes the new grant",
+  SERVER_ONLY,
+  async () => {
+    const first = await world();
+    const refused = await whileHeld(
+      testDatabase,
+      (tx) => disableAccount(tx, { userId: first.owner.userId, now: NOW }),
+      () =>
+        grant(
+          first.agentId,
+          first.owner,
+          readRepository(first.repositoryId),
+          LATER,
+        ),
+    );
+    assert.deepEqual(refused.result, { granted: false, refusal: "forbidden" });
+    assert.deepEqual(refused.waitedOn, ["users"]);
+    assert.deepEqual(await grantRowsOf(first.agentId), []);
+
+    const { owner, repositoryId, agentId } = await world();
+    let grantId: PermissionGrantId | undefined;
+    const disable = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        const created = await grant(
+          agentId,
+          owner,
+          readRepository(repositoryId),
+          NOW,
+          tx,
+        );
+        assert.ok(created.granted, JSON.stringify(created));
+        grantId = created.grant.id;
+      },
+      () => disableAccount(database(), { userId: owner.userId, now: LATER }),
+    );
+    assert.ok(grantId);
+    assert.deepEqual(disable.result, {
+      changed: true,
+      revokedGrantIds: [grantId],
+    });
+    assert.deepEqual(disable.waitedOn, ["users"]);
+  },
+);
+
+test(
+  "an erasure of the agent's owner waits at the account for a grant that holds it, and then revokes the new grant",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const alice = await account("Alice");
+    await database()
+      .insert(userIdentities)
+      .values({
+        id: newUuidV7(),
+        userId: alice.userId,
+        identityProvider: "github",
+        subject: randomBytes(8).toString("hex"),
+        login: "alice",
+        accountCreatedAt: EARLIER,
+        lastSignInAt: EARLIER,
+      });
+    const workspaceId = await workspaceOf(owner);
+    await join(workspaceId, alice);
+    const projectId = await projectIn(workspaceId, owner);
+    const [repositoryId] = await repositoriesIn(projectId, owner);
+    assert.ok(repositoryId);
+    const agentId = await agentOf(projectId, alice);
+    let grantId: PermissionGrantId | undefined;
+    const { result, waitedOn } = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        const created = await grant(
+          agentId,
+          alice,
+          readRepository(repositoryId),
+          NOW,
+          tx,
+        );
+        assert.ok(created.granted, JSON.stringify(created));
+        grantId = created.grant.id;
+      },
+      () => eraseAccount(database(), { userId: alice.userId, now: LATER }),
+    );
+    assert.ok(grantId);
+    assert.ok(result.erased, JSON.stringify(result));
+    assert.deepEqual(
+      [
+        ...result.endedMemberships.flatMap((ended) => ended.revokedGrantIds),
+        ...result.revokedDevices.flatMap((device) => device.revokedGrantIds),
+      ],
+      [grantId],
+    );
+    assert.deepEqual(waitedOn, ["users"]);
+    const row = await grantRow(grantId);
+    assert.deepEqual(row.revokedAt, LATER);
+    assert.equal(row.revokedByUserId, alice.userId);
   },
 );
 

@@ -24,6 +24,7 @@ import {
   projects,
   providerConnections,
   repositories,
+  users,
   workspaceMembers,
   workspaces,
 } from "./schema/index.ts";
@@ -32,9 +33,11 @@ import {
 // grant records of the agents that a device hosts (#75; ADR 0015, P-74 to
 // P-80; Project Manager decisions of 2026-11-02 and 2026-11-14). The routes
 // and their codes are the protocol's `GRANT_ROUTES` and `GRANT_ROUTE_ERRORS`.
-// Only the agent's owner grants and revokes (P-44), and only from the agent's
-// host device it grants. A grant of `terminal.execute` expires within 30 days,
-// which the CHECK `permission_grants_shell_expiry_check` holds as well.
+// Only the agent's owner grants and revokes (P-44), from any of its devices
+// (recommendation 4, Project Manager decision of 2026-11-14), and only from
+// the agent's host device it grants; a disabled account grants nothing. A
+// grant of `terminal.execute` expires within 30 days, which the CHECK
+// `permission_grants_shell_expiry_check` holds as well.
 //
 // Rules for code that writes grants (P-77), which these functions follow: a
 // row never changes after its insert, except that `revoked_at` and
@@ -49,14 +52,16 @@ import {
 // `lockActor` in the API does; then the agent's owner's person
 // (`workspace_members`); then the project; then the repository or the
 // provider connection; then the agent; then the grant. A grant locks the
-// calling device `FOR NO KEY UPDATE` itself, which the API's `lockActor`
-// already holds, so that the grants of one host device are counted one
-// after another (`GRANT_COUNT_LIMITS`); it is the only device that may
-// grant to the agents it hosts. A device revocation locks the device first
-// too, and then the agents and the grants (`src/cascade.ts`), so either the
-// revocation commits first and the grant finds the agent disabled, or the
-// grant commits first and the revocation revokes it. An erasure locks the
-// account's devices before its people as well. Then the grant locks the
+// account `FOR SHARE` and then the calling device `FOR NO KEY UPDATE`
+// itself, so that it holds both without the API too; the API's `lockActor`
+// already holds both `FOR NO KEY UPDATE`. The device's lock counts the
+// grants of one host device one after another (`GRANT_COUNT_LIMITS`); it is
+// the only device that may grant to the agents it hosts. A device
+// revocation locks the device first too, and then the agents and the grants
+// (`src/cascade.ts`), so either the revocation commits first and the grant
+// finds the agent disabled, or the grant commits first and the revocation
+// revokes it. An erasure locks the account and its devices before its
+// people as well. Then the grant locks the
 // owner's person, the project, the repository or the provider connection,
 // and the agent `FOR SHARE`, as `src/people.ts` and `src/repositories.ts`
 // ask of a writer that inserts a grant, and checks each: a removal of the
@@ -64,20 +69,28 @@ import {
 // `FOR NO KEY UPDATE`, so it either commits first and the grant is refused,
 // or waits and then revokes the new grant. The workspace row is read with
 // the project, not locked: only an erasure archives a workspace. An erasure
-// of the owner's account locks its devices first, where it meets the grant,
+// of the owner's account locks the account first, where it meets the grant,
 // and an erasure of another account archives no workspace in which another
 // active, claimed person remains, as the owner's person that the grant holds
 // is. A revocation locks the owner's person `FOR SHARE` and
 // then the grant `FOR NO KEY UPDATE`, the order of a removal, which locks the
 // person, the agents, and then their grants.
 //
-// A disabled account is the API's check: `lockActor` locks the account
-// first and refuses a disabled one, and `disableAccount` updates the
-// account's row before it revokes the grants of its agents, so the two run
-// one after another.
+// A disabled account is refused here as well as by the API, whose
+// `lockActor` refuses it before any write, so that a caller without
+// `lockActor` cannot grant either. The grant reads the account under its
+// `FOR SHARE` lock, and `disableAccount` updates the account's row before it
+// revokes the grants of its agents, so either the disable commits first and
+// the grant finds the account disabled, or the grant commits first and the
+// disable revokes it. `eraseAccount` locks the account after its identities
+// and before its devices, and the sign-in locks the account after the
+// identity and before the device, so neither takes the grant's locks in
+// another order. The refusal is `forbidden`, the refusal of a caller who may
+// not act, as for an account that is not the agent's owner: it names the
+// caller's own account and reveals nothing of the agent, and `conflict` is
+// the state of the agent and its scope.
 //
-// Provisional (#75): who revokes (the owner only, from any of its devices,
-// recommendation 4), the count limits, the order of the refusals, and the
+// Provisional (#75): the count limits, the order of the refusals, and the
 // order of the records (by grant ID) are settled here with the conservative
 // option and await the Project Manager's confirmation.
 
@@ -210,8 +223,9 @@ export type GrantCapabilityResult =
        * `not_found`: the agent does not exist or is in a workspace that the
        * account is not an active member of, or the scope is not a repository
        * of the agent's project or a provider connection of the agent's host
-       * device; `forbidden`: the account is not the agent's owner, or the
-       * calling device is not the agent's host device; `conflict`: a disabled
+       * device; `forbidden`: the account is disabled or is not the agent's
+       * owner, or the calling device is not the agent's host device;
+       * `conflict`: a disabled
        * agent, an archived workspace, project, or repository, a removed
        * provider connection, or a grant of the same capability on the same
        * scope that is neither revoked nor expired; `grant_limit`: a count
@@ -239,24 +253,25 @@ function sameScope(
 }
 
 /**
- * Grants one capability on one scope to an agent in one transaction (#75):
- * only the agent's owner, from the agent's host device. It locks the calling
- * device `FOR NO KEY UPDATE`, then the owner's active person, the project,
- * the repository or the provider connection, and the agent, each `FOR
- * SHARE`, as the lock order above says, and decides in this order:
+ * Grants one capability on one scope to an agent in one transaction (#75): only
+ * the agent's owner, from the agent's host device. It locks the account `FOR
+ * SHARE`, the calling device `FOR NO KEY UPDATE`, then the owner's active
+ * person, the project, the repository or the provider connection, and the
+ * agent, each `FOR SHARE`, as the lock order above says, and decides in this
+ * order: `forbidden` for a disabled account, before the device is locked;
  * `not_found` for an unknown agent or an account without an active person in
- * its workspace; `forbidden` for an account that is not the agent's owner,
- * then for a calling device that is not its host device; `not_found` for a
- * scope that is not the agent's project's repository or its host device's
- * provider connection; `conflict` for a disabled agent, an archived workspace
- * or project, a removed repository or provider connection, and then for a
- * grant of the same capability on the same scope that is neither revoked nor
- * expired; and `grant_limit` when the agent holds `GRANT_COUNT_LIMITS.perAgent`
- * grants that are not revoked, or the agents of the host device hold
+ * its workspace; `forbidden` for an account that is not the agent's owner, then
+ * for a calling device that is not its host device; `not_found` for a scope
+ * that is not the agent's project's repository or its host device's provider
+ * connection; `conflict` for a disabled agent, an archived workspace or
+ * project, a removed repository or provider connection, and then for a grant of
+ * the same capability on the same scope that is neither revoked nor expired;
+ * and `grant_limit` when the agent holds `GRANT_COUNT_LIMITS.perAgent` grants
+ * that are not revoked, or the agents of the host device hold
  * `GRANT_COUNT_LIMITS.perHostDevice`, an expired grant included until it is
- * revoked. An expired grant of the same capability on the same scope does
- * not count: it is revoked, with the account as the revoker, and replaced in
- * the same transaction (P-77). The new grant gets `created_at` `now` and
+ * revoked. An expired grant of the same capability on the same scope does not
+ * count: it is revoked, with the account as the revoker, and replaced in the
+ * same transaction (P-77). The new grant gets `created_at` `now` and
  * `expires_at` `now` plus `lifetimeSeconds`, or null. Inside another
  * transaction it runs as a savepoint.
  */
@@ -268,6 +283,14 @@ export async function grantCapability(
     db.transaction(async (tx): Promise<GrantCapabilityResult> => {
       const refuse = (refusal: GrantRefusal | "grant_limit") =>
         ({ granted: false, refusal }) as const;
+      const [account] = await tx
+        .select({ disabledAt: users.disabledAt })
+        .from(users)
+        .where(eq(users.id, input.userId))
+        .for("share");
+      if (account !== undefined && account.disabledAt !== null) {
+        return refuse("forbidden");
+      }
       await tx
         .select({ id: devices.id })
         .from(devices)
