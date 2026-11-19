@@ -74,6 +74,7 @@ import { registerOwnJoinRequestIpc } from "./own-join-request-ipc.ts";
 import { createOwnJoinRequestService } from "./own-join-requests/service.ts";
 import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
+import { createGrantStore } from "./permissions/grant-store.ts";
 import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
 import {
@@ -324,6 +325,20 @@ function start(): void {
     log: (message) => console.info(message),
   });
   closables.add(agents);
+
+  // The grant store of the permission enforcement point (#55): the last
+  // answer of `GET /grant-records`, usable only while the selected
+  // workspace's connection is live and the records were read again since its
+  // last `workspace.subscribed`. Nothing checks with it yet; the runtime
+  // will re-check its running work on `onGrantsChanged`. The logs are fixed
+  // text with a failure code at most, never an ID.
+  const grantStore = createGrantStore({
+    account,
+    connection,
+    workspaces,
+    log: (message) => console.info(message),
+  });
+  closables.add(grantStore);
 
   // The agent activity reaches the renderer read-only, with the owners'
   // names resolved in the main process and the newest runs only, at most

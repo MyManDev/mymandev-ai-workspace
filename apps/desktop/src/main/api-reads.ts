@@ -1,9 +1,10 @@
 // The reads of workspace, chat, and agent data that the main process may
 // send to the API for #27 and #28, and the reads of invitations, join
 // requests, and claims for the screens of #95 (decision D1 of 2026-11-06,
-// and D8 of 2026-11-13), and of a project's registered repositories (#286):
-// a frozen allowlist of eleven `GET` routes, each with the protocol's
-// response schema and a fixed cap on the size of its answer.
+// and D8 of 2026-11-13), of a project's registered repositories (#286), and
+// of this device's grant records for the grant store (#55): a frozen
+// allowlist of twelve `GET` routes, each with the protocol's response schema
+// and a fixed cap on the size of its answer.
 // The account service sends them with the device session
 // (`readWorkspaceData`); no IPC channel and no bridge member reach them.
 // Chat messages are sent over the connection, never here.
@@ -21,6 +22,9 @@ import {
   ChatHistoryResponseSchema,
   type ClaimListResponse,
   ClaimListResponseSchema,
+  GRANT_ROUTES,
+  type GrantRecordListResponse,
+  GrantRecordListResponseSchema,
   type InvitationListResponse,
   InvitationListResponseSchema,
   type JoinRequestListResponse,
@@ -89,7 +93,8 @@ function read<T>(
  * 0.69 MB, and 1,000 of the account's own join requests about 0.52 MB. For
  * the claim notices (D8), 1,000 claims are about 0.33 MB; the server sends
  * 50. For #286, 1,000 repositories with names of 100 four-byte characters
- * are about 0.57 MB; a project holds 20.
+ * are about 0.57 MB; a project holds 20. For #55, 1,000 grant records with
+ * every fact and time set are about 1.12 MB.
  */
 export const WORKSPACE_READS = Object.freeze({
   /** `GET /workspaces`: the account's workspaces. */
@@ -179,6 +184,16 @@ export const WORKSPACE_READS = Object.freeze({
     RepositoryListResponseSchema,
     1 * MIB,
   ),
+  /**
+   * `GET /grant-records`: the grant records of the agents that this device
+   * hosts, for the grant store (#55) only.
+   */
+  listGrantRecords: read(
+    GRANT_ROUTES.listGrantRecords,
+    [],
+    GrantRecordListResponseSchema,
+    2 * MIB,
+  ),
 });
 export type WorkspaceReadName = keyof typeof WORKSPACE_READS;
 
@@ -198,6 +213,7 @@ export interface WorkspaceReadParams {
   readonly listOwnJoinRequests: NoParams;
   readonly listClaims: { readonly workspaceId: WorkspaceId };
   readonly listRepositories: { readonly projectId: ProjectId };
+  readonly listGrantRecords: NoParams;
 }
 
 /**
@@ -222,6 +238,7 @@ export interface WorkspaceReadQuery {
   readonly listOwnJoinRequests: never;
   readonly listClaims: never;
   readonly listRepositories: never;
+  readonly listGrantRecords: never;
 }
 
 /** The answer of each read, as its response schema parsed it. */
@@ -237,6 +254,7 @@ export interface WorkspaceReadAnswer {
   readonly listOwnJoinRequests: OwnJoinRequestListResponse;
   readonly listClaims: ClaimListResponse;
   readonly listRepositories: RepositoryListResponse;
+  readonly listGrantRecords: GrantRecordListResponse;
 }
 
 /**
