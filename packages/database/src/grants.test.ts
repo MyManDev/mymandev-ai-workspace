@@ -1410,7 +1410,8 @@ test(
         id: newUuidV7(),
         userId: alice.userId,
         identityProvider: "github",
-        subject: randomBytes(8).toString("hex"),
+        // A GitHub subject is a decimal ID without a leading zero.
+        subject: String(BigInt(`0x${randomBytes(6).toString("hex")}`) + 1n),
         login: "alice",
         accountCreatedAt: EARLIER,
         lastSignInAt: EARLIER,
