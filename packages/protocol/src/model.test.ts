@@ -226,6 +226,7 @@ test("every API error code has its fixed HTTP status", () => {
     project_limit: 409,
     run_limit: 409,
     repository_limit: 409,
+    grant_limit: 409,
     device_limit: 409,
     device_daily_limit: 429,
     rate_limited: 429,

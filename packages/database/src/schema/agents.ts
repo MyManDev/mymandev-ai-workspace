@@ -310,6 +310,11 @@ export const permissionGrants = pgTable(
   },
   (t) => [
     index("permission_grants_project_id_idx").on(t.projectId),
+    // The grants of a host device that are not revoked: its count limit and
+    // its grant records (#75).
+    index("permission_grants_active_host_device_id_idx")
+      .on(t.hostDeviceId)
+      .where(sql`${t.revokedAt} is null`),
     check(
       "permission_grants_capability_check",
       sql`${t.capability} in ('repo.read', 'repo.write', 'terminal.execute', 'git.commit', 'git.push', 'provider.use')`,
@@ -327,6 +332,14 @@ export const permissionGrants = pgTable(
     check(
       "permission_grants_expiry_check",
       sql`${t.expiresAt} is null or ${t.expiresAt} > ${t.createdAt}`,
+    ),
+    // A grant of terminal.execute always expires, within 30 days (720 hours)
+    // of its creation, the protocol's SHELL_GRANT_MAX_LIFETIME_SECONDS (#75,
+    // Project Manager decision of 2026-11-14, which narrows ADR 0015, P-71,
+    // for the shell only).
+    check(
+      "permission_grants_shell_expiry_check",
+      sql`${t.capability} <> 'terminal.execute' or (${t.expiresAt} is not null and ${t.expiresAt} <= ${t.createdAt} + interval '720 hours')`,
     ),
     // One non-revoked grant per agent, capability and repository. An expired
     // grant keeps its slot until it is revoked, because an index predicate

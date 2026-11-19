@@ -188,6 +188,17 @@ export {
   type RemoveRepositoryResult,
 } from "./repositories.ts";
 export {
+  grantCapability,
+  type GrantCapabilityInput,
+  type GrantCapabilityResult,
+  type GrantRefusal,
+  listGrantRecords,
+  type ListGrantRecordsInput,
+  revokeGrant,
+  type RevokeGrantInput,
+  type RevokeGrantResult,
+} from "./grants.ts";
+export {
   listChatMessages,
   type ListChatMessagesInput,
   type ListChatMessagesResult,
