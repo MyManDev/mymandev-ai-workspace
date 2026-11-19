@@ -7,27 +7,33 @@
 // - Freshness. A read is usable only while the selected workspace's
 //   connection is live and the records were read again since its last
 //   `workspace.subscribed`: a read sent before that frame does not count.
-//   A lost or closed connection, a sign-out, another device or account,
-//   another selected workspace, the end or refusal of its subscription, a
-//   failed or refused read, and a list that the schema or the identity
-//   check refuses make the store unusable at once, so every check denies.
-// - Reads. After each `workspace.subscribed` of the selected workspace; on
-//   `agent.grant.created` (the event names no device, and only the agent's
-//   host device grants, so the store cannot tell a grant of this device
-//   from another's) and on `agent.grant.revoked` for an agent that the held
-//   records name, or while a read is on its way; and on the changes that
-//   revoke grants in their own transaction (P-77): `workspace.member.removed`,
-//   a server cancellation that disabled agents (`agent.run.state_changed`
-//   with a code of `RUN_CANCEL_REASONS`; no event reports a disabled agent),
-//   `account.device_revoked`, and `workspace.repository.removed`. Reads are
-//   merged like the claim service's: while one is on its way, one more
-//   follows its answer, which is dropped; a failed read is retried with the
-//   workspace service's backoff while connected. An event never changes a
-//   record; it only starts a read (P-76).
-// - One answer. `read()` gives the records of one answer, frozen, or not
-//   usable. Only records of the selected workspace are kept, because only
-//   its events reach this device; the answer must name this device and the
-//   account of the connection, or it is refused.
+//   A lost or closed connection (#316 bounds how long a silently lost one
+//   stays connected), a sign-out, another device, another selected
+//   workspace, the end or refusal of its subscription, a failed or refused
+//   read, and a list that the schema or the identity check refuses make the
+//   store unusable at once, so every check denies.
+// - Reads. After each `workspace.subscribed` of the selected workspace;
+//   every `GRANT_REREAD_INTERVAL_MS` while it stays live, for revocations
+//   that send no event and for missed events; on `agent.grant.created` (the
+//   event names no device, and only the agent's host device grants, so the
+//   store cannot tell a grant of this device from another's) and on
+//   `agent.grant.revoked` for an agent that the held records name, or while
+//   a read is on its way; and on the changes that revoke grants in their own
+//   transaction (P-77): `workspace.member.removed`, a server cancellation
+//   that disabled agents (`agent.run.state_changed` with a code of
+//   `RUN_CANCEL_REASONS`; no event reports a disabled agent), the account
+//   frame `account.device_revoked`, and `workspace.repository.removed`.
+//   Reads are merged like the claim service's: while one is on its way, one
+//   more follows its answer; a failed read is retried with the workspace
+//   service's backoff while connected.
+// - Revocations. `agent.grant.revoked` leaves its grant out of `read()` at
+//   once, until a read sent after the event answers (decision 1 of
+//   2026-11-19 on #315). An event never adds or changes a record.
+// - One answer. `read()` gives the records of one answer without the grants
+//   revoked since, frozen, or not usable. Only records of the selected
+//   workspace are kept, because only its events reach this device; the
+//   answer must name this device and the account of the connection, or it is
+//   refused.
 // - The change signal. `onGrantsChanged` calls its listeners whenever the
 //   records change, the store becomes unusable, or a held grant reaches its
 //   `expiresAt`. The future runtime re-checks its running work with the
@@ -66,6 +72,12 @@ import type { GrantStore, GrantStoreRead } from "./enforcement.ts";
  */
 const MAX_TIMER_MS = 2 ** 31 - 1;
 
+/**
+ * How long a live store waits after sending a read before it reads again
+ * (decision 3 of 2026-11-19 on #315).
+ */
+export const GRANT_REREAD_INTERVAL_MS = 5 * 60_000;
+
 /** The part of the connection client that the store uses: no way to send. */
 export type GrantStoreConnection = Pick<
   ConnectionClient,
@@ -81,6 +93,8 @@ export interface GrantStoreOptions {
   readonly workspaces: Pick<WorkspaceService, "state" | "onChange">;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
+  /** Defaults to `GRANT_REREAD_INTERVAL_MS`. */
+  readonly rereadIntervalMs?: number;
   /** The wall clock in milliseconds, for the expiry signal; defaults to `Date.now`. */
   readonly wallClock?: () => number;
   /**
@@ -147,20 +161,16 @@ function frozenRecord(record: GrantRecord): GrantRecord {
 }
 
 /**
- * The signed-in device with a ready key, as its ID and its account's login,
- * or null.
+ * The ID of the signed-in device with a ready key, or null. The login is left
+ * out: a changed login of the same device keeps the records, whose account is
+ * checked against the connection's `userId`.
  */
-function signedInDevice(
-  status: AccountStatus,
-): { readonly deviceId: string; readonly key: string } | null {
+function signedInDevice(status: AccountStatus): string | null {
   return status.apiOrigin === "set" &&
     status.device === "signed_in" &&
     status.deviceKey === "ready" &&
     status.account.kind === "signed_in"
-    ? {
-        deviceId: status.account.deviceId,
-        key: `${status.account.deviceId} ${status.account.login}`,
-      }
+    ? status.account.deviceId
     : null;
 }
 
@@ -198,6 +208,7 @@ export function createGrantStore(
   const { account, connection, workspaces } = options;
   const schedule = options.scheduleTimer ?? scheduleWithSetTimeout;
   const wallClock = options.wallClock ?? (() => Date.now());
+  const rereadIntervalMs = options.rereadIntervalMs ?? GRANT_REREAD_INTERVAL_MS;
 
   function log(message: string): void {
     try {
@@ -208,8 +219,8 @@ export function createGrantStore(
   }
 
   let closed = false;
-  /** The signed-in device, or null. */
-  let device: ReturnType<typeof signedInDevice> = null;
+  /** The ID of the signed-in device, or null. */
+  let device: string | null = null;
   let connected = false;
   let selected: WorkspaceId | null = null;
   /** Whether `workspace.subscribed` of `selected` came on this connection. */
@@ -217,13 +228,23 @@ export function createGrantStore(
   /** Changes at every drop; an answer of an earlier epoch is dropped. */
   let epoch = 0;
   let inFlight = false;
-  /** A trigger came while a read was on its way: its answer is dropped. */
+  /** A trigger came while a read was on its way: one more read follows it. */
   let again = false;
+  /** The reads sent so far; the number of each read. */
+  let sentReads = 0;
   /** The failed reads in a row, for the backoff. */
   let attempt = 0;
   let cancelRetry: (() => void) | null = null;
+  let cancelReread: (() => void) | null = null;
   let cancelExpiry: (() => void) | null = null;
 
+  /** The selected workspace's records of the held answer, or null while unusable. */
+  let held: readonly GrantRecord[] | null = null;
+  /**
+   * The grants of `agent.grant.revoked` events not yet covered by an answer,
+   * each with `sentReads` at its event: only a later read's answer covers it.
+   */
+  const revoked = new Map<string, number>();
   /** The read that `read()` gives. */
   let current: GrantStoreRead = UNUSABLE;
   /** The records of `current` as JSON, or null while unusable. */
@@ -235,11 +256,17 @@ export function createGrantStore(
   const listeners = new Set<() => void>();
 
   function setUnusable(): void {
+    held = null;
     current = UNUSABLE;
     currentKey = null;
   }
 
-  function setRecords(records: readonly GrantRecord[]): void {
+  /** Sets `current` to the held records without the revoked grants. */
+  function setCurrent(): void {
+    if (held === null) {
+      return;
+    }
+    const records = held.filter((record) => !revoked.has(record.grant.id));
     const key = JSON.stringify(records);
     if (key === currentKey) {
       return;
@@ -319,13 +346,19 @@ export function createGrantStore(
     cancelRetry = null;
   }
 
-  /** Drops the records and the answers on their way: unusable at once. */
+  /**
+   * Drops the records, the revoked grants, and the answers on their way:
+   * unusable at once.
+   */
   function drop(): void {
     epoch += 1;
     inFlight = false;
     again = false;
     attempt = 0;
     stopRetry();
+    cancelReread?.();
+    cancelReread = null;
+    revoked.clear();
     setUnusable();
   }
 
@@ -337,8 +370,8 @@ export function createGrantStore(
   }
 
   /**
-   * Reads the records. While a read is on its way, its answer is dropped and
-   * they are read again after it; while a retry waits, the retry reads them.
+   * Reads the records. While a read is on its way, they are read again after
+   * its answer; while a retry waits, the retry reads them.
    */
   function request(): void {
     if (!mayRead()) {
@@ -357,19 +390,31 @@ export function createGrantStore(
   function send(): void {
     inFlight = true;
     again = false;
+    sentReads += 1;
+    const number = sentReads;
     const sent = epoch;
     const identity = connection.identity();
+    cancelReread?.();
+    cancelReread = schedule(
+      () =>
+        run(() => {
+          cancelReread = null;
+          request();
+        }),
+      rereadIntervalMs,
+    );
     void account
       .readWorkspaceData("listGrantRecords", {})
       .catch((): WorkspaceReadResult<never> => ({
         ok: false,
         reason: "unavailable",
       }))
-      .then((result) => run(() => answered(sent, identity, result)));
+      .then((result) => run(() => answered(sent, number, identity, result)));
   }
 
   function answered(
     sent: number,
+    number: number,
     sentIdentity: ConnectionIdentity | null,
     result: WorkspaceReadResult<GrantRecordListResponse>,
   ): void {
@@ -377,38 +422,56 @@ export function createGrantStore(
       return;
     }
     inFlight = false;
-    if (!result.ok) {
-      // A failed read is not a usable read, also when a newer one follows.
-      setUnusable();
-    }
-    if (again && (result.ok || result.reason !== "rate_limited")) {
-      // A trigger came after this read was sent: only a newer answer counts.
+    const failure = accept(number, sentIdentity, result);
+    if (again && failure !== "rate_limited") {
+      // A trigger came after this read was sent: one more read follows. An
+      // accepted answer is held meanwhile, because it is newer than the one
+      // held before.
       request();
       return;
     }
     again = false;
+    if (failure !== null) {
+      readFailed(failure);
+    }
+  }
+
+  /**
+   * Holds the answer of read `number`, or makes the store unusable and gives
+   * the reason.
+   */
+  function accept(
+    number: number,
+    sentIdentity: ConnectionIdentity | null,
+    result: WorkspaceReadResult<GrantRecordListResponse>,
+  ): WorkspaceReadFailure | null {
     if (!result.ok) {
-      readFailed(result.reason);
-      return;
+      setUnusable();
+      return result.reason;
     }
     const identity = connection.identity();
     if (
       identity === null ||
-      identity.deviceId !== device?.deviceId ||
+      identity.deviceId !== device ||
       !sameIdentity(identity, sentIdentity) ||
       !namesIdentity(result.value.records, identity)
     ) {
       // The answer names another device or account than the connection.
       setUnusable();
-      readFailed("failed");
-      return;
+      return "failed";
     }
     attempt = 0;
-    setRecords(
-      result.value.records.filter(
-        (record) => record.facts.project.workspaceId === selected,
-      ),
+    for (const [grantId, readsAtEvent] of revoked) {
+      if (readsAtEvent < number) {
+        // This read was sent after the event.
+        revoked.delete(grantId);
+      }
+    }
+    held = result.value.records.filter(
+      (record) => record.facts.project.workspaceId === selected,
     );
+    setCurrent();
+    return null;
   }
 
   function readFailed(reason: WorkspaceReadFailure): void {
@@ -430,7 +493,7 @@ export function createGrantStore(
 
   function accountChanged(status: AccountStatus): void {
     const next = signedInDevice(status);
-    if (next?.key !== device?.key) {
+    if (next !== device) {
       device = next;
       subscribed = false;
       drop();
@@ -500,9 +563,12 @@ export function createGrantStore(
         request();
         return;
       case "agent.grant.revoked":
+        // The grant is left out at once, also of an answer on its way.
+        revoked.set(event.payload.grantId, sentReads);
+        setCurrent();
         if (
           inFlight ||
-          current.records.some(
+          (held ?? []).some(
             (record) =>
               record.grant.granteeAgentId === event.payload.granteeAgentId,
           )

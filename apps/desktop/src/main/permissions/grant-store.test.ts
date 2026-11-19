@@ -19,6 +19,7 @@ import {
 } from "../workspace/service.ts";
 import {
   createGrantStore,
+  GRANT_REREAD_INTERVAL_MS,
   type GrantStoreOptions,
   type GrantStoreService,
 } from "./grant-store.ts";
@@ -41,8 +42,11 @@ const OTHER_AGENT = id(0xe2);
 const REPOSITORY = id(0xf1);
 const GRANT = id(0x101);
 const SECOND_GRANT = id(0x102);
+const THIRD_GRANT = id(0x103);
 const T0 = "2026-11-19T10:00:00.000Z";
 const NOW = Date.parse("2026-11-19T12:00:00.000Z");
+/** The injected interval of the rereads, unlike every other delay here. */
+const REREAD_MS = 123_456;
 
 interface RecordOptions {
   readonly grantId?: string;
@@ -157,15 +161,12 @@ function grantCreated(
   );
 }
 
-function grantRevoked(
-  agentId = AGENT,
-  workspaceId: WorkspaceId = WORKSPACE,
-): ServerMessage {
-  return event(
-    "agent.grant.revoked",
-    { grantId: GRANT, granteeAgentId: agentId, revokedAt: T0 },
-    workspaceId,
-  );
+function grantRevoked(agentId = AGENT, grantId = GRANT): ServerMessage {
+  return event("agent.grant.revoked", {
+    grantId,
+    granteeAgentId: agentId,
+    revokedAt: T0,
+  });
 }
 
 function runCancelled(reason: string): ServerMessage {
@@ -221,7 +222,7 @@ const TRIGGERS: readonly (readonly [string, () => ServerMessage])[] = [
 const NOT_TRIGGERS: readonly (readonly [string, () => ServerMessage])[] = [
   [
     "agent.grant.revoked of an agent that no record names",
-    () => grantRevoked(OTHER_AGENT),
+    () => grantRevoked(OTHER_AGENT, SECOND_GRANT),
   ],
   [
     "agent.grant.created of another workspace",
@@ -269,7 +270,9 @@ interface Read {
   readonly resolve: (result: ListResult) => void;
 }
 
-function setup() {
+/** `rereadIntervalMs` null leaves the default. */
+function setup(rereadIntervalMs: number | null = REREAD_MS) {
+  const rereadMs = rereadIntervalMs ?? GRANT_REREAD_INTERVAL_MS;
   let status = signedIn();
   let connectionState = "connected";
   let identity: ConnectionIdentity | null = {
@@ -335,6 +338,7 @@ function setup() {
         timer.active = false;
       };
     },
+    ...(rereadIntervalMs === null ? {} : { rereadIntervalMs }),
     wallClock: () => wallClock,
     log: (message) => logs.push(message),
   };
@@ -353,10 +357,28 @@ function setup() {
       statusListeners.size +
       messageListeners.size +
       workspaceListeners.size,
+    /** The delays of the active timers other than the reread. */
     pending: () =>
-      timers.filter((timer) => timer.active).map((timer) => timer.delayMs),
+      timers
+        .filter((timer) => timer.active && timer.delayMs !== rereadMs)
+        .map((timer) => timer.delayMs),
+    /** The active reread timers. */
+    rereads: () =>
+      timers.filter((timer) => timer.active && timer.delayMs === rereadMs)
+        .length,
+    /** Fires the active timers other than the reread. */
     fire() {
-      for (const timer of timers.filter((entry) => entry.active)) {
+      for (const timer of timers.filter(
+        (entry) => entry.active && entry.delayMs !== rereadMs,
+      )) {
+        timer.active = false;
+        timer.callback();
+      }
+    },
+    fireReread() {
+      for (const timer of timers.filter(
+        (entry) => entry.active && entry.delayMs === rereadMs,
+      )) {
         timer.active = false;
         timer.callback();
       }
@@ -468,7 +490,6 @@ const DROPS: readonly (readonly [
   ["the connection is closed", (h) => h.setConnection("offline")],
   ["a sign-out", (h) => h.setAccount(SIGNED_OUT)],
   ["another device", (h) => h.setAccount(signedIn(OTHER_DEVICE))],
-  ["another account", (h) => h.setAccount(signedIn(DEVICE, "hubot"))],
   [
     "the workspace service signs out",
     (h) => h.setWorkspaces({ status: "signed_out" }),
@@ -608,26 +629,28 @@ test("a revocation of an agent that no record names reads while a read is on its
   h.receive(grantCreated(OTHER_AGENT));
   expect(h.reads).toHaveLength(2);
   // The answer on its way may hold the revoked grant.
-  h.receive(grantRevoked(OTHER_AGENT));
+  h.receive(grantRevoked(OTHER_AGENT, SECOND_GRANT));
   await h.answer(
     1,
     list(record(), record({ grantId: SECOND_GRANT, agentId: OTHER_AGENT })),
   );
+  expect(h.store.read().records).toEqual([record()]);
   expect(h.reads).toHaveLength(3);
   await h.answer(2, list(record()));
   expect(h.store.read().records).toEqual([record()]);
 });
 
-test("reads merge: triggers during a read drop its answer and read once more", async () => {
+test("reads merge: triggers during a read keep its answer and read once more", async () => {
   const h = await live();
   h.receive(grantCreated());
-  h.receive(grantRevoked());
+  h.receive(grantRevoked(OTHER_AGENT, SECOND_GRANT));
   h.receive(grantCreated());
   h.receive(runCancelled("member_removed"));
   expect(h.reads).toHaveLength(2);
-  await h.answer(1, list());
-  // The answer was dropped: the records of the first answer stay.
-  expect(h.store.read().records).toEqual([record()]);
+  const newer = record({ grantId: THIRD_GRANT });
+  await h.answer(1, list(record(), newer));
+  // The answer is newer than the held one, so it is kept.
+  expect(h.store.read().records).toEqual([record(), newer]);
   expect(h.reads).toHaveLength(3);
   await h.answer(2, list());
   expect(h.store.read()).toEqual({ usable: true, records: [] });
@@ -676,6 +699,80 @@ test("a failed read is retried with the backoff while connected, and triggers wa
   expect(h.reads).toHaveLength(8);
 });
 
+test("a live store reads again on the interval, merged with the other reads", async () => {
+  // Nothing waits before the first read.
+  const h = setup();
+  expect(h.rereads()).toBe(0);
+  h.receive(subscribed());
+  expect(h.rereads()).toBe(1);
+  await h.answer(0, list(record()));
+  h.fireReread();
+  expect(h.reads).toHaveLength(2);
+  expect(h.rereads()).toBe(1);
+  await h.answer(1, list());
+  expect(h.store.read()).toEqual({ usable: true, records: [] });
+
+  // During a read, the interval reads once after its answer.
+  h.fireReread();
+  h.receive(grantCreated());
+  expect(h.reads).toHaveLength(3);
+  await h.answer(2, list(record()));
+  expect(h.reads).toHaveLength(4);
+  await h.answer(3, list(record()));
+
+  // A failed reread makes it unusable; while its retry waits, the interval
+  // does not read, and the retry does.
+  h.fireReread();
+  await h.answer(4, failed("failed"));
+  expect(h.store.read().usable).toBe(false);
+  expect(h.pending()).toEqual([WORKSPACE_RETRY_BASE_MS]);
+  h.fireReread();
+  expect(h.reads).toHaveLength(5);
+  h.fire();
+  expect(h.reads).toHaveLength(6);
+  await h.answer(5, list(record()));
+  expect(h.store.read().usable).toBe(true);
+});
+
+test("the interval defaults to 5 minutes, keeps one timer, and stops on each drop", async () => {
+  expect(GRANT_REREAD_INTERVAL_MS).toBe(5 * 60_000);
+  const d = setup(null);
+  d.receive(subscribed());
+  expect(d.rereads()).toBe(1);
+
+  for (const [name, drop] of DROPS) {
+    const h = await live();
+    expect(h.rereads(), name).toBe(1);
+    drop(h);
+    expect(h.rereads(), name).toBe(0);
+  }
+  // A trigger's read restarts the wait: one timer at a time.
+  const h = await live();
+  h.receive(grantCreated());
+  expect(h.rereads()).toBe(1);
+});
+
+test("a changed login of the same device keeps the records and the read on its way", async () => {
+  const h = await live();
+  h.receive(grantCreated());
+  h.setAccount(signedIn(DEVICE, "hubot"));
+  expect(h.store.read().records).toEqual([record()]);
+  expect(h.signals()).toBe(1);
+  const added = record({ grantId: SECOND_GRANT });
+  await h.answer(1, list(record(), added));
+  expect(h.store.read().records).toEqual([record(), added]);
+});
+
+test("an answer is refused when the connection's device is not the account's", async () => {
+  const h = await live();
+  // The connection and the answer agree on another device than the account.
+  h.setIdentity({ userId: USER, deviceId: OTHER_DEVICE } as ConnectionIdentity);
+  h.receive(grantCreated());
+  await h.answer(1, list(record({ hostDeviceId: OTHER_DEVICE })));
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+  expect(h.logs).toEqual(["The grant records did not load (failed)."]);
+});
+
 test("read() gives one snapshot of one answer, frozen, until the next answer", async () => {
   const other = record({ grantId: SECOND_GRANT, agentId: OTHER_AGENT });
   const h = await live(record(), other);
@@ -709,18 +806,75 @@ test("only the selected workspace's records are kept", async () => {
   expect(h.store.read().records).toEqual([record()]);
 });
 
-test("an event never builds or removes a record; only the read's answer does", async () => {
+test("an event never adds or changes a record; only the read's answer does", async () => {
   const h = await live();
   const before = h.store.read();
   h.receive(grantCreated(OTHER_AGENT));
-  h.receive(grantRevoked());
+  h.receive(grantCreated());
   expect(h.store.read()).toBe(before);
   expect(h.signals()).toBe(1);
-  await h.answer(1, list());
-  // The second trigger came during the read, so its answer was dropped.
+  const added = record({ grantId: SECOND_GRANT, agentId: OTHER_AGENT });
+  await h.answer(1, list(record(), added));
+  expect(h.store.read().records).toEqual([record(), added]);
+});
+
+test("ten rounds of agent.grant.created during reads: read() gives the newest answer", async () => {
+  const h = await live();
+  h.receive(grantCreated());
+  for (let round = 1; round <= 10; round += 1) {
+    h.receive(grantCreated());
+    const newest = record({ grantId: id(0x400 + round) });
+    await h.answer(round, list(newest));
+    expect(h.store.read().records, `round ${round}`).toEqual([newest]);
+    expect(h.reads).toHaveLength(round + 2);
+  }
+  await h.answer(11, list(record()));
+  expect(h.store.read().records).toEqual([record()]);
+  expect(h.reads).toHaveLength(12);
+});
+
+test("agent.grant.revoked leaves its grant out at once and signals", async () => {
+  const other = record({ grantId: SECOND_GRANT, agentId: OTHER_AGENT });
+  const h = await live(record(), other);
+  h.receive(grantRevoked());
+  expect(h.store.read().records).toEqual([other]);
+  expect(h.signals()).toBe(2);
+  // The revocation of a grant that is not held changes nothing.
+  const before = h.store.read();
+  h.receive(grantRevoked(OTHER_AGENT, THIRD_GRANT));
   expect(h.store.read()).toBe(before);
-  await h.answer(2, list());
+  expect(h.signals()).toBe(2);
+});
+
+test("a revoked grant stays out of an answer to a read sent before its event", async () => {
+  const h = await live();
+  h.receive(grantCreated());
+  h.receive(grantRevoked());
+  expect(h.store.read()).toEqual({ usable: true, records: [] });
+  await h.answer(1, list(record()));
+  expect(h.store.read()).toEqual({ usable: true, records: [] });
+  expect(h.signals()).toBe(2);
+});
+
+test("a revoked grant is cleared once a read sent after its event answers", async () => {
+  const h = await live();
+  h.receive(grantRevoked());
   expect(h.store.read().records).toEqual([]);
+  expect(h.reads).toHaveLength(2);
+  // The answer of a read sent after the event is the server's word.
+  await h.answer(1, list(record()));
+  expect(h.store.read().records).toEqual([record()]);
+});
+
+test("a revocation before a drop does not outlive the next subscription's answer", async () => {
+  const h = await live();
+  h.receive(grantRevoked());
+  h.setConnection("waiting");
+  h.setConnection("connected");
+  h.setIdentity({ userId: USER, deviceId: DEVICE } as ConnectionIdentity);
+  h.receive(subscribed());
+  await h.answer(2, list(record()));
+  expect(h.store.read().records).toEqual([record()]);
 });
 
 test("the change signal follows changed records, unusable states, and expiries", async () => {
@@ -771,7 +925,7 @@ test("the change signal follows changed records, unusable states, and expiries",
   e.fire();
   expect(e.signals()).toBe(3);
   expect(e.pending()).toEqual([]);
-  // Unusable cancels the expiry timer.
+  // A held grant whose expiry has passed schedules no timer.
   e.receive(grantCreated());
   await e.answer(1, list(record({ expiresAt: late })));
   expect(e.pending()).toHaveLength(0);
@@ -810,10 +964,12 @@ test("close stops listening, cancels the timers, signals once, and stays unusabl
   h.receive(grantCreated());
   expect(h.listeners()).toBe(4);
   expect(h.pending()).toEqual([60_000]);
+  expect(h.rereads()).toBe(1);
   h.store.close();
   h.store.close();
   expect(h.listeners()).toBe(0);
   expect(h.pending()).toEqual([]);
+  expect(h.rereads()).toBe(0);
   expect(h.signals()).toBe(2);
   expect(h.store.read()).toEqual({ usable: false, records: [] });
   await h.answer(1, list(record()));
