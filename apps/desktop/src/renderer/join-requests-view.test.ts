@@ -1586,3 +1586,22 @@ test("an action of another kind ends the sentence of the last action or refresh,
   await done;
   expect(running.last().message).toBe("The request was denied.");
 });
+
+test("a refresh empties the sentence at its start, so that the same answer twice is a new sentence (#319)", async () => {
+  let release: () => void = () => undefined;
+  const load = () =>
+    new Promise<JoinRequestLoadResult>((done) => {
+      release = () => done({ outcome: "refused", reason: "too_soon" });
+    });
+  const { actions, last } = controllerWith({ load });
+  const first = actions.refresh();
+  release();
+  await first;
+  expect(last().message).toBe(JOIN_REQUEST_REFRESH_MESSAGES.too_soon);
+  const second = actions.refresh();
+  // The start empties the sentence, so that the same one is new again.
+  expect(last().message).toBeUndefined();
+  release();
+  await second;
+  expect(last().message).toBe(JOIN_REQUEST_REFRESH_MESSAGES.too_soon);
+});

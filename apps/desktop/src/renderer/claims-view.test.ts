@@ -954,3 +954,23 @@ test("an action of another kind ends the refresh's sentence, once, and a later s
   claims.listChanged(known(), listed({ revision: CLAIMS.revision + 1 }));
   expect(last().message).toBeUndefined();
 });
+
+test("a refresh empties the sentence at its start, so that the same answer twice is a new sentence (#319)", async () => {
+  let release: () => void = () => undefined;
+  const load = () =>
+    new Promise<ClaimLoadResult>((done) => {
+      release = () => done({ outcome: "refused", reason: "too_soon" });
+    });
+  const { claims, last } = controllerWith({ load });
+  claims.listChanged(known(), listed());
+  const first = claims.refresh();
+  release();
+  await first;
+  expect(last().message).toBe(CLAIM_REFRESH_MESSAGES.too_soon);
+  const second = claims.refresh();
+  // The start empties the sentence, so that the same one is new again.
+  expect(last().message).toBeUndefined();
+  release();
+  await second;
+  expect(last().message).toBe(CLAIM_REFRESH_MESSAGES.too_soon);
+});

@@ -1483,3 +1483,22 @@ test("ending the sentences keeps a running action's answer, an open question, an
   away.actions.listChanged(known(), listed(), NOW);
   expect(away.last().message).toBe(INVITATION_CREATED_UNSEEN_MESSAGE);
 });
+
+test("a refresh empties the sentence at its start, so that the same answer twice is a new sentence (#319)", async () => {
+  let release: () => void = () => undefined;
+  const load = () =>
+    new Promise<InvitationLoadResult>((done) => {
+      release = () => done({ outcome: "refused", reason: "too_soon" });
+    });
+  const { actions, last } = controllerWith({ load });
+  const first = actions.refresh();
+  release();
+  await first;
+  expect(last().message).toBe(INVITATION_REFRESH_MESSAGES.too_soon);
+  const second = actions.refresh();
+  // The start empties the sentence, so that the same one is new again.
+  expect(last().message).toBeUndefined();
+  release();
+  await second;
+  expect(last().message).toBe(INVITATION_REFRESH_MESSAGES.too_soon);
+});

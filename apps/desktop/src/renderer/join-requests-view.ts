@@ -1146,6 +1146,13 @@ export function createJoinRequestActions(
         return;
       }
       unseenIn = undefined;
+      // Its start empties the sentence, so that the same answer again is
+      // announced and brought into view again (#319).
+      if (message !== undefined) {
+        message = undefined;
+        refreshedAt = undefined;
+        show();
+      }
       const startSelection = selection;
       let sentence: string;
       let loading = false;

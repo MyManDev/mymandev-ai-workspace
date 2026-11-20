@@ -18,6 +18,8 @@ import type {
 } from "../shared/desktop-bridge.ts";
 import { createRecentClaims, type RecentClaimsView } from "./claims-view.ts";
 import {
+  InvitationCodeBox,
+  InvitationQuestionBox,
   useInvitationActions,
   type InvitationActionHandlers,
 } from "./InvitationActions.tsx";
@@ -27,11 +29,13 @@ import {
   type InvitationActionsView,
 } from "./invitations-view.ts";
 import {
+  JoinRequestQuestionBox,
   useJoinRequestActions,
   type JoinRequestActionHandlers,
 } from "./JoinRequests.tsx";
 import type { JoinRequestActionRequest } from "./join-requests-view.ts";
 import {
+  PeopleActionDialogBox,
   ResultParagraph,
   usePeopleActions,
   type PeopleActionHandlers,
@@ -694,9 +698,19 @@ test("after an action of one kind and then one of another kind, the screen shows
   });
 });
 
+/** The screen's components with hooks, which stay leaves of `elementsOf`. */
+const HOOK_COMPONENTS: ReadonlySet<unknown> = new Set([
+  ResultParagraph,
+  PeopleActionDialogBox,
+  InvitationQuestionBox,
+  InvitationCodeBox,
+  JoinRequestQuestionBox,
+]);
+
 /**
  * The elements of a tree. A component without hooks is called to reach its
- * elements; one with hooks, such as a status paragraph, stays a leaf.
+ * elements; one with hooks (`HOOK_COMPONENTS`) stays a leaf, and any other
+ * error fails the test.
  */
 function elementsOf(node: ReactNode): ReactElement<{ readonly id?: string }>[] {
   if (Array.isArray(node)) {
@@ -709,14 +723,11 @@ function elementsOf(node: ReactNode): ReactElement<{ readonly id?: string }>[] {
   ) {
     return [];
   }
+  if (HOOK_COMPONENTS.has(node.type)) {
+    return [node];
+  }
   if (typeof node.type === "function") {
-    try {
-      return elementsOf(
-        (node.type as (props: unknown) => ReactNode)(node.props),
-      );
-    } catch {
-      return [node];
-    }
+    return elementsOf((node.type as (props: unknown) => ReactNode)(node.props));
   }
   return [node, ...elementsOf(node.props.children)];
 }

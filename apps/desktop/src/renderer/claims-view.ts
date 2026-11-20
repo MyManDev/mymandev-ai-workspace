@@ -596,6 +596,13 @@ export function createRecentClaims(
 
   const controller: RecentClaims = {
     refresh: async () => {
+      // Its start empties the sentence, so that the same answer again is
+      // announced and brought into view again (#319).
+      if (message !== undefined) {
+        message = undefined;
+        refreshedAt = undefined;
+        show();
+      }
       const at = generation;
       let sentence: string;
       let loading = false;

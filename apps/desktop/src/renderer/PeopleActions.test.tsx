@@ -737,7 +737,7 @@ function scrolledElement() {
   };
 }
 
-test("a new sentence brings its status paragraph into view by the shortest scroll, and an empty one does not (#319)", () => {
+test("bringResultIntoView scrolls a paragraph with a sentence into view by the shortest scroll, and an empty one not at all (#319)", () => {
   const { scrolls, element } = scrolledElement();
   bringResultIntoView(element, "");
   expect(scrolls).toEqual([]);
@@ -749,7 +749,7 @@ test("a new sentence brings its status paragraph into view by the shortest scrol
   ).not.toThrow();
 });
 
-test("a refused promotion from a device that is too new shows its sentence in the people actions' status paragraph, which brings it into view and never takes the focus (#319)", () => {
+test("a refused promotion from a device that is too new shows its sentence in the people actions' ResultParagraph, which has no tab stop (#319)", () => {
   const refusal = describePeopleActionResult("promote", {
     outcome: "refused",
     reason: "device_too_new",
@@ -762,18 +762,41 @@ test("a refused promotion from a device that is too new shows its sentence in th
   expect(render({ actions })).toContain(
     `<p class="people-status" id="people-action-message" role="status">${refusal}</p>`,
   );
-  // The paragraph is the one that brings each new sentence into view.
+  // The paragraph is a ResultParagraph with the sentence as its text; its
+  // effect is pinned by the next test, because a server render runs none.
   const paragraph = elementsOf(screen({ actions })).find(
     (element) => element.props.id === PEOPLE_ACTION_MESSAGE_ID,
   );
   expect(paragraph?.type).toBe(ResultParagraph);
   const props = paragraph?.props as { readonly text?: string } | undefined;
   expect(props?.text).toBe(refusal);
-  const { scrolls, element } = scrolledElement();
-  bringResultIntoView(element, props?.text ?? "");
-  expect(scrolls).toEqual([{ block: "nearest" }]);
   // It has no tab stop, so the focus stays on "Make admin".
   expect(render({ actions })).not.toMatch(
     /id="people-action-message"[^>]*tabindex/,
   );
+});
+
+const RESULT_SOURCES = import.meta.glob<string>(["./PeopleActions.tsx"], {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+test("ResultParagraph brings each new text into view in one effect on its own paragraph, keyed on the text, and never moves the focus (#319)", () => {
+  const source = RESULT_SOURCES["./PeopleActions.tsx"] ?? "";
+  const start = source.indexOf("export function ResultParagraph(");
+  const end = source.indexOf("\n}\n", start);
+  expect(start).toBeGreaterThan(-1);
+  const component = source.slice(start, end);
+  expect(component).toContain(
+    "const ref = useRef<HTMLParagraphElement>(null);",
+  );
+  expect(component.match(/useEffect\(/g)).toHaveLength(1);
+  expect(component).toContain(
+    "useEffect(() => bringResultIntoView(ref.current, text), [text]);",
+  );
+  expect(component).toMatch(
+    /<p ref=\{ref\} className="people-status" id=\{id\} role="status">/,
+  );
+  expect(component).not.toMatch(/\.focus\s*\(|tabIndex/);
 });
