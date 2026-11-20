@@ -783,7 +783,9 @@ export interface ProjectRepositoryActions {
    * Starts an action that the panel offers: a removal and a link open
    * their question, a link with the folders of the latest model and the
    * one of `initialFolderChoice` chosen, and an unlink runs at once. While
-   * an action runs, nothing starts. Resolves once the view shows how the
+   * an action runs, nothing starts. A removal's question opens only while
+   * the latest model offers it (`isOffered`), so not for a repository that
+   * is no longer removable (#309). Resolves once the view shows how the
    * action ended; it never rejects.
    */
   readonly start: (request: RepositoryActionRequest) => Promise<void>;
@@ -928,10 +930,16 @@ export function createProjectRepositoryActions(
         return Promise.resolve();
       }
       switch (request.kind) {
-        case "remove":
-          dialog = Object.freeze({ kind: "remove", request });
+        case "remove": {
+          const question = Object.freeze({ kind: "remove", request } as const);
+          // A click on a button of an earlier render, after the flag cleared.
+          if (model === undefined || !isOffered(model, question)) {
+            return Promise.resolve();
+          }
+          dialog = question;
           show();
           return Promise.resolve();
+        }
         case "link": {
           const choices =
             model === undefined

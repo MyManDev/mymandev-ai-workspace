@@ -1142,6 +1142,19 @@ test("a question ends once the panel no longer offers it as it was asked, and a 
   expect(linking.last().dialog?.kind).toBe("link");
 });
 
+test("a removal's question does not open for a repository that the account may no longer remove, as a button of an earlier render asks, and a confirmation then sends nothing (#309)", async () => {
+  const { actions, calls, last } = controllerWith(
+    model(known({ repositories: [{ ...A, removable: false }, B] })),
+  );
+  await actions.start(request("remove"));
+  expect(last().dialog).toBeUndefined();
+  await actions.confirm();
+  expect(calls).toEqual([]);
+  // Another repository that the account may remove still asks.
+  await actions.start(request("remove", B));
+  expect(last().dialog?.kind).toBe("remove");
+});
+
 test("a link's folders follow the mount list: a new folder is offered, and a chosen folder that goes is no longer chosen", async () => {
   const { actions, calls, last } = controllerWith();
   await actions.start(request("link"));
