@@ -3,6 +3,7 @@ import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import type { RuntimeStatus } from "../shared/ipc-contract.ts";
 import { APP_ENTRY_URL } from "./app-protocol.ts";
 import {
+  createEventPublisher,
   createInvokeHandler,
   createStatusPublisher,
   isApplicationFrame,
@@ -331,6 +332,35 @@ test("subscribing again after a reload or a crash adds no second destroyed liste
   expect(publisher.size()).toBe(1);
   receiver.destroy();
   expect(publisher.size()).toBe(0);
+});
+
+test("a receiver of every event channel gets one destroyed listener, which empties every publisher", () => {
+  const channels = Object.values(EVENT_CHANNELS);
+  // More publishers than Node's default limit of ten listeners per event.
+  expect(channels.length).toBeGreaterThan(10);
+  const publishers = channels.map((channel) =>
+    createEventPublisher(channel, DEV_URL),
+  );
+  const receiver = fakeReceiver();
+  const other = fakeReceiver();
+
+  for (const publisher of publishers) {
+    publisher.add(receiver);
+    publisher.add(other);
+    publisher.add(receiver);
+  }
+
+  expect(receiver.destroyedListeners()).toBe(1);
+  expect(other.destroyedListeners()).toBe(1);
+  receiver.destroy();
+  expect(receiver.destroyedListeners()).toBe(0);
+  expect(publishers.map((publisher) => publisher.size())).toEqual(
+    channels.map(() => 1),
+  );
+  other.destroy();
+  expect(publishers.map((publisher) => publisher.size())).toEqual(
+    channels.map(() => 0),
+  );
 });
 
 function fakeRuntime(initial: RuntimeStatus) {

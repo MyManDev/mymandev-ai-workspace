@@ -133,6 +133,35 @@ export function createStatusPublisher(appUrl: string): StatusPublisher {
   return createEventPublisher(EVENT_CHANNELS.runtimeStatusChanged, appUrl);
 }
 
+// The callbacks that run when a receiver is destroyed, from every publisher
+// that holds it. Each receiver gets one "destroyed" listener for all of
+// them, so a window that subscribes to every event channel stays below
+// Node's default limit of ten listeners per event.
+const destroyedCallbacks = new WeakMap<StatusReceiver, Set<() => void>>();
+
+/**
+ * Runs `callback` once when `receiver` is destroyed. A receiver that is
+ * already destroyed never runs it; `publish` drops such a receiver.
+ */
+function onReceiverDestroyed(
+  receiver: StatusReceiver,
+  callback: () => void,
+): void {
+  let callbacks = destroyedCallbacks.get(receiver);
+  if (callbacks === undefined) {
+    const created = new Set<() => void>();
+    receiver.once("destroyed", () => {
+      destroyedCallbacks.delete(receiver);
+      for (const run of created) {
+        run();
+      }
+    });
+    destroyedCallbacks.set(receiver, created);
+    callbacks = created;
+  }
+  callbacks.add(callback);
+}
+
 /**
  * Sends the payloads of one event channel to the frames that subscribed.
  * Every payload is parsed with the contract first, so unknown keys never
@@ -143,9 +172,9 @@ export function createEventPublisher<C extends EventChannel>(
   appUrl: string,
 ): EventPublisher<C> {
   const receivers = new Set<StatusReceiver>();
-  // Receivers that already have a "destroyed" listener. A receiver that
-  // leaves the set and subscribes again, for example after a reload or a
-  // renderer crash, gets no second listener.
+  // Receivers that this publisher already watches. A receiver that leaves
+  // the set and subscribes again, for example after a reload or a renderer
+  // crash, adds no second callback.
   const watched = new WeakSet<StatusReceiver>();
   const schema = EVENT_CONTRACT[channel];
   return Object.freeze({
@@ -153,7 +182,7 @@ export function createEventPublisher<C extends EventChannel>(
       receivers.add(receiver);
       if (!watched.has(receiver)) {
         watched.add(receiver);
-        receiver.once("destroyed", () => {
+        onReceiverDestroyed(receiver, () => {
           receivers.delete(receiver);
         });
       }
