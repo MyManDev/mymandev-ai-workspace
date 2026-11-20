@@ -12,11 +12,12 @@
 // The decision of 2026-11-14 settles the identity, the name, and that the
 // path stays on the device. The Project Manager's decisions of 2026-11-14 on
 // #286 settle who may register and remove, and that a full project answers
-// with its own code, `repository_limit`. Provisional (#286): the two limits,
-// the rule of the name, the paths, the event payloads, and what a removal
-// does to grants and runs. Each such choice below is the conservative one, as
-// the project routes settle them, and is marked "Provisional"; the README
-// lists them with their alternatives under "Repository routes".
+// with its own code, `repository_limit`. The Project Manager's decision of
+// 2026-11-17 on #286 accepts the remaining points as proposed: the two
+// limits, the rule of the name, the paths, the event payloads, and what a
+// removal does to grants and runs. Each follows the project routes, and the
+// README lists them under "Repository routes". The limits may be tuned with
+// use (ADR 0014, P-64).
 
 import * as z from "zod";
 import type { ApiRoute } from "./auth-api.ts";
@@ -48,7 +49,8 @@ export const REPOSITORY_ROUTES = Object.freeze({
    * `conflict`, a project at its limit of repositories that are not removed
    * answers `repository_limit` (decision of 2026-11-14), and an account at
    * its limit of registrations within 24 hours answers `rate_limited`.
-   * Provisional (#286): both limits are 20.
+   * Both limits are 20 (the Project Manager's decision of 2026-11-17 on
+   * #286).
    */
   registerRepository: route("POST", "/projects/:projectId/repositories"),
   /**
@@ -110,10 +112,10 @@ export const REPOSITORY_ROUTE_ERRORS = Object.freeze({
  * A registration over `perProject` answers `repository_limit`, and one over
  * `perDay` answers `rate_limited` with `Retry-After`. The API applies these
  * values. Both lie far below `MAX_ANSWER_LIST_ITEMS`, so raising one never
- * breaks an older desktop. The numbers await the Project Manager's
- * confirmation (Provisional, #286): 20 is the account's limit of new
- * projects in 24 hours and of active devices, and a limit is raised more
- * easily than lowered.
+ * breaks an older desktop. The numbers are the Project Manager's decision
+ * of 2026-11-17 on #286 and may be tuned with use (ADR 0014, P-64): 20 is
+ * also the account's limit of new projects in 24 hours and of active
+ * devices, and a limit is raised more easily than lowered.
  */
 export const REPOSITORY_COUNT_LIMITS = Object.freeze({
   perProject: 20,
@@ -124,9 +126,8 @@ export const REPOSITORY_COUNT_LIMITS = Object.freeze({
  * Text without a slash and without a backslash. A repository's name as sent
  * must match it: a folder's full path, on any operating system, and a remote
  * URL hold one of the two, so neither can travel as a name. The path of a
- * repository never leaves the device (ADR 0005, ADR 0013). Provisional
- * (#286): the rule awaits the Project Manager's confirmation; without it a
- * name is any label.
+ * repository never leaves the device (ADR 0005, ADR 0013). The rule is the
+ * Project Manager's decision of 2026-11-17 on #286.
  */
 export const REPOSITORY_NAME_PATTERN = /^[^/\\]*$/u;
 

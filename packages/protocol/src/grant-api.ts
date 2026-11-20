@@ -95,17 +95,17 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  *   so the code tells nothing new.
  * - `conflict`: what the request names exists, but is not in the state that
  *   the action needs. For a grant: a disabled agent, an archived repository,
- *   project, or workspace, a removed provider connection, a grant of the same
- *   capability on the same scope that is neither revoked nor expired, or a
- *   count limit of `GRANT_COUNT_LIMITS`. For a revocation: a grant that is
- *   already revoked.
+ *   project, or workspace, a removed provider connection, or a grant of the
+ *   same capability on the same scope that is neither revoked nor expired.
+ *   For a revocation: a grant that is already revoked.
+ * - `grant_limit`: a grant over a count limit of `GRANT_COUNT_LIMITS`, with
+ *   its own code and without `Retry-After` (#75, decision of 2026-11-14).
  *
- * Provisional (#75): the codes. No route adds a code to `API_ERROR_STATUS`;
- * a count limit answers `conflict` until a code of its own is decided.
+ * Provisional (#75): the other codes.
  */
 export const GRANT_ROUTE_ERRORS = Object.freeze({
   listGrantRecords: errors(),
-  grantCapability: errors("not_found", "forbidden", "conflict"),
+  grantCapability: errors("not_found", "forbidden", "conflict", "grant_limit"),
   revokeGrant: errors("not_found", "forbidden", "conflict"),
 } satisfies Record<GrantRouteName, readonly ApiErrorCode[]>);
 
@@ -135,9 +135,9 @@ export const SHELL_GRANT_MAX_LIFETIME_SECONDS = 2_592_000;
  * device hosts, so that `GET /grant-records` always holds every one of them
  * and is never cut: a record that is left out would deny a check. An expired
  * grant counts until it is revoked, as it keeps its place in the database.
- * A grant over either limit answers `conflict`, without `Retry-After`,
- * because no time frees a place. Provisional (#75): both values and the
- * code. The API applies these values.
+ * A grant over either limit answers its own code, `grant_limit`, without
+ * `Retry-After`, because no time frees a place (#75, decision of
+ * 2026-11-14). Provisional (#75): both values. The API applies these values.
  */
 export const GRANT_COUNT_LIMITS = Object.freeze({
   perAgent: 100,

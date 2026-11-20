@@ -34,9 +34,8 @@ import {
 // the project's workspace registers a repository, and the account that
 // registered it, the owner, and the admins remove it.
 //
-// Provisional (#286): settled here with the conservative option, as the
-// project functions settle them, and awaiting the Project Manager's
-// confirmation:
+// Decided by the Project Manager on 2026-11-17 (#286), as proposed, the way
+// the project functions settle the same points:
 //
 // - A project holds `REPOSITORY_COUNT_LIMITS.perProject` repositories that
 //   are not removed, and an account registers
