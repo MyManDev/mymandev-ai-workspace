@@ -74,6 +74,7 @@ import {
   type WorkspaceReadResult,
   workspaceReadFailed,
   workspaceReadFailureOf,
+  workspaceReadHeldBack,
   workspaceReadRequest,
 } from "./api-reads.ts";
 import { isDeviceKeyError } from "./device-key/errors.ts";
@@ -359,13 +360,25 @@ export interface AccountService {
    * one that has ended since, or the code of a renewal arrived, or when
    * the account or the device changed
    * meanwhile; a failure carries no data and is answered as it is, also when
-   * its own refusal changed the device. Never rejects.
+   * its own refusal changed the device. The `unavailable` of a read held
+   * back by such an action, a sign-in, or the key's load, which sends
+   * nothing, carries `heldBack: true` (#318), and `onReadsResumed` tells
+   * when reads go on. Never rejects.
    */
   readonly readWorkspaceData: <N extends WorkspaceReadName>(
     name: N,
     params: WorkspaceReadParams[N],
     query?: WorkspaceReadQuery[N],
   ) => Promise<WorkspaceReadResult<WorkspaceReadAnswer[N]>>;
+  /**
+   * Calls `listener`, without arguments, once reads go on after a read was
+   * held back (`heldBack` of `readWorkspaceData` and `readDeviceList`):
+   * after the action, the sign-in, or the key's load that held it back
+   * ended, in a later microtask, when no other one holds the reads by then
+   * (#318). The grant store reads again then. A listener that throws is
+   * reported and changes nothing. The result removes the listener.
+   */
+  readonly onReadsResumed: (listener: () => void) => () => void;
   /**
    * Reads the account's devices and the end of a registration lock in force
    * (`GET /devices`, the session's `listDevices`; D4 and D5b of #95), for
@@ -716,6 +729,11 @@ export function createAccountService(
   const now = options.now ?? (() => performance.now());
   const listeners = new Set<(status: AccountStatus) => void>();
   const deviceActionListeners = new Set<() => void>();
+  const readsResumedListeners = new Set<() => void>();
+  /** A read was held back since the listeners of `onReadsResumed` were told. */
+  let readsHeldBack = false;
+  /** A check for `onReadsResumed` waits in a microtask. */
+  let readsResumeQueued = false;
 
   let system: AccountSystem | null = null;
   let flow: Pick<SignInFlow, "start" | "reset"> | null = null;
@@ -851,6 +869,40 @@ export function createAccountService(
         report("An account status listener failed.");
       }
     }
+    readsMayResume();
+  }
+
+  /**
+   * Tells the listeners of `onReadsResumed`, in a microtask, when a read was
+   * held back and none would be any more. It runs on each publish and each
+   * release of the `operation` lock, which are the only ways that
+   * `readsPaused` and the key's load end.
+   */
+  function readsMayResume(): void {
+    if (!readsHeldBack || readsResumeQueued) {
+      return;
+    }
+    readsResumeQueued = true;
+    queueMicrotask(() => {
+      readsResumeQueued = false;
+      if (!readsHeldBack || readsPaused() || deviceKey === "loading") {
+        return;
+      }
+      readsHeldBack = false;
+      for (const listener of [...readsResumedListeners]) {
+        try {
+          listener();
+        } catch {
+          report("A read listener failed.");
+        }
+      }
+    });
+  }
+
+  /** Releases the `operation` lock. */
+  function releaseOperation(): void {
+    operation = null;
+    readsMayResume();
   }
 
   async function readAccount(opened: AccountSystem): Promise<Account> {
@@ -1430,7 +1482,7 @@ export function createAccountService(
       }
       return Object.freeze({ outcome: "started" });
     } finally {
-      operation = null;
+      releaseOperation();
     }
   }
 
@@ -1497,7 +1549,7 @@ export function createAccountService(
       report("The device key could not be loaded.");
       return Object.freeze({ outcome: "failed" });
     } finally {
-      operation = null;
+      releaseOperation();
     }
   }
 
@@ -1623,7 +1675,7 @@ export function createAccountService(
       await refreshSession();
       return Object.freeze({ outcome: "failed" });
     } finally {
-      operation = null;
+      releaseOperation();
     }
   }
 
@@ -1661,7 +1713,7 @@ export function createAccountService(
   /** Releases the lock that `beginAction` took; `busy` took none. */
   function endAction(value: AccountSession | ActionRefusal): void {
     if (value !== ACTION_BUSY) {
-      operation = null;
+      releaseOperation();
     }
   }
 
@@ -1863,7 +1915,7 @@ export function createAccountService(
       report("The device could not be revoked.");
       return sent ? LIST_ACTION_UNKNOWN : LIST_ACTION_FAILED;
     } finally {
-      operation = null;
+      releaseOperation();
     }
   }
 
@@ -1913,7 +1965,7 @@ export function createAccountService(
       report("The registration lock could not be lifted.");
       return sent ? LIST_ACTION_UNKNOWN : LIST_ACTION_FAILED;
     } finally {
-      operation = null;
+      releaseOperation();
     }
   }
 
@@ -1982,11 +2034,13 @@ export function createAccountService(
     // refresh, which may report a sign-out or retry a removal with the
     // key, so that they never overlap it.
     if (readsPaused()) {
-      return workspaceReadFailed("unavailable");
+      readsHeldBack = true;
+      return workspaceReadHeldBack();
     }
     await backgroundSettled();
     if (readsPaused() || deviceKey === "loading") {
-      return workspaceReadFailed("unavailable");
+      readsHeldBack = true;
+      return workspaceReadHeldBack();
     }
     const held = session;
     if (system === null || held === null || account.kind !== "signed_in") {
@@ -2210,6 +2264,13 @@ export function createAccountService(
       deviceActionListeners.add(entry);
       return () => {
         deviceActionListeners.delete(entry);
+      };
+    },
+    onReadsResumed: (listener: () => void) => {
+      const entry = () => listener();
+      readsResumedListeners.add(entry);
+      return () => {
+        readsResumedListeners.delete(entry);
       };
     },
     signWebSocketChallenge,
