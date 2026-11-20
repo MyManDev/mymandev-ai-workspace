@@ -1,0 +1,2 @@
+CREATE INDEX "permission_grants_active_host_device_id_idx" ON "permission_grants" USING btree ("host_device_id") WHERE "permission_grants"."revoked_at" is null;--> statement-breakpoint
+ALTER TABLE "permission_grants" ADD CONSTRAINT "permission_grants_shell_expiry_check" CHECK ("permission_grants"."capability" <> 'terminal.execute' or ("permission_grants"."expires_at" is not null and "permission_grants"."expires_at" <= "permission_grants"."created_at" + interval '720 hours'));

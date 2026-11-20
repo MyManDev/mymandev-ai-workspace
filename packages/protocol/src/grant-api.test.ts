@@ -32,6 +32,7 @@ import { CAPABILITY_SCOPE } from "./grant-scope.ts";
 import { MEMBERSHIP_ROUTES } from "./membership-api.ts";
 import {
   API_ERROR_CODES,
+  API_ERROR_STATUS,
   type ApiErrorCode,
   CAPABILITIES,
   type Capability,
@@ -334,7 +335,7 @@ test("a write names its agent and its grant by ID, and the list takes no paramet
   );
 });
 
-test("each grant route answers only known error codes, the common ones included, and no code of its own", () => {
+test("each grant route answers only known error codes, the common ones included, and a grant over a count limit answers grant_limit", () => {
   assert.deepEqual(Object.keys(GRANT_ROUTE_ERRORS), Object.keys(GRANT_ROUTES));
   const known = new Set<string>(API_ERROR_CODES);
   for (const [name, codes] of Object.entries(GRANT_ROUTE_ERRORS)) {
@@ -349,22 +350,27 @@ test("each grant route answers only known error codes, the common ones included,
   }
   assert.deepEqual(specificCodes(), {
     listGrantRecords: [],
-    grantCapability: ["not_found", "forbidden", "conflict"],
+    grantCapability: ["not_found", "forbidden", "conflict", "grant_limit"],
     revokeGrant: ["not_found", "forbidden", "conflict"],
   });
-  // A count limit of grants answers `conflict` for now (provisional, #75):
-  // no grant route answers the count limit code of another route, and no
-  // code exists for grants.
+  // A count limit of grants answers its own code, not `conflict` (#75,
+  // decision of 2026-11-14), and only a grant answers it: no grant route
+  // answers the count limit code of another route.
+  assert.equal(API_ERROR_STATUS.grant_limit, 409);
   const limitCodes = API_ERROR_CODES.filter((code) => code.endsWith("_limit"));
   assert.ok(limitCodes.includes("project_limit"));
   for (const code of limitCodes) {
     for (const [name, codes] of Object.entries(GRANT_ROUTE_ERRORS)) {
-      assert.equal(codes.includes(code), false, `${name}: ${code}`);
+      assert.equal(
+        codes.includes(code),
+        code === "grant_limit" && name === "grantCapability",
+        `${name}: ${code}`,
+      );
     }
   }
   assert.deepEqual(
     API_ERROR_CODES.filter((code) => /grant/u.test(code)),
-    [],
+    ["grant_limit"],
   );
 });
 

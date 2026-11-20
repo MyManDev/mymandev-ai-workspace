@@ -833,6 +833,7 @@ test("a removal revokes every grant scoped to the repository that is not revoked
   });
   const ofBob = await grantTo(projectId, removed.id, bobAgent, bob, {
     capability: "terminal.execute",
+    expiresAt: new Date(NOW.getTime() + DAY_MS),
   });
   const revokedBefore = await grantTo(
     projectId,

@@ -3,6 +3,7 @@ import {
   AgentRunListResponseSchema,
   ChatHistoryResponseSchema,
   ClaimListResponseSchema,
+  GrantRecordListResponseSchema,
   InvitationListResponseSchema,
   JoinRequestListResponseSchema,
   OwnJoinRequestListResponseSchema,
@@ -94,6 +95,7 @@ const READS: [WorkspaceReadName, Record<string, string>, string, number][] = [
     `/projects/${PROJECT_ID}/repositories`,
     1 * MIB,
   ],
+  ["listGrantRecords", {}, "/grant-records", 2 * MIB],
 ];
 
 /** Sends the request as the session does, with an answer of exactly `size` bytes. */
@@ -123,7 +125,7 @@ async function answerOfSize(
   return answer.kind;
 }
 
-test("the allowlist holds exactly eleven GET reads, frozen", () => {
+test("the allowlist holds exactly twelve GET reads, frozen", () => {
   expect(Object.keys(WORKSPACE_READS)).toEqual(READS.map(([name]) => name));
   expect(Object.isFrozen(WORKSPACE_READS)).toBe(true);
   for (const entry of Object.values(WORKSPACE_READS)) {
@@ -199,6 +201,8 @@ test("a name off the allowlist, a wrong parameter, or a query of another read is
     ["listClaims", { workspaceId: WORKSPACE_ID }, { limit: 50 }],
     ["listRepositories", { workspaceId: WORKSPACE_ID }, undefined],
     ["listRepositories", { projectId: PROJECT_ID }, { limit: 20 }],
+    ["listGrantRecords", { workspaceId: WORKSPACE_ID }, undefined],
+    ["listGrantRecords", {}, { limit: 5 }],
   ];
   for (const [name, params, query] of refused) {
     expect(
@@ -233,6 +237,7 @@ test("each read's answer is checked with its response schema", () => {
     listOwnJoinRequests: { joinRequests: [] },
     listClaims: { claims: [] },
     listRepositories: { repositories: [] },
+    listGrantRecords: { records: [] },
   };
   for (const [name, params] of READS) {
     const request = workspaceReadRequest(name, params, undefined)!;
@@ -299,6 +304,7 @@ test("each read's answer schema is the protocol schema of its route", () => {
     listOwnJoinRequests: OwnJoinRequestListResponseSchema,
     listClaims: ClaimListResponseSchema,
     listRepositories: RepositoryListResponseSchema,
+    listGrantRecords: GrantRecordListResponseSchema,
   };
   expect(Object.keys(WORKSPACE_READS).sort()).toEqual(
     Object.keys(schemas).sort(),

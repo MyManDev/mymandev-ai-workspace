@@ -26,6 +26,7 @@ import {
   newId,
   newUuidV7,
   RUN_STATES,
+  SHELL_GRANT_MAX_LIFETIME_SECONDS,
   TERMINAL_RUN_STATES,
   UNCLAIMED_MEMBER_LIMIT,
   type AgentId,
@@ -625,14 +626,23 @@ test("permission grants: one capability per row, scoped, unique while active", a
     grantedByUserId: world.alice,
   };
   const grantIds = new Map<Capability, PermissionGrantId>();
+  const grantedAt = new Date("2026-10-27T12:00:00.000Z");
   for (const capability of CAPABILITIES) {
     const scope =
       capability === "provider.use"
         ? { providerConnectionId: world.aliceConnection }
         : { repositoryId: world.repository };
+    // A grant of terminal.execute always expires (below).
+    const expiry =
+      capability === "terminal.execute"
+        ? {
+            createdAt: grantedAt,
+            expiresAt: new Date(grantedAt.getTime() + 60_000),
+          }
+        : {};
     grantIds.set(
       capability,
-      await insertGrant({ ...byAlice, capability, ...scope }),
+      await insertGrant({ ...byAlice, capability, ...scope, ...expiry }),
     );
   }
 
@@ -719,17 +729,30 @@ test("permission grants: one capability per row, scoped, unique while active", a
     );
   }
 
-  // Revoke git.push, then grant it again.
+  // Revoke git.push, then grant it again. Half a revocation is refused: on
+  // insert by the CHECK, on update first by the trigger of migration
+  // 0017_grant_immutability.
   const gitPush = grantIds.get("git.push");
   assert.ok(gitPush);
+  await rejectsWith(
+    () =>
+      insertGrant({
+        ...byAlice,
+        capability: "git.push",
+        repositoryId: world.repository,
+        revokedAt: new Date(),
+      }),
+    "23514",
+    "permission_grants_revocation_check",
+  );
   await rejectsWith(
     () =>
       db
         .update(permissionGrants)
         .set({ revokedAt: new Date() })
         .where(eq(permissionGrants.id, gitPush)),
-    "23514",
-    "permission_grants_revocation_check",
+    "23000",
+    "permission_grants_revocation_pair",
   );
   await db
     .update(permissionGrants)
@@ -762,6 +785,55 @@ test("permission grants: one capability per row, scoped, unique while active", a
   await insertGrant({
     ...byBob,
     expiresAt: new Date(createdAt.getTime() + 60_000),
+  });
+});
+
+test("a grant of terminal.execute always expires, at most SHELL_GRANT_MAX_LIFETIME_SECONDS after its creation; other capabilities need no expiry", async () => {
+  const world = await seed();
+  const createdAt = new Date("2026-10-25T00:30:00.000Z");
+  const maxMs = SHELL_GRANT_MAX_LIFETIME_SECONDS * 1000;
+  const shell = {
+    projectId: world.project,
+    granteeAgentId: world.aliceAgent,
+    hostDeviceId: world.aliceDevice,
+    grantedByUserId: world.alice,
+    capability: "terminal.execute" as const,
+    repositoryId: world.repository,
+    createdAt,
+  };
+  for (const expiresAt of [null, new Date(createdAt.getTime() + maxMs + 1)]) {
+    await rejectsWith(
+      () => insertGrant({ ...shell, expiresAt }),
+      "23514",
+      "permission_grants_shell_expiry_check",
+    );
+  }
+  // The bound is in hours, so a session time zone that turns its clocks
+  // back within the 30 days (Europe/Berlin on 2026-10-25, 01:00 UTC) gives
+  // no extra hour, as "30 days" would.
+  await database().transaction(async (tx) => {
+    await tx.execute(sql`set local time zone 'Europe/Berlin'`);
+    await rejectsWith(
+      () =>
+        tx.transaction((savepoint) =>
+          savepoint.insert(permissionGrants).values({
+            ...shell,
+            id: newId<PermissionGrantId>(),
+            expiresAt: new Date(createdAt.getTime() + maxMs + 1),
+          }),
+        ),
+      "23514",
+      "permission_grants_shell_expiry_check",
+    );
+  });
+  await insertGrant({
+    ...shell,
+    expiresAt: new Date(createdAt.getTime() + maxMs),
+  });
+  await insertGrant({
+    ...shell,
+    capability: "repo.read",
+    expiresAt: null,
   });
 });
 

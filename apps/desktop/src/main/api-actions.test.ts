@@ -585,6 +585,8 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     run_daily_limit: "failed",
     // A registration in a full project (#286, decision of 2026-11-14).
     repository_limit: "repository_limit",
+    // No write of the desktop grants a capability yet (#75).
+    grant_limit: "failed",
     // Only the sign-in answers it, never a write (#255).
     device_limit: "failed",
     // Nor this one: a write then fails without a wait, never as the
