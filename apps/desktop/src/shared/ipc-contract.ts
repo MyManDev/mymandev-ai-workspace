@@ -1110,9 +1110,13 @@ export type RepositoryLinkState = (typeof REPOSITORY_LINK_STATES)[number];
 /**
  * A registered repository of the open project as the renderer may know it:
  * its ID and name, whether the signed-in account linked it to a folder on
- * this device (`linked`), and the mount of that folder while it is mounted
- * (`mountId`), else null. No path crosses here: the mount list shows the
- * folder of a mount, and a linked folder that is not mounted is not named.
+ * this device (`linked`), the mount of that folder while it is mounted
+ * (`mountId`), else null, and whether the account may remove it
+ * (`removable`, #309): the main process works it out from who registered
+ * it and the account's own person and role, so no member ID crosses, and
+ * the server still decides each removal. No path crosses here: the mount
+ * list shows the folder of a mount, and a linked folder that is not mounted
+ * is not named.
  */
 export const ProjectRepositoryViewSchema = z
   .object({
@@ -1120,6 +1124,7 @@ export const ProjectRepositoryViewSchema = z
     name: z.string().min(1).max(PROJECT_REPOSITORY_LIMITS.name),
     linked: z.boolean(),
     mountId: MountIdSchema.nullable(),
+    removable: z.boolean(),
   })
   .refine((value) => value.linked || value.mountId === null, {
     message: "Only a linked repository names a mount",
@@ -1130,8 +1135,8 @@ export type ProjectRepositoryView = z.infer<typeof ProjectRepositoryViewSchema>;
 const ProjectRepositoriesViewFields = {
   /**
    * Grows by one with every change of the repositories, the links, the
-   * mounts, or the account. A receiver keeps the view with the highest
-   * revision, like the runtime status.
+   * mounts, the account, or what the account may remove. A receiver keeps
+   * the view with the highest revision, like the runtime status.
    */
   revision: z.int().nonnegative(),
   /** The selected workspace while a project is open, else null. */
@@ -1150,8 +1155,8 @@ const ProjectRepositoriesViewFields = {
  * `{ revision, status, problem?, workspaceId, projectId, links,
  * repositories }`, with a problem only while `unavailable`. The status is
  * the agents' status: `no_project`, `loading`, `ready`, or `unavailable`.
- * It holds IDs, names, and mount IDs only: no path, no member ID, and no
- * user ID.
+ * It holds IDs, names, mount IDs, and flags only: no path, no member ID,
+ * and no user ID.
  */
 export const ProjectRepositoriesViewSchema = z.discriminatedUnion("status", [
   z.object({
