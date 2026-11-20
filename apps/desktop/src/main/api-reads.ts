@@ -291,12 +291,30 @@ export type WorkspaceReadFailure = (typeof WORKSPACE_READ_FAILURES)[number];
 
 export type WorkspaceReadResult<T> =
   | { readonly ok: true; readonly value: T }
-  | { readonly ok: false; readonly reason: WorkspaceReadFailure };
+  | {
+      readonly ok: false;
+      readonly reason: WorkspaceReadFailure;
+      /**
+       * Set only on an `unavailable` that the account service gave without
+       * sending anything, because an action of the person, a sign-in, or the
+       * key's load held the reads back (`workspaceReadHeldBack`). Its
+       * `onReadsResumed` tells when they may go on (#318).
+       */
+      readonly heldBack?: true;
+    };
 
 export function workspaceReadFailed(
   reason: WorkspaceReadFailure,
 ): WorkspaceReadResult<never> {
   return Object.freeze({ ok: false, reason });
+}
+
+/**
+ * The `unavailable` of a read that the account service held back locally
+ * and never sent (#318): not an answer of the API.
+ */
+export function workspaceReadHeldBack(): WorkspaceReadResult<never> {
+  return Object.freeze({ ok: false, reason: "unavailable", heldBack: true });
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {

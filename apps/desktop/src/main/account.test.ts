@@ -135,6 +135,12 @@ const AUTH_RESPONSE: AuthResponseFrame = Object.freeze({
 } as AuthResponseFrame);
 
 const WORKSPACE_LIST = Object.freeze({ workspaces: [] });
+/** The answer of a read that the service held back without sending it (#318). */
+const HELD_BACK = Object.freeze({
+  ok: false,
+  reason: "unavailable",
+  heldBack: true,
+});
 const WORKSPACE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1" as WorkspaceId;
 const PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192e1" as ProjectId;
 
@@ -2960,7 +2966,7 @@ test("after a sign-out, a sign-in refused because another GitHub account was use
 });
 
 test("sign-out and removal are refused while busy and without an account, and the device list is not read then", async () => {
-  const unavailable = { ok: false, reason: "unavailable" };
+  const unavailable = HELD_BACK;
   const before = harness();
   for (const action of [before.service.signOut, before.service.removeDevice]) {
     await expect(action()).resolves.toEqual({
@@ -3403,10 +3409,11 @@ test("while a device action of the list runs, the other actions answer busy, rea
   await expect(h.service.readDeviceList()).resolves.toEqual({
     ok: false,
     reason: "unavailable",
+    heldBack: true,
   });
   await expect(
     h.service.readWorkspaceData("listWorkspaces", {}),
-  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  ).resolves.toEqual(HELD_BACK);
   await expect(
     h.service.revokeOtherDevice(OTHER_DEVICE, "removed"),
   ).resolves.toEqual({ outcome: "refused", reason: "unavailable" });
@@ -3427,6 +3434,86 @@ test("while a device action of the list runs, the other actions answer busy, rea
   expect(
     h.log.filter((step) => step.startsWith("session revokeOtherDevice")),
   ).toEqual([`session revokeOtherDevice ${OTHER_DEVICE_ID} lost`]);
+});
+
+test("onReadsResumed tells once, after the lock that held a read back ends, also after a kept confirmation", async () => {
+  const h = harness();
+  await h.service.initialize();
+  let resumed = 0;
+  const remove = h.service.onReadsResumed(() => {
+    resumed += 1;
+  });
+
+  // Without a read held back, an action that ends tells nothing.
+  h.confirmRevoke = async () => false;
+  await expect(
+    h.service.revokeOtherDevice(OTHER_DEVICE, "lost"),
+  ).resolves.toEqual({ outcome: "cancelled" });
+  await settle();
+  expect(resumed).toBe(0);
+
+  // Reads held back during a revocation's confirmation, which is kept.
+  let answer: (confirmed: boolean) => void = () => undefined;
+  h.confirmRevoke = () =>
+    new Promise((resolve) => {
+      answer = resolve;
+    });
+  const revoking = h.service.revokeOtherDevice(OTHER_DEVICE, "lost");
+  await settle();
+  await expect(
+    h.service.readWorkspaceData("listGrantRecords", {}),
+  ).resolves.toEqual(HELD_BACK);
+  await expect(h.service.readDeviceList()).resolves.toEqual(HELD_BACK);
+  await settle();
+  expect(resumed).toBe(0);
+  answer(false);
+  await expect(revoking).resolves.toEqual({ outcome: "cancelled" });
+  await settle();
+  expect(resumed).toBe(1);
+  expect(h.requests).toEqual([]);
+
+  // Told once: a later action tells nothing until a read is held back again.
+  h.confirmRevoke = async () => true;
+  await expect(
+    h.service.revokeOtherDevice(OTHER_DEVICE, "removed"),
+  ).resolves.toEqual({ outcome: "revoked", reason: "removed" });
+  await settle();
+  expect(resumed).toBe(1);
+
+  // A read held back from the code of a renewal on: told at its outcome.
+  const attempt = startedSignIn();
+  h.start = async () => attempt.start;
+  await h.service.startSignIn();
+  h.callback?.();
+  await expect(
+    h.service.readWorkspaceData("listWorkspaces", {}),
+  ).resolves.toEqual(HELD_BACK);
+  await settle();
+  expect(resumed).toBe(1);
+  const done = nextStatus(h, (status) => status.signIn.kind === "idle");
+  attempt.settle({ kind: "cancelled" });
+  await done;
+  await settle();
+  expect(resumed).toBe(2);
+
+  // A listener that throws is reported; a removed listener is not called.
+  h.service.onReadsResumed(() => {
+    throw new Error("broken");
+  });
+  remove();
+  answer = () => undefined;
+  h.confirmRevoke = () =>
+    new Promise((resolve) => {
+      answer = resolve;
+    });
+  const again = h.service.revokeOtherDevice(OTHER_DEVICE, "lost");
+  await settle();
+  await expect(h.service.readDeviceList()).resolves.toEqual(HELD_BACK);
+  answer(false);
+  await again;
+  await settle();
+  expect(resumed).toBe(2);
+  expect(h.errors).toEqual(["A read listener failed."]);
 });
 
 test("the device actions of the list ask nothing when the person keeps the confirmation or it fails, and refuse this device and a device that is not signed in", async () => {
@@ -3741,6 +3828,7 @@ test("a device list read is unavailable during a device action, and its answer i
   await expect(h.service.readDeviceList()).resolves.toEqual({
     ok: false,
     reason: "unavailable",
+    heldBack: true,
   });
   expect(h.log.filter((step) => step === "session listDevices")).toHaveLength(
     sent,
@@ -3931,6 +4019,7 @@ test("This is not me waits for the background refresh before it asks, removes, o
   await expect(h.service.readDeviceList()).resolves.toEqual({
     ok: false,
     reason: "unavailable",
+    heldBack: true,
   });
   await settle();
   expect(h.log.at(-1)).toBe("session reportSignOut");
@@ -4407,7 +4496,7 @@ test("a read is unavailable during This is not me, a sign-out, and a device remo
   await tick();
   await expect(
     h.service.readWorkspaceData("listWorkspaces", {}),
-  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  ).resolves.toEqual(HELD_BACK);
   confirm(false);
   await forgetting;
 
@@ -4421,7 +4510,7 @@ test("a read is unavailable during This is not me, a sign-out, and a device remo
   await tick();
   await expect(
     h.service.readWorkspaceData("getWorkspace", { workspaceId: WORKSPACE_ID }),
-  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  ).resolves.toEqual(HELD_BACK);
   signedOut({ ok: true, value: "reported" });
   await signingOut;
 
@@ -4433,7 +4522,7 @@ test("a read is unavailable during This is not me, a sign-out, and a device remo
   await tick();
   await expect(
     h.service.readWorkspaceData("listProjects", { workspaceId: WORKSPACE_ID }),
-  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  ).resolves.toEqual(HELD_BACK);
   confirm(false);
   await removing;
 
@@ -4463,7 +4552,7 @@ test("a read is unavailable during a sign-in, also with a pending key replacemen
   });
   await expect(
     h.service.readWorkspaceData("listAgents", { projectId: PROJECT_ID }),
-  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  ).resolves.toEqual(HELD_BACK);
   expect(h.requests).toHaveLength(1);
 
   finish({ ok: true, value: WORKSPACE_LIST });
@@ -4738,6 +4827,7 @@ test("an action that starts while a read waits for the startup refresh makes the
   await expect(reading).resolves.toEqual({
     ok: false,
     reason: "unavailable",
+    heldBack: true,
   });
   await expect(signingOut).resolves.toEqual({ outcome: "signed_out" });
   expect(h.requests).toEqual([]);
@@ -4756,7 +4846,7 @@ test("an action that starts while a read waits for the startup refresh makes the
   await tick();
   startRefresh.release();
   await starting;
-  await expect(read).resolves.toEqual({ ok: false, reason: "unavailable" });
+  await expect(read).resolves.toEqual(HELD_BACK);
   await expect(started).resolves.toEqual({ outcome: "started" });
   expect(s.requests).toEqual([]);
   signIn.settle({ kind: "cancelled" });
@@ -4807,7 +4897,7 @@ test("a read is unavailable during an unlock, an unlock or This is not me that b
   await tick();
   await expect(
     h.service.readWorkspaceData("listWorkspaces", {}),
-  ).resolves.toEqual({ ok: false, reason: "unavailable" });
+  ).resolves.toEqual(HELD_BACK);
   expect(h.requests).toEqual([]);
   release();
   await expect(unlocking).resolves.toEqual({
@@ -5528,7 +5618,7 @@ test("during the browser part of a renewal reads and writes are answered, and du
   const starting = h.service.startSignIn();
   await settle();
   expect(h.service.status().signIn).toEqual({ kind: "starting" });
-  await expect(readList(h)).resolves.toEqual(UNAVAILABLE);
+  await expect(readList(h)).resolves.toEqual(HELD_BACK);
   await expect(leave(h)).resolves.toEqual(UNAVAILABLE);
   expect(h.requests).toEqual([]);
 
@@ -5551,8 +5641,8 @@ test("during the browser part of a renewal reads and writes are answered, and du
   // The code arrived, and the flow replaces the key next.
   h.callback?.();
   expect(h.service.status().signIn).toEqual({ kind: "completing" });
-  await expect(readList(h)).resolves.toEqual(UNAVAILABLE);
-  await expect(h.service.readDeviceList()).resolves.toEqual(UNAVAILABLE);
+  await expect(readList(h)).resolves.toEqual(HELD_BACK);
+  await expect(h.service.readDeviceList()).resolves.toEqual(HELD_BACK);
   await expect(leave(h)).resolves.toEqual(UNAVAILABLE);
   expect(h.requests).toHaveLength(2);
 
@@ -5649,13 +5739,11 @@ test("a first sign-in, and any sign-in of a device that is not signed in, still 
     expect(h.service.status().signIn, name).toMatchObject({
       kind: "waiting",
     });
-    await expect(readList(h), name).resolves.toEqual(UNAVAILABLE);
-    await expect(h.service.readDeviceList(), name).resolves.toEqual(
-      UNAVAILABLE,
-    );
+    await expect(readList(h), name).resolves.toEqual(HELD_BACK);
+    await expect(h.service.readDeviceList(), name).resolves.toEqual(HELD_BACK);
     await expect(leave(h), name).resolves.toEqual(UNAVAILABLE);
     h.callback?.();
-    await expect(readList(h), name).resolves.toEqual(UNAVAILABLE);
+    await expect(readList(h), name).resolves.toEqual(HELD_BACK);
     await expect(leave(h), name).resolves.toEqual(UNAVAILABLE);
     expect(h.requests, name).toEqual([]);
 
@@ -5755,7 +5843,7 @@ test("a renewal whose browser posted before the start returned pauses reads at o
   };
   await h.service.startSignIn();
   expect(h.service.status().signIn).toEqual({ kind: "completing" });
-  await expect(readList(h)).resolves.toEqual(UNAVAILABLE);
+  await expect(readList(h)).resolves.toEqual(HELD_BACK);
   const oldCallback = h.callback;
   const done = nextStatus(h, (status) => status.signIn.kind === "idle");
   first.settle({ kind: "timed_out" });
