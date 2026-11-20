@@ -1265,6 +1265,9 @@ export type RemoveRepositoryResult = z.infer<
  * - `not_mounted`: nothing is mounted with the mount ID.
  * - `folder_linked`: the account linked the folder to another repository;
  *   unlink it first.
+ * - `nested_link`: the folder is inside, or contains, a folder that the
+ *   account linked to another repository on this device, of any project;
+ *   unlink that repository first (#302).
  * - `symbolic_link`: the folder or its common Git folder is a symbolic link
  *   or, on Windows, a junction, which cannot be linked.
  * - `folder_missing`: the folder or its common Git folder could not be read
@@ -1288,6 +1291,7 @@ export const LINK_REPOSITORY_REFUSALS = Object.freeze([
   "not_registered",
   "not_mounted",
   "folder_linked",
+  "nested_link",
   "symbolic_link",
   "folder_missing",
   "busy",

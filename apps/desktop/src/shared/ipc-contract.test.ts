@@ -2662,17 +2662,20 @@ test("register and remove answer ok, refused with a known reason and a wait only
     }
   }
   // The person confirms each link in the main process: cancelling it, a
-  // second confirmation, and a folder that cannot be linked have their own
-  // refusals; unlinking needs none of them.
+  // second confirmation, a folder that cannot be linked, and a folder inside
+  // or around another linked folder (#302) have their own refusals;
+  // unlinking needs none of them.
   expect(LINK_REPOSITORY_REFUSALS).toEqual(
     expect.arrayContaining([
       "cancelled",
       "busy",
       "symbolic_link",
       "folder_missing",
+      "folder_linked",
+      "nested_link",
     ]),
   );
-  for (const reason of ["cancelled", "busy", "symbolic_link"]) {
+  for (const reason of ["cancelled", "busy", "symbolic_link", "nested_link"]) {
     expect(UNLINK_REPOSITORY_REFUSALS).not.toContain(reason);
   }
 });

@@ -8,7 +8,7 @@ import {
   session,
 } from "electron";
 import { readFile, realpath } from "node:fs/promises";
-import { join } from "node:path";
+import path, { join } from "node:path";
 import {
   FORGET_CONFIRMATION,
   forgetConfirmationDetail,
@@ -363,6 +363,12 @@ function start(): void {
     workspaces,
     mounts: repositories,
     store: createSystemRepositoryLinkStore(),
+    // A link inside, or around, another of the account's linked folders is
+    // refused (#302). Folders compare without regard to case on Windows and
+    // on macOS, whose volumes ignore case by default.
+    pathApi: path,
+    caseInsensitivePaths:
+      process.platform === "win32" || process.platform === "darwin",
     // The identity of a linked folder and of its common Git folder, read
     // with `lstat` when it is linked and at each resolution.
     identify: (folders) => readFolderIdentity(systemLstat, folders),

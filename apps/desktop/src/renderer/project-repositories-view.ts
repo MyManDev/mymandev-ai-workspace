@@ -274,6 +274,8 @@ export const LINK_REPOSITORY_REFUSAL_MESSAGES: Readonly<
     "The folder is no longer in the list of this device's repositories. Add it again, then link it.",
   folder_linked:
     "You linked this folder to another repository already, perhaps of another project. Unlink that repository first.",
+  nested_link:
+    "This folder is inside, or contains, a folder that you linked to another repository, perhaps of another project. Unlink that repository first.",
   symbolic_link:
     "The folder or its Git folder is a symbolic link or a junction, which cannot be linked. Add the repository from its real folder instead.",
   folder_missing:
