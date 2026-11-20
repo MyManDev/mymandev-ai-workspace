@@ -233,23 +233,23 @@ function controls(
   mounts: RepositoryPanelView,
   actions: Partial<ProjectRepositoriesControls["actions"]>,
 ): ProjectRepositoriesControls {
+  // Who may remove a repository (#309), a required field once it merges. A
+  // variable, not a literal in the cast, so that the extra field compiles
+  // before that too.
+  const repository = {
+    repositoryId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b1",
+    name: "app",
+    linked: false,
+    mountId: null,
+    removable: true,
+  };
   const state = {
     revision: 1,
     status: "ready",
     workspaceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a1",
     projectId: PROJECT,
     links: "ready",
-    repositories: [
-      {
-        repositoryId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b1",
-        name: "app",
-        linked: false,
-        mountId: null,
-        // Who may remove a repository (#309); a required field once it
-        // merges.
-        removable: true,
-      },
-    ],
+    repositories: [repository],
   } as ProjectRepositoriesView;
   return {
     model: describeProjectRepositories(
