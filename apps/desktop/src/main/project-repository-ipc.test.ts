@@ -215,8 +215,14 @@ test("the view holds IDs, names, the link, the mount ID, and whether the account
     ).repositories[0],
   ).toMatchObject({ linked: false, mountId: null });
   // Whether the account may remove a repository crosses as the service
-  // worked it out (#309), and nothing of who registered it.
-  for (const removable of [true, false]) {
+  // worked it out (#309), and nothing of who registered it. A link does not
+  // make a repository removable.
+  const rows = [
+    { linked: false, mountId: null, removable: true },
+    { linked: false, mountId: null, removable: false },
+    { linked: true, mountId: MOUNT, removable: false },
+  ] as const;
+  for (const row of rows) {
     expect(
       projectRepositoriesView(
         state({
@@ -224,24 +230,15 @@ test("the view holds IDs, names, the link, the mount ID, and whether the account
             {
               repositoryId: REPOSITORY,
               name: "web app",
-              linked: false,
-              mountId: null,
-              removable,
+              ...row,
               ...({ createdByMemberId: WORKSPACE } as object),
             },
           ],
         }),
         1,
       ).repositories,
-    ).toEqual([
-      {
-        repositoryId: REPOSITORY,
-        name: "web app",
-        linked: false,
-        mountId: null,
-        removable,
-      },
-    ]);
+      JSON.stringify(row),
+    ).toEqual([{ repositoryId: REPOSITORY, name: "web app", ...row }]);
   }
 });
 
