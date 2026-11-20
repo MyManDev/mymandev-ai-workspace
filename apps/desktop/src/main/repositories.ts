@@ -115,6 +115,18 @@ interface Mount {
   firstChangeAt: number | undefined;
 }
 
+/**
+ * A folder as mounts compare it: in lower case where `caseInsensitive`
+ * (Windows), as it is otherwise. The repository links (#286, #302) compare
+ * their folders the same way.
+ */
+export function comparableFolder(
+  folder: string,
+  caseInsensitive: boolean,
+): string {
+  return caseInsensitive ? folder.toLowerCase() : folder;
+}
+
 export function createRepositoryService(
   options: RepositoryServiceOptions,
 ): RepositoryService {
@@ -223,7 +235,7 @@ export function createRepositoryService(
   };
 
   const pathKey = (path: string) =>
-    options.caseInsensitivePaths ? path.toLowerCase() : path;
+    comparableFolder(path, options.caseInsensitivePaths);
 
   const mount = async (folder: string): Promise<MountResult> => {
     if (closing.signal.aborted) {

@@ -1985,10 +1985,18 @@ test("addWorkspace changes nothing and reads nothing without a signed-in device 
   expect(h.reads).toEqual([]);
 });
 
-test("ownMemberId gives the account's own person of each listed workspace", async () => {
+test("ownMemberId gives the account's own person of each listed workspace, and listLoaded says whether the list answered", async () => {
   const h = new Harness();
   expect(h.service.ownMemberId(WS_A)).toBeNull();
+  expect(h.service.listLoaded()).toBe(false);
   h.setConnection("connected");
+  // A failed first load leaves it false; a created workspace alone does not
+  // make it true.
+  await h.answer("listWorkspaces", failure("unavailable"));
+  expect(h.service.listLoaded()).toBe(false);
+  h.service.addWorkspace({ id: WS_C, name: "Workspace Gamma" }, NEW_MEMBER);
+  expect(h.service.ownMemberId(WS_C)).toBe(NEW_MEMBER);
+  expect(h.service.listLoaded()).toBe(false);
   await h.answer(
     "listWorkspaces",
     ok(
@@ -2009,6 +2017,7 @@ test("ownMemberId gives the account's own person of each listed workspace", asyn
   expect(h.service.ownMemberId(WS_A)).toBe(OWNER);
   expect(h.service.ownMemberId(WS_B)).toBe(MEMBER);
   expect(h.service.ownMemberId(WS_C)).toBeNull();
+  expect(h.service.listLoaded()).toBe(true);
 
   // An ended membership forgets it at once; the next list replaces them.
   h.receive(
@@ -2027,10 +2036,13 @@ test("ownMemberId gives the account's own person of each listed workspace", asyn
   // A sign-out forgets them, and so does close.
   h.setAccount(SIGNED_OUT);
   expect(h.service.ownMemberId(WS_C)).toBeNull();
+  expect(h.service.listLoaded()).toBe(false);
   const g = await withList([WS_A]);
   expect(g.service.ownMemberId(WS_A)).toBe(OWNER);
+  expect(g.service.listLoaded()).toBe(true);
   g.service.close();
   expect(g.service.ownMemberId(WS_A)).toBeNull();
+  expect(g.service.listLoaded()).toBe(false);
 });
 
 test("ownRole gives the role of the account's own person in each listed workspace from the list, not another person's role or the selected workspace's events", async () => {

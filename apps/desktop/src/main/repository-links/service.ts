@@ -39,6 +39,7 @@
 //
 // The logs are fixed text with a failure code at most, never a name, an ID,
 // or a path.
+import type { PlatformPath } from "node:path";
 import {
   type MemberId,
   type ProjectId,
@@ -72,7 +73,12 @@ import type {
   WorkspaceReadResult,
 } from "../api-reads.ts";
 import type { ConnectionClient, ServerMessage } from "../connection/client.ts";
-import type { MountedFolder, RepositoryService } from "../repositories.ts";
+import {
+  comparableFolder,
+  type MountedFolder,
+  type RepositoryService,
+} from "../repositories.ts";
+import { relativeInside } from "../repository-watcher.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 import {
   createResyncGate,
@@ -217,7 +223,7 @@ export type ProjectRepositoryConnection = Pick<
 /** The part of the workspace service that this service uses. */
 export type ProjectRepositoryWorkspaces = Pick<
   WorkspaceService,
-  "state" | "onChange" | "ownMemberId" | "people"
+  "state" | "onChange" | "ownMemberId" | "people" | "listLoaded"
 >;
 
 /** The part of the repository (mount) service that this service uses. */
@@ -232,6 +238,14 @@ export interface ProjectRepositoryServiceOptions {
   readonly workspaces: ProjectRepositoryWorkspaces;
   readonly mounts: ProjectRepositoryMounts;
   readonly store: RepositoryLinkStore;
+  /** The path functions of this system (`node:path`), for `folderRelation`. */
+  readonly pathApi: PlatformPath;
+  /**
+   * Whether the links compare folders without regard to case
+   * (`folderRelation`): on Windows, and on macOS, whose volumes ignore case
+   * by default.
+   */
+  readonly caseInsensitivePaths: boolean;
   /**
    * Reads the identity of a mounted repository's top-level folder and
    * common Git folder (`readFolderIdentity` with the system's `lstat`). A
@@ -513,6 +527,35 @@ interface ProposedLink {
    * whose place the new one takes.
    */
   readonly evicts: RepositoryLink | undefined;
+}
+
+/**
+ * How two folders lie to each other: the same folder (`same`), one inside
+ * the other (`nested`), or neither (`apart`). They are compared as the paths
+ * that Git reported, as mounts compare them (`comparableFolder`), and with
+ * `relativeInside` of the system's path functions, so a folder whose name
+ * only begins with the other's (`/a/repo2` and `/a/repo`) is apart. With
+ * `caseInsensitive`, case does not count; the Windows path functions also
+ * take both separators and a drive letter in either case, and folders on
+ * different drives are apart.
+ */
+export type FolderRelation = "same" | "nested" | "apart";
+
+export function folderRelation(
+  a: string,
+  b: string,
+  pathApi: PlatformPath,
+  caseInsensitive: boolean,
+): FolderRelation {
+  const first = comparableFolder(a, caseInsensitive);
+  const second = comparableFolder(b, caseInsensitive);
+  if (pathApi.relative(first, second) === "") {
+    return "same";
+  }
+  return relativeInside(first, second, pathApi) !== undefined ||
+    relativeInside(second, first, pathApi) !== undefined
+    ? "nested"
+    : "apart";
 }
 
 /** Whether two proposals link the same account's repository to the same folders. */
@@ -1415,6 +1458,19 @@ export function createProjectRepositoryService(
     if (closed || device === null || linkState !== "ready") {
       return "unavailable";
     }
+    // Until the account's workspace list has loaded, the account's own
+    // person is known at most in a workspace that it created meanwhile, so
+    // its links in the other workspaces would not count for the checks of
+    // the same and of nested folders below: no link is made (#302).
+    let listLoaded: boolean;
+    try {
+      listLoaded = workspaces.listLoaded();
+    } catch {
+      listLoaded = false;
+    }
+    if (!listLoaded) {
+      return "unavailable";
+    }
     const listed = repositories?.find(
       (repository) => repository.id === repositoryId,
     );
@@ -1448,6 +1504,36 @@ export function createProjectRepositoryService(
     );
     if (elsewhere) {
       return "folder_linked";
+    }
+    // A folder inside, or around, a folder that the account linked to
+    // another repository, of any project, is refused (the Project Manager's
+    // decision of 2026-11-20 on #302), whether that folder is mounted or
+    // not: a grant on one repository then never reaches the files of
+    // another. The same folder in another case, where case does not count,
+    // is the same folder. The account's earlier link of this repository is
+    // replaced, so it does not count. This runs again when the write starts,
+    // after the writes before it, so of two links on their way the later
+    // one sees the earlier: the earlier link's continuation adds it to
+    // `links` before the next queued write runs. The check after the write
+    // is the safety net.
+    let nested = false;
+    for (const held of links) {
+      if (held === replaces || !ownLink(held)) {
+        continue;
+      }
+      const relation = folderRelation(
+        held.folder,
+        mounted.topLevel,
+        options.pathApi,
+        options.caseInsensitivePaths,
+      );
+      if (relation === "same") {
+        return "folder_linked";
+      }
+      nested ||= relation === "nested";
+    }
+    if (nested) {
+      return "nested_link";
     }
     let evicts: RepositoryLink | undefined;
     if (replaces === undefined && links.length >= MAX_REPOSITORY_LINKS) {

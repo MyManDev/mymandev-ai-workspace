@@ -1,3 +1,4 @@
+import path, { type PlatformPath } from "node:path";
 import {
   decodeServerMessage,
   type ProjectId,
@@ -28,6 +29,7 @@ import {
 } from "./link-store.ts";
 import {
   createProjectRepositoryService,
+  folderRelation,
   LINK_CANCEL_PAUSE_MS,
   LINK_WRITE_RETRY_FIRST_MS,
   LINK_WRITE_RETRY_MAX_MS,
@@ -239,7 +241,12 @@ interface Write {
 
 interface HarnessOptions {
   readonly read?: () => Promise<RepositoryLinkRead>;
+  /** Whether the mounts compare folders without regard to case. */
   readonly caseInsensitive?: boolean;
+  /** The links' path functions; `path.posix` by default. */
+  readonly pathApi?: PlatformPath;
+  /** Whether the links ignore case; as `caseInsensitive` by default. */
+  readonly linksIgnoreCase?: boolean;
 }
 
 class Harness {
@@ -261,6 +268,8 @@ class Harness {
   people: readonly PersonState[] = Object.freeze([person(OWN)]);
   /** Makes the workspace service's `people` throw. */
   throwOnPeople = false;
+  /** Whether the workspace service's list answered; "throw" makes it throw. */
+  workspaceListLoaded: boolean | "throw" = true;
   readonly mounts = new Map<string, string>();
   /** Mounts whose state is `unavailable`. */
   readonly unavailableMounts = new Set<string>();
@@ -341,6 +350,12 @@ class Harness {
         },
         ownMemberId: (workspaceId) =>
           (this.ownMembers.get(workspaceId) ?? null) as never,
+        listLoaded: () => {
+          if (this.workspaceListLoaded === "throw") {
+            throw new Error("list failed");
+          }
+          return this.workspaceListLoaded;
+        },
         people: () => {
           if (this.throwOnPeople) {
             throw new Error("people failed");
@@ -373,6 +388,9 @@ class Harness {
           return () => this.mountListeners.delete(entry);
         },
       },
+      pathApi: options.pathApi ?? path.posix,
+      caseInsensitivePaths:
+        options.linksIgnoreCase ?? options.caseInsensitive === true,
       store: {
         read: options.read ?? (() => Promise.resolve({ kind: "none" })),
         write: async (links) => {
@@ -1423,6 +1441,336 @@ test("where folders ignore case, a folder in another case is the same folder", a
     outcome: "refused",
     reason: "folder_linked",
   });
+});
+
+// Nested folders (#302).
+
+test("folderRelation tells the same folder, a folder inside or around another, and folders apart, with a shared name prefix apart", () => {
+  const posix: [string, string, string][] = [
+    ["/a/repo", "/a/repo", "same"],
+    ["/a/repo", "/a/repo/", "same"],
+    ["/a/repo", "/a/repo/sub", "nested"],
+    ["/a/repo/sub/deeper", "/a/repo", "nested"],
+    ["/", "/a/repo", "nested"],
+    ["/a/repo", "/a/repo2", "apart"],
+    ["/a/repo2", "/a/repo", "apart"],
+    ["/a/repo", "/a/rep", "apart"],
+    ["/a/repo", "/a/repo..x", "apart"],
+    ["/a/repo", "/b/repo", "apart"],
+    ["/a/Repo", "/a/repo/sub", "apart"],
+  ];
+  for (const [a, b, relation] of posix) {
+    expect(folderRelation(a, b, path.posix, false), `${a} ${b}`).toBe(relation);
+  }
+  // Where case does not count, as on macOS.
+  const folded: [string, string, string][] = [
+    ["/a/Repo", "/a/repo", "same"],
+    ["/a/Repo", "/A/REPO/sub", "nested"],
+    ["/A/REPO/SUB", "/a/repo", "nested"],
+    ["/a/Repo", "/a/REPO2", "apart"],
+  ];
+  for (const [a, b, relation] of folded) {
+    expect(folderRelation(a, b, path.posix, true), `${a} ${b}`).toBe(relation);
+  }
+  // Windows: either separator, a drive letter in either case, a trailing
+  // separator, a share, and another drive.
+  const windows: [string, string, string][] = [
+    ["C:\\Users\\octocat\\Web", "c:/users/OCTOCAT/web", "same"],
+    ["C:\\Users\\octocat\\Web", "C:\\Users\\octocat\\Web\\", "same"],
+    ["C:\\Users\\octocat\\Web", "c:/Users/octocat/Web/packages/lib", "nested"],
+    ["C:\\USERS\\OCTOCAT\\WEB\\lib", "c:\\users\\octocat\\web", "nested"],
+    ["C:\\", "C:\\Users\\octocat\\Web", "nested"],
+    ["\\\\server\\share\\web", "//SERVER/share/web/lib", "nested"],
+    ["C:\\Users\\octocat\\Web", "C:\\Users\\octocat\\Web2", "apart"],
+    ["C:\\Users\\octocat\\Web2", "c:/users/octocat/web", "apart"],
+    ["C:\\Users\\octocat\\Web", "D:\\Users\\octocat\\Web\\lib", "apart"],
+    ["C:\\Users\\octocat\\Web", "D:\\Users\\octocat\\Web", "apart"],
+  ];
+  for (const [a, b, relation] of windows) {
+    expect(folderRelation(a, b, path.win32, true), `${a} ${b}`).toBe(relation);
+  }
+});
+
+test("link refuses a folder inside, or around, a folder that the account linked to another repository, of any project, also while that one is not mounted, without asking or writing", async () => {
+  const inWorkspaceB = linkOf(REPO_3, "/home/octocat/secret-b", {
+    workspaceId: WS_B,
+    projectId: PROJECT_2,
+  });
+  const harness = new Harness({
+    read: () => Promise.resolve({ kind: "links", links: [inWorkspaceB] }),
+  });
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+  await harness.service.link(REPO_1, MOUNT_1);
+  const writes = harness.written.length;
+
+  const refusedFolders = [
+    // Inside the folder linked to REPO_1, deeper, and around it.
+    `${FOLDER_1}/packages/lib`,
+    `${FOLDER_1}/packages/lib/deeper`,
+    "/home/octocat",
+    "/home",
+    // Inside the folder that the account linked in another workspace.
+    "/home/octocat/secret-b/vendor",
+  ];
+  for (const folder of refusedFolders) {
+    harness.folders.add(folder);
+    harness.mount(MOUNT_2, folder);
+    await expect(
+      harness.service.link(REPO_2, MOUNT_2),
+      folder,
+    ).resolves.toEqual({ outcome: "refused", reason: "nested_link" });
+    harness.unmount(MOUNT_2);
+  }
+  // The linked folder need not be mounted.
+  harness.unmount(MOUNT_1);
+  harness.folders.add(`${FOLDER_1}/lib`);
+  harness.mount(MOUNT_2, `${FOLDER_1}/lib`);
+  await expect(harness.service.link(REPO_2, MOUNT_2)).resolves.toEqual({
+    outcome: "refused",
+    reason: "nested_link",
+  });
+  expect(harness.written).toHaveLength(writes);
+  expect(harness.confirmations).toHaveLength(1);
+  expect(harness.state.repositories[1]).toMatchObject({ linked: false });
+});
+
+test("a nested folder that another account or a former person linked is no obstacle, nor is a sibling folder whose name begins with the linked one's", async () => {
+  const otherAccount = linkOf(REPO_3, "/home/shared/web", {
+    ownMemberId: OTHER_OWN as never,
+  });
+  const former = linkOf(REPO_3, "/home/former/web", {
+    workspaceId: WS_GONE,
+    projectId: PROJECT_2,
+  });
+  const harness = new Harness({
+    read: () =>
+      Promise.resolve({ kind: "links", links: [otherAccount, former] }),
+  });
+  await harness.ready(
+    repository(REPO_1),
+    repository(REPO_2),
+    repository(REPO_3),
+  );
+  harness.folders.add("/home/shared/web/lib");
+  harness.mount(MOUNT_1, "/home/shared/web/lib");
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "linked",
+  });
+  harness.folders.add("/home/former");
+  harness.mount(MOUNT_2, "/home/former");
+  await expect(harness.service.link(REPO_2, MOUNT_2)).resolves.toEqual({
+    outcome: "linked",
+  });
+
+  // REPO_1 is at /home/shared/web/lib; its siblings with a longer and a
+  // shorter name are apart.
+  for (const folder of ["/home/shared/web/lib2", "/home/shared/web/li"]) {
+    harness.folders.add(folder);
+    harness.unmount(MOUNT_2);
+    harness.mount(MOUNT_2, folder);
+    await expect(
+      harness.service.link(REPO_2, MOUNT_2),
+      folder,
+    ).resolves.toEqual({ outcome: "linked" });
+  }
+  expect(harness.lastWritten()).toEqual([
+    otherAccount,
+    former,
+    linkOf(REPO_1, "/home/shared/web/lib"),
+    linkOf(REPO_2, "/home/shared/web/li"),
+  ]);
+});
+
+test("a repository is linked again to its own folder, or to a folder inside or around it, as before: its earlier link does not count", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+  await harness.service.link(REPO_1, MOUNT_1);
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "linked",
+  });
+  expect(harness.lastWritten()).toEqual([linkOf(REPO_1, FOLDER_1)]);
+
+  harness.unmount(MOUNT_1);
+  for (const folder of [`${FOLDER_1}/lib`, "/home/octocat", FOLDER_1]) {
+    harness.folders.add(folder);
+    harness.unmount(MOUNT_2);
+    harness.mount(MOUNT_2, folder);
+    await expect(
+      harness.service.link(REPO_1, MOUNT_2),
+      folder,
+    ).resolves.toEqual({ outcome: "linked" });
+    expect(harness.lastWritten()).toEqual([linkOf(REPO_1, folder)]);
+  }
+  expect(harness.confirmations).toHaveLength(5);
+});
+
+test("on Windows, folders nest without regard to case, with either separator and a trailing one; another drive and a longer name are apart", async () => {
+  const web = "C:\\Users\\octocat\\Web";
+  const harness = new Harness({ caseInsensitive: true, pathApi: path.win32 });
+  await harness.ready(
+    repository(REPO_1),
+    repository(REPO_2),
+    repository(REPO_3),
+  );
+  harness.folders.add(web);
+  harness.mount(MOUNT_1, web);
+  await harness.service.link(REPO_1, MOUNT_1);
+
+  const cases: [string, string][] = [
+    ["c:/users/OCTOCAT/web/packages/lib", "nested_link"],
+    ["C:\\USERS\\OCTOCAT", "nested_link"],
+    ["c:\\", "nested_link"],
+    // The same folder, which the mounts do not tell with its separators.
+    ["c:/Users/octocat/Web/", "folder_linked"],
+  ];
+  for (const [folder, reason] of cases) {
+    harness.folders.add(folder);
+    harness.mount(MOUNT_2, folder);
+    await expect(
+      harness.service.link(REPO_2, MOUNT_2),
+      folder,
+    ).resolves.toEqual({ outcome: "refused", reason });
+    harness.unmount(MOUNT_2);
+  }
+  for (const [repositoryId, folder] of [
+    [REPO_2, "C:\\Users\\octocat\\Web2"],
+    [REPO_3, "D:\\Users\\octocat\\Web\\lib"],
+  ] as const) {
+    harness.folders.add(folder);
+    harness.mount(MOUNT_2, folder);
+    await expect(
+      harness.service.link(repositoryId, MOUNT_2),
+      folder,
+    ).resolves.toEqual({ outcome: "linked" });
+    harness.unmount(MOUNT_2);
+  }
+});
+
+test("on macOS, folders nest without regard to case, also where the mounts tell the case; on Linux, case counts", async () => {
+  const web = "/Users/octocat/Web";
+  // The mounts tell the case on macOS; the links do not.
+  const mac = new Harness({ linksIgnoreCase: true });
+  await mac.ready(repository(REPO_1), repository(REPO_2));
+  mac.folders.add(web);
+  mac.mount(MOUNT_1, web);
+  await mac.service.link(REPO_1, MOUNT_1);
+  const cases: [string, string][] = [
+    ["/users/octocat/web/lib", "nested_link"],
+    ["/Users/Octocat", "nested_link"],
+    ["/Users/octocat/WEB", "folder_linked"],
+  ];
+  for (const [folder, reason] of cases) {
+    mac.folders.add(folder);
+    mac.mount(MOUNT_2, folder);
+    await expect(mac.service.link(REPO_2, MOUNT_2), folder).resolves.toEqual({
+      outcome: "refused",
+      reason,
+    });
+    mac.unmount(MOUNT_2);
+  }
+  mac.folders.add("/Users/octocat/Web2");
+  mac.mount(MOUNT_2, "/Users/octocat/Web2");
+  await expect(mac.service.link(REPO_2, MOUNT_2)).resolves.toEqual({
+    outcome: "linked",
+  });
+
+  const linux = new Harness();
+  await linux.ready(repository(REPO_1), repository(REPO_2));
+  linux.folders.add(web);
+  linux.folders.add("/users/octocat/web/lib");
+  linux.mount(MOUNT_1, web);
+  linux.mount(MOUNT_2, "/users/octocat/web/lib");
+  await linux.service.link(REPO_1, MOUNT_1);
+  await expect(linux.service.link(REPO_2, MOUNT_2)).resolves.toEqual({
+    outcome: "linked",
+  });
+});
+
+test("until the account's workspace list has loaded, a link is unavailable, also one nested in a link of a workspace that the account's person is not known in yet", async () => {
+  // The account's link in WS_B; the list has not loaded, and only WS_A,
+  // created meanwhile, names the account's person.
+  const inWorkspaceB = linkOf(REPO_3, "/home/octocat/secret-b", {
+    workspaceId: WS_B,
+    projectId: PROJECT_2,
+  });
+  const harness = new Harness({
+    read: () => Promise.resolve({ kind: "links", links: [inWorkspaceB] }),
+  });
+  harness.workspaceListLoaded = false;
+  harness.ownMembers.delete(WS_B);
+  await harness.ready(repository(REPO_1));
+  const inner = "/home/octocat/secret-b/vendor";
+  harness.folders.add(inner);
+  harness.mount(MOUNT_1, inner);
+
+  for (const loaded of [false, "throw"] as const) {
+    harness.workspaceListLoaded = loaded;
+    await expect(
+      harness.service.link(REPO_1, MOUNT_1),
+      String(loaded),
+    ).resolves.toEqual({ outcome: "refused", reason: "unavailable" });
+  }
+  expect(harness.confirmations).toHaveLength(0);
+  expect(harness.written).toHaveLength(0);
+
+  // Once the list has loaded, it names the account's person in WS_B.
+  harness.workspaceListLoaded = true;
+  harness.ownMembers.set(WS_B, OWN);
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "nested_link",
+  });
+
+  // A list that stops being loaded while the person is asked links nothing.
+  harness.mount(MOUNT_2, FOLDER_1);
+  harness.holdConfirm = deferred();
+  const answer = harness.service.link(REPO_1, MOUNT_2);
+  await settle();
+  expect(harness.confirmations).toHaveLength(1);
+  harness.workspaceListLoaded = false;
+  harness.holdConfirm.resolve(true);
+  await expect(answer).resolves.toEqual({
+    outcome: "refused",
+    reason: "unavailable",
+  });
+  expect(harness.written).toHaveLength(0);
+});
+
+test("of two nested links on their way, the later one is refused when its write starts, after the earlier one was written", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  const inner = `${FOLDER_1}/lib`;
+  harness.folders.add(inner);
+  harness.mount(MOUNT_1, FOLDER_1);
+  harness.mount(MOUNT_2, inner);
+  harness.holdWrite = deferred();
+  const hold = harness.holdWrite;
+
+  const outer = harness.service.link(REPO_1, MOUNT_1);
+  await settle();
+  expect(harness.written).toEqual([[linkOf(REPO_1, FOLDER_1)]]);
+  // The second passes its first check and its dialog while the first one
+  // is written, and waits behind it.
+  const nested = harness.service.link(REPO_2, MOUNT_2);
+  await settle();
+  expect(harness.confirmations).toHaveLength(2);
+  expect(harness.written).toHaveLength(1);
+
+  harness.holdWrite = null;
+  hold.resolve();
+  await expect(outer).resolves.toEqual({ outcome: "linked" });
+  await expect(nested).resolves.toEqual({
+    outcome: "refused",
+    reason: "nested_link",
+  });
+  await settle();
+  expect(harness.written).toEqual([[linkOf(REPO_1, FOLDER_1)]]);
+  expect(harness.state.repositories).toMatchObject([
+    { repositoryId: REPO_1, linked: true },
+    { repositoryId: REPO_2, linked: false },
+  ]);
 });
 
 test("link is unavailable while the links load, without the account's person, and signed out; a failed write links nothing", async () => {

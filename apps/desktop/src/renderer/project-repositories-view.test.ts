@@ -344,6 +344,13 @@ test("a link's answer reads naturally after the confirmation dialog was cancelle
   expect(describeLinkResult({ outcome: "refused", reason: "busy" })).toBe(
     "The repository was not linked. A confirmation of another link is open, or one was cancelled a moment ago. Answer that dialog or wait a few seconds, then try again.",
   );
+  // A folder inside, or around, another linked folder (#302) says which
+  // link to undo.
+  expect(
+    describeLinkResult({ outcome: "refused", reason: "nested_link" }),
+  ).toBe(
+    "The repository was not linked. This folder is inside, or contains, a folder that you linked to another repository, perhaps of another project. Unlink that repository first.",
+  );
   for (const reason of LINK_REPOSITORY_REFUSALS) {
     expect(describeLinkResult({ outcome: "refused", reason })).toBe(
       `The repository was not linked. ${LINK_REPOSITORY_REFUSAL_MESSAGES[reason]}`,
