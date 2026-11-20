@@ -295,6 +295,14 @@ export interface WorkspaceService {
    */
   readonly ownMemberId: (workspaceId: WorkspaceId) => MemberId | null;
   /**
+   * Whether the list answered since this device signed in. It stays true
+   * during later loads and after a failed one, which keep what was loaded,
+   * and is false after a sign-out or another device. Until then
+   * `ownMemberId` knows at most a workspace that `addWorkspace` added, so
+   * the repository links fail closed (#302).
+   */
+  readonly listLoaded: () => boolean;
+  /**
    * The role of the account's own person in a workspace of the list, from
    * the list's last answer, or null for a workspace that it does not hold,
    * also one that `addWorkspace` added until the list holds it. It is the
@@ -1221,6 +1229,7 @@ export function createWorkspaceService(
     selectedWorkspaceId: () => selected,
     ownMemberId: (workspaceId: WorkspaceId) =>
       closed ? null : (ownMembers.get(workspaceId) ?? null),
+    listLoaded: () => !closed && listLoaded,
     ownRole: (workspaceId: WorkspaceId) =>
       closed ? null : (ownRoles.get(workspaceId) ?? null),
     listGeneration: () => listGeneration,

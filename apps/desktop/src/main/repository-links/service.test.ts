@@ -268,6 +268,8 @@ class Harness {
   people: readonly PersonState[] = Object.freeze([person(OWN)]);
   /** Makes the workspace service's `people` throw. */
   throwOnPeople = false;
+  /** Whether the workspace service's list answered; "throw" makes it throw. */
+  workspaceListLoaded: boolean | "throw" = true;
   readonly mounts = new Map<string, string>();
   /** Mounts whose state is `unavailable`. */
   readonly unavailableMounts = new Set<string>();
@@ -348,6 +350,12 @@ class Harness {
         },
         ownMemberId: (workspaceId) =>
           (this.ownMembers.get(workspaceId) ?? null) as never,
+        listLoaded: () => {
+          if (this.workspaceListLoaded === "throw") {
+            throw new Error("list failed");
+          }
+          return this.workspaceListLoaded;
+        },
         people: () => {
           if (this.throwOnPeople) {
             throw new Error("people failed");
@@ -1678,6 +1686,56 @@ test("on macOS, folders nest without regard to case, also where the mounts tell 
   await expect(linux.service.link(REPO_2, MOUNT_2)).resolves.toEqual({
     outcome: "linked",
   });
+});
+
+test("until the account's workspace list has loaded, a link is unavailable, also one nested in a link of a workspace that the account's person is not known in yet", async () => {
+  // The account's link in WS_B; the list has not loaded, and only WS_A,
+  // created meanwhile, names the account's person.
+  const inWorkspaceB = linkOf(REPO_3, "/home/octocat/secret-b", {
+    workspaceId: WS_B,
+    projectId: PROJECT_2,
+  });
+  const harness = new Harness({
+    read: () => Promise.resolve({ kind: "links", links: [inWorkspaceB] }),
+  });
+  harness.workspaceListLoaded = false;
+  harness.ownMembers.delete(WS_B);
+  await harness.ready(repository(REPO_1));
+  const inner = "/home/octocat/secret-b/vendor";
+  harness.folders.add(inner);
+  harness.mount(MOUNT_1, inner);
+
+  for (const loaded of [false, "throw"] as const) {
+    harness.workspaceListLoaded = loaded;
+    await expect(
+      harness.service.link(REPO_1, MOUNT_1),
+      String(loaded),
+    ).resolves.toEqual({ outcome: "refused", reason: "unavailable" });
+  }
+  expect(harness.confirmations).toHaveLength(0);
+  expect(harness.written).toHaveLength(0);
+
+  // Once the list has loaded, it names the account's person in WS_B.
+  harness.workspaceListLoaded = true;
+  harness.ownMembers.set(WS_B, OWN);
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "refused",
+    reason: "nested_link",
+  });
+
+  // A list that stops being loaded while the person is asked links nothing.
+  harness.mount(MOUNT_2, FOLDER_1);
+  harness.holdConfirm = deferred();
+  const answer = harness.service.link(REPO_1, MOUNT_2);
+  await settle();
+  expect(harness.confirmations).toHaveLength(1);
+  harness.workspaceListLoaded = false;
+  harness.holdConfirm.resolve(true);
+  await expect(answer).resolves.toEqual({
+    outcome: "refused",
+    reason: "unavailable",
+  });
+  expect(harness.written).toHaveLength(0);
 });
 
 test("of two nested links on their way, the later one is refused when its write starts, after the earlier one was written", async () => {

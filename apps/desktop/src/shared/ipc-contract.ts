@@ -1280,8 +1280,9 @@ export type RemoveRepositoryResult = z.infer<
  * - `limit`: this device holds as many links as it keeps, and all of them
  *   are the account's own. A link of another account or a former person
  *   makes room first, the oldest first.
- * - `unavailable`: no account is signed in, the account's own person in the
- *   workspace is not known, or the links are not `ready`.
+ * - `unavailable`: no account is signed in, the account's workspace list
+ *   has not loaded yet, the account's own person in the workspace is not
+ *   known, or the links are not `ready`.
  * - `failed`: the confirmation could not be shown, what was confirmed
  *   changed before the write (also the folder's identity while the dialog
  *   was open), or the link could not be written; nothing changed.

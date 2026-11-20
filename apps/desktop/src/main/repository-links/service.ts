@@ -223,7 +223,7 @@ export type ProjectRepositoryConnection = Pick<
 /** The part of the workspace service that this service uses. */
 export type ProjectRepositoryWorkspaces = Pick<
   WorkspaceService,
-  "state" | "onChange" | "ownMemberId" | "people"
+  "state" | "onChange" | "ownMemberId" | "people" | "listLoaded"
 >;
 
 /** The part of the repository (mount) service that this service uses. */
@@ -1458,6 +1458,19 @@ export function createProjectRepositoryService(
     if (closed || device === null || linkState !== "ready") {
       return "unavailable";
     }
+    // Until the account's workspace list has loaded, the account's own
+    // person is known at most in a workspace that it created meanwhile, so
+    // its links in the other workspaces would not count for the checks of
+    // the same and of nested folders below: no link is made (#302).
+    let listLoaded: boolean;
+    try {
+      listLoaded = workspaces.listLoaded();
+    } catch {
+      listLoaded = false;
+    }
+    if (!listLoaded) {
+      return "unavailable";
+    }
     const listed = repositories?.find(
       (repository) => repository.id === repositoryId,
     );
@@ -1500,7 +1513,9 @@ export function createProjectRepositoryService(
     // is the same folder. The account's earlier link of this repository is
     // replaced, so it does not count. This runs again when the write starts,
     // after the writes before it, so of two links on their way the later
-    // one sees the earlier.
+    // one sees the earlier: the earlier link's continuation adds it to
+    // `links` before the next queued write runs. The check after the write
+    // is the safety net.
     let nested = false;
     for (const held of links) {
       if (held === replaces || !ownLink(held)) {
