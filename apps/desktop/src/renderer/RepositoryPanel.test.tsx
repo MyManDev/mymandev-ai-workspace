@@ -245,6 +245,9 @@ function controls(
         name: "app",
         linked: false,
         mountId: null,
+        // Who may remove a repository (#309); a required field once it
+        // merges.
+        removable: true,
       },
     ],
   } as ProjectRepositoriesView;
