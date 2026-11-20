@@ -1555,3 +1555,53 @@ test("the lists never change from an answer: the controller holds no requests", 
     ]);
   }
 });
+
+test("an action of another kind ends the sentence of the last action or refresh, once, and keeps a running action's answer and an open question (#319)", async () => {
+  const { actions, views, last } = controllerWith({
+    pause: OK,
+    load: () => Promise.resolve({ outcome: "loading" }),
+  });
+  await actions.start(PAUSE);
+  expect(last().message).toBe("New join requests are paused.");
+  actions.clearMessage();
+  expect(last()).toEqual(IDLE_JOIN_REQUEST_ACTIONS);
+  const before = views.length;
+  actions.clearMessage();
+  expect(views).toHaveLength(before);
+
+  await actions.refresh();
+  expect(last().message).toBe(JOIN_REQUEST_REFRESH_MESSAGES.loading);
+  actions.clearMessage();
+  actions.listChanged(known(), listed({ revision: LISTED.revision + 1 }));
+  expect(last().message).toBeUndefined();
+
+  const deny = pending<JoinRequestActionResult>();
+  const running = controllerWith({ deny: deny.answer });
+  await running.actions.start(DENY);
+  running.actions.clearMessage();
+  expect(running.last().dialog?.request).toEqual(DENY);
+  const done = running.actions.confirm();
+  running.actions.clearMessage();
+  deny.resolve({ outcome: "ok" });
+  await done;
+  expect(running.last().message).toBe("The request was denied.");
+});
+
+test("a refresh empties the sentence at its start, so that the same answer twice is a new sentence (#319)", async () => {
+  let release: () => void = () => undefined;
+  const load = () =>
+    new Promise<JoinRequestLoadResult>((done) => {
+      release = () => done({ outcome: "refused", reason: "too_soon" });
+    });
+  const { actions, last } = controllerWith({ load });
+  const first = actions.refresh();
+  release();
+  await first;
+  expect(last().message).toBe(JOIN_REQUEST_REFRESH_MESSAGES.too_soon);
+  const second = actions.refresh();
+  // The start empties the sentence, so that the same one is new again.
+  expect(last().message).toBeUndefined();
+  release();
+  await second;
+  expect(last().message).toBe(JOIN_REQUEST_REFRESH_MESSAGES.too_soon);
+});

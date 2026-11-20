@@ -649,6 +649,8 @@ export function useInvitationActions(
 ): {
   readonly actions: InvitationActionsView;
   readonly handlers: InvitationActionHandlers | undefined;
+  /** Ends the sentence of the last action (#319); undefined without the bridges. */
+  readonly clearMessage: (() => void) | undefined;
 } {
   const [actions, setActions] = useState(IDLE_INVITATION_ACTIONS);
   const controller = useMemo(
@@ -705,5 +707,5 @@ export function useInvitationActions(
           },
     [controller, onStart],
   );
-  return { actions, handlers };
+  return { actions, handlers, clearMessage: controller?.clearMessage };
 }

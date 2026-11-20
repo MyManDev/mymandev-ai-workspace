@@ -8,6 +8,7 @@ import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
 import type { PeopleView, PersonView } from "../shared/ipc-contract.ts";
+import { ResultParagraph } from "./PeopleActions.tsx";
 import { PeopleScreenContent } from "./PeopleScreen.tsx";
 import { peopleDateFormat, type PeopleScreenView } from "./people-view.ts";
 import {
@@ -168,13 +169,21 @@ interface ButtonProps {
   readonly onClick?: () => void;
 }
 
-/** The elements of a tree whose components have no hooks. */
+/**
+ * The element and every element below it. A component without hooks is
+ * called to reach its elements; the status paragraph (`ResultParagraph`),
+ * the part's only component with hooks, stays a leaf, and any other error
+ * fails the test.
+ */
 function elementsOf(node: ReactNode): ReactElement<ButtonProps>[] {
   if (Array.isArray(node)) {
     return node.flatMap((child: ReactNode) => elementsOf(child));
   }
   if (!isValidElement<ButtonProps>(node)) {
     return [];
+  }
+  if (node.type === ResultParagraph) {
+    return [node];
   }
   if (typeof node.type === "function") {
     return elementsOf(

@@ -778,6 +778,8 @@ export function useJoinRequestActions(
 ): {
   readonly actions: JoinRequestActionsView;
   readonly handlers: JoinRequestActionHandlers | undefined;
+  /** Ends the sentence of the last action (#319); undefined without the bridges. */
+  readonly clearMessage: (() => void) | undefined;
 } {
   const [actions, setActions] = useState(IDLE_JOIN_REQUEST_ACTIONS);
   const { joinRequestActions, joinRequests: list, invitationActions } = bridges;
@@ -850,5 +852,5 @@ export function useJoinRequestActions(
           },
     [controller, onStart],
   );
-  return { actions, handlers };
+  return { actions, handlers, clearMessage: controller?.clearMessage };
 }

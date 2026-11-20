@@ -673,6 +673,12 @@ export interface PeopleActions {
    */
   readonly define: (workspaceId: string) => Promise<boolean>;
   /**
+   * Ends the sentence of the last action, as an action of another kind on
+   * the screen starts, so that the screen shows only the result of the last
+   * action (#319). An action that runs still shows its answer.
+   */
+  readonly clearMessage: () => void;
+  /**
    * Follows the screen's view by the renderer's clock `now`:
    *
    * - the open question ends once the screen no longer offers it as it is
@@ -866,6 +872,13 @@ export function createPeopleActions(
       }
       await run("define", workspaceId, () => bridge.define(workspaceId, name));
       return false;
+    },
+    clearMessage: () => {
+      keepThroughSwitch = false;
+      if (message !== undefined) {
+        message = undefined;
+        show();
+      }
     },
     listChanged: (view: PeopleScreenView, now: number) => {
       let changed = false;

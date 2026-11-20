@@ -7,11 +7,15 @@ import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type { PeopleView, PersonView } from "../shared/ipc-contract.ts";
 import {
+  bringResultIntoView,
+  PEOPLE_ACTION_MESSAGE_ID,
   PeopleActionDialogContent,
+  ResultParagraph,
   type PeopleActionHandlers,
 } from "./PeopleActions.tsx";
 import { PeopleScreenContent } from "./PeopleScreen.tsx";
 import {
+  describePeopleActionResult,
   IDLE_PEOPLE_ACTIONS,
   offerTimeFormat,
   type PeopleActionDialog,
@@ -718,4 +722,81 @@ test("the screen with its actions shows no ID, its element IDs are unique, every
       expect(html).not.toMatch(/\sstyle=/);
     }
   }
+});
+
+/** A status paragraph that records each scroll into view. */
+function scrolledElement() {
+  const scrolls: ScrollIntoViewOptions[] = [];
+  return {
+    scrolls,
+    element: {
+      scrollIntoView: (options: ScrollIntoViewOptions) => {
+        scrolls.push(options);
+      },
+    },
+  };
+}
+
+test("bringResultIntoView scrolls a paragraph with a sentence into view by the shortest scroll, and an empty one not at all (#319)", () => {
+  const { scrolls, element } = scrolledElement();
+  bringResultIntoView(element, "");
+  expect(scrolls).toEqual([]);
+  bringResultIntoView(element, "The person was removed.");
+  expect(scrolls).toEqual([{ block: "nearest" }]);
+  // Before the paragraph is in the page, nothing happens.
+  expect(() =>
+    bringResultIntoView(null, "The person was removed."),
+  ).not.toThrow();
+});
+
+test("a refused promotion from a device that is too new shows its sentence in the people actions' ResultParagraph, which has no tab stop (#319)", () => {
+  const refusal = describePeopleActionResult("promote", {
+    outcome: "refused",
+    reason: "device_too_new",
+    retryAfterMs: null,
+  });
+  expect(refusal).toBe(
+    "The person could not be made an admin. Promoting an admin and offering the ownership need a device that was registered at least 72 hours ago. Use an older device, or try again later.",
+  );
+  const actions = { ...IDLE_PEOPLE_ACTIONS, message: refusal };
+  expect(render({ actions })).toContain(
+    `<p class="people-status" id="people-action-message" role="status">${refusal}</p>`,
+  );
+  // The paragraph is a ResultParagraph with the sentence as its text; its
+  // effect is pinned by the next test, because a server render runs none.
+  const paragraph = elementsOf(screen({ actions })).find(
+    (element) => element.props.id === PEOPLE_ACTION_MESSAGE_ID,
+  );
+  expect(paragraph?.type).toBe(ResultParagraph);
+  const props = paragraph?.props as { readonly text?: string } | undefined;
+  expect(props?.text).toBe(refusal);
+  // It has no tab stop, so the focus stays on "Make admin".
+  expect(render({ actions })).not.toMatch(
+    /id="people-action-message"[^>]*tabindex/,
+  );
+});
+
+const RESULT_SOURCES = import.meta.glob<string>(["./PeopleActions.tsx"], {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+test("ResultParagraph brings each new text into view in one effect on its own paragraph, keyed on the text, and never moves the focus (#319)", () => {
+  const source = RESULT_SOURCES["./PeopleActions.tsx"] ?? "";
+  const start = source.indexOf("export function ResultParagraph(");
+  const end = source.indexOf("\n}\n", start);
+  expect(start).toBeGreaterThan(-1);
+  const component = source.slice(start, end);
+  expect(component).toContain(
+    "const ref = useRef<HTMLParagraphElement>(null);",
+  );
+  expect(component.match(/useEffect\(/g)).toHaveLength(1);
+  expect(component).toContain(
+    "useEffect(() => bringResultIntoView(ref.current, text), [text]);",
+  );
+  expect(component).toMatch(
+    /<p ref=\{ref\} className="people-status" id=\{id\} role="status">/,
+  );
+  expect(component).not.toMatch(/\.focus\s*\(|tabIndex/);
 });

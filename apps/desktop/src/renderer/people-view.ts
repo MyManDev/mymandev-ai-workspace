@@ -311,3 +311,60 @@ export function formatPeopleDate(
   const date = new Date(timestamp);
   return Number.isNaN(date.getTime()) ? timestamp : format.format(date);
 }
+
+/**
+ * The kinds of action on the people screen, each with the sentence of its
+ * last action in a status paragraph of its own: the copy of the workspace
+ * ID, the people actions (also "Remove" on a recent claim), the invitation
+ * actions, the join request actions, and the refresh of the recent claims.
+ */
+export type PeopleScreenActionKind =
+  "copy" | "people" | "invitations" | "joinRequests" | "claims";
+
+/**
+ * Ends the sentence of every kind of action but `kind`, as an action of
+ * `kind` starts, so that the screen shows only the result of the last
+ * action, never an older one of another kind (#319). A kind without its
+ * bridge has no end.
+ */
+export function endOtherSentences(
+  kind: PeopleScreenActionKind,
+  ends: Readonly<Record<PeopleScreenActionKind, (() => void) | undefined>>,
+): void {
+  for (const [other, end] of Object.entries(ends)) {
+    if (other !== kind) {
+      end?.();
+    }
+  }
+}
+
+/** The names of the functions of `T`. */
+export type FunctionName<T> = {
+  [K in keyof T]-?: T[K] extends (...args: never[]) => unknown ? K : never;
+}[keyof T];
+
+/**
+ * `handlers` with each function in `names` calling `before` first and then
+ * itself with the same arguments; the other members stay as they are.
+ * Undefined handlers stay undefined.
+ */
+export function callingFirst<T extends object>(
+  handlers: T | undefined,
+  names: readonly FunctionName<T>[],
+  before: () => void,
+): T | undefined {
+  if (handlers === undefined) {
+    return undefined;
+  }
+  const called = { ...handlers };
+  for (const name of names) {
+    const handler = handlers[name] as (...args: unknown[]) => unknown;
+    Object.assign(called, {
+      [name]: (...args: unknown[]) => {
+        before();
+        return handler(...args);
+      },
+    });
+  }
+  return called;
+}

@@ -1436,3 +1436,69 @@ test("a refresh's answer after a switch shows nothing", async () => {
   await done;
   expect(last().message).toBeUndefined();
 });
+
+test("an action of another kind ends the sentence of the last action or refresh, once, and a later state brings no refresh's sentence back (#319)", async () => {
+  const { actions, views, last } = controllerWith({
+    revoke: () => Promise.resolve({ outcome: "ok" }),
+    load: () => Promise.resolve({ outcome: "loading" }),
+  });
+  actions.start(REVOKE);
+  await actions.confirm();
+  expect(last().message).toBe(INVITATION_ACTION_DONE_MESSAGES.revoke);
+  actions.clearMessage();
+  expect(last()).toEqual(IDLE_INVITATION_ACTIONS);
+  const before = views.length;
+  actions.clearMessage();
+  expect(views).toHaveLength(before);
+
+  await actions.refresh();
+  expect(last().message).toBe(INVITATION_REFRESH_MESSAGES.loading);
+  actions.clearMessage();
+  expect(last().message).toBeUndefined();
+  actions.listChanged(known(), listed({ revision: 4 }), NOW);
+  expect(last().message).toBeUndefined();
+});
+
+test("ending the sentences keeps a running action's answer, an open question, and the code's dialog, and the sentence of a code that could not be shown still shows on its workspace (#319)", async () => {
+  const create = pending<CreateInvitationResult>();
+  const { actions, last } = controllerWith({ create: create.answer });
+  actions.start(INVITE);
+  const done = actions.confirm();
+  actions.clearMessage();
+  create.resolve(CREATED);
+  await done;
+  expect(last().message).toBe(INVITATION_ACTION_DONE_MESSAGES.invite);
+  expect(last().code?.code).toBe(CODE);
+  actions.clearMessage();
+  expect(last().message).toBeUndefined();
+  expect(last().code?.code).toBe(CODE);
+
+  const asking = controllerWith({});
+  asking.actions.start(REVOKE);
+  asking.actions.clearMessage();
+  expect(asking.last().question).toBe(REVOKE);
+
+  const away = await createdAway([known({ workspaceId: OTHER_WORKSPACE })]);
+  away.actions.clearMessage();
+  away.actions.listChanged(known(), listed(), NOW);
+  expect(away.last().message).toBe(INVITATION_CREATED_UNSEEN_MESSAGE);
+});
+
+test("a refresh empties the sentence at its start, so that the same answer twice is a new sentence (#319)", async () => {
+  let release: () => void = () => undefined;
+  const load = () =>
+    new Promise<InvitationLoadResult>((done) => {
+      release = () => done({ outcome: "refused", reason: "too_soon" });
+    });
+  const { actions, last } = controllerWith({ load });
+  const first = actions.refresh();
+  release();
+  await first;
+  expect(last().message).toBe(INVITATION_REFRESH_MESSAGES.too_soon);
+  const second = actions.refresh();
+  // The start empties the sentence, so that the same one is new again.
+  expect(last().message).toBeUndefined();
+  release();
+  await second;
+  expect(last().message).toBe(INVITATION_REFRESH_MESSAGES.too_soon);
+});

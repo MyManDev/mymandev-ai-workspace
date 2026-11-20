@@ -315,3 +315,23 @@ test("a change of the shown ID while a copy runs keeps the copy running, and its
   copy.shown(WORKSPACE);
   expect(views.at(-1)).toEqual(IDLE_WORKSPACE_ID_COPY);
 });
+
+test("an action of another kind forgets the last copy, once, and a copy on its way still reports how it ended (#319)", async () => {
+  const fake = fakeBridge();
+  const views: WorkspaceIdCopyView[] = [];
+  const copy = createWorkspaceIdCopy(fake.bridge, (view) => views.push(view));
+  copy.shown(WORKSPACE);
+  const done = copy.copy(WORKSPACE);
+  copy.clearMessage();
+  fake.answers[0]?.resolve({ outcome: "ok" });
+  await done;
+  expect(views.at(-1)).toEqual({
+    running: false,
+    last: { workspaceId: WORKSPACE, copied: true },
+  });
+  copy.clearMessage();
+  expect(views.at(-1)).toEqual(IDLE_WORKSPACE_ID_COPY);
+  const before = views.length;
+  copy.clearMessage();
+  expect(views).toHaveLength(before);
+});

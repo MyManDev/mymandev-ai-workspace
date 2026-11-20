@@ -938,3 +938,39 @@ test("the claims never change from an answer: the controller holds no claim", as
     expect(Object.keys(view.marked).sort()).toEqual(["memberIds", "scope"]);
   }
 });
+
+test("an action of another kind ends the refresh's sentence, once, and a later state brings none back (#319)", async () => {
+  const { claims, views, last } = controllerWith({
+    load: () => Promise.resolve({ outcome: "loading" }),
+  });
+  claims.listChanged(known(), listed());
+  await claims.refresh();
+  expect(last().message).toBe(CLAIM_REFRESH_MESSAGES.loading);
+  claims.clearMessage();
+  expect(last()).toEqual(IDLE_RECENT_CLAIMS);
+  const before = views.length;
+  claims.clearMessage();
+  expect(views).toHaveLength(before);
+  claims.listChanged(known(), listed({ revision: CLAIMS.revision + 1 }));
+  expect(last().message).toBeUndefined();
+});
+
+test("a refresh empties the sentence at its start, so that the same answer twice is a new sentence (#319)", async () => {
+  let release: () => void = () => undefined;
+  const load = () =>
+    new Promise<ClaimLoadResult>((done) => {
+      release = () => done({ outcome: "refused", reason: "too_soon" });
+    });
+  const { claims, last } = controllerWith({ load });
+  claims.listChanged(known(), listed());
+  const first = claims.refresh();
+  release();
+  await first;
+  expect(last().message).toBe(CLAIM_REFRESH_MESSAGES.too_soon);
+  const second = claims.refresh();
+  // The start empties the sentence, so that the same one is new again.
+  expect(last().message).toBeUndefined();
+  release();
+  await second;
+  expect(last().message).toBe(CLAIM_REFRESH_MESSAGES.too_soon);
+});

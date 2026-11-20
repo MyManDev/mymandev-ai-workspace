@@ -58,6 +58,7 @@ import {
   PEOPLE_TITLE_ID,
   PeopleActionDialogBox,
   PersonActionButtons,
+  ResultParagraph,
   usePeopleActions,
   usePeopleClock,
   type PeopleActionHandlers,
@@ -77,13 +78,16 @@ import {
 } from "./WorkspaceIdPart.tsx";
 import { describeWorkspaceId } from "./workspace-id-view.ts";
 import {
+  callingFirst,
   describeMorePeople,
   describePeopleScreen,
+  endOtherSentences,
   followPeople,
   formatPeopleDate,
   initialPeopleScreenView,
   PEOPLE_MESSAGES,
   peopleDateFormat,
+  type PeopleScreenActionKind,
   type PeopleScreenView,
   type PersonRow,
 } from "./people-view.ts";
@@ -107,7 +111,9 @@ import {
  * invitations (#95, D2 and D3), and they see the pending join requests and
  * the blocked accounts and decide on them (#95, D1 and D3), and the recent
  * claims, with "Remove" through the people actions' question (#95, D8 and
- * D9).
+ * D9). As an action of one kind starts, the sentences of the other kinds
+ * end (`endOtherSentences`), so that the screen shows only the result of
+ * the last action (#319).
  */
 export function PeopleScreen({
   workspaces,
@@ -159,7 +165,8 @@ export function PeopleScreen({
   // The later of the two readings, so that both the offer and the
   // invitations end on time.
   const now = Math.max(peopleNow, invitationsNow);
-  const { actions, handlers } = usePeopleActions(peopleActions, view, now);
+  const peopleParts = usePeopleActions(peopleActions, view, now);
+  const { actions } = peopleParts;
   const invitationParts = useInvitationActions(
     invitationActions,
     invitations,
@@ -186,24 +193,108 @@ export function PeopleScreen({
     joinRequestActions: joinRequestParts.actions,
   });
   useClaimsRendered(claimParts.controller, view, claimsView, claimsSeen);
+  const started = endingOtherSentences({
+    copy: {
+      handlers: workspaceIdCopy,
+      clearMessage: workspaceIdCopy?.clearMessage,
+    },
+    people: peopleParts,
+    invitations: invitationParts,
+    joinRequests: joinRequestParts,
+    claims: {
+      handlers: claimParts.handlers,
+      clearMessage: claimParts.controller?.clearMessage,
+    },
+  });
   return (
     <PeopleScreenContent
       view={view}
-      workspaceIdCopy={workspaceIdCopy}
+      workspaceIdCopy={started.copy}
       now={now}
       actions={actions}
-      handlers={handlers}
+      handlers={started.people}
       invitations={invitationsView}
       invitationActions={invitationParts.actions}
-      invitationHandlers={invitationParts.handlers}
+      invitationHandlers={started.invitations}
       joinRequests={joinRequestsView}
       joinRequestActions={joinRequestParts.actions}
-      joinRequestHandlers={joinRequestParts.handlers}
+      joinRequestHandlers={started.joinRequests}
       claims={claimsView}
       claimActions={claimParts.view}
-      claimHandlers={claimParts.handlers}
+      claimHandlers={started.claims}
     />
   );
+}
+
+/** The handlers of one kind of action, and the end of its last sentence. */
+export interface ActionKindParts<H> {
+  /** Undefined without the kind's bridges. */
+  readonly handlers: H | undefined;
+  /** Ends the sentence of the kind's last action; undefined without its bridges. */
+  readonly clearMessage: (() => void) | undefined;
+}
+
+/** The handlers of every kind of action on the people screen. */
+export interface PeopleScreenActionParts {
+  readonly copy: ActionKindParts<WorkspaceIdCopyControls>;
+  readonly people: ActionKindParts<PeopleActionHandlers>;
+  readonly invitations: ActionKindParts<InvitationActionHandlers>;
+  readonly joinRequests: ActionKindParts<JoinRequestActionHandlers>;
+  readonly claims: ActionKindParts<RecentClaimHandlers>;
+}
+
+/**
+ * The handlers of every kind of action on the screen, in which each control
+ * that starts an action, also one that asks first, first ends the
+ * sentences of the other kinds (`endOtherSentences`), so that the screen
+ * shows only the result of the last action (#319): "Copy"; a people
+ * action's button, its question's confirmation, and "Add person"; an
+ * invitation action's or a join request action's button, its question's
+ * confirmation, and its refresh; and the recent claims' refresh. "Remove"
+ * on a claim is a people action. Closing a question or a code's dialog and
+ * typing start nothing.
+ */
+export function endingOtherSentences(parts: PeopleScreenActionParts): {
+  readonly copy: WorkspaceIdCopyControls | undefined;
+  readonly people: PeopleActionHandlers | undefined;
+  readonly invitations: InvitationActionHandlers | undefined;
+  readonly joinRequests: JoinRequestActionHandlers | undefined;
+  readonly claims: RecentClaimHandlers | undefined;
+} {
+  const ends: Readonly<
+    Record<PeopleScreenActionKind, (() => void) | undefined>
+  > = {
+    copy: parts.copy.clearMessage,
+    people: parts.people.clearMessage,
+    invitations: parts.invitations.clearMessage,
+    joinRequests: parts.joinRequests.clearMessage,
+    claims: parts.claims.clearMessage,
+  };
+  const starting = (kind: PeopleScreenActionKind) => () =>
+    endOtherSentences(kind, ends);
+  return {
+    copy: callingFirst(parts.copy.handlers, ["onCopy"], starting("copy")),
+    people: callingFirst(
+      parts.people.handlers,
+      ["onStart", "onConfirm", "onDefine"],
+      starting("people"),
+    ),
+    invitations: callingFirst(
+      parts.invitations.handlers,
+      ["onStart", "onConfirm", "onRefresh"],
+      starting("invitations"),
+    ),
+    joinRequests: callingFirst(
+      parts.joinRequests.handlers,
+      ["onStart", "onConfirm", "onRefresh"],
+      starting("joinRequests"),
+    ),
+    claims: callingFirst(
+      parts.claims.handlers,
+      ["onRefresh"],
+      starting("claims"),
+    ),
+  };
 }
 
 export interface PeopleScreenContentProps {
@@ -262,7 +353,12 @@ export interface PeopleScreenContentProps {
 /**
  * The screen for a view, without state. The status paragraph is always
  * rendered, empty when there is nothing to say, so that a screen reader
- * announces a new text. Display names are text that people entered, so
+ * announces a new text. Each kind of action has a status paragraph of its
+ * own for the sentence of its last action (`ResultParagraph`), and the
+ * screen shows only the sentence of the last action of any kind (#319): a
+ * new sentence is brought into view when its paragraph is out of view, for
+ * example after an action far down the screen, without moving the focus.
+ * Display names are text that people entered, so
  * each one takes its direction from its own content (`dir="auto"`); a
  * GitHub login is shown in a monospace font, so that a display name cannot
  * pass for it (ADR 0014, "People and roles"). The heading stays "People",
@@ -395,36 +491,28 @@ export function PeopleScreenContent({
         {status}
       </p>
       {handlers === undefined ? null : (
-        <p
-          className="people-status"
+        <ResultParagraph
           id={PEOPLE_ACTION_MESSAGE_ID}
-          role="status"
-        >
-          {actions.message ?? ""}
-        </p>
+          text={actions.message ?? ""}
+        />
       )}
       {invitationHandlers === undefined ? null : (
-        <p
-          className="people-status"
+        <ResultParagraph
           id={INVITATION_ACTION_MESSAGE_ID}
-          role="status"
-        >
-          {invitationActions.message ?? ""}
-        </p>
+          text={invitationActions.message ?? ""}
+        />
       )}
       {joinRequestHandlers === undefined ? null : (
-        <p
-          className="people-status"
+        <ResultParagraph
           id={JOIN_REQUEST_ACTION_MESSAGE_ID}
-          role="status"
-        >
-          {joinRequestActions.message ?? ""}
-        </p>
+          text={joinRequestActions.message ?? ""}
+        />
       )}
       {claimHandlers === undefined ? null : (
-        <p className="people-status" id={CLAIM_ACTION_MESSAGE_ID} role="status">
-          {claimActions.message ?? ""}
-        </p>
+        <ResultParagraph
+          id={CLAIM_ACTION_MESSAGE_ID}
+          text={claimActions.message ?? ""}
+        />
       )}
       {adminHint ? (
         <p className="people-hint">{PEOPLE_MESSAGES.adminHint}</p>

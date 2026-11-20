@@ -668,6 +668,14 @@ export interface InvitationActions {
   /** Asks the main process to load the invitations again; nothing while an action runs. */
   readonly refresh: () => Promise<void>;
   /**
+   * Ends the sentence of the last action or refresh, as an action of
+   * another kind on the screen starts, so that the screen shows only the
+   * result of the last action (#319). An action that runs still shows its
+   * answer, and the sentence of a create whose code was dropped still
+   * shows when its workspace is shown again.
+   */
+  readonly clearMessage: () => void;
+  /**
    * Follows the screen's views by the renderer's clock `now`:
    *
    * - the open question ends once the screen no longer offers it as it is
@@ -868,6 +876,13 @@ export function createInvitationActions(
       // A refresh ends the sentence of a create whose code was not shown,
       // also before its workspace is shown again.
       unseenIn = undefined;
+      // Its start empties the sentence, so that the same answer again is
+      // announced and brought into view again (#319).
+      if (message !== undefined) {
+        message = undefined;
+        refreshedAt = undefined;
+        show();
+      }
       const startSelection = selection;
       let sentence: string;
       let loading = false;
@@ -885,6 +900,13 @@ export function createInvitationActions(
       if (selection === startSelection && !running) {
         message = sentence;
         refreshedAt = loading ? (latest?.revision ?? -1) : undefined;
+        show();
+      }
+    },
+    clearMessage: () => {
+      refreshedAt = undefined;
+      if (message !== undefined) {
+        message = undefined;
         show();
       }
     },
