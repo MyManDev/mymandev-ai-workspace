@@ -1025,6 +1025,32 @@ test("the project panel follows the mount list and the project's repositories fo
   );
 });
 
+// The shell's source, to check how it places the project panel.
+const APP_SOURCES = import.meta.glob<string>("./App.tsx", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+test("the shell renders the project panel once, in one place, and without a key, so that neither a switch of the side panel's tab nor another project mounts a new one and drops what it holds (#310)", () => {
+  const code = (APP_SOURCES["./App.tsx"] ?? "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/,? \)/g, ")");
+  const elements = code.match(/<ProjectPanel\b[^>]*\/>/g) ?? [];
+  expect(elements).toEqual([
+    "<ProjectPanel panel={open.view.panel} projectId={open.project.id} dispatch={dispatch} agents={agents} repositories={repositories} projectRepositories={projectRepositories} />",
+  ]);
+  // A key, also one passed in a spread, would mount a new panel, with a
+  // new, idle controller, whenever it changes.
+  expect(elements[0]).not.toMatch(/\bkey=|\{\.\.\./);
+  expect(code).toContain(
+    "{open === undefined ? null : (<ProjectPanel panel={open.view.panel}",
+  );
+});
+
 // The entry point's source, to check what it passes from `window.desktop`.
 const ENTRY_SOURCES = import.meta.glob<string>("./main.tsx", {
   query: "?raw",
