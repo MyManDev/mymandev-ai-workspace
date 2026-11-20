@@ -32,6 +32,10 @@
 // - The path never leaves the main process: no state, log, or request holds
 //   it. The renderer gets a mount ID for a linked folder while it is
 //   mounted.
+// - Whether the account may remove each repository is worked out here, from
+//   who registered it and the account's own person and role in the workspace
+//   service (#309): the renderer gets the answer, never a member ID. The
+//   server still decides each removal.
 //
 // The logs are fixed text with a failure code at most, never a name, an ID,
 // or a path.
@@ -110,6 +114,14 @@ export interface ProjectRepositoryEntry {
   readonly linked: boolean;
   /** The mount of the linked folder while it is mounted, else null. */
   readonly mountId: string | null;
+  /**
+   * Whether the signed-in account may remove it (`removalRights`): the
+   * account's own person registered it, or is the workspace's owner or an
+   * admin (the decision of 2026-11-14 on #286). The server decides each
+   * removal all the same, so a role that changed meanwhile answers
+   * `forbidden`.
+   */
+  readonly removable: boolean;
 }
 
 /** The service's state. Every value is frozen; it holds no path. */
@@ -205,7 +217,7 @@ export type ProjectRepositoryConnection = Pick<
 /** The part of the workspace service that this service uses. */
 export type ProjectRepositoryWorkspaces = Pick<
   WorkspaceService,
-  "state" | "onChange" | "ownMemberId"
+  "state" | "onChange" | "ownMemberId" | "people"
 >;
 
 /** The part of the repository (mount) service that this service uses. */
@@ -666,7 +678,45 @@ export function createProjectRepositoryService(
     }
   }
 
+  /**
+   * What the signed-in account may remove in the open project's workspace,
+   * or null for nothing: its own person there, which may remove the
+   * repositories that it registered, and whether that person is the owner or
+   * an admin, who may remove every one (the decision of 2026-11-14 on #286).
+   * The role is the person's in the selected workspace's people, which its
+   * events keep current, as the invitations and the join requests read it;
+   * a person that the people do not hold yet, or that was removed, may
+   * remove nothing.
+   */
+  function removalRights(): {
+    readonly ownMemberId: MemberId;
+    readonly administers: boolean;
+  } | null {
+    // A state with repositories always has a device and a workspace; this
+    // keeps a later caller closed as well.
+    if (device === null || workspaceId === null) {
+      return null;
+    }
+    try {
+      const own = workspaces.ownMemberId(workspaceId);
+      const person =
+        own === null
+          ? undefined
+          : workspaces.people().find((entry) => entry.id === own);
+      if (own === null || person === undefined || person.removedAt !== null) {
+        return null;
+      }
+      return {
+        ownMemberId: own,
+        administers: person.role === "owner" || person.role === "admin",
+      };
+    } catch {
+      return null;
+    }
+  }
+
   function buildState(): ProjectRepositoryState {
+    const rights = repositories === null ? null : removalRights();
     const entries =
       repositories === null
         ? NO_ENTRIES
@@ -678,6 +728,10 @@ export function createProjectRepositoryService(
                 name: repository.name,
                 linked: link !== undefined,
                 mountId: link === undefined ? null : mountOf(link.folder),
+                removable:
+                  rights !== null &&
+                  (rights.administers ||
+                    repository.createdByMemberId === rights.ownMemberId),
               });
             }),
           );
@@ -989,7 +1043,8 @@ export function createProjectRepositoryService(
         reload();
       }
     }
-    // The own person of a workspace may have changed with the list.
+    // The own person of a workspace may have changed with the list, and its
+    // role with the people.
     touch();
   }
 

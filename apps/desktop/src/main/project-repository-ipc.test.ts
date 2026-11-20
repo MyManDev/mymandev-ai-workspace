@@ -55,6 +55,7 @@ function state(
         name: "web app",
         linked: true,
         mountId: MOUNT,
+        removable: true,
       }),
     ]),
     ...overrides,
@@ -161,7 +162,7 @@ function setup(initial: ProjectRepositoryState = state()) {
   };
 }
 
-test("the view holds IDs, names, the link, and the mount ID only, and a problem only while unavailable", () => {
+test("the view holds IDs, names, the link, the mount ID, and whether the account may remove each repository only, and a problem only while unavailable", () => {
   const view = projectRepositoriesView(
     state({
       // Extra fields of the state never cross.
@@ -181,6 +182,7 @@ test("the view holds IDs, names, the link, and the mount ID only, and a problem 
         name: "web app",
         linked: true,
         mountId: MOUNT,
+        removable: true,
       },
     ],
   });
@@ -205,12 +207,39 @@ test("the view holds IDs, names, the link, and the mount ID only, and a problem 
             name: "web app",
             linked: false,
             mountId: MOUNT,
+            removable: true,
           },
         ],
       }),
       1,
     ).repositories[0],
   ).toMatchObject({ linked: false, mountId: null });
+  // Whether the account may remove a repository crosses as the service
+  // worked it out (#309), and nothing of who registered it. A link does not
+  // make a repository removable.
+  const rows = [
+    { linked: false, mountId: null, removable: true },
+    { linked: false, mountId: null, removable: false },
+    { linked: true, mountId: MOUNT, removable: false },
+  ] as const;
+  for (const row of rows) {
+    expect(
+      projectRepositoriesView(
+        state({
+          repositories: [
+            {
+              repositoryId: REPOSITORY,
+              name: "web app",
+              ...row,
+              ...({ createdByMemberId: WORKSPACE } as object),
+            },
+          ],
+        }),
+        1,
+      ).repositories,
+      JSON.stringify(row),
+    ).toEqual([{ repositoryId: REPOSITORY, name: "web app", ...row }]);
+  }
 });
 
 test("the contract's limits and problems match the protocol and the reads", () => {
@@ -319,6 +348,7 @@ test("a view that the contract refuses is reported with a fixed message, and clo
           name: "web app",
           linked: false,
           mountId: null,
+          removable: false,
         }),
       ),
     }),

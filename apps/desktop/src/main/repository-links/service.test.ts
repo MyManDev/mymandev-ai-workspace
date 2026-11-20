@@ -18,7 +18,7 @@ import {
 } from "../api-actions.ts";
 import type { WorkspaceReadResult } from "../api-reads.ts";
 import type { ServerMessage } from "../connection/client.ts";
-import type { WorkspaceState } from "../workspace/service.ts";
+import type { PersonState, WorkspaceState } from "../workspace/service.ts";
 import type { LinkConfirmationRequest } from "./confirmation.ts";
 import type { RepositoryFolderIdentity } from "./identity.ts";
 import {
@@ -43,6 +43,8 @@ const WS_B = "0192f0a0-7b3c-7d4e-8f50-0000000000a2" as WorkspaceId;
 const WS_GONE = "0192f0a0-7b3c-7d4e-8f50-0000000000a3" as WorkspaceId;
 const OWN = "0192f0a0-7b3c-7d4e-8f50-0000000000c1";
 const OTHER_OWN = "0192f0a0-7b3c-7d4e-8f50-0000000000c2";
+/** Another person of WS_A, who registers a repository in some tests. */
+const OTHER_PERSON = "0192f0a0-7b3c-7d4e-8f50-0000000000c3";
 const PROJECT_1 = "0192f0a0-7b3c-7d4e-8f50-0000000000e1" as ProjectId;
 const PROJECT_2 = "0192f0a0-7b3c-7d4e-8f50-0000000000e2" as ProjectId;
 const REPO_1 = "0192f0a0-7b3c-7d4e-8f50-0000000000f1";
@@ -94,8 +96,25 @@ function repository(
   id: string,
   projectId: ProjectId = PROJECT_1,
   name = "web app",
+  createdByMemberId = OWN,
 ) {
-  return { id, projectId, name, createdByMemberId: OWN };
+  return { id, projectId, name, createdByMemberId };
+}
+
+/** A person of the selected workspace, as the workspace service holds it. */
+function person(
+  id: string,
+  role: PersonState["role"] = "member",
+  removedAt: string | null = null,
+): PersonState {
+  return Object.freeze({
+    id,
+    displayName: "Ada",
+    role,
+    claimed: true,
+    identity: null,
+    removedAt,
+  }) as PersonState;
 }
 
 function list(...repositories: ReturnType<typeof repository>[]) {
@@ -238,6 +257,10 @@ class Harness {
     [WS_A, OWN],
     [WS_B, OWN],
   ]);
+  /** The selected workspace's people: the account's own person, a member. */
+  people: readonly PersonState[] = Object.freeze([person(OWN)]);
+  /** Makes the workspace service's `people` throw. */
+  throwOnPeople = false;
   readonly mounts = new Map<string, string>();
   /** Mounts whose state is `unavailable`. */
   readonly unavailableMounts = new Set<string>();
@@ -318,6 +341,12 @@ class Harness {
         },
         ownMemberId: (workspaceId) =>
           (this.ownMembers.get(workspaceId) ?? null) as never,
+        people: () => {
+          if (this.throwOnPeople) {
+            throw new Error("people failed");
+          }
+          return this.people;
+        },
       },
       mounts: {
         folderOf: (mountId) => {
@@ -414,6 +443,21 @@ class Harness {
       revision: this.workspaceState.revision + 1,
       selectedWorkspaceId: workspaceId,
       openProjectId: projectId,
+    });
+    for (const listener of [...this.workspaceListeners]) {
+      listener(this.workspaceState);
+    }
+  }
+
+  /**
+   * Changes the selected workspace's people, as a member event or a reload
+   * does: the workspace service's state changes with them.
+   */
+  setPeople(...people: PersonState[]): void {
+    this.people = Object.freeze(people);
+    this.workspaceState = Object.freeze({
+      ...this.workspaceState,
+      revision: this.workspaceState.revision + 1,
     });
     for (const listener of [...this.workspaceListeners]) {
       listener(this.workspaceState);
@@ -878,6 +922,102 @@ test("a removal answered conflict or not_found reads the list again, which drops
   expect(harness.lastWritten()).toEqual([]);
 });
 
+// Who may remove a repository (#309).
+
+/** Whether the account may remove each repository, in the list's order. */
+function removableOf(harness: Harness): boolean[] {
+  return harness.state.repositories.map((entry) => entry.removable);
+}
+
+test("each repository says whether the account may remove it: a member one that its own person registered, the owner and an admin every one", async () => {
+  const harness = new Harness();
+  await harness.ready(
+    repository(REPO_1),
+    repository(REPO_2, PROJECT_1, "api", OTHER_PERSON),
+  );
+  expect(removableOf(harness)).toEqual([true, false]);
+  // A repository that arrives with its event says who registered it too.
+  harness.deliver(
+    registeredEvent(repository(REPO_3, PROJECT_1, "docs", OTHER_PERSON)),
+  );
+  expect(removableOf(harness)).toEqual([true, false, false]);
+
+  for (const role of ["admin", "owner"] as const) {
+    harness.setPeople(person(OWN, role), person(OTHER_PERSON));
+    expect(removableOf(harness), role).toEqual([true, true, true]);
+  }
+  // A demotion, which a member event or a reload brings, takes it back at
+  // once, and publishes the change.
+  const published = harness.states.length;
+  // The account's own person counts, wherever the people hold it.
+  harness.setPeople(person(OTHER_PERSON, "admin"), person(OWN));
+  expect(removableOf(harness)).toEqual([true, false, false]);
+  expect(harness.states.length).toBe(published + 1);
+  expect(
+    harness.states.at(-1)?.repositories.map((entry) => entry.removable),
+  ).toEqual([true, false, false]);
+});
+
+test("nothing is removable while the account's own person is not among the people, was removed, or cannot be read, and another account's person registered none of them", async () => {
+  const harness = new Harness();
+  // The people have not loaded: even the account's own repository waits.
+  harness.people = Object.freeze([]);
+  await harness.ready(
+    repository(REPO_1),
+    repository(REPO_2, PROJECT_1, "api", OTHER_PERSON),
+  );
+  expect(removableOf(harness)).toEqual([false, false]);
+  harness.setPeople(person(OWN, "admin"));
+  expect(removableOf(harness)).toEqual([true, true]);
+
+  // A removed person may remove nothing, whatever its role.
+  harness.setPeople(person(OWN, "admin", AT));
+  expect(removableOf(harness)).toEqual([false, false]);
+  harness.setPeople(person(OWN, "member", AT));
+  expect(removableOf(harness)).toEqual([false, false]);
+
+  // People that cannot be read count as none.
+  harness.throwOnPeople = true;
+  harness.setPeople(person(OWN, "admin"));
+  expect(removableOf(harness)).toEqual([false, false]);
+  harness.throwOnPeople = false;
+
+  // Another account on this device: its own person did not register REPO_1.
+  harness.setAccount(accountStatus(false));
+  harness.ownMembers.set(WS_A, OTHER_OWN);
+  harness.people = Object.freeze([person(OTHER_OWN)]);
+  harness.setAccount(accountStatus(true));
+  await harness.answerRead({
+    ok: true,
+    value: list(
+      repository(REPO_1),
+      repository(REPO_2, PROJECT_1, "api", OTHER_OWN),
+    ),
+  });
+  expect(removableOf(harness)).toEqual([false, true]);
+  // A workspace whose own person the list does not name: nothing.
+  harness.ownMembers.delete(WS_A);
+  harness.setPeople(person(OTHER_OWN, "owner"));
+  expect(removableOf(harness)).toEqual([false, false]);
+});
+
+test("the state names no member ID: each repository holds its ID, its name, its link, its mount, and whether it is removable", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1, PROJECT_1, "web app", OTHER_PERSON));
+  expect(harness.state.repositories).toEqual([
+    {
+      repositoryId: REPO_1,
+      name: "web app",
+      linked: false,
+      mountId: null,
+      removable: false,
+    },
+  ]);
+  const text = JSON.stringify(harness.states);
+  expect(text).not.toContain(OWN);
+  expect(text).not.toContain(OTHER_PERSON);
+});
+
 // Linking.
 
 test("link asks the person in the main process's dialog, naming the repository and the folder, and keeps the folder and its identity for the account; the state shows the mount, never the path", async () => {
@@ -894,7 +1034,13 @@ test("link asks the person in the main process's dialog, naming the repository a
   expect(harness.written).toEqual([[linkOf(REPO_1, FOLDER_1)]]);
   expect(harness.lastWritten()?.[0]?.identity).toEqual(identityOf(FOLDER_1));
   expect(harness.state.repositories).toEqual([
-    { repositoryId: REPO_1, name: "web app", linked: true, mountId: MOUNT_1 },
+    {
+      repositoryId: REPO_1,
+      name: "web app",
+      linked: true,
+      mountId: MOUNT_1,
+      removable: true,
+    },
   ]);
   expect(JSON.stringify(harness.states)).not.toContain(FOLDER_1);
   expect(JSON.stringify(harness.states)).not.toContain(

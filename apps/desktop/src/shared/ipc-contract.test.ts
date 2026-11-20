@@ -2390,6 +2390,7 @@ const PROJECT_REPOSITORY = Object.freeze({
   name: "web",
   linked: true,
   mountId: MOUNT_ID,
+  removable: true,
 });
 
 const PROJECT_REPOSITORIES = Object.freeze({
@@ -2431,11 +2432,13 @@ test("a project repositories view with every status, problem, and link state is 
       status: "unavailable",
     }).success,
   ).toBe(false);
-  // Linked, and linked without a mount; and not linked.
+  // Linked, and linked without a mount; and not linked. Removable, and not
+  // (#309).
   for (const repository of [
     PROJECT_REPOSITORY,
     { ...PROJECT_REPOSITORY, mountId: null },
     { ...PROJECT_REPOSITORY, linked: false, mountId: null },
+    { ...PROJECT_REPOSITORY, removable: false },
   ]) {
     expect(
       ProjectRepositoriesViewSchema.safeParse({
@@ -2498,6 +2501,19 @@ test("a project repositories view over the limits or with wrong values is refuse
     // A repository that is not linked names no mount.
     { repositories: [{ ...PROJECT_REPOSITORY, linked: false }] },
     { repositories: [{ ...PROJECT_REPOSITORY, linked: "yes" }] },
+    // Whether the account may remove it is always said, as a boolean.
+    { repositories: [{ ...PROJECT_REPOSITORY, removable: "yes" }] },
+    { repositories: [{ ...PROJECT_REPOSITORY, removable: null }] },
+    {
+      repositories: [
+        {
+          repositoryId: REPOSITORY_ID,
+          name: "web",
+          linked: true,
+          mountId: MOUNT_ID,
+        },
+      ],
+    },
   ];
   for (const change of invalid) {
     expect(

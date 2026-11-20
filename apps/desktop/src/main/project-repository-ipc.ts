@@ -39,8 +39,9 @@ Object.freeze(PROBLEMS);
 /**
  * The frozen copy of the service's state that crosses IPC, with `revision`
  * as its revision: IDs, names, whether the account linked each repository,
- * and the mount ID of a linked folder while it is mounted. No path, member
- * ID, or user ID crosses.
+ * the mount ID of a linked folder while it is mounted, and whether the
+ * account may remove each repository, which the service worked out (#309).
+ * No path, member ID, or user ID crosses.
  */
 export function projectRepositoriesView(
   state: ProjectRepositoryState,
@@ -58,6 +59,7 @@ export function projectRepositoriesView(
           name: entry.name,
           linked: entry.linked,
           mountId: entry.linked ? entry.mountId : null,
+          removable: entry.removable,
         }),
       ),
     ),

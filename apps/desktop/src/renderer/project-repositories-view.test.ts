@@ -62,8 +62,9 @@ function repository(
   name: string,
   mountId: string | null = null,
   linked = mountId !== null,
+  removable = true,
 ): ProjectRepositoryView {
-  return { repositoryId, name, linked, mountId };
+  return { repositoryId, name, linked, mountId, removable };
 }
 
 const A = repository(REPOSITORY_A, "app");
@@ -499,6 +500,13 @@ test("each row offers its actions: Link and Remove while the list is ready, Unli
           (action) => action.repositoryId,
         ),
   ).toEqual([REPOSITORY_A, REPOSITORY_A, REPOSITORY_A]);
+  // Each row carries whether the account may remove it, as the main
+  // process said (#309).
+  expect(
+    model(
+      known({ repositories: [linked, { ...B, removable: false }] }),
+    ).rows?.map((row) => row.removable),
+  ).toEqual([true, false]);
   // Without the mount list, no link.
   expect(kindsOf(model(known({ repositories }), { kind: "pending" }))).toEqual([
     [`unlink ${PROJECT} app`, `remove ${PROJECT} app`],
@@ -521,6 +529,40 @@ test("each row offers its actions: Link and Remove while the list is ready, Unli
     expect(shown.linksProjectId, links).toBeNull();
     expect(kindsOf(shown), links).toEqual([[], []]);
   }
+});
+
+test("Remove from the project only on a repository that the account may remove, which the main process said (#309); the other actions stay", () => {
+  const kindsOf = (shown: ProjectRepositoriesModel) =>
+    (shown.rows ?? []).map((row) =>
+      repositoryActions(shown, row).map((action) => action.kind),
+    );
+  const linked = repository(REPOSITORY_A, "app", MOUNT_1, true, false);
+  const plain = repository(REPOSITORY_B, "docs", null, false, false);
+  expect(kindsOf(model(known({ repositories: [linked, plain] })))).toEqual([
+    ["link", "unlink"],
+    ["link"],
+  ]);
+  expect(
+    kindsOf(
+      model(known({ repositories: [linked, { ...plain, removable: true }] })),
+    ),
+  ).toEqual([
+    ["link", "unlink"],
+    ["link", "remove"],
+  ]);
+  // A removable repository of a list that is not ready offers no removal
+  // either.
+  expect(
+    kindsOf(
+      model(
+        known({
+          status: "unavailable",
+          problem: "failed",
+          repositories: [{ ...linked, removable: true }],
+        }),
+      ),
+    ),
+  ).toEqual([["unlink"]]);
 });
 
 test("an empty ready list says so and still offers the registration", () => {
@@ -1111,6 +1153,11 @@ test("a question ends once the panel no longer offers it as it was asked, and a 
       "remove",
       model(known({ status: "unavailable", problem: "unavailable" })),
     ],
+    [
+      "the account may no longer remove the repository (#309)",
+      "remove",
+      model(known({ repositories: [{ ...A, removable: false }, B] })),
+    ],
     ["the links are not ready", "link", model(known({ links: "loading" }))],
     [
       "the mount list is not known",
@@ -1133,6 +1180,27 @@ test("a question ends once the panel no longer offers it as it was asked, and a 
   const { actions, last } = controllerWith();
   await actions.start(request("remove"));
   actions.follow(model(known({ links: "unavailable" })));
+  expect(last().dialog?.kind).toBe("remove");
+  // A link's question stays when the account may no longer remove the
+  // repository.
+  const linking = controllerWith();
+  await linking.actions.start(request("link"));
+  linking.actions.follow(
+    model(known({ repositories: [{ ...A, removable: false }, B] })),
+  );
+  expect(linking.last().dialog?.kind).toBe("link");
+});
+
+test("a removal's question does not open for a repository that the account may no longer remove, as a button of an earlier render asks, and a confirmation then sends nothing (#309)", async () => {
+  const { actions, calls, last } = controllerWith(
+    model(known({ repositories: [{ ...A, removable: false }, B] })),
+  );
+  await actions.start(request("remove"));
+  expect(last().dialog).toBeUndefined();
+  await actions.confirm();
+  expect(calls).toEqual([]);
+  // Another repository that the account may remove still asks.
+  await actions.start(request("remove", B));
   expect(last().dialog?.kind).toBe("remove");
 });
 
