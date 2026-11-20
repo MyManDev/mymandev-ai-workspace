@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { WorkspaceBridge } from "../shared/desktop-bridge.ts";
+import { ResultParagraph } from "./PeopleActions.tsx";
 import type { PeopleScreenView } from "./people-view.ts";
 import {
   createWorkspaceIdCopy,
@@ -20,6 +21,12 @@ export const WORKSPACE_ID_MESSAGE_ID = "workspace-id-message";
 export interface WorkspaceIdCopyControls {
   readonly view: WorkspaceIdCopyView;
   readonly onCopy: (workspaceId: string) => void;
+}
+
+/** The controls of the copy, with the end of its sentence for the screen (#319). */
+export interface WorkspaceIdCopyHook extends WorkspaceIdCopyControls {
+  /** Forgets the last copy, as an action of another kind starts. */
+  readonly clearMessage: () => void;
 }
 
 /**
@@ -68,9 +75,10 @@ export function WorkspaceIdPart({
           </div>
         </div>
       )}
-      <p className="people-status" id={WORKSPACE_ID_MESSAGE_ID} role="status">
-        {describeWorkspaceIdCopy(copy.view, workspaceId)}
-      </p>
+      <ResultParagraph
+        id={WORKSPACE_ID_MESSAGE_ID}
+        text={describeWorkspaceIdCopy(copy.view, workspaceId)}
+      />
     </>
   );
 }
@@ -86,7 +94,7 @@ export function WorkspaceIdPart({
 export function useWorkspaceIdCopy(
   bridge: Pick<WorkspaceBridge, "copyId"> | undefined,
   workspaceId: string | null,
-): WorkspaceIdCopyControls | undefined {
+): WorkspaceIdCopyHook | undefined {
   const [view, setView] = useState(IDLE_WORKSPACE_ID_COPY);
   const controller = useMemo(
     () =>
@@ -100,5 +108,7 @@ export function useWorkspaceIdCopy(
     },
     [controller],
   );
-  return controller === undefined ? undefined : { view, onCopy };
+  return controller === undefined
+    ? undefined
+    : { view, onCopy, clearMessage: controller.clearMessage };
 }

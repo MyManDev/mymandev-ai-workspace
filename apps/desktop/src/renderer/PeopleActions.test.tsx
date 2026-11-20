@@ -7,11 +7,15 @@ import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type { PeopleView, PersonView } from "../shared/ipc-contract.ts";
 import {
+  bringResultIntoView,
+  PEOPLE_ACTION_MESSAGE_ID,
   PeopleActionDialogContent,
+  ResultParagraph,
   type PeopleActionHandlers,
 } from "./PeopleActions.tsx";
 import { PeopleScreenContent } from "./PeopleScreen.tsx";
 import {
+  describePeopleActionResult,
   IDLE_PEOPLE_ACTIONS,
   offerTimeFormat,
   type PeopleActionDialog,
@@ -718,4 +722,58 @@ test("the screen with its actions shows no ID, its element IDs are unique, every
       expect(html).not.toMatch(/\sstyle=/);
     }
   }
+});
+
+/** A status paragraph that records each scroll into view. */
+function scrolledElement() {
+  const scrolls: ScrollIntoViewOptions[] = [];
+  return {
+    scrolls,
+    element: {
+      scrollIntoView: (options: ScrollIntoViewOptions) => {
+        scrolls.push(options);
+      },
+    },
+  };
+}
+
+test("a new sentence brings its status paragraph into view by the shortest scroll, and an empty one does not (#319)", () => {
+  const { scrolls, element } = scrolledElement();
+  bringResultIntoView(element, "");
+  expect(scrolls).toEqual([]);
+  bringResultIntoView(element, "The person was removed.");
+  expect(scrolls).toEqual([{ block: "nearest" }]);
+  // Before the paragraph is in the page, nothing happens.
+  expect(() =>
+    bringResultIntoView(null, "The person was removed."),
+  ).not.toThrow();
+});
+
+test("a refused promotion from a device that is too new shows its sentence in the people actions' status paragraph, which brings it into view and never takes the focus (#319)", () => {
+  const refusal = describePeopleActionResult("promote", {
+    outcome: "refused",
+    reason: "device_too_new",
+    retryAfterMs: null,
+  });
+  expect(refusal).toBe(
+    "The person could not be made an admin. Promoting an admin and offering the ownership need a device that was registered at least 72 hours ago. Use an older device, or try again later.",
+  );
+  const actions = { ...IDLE_PEOPLE_ACTIONS, message: refusal };
+  expect(render({ actions })).toContain(
+    `<p class="people-status" id="people-action-message" role="status">${refusal}</p>`,
+  );
+  // The paragraph is the one that brings each new sentence into view.
+  const paragraph = elementsOf(screen({ actions })).find(
+    (element) => element.props.id === PEOPLE_ACTION_MESSAGE_ID,
+  );
+  expect(paragraph?.type).toBe(ResultParagraph);
+  const props = paragraph?.props as { readonly text?: string } | undefined;
+  expect(props?.text).toBe(refusal);
+  const { scrolls, element } = scrolledElement();
+  bringResultIntoView(element, props?.text ?? "");
+  expect(scrolls).toEqual([{ block: "nearest" }]);
+  // It has no tab stop, so the focus stays on "Make admin".
+  expect(render({ actions })).not.toMatch(
+    /id="people-action-message"[^>]*tabindex/,
+  );
 });

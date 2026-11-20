@@ -7,8 +7,10 @@ import {
   type PersonView,
 } from "../shared/ipc-contract.ts";
 import {
+  callingFirst,
   describeMorePeople,
   describePeopleScreen,
+  endOtherSentences,
   followPeople,
   formatPeopleDate,
   initialPeopleScreenView,
@@ -394,4 +396,51 @@ test("a verified date is shown in the given locale and time zone, and a value th
   expect(peopleDateFormat().resolvedOptions().timeZone).toBe(
     new Intl.DateTimeFormat().resolvedOptions().timeZone,
   );
+});
+
+test("an action of one kind ends the sentence of every other kind, never its own, and skips a kind without its bridge (#319)", () => {
+  const ended: string[] = [];
+  const end = (kind: string) => () => {
+    ended.push(kind);
+  };
+  const ends = {
+    copy: end("copy"),
+    people: end("people"),
+    invitations: undefined,
+    joinRequests: end("joinRequests"),
+    claims: end("claims"),
+  };
+  endOtherSentences("people", ends);
+  expect(ended).toEqual(["copy", "joinRequests", "claims"]);
+  ended.length = 0;
+  endOtherSentences("claims", ends);
+  expect(ended).toEqual(["copy", "people", "joinRequests"]);
+});
+
+test("callingFirst calls `before` and then the handler with the same arguments and result, for the named functions only (#319)", () => {
+  const calls: string[] = [];
+  const handlers = {
+    onStart: (name: string, count: number) => {
+      calls.push(`start ${name} ${String(count)}`);
+      return count + 1;
+    },
+    onCancel: () => {
+      calls.push("cancel");
+    },
+    label: "kept",
+  };
+  const called = callingFirst(handlers, ["onStart"], () => {
+    calls.push("before");
+  });
+  expect(called?.onStart("a", 1)).toBe(2);
+  called?.onCancel();
+  expect(calls).toEqual(["before", "start a 1", "cancel"]);
+  expect(called?.onCancel).toBe(handlers.onCancel);
+  expect(called?.label).toBe("kept");
+  // The handlers themselves stay as they are.
+  expect(handlers.onStart("b", 2)).toBe(3);
+  expect(calls).toEqual(["before", "start a 1", "cancel", "start b 2"]);
+  expect(
+    callingFirst<typeof handlers>(undefined, ["onStart"], () => undefined),
+  ).toBeUndefined();
 });

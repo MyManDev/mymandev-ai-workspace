@@ -938,3 +938,19 @@ test("the claims never change from an answer: the controller holds no claim", as
     expect(Object.keys(view.marked).sort()).toEqual(["memberIds", "scope"]);
   }
 });
+
+test("an action of another kind ends the refresh's sentence, once, and a later state brings none back (#319)", async () => {
+  const { claims, views, last } = controllerWith({
+    load: () => Promise.resolve({ outcome: "loading" }),
+  });
+  claims.listChanged(known(), listed());
+  await claims.refresh();
+  expect(last().message).toBe(CLAIM_REFRESH_MESSAGES.loading);
+  claims.clearMessage();
+  expect(last()).toEqual(IDLE_RECENT_CLAIMS);
+  const before = views.length;
+  claims.clearMessage();
+  expect(views).toHaveLength(before);
+  claims.listChanged(known(), listed({ revision: CLAIMS.revision + 1 }));
+  expect(last().message).toBeUndefined();
+});

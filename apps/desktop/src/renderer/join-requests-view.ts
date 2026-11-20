@@ -805,6 +805,14 @@ export interface JoinRequestActions {
   /** Asks the main process to load the join requests again; nothing while an action runs. */
   readonly refresh: () => Promise<void>;
   /**
+   * Ends the sentence of the last action or refresh, as an action of
+   * another kind on the screen starts, so that the screen shows only the
+   * result of the last action (#319). An action that runs still shows its
+   * answer, and the sentence of an invitation whose code was dropped still
+   * shows when its workspace is shown again.
+   */
+  readonly clearMessage: () => void;
+  /**
    * Follows the screen's views:
    *
    * - the open question ends once the screen no longer offers it as it is
@@ -1155,6 +1163,13 @@ export function createJoinRequestActions(
       if (selection === startSelection && !running) {
         message = sentence;
         refreshedAt = loading ? (latestRevision ?? -1) : undefined;
+        show();
+      }
+    },
+    clearMessage: () => {
+      refreshedAt = undefined;
+      if (message !== undefined) {
+        message = undefined;
         show();
       }
     },

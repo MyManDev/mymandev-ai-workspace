@@ -500,6 +500,12 @@ export interface RecentClaims {
   /** Asks the main process to load the claims again, and says how it went. */
   readonly refresh: () => Promise<void>;
   /**
+   * Ends the sentence of the last refresh, as an action of another kind on
+   * the screen starts, so that the screen shows only the result of the last
+   * action (#319).
+   */
+  readonly clearMessage: () => void;
+  /**
    * Reports the claims that the screen showed (`shownClaims`) with
    * `claims.markSeen`, each once during the visit, and only for the scope
    * that the latest people name. A reported claim stays marked "New" until
@@ -606,6 +612,13 @@ export function createRecentClaims(
       if (generation === at) {
         message = sentence;
         refreshedAt = loading ? (latestRevision ?? -1) : undefined;
+        show();
+      }
+    },
+    clearMessage: () => {
+      refreshedAt = undefined;
+      if (message !== undefined) {
+        message = undefined;
         show();
       }
     },

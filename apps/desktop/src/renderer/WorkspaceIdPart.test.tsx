@@ -168,7 +168,11 @@ interface ButtonProps {
   readonly onClick?: () => void;
 }
 
-/** The elements of a tree whose components have no hooks. */
+/**
+ * The element and every element below it. A component without hooks is
+ * called to reach its elements; one with hooks, such as the status
+ * paragraph, stays a leaf.
+ */
 function elementsOf(node: ReactNode): ReactElement<ButtonProps>[] {
   if (Array.isArray(node)) {
     return node.flatMap((child: ReactNode) => elementsOf(child));
@@ -177,9 +181,13 @@ function elementsOf(node: ReactNode): ReactElement<ButtonProps>[] {
     return [];
   }
   if (typeof node.type === "function") {
-    return elementsOf(
-      (node.type as (props: ButtonProps) => ReactNode)(node.props),
-    );
+    try {
+      return elementsOf(
+        (node.type as (props: ButtonProps) => ReactNode)(node.props),
+      );
+    } catch {
+      return [node];
+    }
   }
   return [node, ...elementsOf(node.props.children)];
 }

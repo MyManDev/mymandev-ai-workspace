@@ -89,6 +89,12 @@ export interface WorkspaceIdCopy {
    * while the people are not ready, or after a sign-out and a sign-in.
    */
   readonly shown: (workspaceId: string | null) => void;
+  /**
+   * Forgets the last copy, as an action of another kind on the screen
+   * starts, so that the screen shows only the result of the last action
+   * (#319). A copy that runs still shows how it ended.
+   */
+  readonly clearMessage: () => void;
 }
 
 /**
@@ -136,6 +142,12 @@ export function createWorkspaceIdCopy(
         return;
       }
       shownId = workspaceId;
+      if (last !== undefined) {
+        last = undefined;
+        show();
+      }
+    },
+    clearMessage: () => {
       if (last !== undefined) {
         last = undefined;
         show();

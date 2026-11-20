@@ -51,6 +51,50 @@ export interface PeopleActionHandlers {
   readonly onDefine: (workspaceId: string) => void;
 }
 
+/** What `bringResultIntoView` uses of the status paragraph, as an `Element` offers it. */
+export interface ResultElement {
+  readonly scrollIntoView: (options: ScrollIntoViewOptions) => void;
+}
+
+/**
+ * Brings the status paragraph of a new sentence into view, by the shortest
+ * scroll and only when it is not in view already (`block: "nearest"`), so
+ * that the result of an action far down the screen is seen without
+ * scrolling (#319). The focus stays where it is. An empty paragraph stays
+ * where it is.
+ */
+export function bringResultIntoView(
+  element: ResultElement | null,
+  text: string,
+): void {
+  if (element !== null && text !== "") {
+    element.scrollIntoView({ block: "nearest" });
+  }
+}
+
+/**
+ * The status paragraph of one kind of action on the people screen, with
+ * the sentence of its last action: always rendered, empty when there is
+ * nothing to say, so that a screen reader announces a new text politely.
+ * Each new sentence is brought into view (`bringResultIntoView`), and
+ * the paragraph never takes the focus.
+ */
+export function ResultParagraph({
+  id,
+  text,
+}: {
+  readonly id: string;
+  readonly text: string;
+}) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  useEffect(() => bringResultIntoView(ref.current, text), [text]);
+  return (
+    <p ref={ref} className="people-status" id={id} role="status">
+      {text}
+    </p>
+  );
+}
+
 /**
  * A button of a people action, also of the recent claims' refresh. While an
  * action runs it stays focusable and does nothing (`aria-disabled`), like
@@ -441,6 +485,8 @@ export function usePeopleActions(
 ): {
   readonly actions: PeopleActionsView;
   readonly handlers: PeopleActionHandlers | undefined;
+  /** Ends the sentence of the last action (#319); undefined without the bridge. */
+  readonly clearMessage: (() => void) | undefined;
 } {
   const [actions, setActions] = useState(IDLE_PEOPLE_ACTIONS);
   const controller = useMemo(
@@ -496,7 +542,7 @@ export function usePeopleActions(
           },
     [controller, onStart],
   );
-  return { actions, handlers };
+  return { actions, handlers, clearMessage: controller?.clearMessage };
 }
 
 /**

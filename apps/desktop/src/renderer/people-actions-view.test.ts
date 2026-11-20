@@ -1294,3 +1294,53 @@ test("the people never change from an answer: the controller holds no people", a
   // The new person's member ID stays out of what the screen shows.
   expect(JSON.stringify(last())).not.toContain(UNCLAIMED);
 });
+
+test("an action of another kind ends the sentence of the last action once, also a confirmed leave's, which the switch of the leave does not bring back (#319)", async () => {
+  const { actions, views, last } = controllerWith(() =>
+    Promise.resolve({ outcome: "ok" }),
+  );
+  await actions.start({ kind: "promote", ...TARGET });
+  expect(last().message).toBe("The person is now an admin.");
+  const before = views.length;
+  actions.clearMessage();
+  expect(last()).toEqual({ ...IDLE_PEOPLE_ACTIONS });
+  expect(views).toHaveLength(before + 1);
+  // Without a sentence there is nothing to end, and no new view.
+  actions.clearMessage();
+  expect(views).toHaveLength(before + 1);
+
+  // An ended sentence of a confirmed leave does not come back with the
+  // switch that the leave brings.
+  const leaving = controllerWith(
+    () => Promise.resolve({ outcome: "ok" }),
+    known({ ownMemberId: MEMBER }),
+  );
+  await leaving.actions.start({ kind: "leave", ...IN_WORKSPACE });
+  await leaving.actions.confirm();
+  leaving.actions.clearMessage();
+  leaving.actions.listChanged(known({ workspaceId: OTHER_WORKSPACE }), NOW);
+  expect(leaving.last().message).toBeUndefined();
+});
+
+test("an action that runs while another kind ends the sentences still shows its answer, and a question or a name stays (#319)", async () => {
+  const { answer, resolve } = pending();
+  const { actions, last } = controllerWith(answer);
+  const run = actions.start({ kind: "promote", ...TARGET });
+  actions.clearMessage();
+  resolve({
+    outcome: "refused",
+    reason: "device_too_new",
+    retryAfterMs: null,
+  });
+  await run;
+  expect(last().message).toBe(
+    "The person could not be made an admin. Promoting an admin and offering the ownership need a device that was registered at least 72 hours ago. Use an older device, or try again later.",
+  );
+
+  const open = controllerWith(() => Promise.resolve({ outcome: "ok" }));
+  open.actions.editDefineDraft("Grace");
+  await open.actions.start({ kind: "remove", ...TARGET, claimed: true });
+  open.actions.clearMessage();
+  expect(open.last().dialog?.request.kind).toBe("remove");
+  expect(open.last().defineDraft).toBe("Grace");
+});
