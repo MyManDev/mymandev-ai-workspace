@@ -139,7 +139,10 @@ export function createStatusPublisher(appUrl: string): StatusPublisher {
 // Node's default limit of ten listeners per event.
 const destroyedCallbacks = new WeakMap<StatusReceiver, Set<() => void>>();
 
-/** Runs `callback` once when `receiver` is destroyed. */
+/**
+ * Runs `callback` once when `receiver` is destroyed. A receiver that is
+ * already destroyed never runs it; `publish` drops such a receiver.
+ */
 function onReceiverDestroyed(
   receiver: StatusReceiver,
   callback: () => void,
@@ -147,13 +150,13 @@ function onReceiverDestroyed(
   let callbacks = destroyedCallbacks.get(receiver);
   if (callbacks === undefined) {
     const created = new Set<() => void>();
-    destroyedCallbacks.set(receiver, created);
     receiver.once("destroyed", () => {
       destroyedCallbacks.delete(receiver);
       for (const run of created) {
         run();
       }
     });
+    destroyedCallbacks.set(receiver, created);
     callbacks = created;
   }
   callbacks.add(callback);

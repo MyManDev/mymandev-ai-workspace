@@ -989,7 +989,7 @@ To add a channel:
 
 1. Add its name to `INVOKE_CHANNELS` or `EVENT_CHANNELS` in `ipc-channels.ts`, with a `domain:action` name.
 2. Add its schemas to `INVOKE_CONTRACT` or `EVENT_CONTRACT` in `ipc-contract.ts`. Every string and array has a maximum length, and objects use `z.object`, which strips unknown keys (ADR 0003). Never send a secret: the device key, tokens, and sign-in codes stay in the main process (ADR 0014).
-3. Register an invoke handler with `createInvokeHandler` in `src/main/ipc.ts` (the implementation may return a promise), or send an event through `createEventPublisher`, which checks its receivers. All the publishers share one `destroyed` listener per window, so a new event channel adds no listener to it.
+3. Register an invoke handler with `createInvokeHandler` in `src/main/ipc.ts` (the implementation may return a promise), or send an event through `createEventPublisher`, which checks its receivers. All the publishers share one `destroyed` listener per receiving web contents, so a new event channel adds no listener to it.
 4. Add a function for it to `DesktopBridge` in `src/shared/desktop-bridge.ts` and to `createDesktopBridge`. Never expose `ipcRenderer`, a channel name parameter, or a generic `invoke` or `send`.
 5. Add tests: the schemas accept and refuse, the handler refuses a foreign sender and invalid arguments, and the bridge keeps its exact shape (`ipc-contract.test.ts`, `ipc.test.ts`, `bridge.test.ts`).
 
