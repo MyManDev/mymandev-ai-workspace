@@ -10,7 +10,11 @@ import {
   WorkspaceNav,
   type WorkspaceSidebar,
 } from "./Navigation.tsx";
-import { ProjectPanel } from "./ProjectPanel.tsx";
+import { ProjectPanelContent } from "./ProjectPanel.tsx";
+import {
+  describeProjectRepositories,
+  IDLE_PROJECT_REPOSITORY_ACTIONS,
+} from "./project-repositories-view.ts";
 import {
   createShellState,
   PANEL_IDS,
@@ -213,26 +217,46 @@ test("each side panel tab selects its panel", () => {
   const { dispatch, take } = recorder();
 
   for (const panel of PANEL_IDS) {
-    expect(
-      clickEveryButton(
-        ProjectPanel({ panel, projectId: "project-a", dispatch }),
-        take,
-      ),
-    ).toEqual([
+    expect(clickEveryButton(projectPanel(panel, dispatch), take)).toEqual([
       ["Agents", [{ type: "show-panel", panel: "agents" }]],
       ["Repositories", [{ type: "show-panel", panel: "repositories" }]],
     ]);
   }
 });
 
+/**
+ * The side panel's tabs with the selected `panel`, without its state, which
+ * the project panel holds (#310).
+ */
+function projectPanel(
+  panel: PanelId,
+  dispatch: (action: ShellAction) => void,
+): ReactNode {
+  return ProjectPanelContent({
+    panel,
+    projectId: "project-a",
+    dispatch,
+    mounts: { kind: "pending" },
+    project: {
+      model: describeProjectRepositories(
+        { kind: "pending" },
+        { kind: "pending" },
+        "project-a",
+      ),
+      actions: IDLE_PROJECT_REPOSITORY_ACTIONS,
+      handlers: undefined,
+    },
+  });
+}
+
 function pressKey(
   panel: PanelId,
   key: string,
 ): { actions: ShellAction[]; focused: string[]; prevented: boolean } {
   const { dispatch, take } = recorder();
-  const tablist = elementsOf(
-    ProjectPanel({ panel, projectId: "project-a", dispatch }),
-  ).find((element) => element.props.role === "tablist");
+  const tablist = elementsOf(projectPanel(panel, dispatch)).find(
+    (element) => element.props.role === "tablist",
+  );
   const focused: string[] = [];
   let prevented = false;
   tablist?.props.onKeyDown?.({

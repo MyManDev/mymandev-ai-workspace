@@ -984,6 +984,55 @@ test("a call that fails on its way, also one that throws at once, says that noth
   expect(views.at(-1)?.running).toBe(false);
 });
 
+test("the controller keeps a running action through every model of the same project, as the project panel follows them on either tab: no second registration starts, and the answer shows its sentence and empties the field (#310)", async () => {
+  const { actions, calls, answers, last } = controllerWith();
+  actions.editRegisterDraft("app");
+  const done = actions.register(PROJECT);
+  // A switch to the agents tab and back: the project panel renders again
+  // and follows a new model of the same project each time.
+  actions.follow(model());
+  actions.follow(model(known(), { kind: "pending" }));
+  actions.follow(model());
+  expect(last().running).toBe(true);
+  expect(last().registerDraft).toBe("app");
+  await actions.register(PROJECT);
+  await actions.start(request("remove"));
+  expect(last().dialog).toBeUndefined();
+  expect(calls).toEqual([`register ${PROJECT} app`]);
+  answers.register.resolve({ outcome: "ok", repositoryId: REPOSITORY_A });
+  await done;
+  expect(last().running).toBe(false);
+  expect(last().message).toBe(PROJECT_REPOSITORY_DONE_MESSAGES.register);
+  expect(last().registerDraft).toBe("");
+});
+
+test("an action that runs holds the buttons through another project and back: while a registration of the project runs, opening another project and this one again lets no second registration start (#310)", async () => {
+  const { actions, calls, answers, last } = controllerWith();
+  actions.editRegisterDraft("app");
+  const done = actions.register(PROJECT);
+  // The shell shows another project, then this one again, before the
+  // answer arrives; the project panel stays mounted and follows each.
+  actions.follow(
+    model(known({ projectId: OTHER_PROJECT }), MOUNTS, OTHER_PROJECT),
+  );
+  expect(last().running).toBe(true);
+  actions.follow(model());
+  expect(last().running).toBe(true);
+  actions.editRegisterDraft("app");
+  await actions.register(PROJECT);
+  await actions.start(request("unlink"));
+  await actions.start(request("remove"));
+  expect(last().dialog).toBeUndefined();
+  expect(calls).toEqual([`register ${PROJECT} app`]);
+  answers.register.resolve({ outcome: "ok", repositoryId: REPOSITORY_A });
+  await done;
+  // The answer belongs to the earlier visit, so it shows no sentence and
+  // leaves the name typed since alone; the action ended all the same.
+  expect(last().running).toBe(false);
+  expect(last().message).toBeUndefined();
+  expect(last().registerDraft).toBe("app");
+});
+
 test("an answer that arrives after the shell showed another project shows no sentence, moves no focus, and leaves a name typed since alone", async () => {
   const { actions, answers, last } = controllerWith();
   actions.editRegisterDraft("app");

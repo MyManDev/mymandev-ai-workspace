@@ -539,12 +539,13 @@ export function projectRepositoryHandlers(
 }
 
 /**
- * Follows the open project's registered repositories while the panel is
- * shown, for the project that the shell shows (`projectId`) and the mount
- * list (`mounts`), and runs the part's actions
+ * Follows the open project's registered repositories while the component
+ * that calls it is shown, for the project that the shell shows
+ * (`projectId`) and the mount list (`mounts`), and runs the part's actions
  * (`createProjectRepositoryActions`), which follow every model, with the
  * handlers of `projectRepositoryHandlers`; undefined handlers without the
- * bridge.
+ * bridge. The project panel calls it (#310), so that the controller lives
+ * while the project is open, also while the agents tab is shown.
  *
  * The focus: a question remembers the button that opened it, which the
  * dialog gives the focus back to; when the question ends after that button
@@ -553,6 +554,8 @@ export function projectRepositoryHandlers(
  * remembered (`rememberRunningButton`), and once it has left the page, for
  * example with a removed repository or after "Unlink", the focus moves to
  * the part's title while it is on the page (`decideFocusAfterLeave`, #274).
+ * A button that left with the repository panel, on a switch to the agents
+ * tab, counts as left: while the title is not on the page, nothing moves.
  */
 export function useProjectRepositories(
   bridge: ProjectRepositoriesBridge | undefined,

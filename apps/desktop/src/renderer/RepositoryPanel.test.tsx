@@ -2,12 +2,25 @@ import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type {
   MountedRepository,
+  ProjectRepositoriesView,
   RepositoryList,
 } from "../shared/ipc-contract.ts";
+import type {
+  ProjectRepositoriesControls,
+  ProjectRepositoryHandlers,
+} from "./ProjectRepositories.tsx";
 import {
+  describeProjectRepositories,
+  IDLE_PROJECT_REPOSITORY_ACTIONS,
+  PROJECT_REPOSITORY_DONE_MESSAGES,
+  PROJECT_REPOSITORY_MESSAGES,
+} from "./project-repositories-view.ts";
+import {
+  RepositoryPanel,
   RepositoryPanelContent,
   type RepositoryPanelContentProps,
 } from "./RepositoryPanel.tsx";
+import type { RepositoryPanelView } from "./repository-view.ts";
 
 const COMMIT = "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d";
 
@@ -201,6 +214,97 @@ test("the open project's repositories come first, between the panel's title and 
   );
 });
 
+// The project's repositories that the project panel holds (#310).
+
+const PROJECT = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a2";
+
+/** Handlers that do nothing; the panel only renders here. */
+const HANDLERS: ProjectRepositoryHandlers = {
+  onStart: () => undefined,
+  onChoose: () => undefined,
+  onConfirm: () => undefined,
+  onCancel: () => undefined,
+  onRegisterDraft: () => undefined,
+  onRegister: () => undefined,
+};
+
+/** The controls of a ready project with one repository and `actions`. */
+function controls(
+  mounts: RepositoryPanelView,
+  actions: Partial<ProjectRepositoriesControls["actions"]>,
+): ProjectRepositoriesControls {
+  // Who may remove a repository (#309), a required field once it merges. A
+  // variable, not a literal in the cast, so that the extra field compiles
+  // before that too.
+  const repository = {
+    repositoryId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b1",
+    name: "app",
+    linked: false,
+    mountId: null,
+    removable: true,
+  };
+  const state = {
+    revision: 1,
+    status: "ready",
+    workspaceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a1",
+    projectId: PROJECT,
+    links: "ready",
+    repositories: [repository],
+  } as ProjectRepositoriesView;
+  return {
+    model: describeProjectRepositories(
+      { kind: "known", state },
+      mounts,
+      PROJECT,
+    ),
+    actions: { ...IDLE_PROJECT_REPOSITORY_ACTIONS, ...actions },
+    handlers: HANDLERS,
+  };
+}
+
+test("after a switch back to the repositories tab, the panel shows what the project panel kept: the action that runs holds every button, with its sentence and the name typed, and an answer that came meanwhile shows its sentence (#310)", () => {
+  const mounts: RepositoryPanelView = { kind: "known", list: listOf(READY) };
+  const running = renderToString(
+    <RepositoryPanel
+      repositories={undefined}
+      mounts={mounts}
+      project={controls(mounts, {
+        running: true,
+        message: PROJECT_REPOSITORY_MESSAGES.linkWaiting,
+        registerDraft: "docs",
+      })}
+    />,
+  );
+  expect(running).toContain(
+    `<p class="repository-status" id="project-repository-message" role="status">${PROJECT_REPOSITORY_MESSAGES.linkWaiting}</p>`,
+  );
+  expect(running).toContain('spellCheck="false" readOnly=""');
+  expect(running).toContain('value="docs"');
+  expect(running).toContain(
+    '<button type="submit" class="panel-action" aria-disabled="true">Register</button>',
+  );
+  expect(running).toContain(
+    '<button type="button" class="panel-action" aria-describedby="project-repository-name-0" aria-disabled="true">Link to a folder</button>',
+  );
+  // The mount list that the project panel follows shows below.
+  expect(running).toContain("<code>/home/user/project</code>");
+
+  const answered = renderToString(
+    <RepositoryPanel
+      repositories={undefined}
+      mounts={mounts}
+      project={controls(mounts, {
+        message: PROJECT_REPOSITORY_DONE_MESSAGES.register,
+      })}
+    />,
+  );
+  expect(answered).toContain(
+    `<p class="repository-status" id="project-repository-message" role="status">${PROJECT_REPOSITORY_DONE_MESSAGES.register}</p>`,
+  );
+  expect(answered).toContain('value=""');
+  expect(answered).not.toContain('aria-disabled="true"');
+});
+
 // The panel's wiring, which needs a DOM to run.
 
 const SOURCES = import.meta.glob<string>("./RepositoryPanel.tsx", {
@@ -209,17 +313,27 @@ const SOURCES = import.meta.glob<string>("./RepositoryPanel.tsx", {
   eager: true,
 });
 
-test("the panel follows the open project's repositories for the shown project with this device's mount list, and shows their part with its dialog above this device's repositories", () => {
+test("the panel shows the mount list and the project's repositories that the project panel passes in, with their part above this device's repositories, and follows neither itself (#310)", () => {
   const code = (SOURCES["./RepositoryPanel.tsx"] ?? "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
     .replace(/\s+/g, " ")
     .replace(/\( /g, "(")
     .replace(/,? \)/g, ")");
-  expect(code).toContain("const mounts = useRepositoryPanel(repositories);");
-  expect(code).toContain(
-    "const project = useProjectRepositories(projectRepositories, projectId, mounts.view);",
+  const start = code.indexOf("export function RepositoryPanel(");
+  const end = code.indexOf("export interface RepositoryPanelContentProps");
+  expect(start).toBeGreaterThan(-1);
+  expect(end).toBeGreaterThan(start);
+  const panel = code.slice(start, end);
+  expect(panel).toContain(
+    "const actions = useMountActions(repositories); return (<RepositoryPanelContent view={mounts} {...actions} project={<ProjectRepositoriesPart {...project} />} />); }",
   );
+  // Neither the project's repositories nor the mount list is followed here.
+  expect(panel).not.toMatch(/useProjectRepositories|useMountList|subscribe/);
+  expect(code).not.toContain("useProjectRepositories");
+  // The mount list's subscription passes each list on, and a refusal.
   expect(code).toContain(
-    "<RepositoryPanelContent {...mounts} project={<ProjectRepositoriesPart {...project} />} />",
+    'useEffect(() => { if (bridge === undefined) { return undefined; } return bridge.subscribe((list) => setView({ kind: "known", list }), () => setView({ kind: "unavailable" })); }, [bridge]); return view; }',
   );
 });
 

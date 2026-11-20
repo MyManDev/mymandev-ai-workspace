@@ -5,7 +5,12 @@ import type {
   RepositoryBridge,
 } from "../shared/desktop-bridge.ts";
 import { AgentPanel } from "./AgentPanel.tsx";
-import { RepositoryPanel } from "./RepositoryPanel.tsx";
+import {
+  useProjectRepositories,
+  type ProjectRepositoriesControls,
+} from "./ProjectRepositories.tsx";
+import { RepositoryPanel, useMountList } from "./RepositoryPanel.tsx";
+import type { RepositoryPanelView } from "./repository-view.ts";
 import {
   PANEL_IDS,
   PANELS,
@@ -53,6 +58,16 @@ export function panelForKey(
  * repositories are the open project's registered repositories, with their
  * links to folders on this device, and the repositories mounted on this
  * device, which every project shows the same.
+ *
+ * The project's repositories and their actions, and the mount list that
+ * they need, are followed here (`useProjectRepositories` and
+ * `useMountList`), not in the repository panel, which leaves the page with a
+ * switch to the agents tab (#310). So they live while the project is open,
+ * whichever tab is shown: an action that runs keeps holding the buttons, its
+ * answer still shows its sentence and empties the name field, and the name
+ * field keeps what was typed. Another project, a sign-out, and a state of
+ * another project still end what belonged to the earlier one
+ * (`createProjectRepositoryActions`).
  */
 export function ProjectPanel({
   panel,
@@ -72,6 +87,51 @@ export function ProjectPanel({
   readonly repositories?: RepositoryBridge | undefined;
   /** The project repository functions from the preload script; undefined outside Electron. */
   readonly projectRepositories?: ProjectRepositoriesBridge | undefined;
+}) {
+  const mounts = useMountList(repositories);
+  const project = useProjectRepositories(
+    projectRepositories,
+    projectId,
+    mounts,
+  );
+  return (
+    <ProjectPanelContent
+      panel={panel}
+      projectId={projectId}
+      dispatch={dispatch}
+      agents={agents}
+      repositories={repositories}
+      mounts={mounts}
+      project={project}
+    />
+  );
+}
+
+/**
+ * The side panel without state: the tabs and the selected tab's panel, with
+ * the mount list and the project's repositories that `ProjectPanel` holds.
+ */
+export function ProjectPanelContent({
+  panel,
+  projectId,
+  dispatch,
+  agents,
+  repositories,
+  mounts,
+  project,
+}: {
+  readonly panel: PanelId;
+  /** The open project. */
+  readonly projectId: string;
+  readonly dispatch: Dispatch<ShellAction>;
+  /** The agent functions from the preload script; undefined outside Electron. */
+  readonly agents?: AgentBridge | undefined;
+  /** The repository functions from the preload script; undefined outside Electron. */
+  readonly repositories?: RepositoryBridge | undefined;
+  /** This device's mount list (`useMountList`). */
+  readonly mounts: RepositoryPanelView;
+  /** The project's repositories and their actions (`useProjectRepositories`). */
+  readonly project: ProjectRepositoriesControls;
 }) {
   const selectWithKey = (event: KeyboardEvent<HTMLElement>) => {
     const next = panelForKey(panel, event.key);
@@ -124,8 +184,8 @@ export function ProjectPanel({
         ) : (
           <RepositoryPanel
             repositories={repositories}
-            projectRepositories={projectRepositories}
-            projectId={projectId}
+            mounts={mounts}
+            project={project}
           />
         )}
       </div>

@@ -62,8 +62,15 @@ import {
   type DeviceRemovalView,
 } from "./connection-status.ts";
 import { WorkspaceNav } from "./Navigation.tsx";
-import { ProjectPanel } from "./ProjectPanel.tsx";
+import { AgentPanel } from "./AgentPanel.tsx";
+import { ProjectPanelContent } from "./ProjectPanel.tsx";
+import type { ProjectRepositoriesControls } from "./ProjectRepositories.tsx";
+import {
+  describeProjectRepositories,
+  IDLE_PROJECT_REPOSITORY_ACTIONS,
+} from "./project-repositories-view.ts";
 import { RepositoryPanel } from "./RepositoryPanel.tsx";
+import type { RepositoryPanelView } from "./repository-view.ts";
 import {
   createShellState,
   type ProjectSummary,
@@ -911,30 +918,8 @@ test("with the bridge, the repository panel waits for the first list and offers 
   expect(html).not.toContain("Repositories are not available.");
 });
 
-test("the project panel gives the repository panel the open project and both repository bridges", () => {
-  const repositories: RepositoryBridge = {
-    list: () => Promise.resolve({ revision: 0, repositories: [] }),
-    subscribe: () => () => undefined,
-    mount: () => Promise.resolve({ outcome: "cancelled" }),
-    unmount: () => Promise.resolve(false),
-  };
-  const refuse = () => Promise.reject(new Error("not called"));
-  const projectRepositories: ProjectRepositoriesBridge = {
-    getState: refuse,
-    subscribeState: () => () => undefined,
-    register: refuse,
-    remove: refuse,
-    link: refuse,
-    unlink: refuse,
-  };
-  const tree = ProjectPanel({
-    panel: "repositories",
-    projectId: "project-b",
-    dispatch: () => undefined,
-    repositories,
-    projectRepositories,
-  });
-  // The repository panel uses hooks, so it stays an element here.
+/** The props of every element of `type` in `tree`, which stays unrendered. */
+function propsOf(tree: ReactNode, type: unknown): unknown[] {
   const found: unknown[] = [];
   const visit = (node: ReactNode): void => {
     if (Array.isArray(node)) {
@@ -944,15 +929,126 @@ test("the project panel gives the repository panel the open project and both rep
     if (!isValidElement<{ readonly children?: ReactNode }>(node)) {
       return;
     }
-    if (node.type === RepositoryPanel) {
+    if (node.type === type) {
       found.push(node.props);
     }
     visit(node.props.children);
   };
   visit(tree);
-  expect(found).toEqual([
-    { repositories, projectRepositories, projectId: "project-b" },
+  return found;
+}
+
+test("the project panel's content gives the repository panel the repository bridge, the mount list, and the project's repositories that the project panel holds, and the agents tab the agents (#310)", () => {
+  const repositories: RepositoryBridge = {
+    list: () => Promise.resolve({ revision: 0, repositories: [] }),
+    subscribe: () => () => undefined,
+    mount: () => Promise.resolve({ outcome: "cancelled" }),
+    unmount: () => Promise.resolve(false),
+  };
+  const agents: AgentBridge = {
+    getState: () => Promise.reject(new Error("not called")),
+    subscribeState: () => () => undefined,
+  };
+  const mounts: RepositoryPanelView = {
+    kind: "known",
+    list: { revision: 1, repositories: [] },
+  };
+  const project: ProjectRepositoriesControls = {
+    model: describeProjectRepositories(
+      { kind: "pending" },
+      mounts,
+      "project-b",
+    ),
+    actions: { ...IDLE_PROJECT_REPOSITORY_ACTIONS, running: true },
+    handlers: undefined,
+  };
+  const props = {
+    projectId: "project-b",
+    dispatch: () => undefined,
+    agents,
+    repositories,
+    mounts,
+    project,
+  };
+  // Both panels use hooks, so they stay elements here.
+  const shown = propsOf(
+    ProjectPanelContent({ ...props, panel: "repositories" }),
+    RepositoryPanel,
+  );
+  expect(shown).toEqual([{ repositories, mounts, project }]);
+  const [first] = shown as { mounts: unknown; project: unknown }[];
+  expect(first?.mounts).toBe(mounts);
+  expect(first?.project).toBe(project);
+
+  // The agents tab shows the agents, and the repository panel leaves; the
+  // project's repositories stay with the project panel, which passes the
+  // same controls again on a switch back.
+  const agentsTab = ProjectPanelContent({ ...props, panel: "agents" });
+  expect(propsOf(agentsTab, RepositoryPanel)).toEqual([]);
+  expect(propsOf(agentsTab, AgentPanel)).toEqual([
+    { agents, projectId: "project-b" },
   ]);
+  const [back] = propsOf(
+    ProjectPanelContent({ ...props, panel: "repositories" }),
+    RepositoryPanel,
+  ) as { project: unknown }[];
+  expect(back?.project).toBe(project);
+});
+
+// The project panel's wiring, which needs a DOM to run.
+const PANEL_SOURCES = import.meta.glob<string>("./ProjectPanel.tsx", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+test("the project panel follows the mount list and the project's repositories for the open project before it chooses a tab, and passes them to its content, which holds no state (#310)", () => {
+  const code = (PANEL_SOURCES["./ProjectPanel.tsx"] ?? "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/,? \)/g, ")");
+  const start = code.indexOf("export function ProjectPanel(");
+  const content = code.indexOf("export function ProjectPanelContent(");
+  expect(start).toBeGreaterThan(-1);
+  expect(content).toBeGreaterThan(start);
+  const panel = code.slice(start, content);
+  expect(panel).toContain(
+    "const mounts = useMountList(repositories); const project = useProjectRepositories(projectRepositories, projectId, mounts); return (<ProjectPanelContent panel={panel} projectId={projectId} dispatch={dispatch} agents={agents} repositories={repositories} mounts={mounts} project={project} />); }",
+  );
+  // The content, which switches the tabs, calls no hook, so a switch keeps
+  // what the project panel holds.
+  expect(code.slice(content)).not.toMatch(/\buse[A-Z]\w*\(/);
+  expect(code.slice(content)).toContain(
+    "<RepositoryPanel repositories={repositories} mounts={mounts} project={project} />",
+  );
+});
+
+// The shell's source, to check how it places the project panel.
+const APP_SOURCES = import.meta.glob<string>("./App.tsx", {
+  query: "?raw",
+  import: "default",
+  eager: true,
+});
+
+test("the shell renders the project panel once, in one place, and without a key, so that neither a switch of the side panel's tab nor another project mounts a new one and drops what it holds (#310)", () => {
+  const code = (APP_SOURCES["./App.tsx"] ?? "")
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\/\/[^\n]*/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/,? \)/g, ")");
+  const elements = code.match(/<ProjectPanel\b[^>]*\/>/g) ?? [];
+  expect(elements).toEqual([
+    "<ProjectPanel panel={open.view.panel} projectId={open.project.id} dispatch={dispatch} agents={agents} repositories={repositories} projectRepositories={projectRepositories} />",
+  ]);
+  // A key, also one passed in a spread, would mount a new panel, with a
+  // new, idle controller, whenever it changes.
+  expect(elements[0]).not.toMatch(/\bkey=|\{\.\.\./);
+  expect(code).toContain(
+    "{open === undefined ? null : (<ProjectPanel panel={open.view.panel}",
+  );
 });
 
 // The entry point's source, to check what it passes from `window.desktop`.

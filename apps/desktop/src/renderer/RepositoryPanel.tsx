@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import type {
-  ProjectRepositoriesBridge,
-  RepositoryBridge,
-} from "../shared/desktop-bridge.ts";
+import type { RepositoryBridge } from "../shared/desktop-bridge.ts";
 import type {
   GitRemote,
   MountedRepository,
@@ -10,7 +7,7 @@ import type {
 } from "../shared/ipc-contract.ts";
 import {
   ProjectRepositoriesPart,
-  useProjectRepositories,
+  type ProjectRepositoriesControls,
 } from "./ProjectRepositories.tsx";
 import {
   describeBranch,
@@ -31,27 +28,31 @@ export const DEVICE_REPOSITORIES_TITLE_ID = "device-repositories-title";
  * repositories mounted on this device, with their branch, their changes,
  * and their remotes, read-only. The mount list follows the main process,
  * which refreshes it after file changes; it is the same for every project.
+ *
+ * The project panel follows the mount list and the project's repositories
+ * (`useMountList` and `useProjectRepositories`) and passes them in, so that
+ * they live while the project is open, whichever tab of the side panel is
+ * shown (#310): this panel leaves the page with a switch to the agents tab,
+ * and an action that still runs, its sentence, the open question, and the
+ * name field stay with the project panel. Only adding and removing a mount
+ * live here.
  */
 export function RepositoryPanel({
   repositories,
-  projectRepositories,
-  projectId,
+  mounts,
+  project,
 }: {
   readonly repositories: RepositoryBridge | undefined;
-  /** The project repository functions from the preload script; undefined outside Electron. */
-  readonly projectRepositories: ProjectRepositoriesBridge | undefined;
-  /** The open project. */
-  readonly projectId: string;
+  /** This device's mount list, which the project panel follows. */
+  readonly mounts: RepositoryPanelView;
+  /** The project's repositories and their actions, which the project panel holds. */
+  readonly project: ProjectRepositoriesControls;
 }) {
-  const mounts = useRepositoryPanel(repositories);
-  const project = useProjectRepositories(
-    projectRepositories,
-    projectId,
-    mounts.view,
-  );
+  const actions = useMountActions(repositories);
   return (
     <RepositoryPanelContent
-      {...mounts}
+      view={mounts}
+      {...actions}
       project={<ProjectRepositoriesPart {...project} />}
     />
   );
@@ -236,16 +237,17 @@ function RemoteItem({ remote }: { readonly remote: GitRemote }) {
   );
 }
 
-/** Follows the mounted repositories while the panel is shown. */
-function useRepositoryPanel(
+/**
+ * Follows the mounted repositories while the component that calls it is
+ * shown: the project panel, so that the project's repositories have the
+ * mount list on either tab.
+ */
+export function useMountList(
   bridge: RepositoryBridge | undefined,
-): RepositoryPanelContentProps {
+): RepositoryPanelView {
   const [view, setView] = useState(() =>
     initialRepositoryView(bridge !== undefined),
   );
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<string | undefined>(undefined);
-
   useEffect(() => {
     if (bridge === undefined) {
       return undefined;
@@ -255,6 +257,18 @@ function useRepositoryPanel(
       () => setView({ kind: "unavailable" }),
     );
   }, [bridge]);
+  return view;
+}
+
+/** Adds and removes a mount while the repository panel is shown. */
+function useMountActions(
+  bridge: RepositoryBridge | undefined,
+): Pick<
+  RepositoryPanelContentProps,
+  "busy" | "message" | "onMount" | "onUnmount"
+> {
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState<string | undefined>(undefined);
 
   const onMount = useCallback(() => {
     if (bridge === undefined) {
@@ -291,5 +305,5 @@ function useRepositoryPanel(
     [bridge],
   );
 
-  return { view, busy, message, onMount, onUnmount };
+  return { busy, message, onMount, onUnmount };
 }
