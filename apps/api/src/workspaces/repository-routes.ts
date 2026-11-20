@@ -90,9 +90,9 @@ function refusedRegistration(
  * project's workspace. Neither change writes an audit record: they are not
  * administrative actions of ADR 0014. Who may register and remove, and the
  * code `repository_limit`, follow the Project Manager's decisions of
- * 2026-11-14 (#286). Provisional (#286): the two limits and what a removal
- * does are settled with the conservative option and await the Project
- * Manager's confirmation (protocol README, "Repository routes").
+ * 2026-11-14 (#286), and the two limits and what a removal does follow the
+ * Project Manager's decision of 2026-11-17 on #286 (protocol README,
+ * "Repository routes").
  */
 export function registerRepositoryRoutes(
   project: FastifyInstance,
@@ -159,10 +159,10 @@ export function registerRepositoryRoutes(
 
   // The removal revokes the grants on the repository in its transaction
   // (ADR 0015, P-77). The event names the repository and no grant: every
-  // grant scoped to it is revoked. Provisional (#286): no
-  // `agent.grant.revoked` is sent for those grants until the grant routes
-  // send them for every change that revokes grants (#75), as a device
-  // revocation and a removal of a person send none yet.
+  // grant scoped to it is revoked. No `agent.grant.revoked` is sent for
+  // those grants until the grant routes send them for every change that
+  // revokes grants (#75), as a device revocation and a removal of a person
+  // send none yet (the Project Manager's decision of 2026-11-17 on #286).
   project.post(
     REPOSITORY_ROUTES.removeRepository.path,
     { schema: { params: RepositoryParamsSchema } },
