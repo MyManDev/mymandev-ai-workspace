@@ -16,10 +16,9 @@
 // from a closed list, and a time, never a path, a command, or a value that
 // the requester sent.
 //
-// Not in this module: the grant store's real source (#75), the freshness
-// bound of locally held facts (P-76), the wiring into the main process and
-// the IPC, and stopping work that runs when a grant becomes inactive or the
-// sign-in ends.
+// Not in this module: the grant store and the freshness of its records
+// (`grant-store.ts`; P-76), the wiring into a tool and the IPC, and stopping
+// work that runs when a grant becomes inactive or the sign-in ends.
 import {
   AgentIdSchema,
   type AgentId,
