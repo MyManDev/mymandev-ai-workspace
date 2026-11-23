@@ -297,6 +297,17 @@ test("a connection shows its ID, kind, label, and registration time, and never a
     ["an ID that is not a UUIDv7", { ...connection, id: "not-an-id" }],
     ["a time without its zone", { ...connection, createdAt: "2026-11-23" }],
     ["an empty label", { ...connection, label: "" }],
+    [
+      "a label with a control character",
+      { ...connection, label: "Wo\u0000rk" },
+    ],
+    [
+      "a label over the limit",
+      {
+        ...connection,
+        label: "a".repeat(LIMITS.providerConnectionLabel + 1),
+      },
+    ],
   ] as const) {
     assert.equal(
       ProviderConnectionSchema.safeParse(value).success,
