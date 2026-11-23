@@ -2,6 +2,8 @@ import { readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  CONNECTION_HEARTBEAT_INTERVAL_MS,
+  CONNECTION_LIVENESS_BOUND_MS,
   PROTOCOL_VERSION,
   type AuthChallengeFrame,
   type AuthResponseFrame,
@@ -75,6 +77,11 @@ const RESPONSE: AuthResponseFrame = Object.freeze({
   deviceId: DEVICE_ID,
   signature: SIGNATURE,
 } as AuthResponseFrame);
+
+const HEARTBEAT = Object.freeze({
+  protocolVersion: 0,
+  type: "connection.heartbeat",
+});
 
 const PRESENCE = Object.freeze({
   protocolVersion: 0,
@@ -261,6 +268,20 @@ function harness(
     clock = end;
   }
 
+  /**
+   * Advances `ms` while the server sends `connection.heartbeat` on the last
+   * socket every `CONNECTION_HEARTBEAT_INTERVAL_MS`, as a live connection
+   * does.
+   */
+  function advanceLive(ms: number): void {
+    const end = clock + ms;
+    while (clock + CONNECTION_HEARTBEAT_INTERVAL_MS <= end) {
+      advance(CONNECTION_HEARTBEAT_INTERVAL_MS);
+      last().receiveJson(HEARTBEAT);
+    }
+    advance(end - clock);
+  }
+
   function emit(next: AccountStatus): void {
     status = next;
     for (const listener of [...accountListeners]) {
@@ -293,6 +314,7 @@ function harness(
     challenges,
     state,
     advance,
+    advanceLive,
     emit,
     last,
     authenticate,
@@ -1358,13 +1380,13 @@ test("the backoff waits between half and all of min(60 s, 1 s x 2^n), and resets
 
     // A connection that drops before 60 seconds keeps the count.
     await h.authenticate();
-    h.advance(STABLE_CONNECTION_MS - 1);
+    h.advanceLive(STABLE_CONNECTION_MS - 1);
     h.last().closed(1006);
     expect(waitOf(h)).toBe(random === 0 ? 30_000 : 60_000);
     h.advance(waitOf(h));
     // After 60 seconds connected, the count starts again.
     await h.authenticate();
-    h.advance(STABLE_CONNECTION_MS);
+    h.advanceLive(STABLE_CONNECTION_MS);
     h.last().closed(1006);
     expect(waitOf(h)).toBe(random === 0 ? 500 : 1_000);
   }
@@ -1582,6 +1604,168 @@ test("messages reach the listeners only after auth.ok, and a failing listener st
   stop();
   h.last().receiveJson(PRESENCE);
   expect(received).toHaveLength(1);
+});
+
+test("after auth.ok, 45 seconds without a message close the socket with 1000 and connect again, as any lost connection", async () => {
+  expect(CONNECTION_LIVENESS_BOUND_MS).toBe(45_000);
+  const h = harness();
+  const statuses: ConnectionStatus[] = [];
+  h.client.onStatusChange((status) => statuses.push(status));
+  await h.authenticate();
+  const socket = h.last();
+  expect(h.client.identity()).not.toBeNull();
+
+  h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
+  expect(socket.closes).toEqual([]);
+  expect(h.client.status().state).toBe("connected");
+  h.advance(1);
+  expect(socket.closes).toEqual([1000]);
+  // The status listeners hear of it at once, as of any other lost connection.
+  expect(statuses.map((status) => status.state)).toEqual([
+    "authenticating",
+    "connected",
+    "waiting",
+  ]);
+  expect(h.client.status()).toMatchObject({
+    state: "waiting",
+    reason: "connection_lost",
+  });
+  expect(h.client.identity()).toBeNull();
+  expect(h.client.sendAs(chatSendAs)).toBe("not_connected");
+  expect(h.logs).toContain(
+    "The connection to the API received no message within its bound.",
+  );
+
+  // The next socket opens after the backoff and the close of this one.
+  socket.closed(1000);
+  h.advance(backoffDelayMs(0));
+  expect(h.sockets).toHaveLength(2);
+  await h.authenticate();
+  expect(h.client.status().state).toBe("connected");
+  // The closed socket's bound ended with it; the new one has its own.
+  h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
+  expect(h.last().closes).toEqual([]);
+  h.advance(1);
+  expect(h.last().closes).toEqual([1000]);
+  expect(socket.closes).toEqual([1000]);
+});
+
+test("any message after auth.ok starts the bound again: a heartbeat, a frame, or an event", async () => {
+  const h = harness();
+  await h.authenticate();
+  const socket = h.last();
+  const messages: unknown[] = [
+    HEARTBEAT,
+    PRESENCE,
+    {
+      protocolVersion: 0,
+      type: "workspace.subscribed",
+      workspaceId: WORKSPACE_ID,
+      onlineMemberIds: [],
+    },
+    {
+      protocolVersion: 0,
+      id: EVENT_ID,
+      type: "agent.run.state_changed",
+      occurredAt: "2026-11-03T10:00:00.000Z",
+      workspaceId: WORKSPACE_ID,
+      actor: { kind: "system" },
+      deviceId: null,
+      payload: {
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        previousState: null,
+        state: "queued",
+      },
+    },
+    HEARTBEAT,
+  ];
+  for (const message of messages) {
+    h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
+    socket.receiveJson(message);
+    expect(socket.closes).toEqual([]);
+  }
+  h.advanceLive(10 * CONNECTION_LIVENESS_BOUND_MS);
+  expect(socket.closes).toEqual([]);
+  expect(h.client.status().state).toBe("connected");
+  expect(h.sockets).toHaveLength(1);
+
+  // Then silence for the bound closes it.
+  h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
+  expect(socket.closes).toEqual([]);
+  h.advance(1);
+  expect(socket.closes).toEqual([1000]);
+  expect(h.client.status()).toMatchObject({
+    state: "waiting",
+    reason: "connection_lost",
+  });
+});
+
+test("connection.heartbeat reaches no message listener, and is refused before auth.ok", async () => {
+  const h = harness();
+  const received: ServerMessage[] = [];
+  h.client.onMessage((message) => received.push(message));
+  await h.authenticate();
+  h.last().receiveJson(HEARTBEAT);
+  h.last().receiveJson({ ...HEARTBEAT, extra: 1 });
+  expect(received).toEqual([]);
+  h.last().receiveJson(PRESENCE);
+  expect(received).toEqual([{ kind: "frame", frame: PRESENCE }]);
+  // Nothing answers it.
+  expect(h.last().sent).toHaveLength(1);
+  expect(h.last().closes).toEqual([]);
+
+  // The server sends it only after auth.ok.
+  const early = harness();
+  early.last().open();
+  early.last().receiveJson(CHALLENGE);
+  await flush();
+  early.last().receiveJson(HEARTBEAT);
+  expect(early.last().closes).toEqual([1000]);
+  expect(early.client.status()).toMatchObject({
+    state: "waiting",
+    reason: "invalid_message",
+  });
+});
+
+test("the bound ends with every close: the server's, a refused message, a sign-out, another device, a resume, and the quit", async () => {
+  const closes: [string, (h: ReturnType<typeof harness>) => void][] = [
+    ["the server closes", (h) => h.last().closed(1006)],
+    ["a refused message", (h) => h.last().receive("{")],
+    ["a sign-out", (h) => h.emit(SIGNED_OUT)],
+    ["another device", (h) => h.emit(accountStatus({}, OTHER_DEVICE_ID))],
+    ["a resume", (h) => h.client.systemResumed()],
+    ["the quit", (h) => h.client.close()],
+  ];
+  for (const [name, close] of closes) {
+    const h = harness();
+    await h.authenticate();
+    const socket = h.last();
+    close(h);
+    if (socket.closes.length > 0) {
+      // The close event of the socket that the client closed.
+      socket.closed(1000);
+    }
+    const logged = h.logs.length;
+    h.advance(2 * CONNECTION_LIVENESS_BOUND_MS);
+    expect(
+      h.logs.slice(logged).filter((line) => line.includes("within its bound")),
+      name,
+    ).toEqual([]);
+    expect(socket.closes.length, name).toBeLessThanOrEqual(1);
+  }
+
+  // After the quit, and after a sign-out once the socket closed, no timer
+  // is left.
+  const quit = harness();
+  await quit.authenticate();
+  quit.client.close();
+  expect(quit.pendingTimers()).toBe(0);
+  const signedOut = harness();
+  await signedOut.authenticate();
+  signedOut.emit(SIGNED_OUT);
+  signedOut.last().closed(1000);
+  expect(signedOut.pendingTimers()).toBe(0);
 });
 
 test("a waiting connection retries now on request, within the cooldown only once", () => {

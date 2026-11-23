@@ -12,7 +12,10 @@
 // `auth.ok` for the socket's lifetime, and sends events only through
 // `sendAs`, which builds each event from the identity that the server binds
 // it to. It acts on each close reason as ADR 0014's table says, and backs off
-// between attempts.
+// between attempts. After `auth.ok` it closes the socket and connects again
+// when no message of any kind arrived for `CONNECTION_LIVENESS_BOUND_MS`
+// (#316); the server's `connection.heartbeat` keeps a live connection busy,
+// and the client passes it on to no one.
 //
 // The renderer gets the status only: fixed codes and a time. No frame,
 // nonce, signature, key, or user ID is logged or reaches the renderer. The
@@ -22,6 +25,7 @@
 // account and the device, such as the chat service, so it leaves this module
 // but stays in the main process.
 import {
+  CONNECTION_LIVENESS_BOUND_MS,
   decodeClientMessage,
   decodeServerMessage,
   MAX_FRAME_BYTES,
@@ -211,7 +215,10 @@ export type ConnectionAccount = Pick<
 /** An event that a device sends: never one that only the server sends. */
 export type ClientEvent = Exclude<ProtocolEvent, { type: ServerOnlyEventType }>;
 
-/** A message of the server after `auth.ok`, decoded with `decodeServerMessage`. */
+/**
+ * A message of the server after `auth.ok`, decoded with `decodeServerMessage`.
+ * A `connection.heartbeat` is never one: the client keeps it to itself.
+ */
 export type ServerMessage =
   | { readonly kind: "event"; readonly event: ReceivedServerEvent }
   | { readonly kind: "frame"; readonly frame: ServerFrame };
@@ -342,6 +349,11 @@ interface Live {
    * the socket closed or the client closed it.
    */
   identity: ConnectionIdentity | null;
+  /**
+   * Cancels the timer of the phase: the opening handshake, the wait for
+   * `auth.ok`, and after it the liveness bound, which every message
+   * starts again.
+   */
   cancelTimer: (() => void) | null;
 }
 
@@ -658,6 +670,23 @@ export function createConnectionClient(
     backOff("timeout");
   }
 
+  /**
+   * Starts the liveness bound of an authenticated socket again (#316): no
+   * message for `CONNECTION_LIVENESS_BOUND_MS` closes it as any other lost
+   * connection, so every listener of the status sees it at once.
+   */
+  function watchLiveness(record: Live): void {
+    stopTimer(record);
+    record.cancelTimer = schedule(() => {
+      if (live !== record) {
+        return;
+      }
+      log("The connection to the API received no message within its bound.");
+      closeLive(record);
+      backOff("connection_lost");
+    }, CONNECTION_LIVENESS_BOUND_MS);
+  }
+
   /** Closes after a message that the client does not accept, and backs off. */
   function refuseMessage(record: Live): void {
     log("The connection to the API received a message that it refuses.");
@@ -668,6 +697,11 @@ export function createConnectionClient(
   function received(record: Live, data: unknown): void {
     if (live !== record) {
       return;
+    }
+    if (record.phase === "open") {
+      // Any message shows that the connection is live; one that the client
+      // refuses closes it below.
+      watchLiveness(record);
     }
     // Only text frames; a binary message is anything but a string.
     if (typeof data !== "string") {
@@ -740,6 +774,13 @@ export function createConnectionClient(
           refuseMessage(record);
           return;
         }
+        if (
+          decoded.kind === "frame" &&
+          decoded.frame.type === "connection.heartbeat"
+        ) {
+          // It only keeps the connection live, which it did above.
+          return;
+        }
         deliver(
           decoded.kind === "event"
             ? Object.freeze({ kind: "event", event: decoded.event })
@@ -779,8 +820,8 @@ export function createConnectionClient(
   }
 
   function authenticated(record: Live, identity: ConnectionIdentity): void {
-    stopTimer(record);
     record.phase = "open";
+    watchLiveness(record);
     record.identity = Object.freeze({ ...identity });
     log("The connection to the API is authenticated.");
     setStatus({ state: "connected" });
