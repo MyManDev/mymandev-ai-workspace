@@ -134,6 +134,18 @@ export async function revokeGrants(
 }
 
 /**
+ * A grant that a change revoked, with what the server's `agent.grant.revoked`
+ * about it needs (#75): the grant, its agent, the workspace of its project,
+ * whose members are told, and the time stored as `revoked_at`.
+ */
+export type RevokedGrant = Readonly<{
+  grantId: PermissionGrantId;
+  granteeAgentId: AgentId;
+  workspaceId: WorkspaceId;
+  revokedAt: Date;
+}>;
+
+/**
  * Moves the unfinished runs that `which` selects to `cancelled` with the
  * reason code `reason` and `finished_at` set to `now` (P-60). Each run is
  * read with the state it had and its project's workspace before it is

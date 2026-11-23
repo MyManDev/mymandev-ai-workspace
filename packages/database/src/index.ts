@@ -199,6 +199,7 @@ export {
   type RevokeGrantInput,
   type RevokeGrantResult,
 } from "./grants.ts";
+export type { RevokedGrant } from "./cascade.ts";
 export {
   listChatMessages,
   type ListChatMessagesInput,
