@@ -146,6 +146,42 @@ export type RevokedGrant = Readonly<{
 }>;
 
 /**
+ * The grants with these IDs that are revoked, each with what its
+ * `agent.grant.revoked` needs, in the order of their IDs (#75). A change that
+ * revoked grants through `revokeGrants` reads them with this inside its own
+ * transaction, after the revocation, so that the API sends one event per
+ * grant after the commit (ADR 0015, update of 2026-11-14) to the members of
+ * the grant's own workspace: a device revocation can revoke grants in
+ * several workspaces. A grant's agent and project never change, and its
+ * `revoked_at` is set once, so the read gives what the change wrote. It
+ * locks nothing; the change holds the grants' locks already.
+ */
+export async function revokedGrantsOf(
+  tx: Database,
+  ids: readonly PermissionGrantId[],
+): Promise<readonly RevokedGrant[]> {
+  if (ids.length === 0) {
+    return Object.freeze([]);
+  }
+  const rows = await tx
+    .select({
+      grantId: permissionGrants.id,
+      granteeAgentId: permissionGrants.granteeAgentId,
+      workspaceId: projects.workspaceId,
+      revokedAt: permissionGrants.revokedAt,
+    })
+    .from(permissionGrants)
+    .innerJoin(projects, eq(projects.id, permissionGrants.projectId))
+    .where(idIn(permissionGrants.id, ids))
+    .orderBy(permissionGrants.id);
+  return Object.freeze(
+    rows.flatMap(({ revokedAt, ...grant }) =>
+      revokedAt === null ? [] : [Object.freeze({ ...grant, revokedAt })],
+    ),
+  );
+}
+
+/**
  * Moves the unfinished runs that `which` selects to `cancelled` with the
  * reason code `reason` and `finished_at` set to `now` (P-60). Each run is
  * read with the state it had and its project's workspace before it is

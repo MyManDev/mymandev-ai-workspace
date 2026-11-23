@@ -50,7 +50,8 @@ import type { WorkspaceEvent } from "./events.ts";
 // devices, the workspace's owner, and admins disable it, which revokes its
 // grants and cancels its unfinished runs in the same transaction. Each change
 // sends its event to every connection subscribed to the project's workspace,
-// after the commit, and a disable sends one run event for each cancelled run.
+// after the commit, and a disable sends one agent.grant.revoked for each
+// revoked grant (#75) and one run event for each cancelled run.
 
 const database = useTestDatabase();
 
@@ -565,7 +566,7 @@ async function runOf(
   return id;
 }
 
-test("a disable revokes the agent's grants, cancels its unfinished runs with agent_disabled, and every subscribed member receives the disabled agent and each cancelled run", async (t) => {
+test("a disable revokes the agent's grants, cancels its unfinished runs with agent_disabled, and every subscribed member receives the disabled agent, each revoked grant, and each cancelled run", async (t) => {
   const { account, events, clock } = instance(t);
   const ada = await account(2961);
   const bob = await account(2962);
@@ -652,7 +653,8 @@ test("a disable revokes the agent's grants, cancels its unfinished runs with age
     [running, "running"],
   ]);
   // The owner of the workspace and the agent's owner alike, whatever role:
-  // first the disabled agent, then one run event for each cancelled run.
+  // first the disabled agent, then one agent.grant.revoked for each revoked
+  // grant (#75), then one run event for each cancelled run.
   for (const client of [adaClient, bobClient]) {
     const first = await nextEvent(client);
     assert.ok(first.type === "workspace.agent.disabled", first.type);
@@ -661,6 +663,16 @@ test("a disable revokes the agent's grants, cancels its unfinished runs with age
     assert.equal(first.deviceId, null);
     assert.deepEqual(first.payload, {
       agent: { ...agent, disabledAt: at.toISOString() },
+    });
+    const revokedGrant = await nextEvent(client);
+    assert.ok(revokedGrant.type === "agent.grant.revoked", revokedGrant.type);
+    assert.equal(revokedGrant.workspaceId, workspace.id);
+    assert.deepEqual(revokedGrant.actor, { kind: "system" });
+    assert.equal(revokedGrant.deviceId, null);
+    assert.deepEqual(revokedGrant.payload, {
+      grantId: granted,
+      granteeAgentId: agent.id,
+      revokedAt: at.toISOString(),
     });
     const seen = new Map<string, string | null>();
     for (let n = 0; n < cancelled.size; n += 1) {

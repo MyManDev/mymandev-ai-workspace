@@ -460,6 +460,7 @@ export async function buildApp(
         database,
         requireAccessToken,
         now,
+        connections,
       });
       // Granting and revoking capabilities, and the calling device's grant
       // records (#75).

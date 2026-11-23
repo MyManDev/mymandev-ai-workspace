@@ -275,6 +275,7 @@ export async function registerWorkspaceRoutes(
         database,
         now: options.now,
         onWorkspaceEvent: options.onWorkspaceEvent,
+        connections: options.connections,
       });
     });
   });

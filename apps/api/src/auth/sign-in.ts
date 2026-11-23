@@ -4,6 +4,8 @@ import {
   devices,
   requireSignIn,
   revokeDevice,
+  type RevokedGrant,
+  revokedGrantsOf,
   toDatabaseError,
   userIdentities,
   users,
@@ -32,7 +34,7 @@ import type { FastifyInstance } from "fastify";
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
-import { sendCancelledRuns } from "../workspaces/events.ts";
+import { sendCancelledRuns, sendRevokedGrants } from "../workspaces/events.ts";
 import {
   type RecentRevocations,
   s256,
@@ -90,6 +92,8 @@ type SignInResult = Readonly<{
   registered: DeviceListItem | null;
   /** The previous device that this sign-in revoked as replaced, if any. */
   replacedDeviceId: DeviceId | null;
+  /** The grants that revoking the previous device revoked (#75). */
+  revokedGrants: readonly RevokedGrant[];
   /** The runs that revoking the previous device cancelled. */
   cancelledRuns: readonly CancelledRun[];
 }>;
@@ -267,8 +271,10 @@ export async function registerSignIn(
             tokens.dropDevice(replaced);
             // The replaced device learns it from its close, before any frame.
             connections.closeDevice(replaced, "device_revoked", request.log);
-            // Each cancelled run reaches its workspace's subscribed
-            // connections (ADR 0014, P-60; #110).
+            // Each revoked grant and each cancelled run reaches its
+            // workspace's subscribed connections (ADR 0014, P-60; ADR 0015,
+            // P-77; #75, #110).
+            sendRevokedGrants(connections, result.revokedGrants, now);
             sendCancelledRuns(connections, result.cancelledRuns, now);
           }
           if (result.registered === null) {
@@ -355,6 +361,7 @@ async function signIn(
   let deviceId: DeviceId;
   let registered: DeviceListItem | null = null;
   let replacedDeviceId: DeviceId | null = null;
+  let revokedGrants: readonly RevokedGrant[] = [];
   let cancelledRuns: readonly CancelledRun[] = [];
   if (device.kind === "existing") {
     const [row] = await tx
@@ -513,6 +520,7 @@ async function signIn(
         });
         if (replaced.revoked) {
           replacedDeviceId = device.previousDeviceId;
+          revokedGrants = await revokedGrantsOf(tx, replaced.revokedGrantIds);
           cancelledRuns = replaced.cancelledRuns;
         }
       }
@@ -532,6 +540,7 @@ async function signIn(
     },
     registered,
     replacedDeviceId,
+    revokedGrants,
     cancelledRuns,
   };
 }
