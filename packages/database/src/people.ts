@@ -60,15 +60,16 @@ import {
 // (`src/cascade.ts`), in that order, as a device revocation does after its
 // device.
 //
-// A future writer that inserts an agent, a grant, or a run (#75, M3) locks
-// the person of each account it attaches the row to first: the agent's
-// owner, and for a run also the requester, in the order of their IDs,
-// `FOR SHARE` or stronger, and it checks that each is still active. A
-// removal holds the person `FOR NO KEY UPDATE`, which `FOR SHARE` waits for
-// and `FOR KEY SHARE` does not; so either the removal commits first and the
-// writer finds the person removed, or the insert commits first and the
-// removal sees the new row. Without this a removal could miss an agent,
-// grant, or run that a concurrent insert added.
+// A writer that inserts an agent, a grant, or a run (`createAgent`,
+// `grantCapability`, `createRun`; #294, #75, #35) locks the person of each
+// account it attaches the row to first: the agent's owner, and for a run
+// also the requester, in the order of their IDs, `FOR SHARE` or stronger,
+// and it checks that each is still active. A removal holds the person
+// `FOR NO KEY UPDATE`, which `FOR SHARE` waits for and `FOR KEY SHARE` does
+// not; so either the removal commits first and the writer finds the person
+// removed, or the insert commits first and the removal sees the new row.
+// Without this a removal could miss an agent, grant, or run that a
+// concurrent insert added. A new writer of such rows follows the same rule.
 
 /**
  * Why an action on a person was refused. Nothing was written.

@@ -38,7 +38,8 @@ import {
 //
 // - Any active member of the project's workspace creates an agent, from the
 //   calling device, which becomes the agent's host device; the caller's
-//   account owns it. An agent's project, owner, and host device never
+//   active person owns it, and the row stores the person's account
+//   (`owner_user_id`). An agent's project, owner, and host device never
 //   change, and its name is a label: no unique index, stored as given. The
 //   API passes names that the protocol checked. An agent has no provider
 //   kind: a run names its provider connection (ADR 0007, update of
@@ -82,7 +83,7 @@ const DAY_MS = 24 * 60 * 60_000;
 
 export type CreateAgentInput = Readonly<{
   projectId: ProjectId;
-  /** The acting account; its active person in the project's workspace creates the agent, and the account owns it. */
+  /** The acting account; its active person in the project's workspace creates and owns the agent, and the row stores the account. */
   userId: UserId;
   /** The calling device of the account; it becomes the agent's host device. */
   deviceId: DeviceId;
@@ -133,7 +134,8 @@ export type CreateAgentResult =
 
 /**
  * Creates an agent in a project in one transaction (#294), hosted on the
- * calling device and owned by the acting account. It decides in this order:
+ * calling device and owned by the acting account's active person, whose
+ * account the row stores. It decides in this order:
  * `forbidden` for a disabled account or a device that is not an active
  * device of the account; `not_member`; `conflict` for an archived project
  * or workspace; `agent_limit` when the project holds
@@ -329,6 +331,8 @@ export async function disableAgent(
   const refused = (
     refusal: Extract<DisableAgentResult, { disabled: false }>["refusal"],
   ): DisableAgentResult => ({ disabled: false, refusal });
+  // A disabled account or a revoked device is the API's check (`lockActor`),
+  // as for `removeRepository`.
   return withDatabaseErrors(() =>
     db.transaction(async (tx): Promise<DisableAgentResult> => {
       const [found] = await tx
