@@ -1390,7 +1390,7 @@ export function createProjectRepositoryService(
     // the server does not keep names unique, so a second one would register
     // the name twice. It is refused, never queued, because a queued one
     // would still reach the server. The guard ends with the answer,
-    // whatever it is; the request's own timeout bounds the wait.
+    // whatever it is; the request timeouts bound the wait.
     if (registering.has(target)) {
       return refused("busy");
     }
