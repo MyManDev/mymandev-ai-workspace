@@ -7,6 +7,7 @@ import {
   AgentListItemSchema,
   CreateAgentResponseSchema,
   type DeviceId,
+  type EventId,
   type MemberId,
   type MemberRole,
   newId,
@@ -29,6 +30,7 @@ import {
   type DisableAgentInput,
   type DisableAgentResult,
 } from "./agents.ts";
+import { postChatMessage } from "./chat.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
 import { DatabaseError, withDatabaseErrors } from "./errors.ts";
@@ -37,6 +39,7 @@ import { activePersonOf, createWorkspace } from "./membership.ts";
 import { removeMember } from "./people.ts";
 import { createProject } from "./projects.ts";
 import { SERVER_ONLY, whileHeld } from "./race-testing.ts";
+import { createRun } from "./runs.ts";
 import {
   agentRuns,
   agents,
@@ -1202,5 +1205,87 @@ test(
     assert.ok(result.disabled);
     assert.deepEqual(result.revokedGrantIds, [grantId]);
     assert.deepEqual(waitedOn, ["agents"]);
+  },
+);
+
+test(
+  "of two concurrent creations of one account in two projects for its last place of the day, the second waits at the account and is rate_limited",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId, projectId } = await setUp();
+    const otherProject = await projectIn(workspaceId, owner, "Web");
+    await fill(projectId, owner, PER_DAY - 1, { createdAt: EARLIER });
+    const { result, waitedOn } = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        assert.ok((await createAgent(tx, input(projectId, owner))).created);
+      },
+      () => create(otherProject, owner),
+    );
+    // The projects differ, so only the account's lock orders the counts.
+    assert.deepEqual(result, {
+      created: false,
+      refusal: "rate_limited",
+      retryAfterMs: EARLIER.getTime() + DAY_MS - NOW.getTime(),
+    });
+    assert.deepEqual(waitedOn, ["users"]);
+    assert.equal(await agentCount(projectId), PER_DAY);
+    assert.equal(await agentCount(otherProject), 0);
+  },
+);
+
+test(
+  "a disable waits at the agent for a run creation and cancels the new run",
+  SERVER_ONLY,
+  async () => {
+    const { owner, workspaceId, projectId } = await setUp();
+    const admin = await account("Admin");
+    await join(workspaceId, admin, "admin");
+    const agentId = await created(projectId, owner);
+    const providerConnectionId = newId<ProviderConnectionId>();
+    await database()
+      .insert(providerConnections)
+      .values({ id: providerConnectionId, hostDeviceId: owner.deviceId });
+    const message = await postChatMessage(database(), {
+      actor: { workspaceId, ...owner },
+      projectId,
+      eventId: newId<EventId>(),
+      body: "Add a health check",
+      now: NOW,
+    });
+    assert.ok(message.posted, JSON.stringify(message));
+    let runId: RunId | undefined;
+    const { result, waitedOn } = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        const run = await createRun(tx, {
+          ...owner,
+          projectId,
+          agentId,
+          providerConnectionId,
+          inputMessageId: message.message.id,
+          now: NOW,
+        });
+        assert.ok(run.created, JSON.stringify(run));
+        runId = run.run.id;
+      },
+      () =>
+        disableAgent(database(), {
+          projectId,
+          agentId,
+          userId: admin.userId,
+          now: LATER,
+        }),
+    );
+    assert.ok(runId !== undefined);
+    assert.ok(result.disabled);
+    assert.deepEqual(
+      result.cancelledRuns.map((run) => run.runId),
+      [runId],
+    );
+    assert.deepEqual(waitedOn, ["agents"]);
+    const row = await runRow(runId);
+    assert.equal(row.state, "cancelled");
+    assert.equal(row.stateReason, "agent_disabled");
   },
 );
