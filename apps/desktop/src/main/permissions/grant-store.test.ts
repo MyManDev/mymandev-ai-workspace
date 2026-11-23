@@ -1115,6 +1115,38 @@ test("held-back reads keep the held answer for at most 60 seconds from the first
   expect(f.pending()).toEqual([WORKSPACE_RETRY_BASE_MS]);
 });
 
+test("a grace after held-back reads ends no later than 60 seconds from the first of them", async () => {
+  // The interval's reread is held back while a dialog stays open.
+  const h = await live();
+  h.fireReread();
+  expect(h.reads).toHaveLength(2);
+  await h.answer(1, heldBack());
+  expect(h.pending()).toEqual([GRANT_READ_GRACE_MS]);
+  // Reads go on after 50 seconds, and the interval's read fails for a moment.
+  h.setClock(NOW + 50_000);
+  h.resume();
+  expect(h.reads).toHaveLength(3);
+  await h.answer(2, failed("unavailable"));
+  // The answer stays for the 10 seconds left of the bound, not 60 more.
+  expect(h.store.read().usable).toBe(true);
+  expect(h.pending()).toEqual([10_000, WORKSPACE_RETRY_BASE_MS]);
+  h.setClock(NOW + GRANT_READ_GRACE_MS - 1);
+  expect(h.store.read().usable).toBe(true);
+  h.setClock(NOW + GRANT_READ_GRACE_MS);
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+
+  // When reads go on only once the bound has passed, and its timer is late,
+  // the failure makes the store unusable at once.
+  const l = await live();
+  l.fireReread();
+  await l.answer(1, heldBack());
+  l.setClock(NOW + GRANT_READ_GRACE_MS + 1);
+  l.resume();
+  await l.answer(2, failed("unavailable"));
+  expect(l.store.read()).toEqual({ usable: false, records: [] });
+  expect(l.pending()).toEqual([WORKSPACE_RETRY_BASE_MS]);
+});
+
 test("the wall clock ends the bound of held-back reads before a late timer, and signals once", async () => {
   const h = await live();
   h.receive(DEVICE_REVOKED());

@@ -426,16 +426,26 @@ export function createGrantStore(
     bound.endsAt = null;
   }
 
-  /** Keeps the held answer for at most `GRANT_READ_GRACE_MS` from now (#318). */
-  function startBound(bound: Bound): void {
-    bound.endsAt = wallClock() + GRANT_READ_GRACE_MS;
+  /**
+   * Keeps the held answer for at most `GRANT_READ_GRACE_MS` from now (#318),
+   * and not past `until` when one is given; a bound that would end by then
+   * ends at once.
+   */
+  function startBound(bound: Bound, until: number | null = null): void {
+    const now = wallClock();
+    const endsAt = Math.min(now + GRANT_READ_GRACE_MS, until ?? Infinity);
+    if (endsAt <= now) {
+      expire(bound);
+      return;
+    }
+    bound.endsAt = endsAt;
     bound.cancel = schedule(
       () =>
         run(() => {
           bound.cancel = null;
           expire(bound);
         }),
-      GRANT_READ_GRACE_MS,
+      endsAt - now,
     );
   }
 
@@ -561,7 +571,12 @@ export function createGrantStore(
       }
       return;
     }
-    // An answer, also a failure, ends a run of held-back reads.
+    // An answer, also a failure, ends a run of held-back reads. A grace that
+    // follows such a run ends no later than the run's bound: without a read
+    // that succeeds, the held answer stays at most `GRANT_READ_GRACE_MS` from
+    // the first held-back read (the Project Manager's decision of 2026-11-23
+    // on #324).
+    const holdEndsAt = hold.endsAt;
     endBound(hold);
     const failure = accept(number, sentIdentity, result);
     if (failure === null) {
@@ -576,7 +591,7 @@ export function createGrantStore(
     ) {
       // Decision 2 of 2026-11-20 on #318: the held answer stays until the
       // retry answers, for at most `GRANT_READ_GRACE_MS`.
-      startBound(grace);
+      startBound(grace, holdEndsAt);
     } else {
       endBound(grace);
       setUnusable();
