@@ -32,8 +32,10 @@ import { providerConnections } from "./providers.ts";
 import { projects, repositories } from "./workspaces.ts";
 
 /**
- * An agent runs on its host device, where provider credentials stay. The
- * provider kind is deferred to M3.
+ * An agent runs on its host device, where provider credentials stay. It has
+ * no provider kind: a run names the provider connection that it uses (ADR
+ * 0007, update of 2026-11-14; #294). Its project, owner, and host device
+ * never change; disabling it is final in v0 (#294).
  */
 export const agents = pgTable(
   "agents",
@@ -59,6 +61,8 @@ export const agents = pgTable(
   (t) => [
     index("agents_project_id_idx").on(t.projectId),
     index("agents_host_device_id_idx").on(t.hostDeviceId),
+    // Counts the agents an account created in the last 24 hours (#294).
+    index("agents_owner_user_id_created_at_idx").on(t.ownerUserId, t.createdAt),
     // Targets of composite foreign keys from grants, runs and messages.
     unique("agents_id_project_id_key").on(t.id, t.projectId),
     unique("agents_id_host_device_id_key").on(t.id, t.hostDeviceId),
