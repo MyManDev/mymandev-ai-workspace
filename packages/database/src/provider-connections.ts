@@ -47,9 +47,8 @@ import {
 //   (ADR 0015, P-77). It cancels no run, as a repository removal cancels
 //   none: the host device stops the work that relied on the connection
 //   (#55). The result lists the revoked grants for the `agent.grant.revoked`
-//   events that the grant routes will send (#75); the API sends none yet,
-//   as for a repository removal, an agent's disable, a device revocation,
-//   or a removal of a person.
+//   events that the API sends after the commit (#75; `revokedGrantsOf` of
+//   `src/cascade.ts`), as for every change that revokes grants.
 // - A device revocation does not mark its connections removed: it already
 //   revokes the grants of the device's agents, and the host device fact of a
 //   grant record denies (ADR 0014, ADR 0015).

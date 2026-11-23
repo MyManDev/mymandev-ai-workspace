@@ -1,13 +1,17 @@
-import type { CancelledRun } from "@mymandev/database";
+import type { CancelledRun, RevokedGrant } from "@mymandev/database";
 import {
+  type AgentGrantCreatedEvent,
+  type AgentGrantRevokedEvent,
   type AgentRunStateChangedEvent,
   type ApproverEventType,
   type EventId,
   type MemberId,
   newId,
+  type PermissionGrant,
   PROTOCOL_VERSION,
   type ProtocolEvent,
   type UserId,
+  type WorkspaceGrant,
   type WorkspaceId,
 } from "@mymandev/protocol";
 import type { FastifyBaseLogger, FastifyRequest } from "fastify";
@@ -150,6 +154,119 @@ export function sendCancelledRuns(
   for (const run of runs) {
     connections.sendToWorkspace(cancelledRunEvent(run, now));
   }
+}
+
+/**
+ * A grant as the members of its workspace see it in `agent.grant.created`
+ * (`WorkspaceGrant`, #75), built field by field from the whole grant, so that
+ * neither the granting account, the revocation fields, nor the provider
+ * connection of a `provider.use` grant, which is device data (#110), reaches
+ * the members, also when the grant gains a field later.
+ */
+export function workspaceGrant(grant: PermissionGrant): WorkspaceGrant {
+  const header = {
+    id: grant.id,
+    projectId: grant.projectId,
+    granteeAgentId: grant.granteeAgentId,
+    createdAt: grant.createdAt,
+    expiresAt: grant.expiresAt,
+  };
+  return grant.capability === "provider.use"
+    ? { ...header, capability: grant.capability }
+    : {
+        ...header,
+        capability: grant.capability,
+        repositoryId: grant.repositoryId,
+      };
+}
+
+/** `agent.grant.created` for a new grant of the workspace's agent (#75). */
+export function grantCreatedEvent(
+  workspaceId: WorkspaceId,
+  grant: PermissionGrant,
+  now: Date,
+): AgentGrantCreatedEvent {
+  return {
+    ...serverEventHeader(workspaceId, now),
+    type: "agent.grant.created",
+    payload: { grant: workspaceGrant(grant) },
+  };
+}
+
+/**
+ * `agent.grant.revoked` for one grant that a change revoked (#75; ADR 0015,
+ * P-77): the grant, its agent, and the time that the server stored as
+ * `revoked_at`, without who revoked it or why.
+ */
+export function grantRevokedEvent(
+  grant: RevokedGrant,
+  now: Date,
+): AgentGrantRevokedEvent {
+  return {
+    ...serverEventHeader(grant.workspaceId, now),
+    type: "agent.grant.revoked",
+    payload: {
+      grantId: grant.grantId,
+      granteeAgentId: grant.granteeAgentId,
+      revokedAt: grant.revokedAt.toISOString(),
+    },
+  };
+}
+
+/**
+ * Sends grant events, in the order given, to the connections subscribed to
+ * each event's workspace (`members` in `SERVER_EVENT_AUDIENCES`). The change
+ * is committed, so a failure to tell the subscribers never fails the answer
+ * or stops the events after it; it is only logged, with the event type, the
+ * workspace ID, and the error's type.
+ */
+export function sendGrantEvents(
+  log: FastifyBaseLogger,
+  connections: ConnectionRegistry,
+  events: readonly (AgentGrantCreatedEvent | AgentGrantRevokedEvent)[],
+): void {
+  for (const event of events) {
+    try {
+      const sent = connections.sendToWorkspace(event);
+      log.debug(
+        { eventType: event.type, workspaceId: event.workspaceId, sent },
+        "grant event",
+      );
+    } catch (error) {
+      log.error(
+        {
+          eventType: event.type,
+          workspaceId: event.workspaceId,
+          errorType: error instanceof Error ? error.name : typeof error,
+        },
+        "grant event failed",
+      );
+    }
+  }
+}
+
+/**
+ * Sends each grant that a committed change revoked as `agent.grant.revoked`
+ * to the connections subscribed to the grant's workspace, and to no one else
+ * (`members` in `SERVER_EVENT_AUDIENCES`; #75, ADR 0015 update of
+ * 2026-11-14): one event per grant, in the order of the grant IDs. A change
+ * that spans workspaces, such as a device revocation, tells each workspace
+ * of its own grants only, as `sendCancelledRuns` does with runs. Each event
+ * is sent as the grant routes send theirs (`sendGrantEvents`), so a failure
+ * is logged and neither fails the committed change's answer nor keeps the
+ * events after it, such as the cancelled runs, from being sent.
+ */
+export function sendRevokedGrants(
+  log: FastifyBaseLogger,
+  connections: ConnectionRegistry,
+  grants: readonly RevokedGrant[],
+  now: Date,
+): void {
+  sendGrantEvents(
+    log,
+    connections,
+    grants.map((grant) => grantRevokedEvent(grant, now)),
+  );
 }
 
 /** The header of an event that the server originates at `now`. */

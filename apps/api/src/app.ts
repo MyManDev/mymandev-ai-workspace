@@ -30,6 +30,7 @@ import {
 } from "./gateway.ts";
 import { dispatchDeviceEvents } from "./device-events.ts";
 import { serializeError, serializeRequest } from "./log.ts";
+import { registerGrantRoutes } from "./grants/grant-routes.ts";
 import { registerProviderConnectionRoutes } from "./providers/provider-connection-routes.ts";
 import { runTransitionHandler } from "./workspaces/agent-events.ts";
 import { chatSendHandler } from "./workspaces/chat-events.ts";
@@ -466,6 +467,15 @@ export async function buildApp(
         database,
         requireAccessToken,
         now,
+        connections,
+      });
+      // Granting and revoking capabilities, and the calling device's grant
+      // records (#75).
+      await registerGrantRoutes(app, {
+        database,
+        requireAccessToken,
+        now,
+        connections,
       });
       await registerWorkspaceRoutes(app, {
         database,

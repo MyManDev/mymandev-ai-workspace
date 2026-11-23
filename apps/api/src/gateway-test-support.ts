@@ -244,7 +244,11 @@ export type QueryKind = "select" | "update";
  * next query that starts with `update(table)` or `select(...).from(table)`,
  * as `kind` says, waits for `before` first: a change that commits while the
  * gateway is between two of its steps. `started(kind, table)` counts the
- * queries that started so far, subqueries included.
+ * queries that started so far, subqueries included. After
+ * `interceptNextTransaction(before)`, the next `transaction(...)` waits for
+ * `before` before it begins: a change that commits after a request was
+ * authenticated and before the route's transaction, whose own queries run
+ * on the transaction and are not intercepted.
  */
 export function interceptingDatabase(target: Database) {
   let hook: Readonly<{
@@ -252,6 +256,7 @@ export function interceptingDatabase(target: Database) {
     table: unknown;
     before: () => Promise<unknown>;
   }> | null = null;
+  let transactionHook: (() => Promise<unknown>) | null = null;
   const queries: Array<Readonly<{ kind: QueryKind; table: unknown }>> = [];
   const take = (kind: QueryKind, table: unknown) => {
     queries.push({ kind, table });
@@ -277,6 +282,15 @@ export function interceptingDatabase(target: Database) {
         return value;
       }
       const method = value as AnyFunction;
+      if (property === "transaction") {
+        return (...args: unknown[]) => {
+          const before = transactionHook;
+          transactionHook = null;
+          return before === null
+            ? method.apply(object, args)
+            : before().then(() => method.apply(object, args));
+        };
+      }
       if (property === "update") {
         return (table: unknown) =>
           wrap("update", method.call(object, table) as object, table);
@@ -310,6 +324,9 @@ export function interceptingDatabase(target: Database) {
       before: () => Promise<unknown>,
     ) => {
       hook = { kind, table, before };
+    },
+    interceptNextTransaction: (before: () => Promise<unknown>) => {
+      transactionHook = before;
     },
     started: (kind: QueryKind, table: unknown) =>
       queries.filter((query) => query.kind === kind && query.table === table)

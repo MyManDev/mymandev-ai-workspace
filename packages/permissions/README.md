@@ -40,7 +40,7 @@ The permission contract is a shared boundary. It changes only by agreement betwe
 
 - Enforcement: the enforcement point in the local runtime (#55).
 - The provider connection entity and its binding to the agent's host device (ADR 0015, P-82), and local credential storage (#33).
-- The grant routes and the grant events. Their contract is in `@mymandev/protocol` (#75); the database writers and the API routes follow in their own changes.
+- The grant routes and the grant events. Their contract is in `@mymandev/protocol`, the writers in `@mymandev/database`, and the routes in `@mymandev/api` (#75).
 - The database migration that adds the provider connection column; it comes with the provider connection entity (ADR 0015, P-79).
 - The permission screen.
 
