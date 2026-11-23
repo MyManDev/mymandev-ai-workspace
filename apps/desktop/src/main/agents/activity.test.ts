@@ -583,7 +583,7 @@ test("a created run carries the event's reason", () => {
 test("a server cancellation with a known code marks the agents stale", () => {
   const activity = snapshot([run(1, "running"), run(2, "queued")]);
 
-  for (const reason of ["device_revoked", "member_removed"]) {
+  for (const reason of ["device_revoked", "member_removed", "agent_disabled"]) {
     const outcome = applyRunEvent(
       activity,
       runEvent(1, "running", "cancelled", { actor: "system", reason }),

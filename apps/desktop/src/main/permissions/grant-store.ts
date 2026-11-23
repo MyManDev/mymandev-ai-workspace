@@ -31,8 +31,10 @@
 //   a read is on its way; and on the changes that revoke grants in their own
 //   transaction (P-77): `workspace.member.removed`, a server cancellation
 //   that disabled agents (`agent.run.state_changed` with a code of
-//   `RUN_CANCEL_REASONS`; no event reports a disabled agent), the account
-//   frame `account.device_revoked`, and `workspace.repository.removed`.
+//   `RUN_CANCEL_REASONS`; no event reports the agents that a revocation or a
+//   removal disabled), the account
+//   frame `account.device_revoked`, `workspace.repository.removed`, and
+//   `workspace.agent.disabled` (#294).
 //   Reads are merged like the claim service's: while one is on its way, one
 //   more follows its answer; a failed read is retried with the workspace
 //   service's backoff while connected, and a held-back one when reads go
@@ -744,6 +746,7 @@ export function createGrantStore(
       case "agent.grant.created":
       case "workspace.member.removed":
       case "workspace.repository.removed":
+      case "workspace.agent.disabled":
         request("other");
         return;
       case "agent.grant.revoked":
@@ -769,7 +772,7 @@ export function createGrantStore(
           reasons.includes(event.payload.reason)
         ) {
           // The server disabled agents of a revoked device or a removed
-          // person, which revokes their grants.
+          // person, or the agent itself, which revokes their grants.
           request("other");
         }
         return;

@@ -51,10 +51,12 @@ export type RunEventInput = Pick<
 
 /**
  * What applying a run event did. Every outcome carries `agentsStale`: true
- * when the server cancelled the run because a device was revoked or a person
- * was removed (a `system` actor and a code of `RUN_CANCEL_REASONS`). Both
- * also disable agents, in every project of the workspace, and no event
- * reports that, so the caller reloads the agents. Agents and runs are two
+ * when the server cancelled the run because a device was revoked, a person
+ * was removed, or the agent was disabled (a `system` actor and a code of
+ * `RUN_CANCEL_REASONS`). Each also disables agents: a revocation and a
+ * removal in every project of the workspace, and no event reports that, so
+ * the caller reloads the agents; a disabling also sends
+ * `workspace.agent.disabled` (#294), which may come after the run event. Agents and runs are two
  * separate reads, so this holds also when the runs already show the
  * cancellation, and for a run of another project.
  *

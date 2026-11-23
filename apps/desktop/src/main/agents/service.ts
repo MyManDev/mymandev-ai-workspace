@@ -10,8 +10,9 @@
 //   agent list is never older than the runs. The events that arrived
 //   meanwhile apply after the reload, in order.
 // - A server cancellation that disabled agents (the model's `agentsStale`),
-//   `workspace.member.removed`, and `account.device_revoked` reload the
-//   agent list alone. An event for
+//   `workspace.member.removed`, `account.device_revoked`, and
+//   `workspace.agent.created` and `workspace.agent.disabled` of the open
+//   project (#294) reload the agent list alone. An event for
 //   a run of a listed agent that the activity does not hold (`unknown_run`)
 //   reloads everything, at most once for each reload, so that data that
 //   stays inconsistent does not reload in a loop. Both wait a moment, so
@@ -145,13 +146,21 @@ export interface AgentActivityService {
 /** The events that this service passes through its gate. */
 export type AgentEvent = Extract<
   ReceivedServerEvent,
-  { type: "agent.run.state_changed" | "workspace.member.removed" }
+  {
+    type:
+      | "agent.run.state_changed"
+      | "workspace.member.removed"
+      | "workspace.agent.created"
+      | "workspace.agent.disabled";
+  }
 >;
 
 function isAgentEvent(event: ReceivedServerEvent): event is AgentEvent {
   return (
     event.type === "agent.run.state_changed" ||
-    event.type === "workspace.member.removed"
+    event.type === "workspace.member.removed" ||
+    event.type === "workspace.agent.created" ||
+    event.type === "workspace.agent.disabled"
   );
 }
 
@@ -580,6 +589,16 @@ export function createAgentActivityService(
       if (event.type === "workspace.member.removed") {
         // The removal disabled the person's agents, and no event reports it.
         agentsStale = true;
+        continue;
+      }
+      if (
+        event.type === "workspace.agent.created" ||
+        event.type === "workspace.agent.disabled"
+      ) {
+        // The open project's agent list changed (#294). The list is read
+        // again, so that the agents stay one answer of the server; an agent
+        // of another project changes nothing here.
+        agentsStale ||= event.payload.agent.projectId === projectId;
         continue;
       }
       if (activity === null) {
