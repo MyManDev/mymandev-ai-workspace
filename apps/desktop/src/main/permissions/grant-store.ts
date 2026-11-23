@@ -31,8 +31,8 @@
 //   request limit. The store knows its agents from the records: every agent
 //   that an answer for this device named, also after its grants ended,
 //   until the device changes; before the first answer it reads on each such
-//   event. The first grant of an agent that no answer named yet is read by
-//   this device's grant action (`ownGrantAnswered`) or by the interval. On
+//   event. A grant on an agent that no answer named yet is read by this
+//   device's grant action (`ownGrantAnswered`) or by the interval. On
 //   `agent.grant.revoked` for an agent that the held records name, or while
 //   a read is on its way; and on the changes that revoke grants in their own
 //   transaction (P-77): `workspace.member.removed`, a server cancellation
@@ -183,11 +183,13 @@ export interface GrantStoreService extends GrantStore {
   readonly onGrantsChanged: (listener: () => void) => () => void;
   /**
    * Reads the records again, as `agent.grant.created` of a known agent does.
-   * This device's grant action calls it once `POST /agents/:agentId/grants`
-   * answered with the new grant, so that the grant is held without waiting
-   * for the interval, also the first grant of an agent that no answer named
-   * yet (#335). Granting is not available on the desktop yet, so nothing
-   * calls it.
+   * This device's grant action calls it once its
+   * `POST /agents/:agentId/grants` ends, whatever the outcome, also a
+   * failure or a timeout, because the grant may be stored even then. So the
+   * grant is held without waiting for the interval, also one on an agent
+   * that no answer named yet, such as a new agent's first grant or one whose
+   * grants all ended before the first answer (#335). Granting is not
+   * available on the desktop yet, so nothing calls it.
    */
   readonly ownGrantAnswered: () => void;
   /** Stops listening and cancels the timers, for the quit. Unusable from then on. */

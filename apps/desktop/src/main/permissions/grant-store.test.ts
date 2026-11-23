@@ -686,6 +686,62 @@ test("a refused list makes it unusable: another device, another account, or anot
   }
 });
 
+test("a refused answer adds no agent and leaves the agents unknown", async () => {
+  const refused: readonly (readonly [
+    string,
+    (agentId: string) => ListResult,
+    (h: ReturnType<typeof setup>) => void,
+  ])[] = [
+    [
+      "another host device",
+      (agentId) => list(record({ agentId, hostDeviceId: OTHER_DEVICE })),
+      () => undefined,
+    ],
+    [
+      "another account",
+      (agentId) => list(record({ agentId, userId: OTHER_USER })),
+      () => undefined,
+    ],
+    [
+      "another identity of the connection",
+      (agentId) => list(record({ agentId })),
+      (h) =>
+        h.setIdentity({
+          userId: OTHER_USER,
+          deviceId: DEVICE,
+        } as ConnectionIdentity),
+    ],
+  ];
+  const own = { userId: USER, deviceId: DEVICE } as ConnectionIdentity;
+  for (const [name, answer, change] of refused) {
+    // After an accepted answer, the refused answer's agent stays unknown.
+    const h = await live();
+    h.receive(grantCreated());
+    change(h);
+    await h.answer(1, answer(OTHER_AGENT));
+    expect(h.store.read().usable, name).toBe(false);
+    h.setIdentity(own);
+    h.fire();
+    await h.answer(2, list(record()));
+    expect(h.store.read().usable, name).toBe(true);
+    h.receive(grantCreated(OTHER_AGENT));
+    expect(h.reads, name).toHaveLength(3);
+
+    // Before an accepted answer, a refused one leaves the store unable to
+    // tell, so a grant on any agent reads once more after the retry.
+    const f = setup();
+    f.receive(subscribed());
+    change(f);
+    await f.answer(0, answer(AGENT));
+    f.setIdentity(own);
+    f.fire();
+    expect(f.reads, name).toHaveLength(2);
+    f.receive(grantCreated(OTHER_AGENT));
+    await f.answer(1, list());
+    expect(f.reads, name).toHaveLength(3);
+  }
+});
+
 test("each trigger reads again, and other messages do not", async () => {
   for (const [name, message] of TRIGGERS) {
     const h = await live();
