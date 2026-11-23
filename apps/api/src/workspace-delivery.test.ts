@@ -1136,6 +1136,9 @@ test("the heartbeat pings every 30 seconds and terminates a connection that did 
   const ada = await signInDevice(app);
   const answered = t.mock.method(connections, "answered");
   const heartbeat = t.mock.method(connections, "heartbeat");
+  // The mocked clock also runs the interval of connection.heartbeat (#316),
+  // which gateway.test.ts covers; here only the pings count.
+  t.mock.method(connections, "sendHeartbeats", () => 0);
 
   const {
     workspaceId,
@@ -1350,6 +1353,53 @@ test("sendToWorkspace and sendEvent send an event of APPROVER_EVENT_TYPES to no 
   assert.equal(registry.sendToWorkspace(removed, sender.context), 2);
   assert.equal(registry.sendEvent(sender.context, removed), true);
   assert.equal(refused.length, 3 * APPROVER_EVENT_TYPES.length);
+});
+
+test("sendHeartbeats sends connection.heartbeat to each live connection after auth.ok, never before it, after its close, or past backpressure", () => {
+  const registry = new ConnectionRegistry();
+  const heartbeat = { protocolVersion: 0, type: "connection.heartbeat" };
+  const first = fakeConnection(registry);
+  const second = fakeConnection(registry);
+  // Registered, but `auth.ok` has not gone out yet.
+  const unconfirmed = fakeSocket();
+  const unconfirmedContext: AuthenticatedConnectionContext = Object.freeze({
+    connectionId: newId<ConnectionId>(),
+    identity: Object.freeze({
+      userId: newId<UserId>(),
+      deviceId: newId<DeviceId>(),
+    }),
+    signedInAt: 0,
+  });
+  registry.register(unconfirmed.ws, unconfirmedContext, 0);
+
+  assert.equal(registry.sendHeartbeats(), 2);
+  assert.deepEqual(first.sent, [heartbeat]);
+  assert.deepEqual(second.sent, [heartbeat]);
+  assert.deepEqual(unconfirmed.sent, []);
+  assert.deepEqual(decodeServerMessage(first.sent[0]), {
+    ok: true,
+    kind: "frame",
+    frame: heartbeat,
+  });
+
+  // A connection that closed has left the registry.
+  registry.remove(first.ws, first.context);
+  assert.equal(registry.sendHeartbeats(), 1);
+  assert.equal(first.sent.length, 1);
+  assert.equal(second.sent.length, 2);
+
+  // A socket that the server is closing gets none.
+  second.socket.readyState = 2;
+  assert.equal(registry.sendHeartbeats(), 0);
+  assert.equal(second.sent.length, 2);
+
+  // One that reads too slowly closes instead.
+  const slow = fakeConnection(registry);
+  slow.socket.bufferedAmount = MAX_BUFFERED_BYTES + 1;
+  assert.equal(registry.sendHeartbeats(), 0);
+  assert.deepEqual(slow.sent, []);
+  assert.deepEqual(slow.closes, [[CloseCode.tryAgainLater, "backpressure"]]);
+  assert.equal(registry.connectionOf(slow.context.identity.deviceId), null);
 });
 
 test("the heartbeat terminates only a connection that missed a ping, and answered pongs keep the others", () => {

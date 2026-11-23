@@ -15,6 +15,8 @@ import {
   type AuthenticatedClientFrame,
   type AuthOkFrame,
   type AuthResponseFrame,
+  CONNECTION_HEARTBEAT_INTERVAL_MS,
+  type ConnectionHeartbeatFrame,
   type ConnectionId,
   decodeClientFrame,
   decodeClientMessage,
@@ -145,9 +147,17 @@ export const MAX_SUBSCRIBE_RECHECKS = 3;
  * The gateway pings every authenticated connection this often, and
  * terminates one that did not answer the previous ping with a pong, so that
  * a half-open connection ends within two intervals and its person goes
- * offline.
+ * offline. These are WebSocket pings, which a desktop never sees; the
+ * protocol's `connection.heartbeat` frame goes out every
+ * `CONNECTION_HEARTBEAT_INTERVAL_MS` besides them (#316).
  */
 export const HEARTBEAT_INTERVAL_MS = 30_000;
+
+/** The frame that `sendHeartbeats` sends; it carries nothing else. */
+const CONNECTION_HEARTBEAT: ConnectionHeartbeatFrame = Object.freeze({
+  protocolVersion: PROTOCOL_VERSION,
+  type: "connection.heartbeat",
+});
 
 /**
  * A connection with more than this many bytes waiting to be sent reads too
@@ -790,6 +800,25 @@ export class ConnectionRegistry {
       }
     }
     return terminated;
+  }
+
+  /**
+   * Sends `connection.heartbeat` (#316) to every live connection that got
+   * `auth.ok` and is still open, so that a device notices a connection
+   * that stopped carrying messages. It goes through the same backpressure
+   * check as every other frame: a connection that reads too slowly closes
+   * instead. A connection that closed has left the registry and gets
+   * nothing. Returns how many connections it was sent to.
+   */
+  sendHeartbeats(): number {
+    const text = JSON.stringify(CONNECTION_HEARTBEAT);
+    let sent = 0;
+    for (const live of Array.from(this.#live.values())) {
+      if (live.confirmed && this.#send(live, text)) {
+        sent += 1;
+      }
+    }
+    return sent;
   }
 
   /**
@@ -1476,7 +1505,8 @@ export type GatewayOptions = Readonly<{
  * 60 seconds `sweepConnections` re-checks the live connections; a tick while
  * the previous sweep still runs is skipped. Every 30 seconds the heartbeat
  * pings the live connections and terminates one that did not answer the
- * previous ping.
+ * previous ping. Every 15 seconds (`CONNECTION_HEARTBEAT_INTERVAL_MS`) every
+ * live connection after `auth.ok` gets `connection.heartbeat` (#316).
  */
 export function registerGateway(
   app: FastifyInstance,
@@ -1505,9 +1535,14 @@ export function registerGateway(
     connections.heartbeat(app.log);
   }, HEARTBEAT_INTERVAL_MS);
   heartbeat.unref();
+  const heartbeatFrames = setInterval(() => {
+    connections.sendHeartbeats();
+  }, CONNECTION_HEARTBEAT_INTERVAL_MS);
+  heartbeatFrames.unref();
   app.addHook("onClose", async () => {
     clearInterval(sweeper);
     clearInterval(heartbeat);
+    clearInterval(heartbeatFrames);
     // The database closes after this hook, so a running sweep ends first.
     await sweeping;
   });

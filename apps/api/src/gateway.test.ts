@@ -11,6 +11,8 @@ import {
 import {
   type AgentId,
   type AuthChallengeFrame,
+  CONNECTION_HEARTBEAT_INTERVAL_MS,
+  CONNECTION_LIVENESS_BOUND_MS,
   type ConnectionId,
   decodeServerMessage,
   type DeviceId,
@@ -79,6 +81,7 @@ import {
   ConnectionRegistry,
   type ConnectionIdentity,
   type EventHandler,
+  HEARTBEAT_INTERVAL_MS,
   LAST_SEEN_INTERVAL_MS,
   MAX_UNAUTHENTICATED_CONNECTIONS,
   REFUSED_CLOSE_GRACE_MS,
@@ -2014,35 +2017,109 @@ test("account frames reach only the account's other connections after auth.ok, n
   }
 });
 
-/**
- * Builds a gateway app while setInterval and clearInterval are spied on and
- * returns the sweep interval that the gateway registered: its tick, and
- * whether it was cleared. Other intervals in the process do not matter.
- */
+/** `intervalTimerApp` for the sweep's interval. */
 async function sweepTimerApp(
   t: TestContext,
   options: Parameters<typeof gatewayApp>[1],
 ) {
+  return intervalTimerApp(t, options, CONNECTION_SWEEP_INTERVAL_MS, "sweep");
+}
+
+/**
+ * Builds a gateway app while setInterval and clearInterval are spied on and
+ * returns the gateway's interval of `intervalMs`: its tick, which the test
+ * runs by hand, and whether it was cleared. Other intervals in the process
+ * do not matter.
+ */
+async function intervalTimerApp(
+  t: TestContext,
+  options: Parameters<typeof gatewayApp>[1],
+  intervalMs: number,
+  label: string,
+) {
   const setIntervalSpy = t.mock.method(globalThis, "setInterval");
   const clearIntervalSpy = t.mock.method(globalThis, "clearInterval");
   const built = await gatewayApp(t, options);
-  const sweeps = setIntervalSpy.mock.calls.filter(
+  const intervals = setIntervalSpy.mock.calls.filter(
     (call) =>
-      call.arguments[1] === CONNECTION_SWEEP_INTERVAL_MS &&
+      call.arguments[1] === intervalMs &&
       /[/\\]gateway\.ts:/u.test(call.stack.stack ?? ""),
   );
-  assert.equal(sweeps.length, 1, "the gateway registers one sweep interval");
-  const [sweep] = sweeps;
-  assert.ok(sweep);
+  assert.equal(
+    intervals.length,
+    1,
+    `the gateway registers one ${label} interval`,
+  );
+  const [interval] = intervals;
+  assert.ok(interval);
   return {
     ...built,
-    tick: sweep.arguments[0] as () => void,
+    tick: interval.arguments[0] as () => void,
     cleared: () =>
       clearIntervalSpy.mock.calls.some(
-        (call) => call.arguments[0] === sweep.result,
+        (call) => call.arguments[0] === interval.result,
       ),
   };
 }
+
+test("every 15 seconds each connection after auth.ok gets connection.heartbeat, never one before auth.ok or after its close, and the interval is cleared when the app closes", async (t) => {
+  // The device's bound of three missed heartbeats lies below the drop after
+  // two unanswered pings.
+  assert.equal(CONNECTION_HEARTBEAT_INTERVAL_MS, 15_000);
+  assert.ok(CONNECTION_LIVENESS_BOUND_MS < 2 * HEARTBEAT_INTERVAL_MS);
+  const connections = new ConnectionRegistry();
+  const sent = t.mock.method(connections, "sendHeartbeats");
+  const { app, tick, cleared } = await intervalTimerApp(
+    t,
+    { githubId: 3035, connections },
+    CONNECTION_HEARTBEAT_INTERVAL_MS,
+    "connection heartbeat",
+  );
+  const heartbeat = { protocolVersion: 0, type: "connection.heartbeat" };
+
+  const first = await signInDevice(app);
+  const second = await signInDevice(app);
+  const { client: firstClient } = await connected(t, app, first);
+  const { client: secondClient } = await connected(t, app, second);
+  // A connection that has not answered its challenge gets none.
+  const pending = await connect(t, app);
+  await challengeOf(pending);
+  await settle();
+  assert.equal(sent.mock.callCount(), 0, "nothing before the first tick");
+  assert.deepEqual(
+    [firstClient.unread(), secondClient.unread(), pending.unread()],
+    [0, 0, 0],
+  );
+
+  tick();
+  assert.equal(sent.mock.calls.at(-1)?.result, 2);
+  assert.deepEqual(await nextFrame(firstClient), heartbeat);
+  assert.deepEqual(await nextFrame(secondClient), heartbeat);
+  tick();
+  assert.deepEqual(await nextFrame(firstClient), heartbeat);
+  assert.deepEqual(await nextFrame(secondClient), heartbeat);
+  await settle();
+  assert.equal(pending.unread(), 0);
+
+  // After a close, the closed connection gets nothing more.
+  assert.ok(
+    connections.closeDevice(
+      second.deviceId as DeviceId,
+      "sign_in_required",
+      app.log,
+    ),
+  );
+  assert.deepEqual(await secondClient.closed, closedWith("sign_in_required"));
+  tick();
+  assert.equal(sent.mock.calls.at(-1)?.result, 1);
+  assert.deepEqual(await nextFrame(firstClient), heartbeat);
+  await settle();
+  assert.equal(secondClient.unread(), 0);
+
+  assert.equal(cleared(), false);
+  await app.close();
+  assert.ok(cleared(), "the interval is cleared");
+});
 
 test("the gateway sweeps every 60 seconds, skips a tick while a sweep runs, and clears its interval when the app closes", async (t) => {
   const connections = new ConnectionRegistry();
