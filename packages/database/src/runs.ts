@@ -76,8 +76,14 @@ import {
 // first, and then either is seen by the creation or waits for it and sees
 // the new run. `removeRepository` (`src/repositories.ts`) locks the project
 // `FOR NO KEY UPDATE` before the repository, so a creation waits for it
-// already at the project; no writer removes a connection yet. The message
-// is read without a lock: a message never changes its conversation.
+// already at the project. `removeProviderConnection`
+// (`src/provider-connections.ts`, #295) locks the account and the device
+// before the connection; the API's `lockActor` already holds both for a
+// creation, which only the connection's host device asks for, so through the
+// API the two meet there. Without it, a creation either waits at the
+// connection and is `conflict`, or the removal waits for it there and leaves
+// the new run, as a removal cancels no run. The message is read without a
+// lock: a message never changes its conversation.
 
 const DAY_MS = 24 * 60 * 60_000;
 

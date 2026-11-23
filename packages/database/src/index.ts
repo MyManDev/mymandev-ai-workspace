@@ -227,6 +227,16 @@ export {
   type DisableAgentResult,
 } from "./agents.ts";
 export {
+  type ListProviderConnectionsInput,
+  listProviderConnections,
+  registerProviderConnection,
+  type RegisterProviderConnectionInput,
+  type RegisterProviderConnectionResult,
+  removeProviderConnection,
+  type RemoveProviderConnectionInput,
+  type RemoveProviderConnectionResult,
+} from "./provider-connections.ts";
+export {
   createRun,
   type CreateRunInput,
   type CreateRunRefusal,

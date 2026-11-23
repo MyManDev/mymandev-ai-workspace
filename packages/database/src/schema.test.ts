@@ -21,6 +21,7 @@ import {
   DEVICE_REVOCATION_REASONS,
   GITHUB_LOGIN_PATTERN,
   IDENTITY_PROVIDERS,
+  PROVIDER_KINDS,
   JOIN_REQUEST_DECISIONS,
   MEMBER_ROLES,
   newId,
@@ -208,8 +209,18 @@ async function seed(): Promise<World> {
   const aliceConnection = newId<ProviderConnectionId>();
   const bobConnection = newId<ProviderConnectionId>();
   await db.insert(providerConnections).values([
-    { id: aliceConnection, hostDeviceId: aliceDevice },
-    { id: bobConnection, hostDeviceId: bobDevice },
+    {
+      id: aliceConnection,
+      hostDeviceId: aliceDevice,
+      kind: "claude",
+      label: "Work",
+    },
+    {
+      id: bobConnection,
+      hostDeviceId: bobDevice,
+      kind: "codex",
+      label: "Home",
+    },
   ]);
   const workspace = newId<WorkspaceId>();
   await db
@@ -447,6 +458,11 @@ test("the CHECK vocabularies equal the protocol constants", async () => {
     sorted(await checkValues("user_identities_identity_provider_check")),
     sorted(IDENTITY_PROVIDERS),
   );
+  // A new provider kind is a protocol change and a change of this CHECK (#295).
+  assert.deepEqual(
+    sorted(await checkValues("provider_connections_kind_check")),
+    sorted(PROVIDER_KINDS),
+  );
   // The server-only vocabularies of packages/database.
   assert.deepEqual(
     sorted(await checkValues("audit_events_action_check")),
@@ -668,9 +684,12 @@ test("permission grants: one capability per row, scoped, unique while active", a
   );
   // Another connection on the same device is a separate scope.
   const secondConnection = newId<ProviderConnectionId>();
-  await db
-    .insert(providerConnections)
-    .values({ id: secondConnection, hostDeviceId: world.aliceDevice });
+  await db.insert(providerConnections).values({
+    id: secondConnection,
+    hostDeviceId: world.aliceDevice,
+    kind: "claude",
+    label: "Work",
+  });
   await insertGrant({
     ...byAlice,
     capability: "provider.use",

@@ -174,7 +174,12 @@ async function connectionOf(
   const id = newId<ProviderConnectionId>();
   await database()
     .insert(providerConnections)
-    .values({ id, hostDeviceId: device.deviceId as DeviceId });
+    .values({
+      id,
+      hostDeviceId: device.deviceId as DeviceId,
+      kind: "claude",
+      label: "Work",
+    });
   return id;
 }
 

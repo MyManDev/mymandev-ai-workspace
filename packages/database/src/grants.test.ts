@@ -187,7 +187,7 @@ async function connectionOn(deviceId: DeviceId): Promise<ProviderConnectionId> {
   const id = newId<ProviderConnectionId>();
   await database()
     .insert(providerConnections)
-    .values({ id, hostDeviceId: deviceId });
+    .values({ id, hostDeviceId: deviceId, kind: "claude", label: "Work" });
   return id;
 }
 
