@@ -837,6 +837,85 @@ test("workspace.member.removed reloads the agent list alone, also when it waited
   expect(h.state.agents[1]?.disabledAt).toBe(LATER);
 });
 
+function agentEvent(
+  type: "workspace.agent.created" | "workspace.agent.disabled",
+  projectId: ProjectId = PROJECT_1,
+  workspaceId: WorkspaceId = WS_A,
+  agentId = AGENT_2,
+): ServerMessage {
+  return event(
+    type,
+    {
+      agent: {
+        id: agentId,
+        projectId,
+        name: "Agent Beta",
+        ownerMemberId: MEMBER,
+        disabledAt: type === "workspace.agent.disabled" ? LATER : null,
+      },
+    },
+    { kind: "system" },
+    workspaceId,
+  );
+}
+
+test("workspace.agent.created and workspace.agent.disabled of the open project reload the agent list alone, and of another project or workspace nothing", async () => {
+  const h = await liveHarness();
+  h.receive(agentEvent("workspace.agent.created", PROJECT_2));
+  h.receive(agentEvent("workspace.agent.disabled", PROJECT_2));
+  h.receive(agentEvent("workspace.agent.created", PROJECT_1, WS_B));
+  expect(h.openTimers()).toEqual([]);
+
+  h.receive(agentEvent("workspace.agent.created"));
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.readNames()).toEqual(["listAgents"]);
+  await h.answer("listAgents", ok(agentList([AGENT_1, AGENT_2])));
+  expect(h.state.agents.map((agent) => agent.id)).toEqual([AGENT_1, AGENT_2]);
+
+  h.receive(agentEvent("workspace.agent.disabled"));
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.readNames()).toEqual(["listAgents"]);
+  await h.answer(
+    "listAgents",
+    ok(agentList([AGENT_1, AGENT_2], PROJECT_1, [AGENT_2])),
+  );
+  expect(h.state.agents[1]?.disabledAt).toBe(LATER);
+  expect(runStates(h.state)).toEqual(["01 running"]);
+});
+
+test("a server cancellation because an agent was disabled reloads only on workspace.agent.disabled of the open project", async () => {
+  const h = await liveHarness();
+  // A disabling in another project: its event names that project, and the
+  // cancellation of its run reloads nothing.
+  h.receive(
+    agentEvent("workspace.agent.disabled", PROJECT_2, WS_A, OTHER_AGENT),
+  );
+  h.receive(
+    runEvent(7, "running", "cancelled", {
+      agentId: OTHER_AGENT,
+      cancelledFor: "agent_disabled",
+    }),
+  );
+  expect(h.openTimers()).toEqual([]);
+  expect(h.reads).toEqual([]);
+
+  // A disabling in the open project: the event comes before the run events.
+  h.receive(agentEvent("workspace.agent.disabled", PROJECT_1, WS_A, AGENT_1));
+  h.receive(
+    runEvent(1, "running", "cancelled", { cancelledFor: "agent_disabled" }),
+  );
+  expect(runStates(h.state)).toEqual(["01 cancelled"]);
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.readNames()).toEqual(["listAgents"]);
+  await h.answer(
+    "listAgents",
+    ok(agentList([AGENT_1, AGENT_2], PROJECT_1, [AGENT_1])),
+  );
+  expect(h.state.agents[0]?.disabledAt).toBe(LATER);
+  expect(h.openTimers()).toEqual([]);
+  expect(h.reads).toEqual([]);
+});
+
 test("a full reload replaces a waiting reload of the agents", async () => {
   const h = await liveHarness();
   h.receive(memberRemoved());

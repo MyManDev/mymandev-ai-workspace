@@ -4,7 +4,7 @@ import {
   MemberRoleSchema,
   WorkspaceMemberSchema,
 } from "./account.ts";
-import { AgentRunListItemSchema } from "./agent-api.ts";
+import { AgentListItemSchema, AgentRunListItemSchema } from "./agent-api.ts";
 import {
   ChatMessageSchema,
   displayText,
@@ -342,6 +342,55 @@ export const WorkspaceRepositoryRemovedEventSchema = z.object({
   }),
 });
 
+// Agent events (#294): the agents of a project, which every member of its
+// workspace sees. Only the server originates them, after the commit, with a
+// `system` actor and `deviceId: null`, like the repository events (see
+// `actorAllowed`). The payload is the agent as the agent list shows it to
+// every member, `AgentListItem`, which never names the host device (#110).
+
+/**
+ * A member created an agent in a project of the workspace, hosted on the
+ * creating device and owned by the creator's person. A new agent is enabled.
+ */
+export const WorkspaceAgentCreatedEventSchema = z
+  .object({
+    ...envelopeHeaderShape,
+    type: z.literal("workspace.agent.created"),
+    payload: z.object({ agent: AgentListItemSchema }),
+  })
+  .superRefine((event, ctx) => {
+    if (event.payload.agent.disabledAt !== null) {
+      ctx.addIssue({
+        code: "custom",
+        message: "A new agent is enabled",
+        path: ["payload", "agent", "disabledAt"],
+      });
+    }
+  });
+
+/**
+ * An agent was disabled, for good in v0. In the same transaction the server
+ * revoked the agent's active grants (ADR 0015, P-77) and cancelled its
+ * unfinished runs with the reason `agent_disabled`, each of which it reports
+ * with its own `agent.run.state_changed`. `disabledAt` is the time that the
+ * server stores, which is also the event's `occurredAt`.
+ */
+export const WorkspaceAgentDisabledEventSchema = z
+  .object({
+    ...envelopeHeaderShape,
+    type: z.literal("workspace.agent.disabled"),
+    payload: z.object({ agent: AgentListItemSchema }),
+  })
+  .superRefine((event, ctx) => {
+    if (event.payload.agent.disabledAt === null) {
+      ctx.addIssue({
+        code: "custom",
+        message: "A disabled agent has a time of its disabling",
+        path: ["payload", "agent", "disabledAt"],
+      });
+    }
+  });
+
 // Join request events (#210, #227): the pending join requests and the
 // blocks in force of a workspace, which only its owner and admins see. Only
 // the server originates them, after the commit, with a `system` actor and
@@ -523,6 +572,8 @@ export const ProtocolEventSchema = z.discriminatedUnion("type", [
   WorkspaceProjectRenamedEventSchema,
   WorkspaceRepositoryRegisteredEventSchema,
   WorkspaceRepositoryRemovedEventSchema,
+  WorkspaceAgentCreatedEventSchema,
+  WorkspaceAgentDisabledEventSchema,
   WorkspaceJoinRequestCreatedEventSchema,
   WorkspaceJoinRequestResolvedEventSchema,
   WorkspaceJoinRequestUnblockedEventSchema,
@@ -547,6 +598,8 @@ export const SERVER_ONLY_EVENT_TYPES = Object.freeze([
   "workspace.project.renamed",
   "workspace.repository.registered",
   "workspace.repository.removed",
+  "workspace.agent.created",
+  "workspace.agent.disabled",
   "workspace.join_request.created",
   "workspace.join_request.resolved",
   "workspace.join_request.unblocked",
@@ -608,6 +661,8 @@ export const SERVER_EVENT_AUDIENCES = Object.freeze({
   "workspace.project.renamed": "members",
   "workspace.repository.registered": "members",
   "workspace.repository.removed": "members",
+  "workspace.agent.created": "members",
+  "workspace.agent.disabled": "members",
   "workspace.join_request.created": "approvers",
   "workspace.join_request.resolved": "approvers",
   "workspace.join_request.unblocked": "approvers",
@@ -659,12 +714,14 @@ export function actorAllowed(event: ProtocolEvent): boolean {
     case "workspace.project.renamed":
     case "workspace.repository.registered":
     case "workspace.repository.removed":
+    case "workspace.agent.created":
+    case "workspace.agent.disabled":
     case "workspace.join_request.created":
     case "workspace.join_request.resolved":
     case "workspace.join_request.unblocked":
     case "chat.message.created":
-      // Only the server reports membership, project, repository, and join
-      // request changes and stored messages.
+      // Only the server reports membership, project, repository, agent, and
+      // join request changes and stored messages.
       return event.actor.kind === "system" && event.deviceId === null;
     case "agent.grant.created":
     case "agent.grant.revoked":
@@ -679,12 +736,12 @@ export function actorAllowed(event: ProtocolEvent): boolean {
 /**
  * Whether a run transition's `reason` fits its actor (#201). A code of
  * `RUN_CANCEL_REASONS` says that the server cancelled the run because a
- * device was revoked or a person was removed, so only a `system` actor may
- * give one; an agent may give any other reason, in any state. The decoders
- * do not apply this rule, unlike `actorAllowed`, because a decode error
- * closes the connection: the server answers an agent's transition with
- * such a reason with `event.refused` and `conflict`, stores and relays
- * nothing, and the connection stays open.
+ * device was revoked, a person was removed, or the agent was disabled, so
+ * only a `system` actor may give one; an agent may give any other reason, in
+ * any state. The decoders do not apply this rule, unlike `actorAllowed`,
+ * because a decode error closes the connection: the server answers an
+ * agent's transition with such a reason with `event.refused` and
+ * `conflict`, stores and relays nothing, and the connection stays open.
  */
 export function runReasonAllowed(
   event: Pick<AgentRunStateChangedEvent, "actor" | "payload">,

@@ -29,9 +29,11 @@ export type ApproverEvent = Extract<ProtocolEvent, { type: ApproverEventType }>;
  * workspace must see (`workspace.member.*` and
  * `workspace.ownership.transferred`). Only the server originates it, with a
  * `system` actor and `deviceId: null` (ADR 0014, "Protocol"). The project
- * events `workspace.project.created` and `workspace.project.renamed` (#155)
- * and the repository events `workspace.repository.registered` and
- * `workspace.repository.removed` (#286) share the type and its delivery.
+ * events `workspace.project.created` and `workspace.project.renamed` (#155),
+ * the repository events `workspace.repository.registered` and
+ * `workspace.repository.removed` (#286), and the agent events
+ * `workspace.agent.created` and `workspace.agent.disabled` (#294) share the
+ * type and its delivery.
  * Other events that only the server originates, such as
  * `chat.message.created`, are not membership events, and neither are the
  * events of `APPROVER_EVENT_TYPES` (`ApproverEvent`), which only the owner
@@ -106,10 +108,11 @@ export function deliverApproverEvent(
 }
 
 /**
- * The event that tells a workspace's members that a device revocation or a
- * removal cancelled a run (ADR 0014, "Removal and ownership"; P-60): a
- * `system` actor, `deviceId: null`, and the reason code stored with the run,
- * `device_revoked` or `member_removed`, with the run's correlation ID and
+ * The event that tells a workspace's members that a device revocation, a
+ * removal, or an agent's disabling cancelled a run (ADR 0014, "Removal and
+ * ownership"; P-60; #294): a `system` actor, `deviceId: null`, and the
+ * reason code stored with the run, `device_revoked`, `member_removed`, or
+ * `agent_disabled`, with the run's correlation ID and
  * repository when it has them.
  */
 export function cancelledRunEvent(
@@ -132,7 +135,8 @@ export function cancelledRunEvent(
 }
 
 /**
- * Sends each run that a committed device revocation or removal cancelled as
+ * Sends each run that a committed device revocation, removal, or disabling
+ * of an agent cancelled as
  * `agent.run.state_changed` to the connections subscribed to the run's
  * workspace, and to no one else. After a revocation, the caller closes the
  * revoked device's connection first; after a removal, the removed person's

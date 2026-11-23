@@ -617,6 +617,35 @@ test("a server cancellation with a known code marks the agents stale", () => {
   }
 });
 
+test("a server cancellation because the agent was disabled leaves the agents to workspace.agent.disabled", () => {
+  // The run still finishes with its code, but `workspace.agent.disabled`,
+  // which names the project, reports the agent (#294).
+  const outcome = applyRunEvent(
+    snapshot([run(1, "running")]),
+    runEvent(1, "running", "cancelled", {
+      actor: "system",
+      reason: "agent_disabled",
+    }),
+  );
+  expect(outcome).toMatchObject({ kind: "applied", agentsStale: false });
+  expect(applied(outcome).finishedRuns[0]).toMatchObject({
+    id: runId(1),
+    state: "cancelled",
+    reason: "agent_disabled",
+  });
+  // A run of another project reloads nothing either.
+  expect(
+    applyRunEvent(
+      snapshot([]),
+      runEvent(1, "queued", "cancelled", {
+        actor: "system",
+        reason: "agent_disabled",
+        agentId: UNLISTED_AGENT_ID,
+      }),
+    ),
+  ).toEqual({ kind: "unknown_agent", agentsStale: false });
+});
+
 test("a server cancellation marks the agents stale also when the runs already show it", () => {
   const event = runEvent(1, "queued", "cancelled", {
     actor: "system",

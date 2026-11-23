@@ -739,7 +739,8 @@ test("membership events come only from the server, with a system actor and no de
     );
   }
   // The project events are tested in `project-api.test.ts`, the repository
-  // events in `repository-api.test.ts`, and the join request events in
+  // events in `repository-api.test.ts`, the agent events in
+  // `agent-api.test.ts`, and the join request events in
   // `membership-api.test.ts`.
   assert.deepEqual(
     [...SERVER_ONLY_EVENT_TYPES].sort(),
@@ -750,6 +751,8 @@ test("membership events come only from the server, with a system actor and no de
         "workspace.project.renamed",
         "workspace.repository.registered",
         "workspace.repository.removed",
+        "workspace.agent.created",
+        "workspace.agent.disabled",
         "workspace.join_request.created",
         "workspace.join_request.resolved",
         "workspace.join_request.unblocked",

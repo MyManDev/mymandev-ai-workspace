@@ -218,6 +218,15 @@ export {
   type RunTransitionRefusal,
 } from "./agent-activity.ts";
 export {
+  createAgent,
+  type CreateAgentInput,
+  type CreateAgentRefusal,
+  type CreateAgentResult,
+  disableAgent,
+  type DisableAgentInput,
+  type DisableAgentResult,
+} from "./agents.ts";
+export {
   createRun,
   type CreateRunInput,
   type CreateRunRefusal,

@@ -81,12 +81,13 @@ export const RUN_STATE_LABELS: Readonly<Record<AgentRunStateView, string>> =
 /**
  * The texts of the codes that the server writes as the reason of a run that
  * it cancels itself (the protocol's `RUN_CANCEL_REASONS`): the person who
- * owns the agent or asked for the run was removed from the workspace, or
- * the device that hosts the agent was removed.
+ * owns the agent or asked for the run was removed from the workspace, the
+ * device that hosts the agent was removed, or the agent was disabled (#294).
  */
 export const RUN_CANCEL_MESSAGES = Object.freeze({
   member_removed: "Cancelled because a person was removed from the workspace.",
   device_revoked: "Cancelled because the agent's device was removed.",
+  agent_disabled: "Cancelled because the agent was disabled.",
 });
 export type RunCancelCode = keyof typeof RUN_CANCEL_MESSAGES;
 

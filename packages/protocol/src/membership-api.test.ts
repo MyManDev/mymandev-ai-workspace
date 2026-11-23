@@ -393,6 +393,8 @@ test("each route answers only known error codes, the common ones included", () =
     "repository_limit",
     // So have the count limits of grants (#75).
     "grant_limit",
+    // And the count limits of a project's agents (#294).
+    "agent_limit",
     // The limits of projects and active devices have their own routes (#255).
     "project_limit",
     "device_limit",

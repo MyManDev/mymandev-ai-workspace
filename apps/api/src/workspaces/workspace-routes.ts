@@ -252,13 +252,18 @@ export async function registerWorkspaceRoutes(
     });
 
     // A project ID names its workspace, so these routes check the
-    // membership of the project's workspace (#27, #28, #286).
+    // membership of the project's workspace (#27, #28, #286, #294).
     await scope.register(async (project) => {
       requireProjectMember(project, database);
 
       registerChatRoutes(project, { database });
 
-      registerAgentRoutes(project, { database });
+      registerAgentRoutes(project, {
+        database,
+        now: options.now,
+        onWorkspaceEvent: options.onWorkspaceEvent,
+        connections: options.connections,
+      });
 
       registerRunRoutes(project, {
         database,

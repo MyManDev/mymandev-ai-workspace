@@ -208,6 +208,23 @@ const TRIGGERS: readonly (readonly [string, () => ServerMessage])[] = [
     () => runCancelled("device_revoked"),
   ],
   [
+    "a cancellation that disabled its agent (agent_disabled)",
+    () => runCancelled("agent_disabled"),
+  ],
+  [
+    "workspace.agent.disabled",
+    () =>
+      event("workspace.agent.disabled", {
+        agent: {
+          id: OTHER_AGENT,
+          projectId: PROJECT,
+          name: "Builder",
+          ownerMemberId: id(0x301),
+          disabledAt: T0,
+        },
+      }),
+  ],
+  [
     "account.device_revoked",
     () =>
       frame({
@@ -246,6 +263,37 @@ const NOT_TRIGGERS: readonly (readonly [string, () => ServerMessage])[] = [
       ),
   ],
   ["a cancellation without a server code", () => runCancelled("stopped")],
+  [
+    // A new agent holds no grant.
+    "workspace.agent.created",
+    () =>
+      event("workspace.agent.created", {
+        agent: {
+          id: OTHER_AGENT,
+          projectId: PROJECT,
+          name: "Builder",
+          ownerMemberId: id(0x301),
+          disabledAt: null,
+        },
+      }),
+  ],
+  [
+    "workspace.agent.disabled of another workspace",
+    () =>
+      event(
+        "workspace.agent.disabled",
+        {
+          agent: {
+            id: OTHER_AGENT,
+            projectId: OTHER_PROJECT,
+            name: "Builder",
+            ownerMemberId: id(0x301),
+            disabledAt: T0,
+          },
+        },
+        OTHER_WORKSPACE,
+      ),
+  ],
   [
     "workspace.member.renamed",
     () =>

@@ -1,0 +1,1 @@
+CREATE INDEX "agents_owner_user_id_created_at_idx" ON "agents" USING btree ("owner_user_id","created_at");

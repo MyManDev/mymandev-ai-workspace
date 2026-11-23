@@ -364,7 +364,11 @@ test("after a terminal acknowledgement, no transition is allowed", () => {
 test("the host may send any reason within the protocol's limits except the server's cancel reasons", () => {
   // The server's codes (P-60, #201), written out as well, so that a change
   // of the protocol's list shows here.
-  expect([...RUN_CANCEL_REASONS]).toEqual(["member_removed", "device_revoked"]);
+  expect([...RUN_CANCEL_REASONS]).toEqual([
+    "member_removed",
+    "device_revoked",
+    "agent_disabled",
+  ]);
   for (const reason of RUN_CANCEL_REASONS) {
     for (const [from, to] of [
       ["running", "cancelled"],

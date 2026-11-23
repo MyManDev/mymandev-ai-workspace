@@ -142,7 +142,11 @@ test("the account vocabularies are exactly the values of ADR 0014", () => {
     JOIN_REQUEST_DECISIONS.filter((decision) => decision !== "blocked"),
   );
   assert.deepEqual(IDENTITY_PROVIDERS, ["github"]);
-  assert.deepEqual(RUN_CANCEL_REASONS, ["member_removed", "device_revoked"]);
+  assert.deepEqual(RUN_CANCEL_REASONS, [
+    "member_removed",
+    "device_revoked",
+    "agent_disabled",
+  ]);
   assert.deepEqual(OWNERSHIP_OFFER_END_REASONS, ["withdrawn", "expired"]);
   assert.deepEqual(INVITATION_LIFETIME_SECONDS, {
     min: 3_600,
@@ -227,6 +231,7 @@ test("every API error code has its fixed HTTP status", () => {
     run_limit: 409,
     repository_limit: 409,
     grant_limit: 409,
+    agent_limit: 409,
     device_limit: 409,
     device_daily_limit: 429,
     rate_limited: 429,

@@ -335,6 +335,7 @@ test("each known cancellation code has its own text", () => {
     member_removed:
       "Cancelled because a person was removed from the workspace.",
     device_revoked: "Cancelled because the agent's device was removed.",
+    agent_disabled: "Cancelled because the agent was disabled.",
   });
 });
 
@@ -351,6 +352,11 @@ test("a known cancellation code of a cancelled run is its own text, and every ot
     kind: "cancel_code",
     code: "member_removed",
     text: "Cancelled because a person was removed from the workspace.",
+  });
+  expect(reason("cancelled", "agent_disabled")).toEqual({
+    kind: "cancel_code",
+    code: "agent_disabled",
+    text: "Cancelled because the agent was disabled.",
   });
   expect(reason("cancelled", null)).toBeNull();
   // A code in another state, an unknown code, another case, and the names
