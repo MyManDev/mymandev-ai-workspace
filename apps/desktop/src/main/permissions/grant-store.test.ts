@@ -19,6 +19,7 @@ import {
 } from "../workspace/service.ts";
 import {
   createGrantStore,
+  GRANT_READ_GRACE_MS,
   GRANT_REREAD_INTERVAL_MS,
   type GrantStoreOptions,
   type GrantStoreService,
@@ -96,8 +97,15 @@ function list(...records: GrantRecord[]): ListResult {
   };
 }
 
-function failed(reason: "not_found" | "failed" | "rate_limited"): ListResult {
+function failed(
+  reason: "not_found" | "failed" | "rate_limited" | "unavailable",
+): ListResult {
   return { ok: false, reason };
+}
+
+/** The answer of a read that the account service held back unsent (#318). */
+function heldBack(): ListResult {
+  return { ok: false, reason: "unavailable", heldBack: true };
 }
 
 function frame(input: Record<string, unknown>): ServerMessage {
@@ -289,6 +297,7 @@ function setup(rereadIntervalMs: number | null = REREAD_MS) {
   const statusListeners = new Set<(status: { state: string }) => void>();
   const messageListeners = new Set<(message: ServerMessage) => void>();
   const workspaceListeners = new Set<() => void>();
+  const resumeListeners = new Set<() => void>();
   const logs: string[] = [];
   let signals = 0;
 
@@ -307,6 +316,7 @@ function setup(rereadIntervalMs: number | null = REREAD_MS) {
         new Promise<ListResult>((resolve) => {
           reads.push({ name, params, resolve });
         })) as unknown as GrantStoreOptions["account"]["readWorkspaceData"],
+      onReadsResumed: (listener) => listen(resumeListeners, listener),
     },
     connection: {
       status: () => ({ state: connectionState }) as never,
@@ -356,7 +366,8 @@ function setup(rereadIntervalMs: number | null = REREAD_MS) {
       accountListeners.size +
       statusListeners.size +
       messageListeners.size +
-      workspaceListeners.size,
+      workspaceListeners.size +
+      resumeListeners.size,
     /** The delays of the active timers other than the reread. */
     pending: () =>
       timers
@@ -370,6 +381,18 @@ function setup(rereadIntervalMs: number | null = REREAD_MS) {
     fire() {
       for (const timer of timers.filter(
         (entry) => entry.active && entry.delayMs !== rereadMs,
+      )) {
+        timer.active = false;
+        timer.callback();
+      }
+    },
+    /** Fires the active timers of `delayMs`, other than the reread. */
+    fireDelay(delayMs: number) {
+      for (const timer of timers.filter(
+        (entry) =>
+          entry.active &&
+          entry.delayMs === delayMs &&
+          entry.delayMs !== rereadMs,
       )) {
         timer.active = false;
         timer.callback();
@@ -411,6 +434,12 @@ function setup(rereadIntervalMs: number | null = REREAD_MS) {
       workspaceStatus = next.status ?? workspaceStatus;
       selected = next.selected === undefined ? selected : next.selected;
       for (const listener of [...workspaceListeners]) {
+        listener();
+      }
+    },
+    /** The account service tells that reads go on. */
+    resume() {
+      for (const listener of [...resumeListeners]) {
         listener();
       }
     },
@@ -962,7 +991,7 @@ test("close stops listening, cancels the timers, signals once, and stays unusabl
     record({ expiresAt: new Date(NOW + 60_000).toISOString() }),
   );
   h.receive(grantCreated());
-  expect(h.listeners()).toBe(4);
+  expect(h.listeners()).toBe(5);
   expect(h.pending()).toEqual([60_000]);
   expect(h.rereads()).toBe(1);
   h.store.close();
@@ -983,4 +1012,390 @@ test("close stops listening, cancels the timers, signals once, and stays unusabl
   expect(r.pending()).toEqual([WORKSPACE_RETRY_BASE_MS]);
   r.store.close();
   expect(r.pending()).toEqual([]);
+});
+
+const DEVICE_REVOKED = () =>
+  frame({
+    type: "account.device_revoked",
+    deviceId: OTHER_DEVICE,
+    reason: "removed",
+    revokedAt: T0,
+  });
+
+/** A live store whose reread failed with `reason`: its grace runs. */
+async function inGrace(
+  reason: "unavailable" | "rate_limited",
+  ...records: GrantRecord[]
+) {
+  const h = await live(...records);
+  h.fireReread();
+  expect(h.reads).toHaveLength(2);
+  await h.answer(1, failed(reason));
+  return h;
+}
+
+test("a read that the account service held back keeps the held answer and reads again once reads go on", async () => {
+  const h = await live();
+  // The revocation of another device holds the reads back meanwhile.
+  h.receive(DEVICE_REVOKED());
+  expect(h.reads).toHaveLength(2);
+  await h.answer(1, heldBack());
+  expect(h.store.read()).toEqual({ usable: true, records: [record()] });
+  expect(h.signals()).toBe(1);
+  // No retry: the lock's end reads. Only the bound of 60 seconds waits.
+  expect(h.pending()).toEqual([GRANT_READ_GRACE_MS]);
+  expect(h.logs).toEqual(["The grant records wait for the account."]);
+  // A revocation of another device takes about 2 seconds.
+  h.setClock(NOW + 2_000);
+  expect(h.store.read().usable).toBe(true);
+
+  // A revocation is not delayed: its grant is left out at once.
+  h.receive(grantRevoked());
+  expect(h.store.read()).toEqual({ usable: true, records: [] });
+  expect(h.signals()).toBe(2);
+  expect(h.reads).toHaveLength(3);
+  await h.answer(2, heldBack());
+  // A second held-back read does not start another bound.
+  expect(h.pending()).toEqual([GRANT_READ_GRACE_MS]);
+
+  h.resume();
+  expect(h.reads).toHaveLength(4);
+  const added = record({ grantId: SECOND_GRANT });
+  await h.answer(3, list(added));
+  expect(h.store.read()).toEqual({ usable: true, records: [added] });
+  // The answer ended the run of held-back reads and its bound.
+  expect(h.pending()).toEqual([]);
+  h.setClock(NOW + GRANT_READ_GRACE_MS * 10);
+  expect(h.store.read().usable).toBe(true);
+  // Nothing waits any more: reads going on read nothing.
+  h.resume();
+  expect(h.reads).toHaveLength(4);
+});
+
+test("held-back reads keep the held answer for at most 60 seconds from the first, then it is unusable until a read succeeds", async () => {
+  // A confirmation dialog of a device action stays open.
+  const h = await live();
+  h.receive(DEVICE_REVOKED());
+  await h.answer(1, heldBack());
+  // Later held-back reads do not extend the bound.
+  h.setClock(NOW + 30_000);
+  h.receive(grantCreated());
+  await h.answer(2, heldBack());
+  expect(h.pending()).toEqual([GRANT_READ_GRACE_MS]);
+  h.setClock(NOW + GRANT_READ_GRACE_MS - 1);
+  expect(h.store.read().usable).toBe(true);
+  h.fireDelay(GRANT_READ_GRACE_MS);
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+  expect(h.signals()).toBe(2);
+  expect(h.logs).toEqual([
+    "The grant records wait for the account.",
+    "The grant records wait for the account.",
+    "The grant records waited too long for the account.",
+  ]);
+  // More held-back reads keep it unusable and start no bound.
+  h.receive(grantCreated());
+  await h.answer(3, heldBack());
+  expect(h.store.read().usable).toBe(false);
+  expect(h.pending()).toEqual([]);
+  // The read once reads go on makes it usable again.
+  h.resume();
+  expect(h.reads).toHaveLength(5);
+  await h.answer(4, list(record()));
+  expect(h.store.read().usable).toBe(true);
+  expect(h.signals()).toBe(3);
+
+  // A failed answer also ends the run: the next held-back read starts a new
+  // bound from its own time.
+  const f = await live();
+  f.receive(grantCreated());
+  await f.answer(1, heldBack());
+  f.resume();
+  await f.answer(2, failed("unavailable"));
+  expect(f.store.read().usable).toBe(false);
+  expect(f.pending()).toEqual([WORKSPACE_RETRY_BASE_MS]);
+});
+
+test("a grace after held-back reads ends no later than 60 seconds from the first of them", async () => {
+  // The interval's reread is held back while a dialog stays open.
+  const h = await live();
+  h.fireReread();
+  expect(h.reads).toHaveLength(2);
+  await h.answer(1, heldBack());
+  expect(h.pending()).toEqual([GRANT_READ_GRACE_MS]);
+  // Reads go on after 50 seconds, and the interval's read fails for a moment.
+  h.setClock(NOW + 50_000);
+  h.resume();
+  expect(h.reads).toHaveLength(3);
+  await h.answer(2, failed("unavailable"));
+  // The answer stays for the 10 seconds left of the bound, not 60 more.
+  expect(h.store.read().usable).toBe(true);
+  expect(h.pending()).toEqual([10_000, WORKSPACE_RETRY_BASE_MS]);
+  h.setClock(NOW + GRANT_READ_GRACE_MS - 1);
+  expect(h.store.read().usable).toBe(true);
+  h.setClock(NOW + GRANT_READ_GRACE_MS);
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+
+  // When reads go on only once the bound has passed, and its timer is late,
+  // the failure makes the store unusable at once.
+  const l = await live();
+  l.fireReread();
+  await l.answer(1, heldBack());
+  l.setClock(NOW + GRANT_READ_GRACE_MS + 1);
+  l.resume();
+  await l.answer(2, failed("unavailable"));
+  expect(l.store.read()).toEqual({ usable: false, records: [] });
+  expect(l.pending()).toEqual([WORKSPACE_RETRY_BASE_MS]);
+});
+
+test("the wall clock ends the bound of held-back reads before a late timer, and signals once", async () => {
+  const h = await live();
+  h.receive(DEVICE_REVOKED());
+  await h.answer(1, heldBack());
+  h.setClock(NOW + GRANT_READ_GRACE_MS);
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+  // The listeners hear of it once, after the read.
+  expect(h.signals()).toBe(1);
+  await settle();
+  expect(h.signals()).toBe(2);
+  expect(h.store.read().usable).toBe(false);
+  await settle();
+  expect(h.signals()).toBe(2);
+  // Its timer is cancelled, and the log is written once.
+  expect(h.pending()).toEqual([]);
+  expect(h.logs).toEqual([
+    "The grant records wait for the account.",
+    "The grant records waited too long for the account.",
+  ]);
+});
+
+test("a held-back first read after workspace.subscribed leaves it unusable until a read succeeds", async () => {
+  const h = setup();
+  h.receive(subscribed());
+  await h.answer(0, heldBack());
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+  expect(h.pending()).toEqual([]);
+  h.resume();
+  expect(h.reads).toHaveLength(2);
+  await h.answer(1, list(record()));
+  expect(h.store.read()).toEqual({ usable: true, records: [record()] });
+
+  // A drop forgets the waiting read.
+  const d = setup();
+  d.receive(subscribed());
+  await d.answer(0, heldBack());
+  d.setConnection("waiting");
+  d.resume();
+  expect(d.reads).toHaveLength(1);
+});
+
+test("reads going on while a read is on its way read once more after its answer", async () => {
+  const h = await live();
+  h.receive(grantCreated());
+  // The lock ended before the store learned that this read was held back.
+  h.resume();
+  await h.answer(1, heldBack());
+  expect(h.reads).toHaveLength(3);
+  expect(h.store.read().usable).toBe(true);
+  await h.answer(2, list(record()));
+  expect(h.reads).toHaveLength(3);
+
+  // That read is not a read of the interval: a transient failure of it
+  // makes the store unusable.
+  const o = await live();
+  o.receive(grantCreated());
+  o.resume();
+  await o.answer(1, list(record()));
+  expect(o.reads).toHaveLength(3);
+  await o.answer(2, failed("unavailable"));
+  expect(o.store.read().usable).toBe(false);
+  expect(o.pending()).toEqual([WORKSPACE_RETRY_BASE_MS]);
+
+  // Also after a reread on its way that failed: its grace ends with it.
+  const r = await live();
+  r.fireReread();
+  r.resume();
+  await r.answer(1, failed("unavailable"));
+  expect(r.store.read().usable).toBe(true);
+  expect(r.reads).toHaveLength(3);
+  await r.answer(2, failed("unavailable"));
+  expect(r.store.read().usable).toBe(false);
+});
+
+test("a grace is never extended: a reread that the interval queued during a failing reread ends it", async () => {
+  const h = await live();
+  h.fireReread();
+  // The interval fires again while the reread is on its way.
+  h.fireReread();
+  expect(h.reads).toHaveLength(2);
+  await h.answer(1, failed("unavailable"));
+  expect(h.store.read().usable).toBe(true);
+  expect(h.reads).toHaveLength(3);
+  await h.answer(2, failed("unavailable"));
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+  expect(h.signals()).toBe(2);
+});
+
+test("a transient failure of a reread keeps the held answer until the retry, whose success keeps it usable", async () => {
+  for (const reason of ["unavailable", "rate_limited"] as const) {
+    const h = await inGrace(reason);
+    expect(h.store.read(), reason).toEqual({
+      usable: true,
+      records: [record()],
+    });
+    expect(h.signals(), reason).toBe(1);
+    expect(h.logs, reason).toEqual([
+      `The grant records did not load (${reason}).`,
+    ]);
+    const retryMs =
+      reason === "rate_limited"
+        ? RATE_LIMITED_RETRY_MS
+        : WORKSPACE_RETRY_BASE_MS;
+    expect(h.pending(), reason).toEqual([GRANT_READ_GRACE_MS, retryMs]);
+    if (reason === "rate_limited") {
+      // The retry waits as long as the grace: the grace ends first.
+      h.fire();
+      expect(h.store.read().usable, reason).toBe(false);
+      expect(h.reads, reason).toHaveLength(3);
+      await h.answer(2, list(record()));
+      expect(h.store.read().usable, reason).toBe(true);
+      continue;
+    }
+    // Triggers during the wait do not read; the retry does.
+    h.receive(grantCreated());
+    expect(h.reads, reason).toHaveLength(2);
+    h.fireDelay(WORKSPACE_RETRY_BASE_MS);
+    expect(h.reads, reason).toHaveLength(3);
+    expect(h.store.read().usable, reason).toBe(true);
+    const added = record({ grantId: SECOND_GRANT });
+    await h.answer(2, list(record(), added));
+    expect(h.store.read().records, reason).toEqual([record(), added]);
+    // The grace ended with the answer.
+    expect(h.pending(), reason).toEqual([]);
+    h.setClock(NOW + GRANT_READ_GRACE_MS);
+    expect(h.store.read().usable, reason).toBe(true);
+    expect(h.signals(), reason).toBe(2);
+  }
+});
+
+test("a failed retry after a transient failure of a reread makes it unusable", async () => {
+  for (const second of ["unavailable", "rate_limited", "failed"] as const) {
+    const h = await inGrace("unavailable");
+    h.fireDelay(WORKSPACE_RETRY_BASE_MS);
+    await h.answer(2, failed(second));
+    expect(h.store.read(), second).toEqual({ usable: false, records: [] });
+    expect(h.signals(), second).toBe(2);
+    expect(h.pending(), second).toEqual([
+      second === "rate_limited"
+        ? RATE_LIMITED_RETRY_MS
+        : WORKSPACE_RETRY_BASE_MS * 2,
+    ]);
+  }
+});
+
+test("60 seconds after a transient failure of a reread without an answer make it unusable", async () => {
+  const h = await inGrace("unavailable");
+  h.fireDelay(WORKSPACE_RETRY_BASE_MS);
+  expect(h.reads).toHaveLength(3);
+  h.setClock(NOW + GRANT_READ_GRACE_MS - 1);
+  expect(h.store.read().usable).toBe(true);
+  // The wall clock ends it, also before its timer fires, and the listeners
+  // hear of it once, after the read.
+  h.setClock(NOW + GRANT_READ_GRACE_MS);
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+  expect(h.signals()).toBe(1);
+  await settle();
+  expect(h.signals()).toBe(2);
+  // Its timer is cancelled.
+  expect(h.pending()).toEqual([]);
+  h.fireDelay(GRANT_READ_GRACE_MS);
+  expect(h.store.read()).toEqual({ usable: false, records: [] });
+  await settle();
+  expect(h.signals()).toBe(2);
+  expect(h.logs).toEqual([
+    "The grant records did not load (unavailable).",
+    "The grant records were not read again in time.",
+  ]);
+  // The retry's later answer makes it usable again.
+  await h.answer(2, list(record()));
+  expect(h.store.read().usable).toBe(true);
+
+  // A retry held back does not end the grace, and does not extend it.
+  const b = await inGrace("unavailable");
+  b.fireDelay(WORKSPACE_RETRY_BASE_MS);
+  await b.answer(2, heldBack());
+  expect(b.store.read().usable).toBe(true);
+  b.resume();
+  expect(b.reads).toHaveLength(4);
+  b.fireDelay(GRANT_READ_GRACE_MS);
+  expect(b.store.read().usable).toBe(false);
+
+  // The timer alone also ends it and signals.
+  const t = await inGrace("unavailable");
+  t.fireDelay(WORKSPACE_RETRY_BASE_MS);
+  t.fireDelay(GRANT_READ_GRACE_MS);
+  expect(t.store.read()).toEqual({ usable: false, records: [] });
+  expect(t.signals()).toBe(2);
+});
+
+test("only a reread gets the grace: a transient failure of a first read, a trigger's read, or a merged one makes it unusable", async () => {
+  for (const reason of ["unavailable", "rate_limited"] as const) {
+    const first = setup();
+    first.receive(subscribed());
+    await first.answer(0, failed(reason));
+    expect(first.store.read().usable, reason).toBe(false);
+    // A reread without a held answer has nothing to keep.
+    first.fireReread();
+    expect(first.reads, reason).toHaveLength(1);
+
+    const h = await live();
+    h.receive(grantCreated());
+    await h.answer(1, failed(reason));
+    expect(h.store.read().usable, reason).toBe(false);
+    // Only the retry waits, no grace.
+    expect(h.pending(), reason).toEqual([
+      reason === "rate_limited"
+        ? RATE_LIMITED_RETRY_MS
+        : WORKSPACE_RETRY_BASE_MS,
+    ]);
+
+    // A reread merged with a trigger is the trigger's read.
+    const m = await live();
+    m.receive(grantCreated());
+    m.fireReread();
+    m.receive(grantCreated());
+    await m.answer(1, list(record()));
+    expect(m.reads, reason).toHaveLength(3);
+    await m.answer(2, failed(reason));
+    expect(m.store.read().usable, reason).toBe(false);
+  }
+});
+
+test("a connection drop during the grace makes it unusable at once", async () => {
+  for (const [name, drop] of DROPS) {
+    const h = await inGrace("unavailable");
+    drop(h);
+    expect(h.store.read(), name).toEqual({ usable: false, records: [] });
+    expect(h.signals(), name).toBe(2);
+    expect(h.pending(), name).toEqual([]);
+  }
+  // A new subscription ends it as well: its first read must succeed.
+  const h = await inGrace("unavailable");
+  h.receive(subscribed());
+  expect(h.store.read().usable).toBe(false);
+  expect(h.pending()).toEqual([]);
+});
+
+test("a revocation event during the grace still drops its grant at once", async () => {
+  const other = record({ grantId: SECOND_GRANT, agentId: OTHER_AGENT });
+  const h = await inGrace("unavailable", record(), other);
+  h.receive(grantRevoked());
+  expect(h.store.read()).toEqual({ usable: true, records: [other] });
+  expect(h.signals()).toBe(2);
+  // The retry reads, and its failure ends the grace.
+  expect(h.reads).toHaveLength(2);
+  h.fireDelay(WORKSPACE_RETRY_BASE_MS);
+  await h.answer(2, failed("unavailable"));
+  expect(h.store.read().usable).toBe(false);
 });

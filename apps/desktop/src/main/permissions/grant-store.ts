@@ -1,8 +1,9 @@
 // The grant store of this device (#55; ADR 0015, P-76; the Project
-// Manager's decisions of 2026-11-19): the `GrantStore` of the enforcement
-// core (`enforcement.ts`). It holds the last answer of `GET /grant-records`,
-// read with the account service's `readWorkspaceData`, and it is the only
-// source of the records that the core checks.
+// Manager's decisions of 2026-11-19, and of 2026-11-20 on #318): the
+// `GrantStore` of the enforcement core (`enforcement.ts`). It holds the
+// last answer of `GET /grant-records`, read with the account service's
+// `readWorkspaceData`, and it is the only source of the records that the
+// core checks.
 //
 // - Freshness. A read is usable only while the selected workspace's
 //   connection is live and the records were read again since its last
@@ -11,7 +12,16 @@
 //   stays connected), a sign-out, another device, another selected
 //   workspace, the end or refusal of its subscription, a failed or refused
 //   read, and a list that the schema or the identity check refuses make the
-//   store unusable at once, so every check denies.
+//   store unusable at once, so every check denies. Two exceptions keep the
+//   held answer for at most `GRANT_READ_GRACE_MS` each (#318): a read that
+//   the account service held back without sending it (`heldBack`) is not a
+//   failed read, and the store reads again once its `onReadsResumed`
+//   tells, counted from the first held-back read until a read is answered;
+//   and a transient failure of a reread of the interval (`unavailable`,
+//   such as the 30-second timeout or a server error, or `rate_limited`)
+//   keeps it until the retry answers, counted from the failure. Each bound
+//   ends by its timer or, should the timer be late, by the wall clock in
+//   `read()`. A first read after the subscription still has to succeed.
 // - Reads. After each `workspace.subscribed` of the selected workspace;
 //   every `GRANT_REREAD_INTERVAL_MS` while it stays live, for revocations
 //   that send no event and for missed events; on `agent.grant.created` (the
@@ -25,7 +35,8 @@
 //   frame `account.device_revoked`, and `workspace.repository.removed`.
 //   Reads are merged like the claim service's: while one is on its way, one
 //   more follows its answer; a failed read is retried with the workspace
-//   service's backoff while connected.
+//   service's backoff while connected, and a held-back one when reads go
+//   on.
 // - Revocations. `agent.grant.revoked` leaves its grant out of `read()` at
 //   once, until a read sent after the event answers (decision 1 of
 //   2026-11-19 on #315). An event never adds or changes a record.
@@ -48,6 +59,7 @@ import {
 } from "@mymandev/protocol";
 import type { GrantRecord } from "@mymandev/permissions";
 import type { AccountStatus } from "../../shared/ipc-contract.ts";
+import type { AccountService } from "../account.ts";
 import type {
   WorkspaceReadFailure,
   WorkspaceReadResult,
@@ -60,7 +72,6 @@ import type {
 import type { ScheduleTimer } from "../runtime.ts";
 import {
   workspaceRetryDelayMs,
-  type WorkspaceAccount,
   type WorkspaceService,
 } from "../workspace/service.ts";
 import type { GrantStore, GrantStoreRead } from "./enforcement.ts";
@@ -78,6 +89,42 @@ const MAX_TIMER_MS = 2 ** 31 - 1;
  */
 export const GRANT_REREAD_INTERVAL_MS = 5 * 60_000;
 
+/**
+ * How long the held answer stays usable, at most, after a transient failure
+ * of a reread of the interval (until the retry answers; decision 2 of
+ * 2026-11-20 on #318), and after the first of a run of reads that the
+ * account service held back (until a read is answered; the Project
+ * Manager's decision of 2026-11-20 on the review of #324).
+ */
+export const GRANT_READ_GRACE_MS = 60_000;
+
+/**
+ * Why a read is sent: `reread` only for the interval, `other` for
+ * everything else (a subscription, an event, a retry). Merged reads take
+ * `other` when any of their triggers was one.
+ */
+type ReadCause = "reread" | "other";
+
+function mergeCause(
+  a: ReadCause | null,
+  b: ReadCause | null,
+): ReadCause | null {
+  return a === "other" || b === "other" ? "other" : (a ?? b);
+}
+
+/** A bound of the held answer (#318). */
+interface Bound {
+  cancel: (() => void) | null;
+  endsAt: number | null;
+  /** The log when it ends. */
+  readonly message: string;
+}
+
+/** The failures of a sent read that may pass, with a held answer (#318). */
+function isTransient(reason: WorkspaceReadFailure): boolean {
+  return reason === "unavailable" || reason === "rate_limited";
+}
+
 /** The part of the connection client that the store uses: no way to send. */
 export type GrantStoreConnection = Pick<
   ConnectionClient,
@@ -86,8 +133,8 @@ export type GrantStoreConnection = Pick<
 
 export interface GrantStoreOptions {
   readonly account: Pick<
-    WorkspaceAccount,
-    "status" | "onStatusChange" | "readWorkspaceData"
+    AccountService,
+    "status" | "onStatusChange" | "readWorkspaceData" | "onReadsResumed"
   >;
   readonly connection: GrantStoreConnection;
   readonly workspaces: Pick<WorkspaceService, "state" | "onChange">;
@@ -95,7 +142,10 @@ export interface GrantStoreOptions {
   readonly scheduleTimer?: ScheduleTimer;
   /** Defaults to `GRANT_REREAD_INTERVAL_MS`. */
   readonly rereadIntervalMs?: number;
-  /** The wall clock in milliseconds, for the expiry signal; defaults to `Date.now`. */
+  /**
+   * The wall clock in milliseconds, for the expiry signal and the end of
+   * `GRANT_READ_GRACE_MS`; defaults to `Date.now`.
+   */
   readonly wallClock?: () => number;
   /**
    * Receives fixed messages with a failure code at most, never an ID. An
@@ -228,8 +278,16 @@ export function createGrantStore(
   /** Changes at every drop; an answer of an earlier epoch is dropped. */
   let epoch = 0;
   let inFlight = false;
-  /** A trigger came while a read was on its way: one more read follows it. */
-  let again = false;
+  /**
+   * A trigger came while a read was on its way: one more read follows it,
+   * for this cause. Null without one.
+   */
+  let next: ReadCause | null = null;
+  /**
+   * A read that the account service held back waits for `onReadsResumed`,
+   * for this cause; null when none waits (#318).
+   */
+  let waiting: ReadCause | null = null;
   /** The reads sent so far; the number of each read. */
   let sentReads = 0;
   /** The failed reads in a row, for the backoff. */
@@ -237,6 +295,22 @@ export function createGrantStore(
   let cancelRetry: (() => void) | null = null;
   let cancelReread: (() => void) | null = null;
   let cancelExpiry: (() => void) | null = null;
+  /**
+   * The bound of the held answer after a transient failure of a reread
+   * (`grace`), and after the first of a run of held-back reads (`hold`):
+   * the timer's cancel and the end on `wallClock`, both null while none
+   * runs (#318).
+   */
+  const grace: Bound = {
+    cancel: null,
+    endsAt: null,
+    message: "The grant records were not read again in time.",
+  };
+  const hold: Bound = {
+    cancel: null,
+    endsAt: null,
+    message: "The grant records waited too long for the account.",
+  };
 
   /** The selected workspace's records of the held answer, or null while unusable. */
   let held: readonly GrantRecord[] | null = null;
@@ -346,6 +420,57 @@ export function createGrantStore(
     cancelRetry = null;
   }
 
+  function endBound(bound: Bound): void {
+    bound.cancel?.();
+    bound.cancel = null;
+    bound.endsAt = null;
+  }
+
+  /**
+   * Keeps the held answer for at most `GRANT_READ_GRACE_MS` from now (#318),
+   * and not past `until` when one is given; a bound that would end by then
+   * ends at once.
+   */
+  function startBound(bound: Bound, until: number | null = null): void {
+    const now = wallClock();
+    const endsAt = Math.min(now + GRANT_READ_GRACE_MS, until ?? Infinity);
+    if (endsAt <= now) {
+      expire(bound);
+      return;
+    }
+    bound.endsAt = endsAt;
+    bound.cancel = schedule(
+      () =>
+        run(() => {
+          bound.cancel = null;
+          expire(bound);
+        }),
+      endsAt - now,
+    );
+  }
+
+  /** Ends `bound`: the store is unusable until a read succeeds. */
+  function expire(bound: Bound): void {
+    endBound(bound);
+    log(bound.message);
+    setUnusable();
+  }
+
+  /**
+   * Ends each bound whose end has passed on the wall clock, also before its
+   * timer fires. True when one did.
+   */
+  function expireLate(): boolean {
+    let late = false;
+    for (const bound of [grace, hold]) {
+      if (bound.endsAt !== null && wallClock() >= bound.endsAt) {
+        expire(bound);
+        late = true;
+      }
+    }
+    return late;
+  }
+
   /**
    * Drops the records, the revoked grants, and the answers on their way:
    * unusable at once.
@@ -353,9 +478,12 @@ export function createGrantStore(
   function drop(): void {
     epoch += 1;
     inFlight = false;
-    again = false;
+    next = null;
+    waiting = null;
     attempt = 0;
     stopRetry();
+    endBound(grace);
+    endBound(hold);
     cancelReread?.();
     cancelReread = null;
     revoked.clear();
@@ -373,23 +501,26 @@ export function createGrantStore(
    * Reads the records. While a read is on its way, they are read again after
    * its answer; while a retry waits, the retry reads them.
    */
-  function request(): void {
+  function request(cause: ReadCause): void {
     if (!mayRead()) {
       return;
     }
     if (inFlight) {
-      again = true;
+      next = mergeCause(next, cause);
       return;
     }
     if (cancelRetry !== null) {
       return;
     }
-    send();
+    send(cause);
   }
 
-  function send(): void {
+  function send(given: ReadCause): void {
+    // A held-back read that waits is sent with this one.
+    const cause = mergeCause(given, waiting) ?? given;
     inFlight = true;
-    again = false;
+    next = null;
+    waiting = null;
     sentReads += 1;
     const number = sentReads;
     const sent = epoch;
@@ -399,7 +530,7 @@ export function createGrantStore(
       () =>
         run(() => {
           cancelReread = null;
-          request();
+          request("reread");
         }),
       rereadIntervalMs,
     );
@@ -409,36 +540,78 @@ export function createGrantStore(
         ok: false,
         reason: "unavailable",
       }))
-      .then((result) => run(() => answered(sent, number, identity, result)));
+      .then((result) =>
+        run(() => answered(sent, number, identity, cause, result)),
+      );
   }
 
   function answered(
     sent: number,
     number: number,
     sentIdentity: ConnectionIdentity | null,
+    cause: ReadCause,
     result: WorkspaceReadResult<GrantRecordListResponse>,
   ): void {
     if (closed || sent !== epoch) {
       return;
     }
     inFlight = false;
+    if (!result.ok && result.heldBack === true) {
+      // Never sent (decision 1 of 2026-11-20 on #318): not a failed read.
+      // The held answer stays, for at most `GRANT_READ_GRACE_MS` from the
+      // first held-back read of a run of them, and the read waits for
+      // `onReadsResumed`.
+      log("The grant records wait for the account.");
+      if (held !== null && hold.cancel === null) {
+        startBound(hold);
+      }
+      waiting = mergeCause(waiting, cause);
+      if (next !== null) {
+        request(next);
+      }
+      return;
+    }
+    // An answer, also a failure, ends a run of held-back reads. A grace that
+    // follows such a run ends no later than the run's bound: without a read
+    // that succeeds, the held answer stays at most `GRANT_READ_GRACE_MS` from
+    // the first held-back read (the Project Manager's decision of 2026-11-23
+    // on #324).
+    const holdEndsAt = hold.endsAt;
+    endBound(hold);
     const failure = accept(number, sentIdentity, result);
-    if (again && failure !== "rate_limited") {
+    if (failure === null) {
+      endBound(grace);
+    } else if (
+      cause === "reread" &&
+      isTransient(failure) &&
+      held !== null &&
+      // A grace is never extended: a reread that fails during one, such as
+      // one that the interval queued while the first was on its way, ends it.
+      grace.cancel === null
+    ) {
+      // Decision 2 of 2026-11-20 on #318: the held answer stays until the
+      // retry answers, for at most `GRANT_READ_GRACE_MS`.
+      startBound(grace, holdEndsAt);
+    } else {
+      endBound(grace);
+      setUnusable();
+    }
+    if (next !== null && failure !== "rate_limited") {
       // A trigger came after this read was sent: one more read follows. An
       // accepted answer is held meanwhile, because it is newer than the one
       // held before.
-      request();
+      request(next);
       return;
     }
-    again = false;
+    next = null;
     if (failure !== null) {
       readFailed(failure);
     }
   }
 
   /**
-   * Holds the answer of read `number`, or makes the store unusable and gives
-   * the reason.
+   * Holds the answer of read `number`, or gives the reason why it is not
+   * held; the caller decides what a failure does to the held answer.
    */
   function accept(
     number: number,
@@ -446,7 +619,6 @@ export function createGrantStore(
     result: WorkspaceReadResult<GrantRecordListResponse>,
   ): WorkspaceReadFailure | null {
     if (!result.ok) {
-      setUnusable();
       return result.reason;
     }
     const identity = connection.identity();
@@ -457,7 +629,6 @@ export function createGrantStore(
       !namesIdentity(result.value.records, identity)
     ) {
       // The answer names another device or account than the connection.
-      setUnusable();
       return "failed";
     }
     attempt = 0;
@@ -482,13 +653,26 @@ export function createGrantStore(
         () => {
           run(() => {
             cancelRetry = null;
-            request();
+            request("other");
           });
         },
         workspaceRetryDelayMs(attempt, reason),
       );
     }
     attempt += 1;
+  }
+
+  /**
+   * Reads go on at the account service: a held-back read is sent now. One on
+   * its way may have been held back before the lock ended, so one more read
+   * follows it; that one is not a read of the interval alone.
+   */
+  function readsResumed(): void {
+    if (inFlight) {
+      next = mergeCause(next, "other");
+    } else if (waiting !== null) {
+      request(waiting);
+    }
   }
 
   function accountChanged(status: AccountStatus): void {
@@ -535,7 +719,7 @@ export function createGrantStore(
             // Only a read sent after this frame counts.
             subscribed = true;
             drop();
-            request();
+            request("other");
           }
           return;
         case "workspace.unsubscribed":
@@ -546,7 +730,7 @@ export function createGrantStore(
           }
           return;
         case "account.device_revoked":
-          request();
+          request("other");
           return;
         default:
           return;
@@ -560,7 +744,7 @@ export function createGrantStore(
       case "agent.grant.created":
       case "workspace.member.removed":
       case "workspace.repository.removed":
-        request();
+        request("other");
         return;
       case "agent.grant.revoked":
         // The grant is left out at once, also of an answer on its way.
@@ -573,7 +757,7 @@ export function createGrantStore(
               record.grant.granteeAgentId === event.payload.granteeAgentId,
           )
         ) {
-          request();
+          request("other");
         }
         return;
       case "agent.run.state_changed": {
@@ -586,7 +770,7 @@ export function createGrantStore(
         ) {
           // The server disabled agents of a revoked device or a removed
           // person, which revokes their grants.
-          request();
+          request("other");
         }
         return;
       }
@@ -602,13 +786,21 @@ export function createGrantStore(
     ),
     workspaces.onChange(() => run(workspacesChanged)),
     connection.onMessage((message) => run(() => messageReceived(message))),
+    account.onReadsResumed(() => run(readsResumed)),
   ];
   device = signedInDevice(account.status());
   connected = connection.status().state === "connected";
   workspacesChanged();
 
   return Object.freeze({
-    read: () => current,
+    read: () => {
+      // A bound ends on the wall clock as well, should its timer be late;
+      // the listeners hear of it once, after this read.
+      if (expireLate()) {
+        queueMicrotask(flush);
+      }
+      return current;
+    },
     onGrantsChanged: (listener: () => void) => {
       const entry = () => listener();
       listeners.add(entry);
