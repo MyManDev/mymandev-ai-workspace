@@ -12,6 +12,8 @@ import {
   newUuidV7,
   type PermissionGrantId,
   type ProjectId,
+  type ProviderConnectionId,
+  type ProviderKind,
   type RepositoryId,
   type RunId,
   type RunState,
@@ -26,6 +28,7 @@ import {
   ERASED_AGENT_NAME,
   ERASED_DEVICE_LABEL,
   ERASED_DISPLAY_NAME,
+  ERASED_PROVIDER_CONNECTION_LABEL,
   eraseAccount,
 } from "./account-erasure.ts";
 import { enableAccount } from "./account-status.ts";
@@ -50,6 +53,7 @@ import {
   devices,
   permissionGrants,
   projects,
+  providerConnections,
   repositories,
   userIdentities,
   users,
@@ -780,6 +784,71 @@ test("an erasure ends each membership as a removal does, revokes every device wi
   assert.deepEqual(await auditAt(LATER), []);
   assert.deepEqual((await userRow(erased.userId)).updatedAt, ERASED_AT);
   assert.deepEqual((await identityRow(erased.userId)).erasedAt, ERASED_AT);
+});
+
+test("an erasure replaces the label of every provider connection on the account's devices, removed ones and those of a device revoked before included, and keeps their kinds; another account's connection keeps its label", async () => {
+  const erased = await account("Erin");
+  const other = await account("Mia");
+  const secondDevice = await deviceOf(erased.userId);
+  const revokedBefore = await deviceOf(erased.userId, {
+    revokedAt: NOW,
+    revocationReason: "removed",
+  });
+  const connectionOn = async (
+    hostDeviceId: DeviceId,
+    kind: ProviderKind,
+    label: string,
+    removedAt: Date | null = null,
+  ): Promise<ProviderConnectionId> => {
+    const id = newId<ProviderConnectionId>();
+    await database()
+      .insert(providerConnections)
+      .values({ id, hostDeviceId, kind, label, createdAt: NOW, removedAt });
+    return id;
+  };
+  const kept = await connectionOn(erased.deviceId, "claude", "Erin's Claude");
+  const removed = await connectionOn(
+    erased.deviceId,
+    "codex",
+    "Erin at work",
+    NOW,
+  );
+  const onSecond = await connectionOn(secondDevice, "codex", "Erin at home");
+  const onRevoked = await connectionOn(revokedBefore, "claude", "Old laptop");
+  const othersConnection = await connectionOn(
+    other.deviceId,
+    "claude",
+    "Mia's Claude",
+  );
+
+  const result = await eraseAccount(database(), {
+    userId: erased.userId,
+    now: ERASED_AT,
+  });
+  assert.ok(result.erased);
+
+  const connectionRow = (id: ProviderConnectionId) =>
+    rowOf(
+      database()
+        .select()
+        .from(providerConnections)
+        .where(eq(providerConnections.id, id)),
+    );
+  for (const [id, kind, removedAt] of [
+    [kept, "claude", null],
+    [removed, "codex", NOW],
+    [onSecond, "codex", null],
+    [onRevoked, "claude", null],
+  ] as const) {
+    const row = await connectionRow(id);
+    assert.equal(row.label, ERASED_PROVIDER_CONNECTION_LABEL);
+    assert.equal(row.kind, kind);
+    assert.deepEqual(row.removedAt, removedAt, "an erasure removes nothing");
+    assert.deepEqual(row.createdAt, NOW);
+  }
+  const othersRow = await connectionRow(othersConnection);
+  assert.equal(othersRow.label, "Mia's Claude");
+  assert.equal(othersRow.kind, "claude");
 });
 
 test("the owner of workspaces without another active, claimed person is erased: each is archived, its open invitations revoked, the pending requests of other accounts denied, and the owner made a member and removed, audited with account_erased", async () => {

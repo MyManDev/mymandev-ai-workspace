@@ -21,6 +21,7 @@ export {
   ERASED_AGENT_NAME,
   ERASED_DEVICE_LABEL,
   ERASED_DISPLAY_NAME,
+  ERASED_PROVIDER_CONNECTION_LABEL,
   eraseAccount,
   type EraseAccountInput,
   type EraseAccountResult,

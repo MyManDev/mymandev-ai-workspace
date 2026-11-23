@@ -22,6 +22,7 @@ import {
   auditEvents,
   devices,
   projects,
+  providerConnections,
   repositories,
   userIdentities,
   users,
@@ -107,7 +108,9 @@ import {
 // admin is an active, claimed person, so the erasure would be refused anyway.
 //
 // After the decision and the archive's writes come the agents that the
-// account owns, for their names, in the order of their IDs. Then each removal
+// account owns, for their names, in the order of their IDs, and then the
+// provider connections on the account's devices, removed ones included, for
+// their labels, in the order of their IDs (#295). Then each removal
 // locks its invitations, agents, grants, and runs (`removePerson` in
 // `src/people.ts`), and each device revocation locks the agents, grants, and
 // runs of its device (`revokeDevice`), each in the order of their IDs
@@ -152,6 +155,13 @@ export const ERASED_DEVICE_LABEL = "Former device";
  * decision of 2026-11-02).
  */
 export const ERASED_AGENT_NAME = "Former agent";
+
+/**
+ * The fixed placeholder that replaces the labels of the provider connections
+ * on the erased account's devices, which a person chose and which can hold
+ * personal data (Project Manager decision of 2026-11-02; #295).
+ */
+export const ERASED_PROVIDER_CONNECTION_LABEL = "Former connection";
 
 /**
  * The fixed placeholder that replaces the name of a workspace that the
@@ -284,8 +294,10 @@ function idsIn<Id extends string>(
  *   the account, removed ones included, and the requested display names of
  *   every join request of the account with `ERASED_DISPLAY_NAME`, the labels
  *   of every device of the account, revoked ones included, with
- *   `ERASED_DEVICE_LABEL`, and the names of every agent that the account
- *   owns, disabled ones included, with `ERASED_AGENT_NAME`, and sets
+ *   `ERASED_DEVICE_LABEL`, the names of every agent that the account owns,
+ *   disabled ones included, with `ERASED_AGENT_NAME`, and the labels of
+ *   every provider connection on those devices, removed ones included, with
+ *   `ERASED_PROVIDER_CONNECTION_LABEL` (their kinds stay), and sets
  *   `users.disabled_at`, keeping an earlier time;
  * - it withdraws each pending join request of the account, with the account
  *   as `decided_by_user_id` and a `join_request.withdrawn` audit record, and
@@ -712,6 +724,40 @@ export async function eraseAccount(
               idIn(
                 agents.id,
                 ownedAgents.map((agent) => agent.id),
+              ),
+            );
+        }
+
+        // The provider connections on the account's devices, removed ones
+        // included, for their labels, after the people and the agents. This
+        // cannot wait in a cycle: every transaction that locks such a
+        // connection locks a row of the account that the erasure holds
+        // before it. `removeProviderConnection` and `grantCapability`
+        // (`src/grants.ts`) lock the account first, and a grant by another
+        // account locks the owner's person before the connection;
+        // `createRun` (`src/runs.ts`) locks the requester's person, who is
+        // the agent's owner and so the account here, then the agent, and
+        // then the connection. The device revocations and removals below
+        // lock no connection.
+        const connections = await tx
+          .select({ id: providerConnections.id })
+          .from(providerConnections)
+          .where(
+            idIn(
+              providerConnections.hostDeviceId,
+              accountDevices.map((device) => device.id),
+            ),
+          )
+          .orderBy(providerConnections.id)
+          .for("no key update");
+        if (connections.length > 0) {
+          await tx
+            .update(providerConnections)
+            .set({ label: ERASED_PROVIDER_CONNECTION_LABEL })
+            .where(
+              idIn(
+                providerConnections.id,
+                connections.map((connection) => connection.id),
               ),
             );
         }
