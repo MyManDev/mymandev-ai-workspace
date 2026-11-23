@@ -178,6 +178,7 @@ class FakeSocket {
 
 interface Timer {
   at: number;
+  delayMs: number;
   callback: () => void;
   active: boolean;
 }
@@ -238,7 +239,12 @@ function harness(
       };
     },
     scheduleTimer: (callback, delayMs) => {
-      const timer: Timer = { at: clock + delayMs, callback, active: true };
+      const timer: Timer = {
+        at: clock + delayMs,
+        delayMs,
+        callback,
+        active: true,
+      };
       timers.push(timer);
       return () => {
         timer.active = false;
@@ -320,7 +326,15 @@ function harness(
     authenticate,
     states: () => statuses.map((value) => value.state),
     clock: () => clock,
-    pendingTimers: () => timers.filter((timer) => timer.active).length,
+    /**
+     * The timers that have neither run nor been cancelled; with `delayMs`,
+     * only those of that delay.
+     */
+    pendingTimers: (delayMs?: number) =>
+      timers.filter(
+        (timer) =>
+          timer.active && (delayMs === undefined || timer.delayMs === delayMs),
+      ).length,
   };
 }
 
@@ -1741,7 +1755,12 @@ test("the bound ends with every close: the server's, a refused message, a sign-o
     const h = harness();
     await h.authenticate();
     const socket = h.last();
+    // Only the bound has this delay.
+    expect(h.pendingTimers(CONNECTION_LIVENESS_BOUND_MS), name).toBe(1);
     close(h);
+    // The close cancels the timer itself: a timer left behind would find its
+    // socket no longer live and do nothing, so the log alone cannot tell.
+    expect(h.pendingTimers(CONNECTION_LIVENESS_BOUND_MS), name).toBe(0);
     if (socket.closes.length > 0) {
       // The close event of the socket that the client closed.
       socket.closed(1000);
