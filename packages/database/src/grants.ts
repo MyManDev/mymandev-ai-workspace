@@ -12,7 +12,17 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { and, eq, isNull, ne, type SQL, sql } from "drizzle-orm";
+import {
+  and,
+  count,
+  eq,
+  gt,
+  isNull,
+  min,
+  ne,
+  type SQL,
+  sql,
+} from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import { revokeGrants } from "./cascade.ts";
 import type { Database } from "./db.ts";
@@ -52,11 +62,21 @@ import {
 // `lockActor` in the API does; then the agent's owner's person
 // (`workspace_members`); then the project; then the repository or the
 // provider connection; then the agent; then the grant. A grant locks the
-// account `FOR SHARE` and then the calling device `FOR NO KEY UPDATE`
-// itself, so that it holds both without the API too; the API's `lockActor`
-// already holds both `FOR NO KEY UPDATE`. The device's lock counts the
-// grants of one host device one after another (`GRANT_COUNT_LIMITS`); it is
-// the only device that may grant to the agents it hosts. A device
+// account and then the calling device, each `FOR NO KEY UPDATE`, itself, so
+// that it holds both without the API too, in the modes of the API's
+// `lockActor`. The account's lock counts the grants of one account in 24
+// hours one after another (`GRANT_COUNT_LIMITS.perDay`; #75, decision of
+// 2026-11-23), as `createAgent` counts its agents; it also orders the grants
+// of one host device (`GRANT_COUNT_LIMITS.perHostDevice`), because only the
+// device's own account grants to the agents it hosts, and so does the
+// device's lock. The mode adds no wait in another order: every writer that
+// locks an account's row takes it before any other row lock of its
+// transaction (the sign-in and an erasure after an identity, which a grant
+// does not lock), `FOR SHARE` as a provider connection removal does or `FOR
+// NO KEY UPDATE` as `lockActor` does, and a foreign-key check of a row that
+// names the account takes `FOR KEY SHARE`, which this mode does not block.
+// Before #75's daily limit the grant locked the account `FOR SHARE`; in the
+// API, `lockActor` already held it `FOR NO KEY UPDATE`. A device
 // revocation locks the device first too, and then the agents and the grants
 // (`src/cascade.ts`), so either the revocation commits first and the grant
 // finds the agent disabled, or the grant commits first and the revocation
@@ -79,7 +99,7 @@ import {
 // A disabled account is refused here as well as by the API, whose
 // `lockActor` refuses it before any write, so that a caller without
 // `lockActor` cannot grant either. The grant reads the account under its
-// `FOR SHARE` lock, and `disableAccount` updates the account's row before it
+// lock, and `disableAccount` updates the account's row before it
 // revokes the grants of its agents, so either the disable commits first and
 // the grant finds the account disabled, or the grant commits first and the
 // disable revokes it. `eraseAccount` locks the account after its identities
@@ -90,12 +110,15 @@ import {
 // caller's own account and reveals nothing of the agent, and `conflict` is
 // the state of the agent and its scope.
 //
-// Provisional (#75): the count limits, the order of the refusals, and the
+// Provisional (#75): the count limits of an agent and a host device, the
+// order of the other refusals, and the
 // order of the records (by grant ID) are settled here with the conservative
 // option and await the Project Manager's confirmation.
 
 /** Why a grant or a revocation was refused. Nothing was written. */
 export type GrantRefusal = "not_found" | "forbidden" | "conflict";
+
+const DAY_MS = 24 * 60 * 60_000;
 
 type GrantRow = typeof permissionGrants.$inferSelect;
 
@@ -232,6 +255,15 @@ export type GrantCapabilityResult =
        * limit of `GRANT_COUNT_LIMITS`, which no time frees.
        */
       refusal: GrantRefusal | "grant_limit";
+    }>
+  /**
+   * The account made `GRANT_COUNT_LIMITS.perDay` grants within 24 hours,
+   * the oldest of which leaves the window after `retryAfterMs`.
+   */
+  | Readonly<{
+      granted: false;
+      refusal: "rate_limited";
+      retryAfterMs: number;
     }>;
 
 /**
@@ -254,8 +286,8 @@ function sameScope(
 
 /**
  * Grants one capability on one scope to an agent in one transaction (#75): only
- * the agent's owner, from the agent's host device. It locks the account `FOR
- * SHARE`, the calling device `FOR NO KEY UPDATE`, then the owner's active
+ * the agent's owner, from the agent's host device. It locks the account and
+ * the calling device `FOR NO KEY UPDATE`, then the owner's active
  * person, the project, the repository or the provider connection, and the
  * agent, each `FOR SHARE`, as the lock order above says, and decides in this
  * order: `forbidden` for a disabled account, before the device is locked;
@@ -269,9 +301,14 @@ function sameScope(
  * and `grant_limit` when the agent holds `GRANT_COUNT_LIMITS.perAgent` grants
  * that are not revoked, or the agents of the host device hold
  * `GRANT_COUNT_LIMITS.perHostDevice`, an expired grant included until it is
- * revoked. An expired grant of the same capability on the same scope does not
- * count: it is revoked, with the account as the revoker, and replaced in the
- * same transaction (P-77). The new grant gets `created_at` `now` and
+ * revoked; then `rate_limited`, with `retryAfterMs` until the oldest of them
+ * leaves the window, when the account made `GRANT_COUNT_LIMITS.perDay`
+ * grants, on any agent and revoked ones included, whose `created_at` lies
+ * within 24 hours before `now` (#75, decision of 2026-11-23). An expired
+ * grant of the same capability on the same scope does not count against
+ * `grant_limit`: it is revoked, with the account as the revoker, and
+ * replaced in the same transaction (P-77); its renewal counts against the
+ * daily limit as a grant. The new grant gets `created_at` `now` and
  * `expires_at` `now` plus `lifetimeSeconds`, or null. Inside another
  * transaction it runs as a savepoint.
  */
@@ -287,7 +324,7 @@ export async function grantCapability(
         .select({ disabledAt: users.disabledAt })
         .from(users)
         .where(eq(users.id, input.userId))
-        .for("share");
+        .for("no key update");
       if (account !== undefined && account.disabledAt !== null) {
         return refuse("forbidden");
       }
@@ -387,6 +424,28 @@ export async function grantCapability(
         (held?.ofDevice ?? 0) >= GRANT_COUNT_LIMITS.perHostDevice
       ) {
         return refuse("grant_limit");
+      }
+      // The account's grants of the last 24 hours, on any agent, revoked
+      // ones and renewals included: the account's lock above orders them.
+      const [recent] = await tx
+        .select({ n: count(), oldest: min(permissionGrants.createdAt) })
+        .from(permissionGrants)
+        .where(
+          and(
+            eq(permissionGrants.grantedByUserId, input.userId),
+            gt(
+              permissionGrants.createdAt,
+              new Date(input.now.getTime() - DAY_MS),
+            ),
+          ),
+        );
+      if ((recent?.n ?? 0) >= GRANT_COUNT_LIMITS.perDay) {
+        const oldest = recent?.oldest ?? input.now;
+        return {
+          granted: false,
+          refusal: "rate_limited",
+          retryAfterMs: oldest.getTime() + DAY_MS - input.now.getTime(),
+        };
       }
 
       let replaced: PermissionGrant | null = null;

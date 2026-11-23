@@ -141,6 +141,13 @@
       "when": 1795419966043,
       "tag": "0019_provider_connection_registration",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1795439409443,
+      "tag": "0020_grant_daily_limit",
+      "breakpoints": true
     }
   ]
 }

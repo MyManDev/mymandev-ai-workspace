@@ -8,6 +8,8 @@ import {
   promoteMember,
   removeMember,
   renameMember,
+  type RevokedGrant,
+  revokedGrantsOf,
 } from "@mymandev/database";
 import {
   type AccountRemovedFromWorkspaceFrame,
@@ -31,6 +33,7 @@ import {
   type AccountFrameHandler,
   sendAccountFrame,
   sendCancelledRuns,
+  sendRevokedGrants,
   sendWorkspaceEvent,
   serverEventHeader,
   type WorkspaceEvent,
@@ -43,7 +46,10 @@ export type PeopleRouteOptions = Readonly<{
   onWorkspaceEvent: WorkspaceEventHandler;
   /** Receives `account.removed_from_workspace` after a removal or a departure. */
   onAccountFrame: AccountFrameHandler;
-  /** The open connections, to which the runs that a removal cancelled go. */
+  /**
+   * The open connections, to which the grants that a removal revoked and the
+   * runs that it cancelled go.
+   */
   connections: ConnectionRegistry;
 }>;
 
@@ -90,14 +96,15 @@ export function registerPeopleRoutes(
    * to the workspace with `membership_ended` and sends the person's
    * `offline` to the other subscribers; `account.removed_from_workspace`
    * through `onAccountFrame` to every connection of the person's account;
-   * and each cancelled run as `agent.run.state_changed` to the workspace's
-   * remaining subscribers. `buildApp` connects both handlers to the
-   * registry, which sends at once, so the order holds.
+   * each revoked grant as `agent.grant.revoked` (#75); and each cancelled
+   * run as `agent.run.state_changed`, both to the workspace's remaining
+   * subscribers. `buildApp` connects both handlers to the registry, which
+   * sends at once, so the order holds.
    */
   function sendMembershipEnd(
     request: FastifyRequest,
     workspaceId: WorkspaceId,
-    ended: MembershipEnd,
+    ended: MembershipEnd & { revokedGrants: readonly RevokedGrant[] },
     now: Date,
   ): void {
     send(request, {
@@ -114,6 +121,7 @@ export function registerPeopleRoutes(
       };
       sendAccountFrame(request, options.onAccountFrame, ended.userId, frame);
     }
+    sendRevokedGrants(request.log, connections, ended.revokedGrants, now);
     sendCancelledRuns(connections, ended.cancelledRuns, now);
   }
 
@@ -213,7 +221,10 @@ export function registerPeopleRoutes(
         if (!result.removed) {
           throw refused(result.refusal);
         }
-        return result;
+        return {
+          ...result,
+          revokedGrants: await revokedGrantsOf(tx, result.revokedGrantIds),
+        };
       });
       sendMembershipEnd(request, workspaceId, ended, now);
       return reply.code(204).send();
@@ -309,7 +320,10 @@ export function registerPeopleRoutes(
         if (!result.left) {
           throw refused(result.refusal);
         }
-        return result;
+        return {
+          ...result,
+          revokedGrants: await revokedGrantsOf(tx, result.revokedGrantIds),
+        };
       });
       sendMembershipEnd(request, workspaceId, ended, now);
       return reply.code(204).send();

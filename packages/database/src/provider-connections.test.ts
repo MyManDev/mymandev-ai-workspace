@@ -754,7 +754,7 @@ test(
 );
 
 test(
-  "a grant of provider.use waits at the device for a removal of its connection and is conflict",
+  "a grant of provider.use waits at the account for a removal of its connection and is conflict",
   SERVER_ONLY,
   async () => {
     const owner = await account("Owner");
@@ -775,12 +775,14 @@ test(
         }),
     );
     assert.deepEqual(result, { granted: false, refusal: "conflict" });
-    assert.deepEqual(waitedOn, ["devices"]);
+    // The removal holds the account `FOR SHARE`, which the grant's `FOR NO
+    // KEY UPDATE` waits for, before the device (#75, daily limit).
+    assert.deepEqual(waitedOn, ["users"]);
   },
 );
 
 test(
-  "a removal waits at the device for a grant on its connection and revokes the new grant",
+  "a removal waits at the account for a grant on its connection and revokes the new grant",
   SERVER_ONLY,
   async () => {
     const owner = await account("Owner");
@@ -804,7 +806,9 @@ test(
     );
     assert.ok(grantId !== undefined);
     assert.deepEqual(result, { removed: true, revokedGrantIds: [grantId] });
-    assert.deepEqual(waitedOn, ["devices"]);
+    // The grant holds the account `FOR NO KEY UPDATE`, which the removal's
+    // `FOR SHARE` waits for, before the device (#75, daily limit).
+    assert.deepEqual(waitedOn, ["users"]);
     assert.deepEqual((await grantRow(grantId)).revokedAt, LATER);
   },
 );

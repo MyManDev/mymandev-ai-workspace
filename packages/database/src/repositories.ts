@@ -49,8 +49,8 @@ import {
 //   repository fact (Project Manager decision of 2026-11-14, #75), so this
 //   revocation is what keeps a grant on a removed repository from granting.
 //   The result lists the revoked grants for the `agent.grant.revoked` events
-//   that the grant routes will send (#75); the API sends none yet, as for a
-//   device revocation or a removal of a person.
+//   that the API sends after the commit (#75; `revokedGrantsOf` of
+//   `src/cascade.ts`), as for every change that revokes grants.
 // - A name is a label (ADR 0005, update of 2026-11-02): no unique index, and
 //   it is stored as given. The API passes names that the protocol checked.
 // - Neither function writes an audit record: they are not administrative

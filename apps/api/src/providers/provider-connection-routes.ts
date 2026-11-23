@@ -4,6 +4,7 @@ import {
   registerProviderConnection,
   type RegisterProviderConnectionResult,
   removeProviderConnection,
+  revokedGrantsOf,
 } from "@mymandev/database";
 import {
   PROVIDER_CONNECTION_ROUTES,
@@ -23,12 +24,16 @@ import {
   type RequireAccessToken,
 } from "../auth/authenticate.ts";
 import { ApiError } from "../errors.ts";
+import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
+import { sendRevokedGrants } from "../workspaces/events.ts";
 
 export type ProviderConnectionRouteOptions = Readonly<{
   database: Database;
   requireAccessToken: RequireAccessToken;
   now: () => number;
+  /** The open connections, to which the grants that a removal revoked go. */
+  connections: ConnectionRegistry;
 }>;
 
 /** The path parameter of a removal. */
@@ -93,9 +98,12 @@ function item(connection: ProviderConnection): ProviderConnection {
  * request was authenticated changes nothing. A removal revokes the
  * connection's active `provider.use` grants in the same transaction (ADR
  * 0015, P-77) and cancels no run. No change sends a workspace event, because
- * a connection is device data (#110), and none sends `agent.grant.revoked`
- * until the grant routes send them for every change that revokes grants
- * (#75). Neither change writes an audit record.
+ * a connection is device data (#110); after the commit, a removal sends one
+ * `agent.grant.revoked` for each grant that it revoked to the connections
+ * subscribed to the grant's workspace (#75; ADR 0015, update of
+ * 2026-11-14), as every change that revokes grants does. The event names
+ * the grant and its agent, never the connection. Neither change writes an
+ * audit record.
  */
 export async function registerProviderConnectionRoutes(
   app: FastifyInstance,
@@ -160,7 +168,7 @@ export async function registerProviderConnectionRoutes(
           providerConnectionId: ProviderConnectionId;
         };
         const now = new Date(options.now());
-        await database.transaction(async (tx) => {
+        const revokedGrants = await database.transaction(async (tx) => {
           await lockActor(tx, auth, now.getTime());
           const result = await removeProviderConnection(tx, {
             userId: auth.userId,
@@ -175,7 +183,9 @@ export async function registerProviderConnectionRoutes(
               result.refusal === "forbidden" ? "unauthorized" : result.refusal,
             );
           }
+          return revokedGrantsOf(tx, result.revokedGrantIds);
         });
+        sendRevokedGrants(request.log, options.connections, revokedGrants, now);
         return reply.code(204).send();
       },
     );

@@ -22,7 +22,7 @@ import {
 import { eq } from "drizzle-orm";
 import { eraseAccount } from "./account-erasure.ts";
 import { disableAccount, enableAccount } from "./account-status.ts";
-import { revokeGrants } from "./cascade.ts";
+import { revokedGrantsOf, revokeGrants } from "./cascade.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
 import { DatabaseError, withDatabaseErrors } from "./errors.ts";
@@ -72,7 +72,13 @@ const DAY_MS = 24 * HOUR_MS;
 const NOW = new Date("2026-11-14T12:00:00.000Z");
 const LATER = new Date("2026-11-14T13:00:00.000Z");
 const EARLIER = new Date("2026-11-14T11:00:00.000Z");
-const { perAgent: PER_AGENT, perHostDevice: PER_DEVICE } = GRANT_COUNT_LIMITS;
+/** Before the 24 hours of the daily limit: a grant made then does not count. */
+const LONG_AGO = new Date(NOW.getTime() - 2 * DAY_MS);
+const {
+  perAgent: PER_AGENT,
+  perHostDevice: PER_DEVICE,
+  perDay: PER_DAY,
+} = GRANT_COUNT_LIMITS;
 
 type Account = Readonly<{ userId: UserId; deviceId: DeviceId }>;
 
@@ -262,13 +268,15 @@ async function grantCount(): Promise<number> {
 
 /**
  * `n` grants of the agent that are not revoked, inserted directly: four
- * capabilities on each repository, `n / 4` repositories.
+ * capabilities on each repository, `n / 4` repositories. They were made at
+ * `createdAt`, by default before the 24 hours of the daily limit.
  */
 async function fill(
   projectId: ProjectId,
   agentId: AgentId,
   owner: Account,
   n: number,
+  createdAt: Date = LONG_AGO,
 ): Promise<PermissionGrantId[]> {
   const capabilities = [
     "repo.read",
@@ -285,10 +293,47 @@ async function fill(
     capability: capabilities[index % 4] ?? "repo.read",
     repositoryId: scopes[Math.floor(index / 4)] ?? null,
     grantedByUserId: owner.userId,
-    createdAt: EARLIER,
+    createdAt,
   }));
   await database().insert(permissionGrants).values(rows);
   return rows.map((row) => row.id);
+}
+
+/**
+ * `n` grants of `repo.read` on the repository to the agent, made by the
+ * agent's owner at `createdAt` and revoked a minute later, inserted
+ * directly: they hold no place of an agent or a device, only of the daily
+ * limit.
+ */
+async function madeAndRevoked(
+  projectId: ProjectId,
+  agentId: AgentId,
+  owner: Account,
+  repositoryId: RepositoryId,
+  n: number,
+  createdAt: Date,
+): Promise<void> {
+  const [agent] = await database()
+    .select({ hostDeviceId: agents.hostDeviceId })
+    .from(agents)
+    .where(eq(agents.id, agentId));
+  assert.ok(agent);
+  await database()
+    .insert(permissionGrants)
+    .values(
+      Array.from({ length: n }, () => ({
+        id: newId<PermissionGrantId>(),
+        projectId,
+        granteeAgentId: agentId,
+        hostDeviceId: agent.hostDeviceId,
+        capability: "repo.read" as const,
+        repositoryId,
+        grantedByUserId: owner.userId,
+        createdAt,
+        revokedAt: new Date(createdAt.getTime() + MINUTE_MS),
+        revokedByUserId: owner.userId,
+      })),
+    );
 }
 
 function listOf(who: Account) {
@@ -762,6 +807,128 @@ test(`the agents of a host device hold at most ${PER_DEVICE} grants that are not
   assert.equal(filledAgents.length, PER_DEVICE / PER_AGENT);
 });
 
+test(`an account makes at most ${PER_DAY} grants within 24 hours, on all its agents and devices, revoked ones and renewals included; the next is rate_limited until the oldest is 24 hours old`, async () => {
+  const { owner, projectId, repositoryId, agentId } = await world();
+  const laptop: Account = {
+    userId: owner.userId,
+    deviceId: await deviceOf(owner.userId),
+  };
+  const elsewhere = await agentOf(projectId, owner, laptop.deviceId);
+  // A grant that expires, made through the writer two hours ago, before
+  // the grants below, and later renewed: two grants of the day.
+  const expiring = await granted(
+    agentId,
+    owner,
+    readRepository(repositoryId, 60),
+    new Date(NOW.getTime() - 2 * HOUR_MS),
+  );
+  // Exactly 24 hours old: out of the window, which is half-open.
+  await madeAndRevoked(
+    projectId,
+    agentId,
+    owner,
+    repositoryId,
+    5,
+    new Date(NOW.getTime() - DAY_MS),
+  );
+  const oldest = new Date(NOW.getTime() - 20 * HOUR_MS);
+  await madeAndRevoked(projectId, agentId, owner, repositoryId, 1, oldest);
+  await madeAndRevoked(
+    projectId,
+    elsewhere,
+    owner,
+    repositoryId,
+    PER_DAY - 3,
+    EARLIER,
+  );
+  const renewal = await grant(agentId, owner, readRepository(repositoryId));
+  assert.ok(renewal.granted, JSON.stringify(renewal));
+  assert.equal(renewal.replaced?.id, expiring);
+
+  const [fresh] = await repositoriesIn(projectId, owner);
+  assert.ok(fresh);
+  const before = await grantCount();
+  assert.deepEqual(await grant(agentId, owner, readRepository(fresh)), {
+    granted: false,
+    refusal: "rate_limited",
+    retryAfterMs: oldest.getTime() + DAY_MS - NOW.getTime(),
+  });
+  // The laptop's agent counts against the same account.
+  assert.deepEqual(await grant(elsewhere, laptop, readRepository(fresh)), {
+    granted: false,
+    refusal: "rate_limited",
+    retryAfterMs: oldest.getTime() + DAY_MS - NOW.getTime(),
+  });
+  // A millisecond before the oldest is 24 hours old, the wait is that
+  // millisecond.
+  const almost = new Date(oldest.getTime() + DAY_MS - 1);
+  assert.deepEqual(await grant(agentId, owner, readRepository(fresh), almost), {
+    granted: false,
+    refusal: "rate_limited",
+    retryAfterMs: 1,
+  });
+  assert.equal(await grantCount(), before);
+
+  // Another account has its own count.
+  const other = await world();
+  assert.ok(
+    (
+      await grant(
+        other.agentId,
+        other.owner,
+        readRepository(other.repositoryId),
+      )
+    ).granted,
+  );
+  // Once the oldest is 24 hours old, its place is free.
+  assert.ok(
+    (
+      await grant(
+        agentId,
+        owner,
+        readRepository(fresh),
+        new Date(oldest.getTime() + DAY_MS),
+      )
+    ).granted,
+  );
+});
+
+test("a grant at the daily limit is refused with conflict or grant_limit first, and with rate_limited only when no other refusal applies", async () => {
+  const { owner, projectId, repositoryId, agentId } = await world();
+  const filled = await fill(projectId, agentId, owner, PER_AGENT, EARLIER);
+  await madeAndRevoked(
+    projectId,
+    agentId,
+    owner,
+    repositoryId,
+    PER_DAY - PER_AGENT,
+    EARLIER,
+  );
+  const [active] = filled;
+  assert.ok(active);
+  const { repositoryId: activeScope } = await grantRow(active);
+  assert.ok(activeScope);
+  const before = await grantCount();
+  // An active grant of the same scope: conflict.
+  assert.deepEqual(await grant(agentId, owner, readRepository(activeScope)), {
+    granted: false,
+    refusal: "conflict",
+  });
+  // The agent's count limit: grant_limit, without a wait.
+  assert.deepEqual(await grant(agentId, owner, readRepository(repositoryId)), {
+    granted: false,
+    refusal: "grant_limit",
+  });
+  // Another agent of the account, with places: rate_limited.
+  const second = await agentOf(projectId, owner);
+  assert.deepEqual(await grant(second, owner, readRepository(repositoryId)), {
+    granted: false,
+    refusal: "rate_limited",
+    retryAfterMs: EARLIER.getTime() + DAY_MS - NOW.getTime(),
+  });
+  assert.equal(await grantCount(), before);
+});
+
 test("the database refuses a shell grant without an expiry or beyond 30 days, also from the writer", async () => {
   const { owner, repositoryId, agentId } = await world();
   for (const lifetimeSeconds of [null, SHELL_GRANT_MAX_LIFETIME_SECONDS + 1]) {
@@ -957,6 +1124,47 @@ test("the database lets a grant change only by its revocation, once and whole (P
     { revokedAt: null, revokedByUserId: null },
     "permission_grants_revocation_final",
   );
+});
+
+test("revokedGrantsOf reads each revoked grant with its agent and workspace, in the order of the IDs, and throws for an ID that names no revoked grant", async () => {
+  const { owner, workspaceId, projectId, repositoryId, agentId } =
+    await world();
+  const [secondScope] = await repositoriesIn(projectId, owner);
+  assert.ok(secondScope);
+  const first = await granted(agentId, owner, readRepository(repositoryId));
+  const second = await granted(agentId, owner, readRepository(secondScope));
+  const ids = await database().transaction((tx) =>
+    revokeGrants(
+      tx,
+      eq(permissionGrants.granteeAgentId, agentId),
+      owner.userId,
+      LATER,
+    ),
+  );
+  assert.deepEqual(ids, [first, second].sort());
+  assert.deepEqual(
+    await revokedGrantsOf(database(), ids),
+    ids.map((grantId) => ({
+      grantId,
+      granteeAgentId: agentId,
+      workspaceId,
+      revokedAt: LATER,
+    })),
+  );
+  assert.deepEqual(await revokedGrantsOf(database(), []), []);
+
+  const active = await granted(agentId, owner, readRepository(repositoryId));
+  for (const asked of [
+    [...ids, newId<PermissionGrantId>()],
+    [...ids, active],
+    [first, first],
+  ]) {
+    await assert.rejects(
+      revokedGrantsOf(database(), asked),
+      /^Error: Invariant broken/u,
+      JSON.stringify(asked),
+    );
+  }
 });
 
 test("a revocation is refused in order: not_found for the agent or the person, forbidden for another account, then not_found for a grant of another agent, and nothing is written", async () => {
@@ -1197,7 +1405,7 @@ test("a person who left and joined again has each grant listed once, with the ac
 // Concurrent transactions, on a PostgreSQL server only.
 
 test(
-  `a grant waits at the host device's row for a concurrent grant on another agent of the device that reaches its limit of ${PER_DEVICE}, and is then grant_limit`,
+  `a grant waits at the account's row for a concurrent grant on another agent of the device that reaches its limit of ${PER_DEVICE}, and is then grant_limit`,
   SERVER_ONLY,
   async () => {
     const { owner, projectId, repositoryId, agentId: first } = await world();
@@ -1207,7 +1415,8 @@ test(
       await fill(projectId, await agentOf(projectId, owner), owner, PER_AGENT);
     }
     const fresh = await agentOf(projectId, owner);
-    // The two agents differ, so only the device's row orders them.
+    // The two agents differ, so the account's row, locked before the
+    // device's, orders them.
     const { result, waitedOn } = await whileHeld(
       testDatabase,
       async (tx) => {
@@ -1223,8 +1432,52 @@ test(
       () => grant(fresh, owner, readRepository(repositoryId)),
     );
     assert.deepEqual(result, { granted: false, refusal: "grant_limit" });
-    assert.deepEqual(waitedOn, ["devices"]);
+    assert.deepEqual(waitedOn, ["users"]);
     assert.equal((await listOf(owner)).length, PER_DEVICE);
+  },
+);
+
+test(
+  "of two concurrent grants of one account on two host devices for its last place of the day, the second waits at the account and is rate_limited",
+  SERVER_ONLY,
+  async () => {
+    const { owner, projectId, repositoryId, agentId } = await world();
+    const laptop: Account = {
+      userId: owner.userId,
+      deviceId: await deviceOf(owner.userId),
+    };
+    const elsewhere = await agentOf(projectId, owner, laptop.deviceId);
+    await madeAndRevoked(
+      projectId,
+      agentId,
+      owner,
+      repositoryId,
+      PER_DAY - 1,
+      EARLIER,
+    );
+    // The devices and the agents differ, so only the account's row orders
+    // the two counts.
+    const { result, waitedOn } = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        const last = await grant(
+          agentId,
+          owner,
+          readRepository(repositoryId),
+          NOW,
+          tx,
+        );
+        assert.ok(last.granted, JSON.stringify(last));
+      },
+      () => grant(elsewhere, laptop, readRepository(repositoryId)),
+    );
+    assert.deepEqual(result, {
+      granted: false,
+      refusal: "rate_limited",
+      retryAfterMs: EARLIER.getTime() + DAY_MS - NOW.getTime(),
+    });
+    assert.deepEqual(waitedOn, ["users"]);
+    assert.deepEqual(await grantRowsOf(elsewhere), []);
   },
 );
 

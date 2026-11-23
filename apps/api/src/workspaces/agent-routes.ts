@@ -5,6 +5,7 @@ import {
   disableAgent,
   listProjectAgents,
   listProjectRuns,
+  revokedGrantsOf,
 } from "@mymandev/database";
 import {
   AGENT_ROUTES,
@@ -25,6 +26,7 @@ import type { ConnectionRegistry } from "../gateway.ts";
 import { ProjectPathParamsSchema } from "./access.ts";
 import {
   sendCancelledRuns,
+  sendRevokedGrants,
   sendWorkspaceEvent,
   serverEventHeader,
   type WorkspaceEventHandler,
@@ -38,7 +40,10 @@ export type AgentRouteOptions = Readonly<{
    * the commit.
    */
   onWorkspaceEvent: WorkspaceEventHandler;
-  /** The open connections, to which the runs that a disable cancelled go. */
+  /**
+   * The open connections, to which the grants that a disable revoked and the
+   * runs that it cancelled go.
+   */
   connections: ConnectionRegistry;
 }>;
 
@@ -113,12 +118,10 @@ function listItem(agent: AgentListItem): AgentListItem {
  * device again (`lockActor`) and then decides on the locked person; a frozen
  * copy of its workspace event goes to `onWorkspaceEvent` after the commit,
  * for the subscribers of the project's workspace. A disable then sends one
- * `agent.run.state_changed` for each run that it cancelled, with the reason
- * `agent_disabled`, to the same subscribers. It sends no
- * `agent.grant.revoked` for the grants that it revoked until the grant
- * routes send them for every change that revokes grants (#75), as a
- * repository removal, a device revocation, and a removal of a person send
- * none yet. Neither change writes an audit record.
+ * `agent.grant.revoked` for each grant that it revoked (#75; ADR 0015,
+ * update of 2026-11-14) and one `agent.run.state_changed` for each run that
+ * it cancelled, with the reason `agent_disabled`, to the same subscribers.
+ * Neither change writes an audit record.
  */
 export function registerAgentRoutes(
   project: FastifyInstance,
@@ -229,15 +232,20 @@ export function registerAgentRoutes(
             result.refusal === "not_member" ? "not_found" : result.refusal,
           );
         }
-        return result;
+        return {
+          ...result,
+          revokedGrants: await revokedGrantsOf(tx, result.revokedGrantIds),
+        };
       });
       sendWorkspaceEvent(request, options.onWorkspaceEvent, {
         ...serverEventHeader(disabled.workspaceId, now),
         type: "workspace.agent.disabled",
         payload: { agent: listItem(disabled.agent) },
       });
-      // Each cancelled run reaches its workspace's subscribed connections,
-      // as after a device revocation or a removal (P-60).
+      // Each revoked grant and each cancelled run reaches its workspace's
+      // subscribed connections, as after a device revocation or a removal
+      // (P-60, P-77).
+      sendRevokedGrants(request.log, connections, disabled.revokedGrants, now);
       sendCancelledRuns(connections, disabled.cancelledRuns, now);
       return reply.code(204).send();
     },

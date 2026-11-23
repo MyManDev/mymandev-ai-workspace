@@ -4,6 +4,7 @@ import {
   registerRepository,
   type RegisterRepositoryResult,
   removeRepository,
+  revokedGrantsOf,
 } from "@mymandev/database";
 import {
   type ProjectId,
@@ -18,8 +19,10 @@ import {
 import type { FastifyInstance } from "fastify";
 import { authOf, lockActor } from "../auth/authenticate.ts";
 import { ApiError } from "../errors.ts";
+import type { ConnectionRegistry } from "../gateway.ts";
 import { ProjectPathParamsSchema } from "./access.ts";
 import {
+  sendRevokedGrants,
   sendWorkspaceEvent,
   serverEventHeader,
   type WorkspaceEventHandler,
@@ -33,6 +36,8 @@ export type RepositoryRouteOptions = Readonly<{
    * `workspace.repository.removed` after the commit.
    */
   onWorkspaceEvent: WorkspaceEventHandler;
+  /** The open connections, to which the grants that a removal revoked go. */
+  connections: ConnectionRegistry;
 }>;
 
 /** The path parameters of a route under `/projects/:projectId/repositories/:repositoryId`. */
@@ -159,10 +164,9 @@ export function registerRepositoryRoutes(
 
   // The removal revokes the grants on the repository in its transaction
   // (ADR 0015, P-77). The event names the repository and no grant: every
-  // grant scoped to it is revoked. No `agent.grant.revoked` is sent for
-  // those grants until the grant routes send them for every change that
-  // revokes grants (#75), as a device revocation and a removal of a person
-  // send none yet (the Project Manager's decision of 2026-11-17 on #286).
+  // grant scoped to it is revoked. Then one `agent.grant.revoked` follows
+  // for each of those grants (#75; ADR 0015, update of 2026-11-14), as for
+  // every change that revokes grants.
   project.post(
     REPOSITORY_ROUTES.removeRepository.path,
     { schema: { params: RepositoryParamsSchema } },
@@ -170,7 +174,7 @@ export function registerRepositoryRoutes(
       const auth = authOf(request);
       const { projectId, repositoryId } = request.params as RepositoryParams;
       const now = new Date(options.now());
-      const workspaceId = await database.transaction(async (tx) => {
+      const removed = await database.transaction(async (tx) => {
         await lockActor(tx, auth, now.getTime());
         const result = await removeRepository(tx, {
           projectId,
@@ -185,13 +189,22 @@ export function registerRepositoryRoutes(
             result.refusal === "not_member" ? "not_found" : result.refusal,
           );
         }
-        return result.workspaceId;
+        return {
+          workspaceId: result.workspaceId,
+          revokedGrants: await revokedGrantsOf(tx, result.revokedGrantIds),
+        };
       });
       sendWorkspaceEvent(request, options.onWorkspaceEvent, {
-        ...serverEventHeader(workspaceId, now),
+        ...serverEventHeader(removed.workspaceId, now),
         type: "workspace.repository.removed",
         payload: { projectId, repositoryId },
       });
+      sendRevokedGrants(
+        request.log,
+        options.connections,
+        removed.revokedGrants,
+        now,
+      );
       return reply.code(204).send();
     },
   );

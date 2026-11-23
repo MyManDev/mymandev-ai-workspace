@@ -319,6 +319,12 @@ export const permissionGrants = pgTable(
     index("permission_grants_active_host_device_id_idx")
       .on(t.hostDeviceId)
       .where(sql`${t.revokedAt} is null`),
+    // Counts the grants that an account made in the last 24 hours (#75,
+    // decision of 2026-11-23).
+    index("permission_grants_granted_by_user_id_created_at_idx").on(
+      t.grantedByUserId,
+      t.createdAt,
+    ),
     check(
       "permission_grants_capability_check",
       sql`${t.capability} in ('repo.read', 'repo.write', 'terminal.execute', 'git.commit', 'git.push', 'provider.use')`,
