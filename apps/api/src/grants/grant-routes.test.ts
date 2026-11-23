@@ -1,5 +1,7 @@
 import {
   agents,
+  type Database,
+  devices,
   permissionGrants,
   repositories,
   workspaceMembers,
@@ -39,7 +41,12 @@ import {
   type SignedInDevice,
   useTestDatabase,
 } from "../auth/device-test-support.ts";
-import { type Client, connected, settle } from "../gateway-test-support.ts";
+import {
+  type Client,
+  connected,
+  interceptingDatabase,
+  settle,
+} from "../gateway-test-support.ts";
 import { ConnectionRegistry } from "../gateway.ts";
 
 // The grant routes (#75): only the agent's owner grants, and only from the
@@ -65,11 +72,14 @@ type Account = Readonly<{
 /**
  * One API instance: each account signs in through its own app, and every app
  * shares one registry of connections, one clock, and one database, whose
- * next commit can be made to fail.
+ * next commit can be made to fail; `through` wraps the test database.
  */
-function instance(t: TestContext) {
+function instance(
+  t: TestContext,
+  options: Readonly<{ through?: Database }> = {},
+) {
   const connections = new ConnectionRegistry();
-  const commits = failingCommits(database());
+  const commits = failingCommits(options.through ?? database());
   const clock = fakeClock();
   const account = async (githubId: number): Promise<Account> => {
     const app = await deviceApp(t, {
@@ -1016,4 +1026,66 @@ test("the grant routes need a valid access token, and a revoked device gets 401"
     });
     assert.equal(response.statusCode, 401, url);
   }
+});
+
+test("a device that was revoked after the request was authenticated grants and revokes nothing, and nothing is sent", async (t) => {
+  const intercepting = interceptingDatabase(database());
+  const { account, secondDevice } = instance(t, {
+    through: intercepting.database,
+  });
+  const ada = await account(7595);
+  const bob = await account(7596);
+  const laptop = await secondDevice(bob);
+  const { workspace, project } = await workspaceWithProject(ada);
+  await addClaimed(workspace.id, bob, ada);
+  const agent = await agentOn(bob, project.id);
+  const repositoryId = await repositoryOf(bob, project.id);
+  const made = await granted(bob, agent.id, {
+    capability: "repo.read",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
+  const adaClient = (await connected(t, ada.app, ada.device)).client;
+  await subscribed(adaClient, workspace.id);
+  await drainPresence(adaClient);
+  /**
+   * Revokes the device when the route's transaction is about to begin, after
+   * the request was authenticated, and records that it did. The agent stays
+   * enabled, so only the route's own check of the device refuses.
+   */
+  const revokeBeforeTransaction = (who: Account) => {
+    const revoked = { done: false };
+    intercepting.interceptNextTransaction(async () => {
+      await database()
+        .update(devices)
+        .set({ revokedAt: new Date(), revocationReason: "lost" })
+        .where(eq(devices.id, who.device.deviceId));
+      revoked.done = true;
+    });
+    return revoked;
+  };
+
+  // A grant from the host device.
+  const beforeGrant = revokeBeforeTransaction(bob);
+  const refusedGrant = await grant(bob, agent.id, {
+    capability: "repo.write",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
+  assert.equal(beforeGrant.done, true);
+  assert.equal(refusedGrant.statusCode, 401, refusedGrant.body);
+  assert.equal(errorCode(refusedGrant), "unauthorized");
+  assert.deepEqual(
+    (await grantRowsOf(agent.id)).map((row) => row.id),
+    [made.id],
+  );
+
+  // A revocation from another device of the owner.
+  const beforeRevoke = revokeBeforeTransaction(laptop);
+  const refusedRevoke = await revoke(laptop, agent.id, made.id);
+  assert.equal(beforeRevoke.done, true);
+  assert.equal(refusedRevoke.statusCode, 401, refusedRevoke.body);
+  assert.equal(errorCode(refusedRevoke), "unauthorized");
+  assert.equal((await grantRow(made.id)).revokedAt, null);
+  await quiet(adaClient);
 });
