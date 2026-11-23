@@ -16,6 +16,7 @@ import {
   type AgentRunListResponse,
   type AgentRunStateChangedEvent,
   type ProjectId,
+  type RunCancelReason,
 } from "@mymandev/protocol";
 
 /** One project's agents and runs. Every object and array is frozen. */
@@ -51,14 +52,16 @@ export type RunEventInput = Pick<
 
 /**
  * What applying a run event did. Every outcome carries `agentsStale`: true
- * when the server cancelled the run because a device was revoked, a person
- * was removed, or the agent was disabled (a `system` actor and a code of
- * `RUN_CANCEL_REASONS`). Each also disables agents: a revocation and a
- * removal in every project of the workspace, and no event reports that, so
- * the caller reloads the agents; a disabling also sends
- * `workspace.agent.disabled` (#294), which may come after the run event. Agents and runs are two
- * separate reads, so this holds also when the runs already show the
- * cancellation, and for a run of another project.
+ * when the server cancelled the run because a device was revoked or a person
+ * was removed (a `system` actor and `device_revoked` or `member_removed` of
+ * `RUN_CANCEL_REASONS`). Both also disable agents in every project of the
+ * workspace, and no event reports that, so the caller reloads the agents.
+ * Agents and runs are two separate reads, so this holds also when the runs
+ * already show the cancellation, and for a run of another project. The third
+ * code, `agent_disabled`, leaves it false: a disabling sends
+ * `workspace.agent.disabled` (#294), which names the agent's project, before
+ * the run events, so the caller reloads on that event, and a disabling in
+ * another project reloads nothing.
  *
  * - `applied`: the event changed the activity; `activity` is the new one.
  * - `unchanged`: the activity already holds what the event reports, or the
@@ -148,13 +151,18 @@ export function replaceAgents(
   });
 }
 
+/** Its own event, `workspace.agent.disabled`, reports the disabled agent. */
+const AGENT_DISABLED: RunCancelReason = "agent_disabled";
+
 function cancelsAgents(event: RunEventInput): boolean {
   const reasons: readonly string[] = RUN_CANCEL_REASONS;
+  const reason = event.payload.reason;
   return (
     event.actor.kind === "system" &&
     event.payload.state === "cancelled" &&
-    event.payload.reason !== undefined &&
-    reasons.includes(event.payload.reason)
+    reason !== undefined &&
+    reason !== AGENT_DISABLED &&
+    reasons.includes(reason)
   );
 }
 

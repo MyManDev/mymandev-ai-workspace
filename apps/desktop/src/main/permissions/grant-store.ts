@@ -32,9 +32,8 @@
 //   transaction (P-77): `workspace.member.removed`, a server cancellation
 //   that disabled agents (`agent.run.state_changed` with a code of
 //   `RUN_CANCEL_REASONS`; no event reports the agents that a revocation or a
-//   removal disabled), the account
-//   frame `account.device_revoked`, `workspace.repository.removed`, and
-//   `workspace.agent.disabled` (#294).
+//   removal disabled), the account frame `account.device_revoked`,
+//   `workspace.repository.removed`, and `workspace.agent.disabled` (#294).
 //   Reads are merged like the claim service's: while one is on its way, one
 //   more follows its answer; a failed read is retried with the workspace
 //   service's backoff while connected, and a held-back one when reads go
