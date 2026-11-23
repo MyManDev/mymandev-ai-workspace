@@ -17,6 +17,7 @@ import {
   DEVICE_PLATFORMS,
   LIMITS,
   NOT_BLANK_PATTERN,
+  PROVIDER_KINDS,
   RUN_STATES,
   SAFE_MULTILINE_TEXT_PATTERN,
   SAFE_TEXT_PATTERN,
@@ -67,6 +68,8 @@ export const CapabilitySchema = z.enum(CAPABILITIES);
 export const RunStateSchema = z.enum(RUN_STATES);
 
 export const DevicePlatformSchema = z.enum(DEVICE_PLATFORMS);
+
+export const ProviderKindSchema = z.enum(PROVIDER_KINDS);
 
 /** A person. Handle, email and credentials wait for the account model (#15). */
 export const UserSchema = z.object({

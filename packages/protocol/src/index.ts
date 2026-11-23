@@ -10,6 +10,7 @@ export * from "./auth-api.ts";
 export * from "./membership-api.ts";
 export * from "./chat-api.ts";
 export * from "./agent-api.ts";
+export * from "./provider-connection-api.ts";
 export * from "./grant-scope.ts";
 export * from "./grant.ts";
 export * from "./grant-api.ts";

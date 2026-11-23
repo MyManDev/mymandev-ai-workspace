@@ -37,6 +37,7 @@ import {
   TERMINAL_RUN_STATES,
 } from "./model.ts";
 import { PROJECT_ROUTES } from "./project-api.ts";
+import { PROVIDER_CONNECTION_ROUTES } from "./provider-connection-api.ts";
 import { REPOSITORY_ROUTES } from "./repository-api.ts";
 import { RUN_ROUTES } from "./run-api.ts";
 
@@ -150,6 +151,7 @@ test("every route of the protocol has its own name and its own method and path",
     REPOSITORY_ROUTES,
     RUN_ROUTES,
     GRANT_ROUTES,
+    PROVIDER_CONNECTION_ROUTES,
   ];
   const names = groups.flatMap((routes) => Object.keys(routes));
   assert.equal(new Set(names).size, names.length);
@@ -208,6 +210,7 @@ test("each agent route answers the common codes and its own, frozen, and only a 
   assert.deepEqual(holders("repository_limit"), []);
   assert.deepEqual(holders("run_limit"), []);
   assert.deepEqual(holders("grant_limit"), []);
+  assert.deepEqual(holders("provider_connection_limit"), []);
   // No time frees a place of either count limit of a project, so the status
   // is a conflict and not a wait.
   assert.equal(API_ERROR_STATUS.agent_limit, 409);

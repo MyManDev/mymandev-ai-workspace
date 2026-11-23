@@ -293,6 +293,7 @@ test("the status of an error body fits its code", () => {
     [409, "repository_limit"],
     [409, "grant_limit"],
     [409, "agent_limit"],
+    [409, "provider_connection_limit"],
     [409, "device_limit"],
     // The daily limit of new devices is a wait with its own code (#269).
     [429, "device_daily_limit"],
@@ -324,6 +325,8 @@ test("the status of an error body fits its code", () => {
     [429, "grant_limit"],
     // Nor are the count limits of a project's agents (#294).
     [429, "agent_limit"],
+    // Nor is the limit of a device's provider connections (#295).
+    [429, "provider_connection_limit"],
     // Nor are the limits of projects and active devices (#255).
     [429, "project_limit"],
     [429, "device_limit"],
