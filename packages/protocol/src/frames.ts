@@ -403,7 +403,9 @@ export type EventRefusedFrame = z.infer<typeof EventRefusedFrameSchema>;
  * device never passes it on to the code that follows its messages, and
  * never answers it. A device built before this frame existed refuses it as
  * `unknown_type` and closes its connection, so both peers of protocol
- * version 0 run the same version (ADR 0006).
+ * version 0 run the same version (ADR 0006). A device built after #334
+ * ignores a server frame of a type that it does not know
+ * (`unknownServerFrameType`), so later frame types do not need that.
  */
 export const ConnectionHeartbeatFrameSchema = z.object({
   ...frameHeaderShape,
@@ -631,6 +633,8 @@ export type ServerMessageDecodeResult =
  * frame that only a device sends, such as `chat.message.send` or
  * `auth.response`, is `unknown_type` here. An event with a `deviceId` is
  * `invalid_actor`: the server sends every event with a null device.
+ * `unknownServerFrameType` tells a frame of a type that no peer of this
+ * build knows apart from the other messages refused as `unknown_type`.
  */
 export function decodeServerMessage(input: unknown): ServerMessageDecodeResult {
   const header = probe(input);
@@ -668,4 +672,31 @@ export function decodeServerMessage(input: unknown): ServerMessageDecodeResult {
     return { ok: false, code: "invalid_payload" };
   }
   return { ok: true, kind: "frame", frame: frame.data };
+}
+
+/**
+ * The `type` of a message from the server that is a well-formed frame of a
+ * type that this build does not know (#334): a `protocolVersion` of
+ * `PROTOCOL_VERSION`, and a `type` of at most `LIMITS.eventType` characters
+ * that matches `FRAME_TYPE_PATTERN` and is neither a server frame type nor a
+ * client frame type. `decodeServerMessage` refuses every such message as
+ * `unknown_type`; after `auth.ok` a device drops it and keeps the
+ * connection open, so that a new server frame type is additive. Null for
+ * every other message: an event, also of an unknown type; a frame that only
+ * a device sends; a known type, also one that fails its schema; another
+ * protocol version; and a malformed message. The fields beside `type` are
+ * never read. The type returned is lowercase ASCII letters, digits,
+ * underscores, and one dot, so it may be logged.
+ */
+export function unknownServerFrameType(input: unknown): string | null {
+  const header = probe(input);
+  if (
+    !header.ok ||
+    !framePattern.test(header.type) ||
+    serverFrameTypes.has(header.type) ||
+    clientFrameTypes.has(header.type)
+  ) {
+    return null;
+  }
+  return header.type;
 }

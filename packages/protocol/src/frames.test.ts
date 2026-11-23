@@ -25,6 +25,7 @@ import {
   MAX_FRAME_BYTES,
   PresenceChangedFrameSchema,
   SERVER_FRAME_TYPES,
+  unknownServerFrameType,
   WorkspaceSubscribedFrameSchema,
   WorkspaceSubscribeFrameSchema,
   WorkspaceSubscribeRefusedFrameSchema,
@@ -652,6 +653,76 @@ test("a device refuses auth.response and malformed frames from the server", () =
   ];
   for (const [label, input, code] of cases) {
     assert.deepEqual(decodeServerMessage(input), { ok: false, code }, label);
+  }
+});
+
+test("unknownServerFrameType names only a well-formed frame of a type that no peer knows, never a known type, an event, or a malformed message", () => {
+  const unknown: Json[] = [
+    { protocolVersion: 0, type: "x.y" },
+    { protocolVersion: 0, type: "connection.ping_v2", extra: { list: [1] } },
+    // At the limit.
+    { protocolVersion: 0, type: `a.${"b".repeat(LIMITS.eventType - 2)}` },
+  ];
+  for (const input of unknown) {
+    const before = structuredClone(input);
+    assert.equal(unknownServerFrameType(input), input["type"]);
+    assert.deepEqual(input, before);
+    // The decoder refuses it, as it refuses every other unknown type.
+    assert.deepEqual(decodeServerMessage(input), {
+      ok: false,
+      code: "unknown_type",
+    });
+  }
+
+  const cases: [label: string, input: unknown][] = [
+    // Known types, also with a payload that fails their schema.
+    ...serverFrames().map((frame): [string, unknown] => [
+      String(frame["type"]),
+      frame,
+    ]),
+    ...SERVER_FRAME_TYPES.map((type): [string, unknown] => [
+      `${type} without its fields`,
+      { protocolVersion: 0, type, extra: 1 },
+    ]),
+    // Frames that only a device sends: decodeServerMessage refuses them as
+    // unknown_type, and they stay refused.
+    ["auth.response", authResponse()],
+    ...workspaceClientFrames().map((frame): [string, unknown] => [
+      String(frame["type"]),
+      frame,
+    ]),
+    // Events, known, unknown, or only a device's.
+    ["chat.message.send", chatSend()],
+    ["chat.message.created", chatCreated()],
+    ...membershipEvents().map((event): [string, unknown] => [
+      String(event["type"]),
+      event,
+    ]),
+    ["an unknown event", { ...chatCreated(), type: "chat.message.edited" }],
+    ["a bare three-part type", { protocolVersion: 0, type: "x.y.z" }],
+    // Malformed, or of another version.
+    ["another version", { protocolVersion: 1, type: "x.y" }],
+    ["a version as a string", { protocolVersion: "0", type: "x.y" }],
+    ["no version", { type: "x.y" }],
+    ["no type", { protocolVersion: 0 }],
+    ["a number as the type", { protocolVersion: 0, type: 1 }],
+    ["a one-part type", { protocolVersion: 0, type: "x" }],
+    ["a four-part type", { protocolVersion: 0, type: "a.b.c.d" }],
+    ["an uppercase type", { protocolVersion: 0, type: "X.y" }],
+    ["a leading space", { protocolVersion: 0, type: " x.y" }],
+    ["a line break", { protocolVersion: 0, type: "x.y\nforged log line" }],
+    ["a non-ASCII letter", { protocolVersion: 0, type: "x.\u0131d" }],
+    ["a hidden character", { protocolVersion: 0, type: "x.\u200by" }],
+    [
+      "a type over the limit",
+      { protocolVersion: 0, type: `a.${"b".repeat(LIMITS.eventType - 1)}` },
+    ],
+    ["not an object", "x.y"],
+    ["null", null],
+    ["an array", [{ protocolVersion: 0, type: "x.y" }]],
+  ];
+  for (const [label, input] of cases) {
+    assert.equal(unknownServerFrameType(input), null, label);
   }
 });
 
