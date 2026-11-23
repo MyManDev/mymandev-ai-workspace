@@ -1,5 +1,10 @@
-import { workspaceMembers } from "@mymandev/database";
 import {
+  agentRuns,
+  permissionGrants,
+  workspaceMembers,
+} from "@mymandev/database";
+import {
+  type AgentId,
   CreateAgentResponseSchema,
   CreateProjectResponseSchema,
   CreateWorkspaceResponseSchema,
@@ -8,10 +13,14 @@ import {
   type MemberId,
   newId,
   type PermissionGrant,
+  type ProjectId,
   RegisterProviderConnectionResponseSchema,
   RegisterRepositoryResponseSchema,
+  type RunId,
+  type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
+import { eq } from "drizzle-orm";
 import type { FastifyInstance } from "fastify";
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
@@ -34,8 +43,9 @@ import { ConnectionRegistry } from "../gateway.ts";
 // removal of a person and a departure, a device revocation, and a sign-in
 // that replaces a device. Each event goes to the connections subscribed to
 // the grant's own workspace, so a change that spans workspaces tells each
-// workspace of its own grants only. An agent's disable is covered with its
-// route (agent-routes.test.ts).
+// workspace of its own grants only. The grant events come before the run
+// events of the same change. An agent's disable is covered with its route
+// (agent-routes.test.ts).
 
 const database = useTestDatabase();
 
@@ -47,11 +57,14 @@ type Account = Readonly<{
 
 /**
  * One API instance: each account signs in through its own app, and every app
- * shares one registry of connections, one clock, and one database, whose
- * next commit can be made to fail.
+ * shares one registry of connections (`connections`, a new one by default),
+ * one clock, and one database, whose next commit can be made to fail.
  */
-function instance(t: TestContext) {
-  const connections = new ConnectionRegistry();
+function instance(
+  t: TestContext,
+  options: Readonly<{ connections?: ConnectionRegistry }> = {},
+) {
+  const connections = options.connections ?? new ConnectionRegistry();
   const commits = failingCommits(database());
   const clock = fakeClock();
   const account = async (githubId: number): Promise<Account> => {
@@ -157,6 +170,25 @@ async function connectionOf(account: Account) {
     .providerConnection.id;
 }
 
+/** A queued run of the agent, requested by its owner, written directly. */
+async function runOf(
+  projectId: string,
+  agentId: string,
+  by: Account,
+): Promise<RunId> {
+  const id = newId<RunId>();
+  await database()
+    .insert(agentRuns)
+    .values({
+      id,
+      agentId: agentId as AgentId,
+      projectId: projectId as ProjectId,
+      requestedByUserId: by.device.userId as UserId,
+      state: "queued",
+    });
+  return id;
+}
+
 async function granted(account: Account, agentId: string, payload: object) {
   const response = await post(account, `/agents/${agentId}/grants`, payload);
   assert.equal(response.statusCode, 200, response.body);
@@ -208,6 +240,8 @@ async function received(client: Client): Promise<string[]> {
       seen.push(`frame:${decoded.frame.type}`);
     } else if (decoded.event.type === "agent.grant.revoked") {
       seen.push(`revoked:${decoded.event.payload.grantId}`);
+    } else if (decoded.event.type === "agent.run.state_changed") {
+      seen.push(`run:${decoded.event.payload.runId}`);
     } else {
       seen.push(decoded.event.type);
     }
@@ -385,8 +419,10 @@ test("a removal and a departure send agent.grant.revoked for the grants of the p
   const body = { capability: "repo.read", repositoryId, lifetimeSeconds: null };
   const bobAgent = await agentOn(bob, project.id);
   const bobGrant = await granted(bob, bobAgent.id, body);
+  const bobRun = await runOf(project.id, bobAgent.id, bob);
   const cleoAgent = await agentOn(cleo, project.id);
   const cleoGrant = await granted(cleo, cleoAgent.id, body);
+  const cleoRun = await runOf(project.id, cleoAgent.id, cleo);
   const adaAgent = await agentOn(ada, project.id);
   await granted(ada, adaAgent.id, body);
   const adaClient = (await connected(t, ada.app, ada.device)).client;
@@ -405,7 +441,7 @@ test("a removal and a departure send agent.grant.revoked for the grants of the p
       (await received(client)).filter(
         (seen) => seen !== "frame:presence.changed",
       ),
-      ["workspace.member.removed", `revoked:${bobGrant.id}`],
+      ["workspace.member.removed", `revoked:${bobGrant.id}`, `run:${bobRun}`],
     );
   }
   // The removed person's subscription ended first: no grant event.
@@ -423,6 +459,7 @@ test("a removal and a departure send agent.grant.revoked for the grants of the p
   assert.deepEqual(adaSeen, [
     "workspace.member.removed",
     `revoked:${cleoGrant.id}`,
+    `run:${cleoRun}`,
   ]);
   assert.deepEqual(
     (await received(cleoClient)).filter((seen) => !seen.startsWith("frame:")),
@@ -430,7 +467,7 @@ test("a removal and a departure send agent.grant.revoked for the grants of the p
   );
 });
 
-test("a device revocation and a sign-in that replaces a device send agent.grant.revoked for the device's grants, each to the subscribers of the grant's own workspace", async (t) => {
+test("a device revocation and a sign-in that replaces a device send agent.grant.revoked for the device's grants, each to the subscribers of the grant's own workspace, before the cancelled runs", async (t) => {
   const { account, clock, secondDevice } = instance(t);
   const ada = await account(7631);
   const bob = await account(7632);
@@ -459,6 +496,8 @@ test("a device revocation and a sign-in that replaces a device send agent.grant.
     laptopInAdas.id,
     read(adaRepository),
   );
+  const deskRun = await runOf(adaProject.id, deskInAdas.id, bob);
+  const laptopRun = await runOf(adaProject.id, laptopInAdas.id, laptop);
   const adaClient = (await connected(t, ada.app, ada.device)).client;
   const laptopClient = (await connected(t, laptop.app, laptop.device)).client;
   await subscribed(adaClient, adas.id);
@@ -473,11 +512,12 @@ test("a device revocation and a sign-in that replaces a device send agent.grant.
   });
   const at = new Date(clock.now());
   await expectRevoked(adaClient, deskAdaGrant, adas.id, at);
-  assert.deepEqual(await received(adaClient), []);
+  assert.deepEqual(await received(adaClient), [`run:${deskRun}`]);
   const laptopSeen = await received(laptopClient);
   assert.deepEqual(laptopSeen, [
     "frame:account.device_revoked",
     ...byId([deskAdaGrant, deskBobGrant]).map((grant) => `revoked:${grant.id}`),
+    `run:${deskRun}`,
   ]);
 
   // A new device that replaces the laptop revokes the laptop's grants.
@@ -485,5 +525,51 @@ test("a device revocation and a sign-in that replaces a device send agent.grant.
   await signInDevice(bob.app, newKey(), laptop.device.deviceId);
   const replacedAt = new Date(clock.now());
   await expectRevoked(adaClient, laptopGrant, adas.id, replacedAt);
-  assert.deepEqual(await received(adaClient), []);
+  assert.deepEqual(await received(adaClient), [`run:${laptopRun}`]);
+});
+
+/** A registry whose every `agent.grant.revoked` fails to send. */
+class FailingGrantRevocations extends ConnectionRegistry {
+  override sendToWorkspace(
+    ...args: Parameters<ConnectionRegistry["sendToWorkspace"]>
+  ): number {
+    if (args[0].type === "agent.grant.revoked") {
+      throw new Error("the send failed");
+    }
+    return super.sendToWorkspace(...args);
+  }
+}
+
+test("a grant event that fails to send fails neither the committed change nor the events after it", async (t) => {
+  const { account } = instance(t, {
+    connections: new FailingGrantRevocations(),
+  });
+  const ada = await account(7641);
+  const bob = await account(7642);
+  const { workspace, project } = await workspaceWithProject(ada);
+  const bobPerson = await addClaimed(workspace.id, bob, ada);
+  const repositoryId = await repositoryOf(ada, project.id);
+  const bobAgent = await agentOn(bob, project.id);
+  const bobGrant = await granted(bob, bobAgent.id, {
+    capability: "repo.read",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
+  const bobRun = await runOf(project.id, bobAgent.id, bob);
+  const adaClient = (await connected(t, ada.app, ada.device)).client;
+  await subscribed(adaClient, workspace.id);
+  await received(adaClient);
+
+  await done(ada, `/workspaces/${workspace.id}/members/${bobPerson}/remove`);
+  assert.deepEqual(
+    (await received(adaClient)).filter(
+      (seen) => seen !== "frame:presence.changed",
+    ),
+    ["workspace.member.removed", `run:${bobRun}`],
+  );
+  const [row] = await database()
+    .select({ revokedAt: permissionGrants.revokedAt })
+    .from(permissionGrants)
+    .where(eq(permissionGrants.id, bobGrant.id));
+  assert.notEqual(row?.revokedAt ?? null, null);
 });

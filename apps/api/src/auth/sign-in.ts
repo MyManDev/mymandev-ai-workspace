@@ -274,7 +274,12 @@ export async function registerSignIn(
             // Each revoked grant and each cancelled run reaches its
             // workspace's subscribed connections (ADR 0014, P-60; ADR 0015,
             // P-77; #75, #110).
-            sendRevokedGrants(connections, result.revokedGrants, now);
+            sendRevokedGrants(
+              request.log,
+              connections,
+              result.revokedGrants,
+              now,
+            );
             sendCancelledRuns(connections, result.cancelledRuns, now);
           }
           if (result.registered === null) {

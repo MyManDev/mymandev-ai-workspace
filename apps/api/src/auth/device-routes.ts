@@ -344,7 +344,7 @@ export async function registerDeviceRoutes(
         connections.sendToUser(auth.userId, revoked, deviceId);
         // Each revoked grant and each cancelled run reaches its workspace's
         // subscribed connections (ADR 0014, P-60; ADR 0015, P-77; #75, #110).
-        sendRevokedGrants(connections, ended.revokedGrants, now);
+        sendRevokedGrants(request.log, connections, ended.revokedGrants, now);
         sendCancelledRuns(connections, ended.cancelledRuns, now);
         return reply.code(204).send();
       },

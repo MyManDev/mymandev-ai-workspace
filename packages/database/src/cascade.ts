@@ -154,7 +154,9 @@ export type RevokedGrant = Readonly<{
  * the grant's own workspace: a device revocation can revoke grants in
  * several workspaces. A grant's agent and project never change, and its
  * `revoked_at` is set once, so the read gives what the change wrote. It
- * locks nothing; the change holds the grants' locks already.
+ * locks nothing; the change holds the grants' locks already. An ID that
+ * names no grant, or a grant that is not revoked, breaks that invariant and
+ * throws, rather than leave a revocation without its event.
  */
 export async function revokedGrantsOf(
   tx: Database,
@@ -174,11 +176,15 @@ export async function revokedGrantsOf(
     .innerJoin(projects, eq(projects.id, permissionGrants.projectId))
     .where(idIn(permissionGrants.id, ids))
     .orderBy(permissionGrants.id);
-  return Object.freeze(
-    rows.flatMap(({ revokedAt, ...grant }) =>
-      revokedAt === null ? [] : [Object.freeze({ ...grant, revokedAt })],
-    ),
+  const revoked = rows.flatMap(({ revokedAt, ...grant }) =>
+    revokedAt === null ? [] : [Object.freeze({ ...grant, revokedAt })],
   );
+  if (revoked.length !== ids.length) {
+    throw new Error(
+      `Invariant broken: ${ids.length} revoked grants were asked for, ${revoked.length} were found`,
+    );
+  }
+  return Object.freeze(revoked);
 }
 
 /**

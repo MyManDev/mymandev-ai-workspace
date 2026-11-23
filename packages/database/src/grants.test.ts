@@ -22,7 +22,7 @@ import {
 import { eq } from "drizzle-orm";
 import { eraseAccount } from "./account-erasure.ts";
 import { disableAccount, enableAccount } from "./account-status.ts";
-import { revokeGrants } from "./cascade.ts";
+import { revokedGrantsOf, revokeGrants } from "./cascade.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
 import { DatabaseError, withDatabaseErrors } from "./errors.ts";
@@ -1124,6 +1124,47 @@ test("the database lets a grant change only by its revocation, once and whole (P
     { revokedAt: null, revokedByUserId: null },
     "permission_grants_revocation_final",
   );
+});
+
+test("revokedGrantsOf reads each revoked grant with its agent and workspace, in the order of the IDs, and throws for an ID that names no revoked grant", async () => {
+  const { owner, workspaceId, projectId, repositoryId, agentId } =
+    await world();
+  const [secondScope] = await repositoriesIn(projectId, owner);
+  assert.ok(secondScope);
+  const first = await granted(agentId, owner, readRepository(repositoryId));
+  const second = await granted(agentId, owner, readRepository(secondScope));
+  const ids = await database().transaction((tx) =>
+    revokeGrants(
+      tx,
+      eq(permissionGrants.granteeAgentId, agentId),
+      owner.userId,
+      LATER,
+    ),
+  );
+  assert.deepEqual(ids, [first, second].sort());
+  assert.deepEqual(
+    await revokedGrantsOf(database(), ids),
+    ids.map((grantId) => ({
+      grantId,
+      granteeAgentId: agentId,
+      workspaceId,
+      revokedAt: LATER,
+    })),
+  );
+  assert.deepEqual(await revokedGrantsOf(database(), []), []);
+
+  const active = await granted(agentId, owner, readRepository(repositoryId));
+  for (const asked of [
+    [...ids, newId<PermissionGrantId>()],
+    [...ids, active],
+    [first, first],
+  ]) {
+    await assert.rejects(
+      revokedGrantsOf(database(), asked),
+      /^Error: Invariant broken/u,
+      JSON.stringify(asked),
+    );
+  }
 });
 
 test("a revocation is refused in order: not_found for the agent or the person, forbidden for another account, then not_found for a grant of another agent, and nothing is written", async () => {

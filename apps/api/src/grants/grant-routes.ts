@@ -16,9 +16,8 @@ import {
   GRANT_ROUTES,
   type PermissionGrantId,
   PermissionGrantIdSchema,
-  type ProtocolEvent,
 } from "@mymandev/protocol";
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance } from "fastify";
 import * as z from "zod";
 import {
   authOf,
@@ -28,7 +27,11 @@ import {
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
-import { grantCreatedEvent, grantRevokedEvent } from "../workspaces/events.ts";
+import {
+  grantCreatedEvent,
+  grantRevokedEvent,
+  sendGrantEvents,
+} from "../workspaces/events.ts";
 
 export type GrantRouteOptions = Readonly<{
   database: Database;
@@ -90,41 +93,6 @@ function refusedRevocation(
       return new ApiError(result.refusal);
     default:
       return result.refusal satisfies never;
-  }
-}
-
-/**
- * Sends grant events, in the order given, to the connections subscribed to
- * each event's workspace (`members` in `SERVER_EVENT_AUDIENCES`). The change
- * is committed, so a failure to tell the subscribers never fails the
- * answer; it is only logged, with the event type, the workspace ID, and the
- * error's type.
- */
-function sendGrantEvents(
-  request: FastifyRequest,
-  connections: ConnectionRegistry,
-  events: readonly Extract<
-    ProtocolEvent,
-    { type: "agent.grant.created" | "agent.grant.revoked" }
-  >[],
-): void {
-  for (const event of events) {
-    try {
-      const sent = connections.sendToWorkspace(event);
-      request.log.debug(
-        { eventType: event.type, workspaceId: event.workspaceId, sent },
-        "grant event",
-      );
-    } catch (error) {
-      request.log.error(
-        {
-          eventType: event.type,
-          workspaceId: event.workspaceId,
-          errorType: error instanceof Error ? error.name : typeof error,
-        },
-        "grant event failed",
-      );
-    }
   }
 }
 
@@ -211,7 +179,15 @@ export async function registerGrantRoutes(
           return result;
         });
         const { replaced } = granted;
-        sendGrantEvents(request, connections, [
+        if (replaced !== null && replaced.revokedAt === null) {
+          // The database revoked it in the committed transaction; the change
+          // stands, and only its event is missing.
+          request.log.error(
+            { grantId: replaced.id },
+            "Invariant broken: a replaced grant has no revocation time",
+          );
+        }
+        sendGrantEvents(request.log, connections, [
           ...(replaced === null || replaced.revokedAt === null
             ? []
             : [
@@ -256,9 +232,15 @@ export async function registerGrantRoutes(
         });
         const { grant } = revoked;
         if (grant.revokedAt === null) {
-          throw new Error("A revoked grant has no revocation time");
+          // The revocation is committed, so the answer is still `204`; only
+          // its event cannot be built.
+          request.log.error(
+            { grantId: grant.id },
+            "Invariant broken: a revoked grant has no revocation time",
+          );
+          return reply.code(204).send();
         }
-        sendGrantEvents(request, connections, [
+        sendGrantEvents(request.log, connections, [
           grantRevokedEvent(
             {
               grantId: grant.id,

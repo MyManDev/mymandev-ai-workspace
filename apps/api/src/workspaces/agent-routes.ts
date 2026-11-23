@@ -245,7 +245,7 @@ export function registerAgentRoutes(
       // Each revoked grant and each cancelled run reaches its workspace's
       // subscribed connections, as after a device revocation or a removal
       // (P-60, P-77).
-      sendRevokedGrants(connections, disabled.revokedGrants, now);
+      sendRevokedGrants(request.log, connections, disabled.revokedGrants, now);
       sendCancelledRuns(connections, disabled.cancelledRuns, now);
       return reply.code(204).send();
     },

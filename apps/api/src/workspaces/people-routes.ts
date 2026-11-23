@@ -121,7 +121,7 @@ export function registerPeopleRoutes(
       };
       sendAccountFrame(request, options.onAccountFrame, ended.userId, frame);
     }
-    sendRevokedGrants(connections, ended.revokedGrants, now);
+    sendRevokedGrants(request.log, connections, ended.revokedGrants, now);
     sendCancelledRuns(connections, ended.cancelledRuns, now);
   }
 

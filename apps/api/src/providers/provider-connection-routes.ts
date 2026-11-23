@@ -185,7 +185,7 @@ export async function registerProviderConnectionRoutes(
           }
           return revokedGrantsOf(tx, result.revokedGrantIds);
         });
-        sendRevokedGrants(options.connections, revokedGrants, now);
+        sendRevokedGrants(request.log, options.connections, revokedGrants, now);
         return reply.code(204).send();
       },
     );

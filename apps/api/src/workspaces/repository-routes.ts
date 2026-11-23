@@ -199,7 +199,12 @@ export function registerRepositoryRoutes(
         type: "workspace.repository.removed",
         payload: { projectId, repositoryId },
       });
-      sendRevokedGrants(options.connections, removed.revokedGrants, now);
+      sendRevokedGrants(
+        request.log,
+        options.connections,
+        removed.revokedGrants,
+        now,
+      );
       return reply.code(204).send();
     },
   );
