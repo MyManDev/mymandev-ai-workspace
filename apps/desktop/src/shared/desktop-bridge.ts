@@ -172,6 +172,8 @@ export interface ProjectRepositoriesBridge {
    * Registers a repository in the open project by its name: 1 to 100
    * characters without a slash or a backslash. `repository_limit`, without a
    * wait, means that the project is full until a repository is removed.
+   * `busy` means that another registration of the project still waits for
+   * its answer; nothing was sent.
    */
   readonly register: (
     projectId: string,

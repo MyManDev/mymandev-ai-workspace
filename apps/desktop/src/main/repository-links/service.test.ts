@@ -237,6 +237,8 @@ interface Write {
   readonly params: unknown;
   readonly body: unknown[];
   readonly answer: (result: unknown) => void;
+  /** Makes the write reject, as a call that fails on its way. */
+  readonly fail: (error: unknown) => void;
 }
 
 interface HarnessOptions {
@@ -325,8 +327,14 @@ class Harness {
       ) =>
         this.throwOnAction
           ? Promise.reject(new Error(`web app ${FOLDER_1}`))
-          : new Promise((resolve) => {
-              this.writes.push({ name, params, body, answer: resolve });
+          : new Promise((resolve, reject) => {
+              this.writes.push({
+                name,
+                params,
+                body,
+                answer: resolve,
+                fail: reject,
+              });
             }),
     } as unknown as ProjectRepositoryAccount;
     this.service = createProjectRepositoryService({
@@ -851,6 +859,202 @@ test("every failure of register and remove maps to a fixed refusal, repository_l
     "Removing a repository could not be sent.",
   ]);
   expectNoSecretInLogs(harness);
+});
+
+/**
+ * Registers `name` in PROJECT_1 and expects `busy`, with nothing sent: the
+ * write would show at once, before the answer is awaited.
+ */
+async function expectBusy(
+  harness: Harness,
+  name: string,
+  label?: string,
+): Promise<void> {
+  const sent = harness.writes.length;
+  const answer = harness.service.register(PROJECT_1, name);
+  expect(harness.writes, label).toHaveLength(sent);
+  await expect(answer, label).resolves.toEqual({
+    outcome: "refused",
+    reason: "busy",
+    retryAfterMs: null,
+  });
+}
+
+test("one registration of a project is on its way at a time: another one of it is busy and sends nothing, while another project, a removal, a link, and an unlink are not held", async () => {
+  const harness = new Harness();
+  await harness.ready(repository(REPO_1));
+
+  const first = harness.service.register(PROJECT_1, "web app");
+  expect(harness.writes).toHaveLength(1);
+  // A panel that was closed and opened again forgot the first one; the
+  // main process did not, and sends the same name no second time.
+  await expectBusy(harness, "web app");
+  await expectBusy(harness, "api");
+  expect(harness.writes).toHaveLength(1);
+
+  // The project closed, with no project open, and opened again before the
+  // first answer, as the issue tells it: still busy.
+  harness.open(WS_A, null);
+  await expect(harness.service.register(PROJECT_1, "web app")).resolves.toEqual(
+    { outcome: "refused", reason: "not_open", retryAfterMs: null },
+  );
+  harness.open(WS_A, PROJECT_1);
+  await harness.answerRead({ ok: true, value: list(repository(REPO_1)) });
+  await expectBusy(harness, "web app");
+  expect(harness.writes).toHaveLength(1);
+
+  // Another project's registration is not held.
+  harness.open(WS_A, PROJECT_2);
+  await harness.answerRead({ ok: true, value: list() });
+  const other = harness.service.register(PROJECT_2, "web app");
+  expect(harness.writes).toHaveLength(2);
+  expect(harness.writes[1]).toMatchObject({
+    name: "registerRepository",
+    params: { projectId: PROJECT_2 },
+    body: [{ name: "web app" }],
+  });
+  harness.writes[1]?.answer({
+    ok: true,
+    value: { repository: repository(REPO_2, PROJECT_2) },
+  });
+  await expect(other).resolves.toEqual({ outcome: "ok", repositoryId: REPO_2 });
+
+  // After a switch to another project and back, its registration still
+  // holds the next one.
+  harness.open(WS_A, PROJECT_1);
+  await harness.answerRead({ ok: true, value: list(repository(REPO_1)) });
+  await expectBusy(harness, "web app");
+  expect(harness.writes).toHaveLength(2);
+
+  // A link, an unlink, and a removal of the project are not held.
+  harness.mount(MOUNT_1, FOLDER_1);
+  await expect(harness.service.link(REPO_1, MOUNT_1)).resolves.toEqual({
+    outcome: "linked",
+  });
+  await expect(harness.service.unlink(REPO_1)).resolves.toEqual({
+    outcome: "unlinked",
+  });
+  const removal = harness.service.remove(PROJECT_1, REPO_1);
+  expect(harness.writes).toHaveLength(3);
+  expect(harness.writes[2]).toMatchObject({ name: "removeRepository" });
+  harness.writes[2]?.answer({ ok: true, value: null });
+  await expect(removal).resolves.toEqual({ outcome: "ok" });
+
+  // The first answer ends the guard; the next registration goes through.
+  harness.writes[0]?.answer({
+    ok: true,
+    value: { repository: repository(REPO_3) },
+  });
+  await expect(first).resolves.toEqual({ outcome: "ok", repositoryId: REPO_3 });
+  const next = harness.service.register(PROJECT_1, "web app");
+  expect(harness.writes).toHaveLength(4);
+  expect(harness.writes[3]).toMatchObject({
+    name: "registerRepository",
+    params: { projectId: PROJECT_1 },
+    body: [{ name: "web app" }],
+  });
+  harness.writes[3]?.answer({
+    ok: true,
+    value: { repository: repository(REPO_2) },
+  });
+  await expect(next).resolves.toEqual({ outcome: "ok", repositoryId: REPO_2 });
+});
+
+test("the guard of a project's registration ends with its answer, whatever it is: done, refused, unknown, or a call that fails on its way", async () => {
+  const harness = new Harness();
+  await harness.ready();
+
+  const endings: [
+    string,
+    (write: (typeof harness.writes)[number]) => void,
+    unknown,
+  ][] = [
+    [
+      "ok",
+      (write) =>
+        write.answer({ ok: true, value: { repository: repository(REPO_1) } }),
+      { outcome: "ok", repositoryId: REPO_1 },
+    ],
+    [
+      "refused",
+      (write) => write.answer(workspaceActionFailed("conflict")),
+      { outcome: "refused", reason: "conflict", retryAfterMs: null },
+    ],
+    [
+      "unknown",
+      (write) => write.answer(workspaceActionFailed("unknown")),
+      { outcome: "unknown" },
+    ],
+    [
+      "rejected",
+      (write) => write.fail(new Error(`web app ${FOLDER_1}`)),
+      { outcome: "unknown" },
+    ],
+  ];
+  for (const [label, end, expected] of endings) {
+    const sent = harness.writes.length;
+    const first = harness.service.register(PROJECT_1, "web app");
+    expect(harness.writes, label).toHaveLength(sent + 1);
+    await expectBusy(harness, "web app", label);
+    const write = harness.writes.at(-1);
+    if (write === undefined) {
+      throw new Error("No write waits");
+    }
+    end(write);
+    await expect(first, label).resolves.toEqual(expected);
+  }
+
+  // A call that throws at once ends it too.
+  harness.throwOnAction = true;
+  await expect(harness.service.register(PROJECT_1, "web app")).resolves.toEqual(
+    { outcome: "unknown" },
+  );
+  harness.throwOnAction = false;
+
+  // After every one of them, a registration reaches the server again.
+  const sent = harness.writes.length;
+  const next = harness.service.register(PROJECT_1, "web app");
+  expect(harness.writes).toHaveLength(sent + 1);
+  harness.writes.at(-1)?.answer({
+    ok: true,
+    value: { repository: repository(REPO_2) },
+  });
+  await expect(next).resolves.toEqual({ outcome: "ok", repositoryId: REPO_2 });
+  expect(harness.logs).toEqual([
+    "Registering a repository could not be sent.",
+    "Registering a repository could not be sent.",
+  ]);
+  expectNoSecretInLogs(harness);
+});
+
+test("a registration refused before it is sent holds nothing: the project that it named registers once it is open", async () => {
+  const harness = new Harness();
+  await harness.ready();
+
+  await expect(harness.service.register(PROJECT_2, "web app")).resolves.toEqual(
+    { outcome: "refused", reason: "not_open", retryAfterMs: null },
+  );
+  await expect(harness.service.register("project", "web app")).resolves.toEqual(
+    { outcome: "refused", reason: "invalid", retryAfterMs: null },
+  );
+  expect(harness.writes).toHaveLength(0);
+
+  harness.open(WS_A, PROJECT_2);
+  await harness.answerRead({ ok: true, value: list() });
+  const answer = harness.service.register(PROJECT_2, "web app");
+  expect(harness.writes).toHaveLength(1);
+  expect(harness.writes[0]).toMatchObject({
+    name: "registerRepository",
+    params: { projectId: PROJECT_2 },
+  });
+  harness.writes[0]?.answer({
+    ok: true,
+    value: { repository: repository(REPO_1, PROJECT_2) },
+  });
+  await expect(answer).resolves.toEqual({
+    outcome: "ok",
+    repositoryId: REPO_1,
+  });
 });
 
 test("remove drops the repository and every link of it at once, and writes the links", async () => {

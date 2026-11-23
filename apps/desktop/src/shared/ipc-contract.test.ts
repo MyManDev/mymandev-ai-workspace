@@ -2603,11 +2603,22 @@ test("register and remove answer ok, refused with a known reason and a wait only
     expect(
       schema.safeParse({
         outcome: "refused",
-        reason: "busy",
+        reason: "cancelled",
         retryAfterMs: null,
       }).success,
     ).toBe(false);
   }
+  // Another registration of the project on its way (#317) is `busy`,
+  // without a wait; a removal is never held by it.
+  expect(REGISTER_REPOSITORY_REFUSALS).toContain("busy");
+  expect(
+    RegisterRepositoryResultSchema.safeParse({
+      outcome: "refused",
+      reason: "busy",
+      retryAfterMs: 1_000,
+    }).success,
+  ).toBe(false);
+  expect(REMOVE_REPOSITORY_REFUSALS).not.toContain("busy");
   // The limit of a project has its own refusal, without a wait.
   expect(REGISTER_REPOSITORY_REFUSALS).toContain("repository_limit");
   expect(

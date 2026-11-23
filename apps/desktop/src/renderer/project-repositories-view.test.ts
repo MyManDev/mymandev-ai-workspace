@@ -279,6 +279,17 @@ test("a registration's answer: done, unknown, and each refusal after the start, 
   ).toBe(
     "The repository could not be registered. This project already has as many repositories as it allows. A repository has to be removed first.",
   );
+  // Another registration of the project that the main process still waits
+  // for, perhaps from before the panel was closed (#317).
+  expect(
+    describeRegisterResult({
+      outcome: "refused",
+      reason: "busy",
+      retryAfterMs: null,
+    }),
+  ).toBe(
+    "The repository could not be registered. Another registration in this project is still waiting for the server's answer, perhaps one sent before the project was closed. Wait a moment and check the list before you try again.",
+  );
   expect(
     describeRegisterResult({
       outcome: "refused",

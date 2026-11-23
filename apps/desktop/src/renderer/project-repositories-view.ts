@@ -202,7 +202,9 @@ const TOO_SOON = (wait: string) =>
  * names the API's limit of new repositories of an account in 24 hours.
  * `repository_limit` names no wait, because none helps: only a removal
  * frees a place (the Project Manager's decision of 2026-11-14 on #286); it
- * names no number either.
+ * names no number either. `busy` is another registration of the project
+ * that the main process still waits for, perhaps one sent before the panel
+ * was closed (#317): the list may show it soon.
  */
 export const REGISTER_REPOSITORY_REFUSAL_MESSAGES: Readonly<
   Record<
@@ -216,6 +218,7 @@ export const REGISTER_REPOSITORY_REFUSAL_MESSAGES: Readonly<
   invalid:
     "The name is not allowed. Use visible characters, without line breaks, a slash, or a backslash.",
   not_open: NOT_OPEN,
+  busy: "Another registration in this project is still waiting for the server's answer, perhaps one sent before the project was closed. Wait a moment and check the list before you try again.",
   not_signed_in: SIGNED_OUT,
   unavailable: CANNOT_SEND,
   tooSoon: TOO_SOON,

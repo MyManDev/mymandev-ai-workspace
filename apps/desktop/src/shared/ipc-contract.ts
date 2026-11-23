@@ -1177,6 +1177,9 @@ export type ProjectRepositoriesView = z.infer<
  * Why registering a repository was refused, as for a project, and:
  *
  * - `not_open`: the project is not the open one. Nothing was sent.
+ * - `busy`: another registration of the same project is still waiting for
+ *   its answer, perhaps one sent before the project was closed and opened
+ *   again (#317). Nothing was sent: the server does not keep names unique.
  * - `repository_limit`: the project holds as many repositories as it may
  *   (the Project Manager's decision of 2026-11-14 on #286). It carries no
  *   wait: only removing a repository frees a place.
@@ -1187,6 +1190,7 @@ export type ProjectRepositoriesView = z.infer<
 export const REGISTER_REPOSITORY_REFUSALS = Object.freeze([
   "invalid",
   "not_open",
+  "busy",
   "not_signed_in",
   "unavailable",
   "too_soon",
