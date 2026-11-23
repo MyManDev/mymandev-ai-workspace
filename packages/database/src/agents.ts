@@ -51,8 +51,8 @@ import {
 //   as `revoked_by_user_id` (ADR 0015, P-77), and cancels the agent's
 //   unfinished runs with the reason `agent_disabled` (`src/cascade.ts`). The
 //   result lists the revoked grants for the `agent.grant.revoked` events that
-//   the grant routes will send (#75); the API sends none yet, as for a
-//   repository removal, a device revocation, or a removal of a person.
+//   the API sends after the commit (#75; `revokedGrantsOf` of
+//   `src/cascade.ts`), as for every change that revokes grants.
 // - Neither function writes an audit record: they are not administrative
 //   actions of ADR 0014, and its audit vocabulary has no agent action.
 //
