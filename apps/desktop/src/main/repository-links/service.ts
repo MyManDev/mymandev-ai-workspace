@@ -8,7 +8,9 @@
 //   `workspace.repository.removed` of the selected workspace, through the
 //   service's own resync gate, as the agent service does. The service
 //   registers and removes them with the allowlisted writes. A registration
-//   reaches the list through its server event, as a new project does.
+//   reaches the list through its server event, as a new project does. One
+//   registration of a project is on its way at a time; another one of the
+//   same project answers `busy` until the first one's answer (#317).
 // - The links live in the link store, a file in the local data folder
 //   (link-store.ts). A link names the account's own person in the workspace,
 //   so the service shows and resolves only the links whose person is the
@@ -654,6 +656,11 @@ export function createProjectRepositoryService(
   let confirmation: AbortController | null = null;
   /** Ends the pause after a cancel, while it runs; another link is `busy`. */
   let cancelPause: (() => void) | null = null;
+  /**
+   * The projects with a registration on its way, until its answer: another
+   * registration of one of them is `busy` (#317).
+   */
+  const registering = new Set<ProjectId>();
 
   let revision = 0;
   let dirty = false;
@@ -1378,6 +1385,27 @@ export function createProjectRepositoryService(
       return refused(open.reason);
     }
     const target = open.projectId;
+    // One registration of a project at a time, whichever renderer asks: a
+    // panel that was closed and opened again forgot the one on its way, and
+    // the server does not keep names unique, so a second one would register
+    // the name twice. It is refused, never queued, because a queued one
+    // would still reach the server. The guard ends with the answer,
+    // whatever it is; the request's own timeout bounds the wait.
+    if (registering.has(target)) {
+      return refused("busy");
+    }
+    registering.add(target);
+    try {
+      return await sendRegistration(target, name);
+    } finally {
+      registering.delete(target);
+    }
+  }
+
+  async function sendRegistration(
+    target: ProjectId,
+    name: string,
+  ): Promise<RegisterRepositoryResult> {
     let answer: WorkspaceActionResult<RegisterRepositoryResponse>;
     try {
       answer = await account.sendWorkspaceAction(
