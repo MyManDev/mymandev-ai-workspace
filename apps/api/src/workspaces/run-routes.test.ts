@@ -167,7 +167,7 @@ async function agentOf(
   return agentId;
 }
 
-/** A provider connection of the device, written directly: no route registers one yet. */
+/** A provider connection of the device, written directly, as the run tests need no registration. */
 async function connectionOf(
   device: SignedInDevice,
 ): Promise<ProviderConnectionId> {
