@@ -1489,6 +1489,12 @@ export type GatewayOptions = Readonly<{
   now: () => number;
   connections: ConnectionRegistry;
   onEvent: EventHandler;
+  /**
+   * Whether the gateway sends `connection.heartbeat` every
+   * `CONNECTION_HEARTBEAT_INTERVAL_MS` (#316). `buildApp` turns it on unless
+   * a test turns it off.
+   */
+  connectionHeartbeat: boolean;
 }>;
 
 /**
@@ -1506,7 +1512,8 @@ export type GatewayOptions = Readonly<{
  * the previous sweep still runs is skipped. Every 30 seconds the heartbeat
  * pings the live connections and terminates one that did not answer the
  * previous ping. Every 15 seconds (`CONNECTION_HEARTBEAT_INTERVAL_MS`) every
- * live connection after `auth.ok` gets `connection.heartbeat` (#316).
+ * live connection after `auth.ok` gets `connection.heartbeat` (#316), unless
+ * `connectionHeartbeat` is off.
  */
 export function registerGateway(
   app: FastifyInstance,
@@ -1535,14 +1542,18 @@ export function registerGateway(
     connections.heartbeat(app.log);
   }, HEARTBEAT_INTERVAL_MS);
   heartbeat.unref();
-  const heartbeatFrames = setInterval(() => {
-    connections.sendHeartbeats();
-  }, CONNECTION_HEARTBEAT_INTERVAL_MS);
-  heartbeatFrames.unref();
+  const heartbeatFrames = options.connectionHeartbeat
+    ? setInterval(() => {
+        connections.sendHeartbeats();
+      }, CONNECTION_HEARTBEAT_INTERVAL_MS)
+    : null;
+  heartbeatFrames?.unref();
   app.addHook("onClose", async () => {
     clearInterval(sweeper);
     clearInterval(heartbeat);
-    clearInterval(heartbeatFrames);
+    if (heartbeatFrames !== null) {
+      clearInterval(heartbeatFrames);
+    }
     // The database closes after this hook, so a running sweep ends first.
     await sweeping;
   });

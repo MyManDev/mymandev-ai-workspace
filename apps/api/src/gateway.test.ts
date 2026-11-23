@@ -2071,7 +2071,7 @@ test("every 15 seconds each connection after auth.ok gets connection.heartbeat, 
   const sent = t.mock.method(connections, "sendHeartbeats");
   const { app, tick, cleared } = await intervalTimerApp(
     t,
-    { githubId: 3035, connections },
+    { githubId: 3035, connections, connectionHeartbeat: true },
     CONNECTION_HEARTBEAT_INTERVAL_MS,
     "connection heartbeat",
   );
@@ -2119,6 +2119,44 @@ test("every 15 seconds each connection after auth.ok gets connection.heartbeat, 
   assert.equal(cleared(), false);
   await app.close();
   assert.ok(cleared(), "the interval is cleared");
+});
+
+test("an app built as server.ts builds it sends connection.heartbeat, and a test app sends none unless the test turns it on", async (t) => {
+  const setIntervalSpy = t.mock.method(globalThis, "setInterval");
+  const heartbeatIntervals = () =>
+    setIntervalSpy.mock.calls.filter(
+      (call) =>
+        call.arguments[1] === CONNECTION_HEARTBEAT_INTERVAL_MS &&
+        /[/\\]gateway\.ts:/u.test(call.stack.stack ?? ""),
+    );
+  // A test client must not read a heartbeat in place of the frame it waits
+  // for, so the test apps leave them off.
+  await gatewayApp(t, { githubId: 3040 });
+  assert.equal(heartbeatIntervals().length, 0);
+
+  // server.ts passes no connectionHeartbeat, so the server sends them.
+  const connections = new ConnectionRegistry();
+  const sent = t.mock.method(connections, "sendHeartbeats", () => 0);
+  const app = await buildApp({
+    config: loadConfig({
+      NODE_ENV: "test",
+      API_PUBLIC_ORIGIN: ORIGIN,
+      API_GITHUB_CLIENT_ID: CLIENT_ID,
+      API_GITHUB_CLIENT_SECRET: CLIENT_SECRET,
+    }),
+    version: "0.0.0",
+    logger: false,
+    shutdownGraceMs: 50,
+    database: database(),
+    connections,
+  });
+  t.after(() => app.close());
+  const intervals = heartbeatIntervals();
+  assert.equal(intervals.length, 1, "the server registers the interval");
+  const [interval] = intervals;
+  assert.ok(interval);
+  (interval.arguments[0] as () => void)();
+  assert.equal(sent.mock.callCount(), 1);
 });
 
 test("the gateway sweeps every 60 seconds, skips a tick while a sweep runs, and clears its interval when the app closes", async (t) => {

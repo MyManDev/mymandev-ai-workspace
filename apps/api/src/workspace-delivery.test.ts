@@ -1136,9 +1136,6 @@ test("the heartbeat pings every 30 seconds and terminates a connection that did 
   const ada = await signInDevice(app);
   const answered = t.mock.method(connections, "answered");
   const heartbeat = t.mock.method(connections, "heartbeat");
-  // The mocked clock also runs the interval of connection.heartbeat (#316),
-  // which gateway.test.ts covers; here only the pings count.
-  t.mock.method(connections, "sendHeartbeats", () => 0);
 
   const {
     workspaceId,
