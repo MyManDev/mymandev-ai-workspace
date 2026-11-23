@@ -737,12 +737,11 @@ export function actorAllowed(event: ProtocolEvent): boolean {
  * Whether a run transition's `reason` fits its actor (#201). A code of
  * `RUN_CANCEL_REASONS` says that the server cancelled the run because a
  * device was revoked, a person was removed, or the agent was disabled, so
- * only a `system` actor may
- * give one; an agent may give any other reason, in any state. The decoders
- * do not apply this rule, unlike `actorAllowed`, because a decode error
- * closes the connection: the server answers an agent's transition with
- * such a reason with `event.refused` and `conflict`, stores and relays
- * nothing, and the connection stays open.
+ * only a `system` actor may give one; an agent may give any other reason, in
+ * any state. The decoders do not apply this rule, unlike `actorAllowed`,
+ * because a decode error closes the connection: the server answers an
+ * agent's transition with such a reason with `event.refused` and
+ * `conflict`, stores and relays nothing, and the connection stays open.
  */
 export function runReasonAllowed(
   event: Pick<AgentRunStateChangedEvent, "actor" | "payload">,

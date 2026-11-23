@@ -8,6 +8,7 @@ import {
   AGENT_ROUTES,
   AgentListItemSchema,
   AgentListResponseSchema,
+  type AgentRouteName,
   AgentRunListResponseSchema,
   CreateAgentRequestSchema,
   CreateAgentResponseSchema,
@@ -32,7 +33,6 @@ import {
   LIMITS,
   MAX_ANSWER_LIST_ITEMS,
   RECENT_FINISHED_RUNS,
-  RUN_CANCEL_REASONS,
   RUN_STATES,
   TERMINAL_RUN_STATES,
 } from "./model.ts";
@@ -475,10 +475,27 @@ test("the run list holds the unfinished runs and the most recently finished runs
   }
 });
 
-test("the agent activity schemas export to JSON Schema for documentation", () => {
-  for (const schema of [AgentListResponseSchema, AgentRunListResponseSchema]) {
-    const json = z.toJSONSchema(schema, { io: "input" });
-    assert.equal(typeof json, "object");
+test("the schemas of each agent route export to JSON Schema for documentation", () => {
+  const schemas = {
+    listAgents: [null, AgentListResponseSchema],
+    listRuns: [null, AgentRunListResponseSchema],
+    createAgent: [CreateAgentRequestSchema, CreateAgentResponseSchema],
+    disableAgent: [null, null],
+  } satisfies Record<
+    AgentRouteName,
+    [request: z.ZodType | null, response: z.ZodType | null]
+  >;
+  assert.deepEqual(Object.keys(schemas), Object.keys(AGENT_ROUTES));
+  for (const [name, pair] of Object.entries(schemas)) {
+    for (const schema of pair) {
+      if (schema !== null) {
+        assert.equal(
+          typeof z.toJSONSchema(schema, { io: "input" }),
+          "object",
+          name,
+        );
+      }
+    }
   }
 });
 
@@ -612,8 +629,6 @@ test("the answer of a creation is the new agent as the list shows it: enabled, w
     false,
   );
   assert.equal(CreateAgentResponseSchema.safeParse({}).success, false);
-  const json = z.toJSONSchema(CreateAgentResponseSchema, { io: "input" });
-  assert.equal(typeof json, "object");
 });
 
 test("agent events come only from the server, with a system actor and no device", () => {
@@ -727,10 +742,4 @@ test("agent events carry the agent as the list shows it, never its host device, 
       label,
     );
   }
-});
-
-// `decode.test.ts` holds every code of RUN_CANCEL_REASONS, agent_disabled
-// included, to the server alone (#201).
-test("agent_disabled is a cancel reason of the server", () => {
-  assert.equal(RUN_CANCEL_REASONS.includes("agent_disabled"), true);
 });
