@@ -70,6 +70,23 @@ export const MAX_FRAME_BYTES = 64 * 1024;
  */
 export const WS_AUTH_TIMEOUT_MS = 10_000;
 
+/**
+ * How often the server sends `connection.heartbeat` to every connection
+ * after `auth.ok` (#316). The heartbeat is a frame of the protocol, unlike
+ * the gateway's WebSocket pings, which `net.WebSocket` answers without
+ * showing them to the desktop.
+ */
+export const CONNECTION_HEARTBEAT_INTERVAL_MS = 15_000;
+
+/**
+ * After `auth.ok`, a device closes its connection and connects again when
+ * no message of any kind arrived for this long (#316): three heartbeats
+ * missed in a row. It lies below the gateway's own drop of a connection
+ * that stopped answering pings, about 60 seconds.
+ */
+export const CONNECTION_LIVENESS_BOUND_MS =
+  3 * CONNECTION_HEARTBEAT_INTERVAL_MS;
+
 const frameHeaderShape = Object.freeze({
   protocolVersion: z.literal(PROTOCOL_VERSION),
 });
@@ -379,6 +396,23 @@ export const EventRefusedFrameSchema = z.object({
 });
 export type EventRefusedFrame = z.infer<typeof EventRefusedFrameSchema>;
 
+/**
+ * The server's heartbeat (#316): sent to every connection after `auth.ok`
+ * every `CONNECTION_HEARTBEAT_INTERVAL_MS`, and never before it. It carries
+ * nothing; any message that arrives shows that the connection is live. A
+ * device never passes it on to the code that follows its messages, and
+ * never answers it. A device built before this frame existed refuses it as
+ * `unknown_type` and closes its connection, so both peers of protocol
+ * version 0 run the same version (ADR 0006).
+ */
+export const ConnectionHeartbeatFrameSchema = z.object({
+  ...frameHeaderShape,
+  type: z.literal("connection.heartbeat"),
+});
+export type ConnectionHeartbeatFrame = z.infer<
+  typeof ConnectionHeartbeatFrameSchema
+>;
+
 /** Every frame that the server sends. */
 export const ServerFrameSchema = z.discriminatedUnion("type", [
   AuthChallengeFrameSchema,
@@ -395,6 +429,7 @@ export const ServerFrameSchema = z.discriminatedUnion("type", [
   WorkspaceUnsubscribedFrameSchema,
   PresenceChangedFrameSchema,
   EventRefusedFrameSchema,
+  ConnectionHeartbeatFrameSchema,
 ]);
 export type ServerFrame = z.infer<typeof ServerFrameSchema>;
 

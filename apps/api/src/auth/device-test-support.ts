@@ -198,6 +198,8 @@ export async function deviceApp(
   });
   const app = await buildApp({
     shutdownGraceMs: 50,
+    // A test client reads no heartbeat unless the test turns them on (#316).
+    connectionHeartbeat: false,
     ...rest,
     config: loadConfig({
       NODE_ENV: "test",

@@ -14,6 +14,9 @@ import {
 } from "./envelope.ts";
 import {
   CLIENT_FRAME_TYPES,
+  CONNECTION_HEARTBEAT_INTERVAL_MS,
+  CONNECTION_LIVENESS_BOUND_MS,
+  ConnectionHeartbeatFrameSchema,
   decodeClientFrame,
   decodeClientMessage,
   decodeServerMessage,
@@ -143,7 +146,13 @@ function serverFrames(): Json[] {
     },
     ...workspaceServerFrames(),
     eventRefused(),
+    heartbeatFrame(),
   ];
+}
+
+/** The server's heartbeat (#316). */
+function heartbeatFrame(): Json {
+  return { protocolVersion: 0, type: "connection.heartbeat" };
 }
 
 /** The server refused the event of `chatSend`. */
@@ -336,6 +345,48 @@ test("authentication has 10 seconds and a frame limit of 1 KiB, and an authentic
   assert.equal(MAX_AUTH_FRAME_BYTES, 1024);
   // Equal to the `maxPayload` of the gateway in @mymandev/api.
   assert.equal(MAX_FRAME_BYTES, 64 * 1024);
+});
+
+test("the server sends a heartbeat every 15 seconds, and a device allows three to be missed: 45 seconds", () => {
+  assert.equal(CONNECTION_HEARTBEAT_INTERVAL_MS, 15_000);
+  assert.equal(CONNECTION_LIVENESS_BOUND_MS, 45_000);
+  assert.equal(
+    CONNECTION_LIVENESS_BOUND_MS,
+    3 * CONNECTION_HEARTBEAT_INTERVAL_MS,
+  );
+});
+
+test("connection.heartbeat carries only the header; a device decodes it as a server frame and may never send it", () => {
+  const heartbeat = heartbeatFrame();
+  assert.ok(SERVER_FRAME_TYPES.includes("connection.heartbeat"));
+  assert.equal(
+    CLIENT_FRAME_TYPES.includes("connection.heartbeat" as never),
+    false,
+  );
+  // Unknown fields are stripped, as for every frame.
+  assert.deepEqual(
+    decodeServerMessage({ ...heartbeat, sentAt: NOW, extra: 1 }),
+    { ok: true, kind: "frame", frame: heartbeat },
+  );
+  assert.deepEqual(ConnectionHeartbeatFrameSchema.parse(heartbeat), heartbeat);
+  assert.deepEqual(decodeServerMessage({ ...heartbeat, protocolVersion: 1 }), {
+    ok: false,
+    code: "unsupported_version",
+  });
+  assert.deepEqual(
+    decodeServerMessage({ ...heartbeat, type: "connection.heartbeats" }),
+    { ok: false, code: "unknown_type" },
+  );
+  assert.deepEqual(decodeClientFrame(heartbeat), {
+    ok: false,
+    code: "not_allowed_from_device",
+  });
+  assert.deepEqual(decodeClientMessage(heartbeat), {
+    ok: false,
+    code: "not_allowed_from_device",
+  });
+  // Small enough to cost nothing at its interval.
+  assert.ok(new TextEncoder().encode(JSON.stringify(heartbeat)).length < 64);
 });
 
 test("a frame type has two parts and an event type three, so they never overlap", () => {

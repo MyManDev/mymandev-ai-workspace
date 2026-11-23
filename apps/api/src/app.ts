@@ -73,6 +73,13 @@ export type BuildAppOptions = Readonly<{
    * pass one to count or close connections.
    */
   connections?: ConnectionRegistry;
+  /**
+   * Whether the gateway sends `connection.heartbeat` every 15 seconds (#316).
+   * Default: true, which the server runs with. The test apps turn it off, so
+   * that a test client never reads a heartbeat in place of the frame it
+   * waits for; only the heartbeat tests turn it on.
+   */
+  connectionHeartbeat?: boolean;
   /** How long shutdown waits for WebSocket clients to close. Default: 2000 ms. */
   shutdownGraceMs?: number;
   /**
@@ -489,6 +496,7 @@ export async function buildApp(
         database,
         now,
         connections,
+        connectionHeartbeat: options.connectionHeartbeat ?? true,
         onEvent:
           options.onEvent ??
           dispatchDeviceEvents(
