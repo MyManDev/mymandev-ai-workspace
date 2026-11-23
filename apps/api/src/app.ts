@@ -30,6 +30,7 @@ import {
 } from "./gateway.ts";
 import { dispatchDeviceEvents } from "./device-events.ts";
 import { serializeError, serializeRequest } from "./log.ts";
+import { registerProviderConnectionRoutes } from "./providers/provider-connection-routes.ts";
 import { runTransitionHandler } from "./workspaces/agent-events.ts";
 import { chatSendHandler } from "./workspaces/chat-events.ts";
 import {
@@ -451,6 +452,12 @@ export async function buildApp(
         tokens,
         requireAccessToken,
         connections,
+        now,
+      });
+      // The calling device's provider connections (#295).
+      await registerProviderConnectionRoutes(app, {
+        database,
+        requireAccessToken,
         now,
       });
       await registerWorkspaceRoutes(app, {
