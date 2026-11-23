@@ -6,6 +6,19 @@
 // does not exist and a project of a workspace that the account is not an
 // active member of both answer `404` and `not_found`, so that a route never
 // tells them apart.
+//
+// Creating and disabling an agent (#294; Project Manager decisions of
+// 2026-11-20, whose defaults the Project Manager accepted on 2026-11-23):
+// any active member of the project's workspace creates an agent from the
+// calling device, which becomes the agent's host device, and the caller's
+// person owns it. The agent's owner, from any of the owner's devices, and
+// the workspace's owner and admins disable it. Disabling is final in v0: it
+// revokes the agent's active grants and cancels its unfinished runs in its
+// own transaction (ADR 0015, P-77; `agent_disabled` of
+// `RUN_CANCEL_REASONS`), and nothing enables the agent again. An agent has
+// no provider kind: a run names its provider connection (ADR 0007, update
+// of 2026-11-14). The README lists the contract under "Agent creation and
+// disabling".
 
 import * as z from "zod";
 import type { ApiRoute } from "./auth-api.ts";
@@ -27,9 +40,10 @@ function route(method: ApiRoute["method"], path: string): ApiRoute {
 }
 
 /**
- * The agent activity routes (#28). Every path parameter is an ID, and no
- * route takes a query. The paths start with the project, as the chat
- * history does: a project ID names its workspace.
+ * The agent activity routes (#28) and the routes that create and disable an
+ * agent (#294). Every path parameter is an ID, and no route takes a query.
+ * The paths start with the project, as the chat history does: a project ID
+ * names its workspace.
  */
 export const AGENT_ROUTES = Object.freeze({
   /**
@@ -42,10 +56,23 @@ export const AGENT_ROUTES = Object.freeze({
    * active member.
    */
   listRuns: route("GET", "/projects/:projectId/runs"),
+  /**
+   * Creates an agent in the project and answers `200` with it. Any active
+   * member of the project's workspace; the calling device becomes the
+   * agent's host device, and the caller owns the agent (#294).
+   */
+  createAgent: route("POST", "/projects/:projectId/agents"),
+  /**
+   * Disables an agent of the project and answers `204` without a body. The
+   * agent's owner, from any of the owner's devices, and the workspace's
+   * owner and admins (#294). It revokes the agent's active grants and
+   * cancels its unfinished runs in the same transaction.
+   */
+  disableAgent: route("POST", "/projects/:projectId/agents/:agentId/disable"),
 });
 export type AgentRouteName = keyof typeof AGENT_ROUTES;
 
-/** The codes that every agent activity route can answer. */
+/** The codes that every agent route can answer. */
 const COMMON_ERRORS = Object.freeze([
   "bad_request",
   "unauthorized",
@@ -58,15 +85,53 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
 }
 
 /**
- * Every error code that each agent activity route can answer, with its
- * status from `API_ERROR_STATUS`: the common codes of the membership routes,
- * and `not_found` for a project that does not exist or that is in a
- * workspace that the account is not an active member of.
+ * Every error code that each agent route can answer, with its status from
+ * `API_ERROR_STATUS`: the common codes of the membership routes, and
+ * `not_found` for a project that does not exist or that is in a workspace
+ * that the account is not an active member of. Beyond those, decided in
+ * this order:
+ *
+ * - a creation: `conflict` for an archived project or workspace; then
+ *   `agent_limit` for a project at a count limit of `AGENT_COUNT_LIMITS`,
+ *   without `Retry-After`; then `rate_limited` with `Retry-After` for an
+ *   account at its limit of new agents in 24 hours, whose places come free
+ *   with time;
+ * - a disable: `not_found` for an agent ID that the project does not have,
+ *   also one of another project; `forbidden` for a caller who neither owns
+ *   the agent nor is the workspace's owner or an admin; `conflict` for an
+ *   agent that is already disabled, or an archived project or workspace.
  */
 export const AGENT_ROUTE_ERRORS = Object.freeze({
   listAgents: errors("not_found"),
   listRuns: errors("not_found"),
+  createAgent: errors("not_found", "conflict", "agent_limit"),
+  disableAgent: errors("not_found", "forbidden", "conflict"),
 } satisfies Record<AgentRouteName, readonly ApiErrorCode[]>);
+
+/**
+ * How many agents a project and an account may have (#294; Project Manager
+ * decision of 2026-11-20):
+ *
+ * - `enabledPerProject`: at most 20 enabled agents in one project. A
+ *   creation over it answers `agent_limit`; only disabling an agent frees a
+ *   place.
+ * - `perProject`: at most 500 agents in one project over its lifetime,
+ *   disabled ones included. A creation over it answers `agent_limit` too,
+ *   and nothing frees a place. It keeps the agent list, which holds the
+ *   disabled agents too, within `MAX_ANSWER_LIST_ITEMS`.
+ * - `perDay`: at most 20 new agents of one account within 24 hours, in all
+ *   its projects together, disabled ones included. A creation over it
+ *   answers `rate_limited` with `Retry-After`, by the rule of 2026-11-14 on
+ *   #75: a limit whose places come free with time answers `rate_limited`.
+ *
+ * The API applies these values. They may be tuned with use (ADR 0014,
+ * P-64).
+ */
+export const AGENT_COUNT_LIMITS = Object.freeze({
+  enabledPerProject: 20,
+  perProject: 500,
+  perDay: 20,
+} as const);
 
 /**
  * An agent as every member of its workspace sees it. It names no device:
@@ -84,6 +149,38 @@ export const AgentListItemSchema = z.object({
   disabledAt: UtcTimestampSchema.nullable(),
 });
 export type AgentListItem = z.infer<typeof AgentListItemSchema>;
+
+/**
+ * `POST /projects/:projectId/agents`. The body holds the name only; every
+ * other field is stripped, a host device, an owner, or a provider kind
+ * included. The name is a label of 1 to `LIMITS.agentName` (64) characters
+ * of single-line text by the text rule of ADR 0005: stored as sent, not
+ * normalized, not trimmed, and not unique (ADR 0005, update of 2026-11-02).
+ */
+export const CreateAgentRequestSchema = z.object({
+  name: displayText(LIMITS.agentName),
+});
+export type CreateAgentRequest = z.infer<typeof CreateAgentRequestSchema>;
+
+/**
+ * The answer of `POST /projects/:projectId/agents`: the new agent as every
+ * member sees it in the agent list, enabled and without its host device,
+ * which is the calling device. The schema cannot see the request, so the
+ * device checks that the agent names the project of the path and the name
+ * that it sent, and that `ownerMemberId` is its account's person.
+ */
+export const CreateAgentResponseSchema = z
+  .object({ agent: AgentListItemSchema })
+  .superRefine(({ agent }, ctx) => {
+    if (agent.disabledAt !== null) {
+      ctx.addIssue({
+        code: "custom",
+        message: "A new agent is enabled",
+        path: ["agent", "disabledAt"],
+      });
+    }
+  });
+export type CreateAgentResponse = z.infer<typeof CreateAgentResponseSchema>;
 
 /** The answer of `GET /projects/:projectId/agents`: each agent once. */
 export const AgentListResponseSchema = z

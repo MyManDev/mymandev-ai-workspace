@@ -143,10 +143,13 @@ export type IdentityProvider = (typeof IDENTITY_PROVIDERS)[number];
  * actor (P-60). The desktop shows a known code as its own text. They are
  * the server's alone: it refuses an agent's transition with one of them
  * with `event.refused` and `conflict` (`runReasonAllowed`, #201).
+ * `agent_disabled`: the run's agent was disabled (#294; Project Manager
+ * decision of 2026-11-20).
  */
 export const RUN_CANCEL_REASONS = Object.freeze([
   "member_removed",
   "device_revoked",
+  "agent_disabled",
 ] as const);
 export type RunCancelReason = (typeof RUN_CANCEL_REASONS)[number];
 
@@ -324,6 +327,15 @@ export const API_ERROR_STATUS = Object.freeze({
    * 2026-11-14). Only `POST /agents/:agentId/grants` answers it.
    */
   grant_limit: 409,
+  /**
+   * An agent creation over a count limit of `AGENT_COUNT_LIMITS` (#294;
+   * Project Manager decision of 2026-11-20): a project that already holds
+   * 20 enabled agents, or that already has 500 agents, disabled ones
+   * included. No time frees a place: only disabling an agent frees one of
+   * the first, and nothing frees one of the second, so the answer carries
+   * no `Retry-After`. Only `POST /projects/:projectId/agents` answers it.
+   */
+  agent_limit: 409,
   /**
    * A new device's sign-in on an account that already has 20 active devices
    * (#255). No time frees a place, only revoking one of them does, so the

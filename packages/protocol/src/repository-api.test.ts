@@ -219,6 +219,7 @@ test("each repository route answers only known error codes, the common ones incl
   assert.deepEqual(holders("repository_limit"), ["registerRepository"]);
   // The other limits that no time frees have their own routes.
   assert.deepEqual(holders("project_limit"), []);
+  assert.deepEqual(holders("agent_limit"), []);
   assert.deepEqual(holders("device_limit"), []);
   assert.deepEqual(holders("unclaimed_limit"), []);
   // No time frees a place, so the status is a conflict and not a wait.

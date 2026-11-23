@@ -179,6 +179,7 @@ test("each project route answers only known error codes, the common ones include
   assert.deepEqual(holders("project_limit"), ["createProject"]);
   assert.deepEqual(holders("repository_limit"), []);
   assert.deepEqual(holders("grant_limit"), []);
+  assert.deepEqual(holders("agent_limit"), []);
   assert.deepEqual(holders("device_limit"), []);
   assert.deepEqual(holders("device_daily_limit"), []);
   assert.deepEqual(holders("unclaimed_limit"), []);

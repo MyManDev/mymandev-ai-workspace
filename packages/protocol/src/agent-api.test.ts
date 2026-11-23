@@ -3,23 +3,42 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import * as z from "zod";
 import {
+  AGENT_COUNT_LIMITS,
   AGENT_ROUTE_ERRORS,
   AGENT_ROUTES,
   AgentListItemSchema,
   AgentListResponseSchema,
   AgentRunListResponseSchema,
+  CreateAgentRequestSchema,
+  CreateAgentResponseSchema,
 } from "./agent-api.ts";
 import { AUTH_ROUTES, routePath } from "./auth-api.ts";
 import { CHAT_ROUTES } from "./chat-api.ts";
+import { decodeClientEvent, decodeEvent } from "./decode.ts";
+import {
+  APPROVER_EVENT_TYPES,
+  SERVER_EVENT_AUDIENCES,
+  SERVER_ONLY_EVENT_TYPES,
+  WorkspaceAgentCreatedEventSchema,
+  WorkspaceAgentDisabledEventSchema,
+} from "./envelope.ts";
+import { decodeClientMessage, decodeServerMessage } from "./frames.ts";
+import { GRANT_ROUTES } from "./grant-api.ts";
 import { MEMBERSHIP_ROUTES } from "./membership-api.ts";
 import {
   API_ERROR_CODES,
+  API_ERROR_STATUS,
+  type ApiErrorCode,
   LIMITS,
   MAX_ANSWER_LIST_ITEMS,
   RECENT_FINISHED_RUNS,
+  RUN_CANCEL_REASONS,
   RUN_STATES,
   TERMINAL_RUN_STATES,
 } from "./model.ts";
+import { PROJECT_ROUTES } from "./project-api.ts";
+import { REPOSITORY_ROUTES } from "./repository-api.ts";
+import { RUN_ROUTES } from "./run-api.ts";
 
 const PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b1";
 const OTHER_PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b2";
@@ -73,57 +92,125 @@ function runs(count: number, state: string, from = 1) {
   return Array.from({ length: count }, (_, index) => run(from + index, state));
 }
 
-test("the agent activity routes are fixed, frozen, and read a project", () => {
+test("the agent routes are fixed, frozen, and start with the project", () => {
   assert.deepEqual(
     Object.values(AGENT_ROUTES).map((route) => `${route.method} ${route.path}`),
-    ["GET /projects/:projectId/agents", "GET /projects/:projectId/runs"],
+    [
+      "GET /projects/:projectId/agents",
+      "GET /projects/:projectId/runs",
+      "POST /projects/:projectId/agents",
+      "POST /projects/:projectId/agents/:agentId/disable",
+    ],
   );
   assert.equal(Object.isFrozen(AGENT_ROUTES), true);
   for (const [name, route] of Object.entries(AGENT_ROUTES)) {
     assert.equal(Object.isFrozen(route), true, name);
     assert.equal(route.path.includes("?"), false, `${name}: query`);
+    const params: Record<string, string> = route.path.includes(":agentId")
+      ? { projectId: PROJECT_ID, agentId: AGENT_ID }
+      : { projectId: PROJECT_ID };
     assert.equal(
-      routePath(route.path, { projectId: PROJECT_ID }),
-      route.path.replace(":projectId", PROJECT_ID),
+      routePath(route.path, params),
+      route.path
+        .replace(":projectId", PROJECT_ID)
+        .replace(":agentId", AGENT_ID),
       name,
     );
     assert.throws(
-      () => routePath(route.path, { projectId: PROJECT_ID.toUpperCase() }),
+      () =>
+        routePath(route.path, {
+          ...params,
+          projectId: PROJECT_ID.toUpperCase(),
+        }),
       TypeError,
       name,
+    );
+  }
+  // An agent's name, or anything else that is not an ID, never fills a path.
+  for (const bad of ["Reviewer", AGENT_ID.toUpperCase(), ""]) {
+    assert.throws(
+      () =>
+        routePath(AGENT_ROUTES.disableAgent.path, {
+          projectId: PROJECT_ID,
+          agentId: bad,
+        }),
+      TypeError,
+      JSON.stringify(bad),
     );
   }
 });
 
 test("every route of the protocol has its own name and its own method and path", () => {
-  const groups = [AUTH_ROUTES, MEMBERSHIP_ROUTES, CHAT_ROUTES, AGENT_ROUTES];
+  const groups = [
+    AUTH_ROUTES,
+    MEMBERSHIP_ROUTES,
+    PROJECT_ROUTES,
+    CHAT_ROUTES,
+    AGENT_ROUTES,
+    REPOSITORY_ROUTES,
+    RUN_ROUTES,
+    GRANT_ROUTES,
+  ];
   const names = groups.flatMap((routes) => Object.keys(routes));
   assert.equal(new Set(names).size, names.length);
   const table = groups.flatMap((routes) =>
     Object.values(routes).map((route) => `${route.method} ${route.path}`),
   );
   assert.equal(new Set(table).size, table.length);
-  // The project routes all start with the project, as the history does.
+  // The project's chat and agent activity are read with GET, under the
+  // project, as the history is.
   for (const route of [
     ...Object.values(CHAT_ROUTES),
-    ...Object.values(AGENT_ROUTES),
+    AGENT_ROUTES.listAgents,
+    AGENT_ROUTES.listRuns,
   ]) {
     assert.match(route.path, /^\/projects\/:projectId\/[a-z]+$/u, route.path);
     assert.equal(route.method, "GET", route.path);
   }
+  // A change of an agent is a POST under the project.
+  for (const route of [AGENT_ROUTES.createAgent, AGENT_ROUTES.disableAgent]) {
+    assert.match(route.path, /^\/projects\/:projectId\/agents/u, route.path);
+    assert.equal(route.method, "POST", route.path);
+  }
 });
 
-test("the agent activity routes answer the common codes and not_found, frozen", () => {
+test("each agent route answers the common codes and its own, frozen, and only a creation answers agent_limit", () => {
   assert.deepEqual(Object.keys(AGENT_ROUTE_ERRORS), Object.keys(AGENT_ROUTES));
   const known = new Set<string>(API_ERROR_CODES);
+  assert.deepEqual(
+    Object.fromEntries(
+      Object.entries(AGENT_ROUTE_ERRORS).map(([name, codes]) => [
+        name,
+        codes.filter((code) => !COMMON_CODES.includes(code)),
+      ]),
+    ),
+    {
+      listAgents: ["not_found"],
+      listRuns: ["not_found"],
+      createAgent: ["not_found", "conflict", "agent_limit"],
+      disableAgent: ["not_found", "forbidden", "conflict"],
+    },
+  );
   for (const [name, codes] of Object.entries(AGENT_ROUTE_ERRORS)) {
-    assert.deepEqual(codes, [...COMMON_CODES, "not_found"], name);
+    assert.deepEqual(codes.slice(0, COMMON_CODES.length), COMMON_CODES, name);
     for (const code of codes) {
       assert.equal(known.has(code), true, `${name}: ${code}`);
     }
     assert.equal(Object.isFrozen(codes), true, name);
   }
   assert.equal(Object.isFrozen(AGENT_ROUTE_ERRORS), true);
+  const holders = (code: ApiErrorCode) =>
+    Object.entries(AGENT_ROUTE_ERRORS)
+      .filter(([, codes]) => codes.includes(code))
+      .map(([name]) => name);
+  assert.deepEqual(holders("agent_limit"), ["createAgent"]);
+  // The other limits that no time frees have their own routes.
+  assert.deepEqual(holders("repository_limit"), []);
+  assert.deepEqual(holders("run_limit"), []);
+  assert.deepEqual(holders("grant_limit"), []);
+  // No time frees a place of either count limit of a project, so the status
+  // is a conflict and not a wait.
+  assert.equal(API_ERROR_STATUS.agent_limit, 409);
 });
 
 test("an agent in the list shows its owner's person and whether it is disabled, never its host device", () => {
@@ -395,11 +482,11 @@ test("the agent activity schemas export to JSON Schema for documentation", () =>
   }
 });
 
-test("the README's table lists the agent activity routes with their codes", () => {
+test("the README's tables list the agent routes with their codes", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
   const rows = readme
     .split("\n")
-    .filter((line) => line.startsWith("| `GET /projects/"))
+    .filter((line) => /^\| `(?:GET|POST) \/projects\//u.test(line))
     .map((line) => line.split("|").map((cell) => cell.trim()));
   for (const [name, route] of Object.entries(AGENT_ROUTES)) {
     const row = rows.find(
@@ -418,4 +505,232 @@ test("the README's table lists the agent activity routes with their codes", () =
       name,
     );
   }
+});
+
+// Creating and disabling an agent (#294).
+
+const WORKSPACE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192c4";
+const EVENT_ID = "0192f2a0-7c3e-7e00-8000-0000000000e1";
+
+type Json = Record<string, unknown>;
+
+function agentEvent(type: string, payload: Json): Json {
+  return {
+    protocolVersion: 0,
+    id: EVENT_ID,
+    type,
+    occurredAt: NOW,
+    workspaceId: WORKSPACE_ID,
+    actor: { kind: "system" },
+    deviceId: null,
+    payload,
+  };
+}
+
+function agentEvents(): Json[] {
+  return [
+    agentEvent("workspace.agent.created", { agent }),
+    agentEvent("workspace.agent.disabled", {
+      agent: { ...agent, disabledAt: LATER },
+    }),
+  ];
+}
+
+test("the agent count limits are fixed, frozen, and keep the agent list within MAX_ANSWER_LIST_ITEMS", () => {
+  assert.deepEqual(AGENT_COUNT_LIMITS, {
+    enabledPerProject: 20,
+    perProject: 500,
+    perDay: 20,
+  });
+  assert.equal(Object.isFrozen(AGENT_COUNT_LIMITS), true);
+  // The list holds disabled agents too, so the lifetime limit bounds it.
+  assert.ok(AGENT_COUNT_LIMITS.perProject <= MAX_ANSWER_LIST_ITEMS);
+  assert.ok(
+    AGENT_COUNT_LIMITS.enabledPerProject <= AGENT_COUNT_LIMITS.perProject,
+  );
+});
+
+test("a creation takes a name of single-line text from 1 to 64 characters, and nothing else", () => {
+  const schema = CreateAgentRequestSchema;
+  for (const name of [
+    "Reviewer",
+    "a".repeat(LIMITS.agentName),
+    "\u00C4rger",
+    "Bot \u{1F680}",
+    " Reviewer ",
+    "Reviewer/2",
+  ]) {
+    assert.deepEqual(schema.safeParse({ name }).data, { name }, name);
+  }
+  for (const [label, value] of [
+    ["empty", { name: "" }],
+    ["over 64", { name: "a".repeat(LIMITS.agentName + 1) }],
+    ["blank", { name: " \t " }],
+    ["line feed inside", { name: "Re\nviewer" }],
+    ["line separator inside", { name: "Re\u2028viewer" }],
+    ["byte order mark inside", { name: "Re\uFEFFviewer" }],
+    ["control character", { name: "Re\u0000viewer" }],
+    ["zero-width space", { name: "Re\u200Bviewer" }],
+    ["right-to-left override", { name: "\u202Eweiver" }],
+    ["missing", {}],
+    ["null", { name: null }],
+    ["number", { name: 7 }],
+  ] as const) {
+    assert.equal(schema.safeParse(value).success, false, label);
+  }
+  assert.deepEqual(Object.keys(schema.shape), ["name"]);
+  // The host device, the owner, the project, and a provider kind are never
+  // the caller's to choose: they are stripped.
+  assert.deepEqual(
+    schema.parse({
+      name: "Reviewer",
+      hostDeviceId: DEVICE_ID,
+      ownerUserId: USER_ID,
+      ownerMemberId: MEMBER_ID,
+      projectId: OTHER_PROJECT_ID,
+      id: OTHER_AGENT_ID,
+      kind: "claude",
+      provider: "claude",
+      disabledAt: NOW,
+    }),
+    { name: "Reviewer" },
+  );
+});
+
+test("the answer of a creation is the new agent as the list shows it: enabled, without its host device", () => {
+  assert.deepEqual(CreateAgentResponseSchema.parse({ agent }), { agent });
+  assert.deepEqual(
+    CreateAgentResponseSchema.parse({
+      agent: { ...agent, hostDeviceId: DEVICE_ID, ownerUserId: USER_ID },
+    }),
+    { agent },
+  );
+  assert.equal(
+    CreateAgentResponseSchema.safeParse({
+      agent: { ...agent, disabledAt: NOW },
+    }).success,
+    false,
+  );
+  assert.equal(CreateAgentResponseSchema.safeParse({}).success, false);
+  const json = z.toJSONSchema(CreateAgentResponseSchema, { io: "input" });
+  assert.equal(typeof json, "object");
+});
+
+test("agent events come only from the server, with a system actor and no device", () => {
+  for (const event of agentEvents()) {
+    const label = String(event["type"]);
+    assert.deepEqual(decodeEvent(event), { ok: true, event }, label);
+    assert.deepEqual(
+      decodeServerMessage(event),
+      { ok: true, kind: "event", event },
+      `${label} reaches a device`,
+    );
+    assert.equal(
+      (SERVER_ONLY_EVENT_TYPES as readonly string[]).includes(label),
+      true,
+      label,
+    );
+    assert.deepEqual(
+      decodeEvent({ ...event, actor: { kind: "user", userId: USER_ID } }),
+      { ok: false, code: "invalid_actor" },
+      `${label} from a user`,
+    );
+    assert.deepEqual(
+      decodeEvent({ ...event, actor: { kind: "agent", agentId: AGENT_ID } }),
+      { ok: false, code: "invalid_actor" },
+      `${label} from the agent`,
+    );
+    assert.deepEqual(
+      decodeEvent({ ...event, deviceId: DEVICE_ID }),
+      { ok: false, code: "invalid_actor" },
+      `${label} with a device`,
+    );
+    assert.deepEqual(
+      decodeClientEvent(event),
+      { ok: false, code: "not_allowed_from_device" },
+      `${label} sent by a device`,
+    );
+    assert.deepEqual(
+      decodeClientMessage(event),
+      { ok: false, code: "not_allowed_from_device" },
+      `${label} sent by a device after authentication`,
+    );
+  }
+});
+
+test("agent events go to every member of the workspace, never only to the approvers", () => {
+  for (const type of [
+    "workspace.agent.created",
+    "workspace.agent.disabled",
+  ] as const) {
+    assert.equal(SERVER_EVENT_AUDIENCES[type], "members", type);
+    assert.equal(
+      (APPROVER_EVENT_TYPES as readonly string[]).includes(type),
+      false,
+      type,
+    );
+  }
+});
+
+test("agent events carry the agent as the list shows it, never its host device, and in the state that their type says", () => {
+  assert.deepEqual(
+    Object.keys(WorkspaceAgentCreatedEventSchema.shape.payload.shape),
+    ["agent"],
+  );
+  assert.deepEqual(
+    Object.keys(WorkspaceAgentDisabledEventSchema.shape.payload.shape),
+    ["agent"],
+  );
+  const [created, disabled] = agentEvents();
+  assert.ok(created !== undefined && disabled !== undefined);
+  // The host device and the owner's account are stripped.
+  assert.deepEqual(
+    decodeEvent({
+      ...created,
+      payload: {
+        agent: { ...agent, hostDeviceId: DEVICE_ID, ownerUserId: USER_ID },
+      },
+    }),
+    { ok: true, event: created },
+  );
+  for (const [label, input] of [
+    [
+      "a created agent that is disabled",
+      agentEvent("workspace.agent.created", {
+        agent: { ...agent, disabledAt: NOW },
+      }),
+    ],
+    [
+      "a disabled agent without the time of its disabling",
+      agentEvent("workspace.agent.disabled", { agent }),
+    ],
+    [
+      "a created agent without its owner",
+      agentEvent("workspace.agent.created", {
+        agent: { ...agent, ownerMemberId: undefined },
+      }),
+    ],
+    [
+      "a created agent with a name over 64 characters",
+      agentEvent("workspace.agent.created", {
+        agent: { ...agent, name: "a".repeat(LIMITS.agentName + 1) },
+      }),
+    ],
+    [
+      "a disabled agent named only by its ID",
+      agentEvent("workspace.agent.disabled", { agentId: AGENT_ID }),
+    ],
+  ] as const) {
+    assert.deepEqual(
+      decodeEvent(input),
+      { ok: false, code: "invalid_payload" },
+      label,
+    );
+  }
+});
+
+// `decode.test.ts` holds every code of RUN_CANCEL_REASONS, agent_disabled
+// included, to the server alone (#201).
+test("agent_disabled is a cancel reason of the server", () => {
+  assert.equal(RUN_CANCEL_REASONS.includes("agent_disabled"), true);
 });
