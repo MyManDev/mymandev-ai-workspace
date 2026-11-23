@@ -134,6 +134,13 @@
       "when": 1795415770751,
       "tag": "0018_agent_creation",
       "breakpoints": true
+    },
+    {
+      "idx": 19,
+      "version": "7",
+      "when": 1795419966043,
+      "tag": "0019_provider_connection_registration",
+      "breakpoints": true
     }
   ]
 }

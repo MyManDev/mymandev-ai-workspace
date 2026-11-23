@@ -21,6 +21,7 @@ export {
   ERASED_AGENT_NAME,
   ERASED_DEVICE_LABEL,
   ERASED_DISPLAY_NAME,
+  ERASED_PROVIDER_CONNECTION_LABEL,
   eraseAccount,
   type EraseAccountInput,
   type EraseAccountResult,
@@ -226,6 +227,16 @@ export {
   type DisableAgentInput,
   type DisableAgentResult,
 } from "./agents.ts";
+export {
+  type ListProviderConnectionsInput,
+  listProviderConnections,
+  registerProviderConnection,
+  type RegisterProviderConnectionInput,
+  type RegisterProviderConnectionResult,
+  removeProviderConnection,
+  type RemoveProviderConnectionInput,
+  type RemoveProviderConnectionResult,
+} from "./provider-connections.ts";
 export {
   createRun,
   type CreateRunInput,

@@ -139,6 +139,17 @@ export const IDENTITY_PROVIDERS = Object.freeze(["github"] as const);
 export type IdentityProvider = (typeof IDENTITY_PROVIDERS)[number];
 
 /**
+ * The kinds of AI provider that a provider connection connects a host device
+ * to (#295; Project Manager decision of 2026-11-20): one for each adapter of
+ * the local runtime, `claude` (#30) and `codex` (#31). The list is closed,
+ * like the other closed lists of ADR 0015: a new kind is a protocol change
+ * and a change of the database CHECK `provider_connections_kind_check`,
+ * because an older desktop refuses an unknown value.
+ */
+export const PROVIDER_KINDS = Object.freeze(["claude", "codex"] as const);
+export type ProviderKind = (typeof PROVIDER_KINDS)[number];
+
+/**
  * Reason codes in `reason` when the server cancels a run with a `system`
  * actor (P-60). The desktop shows a known code as its own text. They are
  * the server's alone: it refuses an agent's transition with one of them
@@ -336,6 +347,14 @@ export const API_ERROR_STATUS = Object.freeze({
    * no `Retry-After`. Only `POST /projects/:projectId/agents` answers it.
    */
   agent_limit: 409,
+  /**
+   * A registration of a provider connection on a device that already holds
+   * 10 connections that are not removed (#295; Project Manager decision of
+   * 2026-11-20). No time frees a place, only removing a connection of the
+   * device does, so the answer carries no `Retry-After`. Only
+   * `POST /provider-connections` answers it.
+   */
+  provider_connection_limit: 409,
   /**
    * A new device's sign-in on an account that already has 20 active devices
    * (#255). No time frees a place, only revoking one of them does, so the
@@ -587,6 +606,8 @@ export const LIMITS = Object.freeze({
   name: 100,
   /** Agent name. */
   agentName: 64,
+  /** Provider connection label (#295). */
+  providerConnectionLabel: 64,
   /** Reason given with a run state change. */
   runReason: 500,
   /** Event type name. */

@@ -26,6 +26,7 @@ import {
   OWN_JOIN_REQUEST_DECISIONS,
   OWNERSHIP_OFFER_END_REASONS,
   PRESENCE_STATUSES,
+  PROVIDER_KINDS,
   RECENT_CLAIMS,
   RECENT_FINISHED_RUNS,
   RUN_CANCEL_REASONS,
@@ -155,6 +156,12 @@ test("the account vocabularies are exactly the values of ADR 0014", () => {
   });
 });
 
+test("the provider kinds are the adapters of #30 and #31, a closed list", () => {
+  assert.deepEqual(PROVIDER_KINDS, ["claude", "codex"]);
+  assert.equal(Object.isFrozen(PROVIDER_KINDS), true);
+  assert.equal(LIMITS.providerConnectionLabel, 64);
+});
+
 test("a workspace has at most 50 live invitations and 100 new invitations within 24 hours (ADR 0014, Limits)", () => {
   assert.deepEqual(INVITATION_COUNT_LIMITS, { live: 50, perDay: 100 });
   // The list of live invitations holds at most MAX_ANSWER_LIST_ITEMS, so a
@@ -232,6 +239,7 @@ test("every API error code has its fixed HTTP status", () => {
     repository_limit: 409,
     grant_limit: 409,
     agent_limit: 409,
+    provider_connection_limit: 409,
     device_limit: 409,
     device_daily_limit: 429,
     rate_limited: 429,

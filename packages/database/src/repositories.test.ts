@@ -850,9 +850,12 @@ test("a removal revokes every grant scoped to the repository that is not revoked
   // `provider.use` grant, which names no repository.
   const onKept = await grantTo(projectId, kept.id, aliceAgent, alice);
   const connectionId = newId<ProviderConnectionId>();
-  await db
-    .insert(providerConnections)
-    .values({ id: connectionId, hostDeviceId: alice.deviceId });
+  await db.insert(providerConnections).values({
+    id: connectionId,
+    hostDeviceId: alice.deviceId,
+    kind: "claude",
+    label: "Work",
+  });
   const onProvider = await grantTo(projectId, null, aliceAgent, alice, {
     capability: "provider.use",
     providerConnectionId: connectionId,

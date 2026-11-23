@@ -167,14 +167,19 @@ async function agentOf(
   return agentId;
 }
 
-/** A provider connection of the device, written directly: no route registers one yet. */
+/** A provider connection of the device, written directly, as the run tests need no registration. */
 async function connectionOf(
   device: SignedInDevice,
 ): Promise<ProviderConnectionId> {
   const id = newId<ProviderConnectionId>();
   await database()
     .insert(providerConnections)
-    .values({ id, hostDeviceId: device.deviceId as DeviceId });
+    .values({
+      id,
+      hostDeviceId: device.deviceId as DeviceId,
+      kind: "claude",
+      label: "Work",
+    });
   return id;
 }
 

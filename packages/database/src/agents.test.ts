@@ -838,9 +838,12 @@ test("a disable revokes every grant of the agent that is not revoked yet, with t
     expiresAt: EARLIER,
   });
   const connectionId = newId<ProviderConnectionId>();
-  await db
-    .insert(providerConnections)
-    .values({ id: connectionId, hostDeviceId: alice.deviceId });
+  await db.insert(providerConnections).values({
+    id: connectionId,
+    hostDeviceId: alice.deviceId,
+    kind: "claude",
+    label: "Work",
+  });
   const onProvider = await grantTo(projectId, null, agentId, alice, {
     capability: "provider.use",
     providerConnectionId: connectionId,
@@ -1243,9 +1246,12 @@ test(
     await join(workspaceId, admin, "admin");
     const agentId = await created(projectId, owner);
     const providerConnectionId = newId<ProviderConnectionId>();
-    await database()
-      .insert(providerConnections)
-      .values({ id: providerConnectionId, hostDeviceId: owner.deviceId });
+    await database().insert(providerConnections).values({
+      id: providerConnectionId,
+      hostDeviceId: owner.deviceId,
+      kind: "claude",
+      label: "Work",
+    });
     const message = await postChatMessage(database(), {
       actor: { workspaceId, ...owner },
       projectId,
