@@ -416,7 +416,11 @@ test("a lifetime is 1 minute to 365 days, at most 30 days for a shell, and the c
   assert.equal(SHELL_GRANT_MAX_LIFETIME_SECONDS, 30 * 24 * 60 * 60);
   assert.ok(SHELL_GRANT_MAX_LIFETIME_SECONDS > GRANT_LIFETIME_SECONDS.min);
   assert.ok(SHELL_GRANT_MAX_LIFETIME_SECONDS < GRANT_LIFETIME_SECONDS.max);
-  assert.deepEqual(GRANT_COUNT_LIMITS, { perAgent: 100, perHostDevice: 1_000 });
+  assert.deepEqual(GRANT_COUNT_LIMITS, {
+    perAgent: 100,
+    perHostDevice: 1_000,
+    perDay: 200,
+  });
   // Every grant of a device that is not revoked fits in one answer.
   assert.equal(GRANT_COUNT_LIMITS.perHostDevice, MAX_ANSWER_LIST_ITEMS);
   assert.ok(GRANT_COUNT_LIMITS.perAgent <= GRANT_COUNT_LIMITS.perHostDevice);

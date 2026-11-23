@@ -100,6 +100,10 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  *   For a revocation: a grant that is already revoked.
  * - `grant_limit`: a grant over a count limit of `GRANT_COUNT_LIMITS`, with
  *   its own code and without `Retry-After` (#75, decision of 2026-11-14).
+ * - `rate_limited`, one of the common codes, also answers a grant of an
+ *   account that made `GRANT_COUNT_LIMITS.perDay` grants within 24 hours,
+ *   with `Retry-After`, after every other refusal (#75, decision of
+ *   2026-11-23).
  *
  * Provisional (#75): the other codes.
  */
@@ -130,18 +134,30 @@ export const GRANT_LIFETIME_SECONDS = Object.freeze({
 export const SHELL_GRANT_MAX_LIFETIME_SECONDS = 2_592_000;
 
 /**
- * How many grants that are not revoked may exist: at most 100 for one agent,
- * and at most `MAX_ANSWER_LIST_ITEMS` (1,000) for all the agents that one
- * device hosts, so that `GET /grant-records` always holds every one of them
- * and is never cut: a record that is left out would deny a check. An expired
- * grant counts until it is revoked, as it keeps its place in the database.
- * A grant over either limit answers its own code, `grant_limit`, without
- * `Retry-After`, because no time frees a place (#75, decision of
- * 2026-11-14). Provisional (#75): both values. The API applies these values.
+ * How many grants may exist and be made:
+ *
+ * - `perAgent` and `perHostDevice`: at most 100 grants that are not revoked
+ *   for one agent, and at most `MAX_ANSWER_LIST_ITEMS` (1,000) for all the
+ *   agents that one device hosts, so that `GET /grant-records` always holds
+ *   every one of them and is never cut: a record that is left out would deny
+ *   a check. An expired grant counts until it is revoked, as it keeps its
+ *   place in the database. A grant over either limit answers its own code,
+ *   `grant_limit`, without `Retry-After`, because no time frees a place
+ *   (#75, decision of 2026-11-14). Provisional (#75): both values.
+ * - `perDay`: at most 200 grants of one account within 24 hours, on all its
+ *   agents together, revoked ones included; the renewal of an expired grant
+ *   counts as a grant. A grant over it answers `rate_limited` with
+ *   `Retry-After`, by the rule of 2026-11-14 for a limit that time frees
+ *   (#75, decision of 2026-11-23): every grant sends `agent.grant.created`
+ *   to every subscribed member, so the limit bounds what one member makes
+ *   the others' devices read, and the growth of the grants.
+ *
+ * The API applies these values.
  */
 export const GRANT_COUNT_LIMITS = Object.freeze({
   perAgent: 100,
   perHostDevice: MAX_ANSWER_LIST_ITEMS,
+  perDay: 200,
 } as const);
 
 /**

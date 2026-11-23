@@ -57,7 +57,9 @@ const GrantParamsSchema = AgentParamsSchema.extend({
  * account, which `lockActor` already refuses with `unauthorized` before the
  * database is asked. A count limit answers `409` with `grant_limit` and no
  * `Retry-After`, because no time frees a place, only a revocation does
- * (#75, decision of 2026-11-14).
+ * (#75, decision of 2026-11-14). The account's 200 grants in 24 hours
+ * answer `429` with `rate_limited` and the time until the oldest of them
+ * leaves the window as `Retry-After` (#75, decision of 2026-11-23).
  */
 function refusedGrant(
   result: Extract<GrantCapabilityResult, { granted: false }>,
@@ -68,8 +70,12 @@ function refusedGrant(
     case "conflict":
     case "grant_limit":
       return new ApiError(result.refusal);
+    case "rate_limited":
+      return new ApiError("rate_limited", {
+        retryAfterSeconds: result.retryAfterMs / 1000,
+      });
     default:
-      return result.refusal satisfies never;
+      return result satisfies never;
   }
 }
 
@@ -127,9 +133,10 @@ function sendGrantEvents(
  * of 2026-11-02, 2026-11-14, and 2026-11-19): granting a capability to an
  * agent, revoking a grant, and the grant records of the agents that the
  * calling device hosts. Every route needs an access token, and the account
- * limit of every authenticated route applies; the protocol defines no limit
- * of its own for them beyond the count limits (`GRANT_COUNT_LIMITS`), which
- * the database applies.
+ * limit of every authenticated route applies; beyond it, the count limits of
+ * `GRANT_COUNT_LIMITS`, which the database applies, bound the grants: an
+ * agent's and a host device's grants that are not revoked (`grant_limit`),
+ * and an account's grants in 24 hours (`rate_limited`).
  *
  * No path names a workspace or a project: an agent ID names both, and the
  * database decides on the agent. An agent that does not exist and an agent

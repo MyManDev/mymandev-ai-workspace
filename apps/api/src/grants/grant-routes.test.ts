@@ -45,7 +45,8 @@ import { ConnectionRegistry } from "../gateway.ts";
 // The grant routes (#75): only the agent's owner grants, and only from the
 // agent's host device; the owner revokes from any of its devices; another
 // account learns nothing of an agent that it cannot see; a count limit
-// answers grant_limit; a grant of terminal.execute expires within 30 days;
+// answers grant_limit, and an account's grants of a day rate_limited; a
+// grant of terminal.execute expires within 30 days;
 // each change sends its events after the commit to every connection
 // subscribed to the agent's workspace; and the record list holds the
 // unrevoked grants of the calling device's agents, with their facts.
@@ -718,6 +719,85 @@ test(`an agent with ${GRANT_COUNT_LIMITS.perAgent} grants that are not revoked a
   });
   assert.equal(disabled.statusCode, 409, disabled.body);
   assert.equal(errorCode(disabled), "conflict");
+});
+
+test(`an account that made ${GRANT_COUNT_LIMITS.perDay} grants within 24 hours, renewals and revoked grants included, answers 429 with rate_limited and Retry-After, sends no event, and grants again once the oldest is 24 hours old`, async (t) => {
+  const { account, clock } = instance(t);
+  const bob = await account(7591);
+  const { workspace, project } = await workspaceWithProject(bob);
+  const agent = await agentOn(bob, project.id);
+  const repositoryId = await repositoryOf(bob, project.id);
+  // A grant that expires in a minute, made through the route.
+  const expiring = await granted(bob, agent.id, {
+    capability: "repo.write",
+    repositoryId,
+    lifetimeSeconds: 60,
+  });
+  // Revoked grants of the last 24 hours, the oldest 23 hours ago, written
+  // directly: with the expiring one, one short of the limit.
+  const start = clock.now();
+  const oldest = start - 23 * HOUR_MS;
+  await database()
+    .insert(permissionGrants)
+    .values(
+      Array.from({ length: GRANT_COUNT_LIMITS.perDay - 2 }, (_, index) => {
+        const createdAt = new Date(index === 0 ? oldest : start - HOUR_MS);
+        return {
+          id: newId<PermissionGrantId>(),
+          projectId: project.id,
+          granteeAgentId: agent.id,
+          hostDeviceId: bob.device.deviceId,
+          capability: "repo.read" as const,
+          repositoryId,
+          grantedByUserId: bob.device.userId,
+          createdAt,
+          revokedAt: new Date(createdAt.getTime() + 60_000),
+          revokedByUserId: bob.device.userId,
+        };
+      }),
+    );
+  const bobClient = (await connected(t, bob.app, bob.device)).client;
+  await subscribed(bobClient, workspace.id);
+  await drainPresence(bobClient);
+
+  // The renewal of the expired grant is the last grant of the day.
+  clock.advance(120_000);
+  const renewal = await granted(bob, agent.id, {
+    capability: "repo.write",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
+  assert.notEqual(renewal.id, expiring.id);
+  assert.equal((await nextEvent(bobClient)).type, "agent.grant.revoked");
+  assert.equal((await nextEvent(bobClient)).type, "agent.grant.created");
+  const before = (await grantRowsOf(agent.id)).length;
+
+  const refused = await grant(bob, agent.id, {
+    capability: "git.commit",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
+  assert.equal(refused.statusCode, 429, refused.body);
+  assert.deepEqual(ApiErrorBodySchema.parse(refused.json()), {
+    statusCode: 429,
+    error: "Too Many Requests",
+    message: "Too Many Requests",
+    code: "rate_limited",
+  });
+  // The oldest leaves the 24 hours one hour after `start`.
+  const waitMs = oldest + DAY_MS - clock.now();
+  assert.equal(waitMs, HOUR_MS - 120_000);
+  assert.equal(refused.headers["retry-after"], String(waitMs / 1000));
+  assert.equal((await grantRowsOf(agent.id)).length, before);
+  await quiet(bobClient);
+
+  clock.advance(waitMs);
+  const later = { ...bob, token: await accessToken(bob.app, bob.device) };
+  await granted(later, agent.id, {
+    capability: "git.commit",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
 });
 
 test("a grant that replaces an expired grant of the same scope sends agent.grant.revoked for the expired one and then agent.grant.created", async (t) => {
