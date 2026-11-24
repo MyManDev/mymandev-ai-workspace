@@ -32,6 +32,7 @@ import {
   GRANT_RESULT_MESSAGES,
   grantRequestOf,
   INITIAL_GRANT_FORM,
+  needsProviderConnections,
   OFFERED_CAPABILITIES,
   REVOKE_REFUSAL_MESSAGES,
   type ConnectionsPanelView,
@@ -270,6 +271,42 @@ test("the section waits for the agents, and says when granting is not available 
       }),
     ),
   ).toEqual({ kind: "message", text: GRANT_MESSAGES.pending });
+});
+
+test("the provider connections are needed only while an agent of the open project is grantable here", () => {
+  const known = (agents: readonly AgentView[]) =>
+    ({ kind: "known", state: agentsState(agents) }) as const;
+  expect(needsProviderConnections({ kind: "unavailable" })).toBe(false);
+  expect(needsProviderConnections({ kind: "pending" })).toBe(false);
+  expect(needsProviderConnections(known([]))).toBe(false);
+  expect(
+    needsProviderConnections(
+      known([
+        agent(ELSEWHERE, "Laptop agent", { ownedByMe: true }),
+        agent(THEIRS, "Their agent"),
+      ]),
+    ),
+  ).toBe(false);
+  expect(
+    needsProviderConnections(
+      known([
+        agent(THEIRS, "Their agent"),
+        agent(HERE, "Builder", { ownedByMe: true, grantableHere: true }),
+      ]),
+    ),
+  ).toBe(true);
+  expect(
+    needsProviderConnections({
+      kind: "known",
+      state: {
+        ...agentsState([
+          agent(HERE, "Builder", { ownedByMe: true, grantableHere: true }),
+        ]),
+        status: "no_project",
+        projectId: null,
+      },
+    }),
+  ).toBe(false);
 });
 
 test("when the agents could not be read, the section says that it cannot check now, not that no agent is hosted here", () => {

@@ -18,6 +18,7 @@ import {
   IDLE_GRANT_ACTIONS,
   INITIAL_GRANT_FORM,
   initialGrantsView,
+  needsProviderConnections,
   type ConnectionsPanelView,
   type GrantActionsView,
   type GrantFormState,
@@ -254,11 +255,19 @@ function useFollow<V>(
   return view;
 }
 
-/** Reads this device's provider connections once while the section is shown. */
-function useConnections(grants: GrantBridge | undefined): ConnectionsPanelView {
+/**
+ * Reads this device's provider connections while the section is shown, only
+ * while an agent is grantable here (`needed`), and again each time that
+ * changes from none to some. An answer that comes after the section is
+ * gone, or after no agent is grantable any more, is dropped.
+ */
+function useConnections(
+  grants: GrantBridge | undefined,
+  needed: boolean,
+): ConnectionsPanelView {
   const [view, setView] = useState<ConnectionsPanelView>({ kind: "pending" });
   useEffect(() => {
-    if (grants === undefined) {
+    if (grants === undefined || !needed) {
       return undefined;
     }
     let live = true;
@@ -280,7 +289,7 @@ function useConnections(grants: GrantBridge | undefined): ConnectionsPanelView {
     return () => {
       live = false;
     };
-  }, [grants]);
+  }, [grants, needed]);
   return view;
 }
 
@@ -336,7 +345,10 @@ export function PermissionGrants({
       [grants],
     ),
   );
-  const connections = useConnections(grants);
+  const connections = useConnections(
+    grants,
+    needsProviderConnections(agentView),
+  );
   const [form, setForm] = useState<GrantFormState>(INITIAL_GRANT_FORM);
   const [actionsView, setActionsView] =
     useState<GrantActionsView>(IDLE_GRANT_ACTIONS);

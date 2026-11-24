@@ -356,6 +356,19 @@ function connectionLabel(connection: ProviderConnectionView): string {
 }
 
 /**
+ * Whether the section needs this device's provider connections: only while
+ * an agent of the open project is grantable here. Without one, no form is
+ * shown, so the connections are not read.
+ */
+export function needsProviderConnections(agents: AgentPanelView): boolean {
+  return (
+    agents.kind === "known" &&
+    agents.state.projectId !== null &&
+    agents.state.agents.some((agent) => agent.grantableHere)
+  );
+}
+
+/**
  * The grant section: a message while the agents are not known, else the
  * form for the agents that this device may grant for (`grantableHere`),
  * and the selected agent's grants. When the last reload of the agents
