@@ -57,6 +57,16 @@
 //   the connection's close for the account, `offline`) aborts every run and
 //   reports it `cancelled` with `signed_out`; another device aborts every
 //   run and reports nothing, because only the host device may send.
+// - The end of the sign-in (#55, decision of 2026-11-19). The account's
+//   `signInExpiresAt` ends the sign-in on this device, while the server
+//   keeps the connection open for `SIGN_IN_GRACE_MS` more, so no change of
+//   the account or the connection tells it. The supervisor keeps a timer for
+//   it (in steps of at most `SIGN_IN_TIMER_STEP_MS`), set again on every
+//   change of the account and cancelled at close. At the end, every run
+//   that executes is aborted and reported `cancelled` with `signed_out`, a
+//   start that is acknowledged afterwards is reported the same way instead
+//   of starting, and no queued run is adopted until a new sign-in moves the
+//   end. An end that cannot be read counts as passed.
 // - Interrupted runs (default 6 of 2026-11-24). A lost connection aborts
 //   every run, which is reported `failed` with `host_interrupted`. After
 //   each reload of the runs, a run of an adopted agent in `running` or
@@ -198,6 +208,13 @@ export type RunStartDecision =
       readonly state: "failed" | "cancelled";
       readonly reason: string;
     };
+
+/**
+ * The longest wait of the timer for the end of the sign-in; a longer wait
+ * is made of steps, each of which reads the account again. It stays far
+ * below the 2^31 - 1 ms that a timer can wait.
+ */
+export const SIGN_IN_TIMER_STEP_MS = 24 * 60 * 60_000;
 
 /** The default of `beforeStart`: every start is allowed. */
 export const ALLOW_RUN_START: RunStartDecision = Object.freeze({
@@ -371,6 +388,19 @@ const CHECK_FAILED: RunActionCheck = Object.freeze({
   allowed: false,
   reason: "check_failed",
 });
+
+/**
+ * The end of the signed-in device's sign-in in wall-clock milliseconds, or
+ * null without a signed-in device. An end that cannot be read is 0, so it
+ * counts as passed.
+ */
+function signInEndOf(status: AccountStatus): number | null {
+  if (signedInDevice(status) === null || status.account.kind !== "signed_in") {
+    return null;
+  }
+  const end = Date.parse(status.account.signInExpiresAt);
+  return Number.isFinite(end) ? end : 0;
+}
 
 /** The signed-in device, or null, under the same condition as the services. */
 function signedInDevice(status: AccountStatus): DeviceId | null {
@@ -594,6 +624,10 @@ export function createRunSupervisor(
    */
   function candidates(live: Live): Candidate[] {
     const found: Candidate[] = [];
+    if (signInOver()) {
+      // Nothing starts after the end of the sign-in.
+      return found;
+    }
     for (const agent of live.state.agents) {
       if (!adoptable(agent, live) || agentBusy(agent.id, live)) {
         continue;
@@ -791,9 +825,63 @@ export function createRunSupervisor(
     }
   }
 
+  // The end of the sign-in.
+
+  /** The end of the sign-in of `device`; see `signInEndOf`. */
+  let signInEnd: number | null = null;
+  let cancelSignInTimer: (() => void) | null = null;
+
+  function signInOver(): boolean {
+    return signInEnd !== null && wallClock() >= signInEnd;
+  }
+
+  /** Follows the account's end of the sign-in, and stops the runs at it. */
+  function followSignIn(status: AccountStatus): void {
+    cancelSignInTimer?.();
+    cancelSignInTimer = null;
+    signInEnd = closed ? null : signInEndOf(status);
+    if (signInEnd === null) {
+      return;
+    }
+    const wait = signInEnd - wallClock();
+    if (wait <= 0) {
+      signInEnded();
+      return;
+    }
+    cancelSignInTimer = schedule(
+      () => {
+        cancelSignInTimer = null;
+        followSignIn(account.status());
+        evaluate();
+      },
+      Math.min(wait, SIGN_IN_TIMER_STEP_MS),
+    );
+  }
+
+  /** The sign-in ended: every execution stops and is reported cancelled. */
+  function signInEnded(): void {
+    for (const entry of [...entries.values()]) {
+      if (entry.stage.kind === "executing") {
+        log(
+          `A run was stopped on this device (${HOST_RUN_REASONS.signedOut}).`,
+        );
+        abortExecution(entry, signInEndedTransition(), "due");
+      }
+    }
+  }
+
+  function signInEndedTransition(): Transition {
+    return {
+      from: "running",
+      to: "cancelled",
+      reason: HOST_RUN_REASONS.signedOut,
+    };
+  }
+
   function accountChanged(status: AccountStatus): void {
     const next = signedInDevice(status);
     if (next === device) {
+      followSignIn(status);
       return;
     }
     const previous = device;
@@ -812,6 +900,7 @@ export function createRunSupervisor(
         }
       }
     }
+    followSignIn(status);
   }
 
   function connectionChanged(state: string): void {
@@ -1152,6 +1241,11 @@ export function createRunSupervisor(
         // From the run's known state: it needs no activity.
         return entry;
       }
+      if (stage.purpose === "start" && signInOver()) {
+        // Nothing starts after the end of the sign-in.
+        entries.delete(entry.runId);
+        continue;
+      }
       if (
         live === null ||
         live.workspaceId !== entry.workspaceId ||
@@ -1277,7 +1371,16 @@ export function createRunSupervisor(
     inFlight = null;
     retryAttempt = 0;
     reloadAttempt = 0;
-    if (stage.start !== null && runState === "running") {
+    if (stage.start !== null && runState === "running" && signInOver()) {
+      // The sign-in ended while the start was on its way.
+      log(`A run was stopped on this device (${HOST_RUN_REASONS.signedOut}).`);
+      entry.stage = {
+        kind: "due",
+        transition: signInEndedTransition(),
+        purpose: "finish",
+        start: null,
+      };
+    } else if (stage.start !== null && runState === "running") {
       startExecution(entry, stage.start);
     } else if (isTerminalRunState(runState)) {
       entries.delete(entry.runId);
@@ -1396,6 +1499,7 @@ export function createRunSupervisor(
     }),
   ];
 
+  followSignIn(account.status());
   evaluate();
 
   return Object.freeze({
@@ -1413,6 +1517,8 @@ export function createRunSupervisor(
       cancelProviderRetry = null;
       cancelWake?.();
       cancelWake = null;
+      cancelSignInTimer?.();
+      cancelSignInTimer = null;
       stopReloadRequest();
       if (inFlight?.stage.kind === "sending") {
         inFlight.stage.model.close();

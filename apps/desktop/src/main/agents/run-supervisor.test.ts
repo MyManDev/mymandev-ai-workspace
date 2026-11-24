@@ -56,6 +56,7 @@ import {
 import {
   createRunSupervisor,
   HOST_RUN_REASONS,
+  SIGN_IN_TIMER_STEP_MS,
   RUN_SUPERVISOR_RELOAD_DELAY_MS,
   RUN_SUPERVISOR_RELOAD_MAX_MS,
   RUN_SUPERVISOR_RETRY_DELAY_MS,
@@ -100,7 +101,13 @@ function eventId(n: number): EventId {
   return `0192f0a0-7b3c-7d4e-8f50-0000000e${n.toString(16).padStart(4, "0")}` as EventId;
 }
 
-function accountStatus(deviceId: string = DEVICE_ID): AccountStatus {
+/** The end of the sign-in by default: 30 days after the test's start. */
+const SIGN_IN_END = WALL_START + 30 * 24 * 60 * 60_000;
+
+function accountStatus(
+  deviceId: string = DEVICE_ID,
+  signInEnd: number = SIGN_IN_END,
+): AccountStatus {
   return Object.freeze({
     revision: 1,
     account: Object.freeze({
@@ -108,6 +115,7 @@ function accountStatus(deviceId: string = DEVICE_ID): AccountStatus {
       login: "octocat",
       displayName: "The Octocat",
       deviceId,
+      signInExpiresAt: new Date(signInEnd).toISOString(),
     }),
     signIn: Object.freeze({ kind: "idle" }),
     lastOutcome: null,
@@ -257,6 +265,7 @@ const allLogs: string[] = [];
 
 interface HarnessOptions {
   readonly runs?: readonly AgentRunListItem[];
+  readonly accountStatus?: AccountStatus;
   /** The executors by kind; a Claude executor by default. */
   readonly executors?: Partial<Record<ProviderKind, FakeExecutor>>;
   readonly reserved?: readonly AgentId[];
@@ -318,6 +327,7 @@ class Harness {
 
   constructor(options: HarnessOptions = {}) {
     this.runs = [...(options.runs ?? [])];
+    this.accountStatus = options.accountStatus ?? this.accountStatus;
     this.projectId =
       options.projectId === undefined ? PROJECT_1 : options.projectId;
     this.live = options.live ?? true;
@@ -1183,6 +1193,108 @@ test("a sign-out whose run the server already finished sends nothing after the r
   h.reconnect();
   h.advance(10 * STEP);
   expect(h.sent).toHaveLength(1);
+});
+
+test("the end of the sign-in stops every run, reported cancelled, and nothing starts until a new sign-in moves it", async () => {
+  // The sign-in ends one minute after the start, while the connection
+  // stays open (the server's grace).
+  const end = WALL_START + 60_000;
+  const h = new Harness({
+    runs: [run(1, "queued"), run(2, "queued", { agent: AGENT_B })],
+    accountStatus: accountStatus(DEVICE_ID, end),
+  });
+  await h.answerProviders();
+  h.ackAndStep();
+  h.ack();
+  expect(h.claude.calls).toHaveLength(2);
+  h.advance(60_000 - h.time - 1);
+  expect(h.claude.calls[0]?.execution.signal.aborted).toBe(false);
+  h.advance(1);
+  expect(h.claude.calls[0]?.execution.signal.aborted).toBe(true);
+  expect(h.claude.calls[1]?.execution.signal.aborted).toBe(true);
+  h.advance(STEP);
+  h.ackAndStep();
+  h.ackAndStep();
+  expect(h.walk().slice(2).sort()).toEqual([
+    `1 running>cancelled ${HOST_RUN_REASONS.signedOut}`,
+    `2 running>cancelled ${HOST_RUN_REASONS.signedOut}`,
+  ]);
+  for (const call of h.claude.calls) {
+    call.resolve({ outcome: "completed" });
+  }
+  await settle();
+
+  // A queued run waits while the sign-in is over.
+  h.runs.push(run(3, "queued", { createdAfter: 60 }));
+  h.reload();
+  h.advance(60_000);
+  expect(h.providerReads).toEqual([]);
+  // A new sign-in moves the end: the run goes.
+  h.setAccount(accountStatus(DEVICE_ID, WALL_START + h.time + 60 * 60_000));
+  expect(h.providerReads).toHaveLength(1);
+  await h.answerProviders();
+  expect(h.walk().at(-1)).toBe("3 queued>running");
+  expect(h.violations).toEqual([]);
+});
+
+test("the timer of the end of the sign-in follows the account, waits in steps, and a start acknowledged after the end does not start", async () => {
+  // A renewal before the end moves the timer.
+  const h = await started();
+  h.setAccount(accountStatus(DEVICE_ID, WALL_START + h.time + 1_000));
+  h.setAccount(accountStatus(DEVICE_ID, WALL_START + h.time + 5_000));
+  h.advance(4_999);
+  expect(h.claude.last.execution.signal.aborted).toBe(false);
+  h.advance(1);
+  expect(h.claude.last.execution.signal.aborted).toBe(true);
+
+  // An end far ahead waits in steps that read the account again.
+  const g = await started();
+  expect(
+    g.openTimers().every((timer) => timer.at - g.time <= SIGN_IN_TIMER_STEP_MS),
+  ).toBe(true);
+  g.advance(SIGN_IN_TIMER_STEP_MS);
+  expect(g.claude.last.execution.signal.aborted).toBe(false);
+  g.advance(SIGN_IN_END - WALL_START - g.time);
+  expect(g.claude.last.execution.signal.aborted).toBe(true);
+
+  // A start that the sign-in's end overtook is reported, not started.
+  const f = new Harness({
+    runs: [run(1, "queued")],
+    accountStatus: accountStatus(DEVICE_ID, WALL_START + 100),
+  });
+  await f.answerProviders();
+  expect(f.walk()).toEqual(["1 queued>running"]);
+  f.advance(100);
+  f.ack();
+  expect(f.claude.calls).toEqual([]);
+  f.advance(STEP);
+  expect(f.walk().at(-1)).toBe(
+    `1 running>cancelled ${HOST_RUN_REASONS.signedOut}`,
+  );
+  expect(f.violations).toEqual([]);
+
+  // An end that has passed, or cannot be read, starts nothing.
+  const unreadable = accountStatus();
+  for (const status of [
+    accountStatus(DEVICE_ID, WALL_START - 1),
+    Object.freeze({
+      ...unreadable,
+      account: Object.freeze({
+        ...unreadable.account,
+        signInExpiresAt: "not a time",
+      }),
+    }) as AccountStatus,
+  ]) {
+    const e = new Harness({ runs: [run(1, "queued")], accountStatus: status });
+    e.advance(60_000);
+    expect(e.providerReads).toEqual([]);
+    expect(e.sent).toEqual([]);
+  }
+
+  // Close cancels the timer.
+  const d = await started();
+  d.supervisor.close();
+  expect(d.openTimers()).toEqual([]);
 });
 
 test("another device drops every run without a report", async () => {
