@@ -633,8 +633,9 @@ export type ServerMessageDecodeResult =
  * frame that only a device sends, such as `chat.message.send` or
  * `auth.response`, is `unknown_type` here. An event with a `deviceId` is
  * `invalid_actor`: the server sends every event with a null device.
- * `unknownServerFrameType` tells a frame of a type that no peer of this
- * build knows apart from the other messages refused as `unknown_type`.
+ * `unknownServerFrameType` and `unknownServerEventType` tell a frame and an
+ * event of a type that no peer of this build knows apart from the other
+ * messages refused as `unknown_type`.
  */
 export function decodeServerMessage(input: unknown): ServerMessageDecodeResult {
   const header = probe(input);
