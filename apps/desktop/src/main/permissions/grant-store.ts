@@ -37,8 +37,9 @@
 //   a read is on its way; and on the changes that revoke grants in their own
 //   transaction (P-77): `workspace.member.removed`, a server cancellation
 //   that disabled agents (`agent.run.state_changed` with a code of
-//   `RUN_CANCEL_REASONS`; no event reports the agents that a revocation or a
-//   removal disabled), the account frame `account.device_revoked`,
+//   `RUN_CANCEL_REASONS`; the API also sends `workspace.agent.disabled` for
+//   the agents that a revocation or a removal disabled, #326), the account
+//   frame `account.device_revoked`,
 //   `workspace.repository.removed`, and `workspace.agent.disabled` (#294).
 //   Reads are merged like the claim service's: while one is on its way, one
 //   more follows its answer; a failed read is retried with the workspace
