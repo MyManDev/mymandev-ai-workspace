@@ -1,0 +1,1221 @@
+// The host run supervisor (#35, second part; the defaults of 2026-11-24 on
+// #35, and the decision of 2026-11-19 on #55): it picks up the runs that
+// this device hosts and runs them with the executor of their provider kind
+// (`run-executor.ts`), sending each run's transitions as its agent through
+// the model of a hosted run (`host-run.ts`).
+//
+// - Adoption. Only the unfinished runs of the open project whose agent this
+//   signed-in device hosts (`hostDeviceId`, which only the owner's account
+//   reads, #342) and that is not disabled, while the agent activity is live
+//   (`gateLive`) and the connection is open. A run of a closed project waits
+//   until the project is opened. The agents in `reservedAgentIds` are left
+//   alone: the development agent switch of an unpackaged build moves their
+//   runs, and the supervisor never sends for them.
+// - Order. One run of an agent at a time, the oldest `createdAt` first. An
+//   agent is busy while the supervisor holds one of its runs, while an
+//   executor of one of its runs has not settled (also after an abort), while
+//   one of its runs waits for the next reload after a refusal, and while the
+//   activity shows one of its runs in `running` or `awaiting_input`.
+// - A queued run. The supervisor reads this device's provider connections
+//   (`GET /provider-connections`). A run whose provider connection is not in
+//   the list, or that has none, fails at once (`queued -> failed`,
+//   `provider_connection_missing`); so does one whose provider kind has no
+//   executor (`no_executor`), so that it does not hold one of the agent's
+//   10 unfinished places. Otherwise `beforeStart` is asked, and then
+//   `queued -> running` is sent; once the server acknowledged it, the
+//   executor starts with the held run and an `AbortSignal`, and its outcome
+//   becomes `running -> completed` or `running -> failed`.
+// - `beforeStart` is the seam for a check of `provider.use` with the
+//   enforcement point before `queued -> running`. Whether the supervisor
+//   makes that check waits for the Project Manager (#35, scope of
+//   2026-11-24, and #55), so it defaults to allowing every start, and the
+//   enforcement point is never called before a start.
+// - With an empty executor registry, as in production until #30 and #31,
+//   the supervisor adopts no queued run at all; it only reports the
+//   interrupted runs below. Otherwise every queued run of this device would
+//   fail with `no_executor`, also the runs of the development seed.
+// - Stops (#55, decision of 2026-11-19). An executor's action that it
+//   checked with `RunExecution.check` stays held until it ends. On every
+//   `onGrantsChanged`, each held action is checked again with the
+//   enforcement point for the run that the supervisor holds; at the first
+//   denial the run is aborted and reported `cancelled`: `signed_out` for a
+//   denial of the sign-in, `grant_inactive` for any other. A sign-out (or
+//   the connection's close for the account, `offline`) aborts every run and
+//   reports it `cancelled` with `signed_out`; another device aborts every
+//   run and reports nothing, because only the host device may send.
+// - Interrupted runs (default 6 of 2026-11-24). A lost connection aborts
+//   every run, which is reported `failed` with `host_interrupted`. After
+//   each reload of the runs, a run of an adopted agent in `running` or
+//   `awaiting_input` that this process does not hold (a restart, a crash, a
+//   connection lost mid-run, a run dropped after a refusal) is reported
+//   `failed` with `host_interrupted`. There is no resume in v0.
+// - Refusals. When the server refuses a transition, the supervisor drops the
+//   run and never retries it; the run and its agent wait for the next
+//   reload, which brings the truth.
+// - Owed transitions. A transition that could not be sent, or whose
+//   acknowledgement did not come, because the connection closed or the
+//   device signed out, stays in memory. After the next reload of its
+//   project on the same device, it is sent with a new model, only when the
+//   reloaded run is still in the state that it starts from; otherwise it is
+//   dropped. Another device drops every owed transition.
+// - Sends. One transition in flight at a time, at most one send every
+//   `RUN_SUPERVISOR_SEND_INTERVAL_MS`, resends included. The host run model
+//   checks every transition against `RUN_TRANSITIONS` and every reason
+//   against `runReasonAllowed` and the protocol's limits before it sends.
+//
+// The host reasons are codes of this desktop, sent as plain `reason` text
+// (`HOST_RUN_REASONS`), not a protocol list. The logs are fixed text with a
+// code at most, never an ID.
+import {
+  isTerminalRunState,
+  newId,
+  RUN_CANCEL_REASONS,
+  type AgentId,
+  type AgentListItem,
+  type AgentRunListItem,
+  type DeviceId,
+  type EventId,
+  type ProjectId,
+  type ProviderConnection,
+  type RunId,
+  type RunState,
+  type WorkspaceId,
+} from "@mymandev/protocol";
+import type { AccountStatus } from "../../shared/ipc-contract.ts";
+import type { AccountService } from "../account.ts";
+import type { ConnectionClient } from "../connection/client.ts";
+import type {
+  EnforcementDenialReason,
+  HeldRun,
+  PermissionEnforcement,
+} from "../permissions/enforcement.ts";
+import type { GrantStoreService } from "../permissions/grant-store.ts";
+import type { ScheduleTimer } from "../runtime.ts";
+import { workspaceRetryDelayMs } from "../workspace/service.ts";
+import {
+  createHostRun,
+  HOST_RUN_ACK_TIMEOUT_MS,
+  type HostRun,
+  type HostRunState,
+} from "./host-run.ts";
+import {
+  RUN_EXECUTOR_REASON_PATTERN,
+  type RunActionCheck,
+  type RunExecution,
+  type RunExecutionOutcome,
+  type RunExecutor,
+  type RunExecutorRegistry,
+} from "./run-executor.ts";
+import type { AgentActivityService, AgentActivityState } from "./service.ts";
+
+/**
+ * The reasons that this device gives with a run's `failed` or `cancelled`:
+ * codes of the desktop, sent as plain `reason` text. None of them is a code
+ * of `RUN_CANCEL_REASONS`, which only the server gives.
+ */
+export const HOST_RUN_REASONS = Object.freeze({
+  /** No executor for the provider kind of the run's connection. */
+  noExecutor: "no_executor",
+  /** The run has no provider connection, or it is not one of this device. */
+  providerConnectionMissing: "provider_connection_missing",
+  /** A restart, a crash, or a lost connection interrupted the run. */
+  hostInterrupted: "host_interrupted",
+  /** A grant that the run relies on is no longer active (#55). */
+  grantInactive: "grant_inactive",
+  /** The device signed out, or its sign-in is no longer valid (#55). */
+  signedOut: "signed_out",
+  /** The executor failed without a reason code that may be shown. */
+  executorFailed: "executor_failed",
+} as const);
+export type HostRunReason =
+  (typeof HOST_RUN_REASONS)[keyof typeof HOST_RUN_REASONS];
+
+/**
+ * The shortest time between two sends, resends included: at most 20 sends
+ * in any 10 seconds, against the account's 30 transitions (decision of
+ * 2026-11-05).
+ */
+export const RUN_SUPERVISOR_SEND_INTERVAL_MS = 500;
+
+/**
+ * What `beforeStart` decides for a run that may start: start it, or end it
+ * with `failed` or `cancelled` and a reason instead.
+ */
+export type RunStartDecision =
+  | { readonly start: true }
+  | {
+      readonly start: false;
+      readonly state: "failed" | "cancelled";
+      readonly reason: string;
+    };
+
+/** The default of `beforeStart`: every start is allowed. */
+export const ALLOW_RUN_START: RunStartDecision = Object.freeze({
+  start: true,
+});
+
+/** The part of the account service that the supervisor uses. */
+export type RunSupervisorAccount = Pick<
+  AccountService,
+  "status" | "onStatusChange" | "readWorkspaceData"
+>;
+/** The part of the connection client that the supervisor uses. */
+export type RunSupervisorConnection = Pick<
+  ConnectionClient,
+  "sendAs" | "onMessage" | "status" | "onStatusChange"
+>;
+/** The part of the agent activity service that the supervisor uses. */
+export type RunSupervisorAgents = Pick<
+  AgentActivityService,
+  "state" | "onChange" | "gateLive" | "runsReloaded"
+>;
+/** The part of the grant store that the supervisor uses. */
+export type RunSupervisorGrants = Pick<GrantStoreService, "onGrantsChanged">;
+
+export interface RunSupervisorOptions {
+  readonly account: RunSupervisorAccount;
+  readonly connection: RunSupervisorConnection;
+  readonly agents: RunSupervisorAgents;
+  readonly grants: RunSupervisorGrants;
+  readonly executors: RunExecutorRegistry;
+  /**
+   * The enforcement point, for `RunExecution.check` and the checks after a
+   * change of the grants. Without one, every check of an executor denies.
+   */
+  readonly enforcement?: Pick<PermissionEnforcement, "check">;
+  /**
+   * Asked right before `queued -> running`, for a run that has an executor
+   * and a provider connection of this device. Waits for the Project
+   * Manager's decision on a check of `provider.use` (#35, #55); defaults to
+   * `ALLOW_RUN_START`. A hook that throws, or answers outside
+   * `RunStartDecision`, sends nothing, and the run waits for the next
+   * reload.
+   */
+  readonly beforeStart?: (run: HeldRun) => RunStartDecision;
+  /** Agents whose runs another sender moves; the supervisor leaves them alone. */
+  readonly reservedAgentIds?: readonly AgentId[];
+  /** Defaults to `HOST_RUN_ACK_TIMEOUT_MS`. */
+  readonly ackTimeoutMs?: number;
+  /** Defaults to `setTimeout`. */
+  readonly scheduleTimer?: ScheduleTimer;
+  /** A monotonic clock in milliseconds; defaults to `performance.now`. */
+  readonly now?: () => number;
+  /** The wall clock in milliseconds, for `occurredAt`; defaults to `Date.now`. */
+  readonly wallClock?: () => number;
+  /** Defaults to a new UUIDv7. */
+  readonly newEventId?: () => EventId;
+  /**
+   * Receives fixed messages with a code at most, never an ID. An error that
+   * it throws is ignored.
+   */
+  readonly log?: (message: string) => void;
+}
+
+export interface RunSupervisor {
+  /**
+   * Stops listening, cancels the timers, and aborts every execution without
+   * a report: after the next start, the runs are reported as interrupted.
+   */
+  readonly close: () => void;
+}
+
+interface Transition {
+  readonly from: RunState;
+  readonly to: RunState;
+  readonly reason?: string;
+}
+
+/** What a start needs once `queued -> running` is acknowledged. */
+interface StartPlan {
+  readonly held: HeldRun;
+  readonly executor: RunExecutor;
+  readonly providerKind: ProviderConnection["kind"];
+  readonly inputMessageId: AgentRunListItem["inputMessageId"] | null;
+}
+
+/** An action that an executor checked and that has not ended. */
+interface Lease {
+  readonly request: unknown;
+}
+
+interface Execution {
+  readonly runId: RunId;
+  readonly agentId: AgentId;
+  readonly held: HeldRun;
+  readonly controller: AbortController;
+  readonly leases: Set<Lease>;
+  aborted: boolean;
+}
+
+/**
+ * Why a transition is due: `start` and `refuse` for a queued run, `orphan`
+ * for an interrupted one, `owed` for a transition held over a reload, and
+ * `finish` for the end of an execution or of an abort.
+ */
+type Purpose = "start" | "refuse" | "orphan" | "owed" | "finish";
+
+type Stage =
+  | {
+      readonly kind: "due";
+      readonly transition: Transition;
+      readonly purpose: Purpose;
+      readonly start: StartPlan | null;
+    }
+  | {
+      readonly kind: "sending";
+      readonly transition: Transition;
+      readonly model: HostRun;
+      readonly start: StartPlan | null;
+    }
+  | { readonly kind: "executing"; readonly execution: Execution }
+  | { readonly kind: "owed"; readonly transition: Transition };
+
+interface Entry {
+  readonly runId: RunId;
+  readonly agentId: AgentId;
+  readonly workspaceId: WorkspaceId;
+  readonly projectId: ProjectId;
+  /** The device that adopted the run; only it sends for the run. */
+  readonly deviceId: DeviceId;
+  stage: Stage;
+}
+
+/** Why every run is interrupted at once. */
+type Interruption = "signed_out" | "connection_lost" | "device_changed";
+
+/** The live activity of the open project, when every guard holds. */
+interface Live {
+  readonly device: DeviceId;
+  readonly state: AgentActivityState;
+  readonly workspaceId: WorkspaceId;
+  readonly projectId: ProjectId;
+}
+
+/** The denials of the enforcement point that concern the sign-in. */
+const SIGN_IN_DENIALS: ReadonlySet<EnforcementDenialReason> = new Set([
+  "signed_out",
+  "sign_in_invalid",
+  "device_unknown",
+  "not_this_device",
+]);
+
+const CHECK_FAILED: RunActionCheck = Object.freeze({
+  allowed: false,
+  reason: "check_failed",
+});
+
+/** The signed-in device, or null, under the same condition as the services. */
+function signedInDevice(status: AccountStatus): DeviceId | null {
+  if (
+    status.apiOrigin === "set" &&
+    status.device === "signed_in" &&
+    status.deviceKey === "ready" &&
+    status.account.kind === "signed_in"
+  ) {
+    return status.account.deviceId as DeviceId;
+  }
+  return null;
+}
+
+function scheduleWithSetTimeout(
+  callback: () => void,
+  delayMs: number,
+): () => void {
+  const handle = setTimeout(callback, delayMs);
+  return () => clearTimeout(handle);
+}
+
+/** Older first: the creation time, then the ID, which is a UUIDv7. */
+function olderFirst(a: AgentRunListItem, b: AgentRunListItem): number {
+  const at = Date.parse(a.createdAt) - Date.parse(b.createdAt);
+  if (at !== 0) {
+    return at;
+  }
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/** The reasons that only the server gives. */
+const SERVER_REASONS: readonly string[] = RUN_CANCEL_REASONS;
+
+/** The terminal transition of an executor's outcome. */
+function finishOf(outcome: unknown): Transition {
+  if (typeof outcome === "object" && outcome !== null) {
+    const value = outcome as { outcome?: unknown; reason?: unknown };
+    if (value.outcome === "completed") {
+      return { from: "running", to: "completed" };
+    }
+    if (
+      value.outcome === "failed" &&
+      typeof value.reason === "string" &&
+      RUN_EXECUTOR_REASON_PATTERN.test(value.reason) &&
+      !SERVER_REASONS.includes(value.reason)
+    ) {
+      return { from: "running", to: "failed", reason: value.reason };
+    }
+  }
+  return {
+    from: "running",
+    to: "failed",
+    reason: HOST_RUN_REASONS.executorFailed,
+  };
+}
+
+/** The transition that reports a run that an interruption stopped. */
+function interruptedTransition(
+  cause: Exclude<Interruption, "device_changed">,
+): Transition {
+  return cause === "signed_out"
+    ? { from: "running", to: "cancelled", reason: HOST_RUN_REASONS.signedOut }
+    : {
+        from: "running",
+        to: "failed",
+        reason: HOST_RUN_REASONS.hostInterrupted,
+      };
+}
+
+export function createRunSupervisor(
+  options: RunSupervisorOptions,
+): RunSupervisor {
+  const { account, connection, agents, grants, executors } = options;
+  const enforcement = options.enforcement ?? null;
+  const beforeStart = options.beforeStart ?? (() => ALLOW_RUN_START);
+  const reserved: ReadonlySet<AgentId> = new Set(
+    options.reservedAgentIds ?? [],
+  );
+  const ackTimeoutMs = options.ackTimeoutMs ?? HOST_RUN_ACK_TIMEOUT_MS;
+  const schedule = options.scheduleTimer ?? scheduleWithSetTimeout;
+  const now = options.now ?? (() => performance.now());
+  const wallClock = options.wallClock ?? (() => Date.now());
+  const newEventId = options.newEventId ?? (() => newId<EventId>());
+
+  function log(message: string): void {
+    try {
+      options.log?.(message);
+    } catch {
+      // A failing log changes nothing.
+    }
+  }
+
+  let closed = false;
+  let device: DeviceId | null = signedInDevice(account.status());
+  let connected = connection.status().state === "connected";
+  /** The runs that the supervisor holds, in the order they were adopted. */
+  const entries = new Map<RunId, Entry>();
+  /** Executions whose executor has not settled, aborted ones included. */
+  const executions = new Set<Execution>();
+  /** Runs dropped after a refusal, with their agent, until the next reload. */
+  const dropped = new Map<RunId, AgentId>();
+  /** The entry whose transition is in flight. */
+  let inFlight: Entry | null = null;
+  /** The monotonic time of the last send, or null before the first. */
+  let lastSend: number | null = null;
+  let cancelPace: (() => void) | null = null;
+  /** The value of `runsReloaded` that the last scan saw. */
+  let scannedReload: number | null = null;
+  /** Changes with every change of the device, so that a read for an earlier one is dropped. */
+  let epoch = 0;
+  let providerReadInFlight = false;
+  let cancelProviderRetry: (() => void) | null = null;
+  let providerAttempt = 0;
+
+  // The guards.
+
+  function liveActivity(): Live | null {
+    if (closed || device === null || !connected) {
+      return null;
+    }
+    const state = agents.state();
+    if (
+      state.status !== "ready" ||
+      state.workspaceId === null ||
+      state.projectId === null ||
+      !agents.gateLive()
+    ) {
+      return null;
+    }
+    return {
+      device,
+      state,
+      workspaceId: state.workspaceId,
+      projectId: state.projectId,
+    };
+  }
+
+  /** Whether the supervisor adopts the runs of `agent` on `live`. */
+  function adoptable(agent: AgentListItem | undefined, live: Live): boolean {
+    return (
+      agent !== undefined &&
+      agent.projectId === live.projectId &&
+      agent.hostDeviceId !== undefined &&
+      agent.hostDeviceId === live.device &&
+      agent.disabledAt === null &&
+      !reserved.has(agent.id)
+    );
+  }
+
+  function agentOf(live: Live, agentId: AgentId): AgentListItem | undefined {
+    return live.state.agents.find((agent) => agent.id === agentId);
+  }
+
+  /** Whether `agentId` may not start another run now; see "Order". */
+  function agentBusy(agentId: AgentId, live: Live): boolean {
+    for (const entry of entries.values()) {
+      if (entry.agentId === agentId) {
+        return true;
+      }
+    }
+    for (const execution of executions) {
+      if (execution.agentId === agentId) {
+        return true;
+      }
+    }
+    for (const agent of dropped.values()) {
+      if (agent === agentId) {
+        return true;
+      }
+    }
+    return live.state.unfinishedRuns.some(
+      (run) => run.agentId === agentId && run.state !== "queued",
+    );
+  }
+
+  /** The oldest queued run of each adoptable agent that is not busy. */
+  function candidates(live: Live): AgentRunListItem[] {
+    const found: AgentRunListItem[] = [];
+    for (const agent of live.state.agents) {
+      if (!adoptable(agent, live) || agentBusy(agent.id, live)) {
+        continue;
+      }
+      const queued = live.state.unfinishedRuns
+        .filter((run) => run.agentId === agent.id && run.state === "queued")
+        .sort(olderFirst)[0];
+      if (queued !== undefined) {
+        found.push(queued);
+      }
+    }
+    return found;
+  }
+
+  // The executions.
+
+  function releaseLeases(execution: Execution): void {
+    execution.leases.clear();
+  }
+
+  /**
+   * Aborts the execution of `entry`, and then reports `next` (`due` now,
+   * or `owed` after the next reload), or nothing when `next` is null.
+   */
+  function abortExecution(
+    entry: Entry,
+    next: Transition | null,
+    mode: "due" | "owed",
+  ): void {
+    if (entry.stage.kind !== "executing") {
+      return;
+    }
+    const { execution } = entry.stage;
+    execution.aborted = true;
+    releaseLeases(execution);
+    if (next === null) {
+      entries.delete(entry.runId);
+    } else {
+      entry.stage =
+        mode === "owed"
+          ? { kind: "owed", transition: next }
+          : { kind: "due", transition: next, purpose: "finish", start: null };
+    }
+    try {
+      execution.controller.abort();
+    } catch {
+      // A listener of the signal that throws changes nothing.
+    }
+  }
+
+  function checkAction(execution: Execution, request: unknown): RunActionCheck {
+    if (closed || execution.aborted || enforcement === null) {
+      return CHECK_FAILED;
+    }
+    let decision;
+    try {
+      decision = enforcement.check(execution.held, request);
+    } catch {
+      return CHECK_FAILED;
+    }
+    if (!decision.allowed) {
+      return Object.freeze({ allowed: false, reason: decision.reason });
+    }
+    const lease: Lease = Object.freeze({ request: decision.request });
+    execution.leases.add(lease);
+    return Object.freeze({
+      allowed: true,
+      request: decision.request,
+      end: () => {
+        execution.leases.delete(lease);
+      },
+    });
+  }
+
+  function startExecution(entry: Entry, plan: StartPlan): void {
+    const execution: Execution = {
+      runId: entry.runId,
+      agentId: entry.agentId,
+      held: plan.held,
+      controller: new AbortController(),
+      leases: new Set(),
+      aborted: false,
+    };
+    executions.add(execution);
+    entry.stage = { kind: "executing", execution };
+    const context: RunExecution = Object.freeze({
+      run: plan.held,
+      workspaceId: entry.workspaceId,
+      projectId: entry.projectId,
+      inputMessageId: plan.inputMessageId ?? null,
+      providerKind: plan.providerKind,
+      signal: execution.controller.signal,
+      check: (request: unknown) => checkAction(execution, request),
+    });
+    log("The host run supervisor started a run.");
+    let outcome: Promise<RunExecutionOutcome>;
+    try {
+      outcome = Promise.resolve(plan.executor.start(context));
+    } catch (error: unknown) {
+      outcome = Promise.reject(error);
+    }
+    outcome.then(
+      (value) => settled(entry, execution, value),
+      () => settled(entry, execution, null),
+    );
+  }
+
+  function settled(entry: Entry, execution: Execution, outcome: unknown): void {
+    executions.delete(execution);
+    releaseLeases(execution);
+    if (closed) {
+      return;
+    }
+    if (
+      !execution.aborted &&
+      entries.get(entry.runId) === entry &&
+      entry.stage.kind === "executing" &&
+      entry.stage.execution === execution
+    ) {
+      execution.aborted = true;
+      const transition = finishOf(outcome);
+      entry.stage = {
+        kind: "due",
+        transition,
+        purpose: "finish",
+        start: null,
+      };
+      log(
+        `A run ended on this device (${transition.reason ?? transition.to}).`,
+      );
+    }
+    evaluate();
+  }
+
+  // The interruptions.
+
+  /** Reports every run that an interruption stopped, or drops them all. */
+  function interruptAll(cause: Interruption): void {
+    if (cause !== "device_changed" && entries.size > 0) {
+      log(
+        `The host run supervisor holds its runs' transitions until the next reload (${cause}).`,
+      );
+    }
+    for (const entry of [...entries.values()]) {
+      const stage = entry.stage;
+      if (cause === "device_changed") {
+        if (stage.kind === "sending") {
+          stage.model.close();
+        }
+        if (stage.kind === "executing") {
+          abortExecution(entry, null, "owed");
+        }
+        entries.delete(entry.runId);
+        continue;
+      }
+      switch (stage.kind) {
+        case "sending":
+          stage.model.close();
+          entry.stage = {
+            kind: "owed",
+            transition:
+              stage.start === null
+                ? stage.transition
+                : interruptedTransition(cause),
+          };
+          break;
+        case "executing":
+          abortExecution(entry, interruptedTransition(cause), "owed");
+          break;
+        case "due":
+          if (stage.purpose === "finish" || stage.purpose === "owed") {
+            entry.stage = { kind: "owed", transition: stage.transition };
+          } else {
+            // Computed from the activity: the next reload computes it again.
+            entries.delete(entry.runId);
+          }
+          break;
+        case "owed":
+          break;
+      }
+    }
+    inFlight = null;
+    if (cause === "device_changed") {
+      dropped.clear();
+    }
+  }
+
+  function accountChanged(status: AccountStatus): void {
+    const next = signedInDevice(status);
+    if (next === device) {
+      return;
+    }
+    const previous = device;
+    device = next;
+    epoch += 1;
+    providerReadInFlight = false;
+    if (previous !== null) {
+      interruptAll(next === null ? "signed_out" : "device_changed");
+    }
+    if (next !== null) {
+      // Only the device that adopted a run sends for it.
+      for (const entry of [...entries.values()]) {
+        if (entry.deviceId !== next) {
+          entries.delete(entry.runId);
+        }
+      }
+    }
+  }
+
+  function connectionChanged(state: string): void {
+    const was = connected;
+    connected = state === "connected";
+    if (was && !connected) {
+      interruptAll(state === "offline" ? "signed_out" : "connection_lost");
+    }
+  }
+
+  /** Checks every held action again; the first denial stops its run. */
+  function grantsChanged(): void {
+    accountChanged(account.status());
+    connectionChanged(connection.status().state);
+    for (const entry of [...entries.values()]) {
+      if (entry.stage.kind !== "executing") {
+        continue;
+      }
+      const { execution } = entry.stage;
+      for (const lease of [...execution.leases]) {
+        let reason: EnforcementDenialReason | null;
+        if (enforcement === null) {
+          reason = "check_failed";
+        } else {
+          try {
+            const decision = enforcement.check(execution.held, lease.request);
+            reason = decision.allowed ? null : decision.reason;
+          } catch {
+            reason = "check_failed";
+          }
+        }
+        if (reason === null) {
+          continue;
+        }
+        const code = SIGN_IN_DENIALS.has(reason)
+          ? HOST_RUN_REASONS.signedOut
+          : HOST_RUN_REASONS.grantInactive;
+        log(`A run was stopped on this device (${code}).`);
+        abortExecution(
+          entry,
+          { from: "running", to: "cancelled", reason: code },
+          "due",
+        );
+        break;
+      }
+    }
+  }
+
+  // The reloads and the adoption.
+
+  /** After a reload of the runs: owed transitions, then interrupted runs. */
+  function afterReload(live: Live): void {
+    dropped.clear();
+    for (const entry of [...entries.values()]) {
+      if (
+        entry.stage.kind !== "owed" ||
+        entry.workspaceId !== live.workspaceId ||
+        entry.projectId !== live.projectId
+      ) {
+        continue;
+      }
+      const { transition } = entry.stage;
+      const run = live.state.unfinishedRuns.find(
+        (item) => item.id === entry.runId,
+      );
+      if (run === undefined || run.state !== transition.from) {
+        // The run moved on without it, or ended.
+        entries.delete(entry.runId);
+        continue;
+      }
+      entry.stage = { kind: "due", transition, purpose: "owed", start: null };
+    }
+    // An aborted execution that has not settled yet holds no run: its run
+    // is reported, while its agent stays busy until it settles.
+    for (const run of [...live.state.unfinishedRuns].sort(olderFirst)) {
+      if (
+        (run.state !== "running" && run.state !== "awaiting_input") ||
+        entries.has(run.id) ||
+        !adoptable(agentOf(live, run.agentId), live)
+      ) {
+        continue;
+      }
+      log("The host run supervisor reports an interrupted run.");
+      entries.set(run.id, {
+        runId: run.id,
+        agentId: run.agentId,
+        workspaceId: live.workspaceId,
+        projectId: live.projectId,
+        deviceId: live.device,
+        stage: {
+          kind: "due",
+          transition: {
+            from: run.state,
+            to: "failed",
+            reason: HOST_RUN_REASONS.hostInterrupted,
+          },
+          purpose: "orphan",
+          start: null,
+        },
+      });
+    }
+  }
+
+  /** Drops what the server already finished in the open project. */
+  function followFinished(live: Live): void {
+    for (const entry of [...entries.values()]) {
+      if (
+        entry.workspaceId !== live.workspaceId ||
+        entry.projectId !== live.projectId ||
+        entry.stage.kind === "sending" ||
+        !live.state.finishedRuns.some((run) => run.id === entry.runId)
+      ) {
+        continue;
+      }
+      if (entry.stage.kind === "executing") {
+        log("The server finished a run that ran on this device.");
+        abortExecution(entry, null, "due");
+      } else {
+        entries.delete(entry.runId);
+      }
+    }
+  }
+
+  function readProviderConnections(): void {
+    providerReadInFlight = true;
+    const asked = epoch;
+    void account
+      .readWorkspaceData("listProviderConnections", {})
+      .catch(() => ({ ok: false, reason: "unavailable" }) as const)
+      .then((result) => {
+        if (closed || asked !== epoch) {
+          return;
+        }
+        providerReadInFlight = false;
+        if (!result.ok) {
+          log(`The provider connections could not be read (${result.reason}).`);
+          cancelProviderRetry = schedule(
+            () => {
+              cancelProviderRetry = null;
+              evaluate();
+            },
+            workspaceRetryDelayMs(providerAttempt, result.reason),
+          );
+          providerAttempt += 1;
+          return;
+        }
+        providerAttempt = 0;
+        decideStarts(result.value.providerConnections);
+        evaluate();
+      });
+  }
+
+  /** Decides each candidate with this device's provider connections. */
+  function decideStarts(connections: readonly ProviderConnection[]): void {
+    const live = liveActivity();
+    if (live === null) {
+      return;
+    }
+    for (const run of candidates(live)) {
+      const due = (
+        transition: Transition,
+        purpose: Purpose,
+        start: StartPlan | null,
+      ) => {
+        entries.set(run.id, {
+          runId: run.id,
+          agentId: run.agentId,
+          workspaceId: live.workspaceId,
+          projectId: live.projectId,
+          deviceId: live.device,
+          stage: { kind: "due", transition, purpose, start },
+        });
+      };
+      const found = connections.find(
+        (item) =>
+          run.providerConnectionId !== undefined &&
+          item.id === run.providerConnectionId,
+      );
+      if (found === undefined) {
+        log(
+          `A run cannot run on this device (${HOST_RUN_REASONS.providerConnectionMissing}).`,
+        );
+        due(
+          {
+            from: "queued",
+            to: "failed",
+            reason: HOST_RUN_REASONS.providerConnectionMissing,
+          },
+          "refuse",
+          null,
+        );
+        continue;
+      }
+      const executor = executors.get(found.kind);
+      if (executor === null) {
+        log(
+          `A run cannot run on this device (${HOST_RUN_REASONS.noExecutor}).`,
+        );
+        due(
+          {
+            from: "queued",
+            to: "failed",
+            reason: HOST_RUN_REASONS.noExecutor,
+          },
+          "refuse",
+          null,
+        );
+        continue;
+      }
+      const held: HeldRun = Object.freeze({
+        runId: run.id,
+        agentId: run.agentId,
+        hostDeviceId: live.device,
+        repositoryId: run.repositoryId,
+        providerConnectionId: found.id,
+      });
+      let decision: RunStartDecision;
+      try {
+        decision = beforeStart(held);
+      } catch {
+        log("The check before a run start failed; the run waits.");
+        dropped.set(run.id, run.agentId);
+        continue;
+      }
+      if (decision.start === true) {
+        due({ from: "queued", to: "running" }, "start", {
+          held,
+          executor,
+          providerKind: found.kind,
+          inputMessageId: run.inputMessageId ?? null,
+        });
+        continue;
+      }
+      if (
+        decision.start === false &&
+        (decision.state === "failed" || decision.state === "cancelled") &&
+        typeof decision.reason === "string"
+      ) {
+        due(
+          { from: "queued", to: decision.state, reason: decision.reason },
+          "refuse",
+          null,
+        );
+        continue;
+      }
+      log("The check before a run start failed; the run waits.");
+      dropped.set(run.id, run.agentId);
+    }
+  }
+
+  // The sends.
+
+  /** Whether the pace allows a send now; otherwise the pump is scheduled. */
+  function paceAllows(): boolean {
+    if (lastSend === null) {
+      return true;
+    }
+    const delay = lastSend + RUN_SUPERVISOR_SEND_INTERVAL_MS - now();
+    if (delay <= 0) {
+      return true;
+    }
+    cancelPace ??= schedule(() => {
+      cancelPace = null;
+      evaluate();
+    }, delay);
+    return false;
+  }
+
+  /** The next due entry that may go now, or null. */
+  function nextDue(): Entry | null {
+    const live = liveActivity();
+    for (const entry of [...entries.values()]) {
+      const stage = entry.stage;
+      if (stage.kind !== "due" || entry.deviceId !== device) {
+        continue;
+      }
+      if (stage.purpose === "finish") {
+        // From the run's known state: it needs no activity.
+        return entry;
+      }
+      if (
+        live === null ||
+        live.workspaceId !== entry.workspaceId ||
+        live.projectId !== entry.projectId
+      ) {
+        if (live !== null || agents.state().projectId !== entry.projectId) {
+          // Another project is open, or none: an owed transition waits for
+          // its project's next reload, the others are computed again then.
+          if (stage.purpose === "owed") {
+            entry.stage = { kind: "owed", transition: stage.transition };
+          } else {
+            entries.delete(entry.runId);
+          }
+        }
+        continue;
+      }
+      const run = live.state.unfinishedRuns.find(
+        (item) => item.id === entry.runId,
+      );
+      if (run === undefined || run.state !== stage.transition.from) {
+        // The run moved on meanwhile.
+        entries.delete(entry.runId);
+        continue;
+      }
+      return entry;
+    }
+    return null;
+  }
+
+  function pump(): void {
+    if (closed || device === null || !connected) {
+      return;
+    }
+    if (inFlight !== null) {
+      const stage = inFlight.stage;
+      if (
+        stage.kind === "sending" &&
+        stage.model.state().phase === "resend_due" &&
+        paceAllows()
+      ) {
+        lastSend = now();
+        stage.model.resend();
+      }
+      return;
+    }
+    const entry = nextDue();
+    if (entry === null || entry.stage.kind !== "due" || !paceAllows()) {
+      return;
+    }
+    send(entry, entry.stage.transition, entry.stage.start);
+  }
+
+  function send(
+    entry: Entry,
+    transition: Transition,
+    start: StartPlan | null,
+  ): void {
+    const model: HostRun = createHostRun({
+      workspaceId: entry.workspaceId,
+      agentId: entry.agentId,
+      hostDeviceId: entry.deviceId,
+      runId: entry.runId,
+      runState: transition.from,
+      connection,
+      ackTimeoutMs,
+      scheduleTimer: schedule,
+      wallClock,
+      newEventId,
+      onChange: (state) => modelChanged(entry, model, state),
+    });
+    entry.stage = { kind: "sending", transition, model, start };
+    inFlight = entry;
+    lastSend = now();
+    const result = model.transition(transition.to, transition.reason);
+    if (result === "sent" || result === "stopped") {
+      // A stop has been handled by `modelChanged`.
+      return;
+    }
+    // The model refused the transition before a send: never retried.
+    log(`A run transition was not sent (${result}); the run waits.`);
+    model.close();
+    inFlight = null;
+    entries.delete(entry.runId);
+    dropped.set(entry.runId, entry.agentId);
+  }
+
+  function modelChanged(
+    entry: Entry,
+    model: HostRun,
+    state: HostRunState,
+  ): void {
+    if (
+      closed ||
+      inFlight !== entry ||
+      entry.stage.kind !== "sending" ||
+      entry.stage.model !== model
+    ) {
+      return;
+    }
+    switch (state.phase) {
+      case "idle":
+        acknowledged(entry, entry.stage, state.runState);
+        return;
+      case "stopped":
+        stopped(entry, entry.stage, state);
+        return;
+      case "resend_due":
+        log("A run transition got no acknowledgement; it is sent once more.");
+        pump();
+        return;
+      case "awaiting_ack":
+      case "closed":
+        return;
+    }
+  }
+
+  function acknowledged(
+    entry: Entry,
+    stage: Extract<Stage, { kind: "sending" }>,
+    runState: RunState,
+  ): void {
+    stage.model.close();
+    inFlight = null;
+    if (stage.start !== null && runState === "running") {
+      startExecution(entry, stage.start);
+    } else if (isTerminalRunState(runState)) {
+      entries.delete(entry.runId);
+    } else {
+      // Another state than the one sent: the next reload tells.
+      entries.delete(entry.runId);
+      dropped.set(entry.runId, entry.agentId);
+    }
+    evaluate();
+  }
+
+  function stopped(
+    entry: Entry,
+    stage: Extract<Stage, { kind: "sending" }>,
+    state: HostRunState,
+  ): void {
+    inFlight = null;
+    const stop = state.stop;
+    if (stop === null || stop.cause === "refused") {
+      log(
+        `The server refused a run transition (${stop?.cause === "refused" ? stop.code : "unknown"}); the run waits for the next reload.`,
+      );
+      entries.delete(entry.runId);
+      dropped.set(entry.runId, entry.agentId);
+    } else {
+      const cause =
+        stop.cause === "signed_out" ? "signed_out" : "connection_lost";
+      log(`A run transition is held until the next reload (${stop.cause}).`);
+      entry.stage = {
+        kind: "owed",
+        transition:
+          stage.start === null
+            ? stage.transition
+            : interruptedTransition(cause),
+      };
+    }
+    evaluate();
+  }
+
+  // The evaluation.
+
+  let evaluating = false;
+  let again = false;
+
+  /** Applies what changed and sends what is due. Never re-entered. */
+  function evaluate(): void {
+    if (closed) {
+      return;
+    }
+    if (evaluating) {
+      again = true;
+      return;
+    }
+    evaluating = true;
+    try {
+      do {
+        again = false;
+        const live = liveActivity();
+        if (live !== null) {
+          followFinished(live);
+          const reloads = agents.runsReloaded();
+          if (reloads !== scannedReload) {
+            scannedReload = reloads;
+            afterReload(live);
+          }
+          if (
+            executors.kinds().length > 0 &&
+            !providerReadInFlight &&
+            cancelProviderRetry === null &&
+            candidates(live).length > 0
+          ) {
+            readProviderConnections();
+          }
+        }
+        pump();
+      } while (again && !closed);
+    } finally {
+      evaluating = false;
+    }
+  }
+
+  const removers = [
+    account.onStatusChange((status) => {
+      accountChanged(status);
+      evaluate();
+    }),
+    connection.onStatusChange((status) => {
+      connectionChanged(status.state);
+      evaluate();
+    }),
+    agents.onChange(() => evaluate()),
+    grants.onGrantsChanged(() => {
+      grantsChanged();
+      evaluate();
+    }),
+  ];
+
+  evaluate();
+
+  return Object.freeze({
+    close: () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      for (const remove of removers.splice(0)) {
+        remove();
+      }
+      cancelPace?.();
+      cancelPace = null;
+      cancelProviderRetry?.();
+      cancelProviderRetry = null;
+      if (inFlight?.stage.kind === "sending") {
+        inFlight.stage.model.close();
+      }
+      inFlight = null;
+      for (const entry of [...entries.values()]) {
+        if (entry.stage.kind === "executing") {
+          abortExecution(entry, null, "due");
+        }
+      }
+      entries.clear();
+      dropped.clear();
+    },
+  });
+}
