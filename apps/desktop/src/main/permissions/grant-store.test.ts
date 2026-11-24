@@ -188,11 +188,7 @@ function runCancelled(reason: string): ServerMessage {
 }
 
 const TRIGGERS: readonly (readonly [string, () => ServerMessage])[] = [
-  ["agent.grant.created", () => grantCreated()],
-  [
-    "agent.grant.created of an agent that no record names",
-    () => grantCreated(OTHER_AGENT),
-  ],
+  ["agent.grant.created of a held agent", () => grantCreated()],
   ["agent.grant.revoked of a held agent", () => grantRevoked()],
   [
     "workspace.member.removed",
@@ -245,6 +241,11 @@ const TRIGGERS: readonly (readonly [string, () => ServerMessage])[] = [
 ];
 
 const NOT_TRIGGERS: readonly (readonly [string, () => ServerMessage])[] = [
+  [
+    // Another device's agent, as far as this device can tell (#335).
+    "agent.grant.created of an agent that no answer named",
+    () => grantCreated(OTHER_AGENT),
+  ],
   [
     "agent.grant.revoked of an agent that no record names",
     () => grantRevoked(OTHER_AGENT, SECOND_GRANT),
@@ -685,6 +686,62 @@ test("a refused list makes it unusable: another device, another account, or anot
   }
 });
 
+test("a refused answer adds no agent and leaves the agents unknown", async () => {
+  const refused: readonly (readonly [
+    string,
+    (agentId: string) => ListResult,
+    (h: ReturnType<typeof setup>) => void,
+  ])[] = [
+    [
+      "another host device",
+      (agentId) => list(record({ agentId, hostDeviceId: OTHER_DEVICE })),
+      () => undefined,
+    ],
+    [
+      "another account",
+      (agentId) => list(record({ agentId, userId: OTHER_USER })),
+      () => undefined,
+    ],
+    [
+      "another identity of the connection",
+      (agentId) => list(record({ agentId })),
+      (h) =>
+        h.setIdentity({
+          userId: OTHER_USER,
+          deviceId: DEVICE,
+        } as ConnectionIdentity),
+    ],
+  ];
+  const own = { userId: USER, deviceId: DEVICE } as ConnectionIdentity;
+  for (const [name, answer, change] of refused) {
+    // After an accepted answer, the refused answer's agent stays unknown.
+    const h = await live();
+    h.receive(grantCreated());
+    change(h);
+    await h.answer(1, answer(OTHER_AGENT));
+    expect(h.store.read().usable, name).toBe(false);
+    h.setIdentity(own);
+    h.fire();
+    await h.answer(2, list(record()));
+    expect(h.store.read().usable, name).toBe(true);
+    h.receive(grantCreated(OTHER_AGENT));
+    expect(h.reads, name).toHaveLength(3);
+
+    // Before an accepted answer, a refused one leaves the store unable to
+    // tell, so a grant on any agent reads once more after the retry.
+    const f = setup();
+    f.receive(subscribed());
+    change(f);
+    await f.answer(0, answer(AGENT));
+    f.setIdentity(own);
+    f.fire();
+    expect(f.reads, name).toHaveLength(2);
+    f.receive(grantCreated(OTHER_AGENT));
+    await f.answer(1, list());
+    expect(f.reads, name).toHaveLength(3);
+  }
+});
+
 test("each trigger reads again, and other messages do not", async () => {
   for (const [name, message] of TRIGGERS) {
     const h = await live();
@@ -703,7 +760,7 @@ test("each trigger reads again, and other messages do not", async () => {
 
 test("a revocation of an agent that no record names reads while a read is on its way", async () => {
   const h = await live();
-  h.receive(grantCreated(OTHER_AGENT));
+  h.receive(grantCreated());
   expect(h.reads).toHaveLength(2);
   // The answer on its way may hold the revoked grant.
   h.receive(grantRevoked(OTHER_AGENT, SECOND_GRANT));
@@ -715,6 +772,121 @@ test("a revocation of an agent that no record names reads while a read is on its
   expect(h.reads).toHaveLength(3);
   await h.answer(2, list(record()));
   expect(h.store.read().records).toEqual([record()]);
+});
+
+test("agent.grant.created reads at once for an agent of this device, never for another device's", async () => {
+  const h = await live();
+  // Another device's agent: its records never reach this device, so a read
+  // would only spend the request limit (#335).
+  for (let round = 0; round < 10; round += 1) {
+    h.receive(grantCreated(OTHER_AGENT));
+  }
+  expect(h.reads).toHaveLength(1);
+  expect(h.store.read().records).toEqual([record()]);
+
+  // An agent that an answer named: read at once, not after the interval.
+  h.receive(grantCreated());
+  expect(h.reads).toHaveLength(2);
+  const added = record({ grantId: SECOND_GRANT });
+  await h.answer(1, list(record(), added));
+  expect(h.store.read().records).toEqual([record(), added]);
+  expect(h.reads).toHaveLength(2);
+});
+
+test("an agent stays known after its grants ended and across drops, until the device changes", async () => {
+  const h = await live();
+  // An expired grant's renewal comes after the revocation of the expired
+  // one, whose read may already leave the agent without a record.
+  h.receive(grantRevoked());
+  expect(h.reads).toHaveLength(2);
+  await h.answer(1, list());
+  expect(h.store.read()).toEqual({ usable: true, records: [] });
+  h.receive(grantCreated());
+  expect(h.reads).toHaveLength(3);
+  const renewed = record({ grantId: SECOND_GRANT });
+  await h.answer(2, list(renewed));
+  expect(h.store.read().records).toEqual([renewed]);
+
+  // A lost connection and a new subscription keep the known agents, also
+  // when the first answer after it names none of them.
+  h.setConnection("waiting");
+  h.setConnection("connected");
+  h.setIdentity({ userId: USER, deviceId: DEVICE } as ConnectionIdentity);
+  h.receive(subscribed());
+  await h.answer(3, list());
+  h.receive(grantCreated());
+  expect(h.reads).toHaveLength(5);
+  await h.answer(4, list(renewed));
+
+  // Another device knows none of them: before its first answer it reads on
+  // each grant, once more after the read on its way; then only for its own.
+  h.setAccount(signedIn(OTHER_DEVICE));
+  h.setIdentity({ userId: USER, deviceId: OTHER_DEVICE } as ConnectionIdentity);
+  h.receive(subscribed());
+  expect(h.reads).toHaveLength(6);
+  h.receive(grantCreated());
+  expect(h.reads).toHaveLength(6);
+  await h.answer(5, list());
+  expect(h.reads).toHaveLength(7);
+  await h.answer(6, list());
+  expect(h.store.read()).toEqual({ usable: true, records: [] });
+  h.receive(grantCreated());
+  h.receive(grantCreated(OTHER_AGENT));
+  expect(h.reads).toHaveLength(7);
+});
+
+test("before the first answer agent.grant.created reads once more, since the store cannot tell", async () => {
+  const h = setup();
+  h.receive(subscribed());
+  h.receive(grantCreated(OTHER_AGENT));
+  expect(h.reads).toHaveLength(1);
+  // The first read may have been answered before the grant was stored.
+  await h.answer(0, list(record()));
+  expect(h.reads).toHaveLength(2);
+  await h.answer(1, list(record()));
+  h.receive(grantCreated(OTHER_AGENT));
+  expect(h.reads).toHaveLength(2);
+
+  // A failed first read leaves the agents unknown; the retry reads.
+  const f = setup();
+  f.receive(subscribed());
+  await f.answer(0, failed("unavailable"));
+  f.receive(grantCreated(OTHER_AGENT));
+  expect(f.reads).toHaveLength(1);
+  f.fire();
+  expect(f.reads).toHaveLength(2);
+  await f.answer(1, list());
+  f.receive(grantCreated(OTHER_AGENT));
+  expect(f.reads).toHaveLength(2);
+});
+
+test("this device's grant action reads at once, also for the first grant of an agent that no answer named", async () => {
+  const h = await live();
+  // The first grant of a new agent of this device: its event alone does not
+  // read, the grant action's answer does.
+  h.receive(grantCreated(OTHER_AGENT));
+  expect(h.reads).toHaveLength(1);
+  h.store.ownGrantAnswered();
+  expect(h.reads).toHaveLength(2);
+  const first = record({ grantId: SECOND_GRANT, agentId: OTHER_AGENT });
+  await h.answer(1, list(record(), first));
+  expect(h.store.read().records).toEqual([record(), first]);
+  // From then on the agent's grants read on their event.
+  h.receive(grantCreated(OTHER_AGENT));
+  expect(h.reads).toHaveLength(3);
+  // It merges like any trigger.
+  h.store.ownGrantAnswered();
+  expect(h.reads).toHaveLength(3);
+  await h.answer(2, list(record(), first));
+  expect(h.reads).toHaveLength(4);
+  await h.answer(3, list(record(), first));
+  // It never reads while a read may not be sent, nor after the close.
+  h.setConnection("waiting");
+  h.store.ownGrantAnswered();
+  expect(h.reads).toHaveLength(4);
+  h.store.close();
+  h.store.ownGrantAnswered();
+  expect(h.reads).toHaveLength(4);
 });
 
 test("reads merge: triggers during a read keep its answer and read once more", async () => {

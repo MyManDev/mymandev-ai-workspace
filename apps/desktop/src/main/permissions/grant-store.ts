@@ -24,9 +24,15 @@
 //   `read()`. A first read after the subscription still has to succeed.
 // - Reads. After each `workspace.subscribed` of the selected workspace;
 //   every `GRANT_REREAD_INTERVAL_MS` while it stays live, for revocations
-//   that send no event and for missed events; on `agent.grant.created` (the
-//   event names no device, and only the agent's host device grants, so the
-//   store cannot tell a grant of this device from another's) and on
+//   that send no event and for missed events; on `agent.grant.created` only
+//   for an agent that this device hosts (#335): the event names no device
+//   (#110), and only the agent's host device grants, so a grant on another
+//   device's agent can never change the records and would only spend the
+//   request limit. The store knows its agents from the records: every agent
+//   that an answer for this device named, also after its grants ended,
+//   until the device changes; before the first answer it reads on each such
+//   event. A grant on an agent that no answer named yet is read by this
+//   device's grant action (`ownGrantAnswered`) or by the interval. On
 //   `agent.grant.revoked` for an agent that the held records name, or while
 //   a read is on its way; and on the changes that revoke grants in their own
 //   transaction (P-77): `workspace.member.removed`, a server cancellation
@@ -175,6 +181,17 @@ export interface GrantStoreService extends GrantStore {
    * takes records from the signal, and it never keeps a decision.
    */
   readonly onGrantsChanged: (listener: () => void) => () => void;
+  /**
+   * Reads the records again, as `agent.grant.created` of a known agent does.
+   * This device's grant action calls it once its
+   * `POST /agents/:agentId/grants` ends, whatever the outcome, also a
+   * failure or a timeout, because the grant may be stored even then. So the
+   * grant is held without waiting for the interval, also one on an agent
+   * that no answer named yet, such as a new agent's first grant or one whose
+   * grants all ended before the first answer (#335). Granting is not
+   * available on the desktop yet, so nothing calls it.
+   */
+  readonly ownGrantAnswered: () => void;
   /** Stops listening and cancels the timers, for the quit. Unusable from then on. */
   readonly close: () => void;
 }
@@ -320,6 +337,16 @@ export function createGrantStore(
    * each with `sentReads` at its event: only a later read's answer covers it.
    */
   const revoked = new Map<string, number>();
+  /**
+   * The agents that this device hosts, as far as the store knows (#335): each
+   * agent that an accepted answer named since `device` was signed in, also
+   * of another workspace and after its grants ended, because an agent never
+   * changes its host device. A drop keeps them; another device clears them.
+   * The server's agent limits bound them.
+   */
+  const hostedAgents = new Set<string>();
+  /** Whether an answer was accepted since `device` was signed in. */
+  let hostedKnown = false;
   /** The read that `read()` gives. */
   let current: GrantStoreRead = UNUSABLE;
   /** The records of `current` as JSON, or null while unusable. */
@@ -633,6 +660,10 @@ export function createGrantStore(
       return "failed";
     }
     attempt = 0;
+    for (const { grant } of result.value.records) {
+      hostedAgents.add(grant.granteeAgentId);
+    }
+    hostedKnown = true;
     for (const [grantId, readsAtEvent] of revoked) {
       if (readsAtEvent < number) {
         // This read was sent after the event.
@@ -681,6 +712,8 @@ export function createGrantStore(
     if (next !== device) {
       device = next;
       subscribed = false;
+      hostedAgents.clear();
+      hostedKnown = false;
       drop();
     }
   }
@@ -743,6 +776,15 @@ export function createGrantStore(
     }
     switch (event.type) {
       case "agent.grant.created":
+        // Only a grant on an agent of this device can change the records
+        // (#335). Before the first answer the store cannot tell, so it reads.
+        if (
+          !hostedKnown ||
+          hostedAgents.has(event.payload.grant.granteeAgentId)
+        ) {
+          request("other");
+        }
+        return;
       case "workspace.member.removed":
       case "workspace.repository.removed":
       case "workspace.agent.disabled":
@@ -810,6 +852,7 @@ export function createGrantStore(
         listeners.delete(entry);
       };
     },
+    ownGrantAnswered: () => run(() => request("other")),
     close: () => {
       if (closed) {
         return;
