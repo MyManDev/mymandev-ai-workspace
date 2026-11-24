@@ -43,9 +43,17 @@
 // - Stops (#55, decision of 2026-11-19). An executor's action that it
 //   checked with `RunExecution.check` stays held until it ends. On every
 //   `onGrantsChanged`, each held action is checked again with the
-//   enforcement point for the run that the supervisor holds; at the first
-//   denial the run is aborted and reported `cancelled`: `signed_out` for a
-//   denial of the sign-in, `grant_inactive` for any other. A sign-out (or
+//   enforcement point's `recheck` for the run that the supervisor holds,
+//   which records denials but no shell start; at the first denial the run
+//   is aborted and reported. While connected, a denial maps as follows
+//   (default until the Project Manager decides, #55): `no_grant` is
+//   `cancelled` with `grant_inactive`; a denial of the sign-in
+//   (`signed_out`, `sign_in_invalid`, `device_unknown`, `not_this_device`)
+//   is `cancelled` with `signed_out`; every other denial (`store_unusable`,
+//   `clock_invalid`, `record_failed`, `check_failed`, and the malformed
+//   inputs `run_invalid`, `request_invalid`, `no_scope`,
+//   `request_mismatch`) is `failed` with `grant_check_unavailable`, because
+//   the grant could not be checked, not shown inactive. A sign-out (or
 //   the connection's close for the account, `offline`) aborts every run and
 //   reports it `cancelled` with `signed_out`; another device aborts every
 //   run and reports nothing, because only the host device may send.
@@ -143,6 +151,12 @@ export const HOST_RUN_REASONS = Object.freeze({
   grantInactive: "grant_inactive",
   /** The device signed out, or its sign-in is no longer valid (#55). */
   signedOut: "signed_out",
+  /**
+   * A held action could not be checked again: the grant store was not
+   * usable, the clock or the check failed, or an input was malformed.
+   * Default until the Project Manager decides (#55).
+   */
+  grantCheckUnavailable: "grant_check_unavailable",
   /** The executor failed without a reason code that may be shown. */
   executorFailed: "executor_failed",
 } as const);
@@ -220,10 +234,11 @@ export interface RunSupervisorOptions {
   readonly grants: RunSupervisorGrants;
   readonly executors: RunExecutorRegistry;
   /**
-   * The enforcement point, for `RunExecution.check` and the checks after a
-   * change of the grants. Without one, every check of an executor denies.
+   * The enforcement point: `check` for `RunExecution.check`, and `recheck`
+   * for the checks of held actions after a change of the grants. Without
+   * one, every check of an executor denies.
    */
-  readonly enforcement?: Pick<PermissionEnforcement, "check">;
+  readonly enforcement?: Pick<PermissionEnforcement, "check" | "recheck">;
   /**
    * Asked right before `queued -> running`, for a run that has an executor
    * and a provider connection of this device. Waits for the Project
@@ -410,6 +425,32 @@ function finishOf(outcome: unknown): Transition {
     from: "running",
     to: "failed",
     reason: HOST_RUN_REASONS.executorFailed,
+  };
+}
+
+/**
+ * How a denial of a held action while connected ends its run; see "Stops".
+ * Default until the Project Manager decides (#55).
+ */
+function stopOfDenial(reason: EnforcementDenialReason): Transition {
+  if (reason === "no_grant") {
+    return {
+      from: "running",
+      to: "cancelled",
+      reason: HOST_RUN_REASONS.grantInactive,
+    };
+  }
+  if (SIGN_IN_DENIALS.has(reason)) {
+    return {
+      from: "running",
+      to: "cancelled",
+      reason: HOST_RUN_REASONS.signedOut,
+    };
+  }
+  return {
+    from: "running",
+    to: "failed",
+    reason: HOST_RUN_REASONS.grantCheckUnavailable,
   };
 }
 
@@ -796,7 +837,7 @@ export function createRunSupervisor(
           reason = "check_failed";
         } else {
           try {
-            const decision = enforcement.check(execution.held, lease.request);
+            const decision = enforcement.recheck(execution.held, lease.request);
             reason = decision.allowed ? null : decision.reason;
           } catch {
             reason = "check_failed";
@@ -805,15 +846,9 @@ export function createRunSupervisor(
         if (reason === null) {
           continue;
         }
-        const code = SIGN_IN_DENIALS.has(reason)
-          ? HOST_RUN_REASONS.signedOut
-          : HOST_RUN_REASONS.grantInactive;
-        log(`A run was stopped on this device (${code}).`);
-        abortExecution(
-          entry,
-          { from: "running", to: "cancelled", reason: code },
-          "due",
-        );
+        const stop = stopOfDenial(reason);
+        log(`A run was stopped on this device (${stop.reason ?? stop.to}).`);
+        abortExecution(entry, stop, "due");
         break;
       }
     }

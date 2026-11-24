@@ -39,10 +39,11 @@ import type {
   WorkspaceReadResult,
 } from "../api-reads.ts";
 import type { BuildClientEvent, ServerMessage } from "../connection/client.ts";
-import type {
-  EnforcementDecision,
-  EnforcementDenialReason,
-  HeldRun,
+import {
+  ENFORCEMENT_DENIAL_REASONS,
+  type EnforcementDecision,
+  type EnforcementDenialReason,
+  type HeldRun,
 } from "../permissions/enforcement.ts";
 import { HOST_RUN_ACK_TIMEOUT_MS } from "./host-run.ts";
 import {
@@ -300,7 +301,11 @@ class Harness {
   ) => void)[] = [];
   /** What the fake enforcement point answers. */
   enforcementAnswer: EnforcementDenialReason | null = null;
-  readonly enforcementCalls: { run: HeldRun; request: unknown }[] = [];
+  readonly enforcementCalls: {
+    run: HeldRun;
+    request: unknown;
+    purpose: "check" | "recheck";
+  }[] = [];
   readonly timers: Timer[] = [];
   readonly logs: string[] = [];
   readonly accountListeners = new Set<(status: AccountStatus) => void>();
@@ -377,15 +382,10 @@ class Harness {
         ? {}
         : {
             enforcement: {
-              check: (held: HeldRun, request: unknown): EnforcementDecision => {
-                this.enforcementCalls.push({ run: held, request });
-                return this.enforcementAnswer === null
-                  ? {
-                      allowed: true,
-                      request: request as PermissionRequest,
-                    }
-                  : { allowed: false, reason: this.enforcementAnswer };
-              },
+              check: (held: HeldRun, request: unknown) =>
+                this.decide(held, request, "check"),
+              recheck: (held: HeldRun, request: unknown) =>
+                this.decide(held, request, "recheck"),
             },
           }),
       ...(options.beforeStart === undefined
@@ -414,6 +414,18 @@ class Harness {
         allLogs.push(message);
       },
     });
+  }
+
+  /** The fake enforcement point: it answers `enforcementAnswer`. */
+  decide(
+    held: HeldRun,
+    request: unknown,
+    purpose: "check" | "recheck",
+  ): EnforcementDecision {
+    this.enforcementCalls.push({ run: held, request, purpose });
+    return this.enforcementAnswer === null
+      ? { allowed: true, request: request as PermissionRequest }
+      : { allowed: false, reason: this.enforcementAnswer };
   }
 
   /** The open project's unfinished runs on the server, newest first. */
@@ -1019,10 +1031,15 @@ test("a lost grant aborts the run and reports it cancelled; an ended action is n
   expect(h.enforcementCalls).toHaveLength(1);
   expect(h.enforcementCalls[0]?.run).toBe(execution.run);
 
-  // A change that keeps the grant changes nothing.
+  // A change that keeps the grant changes nothing. The action runs
+  // already, so it is checked again with `recheck`, which records no start.
   h.grantsChanged();
   expect(execution.signal.aborted).toBe(false);
-  expect(h.enforcementCalls).toHaveLength(2);
+  expect(h.enforcementCalls.map((call) => call.purpose)).toEqual([
+    "check",
+    "recheck",
+  ]);
+  expect(h.enforcementCalls[1]?.run).toBe(execution.run);
 
   h.enforcementAnswer = "no_grant";
   h.grantsChanged();
@@ -1065,6 +1082,56 @@ test("a lost grant aborts the run and reports it cancelled; an ended action is n
     `1 running>cancelled ${HOST_RUN_REASONS.signedOut}`,
   );
   expect(f.violations).toEqual([]);
+});
+
+test("a held terminal.execute is checked again with recheck only, and each denial while connected maps to its report", async () => {
+  // A held shell: every re-check uses recheck, never check, so the
+  // enforcement point records no false shell start.
+  const h = await started();
+  const shell = {
+    capability: "terminal.execute",
+    agentId: AGENT_A,
+    repositoryId: REPOSITORY,
+  };
+  expect(h.claude.last.execution.check(shell).allowed).toBe(true);
+  for (let round = 0; round < 3; round += 1) {
+    h.grantsChanged();
+  }
+  expect(h.enforcementCalls.map((call) => call.purpose)).toEqual([
+    "check",
+    "recheck",
+    "recheck",
+    "recheck",
+  ]);
+
+  const cases: [EnforcementDenialReason, string][] = [
+    ["no_grant", `cancelled ${HOST_RUN_REASONS.grantInactive}`],
+    ["signed_out", `cancelled ${HOST_RUN_REASONS.signedOut}`],
+    ["sign_in_invalid", `cancelled ${HOST_RUN_REASONS.signedOut}`],
+    ["device_unknown", `cancelled ${HOST_RUN_REASONS.signedOut}`],
+    ["not_this_device", `cancelled ${HOST_RUN_REASONS.signedOut}`],
+    ["store_unusable", `failed ${HOST_RUN_REASONS.grantCheckUnavailable}`],
+    ["clock_invalid", `failed ${HOST_RUN_REASONS.grantCheckUnavailable}`],
+    ["record_failed", `failed ${HOST_RUN_REASONS.grantCheckUnavailable}`],
+    ["check_failed", `failed ${HOST_RUN_REASONS.grantCheckUnavailable}`],
+    ["run_invalid", `failed ${HOST_RUN_REASONS.grantCheckUnavailable}`],
+    ["request_invalid", `failed ${HOST_RUN_REASONS.grantCheckUnavailable}`],
+    ["no_scope", `failed ${HOST_RUN_REASONS.grantCheckUnavailable}`],
+    ["request_mismatch", `failed ${HOST_RUN_REASONS.grantCheckUnavailable}`],
+  ];
+  expect(new Set(cases.map(([reason]) => reason))).toEqual(
+    new Set(ENFORCEMENT_DENIAL_REASONS),
+  );
+  for (const [reason, report] of cases) {
+    const g = await started();
+    g.claude.last.execution.check(shell);
+    g.enforcementAnswer = reason;
+    g.grantsChanged();
+    expect(g.claude.last.execution.signal.aborted, reason).toBe(true);
+    g.advance(STEP);
+    expect(g.walk().at(-1), reason).toBe(`1 running>${report}`);
+    expect(g.violations, reason).toEqual([]);
+  }
 });
 
 test("without an enforcement point, every check of an executor denies", async () => {
