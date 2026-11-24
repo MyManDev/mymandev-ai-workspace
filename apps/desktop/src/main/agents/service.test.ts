@@ -1095,6 +1095,108 @@ test("runsReloaded counts the reloads that read the runs and applied, and only g
   expect(h.service.runsReloaded()).toBe(3);
 });
 
+/** Agents 1 and 2, hosted on this device and on another one. */
+function hostedAgentList() {
+  return AgentListResponseSchema.parse({
+    agents: agentList([AGENT_1, AGENT_2]).agents.map((agent) => ({
+      ...agent,
+      hostDeviceId: agent.id === AGENT_1 ? DEVICE_ID : OTHER_DEVICE_ID,
+    })),
+  });
+}
+
+test("reloadedRuns holds the unfinished runs of the last reload of the runs, without the runs that events created", async () => {
+  const h = subscribedHarness();
+  expect(h.service.reloadedRuns()).toEqual([]);
+  h.setWorkspace(WS_A, PROJECT_1);
+  const withConnection = {
+    ...run(1, "queued"),
+    providerConnectionId: "0192f0a0-7b3c-7d4e-8f50-0000000000d1",
+    inputMessageId: "0192f0a0-7b3c-7d4e-8f50-0000000000d2",
+  };
+  await h.answerReload(ok(runList([withConnection])));
+  expect(h.service.reloadedRuns()).toEqual([withConnection]);
+  expect(h.service.reloadedRuns()).toBe(h.state.unfinishedRuns);
+
+  // An event changes the activity, not the snapshot.
+  h.receive(runEvent(2, null, "queued", { agentId: AGENT_2 }));
+  h.receive(runEvent(1, "queued", "running"));
+  expect(runStates(h.state)).toEqual(["02 queued", "01 running"]);
+  expect(h.service.reloadedRuns()).toEqual([withConnection]);
+
+  // A reload of the agents alone keeps it; a closed project clears it.
+  h.receive(memberRemoved());
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  await h.answer("listAgents", ok(agentList([AGENT_1, AGENT_2])));
+  expect(h.service.reloadedRuns()).toEqual([withConnection]);
+  h.setWorkspace(WS_A, null);
+  expect(h.service.reloadedRuns()).toEqual([]);
+});
+
+test("a run created by an event for an agent that this device hosts reloads everything after a pause", async () => {
+  const h = subscribedHarness();
+  h.setWorkspace(WS_A, PROJECT_1);
+  await h.answerReload(ok(runList([run(1, "running")])), ok(hostedAgentList()));
+  // Another device's agent: nothing.
+  h.receive(runEvent(2, null, "queued", { agentId: AGENT_2 }));
+  expect(h.openTimers()).toEqual([]);
+  // A transition of a held run: nothing.
+  h.receive(runEvent(1, "running", "awaiting_input"));
+  expect(h.openTimers()).toEqual([]);
+  // This device's agent: one reload for a burst.
+  h.receive(runEvent(3, null, "queued"));
+  h.receive(runEvent(4, null, "queued"));
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.readNames()).toEqual(["listRuns"]);
+  await h.answerReload(
+    ok(runList([run(1, "awaiting_input"), run(3, "queued"), run(4, "queued")])),
+    ok(hostedAgentList()),
+  );
+  expect(h.service.reloadedRuns().map((item) => item.id)).toEqual([
+    runId(1),
+    runId(3),
+    runId(4),
+  ]);
+  // The creation's own event, if late, changes nothing and reloads nothing.
+  h.receive(runEvent(3, null, "queued"));
+  expect(h.openTimers()).toEqual([]);
+  // Its reload is not the one of an `unknown_run`: one still reloads.
+  h.receive(runEvent(8, "queued", "running"));
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.readNames()).toEqual(["listRuns"]);
+});
+
+test("requestReload reloads everything after a pause, only while the gate is live", async () => {
+  const h = subscribedHarness();
+  // No project.
+  h.service.requestReload();
+  expect(h.openTimers()).toEqual([]);
+  h.setWorkspace(WS_A, PROJECT_1);
+  // Before the first reload.
+  h.service.requestReload();
+  expect(h.openTimers()).toEqual([]);
+  await h.answerReload();
+  const before = h.service.runsReloaded();
+  h.service.requestReload();
+  h.service.requestReload();
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.readNames()).toEqual(["listRuns"]);
+  await h.answerReload();
+  expect(h.service.runsReloaded()).toBe(before + 1);
+
+  // Not live: the next workspace.subscribed reloads anyway.
+  h.setConnection("offline");
+  h.service.requestReload();
+  expect(h.openTimers()).toEqual([]);
+  h.setConnection("connected");
+  h.service.requestReload();
+  expect(h.openTimers()).toEqual([]);
+  h.service.close();
+  h.service.requestReload();
+  expect(h.openTimers()).toEqual([]);
+  expect(h.reads).toEqual([]);
+});
+
 test("a refused or ended subscription ends the gate", async () => {
   for (const ending of [
     frame({

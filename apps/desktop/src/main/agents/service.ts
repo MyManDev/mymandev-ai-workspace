@@ -15,8 +15,13 @@
 //   project (#294) reload the agent list alone. An event for
 //   a run of a listed agent that the activity does not hold (`unknown_run`)
 //   reloads everything, at most once for each reload, so that data that
-//   stays inconsistent does not reload in a loop. Both wait a moment, so
-//   that a burst of events reloads once.
+//   stays inconsistent does not reload in a loop. A run created by an event
+//   (`previousState: null`) for an agent that this device hosts reloads
+//   everything too, because the event carries neither the run's provider
+//   connection nor its input message, which the host run supervisor needs
+//   (#35). `requestReload` lets the supervisor ask for a full reload while
+//   the gate is live. All of them wait a moment, so that a burst of events
+//   reloads once.
 // - One reload runs at a time. A failed reload is retried with the
 //   workspace service's backoff.
 // - A sign-out, another device, another workspace, or another project clears
@@ -145,6 +150,24 @@ export interface AgentActivityService {
    * supervisor (#35) looks for interrupted runs after each one.
    */
   readonly runsReloaded: () => number;
+  /**
+   * The open project's unfinished runs as the last reload of the runs read
+   * them, before any event applied on top: empty before the first one and
+   * with no project open. A run that an event created is not in it until
+   * the next reload. The host run supervisor (#35) takes a run's provider
+   * connection and input message only from here, because an event carries
+   * neither.
+   */
+  readonly reloadedRuns: () => readonly AgentRunListItem[];
+  /**
+   * Asks for a reload of the open project's runs and agents after
+   * `AGENT_FOLLOW_UP_DELAY_MS`, merged with any other follow-up. It does
+   * nothing while no project is open, before the first reload, or while
+   * the gate is not live: the next `workspace.subscribed` reloads anyway.
+   * The host run supervisor (#35) calls it, with its own backoff, when one
+   * of its runs waits for a reload while the connection stays open.
+   */
+  readonly requestReload: () => void;
   /** Stops listening and cancels the timers, for the quit. */
   readonly close: () => void;
 }
@@ -245,6 +268,8 @@ export function createAgentActivityService(
   let applied: ResyncGeneration | null = null;
   /** How many reloads that read the runs applied; see `runsReloaded`. */
   let runReloads = 0;
+  /** The unfinished runs of the last reload of the runs; see `reloadedRuns`. */
+  let snapshotRuns: readonly AgentRunListItem[] = NO_RUNS;
   /** The generation of the last reload that an `unknown_run` began. */
   let unknownRunReload: ResyncGeneration | null = null;
 
@@ -253,6 +278,8 @@ export function createAgentActivityService(
    * alone; see `AGENT_FOLLOW_UP_DELAY_MS`.
    */
   let followUpAll = false;
+  /** Whether the waiting follow-up was asked for by an `unknown_run`. */
+  let followUpUnknownRun = false;
   let cancelFollowUp: (() => void) | null = null;
 
   let revision = 0;
@@ -325,6 +352,7 @@ export function createAgentActivityService(
     cancelFollowUp?.();
     cancelFollowUp = null;
     followUpAll = false;
+    followUpUnknownRun = false;
   }
 
   /** Forgets the open project's activity and every reload of it. */
@@ -335,6 +363,7 @@ export function createAgentActivityService(
     stopRetry();
     stopFollowUp();
     activity = null;
+    snapshotRuns = NO_RUNS;
     problem = null;
     attempt = 0;
     wanted = null;
@@ -539,6 +568,7 @@ export function createAgentActivityService(
     applied = request.generation;
     if (runs !== null) {
       runReloads += 1;
+      snapshotRuns = result.activity.unfinishedRuns;
     }
     problem = null;
     attempt = 0;
@@ -571,9 +601,14 @@ export function createAgentActivityService(
     }, delayMs);
   }
 
-  /** Asks for a reload after `AGENT_FOLLOW_UP_DELAY_MS`. */
-  function followUp(scope: ResyncScope): void {
+  /**
+   * Asks for a reload after `AGENT_FOLLOW_UP_DELAY_MS`. `unknownRun` marks
+   * a follow-up that an `unknown_run` asked for, so that its reload does not
+   * begin another one.
+   */
+  function followUp(scope: ResyncScope, unknownRun = false): void {
     followUpAll ||= scope === "all";
+    followUpUnknownRun ||= unknownRun;
     if (cancelFollowUp !== null) {
       return;
     }
@@ -581,13 +616,26 @@ export function createAgentActivityService(
       run(() => {
         cancelFollowUp = null;
         const all = followUpAll;
+        const marked = followUpUnknownRun;
         followUpAll = false;
+        followUpUnknownRun = false;
         const begun = reload(all ? "all" : "part");
-        if (all && begun !== null) {
+        if (marked && begun !== null) {
           unknownRunReload = begun.generation;
         }
       });
     }, AGENT_FOLLOW_UP_DELAY_MS);
+  }
+
+  /** Whether this signed-in device hosts the listed agent `agentId`. */
+  function hostedHere(agentId: string): boolean {
+    return (
+      device !== null &&
+      activity !== null &&
+      activity.agents.some(
+        (agent) => agent.id === agentId && agent.hostDeviceId === device,
+      )
+    );
   }
 
   // The events.
@@ -596,6 +644,7 @@ export function createAgentActivityService(
   function applyEvents(events: readonly AgentEvent[]): void {
     let agentsStale = false;
     let unknownRun = false;
+    let createdHere = false;
     for (const event of events) {
       if (event.type === "workspace.member.removed") {
         // The removal disabled the person's agents. The API also sends
@@ -622,6 +671,10 @@ export function createAgentActivityService(
         case "applied":
           activity = outcome.activity;
           touch();
+          // A run that the event created holds only the event's fields.
+          createdHere ||=
+            event.payload.previousState === null &&
+            hostedHere(event.payload.agentId);
           break;
         case "unknown_run":
           unknownRun = true;
@@ -635,6 +688,9 @@ export function createAgentActivityService(
     // A reload that an `unknown_run` began does not begin another one, so
     // that data that stays inconsistent does not reload in a loop.
     if (unknownRun && applied !== unknownRunReload) {
+      followUp("all", true);
+    }
+    if (createdHere) {
       followUp("all");
     }
     if (agentsStale) {
@@ -774,6 +830,18 @@ export function createAgentActivityService(
       activity !== null &&
       gate.state() === "live",
     runsReloaded: () => runReloads,
+    reloadedRuns: () => snapshotRuns,
+    requestReload: () =>
+      run(() => {
+        if (
+          !closed &&
+          projectId !== null &&
+          activity !== null &&
+          gate.state() === "live"
+        ) {
+          followUp("all");
+        }
+      }),
     close: () => {
       if (closed) {
         return;
