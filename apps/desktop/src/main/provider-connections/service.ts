@@ -560,7 +560,11 @@ export function createProviderConnectionService(
     // The status of every connection follows the connection.
     touch();
     if (isConnected) {
-      reload();
+      // A read on its way is good enough: the status of each connection
+      // comes from `connected` when the state is built, not from the read.
+      if (!inFlight) {
+        reload();
+      }
       return;
     }
     stopRetry();

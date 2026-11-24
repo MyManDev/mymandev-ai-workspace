@@ -392,6 +392,19 @@ test("offline, every connection is unknown, and the next connection reads the li
   ).toEqual(["registered", "registered"]);
 });
 
+test("a connection reached while a read is on its way sends no second read, and the first answer is shown", async () => {
+  // At a launch, the device is signed in before the connection is up.
+  const harness = new Harness(accountStatus(), "offline");
+  expect(harness.reads).toHaveLength(1);
+  harness.setConnection("connected");
+  expect(harness.reads).toHaveLength(1);
+  await harness.ready(TWO);
+  expect(harness.readNames).toHaveLength(1);
+  expect(
+    harness.service.state().connections.map((entry) => entry.status),
+  ).toEqual(["registered", "registered"]);
+});
+
 test("a failed read keeps what was read, each connection unknown, and retries with the backoff until a read succeeds", async () => {
   const harness = new Harness();
   await harness.ready();
