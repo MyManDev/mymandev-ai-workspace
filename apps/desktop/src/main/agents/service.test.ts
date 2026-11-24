@@ -182,6 +182,8 @@ interface RunEventOptions {
   /** A server cancellation with this code. */
   readonly cancelledFor?: string;
   readonly workspaceId?: WorkspaceId;
+  /** A creation that carries the new run, in this project. */
+  readonly inProject?: ProjectId;
 }
 
 /** `agent.run.state_changed`: the server creates, the agent changes. */
@@ -203,6 +205,9 @@ function runEvent(
       ...(options.cancelledFor === undefined
         ? {}
         : { reason: options.cancelledFor }),
+      ...(options.inProject === undefined
+        ? {}
+        : { run: run(n, state, agentId, options.inProject) }),
     },
     system ? { kind: "system" } : { kind: "agent", agentId },
     options.workspaceId,
@@ -1164,6 +1169,48 @@ test("a run created by an event for an agent that this device hosts reloads ever
   h.receive(runEvent(8, "queued", "running"));
   h.fire(AGENT_FOLLOW_UP_DELAY_MS);
   expect(h.readNames()).toEqual(["listRuns"]);
+});
+
+test("a run created in the open project for an agent that the activity does not list yet reloads everything, at most once for each reload", async () => {
+  const NEW_AGENT = "0192f0a0-7b3c-7d4e-8f50-0000000000f3";
+  const h = await liveHarness();
+  // A creation in another project, which names it: nothing.
+  h.receive(
+    runEvent(7, null, "queued", { agentId: OTHER_AGENT, inProject: PROJECT_2 }),
+  );
+  expect(h.openTimers()).toEqual([]);
+  // The new agent's run is created before the reload of the agents that its
+  // creation asked for: that reload reads the runs too.
+  h.receive(
+    agentEvent("workspace.agent.created", PROJECT_1, WS_A, NEW_AGENT),
+  );
+  h.receive(
+    runEvent(5, null, "queued", { agentId: NEW_AGENT, inProject: PROJECT_1 }),
+  );
+  expect(runStates(h.state)).toEqual(["01 running"]);
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  expect(h.readNames()).toEqual(["listRuns"]);
+  await h.answerReload(
+    ok(runList([run(5, "queued", NEW_AGENT), run(1, "running")])),
+    ok(agentList([AGENT_1, AGENT_2, NEW_AGENT])),
+  );
+  expect(runStates(h.state)).toEqual(["05 queued", "01 running"]);
+  expect(h.state.agents.map((agent) => agent.id)).toContain(NEW_AGENT);
+  expect(h.openTimers()).toEqual([]);
+
+  // No loop: when the server still does not list the agent, the reload
+  // that such a creation began does not begin another one.
+  const g = await liveHarness();
+  g.receive(
+    runEvent(5, null, "queued", { agentId: NEW_AGENT, inProject: PROJECT_1 }),
+  );
+  g.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  await g.answerReload();
+  g.receive(
+    runEvent(6, null, "queued", { agentId: NEW_AGENT, inProject: PROJECT_1 }),
+  );
+  expect(g.openTimers()).toEqual([]);
+  expect(g.reads).toEqual([]);
 });
 
 test("requestReload reloads everything after a pause, only while the gate is live", async () => {

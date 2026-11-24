@@ -679,14 +679,23 @@ export function createAgentActivityService(
         case "unknown_run":
           unknownRun = true;
           break;
-        case "unchanged":
         case "unknown_agent":
-          // Most often a run of another project: the event names none.
+          // Most often a run of another project: the event names none. The
+          // creation of a run names its project in `run`: in the open
+          // project, its agent was created after the last reload of the
+          // agents, so the run and its agent are read again, like an
+          // `unknown_run`.
+          unknownRun ||=
+            event.payload.previousState === null &&
+            event.payload.run?.projectId === projectId;
+          break;
+        case "unchanged":
           break;
       }
     }
-    // A reload that an `unknown_run` began does not begin another one, so
-    // that data that stays inconsistent does not reload in a loop.
+    // A reload that an `unknown_run`, or a run of an unlisted agent, began
+    // does not begin another one, so that data that stays inconsistent does
+    // not reload in a loop.
     if (unknownRun && applied !== unknownRunReload) {
       followUp("all", true);
     }
