@@ -10,7 +10,10 @@
 //   host device to the agent's own account only (#342, `hostDeviceId`); it
 //   is compared here with this device's ID and never leaves the main
 //   process: the renderer gets `ownedByMe` and `grantableHere` alone
-//   (`agentAccess`). The owner revokes from any of its devices.
+//   (`agentAccess`). A revocation needs `ownedByMe` only, as the API
+//   lets the owner revoke from any of its devices, but in this version the
+//   screen offers it only on the host device, the only one with a grant
+//   list (#345 tracks the owner's other devices).
 // - What is offered. Every capability but `terminal.execute`, which waits
 //   for the presentation rules of ADR 0015 (#77). A grant names one scope,
 //   a repository or, for `provider.use`, a provider connection of this
