@@ -1035,7 +1035,7 @@ test("the agent's owner reads the agent's grants from its host device and from a
   );
 });
 
-test("only the agent's owner reads the agent's grants: another member, the workspace's owner, and an admin get 403, and a non-member, a removed member, a removed owner, and an unknown agent get the same 404", async (t) => {
+test("only the agent's owner reads the agent's grants: another member, the workspace's owner, and an admin get 403, and a non-member, a removed member, a removed owner, and an unknown agent get the same 404; an owner added again reads them again", async (t) => {
   const { account, secondDevice } = instance(t);
   const ada = await account(7601);
   const bob = await account(7602);
@@ -1099,6 +1099,17 @@ test("only the agent's owner reads the agent's grants: another member, the works
     assert.equal(refused.statusCode, 404, refused.body);
     assert.equal(refused.body, unknown.body);
   }
+  // Added again, as a new active person of the same account, the owner
+  // reads the agent's grants again.
+  await addClaimed(workspace.id, bob, ada);
+  const again = await get(laptop, url);
+  assert.equal(again.statusCode, 200, again.body);
+  assert.deepEqual(
+    AgentGrantListResponseSchema.parse(again.json()).grants.map(
+      (grant) => grant.id,
+    ),
+    [made.id],
+  );
 });
 
 test("a refused or rolled-back grant or revocation sends no grant event and changes nothing, and the same change sends its event once it commits", async (t) => {

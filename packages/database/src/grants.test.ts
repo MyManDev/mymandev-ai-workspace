@@ -2024,6 +2024,39 @@ test("the statement joins no grant for an account that fails either check in its
   ]);
 });
 
+test("an owner who was removed and added again reads the agent's grants again", async () => {
+  const {
+    owner: workspaceOwner,
+    workspaceId,
+    projectId,
+    repositoryId,
+  } = await world();
+  const agentOwner = await account("Agent owner");
+  const firstPerson = await join(workspaceId, agentOwner);
+  const agentId = await agentOf(projectId, agentOwner);
+  const grantId = await granted(
+    agentId,
+    agentOwner,
+    readRepository(repositoryId),
+  );
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: LATER, removedByUserId: workspaceOwner.userId })
+    .where(eq(workspaceMembers.id, firstPerson));
+  assert.deepEqual(await agentGrantsOf(agentId, agentOwner), {
+    listed: false,
+    refusal: "not_found",
+  });
+  // A new active person of the same account: the removed one stays.
+  await join(workspaceId, agentOwner);
+  const again = await agentGrantsOf(agentId, agentOwner);
+  assert.ok(again.listed, JSON.stringify(again));
+  assert.deepEqual(
+    again.grants.map((grant) => grant.id),
+    [grantId],
+  );
+});
+
 test(`the owner reads all ${PER_AGENT} grants of an agent at its count limit, and a list over it throws instead of being cut`, async () => {
   const { owner, projectId, agentId } = await world();
   const ids = await fill(projectId, agentId, owner, PER_AGENT);
