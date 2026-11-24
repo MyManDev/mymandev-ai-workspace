@@ -45,7 +45,9 @@ import {
   workspaceActionFailed,
   workspaceActionFailedFor,
   workspaceActionFailureOf,
+  workspaceActionMayHaveSent,
   workspaceActionRequest,
+  workspaceActionSent,
 } from "./api-actions.ts";
 import {
   SESSION_FAILURE_REASONS,
@@ -871,6 +873,31 @@ test("rate_limited waits as long as the API's Retry-After, or a fixed minute wit
     retryAfterMs: 1_235,
   });
   expect(Object.isFrozen(workspaceActionFailed("invalid"))).toBe(true);
+});
+
+test("a failure marked as sent may have reached the API, as every successful answer; a refusal of the service itself did not (#342)", () => {
+  const sent = workspaceActionSent(workspaceActionFailed("too_soon", 1_000));
+  expect(sent).toEqual({
+    ok: false,
+    reason: "too_soon",
+    retryAfterMs: 1_000,
+    sent: true,
+  });
+  expect(Object.isFrozen(sent)).toBe(true);
+  expect(workspaceActionMayHaveSent(sent)).toBe(true);
+  expect(
+    workspaceActionMayHaveSent(
+      workspaceActionSent(workspaceActionFailed("unavailable")),
+    ),
+  ).toBe(true);
+  expect(workspaceActionMayHaveSent({ ok: true, value: null })).toBe(true);
+  for (const reason of WORKSPACE_ACTION_FAILURES) {
+    const failure =
+      reason === "too_soon" || reason === "rate_limited"
+        ? workspaceActionFailed(reason, 1_000)
+        : workspaceActionFailed(reason);
+    expect(workspaceActionMayHaveSent(failure), reason).toBe(false);
+  }
 });
 
 test("the write budget is far below the API's limit of 300 requests a minute", () => {

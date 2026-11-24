@@ -16,13 +16,16 @@
 //   a repository or, for `provider.use`, a provider connection of this
 //   device, and an optional lifetime, checked with the protocol's
 //   `GrantCapabilityRequestSchema` before anything is sent.
-// - The grant store. After every grant request that it handed to the
-//   account service, whatever the outcome, also a failure, a timeout, or a
-//   thrown error, the grant action calls the store's `ownGrantAnswered()`
-//   once: the grant may be stored even when its answer is lost, and without
-//   the call a first grant of an agent waits for the 5-minute read (#335).
-//   A revocation calls it as well, so that a revocation whose event is lost
-//   leaves the records at once.
+// - The grant store. After every grant request that may have reached the
+//   API, whatever the outcome, also a failure, a timeout, or a thrown
+//   error, the grant action calls the store's `ownGrantAnswered()` once:
+//   the grant may be stored even when its answer is lost, and without the
+//   call a first grant of an agent waits for the 5-minute read (#335). A
+//   revocation calls it as well, so that a revocation whose event is lost
+//   leaves the records at once. A write that the account service refused
+//   without a request (`workspaceActionMayHaveSent`) does not call it: a
+//   read that fails leaves the store unusable until one succeeds, and every
+//   check meanwhile denies.
 // - One grant at a time: a second one while the first waits is refused as
 //   `busy` and never sent.
 //
@@ -52,9 +55,10 @@ import {
   type RevokeGrantResult,
 } from "../../shared/ipc-contract.ts";
 import type { AccountService } from "../account.ts";
-import type {
-  WorkspaceActionFailure,
-  WorkspaceActionResult,
+import {
+  type WorkspaceActionFailure,
+  type WorkspaceActionResult,
+  workspaceActionMayHaveSent,
 } from "../api-actions.ts";
 import type { WorkspaceReadFailure } from "../api-reads.ts";
 import type {
@@ -352,7 +356,10 @@ export function createGrantActions(
     });
   }
 
-  /** Tells the grant store that a grant request ended; never throws. */
+  /**
+   * Tells the grant store that a grant request that may have reached the
+   * API ended; never throws.
+   */
   function answered(): void {
     try {
       grants.ownGrantAnswered();
@@ -447,11 +454,16 @@ export function createGrantActions(
       );
     } catch {
       log("A grant could not be sent.");
+      // It may have reached the API.
+      answered();
       return UNKNOWN;
     } finally {
       granting = false;
-      // Whatever the outcome: the grant may be stored although its answer
-      // was lost (#335).
+    }
+    // Whatever the outcome of a request that may have reached the API: the
+    // grant may be stored although its answer was lost (#335). Never after
+    // a refusal of the account service, which sent nothing.
+    if (workspaceActionMayHaveSent(answer)) {
       answered();
     }
     if (!answer.ok) {
@@ -492,10 +504,12 @@ export function createGrantActions(
       });
     } catch {
       log("A revocation could not be sent.");
+      answered();
       return UNKNOWN;
-    } finally {
-      // `agent.grant.revoked` leaves the grant out at once; the read covers
-      // an event that was lost.
+    }
+    // `agent.grant.revoked` leaves the grant out at once; the read covers
+    // an event that was lost. Never after a refusal without a request.
+    if (workspaceActionMayHaveSent(answer)) {
       answered();
     }
     return answer.ok

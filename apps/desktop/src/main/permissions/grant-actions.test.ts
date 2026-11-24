@@ -33,6 +33,7 @@ import {
   type WorkspaceActionResult,
   workspaceActionFailed,
   workspaceActionFailedFor,
+  workspaceActionSent,
 } from "../api-actions.ts";
 import type { WorkspaceReadResult } from "../api-reads.ts";
 import type { AgentActivityState } from "../agents/service.ts";
@@ -321,16 +322,36 @@ test("the owner grants on the agent's host device: the protocol's request is sen
   expect(harness.answered()).toBe(2);
 });
 
-test("every outcome of a sent grant, also a failure, a lost answer, and a thrown error, reads the grant records again exactly once", async () => {
-  const harness = setup();
-  const outcomes: WorkspaceActionResult<unknown>[] =
-    WORKSPACE_ACTION_FAILURES.map((reason) =>
+/**
+ * Every failure of a write as the account service answers it once the write
+ * was handed to the session (`sent: true`): it may have reached the API.
+ */
+function sentFailures(): WorkspaceActionResult<unknown>[] {
+  return WORKSPACE_ACTION_FAILURES.map((reason) =>
+    workspaceActionSent(
       reason === "too_soon" || reason === "rate_limited"
         ? workspaceActionFailed(reason, 5_000)
         : workspaceActionFailed(reason),
-    );
+    ),
+  );
+}
+
+/**
+ * The account service's own refusals, which send nothing: a request outside
+ * its format, a spent write budget, and an `unavailable` or a
+ * `not_signed_in` found before the request.
+ */
+const LOCAL_REFUSALS = [
+  "invalid",
+  "too_soon",
+  "unavailable",
+  "not_signed_in",
+] as const;
+
+test("every outcome of a grant that may have reached the API, also a failure, a lost answer, and a thrown error, reads the grant records again exactly once", async () => {
+  const harness = setup();
   let expected = 0;
-  for (const outcome of outcomes) {
+  for (const outcome of sentFailures()) {
     const pending = harness.service.grant(AGENT, READ_GRANT);
     await settle();
     harness.sent.at(-1)?.resolve(outcome);
@@ -344,7 +365,11 @@ test("every outcome of a sent grant, also a failure, a lost answer, and a thrown
   await settle();
   harness.sent
     .at(-1)
-    ?.resolve(workspaceActionFailedFor({ ok: false, reason: "no_answer" }));
+    ?.resolve(
+      workspaceActionSent(
+        workspaceActionFailedFor({ ok: false, reason: "no_answer" }),
+      ),
+    );
   expect(await timedOut).toEqual({ outcome: "unknown" });
   expect(harness.answered()).toBe(expected + 1);
   // A send that throws.
@@ -362,6 +387,31 @@ test("every outcome of a sent grant, also a failure, a lost answer, and a thrown
   expect(await other).toEqual({ outcome: "unknown" });
   expect(harness.answered()).toBe(expected + 3);
   expect(harness.logs).toEqual(["A grant could not be sent."]);
+});
+
+test("a grant or a revocation that the account service refused without a request does not read the grant records again", async () => {
+  const harness = setup();
+  for (const reason of LOCAL_REFUSALS) {
+    const outcome =
+      reason === "too_soon"
+        ? workspaceActionFailed(reason, 5_000)
+        : workspaceActionFailed(reason);
+    const granting = harness.service.grant(AGENT, READ_GRANT);
+    await settle();
+    harness.sent.at(-1)?.resolve(outcome);
+    expect(
+      GrantCapabilityResultSchema.parse(await granting),
+      reason,
+    ).toMatchObject({ outcome: "refused", reason });
+    const revoking = harness.service.revoke(AGENT, GRANT);
+    await settle();
+    harness.sent.at(-1)?.resolve(outcome);
+    expect(RevokeGrantResultSchema.parse(await revoking), reason).toMatchObject(
+      { outcome: "refused", reason },
+    );
+    expect(harness.answered(), reason).toBe(0);
+  }
+  expect(harness.sent).toHaveLength(LOCAL_REFUSALS.length * 2);
 });
 
 test("every code that the grant and revoke routes answer becomes its own refusal, rate_limited with the server's Retry-After", async () => {

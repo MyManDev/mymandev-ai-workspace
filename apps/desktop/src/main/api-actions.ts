@@ -540,13 +540,40 @@ export type WorkspaceActionResult<T> =
   | {
       readonly ok: false;
       readonly reason: Exclude<WorkspaceActionFailure, WaitFailure>;
+      /** See `workspaceActionMayHaveSent`. */
+      readonly sent?: true;
     }
   | {
       readonly ok: false;
       readonly reason: WaitFailure;
       /** How long to wait before the next try, in milliseconds. */
       readonly retryAfterMs: number;
+      /** See `workspaceActionMayHaveSent`. */
+      readonly sent?: true;
     };
+
+/** `failure` as one that came after the write was handed to the session. */
+export function workspaceActionSent(
+  failure: WorkspaceActionResult<never>,
+): WorkspaceActionResult<never> {
+  return failure.ok ? failure : Object.freeze({ ...failure, sent: true });
+}
+
+/**
+ * Whether a write may have reached the API (#342). A successful answer was
+ * sent. The account service sets `sent: true` on every failure after it
+ * handed the write to the device session: the write, or the token request
+ * before it, may have reached the API, whatever the failure, also an
+ * `unavailable` or a `not_signed_in` that the session answered. A failure
+ * without it was refused by the service itself, without a request:
+ * `invalid`, `too_soon`, and an `unavailable` or a `not_signed_in` found
+ * before the request.
+ */
+export function workspaceActionMayHaveSent(
+  result: WorkspaceActionResult<unknown>,
+): boolean {
+  return result.ok || result.sent === true;
+}
 
 export function workspaceActionFailed(
   reason: Exclude<WorkspaceActionFailure, WaitFailure>,
