@@ -324,6 +324,29 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   subscribeAgentState: "agents:subscribe-state",
   /**
+   * What the renderer may know of the grants of the open project's agents
+   * (#342), from this device's grant records: never an account or a host
+   * device.
+   */
+  getGrantState: "grants:get-state",
+  /**
+   * The grants of the open project's agents. The calling frame then
+   * receives every later state on `EVENT_CHANNELS.grantStateChanged`.
+   */
+  subscribeGrantState: "grants:subscribe-state",
+  /**
+   * Reads this device's provider connections (#342), the scopes of
+   * `provider.use`: an ID, a kind, and a label each, never a credential.
+   */
+  listProviderConnections: "grants:list-provider-connections",
+  /**
+   * Grants one capability on one scope to an agent of the open project
+   * (#342). Only the agent's owner, on the agent's host device.
+   */
+  grantCapability: "grants:grant",
+  /** Revokes a grant of an agent of the open project (#342). */
+  revokeGrant: "grants:revoke",
+  /**
    * What the renderer may know of the open project's chat: the newest
    * messages that fit the view's limits, with their authors' names, and the
    * person's messages that the server has not stored yet.
@@ -437,6 +460,11 @@ export const EVENT_CHANNELS = Object.freeze({
    * frames that subscribed.
    */
   agentStateChanged: "agents:state-changed",
+  /**
+   * The grants of the open project's agents after changes, at most one
+   * every 50 ms, to the frames that subscribed (#342).
+   */
+  grantStateChanged: "grants:state-changed",
   /**
    * The chat state after changes, at most one every 50 ms, to the frames
    * that subscribed.

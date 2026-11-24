@@ -795,6 +795,7 @@ test("every failure of register and remove maps to a fixed refusal, repository_l
     unclaimed_limit: "failed",
     project_limit: "failed",
     repository_limit: "repository_limit",
+    grant_limit: "failed",
     rate_limited: "rate_limited",
     unknown: "unknown",
     failed: "failed",

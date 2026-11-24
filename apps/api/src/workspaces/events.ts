@@ -117,11 +117,12 @@ export function deliverApproverEvent(
 }
 
 /**
- * The agent as every member reads it in the agent list and in
- * `workspace.agent.created` and `workspace.agent.disabled` (#294), built
- * field by field, so that a field that the database result gains later,
- * such as the host device, is not sent to the members until it is added
- * here (#110).
+ * The agent as every member reads it in `workspace.agent.created` and
+ * `workspace.agent.disabled` (#294), and the base of the creation's answer,
+ * built field by field, so that a field that the database result gains
+ * later is not sent to the members until it is added here. It never holds
+ * the host device (#110), which only the agent's own account reads, in the
+ * agent list and in the creation's answer (#342).
  */
 export function workspaceAgent(agent: AgentListItem): AgentListItem {
   return {

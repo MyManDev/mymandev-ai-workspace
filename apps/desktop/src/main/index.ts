@@ -74,6 +74,8 @@ import { registerOwnJoinRequestIpc } from "./own-join-request-ipc.ts";
 import { createOwnJoinRequestService } from "./own-join-requests/service.ts";
 import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
+import { registerGrantIpc } from "./grant-ipc.ts";
+import { createGrantActions } from "./permissions/grant-actions.ts";
 import { createGrantStore } from "./permissions/grant-store.ts";
 import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
@@ -341,13 +343,36 @@ function start(): void {
   closables.add(grantStore);
 
   // The agent activity reaches the renderer read-only, with the owners'
-  // names resolved in the main process and the newest runs only, at most
-  // one publish every 50 ms. Its waiting publish is cancelled at quit.
+  // names resolved in the main process, whether the account owns each agent
+  // and may grant it from this device (#342), and the newest runs only, at
+  // most one publish every 50 ms. Its waiting publish is cancelled at quit.
   const agentIpc = registerAgentIpc(ipcMain, rendererUrl, {
     agents,
     workspaces,
+    account,
   });
   closables.add(agentIpc);
+
+  // Granting and revoking capabilities from the permission screen (#342):
+  // the grants of the open project's agents from the grant store's
+  // records, this device's provider connections, and the two writes. Only
+  // the agent's owner grants, from the agent's host device; the main
+  // process compares the host device and never sends it to the renderer.
+  // After every grant request, whatever the outcome, the grant store reads
+  // its records again (`ownGrantAnswered`). The logs are fixed text, never
+  // an ID.
+  const grantActions = createGrantActions({
+    account,
+    agents,
+    workspaces,
+    grants: grantStore,
+    log: (message) => console.info(message),
+  });
+  closables.add(grantActions);
+  const grantIpc = registerGrantIpc(ipcMain, rendererUrl, {
+    service: grantActions,
+  });
+  closables.add(grantIpc);
 
   // The open project's registered repositories (#286), read over HTTP and
   // kept current with the selected workspace's repository events through

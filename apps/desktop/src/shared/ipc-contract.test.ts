@@ -9,6 +9,15 @@ import {
   AGENT_RUN_STATES,
   AgentActivityViewSchema,
   API_ORIGIN_STATES,
+  GRANT_CAPABILITY_REFUSALS,
+  GRANT_LIMITS,
+  GrantCapabilityResultSchema,
+  GrantRequestViewSchema,
+  GrantsViewSchema,
+  PROVIDER_CONNECTION_READ_PROBLEMS,
+  ProviderConnectionsResultSchema,
+  REVOKE_GRANT_REFUSALS,
+  RevokeGrantResultSchema,
   CHAT_LIMITS,
   CHAT_LOAD_OLDER_RESULTS,
   CHAT_NOT_SENT_REASONS,
@@ -306,6 +315,12 @@ const OWN_JOIN_REQUEST_ACTION_CHANNELS: ReadonlySet<string> = new Set([
 ]);
 
 /** The project repository action channels, which take IDs and a name. */
+/** The grant channels that take arguments (#342). */
+const GRANT_ACTION_CHANNELS: ReadonlySet<string> = new Set([
+  INVOKE_CHANNELS.grantCapability,
+  INVOKE_CHANNELS.revokeGrant,
+]);
+
 const PROJECT_REPOSITORY_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.registerRepository,
   INVOKE_CHANNELS.removeRepository,
@@ -313,7 +328,7 @@ const PROJECT_REPOSITORY_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.unlinkRepository,
 ]);
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the copy of the workspace ID, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, the project repository actions, and the report of seen claims take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the copy of the workspace ID, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, the project repository actions, the grant actions, and the report of seen claims take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -334,9 +349,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       !INVITATION_ACTION_CHANNELS.has(channel) &&
       !JOIN_REQUEST_ACTION_CHANNELS.has(channel) &&
       !OWN_JOIN_REQUEST_ACTION_CHANNELS.has(channel) &&
-      !PROJECT_REPOSITORY_ACTION_CHANNELS.has(channel),
+      !PROJECT_REPOSITORY_ACTION_CHANNELS.has(channel) &&
+      !GRANT_ACTION_CHANNELS.has(channel),
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 40);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 42);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -2221,6 +2237,8 @@ function agentActivity(overrides: Record<string, unknown> = {}) {
         name: "Agent Alpha",
         ownerName: "Ada Lovelace",
         disabledAt: null,
+        ownedByMe: true,
+        grantableHere: true,
       },
     ],
     unfinishedRuns: [agentRun()],
@@ -2762,6 +2780,8 @@ test("an agent activity drops unknown keys at every level, so no member ID or de
           ownerMemberId: MEMBER_ID,
           hostDeviceId: AGENT_DEVICE_ID,
           disabledAt: null,
+          ownedByMe: true,
+          grantableHere: true,
         },
       ],
       unfinishedRuns: [
@@ -2781,6 +2801,8 @@ test("an agent activity over the limits or with wrong values is refused", () => 
     name: "Agent Alpha",
     ownerName: "Ada Lovelace",
     disabledAt: null,
+    ownedByMe: false,
+    grantableHere: false,
     ...overrides,
   });
   const many = <T>(item: T, count: number) =>
@@ -2818,6 +2840,8 @@ test("an agent activity over the limits or with wrong values is refused", () => 
     }),
     agentActivity({ agents: [agent({ ownerName: undefined })] }),
     agentActivity({ agents: [agent({ disabledAt: "yesterday" })] }),
+    agentActivity({ agents: [agent({ ownedByMe: undefined })] }),
+    agentActivity({ agents: [agent({ grantableHere: "yes" })] }),
     agentActivity({ agents: [agent({ id: MOUNT_ID })] }),
     agentActivity({ unfinishedRuns: [agentRun({ state: "paused" })] }),
     agentActivity({ unfinishedRuns: [agentRun({ reason: "" })] }),
@@ -2849,6 +2873,184 @@ test("an agent activity over the limits or with wrong values is refused", () => 
       }),
     ).success,
   ).toBe(true);
+});
+
+const GRANT_ID = "0192f0a0-7b3c-7d4e-8f50-000000004001";
+const GRANT_REPOSITORY_ID = "0192f0a0-7b3c-7d4e-8f50-000000002001";
+const GRANT_CONNECTION_ID = "0192f0a0-7b3c-7d4e-8f50-000000003001";
+
+function grantView(overrides: Record<string, unknown> = {}) {
+  return {
+    id: GRANT_ID,
+    agentId: AGENT_ID,
+    capability: "repo.read",
+    repositoryId: GRANT_REPOSITORY_ID,
+    providerConnectionId: null,
+    createdAt: RUN_AT,
+    expiresAt: null,
+    expired: false,
+    ...overrides,
+  };
+}
+
+test("the grants view holds each grant with exactly the scope of its capability, frozen, and drops an account or a device", () => {
+  const value = {
+    revision: 2,
+    projectId: AGENT_PROJECT_ID,
+    usable: true,
+    grants: [
+      grantView(),
+      grantView({
+        capability: "provider.use",
+        repositoryId: null,
+        providerConnectionId: GRANT_CONNECTION_ID,
+        expiresAt: RUN_AT,
+        expired: true,
+      }),
+    ],
+  };
+  const parsed = GrantsViewSchema.parse({
+    ...value,
+    grants: value.grants.map((grant) => ({
+      ...grant,
+      grantedByUserId: MEMBER_ID,
+      hostDeviceId: AGENT_DEVICE_ID,
+    })),
+  });
+  expect(parsed).toEqual(value);
+  expect(Object.isFrozen(parsed.grants)).toBe(true);
+  expect(JSON.stringify(parsed)).not.toContain(AGENT_DEVICE_ID);
+  expect(
+    GrantsViewSchema.safeParse({
+      ...value,
+      projectId: null,
+      usable: false,
+      grants: [],
+    }).success,
+  ).toBe(true);
+  for (const grant of [
+    grantView({ capability: "repo.admin" }),
+    grantView({ repositoryId: null }),
+    grantView({ providerConnectionId: GRANT_CONNECTION_ID }),
+    grantView({
+      capability: "provider.use",
+      repositoryId: GRANT_REPOSITORY_ID,
+    }),
+    grantView({ expired: undefined }),
+    grantView({ expiresAt: "tomorrow" }),
+  ]) {
+    expect(
+      GrantsViewSchema.safeParse({ ...value, grants: [grant] }).success,
+      JSON.stringify(grant),
+    ).toBe(false);
+  }
+  expect(
+    GrantsViewSchema.safeParse({
+      ...value,
+      grants: Array.from({ length: GRANT_LIMITS.grants + 1 }, () =>
+        grantView(),
+      ),
+    }).success,
+  ).toBe(false);
+});
+
+test("a grant request names a capability, a scope ID, and a positive lifetime or null, and nothing else crosses", () => {
+  const request = {
+    capability: "repo.write",
+    scopeId: GRANT_REPOSITORY_ID,
+    lifetimeSeconds: 3_600,
+  };
+  expect(
+    GrantRequestViewSchema.parse({ ...request, agentId: AGENT_ID }),
+  ).toEqual(request);
+  expect(
+    GrantRequestViewSchema.safeParse({ ...request, lifetimeSeconds: null })
+      .success,
+  ).toBe(true);
+  for (const value of [
+    { ...request, capability: "repo.admin" },
+    { ...request, scopeId: "../x" },
+    { ...request, lifetimeSeconds: 0 },
+    { ...request, lifetimeSeconds: 1.5 },
+    { ...request, lifetimeSeconds: undefined },
+  ]) {
+    expect(GrantRequestViewSchema.safeParse(value).success).toBe(false);
+  }
+});
+
+test("a grant or revocation result is ok, refused with a fixed reason and a wait for a wait only, or unknown", () => {
+  for (const [schema, refusals, ok] of [
+    [
+      GrantCapabilityResultSchema,
+      GRANT_CAPABILITY_REFUSALS,
+      { outcome: "ok", grantId: GRANT_ID },
+    ],
+    [RevokeGrantResultSchema, REVOKE_GRANT_REFUSALS, { outcome: "ok" }],
+  ] as const) {
+    expect(schema.parse(ok)).toEqual(ok);
+    expect(schema.parse({ outcome: "unknown", grantId: GRANT_ID })).toEqual({
+      outcome: "unknown",
+    });
+    for (const reason of refusals) {
+      const wait = reason === "too_soon" || reason === "rate_limited";
+      const value = {
+        outcome: "refused",
+        reason,
+        retryAfterMs: wait ? 1_000 : null,
+      };
+      expect(schema.parse(value), reason).toEqual(value);
+      expect(
+        schema.safeParse({ ...value, retryAfterMs: wait ? null : 1_000 })
+          .success,
+        reason,
+      ).toBe(false);
+    }
+    expect(
+      schema.safeParse({
+        outcome: "refused",
+        reason: "teapot",
+        retryAfterMs: null,
+      }).success,
+    ).toBe(false);
+  }
+  expect(GRANT_CAPABILITY_REFUSALS).toContain("grant_limit");
+  expect(REVOKE_GRANT_REFUSALS).not.toContain("grant_limit");
+});
+
+test("the provider connections cross with an ID, a kind, and a label only", () => {
+  const connection = {
+    id: GRANT_CONNECTION_ID,
+    kind: "claude",
+    label: "Work laptop",
+  };
+  const parsed = ProviderConnectionsResultSchema.parse({
+    outcome: "ok",
+    connections: [
+      { ...connection, apiKey: "sk-secret", hostDeviceId: AGENT_DEVICE_ID },
+    ],
+  });
+  expect(parsed).toEqual({ outcome: "ok", connections: [connection] });
+  expect(JSON.stringify(parsed)).not.toContain("sk-secret");
+  for (const reason of PROVIDER_CONNECTION_READ_PROBLEMS) {
+    expect(
+      ProviderConnectionsResultSchema.parse({ outcome: "refused", reason }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const value of [
+    { ...connection, kind: "gemini" },
+    { ...connection, label: "" },
+    {
+      ...connection,
+      label: "a".repeat(GRANT_LIMITS.providerConnectionLabel + 1),
+    },
+  ]) {
+    expect(
+      ProviderConnectionsResultSchema.safeParse({
+        outcome: "ok",
+        connections: [value],
+      }).success,
+    ).toBe(false);
+  }
 });
 
 const CHAT_MESSAGE_ID = "0192f0a0-7b3c-7d4e-8f50-000000001001";

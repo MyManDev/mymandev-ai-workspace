@@ -346,7 +346,23 @@ export const WorkspaceRepositoryRemovedEventSchema = z.object({
 // workspace sees. Only the server originates them, after the commit, with a
 // `system` actor and `deviceId: null`, like the repository events (see
 // `actorAllowed`). The payload is the agent as the agent list shows it to
-// every member, `AgentListItem`, which never names the host device (#110).
+// every member, `AgentListItem`, without its host device (#110): an event
+// that names one is refused (#342), as a run event that names a run's
+// provider connection is.
+
+/** Refuses an agent in an event that names its host device (#110, #342). */
+function refuseHostDevice(
+  agent: { readonly hostDeviceId?: unknown },
+  ctx: z.RefinementCtx,
+): void {
+  if (agent.hostDeviceId !== undefined) {
+    ctx.addIssue({
+      code: "custom",
+      message: "An event never names an agent's host device",
+      path: ["payload", "agent", "hostDeviceId"],
+    });
+  }
+}
 
 /**
  * A member created an agent in a project of the workspace, hosted on the
@@ -366,6 +382,7 @@ export const WorkspaceAgentCreatedEventSchema = z
         path: ["payload", "agent", "disabledAt"],
       });
     }
+    refuseHostDevice(event.payload.agent, ctx);
   });
 
 /**
@@ -389,6 +406,7 @@ export const WorkspaceAgentDisabledEventSchema = z
         path: ["payload", "agent", "disabledAt"],
       });
     }
+    refuseHostDevice(event.payload.agent, ctx);
   });
 
 // Join request events (#210, #227): the pending join requests and the

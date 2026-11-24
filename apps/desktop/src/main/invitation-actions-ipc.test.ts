@@ -605,6 +605,7 @@ const MANAGE_EXPECTED: Readonly<Record<WorkspaceActionFailure, unknown>> = {
     reason: "failed",
     retryAfterMs: null,
   },
+  grant_limit: { outcome: "refused", reason: "failed", retryAfterMs: null },
   rate_limited: {
     outcome: "refused",
     reason: "rate_limited",
@@ -659,6 +660,7 @@ const JOIN_EXPECTED: Readonly<Record<WorkspaceActionFailure, unknown>> = {
     reason: "failed",
     retryAfterMs: null,
   },
+  grant_limit: { outcome: "refused", reason: "failed", retryAfterMs: null },
   rate_limited: {
     outcome: "refused",
     reason: "rate_limited",

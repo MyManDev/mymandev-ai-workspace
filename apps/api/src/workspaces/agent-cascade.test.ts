@@ -173,7 +173,11 @@ async function addClaimed(
   return id;
 }
 
-/** A new agent of the account's device in the project, as the agent list shows it. */
+/**
+ * A new agent of the account's device in the project, as every member sees
+ * it in the agent list: the answer's host device, which only the owner reads
+ * (#342), is checked and left out.
+ */
 async function agentOn(
   account: Account,
   projectId: string,
@@ -183,7 +187,11 @@ async function agentOn(
     name,
   });
   assert.equal(response.statusCode, 200, response.body);
-  return CreateAgentResponseSchema.parse(response.json()).agent;
+  const { hostDeviceId, ...agent } = CreateAgentResponseSchema.parse(
+    response.json(),
+  ).agent;
+  assert.equal(hostDeviceId, account.device.deviceId);
+  return agent;
 }
 
 async function repositoryOf(account: Account, projectId: string) {

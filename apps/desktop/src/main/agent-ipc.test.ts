@@ -19,6 +19,7 @@ import {
   AGENT_ACTIVITY_STATUSES,
   AGENT_LIMITS,
   AGENT_RUN_STATES,
+  type AccountStatus,
   type AgentActivityView,
 } from "../shared/ipc-contract.ts";
 import {
@@ -56,6 +57,7 @@ const OWNER = id(0xc1);
 const OTHER_OWNER = id(0xc2);
 const FORMER_OWNER = id(0xc3);
 const DEVICE = id(0xd1);
+const OTHER_DEVICE = id(0xd2);
 const AGENT_1 = id(0xf1);
 const AGENT_2 = id(0xf2);
 const AT = "2026-11-05T10:00:00.000Z";
@@ -66,6 +68,7 @@ function agent(
   name: string,
   ownerMemberId: string,
   disabledAt: string | null = null,
+  hostDeviceId?: string,
 ): AgentListItem {
   return Object.freeze(
     AgentListItemSchema.parse({
@@ -74,9 +77,26 @@ function agent(
       name,
       ownerMemberId,
       disabledAt,
+      ...(hostDeviceId === undefined ? {} : { hostDeviceId }),
     }),
   );
 }
+
+function signedIn(deviceId: string = DEVICE): AccountStatus {
+  return {
+    apiOrigin: "set",
+    device: "signed_in",
+    deviceKey: "ready",
+    account: { kind: "signed_in", deviceId, login: "octocat" },
+  } as unknown as AccountStatus;
+}
+
+const SIGNED_OUT = {
+  apiOrigin: "set",
+  device: "signed_out",
+  deviceKey: "ready",
+  account: { kind: "signed_out" },
+} as unknown as AccountStatus;
 
 function run(
   n: number,
@@ -152,6 +172,9 @@ function fakeServices(initial: AgentActivityState = activity()) {
   ]);
   const agentListeners = new Set<(state: AgentActivityState) => void>();
   const workspaceListeners = new Set<(state: WorkspaceState) => void>();
+  const accountListeners = new Set<(status: AccountStatus) => void>();
+  let status: AccountStatus = signedIn();
+  let ownMember: string | null = OWNER;
   let workspaceRevision = 0;
   const timers: Timer[] = [];
   const errors: string[] = [];
@@ -162,6 +185,16 @@ function fakeServices(initial: AgentActivityState = activity()) {
     stateCalls: () => stateCalls,
     agentListeners,
     workspaceListeners,
+    accountListeners,
+    setStatus(next: AccountStatus) {
+      status = next;
+      for (const listener of [...accountListeners]) {
+        listener(next);
+      }
+    },
+    setOwnMember(memberId: string | null) {
+      ownMember = memberId;
+    },
     /** The timers that were neither cancelled nor fired. */
     waiting: () => timers.filter((timer) => !timer.cancelled && !timer.fired),
     setState(next: AgentActivityState) {
@@ -207,9 +240,20 @@ function fakeServices(initial: AgentActivityState = activity()) {
           };
         },
       },
+      account: {
+        status: () => status,
+        onStatusChange: (listener: (status: AccountStatus) => void) => {
+          accountListeners.add(listener);
+          return () => {
+            accountListeners.delete(listener);
+          };
+        },
+      },
       workspaces: {
         memberName: (memberId: MemberId) =>
           names.get(memberId) ?? UNKNOWN_MEMBER_NAME,
+        ownMemberId: (workspaceId: WorkspaceId) =>
+          workspaceId === WORKSPACE ? (ownMember as MemberId | null) : null,
         onChange: (listener: (state: WorkspaceState) => void) => {
           workspaceListeners.add(listener);
           return () => {
@@ -347,12 +391,17 @@ test("the view holds the owners' names, an unknown person's included, and the mo
         name: "Agent Alpha",
         ownerName: "Ada Lovelace",
         disabledAt: null,
+        // The account owns it, and the list names no host device.
+        ownedByMe: true,
+        grantableHere: false,
       },
       {
         id: AGENT_2,
         name: "Agent Beta",
         ownerName: UNKNOWN_MEMBER_NAME,
         disabledAt: AT,
+        ownedByMe: false,
+        grantableHere: false,
       },
     ],
     unfinishedRuns: [
@@ -384,7 +433,7 @@ test("no member ID, device ID, repository ID, or other key of the model crosses"
     ...agent(AGENT_1, "Agent Alpha", OWNER),
     hostDeviceId: DEVICE,
     deviceId: DEVICE,
-  } as AgentListItem;
+  } as unknown as AgentListItem;
   const leakyRun = {
     ...run(1),
     hostDeviceId: DEVICE,
@@ -417,8 +466,10 @@ test("no member ID, device ID, repository ID, or other key of the model crosses"
     }
     expect(Object.keys(view.agents[0] ?? {}).sort()).toEqual([
       "disabledAt",
+      "grantableHere",
       "id",
       "name",
+      "ownedByMe",
       "ownerName",
     ]);
     for (const item of [...view.unfinishedRuns, ...view.finishedRuns]) {
@@ -432,6 +483,75 @@ test("no member ID, device ID, repository ID, or other key of the model crosses"
       ]);
     }
   }
+});
+
+test("an agent may be granted only from its host device by its owner while it is enabled, and the host device never crosses (#342)", () => {
+  const fake = fakeServices(
+    activity({
+      agents: Object.freeze([
+        // The account's agent on this device.
+        agent(AGENT_1, "Here", OWNER, null, DEVICE),
+        // The account's agent on another of its devices.
+        agent(AGENT_2, "Elsewhere", OWNER, null, OTHER_DEVICE),
+        // The account's disabled agent on this device.
+        agent(id(0xf3), "Disabled", OWNER, AT, DEVICE),
+        // Another member's agent: the list names no host device.
+        agent(id(0xf4), "Theirs", OTHER_OWNER),
+        // The account's agent from a server without the field.
+        agent(id(0xf5), "Older server", OWNER),
+      ]),
+    }),
+  );
+  const { call, subscribe } = register(fake);
+  const { payloads } = subscribe();
+  const flags = (view: AgentActivityView) =>
+    view.agents.map((item) => [item.name, item.ownedByMe, item.grantableHere]);
+
+  const view = call(INVOKE_CHANNELS.getAgentState);
+  expect(flags(view)).toEqual([
+    ["Here", true, true],
+    ["Elsewhere", true, false],
+    ["Disabled", true, false],
+    ["Theirs", false, false],
+    ["Older server", true, false],
+  ]);
+  for (const hidden of [DEVICE, OTHER_DEVICE, OWNER, OTHER_OWNER]) {
+    expect(JSON.stringify(view)).not.toContain(hidden);
+  }
+
+  // Signed in as another device of the account: nothing is grantable here.
+  fake.setStatus(signedIn(OTHER_DEVICE));
+  fake.fire();
+  expect(flags(payloads().at(-1)!)).toEqual([
+    ["Here", true, false],
+    ["Elsewhere", true, true],
+    ["Disabled", true, false],
+    ["Theirs", false, false],
+    ["Older server", true, false],
+  ]);
+  // Signed out, or without a person in the workspace: nothing at all.
+  fake.setStatus(SIGNED_OUT);
+  fake.fire();
+  expect(
+    payloads()
+      .at(-1)!
+      .agents.some((item) => item.grantableHere),
+  ).toBe(false);
+  fake.setStatus(signedIn());
+  fake.setOwnMember(null);
+  expect(flags(call(INVOKE_CHANNELS.getAgentState))).toEqual([
+    ["Here", false, false],
+    ["Elsewhere", false, false],
+    ["Disabled", false, false],
+    ["Theirs", false, false],
+    ["Older server", false, false],
+  ]);
+  // Without a viewer, the pure view grants nothing either.
+  expect(
+    agentActivityView(fake.options.agents.state(), 0, () => "x").agents.some(
+      (item) => item.ownedByMe || item.grantableHere,
+    ),
+  ).toBe(false);
 });
 
 test("the view keeps the 200 newest unfinished runs with a count of the rest, and the 50 most recently finished, in the model's order", () => {

@@ -56,12 +56,21 @@ const READY: AgentActivityView = {
   workspaceId: WORKSPACE,
   projectId: PROJECT,
   agents: [
-    { id: BUILDER, name: "Builder", ownerName: "Ada", disabledAt: null },
+    {
+      id: BUILDER,
+      name: "Builder",
+      ownerName: "Ada",
+      disabledAt: null,
+      ownedByMe: false,
+      grantableHere: false,
+    },
     {
       id: REVIEWER,
       name: "Reviewer",
       ownerName: "Grace",
       disabledAt: "2026-11-05T12:00:00.000Z",
+      ownedByMe: false,
+      grantableHere: false,
     },
   ],
   // The main process's order, which is not the order of the IDs.

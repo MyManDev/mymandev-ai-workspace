@@ -4987,6 +4987,16 @@ const IN_WORKSPACE = Object.freeze({ workspaceId: WORKSPACE_ID });
 const INVITATION_CODE = `mmdi_${"Q7x-_9kPz2".repeat(4)}Lmw`;
 const CREATED = Object.freeze({ created: true });
 const JOIN_REQUEST_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f2" as JoinRequestId;
+/**
+ * A write whose effect is not known. Every failure after the write was
+ * handed to the session carries `sent: true`: it may have reached the API
+ * (#342). A refusal of the service itself does not.
+ */
+const SENT_UNKNOWN = Object.freeze({
+  ok: false,
+  reason: "unknown",
+  sent: true,
+});
 
 test("a workspace action goes to the session once with the allowlist's route, its IDs, and the parsed body, and only the answer comes back", async () => {
   const h = harness();
@@ -5127,20 +5137,22 @@ test("a write is not signed in without an account, and maps the session's failur
   ];
   for (const [result, failure] of cases) {
     h.request = async () => result;
+    // Each one came after the request, also an `unavailable` or a
+    // `not_signed_in` of the session: it may have reached the API.
     await expect(
       h.service.sendWorkspaceAction("promoteMember", {
         workspaceId: WORKSPACE_ID,
         memberId: MEMBER_ID,
       }),
       JSON.stringify(result),
-    ).resolves.toEqual(failure);
+    ).resolves.toEqual({ ...(failure as object), sent: true });
   }
 
   // A session that throws once the write was handed to it.
   h.request = () => Promise.reject(new Error("broken"));
   await expect(
     h.service.sendWorkspaceAction("leaveWorkspace", IN_WORKSPACE),
-  ).resolves.toEqual({ ok: false, reason: "unknown" });
+  ).resolves.toEqual(SENT_UNKNOWN);
   expect(h.errors).toEqual(["A workspace action could not be sent."]);
   // A successful answer without the body that its schema needs.
   h.request = async () => ({ ok: true, value: null });
@@ -5148,7 +5160,7 @@ test("a write is not signed in without an account, and maps the session's failur
     h.service.sendWorkspaceAction("defineMember", IN_WORKSPACE, {
       displayName: "Grace",
     }),
-  ).resolves.toEqual({ ok: false, reason: "unknown" });
+  ).resolves.toEqual(SENT_UNKNOWN);
 });
 
 test("a write whose answer is uncertain is sent once and never again on its own", async () => {
@@ -5165,7 +5177,7 @@ test("a write whose answer is uncertain is sent once and never again on its own"
       h.service.sendWorkspaceAction("createInvitation", IN_WORKSPACE, {
         memberId: MEMBER_ID,
       }),
-    ).resolves.toEqual({ ok: false, reason: "unknown" });
+    ).resolves.toEqual(SENT_UNKNOWN);
     await tick();
     await tick();
     expect(h.log, reason).toEqual([
@@ -5300,7 +5312,7 @@ test("the answer of a write is never dropped silently: after a change of the acc
     outcome: "signed_out",
   });
   finish({ ok: true, value: null });
-  await expect(sending).resolves.toEqual({ ok: false, reason: "unknown" });
+  await expect(sending).resolves.toEqual(SENT_UNKNOWN);
 
   // A failure carries no data.
   finish = heldAnswer(h);
@@ -5310,7 +5322,11 @@ test("the answer of a write is never dropped silently: after a change of the acc
     outcome: "signed_out",
   });
   finish({ ok: false, reason: "refused", code: "conflict" });
-  await expect(sending).resolves.toEqual({ ok: false, reason: "conflict" });
+  await expect(sending).resolves.toEqual({
+    ok: false,
+    reason: "conflict",
+    sent: true,
+  });
 
   // The device is revoked meanwhile: no device is signed in.
   const revoked = harness();
@@ -5320,7 +5336,7 @@ test("the answer of a write is never dropped silently: after a change of the acc
   await tick();
   revoked.emit({ kind: "revoked" });
   finish({ ok: true, value: null });
-  await expect(sending).resolves.toEqual({ ok: false, reason: "unknown" });
+  await expect(sending).resolves.toEqual(SENT_UNKNOWN);
 
   // Without a change, the answer comes back.
   const other = harness();
@@ -5493,10 +5509,10 @@ test("the invitation code goes only in the body of a preview or an accept and co
   expect(results).toEqual([
     { ok: false, reason: "invalid" },
     { ok: false, reason: "invalid" },
-    { ok: false, reason: "invitation_invalid" },
-    { ok: false, reason: "already_member" },
-    { ok: false, reason: "unknown" },
-    { ok: false, reason: "unknown" },
+    { ok: false, reason: "invitation_invalid", sent: true },
+    { ok: false, reason: "already_member", sent: true },
+    SENT_UNKNOWN,
+    SENT_UNKNOWN,
     { ok: false, reason: "invalid" },
   ]);
   expect(h.errors).toEqual([
@@ -5773,7 +5789,7 @@ test("a read or a write on its way when the code of a renewal arrives has its an
   finishRead({ ok: true, value: WORKSPACE_LIST });
   finishWrite({ ok: true, value: null });
   await expect(reading).resolves.toEqual(UNAVAILABLE);
-  await expect(writing).resolves.toEqual({ ok: false, reason: "unknown" });
+  await expect(writing).resolves.toEqual(SENT_UNKNOWN);
   expect(h.service.status().account).toMatchObject({ deviceId: DEVICE_ID });
 
   const done = nextStatus(h, (status) => status.signIn.kind === "idle");
@@ -5808,10 +5824,7 @@ test("the answer of a read or a write on its way across the key replacement of a
     finishRead({ ok: true, value: WORKSPACE_LIST });
     finishWrite({ ok: true, value: null });
     await expect(reading, name).resolves.toEqual(UNAVAILABLE);
-    await expect(writing, name).resolves.toEqual({
-      ok: false,
-      reason: "unknown",
-    });
+    await expect(writing, name).resolves.toEqual(SENT_UNKNOWN);
     await expect(readList(h), name).resolves.toEqual(LISTED);
   }
 });

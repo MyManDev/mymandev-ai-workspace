@@ -2,8 +2,9 @@
 // send to the API for #27 and #28, and the reads of invitations, join
 // requests, and claims for the screens of #95 (decision D1 of 2026-11-06,
 // and D8 of 2026-11-13), of a project's registered repositories (#286), and
-// of this device's grant records for the grant store (#55): a frozen
-// allowlist of twelve `GET` routes, each with the protocol's response schema
+// of this device's grant records for the grant store (#55), and of this
+// device's provider connections for the permission screen (#342): a frozen
+// allowlist of thirteen `GET` routes, each with the protocol's response schema
 // and a fixed cap on the size of its answer.
 // The account service sends them with the device session
 // (`readWorkspaceData`); no IPC channel and no bridge member reach them.
@@ -36,6 +37,9 @@ import {
   type ProjectId,
   type ProjectListResponse,
   ProjectListResponseSchema,
+  PROVIDER_CONNECTION_ROUTES,
+  type ProviderConnectionListResponse,
+  ProviderConnectionListResponseSchema,
   REPOSITORY_ROUTES,
   type RepositoryListResponse,
   RepositoryListResponseSchema,
@@ -94,7 +98,9 @@ function read<T>(
  * the claim notices (D8), 1,000 claims are about 0.33 MB; the server sends
  * 50. For #286, 1,000 repositories with names of 100 four-byte characters
  * are about 0.57 MB; a project holds 20. For #55, 1,000 grant records with
- * every fact and time set are about 1.12 MB.
+ * every fact and time set are about 1.12 MB. For #342, 1,000 provider
+ * connections with labels of 64 four-byte characters are about 0.4 MB; a
+ * device holds 10.
  */
 export const WORKSPACE_READS = Object.freeze({
   /** `GET /workspaces`: the account's workspaces. */
@@ -194,6 +200,17 @@ export const WORKSPACE_READS = Object.freeze({
     GrantRecordListResponseSchema,
     2 * MIB,
   ),
+  /**
+   * `GET /provider-connections`: this device's provider connections that
+   * are not removed, an ID, a kind, and a label each, never a credential,
+   * for the scope of `provider.use` on the permission screen (#342).
+   */
+  listProviderConnections: read(
+    PROVIDER_CONNECTION_ROUTES.listProviderConnections,
+    [],
+    ProviderConnectionListResponseSchema,
+    1 * MIB,
+  ),
 });
 export type WorkspaceReadName = keyof typeof WORKSPACE_READS;
 
@@ -214,6 +231,7 @@ export interface WorkspaceReadParams {
   readonly listClaims: { readonly workspaceId: WorkspaceId };
   readonly listRepositories: { readonly projectId: ProjectId };
   readonly listGrantRecords: NoParams;
+  readonly listProviderConnections: NoParams;
 }
 
 /**
@@ -239,6 +257,7 @@ export interface WorkspaceReadQuery {
   readonly listClaims: never;
   readonly listRepositories: never;
   readonly listGrantRecords: never;
+  readonly listProviderConnections: never;
 }
 
 /** The answer of each read, as its response schema parsed it. */
@@ -255,6 +274,7 @@ export interface WorkspaceReadAnswer {
   readonly listClaims: ClaimListResponse;
   readonly listRepositories: RepositoryListResponse;
   readonly listGrantRecords: GrantRecordListResponse;
+  readonly listProviderConnections: ProviderConnectionListResponse;
 }
 
 /**

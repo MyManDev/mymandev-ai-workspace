@@ -64,6 +64,7 @@ import {
   workspaceActionFailed,
   workspaceActionFailedFor,
   workspaceActionRequest,
+  workspaceActionSent,
 } from "./api-actions.ts";
 import type { ApiOrigin } from "./api-origin.ts";
 import {
@@ -405,10 +406,12 @@ export interface AccountService {
    * `unknown`, as does a successful answer when the account or the device
    * changed while it was on its way, or when such an action or the code of
    * a renewal came meanwhile. Writes beyond `WORKSPACE_ACTION_BUDGET`
-   * answer `too_soon` without a request. An invitation code in the body or
-   * the answer is never kept, logged, or published (D2). The body is
-   * required for a write with one and not allowed for one without. Never
-   * rejects.
+   * answer `too_soon` without a request. Every failure after the write was
+   * handed to the session carries `sent: true`; one that the service
+   * refused without a request does not (`workspaceActionMayHaveSent`, #342).
+   * An invitation code in the body or the answer is never kept, logged, or
+   * published (D2). The body is required for a write with one and not
+   * allowed for one without. Never rejects.
    */
   readonly sendWorkspaceAction: <N extends WorkspaceActionName>(
     name: N,
@@ -2202,9 +2205,10 @@ export function createAccountService(
           report("The account could not be read.");
         });
       }
-      // A failure carries no data, so it is answered as it is.
+      // A failure carries no data, so it is answered as it is, marked as
+      // one that may have reached the API.
       if (!result.ok) {
-        return workspaceActionFailedFor(result);
+        return workspaceActionSent(workspaceActionFailedFor(result));
       }
       // The answer belongs to the account and the device that sent it: when
       // they changed meanwhile, or an action that may change them began, it
@@ -2214,10 +2218,10 @@ export function createAccountService(
         account.deviceId !== deviceId ||
         accountChanges !== changes
       ) {
-        return workspaceActionFailed("unknown");
+        return workspaceActionSent(workspaceActionFailed("unknown"));
       }
       if (call.answer !== "empty" && result.value === null) {
-        return workspaceActionFailed("unknown");
+        return workspaceActionSent(workspaceActionFailed("unknown"));
       }
       return Object.freeze({
         ok: true,
@@ -2227,7 +2231,9 @@ export function createAccountService(
       // A fixed message: never the error, which might hold the body. Before
       // the request, only a value that throws when it is read can fail.
       report("A workspace action could not be sent.");
-      return workspaceActionFailed(sent ? "unknown" : "invalid");
+      return sent
+        ? workspaceActionSent(workspaceActionFailed("unknown"))
+        : workspaceActionFailed("invalid");
     }
   }
 

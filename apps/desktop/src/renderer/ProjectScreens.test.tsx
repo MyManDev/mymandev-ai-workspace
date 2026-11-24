@@ -19,16 +19,16 @@ function itemOf(html: string, capability: string): string {
   return html.slice(open, end + "</li>".length);
 }
 
-test("the permission screen says that granting is not available yet, and offers no control", () => {
+test("without the bridges, outside Electron, the permission screen says that granting is not available here, and offers no control", () => {
   const html = render();
 
   expect(html).toContain(
-    '<section aria-labelledby="permissions-title"><h2 id="permissions-title">Permissions</h2><p>An agent gets only the permissions that its owner grants, each for one capability on one repository or on one AI provider connection.</p><p class="placeholder-note">Granting permissions is not available yet. This screen shows what each permission allows and its risk.</p>',
+    '<section aria-labelledby="permissions-title"><h2 id="permissions-title">Permissions</h2><p>An agent gets only the permissions that its owner grants, each for one capability on one repository or on one AI provider connection.</p><section class="grant-section"><h3 id="grant-title">Grant a permission</h3><p class="placeholder-note">Granting permissions is not available here.</p></section>',
   );
   expect(html).not.toMatch(
     /<(?:button|input|select|textarea|form|dialog|a)[\s>]|\srole=|\stabindex=|\shref=|\sstyle=/,
   );
-  // The confirmation belongs to granting, which this screen does not offer.
+  // The confirmation belongs to granting the shell, which #77 adds.
   for (const confirmation of Object.values(HIGHEST_RISK_CONFIRMATIONS)) {
     expect(html).not.toContain(confirmation.slice(0, 40));
   }

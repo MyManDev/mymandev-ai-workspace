@@ -400,10 +400,11 @@ test("any active member creates an agent, hosted on the calling device and owned
   assert.equal(memberRow.hostDeviceId, secondDevice);
   assert.deepEqual(memberRow.createdAt, LATER);
 
-  // The answer is the agent as the list shows it to every member.
+  // The answer is the agent as the list shows it to every member; the list
+  // adds the host device of the reader's own agents only (#342).
   assert.deepEqual(await listed(projectId, member), [
     byOwner.agent,
-    byMember.agent,
+    { ...byMember.agent, hostDeviceId: secondDevice },
   ]);
   for (const agent of await listed(projectId, owner)) {
     assert.ok(AgentListItemSchema.safeParse(agent).success);

@@ -1,3 +1,9 @@
+import type {
+  AgentBridge,
+  GrantBridge,
+  ProjectRepositoriesBridge,
+} from "../shared/desktop-bridge.ts";
+import { PermissionGrants } from "./PermissionGrants.tsx";
 import {
   describePermissionScreen,
   type CapabilityView,
@@ -5,9 +11,9 @@ import {
 } from "./permission-view.ts";
 
 // The other screens of the open project. Tasks and decisions show
-// placeholder content only, and the permission screen shows what each
-// permission allows, read-only: tasks, decisions, and granting permissions
-// come in later milestones. The chat screen is in ChatScreen.tsx.
+// placeholder content only, and come in later milestones. The permission
+// screen grants and revokes permissions (#342) and shows what each
+// permission allows. The chat screen is in ChatScreen.tsx.
 
 export function TasksScreen() {
   return (
@@ -65,11 +71,20 @@ function CapabilityItem({ view }: { readonly view: CapabilityView }) {
 
 /**
  * The permission screen after the capability and permission contract (ADR
- * 0015) and its presentation rules (#77), read-only: it shows what each
- * capability allows and its risk from `@mymandev/permissions`, and it has no
- * control that grants. Granting comes later.
+ * 0015): the grant form and the grants of the agents that this device may
+ * grant for (#342), and what each capability allows and its risk from
+ * `@mymandev/permissions`. The presentation rules of #77 come later; until
+ * then the form does not offer the highest-risk capability.
  */
-export function PermissionsScreen() {
+export function PermissionsScreen({
+  agents,
+  projectRepositories,
+  grants,
+}: {
+  readonly agents?: AgentBridge | undefined;
+  readonly projectRepositories?: ProjectRepositoriesBridge | undefined;
+  readonly grants?: GrantBridge | undefined;
+} = {}) {
   const view = describePermissionScreen();
   return (
     <section aria-labelledby="permissions-title">
@@ -78,7 +93,11 @@ export function PermissionsScreen() {
         An agent gets only the permissions that its owner grants, each for one
         capability on one repository or on one AI provider connection.
       </p>
-      <p className="placeholder-note">{view.unavailable}</p>
+      <PermissionGrants
+        agents={agents}
+        projectRepositories={projectRepositories}
+        grants={grants}
+      />
       <ul className="permission-statements">
         {view.statements.map((statement, index) => (
           <li key={index}>

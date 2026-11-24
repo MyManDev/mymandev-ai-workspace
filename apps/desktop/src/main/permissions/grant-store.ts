@@ -189,8 +189,8 @@ export interface GrantStoreService extends GrantStore {
    * failure or a timeout, because the grant may be stored even then. So the
    * grant is held without waiting for the interval, also one on an agent
    * that no answer named yet, such as a new agent's first grant or one whose
-   * grants all ended before the first answer (#335). Granting is not
-   * available on the desktop yet, so nothing calls it.
+   * grants all ended before the first answer (#335). The grant action of
+   * `grant-actions.ts` calls it (#342), and after a revocation as well.
    */
   readonly ownGrantAnswered: () => void;
   /** Stops listening and cancels the timers, for the quit. Unusable from then on. */
@@ -232,9 +232,10 @@ function frozenRecord(record: GrantRecord): GrantRecord {
 /**
  * The ID of the signed-in device with a ready key, or null. The login is left
  * out: a changed login of the same device keeps the records, whose account is
- * checked against the connection's `userId`.
+ * checked against the connection's `userId`. The grant action compares it
+ * with an agent's host device (#342).
  */
-function signedInDevice(status: AccountStatus): string | null {
+export function signedInDevice(status: AccountStatus): string | null {
   return status.apiOrigin === "set" &&
     status.device === "signed_in" &&
     status.deviceKey === "ready" &&

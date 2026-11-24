@@ -25,6 +25,7 @@ import type { ApiRoute } from "./auth-api.ts";
 import { displayText, RunStateSchema, UtcTimestampSchema } from "./entities.ts";
 import {
   AgentIdSchema,
+  DeviceIdSchema,
   MemberIdSchema,
   MessageIdSchema,
   ProjectIdSchema,
@@ -48,7 +49,8 @@ function route(method: ApiRoute["method"], path: string): ApiRoute {
 export const AGENT_ROUTES = Object.freeze({
   /**
    * The project's agents, disabled ones included, each with its owner's
-   * person and never with its host device. Any active member.
+   * person. Any active member. Only the account that owns an agent gets its
+   * host device (`hostDeviceId`, #342); every other reader gets none.
    */
   listAgents: route("GET", "/projects/:projectId/agents"),
   /**
@@ -134,10 +136,18 @@ export const AGENT_COUNT_LIMITS = Object.freeze({
 } as const);
 
 /**
- * An agent as every member of its workspace sees it. It names no device:
- * the host device is device data, which only its own account sees (#110),
- * and the owner is shown through their person row, also after they were
- * removed.
+ * An agent in the agent list. The owner is shown through their person row,
+ * also after they were removed.
+ *
+ * `hostDeviceId` is optional (#342; Project Manager decision of
+ * 2026-11-24), as `providerConnectionId` of a run is (#35): the agent's host
+ * device is device data, which only its own account sees (#110). Only the
+ * account that owns the agent gets it, on any of its devices, in the agent
+ * list and in the answer of the creation, so that the owner's desktop knows
+ * whether it is the agent's host device and may grant. It is absent for
+ * every other reader and in every event (`workspace.agent.created` and
+ * `workspace.agent.disabled` refuse it), and an answer of a server before
+ * it still parses.
  */
 export const AgentListItemSchema = z.object({
   id: AgentIdSchema,
@@ -147,6 +157,8 @@ export const AgentListItemSchema = z.object({
   ownerMemberId: MemberIdSchema,
   /** When the agent was disabled; null while it is enabled. */
   disabledAt: UtcTimestampSchema.nullable(),
+  /** The agent's host device: only for the account that owns the agent. */
+  hostDeviceId: DeviceIdSchema.optional(),
 });
 export type AgentListItem = z.infer<typeof AgentListItemSchema>;
 
@@ -163,11 +175,11 @@ export const CreateAgentRequestSchema = z.object({
 export type CreateAgentRequest = z.infer<typeof CreateAgentRequestSchema>;
 
 /**
- * The answer of `POST /projects/:projectId/agents`: the new agent as every
- * member sees it in the agent list, enabled and without its host device,
- * which is the calling device. The schema cannot see the request, so the
- * device checks that the agent names the project of the path and the name
- * that it sent, and that `ownerMemberId` is its account's person.
+ * The answer of `POST /projects/:projectId/agents`: the new agent as its
+ * owner sees it in the agent list, enabled, with its host device, the
+ * calling device (#342). The schema cannot see the request, so the device
+ * checks that the agent names the project of the path and the name that it
+ * sent, and that `ownerMemberId` is its account's person.
  */
 export const CreateAgentResponseSchema = z
   .object({ agent: AgentListItemSchema })

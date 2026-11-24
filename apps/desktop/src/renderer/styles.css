@@ -939,6 +939,52 @@ code {
   margin-block-end: 0;
 }
 
+/* Granting and revoking (#342): one label above each list. */
+.grant-section {
+  padding-block: var(--space-3);
+  border-block-start: var(--border-width) solid var(--color-border);
+}
+
+.grant-section h3,
+.grant-section h4 {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-base);
+}
+
+.grant-form {
+  display: grid;
+  gap: var(--space-1);
+  justify-items: start;
+  margin-block-end: var(--space-2);
+}
+
+.grant-form button {
+  margin-block-start: var(--space-2);
+}
+
+.grant-note {
+  margin: 0 0 var(--space-2);
+}
+
+.grant-list {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.grant-item {
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+/* The expiry is always text; the color only repeats it. */
+.grant-item[data-expired="true"] .grant-expiry {
+  color: var(--color-status-failed);
+}
+
 /* People */
 
 /* A long workspace name wraps instead of widening the screen. */

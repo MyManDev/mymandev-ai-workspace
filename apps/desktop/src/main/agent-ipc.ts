@@ -11,6 +11,7 @@ import {
   type AgentRunView,
   type AgentView,
 } from "../shared/ipc-contract.ts";
+import type { AccountService } from "./account.ts";
 import type {
   AgentActivityService,
   AgentActivityState,
@@ -21,6 +22,11 @@ import {
   createInvokeHandler,
   type IpcRegistry,
 } from "./ipc.ts";
+import {
+  agentAccess,
+  grantViewer,
+  type GrantViewer,
+} from "./permissions/grant-actions.ts";
 import type { ScheduleTimer } from "./runtime.ts";
 import type { WorkspaceService } from "./workspace/service.ts";
 
@@ -52,15 +58,25 @@ function cut(text: string, maxLength: number): string {
     : text;
 }
 
+/** A viewer that owns no agent and hosts none. */
+const NO_VIEWER: GrantViewer = Object.freeze({
+  ownMemberId: null,
+  deviceId: null,
+});
+
 function agentView(
   agent: AgentListItem,
   memberName: (memberId: MemberId) => string,
+  viewer: GrantViewer,
 ): AgentView {
+  const { ownedByMe, grantableHere } = agentAccess(agent, viewer);
   return Object.freeze({
     id: agent.id,
     name: cut(agent.name, AGENT_LIMITS.agentName),
     ownerName: cut(memberName(agent.ownerMemberId), AGENT_LIMITS.ownerName),
     disabledAt: agent.disabledAt,
+    ownedByMe,
+    grantableHere,
   });
 }
 
@@ -79,8 +95,10 @@ function runView(run: AgentRunListItem): AgentRunView {
 /**
  * The frozen copy of the service's state that crosses IPC, with `revision`
  * as its revision. Each agent's owner is resolved to a display name with
- * `memberName`; no member ID, device ID, project ID of a run, or repository
- * ID crosses. The lists keep the model's order and are cut to
+ * `memberName`, and what the account may do with it to two flags with
+ * `viewer` (#342): whether its own person owns it, and whether this device
+ * is its host device and may grant. No member ID, device ID, project ID of
+ * a run, or repository ID crosses. The lists keep the model's order and are cut to
  * `AGENT_LIMITS`: the model holds the unfinished runs the most recently
  * created first, so the first ones are the newest, and `moreUnfinishedRuns`
  * counts the older ones that are left out; the finished runs are the most
@@ -91,6 +109,7 @@ export function agentActivityView(
   state: AgentActivityState,
   revision: number,
   memberName: (memberId: MemberId) => string,
+  viewer: GrantViewer = NO_VIEWER,
 ): AgentActivityView {
   const unfinished = state.unfinishedRuns.slice(0, AGENT_LIMITS.unfinishedRuns);
   const fields = {
@@ -100,7 +119,7 @@ export function agentActivityView(
     agents: Object.freeze(
       state.agents
         .slice(0, AGENT_LIMITS.agents)
-        .map((agent) => agentView(agent, memberName)),
+        .map((agent) => agentView(agent, memberName, viewer)),
     ),
     unfinishedRuns: Object.freeze(unfinished.map(runView)),
     moreUnfinishedRuns: state.unfinishedRuns.length - unfinished.length,
@@ -129,7 +148,12 @@ function scheduleWithSetTimeout(
 
 export interface AgentIpcOptions {
   readonly agents: Pick<AgentActivityService, "state" | "onChange">;
-  readonly workspaces: Pick<WorkspaceService, "memberName" | "onChange">;
+  readonly workspaces: Pick<
+    WorkspaceService,
+    "memberName" | "ownMemberId" | "onChange"
+  >;
+  /** The signed-in device, for whether it hosts an agent (#342). */
+  readonly account: Pick<AccountService, "status" | "onStatusChange">;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
   /** Defaults to `console.error`. */
@@ -147,10 +171,11 @@ export interface AgentIpc {
  * read-only and take no argument. Every handler checks the sender and the
  * arguments first (`createInvokeHandler`) and answers with a view parsed by
  * the contract (`agentActivityView`), so only IDs, names, states, reasons,
- * and times reach the renderer, never a member ID or a device ID.
+ * times, and two flags reach the renderer, never a member ID or a device
+ * ID.
  *
- * A change of the agent service, and a change of the workspace service,
- * which also reports a new name of a person, raise the view's revision at
+ * A change of the agent service, of the account, and of the workspace
+ * service, which also reports a new name of a person, raise the view's revision at
  * once and publish the latest view after `AGENT_PUBLISH_INTERVAL_MS`, so at
  * most one view goes out in each interval and the last change of a burst is
  * always sent. Call it before the first window loads.
@@ -160,7 +185,7 @@ export function registerAgentIpc(
   appUrl: string,
   options: AgentIpcOptions,
 ): AgentIpc {
-  const { agents, workspaces } = options;
+  const { agents, workspaces, account } = options;
   const schedule = options.scheduleTimer ?? scheduleWithSetTimeout;
   const onError =
     options.onError ??
@@ -175,7 +200,13 @@ export function registerAgentIpc(
   let cancelPublish: (() => void) | null = null;
 
   function view(): AgentActivityView {
-    return agentActivityView(agents.state(), revision, workspaces.memberName);
+    const state = agents.state();
+    return agentActivityView(
+      state,
+      revision,
+      workspaces.memberName,
+      grantViewer(account.status(), state, workspaces.ownMemberId),
+    );
   }
 
   function publish(): void {
@@ -214,7 +245,11 @@ export function registerAgentIpc(
       },
     ),
   );
-  const removers = [agents.onChange(changed), workspaces.onChange(changed)];
+  const removers = [
+    agents.onChange(changed),
+    workspaces.onChange(changed),
+    account.onStatusChange(changed),
+  ];
 
   return Object.freeze({
     close: () => {

@@ -15,6 +15,10 @@ import {
   CreateWorkspaceResponseSchema,
   DefineMemberRequestSchema,
   DefineMemberResponseSchema,
+  GRANT_ROUTE_ERRORS,
+  GRANT_ROUTES,
+  GrantCapabilityRequestSchema,
+  GrantCapabilityResponseSchema,
   INVITATION_CODE_PATTERN,
   MEMBERSHIP_ROUTE_ERRORS,
   MEMBERSHIP_ROUTES,
@@ -41,7 +45,9 @@ import {
   workspaceActionFailed,
   workspaceActionFailedFor,
   workspaceActionFailureOf,
+  workspaceActionMayHaveSent,
   workspaceActionRequest,
+  workspaceActionSent,
 } from "./api-actions.ts";
 import {
   SESSION_FAILURE_REASONS,
@@ -54,6 +60,11 @@ const INVITATION_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819301";
 const JOIN_REQUEST_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819311";
 const PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819321";
 const REPOSITORY_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819331";
+const AGENT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819341";
+const GRANT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819351";
+const CONNECTION_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819361";
+const OF_AGENT = { agentId: AGENT_ID };
+const OF_GRANT = { agentId: AGENT_ID, grantId: GRANT_ID };
 const IN_PROJECT = { projectId: PROJECT_ID };
 const OF_REPOSITORY = { projectId: PROJECT_ID, repositoryId: REPOSITORY_ID };
 /** An invitation code of the protocol's format, as a person pastes it. */
@@ -253,6 +264,28 @@ const ACTIONS: [
     `/projects/${PROJECT_ID}/repositories/${REPOSITORY_ID}/remove`,
     undefined,
   ],
+  [
+    "grantCapability",
+    OF_AGENT,
+    {
+      capability: "repo.read",
+      repositoryId: REPOSITORY_ID,
+      lifetimeSeconds: null,
+    },
+    `/agents/${AGENT_ID}/grants`,
+    {
+      capability: "repo.read",
+      repositoryId: REPOSITORY_ID,
+      lifetimeSeconds: null,
+    },
+  ],
+  [
+    "revokeGrant",
+    OF_GRANT,
+    undefined,
+    `/agents/${AGENT_ID}/grants/${GRANT_ID}/revoke`,
+    undefined,
+  ],
 ];
 
 /** The `:name` parameters of a route path, in order. */
@@ -262,7 +295,7 @@ function pathParams(path: string): string[] {
   );
 }
 
-test("the allowlist holds exactly the 26 POST writes of the screens and the repositories, frozen, each the protocol's route with its path parameters", () => {
+test("the allowlist holds exactly the 28 POST writes of the screens, the repositories, and the grants, frozen, each the protocol's route with its path parameters", () => {
   expect(Object.keys(WORKSPACE_ACTIONS)).toEqual(ACTIONS.map(([name]) => name));
   expect(Object.isFrozen(WORKSPACE_ACTIONS)).toBe(true);
   for (const [name, entry] of Object.entries(WORKSPACE_ACTIONS)) {
@@ -275,7 +308,9 @@ test("the allowlist holds exactly the 26 POST writes of the screens and the repo
         ? PROJECT_ROUTES.createProject
         : name === "registerRepository" || name === "removeRepository"
           ? REPOSITORY_ROUTES[name]
-          : MEMBERSHIP_ROUTES[name as keyof typeof MEMBERSHIP_ROUTES];
+          : name === "grantCapability" || name === "revokeGrant"
+            ? GRANT_ROUTES[name]
+            : MEMBERSHIP_ROUTES[name as keyof typeof MEMBERSHIP_ROUTES];
     expect(entry.route, name).toBe(protocol);
   }
   // Left out: the owner's limit of unclaimed people and project renames,
@@ -366,6 +401,11 @@ test("each write's request and answer schemas are the protocol's", () => {
       RegisterRepositoryResponseSchema,
     ],
     removeRepository: [null, "empty"],
+    grantCapability: [
+      GrantCapabilityRequestSchema,
+      GrantCapabilityResponseSchema,
+    ],
+    revokeGrant: [null, "empty"],
   };
   expect(Object.keys(WORKSPACE_ACTIONS).sort()).toEqual(
     Object.keys(schemas).sort(),
@@ -470,12 +510,139 @@ test("a name off the allowlist, a missing, extra, or invalid path parameter, or 
       { ...OF_REPOSITORY, workspaceId: WORKSPACE_ID },
       undefined,
     ],
+    // A grant (#342): one capability on the scope of its kind, a lifetime
+    // that is a number or an explicit null, and no extra field.
+    ["grantCapability", OF_AGENT, undefined],
+    [
+      "grantCapability",
+      OF_AGENT,
+      { capability: "repo.read", repositoryId: REPOSITORY_ID },
+    ],
+    [
+      "grantCapability",
+      OF_AGENT,
+      {
+        capability: "repo.read",
+        providerConnectionId: CONNECTION_ID,
+        lifetimeSeconds: null,
+      },
+    ],
+    [
+      "grantCapability",
+      OF_AGENT,
+      {
+        capability: "provider.use",
+        repositoryId: REPOSITORY_ID,
+        lifetimeSeconds: null,
+      },
+    ],
+    [
+      "grantCapability",
+      OF_AGENT,
+      {
+        capability: "repo.read",
+        repositoryId: REPOSITORY_ID,
+        lifetimeSeconds: 59,
+      },
+    ],
+    [
+      "grantCapability",
+      OF_AGENT,
+      {
+        capability: "terminal.execute",
+        repositoryId: REPOSITORY_ID,
+        lifetimeSeconds: null,
+      },
+    ],
+    [
+      "grantCapability",
+      OF_AGENT,
+      {
+        capability: "terminal.execute",
+        repositoryId: REPOSITORY_ID,
+        lifetimeSeconds: 2_592_001,
+      },
+    ],
+    [
+      "grantCapability",
+      OF_AGENT,
+      {
+        capability: "repo.admin",
+        repositoryId: REPOSITORY_ID,
+        lifetimeSeconds: null,
+      },
+    ],
+    [
+      "grantCapability",
+      OF_AGENT,
+      {
+        capability: "repo.read",
+        repositoryId: REPOSITORY_ID,
+        providerConnectionId: CONNECTION_ID,
+        lifetimeSeconds: null,
+      },
+    ],
+    [
+      "grantCapability",
+      OF_AGENT,
+      {
+        capability: "repo.read",
+        repositoryId: REPOSITORY_ID,
+        lifetimeSeconds: null,
+        granteeAgentId: AGENT_ID,
+      },
+    ],
+    [
+      "grantCapability",
+      IN_PROJECT,
+      {
+        capability: "repo.read",
+        repositoryId: REPOSITORY_ID,
+        lifetimeSeconds: null,
+      },
+    ],
+    [
+      "grantCapability",
+      { agentId: v4 },
+      {
+        capability: "repo.read",
+        repositoryId: REPOSITORY_ID,
+        lifetimeSeconds: null,
+      },
+    ],
+    ["revokeGrant", OF_AGENT, undefined],
+    ["revokeGrant", OF_GRANT, {}],
+    ["revokeGrant", { agentId: AGENT_ID, grantId: upper }, undefined],
   ];
   for (const [name, params, body] of refused) {
     expect(
       workspaceActionRequest(name as WorkspaceActionName, params, body),
       `${name} ${JSON.stringify(params)} ${JSON.stringify(body)}`,
     ).toBeNull();
+  }
+  // The other forms of a grant pass: provider.use on a connection, a
+  // lifetime, and the shell with one of at most 30 days.
+  for (const body of [
+    {
+      capability: "provider.use",
+      providerConnectionId: CONNECTION_ID,
+      lifetimeSeconds: null,
+    },
+    {
+      capability: "git.push",
+      repositoryId: REPOSITORY_ID,
+      lifetimeSeconds: 3_600,
+    },
+    {
+      capability: "terminal.execute",
+      repositoryId: REPOSITORY_ID,
+      lifetimeSeconds: 2_592_000,
+    },
+  ]) {
+    expect(
+      workspaceActionRequest("grantCapability", OF_AGENT, body)?.body,
+      JSON.stringify(body),
+    ).toEqual(body);
   }
 });
 
@@ -585,8 +752,8 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     run_daily_limit: "failed",
     // A registration in a full project (#286, decision of 2026-11-14).
     repository_limit: "repository_limit",
-    // No write of the desktop grants a capability yet (#75).
-    grant_limit: "failed",
+    // A grant over a count limit (#75, #342), without a wait.
+    grant_limit: "grant_limit",
     // No write of the desktop creates an agent yet (#294).
     agent_limit: "failed",
     // No write of the desktop registers a provider connection yet (#295).
@@ -616,6 +783,8 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     createProject: PROJECT_ROUTE_ERRORS.createProject,
     registerRepository: REPOSITORY_ROUTE_ERRORS.registerRepository,
     removeRepository: REPOSITORY_ROUTE_ERRORS.removeRepository,
+    grantCapability: GRANT_ROUTE_ERRORS.grantCapability,
+    revokeGrant: GRANT_ROUTE_ERRORS.revokeGrant,
   };
   for (const name of Object.keys(WORKSPACE_ACTIONS)) {
     expect(routeErrors[name], name).toBeDefined();
@@ -685,6 +854,15 @@ test("rate_limited waits as long as the API's Retry-After, or a fixed minute wit
       retryAfterSeconds: 120,
     }),
   ).toEqual({ ok: false, reason: "repository_limit" });
+  // Nor is the limit of grants (#75, #342).
+  expect(
+    workspaceActionFailedFor({
+      ok: false,
+      reason: "refused",
+      code: "grant_limit",
+      retryAfterSeconds: 120,
+    }),
+  ).toEqual({ ok: false, reason: "grant_limit" });
   expect(workspaceActionFailedFor({ ok: false, reason: "no_answer" })).toEqual({
     ok: false,
     reason: "unknown",
@@ -695,6 +873,31 @@ test("rate_limited waits as long as the API's Retry-After, or a fixed minute wit
     retryAfterMs: 1_235,
   });
   expect(Object.isFrozen(workspaceActionFailed("invalid"))).toBe(true);
+});
+
+test("a failure marked as sent may have reached the API, as every successful answer; a refusal of the service itself did not (#342)", () => {
+  const sent = workspaceActionSent(workspaceActionFailed("too_soon", 1_000));
+  expect(sent).toEqual({
+    ok: false,
+    reason: "too_soon",
+    retryAfterMs: 1_000,
+    sent: true,
+  });
+  expect(Object.isFrozen(sent)).toBe(true);
+  expect(workspaceActionMayHaveSent(sent)).toBe(true);
+  expect(
+    workspaceActionMayHaveSent(
+      workspaceActionSent(workspaceActionFailed("unavailable")),
+    ),
+  ).toBe(true);
+  expect(workspaceActionMayHaveSent({ ok: true, value: null })).toBe(true);
+  for (const reason of WORKSPACE_ACTION_FAILURES) {
+    const failure =
+      reason === "too_soon" || reason === "rate_limited"
+        ? workspaceActionFailed(reason, 1_000)
+        : workspaceActionFailed(reason);
+    expect(workspaceActionMayHaveSent(failure), reason).toBe(false);
+  }
 });
 
 test("the write budget is far below the API's limit of 300 requests a minute", () => {

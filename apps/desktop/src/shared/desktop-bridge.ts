@@ -20,6 +20,9 @@ import type {
   DeviceListLoadResult,
   DeviceListView,
   ForgetResult,
+  GrantCapabilityResult,
+  GrantRequestView,
+  GrantsView,
   InvitationLoadResult,
   InvitationsView,
   JoinRequestActionResult,
@@ -35,10 +38,12 @@ import type {
   PersonActionResult,
   PreviewInvitationResult,
   ProjectRepositoriesView,
+  ProviderConnectionsResult,
   ReconnectResult,
   RegisterRepositoryResult,
   RemoveDeviceResult,
   RemoveRepositoryResult,
+  RevokeGrantResult,
   RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
@@ -102,6 +107,8 @@ export interface DesktopBridge {
   readonly claimMarks: ClaimMarksBridge;
   /** The agent activity of the open project, read-only. */
   readonly agents: AgentBridge;
+  /** The grants of the open project's agents, granting, and revoking. */
+  readonly grants: GrantBridge;
   /** The chat of the open project. */
   readonly chat: ChatBridge;
   /** The account's devices, the registration lock, and new devices. */
@@ -786,6 +793,45 @@ export interface AgentBridge {
     listener: (state: AgentActivityView) => void,
     onError?: () => void,
   ) => () => void;
+}
+
+/**
+ * The grants of the open project's agents, and granting and revoking them
+ * (#342). The grants come from this device's grant records, which only an
+ * agent's host device holds: each names its agent, capability, scope, and
+ * times, never an account or a device. Whether this device may grant an
+ * agent comes with the agent (`grantableHere` of the agent activity); the
+ * main process checks it again before it sends a grant.
+ */
+export interface GrantBridge {
+  /** The current grants. */
+  readonly getState: () => Promise<GrantsView>;
+  /**
+   * Calls `listener` with the current grants and then after changes, at
+   * most once every 50 ms with the latest ones. A state older than the last
+   * one delivered is dropped. `onError` is called when the main process
+   * refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: GrantsView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Reads this device's provider connections, the scopes of
+   * `provider.use`: an ID, a kind, and a label each.
+   */
+  readonly listProviderConnections: () => Promise<ProviderConnectionsResult>;
+  /** Grants one capability on one scope to an agent of the open project. */
+  readonly grant: (
+    agentId: string,
+    request: GrantRequestView,
+  ) => Promise<GrantCapabilityResult>;
+  /** Revokes a grant of an agent of the open project. */
+  readonly revoke: (
+    agentId: string,
+    grantId: string,
+  ) => Promise<RevokeGrantResult>;
 }
 
 /**

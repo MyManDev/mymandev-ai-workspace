@@ -8,6 +8,7 @@ import {
   JoinRequestListResponseSchema,
   OwnJoinRequestListResponseSchema,
   ProjectListResponseSchema,
+  ProviderConnectionListResponseSchema,
   type ProjectId,
   RepositoryListResponseSchema,
   routePath,
@@ -96,6 +97,7 @@ const READS: [WorkspaceReadName, Record<string, string>, string, number][] = [
     1 * MIB,
   ],
   ["listGrantRecords", {}, "/grant-records", 2 * MIB],
+  ["listProviderConnections", {}, "/provider-connections", 1 * MIB],
 ];
 
 /** Sends the request as the session does, with an answer of exactly `size` bytes. */
@@ -125,7 +127,7 @@ async function answerOfSize(
   return answer.kind;
 }
 
-test("the allowlist holds exactly twelve GET reads, frozen", () => {
+test("the allowlist holds exactly thirteen GET reads, frozen", () => {
   expect(Object.keys(WORKSPACE_READS)).toEqual(READS.map(([name]) => name));
   expect(Object.isFrozen(WORKSPACE_READS)).toBe(true);
   for (const entry of Object.values(WORKSPACE_READS)) {
@@ -238,6 +240,7 @@ test("each read's answer is checked with its response schema", () => {
     listClaims: { claims: [] },
     listRepositories: { repositories: [] },
     listGrantRecords: { records: [] },
+    listProviderConnections: { providerConnections: [] },
   };
   for (const [name, params] of READS) {
     const request = workspaceReadRequest(name, params, undefined)!;
@@ -305,6 +308,7 @@ test("each read's answer schema is the protocol schema of its route", () => {
     listClaims: ClaimListResponseSchema,
     listRepositories: RepositoryListResponseSchema,
     listGrantRecords: GrantRecordListResponseSchema,
+    listProviderConnections: ProviderConnectionListResponseSchema,
   };
   expect(Object.keys(WORKSPACE_READS).sort()).toEqual(
     Object.keys(schemas).sort(),

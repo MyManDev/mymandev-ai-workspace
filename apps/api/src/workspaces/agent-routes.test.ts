@@ -148,11 +148,19 @@ async function list(account: Account, projectId: string) {
   return AgentListResponseSchema.parse(response.json()).agents;
 }
 
-/** Creates an agent that must be created. */
+/**
+ * Creates an agent that must be created, and gives it as every member sees
+ * it: the answer names the calling device as the host device, which only
+ * the owner reads (#342), and which is checked and left out here.
+ */
 async function created(account: Account, projectId: string, name: string) {
   const response = await create(account, projectId, name);
   assert.equal(response.statusCode, 200, response.body);
-  return CreateAgentResponseSchema.parse(response.json()).agent;
+  const { hostDeviceId, ...agent } = CreateAgentResponseSchema.parse(
+    response.json(),
+  ).agent;
+  assert.equal(hostDeviceId, account.device.deviceId);
+  return agent;
 }
 
 /** Disables an agent that must be disabled. */
@@ -359,6 +367,90 @@ test("a member creates an agent hosted on the calling device, the list shows it,
   );
 });
 
+test("only the agent's own account reads its host device, on each of its devices, in the list and in the creation's answer; other members, an admin and the workspace's owner included, and every event never do (#342)", async (t) => {
+  const { account, secondDevice, events } = instance(t);
+  const owner = await account(2921);
+  const member = await account(2922);
+  const admin = await account(2923);
+  const { workspace, project } = await workspaceWithProject(owner);
+  await addClaimed(workspace.id, member, owner);
+  await addClaimed(workspace.id, admin, owner, "admin");
+  events.length = 0;
+
+  const response = await create(member, project.id, "Reviewer");
+  assert.equal(response.statusCode, 200, response.body);
+  const answer = CreateAgentResponseSchema.parse(response.json()).agent;
+  assert.equal(answer.hostDeviceId, member.device.deviceId);
+  const ownAgent = await created(owner, project.id, "Builder");
+  const memberElsewhere = await secondDevice(member);
+  const deviceIds = [
+    owner.device.deviceId,
+    member.device.deviceId,
+    memberElsewhere.device.deviceId,
+  ];
+
+  // The member's devices read the host device of the member's agent only,
+  // also from a device that does not host it.
+  for (const reader of [member, memberElsewhere]) {
+    assert.deepEqual(await list(reader, project.id), [answer, ownAgent]);
+  }
+  // The owner of the workspace reads it of its own agent only.
+  const ownerView = await get(owner, `/projects/${project.id}/agents`);
+  assert.equal(ownerView.statusCode, 200, ownerView.body);
+  assert.equal(ownerView.body.includes(member.device.deviceId), false);
+  assert.equal(ownerView.body.includes(memberElsewhere.device.deviceId), false);
+  assert.deepEqual(await list(owner, project.id), [
+    {
+      id: answer.id,
+      projectId: answer.projectId,
+      name: answer.name,
+      ownerMemberId: answer.ownerMemberId,
+      disabledAt: answer.disabledAt,
+    },
+    { ...ownAgent, hostDeviceId: owner.device.deviceId },
+  ]);
+  // An admin who is not the workspace's owner, and owns no agent, reads no
+  // host device at all.
+  const adminView = await get(admin, `/projects/${project.id}/agents`);
+  assert.equal(adminView.statusCode, 200, adminView.body);
+  for (const deviceId of deviceIds) {
+    assert.equal(adminView.body.includes(deviceId), false);
+  }
+  assert.deepEqual(await list(admin, project.id), [
+    {
+      id: answer.id,
+      projectId: answer.projectId,
+      name: answer.name,
+      ownerMemberId: answer.ownerMemberId,
+      disabledAt: answer.disabledAt,
+    },
+    ownAgent,
+  ]);
+
+  // A disable sends the agent without its host device, as the creation did.
+  await disabled(memberElsewhere, project.id, answer.id);
+  assert.deepEqual(
+    events.map((event) => event.type),
+    [
+      "workspace.agent.created",
+      "workspace.agent.created",
+      "workspace.agent.disabled",
+    ],
+  );
+  for (const event of events) {
+    assert.ok(decodeEvent(event).ok, event.type);
+    assert.ok(
+      event.type === "workspace.agent.created" ||
+        event.type === "workspace.agent.disabled",
+    );
+    assert.equal(Object.hasOwn(event.payload.agent, "hostDeviceId"), false);
+    const text = JSON.stringify(event);
+    for (const deviceId of deviceIds) {
+      assert.equal(text.includes(deviceId), false, event.type);
+    }
+  }
+});
+
 test("a creation takes the name only: a host device, an owner, or a provider kind beside it is dropped, and a malformed name answers 400", async (t) => {
   const { account, events } = instance(t);
   const owner = await account(2911);
@@ -376,6 +468,8 @@ test("a creation takes the name only: a host device, an owner, or a provider kin
   });
   assert.equal(response.statusCode, 200, response.body);
   const { agent } = CreateAgentResponseSchema.parse(response.json());
+  // The answer names the calling device, never the one in the body.
+  assert.equal(agent.hostDeviceId, owner.device.deviceId);
   const row = await agentRow(agent.id);
   assert.equal(row.hostDeviceId, owner.device.deviceId);
   assert.equal(row.ownerUserId, owner.device.userId);
@@ -725,7 +819,9 @@ test("an archived project answers 409 to a creation and to a disable, and still 
     assert.equal(errorCode(response), "conflict");
   }
   assert.deepEqual([...events], []);
-  assert.deepEqual(await list(owner, project.id), [agent]);
+  assert.deepEqual(await list(owner, project.id), [
+    { ...agent, hostDeviceId: owner.device.deviceId },
+  ]);
 });
 
 test("a non-member gets the 404 of an unknown project on both agent routes, and so do a removed member and a malformed project ID", async (t) => {
@@ -848,5 +944,7 @@ test("the agent routes need a valid access token", async (t) => {
       assert.equal(errorCode(response), "unauthorized");
     }
   }
-  assert.deepEqual(await list(owner, project.id), [agent]);
+  assert.deepEqual(await list(owner, project.id), [
+    { ...agent, hostDeviceId: owner.device.deviceId },
+  ]);
 });
