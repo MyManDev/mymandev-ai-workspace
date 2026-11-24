@@ -16,7 +16,9 @@ import {
 import { decodeClientMessage, decodeServerMessage } from "./frames.ts";
 import {
   AgentGrantCreatedPayloadSchema,
+  AgentGrantListResponseSchema,
   AgentGrantRevokedPayloadSchema,
+  AgentGrantSchema,
   GRANT_COUNT_LIMITS,
   GRANT_LIFETIME_SECONDS,
   GRANT_ROUTE_ERRORS,
@@ -172,6 +174,20 @@ function record(
   };
 }
 
+/** A grant as its agent's owner reads it on any of its devices. */
+function agentGrant(capability: Capability, fields: Json = {}): Json {
+  const [own] = scopeKeys(capability);
+  return {
+    id: GRANT_ID,
+    granteeAgentId: AGENT_ID,
+    capability,
+    [own]: scopeId(own),
+    createdAt: NOW,
+    expiresAt: null,
+    ...fields,
+  };
+}
+
 /** A grant as the members of its workspace see it. */
 function workspaceGrant(capability: Capability, fields: Json = {}): Json {
   return {
@@ -262,6 +278,7 @@ test("the grant routes are fixed, frozen, and apart from the other routes", () =
   );
   assert.deepEqual(table, [
     "GET /grant-records",
+    "GET /agents/:agentId/grants",
     "POST /agents/:agentId/grants",
     "POST /agents/:agentId/grants/:grantId/revoke",
   ]);
@@ -294,7 +311,7 @@ test("the grant routes are fixed, frozen, and apart from the other routes", () =
   }
 });
 
-test("a write names its agent and its grant by ID, and the list takes no parameter, so it names no device", () => {
+test("a write and the list of an agent's grants name the agent and the grant by ID, and the record list takes no parameter, so it names no device", () => {
   const parameters = Object.fromEntries(
     Object.entries(GRANT_ROUTES).map(([name, route]) => [
       name,
@@ -303,9 +320,21 @@ test("a write names its agent and its grant by ID, and the list takes no paramet
   );
   assert.deepEqual(parameters, {
     listGrantRecords: [],
+    listAgentGrants: ["agentId"],
     grantCapability: ["agentId"],
     revokeGrant: ["agentId", "grantId"],
   });
+  assert.equal(
+    routePath(GRANT_ROUTES.listAgentGrants.path, { agentId: AGENT_ID }),
+    `/agents/${AGENT_ID}/grants`,
+  );
+  assert.throws(
+    () =>
+      routePath(GRANT_ROUTES.listAgentGrants.path, {
+        agentId: AGENT_ID.toUpperCase(),
+      }),
+    TypeError,
+  );
   assert.equal(routePath(GRANT_ROUTES.listGrantRecords.path), "/grant-records");
   assert.throws(
     () =>
@@ -350,6 +379,9 @@ test("each grant route answers only known error codes, the common ones included,
   }
   assert.deepEqual(specificCodes(), {
     listGrantRecords: [],
+    // As a revocation decides (#345, Project Manager decision of
+    // 2026-11-24).
+    listAgentGrants: ["not_found", "forbidden"],
     grantCapability: ["not_found", "forbidden", "conflict", "grant_limit"],
     revokeGrant: ["not_found", "forbidden", "conflict"],
   });
@@ -909,6 +941,129 @@ test("the record list holds whole grant records of one device and one account, e
   }
 });
 
+test("an agent's grants as its owner reads them carry the grant's ID, agent, capability, scope, and times, and nothing of an account, a device, or a record", () => {
+  for (const capability of CAPABILITIES) {
+    for (const fields of [{}, { expiresAt: LATER }]) {
+      const value = agentGrant(capability, fields);
+      assert.deepEqual(AgentGrantSchema.parse(value), value, capability);
+    }
+    // A server that sent more passes nothing more on: the whole grant, its
+    // facts, and the other scope are stripped.
+    const [own, other] = scopeKeys(capability);
+    const parsed = AgentGrantSchema.parse({
+      ...grant(capability),
+      [other]: scopeId(other),
+      hostDeviceId: DEVICE_ID,
+      facts: facts(capability),
+    });
+    assert.deepEqual(parsed, agentGrant(capability), capability);
+    assert.deepEqual(
+      Object.keys(parsed).sort(),
+      [
+        "capability",
+        "createdAt",
+        "expiresAt",
+        "granteeAgentId",
+        "id",
+        own,
+      ].sort(),
+      capability,
+    );
+    const sent = JSON.stringify(parsed);
+    for (const id of [USER_ID, DEVICE_ID, PROJECT_ID, WORKSPACE_ID]) {
+      assert.equal(sent.includes(id), false, `${capability}: ${id}`);
+    }
+  }
+  for (const [label, value] of [
+    ["no scope", without(agentGrant("repo.read"), "repositoryId")],
+    [
+      "the scope of the other kind",
+      {
+        ...without(agentGrant("repo.read"), "repositoryId"),
+        providerConnectionId: PROVIDER_CONNECTION_ID,
+      },
+    ],
+    ["no agent", without(agentGrant("repo.read"), "granteeAgentId")],
+    ["no creation time", without(agentGrant("repo.read"), "createdAt")],
+    ["no expiry field", without(agentGrant("repo.read"), "expiresAt")],
+    ["an expiry at its creation", agentGrant("repo.read", { expiresAt: NOW })],
+    ["an unknown capability", agentGrant("repo.read", { capability: "*" })],
+  ] as const) {
+    assert.equal(AgentGrantSchema.safeParse(value).success, false, label);
+  }
+});
+
+test(`the list of an agent's grants holds each grant once, all of one agent, expired ones included, and at most GRANT_COUNT_LIMITS.perAgent (${GRANT_COUNT_LIMITS.perAgent})`, () => {
+  assert.deepEqual(AgentGrantListResponseSchema.parse({ grants: [] }), {
+    grants: [],
+  });
+  const expired = agentGrant("terminal.execute", {
+    id: grantId(2),
+    expiresAt: LATER,
+  });
+  const list = {
+    grants: [
+      agentGrant("repo.read", { id: grantId(1) }),
+      expired,
+      agentGrant("provider.use", { id: grantId(3) }),
+    ],
+  };
+  assert.deepEqual(AgentGrantListResponseSchema.parse(list), list);
+  assert.deepEqual(
+    issues(
+      AgentGrantListResponseSchema.safeParse({
+        grants: [
+          agentGrant("repo.read", { id: grantId(1) }),
+          agentGrant("repo.write", { id: grantId(1) }),
+        ],
+      }),
+    ),
+    [["grants.1.id", "A grant is listed once"]],
+  );
+  assert.deepEqual(
+    issues(
+      AgentGrantListResponseSchema.safeParse({
+        grants: [
+          agentGrant("repo.read", { id: grantId(1) }),
+          agentGrant("repo.read", {
+            id: grantId(2),
+            granteeAgentId: OTHER_AGENT_ID,
+          }),
+        ],
+      }),
+    ),
+    [["grants.1.granteeAgentId", "Every grant belongs to one agent"]],
+  );
+  const full = Array.from({ length: GRANT_COUNT_LIMITS.perAgent }, (_, index) =>
+    agentGrant("repo.read", { id: grantId(index + 1) }),
+  );
+  assert.ok(GRANT_COUNT_LIMITS.perAgent <= MAX_ANSWER_LIST_ITEMS);
+  assert.equal(
+    AgentGrantListResponseSchema.safeParse({ grants: full }).success,
+    true,
+  );
+  assert.equal(
+    AgentGrantListResponseSchema.safeParse({
+      grants: [
+        ...full,
+        agentGrant("repo.read", { id: grantId(full.length + 1) }),
+      ],
+    }).success,
+    false,
+  );
+  for (const [label, value] of [
+    ["no list", {}],
+    ["records instead of grants", { records: [record(1)] }],
+    ["a hole", { grants: [agentGrant("repo.read"), null] }],
+  ] as const) {
+    assert.equal(
+      AgentGrantListResponseSchema.safeParse(value).success,
+      false,
+      label,
+    );
+  }
+});
+
 test(`the record list holds at most MAX_ANSWER_LIST_ITEMS (${MAX_ANSWER_LIST_ITEMS}) records, as many as a device may hold`, () => {
   const full = Array.from({ length: MAX_ANSWER_LIST_ITEMS }, (_, index) =>
     record(index + 1),
@@ -929,6 +1084,7 @@ test(`the record list holds at most MAX_ANSWER_LIST_ITEMS (${MAX_ANSWER_LIST_ITE
 test("the grant schemas of each route export to JSON Schema", () => {
   const schemas = {
     listGrantRecords: [null, GrantRecordListResponseSchema],
+    listAgentGrants: [null, AgentGrantListResponseSchema],
     grantCapability: [
       GrantCapabilityRequestSchema,
       GrantCapabilityResponseSchema,
@@ -951,6 +1107,7 @@ test("the grant schemas of each route export to JSON Schema", () => {
     }
   }
   for (const schema of [
+    AgentGrantSchema,
     WorkspaceGrantSchema,
     AgentGrantCreatedPayloadSchema,
     AgentGrantRevokedPayloadSchema,
