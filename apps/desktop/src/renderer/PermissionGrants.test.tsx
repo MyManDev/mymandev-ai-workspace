@@ -18,7 +18,10 @@ import type {
   GrantBridge,
   ProjectRepositoriesBridge,
 } from "../shared/desktop-bridge.ts";
-import type { AgentActivityView } from "../shared/ipc-contract.ts";
+import type {
+  AgentActivityView,
+  GrantCapabilityResult,
+} from "../shared/ipc-contract.ts";
 import { agentTimeFormat } from "./agent-view.ts";
 import {
   GRANT_RESULT_ID,
@@ -28,11 +31,13 @@ import {
 } from "./PermissionGrants.tsx";
 import { PermissionsScreen } from "./ProjectScreens.tsx";
 import {
+  createGrantActions,
   describeGrantSection,
   EXPIRY_CHOICES,
   expiryChoices,
   focusAfterConfirmation,
   GRANT_MESSAGES,
+  GRANT_RESULT_MESSAGES,
   IDLE_GRANT_ACTIONS,
   INITIAL_GRANT_FORM,
   OFFERED_CAPABILITIES,
@@ -515,11 +520,13 @@ const AGENTS: AgentActivityView = {
  * The hook's loop without the hook: a form state, the view that it gives,
  * the handlers for it, and the grants that reached the actions.
  */
-function wiring() {
+function wiring(
+  actions: Pick<GrantActions, "grant" | "revoke"> | undefined = undefined,
+) {
   let state: GrantFormState = INITIAL_GRANT_FORM;
   const granted: unknown[][] = [];
   const ends: ConfirmationEnd[] = [];
-  const actions: Pick<GrantActions, "grant" | "revoke"> = {
+  actions ??= {
     grant: async (agentId, request) => {
       granted.push([agentId, request]);
     },
@@ -721,4 +728,44 @@ test("once the person ends the confirmation, the focus goes back to Grant after 
   )!;
   expect(result.props.ref).toBe(focus.result);
   expect(result.props.tabIndex).toBe(-1);
+});
+
+test("confirming twice with the same handlers sends the grant once", async () => {
+  // A bridge whose answer waits, as while the server has not answered.
+  const sent: unknown[][] = [];
+  let answer: (result: GrantCapabilityResult) => void = () => {};
+  const views: GrantActionsView[] = [];
+  const actions = createGrantActions(
+    {
+      grant: (agentId, request) => {
+        sent.push([agentId, request]);
+        return new Promise((resolve) => {
+          answer = resolve;
+        });
+      },
+      revoke: () => Promise.reject(new Error("not called")),
+    },
+    (view) => views.push(view),
+  );
+  const { form, handlers } = wiring(actions);
+  handlers().onCapability("terminal.execute");
+  handlers().onScope(WEB);
+  handlers().onGrant(HERE, form());
+  const shown = form();
+
+  // A double click reaches the same handlers, made for the state that
+  // waits for the confirmation, before the section is drawn again.
+  const same = handlers();
+  same.onConfirm(shown);
+  same.onConfirm(shown);
+  expect(sent).toEqual([
+    [HERE, { ...SHELL_REQUEST, confirmedHighestRisk: true }],
+  ]);
+  answer({ outcome: "ok", grantId: GRANT_1 });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  expect(sent).toHaveLength(1);
+  expect(views.at(-1)).toEqual({
+    running: false,
+    message: GRANT_RESULT_MESSAGES.granted,
+  });
 });
