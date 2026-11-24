@@ -99,15 +99,18 @@ export function followGrants(
 
 /**
  * What the screen knows about the grants of an agent that another device
- * hosts: read for `agentId`, or waiting for that read; `agentId` null before
- * any read. A view of another agent than the selected one counts as
- * waiting, so a late answer never shows under another agent.
+ * hosts: read for `agentId` by the read of `refresh`, or waiting for that
+ * read; `agentId` null while no such agent is selected. A view of another
+ * agent than the selected one counts as waiting, so a late answer never
+ * shows under another agent.
  */
 export type AgentGrantsPanelView =
   | { readonly kind: "pending"; readonly agentId: string | null }
   | {
       readonly kind: "known";
       readonly agentId: string;
+      /** The section's `refresh` when the read began. */
+      readonly refresh: number;
       readonly result: AgentGrantsResult;
     };
 
@@ -124,11 +127,13 @@ export type AgentGrantsChange = (
 /**
  * Reads the grants of `agentId`, an agent that another device hosts, and
  * reports the view through `onView` as changes of the current one (#345).
- * Nothing is read for null. A new agent waits for its own answer; a read
- * again of the same agent, for a new `refresh`, keeps its list until its
- * answer comes. A rejected read, or a bridge that throws, is `failed`.
- * Returns the function that drops the answer, for a later agent or
- * `refresh` and when the section is gone.
+ * For null, nothing is read and the view is reset. Only a read again of the
+ * same agent for a new `refresh`, after a revocation, keeps the list that
+ * it shows until its answer comes; a new agent, or the same agent selected
+ * again, waits for its own answer, so a list is never shown again with its
+ * Revoke buttons before it is read again. A rejected read, or a bridge that
+ * throws, is `failed`. Returns the function that drops the answer, for a
+ * later agent or `refresh` and when the section is gone.
  */
 export function followAgentGrants(
   bridge: Pick<GrantBridge, "listAgentGrants">,
@@ -136,19 +141,21 @@ export function followAgentGrants(
   refresh: number,
   onView: (change: AgentGrantsChange) => void,
 ): () => void {
-  void refresh;
   if (agentId === null) {
+    onView(() => NO_AGENT_GRANTS);
     return () => {};
   }
   let live = true;
   onView((current) =>
-    current.kind === "known" && current.agentId === agentId
+    current.kind === "known" &&
+    current.agentId === agentId &&
+    current.refresh !== refresh
       ? current
       : { kind: "pending", agentId },
   );
   const report = (result: AgentGrantsResult) => {
     if (live) {
-      onView(() => ({ kind: "known", agentId, result }));
+      onView(() => ({ kind: "known", agentId, refresh, result }));
     }
   };
   let answer: Promise<AgentGrantsResult>;

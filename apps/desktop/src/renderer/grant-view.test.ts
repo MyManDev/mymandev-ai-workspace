@@ -1347,6 +1347,7 @@ function readOf(
   return {
     kind: "known",
     agentId,
+    refresh: 0,
     result: { outcome: "ok", agentId, grants },
   };
 }
@@ -1431,6 +1432,7 @@ test("the grants of an agent that another device hosts come from its own read, e
     {
       kind: "known",
       agentId: ELSEWHERE,
+      refresh: 0,
       result: { outcome: "ok", agentId: HERE, grants: [grant(GRANT_1)] },
     } as const,
   ]) {
@@ -1443,6 +1445,7 @@ test("the grants of an agent that another device hosts come from its own read, e
     const refused = elsewhereView({
       kind: "known",
       agentId: ELSEWHERE,
+      refresh: 0,
       result,
     });
     expect(refused.grants).toEqual([]);
@@ -1728,10 +1731,10 @@ function okRead(agentId: string, grants: readonly GrantView[]) {
 
 test("the grants of an agent on another device are read only for an agent, and a late answer after a switch of the agent is dropped", async () => {
   const harness = agentGrantsHarness();
-  // No agent: nothing is read, and the view does not change.
+  // No agent: nothing is read.
   const none = followAgentGrants(harness.bridge, null, 0, harness.onView);
   expect(harness.reads).toEqual([]);
-  expect(harness.changes()).toBe(0);
+  expect(harness.view()).toEqual(NO_AGENT_GRANTS);
   none();
 
   const first = followAgentGrants(harness.bridge, ELSEWHERE, 0, harness.onView);
@@ -1752,6 +1755,7 @@ test("the grants of an agent on another device are read only for an agent, and a
   expect(harness.view()).toEqual({
     kind: "known",
     agentId: SECOND,
+    refresh: 0,
     result: answer,
   });
 });
@@ -1765,7 +1769,12 @@ test("a read again of the same agent keeps its list until its own answer, and dr
   const stop0 = followAgentGrants(harness.bridge, ELSEWHERE, 0, harness.onView);
   harness.reads[0]!.resolve(listed);
   await settled();
-  const known = { kind: "known", agentId: ELSEWHERE, result: listed };
+  const known = {
+    kind: "known",
+    agentId: ELSEWHERE,
+    refresh: 0,
+    result: listed,
+  };
   expect(harness.view()).toEqual(known);
   // A revocation reads again: the list stays while the read waits.
   stop0();
@@ -1785,6 +1794,7 @@ test("a read again of the same agent keeps its list until its own answer, and dr
   expect(harness.view()).toEqual({
     kind: "known",
     agentId: ELSEWHERE,
+    refresh: 2,
     result: last,
   });
   expect(harness.reads.map((read) => read.agentId)).toEqual([
@@ -1792,6 +1802,36 @@ test("a read again of the same agent keeps its list until its own answer, and dr
     ELSEWHERE,
     ELSEWHERE,
   ]);
+});
+
+test("an agent selected again, after none or with the same refresh, waits for its own read instead of showing its old list", async () => {
+  const harness = agentGrantsHarness();
+  const listed = okRead(ELSEWHERE, [grant(GRANT_1, { agentId: ELSEWHERE })]);
+  const stop = followAgentGrants(harness.bridge, ELSEWHERE, 0, harness.onView);
+  harness.reads[0]!.resolve(listed);
+  await settled();
+  expect(harness.view()).toEqual({
+    kind: "known",
+    agentId: ELSEWHERE,
+    refresh: 0,
+    result: listed,
+  });
+  // An agent that this device hosts is selected: the list is dropped.
+  stop();
+  followAgentGrants(harness.bridge, null, 0, harness.onView);
+  expect(harness.view()).toEqual(NO_AGENT_GRANTS);
+  // Selected again: the list waits for the new read, without Revoke.
+  followAgentGrants(harness.bridge, ELSEWHERE, 0, harness.onView);
+  expect(harness.view()).toEqual({ kind: "pending", agentId: ELSEWHERE });
+  expect(harness.reads).toHaveLength(2);
+
+  // Read again for the same refresh, without a revocation: it waits too.
+  const again = agentGrantsHarness();
+  followAgentGrants(again.bridge, ELSEWHERE, 4, again.onView);
+  again.reads[0]!.resolve(listed);
+  await settled();
+  followAgentGrants(again.bridge, ELSEWHERE, 4, again.onView);
+  expect(again.view()).toEqual({ kind: "pending", agentId: ELSEWHERE });
 });
 
 test("a rejected read of an agent's grants, or a bridge that throws, is failed, and an answer after the end is dropped", async () => {
@@ -1802,6 +1842,7 @@ test("a rejected read of an agent's grants, or a bridge that throws, is failed, 
   const failed = {
     kind: "known",
     agentId: ELSEWHERE,
+    refresh: 0,
     result: { outcome: "refused", reason: "failed" },
   };
   expect(harness.view()).toEqual(failed);
