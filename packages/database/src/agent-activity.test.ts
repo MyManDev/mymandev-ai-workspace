@@ -934,6 +934,64 @@ test("a project's agents: every agent of the project with its owner's person, th
   );
 });
 
+test("an agent's owner who was removed and added again reads the host device of the agent that the removal disabled, which shows the owner's new person (#342)", async () => {
+  const { owner, workspaceId, projectId, agentId } = await setUp();
+  const member = await account("Member");
+  const firstPerson = await join(workspaceId, member);
+  const memberAgent = await agentOf(projectId, member, {
+    name: "Reviewer",
+    createdAt: LATER,
+  });
+  const removed = await removeMember(database(), {
+    workspaceId,
+    ...owner,
+    memberId: firstPerson,
+    now: LATER,
+  });
+  assert.ok(removed.removed);
+  const addedAgain = await join(workspaceId, member);
+  assert.notEqual(addedAgain, firstPerson);
+
+  const ownerAgent = {
+    id: agentId,
+    projectId,
+    name: "Builder",
+    ownerMemberId: await personOf(workspaceId, owner),
+    disabledAt: null,
+  };
+  const disabledAgent = {
+    id: memberAgent,
+    projectId,
+    name: "Reviewer",
+    // The account's active person, as `listProjectAgents` shows an owner.
+    ownerMemberId: addedAgain,
+    disabledAt: LATER.toISOString(),
+  };
+  // The owner reads its earlier agent's host device, although the agent
+  // was disabled while the owner was removed.
+  assert.deepEqual(
+    await listProjectAgents(database(), {
+      actorUserId: member.userId,
+      projectId,
+    }),
+    {
+      listed: true,
+      agents: [ownerAgent, { ...disabledAgent, hostDeviceId: member.deviceId }],
+    },
+  );
+  // No other account reads it.
+  assert.deepEqual(
+    await listProjectAgents(database(), {
+      actorUserId: owner.userId,
+      projectId,
+    }),
+    {
+      listed: true,
+      agents: [{ ...ownerAgent, hostDeviceId: owner.deviceId }, disabledAgent],
+    },
+  );
+});
+
 test("a project's runs: every unfinished run, the most recently created first, and the most recently finished runs", async () => {
   const { owner, workspaceId, projectId, agentId, runId } = await setUp();
   const second = await agentOf(projectId, owner);

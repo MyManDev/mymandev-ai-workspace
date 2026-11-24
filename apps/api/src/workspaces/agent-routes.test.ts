@@ -367,12 +367,14 @@ test("a member creates an agent hosted on the calling device, the list shows it,
   );
 });
 
-test("only the agent's own account reads its host device, on each of its devices, in the list and in the creation's answer; other members and every event never do (#342)", async (t) => {
+test("only the agent's own account reads its host device, on each of its devices, in the list and in the creation's answer; other members, an admin and the workspace's owner included, and every event never do (#342)", async (t) => {
   const { account, secondDevice, events } = instance(t);
   const owner = await account(2921);
   const member = await account(2922);
+  const admin = await account(2923);
   const { workspace, project } = await workspaceWithProject(owner);
   await addClaimed(workspace.id, member, owner);
+  await addClaimed(workspace.id, admin, owner, "admin");
   events.length = 0;
 
   const response = await create(member, project.id, "Reviewer");
@@ -406,6 +408,23 @@ test("only the agent's own account reads its host device, on each of its devices
       disabledAt: answer.disabledAt,
     },
     { ...ownAgent, hostDeviceId: owner.device.deviceId },
+  ]);
+  // An admin who is not the workspace's owner, and owns no agent, reads no
+  // host device at all.
+  const adminView = await get(admin, `/projects/${project.id}/agents`);
+  assert.equal(adminView.statusCode, 200, adminView.body);
+  for (const deviceId of deviceIds) {
+    assert.equal(adminView.body.includes(deviceId), false);
+  }
+  assert.deepEqual(await list(admin, project.id), [
+    {
+      id: answer.id,
+      projectId: answer.projectId,
+      name: answer.name,
+      ownerMemberId: answer.ownerMemberId,
+      disabledAt: answer.disabledAt,
+    },
+    ownAgent,
   ]);
 
   // A disable sends the agent without its host device, as the creation did.
