@@ -43,8 +43,8 @@ import { CloseCode, ConnectionRegistry } from "../gateway.ts";
 // person's subscriptions to the workspace end, the other subscribers see the
 // person go offline and then `workspace.member.removed`, every connection of
 // the removed account gets `account.removed_from_workspace`, and each
-// cancelled run reaches the remaining subscribers. Every message is decoded
-// with the desktop's decoder.
+// disabled agent (#326) and then each cancelled run reach the remaining
+// subscribers. Every message is decoded with the desktop's decoder.
 
 const database = useTestDatabase();
 
@@ -225,6 +225,36 @@ function assertRemoved(
   return event.payload.removedAt;
 }
 
+/**
+ * Checks `workspace.agent.disabled` of the system for an agent named
+ * "Builder" that the removal disabled at `disabledAt`, owned by the removed
+ * person, with nothing but the agent list item (#326).
+ */
+function assertDisabled(
+  event: ServerEvent,
+  expected: Readonly<{
+    workspaceId: WorkspaceId;
+    agentId: AgentId;
+    projectId: ProjectId;
+    ownerMemberId: MemberId;
+    disabledAt: string;
+  }>,
+) {
+  assert.ok(event.type === "workspace.agent.disabled", event.type);
+  assert.equal(event.workspaceId, expected.workspaceId);
+  assert.deepEqual(event.actor, { kind: "system" });
+  assert.equal(event.deviceId, null);
+  assert.deepEqual(event.payload, {
+    agent: {
+      id: expected.agentId,
+      projectId: expected.projectId,
+      name: "Builder",
+      ownerMemberId: expected.ownerMemberId,
+      disabledAt: expected.disabledAt,
+    },
+  });
+}
+
 /** Checks a run event of the system that cancelled the run with `member_removed`. */
 function assertCancelled(
   event: ServerEvent,
@@ -338,8 +368,9 @@ test("a removal ends the person's subscriptions, tells every connection of the a
     },
   ] as const;
   const inOrder = [...cancelled].sort((a, b) => (a.runId < b.runId ? -1 : 1));
-  // The remaining subscribers: Bob goes offline, then the removal, then each
-  // cancelled run in the order of the run IDs.
+  // The remaining subscribers: Bob goes offline, then the removal, then Bob's
+  // agent in the team as disabled (#326; not his agent in Cleo's workspace),
+  // then each cancelled run in the order of the run IDs.
   for (const client of [adaClient, cleoClient]) {
     assert.deepEqual(
       await nextFrame(client),
@@ -349,6 +380,13 @@ test("a removal ends the person's subscriptions, tells every connection of the a
       assertRemoved(await nextEvent(client), team.workspaceId, bobInTeam),
       removedAt,
     );
+    assertDisabled(await nextEvent(client), {
+      workspaceId: team.workspaceId,
+      agentId: bobsAgent,
+      projectId: project,
+      ownerMemberId: bobInTeam,
+      disabledAt: removedAt,
+    });
     for (const expected of inOrder) {
       assertCancelled(await nextEvent(client), {
         ...expected,

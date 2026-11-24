@@ -860,6 +860,36 @@ async function runOf(
   return id;
 }
 
+/**
+ * Checks `workspace.agent.disabled` of the system for an agent named
+ * "Builder" that a revocation disabled, as the device decodes it: the agent
+ * list item and nothing else, so no host device (#326). The agent was
+ * disabled when the event occurred.
+ */
+function assertDisabled(
+  event: ServerEvent,
+  expected: Readonly<{
+    workspaceId: WorkspaceId;
+    agentId: AgentId;
+    projectId: ProjectId;
+    ownerMemberId: MemberId;
+  }>,
+) {
+  assert.ok(event.type === "workspace.agent.disabled", event.type);
+  assert.equal(event.workspaceId, expected.workspaceId);
+  assert.deepEqual(event.actor, { kind: "system" });
+  assert.equal(event.deviceId, null);
+  assert.deepEqual(event.payload, {
+    agent: {
+      id: expected.agentId,
+      projectId: expected.projectId,
+      name: "Builder",
+      ownerMemberId: expected.ownerMemberId,
+      disabledAt: event.occurredAt,
+    },
+  });
+}
+
 /** Checks a cancelled run's event as the device decodes it. */
 function assertCancelled(
   event: ServerEvent,
@@ -890,7 +920,7 @@ function assertCancelled(
   });
 }
 
-test("revoking a device sends each run that it cancelled as agent.run.state_changed from the system to the connections subscribed to the run's workspace, and to no one else", async (t) => {
+test("revoking a device sends each agent that it disabled as workspace.agent.disabled and then each run that it cancelled as agent.run.state_changed from the system to the connections subscribed to their workspace, and to no one else", async (t) => {
   const { connections, account } = await instance(t);
   const ada = await account(3271);
   const adaDesktop = await signInDevice(ada.app);
@@ -980,27 +1010,50 @@ test("revoking a device sends each run that it cancelled as agent.run.state_chan
     agentId: otherAgent,
     previousState: "running" as const,
   };
+  // Each workspace hears of its own disabled agent first (#326).
+  const firstDisabled = {
+    workspaceId: first.workspaceId,
+    agentId: laptopAgent,
+    projectId: one.projectId,
+    ownerMemberId: first.ownerId,
+  };
+  const [adaInSecond] = second.memberIds;
+  assert.ok(adaInSecond !== undefined);
+  const secondDisabled = {
+    workspaceId: second.workspaceId,
+    agentId: otherAgent,
+    projectId: two.projectId,
+    ownerMemberId: adaInSecond,
+  };
+  const bobDisabled = await nextEvent(bobConnection.client);
+  assertDisabled(bobDisabled, firstDisabled);
   const bobEvents: ServerEvent[] = [];
   for (const expected of inFirst) {
     const event = await nextEvent(bobConnection.client);
     assertCancelled(event, expected);
     bobEvents.push(event);
   }
+  const cleoDisabled = await nextEvent(cleoConnection.client);
+  assertDisabled(cleoDisabled, secondDisabled);
   const cleoEvent = await nextEvent(cleoConnection.client);
   assertCancelled(cleoEvent, inSecond);
 
-  // Ada's desktop hears of the revocation, then gets the same events.
+  // Ada's desktop hears of the revocation, then gets the same events: the
+  // disabled agents of both workspaces in the order of the agent IDs, then
+  // the runs.
   assert.equal(
     (await nextFrame(desktop.client)).type,
     "account.device_revoked",
   );
+  const disabledInOrder =
+    laptopAgent < otherAgent
+      ? [bobDisabled, cleoDisabled]
+      : [cleoDisabled, bobDisabled];
   const desktopEvents: ServerEvent[] = [];
-  for (const expected of [...inFirst, inSecond]) {
-    const event = await nextEvent(desktop.client);
-    assertCancelled(event, expected);
-    desktopEvents.push(event);
+  for (const expected of [...disabledInOrder, ...bobEvents, cleoEvent]) {
+    desktopEvents.push(await nextEvent(desktop.client));
+    assert.deepEqual(desktopEvents.at(-1), expected);
   }
-  assert.deepEqual(desktopEvents, [...bobEvents, cleoEvent]);
   assert.ok(
     !JSON.stringify(desktopEvents).includes(ada.device.deviceId),
     "no event names the revoked device",
@@ -1021,11 +1074,11 @@ test("revoking a device sends each run that it cancelled as agent.run.state_chan
   );
 });
 
-test("a sign-in that replaces a previous device sends the runs that the revocation cancelled to the workspace's subscribers", async (t) => {
+test("a sign-in that replaces a previous device sends the agents that the revocation disabled and then the runs that it cancelled to the workspace's subscribers", async (t) => {
   const { account } = await instance(t);
   const ada = await account(3281);
   const bob = await account(3282);
-  const { workspaceId } = await workspaceOf(ada.device, [bob.device]);
+  const { workspaceId, ownerId } = await workspaceOf(ada.device, [bob.device]);
   const { projectId } = await projectIn(workspaceId, ada.device);
   const agentId = await agentOn(projectId, ada.device);
   const runId = await runOf(agentId, projectId, "running", ada.device);
@@ -1033,6 +1086,12 @@ test("a sign-in that replaces a previous device sends the runs that the revocati
   await subscribed(bobConnection.client, workspaceId);
 
   await signInDevice(ada.app, newKey(), ada.device.deviceId);
+  assertDisabled(await nextEvent(bobConnection.client), {
+    workspaceId,
+    agentId,
+    projectId,
+    ownerMemberId: ownerId,
+  });
   assertCancelled(await nextEvent(bobConnection.client), {
     workspaceId,
     runId,

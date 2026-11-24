@@ -11,7 +11,6 @@ import {
   AGENT_ROUTES,
   type AgentId,
   AgentIdSchema,
-  type AgentListItem,
   type AgentListResponse,
   type AgentRunListResponse,
   type CreateAgentRequest,
@@ -25,10 +24,12 @@ import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { ProjectPathParamsSchema } from "./access.ts";
 import {
+  agentDisabledEvent,
   sendCancelledRuns,
   sendRevokedGrants,
   sendWorkspaceEvent,
   serverEventHeader,
+  workspaceAgent,
   type WorkspaceEventHandler,
 } from "./events.ts";
 
@@ -87,21 +88,6 @@ function refusedCreation(
     default:
       return result satisfies never;
   }
-}
-
-/**
- * The agent as every member reads it in the agent list, built field by
- * field, so that a field that the database result gains later, such as the
- * host device, is not sent to the members until it is added here (#110).
- */
-function listItem(agent: AgentListItem): AgentListItem {
-  return {
-    id: agent.id,
-    projectId: agent.projectId,
-    name: agent.name,
-    ownerMemberId: agent.ownerMemberId,
-    disabledAt: agent.disabledAt,
-  };
 }
 
 /**
@@ -203,9 +189,9 @@ export function registerAgentRoutes(
       sendWorkspaceEvent(request, options.onWorkspaceEvent, {
         ...serverEventHeader(workspaceId, now),
         type: "workspace.agent.created",
-        payload: { agent: listItem(agent) },
+        payload: { agent: workspaceAgent(agent) },
       });
-      return { agent: listItem(agent) };
+      return { agent: workspaceAgent(agent) };
     },
   );
 
@@ -237,11 +223,13 @@ export function registerAgentRoutes(
           revokedGrants: await revokedGrantsOf(tx, result.revokedGrantIds),
         };
       });
-      sendWorkspaceEvent(request, options.onWorkspaceEvent, {
-        ...serverEventHeader(disabled.workspaceId, now),
-        type: "workspace.agent.disabled",
-        payload: { agent: listItem(disabled.agent) },
-      });
+      // The same event as a cascade sends for each agent that it disabled
+      // (#326).
+      sendWorkspaceEvent(
+        request,
+        options.onWorkspaceEvent,
+        agentDisabledEvent(disabled, now),
+      );
       // Each revoked grant and each cancelled run reaches its workspace's
       // subscribed connections, as after a device revocation or a removal
       // (P-60, P-77).

@@ -280,6 +280,14 @@ async function nextRefused(client: Client, eventId: EventId, code: string) {
   });
 }
 
+/** The next message, which must be `workspace.agent.disabled` of the server for the agent (#326). */
+async function nextDisabled(client: Client, agentId: AgentId) {
+  const event = await nextEvent(client);
+  assert.ok(event.type === "workspace.agent.disabled", event.type);
+  assert.deepEqual(event.actor, { kind: "system" });
+  assert.equal(event.payload.agent.id, agentId);
+}
+
 /** The next message, which must be the server's cancellation of a run with `reason`. */
 async function nextCancelled(
   client: Client,
@@ -749,6 +757,7 @@ test("the server still cancels runs with the codes that it refuses from an agent
     (await nextEvent(cleoConnection.client)).type,
     "workspace.member.removed",
   );
+  await nextDisabled(cleoConnection.client, bobs.agentId);
   await nextCancelled(cleoConnection.client, {
     workspaceId: team.workspaceId,
     agentId: bobs.agentId,
@@ -760,6 +769,7 @@ test("the server still cancels runs with the codes that it refuses from an agent
   // A sign-in that replaces Ada's device revokes it: the server cancels her
   // agent's run with device_revoked.
   await signInDevice(ada.app, newKey(), ada.device.deviceId);
+  await nextDisabled(cleoConnection.client, adas.agentId);
   await nextCancelled(cleoConnection.client, {
     workspaceId: team.workspaceId,
     agentId: adas.agentId,

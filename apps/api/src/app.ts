@@ -447,6 +447,7 @@ export async function buildApp(
         revocations,
         tokens,
         connections,
+        onWorkspaceEvent,
         now,
       });
       await registerDeviceRoutes(app, {
@@ -460,6 +461,7 @@ export async function buildApp(
         tokens,
         requireAccessToken,
         connections,
+        onWorkspaceEvent,
         now,
       });
       // The calling device's provider connections (#295).

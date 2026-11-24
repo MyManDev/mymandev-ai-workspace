@@ -587,7 +587,8 @@ export function createAgentActivityService(
     let unknownRun = false;
     for (const event of events) {
       if (event.type === "workspace.member.removed") {
-        // The removal disabled the person's agents, and no event reports it.
+        // The removal disabled the person's agents. The API also sends
+        // workspace.agent.disabled for each of them (#326); the reloads merge.
         agentsStale = true;
         continue;
       }

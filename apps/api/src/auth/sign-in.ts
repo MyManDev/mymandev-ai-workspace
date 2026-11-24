@@ -2,6 +2,8 @@ import {
   type CancelledRun,
   type Database,
   devices,
+  type DisabledAgent,
+  disabledAgentsOf,
   requireSignIn,
   revokeDevice,
   type RevokedGrant,
@@ -34,7 +36,12 @@ import type { FastifyInstance } from "fastify";
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
-import { sendCancelledRuns, sendRevokedGrants } from "../workspaces/events.ts";
+import {
+  sendCancelledRuns,
+  sendDisabledAgents,
+  sendRevokedGrants,
+  type WorkspaceEventHandler,
+} from "../workspaces/events.ts";
 import {
   type RecentRevocations,
   s256,
@@ -79,6 +86,12 @@ export type SignInRouteOptions = Readonly<{
    * connections.
    */
   connections: ConnectionRegistry;
+  /**
+   * The membership event delivery, through which the agents that revoking a
+   * replaced device disabled reach the connections subscribed to their
+   * workspaces as `workspace.agent.disabled` (#326).
+   */
+  onWorkspaceEvent: WorkspaceEventHandler;
   now: () => number;
 }>;
 
@@ -92,6 +105,8 @@ type SignInResult = Readonly<{
   registered: DeviceListItem | null;
   /** The previous device that this sign-in revoked as replaced, if any. */
   replacedDeviceId: DeviceId | null;
+  /** The agents that revoking the previous device disabled (#326). */
+  disabledAgents: readonly DisabledAgent[];
   /** The grants that revoking the previous device revoked (#75). */
   revokedGrants: readonly RevokedGrant[];
   /** The runs that revoking the previous device cancelled. */
@@ -271,9 +286,16 @@ export async function registerSignIn(
             tokens.dropDevice(replaced);
             // The replaced device learns it from its close, before any frame.
             connections.closeDevice(replaced, "device_revoked", request.log);
-            // Each revoked grant and each cancelled run reaches its
-            // workspace's subscribed connections (ADR 0014, P-60; ADR 0015,
-            // P-77; #75, #110).
+            // Each disabled agent, each revoked grant, and each cancelled run
+            // reaches its workspace's subscribed connections, in this order,
+            // as after an agent's disable (ADR 0014, P-60; ADR 0015, P-77;
+            // #75, #110, #326).
+            sendDisabledAgents(
+              request,
+              options.onWorkspaceEvent,
+              result.disabledAgents,
+              now,
+            );
             sendRevokedGrants(
               request.log,
               connections,
@@ -366,6 +388,7 @@ async function signIn(
   let deviceId: DeviceId;
   let registered: DeviceListItem | null = null;
   let replacedDeviceId: DeviceId | null = null;
+  let disabledAgents: readonly DisabledAgent[] = [];
   let revokedGrants: readonly RevokedGrant[] = [];
   let cancelledRuns: readonly CancelledRun[] = [];
   if (device.kind === "existing") {
@@ -525,6 +548,10 @@ async function signIn(
         });
         if (replaced.revoked) {
           replacedDeviceId = device.previousDeviceId;
+          disabledAgents = await disabledAgentsOf(
+            tx,
+            replaced.disabledAgentIds,
+          );
           revokedGrants = await revokedGrantsOf(tx, replaced.revokedGrantIds);
           cancelledRuns = replaced.cancelledRuns;
         }
@@ -545,6 +572,7 @@ async function signIn(
     },
     registered,
     replacedDeviceId,
+    disabledAgents,
     revokedGrants,
     cancelledRuns,
   };

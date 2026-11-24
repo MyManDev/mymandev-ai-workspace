@@ -1,6 +1,8 @@
 import type {
   AgentId,
+  AgentListItem,
   CorrelationId,
+  MemberId,
   PermissionGrantId,
   ProjectId,
   RepositoryId,
@@ -12,18 +14,21 @@ import type {
 import {
   and,
   type Column,
+  desc,
   eq,
   inArray,
   isNull,
   type SQL,
   sql,
 } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Database } from "./db.ts";
 import {
   agentRuns,
   agents,
   permissionGrants,
   projects,
+  workspaceMembers,
 } from "./schema/index.ts";
 
 // The writes that revoking a device and removing a person share (ADR 0014,
@@ -104,6 +109,91 @@ export async function disableAgents(
       .where(idIn(agents.id, ids));
   }
   return ids;
+}
+
+/**
+ * An agent that a change disabled, with what the server's
+ * `workspace.agent.disabled` about it needs (#326): the workspace of its
+ * project, whose members are told, and the agent as the agent list shows it
+ * (`listProjectAgents`), with `disabledAt` as the change stored it. It
+ * names no host device, which is device data (#110).
+ */
+export type DisabledAgent = Readonly<{
+  workspaceId: WorkspaceId;
+  agent: AgentListItem;
+}>;
+
+const owner = alias(workspaceMembers, "owner");
+
+/**
+ * The agents with these IDs that are disabled, each with what its
+ * `workspace.agent.disabled` needs, in the order of their IDs (#326). A
+ * change that disabled agents through `disableAgents`, a device revocation
+ * or a removal of a person, reads them with this inside its own transaction,
+ * after the disabling, so that the API sends one event per agent after the
+ * commit to the members of the agent's own workspace: a device revocation
+ * can disable agents in several workspaces. The read runs in the
+ * transaction that disabled the agents, after the disabling, so it gives
+ * what that transaction wrote. The owner's person is the account's active person
+ * in the workspace, or else its most recently removed one, as
+ * `listProjectAgents` shows it, so after a removal it is the removed person.
+ * It locks nothing; the change holds the agents' locks already. An ID that
+ * names no agent, an agent that is not disabled, or an owner without a
+ * person in the workspace breaks that invariant and throws, rather than
+ * leave a disabling without its event.
+ */
+export async function disabledAgentsOf(
+  tx: Database,
+  ids: readonly AgentId[],
+): Promise<readonly DisabledAgent[]> {
+  if (ids.length === 0) {
+    return Object.freeze([]);
+  }
+  const ownerPerson = tx
+    .select({ id: owner.id })
+    .from(owner)
+    .where(
+      and(
+        eq(owner.workspaceId, projects.workspaceId),
+        eq(owner.userId, agents.ownerUserId),
+      ),
+    )
+    .orderBy(sql`${owner.removedAt} desc nulls first`, desc(owner.id))
+    .limit(1);
+  const rows = await tx
+    .select({
+      id: agents.id,
+      projectId: agents.projectId,
+      workspaceId: projects.workspaceId,
+      name: agents.name,
+      ownerMemberId: sql<MemberId | null>`(${ownerPerson})`,
+      disabledAt: agents.disabledAt,
+    })
+    .from(agents)
+    .innerJoin(projects, eq(projects.id, agents.projectId))
+    .where(idIn(agents.id, ids))
+    .orderBy(agents.id);
+  const disabled = rows.flatMap(
+    ({ workspaceId, ownerMemberId, disabledAt, ...agent }) =>
+      ownerMemberId === null || disabledAt === null
+        ? []
+        : [
+            Object.freeze({
+              workspaceId,
+              agent: Object.freeze({
+                ...agent,
+                ownerMemberId,
+                disabledAt: disabledAt.toISOString(),
+              }),
+            }),
+          ],
+  );
+  if (disabled.length !== ids.length) {
+    throw new Error(
+      `Invariant broken: ${ids.length} disabled agents were asked for, ${disabled.length} were found`,
+    );
+  }
+  return Object.freeze(disabled);
 }
 
 /**

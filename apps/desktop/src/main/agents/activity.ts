@@ -55,7 +55,8 @@ export type RunEventInput = Pick<
  * when the server cancelled the run because a device was revoked or a person
  * was removed (a `system` actor and `device_revoked` or `member_removed` of
  * `RUN_CANCEL_REASONS`). Both also disable agents in every project of the
- * workspace, and no event reports that, so the caller reloads the agents.
+ * workspace, so the caller reloads the agents; the API also sends
+ * `workspace.agent.disabled` for each of them (#326), and the reloads merge.
  * Agents and runs are two separate reads, so this holds also when the runs
  * already show the cancellation, and for a run of another project. The third
  * code, `agent_disabled`, leaves it false: a disabling sends

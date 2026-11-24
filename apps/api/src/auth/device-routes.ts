@@ -3,6 +3,7 @@ import {
   type Database,
   deviceRow,
   devices,
+  disabledAgentsOf,
   markDeviceAuthenticated,
   revokeDevice,
   revokedGrantsOf,
@@ -30,7 +31,12 @@ import * as z from "zod";
 import { ApiError } from "../errors.ts";
 import type { ConnectionRegistry } from "../gateway.ts";
 import { zodValidatorCompiler } from "../validation.ts";
-import { sendCancelledRuns, sendRevokedGrants } from "../workspaces/events.ts";
+import {
+  sendCancelledRuns,
+  sendDisabledAgents,
+  sendRevokedGrants,
+  type WorkspaceEventHandler,
+} from "../workspaces/events.ts";
 import { authOf, lockActor, type RequireAccessToken } from "./authenticate.ts";
 import { verifyDeviceSignature } from "./device-keys.ts";
 import { type AuthContext, deviceListItem, stateOf } from "./device-state.ts";
@@ -65,6 +71,12 @@ export type DeviceRouteOptions = Readonly<{
    * subscribed to their workspaces.
    */
   connections: ConnectionRegistry;
+  /**
+   * The membership event delivery, through which the agents that a
+   * revocation disabled reach the connections subscribed to their
+   * workspaces as `workspace.agent.disabled` (#326).
+   */
+  onWorkspaceEvent: WorkspaceEventHandler;
   now: () => number;
 }>;
 
@@ -326,6 +338,7 @@ export async function registerDeviceRoutes(
             });
           }
           return {
+            disabledAgents: await disabledAgentsOf(tx, result.disabledAgentIds),
             revokedGrants: await revokedGrantsOf(tx, result.revokedGrantIds),
             cancelledRuns: result.cancelledRuns,
           };
@@ -342,8 +355,16 @@ export async function registerDeviceRoutes(
           revokedAt: now.toISOString(),
         };
         connections.sendToUser(auth.userId, revoked, deviceId);
-        // Each revoked grant and each cancelled run reaches its workspace's
-        // subscribed connections (ADR 0014, P-60; ADR 0015, P-77; #75, #110).
+        // Each disabled agent, each revoked grant, and each cancelled run
+        // reaches its workspace's subscribed connections, in this order, as
+        // after an agent's disable (ADR 0014, P-60; ADR 0015, P-77; #75,
+        // #110, #326).
+        sendDisabledAgents(
+          request,
+          options.onWorkspaceEvent,
+          ended.disabledAgents,
+          now,
+        );
         sendRevokedGrants(request.log, connections, ended.revokedGrants, now);
         sendCancelledRuns(connections, ended.cancelledRuns, now);
         return reply.code(204).send();
