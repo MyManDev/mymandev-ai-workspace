@@ -1,7 +1,8 @@
 // The writes of the workspace screens of #95 that the main process may send
 // to the API (the Project Manager's decision D1 of 2026-11-06), and the
-// registration and removal of a project's repositories (#286), and granting
-// and revoking an agent's capabilities (#342): a frozen
+// registration and removal of a project's repositories (#286), granting
+// and revoking an agent's capabilities (#342), and registering and removing
+// a provider connection of this device (#32, #295): a frozen
 // allowlist of `POST` routes, each with its path parameters, the protocol's
 // request schema or none, and the protocol's answer schema or `empty` for a
 // `204`. The account service sends them with the device session
@@ -63,6 +64,9 @@ import {
   type PermissionGrantId,
   PermissionGrantIdSchema,
   type PreviewInvitationRequest,
+  PROVIDER_CONNECTION_ROUTES,
+  type ProviderConnectionId,
+  ProviderConnectionIdSchema,
   PreviewInvitationRequestSchema,
   type PreviewInvitationResponse,
   PreviewInvitationResponseSchema,
@@ -72,6 +76,10 @@ import {
   RegisterRepositoryRequestSchema,
   type RegisterRepositoryResponse,
   RegisterRepositoryResponseSchema,
+  type RegisterProviderConnectionRequest,
+  RegisterProviderConnectionRequestSchema,
+  type RegisterProviderConnectionResponse,
+  RegisterProviderConnectionResponseSchema,
   type RenameMemberRequest,
   RenameMemberRequestSchema,
   REPOSITORY_ROUTES,
@@ -96,6 +104,7 @@ const PATH_PARAMS = Object.freeze({
   repositoryId: RepositoryIdSchema,
   agentId: AgentIdSchema,
   grantId: PermissionGrantIdSchema,
+  providerConnectionId: ProviderConnectionIdSchema,
 });
 export type WorkspaceActionParam = keyof typeof PATH_PARAMS;
 
@@ -317,6 +326,28 @@ export const WORKSPACE_ACTIONS = Object.freeze({
     null,
     "empty",
   ),
+  /**
+   * Registers a provider connection of this device (#32, #295): its kind and
+   * its label only. The body's schema knows no other key, so a credential,
+   * a provider account, or a device sent beside them is refused here before
+   * anything is sent. The calling device becomes the host device.
+   */
+  registerProviderConnection: action(
+    PROVIDER_CONNECTION_ROUTES.registerProviderConnection,
+    [],
+    RegisterProviderConnectionRequestSchema,
+    RegisterProviderConnectionResponseSchema,
+  ),
+  /**
+   * Removes a provider connection of this device (#32, #295); the API
+   * revokes its `provider.use` grants in the same transaction.
+   */
+  removeProviderConnection: action(
+    PROVIDER_CONNECTION_ROUTES.removeProviderConnection,
+    ["providerConnectionId"],
+    null,
+    "empty",
+  ),
 });
 export type WorkspaceActionName = keyof typeof WORKSPACE_ACTIONS;
 
@@ -364,6 +395,10 @@ export interface WorkspaceActionParams {
     readonly agentId: AgentId;
     readonly grantId: PermissionGrantId;
   };
+  readonly registerProviderConnection: NoParams;
+  readonly removeProviderConnection: {
+    readonly providerConnectionId: ProviderConnectionId;
+  };
 }
 
 /** The body of each write, as the caller passes it; `never` for none. */
@@ -400,6 +435,9 @@ export interface WorkspaceActionBody {
   readonly removeRepository: never;
   readonly grantCapability: GrantCapabilityRequest;
   readonly revokeGrant: never;
+  /** The kind and the label only; never a credential (#33). */
+  readonly registerProviderConnection: RegisterProviderConnectionRequest;
+  readonly removeProviderConnection: never;
 }
 
 /**
@@ -444,6 +482,8 @@ export interface WorkspaceActionAnswer {
   readonly removeRepository: null;
   readonly grantCapability: GrantCapabilityResponse;
   readonly revokeGrant: null;
+  readonly registerProviderConnection: RegisterProviderConnectionResponse;
+  readonly removeProviderConnection: null;
 }
 
 /**
@@ -491,15 +531,17 @@ export const ACTION_RATE_LIMITED_WAIT_MS = 60_000;
  * - `forbidden`, `not_found`, `conflict`, `already_member`,
  *   `invitation_invalid`, `join_requests_closed`, `workspace_not_found`,
  *   `device_too_new`, `unclaimed_limit`, `project_limit`,
- *   `repository_limit`, `grant_limit`: the API's refusal with that code
- *   (`MEMBERSHIP_ROUTE_ERRORS`, `PROJECT_ROUTE_ERRORS`,
- *   `REPOSITORY_ROUTE_ERRORS`, `GRANT_ROUTE_ERRORS`). `unclaimed_limit`
+ *   `repository_limit`, `grant_limit`, `provider_connection_limit`: the
+ *   API's refusal with that code (`MEMBERSHIP_ROUTE_ERRORS`,
+ *   `PROJECT_ROUTE_ERRORS`, `REPOSITORY_ROUTE_ERRORS`, `GRANT_ROUTE_ERRORS`,
+ *   `PROVIDER_CONNECTION_ROUTE_ERRORS`). `unclaimed_limit`
  *   carries no wait: only removing an unclaimed person, or a claim of one,
  *   frees a place for a definition (#242). Neither does `project_limit`:
  *   only archiving a project frees a place for a creation (#255). Nor
  *   `repository_limit`: only removing a repository frees a place for a
  *   registration (#286). Nor `grant_limit`: only revoking a grant frees a
- *   place (#75, #342).
+ *   place (#75, #342). Nor `provider_connection_limit`: only removing a
+ *   connection of the device frees a place (#295).
  * - `rate_limited`: the API's limit; `retryAfterMs` follows its
  *   `Retry-After`, or `ACTION_RATE_LIMITED_WAIT_MS` without one.
  * - `unknown`: whether the API acted is not known: it gave no answer, failed,
@@ -526,6 +568,7 @@ export const WORKSPACE_ACTION_FAILURES = Object.freeze([
   "project_limit",
   "repository_limit",
   "grant_limit",
+  "provider_connection_limit",
   "rate_limited",
   "unknown",
   "failed",
@@ -696,6 +739,7 @@ const SHOWN_CODES: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
   "project_limit",
   "repository_limit",
   "grant_limit",
+  "provider_connection_limit",
 ]);
 
 /** The closed failure of a write for a failure of the device session. */
