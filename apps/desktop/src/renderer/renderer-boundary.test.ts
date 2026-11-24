@@ -43,6 +43,18 @@ const PERMISSIONS_VALUES = new Set([
 ]);
 
 /**
+ * The one renderer module that reads the risk labels of `CAPABILITY_RISK`
+ * (ADR 0015, #77). Every other module takes a capability's risk, its text,
+ * and what the presentation rules make of it (`mayBePreselected`,
+ * `mayBeBundled`, `confirmation`) from that module's model, so no other
+ * module can read a label from elsewhere or infer a capability from one.
+ */
+const RISK_LABEL_READER = "./permission-view.ts";
+
+/** The values that hold the risk labels. */
+const RISK_LABEL_VALUES = new Set(["CAPABILITY_RISK", "CAPABILITY_RISKS"]);
+
+/**
  * Shared modules that the renderer may import values from. Every other shared
  * module is imported with `import type`, so that zod and the IPC channel
  * names stay out of the renderer bundle.
@@ -237,6 +249,47 @@ function permissionsValueImports(file: string, source: string): string[] {
             .filter((name) => !PERMISSIONS_VALUES.has(name))
             .map((name) => `${file}: ${name}`),
     );
+}
+
+/**
+ * Where a module other than RISK_LABEL_READER reads a risk label: a value
+ * import or re-export of `CAPABILITY_RISK` or `CAPABILITY_RISKS` from
+ * `@mymandev/permissions` under any specifier, also of the whole module,
+ * and a string or template literal that is a label, such as `"highest"`,
+ * found with the TypeScript parser, so that a comment names none.
+ */
+function riskLabelReads(file: string, source: string): string[] {
+  if (file === RISK_LABEL_READER) {
+    return [];
+  }
+  const imports = declarationsOf(file, source)
+    .filter(
+      ({ specifier, typeOnly }) =>
+        !typeOnly &&
+        (specifier === "@mymandev/permissions" ||
+          specifier.startsWith("@mymandev/permissions/")),
+    )
+    .flatMap(({ values, text }) =>
+      values === undefined
+        ? [`${file}: ${text}`]
+        : values
+            .filter((name) => RISK_LABEL_VALUES.has(name))
+            .map((name) => `${file}: ${name}`),
+    );
+  const labels = new Set<string>(["standard", "highest"]);
+  const literals: string[] = [];
+  const sourceFile = parse(file, source);
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) &&
+      labels.has(node.text)
+    ) {
+      literals.push(`${file}: "${node.text}"`);
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return [...imports, ...literals];
 }
 
 /** Whether a node is `import.meta`, or `import.<name>` with another name. */
@@ -445,6 +498,37 @@ test("the check finds permission imports beyond the presentation vocabulary", ()
   ]);
 });
 
+test("the check finds a risk label read outside the presentation model", () => {
+  const sample = [
+    "import {",
+    "  CAPABILITY_RISK as RISK,",
+    "  CAPABILITY_SCOPE,",
+    "  type CapabilityRisk,",
+    '} from "@mymandev/permissions/capabilities";',
+    'import { CAPABILITY_RISKS } from "@mymandev/permissions";',
+    'import type { CAPABILITY_RISK as Types } from "@mymandev/permissions/capabilities";',
+    'import * as permissions from "@mymandev/permissions/capabilities";',
+    'export { CAPABILITY_RISK } from "@mymandev/permissions/capabilities";',
+    '// A comment that says "highest" names no label.',
+    'const shell = RISK["terminal.execute"] === "highest";',
+    "const standard = `standard`;",
+    'const element = <li data-risk="highest" />;',
+    'const text = "Highest risk";',
+  ].join("\n");
+
+  expect(riskLabelReads("./sample.tsx", sample)).toEqual([
+    "./sample.tsx: CAPABILITY_RISK",
+    "./sample.tsx: CAPABILITY_RISKS",
+    './sample.tsx: import * as permissions from "@mymandev/permissions/capabilities";',
+    "./sample.tsx: CAPABILITY_RISK",
+    './sample.tsx: "highest"',
+    './sample.tsx: "standard"',
+    './sample.tsx: "highest"',
+  ]);
+  // The presentation model itself reads them.
+  expect(riskLabelReads(RISK_LABEL_READER, sample)).toEqual([]);
+});
+
 test("the checks read every renderer source and no test", () => {
   for (const file of [
     "./AccountPanel.tsx",
@@ -527,5 +611,21 @@ test("no renderer module calls a network or Node.js API or imports a module dyna
 test("the renderer imports only the presentation vocabulary of the permissions package", () => {
   expect(
     FILES.flatMap((file) => permissionsValueImports(file, SOURCES[file] ?? "")),
+  ).toEqual([]);
+});
+
+test("only the presentation model reads the risk labels: no other renderer module imports CAPABILITY_RISK or names a label", () => {
+  expect(FILES).toContain(RISK_LABEL_READER);
+  // Its source would be found in any other module.
+  expect(
+    riskLabelReads("./elsewhere.ts", SOURCES[RISK_LABEL_READER] ?? ""),
+  ).toEqual(
+    expect.arrayContaining([
+      "./elsewhere.ts: CAPABILITY_RISK",
+      './elsewhere.ts: "highest"',
+    ]),
+  );
+  expect(
+    FILES.flatMap((file) => riskLabelReads(file, SOURCES[file] ?? "")),
   ).toEqual([]);
 });
