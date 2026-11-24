@@ -389,6 +389,45 @@ test("every outcome of a grant that may have reached the API, also a failure, a 
   expect(harness.logs).toEqual(["A grant could not be sent."]);
 });
 
+test("every outcome of a revocation that may have reached the API, also a failure, a lost answer, and a thrown error, reads the grant records again exactly once", async () => {
+  const harness = setup();
+  const revoked = harness.service.revoke(AGENT, GRANT);
+  await settle();
+  expect(harness.answered()).toBe(0);
+  harness.sent.at(-1)?.resolve({ ok: true, value: null });
+  expect(await revoked).toEqual({ outcome: "ok" });
+  expect(harness.answered()).toBe(1);
+  let expected = 1;
+  for (const outcome of sentFailures()) {
+    const pending = harness.service.revoke(AGENT, GRANT);
+    await settle();
+    harness.sent.at(-1)?.resolve(outcome);
+    const result = await pending;
+    expected += 1;
+    expect(harness.answered(), JSON.stringify(outcome)).toBe(expected);
+    expect(RevokeGrantResultSchema.safeParse(result).success).toBe(true);
+  }
+  // A lost answer.
+  const timedOut = harness.service.revoke(AGENT, GRANT);
+  await settle();
+  harness.sent
+    .at(-1)
+    ?.resolve(
+      workspaceActionSent(
+        workspaceActionFailedFor({ ok: false, reason: "no_answer" }),
+      ),
+    );
+  expect(await timedOut).toEqual({ outcome: "unknown" });
+  expect(harness.answered()).toBe(expected + 1);
+  // A send that throws.
+  const thrown = harness.service.revoke(AGENT, GRANT);
+  await settle();
+  harness.sent.at(-1)?.reject(new Error("socket hang up"));
+  expect(await thrown).toEqual({ outcome: "unknown" });
+  expect(harness.answered()).toBe(expected + 2);
+  expect(harness.logs).toEqual(["A revocation could not be sent."]);
+});
+
 test("a grant or a revocation that the account service refused without a request does not read the grant records again", async () => {
   const harness = setup();
   for (const reason of LOCAL_REFUSALS) {
