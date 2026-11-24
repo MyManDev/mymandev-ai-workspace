@@ -216,30 +216,42 @@ test("each agent route answers the common codes and its own, frozen, and only a 
   assert.equal(API_ERROR_STATUS.agent_limit, 409);
 });
 
-test("an agent in the list shows its owner's person and whether it is disabled, never its host device", () => {
+test("an agent in the list shows its owner's person and whether it is disabled, and its host device only as an optional field", () => {
   assert.equal(AgentListItemSchema.safeParse(agent).success, true);
   assert.equal(
     AgentListItemSchema.safeParse({ ...agent, disabledAt: NOW }).success,
     true,
   );
-  // The host device and the owner's account are stripped.
+  // The owner's account is stripped; the host device is kept for the
+  // agent's own account (#342), and optional for every other reader.
   const parsed = AgentListItemSchema.parse({
     ...agent,
     hostDeviceId: DEVICE_ID,
     ownerUserId: USER_ID,
   });
-  assert.deepEqual(parsed, agent);
+  assert.deepEqual(parsed, { ...agent, hostDeviceId: DEVICE_ID });
+  assert.deepEqual(AgentListItemSchema.parse(agent), agent);
+  assert.equal(
+    AgentListItemSchema.safeParse({ ...agent, hostDeviceId: "not-an-id" })
+      .success,
+    false,
+  );
+  assert.equal(
+    AgentListItemSchema.safeParse({ ...agent, hostDeviceId: null }).success,
+    false,
+  );
   const keys = Object.keys(AgentListItemSchema.shape);
   assert.deepEqual(keys.sort(), [
     "disabledAt",
+    "hostDeviceId",
     "id",
     "name",
     "ownerMemberId",
     "projectId",
   ]);
-  assert.equal(
-    keys.some((key) => key.toLowerCase().includes("device")),
-    false,
+  assert.deepEqual(
+    keys.filter((key) => key.toLowerCase().includes("device")),
+    ["hostDeviceId"],
   );
 
   const refused: [label: string, value: unknown][] = [
@@ -303,11 +315,13 @@ test("the agent list holds each agent of one project once, at most MAX_ANSWER_LI
       label,
     );
   }
-  // A host device that the server sent by mistake is stripped.
-  const parsed = AgentListResponseSchema.parse({
-    agents: [{ ...agent, hostDeviceId: DEVICE_ID }],
+  // The host device of an agent of the reading account is kept (#342),
+  // beside agents of other accounts without one.
+  const own = { ...agent, hostDeviceId: DEVICE_ID };
+  const other = { ...agent, id: OTHER_AGENT_ID };
+  assert.deepEqual(AgentListResponseSchema.parse({ agents: [own, other] }), {
+    agents: [own, other],
   });
-  assert.deepEqual(parsed, { agents: [agent] });
 });
 
 test("the run list holds the unfinished runs and the most recently finished runs of one project, each list at most MAX_ANSWER_LIST_ITEMS", () => {
@@ -617,13 +631,13 @@ test("a creation takes a name of single-line text from 1 to 64 characters, and n
   );
 });
 
-test("the answer of a creation is the new agent as the list shows it: enabled, without its host device", () => {
+test("the answer of a creation is the new agent as its owner's list shows it: enabled, with its host device", () => {
   assert.deepEqual(CreateAgentResponseSchema.parse({ agent }), { agent });
   assert.deepEqual(
     CreateAgentResponseSchema.parse({
       agent: { ...agent, hostDeviceId: DEVICE_ID, ownerUserId: USER_ID },
     }),
-    { agent },
+    { agent: { ...agent, hostDeviceId: DEVICE_ID } },
   );
   assert.equal(
     CreateAgentResponseSchema.safeParse({
@@ -701,16 +715,35 @@ test("agent events carry the agent as the list shows it, never its host device, 
   );
   const [created, disabled] = agentEvents();
   assert.ok(created !== undefined && disabled !== undefined);
-  // The host device and the owner's account are stripped.
+  // The owner's account is stripped.
   assert.deepEqual(
     decodeEvent({
       ...created,
-      payload: {
-        agent: { ...agent, hostDeviceId: DEVICE_ID, ownerUserId: USER_ID },
-      },
+      payload: { agent: { ...agent, ownerUserId: USER_ID } },
     }),
     { ok: true, event: created },
   );
+  // An event never names the host device (#110, #342), which only the
+  // agent's own account reads from the list.
+  for (const event of [created, disabled]) {
+    const payload = event["payload"] as { agent: Json };
+    assert.deepEqual(
+      decodeEvent({
+        ...event,
+        payload: { agent: { ...payload.agent, hostDeviceId: DEVICE_ID } },
+      }),
+      { ok: false, code: "invalid_payload" },
+      String(event["type"]),
+    );
+    assert.deepEqual(
+      decodeServerMessage({
+        ...event,
+        payload: { agent: { ...payload.agent, hostDeviceId: DEVICE_ID } },
+      }),
+      { ok: false, code: "invalid_payload" },
+      `${String(event["type"])} reaches no device`,
+    );
+  }
   for (const [label, input] of [
     [
       "a created agent that is disabled",
