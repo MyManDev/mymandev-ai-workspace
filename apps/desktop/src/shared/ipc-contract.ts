@@ -2865,11 +2865,18 @@ export type ProviderConnectionsResult = z.infer<
  * connection of this device, and a lifetime in seconds or null for none.
  * The main process builds the protocol's request from it and checks it
  * with `GrantCapabilityRequestSchema`.
+ *
+ * `confirmedHighestRisk` is `true` when the person confirmed a
+ * highest-risk capability, `terminal.execute`, in the separate step of the
+ * permission screen (ADR 0015, #77), and absent otherwise. The main process
+ * refuses a highest-risk capability without it, and a standard one with
+ * it, as `invalid`; it is never sent to the API.
  */
 export const GrantRequestViewSchema = z.object({
   capability: z.enum(GRANT_CAPABILITIES),
   scopeId: ProtocolIdSchema,
   lifetimeSeconds: z.int().positive().nullable(),
+  confirmedHighestRisk: z.literal(true).optional(),
 });
 export type GrantRequestView = z.infer<typeof GrantRequestViewSchema>;
 
@@ -2877,8 +2884,9 @@ export type GrantRequestView = z.infer<typeof GrantRequestViewSchema>;
  * Why a grant was refused:
  *
  * - `invalid`: the scope or the lifetime is outside the protocol's format,
- *   or the capability is not offered yet: `terminal.execute` waits for the
- *   presentation rules of #77. Nothing was sent.
+ *   or `confirmedHighestRisk` does not match the capability: a
+ *   highest-risk capability without the person's confirmation, or a
+ *   standard one with it. Nothing was sent.
  * - `not_open`: the agent is not one of the open project's agents. Nothing
  *   was sent.
  * - `not_grantable`: the account does not own the agent, the agent is

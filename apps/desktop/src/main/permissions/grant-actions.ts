@@ -14,11 +14,20 @@
 //   lets the owner revoke from any of its devices, but in this version the
 //   screen offers it only on the host device, the only one with a grant
 //   list (#345 tracks the owner's other devices).
-// - What is offered. Every capability but `terminal.execute`, which waits
-//   for the presentation rules of ADR 0015 (#77). A grant names one scope,
-//   a repository or, for `provider.use`, a provider connection of this
+// - What is offered. Every capability. A grant names one scope, a
+//   repository or, for `provider.use`, a provider connection of this
 //   device, and an optional lifetime, checked with the protocol's
-//   `GrantCapabilityRequestSchema` before anything is sent.
+//   `GrantCapabilityRequestSchema` before anything is sent; the protocol
+//   requires a lifetime of at most 30 days for `terminal.execute`.
+// - The confirmation of a highest-risk capability (ADR 0015, #77). The
+//   permission screen asks the person to confirm `terminal.execute` in a
+//   separate step, and only then sends the request with
+//   `confirmedHighestRisk: true`. As a defence in depth, a request for a
+//   capability that `CAPABILITY_RISK` labels `highest` without that flag,
+//   or for a standard one with it, is refused here as `invalid` and never
+//   sent. The flag is the screen's presentation rule, not a permission
+//   check: it never decides what an agent may do, and it does not reach
+//   the API.
 // - The grant store. After every grant request that may have reached the
 //   API, whatever the outcome, also a failure, a timeout, or a thrown
 //   error, the grant action calls the store's `ownGrantAnswered()` once:
@@ -44,7 +53,7 @@ import {
   type MemberId,
   PermissionGrantIdSchema,
 } from "@mymandev/protocol";
-import type { GrantRecord } from "@mymandev/permissions";
+import { CAPABILITY_RISK, type GrantRecord } from "@mymandev/permissions";
 import {
   GRANT_LIMITS,
   type AccountStatus,
@@ -272,8 +281,18 @@ export interface GrantActionsService {
   readonly close: () => void;
 }
 
-/** The capabilities that the desktop does not offer yet (#77). */
-const NOT_OFFERED: ReadonlySet<string> = new Set(["terminal.execute"]);
+/**
+ * Whether `request` carries the person's confirmation exactly when its
+ * capability needs one: a capability that `CAPABILITY_RISK` labels
+ * `highest` is sent only with `confirmedHighestRisk: true`, and a standard
+ * one only without it (ADR 0015, #77).
+ */
+export function confirmationMatches(request: GrantRequestView): boolean {
+  const highest =
+    Object.hasOwn(CAPABILITY_RISK, request.capability) &&
+    CAPABILITY_RISK[request.capability] === "highest";
+  return highest === (request.confirmedHighestRisk === true);
+}
 
 export function createGrantActions(
   options: GrantActionsOptions,
@@ -395,7 +414,7 @@ export function createGrantActions(
   function grantRequest(
     request: GrantRequestView,
   ): GrantCapabilityRequest | null {
-    if (NOT_OFFERED.has(request.capability)) {
+    if (!confirmationMatches(request)) {
       return null;
     }
     const scope =

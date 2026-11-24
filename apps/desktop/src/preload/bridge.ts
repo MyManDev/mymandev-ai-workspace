@@ -856,7 +856,7 @@ export function createDesktopBridge(
       ),
   });
 
-  // Only the IDs and a new object with the three fields of a grant go on;
+  // Only the IDs and a new object with the fields of a grant go on;
   // the main process checks each value. Another value is refused here
   // without naming it.
   const grants: GrantBridge = Object.freeze({
@@ -889,7 +889,7 @@ export function createDesktopBridge(
           ) as Promise<GrantCapabilityResult>)
         : Promise.reject(
             new TypeError(
-              "grant needs an agent ID string and a capability, a scope ID string, and a lifetime number or null.",
+              "grant needs an agent ID string and a capability, a scope ID string, a lifetime number or null, and no confirmation other than true.",
             ),
           );
     },
@@ -1031,21 +1031,28 @@ export function createDesktopBridge(
 }
 
 /**
- * A new object with only the three fields of a grant request, or null when
- * one has another type. A getter is read once, so the main process gets
- * the values that were checked.
+ * A new object with only the fields of a grant request, or null when one
+ * has another type: the three fields, and `confirmedHighestRisk` only when
+ * it is `true` (#77). A getter is read once, so the main process gets the
+ * values that were checked.
  */
 function grantRequestOf(request: unknown): GrantRequestView | null {
   if (typeof request !== "object" || request === null) {
     return null;
   }
-  const { capability, scopeId, lifetimeSeconds } = request as Record<
-    string,
-    unknown
-  >;
-  return typeof capability === "string" &&
-    typeof scopeId === "string" &&
-    (lifetimeSeconds === null || typeof lifetimeSeconds === "number")
-    ? ({ capability, scopeId, lifetimeSeconds } as GrantRequestView)
-    : null;
+  const { capability, scopeId, lifetimeSeconds, confirmedHighestRisk } =
+    request as Record<string, unknown>;
+  if (
+    typeof capability !== "string" ||
+    typeof scopeId !== "string" ||
+    (lifetimeSeconds !== null && typeof lifetimeSeconds !== "number") ||
+    (confirmedHighestRisk !== undefined && confirmedHighestRisk !== true)
+  ) {
+    return null;
+  }
+  return (
+    confirmedHighestRisk === true
+      ? { capability, scopeId, lifetimeSeconds, confirmedHighestRisk }
+      : { capability, scopeId, lifetimeSeconds }
+  ) as GrantRequestView;
 }

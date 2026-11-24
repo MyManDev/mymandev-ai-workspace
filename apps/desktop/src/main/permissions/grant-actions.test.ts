@@ -5,6 +5,7 @@ import {
   GRANT_LIFETIME_SECONDS,
   GRANT_ROUTE_ERRORS,
   GrantCapabilityResponseSchema,
+  SHELL_GRANT_MAX_LIFETIME_SECONDS,
   LIMITS,
   MAX_ANSWER_LIST_ITEMS,
   PROVIDER_KINDS,
@@ -37,7 +38,7 @@ import {
 } from "../api-actions.ts";
 import type { WorkspaceReadResult } from "../api-reads.ts";
 import type { AgentActivityState } from "../agents/service.ts";
-import { createGrantActions } from "./grant-actions.ts";
+import { confirmationMatches, createGrantActions } from "./grant-actions.ts";
 
 // The grant and revoke actions of #342 in the main process: who may grant,
 // what is sent, what each answer becomes, and that the grant store reads its
@@ -146,7 +147,9 @@ function granted(capability = "repo.read", agentId = AGENT) {
         ? { providerConnectionId: CONNECTION }
         : { repositoryId: REPOSITORY }),
       createdAt: AT,
-      expiresAt: null,
+      // A grant of the shell always expires (#75).
+      expiresAt:
+        capability === "terminal.execute" ? "2026-11-25T10:00:00.000Z" : null,
       revokedAt: null,
       revokedByUserId: null,
     },
@@ -263,6 +266,20 @@ const READ_GRANT: GrantRequestView = {
   lifetimeSeconds: null,
 };
 
+/** A grant of the shell, confirmed by the person, for the proposed day. */
+const SHELL_GRANT: GrantRequestView = {
+  capability: "terminal.execute",
+  scopeId: REPOSITORY,
+  lifetimeSeconds: 86_400,
+  confirmedHighestRisk: true,
+};
+
+const SHELL_GRANT_WITHOUT_CONFIRMATION: GrantRequestView = {
+  capability: "terminal.execute",
+  scopeId: REPOSITORY,
+  lifetimeSeconds: 86_400,
+};
+
 /** Lets the promises that wait settle. */
 async function settle(): Promise<void> {
   for (let index = 0; index < 5; index += 1) {
@@ -320,6 +337,49 @@ test("the owner grants on the agent's host device: the protocol's request is sen
   harness.sent[1]?.resolve({ ok: true, value: granted() });
   expect(await second).toEqual({ outcome: "ok", grantId: GRANT });
   expect(harness.answered()).toBe(2);
+});
+
+test("the shell is granted only with the person's confirmation, which does not reach the API", async () => {
+  const harness = setup();
+  expect(
+    await harness.service.grant(AGENT, SHELL_GRANT_WITHOUT_CONFIRMATION),
+  ).toEqual({ outcome: "refused", reason: "invalid", retryAfterMs: null });
+  expect(harness.sent).toEqual([]);
+  expect(harness.answered()).toBe(0);
+
+  const pending = harness.service.grant(AGENT, SHELL_GRANT);
+  await settle();
+  expect(harness.sent).toHaveLength(1);
+  expect(harness.sent[0]?.params).toEqual({ agentId: AGENT });
+  expect(harness.sent[0]?.body).toEqual({
+    capability: "terminal.execute",
+    repositoryId: REPOSITORY,
+    lifetimeSeconds: 86_400,
+  });
+  harness.sent[0]?.resolve({ ok: true, value: granted("terminal.execute") });
+  expect(await pending).toEqual({ outcome: "ok", grantId: GRANT });
+  expect(harness.answered()).toBe(1);
+});
+
+test("the confirmation is required exactly for the capabilities that CAPABILITY_RISK labels highest", () => {
+  for (const capability of CAPABILITIES) {
+    const highest = CAPABILITY_RISK[capability] === "highest";
+    const request = {
+      capability,
+      scopeId: capability === "provider.use" ? CONNECTION : REPOSITORY,
+      lifetimeSeconds: 3_600,
+    };
+    expect(confirmationMatches(request), capability).toBe(!highest);
+    expect(
+      confirmationMatches({ ...request, confirmedHighestRisk: true }),
+      capability,
+    ).toBe(highest);
+  }
+  expect(
+    CAPABILITIES.filter(
+      (capability) => CAPABILITY_RISK[capability] === "highest",
+    ),
+  ).toEqual(["terminal.execute"]);
 });
 
 /**
@@ -541,7 +601,7 @@ test("every code that the grant and revoke routes answer becomes its own refusal
   }
 });
 
-test("a grant is refused without a request when the account may not grant the agent here, the agent is not open, the capability is not offered, or the lifetime is out of bounds", async () => {
+test("a grant is refused without a request when the account may not grant the agent here, the agent is not open, the confirmation does not match the capability, or the lifetime is out of bounds", async () => {
   const harness = setup();
   const cases: [string, string, GrantRequestView, string][] = [
     [
@@ -555,14 +615,30 @@ test("a grant is refused without a request when the account may not grant the ag
     ["it is not in the open project", id(0xf9), READ_GRANT, "not_open"],
     ["the agent ID is malformed", "not-an-id", READ_GRANT, "invalid"],
     [
-      // Not offered until the presentation rules of #77.
-      "the shell",
+      // The person did not confirm the highest-risk capability (#77).
+      "the shell without the confirmation",
       AGENT,
-      {
-        capability: "terminal.execute",
-        scopeId: REPOSITORY,
-        lifetimeSeconds: 3_600,
-      },
+      SHELL_GRANT_WITHOUT_CONFIRMATION,
+      "invalid",
+    ],
+    [
+      "a standard capability with the confirmation of the shell",
+      AGENT,
+      { ...READ_GRANT, confirmedHighestRisk: true },
+      "invalid",
+    ],
+    [
+      // A grant of the shell always expires (#75): its expiry cannot be
+      // removed, also when it was confirmed.
+      "the shell without an expiry",
+      AGENT,
+      { ...SHELL_GRANT, lifetimeSeconds: null },
+      "invalid",
+    ],
+    [
+      "the shell for longer than 30 days",
+      AGENT,
+      { ...SHELL_GRANT, lifetimeSeconds: SHELL_GRANT_MAX_LIFETIME_SECONDS + 1 },
       "invalid",
     ],
     [
