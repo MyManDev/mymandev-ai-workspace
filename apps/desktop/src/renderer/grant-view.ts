@@ -6,6 +6,7 @@ import type { GrantBridge } from "../shared/desktop-bridge.ts";
 import type {
   AgentGrantsReadProblem,
   AgentGrantsResult,
+  AgentView,
   GrantCapabilityRefusal,
   GrantCapabilityResult,
   GrantRequestView,
@@ -17,7 +18,6 @@ import type {
   RevokeGrantRefusal,
   RevokeGrantResult,
 } from "../shared/ipc-contract.ts";
-import type { AgentView } from "../shared/ipc-contract.ts";
 import type { AgentPanelView } from "./agent-view.ts";
 import { formatAgentTime } from "./agent-view.ts";
 import {

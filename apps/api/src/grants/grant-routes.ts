@@ -103,11 +103,11 @@ function refusedRevocation(
  * of 2026-11-02, 2026-11-14, 2026-11-19, and 2026-11-24): granting a
  * capability to an agent, revoking a grant, the grant records of the agents
  * that the calling device hosts, and the grants of one agent for its owner
- * on any of its devices (#345). Every route needs an access token, and the account
- * limit of every authenticated route applies; beyond it, the count limits of
- * `GRANT_COUNT_LIMITS`, which the database applies, bound the grants: an
- * agent's and a host device's grants that are not revoked (`grant_limit`),
- * and an account's grants in 24 hours (`rate_limited`).
+ * on any of its devices (#345). Every route needs an access token, and the
+ * account limit of every authenticated route applies; beyond it, the count
+ * limits of `GRANT_COUNT_LIMITS`, which the database applies, bound the
+ * grants: an agent's and a host device's grants that are not revoked
+ * (`grant_limit`), and an account's grants in 24 hours (`rate_limited`).
  *
  * No path names a workspace or a project: an agent ID names both, and the
  * database decides on the agent. An agent that does not exist and an agent

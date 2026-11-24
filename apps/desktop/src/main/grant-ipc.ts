@@ -61,9 +61,9 @@ export interface GrantIpc {
 }
 
 /**
- * Registers the handlers of the grant channels (#342, #345) and sends the grants
- * of the open project's agents to the frames that subscribed, at most one
- * view every `GRANT_PUBLISH_INTERVAL_MS`. Every handler checks the sender
+ * Registers the handlers of the grant channels (#342, #345) and sends the
+ * grants of the open project's agents to the frames that subscribed, at most
+ * one view every `GRANT_PUBLISH_INTERVAL_MS`. Every handler checks the sender
  * and the arguments first (`createInvokeHandler`): the IDs as lowercase
  * UUIDv7s, the capability as one of the contract's names, and the lifetime
  * as a positive integer or null. The results are parsed by the contract,

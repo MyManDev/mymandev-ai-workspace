@@ -47,11 +47,11 @@ import { StatementText } from "./StatementText.tsx";
 
 // The grant form and the grant list of the permission screen (#342), with
 // the presentation rules of ADR 0015 (#77), and the grants of the owner's
-// agents that another device hosts, which can only be revoked here (#345). The components below
-// `PermissionGrants` use no hooks, so the tests render the markup and also
-// call the components as functions, walk the returned elements, and invoke
-// their event handlers; `grantSectionHandlers` is the hook's wiring without
-// the hook.
+// agents that another device hosts, which can only be revoked here (#345).
+// The components below `PermissionGrants` use no hooks, so the tests render
+// the markup and also call the components as functions, walk the returned
+// elements, and invoke their event handlers; `grantSectionHandlers` is the
+// hook's wiring without the hook.
 
 /** What the person can do in the grant section. */
 export interface GrantSectionHandlers {
