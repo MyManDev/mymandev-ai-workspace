@@ -799,6 +799,13 @@ export async function listAgentGrants(
         permissionGrants,
         and(
           eq(permissionGrants.granteeAgentId, agents.id),
+          // Always true, by `permission_grants_agent_host_device_fk`, but it
+          // lets PostgreSQL find the grants through
+          // `permission_grants_active_host_device_id_idx`, which holds at
+          // most the host device's count limit, as `listGrantRecords` does.
+          // Without it, no index serves the agent, and the join reads every
+          // grant that is not revoked in the database.
+          eq(permissionGrants.hostDeviceId, agents.hostDeviceId),
           isNull(permissionGrants.revokedAt),
           member,
           owns,
