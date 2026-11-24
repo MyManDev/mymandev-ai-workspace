@@ -338,9 +338,13 @@ function assertDisabled(
     assert.deepEqual(event.actor, { kind: "system" });
     assert.equal(event.deviceId, null);
     assert.equal(event.occurredAt, at.toISOString());
-    assert.deepEqual(event.payload, {
-      agent: { ...agent, disabledAt: at.toISOString() },
-    });
+    const payload = { agent: { ...agent, disabledAt: at.toISOString() } };
+    assert.deepEqual(event.payload, payload);
+    // As sent, before the decoder strips any field that it does not know.
+    assert.deepEqual(
+      (JSON.parse(raw) as { payload: unknown }).payload,
+      payload,
+    );
     assert.equal(raw.includes(hostDeviceId), false, raw);
   });
 }
