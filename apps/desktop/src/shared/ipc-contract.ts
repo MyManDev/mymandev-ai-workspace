@@ -3483,6 +3483,217 @@ export type LiftRegistrationLockResult = z.infer<
   typeof LiftRegistrationLockResultSchema
 >;
 
+// This device's AI provider connections (#32; #295 and the Project
+// Manager's decisions of 2026-11-20 and 2026-11-23): their metadata and a
+// status, never a credential.
+
+/**
+ * Limits of the provider connection messages: the connections of one view,
+ * the most that one answer of the API holds (the protocol's
+ * `MAX_ANSWER_LIST_ITEMS`; a device holds at most 10), and a label in
+ * characters (code points), the protocol's `LIMITS.providerConnectionLabel`.
+ * The main process's tests check that the values match.
+ */
+export const PROVIDER_CONNECTION_LIMITS = Object.freeze({
+  connections: 1_000,
+  label: 64,
+});
+
+/**
+ * The status of one connection, which the main process computes from a
+ * closed list (a default until the Project Manager decides, 2026-11-24):
+ *
+ * - `registered`: the server lists the connection, and this device checks
+ *   no local credential yet (#33);
+ * - `unknown`: this device is offline, or the last read of the list
+ *   failed, so the connection is shown as it was last read.
+ *
+ * The local credential check of #33 adds its own statuses here, such as
+ * `credential_missing`, `ready`, and `check_failed`. A status check is the
+ * person acting on their own device: it is never a `provider.use` action
+ * and needs no grant.
+ */
+export const PROVIDER_CONNECTION_STATUSES = Object.freeze([
+  "registered",
+  "unknown",
+] as const);
+export type ProviderConnectionStatusView =
+  (typeof PROVIDER_CONNECTION_STATUSES)[number];
+
+/**
+ * The states of the provider connection list: `signed_out` without a
+ * signed-in device with a ready key, `loading` until the list loaded once
+ * for this device, `ready`, and `unavailable` after a failed read, until a
+ * read succeeds.
+ */
+export const PROVIDER_CONNECTION_LIST_STATUSES = Object.freeze([
+  "signed_out",
+  "loading",
+  "ready",
+  "unavailable",
+] as const);
+export type ProviderConnectionListStatusView =
+  (typeof PROVIDER_CONNECTION_LIST_STATUSES)[number];
+
+/** Why the provider connection list is `unavailable`: the failed read. */
+export const PROVIDER_CONNECTION_LIST_PROBLEMS = Object.freeze([
+  "not_signed_in",
+  "rate_limited",
+  "unavailable",
+  "failed",
+] as const);
+export type ProviderConnectionListProblem =
+  (typeof PROVIDER_CONNECTION_LIST_PROBLEMS)[number];
+
+const ProviderConnectionLabelSchema = z
+  .string()
+  .min(1)
+  .max(PROVIDER_CONNECTION_LIMITS.label);
+
+/**
+ * One connection of this device as the Account screen shows it: its ID,
+ * kind, label, when it was registered, and its status. Nothing else
+ * crosses: no device, no account, and no credential.
+ */
+export const ProviderConnectionItemSchema = z.object({
+  id: ProtocolIdSchema,
+  kind: z.enum(PROVIDER_KIND_VIEWS),
+  label: ProviderConnectionLabelSchema,
+  createdAt: TimestampSchema,
+  status: z.enum(PROVIDER_CONNECTION_STATUSES),
+});
+export type ProviderConnectionItemView = z.infer<
+  typeof ProviderConnectionItemSchema
+>;
+
+const ProviderConnectionListFields = {
+  /** Grows by one with every change. The highest revision wins. */
+  revision: z.int().nonnegative(),
+  /** In the server's order, the oldest first. */
+  connections: z
+    .array(ProviderConnectionItemSchema)
+    .max(PROVIDER_CONNECTION_LIMITS.connections)
+    .readonly(),
+};
+
+/**
+ * What the renderer may know of this device's provider connections:
+ * `{ revision, status, problem?, connections }`, with a problem only while
+ * `unavailable`. What was read before stays while a read fails, each
+ * connection then `unknown`.
+ */
+export const ProviderConnectionListViewSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.enum(["signed_out", "loading", "ready"]),
+    ...ProviderConnectionListFields,
+  }),
+  z.object({
+    status: z.literal("unavailable"),
+    problem: z.enum(PROVIDER_CONNECTION_LIST_PROBLEMS),
+    ...ProviderConnectionListFields,
+  }),
+]);
+export type ProviderConnectionListView = z.infer<
+  typeof ProviderConnectionListViewSchema
+>;
+
+/**
+ * What the renderer asks to register: a kind and a label, and no other
+ * key, so that nothing such as a credential travels beside them. The main
+ * process checks the label with the protocol's rules before it sends it.
+ */
+export const RegisterProviderConnectionViewSchema = z.strictObject({
+  kind: z.enum(PROVIDER_KIND_VIEWS),
+  label: ProviderConnectionLabelSchema,
+});
+export type RegisterProviderConnectionView = z.infer<
+  typeof RegisterProviderConnectionViewSchema
+>;
+
+/**
+ * Why a registration was refused:
+ *
+ * - `invalid`: the label is outside the protocol's text rule, for example
+ *   blank or with a line break. Nothing was sent.
+ * - `busy`: another registration or removal is still waiting for its
+ *   answer. Nothing was sent, so that a second press never sends a second
+ *   write.
+ * - `not_signed_in`, `unavailable`, `too_soon`, `rate_limited`: as for the
+ *   other writes; `rate_limited` is also the account's limit of
+ *   registrations in 24 hours, with the server's `Retry-After`.
+ * - `provider_connection_limit`: this device holds as many connections as
+ *   it may; only removing one frees a place. No wait.
+ * - `failed`: the API refused it otherwise.
+ */
+export const REGISTER_PROVIDER_CONNECTION_REFUSALS = Object.freeze([
+  "invalid",
+  "busy",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "provider_connection_limit",
+  "failed",
+] as const);
+export type RegisterProviderConnectionRefusal =
+  (typeof REGISTER_PROVIDER_CONNECTION_REFUSALS)[number];
+
+/**
+ * The result of a registration: `ok`, `refused`, or `unknown` when whether
+ * the API registered it is not known. After every request that it sent,
+ * whatever the answer, the main process reads the list again.
+ */
+export const RegisterProviderConnectionResultSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z.object({ outcome: z.literal("ok") }),
+    createRefusedSchema(REGISTER_PROVIDER_CONNECTION_REFUSALS),
+    CreateUnknownSchema,
+  ],
+);
+export type RegisterProviderConnectionResult = z.infer<
+  typeof RegisterProviderConnectionResultSchema
+>;
+
+/**
+ * Why a removal was refused, as for a registration, and:
+ *
+ * - `not_listed`: the connection is not in the list that the main process
+ *   holds. Nothing was sent.
+ * - `not_found`: the server does not know the connection on this device.
+ * - `conflict`: the connection is already removed.
+ */
+export const REMOVE_PROVIDER_CONNECTION_REFUSALS = Object.freeze([
+  "invalid",
+  "busy",
+  "not_listed",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "not_found",
+  "conflict",
+  "failed",
+] as const);
+export type RemoveProviderConnectionRefusal =
+  (typeof REMOVE_PROVIDER_CONNECTION_REFUSALS)[number];
+
+/**
+ * The result of a removal: `ok`, `refused`, or `unknown`. The server
+ * revokes the connection's `provider.use` grants with it.
+ */
+export const RemoveProviderConnectionResultSchema = z.discriminatedUnion(
+  "outcome",
+  [
+    z.object({ outcome: z.literal("ok") }),
+    createRefusedSchema(REMOVE_PROVIDER_CONNECTION_REFUSALS),
+    CreateUnknownSchema,
+  ],
+);
+export type RemoveProviderConnectionResult = z.infer<
+  typeof RemoveProviderConnectionResultSchema
+>;
+
 /** The schemas of every invoke channel. */
 export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.getRuntimeStatus]: Object.freeze({
@@ -3911,6 +4122,24 @@ export const INVOKE_CONTRACT = Object.freeze({
     /** True when the advice showed and ended. */
     result: z.boolean(),
   }),
+  [INVOKE_CHANNELS.getProviderConnections]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ProviderConnectionListViewSchema,
+  }),
+  [INVOKE_CHANNELS.subscribeProviderConnections]: Object.freeze({
+    args: NoArgumentsSchema,
+    result: ProviderConnectionListViewSchema,
+  }),
+  [INVOKE_CHANNELS.registerProviderConnection]: Object.freeze({
+    /** A kind and a label, and no other key. */
+    args: z.tuple([RegisterProviderConnectionViewSchema]),
+    result: RegisterProviderConnectionResultSchema,
+  }),
+  [INVOKE_CHANNELS.removeProviderConnection]: Object.freeze({
+    /** The ID of a connection of the list. */
+    args: z.tuple([ProtocolIdSchema]),
+    result: RemoveProviderConnectionResultSchema,
+  }),
 });
 
 /** The payload schema of every event channel. */
@@ -3931,6 +4160,7 @@ export const EVENT_CONTRACT = Object.freeze({
   [EVENT_CHANNELS.grantStateChanged]: GrantsViewSchema,
   [EVENT_CHANNELS.chatStateChanged]: ChatViewSchema,
   [EVENT_CHANNELS.deviceListChanged]: DeviceListViewSchema,
+  [EVENT_CHANNELS.providerConnectionsChanged]: ProviderConnectionListViewSchema,
 });
 
 export type InvokeArgs<C extends InvokeChannel> = z.infer<

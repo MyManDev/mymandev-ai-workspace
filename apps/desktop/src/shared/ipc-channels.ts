@@ -406,6 +406,27 @@ export const INVOKE_CHANNELS = Object.freeze({
    * until then. The renderer sends nothing.
    */
   dismissLostDeviceAdvice: "devices:dismiss-advice",
+  /**
+   * What the renderer may know of this device's AI provider connections
+   * (#32): each one's ID, kind, label, registration time, and status, never
+   * a credential.
+   */
+  getProviderConnections: "provider-connections:get-state",
+  /**
+   * This device's provider connections. The calling frame then receives
+   * every later state on `EVENT_CHANNELS.providerConnectionsChanged`.
+   */
+  subscribeProviderConnections: "provider-connections:subscribe-state",
+  /**
+   * Registers a provider connection of this device by its kind and label.
+   * No credential is sent.
+   */
+  registerProviderConnection: "provider-connections:register",
+  /**
+   * Removes a provider connection of this device by its ID; the server
+   * revokes its `provider.use` grants.
+   */
+  removeProviderConnection: "provider-connections:remove",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */
@@ -475,6 +496,11 @@ export const EVENT_CHANNELS = Object.freeze({
    * frames that subscribed.
    */
   deviceListChanged: "devices:state-changed",
+  /**
+   * This device's provider connections after changes, at most one every
+   * 50 ms, to the frames that subscribed (#32).
+   */
+  providerConnectionsChanged: "provider-connections:state-changed",
 } as const);
 
 export type InvokeChannel =
