@@ -221,6 +221,13 @@ export type RunStartDecision =
  */
 export const SIGN_IN_TIMER_STEP_MS = 24 * 60 * 60_000;
 
+/**
+ * How long an aborted executor may take to settle before the supervisor logs
+ * it, once. Its agent stays busy until it settles: an adapter must settle
+ * promptly after an abort (`RunExecutor`).
+ */
+export const RUN_SUPERVISOR_ABORT_WATCHDOG_MS = 30_000;
+
 /** The default of `beforeStart`: every start is allowed. */
 export const ALLOW_RUN_START: RunStartDecision = Object.freeze({
   start: true,
@@ -325,6 +332,8 @@ interface Candidate {
 /** An action that an executor checked and that has not ended. */
 interface Lease {
   readonly request: unknown;
+  /** How many allowed checks of this request have not ended. */
+  open: number;
 }
 
 interface Execution {
@@ -332,8 +341,15 @@ interface Execution {
   readonly agentId: AgentId;
   readonly held: HeldRun;
   readonly controller: AbortController;
-  readonly leases: Set<Lease>;
+  /**
+   * The held actions by their canonical request (`leaseKey`): the same
+   * request checked many times is held once, so an executor that never
+   * calls `end()` cannot grow it beyond the run's few requests.
+   */
+  readonly leases: Map<string, Lease>;
   aborted: boolean;
+  /** Cancels the watchdog of an abort; see `RUN_SUPERVISOR_ABORT_WATCHDOG_MS`. */
+  cancelWatchdog: (() => void) | null;
 }
 
 /**
@@ -437,6 +453,25 @@ function olderFirst(a: AgentRunListItem, b: AgentRunListItem): number {
     return at;
   }
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * The canonical form of an allowed request, built from the run by the
+ * enforcement point: its capability, its agent, and its scope.
+ */
+function leaseKey(request: unknown): string {
+  const value = request as {
+    capability?: unknown;
+    agentId?: unknown;
+    repositoryId?: unknown;
+    providerConnectionId?: unknown;
+  };
+  return JSON.stringify([
+    value.capability ?? null,
+    value.agentId ?? null,
+    value.repositoryId ?? null,
+    value.providerConnectionId ?? null,
+  ]);
 }
 
 /** The reasons that only the server gives. */
@@ -702,6 +737,16 @@ export function createRunSupervisor(
     const { execution } = entry.stage;
     execution.aborted = true;
     releaseLeases(execution);
+    if (!closed && execution.cancelWatchdog === null) {
+      execution.cancelWatchdog = schedule(() => {
+        execution.cancelWatchdog = null;
+        if (executions.has(execution)) {
+          log(
+            "An aborted run executor did not settle within 30 seconds; its agent waits.",
+          );
+        }
+      }, RUN_SUPERVISOR_ABORT_WATCHDOG_MS);
+    }
     if (next === null) {
       entries.delete(entry.runId);
     } else {
@@ -722,21 +767,36 @@ export function createRunSupervisor(
       return CHECK_FAILED;
     }
     let decision;
+    let key: string;
     try {
       decision = enforcement.check(execution.held, request);
+      if (!decision.allowed) {
+        return Object.freeze({ allowed: false, reason: decision.reason });
+      }
+      key = leaseKey(decision.request);
     } catch {
       return CHECK_FAILED;
     }
-    if (!decision.allowed) {
-      return Object.freeze({ allowed: false, reason: decision.reason });
+    let lease = execution.leases.get(key);
+    if (lease === undefined) {
+      lease = { request: decision.request, open: 0 };
+      execution.leases.set(key, lease);
     }
-    const lease: Lease = Object.freeze({ request: decision.request });
-    execution.leases.add(lease);
+    lease.open += 1;
+    const held = lease;
+    let ended = false;
     return Object.freeze({
       allowed: true,
       request: decision.request,
       end: () => {
-        execution.leases.delete(lease);
+        if (ended) {
+          return;
+        }
+        ended = true;
+        held.open -= 1;
+        if (held.open <= 0 && execution.leases.get(key) === held) {
+          execution.leases.delete(key);
+        }
       },
     });
   }
@@ -747,8 +807,9 @@ export function createRunSupervisor(
       agentId: entry.agentId,
       held: plan.held,
       controller: new AbortController(),
-      leases: new Set(),
+      leases: new Map(),
       aborted: false,
+      cancelWatchdog: null,
     };
     executions.add(execution);
     entry.stage = { kind: "executing", execution };
@@ -777,6 +838,8 @@ export function createRunSupervisor(
   function settled(entry: Entry, execution: Execution, outcome: unknown): void {
     executions.delete(execution);
     releaseLeases(execution);
+    execution.cancelWatchdog?.();
+    execution.cancelWatchdog = null;
     if (closed) {
       return;
     }
@@ -949,7 +1012,7 @@ export function createRunSupervisor(
         continue;
       }
       const { execution } = entry.stage;
-      for (const lease of [...execution.leases]) {
+      for (const lease of [...execution.leases.values()]) {
         let reason: EnforcementDenialReason | null;
         if (enforcement === null) {
           reason = "check_failed";
@@ -1590,6 +1653,10 @@ export function createRunSupervisor(
         if (entry.stage.kind === "executing") {
           abortExecution(entry, null, "due");
         }
+      }
+      for (const execution of executions) {
+        execution.cancelWatchdog?.();
+        execution.cancelWatchdog = null;
       }
       entries.clear();
       dropped.clear();

@@ -56,6 +56,7 @@ import {
 import {
   createRunSupervisor,
   HOST_RUN_REASONS,
+  RUN_SUPERVISOR_ABORT_WATCHDOG_MS,
   SIGN_IN_TIMER_STEP_MS,
   RUN_SUPERVISOR_RELOAD_DELAY_MS,
   RUN_SUPERVISOR_RELOAD_MAX_MS,
@@ -1150,6 +1151,85 @@ test("a held terminal.execute is checked again with recheck only, and each denia
     expect(g.walk().at(-1), reason).toBe(`1 running>${report}`);
     expect(g.violations, reason).toEqual([]);
   }
+});
+
+test("the same request checked many times is held once, until each of its checks ended", async () => {
+  const h = await started();
+  const { execution } = h.claude.last;
+  const use = { capability: "provider.use", agentId: AGENT_A };
+  const read = {
+    capability: "repo.read",
+    agentId: AGENT_A,
+    repositoryId: REPOSITORY,
+  };
+  // An executor that never calls end().
+  for (let index = 0; index < 1_000; index += 1) {
+    execution.check(use);
+  }
+  const ends: (() => void)[] = [];
+  for (let index = 0; index < 2; index += 1) {
+    const check = execution.check(read);
+    if (!check.allowed) {
+      throw new Error("The check was denied");
+    }
+    ends.push(check.end);
+  }
+  const rechecks = () =>
+    h.enforcementCalls.filter((call) => call.purpose === "recheck");
+  h.grantsChanged();
+  // One recheck for each distinct request, not one for each check.
+  expect(rechecks().map((call) => call.request)).toEqual([use, read]);
+
+  // One of the two checks of `read` ended: it is still held.
+  ends[0]?.();
+  ends[0]?.();
+  h.grantsChanged();
+  expect(rechecks()).toHaveLength(4);
+  // Both ended: only `use` is held.
+  ends[1]?.();
+  h.grantsChanged();
+  expect(
+    rechecks()
+      .slice(4)
+      .map((call) => call.request),
+  ).toEqual([use]);
+  expect(execution.signal.aborted).toBe(false);
+});
+
+test("an aborted executor that never settles keeps its agent waiting, and is logged once after 30 seconds", async () => {
+  const line =
+    "An aborted run executor did not settle within 30 seconds; its agent waits.";
+  const h = await started([
+    run(1, "queued"),
+    run(2, "queued", { createdAfter: 9 }),
+  ]);
+  h.setConnection(LOST);
+  expect(h.claude.last.execution.signal.aborted).toBe(true);
+  h.advance(RUN_SUPERVISOR_ABORT_WATCHDOG_MS - 1);
+  expect(h.logs).not.toContain(line);
+  h.advance(1);
+  expect(h.logs.filter((message) => message === line)).toHaveLength(1);
+  h.reconnect();
+  h.advance(STEP);
+  h.ackAndStep();
+  h.advance(10 * RUN_SUPERVISOR_ABORT_WATCHDOG_MS);
+  expect(h.logs.filter((message) => message === line)).toHaveLength(1);
+  // The agent's next run still waits for the executor.
+  expect(h.providerReads).toEqual([]);
+  expect(h.walk().at(-1)).toBe(
+    `1 running>failed ${HOST_RUN_REASONS.hostInterrupted}`,
+  );
+  h.claude.last.resolve({ outcome: "completed" });
+  await settle();
+  expect(h.providerReads).toHaveLength(1);
+
+  // An executor that settles in time is not logged.
+  const g = await started();
+  g.setConnection(LOST);
+  g.claude.last.resolve({ outcome: "completed" });
+  await settle();
+  g.advance(10 * RUN_SUPERVISOR_ABORT_WATCHDOG_MS);
+  expect(g.logs).not.toContain(line);
 });
 
 test("without an enforcement point, every check of an executor denies", async () => {

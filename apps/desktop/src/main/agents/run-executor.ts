@@ -42,7 +42,10 @@ export const RUN_EXECUTOR_REASON_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 /**
  * The check of one action, as `RunExecution.check` answers it. An allowed
  * check carries the request that was checked, built from the held run: act
- * only on it. Its `end` tells the supervisor that the action is over.
+ * only on it. Its `end` tells the supervisor that the action is over. The
+ * supervisor holds each distinct request once, counting the allowed checks
+ * of it that have not ended, so checking the same request again and again
+ * never grows what it holds.
  */
 export type RunActionCheck =
   | {
@@ -103,8 +106,10 @@ export interface RunExecution {
  * started, aborts the provider calls in flight, starts nothing more, and
  * then settles its promise promptly, with any outcome. The supervisor has
  * already reported the run (or the server already finished it), so the
- * outcome after an abort is ignored. An executor that never settles keeps
- * its agent's next run waiting until the app quits.
+ * outcome after an abort is ignored. An adapter must settle promptly after
+ * an abort: one that never settles keeps its agent's next run waiting until
+ * the app quits, and after `RUN_SUPERVISOR_ABORT_WATCHDOG_MS` (30 seconds)
+ * the supervisor logs it once, with no ID.
  *
  * Before each action and each process start, the executor calls
  * `execution.check`, and acts only when it is allowed.
