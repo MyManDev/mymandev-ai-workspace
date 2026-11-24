@@ -25,6 +25,7 @@ import type {
   PeopleActionsBridge,
   PeopleBridge,
   ProjectRepositoriesBridge,
+  ProviderConnectionsBridge,
   RepositoryBridge,
   RuntimeBridge,
   WorkspaceBridge,
@@ -155,6 +156,8 @@ export interface AppProps {
   readonly chat?: ChatBridge | undefined;
   /** The account's devices from the preload script; undefined outside Electron. */
   readonly devices?: DeviceListBridge | undefined;
+  /** This device's AI provider connections from the preload script; undefined outside Electron. */
+  readonly providerConnections?: ProviderConnectionsBridge | undefined;
   /**
    * The workspace state shown until the bridge delivers one, for tests and
    * previews. Without it, the shell starts without projects.
@@ -197,6 +200,7 @@ export function App({
   grants,
   chat,
   devices,
+  providerConnections,
   initialWorkspaceState,
   initialClaimsState,
   initialClaimMarksState,
@@ -314,6 +318,7 @@ export function App({
           accountView={accountView}
           chat={chat}
           devices={devices}
+          providerConnections={providerConnections}
           agents={agents}
           projectRepositories={projectRepositories}
           grants={grants}
@@ -367,6 +372,7 @@ function ScreenContent({
   accountView,
   chat,
   devices,
+  providerConnections,
   agents,
   projectRepositories,
   grants,
@@ -399,6 +405,7 @@ function ScreenContent({
   readonly accountView: AccountView;
   readonly chat: ChatBridge | undefined;
   readonly devices: DeviceListBridge | undefined;
+  readonly providerConnections: ProviderConnectionsBridge | undefined;
   /** For the permission screen (#342). */
   readonly agents: AgentBridge | undefined;
   readonly projectRepositories: ProjectRepositoriesBridge | undefined;
@@ -426,7 +433,13 @@ function ScreenContent({
         />
       );
     case "account":
-      return <AccountScreen account={account} devices={devices} />;
+      return (
+        <AccountScreen
+          account={account}
+          devices={devices}
+          providerConnections={providerConnections}
+        />
+      );
     case "people":
       return (
         <PeopleScreen
