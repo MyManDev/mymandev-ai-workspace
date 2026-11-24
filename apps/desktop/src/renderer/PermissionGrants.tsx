@@ -16,6 +16,7 @@ import {
   createGrantActions,
   describeGrantSection,
   endConfirmation,
+  endHiddenConfirmation,
   followGrants,
   GRANT_MESSAGES,
   IDLE_GRANT_ACTIONS,
@@ -556,6 +557,17 @@ export function PermissionGrants({
     now: Date.now(),
     timeFormat: agentTimeFormat(),
   });
+  // A confirmation that the section no longer shows ends, so that it does
+  // not come back and take the focus once the form shows its grant again.
+  const hidden =
+    endHiddenConfirmation(form, view) === form ? null : form.confirming;
+  useEffect(() => {
+    if (hidden !== null) {
+      setForm((state) =>
+        state.confirming === hidden ? endConfirmation(state) : state,
+      );
+    }
+  }, [hidden]);
   return (
     <GrantSectionContent
       view={view}

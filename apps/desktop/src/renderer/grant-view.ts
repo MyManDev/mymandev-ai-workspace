@@ -46,7 +46,8 @@ import { describeWait } from "./wait-text.ts";
 //   on its own, in a second step: "Grant" asks the person to confirm, and
 //   only the confirmation sends the request, with `confirmedHighestRisk`.
 //   Cancelling, or changing the agent, the capability, the scope, or the
-//   expiry, ends the confirmation, and nothing is sent.
+//   expiry, ends the confirmation, and nothing is sent. A confirmation that
+//   the section stops showing ends too (`endHiddenConfirmation`).
 // - The shell is proposed an expiry of `SHELL_PROPOSED_LIFETIME_SECONDS`,
 //   which the person can change but not remove; the other capabilities
 //   keep an optional expiry and are proposed none.
@@ -264,6 +265,22 @@ export function askConfirmation(
 /** The form without a confirmation: cancelled, or answered. */
 export function endConfirmation(state: GrantFormState): GrantFormState {
   return state.confirming === null ? state : { ...state, confirming: null };
+}
+
+/**
+ * The form without a confirmation that the section no longer shows, or
+ * `state` itself. The confirmation hides while the form stops showing the
+ * grant that the person asked to confirm: the agents are read again, the
+ * agent is no longer grantable here, or the scope is gone. Once hidden, it
+ * ends, so that it never comes back on its own, and takes the focus, when
+ * the form shows that grant again.
+ */
+export function endHiddenConfirmation(
+  state: GrantFormState,
+  view: GrantSectionView,
+): GrantFormState {
+  const shown = view.kind === "form" && view.form?.confirmation !== undefined;
+  return shown ? state : endConfirmation(state);
 }
 
 function samePending(a: PendingGrant, b: PendingGrant): boolean {

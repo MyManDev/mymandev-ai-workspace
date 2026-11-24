@@ -31,6 +31,7 @@ import {
   describeGrantSection,
   describeRevokeResult,
   endConfirmation,
+  endHiddenConfirmation,
   EXPIRY_CHOICES,
   expiryChoices,
   GRANT_MESSAGES,
@@ -562,6 +563,81 @@ test("cancelling, or changing the agent, the capability, the scope, or the expir
   expect(
     formOf(describeGrantSection(input({ form: other }))).confirmation,
   ).toBeUndefined();
+});
+
+test("a confirmation that the section stops showing ends, so it never comes back when the form shows its grant again", () => {
+  const asked = confirming(SHELL_FORM);
+  const shown = describeGrantSection(input({ form: asked.state }));
+  // While it is shown, it waits.
+  expect(endHiddenConfirmation(asked.state, shown)).toBe(asked.state);
+  // Without a confirmation, nothing changes.
+  expect(endHiddenConfirmation(SHELL_FORM, shown)).toBe(SHELL_FORM);
+
+  const hidings: [string, Partial<GrantSectionInput>][] = [
+    [
+      "the agents are read again",
+      {
+        agents: {
+          kind: "known",
+          state: { ...agentsState([]), status: "loading" },
+        },
+      },
+    ],
+    ["the agents are not known", { agents: { kind: "pending" } }],
+    [
+      "the agent is no longer grantable here",
+      {
+        agents: {
+          kind: "known",
+          state: agentsState([
+            agent(HERE, "Builder", { ownedByMe: true }),
+            agent(SECOND, "Reviewer", { ownedByMe: true, grantableHere: true }),
+          ]),
+        },
+      },
+    ],
+    [
+      "no agent is grantable here",
+      { agents: { kind: "known", state: agentsState([]) } },
+    ],
+    [
+      "the scope is gone",
+      {
+        repositories: {
+          kind: "known",
+          state: {
+            ...REPOSITORIES,
+            repositories: REPOSITORIES.repositories.filter(
+              (repository) => repository.repositoryId !== WEB,
+            ),
+          },
+        },
+      },
+    ],
+    ["the repositories are not known", { repositories: { kind: "pending" } }],
+  ];
+  for (const [label, hiding] of hidings) {
+    const hidden = describeGrantSection(
+      input({ ...hiding, form: asked.state }),
+    );
+    expect(
+      hidden.kind === "form" ? hidden.form?.confirmation : undefined,
+      label,
+    ).toBeUndefined();
+    // Kept, it would come back with the form's grant.
+    expect(
+      formOf(describeGrantSection(input({ form: asked.state }))).confirmation,
+      label,
+    ).toBeDefined();
+    const ended = endHiddenConfirmation(asked.state, hidden);
+    expect(ended, label).toEqual({ ...asked.state, confirming: null });
+    const back = formOf(describeGrantSection(input({ form: ended })));
+    expect(back.confirmation, label).toBeUndefined();
+    expect(confirmedGrantOf(ended, asked.form), label).toBeNull();
+    // The person's choices stay.
+    expect(back.capability, label).toBe("terminal.execute");
+    expect(back.scopeId, label).toBe(WEB);
+  }
 });
 
 test("the confirmation says that the shell can still commit and push only while the agent lacks git.commit or git.push on the repository, from its current grants", () => {
