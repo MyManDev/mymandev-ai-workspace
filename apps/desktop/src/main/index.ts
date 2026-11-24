@@ -77,6 +77,8 @@ import { registerPeopleIpc } from "./people-ipc.ts";
 import { registerGrantIpc } from "./grant-ipc.ts";
 import { createGrantActions } from "./permissions/grant-actions.ts";
 import { createGrantStore } from "./permissions/grant-store.ts";
+import { registerProviderConnectionIpc } from "./provider-connection-ipc.ts";
+import { createProviderConnectionService } from "./provider-connections/service.ts";
 import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
 import {
@@ -373,6 +375,26 @@ function start(): void {
     service: grantActions,
   });
   closables.add(grantIpc);
+
+  // This device's AI provider connections (#32): the list that the server
+  // holds for this device, a status for each from a closed list, and
+  // registering and removing one, one write at a time. Metadata only: no
+  // credential is read, kept, or sent. A removal tells the grant store,
+  // because the server revokes the connection's `provider.use` grants. The
+  // logs are fixed text, never a label or an ID.
+  const providerConnections = createProviderConnectionService({
+    account,
+    connection,
+    grants: grantStore,
+    log: (message) => console.info(message),
+  });
+  closables.add(providerConnections);
+  const providerConnectionIpc = registerProviderConnectionIpc(
+    ipcMain,
+    rendererUrl,
+    { service: providerConnections },
+  );
+  closables.add(providerConnectionIpc);
 
   // The open project's registered repositories (#286), read over HTTP and
   // kept current with the selected workspace's repository events through
