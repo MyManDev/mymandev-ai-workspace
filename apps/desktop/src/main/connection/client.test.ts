@@ -26,6 +26,7 @@ import {
   gatewayUrl,
   HANDSHAKE_TIMEOUT_MS,
   MAX_BUFFERED_SEND_BYTES,
+  MAX_LOGGED_UNKNOWN_FRAME_TYPES,
   RECEIVE_LIMIT_BYTES,
   RECONNECT_BUDGET,
   RECONNECT_BUDGET_WINDOW_MS,
@@ -90,6 +91,18 @@ const PRESENCE = Object.freeze({
   memberId: MEMBER_ID,
   status: "online",
 });
+
+/** A well-formed frame of a type that no peer of this build knows (#334). */
+const UNKNOWN_FRAME = Object.freeze({
+  protocolVersion: 0,
+  type: "connection.ping_v2",
+  note: "text of the server that no log may hold",
+});
+
+/** The log line of an ignored frame of `type`. */
+function ignoredLine(type: string): string {
+  return `The connection to the API ignored a frame of the unknown type ${type}.`;
+}
 
 /** A chat message that a person sends from this device. */
 function chatSend(body = "Hello"): ClientEvent {
@@ -1448,8 +1461,68 @@ test("a binary message, invalid JSON, a message the protocol refuses, or one ove
     ["binary", Buffer.from(JSON.stringify(PRESENCE))],
     ["array buffer", new ArrayBuffer(8)],
     ["invalid JSON", "{"],
-    ["unknown frame", JSON.stringify({ protocolVersion: 0, type: "x.y" })],
+    ["not an object", JSON.stringify("connection.ping_v2")],
+    // A known type that fails its schema is not an unknown frame (#334).
+    [
+      "a known frame type without its fields",
+      JSON.stringify({
+        protocolVersion: 0,
+        type: "presence.changed",
+      }),
+    ],
+    [
+      "a known frame with an invalid field",
+      JSON.stringify({
+        ...PRESENCE,
+        status: "away",
+      }),
+    ],
+    // Another protocol version, also of an unknown type.
+    ["another version", JSON.stringify({ ...PRESENCE, protocolVersion: 1 })],
+    [
+      "an unknown frame of another version",
+      JSON.stringify({
+        ...UNKNOWN_FRAME,
+        protocolVersion: 1,
+      }),
+    ],
+    ["no version", JSON.stringify({ type: UNKNOWN_FRAME.type })],
+    // A type that is not a frame type is malformed, not unknown.
+    ["an uppercase type", JSON.stringify({ ...UNKNOWN_FRAME, type: "X.y" })],
+    [
+      "a type with a line break",
+      JSON.stringify({
+        ...UNKNOWN_FRAME,
+        type: "x.y\nforged",
+      }),
+    ],
+    [
+      "a type over the limit",
+      JSON.stringify({
+        ...UNKNOWN_FRAME,
+        type: `x.${"y".repeat(100)}`,
+      }),
+    ],
+    // What only a device sends is known, and never ignored.
     ["client frame", JSON.stringify(RESPONSE)],
+    [
+      "a subscription request",
+      JSON.stringify({
+        protocolVersion: 0,
+        type: "workspace.subscribe",
+        workspaceId: WORKSPACE_ID,
+      }),
+    ],
+    ["a device's chat message", JSON.stringify(chatSend())],
+    // An event of an unknown type is no frame.
+    [
+      "an unknown event",
+      JSON.stringify({
+        ...chatSend(),
+        type: "chat.message.edited",
+        deviceId: null,
+      }),
+    ],
     ["over the limit", big],
     ["over the limit in bytes", wide],
     ["a second auth.ok", JSON.stringify(AUTH_OK)],
@@ -1467,6 +1540,10 @@ test("a binary message, invalid JSON, a message the protocol refuses, or one ove
       reason: "invalid_message",
     });
     expect(received, name).toEqual([]);
+    expect(
+      h.logs.filter((line) => line.includes("unknown type")),
+      name,
+    ).toEqual([]);
   }
   // A message within the limit is delivered.
   const h = harness();
@@ -1477,6 +1554,87 @@ test("a binary message, invalid JSON, a message the protocol refuses, or one ove
   h.last().receive(fits);
   expect(received).toEqual([{ kind: "frame", frame: PRESENCE }]);
   expect(h.last().closes).toEqual([]);
+});
+
+test("after auth.ok a well-formed frame of an unknown type is dropped, its type logged, and the connection stays open", async () => {
+  const h = harness();
+  const received: ServerMessage[] = [];
+  h.client.onMessage((message) => received.push(message));
+  await h.authenticate();
+  const socket = h.last();
+  const sent = socket.sent.length;
+
+  socket.receiveJson(UNKNOWN_FRAME);
+  socket.receiveJson({ ...UNKNOWN_FRAME, nested: { list: [1, 2] } });
+  socket.receiveJson({ protocolVersion: 0, type: "x.y" });
+  expect(socket.closes).toEqual([]);
+  expect(h.client.status().state).toBe("connected");
+  expect(h.client.identity()).not.toBeNull();
+  expect(received).toEqual([]);
+  // Nothing answers it.
+  expect(socket.sent).toHaveLength(sent);
+  // Each type is logged once per socket, and nothing of the frame but its
+  // type.
+  const ignored = h.logs.filter((line) => line.includes("unknown type"));
+  expect(ignored).toEqual([
+    ignoredLine(UNKNOWN_FRAME.type),
+    ignoredLine("x.y"),
+  ]);
+  expect(JSON.stringify(h.logs)).not.toContain(UNKNOWN_FRAME.note);
+
+  // Later messages are delivered as before.
+  socket.receiveJson(PRESENCE);
+  expect(received).toEqual([{ kind: "frame", frame: PRESENCE }]);
+  expect(socket.closes).toEqual([]);
+});
+
+test("an ignored frame of an unknown type starts the liveness bound again, as any message", async () => {
+  const h = harness();
+  await h.authenticate();
+  const socket = h.last();
+  for (let index = 0; index < 3; index += 1) {
+    h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
+    socket.receiveJson(UNKNOWN_FRAME);
+    expect(socket.closes).toEqual([]);
+  }
+  h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
+  expect(socket.closes).toEqual([]);
+  expect(h.client.status().state).toBe("connected");
+  h.advance(1);
+  expect(socket.closes).toEqual([1000]);
+  expect(h.client.status()).toMatchObject({
+    state: "waiting",
+    reason: "connection_lost",
+  });
+});
+
+test("unknown frame types are logged for at most a bounded number of types per socket, and again on the next socket", async () => {
+  expect(MAX_LOGGED_UNKNOWN_FRAME_TYPES).toBe(16);
+  const h = harness();
+  await h.authenticate();
+  const types = Array.from(
+    { length: MAX_LOGGED_UNKNOWN_FRAME_TYPES + 4 },
+    (_, index) => `future.frame_${String(index)}`,
+  );
+  for (const type of types) {
+    h.last().receiveJson({ protocolVersion: 0, type });
+    h.last().receiveJson({ protocolVersion: 0, type });
+  }
+  expect(h.last().closes).toEqual([]);
+  const ignored = (): string[] =>
+    h.logs.filter((line) => line.includes("unknown type"));
+  expect(ignored()).toEqual(
+    types.slice(0, MAX_LOGGED_UNKNOWN_FRAME_TYPES).map(ignoredLine),
+  );
+
+  // A new socket logs its own.
+  h.last().closed(1006);
+  h.advance(waitOf(h));
+  expect(h.sockets).toHaveLength(2);
+  await h.authenticate();
+  h.last().receiveJson({ protocolVersion: 0, type: types.at(-1) });
+  expect(ignored().at(-1)).toBe(ignoredLine(types.at(-1) ?? ""));
+  expect(ignored()).toHaveLength(MAX_LOGGED_UNKNOWN_FRAME_TYPES + 1);
 });
 
 test("before auth.ok only the challenge and then auth.ok of the signed device are accepted", async () => {
@@ -1524,6 +1682,28 @@ test("before auth.ok only the challenge and then auth.ok of the signed device ar
         socket.receiveJson(PRESENCE);
       },
     ],
+    // A frame of an unknown type is ignored only after auth.ok (#334).
+    [
+      "an unknown frame before the challenge",
+      async (socket) => {
+        socket.receiveJson(UNKNOWN_FRAME);
+      },
+    ],
+    [
+      "an unknown frame while signing",
+      async (socket) => {
+        socket.receiveJson(CHALLENGE);
+        socket.receiveJson(UNKNOWN_FRAME);
+      },
+    ],
+    [
+      "an unknown frame instead of auth.ok",
+      async (socket) => {
+        socket.receiveJson(CHALLENGE);
+        await flush();
+        socket.receiveJson(UNKNOWN_FRAME);
+      },
+    ],
   ];
   for (const [name, run] of cases) {
     const h = harness();
@@ -1536,6 +1716,10 @@ test("before auth.ok only the challenge and then auth.ok of the signed device ar
       reason: "invalid_message",
     });
     expect(h.last().sent.length, name).toBeLessThanOrEqual(1);
+    expect(
+      h.logs.filter((line) => line.includes("unknown type")),
+      name,
+    ).toEqual([]);
   }
 });
 
