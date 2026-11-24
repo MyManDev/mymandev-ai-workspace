@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import type {
   AccountStatus,
+  GrantsView,
   ProjectRepositoriesView,
   RepositoryList,
   RuntimeStatus,
@@ -59,7 +60,7 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the project repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the join request, the join request action, the own join request, the own join request action, the claim, the claim mark, the agent, the chat, and the device list functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the project repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the join request, the join request action, the own join request, the own join request action, the claim, the claim mark, the agent, the grant, the chat, and the device list functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
@@ -71,6 +72,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
     "connection",
     "devices",
     "electronVersion",
+    "grants",
     "invitationActions",
     "invitations",
     "joinRequestActions",
@@ -189,6 +191,13 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
     "getState",
     "subscribeState",
   ]);
+  expect(Object.keys(bridge.grants).sort()).toEqual([
+    "getState",
+    "grant",
+    "listProviderConnections",
+    "revoke",
+    "subscribeState",
+  ]);
   expect(Object.keys(bridge.chat).sort()).toEqual([
     "discard",
     "getState",
@@ -225,6 +234,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
   expect(Object.isFrozen(bridge.claims)).toBe(true);
   expect(Object.isFrozen(bridge.claimMarks)).toBe(true);
   expect(Object.isFrozen(bridge.agents)).toBe(true);
+  expect(Object.isFrozen(bridge.grants)).toBe(true);
   expect(Object.isFrozen(bridge.chat)).toBe(true);
   expect(Object.isFrozen(bridge.devices)).toBe(true);
   for (const value of [
@@ -245,6 +255,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
     ...Object.values(bridge.claims),
     ...Object.values(bridge.claimMarks),
     ...Object.values(bridge.agents),
+    ...Object.values(bridge.grants),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
   ]) {
@@ -274,6 +285,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.claims),
     ...Object.values(bridge.claimMarks),
     ...Object.values(bridge.agents),
+    ...Object.values(bridge.grants),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
   ] as unknown[];
@@ -637,6 +649,125 @@ test("the project repository subscription delivers the state and every newer one
   await settle();
   expect(errors).toBe(1);
   expect(reported).toEqual(["A project repository callback failed."]);
+});
+
+const AGENT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819341";
+const GRANT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819351";
+
+const grantsView = (revision: number): GrantsView => ({
+  revision,
+  projectId: null,
+  usable: false,
+  grants: [],
+});
+
+test("each grant function calls its own channel with only its values, a new request object with its three fields, and passes the answer through", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const call = (name: keyof typeof bridge.grants) =>
+    bridge.grants[name] as (...args: unknown[]) => Promise<unknown>;
+  const request = {
+    capability: "repo.read",
+    scopeId: REPOSITORY_ID,
+    lifetimeSeconds: null,
+    grantedByUserId: "someone",
+  };
+
+  const answers = [
+    call("getState")("extra"),
+    call("listProviderConnections")("extra"),
+    call("grant")(AGENT_ID, request, "extra"),
+    call("revoke")(AGENT_ID, GRANT_ID, "extra"),
+  ];
+  fake.answers.forEach((answer, index) => answer.resolve({ index }));
+
+  await expect(Promise.all(answers)).resolves.toEqual([
+    { index: 0 },
+    { index: 1 },
+    { index: 2 },
+    { index: 3 },
+  ]);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getGrantState, args: [] },
+    { channel: INVOKE_CHANNELS.listProviderConnections, args: [] },
+    {
+      channel: INVOKE_CHANNELS.grantCapability,
+      args: [
+        AGENT_ID,
+        {
+          capability: "repo.read",
+          scopeId: REPOSITORY_ID,
+          lifetimeSeconds: null,
+        },
+      ],
+    },
+    { channel: INVOKE_CHANNELS.revokeGrant, args: [AGENT_ID, GRANT_ID] },
+  ]);
+  expect(fake.invoked[2]?.args[1]).not.toBe(request);
+});
+
+test("each grant action refuses a value of another type without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const call = (name: keyof typeof bridge.grants) =>
+    bridge.grants[name] as (...args: unknown[]) => Promise<unknown>;
+  const secret = { token: "secret-token" };
+  const request = {
+    capability: "repo.read",
+    scopeId: REPOSITORY_ID,
+    lifetimeSeconds: 60,
+  };
+
+  for (const attempt of [
+    () => call("grant")(secret, request),
+    () => call("grant")(AGENT_ID, null),
+    () => call("grant")(AGENT_ID, "secret-token"),
+    () => call("grant")(AGENT_ID, { ...request, capability: secret }),
+    () => call("grant")(AGENT_ID, { ...request, scopeId: 7 }),
+    () => call("grant")(AGENT_ID, { ...request, lifetimeSeconds: "60" }),
+    () => call("grant")(AGENT_ID, { ...request, lifetimeSeconds: undefined }),
+    () => call("revoke")(AGENT_ID, secret),
+    () => call("revoke")(undefined, GRANT_ID),
+  ]) {
+    const error = await attempt().then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(TypeError);
+    expect(String(error)).not.toContain("secret-token");
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("the grant subscription delivers the state and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const reported: string[] = [];
+  const bridge = createDesktopBridge("44.9.1", fake.ipc, (message) =>
+    reported.push(message),
+  );
+  const calls: unknown[][] = [];
+
+  const end = bridge.grants.subscribeState((...args: unknown[]) =>
+    calls.push(args),
+  );
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeGrantState, args: [] },
+  ]);
+  fake.emit(EVENT_CHANNELS.grantStateChanged, grantsView(3));
+  fake.answers[0]?.resolve(grantsView(2));
+  await settle();
+  fake.emit(EVENT_CHANNELS.grantStateChanged, grantsView(4));
+  end();
+  fake.emit(EVENT_CHANNELS.grantStateChanged, grantsView(5));
+
+  expect(calls).toEqual([[grantsView(3)], [grantsView(4)]]);
+  expect(fake.listenerCount(EVENT_CHANNELS.grantStateChanged)).toBe(0);
+
+  bridge.grants.subscribeState(() => {
+    throw new Error("listener");
+  });
+  fake.emit(EVENT_CHANNELS.grantStateChanged, grantsView(1));
+  expect(reported).toEqual(["A grant state callback failed."]);
 });
 
 const accountStatus = (revision: number): AccountStatus => ({

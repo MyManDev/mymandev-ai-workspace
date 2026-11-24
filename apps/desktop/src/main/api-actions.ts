@@ -1,6 +1,7 @@
 // The writes of the workspace screens of #95 that the main process may send
 // to the API (the Project Manager's decision D1 of 2026-11-06), and the
-// registration and removal of a project's repositories (#286): a frozen
+// registration and removal of a project's repositories (#286), and granting
+// and revoking an agent's capabilities (#342): a frozen
 // allowlist of `POST` routes, each with its path parameters, the protocol's
 // request schema or none, and the protocol's answer schema or `empty` for a
 // `204`. The account service sends them with the device session
@@ -15,6 +16,8 @@
 // refusal names a fixed reason only.
 import {
   type AcceptInvitationRequest,
+  type AgentId,
+  AgentIdSchema,
   AcceptInvitationRequestSchema,
   type AcceptInvitationResponse,
   AcceptInvitationResponseSchema,
@@ -43,6 +46,11 @@ import {
   DefineMemberRequestSchema,
   type DefineMemberResponse,
   DefineMemberResponseSchema,
+  GRANT_ROUTES,
+  type GrantCapabilityRequest,
+  GrantCapabilityRequestSchema,
+  type GrantCapabilityResponse,
+  GrantCapabilityResponseSchema,
   type InvitationId,
   InvitationIdSchema,
   type JoinRequestId,
@@ -52,6 +60,8 @@ import {
   MemberIdSchema,
   type OfferOwnershipRequest,
   OfferOwnershipRequestSchema,
+  type PermissionGrantId,
+  PermissionGrantIdSchema,
   type PreviewInvitationRequest,
   PreviewInvitationRequestSchema,
   type PreviewInvitationResponse,
@@ -84,6 +94,8 @@ const PATH_PARAMS = Object.freeze({
   joinRequestId: JoinRequestIdSchema,
   projectId: ProjectIdSchema,
   repositoryId: RepositoryIdSchema,
+  agentId: AgentIdSchema,
+  grantId: PermissionGrantIdSchema,
 });
 export type WorkspaceActionParam = keyof typeof PATH_PARAMS;
 
@@ -287,6 +299,24 @@ export const WORKSPACE_ACTIONS = Object.freeze({
     null,
     "empty",
   ),
+  /**
+   * Grants one capability on one scope to an agent (#342): the agent's owner,
+   * on the agent's host device only. Its answer is the new grant, whole,
+   * which names the granting account; it stays in the main process.
+   */
+  grantCapability: action(
+    GRANT_ROUTES.grantCapability,
+    ["agentId"],
+    GrantCapabilityRequestSchema,
+    GrantCapabilityResponseSchema,
+  ),
+  /** Revokes a grant of an agent (#342): the agent's owner, from any device. */
+  revokeGrant: action(
+    GRANT_ROUTES.revokeGrant,
+    ["agentId", "grantId"],
+    null,
+    "empty",
+  ),
 });
 export type WorkspaceActionName = keyof typeof WORKSPACE_ACTIONS;
 
@@ -329,6 +359,11 @@ export interface WorkspaceActionParams {
     readonly projectId: ProjectId;
     readonly repositoryId: RepositoryId;
   };
+  readonly grantCapability: { readonly agentId: AgentId };
+  readonly revokeGrant: {
+    readonly agentId: AgentId;
+    readonly grantId: PermissionGrantId;
+  };
 }
 
 /** The body of each write, as the caller passes it; `never` for none. */
@@ -363,6 +398,8 @@ export interface WorkspaceActionBody {
   /** The name as typed; it is sent as it is (a label, ADR 0005). */
   readonly registerRepository: z.input<typeof RegisterRepositoryRequestSchema>;
   readonly removeRepository: never;
+  readonly grantCapability: GrantCapabilityRequest;
+  readonly revokeGrant: never;
 }
 
 /**
@@ -405,6 +442,8 @@ export interface WorkspaceActionAnswer {
   readonly createProject: CreateProjectResponse;
   readonly registerRepository: RegisterRepositoryResponse;
   readonly removeRepository: null;
+  readonly grantCapability: GrantCapabilityResponse;
+  readonly revokeGrant: null;
 }
 
 /**
@@ -452,13 +491,15 @@ export const ACTION_RATE_LIMITED_WAIT_MS = 60_000;
  * - `forbidden`, `not_found`, `conflict`, `already_member`,
  *   `invitation_invalid`, `join_requests_closed`, `workspace_not_found`,
  *   `device_too_new`, `unclaimed_limit`, `project_limit`,
- *   `repository_limit`: the API's refusal with that code
+ *   `repository_limit`, `grant_limit`: the API's refusal with that code
  *   (`MEMBERSHIP_ROUTE_ERRORS`, `PROJECT_ROUTE_ERRORS`,
- *   `REPOSITORY_ROUTE_ERRORS`). `unclaimed_limit` carries no wait: only
- *   removing an unclaimed person, or a claim of one, frees a place for a
- *   definition (#242). Neither does `project_limit`: only archiving a
- *   project frees a place for a creation (#255). Nor `repository_limit`:
- *   only removing a repository frees a place for a registration (#286).
+ *   `REPOSITORY_ROUTE_ERRORS`, `GRANT_ROUTE_ERRORS`). `unclaimed_limit`
+ *   carries no wait: only removing an unclaimed person, or a claim of one,
+ *   frees a place for a definition (#242). Neither does `project_limit`:
+ *   only archiving a project frees a place for a creation (#255). Nor
+ *   `repository_limit`: only removing a repository frees a place for a
+ *   registration (#286). Nor `grant_limit`: only revoking a grant frees a
+ *   place (#75, #342).
  * - `rate_limited`: the API's limit; `retryAfterMs` follows its
  *   `Retry-After`, or `ACTION_RATE_LIMITED_WAIT_MS` without one.
  * - `unknown`: whether the API acted is not known: it gave no answer, failed,
@@ -484,6 +525,7 @@ export const WORKSPACE_ACTION_FAILURES = Object.freeze([
   "unclaimed_limit",
   "project_limit",
   "repository_limit",
+  "grant_limit",
   "rate_limited",
   "unknown",
   "failed",
@@ -626,6 +668,7 @@ const SHOWN_CODES: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
   "unclaimed_limit",
   "project_limit",
   "repository_limit",
+  "grant_limit",
 ]);
 
 /** The closed failure of a write for a failure of the device session. */

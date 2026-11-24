@@ -50,12 +50,21 @@ const READY: AgentActivityView = {
   workspaceId: WORKSPACE,
   projectId: PROJECT,
   agents: [
-    { id: BUILDER, name: "Builder", ownerName: "Ada", disabledAt: null },
+    {
+      id: BUILDER,
+      name: "Builder",
+      ownerName: "Ada",
+      disabledAt: null,
+      ownedByMe: false,
+      grantableHere: false,
+    },
     {
       id: REVIEWER,
       name: "Reviewer",
       ownerName: "Grace",
       disabledAt: DISABLED_AT,
+      ownedByMe: false,
+      grantableHere: false,
     },
   ],
   unfinishedRuns: [
@@ -287,6 +296,8 @@ test("names and reasons are rendered as text, never as markup", () => {
           name: "<b>Builder</b>",
           ownerName: '<img src="x" onerror="alert(1)">',
           disabledAt: null,
+          ownedByMe: false,
+          grantableHere: false,
         },
       ],
       unfinishedRuns: [

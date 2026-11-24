@@ -7,6 +7,7 @@ import type {
   ConnectionBridge,
   DesktopBridge,
   DeviceListBridge,
+  GrantBridge,
   InvitationActionsBridge,
   InvitationsBridge,
   JoinRequestActionsBridge,
@@ -48,6 +49,9 @@ import type {
   DeviceListLoadResult,
   DeviceListView,
   ForgetResult,
+  GrantCapabilityResult,
+  GrantRequestView,
+  GrantsView,
   InvitationLoadResult,
   InvitationsView,
   JoinRequestActionResult,
@@ -63,10 +67,12 @@ import type {
   PersonActionResult,
   PreviewInvitationResult,
   ProjectRepositoriesView,
+  ProviderConnectionsResult,
   ReconnectResult,
   RegisterRepositoryResult,
   RemoveDeviceResult,
   RemoveRepositoryResult,
+  RevokeGrantResult,
   RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
@@ -850,6 +856,55 @@ export function createDesktopBridge(
       ),
   });
 
+  // Only the IDs and a new object with the three fields of a grant go on;
+  // the main process checks each value. Another value is refused here
+  // without naming it.
+  const grants: GrantBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(INVOKE_CHANNELS.getGrantState) as Promise<GrantsView>,
+    subscribeState: (
+      listener: (state: GrantsView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeGrantState,
+        EVENT_CHANNELS.grantStateChanged,
+        "A grant state callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    listProviderConnections: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.listProviderConnections,
+      ) as Promise<ProviderConnectionsResult>,
+    grant: (agentId: string, request: GrantRequestView) => {
+      const copy = grantRequestOf(request);
+      return typeof agentId === "string" && copy !== null
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.grantCapability,
+            agentId,
+            copy,
+          ) as Promise<GrantCapabilityResult>)
+        : Promise.reject(
+            new TypeError(
+              "grant needs an agent ID string and a capability, a scope ID string, and a lifetime number or null.",
+            ),
+          );
+    },
+    revoke: (agentId: string, grantId: string) =>
+      typeof agentId === "string" && typeof grantId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.revokeGrant,
+            agentId,
+            grantId,
+          ) as Promise<RevokeGrantResult>)
+        : Promise.reject(
+            new TypeError("revoke needs an agent ID and a grant ID string."),
+          ),
+  });
+
   // The text and the event IDs go to the main process only; the errors
   // name no value.
   const chat: ChatBridge = Object.freeze({
@@ -969,7 +1024,28 @@ export function createDesktopBridge(
     claims,
     claimMarks,
     agents,
+    grants,
     chat,
     devices,
   });
+}
+
+/**
+ * A new object with only the three fields of a grant request, or null when
+ * one has another type. A getter is read once, so the main process gets
+ * the values that were checked.
+ */
+function grantRequestOf(request: unknown): GrantRequestView | null {
+  if (typeof request !== "object" || request === null) {
+    return null;
+  }
+  const { capability, scopeId, lifetimeSeconds } = request as Record<
+    string,
+    unknown
+  >;
+  return typeof capability === "string" &&
+    typeof scopeId === "string" &&
+    (lifetimeSeconds === null || typeof lifetimeSeconds === "number")
+    ? ({ capability, scopeId, lifetimeSeconds } as GrantRequestView)
+    : null;
 }
