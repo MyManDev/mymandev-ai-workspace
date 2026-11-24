@@ -4,7 +4,13 @@
 // the returned elements, and invoke their event handlers; the hook's wiring
 // is `grantSectionHandlers`, which the tests drive with a form state of
 // their own.
-import { isValidElement, type ReactElement, type ReactNode } from "react";
+import {
+  createRef,
+  isValidElement,
+  type ReactElement,
+  type ReactNode,
+  type Ref,
+} from "react";
 import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
 import type {
@@ -25,10 +31,12 @@ import {
   describeGrantSection,
   EXPIRY_CHOICES,
   expiryChoices,
+  focusAfterConfirmation,
   GRANT_MESSAGES,
   IDLE_GRANT_ACTIONS,
   INITIAL_GRANT_FORM,
   OFFERED_CAPABILITIES,
+  type ConfirmationEnd,
   type GrantActions,
   type GrantActionsView,
   type GrantConfirmationView,
@@ -58,6 +66,8 @@ interface HostProps {
   readonly type?: string;
   readonly disabled?: boolean;
   readonly value?: string;
+  readonly ref?: Ref<unknown>;
+  readonly tabIndex?: number;
 }
 
 function elementsOf(node: ReactNode): ReactElement<HostProps>[] {
@@ -247,14 +257,14 @@ test("the form cannot be sent without a scope, and every control waits while an 
     /<button type="button" (?=[^>]*disabled="")[^>]*aria-label="Revoke repo\.write on web"/,
   );
   expect(running).toContain(
-    `<p id="${GRANT_RESULT_ID}" role="status">${GRANT_MESSAGES.running}</p>`,
+    `<p id="${GRANT_RESULT_ID}" role="status" tabindex="-1">${GRANT_MESSAGES.running}</p>`,
   );
   const done = render(VIEW, {
     running: false,
     message: "The permission was granted.",
   });
   expect(done).toContain(
-    `<p id="${GRANT_RESULT_ID}" role="status">The permission was granted.</p>`,
+    `<p id="${GRANT_RESULT_ID}" role="status" tabindex="-1">The permission was granted.</p>`,
   );
 });
 
@@ -508,14 +518,15 @@ const AGENTS: AgentActivityView = {
 function wiring() {
   let state: GrantFormState = INITIAL_GRANT_FORM;
   const granted: unknown[][] = [];
+  const ends: ConfirmationEnd[] = [];
   const actions: Pick<GrantActions, "grant" | "revoke"> = {
     grant: async (agentId, request) => {
       granted.push([agentId, request]);
     },
     revoke: async () => {},
   };
-  const form = () => {
-    const view = describeGrantSection({
+  const section = () =>
+    describeGrantSection({
       agents: { kind: "known", state: AGENTS },
       repositories: {
         kind: "known",
@@ -542,6 +553,8 @@ function wiring() {
       now: Date.parse("2026-11-24T12:00:00.000Z"),
       timeFormat: agentTimeFormat({ locale: "en-US", timeZone: "UTC" }),
     });
+  const form = () => {
+    const view = section();
     if (view.kind !== "form" || view.form === null) {
       throw new Error("no form");
     }
@@ -554,8 +567,9 @@ function wiring() {
         state = change(state);
       },
       actions,
+      (end) => ends.push(end),
     );
-  return { form, handlers, granted, state: () => state };
+  return { section, form, handlers, granted, ends, state: () => state };
 }
 
 test("a standard capability is granted at once, without the confirmation flag", () => {
@@ -618,4 +632,93 @@ test("cancelling the confirmation, or changing the agent, the capability, the sc
     handlers().onConfirm(form());
     expect(granted, label).toEqual([]);
   }
+});
+
+test("once the person ends the confirmation, the focus goes back to Grant after Cancel, and to the sentence after an action after a confirmation that sent", () => {
+  const asking = () => {
+    const wired = wiring();
+    wired.handlers().onCapability("terminal.execute");
+    wired.handlers().onScope(WEB);
+    wired.handlers().onGrant(HERE, wired.form());
+    expect(wired.form().confirmation).toBeDefined();
+    return wired;
+  };
+
+  const cancelled = asking();
+  cancelled.handlers().onCancel();
+  expect(cancelled.ends).toEqual(["cancelled"]);
+  expect(
+    focusAfterConfirmation(
+      "cancelled",
+      cancelled.section(),
+      IDLE_GRANT_ACTIONS,
+    ),
+  ).toBe("submit");
+
+  const sent = asking();
+  sent.handlers().onConfirm(sent.form());
+  expect(sent.granted).toHaveLength(1);
+  expect(sent.ends).toEqual(["sent"]);
+  // "Grant" is disabled while the request waits.
+  expect(
+    focusAfterConfirmation("sent", sent.section(), {
+      running: true,
+      message: undefined,
+    }),
+  ).toBe("result");
+
+  // A confirmation of another grant than the one that waits sends
+  // nothing, and leaves "Grant" to use again.
+  const other = asking();
+  const asked = other.form();
+  other.handlers().onConfirm({
+    ...asked,
+    confirmation: {
+      ...asked.confirmation!,
+      pending: { agentId: SECOND, request: SHELL_REQUEST },
+    },
+  });
+  expect(other.granted).toEqual([]);
+  expect(other.ends).toEqual(["not_sent"]);
+  expect(other.state().confirming).toBeNull();
+
+  // Once nothing waits, the handlers end nothing, so a later render
+  // does not move the focus.
+  const stale = asking();
+  const shown = stale.form();
+  stale.handlers().onExpiry("week");
+  stale.handlers().onConfirm(shown);
+  stale.handlers().onCancel();
+  expect(stale.granted).toEqual([]);
+  expect(stale.ends).toEqual([]);
+
+  // Every other change ends nothing that moves the focus.
+  const changed = asking();
+  changed.handlers().onScope(WEB);
+  expect(changed.ends).toEqual([]);
+
+  // The two places take the hook's refs, and the sentence can take the
+  // focus without being in the tab order.
+  const focus = {
+    submit: createRef<HTMLButtonElement>(),
+    result: createRef<HTMLParagraphElement>(),
+  };
+  const elements = elementsOf(
+    GrantSectionContent({
+      view: { ...VIEW, form: SHELL_FORM },
+      actions: IDLE_GRANT_ACTIONS,
+      handlers: recorder().handlers,
+      focus,
+    }),
+  );
+  const submit = elements.filter(
+    (element) => element.type === "button" && element.props.type === "submit",
+  );
+  expect(submit).toHaveLength(1);
+  expect(submit[0]!.props.ref).toBe(focus.submit);
+  const result = elements.find(
+    (element) => element.props.id === GRANT_RESULT_ID,
+  )!;
+  expect(result.props.ref).toBe(focus.result);
+  expect(result.props.tabIndex).toBe(-1);
 });

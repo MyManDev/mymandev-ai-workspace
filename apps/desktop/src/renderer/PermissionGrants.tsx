@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type Ref } from "react";
 import type {
   AgentBridge,
   GrantBridge,
@@ -17,6 +17,7 @@ import {
   describeGrantSection,
   endConfirmation,
   endHiddenConfirmation,
+  focusAfterConfirmation,
   followGrants,
   GRANT_MESSAGES,
   IDLE_GRANT_ACTIONS,
@@ -24,6 +25,7 @@ import {
   initialGrantsView,
   needsProviderConnections,
   submitGrant,
+  type ConfirmationEnd,
   type ConnectionsPanelView,
   type GrantActions,
   type GrantActionsView,
@@ -65,16 +67,28 @@ export interface GrantSectionHandlers {
 export const GRANT_RESULT_ID = "grant-result";
 
 /**
+ * Where the hook puts the focus once a confirmation has closed
+ * (`focusAfterConfirmation`): the form's "Grant" and the sentence after an
+ * action.
+ */
+export interface GrantSectionFocus {
+  readonly submit: Ref<HTMLButtonElement>;
+  readonly result: Ref<HTMLParagraphElement>;
+}
+
+/**
  * The handlers of the section for the form state `current`: every change
  * goes through `changeGrantForm`, which ends a confirmation that waits;
  * "Grant" sends only a capability without its own confirmation and asks
  * for the confirmation of one with it; only the confirmation of the grant
- * that the form shows sends it, with `confirmedHighestRisk`.
+ * that the form shows sends it, with `confirmedHighestRisk`. `onEnded`
+ * hears how the person ended a confirmation that waited, for the focus.
  */
 export function grantSectionHandlers(
   current: GrantFormState,
   update: (change: (state: GrantFormState) => GrantFormState) => void,
   actions: Pick<GrantActions, "grant" | "revoke"> | undefined,
+  onEnded: (end: ConfirmationEnd) => void = () => {},
 ): GrantSectionHandlers {
   return {
     onAgent: (agentId) =>
@@ -97,11 +111,21 @@ export function grantSectionHandlers(
     onConfirm: (shown) => {
       const confirmed = confirmedGrantOf(current, shown);
       update(endConfirmation);
-      if (confirmed !== null && actions !== undefined) {
+      const sent = confirmed !== null && actions !== undefined;
+      if (sent) {
         void actions.grant(confirmed.agentId, confirmed.request);
       }
+      // Only a confirmation that waited ends, and moves the focus.
+      if (current.confirming !== null) {
+        onEnded(sent ? "sent" : "not_sent");
+      }
     },
-    onCancel: () => update(endConfirmation),
+    onCancel: () => {
+      update(endConfirmation);
+      if (current.confirming !== null) {
+        onEnded("cancelled");
+      }
+    },
     onRevoke: (agentId, grantId) => {
       if (actions !== undefined) {
         void actions.revoke(agentId, grantId);
@@ -114,10 +138,12 @@ function GrantForm({
   form,
   running,
   handlers,
+  submitRef,
 }: {
   readonly form: GrantFormView;
   readonly running: boolean;
   readonly handlers: GrantSectionHandlers;
+  readonly submitRef: Ref<HTMLButtonElement> | undefined;
 }) {
   const scopeLabel =
     form.scopeKind === "repository"
@@ -224,6 +250,7 @@ function GrantForm({
         </p>
       )}
       <button
+        ref={submitRef}
         type="submit"
         disabled={running || !form.ready || form.confirmation !== undefined}
       >
@@ -332,10 +359,13 @@ export function GrantSectionContent({
   view,
   actions,
   handlers,
+  focus,
 }: {
   readonly view: GrantSectionView;
   readonly actions: GrantActionsView;
   readonly handlers: GrantSectionHandlers;
+  /** Where the hook puts the focus after a confirmation; none in tests. */
+  readonly focus?: GrantSectionFocus;
 }) {
   // A subsection without a name, so that it adds no landmark region.
   return (
@@ -350,6 +380,7 @@ export function GrantSectionContent({
               form={view.form}
               running={actions.running}
               handlers={handlers}
+              submitRef={focus?.submit}
             />
           )}
           {view.form?.confirmation === undefined ? null : (
@@ -365,7 +396,12 @@ export function GrantSectionContent({
               {note}
             </p>
           ))}
-          <p id={GRANT_RESULT_ID} role="status">
+          <p
+            id={GRANT_RESULT_ID}
+            ref={focus?.result}
+            role="status"
+            tabIndex={-1}
+          >
             {actions.running ? GRANT_MESSAGES.running : actions.message}
           </p>
           {view.form === null ? null : (
@@ -557,6 +593,24 @@ export function PermissionGrants({
     now: Date.now(),
     timeFormat: agentTimeFormat(),
   });
+  // Once the person ends a confirmation, the focus goes where
+  // `focusAfterConfirmation` says, rather than being lost with its buttons.
+  const ended = useRef<ConfirmationEnd | null>(null);
+  const submitRef = useRef<HTMLButtonElement>(null);
+  const resultRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    const end = ended.current;
+    if (end === null) {
+      return;
+    }
+    ended.current = null;
+    const target = focusAfterConfirmation(end, view, actionsView);
+    if (target === "submit") {
+      submitRef.current?.focus();
+    } else if (target === "result") {
+      resultRef.current?.focus();
+    }
+  });
   // A confirmation that the section no longer shows ends, so that it does
   // not come back and take the focus once the form shows its grant again.
   const hidden =
@@ -572,7 +626,10 @@ export function PermissionGrants({
     <GrantSectionContent
       view={view}
       actions={actionsView}
-      handlers={grantSectionHandlers(form, setForm, actions)}
+      handlers={grantSectionHandlers(form, setForm, actions, (end) => {
+        ended.current = end;
+      })}
+      focus={{ submit: submitRef, result: resultRef }}
     />
   );
 }

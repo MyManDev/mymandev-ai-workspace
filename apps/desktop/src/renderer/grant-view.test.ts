@@ -34,10 +34,12 @@ import {
   endHiddenConfirmation,
   EXPIRY_CHOICES,
   expiryChoices,
+  focusAfterConfirmation,
   GRANT_MESSAGES,
   GRANT_REFUSAL_MESSAGES,
   GRANT_RESULT_MESSAGES,
   grantRequestOf,
+  IDLE_GRANT_ACTIONS,
   INITIAL_CAPABILITY,
   INITIAL_GRANT_FORM,
   missingShellGitCapabilities,
@@ -637,6 +639,63 @@ test("a confirmation that the section stops showing ends, so it never comes back
     // The person's choices stay.
     expect(back.capability, label).toBe("terminal.execute");
     expect(back.scopeId, label).toBe(WEB);
+  }
+});
+
+test("after a confirmation closes, the focus goes back to Grant where it can be used, and to the sentence after an action otherwise", () => {
+  const asked = confirming(SHELL_FORM);
+  const closed = describeGrantSection(
+    input({ form: endConfirmation(asked.state) }),
+  );
+  const running = { running: true, message: undefined } as const;
+  expect(formOf(closed).ready).toBe(true);
+
+  // Cancelled, or confirmed without a request: back to "Grant".
+  expect(focusAfterConfirmation("cancelled", closed, IDLE_GRANT_ACTIONS)).toBe(
+    "submit",
+  );
+  expect(focusAfterConfirmation("not_sent", closed, IDLE_GRANT_ACTIONS)).toBe(
+    "submit",
+  );
+  // Sent: "Grant" and every list wait, so the sentence takes it, also once
+  // the answer came.
+  expect(focusAfterConfirmation("sent", closed, running)).toBe("result");
+  expect(
+    focusAfterConfirmation("sent", closed, {
+      running: false,
+      message: GRANT_RESULT_MESSAGES.granted,
+    }),
+  ).toBe("result");
+  // "Grant" cannot be used: while another action waits, without a scope,
+  // or without an agent to grant for.
+  expect(focusAfterConfirmation("cancelled", closed, running)).toBe("result");
+  const notReady = describeGrantSection(
+    input({ form: { ...SHELL_FORM, scopeId: null } }),
+  );
+  expect(formOf(notReady).ready).toBe(false);
+  expect(
+    focusAfterConfirmation("cancelled", notReady, IDLE_GRANT_ACTIONS),
+  ).toBe("result");
+  const noAgent = describeGrantSection(
+    input({ agents: { kind: "known", state: agentsState([]) } }),
+  );
+  expect(noAgent).toMatchObject({ kind: "form", form: null });
+  expect(focusAfterConfirmation("cancelled", noAgent, IDLE_GRANT_ACTIONS)).toBe(
+    "result",
+  );
+  // No place for it: a message instead of the form, or a confirmation
+  // that is still shown.
+  const message = describeGrantSection(input({ agents: { kind: "pending" } }));
+  expect(message.kind).toBe("message");
+  for (const end of ["cancelled", "sent", "not_sent"] as const) {
+    expect(focusAfterConfirmation(end, message, IDLE_GRANT_ACTIONS)).toBeNull();
+    expect(
+      focusAfterConfirmation(
+        end,
+        describeGrantSection(input({ form: asked.state })),
+        IDLE_GRANT_ACTIONS,
+      ),
+    ).toBeNull();
   }
 });
 

@@ -955,6 +955,44 @@ export function confirmedGrantOf(
   };
 }
 
+/**
+ * How the person ended a confirmation: cancelled, or confirmed, with the
+ * request sent or, for a grant that the form no longer showed, not sent.
+ */
+export type ConfirmationEnd = "cancelled" | "sent" | "not_sent";
+
+/** Where the focus goes once a confirmation has closed. */
+export type GrantFocusTarget = "submit" | "result";
+
+/**
+ * Where the focus goes once the confirmation that the person ended has
+ * closed, so that it is not lost with the confirmation's buttons, or null
+ * while there is no place for it.
+ *
+ * After "Cancel", or a confirmation that sent nothing, it goes back to the
+ * form's "Grant after confirming", where the person was. After a
+ * confirmation that sent the request, it goes to the sentence after the
+ * action: while the request waits, "Grant" and every list of the form are
+ * disabled and cannot take the focus, and the sentence is where the
+ * outcome appears. The sentence is also the place whenever "Grant" cannot
+ * be used: an action waits, or the form is not ready or has no agent.
+ */
+export function focusAfterConfirmation(
+  end: ConfirmationEnd,
+  view: GrantSectionView,
+  actions: GrantActionsView,
+): GrantFocusTarget | null {
+  if (view.kind !== "form" || view.form?.confirmation !== undefined) {
+    return null;
+  }
+  return end !== "sent" &&
+    view.form !== null &&
+    view.form.ready &&
+    !actions.running
+    ? "submit"
+    : "result";
+}
+
 /** What the actions show: whether one waits, and the last sentence. */
 export interface GrantActionsView {
   readonly running: boolean;
