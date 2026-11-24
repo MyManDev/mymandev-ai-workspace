@@ -1067,6 +1067,34 @@ test("gateLive holds only while the open project is reloaded since workspace.sub
   expect(h.service.gateLive()).toBe(false);
 });
 
+test("runsReloaded counts the reloads that read the runs and applied, and only grows", async () => {
+  const h = new Harness();
+  expect(h.service.runsReloaded()).toBe(0);
+  h.setWorkspace(WS_A, PROJECT_1);
+  await h.answerReload();
+  expect(h.service.runsReloaded()).toBe(1);
+  h.setConnection("connected");
+  h.receive(subscribed());
+  await h.answer("listRuns", ok(runList([run(1, "running")])));
+  // The runs alone apply nothing.
+  expect(h.service.runsReloaded()).toBe(1);
+  await h.answer("listAgents", ok(agentList([AGENT_1, AGENT_2])));
+  expect(h.service.runsReloaded()).toBe(2);
+
+  // A reload of the agents alone reads no run.
+  h.receive(memberRemoved());
+  h.fire(AGENT_FOLLOW_UP_DELAY_MS);
+  await h.answer("listAgents", ok(agentList([AGENT_1, AGENT_2])));
+  expect(h.service.runsReloaded()).toBe(2);
+
+  // A closed project keeps the count; the next one adds to it.
+  h.setWorkspace(WS_A, null);
+  expect(h.service.runsReloaded()).toBe(2);
+  h.setWorkspace(WS_A, PROJECT_1);
+  await h.answerReload();
+  expect(h.service.runsReloaded()).toBe(3);
+});
+
 test("a refused or ended subscription ends the gate", async () => {
   for (const ending of [
     frame({

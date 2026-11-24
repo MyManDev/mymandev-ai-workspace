@@ -139,6 +139,12 @@ export interface AgentActivityService {
    * development switch sends only while this holds.
    */
   readonly gateLive: () => boolean;
+  /**
+   * How many reloads that read the open project's runs applied since the
+   * service started, of any project; it only grows. The host run
+   * supervisor (#35) looks for interrupted runs after each one.
+   */
+  readonly runsReloaded: () => number;
   /** Stops listening and cancels the timers, for the quit. */
   readonly close: () => void;
 }
@@ -237,6 +243,8 @@ export function createAgentActivityService(
   let inFlight = false;
   /** The generation of the last reload that applied. */
   let applied: ResyncGeneration | null = null;
+  /** How many reloads that read the runs applied; see `runsReloaded`. */
+  let runReloads = 0;
   /** The generation of the last reload that an `unknown_run` began. */
   let unknownRunReload: ResyncGeneration | null = null;
 
@@ -529,6 +537,9 @@ export function createAgentActivityService(
     }
     activity = result.activity;
     applied = request.generation;
+    if (runs !== null) {
+      runReloads += 1;
+    }
     problem = null;
     attempt = 0;
     touch();
@@ -762,6 +773,7 @@ export function createAgentActivityService(
       projectId !== null &&
       activity !== null &&
       gate.state() === "live",
+    runsReloaded: () => runReloads,
     close: () => {
       if (closed) {
         return;
