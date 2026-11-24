@@ -1,3 +1,7 @@
+import {
+  CAPABILITY_RISK,
+  CAPABILITY_RISKS,
+} from "@mymandev/permissions/capabilities";
 import ts from "typescript";
 import { expect, test } from "vitest";
 
@@ -253,29 +257,30 @@ function permissionsValueImports(file: string, source: string): string[] {
 
 /**
  * Where a module other than RISK_LABEL_READER reads a risk label: a value
- * import or re-export of `CAPABILITY_RISK` or `CAPABILITY_RISKS` from
- * `@mymandev/permissions` under any specifier, also of the whole module,
- * and a string or template literal that is a label, such as `"highest"`,
- * found with the TypeScript parser, so that a comment names none.
+ * import or re-export named `CAPABILITY_RISK` or `CAPABILITY_RISKS` from any
+ * module, so that also one that passes them on, such as RISK_LABEL_READER,
+ * is no way around the rule; a value import or re-export of the whole of
+ * `@mymandev/permissions` under any of its specifiers; and a string or
+ * template literal that is a label, such as `"highest"`, found with the
+ * TypeScript parser, so that a comment names none.
  */
 function riskLabelReads(file: string, source: string): string[] {
   if (file === RISK_LABEL_READER) {
     return [];
   }
   const imports = declarationsOf(file, source)
-    .filter(
-      ({ specifier, typeOnly }) =>
-        !typeOnly &&
-        (specifier === "@mymandev/permissions" ||
-          specifier.startsWith("@mymandev/permissions/")),
-    )
-    .flatMap(({ values, text }) =>
-      values === undefined
+    .filter(({ typeOnly }) => !typeOnly)
+    .flatMap(({ specifier, values, text }) => {
+      if (values !== undefined) {
+        return values
+          .filter((name) => RISK_LABEL_VALUES.has(name))
+          .map((name) => `${file}: ${name}`);
+      }
+      return specifier === "@mymandev/permissions" ||
+        specifier.startsWith("@mymandev/permissions/")
         ? [`${file}: ${text}`]
-        : values
-            .filter((name) => RISK_LABEL_VALUES.has(name))
-            .map((name) => `${file}: ${name}`),
-    );
+        : [];
+    });
   const labels = new Set<string>(["standard", "highest"]);
   const literals: string[] = [];
   const sourceFile = parse(file, source);
@@ -514,6 +519,11 @@ test("the check finds a risk label read outside the presentation model", () => {
     "const standard = `standard`;",
     'const element = <li data-risk="highest" />;',
     'const text = "Highest risk";',
+    // Through another module, the presentation model's own included.
+    'import { CAPABILITY_RISK as Passed } from "./permission-view.ts";',
+    'export { CAPABILITY_RISKS as Labels } from "./labels.ts";',
+    'import type { CAPABILITY_RISK as Typed } from "./permission-view.ts";',
+    'import * as view from "./permission-view.ts";',
   ].join("\n");
 
   expect(riskLabelReads("./sample.tsx", sample)).toEqual([
@@ -521,6 +531,8 @@ test("the check finds a risk label read outside the presentation model", () => {
     "./sample.tsx: CAPABILITY_RISKS",
     './sample.tsx: import * as permissions from "@mymandev/permissions/capabilities";',
     "./sample.tsx: CAPABILITY_RISK",
+    "./sample.tsx: CAPABILITY_RISK",
+    "./sample.tsx: CAPABILITY_RISKS",
     './sample.tsx: "highest"',
     './sample.tsx: "standard"',
     './sample.tsx: "highest"',
@@ -628,4 +640,13 @@ test("only the presentation model reads the risk labels: no other renderer modul
   expect(
     FILES.flatMap((file) => riskLabelReads(file, SOURCES[file] ?? "")),
   ).toEqual([]);
+});
+
+test("the presentation model does not pass the risk labels on, under their names or others", async () => {
+  const model: Record<string, unknown> = await import("./permission-view.ts");
+  for (const name of RISK_LABEL_VALUES) {
+    expect(Object.keys(model)).not.toContain(name);
+  }
+  expect(Object.values(model)).not.toContain(CAPABILITY_RISK);
+  expect(Object.values(model)).not.toContain(CAPABILITY_RISKS);
 });
