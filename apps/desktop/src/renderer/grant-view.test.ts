@@ -775,7 +775,7 @@ test("the confirmation says that the shell can still commit and push only while 
   ]) {
     expect(statementsWith(grants)).toEqual([shellGitStatement(["git.push"])]);
   }
-  // Without the agent's grants, it is said without naming them.
+  // Without the agent's grants, it is said as a condition.
   for (const grants of [
     { kind: "pending" } as const,
     { kind: "unavailable" } as const,

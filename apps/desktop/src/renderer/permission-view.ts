@@ -109,8 +109,9 @@ export type ShellGitCapability = (typeof SHELL_GIT_CAPABILITIES)[number];
  * (ADR 0015, #77): that the shell can still commit and push. `missing`
  * names the ones that the agent's current grants on that repository lack,
  * or is `unknown` while the screen does not hold the agent's grants; then
- * the screen says it without naming the agent's grants. Nothing is said
- * when the agent has both. It is a statement for the person, never a check:
+ * the screen says it as a condition, since the agent may have both, and
+ * claims nothing about its grants. Nothing is said when the agent has
+ * both. It is a statement for the person, never a check:
  * nothing is inferred from `terminal.execute`.
  */
 export function shellGitStatement(
@@ -118,11 +119,11 @@ export function shellGitStatement(
 ): Statement | undefined {
   if (missing === "unknown") {
     return [
-      "A shell can commit and push even without ",
+      "If this agent does not have ",
       { capability: "git.commit" },
       " or ",
       { capability: "git.push" },
-      ".",
+      " on this repository, the shell can still commit and push.",
     ];
   }
   const [first, second] = SHELL_GIT_CAPABILITIES.filter((capability) =>

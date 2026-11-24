@@ -266,9 +266,10 @@ test("that the shell can still commit and push is said only while the agent lack
   expect(textOf(shellGitStatement(["git.push"])!)).toBe(
     "This agent does not have git.push on this repository, but the shell can still commit and push.",
   );
-  // Without the agent's grants, it is said without naming them.
+  // Without the agent's grants, it is said as a condition, and claims
+  // nothing about them.
   expect(textOf(shellGitStatement("unknown")!)).toBe(
-    "A shell can commit and push even without git.commit or git.push.",
+    "If this agent does not have git.commit or git.push on this repository, the shell can still commit and push.",
   );
 });
 
