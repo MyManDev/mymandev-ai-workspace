@@ -1181,9 +1181,7 @@ test("a run created in the open project for an agent that the activity does not 
   expect(h.openTimers()).toEqual([]);
   // The new agent's run is created before the reload of the agents that its
   // creation asked for: that reload reads the runs too.
-  h.receive(
-    agentEvent("workspace.agent.created", PROJECT_1, WS_A, NEW_AGENT),
-  );
+  h.receive(agentEvent("workspace.agent.created", PROJECT_1, WS_A, NEW_AGENT));
   h.receive(
     runEvent(5, null, "queued", { agentId: NEW_AGENT, inProject: PROJECT_1 }),
   );
