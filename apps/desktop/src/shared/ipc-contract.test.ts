@@ -11,6 +11,8 @@ import {
   API_ORIGIN_STATES,
   GRANT_CAPABILITY_REFUSALS,
   GRANT_LIMITS,
+  AGENT_GRANTS_READ_PROBLEMS,
+  AgentGrantsResultSchema,
   GrantCapabilityResultSchema,
   GrantRequestViewSchema,
   GrantsViewSchema,
@@ -315,10 +317,11 @@ const OWN_JOIN_REQUEST_ACTION_CHANNELS: ReadonlySet<string> = new Set([
 ]);
 
 /** The project repository action channels, which take IDs and a name. */
-/** The grant channels that take arguments (#342). */
+/** The grant channels that take arguments (#342, #345). */
 const GRANT_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.grantCapability,
   INVOKE_CHANNELS.revokeGrant,
+  INVOKE_CHANNELS.listAgentGrants,
 ]);
 
 const PROJECT_REPOSITORY_ACTION_CHANNELS: ReadonlySet<string> = new Set([
@@ -352,7 +355,7 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       !PROJECT_REPOSITORY_ACTION_CHANNELS.has(channel) &&
       !GRANT_ACTION_CHANNELS.has(channel),
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 42);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 43);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -3027,6 +3030,82 @@ test("a grant or revocation result is ok, refused with a fixed reason and a wait
   }
   expect(GRANT_CAPABILITY_REFUSALS).toContain("grant_limit");
   expect(REVOKE_GRANT_REFUSALS).not.toContain("grant_limit");
+});
+
+test("the grants of an agent that another device hosts cross as grant views of that agent, frozen, at most an agent's limit, without an account or a device, or as a fixed problem", () => {
+  const value = {
+    outcome: "ok",
+    agentId: AGENT_ID,
+    grants: [
+      grantView(),
+      grantView({
+        id: AGENT_ID,
+        capability: "provider.use",
+        repositoryId: null,
+        providerConnectionId: GRANT_CONNECTION_ID,
+        expiresAt: RUN_AT,
+        expired: true,
+      }),
+    ],
+  };
+  const parsed = AgentGrantsResultSchema.parse({
+    ...value,
+    hostDeviceId: AGENT_DEVICE_ID,
+    grants: value.grants.map((grant) => ({
+      ...grant,
+      grantedByUserId: MEMBER_ID,
+      hostDeviceId: AGENT_DEVICE_ID,
+    })),
+  });
+  expect(parsed).toEqual(value);
+  expect(parsed.outcome === "ok" && Object.isFrozen(parsed.grants)).toBe(true);
+  expect(JSON.stringify(parsed)).not.toContain(AGENT_DEVICE_ID);
+  expect(JSON.stringify(parsed)).not.toContain(MEMBER_ID);
+  expect(
+    AgentGrantsResultSchema.parse({
+      outcome: "ok",
+      agentId: AGENT_ID,
+      grants: [],
+    }),
+  ).toEqual({ outcome: "ok", agentId: AGENT_ID, grants: [] });
+  for (const [label, invalid] of [
+    [
+      "a grant of another agent",
+      { ...value, grants: [grantView({ agentId: GRANT_ID })] },
+    ],
+    ["no agent", { outcome: "ok", grants: [] }],
+    [
+      "a grant outside its form",
+      { ...value, grants: [grantView({ repositoryId: null })] },
+    ],
+    [
+      "more grants than an agent holds",
+      {
+        ...value,
+        grants: Array.from({ length: GRANT_LIMITS.agentGrants + 1 }, () =>
+          grantView(),
+        ),
+      },
+    ],
+  ] as const) {
+    expect(AgentGrantsResultSchema.safeParse(invalid).success, label).toBe(
+      false,
+    );
+  }
+  for (const reason of AGENT_GRANTS_READ_PROBLEMS) {
+    expect(
+      AgentGrantsResultSchema.parse({
+        outcome: "refused",
+        reason,
+        retryAfterMs: 5,
+      }),
+    ).toEqual({ outcome: "refused", reason });
+  }
+  for (const reason of ["forbidden", "teapot"]) {
+    expect(
+      AgentGrantsResultSchema.safeParse({ outcome: "refused", reason }).success,
+    ).toBe(false);
+  }
 });
 
 test("the provider connections cross with an ID, a kind, and a label only", () => {

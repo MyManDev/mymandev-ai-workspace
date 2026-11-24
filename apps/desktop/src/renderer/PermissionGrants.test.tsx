@@ -356,6 +356,7 @@ test("with the bridges, the screen subscribes once it is shown and first says th
           listProviderConnections: unused,
           grant: unused,
           revoke: unused,
+          listAgentGrants: unused,
         } as GrantBridge
       }
     />,

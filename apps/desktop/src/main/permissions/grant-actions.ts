@@ -1,6 +1,7 @@
-// Granting and revoking an agent's capabilities from this device (#342; the
-// Project Manager's decisions of 2026-11-24), in the main process: the
-// grants of the open project's agents from the grant store's records, this
+// Granting and revoking an agent's capabilities from this device (#342,
+// #345; the Project Manager's decisions of 2026-11-24), in the main process:
+// the grants of the open project's agents from the grant store's records,
+// the grants of the account's agents that another device hosts, this
 // device's provider connections, and the two writes, `POST
 // /agents/:agentId/grants` and `POST /agents/:agentId/grants/:grantId/revoke`,
 // sent with the account service's `sendWorkspaceAction`.
@@ -11,9 +12,16 @@
 //   is compared here with this device's ID and never leaves the main
 //   process: the renderer gets `ownedByMe` and `grantableHere` alone
 //   (`agentAccess`). A revocation needs `ownedByMe` only, as the API
-//   lets the owner revoke from any of its devices, but in this version the
-//   screen offers it only on the host device, the only one with a grant
-//   list (#345 tracks the owner's other devices).
+//   lets the owner revoke from any of its devices.
+// - The owner's agents that another device hosts (#345). This device holds
+//   no grant records for them, so `listAgentGrants` reads one such agent's
+//   grants with `GET /agents/:agentId/grants`, on demand, when the
+//   permission screen shows the agent and again after a revocation: only
+//   for an agent of the open project that the account owns and that is not
+//   grantable here, and never on its own. The answer carries no host device
+//   and no record fact; only grants of the agent that was asked for are
+//   passed on, as `GrantView`s, at most `GRANT_LIMITS.agentGrants`. Nothing
+//   is kept: each call reads again.
 // - What is offered. Every capability. A grant names one scope, a
 //   repository or, for `provider.use`, a provider connection of this
 //   device, and an optional lifetime, checked with the protocol's
@@ -43,6 +51,7 @@
 //
 // The logs are fixed text, never an ID, a name, or a label.
 import {
+  type AgentGrant,
   type AgentId,
   AgentIdSchema,
   type AgentListItem,
@@ -57,6 +66,8 @@ import { CAPABILITY_RISK, type GrantRecord } from "@mymandev/permissions";
 import {
   GRANT_LIMITS,
   type AccountStatus,
+  type AgentGrantsReadProblem,
+  type AgentGrantsResult,
   type GrantCapabilityRefusal,
   type GrantCapabilityResult,
   type GrantRequestView,
@@ -180,6 +191,16 @@ const READ_PROBLEMS = {
 } satisfies Record<WorkspaceReadFailure, ProviderConnectionReadProblem>;
 Object.freeze(READ_PROBLEMS);
 
+/** Each failure of a read and the problem of an agent's grants. */
+const AGENT_GRANTS_PROBLEMS = {
+  not_signed_in: "not_signed_in",
+  not_found: "not_found",
+  rate_limited: "rate_limited",
+  unavailable: "unavailable",
+  failed: "failed",
+} satisfies Record<WorkspaceReadFailure, AgentGrantsReadProblem>;
+Object.freeze(AGENT_GRANTS_PROBLEMS);
+
 const UNKNOWN = Object.freeze({ outcome: "unknown" } as const);
 
 type Refused<R extends string> = {
@@ -230,6 +251,24 @@ function grantView(record: GrantRecord, nowMs: number): GrantView {
   });
 }
 
+/**
+ * A grant of an agent that another device hosts, as the screen may know
+ * it: the same form as a record's, without an account or a device.
+ */
+function agentGrantView(grant: AgentGrant, nowMs: number): GrantView {
+  return Object.freeze({
+    id: grant.id,
+    agentId: grant.granteeAgentId,
+    capability: grant.capability,
+    repositoryId: "repositoryId" in grant ? grant.repositoryId : null,
+    providerConnectionId:
+      "providerConnectionId" in grant ? grant.providerConnectionId : null,
+    createdAt: grant.createdAt,
+    expiresAt: grant.expiresAt,
+    expired: hasExpired(grant.expiresAt, nowMs),
+  });
+}
+
 /** The grants of the open project's agents, without a revision. */
 export interface GrantsState {
   readonly projectId: string | null;
@@ -267,6 +306,11 @@ export interface GrantActionsService {
   readonly onChange: (listener: () => void) => () => void;
   /** Reads this device's provider connections. Never rejects. */
   readonly listProviderConnections: () => Promise<ProviderConnectionsResult>;
+  /**
+   * Reads the grants of an agent of the open project that the account owns
+   * and that another device hosts (#345). Never rejects.
+   */
+  readonly listAgentGrants: (agentId: string) => Promise<AgentGrantsResult>;
   /** Grants one capability on one scope to an agent. Never rejects. */
   readonly grant: (
     agentId: string,
@@ -410,6 +454,60 @@ export function createGrantActions(
     });
   }
 
+  async function listAgentGrants(
+    agentValue: string,
+  ): Promise<AgentGrantsResult> {
+    const refuse = (reason: AgentGrantsReadProblem): AgentGrantsResult =>
+      Object.freeze({ outcome: "refused", reason });
+    const agentId = AgentIdSchema.safeParse(agentValue);
+    if (!agentId.success) {
+      return refuse("invalid");
+    }
+    if (closed) {
+      return refuse("unavailable");
+    }
+    const found = openAgent(agentId.data);
+    if (found === null) {
+      return refuse("not_open");
+    }
+    if (!found.access.ownedByMe) {
+      return refuse("not_owner");
+    }
+    // The grant records of this device hold the grants of an agent that it
+    // may grant for; only another device's agents are read here.
+    if (found.access.grantableHere) {
+      return refuse("hosted_here");
+    }
+    let result;
+    try {
+      result = await account.readWorkspaceData("listAgentGrants", {
+        agentId: agentId.data,
+      });
+    } catch {
+      log("The grants of an agent could not be read.");
+      return refuse("unavailable");
+    }
+    if (!result.ok) {
+      return refuse(AGENT_GRANTS_PROBLEMS[result.reason]);
+    }
+    const { grants: listed } = result.value;
+    // Grants of another agent are not this read's answer.
+    if (listed.some((grant) => grant.granteeAgentId !== agentId.data)) {
+      log("The grants of an agent named another agent.");
+      return refuse("failed");
+    }
+    const nowMs = wallClock();
+    return Object.freeze({
+      outcome: "ok",
+      agentId: agentId.data,
+      grants: Object.freeze(
+        listed
+          .slice(0, GRANT_LIMITS.agentGrants)
+          .map((grant) => agentGrantView(grant, nowMs)),
+      ),
+    });
+  }
+
   /** The protocol's request for `request`, or null outside its format. */
   function grantRequest(
     request: GrantRequestView,
@@ -543,6 +641,7 @@ export function createGrantActions(
       };
     },
     listProviderConnections,
+    listAgentGrants,
     grant,
     revoke,
     close: () => {

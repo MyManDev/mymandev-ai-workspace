@@ -2,14 +2,18 @@
 // send to the API for #27 and #28, and the reads of invitations, join
 // requests, and claims for the screens of #95 (decision D1 of 2026-11-06,
 // and D8 of 2026-11-13), of a project's registered repositories (#286), and
-// of this device's grant records for the grant store (#55), and of this
-// device's provider connections for the permission screen (#342): a frozen
-// allowlist of thirteen `GET` routes, each with the protocol's response schema
-// and a fixed cap on the size of its answer.
+// of this device's grant records for the grant store (#55), of this
+// device's provider connections for the permission screen (#342), and of the
+// grants of one of the account's agents that another device hosts (#345): a
+// frozen allowlist of fourteen `GET` routes, each with the protocol's
+// response schema and a fixed cap on the size of its answer.
 // The account service sends them with the device session
 // (`readWorkspaceData`); no IPC channel and no bridge member reach them.
 // Chat messages are sent over the connection, never here.
 import {
+  type AgentGrantListResponse,
+  AgentGrantListResponseSchema,
+  type AgentId,
   AGENT_ROUTES,
   type AgentListResponse,
   AgentListResponseSchema,
@@ -100,7 +104,9 @@ function read<T>(
  * are about 0.57 MB; a project holds 20. For #55, 1,000 grant records with
  * every fact and time set are about 1.12 MB. For #342, 1,000 provider
  * connections with labels of 64 four-byte characters are about 0.4 MB; a
- * device holds 10.
+ * device holds 10. For #345, the 100 grants of an agent
+ * (`GRANT_COUNT_LIMITS.perAgent`), each with every field set, are about
+ * 25 KB.
  */
 export const WORKSPACE_READS = Object.freeze({
   /** `GET /workspaces`: the account's workspaces. */
@@ -211,6 +217,18 @@ export const WORKSPACE_READS = Object.freeze({
     ProviderConnectionListResponseSchema,
     1 * MIB,
   ),
+  /**
+   * `GET /agents/:agentId/grants`: the grants that are not revoked of one
+   * of the account's agents, for the permission screen of a device that
+   * does not host the agent (#345): an ID, the agent, a capability, a
+   * scope, and times each, never a host device or a record fact.
+   */
+  listAgentGrants: read(
+    GRANT_ROUTES.listAgentGrants,
+    ["agentId"],
+    AgentGrantListResponseSchema,
+    256 * KIB,
+  ),
 });
 export type WorkspaceReadName = keyof typeof WORKSPACE_READS;
 
@@ -232,6 +250,7 @@ export interface WorkspaceReadParams {
   readonly listRepositories: { readonly projectId: ProjectId };
   readonly listGrantRecords: NoParams;
   readonly listProviderConnections: NoParams;
+  readonly listAgentGrants: { readonly agentId: AgentId };
 }
 
 /**
@@ -258,6 +277,7 @@ export interface WorkspaceReadQuery {
   readonly listRepositories: never;
   readonly listGrantRecords: never;
   readonly listProviderConnections: never;
+  readonly listAgentGrants: never;
 }
 
 /** The answer of each read, as its response schema parsed it. */
@@ -275,6 +295,7 @@ export interface WorkspaceReadAnswer {
   readonly listRepositories: RepositoryListResponse;
   readonly listGrantRecords: GrantRecordListResponse;
   readonly listProviderConnections: ProviderConnectionListResponse;
+  readonly listAgentGrants: AgentGrantListResponse;
 }
 
 /**

@@ -194,6 +194,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
   expect(Object.keys(bridge.grants).sort()).toEqual([
     "getState",
     "grant",
+    "listAgentGrants",
     "listProviderConnections",
     "revoke",
     "subscribeState",
@@ -687,6 +688,7 @@ test("each grant function calls its own channel with only its values, a new requ
     call("grant")(AGENT_ID, request, "extra"),
     call("revoke")(AGENT_ID, GRANT_ID, "extra"),
     call("grant")(AGENT_ID, shell),
+    call("listAgentGrants")(AGENT_ID, "extra"),
   ];
   fake.answers.forEach((answer, index) => answer.resolve({ index }));
 
@@ -696,6 +698,7 @@ test("each grant function calls its own channel with only its values, a new requ
     { index: 2 },
     { index: 3 },
     { index: 4 },
+    { index: 5 },
   ]);
   expect(fake.invoked).toEqual([
     { channel: INVOKE_CHANNELS.getGrantState, args: [] },
@@ -724,6 +727,7 @@ test("each grant function calls its own channel with only its values, a new requ
         },
       ],
     },
+    { channel: INVOKE_CHANNELS.listAgentGrants, args: [AGENT_ID] },
   ]);
   expect(fake.invoked[2]?.args[1]).not.toBe(request);
 });
@@ -752,6 +756,9 @@ test("each grant action refuses a value of another type without calling the main
     () => call("grant")(AGENT_ID, { ...request, confirmedHighestRisk: "yes" }),
     () => call("revoke")(AGENT_ID, secret),
     () => call("revoke")(undefined, GRANT_ID),
+    () => call("listAgentGrants")(secret),
+    () => call("listAgentGrants")(),
+    () => call("listAgentGrants")(7),
   ]) {
     const error = await attempt().then(
       () => null,

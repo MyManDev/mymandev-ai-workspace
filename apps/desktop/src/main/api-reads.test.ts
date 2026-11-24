@@ -1,8 +1,11 @@
 import {
+  type AgentId,
+  AgentGrantListResponseSchema,
   AgentListResponseSchema,
   AgentRunListResponseSchema,
   ChatHistoryResponseSchema,
   ClaimListResponseSchema,
+  GRANT_COUNT_LIMITS,
   GrantRecordListResponseSchema,
   InvitationListResponseSchema,
   JoinRequestListResponseSchema,
@@ -35,6 +38,7 @@ import {
 const ORIGIN = "https://api.mymandev.example";
 const WORKSPACE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1" as WorkspaceId;
 const PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192e1" as ProjectId;
+const AGENT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f1" as AgentId;
 const KIB = 1024;
 const MIB = 1024 * KIB;
 
@@ -98,6 +102,12 @@ const READS: [WorkspaceReadName, Record<string, string>, string, number][] = [
   ],
   ["listGrantRecords", {}, "/grant-records", 2 * MIB],
   ["listProviderConnections", {}, "/provider-connections", 1 * MIB],
+  [
+    "listAgentGrants",
+    { agentId: AGENT_ID },
+    `/agents/${AGENT_ID}/grants`,
+    256 * KIB,
+  ],
 ];
 
 /** Sends the request as the session does, with an answer of exactly `size` bytes. */
@@ -127,7 +137,7 @@ async function answerOfSize(
   return answer.kind;
 }
 
-test("the allowlist holds exactly thirteen GET reads, frozen", () => {
+test("the allowlist holds exactly fourteen GET reads, frozen", () => {
   expect(Object.keys(WORKSPACE_READS)).toEqual(READS.map(([name]) => name));
   expect(Object.isFrozen(WORKSPACE_READS)).toBe(true);
   for (const entry of Object.values(WORKSPACE_READS)) {
@@ -136,6 +146,25 @@ test("the allowlist holds exactly thirteen GET reads, frozen", () => {
   }
   // The default for every other route is unchanged.
   expect(MAX_API_ANSWER_BYTES).toBe(512 * KIB);
+});
+
+test("the cap of an agent's grants holds every grant that an agent may have, with every field set", () => {
+  const grants = Array.from(
+    { length: GRANT_COUNT_LIMITS.perAgent },
+    (_, index) => ({
+      id: `0192f2a0-7c3e-7a1b-8c4d-${index.toString(16).padStart(12, "0")}`,
+      granteeAgentId: AGENT_ID,
+      capability: "terminal.execute",
+      repositoryId: PROJECT_ID,
+      createdAt: "2026-11-24T10:00:00.000Z",
+      expiresAt: "2026-12-24T10:00:00.000Z",
+    }),
+  );
+  const answer = JSON.stringify({ grants });
+  expect(AgentGrantListResponseSchema.safeParse({ grants }).success).toBe(true);
+  expect(new TextEncoder().encode(answer).length).toBeLessThan(
+    WORKSPACE_READS.listAgentGrants.maxAnswerBytes / 4,
+  );
 });
 
 test("each read fills its path, and only listMessages has a query", () => {
@@ -205,6 +234,11 @@ test("a name off the allowlist, a wrong parameter, or a query of another read is
     ["listRepositories", { projectId: PROJECT_ID }, { limit: 20 }],
     ["listGrantRecords", { workspaceId: WORKSPACE_ID }, undefined],
     ["listGrantRecords", {}, { limit: 5 }],
+    ["listAgentGrants", {}, undefined],
+    ["listAgentGrants", { projectId: PROJECT_ID }, undefined],
+    ["listAgentGrants", { agentId: 7 }, undefined],
+    ["listAgentGrants", { agentId: AGENT_ID, deviceId: AGENT_ID }, undefined],
+    ["listAgentGrants", { agentId: AGENT_ID }, { limit: 5 }],
   ];
   for (const [name, params, query] of refused) {
     expect(
@@ -241,6 +275,7 @@ test("each read's answer is checked with its response schema", () => {
     listRepositories: { repositories: [] },
     listGrantRecords: { records: [] },
     listProviderConnections: { providerConnections: [] },
+    listAgentGrants: { grants: [] },
   };
   for (const [name, params] of READS) {
     const request = workspaceReadRequest(name, params, undefined)!;
@@ -309,6 +344,7 @@ test("each read's answer schema is the protocol schema of its route", () => {
     listRepositories: RepositoryListResponseSchema,
     listGrantRecords: GrantRecordListResponseSchema,
     listProviderConnections: ProviderConnectionListResponseSchema,
+    listAgentGrants: AgentGrantListResponseSchema,
   };
   expect(Object.keys(WORKSPACE_READS).sort()).toEqual(
     Object.keys(schemas).sort(),

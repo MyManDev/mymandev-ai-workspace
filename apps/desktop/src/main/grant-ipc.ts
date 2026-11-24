@@ -42,7 +42,12 @@ function scheduleWithSetTimeout(
 export interface GrantIpcOptions {
   readonly service: Pick<
     GrantActionsService,
-    "state" | "onChange" | "listProviderConnections" | "grant" | "revoke"
+    | "state"
+    | "onChange"
+    | "listProviderConnections"
+    | "listAgentGrants"
+    | "grant"
+    | "revoke"
   >;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
@@ -56,15 +61,16 @@ export interface GrantIpc {
 }
 
 /**
- * Registers the handlers of the grant channels (#342) and sends the grants
+ * Registers the handlers of the grant channels (#342, #345) and sends the grants
  * of the open project's agents to the frames that subscribed, at most one
  * view every `GRANT_PUBLISH_INTERVAL_MS`. Every handler checks the sender
  * and the arguments first (`createInvokeHandler`): the IDs as lowercase
  * UUIDv7s, the capability as one of the contract's names, and the lifetime
  * as a positive integer or null. The results are parsed by the contract,
- * so only fixed codes, a wait, a new grant's ID, and this device's provider
- * connections (an ID, a kind, and a label each) reach the renderer. Call it
- * before the first window loads.
+ * so only fixed codes, a wait, a new grant's ID, this device's provider
+ * connections (an ID, a kind, and a label each), and the grants of an agent
+ * that another device hosts (IDs, a capability, a scope, and times each)
+ * reach the renderer. Call it before the first window loads.
  */
 export function registerGrantIpc(
   ipc: IpcRegistry,
@@ -136,6 +142,14 @@ export function registerGrantIpc(
       INVOKE_CHANNELS.grantCapability,
       appUrl,
       (_event, [agentId, request]) => service.grant(agentId, request),
+    ),
+  );
+  ipc.handle(
+    INVOKE_CHANNELS.listAgentGrants,
+    createInvokeHandler(
+      INVOKE_CHANNELS.listAgentGrants,
+      appUrl,
+      (_event, [agentId]) => service.listAgentGrants(agentId),
     ),
   );
   ipc.handle(
