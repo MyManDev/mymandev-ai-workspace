@@ -232,9 +232,10 @@ function frozenRecord(record: GrantRecord): GrantRecord {
 /**
  * The ID of the signed-in device with a ready key, or null. The login is left
  * out: a changed login of the same device keeps the records, whose account is
- * checked against the connection's `userId`.
+ * checked against the connection's `userId`. The grant action compares it
+ * with an agent's host device (#342).
  */
-function signedInDevice(status: AccountStatus): string | null {
+export function signedInDevice(status: AccountStatus): string | null {
   return status.apiOrigin === "set" &&
     status.device === "signed_in" &&
     status.deviceKey === "ready" &&

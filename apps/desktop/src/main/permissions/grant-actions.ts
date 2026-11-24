@@ -66,7 +66,7 @@ import type {
   AgentActivityState,
 } from "../agents/service.ts";
 import type { WorkspaceService } from "../workspace/service.ts";
-import type { GrantStoreService } from "./grant-store.ts";
+import { type GrantStoreService, signedInDevice } from "./grant-store.ts";
 
 /** Who reads an agent: the account's own person and this device. */
 export interface GrantViewer {
@@ -104,19 +104,6 @@ export function agentAccess(
   return Object.freeze({ ownedByMe, grantableHere });
 }
 
-/**
- * The ID of the signed-in device with a ready key, or null, as the grant
- * store and the agent service find it.
- */
-export function signedInDeviceId(status: AccountStatus): string | null {
-  return status.apiOrigin === "set" &&
-    status.device === "signed_in" &&
-    status.deviceKey === "ready" &&
-    status.account.kind === "signed_in"
-    ? status.account.deviceId
-    : null;
-}
-
 /** The viewer of the open project's agents. */
 export function grantViewer(
   status: AccountStatus,
@@ -128,7 +115,7 @@ export function grantViewer(
   return Object.freeze({
     ownMemberId:
       state.workspaceId === null ? null : ownMemberId(state.workspaceId),
-    deviceId: signedInDeviceId(status),
+    deviceId: signedInDevice(status),
   });
 }
 
