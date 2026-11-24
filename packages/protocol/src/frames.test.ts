@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decodeClientEvent, decodeEvent } from "./decode.ts";
+import {
+  decodeClientEvent,
+  decodeEvent,
+  unknownServerEventType,
+} from "./decode.ts";
 import {
   APPROVER_EVENT_TYPES,
   type ApproverEventType,
@@ -723,6 +727,131 @@ test("unknownServerFrameType names only a well-formed frame of a type that no pe
   ];
   for (const [label, input] of cases) {
     assert.equal(unknownServerFrameType(input), null, label);
+  }
+});
+
+/** A well-formed event of a type that no peer of this build knows (#339). */
+function unknownEvent(fields: Json = {}): Json {
+  return {
+    protocolVersion: 0,
+    id: OTHER_EVENT_ID,
+    type: "chat.message.edited",
+    occurredAt: NOW,
+    workspaceId: WORKSPACE_ID,
+    actor: { kind: "system" },
+    deviceId: null,
+    causationId: EVENT_ID,
+    payload: { note: "text of the server" },
+    ...fields,
+  };
+}
+
+test("unknownServerEventType names only a well-formed event of a type that no peer knows, never a known type, a device's event, a frame, or a malformed message", () => {
+  const unknown: Json[] = [
+    unknownEvent(),
+    // Only the header is checked: any payload, or none.
+    unknownEvent({ payload: { nested: { list: [1, 2] } } }),
+    unknownEvent({ payload: undefined }),
+    unknownEvent({
+      type: "workspace.thing.happened",
+      actor: { kind: "user", userId: USER_ID },
+      correlationId: EVENT_ID,
+      causationId: undefined,
+    }),
+    unknownEvent({
+      type: "x.y.z",
+      actor: { kind: "agent", agentId: AGENT_ID },
+    }),
+    // At the limit.
+    unknownEvent({ type: `a.b.${"c".repeat(LIMITS.eventType - 4)}` }),
+  ];
+  for (const input of unknown) {
+    const before = structuredClone(input);
+    assert.equal(unknownServerEventType(input), input["type"]);
+    assert.deepEqual(input, before);
+    // The decoder refuses it, as it refuses every other unknown type.
+    assert.deepEqual(decodeServerMessage(input), {
+      ok: false,
+      code: "unknown_type",
+    });
+    // A frame is never an event.
+    assert.equal(unknownServerFrameType(input), null);
+  }
+
+  const cases: [label: string, input: unknown][] = [
+    // Every known type, with a header that is well-formed and a payload that
+    // fails its schema, and the events themselves.
+    ...EVENT_TYPES.map((type): [string, unknown] => [
+      `${type} without its payload`,
+      unknownEvent({ type }),
+    ]),
+    ["chat.message.created", chatCreated()],
+    ...membershipEvents().map((event): [string, unknown] => [
+      String(event["type"]),
+      event,
+    ]),
+    ["a relayed run transition", { ...runTransition(), deviceId: null }],
+    // What only a device sends, with its device or without one.
+    ...CLIENT_ONLY_EVENT_TYPES.map((type): [string, unknown] => [
+      `${type} without a device`,
+      { ...chatSend(), type, deviceId: null },
+    ]),
+    ["chat.message.send", chatSend()],
+    // The server sends every event with a null device.
+    ["an unknown event with a device", unknownEvent({ deviceId: DEVICE_ID })],
+    [
+      "an unknown event without deviceId",
+      unknownEvent({ deviceId: undefined }),
+    ],
+    // A malformed header.
+    ["no id", unknownEvent({ id: undefined })],
+    ["an id that is no UUIDv7", unknownEvent({ id: "not-an-id" })],
+    ["an uppercase id", unknownEvent({ id: OTHER_EVENT_ID.toUpperCase() })],
+    ["no occurredAt", unknownEvent({ occurredAt: undefined })],
+    ["a local time", unknownEvent({ occurredAt: "2026-10-30T17:00:00" })],
+    ["no workspace", unknownEvent({ workspaceId: undefined })],
+    ["a workspace that is no ID", unknownEvent({ workspaceId: "x" })],
+    ["no actor", unknownEvent({ actor: undefined })],
+    ["an unknown actor", unknownEvent({ actor: { kind: "robot" } })],
+    ["a user actor without a user", unknownEvent({ actor: { kind: "user" } })],
+    ["a malformed device", unknownEvent({ deviceId: "x" })],
+    ["a malformed correlation", unknownEvent({ correlationId: 1 })],
+    ["a malformed causation", unknownEvent({ causationId: "x" })],
+    // Frames, known or unknown.
+    ["an unknown frame", { protocolVersion: 0, type: "x.y" }],
+    ["an unknown frame with a header", unknownEvent({ type: "chat.edited" })],
+    ...serverFrames().map((frame): [string, unknown] => [
+      String(frame["type"]),
+      frame,
+    ]),
+    // Another version.
+    ["another version", unknownEvent({ protocolVersion: 1 })],
+    ["a version as a string", unknownEvent({ protocolVersion: "0" })],
+    ["no version", unknownEvent({ protocolVersion: undefined })],
+    // A type that is no event type.
+    ["no type", unknownEvent({ type: undefined })],
+    ["a number as the type", unknownEvent({ type: 1 })],
+    ["a four-part type", unknownEvent({ type: "a.b.c.d" })],
+    ["an uppercase type", unknownEvent({ type: "Chat.message.edited" })],
+    ["a leading space", unknownEvent({ type: " chat.message.edited" })],
+    [
+      "a line break",
+      unknownEvent({ type: "chat.message.edited\nforged log line" }),
+    ],
+    ["a dotless i", unknownEvent({ type: "chat.message.ed\u0131ted" })],
+    ["a Cyrillic a", unknownEvent({ type: "ch\u0430t.message.edited" })],
+    ["a fullwidth dot", unknownEvent({ type: "chat\uff0emessage.edited" })],
+    ["a hidden character", unknownEvent({ type: "chat.message.\u200bedited" })],
+    [
+      "a type over the limit",
+      unknownEvent({ type: `a.b.${"c".repeat(LIMITS.eventType - 3)}` }),
+    ],
+    ["not an object", "chat.message.edited"],
+    ["null", null],
+    ["an array", [unknownEvent()]],
+  ];
+  for (const [label, input] of cases) {
+    assert.equal(unknownServerEventType(input), null, label);
   }
 });
 

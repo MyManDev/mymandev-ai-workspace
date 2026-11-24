@@ -16,9 +16,10 @@
 // when no message of any kind arrived for `CONNECTION_LIVENESS_BOUND_MS`
 // (#316); the server's `connection.heartbeat` keeps a live connection busy,
 // and the client passes it on to no one. After `auth.ok` it also drops a
-// well-formed server frame of a type that it does not know, logs its type,
-// and stays connected (#334), so that a new server frame type is additive;
-// every other message that does not decode closes the socket.
+// well-formed server frame (#334) or event (#339) of a type that it does not
+// know, logs its type, and stays connected, so that a new server frame or
+// event type is additive; every other message that does not decode closes
+// the socket.
 //
 // The renderer gets the status only: fixed codes and a time. No frame,
 // nonce, signature, key, or user ID is logged or reaches the renderer. The
@@ -33,6 +34,7 @@ import {
   decodeServerMessage,
   MAX_FRAME_BYTES,
   PROTOCOL_VERSION,
+  unknownServerEventType,
   unknownServerFrameType,
   WS_CLOSE_CODES,
   type AuthChallengeFrame,
@@ -74,6 +76,13 @@ export const RECEIVE_LIMIT_BYTES = 1024 * 1024;
  * fill the log. Every such frame is dropped, logged or not.
  */
 export const MAX_LOGGED_UNKNOWN_FRAME_TYPES = 16;
+
+/**
+ * The same for a server event of an unknown type (#339): logged the first
+ * time that its type arrives on a socket, for at most this many event types
+ * per socket. Every such event is dropped, logged or not.
+ */
+export const MAX_LOGGED_UNKNOWN_EVENT_TYPES = 16;
 
 /** A send is refused while more than this waits to go out (`bufferedAmount`). */
 export const MAX_BUFFERED_SEND_BYTES = 1024 * 1024;
@@ -230,8 +239,8 @@ export type ClientEvent = Exclude<ProtocolEvent, { type: ServerOnlyEventType }>;
 /**
  * A message of the server after `auth.ok`, decoded with `decodeServerMessage`.
  * A `connection.heartbeat` is never one: the client keeps it to itself. A
- * server frame of a type that this build does not know is never one either:
- * the client drops it (#334).
+ * server frame (#334) or event (#339) of a type that this build does not
+ * know is never one either: the client drops it.
  */
 export type ServerMessage =
   | { readonly kind: "event"; readonly event: ReceivedServerEvent }
@@ -278,8 +287,9 @@ export interface ConnectionClientOptions {
   readonly random?: () => number;
   /**
    * Receives fixed messages with a close code, or the type of an ignored
-   * server frame (`unknownServerFrameType`), at most; never a frame, a
-   * nonce, a signature, or a key. An error that it throws is ignored.
+   * server frame (`unknownServerFrameType`) or event
+   * (`unknownServerEventType`), at most; never a frame, an event, a nonce, a
+   * signature, or a key. An error that it throws is ignored.
    */
   readonly log?: (message: string) => void;
 }
@@ -372,6 +382,8 @@ interface Live {
   cancelTimer: (() => void) | null;
   /** The unknown server frame types that this socket logged (#334). */
   loggedFrameTypes: Set<string>;
+  /** The unknown server event types that this socket logged (#339). */
+  loggedEventTypes: Set<string>;
 }
 
 const scheduleWithSetTimeout: ScheduleTimer = (callback, delayMs) => {
@@ -611,6 +623,7 @@ export function createConnectionClient(
       identity: null,
       cancelTimer: null,
       loggedFrameTypes: new Set(),
+      loggedEventTypes: new Set(),
     };
     live = record;
     setStatus({ state: "connecting" });
@@ -713,23 +726,26 @@ export function createConnectionClient(
   }
 
   /**
-   * Drops a well-formed server frame of a type that this build does not
-   * know, after `auth.ok` (#334): a newer API may send it. It reaches no
-   * listener, is never answered, and has started the liveness bound again,
-   * as every message does. Its type matches `FRAME_TYPE_PATTERN` and has at
-   * most 100 characters, so the log line carries no other text from the
-   * server.
+   * Drops a well-formed server frame (#334) or event (#339) of a type that
+   * this build does not know, after `auth.ok`: a newer API may send it. It
+   * reaches no listener, is never answered, and has started the liveness
+   * bound again, as every message does. Its type matches
+   * `FRAME_TYPE_PATTERN` or `EVENT_TYPE_PATTERN` and has at most 100
+   * characters, so the log line carries no other text from the server. Each
+   * type is logged once per socket, for at most `limit` types.
    */
-  function ignoreUnknownFrame(record: Live, type: string): void {
-    if (
-      record.loggedFrameTypes.has(type) ||
-      record.loggedFrameTypes.size >= MAX_LOGGED_UNKNOWN_FRAME_TYPES
-    ) {
+  function ignoreUnknown(
+    logged: Set<string>,
+    limit: number,
+    kind: "a frame" | "an event",
+    type: string,
+  ): void {
+    if (logged.has(type) || logged.size >= limit) {
       return;
     }
-    record.loggedFrameTypes.add(type);
+    logged.add(type);
     log(
-      `The connection to the API ignored a frame of the unknown type ${type}.`,
+      `The connection to the API ignored ${kind} of the unknown type ${type}.`,
     );
   }
 
@@ -738,9 +754,9 @@ export function createConnectionClient(
       return;
     }
     if (record.phase === "open") {
-      // Any message shows that the connection is live, also a frame of an
-      // unknown type that the client drops below; one that the client
-      // refuses closes it below.
+      // Any message shows that the connection is live, also a frame or an
+      // event of an unknown type that the client drops below; one that the
+      // client refuses closes it below.
       watchLiveness(record);
     }
     // Only text frames; a binary message is anything but a string.
@@ -777,11 +793,28 @@ export function createConnectionClient(
         return;
       }
       if (decoded.code === "unknown_type" && record.phase === "open") {
-        // Null for everything else refused as `unknown_type`: an event or a
-        // frame that only a device sends, and an event of an unknown type.
-        const type = unknownServerFrameType(input);
-        if (type !== null) {
-          ignoreUnknownFrame(record, type);
+        // Both are null for everything else refused as `unknown_type`: an
+        // event or a frame that only a device sends, and an unknown event
+        // with a device. A malformed header is `malformed` and never gets
+        // here.
+        const frameType = unknownServerFrameType(input);
+        if (frameType !== null) {
+          ignoreUnknown(
+            record.loggedFrameTypes,
+            MAX_LOGGED_UNKNOWN_FRAME_TYPES,
+            "a frame",
+            frameType,
+          );
+          return;
+        }
+        const eventType = unknownServerEventType(input);
+        if (eventType !== null) {
+          ignoreUnknown(
+            record.loggedEventTypes,
+            MAX_LOGGED_UNKNOWN_EVENT_TYPES,
+            "an event",
+            eventType,
+          );
           return;
         }
       }

@@ -26,6 +26,7 @@ import {
   gatewayUrl,
   HANDSHAKE_TIMEOUT_MS,
   MAX_BUFFERED_SEND_BYTES,
+  MAX_LOGGED_UNKNOWN_EVENT_TYPES,
   MAX_LOGGED_UNKNOWN_FRAME_TYPES,
   RECEIVE_LIMIT_BYTES,
   RECONNECT_BUDGET,
@@ -103,6 +104,40 @@ const UNKNOWN_FRAME = Object.freeze({
 function ignoredLine(type: string): string {
   return `The connection to the API ignored a frame of the unknown type ${type}.`;
 }
+
+/** A well-formed event of a type that no peer of this build knows (#339). */
+const UNKNOWN_EVENT = Object.freeze({
+  protocolVersion: 0,
+  id: EVENT_ID,
+  type: "chat.message.edited",
+  occurredAt: "2026-11-03T10:00:00.000Z",
+  workspaceId: WORKSPACE_ID,
+  actor: Object.freeze({ kind: "system" }),
+  deviceId: null,
+  payload: Object.freeze({ note: "text of the server that no log may hold" }),
+});
+
+/** The log line of an ignored event of `type`. */
+function ignoredEventLine(type: string): string {
+  return `The connection to the API ignored an event of the unknown type ${type}.`;
+}
+
+/** A known server event: the server created a run. */
+const RUN_CREATED = Object.freeze({
+  protocolVersion: 0,
+  id: EVENT_ID,
+  type: "agent.run.state_changed",
+  occurredAt: "2026-11-03T10:00:00.000Z",
+  workspaceId: WORKSPACE_ID,
+  actor: Object.freeze({ kind: "system" }),
+  deviceId: null,
+  payload: Object.freeze({
+    runId: RUN_ID,
+    agentId: AGENT_ID,
+    previousState: null,
+    state: "queued",
+  }),
+});
 
 /** A chat message that a person sends from this device. */
 function chatSend(body = "Hello"): ClientEvent {
@@ -1514,14 +1549,89 @@ test("a binary message, invalid JSON, a message the protocol refuses, or one ove
       }),
     ],
     ["a device's chat message", JSON.stringify(chatSend())],
-    // An event of an unknown type is no frame.
     [
-      "an unknown event",
+      "a device's chat message without a device",
+      JSON.stringify({ ...chatSend(), deviceId: null }),
+    ],
+    // A known event type that fails its schema is not an unknown event
+    // (#339).
+    [
+      "a known event type with another payload",
+      JSON.stringify({ ...UNKNOWN_EVENT, type: "chat.message.created" }),
+    ],
+    [
+      "a known event with an invalid field",
       JSON.stringify({
-        ...chatSend(),
-        type: "chat.message.edited",
-        deviceId: null,
+        ...RUN_CREATED,
+        payload: { ...RUN_CREATED.payload, state: "paused" },
       }),
+    ],
+    [
+      "a known event with a device",
+      JSON.stringify({ ...RUN_CREATED, deviceId: DEVICE_ID }),
+    ],
+    // An unknown event is ignored only with a well-formed header and no
+    // device.
+    [
+      "an unknown event with a device",
+      JSON.stringify({ ...UNKNOWN_EVENT, deviceId: DEVICE_ID }),
+    ],
+    [
+      "an unknown event of another version",
+      JSON.stringify({ ...UNKNOWN_EVENT, protocolVersion: 1 }),
+    ],
+    [
+      "an unknown event without an id",
+      JSON.stringify({ ...UNKNOWN_EVENT, id: undefined }),
+    ],
+    [
+      "an unknown event with a malformed id",
+      JSON.stringify({ ...UNKNOWN_EVENT, id: EVENT_ID.toUpperCase() }),
+    ],
+    [
+      "an unknown event with a local time",
+      JSON.stringify({ ...UNKNOWN_EVENT, occurredAt: "2026-11-03T10:00:00" }),
+    ],
+    [
+      "an unknown event without a workspace",
+      JSON.stringify({ ...UNKNOWN_EVENT, workspaceId: undefined }),
+    ],
+    [
+      "an unknown event of an unknown actor",
+      JSON.stringify({ ...UNKNOWN_EVENT, actor: { kind: "robot" } }),
+    ],
+    [
+      "an unknown event of a user actor without a user",
+      JSON.stringify({ ...UNKNOWN_EVENT, actor: { kind: "user" } }),
+    ],
+    [
+      "an unknown event without deviceId",
+      JSON.stringify({ ...UNKNOWN_EVENT, deviceId: undefined }),
+    ],
+    [
+      "an unknown event with a malformed causation",
+      JSON.stringify({ ...UNKNOWN_EVENT, causationId: "x" }),
+    ],
+    // A type that is not an event type is malformed, not unknown.
+    [
+      "an uppercase event type",
+      JSON.stringify({ ...UNKNOWN_EVENT, type: "Chat.message.edited" }),
+    ],
+    [
+      "an event type with a line break",
+      JSON.stringify({ ...UNKNOWN_EVENT, type: "chat.message.edited\nforged" }),
+    ],
+    [
+      "an event type with a lookalike letter",
+      JSON.stringify({ ...UNKNOWN_EVENT, type: "ch\u0430t.message.edited" }),
+    ],
+    [
+      "a four-part type",
+      JSON.stringify({ ...UNKNOWN_EVENT, type: "chat.message.edited.again" }),
+    ],
+    [
+      "an event type over the limit",
+      JSON.stringify({ ...UNKNOWN_EVENT, type: `a.b.${"c".repeat(97)}` }),
     ],
     ["over the limit", big],
     ["over the limit in bytes", wide],
@@ -1588,24 +1698,71 @@ test("after auth.ok a well-formed frame of an unknown type is dropped, its type 
   expect(socket.closes).toEqual([]);
 });
 
-test("an ignored frame of an unknown type starts the liveness bound again, as any message", async () => {
+test("after auth.ok a well-formed event of an unknown type is dropped, its type logged, and the connection stays open", async () => {
   const h = harness();
+  const received: ServerMessage[] = [];
+  h.client.onMessage((message) => received.push(message));
   await h.authenticate();
   const socket = h.last();
-  for (let index = 0; index < 3; index += 1) {
-    h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
-    socket.receiveJson(UNKNOWN_FRAME);
-    expect(socket.closes).toEqual([]);
-  }
-  h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
+  const sent = socket.sent.length;
+
+  socket.receiveJson(UNKNOWN_EVENT);
+  // Only the header counts: another payload, or none, and another actor.
+  socket.receiveJson({ ...UNKNOWN_EVENT, payload: { nested: [1, 2] } });
+  socket.receiveJson({
+    ...UNKNOWN_EVENT,
+    type: "workspace.thing.happened",
+    actor: { kind: "user", userId: USER_ID },
+    payload: undefined,
+  });
+  socket.receiveJson({ ...UNKNOWN_EVENT, type: "x.y.z" });
   expect(socket.closes).toEqual([]);
   expect(h.client.status().state).toBe("connected");
-  h.advance(1);
-  expect(socket.closes).toEqual([1000]);
-  expect(h.client.status()).toMatchObject({
-    state: "waiting",
-    reason: "connection_lost",
-  });
+  expect(h.client.identity()).not.toBeNull();
+  expect(received).toEqual([]);
+  // Nothing answers it.
+  expect(socket.sent).toHaveLength(sent);
+  // Each type is logged once per socket, and nothing of the event but its
+  // type.
+  const ignored = h.logs.filter((line) => line.includes("unknown type"));
+  expect(ignored).toEqual([
+    ignoredEventLine(UNKNOWN_EVENT.type),
+    ignoredEventLine("workspace.thing.happened"),
+    ignoredEventLine("x.y.z"),
+  ]);
+  const logs = JSON.stringify(h.logs);
+  expect(logs).not.toContain(UNKNOWN_EVENT.payload.note);
+  expect(logs).not.toContain(EVENT_ID);
+  expect(logs).not.toContain(WORKSPACE_ID);
+  expect(logs).not.toContain(USER_ID);
+
+  // Later messages are delivered as before.
+  socket.receiveJson(RUN_CREATED);
+  expect(received).toEqual([{ kind: "event", event: RUN_CREATED }]);
+  expect(socket.closes).toEqual([]);
+});
+
+test("an ignored frame or event of an unknown type starts the liveness bound again, as any message", async () => {
+  for (const message of [UNKNOWN_FRAME, UNKNOWN_EVENT]) {
+    const name = message.type;
+    const h = harness();
+    await h.authenticate();
+    const socket = h.last();
+    for (let index = 0; index < 3; index += 1) {
+      h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
+      socket.receiveJson(message);
+      expect(socket.closes, name).toEqual([]);
+    }
+    h.advance(CONNECTION_LIVENESS_BOUND_MS - 1);
+    expect(socket.closes, name).toEqual([]);
+    expect(h.client.status().state, name).toBe("connected");
+    h.advance(1);
+    expect(socket.closes, name).toEqual([1000]);
+    expect(h.client.status(), name).toMatchObject({
+      state: "waiting",
+      reason: "connection_lost",
+    });
+  }
 });
 
 test("unknown frame types are logged for at most a bounded number of types per socket, and again on the next socket", async () => {
@@ -1635,6 +1792,39 @@ test("unknown frame types are logged for at most a bounded number of types per s
   h.last().receiveJson({ protocolVersion: 0, type: types.at(-1) });
   expect(ignored().at(-1)).toBe(ignoredLine(types.at(-1) ?? ""));
   expect(ignored()).toHaveLength(MAX_LOGGED_UNKNOWN_FRAME_TYPES + 1);
+});
+
+test("unknown event types are logged for at most a bounded number of types per socket, apart from frame types, and again on the next socket", async () => {
+  expect(MAX_LOGGED_UNKNOWN_EVENT_TYPES).toBe(16);
+  const h = harness();
+  await h.authenticate();
+  const types = Array.from(
+    { length: MAX_LOGGED_UNKNOWN_EVENT_TYPES + 4 },
+    (_, index) => `future.thing.happened_${String(index)}`,
+  );
+  for (const type of types) {
+    h.last().receiveJson({ ...UNKNOWN_EVENT, type });
+    h.last().receiveJson({ ...UNKNOWN_EVENT, type });
+  }
+  expect(h.last().closes).toEqual([]);
+  const ignored = (): string[] =>
+    h.logs.filter((line) => line.includes("unknown type"));
+  expect(ignored()).toEqual(
+    types.slice(0, MAX_LOGGED_UNKNOWN_EVENT_TYPES).map(ignoredEventLine),
+  );
+  // Frame types have their own limit.
+  h.last().receiveJson(UNKNOWN_FRAME);
+  expect(ignored().at(-1)).toBe(ignoredLine(UNKNOWN_FRAME.type));
+  expect(ignored()).toHaveLength(MAX_LOGGED_UNKNOWN_EVENT_TYPES + 1);
+
+  // A new socket logs its own.
+  h.last().closed(1006);
+  h.advance(waitOf(h));
+  expect(h.sockets).toHaveLength(2);
+  await h.authenticate();
+  h.last().receiveJson({ ...UNKNOWN_EVENT, type: types.at(-1) });
+  expect(ignored().at(-1)).toBe(ignoredEventLine(types.at(-1) ?? ""));
+  expect(ignored()).toHaveLength(MAX_LOGGED_UNKNOWN_EVENT_TYPES + 2);
 });
 
 test("before auth.ok only the challenge and then auth.ok of the signed device are accepted", async () => {
@@ -1702,6 +1892,28 @@ test("before auth.ok only the challenge and then auth.ok of the signed device ar
         socket.receiveJson(CHALLENGE);
         await flush();
         socket.receiveJson(UNKNOWN_FRAME);
+      },
+    ],
+    // So is an event of an unknown type (#339).
+    [
+      "an unknown event before the challenge",
+      async (socket) => {
+        socket.receiveJson(UNKNOWN_EVENT);
+      },
+    ],
+    [
+      "an unknown event while signing",
+      async (socket) => {
+        socket.receiveJson(CHALLENGE);
+        socket.receiveJson(UNKNOWN_EVENT);
+      },
+    ],
+    [
+      "an unknown event instead of auth.ok",
+      async (socket) => {
+        socket.receiveJson(CHALLENGE);
+        await flush();
+        socket.receiveJson(UNKNOWN_EVENT);
       },
     ],
   ];

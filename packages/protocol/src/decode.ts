@@ -72,6 +72,39 @@ export function decodeEvent(input: unknown): DecodeResult {
   return { ok: true, event: event.data };
 }
 
+/**
+ * The `type` of a message from the server that is a well-formed event of a
+ * type that this build does not know (#339; ADR 0006: clients drop and log
+ * an unknown event type). Well-formed means the header that `decodeEvent`
+ * checks before it looks at the type: `protocolVersion` is
+ * `PROTOCOL_VERSION`; `type` has at most `LIMITS.eventType` characters and
+ * matches `EVENT_TYPE_PATTERN`; and `id`, `occurredAt`, `workspaceId`,
+ * `actor`, `deviceId`, `correlationId`, and `causationId` fit the envelope.
+ * `deviceId` is also null, because the server sends every event with a null
+ * device (`decodeServerMessage`). The type is none of `EVENT_TYPES`, so it is
+ * neither an event type that the server sends nor one that only a device
+ * sends (`CLIENT_ONLY_EVENT_TYPES`). `decodeServerMessage` refuses every such
+ * message as `unknown_type`; after `auth.ok` a device drops it and keeps the
+ * connection open, so that a new server event type is additive. Null for
+ * every other message: a frame, also of an unknown type; an event of a known
+ * type, also one that fails its schema; an event that only a device sends;
+ * an event with a device; another protocol version; and a malformed message
+ * or header. The payload and the other fields beside the header are never
+ * read. The type returned is lowercase ASCII letters, digits, underscores,
+ * and two dots, so it may be logged.
+ */
+export function unknownServerEventType(input: unknown): string | null {
+  const header = EnvelopeHeaderSchema.safeParse(input);
+  if (
+    !header.success ||
+    knownTypes.has(header.data.type) ||
+    header.data.deviceId !== null
+  ) {
+    return null;
+  }
+  return header.data.type;
+}
+
 declare const unverified: unique symbol;
 
 /**
