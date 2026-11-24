@@ -15,6 +15,7 @@ import type {
   ClaimsBridge,
   ConnectionBridge,
   DeviceListBridge,
+  GrantBridge,
   InvitationActionsBridge,
   InvitationsBridge,
   JoinRequestActionsBridge,
@@ -148,6 +149,8 @@ export interface AppProps {
   readonly ownJoinRequestActions?: OwnJoinRequestActionsBridge | undefined;
   /** The open project's agent activity from the preload script; undefined outside Electron. */
   readonly agents?: AgentBridge | undefined;
+  /** The grants of the open project's agents from the preload script; undefined outside Electron. */
+  readonly grants?: GrantBridge | undefined;
   /** The open project's chat from the preload script; undefined outside Electron. */
   readonly chat?: ChatBridge | undefined;
   /** The account's devices from the preload script; undefined outside Electron. */
@@ -191,6 +194,7 @@ export function App({
   ownJoinRequests,
   ownJoinRequestActions,
   agents,
+  grants,
   chat,
   devices,
   initialWorkspaceState,
@@ -310,6 +314,9 @@ export function App({
           accountView={accountView}
           chat={chat}
           devices={devices}
+          agents={agents}
+          projectRepositories={projectRepositories}
+          grants={grants}
           homeSignIn={homeCase}
           homeStart={homeStart.view}
           onStartSignIn={homeStart.onStart}
@@ -360,6 +367,9 @@ function ScreenContent({
   accountView,
   chat,
   devices,
+  agents,
+  projectRepositories,
+  grants,
   homeSignIn,
   homeStart,
   onStartSignIn,
@@ -389,6 +399,10 @@ function ScreenContent({
   readonly accountView: AccountView;
   readonly chat: ChatBridge | undefined;
   readonly devices: DeviceListBridge | undefined;
+  /** For the permission screen (#342). */
+  readonly agents: AgentBridge | undefined;
+  readonly projectRepositories: ProjectRepositoriesBridge | undefined;
+  readonly grants: GrantBridge | undefined;
   /** What the home screen says about the sign-in. */
   readonly homeSignIn: HomeSignIn;
   /** The sign-in that the home screen started. */
@@ -454,7 +468,16 @@ function ScreenContent({
     case "decisions":
       return <DecisionsScreen />;
     case "permissions":
-      return <PermissionsScreen />;
+      // Each project gets its own screen, so no choice of the form or
+      // sentence of an answer moves to another one.
+      return (
+        <PermissionsScreen
+          key={view.projectId}
+          agents={agents}
+          projectRepositories={projectRepositories}
+          grants={grants}
+        />
+      );
   }
 }
 

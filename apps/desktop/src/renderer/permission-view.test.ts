@@ -10,7 +10,6 @@ import {
   CAPABILITY_MEANINGS,
   describeCapability,
   describePermissionScreen,
-  GRANTING_UNAVAILABLE,
   HIGHEST_RISK_CONFIRMATIONS,
   RISK_LABELS,
   SCOPE_TEXTS,
@@ -76,7 +75,6 @@ test("every capability, risk label, and scope kind has its text, and every text 
     ...Object.values(HIGHEST_RISK_CONFIRMATIONS),
     ...SCREEN_STATEMENTS.map(textOf),
     ...SHELL_STATEMENTS.map(textOf),
-    GRANTING_UNAVAILABLE,
   ]) {
     expect(text).toMatch(/^[A-Z].*[.?]$/s);
   }
@@ -248,10 +246,11 @@ test("the screen says that repo.read with provider.use sends the repository's co
   ]);
 });
 
-test("the screen says that granting is not available yet", () => {
-  expect(describePermissionScreen().unavailable).toBe(
-    "Granting permissions is not available yet. This screen shows what each permission allows and its risk.",
-  );
+test("the reference part says nothing about granting, which the grant section does (#342)", () => {
+  expect(Object.keys(describePermissionScreen()).sort()).toEqual([
+    "groups",
+    "statements",
+  ]);
 });
 
 test("each capability says what it allows", () => {

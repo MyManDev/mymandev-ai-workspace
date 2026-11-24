@@ -29,6 +29,7 @@ createRoot(container).render(
       ownJoinRequests={window.desktop?.ownJoinRequests}
       ownJoinRequestActions={window.desktop?.ownJoinRequestActions}
       agents={window.desktop?.agents}
+      grants={window.desktop?.grants}
       chat={window.desktop?.chat}
       devices={window.desktop?.devices}
     />

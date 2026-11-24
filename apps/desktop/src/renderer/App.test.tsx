@@ -199,7 +199,7 @@ const SCREEN_CASES: readonly ScreenCase[] = [
   {
     view: { screen: "permissions", projectId: "project-b", panel: "agents" },
     title: '<h2 id="permissions-title">Permissions</h2>',
-    placeholder: "Granting permissions is not available yet.",
+    placeholder: "Granting permissions is not available here.",
     current: ["Workspace B (true)", "Project B (true)", "Permissions (page)"],
   },
 ];
@@ -1112,7 +1112,7 @@ test("the repository panel gets the project's repositories: with the bridge, it 
   );
 });
 
-test("the permission screen shows every capability of ADR 0015 read-only, grouped by scope kind", () => {
+test("the permission screen shows every capability of ADR 0015, grouped by scope kind", () => {
   const html = render({
     initialView: {
       screen: "permissions",
@@ -1149,8 +1149,9 @@ test("the permission screen shows every capability of ADR 0015 read-only, groupe
       ),
     ).toHaveLength(1);
   }
+  // Without the bridges, the grant section says that it is not available.
   expect(html).toContain(
-    '<p class="placeholder-note">Granting permissions is not available yet. This screen shows what each permission allows and its risk.</p>',
+    '<p class="placeholder-note">Granting permissions is not available here.</p>',
   );
   // One labelled region for the screen; the subsections add none.
   expect(html.match(/<section class="permission-section">/g)).toHaveLength(2);
@@ -1158,6 +1159,10 @@ test("the permission screen shows every capability of ADR 0015 read-only, groupe
     "<section aria-label",
   ]);
   expect(html).toContain('<section aria-labelledby="permissions-title">');
+  // The entry point passes the preload script's grants to the screen (#342).
+  expect(ENTRY_SOURCES["./main.tsx"]).toContain(
+    "grants={window.desktop?.grants}",
+  );
 });
 
 test("workspace and project names are rendered as text, not as markup", () => {

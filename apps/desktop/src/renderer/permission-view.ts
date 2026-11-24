@@ -79,8 +79,8 @@ export const CAPABILITY_MEANINGS: Readonly<
  * What a shell can do (ADR 0015, P-70, and #77). The repository scope of
  * `terminal.execute` is where the shell starts, not a sandbox. The end of the
  * last statement is the one that #77 requires while `terminal.execute` is
- * granted while `git.commit` or `git.push` is not; this read-only screen shows
- * it always.
+ * granted while `git.commit` or `git.push` is not; the screen's reference
+ * part shows it always.
  */
 export const SHELL_STATEMENTS: readonly Statement[] = Object.freeze([
   [
@@ -103,18 +103,18 @@ export const SHELL_STATEMENTS: readonly Statement[] = Object.freeze([
   ],
 ]);
 
-// OPEN QUESTION for the Project Manager (#77, ADR 0015 P-71): the default
-// expiry that the grant of `terminal.execute` proposes is not decided.
-// Neither this text nor the model holds one yet. Its bound is decided: since
-// the decision of 2026-11-14 (#75), a grant of `terminal.execute` requires an
-// expiry of at most 30 days (`SHELL_GRANT_MAX_LIFETIME_SECONDS` of
-// `@mymandev/protocol`), so the person can change the proposed expiry within
-// that bound but not remove it.
+// The default expiry that the grant of `terminal.execute` proposes is
+// decided (#77, Project Manager decision of 2026-11-24): 24 hours, which the
+// person can change within `GRANT_LIFETIME_SECONDS.min` and
+// `SHELL_GRANT_MAX_LIFETIME_SECONDS` (30 days) of `@mymandev/protocol` but
+// not remove. #77 applies it with the other presentation rules; until then
+// the grant form of #342 (`grant-view.ts`) does not offer the shell.
 
 /**
  * The confirmation that a highest-risk capability needs before it is granted
  * on its own. The type requires one for every capability that
- * `CAPABILITY_RISK` labels `highest`. Granting comes later (#77, after #75).
+ * `CAPABILITY_RISK` labels `highest`. #77 adds it to the grant form; until
+ * then the form offers no highest-risk capability (#342).
  */
 export const HIGHEST_RISK_CONFIRMATIONS: Readonly<
   Record<HighestRiskCapability, string>
@@ -154,10 +154,6 @@ export const SCREEN_STATEMENTS: readonly Statement[] = Object.freeze([
     " on an AI provider connection, the agent can send that repository's content to that connection's provider.",
   ],
 ]);
-
-/** The sentence that says that this screen does not grant yet. */
-export const GRANTING_UNAVAILABLE =
-  "Granting permissions is not available yet. This screen shows what each permission allows and its risk.";
 
 /** One capability as the screen shows it. */
 export interface CapabilityView {
@@ -200,7 +196,6 @@ export interface ScopeGroupView {
 export interface PermissionScreenView {
   readonly statements: readonly Statement[];
   readonly groups: readonly ScopeGroupView[];
-  readonly unavailable: string;
 }
 
 /** The capability names, in the order of the contract. */
@@ -258,6 +253,5 @@ export function describePermissionScreen(): PermissionScreenView {
         ],
       };
     }),
-    unavailable: GRANTING_UNAVAILABLE,
   };
 }
