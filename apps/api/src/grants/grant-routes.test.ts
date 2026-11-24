@@ -1033,6 +1033,15 @@ test("the agent's owner reads the agent's grants from its host device and from a
     ),
     expected.map((grant) => grant.id).filter((id) => id !== shell.id),
   );
+  // A disabled agent's grants that are not revoked, which only data written
+  // outside the API leaves, are still listed for its owner.
+  await database()
+    .update(agents)
+    .set({ disabledAt: new Date() })
+    .where(eq(agents.id, agent.id));
+  const disabled = await get(laptop, `/agents/${agent.id}/grants`);
+  assert.equal(disabled.statusCode, 200, disabled.body);
+  assert.deepEqual(disabled.json(), after.json());
 });
 
 test("only the agent's owner reads the agent's grants: another member, the workspace's owner, and an admin get 403, and a non-member, a removed member, a removed owner, and an unknown agent get the same 404; an owner added again reads them again", async (t) => {

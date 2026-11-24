@@ -2057,6 +2057,23 @@ test("an owner who was removed and added again reads the agent's grants again", 
   );
 });
 
+test("the owner reads the grants of a disabled agent that are not revoked", async () => {
+  const { owner, repositoryId, agentId } = await world();
+  const grantId = await granted(agentId, owner, readRepository(repositoryId));
+  // Disabling revokes the agent's grants; only data written outside the
+  // functions leaves one, and the owner can still read and revoke it.
+  await database()
+    .update(agents)
+    .set({ disabledAt: LATER })
+    .where(eq(agents.id, agentId));
+  const result = await agentGrantsOf(agentId, owner);
+  assert.ok(result.listed, JSON.stringify(result));
+  assert.deepEqual(
+    result.grants.map((grant) => grant.id),
+    [grantId],
+  );
+});
+
 test(`the owner reads all ${PER_AGENT} grants of an agent at its count limit, and a list over it throws instead of being cut`, async () => {
   const { owner, projectId, agentId } = await world();
   const ids = await fill(projectId, agentId, owner, PER_AGENT);
