@@ -28,6 +28,7 @@ import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
 import { DatabaseError, withDatabaseErrors } from "./errors.ts";
 import {
+  agentGrantRows,
   grantCapability,
   type GrantCapabilityResult,
   listAgentGrants,
@@ -1972,6 +1973,55 @@ test("only the agent's owner reads its grants, from any of its devices: another 
     listed: false,
     refusal: "not_found",
   });
+});
+
+test("the statement joins no grant for an account that fails either check in its SQL: a member who is not the owner, and an owner without an active person", async () => {
+  const {
+    owner: workspaceOwner,
+    workspaceId,
+    projectId,
+    repositoryId,
+  } = await world();
+  const agentOwner = await account("Agent owner");
+  const ownerPerson = await join(workspaceId, agentOwner);
+  const agentId = await agentOf(projectId, agentOwner);
+  const grantId = await granted(
+    agentId,
+    agentOwner,
+    readRepository(repositoryId),
+  );
+  const member = await account("Member");
+  await join(workspaceId, member);
+  const rowsOf = (who: Account) =>
+    agentGrantRows(database(), { agentId, userId: who.userId });
+
+  // The owner with an active person: both checks hold, and the grant is
+  // joined.
+  assert.deepEqual(
+    (await rowsOf(agentOwner)).map((row) => [
+      row.member,
+      row.owns,
+      row.grant?.id,
+    ]),
+    [[true, true, grantId]],
+  );
+  // The ownership check of the join, apart from the refusal in JavaScript:
+  // a member who is not the owner, and the workspace's owner, get the
+  // agent's row without a grant.
+  for (const who of [member, workspaceOwner]) {
+    assert.deepEqual(await rowsOf(who), [
+      { member: true, owns: false, grant: null },
+    ]);
+  }
+  // The membership check of the join: the owner whose person is removed
+  // gets the agent's row without a grant.
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: LATER, removedByUserId: workspaceOwner.userId })
+    .where(eq(workspaceMembers.id, ownerPerson));
+  assert.deepEqual(await rowsOf(agentOwner), [
+    { member: false, owns: true, grant: null },
+  ]);
 });
 
 test(`the owner reads all ${PER_AGENT} grants of an agent at its count limit, and a list over it throws instead of being cut`, async () => {

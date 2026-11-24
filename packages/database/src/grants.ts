@@ -766,55 +766,7 @@ export async function listAgentGrants(
   db: Database,
   input: ListAgentGrantsInput,
 ): Promise<ListAgentGrantsResult> {
-  const rows = await withDatabaseErrors(() => {
-    const activePerson = db
-      .select({ id: reader.id })
-      .from(reader)
-      .where(
-        and(
-          eq(reader.workspaceId, projects.workspaceId),
-          eq(reader.userId, input.userId),
-          isNull(reader.removedAt),
-        ),
-      );
-    const member = sql<boolean>`${exists(activePerson)}`;
-    const owns = sql<boolean>`${agents.ownerUserId} = ${input.userId}`;
-    return db
-      .select({
-        member,
-        owns,
-        grant: {
-          id: permissionGrants.id,
-          granteeAgentId: permissionGrants.granteeAgentId,
-          capability: permissionGrants.capability,
-          repositoryId: permissionGrants.repositoryId,
-          providerConnectionId: permissionGrants.providerConnectionId,
-          createdAt: permissionGrants.createdAt,
-          expiresAt: permissionGrants.expiresAt,
-        },
-      })
-      .from(agents)
-      .innerJoin(projects, eq(projects.id, agents.projectId))
-      .leftJoin(
-        permissionGrants,
-        and(
-          eq(permissionGrants.granteeAgentId, agents.id),
-          // Always true, by `permission_grants_agent_host_device_fk`, but it
-          // lets PostgreSQL find the grants through
-          // `permission_grants_active_host_device_id_idx`, which holds at
-          // most the host device's count limit, as `listGrantRecords` does.
-          // Without it, no index serves the agent, and the join reads every
-          // grant that is not revoked in the database.
-          eq(permissionGrants.hostDeviceId, agents.hostDeviceId),
-          isNull(permissionGrants.revokedAt),
-          member,
-          owns,
-        ),
-      )
-      .where(eq(agents.id, input.agentId))
-      .orderBy(permissionGrants.id)
-      .limit(GRANT_COUNT_LIMITS.perAgent + 1);
-  });
+  const rows = await withDatabaseErrors(() => agentGrantRows(db, input));
   const [first] = rows;
   if (first === undefined || !first.member) {
     return { listed: false, refusal: "not_found" };
@@ -835,6 +787,63 @@ export async function listAgentGrants(
       grant === null ? [] : [agentGrantOf(grant)],
     ),
   };
+}
+
+/**
+ * The one statement of `listAgentGrants`: the agent's row, if it exists,
+ * with `member` and `owns` for the reading account, joined to the grants
+ * that are not revoked only while both hold. Exported for its tests only,
+ * which run it for an account that fails one of them and see that no grant
+ * comes back; the package does not export it.
+ */
+export function agentGrantRows(db: Database, input: ListAgentGrantsInput) {
+  const activePerson = db
+    .select({ id: reader.id })
+    .from(reader)
+    .where(
+      and(
+        eq(reader.workspaceId, projects.workspaceId),
+        eq(reader.userId, input.userId),
+        isNull(reader.removedAt),
+      ),
+    );
+  const member = sql<boolean>`${exists(activePerson)}`;
+  const owns = sql<boolean>`${agents.ownerUserId} = ${input.userId}`;
+  return db
+    .select({
+      member,
+      owns,
+      grant: {
+        id: permissionGrants.id,
+        granteeAgentId: permissionGrants.granteeAgentId,
+        capability: permissionGrants.capability,
+        repositoryId: permissionGrants.repositoryId,
+        providerConnectionId: permissionGrants.providerConnectionId,
+        createdAt: permissionGrants.createdAt,
+        expiresAt: permissionGrants.expiresAt,
+      },
+    })
+    .from(agents)
+    .innerJoin(projects, eq(projects.id, agents.projectId))
+    .leftJoin(
+      permissionGrants,
+      and(
+        eq(permissionGrants.granteeAgentId, agents.id),
+        // Always true, by `permission_grants_agent_host_device_fk`, but it
+        // lets PostgreSQL find the grants through
+        // `permission_grants_active_host_device_id_idx`, which holds at
+        // most the host device's count limit, as `listGrantRecords` does.
+        // Without it, no index serves the agent, and the join reads every
+        // grant that is not revoked in the database.
+        eq(permissionGrants.hostDeviceId, agents.hostDeviceId),
+        isNull(permissionGrants.revokedAt),
+        member,
+        owns,
+      ),
+    )
+    .where(eq(agents.id, input.agentId))
+    .orderBy(permissionGrants.id)
+    .limit(GRANT_COUNT_LIMITS.perAgent + 1);
 }
 
 /**
