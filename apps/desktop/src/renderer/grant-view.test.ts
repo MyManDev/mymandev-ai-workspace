@@ -567,6 +567,55 @@ test("cancelling, or changing the agent, the capability, the scope, or the expir
   ).toBeUndefined();
 });
 
+test("a view that is not consistent never sends a confirmation: neither for a capability without its own, nor for another grant than the form shows", () => {
+  const asked = confirming(SHELL_FORM);
+  const pending = asked.state.confirming!;
+  const request = {
+    capability: "terminal.execute",
+    scopeId: WEB,
+    lifetimeSeconds: 86_400,
+    confirmedHighestRisk: true,
+  };
+  expect(confirmedGrantOf(asked.state, asked.form)).toEqual({
+    agentId: HERE,
+    request,
+  });
+
+  // A standard capability with a confirmation that matches the state and
+  // the form: only its own confirmation, which it has none of, could send.
+  const readPending = {
+    agentId: HERE,
+    request: { capability: "repo.read", scopeId: WEB, lifetimeSeconds: 86_400 },
+  } as const;
+  const standard: GrantFormView = {
+    ...asked.form,
+    capability: "repo.read",
+    risk: "standard",
+    needsConfirmation: true,
+    confirmation: { ...asked.form.confirmation!, pending: readPending },
+  };
+  expect(grantRequestOf(standard)).toEqual(readPending.request);
+  expect(
+    confirmedGrantOf(askConfirmation(SHELL_FORM, readPending), standard),
+  ).toBeNull();
+
+  // A confirmation that matches the state but not the grant that the form
+  // shows: another scope, another expiry, another agent.
+  for (const other of [
+    { ...pending, request: { ...pending.request, scopeId: API } },
+    { ...pending, request: { ...pending.request, lifetimeSeconds: 3_600 } },
+    { ...pending, agentId: SECOND },
+  ]) {
+    const inconsistent: GrantFormView = {
+      ...asked.form,
+      confirmation: { ...asked.form.confirmation!, pending: other },
+    };
+    expect(
+      confirmedGrantOf(askConfirmation(SHELL_FORM, other), inconsistent),
+    ).toBeNull();
+  }
+});
+
 test("a confirmation that the section stops showing ends, so it never comes back when the form shows its grant again", () => {
   const asked = confirming(SHELL_FORM);
   const shown = describeGrantSection(input({ form: asked.state }));
