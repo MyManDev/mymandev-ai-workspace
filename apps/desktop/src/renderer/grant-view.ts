@@ -138,6 +138,8 @@ export const GRANT_MESSAGES = Object.freeze({
     "Permissions can be granted once this device is signed in and the project is open.",
   noGrantableAgent:
     "No agent of yours in this project is hosted on this device. Only an agent's owner grants it permissions, and only from the device that hosts the agent.",
+  agentsUnknown:
+    "The agents of this project could not be read, so it cannot be checked now whether one of yours is hosted on this device.",
   shellLater:
     "The highest-risk permission, terminal.execute, cannot be granted here yet.",
   agentLabel: "Agent",
@@ -356,9 +358,11 @@ function connectionLabel(connection: ProviderConnectionView): string {
 /**
  * The grant section: a message while the agents are not known, else the
  * form for the agents that this device may grant for (`grantableHere`),
- * and the selected agent's grants. The selection falls back to the first
- * such agent, and a scope or an expiry that is no longer offered is no
- * longer chosen.
+ * and the selected agent's grants. When the last reload of the agents
+ * failed and no agent is grantable here, it says that this cannot be
+ * checked now rather than that no agent is hosted here. The selection
+ * falls back to the first such agent, and a scope or an expiry that is no
+ * longer offered is no longer chosen.
  */
 export function describeGrantSection(
   input: GrantSectionInput,
@@ -382,7 +386,11 @@ export function describeGrantSection(
     return {
       kind: "form",
       form: null,
-      notes: [GRANT_MESSAGES.noGrantableAgent],
+      notes: [
+        state.status === "unavailable"
+          ? GRANT_MESSAGES.agentsUnknown
+          : GRANT_MESSAGES.noGrantableAgent,
+      ],
       grants: [],
       grantsNote: undefined,
     };

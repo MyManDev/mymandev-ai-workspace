@@ -272,6 +272,54 @@ test("the section waits for the agents, and says when granting is not available 
   ).toEqual({ kind: "message", text: GRANT_MESSAGES.pending });
 });
 
+test("when the agents could not be read, the section says that it cannot check now, not that no agent is hosted here", () => {
+  const unavailable = (agents: readonly AgentView[]) =>
+    describeGrantSection(
+      input({
+        agents: {
+          kind: "known",
+          state: {
+            ...agentsState(agents),
+            status: "unavailable",
+            problem: "unavailable",
+          },
+        },
+      }),
+    );
+  const unknown = {
+    kind: "form",
+    form: null,
+    notes: [GRANT_MESSAGES.agentsUnknown],
+    grants: [],
+    grantsNote: undefined,
+  };
+  expect(unavailable([])).toEqual(unknown);
+  expect(unavailable([agent(THEIRS, "Their agent")])).toEqual(unknown);
+  expect(GRANT_MESSAGES.agentsUnknown).not.toBe(
+    GRANT_MESSAGES.noGrantableAgent,
+  );
+  // Agents read before the failure that are grantable here keep the form;
+  // the server still decides each grant.
+  expect(
+    formOf(
+      unavailable([
+        agent(HERE, "Builder", { ownedByMe: true, grantableHere: true }),
+      ]),
+    ).agentId,
+  ).toBe(HERE);
+  // A list that was read says that no agent is hosted here.
+  expect(
+    describeGrantSection(
+      input({
+        agents: {
+          kind: "known",
+          state: agentsState([agent(THEIRS, "Their agent")]),
+        },
+      }),
+    ),
+  ).toEqual({ ...unknown, notes: [GRANT_MESSAGES.noGrantableAgent] });
+});
+
 test("a repository capability offers the project's repositories, and provider.use this device's connections, each chosen by the person", () => {
   const form = formOf(describeGrantSection(input()));
   expect(form.scopeKind).toBe("repository");
