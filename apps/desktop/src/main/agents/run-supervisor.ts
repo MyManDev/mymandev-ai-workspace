@@ -58,10 +58,13 @@
 //   `clock_invalid`, `record_failed`, `check_failed`, and the malformed
 //   inputs `run_invalid`, `request_invalid`, `no_scope`,
 //   `request_mismatch`) is `failed` with `grant_check_unavailable`, because
-//   the grant could not be checked, not shown inactive. A sign-out (or
-//   the connection's close for the account, `offline`) aborts every run and
-//   reports it `cancelled` with `signed_out`; another device aborts every
-//   run and reports nothing, because only the host device may send.
+//   the grant could not be checked, not shown inactive. A sign-out, or the
+//   connection's close for the account (`offline`), aborts every run and
+//   reports it `cancelled` with `signed_out`. `offline` also covers a
+//   device key that is not ready and an API origin that is not set, so
+//   those are reported `cancelled` with `signed_out` too. Another device
+//   aborts every run and reports nothing, because only the host device may
+//   send.
 // - The end of the sign-in (#55, decision of 2026-11-19). The account's
 //   `signInExpiresAt` ends the sign-in on this device, while the server
 //   keeps the connection open for `SIGN_IN_GRACE_MS` more, so no change of
@@ -99,7 +102,9 @@
 //   device signed out, stays in memory. After the next reload of its
 //   project on the same device, it is sent with a new model, only when the
 //   reloaded run is still in the state that it starts from; otherwise it is
-//   dropped. Another device drops every owed transition.
+//   dropped. Another device drops every owed transition. The owed
+//   transitions of a project that is never opened again stay in memory
+//   until the app quits, at most one for each of its unfinished runs.
 // - Sends. One transition in flight at a time, at most one send every
 //   `RUN_SUPERVISOR_SEND_INTERVAL_MS`, resends included. The host run model
 //   checks every transition against `RUN_TRANSITIONS` and every reason

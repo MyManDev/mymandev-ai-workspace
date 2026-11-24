@@ -333,9 +333,11 @@ function start(): void {
   // The grant store of the permission enforcement point (#55): the last
   // answer of `GET /grant-records`, usable only while the selected
   // workspace's connection is live and the records were read again since its
-  // last `workspace.subscribed`. The host run supervisor below re-checks the
-  // running work of its runs on `onGrantsChanged`. The logs are fixed text
-  // with a failure code at most, never an ID.
+  // last `workspace.subscribed`. The host run supervisor below listens to
+  // `onGrantsChanged`, but no enforcement point is wired yet, so every check
+  // of an executor denies and nothing is ever held or re-checked until #30
+  // and #31 wire it. The logs are fixed text with a failure code at most,
+  // never an ID.
   const grantStore = createGrantStore({
     account,
     connection,
@@ -356,10 +358,15 @@ function start(): void {
   // The host run supervisor (#35, second part): it picks up the open
   // project's runs whose agent this device hosts and runs them with the
   // executor of their provider kind. Production registers no executor until
-  // the adapters of #30 and #31, so it adopts no queued run; it only reports
-  // the runs that a restart, a crash, or a lost connection interrupted as
-  // `failed`. It never touches the runs of the development switch's agent.
-  // The `provider.use` check before a start waits for the Project Manager
+  // the adapters of #30 and #31, so every queued run of this device with a
+  // provider connection fails with `no_executor` or
+  // `provider_connection_missing` (default 5 of 2026-11-24, default until the
+  // Project Manager decides), a seeded run without one stays queued, and
+  // the runs that a restart, a crash, or a lost connection interrupted are
+  // reported `failed`. No enforcement point is wired yet: every check of an
+  // executor denies, and nothing is re-checked, until #30 and #31 wire it.
+  // It never touches the runs of the development switch's agent. The
+  // `provider.use` check before a start waits for the Project Manager
   // (`beforeStart` keeps its default). The logs are fixed text with a code
   // at most, never an ID.
   const runSupervisor = createRunSupervisor({
