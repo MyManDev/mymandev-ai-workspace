@@ -646,6 +646,69 @@ test("a write that the account service refused without a request reads nothing a
   expect(harness.writes).toHaveLength(4);
 });
 
+test("a removal that threw reads the grant records again exactly once, and the list again", async () => {
+  const harness = new Harness();
+  await harness.ready(TWO);
+  const pending = harness.service.remove(CONNECTION_1);
+  harness.writes[0]?.fail(new Error("broken"));
+  await expect(pending).resolves.toEqual({ outcome: "unknown" });
+  expect(harness.grantReads).toBe(1);
+  expect(harness.reads).toHaveLength(1);
+  await harness.ready(ONE);
+  expect(harness.grantReads).toBe(1);
+});
+
+test("a write that may have reached the API while a read is on its way drops that stale answer and reads exactly once more", async () => {
+  const harness = new Harness();
+  expect(harness.reads).toHaveLength(1);
+  const pending = harness.service.register("codex", "Personal");
+  harness.writes[0]?.answer(registeredAnswer("codex", "Personal"));
+  await expect(pending).resolves.toEqual({ outcome: "ok" });
+  // The read on its way may predate the new connection.
+  await harness.answer(ok(ONE));
+  expect(harness.service.state()).toMatchObject({
+    status: "loading",
+    connections: [],
+  });
+  expect(harness.reads).toHaveLength(1);
+  await harness.ready(TWO);
+  expect(harness.service.state().connections).toHaveLength(2);
+  expect(harness.readNames).toHaveLength(2);
+  expect(harness.reads).toHaveLength(0);
+});
+
+test("a switch to another device while a write waits sends no extra read for the new device when the write answers", async () => {
+  const harness = new Harness();
+  await harness.ready(TWO);
+  const pending = harness.service.remove(CONNECTION_1);
+  harness.setAccount(accountStatus({}, OTHER_DEVICE_ID));
+  // The new device's own read.
+  expect(harness.reads).toHaveLength(1);
+  harness.writes[0]?.answer({ ok: true, value: null });
+  await pending;
+  expect(harness.reads).toHaveLength(1);
+  // Its answer counts: no read for the new device was asked for meanwhile.
+  await harness.ready(ONE);
+  expect(harness.service.state().connections).toHaveLength(1);
+  expect(harness.reads).toHaveLength(0);
+  expect(harness.readNames).toHaveLength(2);
+});
+
+test("a connection reached while a sign-in runs sends no read until the sign-in ends", async () => {
+  const harness = new Harness();
+  await harness.ready();
+  harness.setAccount(
+    accountStatus({ signIn: Object.freeze({ kind: "completing" }) }),
+  );
+  harness.setConnection("offline");
+  harness.setConnection("connected");
+  expect(harness.reads).toHaveLength(0);
+  harness.setAccount(accountStatus());
+  expect(harness.reads).toHaveLength(1);
+  await harness.ready(TWO);
+  expect(harness.readNames).toHaveLength(2);
+});
+
 test("every failure of a write maps to a fixed refusal of the contract, with a wait only for too_soon and rate_limited", async () => {
   const expectedRegister: Record<WorkspaceActionFailure, string> = {
     invalid: "invalid",
