@@ -76,11 +76,11 @@ export const CAPABILITY_MEANINGS: Readonly<
 });
 
 /**
- * What a shell can do (ADR 0015, P-70, and #77). The repository scope of
- * `terminal.execute` is where the shell starts, not a sandbox. The end of the
- * last statement is the one that #77 requires while `terminal.execute` is
- * granted while `git.commit` or `git.push` is not; the screen's reference
- * part shows it always.
+ * What a shell can do (ADR 0015, P-70, and #77), shown wherever
+ * `terminal.execute` is: in the reference part and in the grant form. The
+ * repository scope of `terminal.execute` is where the shell starts, not a
+ * sandbox. That the shell can still commit and push without `git.commit` or
+ * `git.push` is said only where it applies, by `shellGitStatement`.
  */
 export const SHELL_STATEMENTS: readonly Statement[] = Object.freeze([
   [
@@ -94,27 +94,76 @@ export const SHELL_STATEMENTS: readonly Statement[] = Object.freeze([
     ", and read the credentials stored for that user, including local AI provider credentials.",
   ],
   ["So a shell can send files and those credentials over the network."],
-  [
-    "A shell can commit and push even without ",
-    { capability: "git.commit" },
-    " or ",
-    { capability: "git.push" },
-    ".",
-  ],
 ]);
 
-// The default expiry that the grant of `terminal.execute` proposes is
-// decided (#77, Project Manager decision of 2026-11-24): 24 hours, which the
-// person can change within `GRANT_LIFETIME_SECONDS.min` and
-// `SHELL_GRANT_MAX_LIFETIME_SECONDS` (30 days) of `@mymandev/protocol` but
-// not remove. #77 applies it with the other presentation rules; until then
-// the grant form of #342 (`grant-view.ts`) does not offer the shell.
+/** The two capabilities whose commands a shell can run without them. */
+export const SHELL_GIT_CAPABILITIES = Object.freeze([
+  "git.commit",
+  "git.push",
+] as const satisfies readonly PermissionCapability[]);
+export type ShellGitCapability = (typeof SHELL_GIT_CAPABILITIES)[number];
+
+/**
+ * What the screen says when `terminal.execute` is granted, or being granted,
+ * on a repository while the agent lacks `git.commit` or `git.push` on it
+ * (ADR 0015, #77): that the shell can still commit and push. `missing`
+ * names the ones that the agent's current grants on that repository lack,
+ * or is `unknown` while the screen does not hold the agent's grants; then
+ * the screen says it as a condition, since the agent may have both, and
+ * claims nothing about its grants. Nothing is said when the agent has
+ * both. It is a statement for the person, never a check:
+ * nothing is inferred from `terminal.execute`.
+ */
+export function shellGitStatement(
+  missing: readonly ShellGitCapability[] | "unknown",
+): Statement | undefined {
+  if (missing === "unknown") {
+    return [
+      "If this agent does not have ",
+      { capability: "git.commit" },
+      " or ",
+      { capability: "git.push" },
+      " on this repository, the shell can still commit and push.",
+    ];
+  }
+  const [first, second] = SHELL_GIT_CAPABILITIES.filter((capability) =>
+    missing.includes(capability),
+  );
+  if (first === undefined) {
+    return undefined;
+  }
+  return second === undefined
+    ? [
+        "This agent does not have ",
+        { capability: first },
+        " on this repository, but the shell can still commit and push.",
+      ]
+    : [
+        "This agent has neither ",
+        { capability: first },
+        " nor ",
+        { capability: second },
+        " on this repository, but the shell can still commit and push.",
+      ];
+}
+
+/**
+ * The expiry that the grant form proposes for `terminal.execute`: 24 hours
+ * (#77, Project Manager decision of 2026-11-24). The person can change it
+ * within `GRANT_LIFETIME_SECONDS.min` and `SHELL_GRANT_MAX_LIFETIME_SECONDS`
+ * (30 days) of `@mymandev/protocol`, but not remove it: a grant of the shell
+ * always expires (ADR 0015, update of 2026-11-14). The other capabilities
+ * keep an optional expiry, and the form proposes none for them. The tests
+ * check the value against the protocol's bounds, which the renderer does
+ * not import.
+ */
+export const SHELL_PROPOSED_LIFETIME_SECONDS = 86_400;
 
 /**
  * The confirmation that a highest-risk capability needs before it is granted
- * on its own. The type requires one for every capability that
- * `CAPABILITY_RISK` labels `highest`. #77 adds it to the grant form; until
- * then the form offers no highest-risk capability (#342).
+ * on its own: the grant form asks for it in a separate step, and only the
+ * person's answer there sends the grant (#77). The type requires one for
+ * every capability that `CAPABILITY_RISK` labels `highest`.
  */
 export const HIGHEST_RISK_CONFIRMATIONS: Readonly<
   Record<HighestRiskCapability, string>
@@ -122,6 +171,38 @@ export const HIGHEST_RISK_CONFIRMATIONS: Readonly<
   "terminal.execute":
     "Allow this agent to run a shell in this repository? The shell runs as the user of the agent's device and is not limited to the repository: it can read and change files outside the repository, use the network, commit and push, and read the credentials stored for that user, including local AI provider credentials.",
 });
+
+/** The confirmation of a highest-risk capability without a text of its own. */
+export const HIGHEST_RISK_FALLBACK_CONFIRMATION =
+  "Allow this agent this highest-risk permission? It can let the agent do much more than its name says.";
+
+/**
+ * That `repo.read` with `provider.use` lets the agent send the repository's
+ * content to the provider (ADR 0015, P-69). A statement for the person, not
+ * an inference: the screen shows it in the statements of the whole screen
+ * and in the grant form wherever either capability is chosen, whatever the
+ * agent holds.
+ */
+export const REPOSITORY_PROVIDER_STATEMENT: Statement = Object.freeze([
+  "With ",
+  { capability: "repo.read" },
+  " on a repository and ",
+  { capability: "provider.use" },
+  " on an AI provider connection, the agent can send that repository's content to that connection's provider.",
+]);
+
+/**
+ * The statements that the grant form shows with `capability`, beyond what
+ * it allows and what a shell can do: `REPOSITORY_PROVIDER_STATEMENT` for
+ * `repo.read` and `provider.use`.
+ */
+export function grantStatements(
+  capability: PermissionCapability,
+): readonly Statement[] {
+  return capability === "repo.read" || capability === "provider.use"
+    ? [REPOSITORY_PROVIDER_STATEMENT]
+    : [];
+}
 
 /**
  * The statements for the whole screen (ADR 0008, ADR 0015, and #77). None of
@@ -146,13 +227,7 @@ export const SCREEN_STATEMENTS: readonly Statement[] = Object.freeze([
     { capability: "terminal.execute" },
     ".",
   ],
-  [
-    "With ",
-    { capability: "repo.read" },
-    " on a repository and ",
-    { capability: "provider.use" },
-    " on an AI provider connection, the agent can send that repository's content to that connection's provider.",
-  ],
+  REPOSITORY_PROVIDER_STATEMENT,
 ]);
 
 /** One capability as the screen shows it. */
@@ -164,7 +239,11 @@ export interface CapabilityView {
   /** The screen's text for `risk`. */
   readonly riskLabel: string;
   readonly meaning: string;
-  /** What a shell can do, for `terminal.execute`; otherwise empty. */
+  /**
+   * What a shell can do, for `terminal.execute`; otherwise empty. Whether
+   * it can commit and push without `git.commit` or `git.push` depends on
+   * the agent's grants, so it is not here (`shellGitStatement`).
+   */
   readonly details: readonly Statement[];
   /**
    * Whether a grant form may select it before the person does. False for a
@@ -227,8 +306,27 @@ export function describeCapability(
     details: capability === "terminal.execute" ? SHELL_STATEMENTS : [],
     mayBePreselected: !highest,
     mayBeBundled: !highest,
-    confirmation: highest ? HIGHEST_RISK_CONFIRMATIONS[capability] : undefined,
+    // The type holds a text for every highest-risk capability; the
+    // fallback keeps the confirmation step also for a label that the table
+    // gains before this module does.
+    confirmation: highest
+      ? (HIGHEST_RISK_CONFIRMATIONS[capability] ??
+        HIGHEST_RISK_FALLBACK_CONFIRMATION)
+      : undefined,
   };
+}
+
+/**
+ * Every capability in the order that a list of them offers: the standard
+ * ones in the order of the contract, then the highest-risk ones, so that a
+ * highest-risk capability stands on its own at the end.
+ */
+export function describeCapabilitiesInOfferOrder(): CapabilityView[] {
+  const capabilities = capabilityNames().map(describeCapability);
+  return [
+    ...capabilities.filter((view) => view.risk !== "highest"),
+    ...capabilities.filter((view) => view.risk === "highest"),
+  ];
 }
 
 /**
@@ -238,20 +336,14 @@ export function describeCapability(
  * contract, so that the highest-risk capability stands on its own.
  */
 export function describePermissionScreen(): PermissionScreenView {
-  const capabilities = capabilityNames().map(describeCapability);
+  const capabilities = describeCapabilitiesInOfferOrder();
   return {
     statements: SCREEN_STATEMENTS,
-    groups: GRANT_SCOPE_KINDS.map((scope) => {
-      const inScope = capabilities.filter((view) => view.scope === scope);
-      return {
-        scope,
-        title: SCOPE_TEXTS[scope].title,
-        text: SCOPE_TEXTS[scope].text,
-        capabilities: [
-          ...inScope.filter((view) => view.risk !== "highest"),
-          ...inScope.filter((view) => view.risk === "highest"),
-        ],
-      };
-    }),
+    groups: GRANT_SCOPE_KINDS.map((scope) => ({
+      scope,
+      title: SCOPE_TEXTS[scope].title,
+      text: SCOPE_TEXTS[scope].text,
+      capabilities: capabilities.filter((view) => view.scope === scope),
+    })),
   };
 }

@@ -4,17 +4,28 @@ import {
   CAPABILITY_SCOPE,
   GRANT_SCOPE_KINDS,
 } from "@mymandev/permissions/capabilities";
-import { CAPABILITIES } from "@mymandev/protocol";
+import {
+  CAPABILITIES,
+  GRANT_LIFETIME_SECONDS,
+  SHELL_GRANT_MAX_LIFETIME_SECONDS,
+} from "@mymandev/protocol";
 import { afterEach, expect, test, vi } from "vitest";
 import {
   CAPABILITY_MEANINGS,
+  describeCapabilitiesInOfferOrder,
   describeCapability,
   describePermissionScreen,
+  grantStatements,
   HIGHEST_RISK_CONFIRMATIONS,
+  HIGHEST_RISK_FALLBACK_CONFIRMATION,
+  REPOSITORY_PROVIDER_STATEMENT,
   RISK_LABELS,
   SCOPE_TEXTS,
   SCREEN_STATEMENTS,
+  SHELL_GIT_CAPABILITIES,
+  SHELL_PROPOSED_LIFETIME_SECONDS,
   SHELL_STATEMENTS,
+  shellGitStatement,
   type CapabilityView,
   type PermissionCapability,
   type Statement,
@@ -157,6 +168,21 @@ test("the screen follows CAPABILITY_RISK, not a list of its own", async () => {
     mayBeBundled: true,
     confirmation: undefined,
   });
+  // A capability that the table labels highest is confirmed on its own,
+  // also without a text of its own.
+  expect(byName.get("repo.read")?.confirmation).toBe(
+    model.HIGHEST_RISK_FALLBACK_CONFIRMATION,
+  );
+  expect(
+    model.describeCapabilitiesInOfferOrder().map((view) => view.capability),
+  ).toEqual([
+    "repo.write",
+    "terminal.execute",
+    "git.commit",
+    "git.push",
+    "provider.use",
+    "repo.read",
+  ]);
   // The highest-risk capability is listed last in its group.
   expect(views.map((view) => view.capability)).toEqual([
     "repo.write",
@@ -201,7 +227,7 @@ test("terminal.execute has its own explicit confirmation, and no other capabilit
   expect(Object.keys(HIGHEST_RISK_CONFIRMATIONS)).toEqual(["terminal.execute"]);
 });
 
-test("terminal.execute says what a shell can do, and that it can commit and push without git.commit or git.push", () => {
+test("terminal.execute says what a shell can do, and nothing that depends on the agent's grants", () => {
   const details = viewOf("terminal.execute").details;
 
   expect(details).toBe(SHELL_STATEMENTS);
@@ -209,23 +235,79 @@ test("terminal.execute says what a shell can do, and that it can commit and push
     "A shell runs as the user of the agent's device. The repository is only where it starts: it is not a sandbox.",
     "A shell can read and change files outside the repository, use the network, run git commit and git push, and read the credentials stored for that user, including local AI provider credentials.",
     "So a shell can send files and those credentials over the network.",
-    "A shell can commit and push even without git.commit or git.push.",
   ]);
   // The commands are code, like the capability names.
   expect(details[1]).toContainEqual({ command: "git commit" });
   expect(details[1]).toContainEqual({ command: "git push" });
-  expect(details[3]).toEqual([
-    "A shell can commit and push even without ",
-    { capability: "git.commit" },
-    " or ",
-    { capability: "git.push" },
-    ".",
-  ]);
   for (const view of allCapabilities()) {
     if (view.capability !== "terminal.execute") {
       expect(view.details).toEqual([]);
     }
   }
+});
+
+test("that the shell can still commit and push is said only while the agent lacks git.commit or git.push on the repository, naming the ones it lacks", () => {
+  expect(SHELL_GIT_CAPABILITIES).toEqual(["git.commit", "git.push"]);
+  expect(shellGitStatement([])).toBeUndefined();
+  expect(shellGitStatement(["git.commit", "git.push"])).toEqual([
+    "This agent has neither ",
+    { capability: "git.commit" },
+    " nor ",
+    { capability: "git.push" },
+    " on this repository, but the shell can still commit and push.",
+  ]);
+  // The order of the contract, whatever the order of the list.
+  expect(shellGitStatement(["git.push", "git.commit"])).toEqual(
+    shellGitStatement(["git.commit", "git.push"]),
+  );
+  expect(textOf(shellGitStatement(["git.commit"])!)).toBe(
+    "This agent does not have git.commit on this repository, but the shell can still commit and push.",
+  );
+  expect(textOf(shellGitStatement(["git.push"])!)).toBe(
+    "This agent does not have git.push on this repository, but the shell can still commit and push.",
+  );
+  // Without the agent's grants, it is said as a condition, and claims
+  // nothing about them.
+  expect(textOf(shellGitStatement("unknown")!)).toBe(
+    "If this agent does not have git.commit or git.push on this repository, the shell can still commit and push.",
+  );
+});
+
+test("the proposed expiry of the shell is 24 hours, within the protocol's bounds of a shell grant", () => {
+  expect(SHELL_PROPOSED_LIFETIME_SECONDS).toBe(24 * 60 * 60);
+  expect(SHELL_PROPOSED_LIFETIME_SECONDS).toBeGreaterThanOrEqual(
+    GRANT_LIFETIME_SECONDS.min,
+  );
+  expect(SHELL_PROPOSED_LIFETIME_SECONDS).toBeLessThanOrEqual(
+    SHELL_GRANT_MAX_LIFETIME_SECONDS,
+  );
+});
+
+test("the grant form says that repo.read with provider.use sends the repository's content to the provider wherever either is chosen, and nowhere else", () => {
+  expect(grantStatements("repo.read")).toEqual([REPOSITORY_PROVIDER_STATEMENT]);
+  expect(grantStatements("provider.use")).toEqual([
+    REPOSITORY_PROVIDER_STATEMENT,
+  ]);
+  for (const capability of CAPABILITIES) {
+    if (capability !== "repo.read" && capability !== "provider.use") {
+      expect(grantStatements(capability), capability).toEqual([]);
+    }
+  }
+  expect(SCREEN_STATEMENTS).toContain(REPOSITORY_PROVIDER_STATEMENT);
+});
+
+test("a list of capabilities offers the standard ones in the contract's order and the highest-risk one last", () => {
+  expect(
+    describeCapabilitiesInOfferOrder().map((view) => view.capability),
+  ).toEqual([
+    "repo.read",
+    "repo.write",
+    "git.commit",
+    "git.push",
+    "provider.use",
+    "terminal.execute",
+  ]);
+  expect(HIGHEST_RISK_FALLBACK_CONFIRMATION).toMatch(/\?/);
 });
 
 test("the screen says that repo.read with provider.use sends the repository's content to the provider, and that no permission includes another for a check but can allow more than its name", () => {

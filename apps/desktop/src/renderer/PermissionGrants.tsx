@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type Ref } from "react";
 import type {
   AgentBridge,
   GrantBridge,
@@ -10,17 +10,26 @@ import {
   initialAgentPanelView,
 } from "./agent-view.ts";
 import {
+  askConfirmation,
+  changeGrantForm,
+  confirmedGrantOf,
   createGrantActions,
   describeGrantSection,
+  endConfirmation,
+  endHiddenConfirmation,
+  focusAfterConfirmation,
   followGrants,
   GRANT_MESSAGES,
-  grantRequestOf,
   IDLE_GRANT_ACTIONS,
   INITIAL_GRANT_FORM,
   initialGrantsView,
   needsProviderConnections,
+  submitGrant,
+  type ConfirmationEnd,
   type ConnectionsPanelView,
+  type GrantActions,
   type GrantActionsView,
+  type GrantConfirmationView,
   type GrantFormState,
   type GrantFormView,
   type GrantSectionView,
@@ -30,11 +39,14 @@ import {
   followProjectRepositories,
   initialProjectRepositoriesView,
 } from "./project-repositories-view.ts";
+import { StatementText } from "./StatementText.tsx";
 
-// The grant form and the grant list of the permission screen (#342). The
-// components below `PermissionGrants` use no hooks, so the tests render the
-// markup and also call the components as functions, walk the returned
-// elements, and invoke their event handlers.
+// The grant form and the grant list of the permission screen (#342), with
+// the presentation rules of ADR 0015 (#77). The components below
+// `PermissionGrants` use no hooks, so the tests render the markup and also
+// call the components as functions, walk the returned elements, and invoke
+// their event handlers; `grantSectionHandlers` is the hook's wiring without
+// the hook.
 
 /** What the person can do in the grant section. */
 export interface GrantSectionHandlers {
@@ -42,21 +54,96 @@ export interface GrantSectionHandlers {
   readonly onCapability: (capability: PermissionCapability) => void;
   readonly onScope: (scopeId: string) => void;
   readonly onExpiry: (expiryId: string) => void;
+  /** "Grant": sends, or asks for the confirmation of the shell. */
   readonly onGrant: (agentId: string, form: GrantFormView) => void;
+  /** The person confirmed the grant that the confirmation shows. */
+  readonly onConfirm: (form: GrantFormView) => void;
+  /** The person cancelled the confirmation: nothing is sent. */
+  readonly onCancel: () => void;
   readonly onRevoke: (agentId: string, grantId: string) => void;
 }
 
 /** The ID of the sentence after an action, which a screen reader announces. */
 export const GRANT_RESULT_ID = "grant-result";
 
+/**
+ * Where the hook puts the focus once a confirmation has closed
+ * (`focusAfterConfirmation`): the form's "Grant" and the sentence after an
+ * action.
+ */
+export interface GrantSectionFocus {
+  readonly submit: Ref<HTMLButtonElement>;
+  readonly result: Ref<HTMLParagraphElement>;
+}
+
+/**
+ * The handlers of the section for the form state `current`: every change
+ * goes through `changeGrantForm`, which ends a confirmation that waits;
+ * "Grant" sends only a capability without its own confirmation and asks
+ * for the confirmation of one with it; only the confirmation of the grant
+ * that the form shows sends it, with `confirmedHighestRisk`. `onEnded`
+ * hears how the person ended a confirmation that waited, for the focus.
+ */
+export function grantSectionHandlers(
+  current: GrantFormState,
+  update: (change: (state: GrantFormState) => GrantFormState) => void,
+  actions: Pick<GrantActions, "grant" | "revoke"> | undefined,
+  onEnded: (end: ConfirmationEnd) => void = () => {},
+): GrantSectionHandlers {
+  return {
+    onAgent: (agentId) =>
+      update((state) => changeGrantForm(state, { agentId })),
+    onCapability: (capability) =>
+      update((state) => changeGrantForm(state, { capability })),
+    onScope: (scopeId) =>
+      update((state) => changeGrantForm(state, { scopeId })),
+    onExpiry: (expiryId) =>
+      update((state) => changeGrantForm(state, { expiryId })),
+    onGrant: (_agentId, shown) => {
+      const submission = submitGrant(shown);
+      if (submission.kind === "confirm") {
+        const { pending } = submission;
+        update((state) => askConfirmation(state, pending));
+      } else if (submission.kind === "send" && actions !== undefined) {
+        void actions.grant(submission.agentId, submission.request);
+      }
+    },
+    onConfirm: (shown) => {
+      const confirmed = confirmedGrantOf(current, shown);
+      update(endConfirmation);
+      const sent = confirmed !== null && actions !== undefined;
+      if (sent) {
+        void actions.grant(confirmed.agentId, confirmed.request);
+      }
+      // Only a confirmation that waited ends, and moves the focus.
+      if (current.confirming !== null) {
+        onEnded(sent ? "sent" : "not_sent");
+      }
+    },
+    onCancel: () => {
+      update(endConfirmation);
+      if (current.confirming !== null) {
+        onEnded("cancelled");
+      }
+    },
+    onRevoke: (agentId, grantId) => {
+      if (actions !== undefined) {
+        void actions.revoke(agentId, grantId);
+      }
+    },
+  };
+}
+
 function GrantForm({
   form,
   running,
   handlers,
+  submitRef,
 }: {
   readonly form: GrantFormView;
   readonly running: boolean;
   readonly handlers: GrantSectionHandlers;
+  readonly submitRef: Ref<HTMLButtonElement> | undefined;
 }) {
   const scopeLabel =
     form.scopeKind === "repository"
@@ -93,16 +180,30 @@ function GrantForm({
         id="grant-capability"
         value={form.capability}
         disabled={running}
+        aria-describedby="grant-capability-about"
         onChange={(event) =>
           handlers.onCapability(event.target.value as PermissionCapability)
         }
       >
-        {form.capabilities.map((capability) => (
-          <option key={capability} value={capability}>
-            {capability}
+        {form.capabilities.map((choice) => (
+          <option key={choice.capability} value={choice.capability}>
+            {`${choice.capability} (${choice.riskLabel})`}
           </option>
         ))}
       </select>
+      <div
+        id="grant-capability-about"
+        className="grant-capability"
+        data-risk={form.risk}
+      >
+        <p className="capability-risk">{form.riskLabel}</p>
+        <p>{form.meaning}</p>
+        {[...form.details, ...form.statements].map((statement, index) => (
+          <p key={index}>
+            <StatementText statement={statement} />
+          </p>
+        ))}
+      </div>
       <label htmlFor="grant-scope">{scopeLabel}</label>
       <select
         id="grant-scope"
@@ -132,6 +233,9 @@ function GrantForm({
         id="grant-expiry"
         value={form.expiryId}
         disabled={running}
+        aria-describedby={
+          form.expiryNote === undefined ? undefined : "grant-expiry-note"
+        }
         onChange={(event) => handlers.onExpiry(event.target.value)}
       >
         {form.expiries.map((choice) => (
@@ -140,26 +244,128 @@ function GrantForm({
           </option>
         ))}
       </select>
-      <button type="submit" disabled={running || !form.ready}>
-        {GRANT_MESSAGES.submit}
+      {form.expiryNote === undefined ? null : (
+        <p id="grant-expiry-note" className="grant-note">
+          {form.expiryNote}
+        </p>
+      )}
+      <button
+        ref={submitRef}
+        type="submit"
+        disabled={running || !form.ready || form.confirmation !== undefined}
+      >
+        {form.needsConfirmation
+          ? GRANT_MESSAGES.submitConfirmation
+          : GRANT_MESSAGES.submit}
       </button>
     </form>
   );
 }
 
+/** The ID of the confirmation's text. */
+export const GRANT_CONFIRM_TEXT_ID = "grant-confirm-text";
+/** The ID of the grant that the confirmation shows. */
+export const GRANT_CONFIRM_GRANT_ID = "grant-confirm-grant";
+
+/** The ID of the confirmation's warning at `index`. */
+export function grantConfirmWarningId(index: number): string {
+  return `grant-confirm-warning-${index}`;
+}
+
+/**
+ * The separate step of a highest-risk capability: what the person is asked
+ * to confirm, the grant as the form shows it, and "Cancel" first, which
+ * takes the focus. The group is described by its text, the grant, and its
+ * warnings, so that a screen reader reads them when the focus enters it,
+ * not only the group's name and "Cancel".
+ */
+function GrantConfirmation({
+  form,
+  confirmation,
+  running,
+  handlers,
+}: {
+  readonly form: GrantFormView;
+  readonly confirmation: GrantConfirmationView;
+  readonly running: boolean;
+  readonly handlers: GrantSectionHandlers;
+}) {
+  const scopeLabel =
+    form.scopeKind === "repository"
+      ? GRANT_MESSAGES.repositoryLabel
+      : GRANT_MESSAGES.connectionLabel;
+  const described = [
+    GRANT_CONFIRM_TEXT_ID,
+    GRANT_CONFIRM_GRANT_ID,
+    ...confirmation.statements.map((_, index) => grantConfirmWarningId(index)),
+  ].join(" ");
+  return (
+    <div
+      className="grant-confirmation"
+      role="group"
+      aria-labelledby="grant-confirm-title"
+      aria-describedby={described}
+      data-risk={form.risk}
+    >
+      <h4 id="grant-confirm-title">{GRANT_MESSAGES.confirmTitle}</h4>
+      <p id={GRANT_CONFIRM_TEXT_ID}>{confirmation.text}</p>
+      <dl id={GRANT_CONFIRM_GRANT_ID} className="grant-confirmation-grant">
+        <dt>{GRANT_MESSAGES.agentLabel}</dt>
+        <dd>{confirmation.agent}</dd>
+        <dt>{GRANT_MESSAGES.capabilityLabel}</dt>
+        <dd>
+          <code>{confirmation.pending.request.capability}</code>
+        </dd>
+        <dt>{scopeLabel}</dt>
+        <dd>{confirmation.scope}</dd>
+        <dt>{GRANT_MESSAGES.expiryLabel}</dt>
+        <dd>{confirmation.expiry}</dd>
+      </dl>
+      {confirmation.statements.map((statement, index) => (
+        <p
+          key={index}
+          id={grantConfirmWarningId(index)}
+          className="grant-warning"
+        >
+          <StatementText statement={statement} />
+        </p>
+      ))}
+      <button
+        type="button"
+        autoFocus
+        disabled={running}
+        onClick={() => handlers.onCancel()}
+      >
+        {GRANT_MESSAGES.cancel}
+      </button>{" "}
+      <button
+        type="button"
+        disabled={running}
+        onClick={() => handlers.onConfirm(form)}
+      >
+        {GRANT_MESSAGES.confirm}
+      </button>
+    </div>
+  );
+}
+
 /**
  * The grant section: the form for the agents that this device may grant
- * for, the selected agent's grants with a revoke control each, and the
- * sentence after the last action.
+ * for, the confirmation of a highest-risk capability while it waits, the
+ * selected agent's grants with a revoke control each, and the sentence
+ * after the last action.
  */
 export function GrantSectionContent({
   view,
   actions,
   handlers,
+  focus,
 }: {
   readonly view: GrantSectionView;
   readonly actions: GrantActionsView;
   readonly handlers: GrantSectionHandlers;
+  /** Where the hook puts the focus after a confirmation; optional, the hook passes it. */
+  readonly focus?: GrantSectionFocus;
 }) {
   // A subsection without a name, so that it adds no landmark region.
   return (
@@ -174,6 +380,15 @@ export function GrantSectionContent({
               form={view.form}
               running={actions.running}
               handlers={handlers}
+              submitRef={focus?.submit}
+            />
+          )}
+          {view.form?.confirmation === undefined ? null : (
+            <GrantConfirmation
+              form={view.form}
+              confirmation={view.form.confirmation}
+              running={actions.running}
+              handlers={handlers}
             />
           )}
           {view.notes.map((note) => (
@@ -181,7 +396,12 @@ export function GrantSectionContent({
               {note}
             </p>
           ))}
-          <p id={GRANT_RESULT_ID} role="status">
+          <p
+            id={GRANT_RESULT_ID}
+            ref={focus?.result}
+            role="status"
+            tabIndex={-1}
+          >
             {actions.running ? GRANT_MESSAGES.running : actions.message}
           </p>
           {view.form === null ? null : (
@@ -233,6 +453,11 @@ function GrantList({
               >
                 {GRANT_MESSAGES.revoke}
               </button>
+              {grant.statements.map((statement, index) => (
+                <p key={index} className="grant-warning">
+                  <StatementText statement={statement} />
+                </p>
+              ))}
             </li>
           ))}
         </ul>
@@ -368,29 +593,43 @@ export function PermissionGrants({
     now: Date.now(),
     timeFormat: agentTimeFormat(),
   });
-  const handlers: GrantSectionHandlers = {
-    onAgent: (agentId) => setForm((current) => ({ ...current, agentId })),
-    onCapability: (capability) =>
-      setForm((current) => ({ ...current, capability, scopeId: null })),
-    onScope: (scopeId) => setForm((current) => ({ ...current, scopeId })),
-    onExpiry: (expiryId) => setForm((current) => ({ ...current, expiryId })),
-    onGrant: (agentId, shown) => {
-      const request = grantRequestOf(shown);
-      if (actions !== undefined && request !== null) {
-        void actions.grant(agentId, request);
-      }
-    },
-    onRevoke: (agentId, grantId) => {
-      if (actions !== undefined) {
-        void actions.revoke(agentId, grantId);
-      }
-    },
-  };
+  // Once the person ends a confirmation, the focus goes where
+  // `focusAfterConfirmation` says, rather than being lost with its buttons.
+  const ended = useRef<ConfirmationEnd | null>(null);
+  const submitRef = useRef<HTMLButtonElement>(null);
+  const resultRef = useRef<HTMLParagraphElement>(null);
+  useEffect(() => {
+    const end = ended.current;
+    if (end === null) {
+      return;
+    }
+    ended.current = null;
+    const target = focusAfterConfirmation(end, view, actionsView);
+    if (target === "submit") {
+      submitRef.current?.focus();
+    } else if (target === "result") {
+      resultRef.current?.focus();
+    }
+  });
+  // A confirmation that the section no longer shows ends, so that it does
+  // not come back and take the focus once the form shows its grant again.
+  const hidden =
+    endHiddenConfirmation(form, view) === form ? null : form.confirming;
+  useEffect(() => {
+    if (hidden !== null) {
+      setForm((state) =>
+        state.confirming === hidden ? endConfirmation(state) : state,
+      );
+    }
+  }, [hidden]);
   return (
     <GrantSectionContent
       view={view}
       actions={actionsView}
-      handlers={handlers}
+      handlers={grantSectionHandlers(form, setForm, actions, (end) => {
+        ended.current = end;
+      })}
+      focus={{ submit: submitRef, result: resultRef }}
     />
   );
 }

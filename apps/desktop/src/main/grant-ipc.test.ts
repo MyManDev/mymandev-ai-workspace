@@ -211,6 +211,10 @@ test("every handler refuses a foreign sender and arguments outside the contract,
       INVOKE_CHANNELS.grantCapability,
       [AGENT, { capability: "repo.read", scopeId: REPOSITORY }],
     ],
+    [
+      INVOKE_CHANNELS.grantCapability,
+      [AGENT, { ...REQUEST, confirmedHighestRisk: false }],
+    ],
     [INVOKE_CHANNELS.revokeGrant, [AGENT]],
     [INVOKE_CHANNELS.revokeGrant, [AGENT, GRANT.toUpperCase()]],
   ];

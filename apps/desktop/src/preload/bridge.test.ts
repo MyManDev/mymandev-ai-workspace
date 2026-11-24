@@ -661,7 +661,7 @@ const grantsView = (revision: number): GrantsView => ({
   grants: [],
 });
 
-test("each grant function calls its own channel with only its values, a new request object with its three fields, and passes the answer through", async () => {
+test("each grant function calls its own channel with only its values, a new request object with its fields, and passes the answer through", async () => {
   const fake = fakeIpc();
   const bridge = createDesktopBridge("44.9.1", fake.ipc);
   const call = (name: keyof typeof bridge.grants) =>
@@ -673,11 +673,20 @@ test("each grant function calls its own channel with only its values, a new requ
     grantedByUserId: "someone",
   };
 
+  const shell = {
+    capability: "terminal.execute",
+    scopeId: REPOSITORY_ID,
+    lifetimeSeconds: 86_400,
+    confirmedHighestRisk: true,
+    grantedByUserId: "someone",
+  };
+
   const answers = [
     call("getState")("extra"),
     call("listProviderConnections")("extra"),
     call("grant")(AGENT_ID, request, "extra"),
     call("revoke")(AGENT_ID, GRANT_ID, "extra"),
+    call("grant")(AGENT_ID, shell),
   ];
   fake.answers.forEach((answer, index) => answer.resolve({ index }));
 
@@ -686,6 +695,7 @@ test("each grant function calls its own channel with only its values, a new requ
     { index: 1 },
     { index: 2 },
     { index: 3 },
+    { index: 4 },
   ]);
   expect(fake.invoked).toEqual([
     { channel: INVOKE_CHANNELS.getGrantState, args: [] },
@@ -702,6 +712,18 @@ test("each grant function calls its own channel with only its values, a new requ
       ],
     },
     { channel: INVOKE_CHANNELS.revokeGrant, args: [AGENT_ID, GRANT_ID] },
+    {
+      channel: INVOKE_CHANNELS.grantCapability,
+      args: [
+        AGENT_ID,
+        {
+          capability: "terminal.execute",
+          scopeId: REPOSITORY_ID,
+          lifetimeSeconds: 86_400,
+          confirmedHighestRisk: true,
+        },
+      ],
+    },
   ]);
   expect(fake.invoked[2]?.args[1]).not.toBe(request);
 });
@@ -726,6 +748,8 @@ test("each grant action refuses a value of another type without calling the main
     () => call("grant")(AGENT_ID, { ...request, scopeId: 7 }),
     () => call("grant")(AGENT_ID, { ...request, lifetimeSeconds: "60" }),
     () => call("grant")(AGENT_ID, { ...request, lifetimeSeconds: undefined }),
+    () => call("grant")(AGENT_ID, { ...request, confirmedHighestRisk: false }),
+    () => call("grant")(AGENT_ID, { ...request, confirmedHighestRisk: "yes" }),
     () => call("revoke")(AGENT_ID, secret),
     () => call("revoke")(undefined, GRANT_ID),
   ]) {

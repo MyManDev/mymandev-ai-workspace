@@ -966,6 +966,55 @@ code {
   margin: 0 0 var(--space-2);
 }
 
+/* The chosen capability and the confirmation of the shell (#77). The risk
+   and the warnings are always text; the mark only repeats them. */
+.grant-capability,
+.grant-confirmation {
+  max-width: 60ch;
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-border);
+  border-radius: var(--radius);
+}
+
+.grant-capability p,
+.grant-confirmation p {
+  margin: 0 0 var(--space-1);
+}
+
+.grant-capability .capability-risk {
+  font-weight: var(--font-weight-strong);
+}
+
+.grant-capability[data-risk="highest"],
+.grant-confirmation[data-risk="highest"] {
+  border-inline-start: var(--mark-width) solid var(--color-status-failed);
+}
+
+.grant-capability[data-risk="highest"] .capability-risk {
+  color: var(--color-status-failed);
+}
+
+.grant-confirmation {
+  margin-block-end: var(--space-2);
+}
+
+.grant-confirmation-grant {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-1) var(--space-2);
+  margin: 0 0 var(--space-2);
+}
+
+.grant-confirmation-grant dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.grant-warning {
+  margin: var(--space-1) 0 0;
+  font-weight: var(--font-weight-strong);
+}
+
 .grant-list {
   display: grid;
   gap: var(--space-2);

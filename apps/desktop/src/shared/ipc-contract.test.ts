@@ -2954,7 +2954,7 @@ test("the grants view holds each grant with exactly the scope of its capability,
   ).toBe(false);
 });
 
-test("a grant request names a capability, a scope ID, and a positive lifetime or null, and nothing else crosses", () => {
+test("a grant request names a capability, a scope ID, a positive lifetime or null, and the person's confirmation only as true, and nothing else crosses", () => {
   const request = {
     capability: "repo.write",
     scopeId: GRANT_REPOSITORY_ID,
@@ -2967,7 +2967,19 @@ test("a grant request names a capability, a scope ID, and a positive lifetime or
     GrantRequestViewSchema.safeParse({ ...request, lifetimeSeconds: null })
       .success,
   ).toBe(true);
+  // The confirmation of a highest-risk capability (#77) crosses as true.
+  const shell = {
+    capability: "terminal.execute",
+    scopeId: GRANT_REPOSITORY_ID,
+    lifetimeSeconds: 86_400,
+    confirmedHighestRisk: true,
+  };
+  expect(GrantRequestViewSchema.parse(shell)).toEqual(shell);
   for (const value of [
+    { ...shell, confirmedHighestRisk: false },
+    { ...shell, confirmedHighestRisk: "true" },
+    { ...shell, confirmedHighestRisk: 1 },
+    { ...shell, confirmedHighestRisk: null },
     { ...request, capability: "repo.admin" },
     { ...request, scopeId: "../x" },
     { ...request, lifetimeSeconds: 0 },

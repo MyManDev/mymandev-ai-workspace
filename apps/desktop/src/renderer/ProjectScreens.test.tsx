@@ -28,7 +28,7 @@ test("without the bridges, outside Electron, the permission screen says that gra
   expect(html).not.toMatch(
     /<(?:button|input|select|textarea|form|dialog|a)[\s>]|\srole=|\stabindex=|\shref=|\sstyle=/,
   );
-  // The confirmation belongs to granting the shell, which #77 adds.
+  // The confirmation belongs to granting the shell, which needs the bridges.
   for (const confirmation of Object.values(HIGHEST_RISK_CONFIRMATIONS)) {
     expect(html).not.toContain(confirmation.slice(0, 40));
   }
@@ -74,7 +74,7 @@ test("terminal.execute alone is shown as the highest risk, last in its group, wi
   expect(html.match(/data-risk="highest"/g)).toHaveLength(1);
   expect(html.match(/Highest risk/g)).toHaveLength(1);
   expect(item).toBe(
-    '<li class="capability" data-risk="highest"><h4 class="capability-name"><code>terminal.execute</code></h4><p class="capability-risk">Highest risk</p><p>Run a shell that starts in the repository.</p><p>A shell runs as the user of the agent&#x27;s device. The repository is only where it starts: it is not a sandbox.</p><p>A shell can read and change files outside the repository, use the network, run <code>git commit</code> and <code>git push</code>, and read the credentials stored for that user, including local AI provider credentials.</p><p>So a shell can send files and those credentials over the network.</p><p>A shell can commit and push even without <code>git.commit</code> or <code>git.push</code>.</p></li>',
+    '<li class="capability" data-risk="highest"><h4 class="capability-name"><code>terminal.execute</code></h4><p class="capability-risk">Highest risk</p><p>Run a shell that starts in the repository.</p><p>A shell runs as the user of the agent&#x27;s device. The repository is only where it starts: it is not a sandbox.</p><p>A shell can read and change files outside the repository, use the network, run <code>git commit</code> and <code>git push</code>, and read the credentials stored for that user, including local AI provider credentials.</p><p>So a shell can send files and those credentials over the network.</p></li>',
   );
   // Last in the repository group, right before the group ends.
   expect(html).toContain(`${item}</ul></section>`);
