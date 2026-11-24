@@ -2,6 +2,8 @@ import {
   type Database,
   defineMember,
   demoteMember,
+  type DisabledAgent,
+  disabledAgentsOf,
   leaveWorkspace,
   type MembershipEnd,
   type PersonRefusal,
@@ -33,6 +35,7 @@ import {
   type AccountFrameHandler,
   sendAccountFrame,
   sendCancelledRuns,
+  sendDisabledAgents,
   sendRevokedGrants,
   sendWorkspaceEvent,
   serverEventHeader,
@@ -48,7 +51,8 @@ export type PeopleRouteOptions = Readonly<{
   onAccountFrame: AccountFrameHandler;
   /**
    * The open connections, to which the grants that a removal revoked and the
-   * runs that it cancelled go.
+   * runs that it cancelled go. The agents that it disabled go through
+   * `onWorkspaceEvent`.
    */
   connections: ConnectionRegistry;
 }>;
@@ -96,15 +100,20 @@ export function registerPeopleRoutes(
    * to the workspace with `membership_ended` and sends the person's
    * `offline` to the other subscribers; `account.removed_from_workspace`
    * through `onAccountFrame` to every connection of the person's account;
-   * each revoked grant as `agent.grant.revoked` (#75); and each cancelled
-   * run as `agent.run.state_changed`, both to the workspace's remaining
-   * subscribers. `buildApp` connects both handlers to the registry, which
-   * sends at once, so the order holds.
+   * each disabled agent as `workspace.agent.disabled` through
+   * `onWorkspaceEvent` (#326); each revoked grant as `agent.grant.revoked`
+   * (#75); and each cancelled run as `agent.run.state_changed`, all three to
+   * the workspace's remaining subscribers. `buildApp` connects both
+   * handlers to the registry, which sends at once, so the order holds.
    */
   function sendMembershipEnd(
     request: FastifyRequest,
     workspaceId: WorkspaceId,
-    ended: MembershipEnd & { revokedGrants: readonly RevokedGrant[] },
+    ended: MembershipEnd &
+      Readonly<{
+        disabledAgents: readonly DisabledAgent[];
+        revokedGrants: readonly RevokedGrant[];
+      }>,
     now: Date,
   ): void {
     send(request, {
@@ -121,6 +130,12 @@ export function registerPeopleRoutes(
       };
       sendAccountFrame(request, options.onAccountFrame, ended.userId, frame);
     }
+    sendDisabledAgents(
+      request,
+      options.onWorkspaceEvent,
+      ended.disabledAgents,
+      now,
+    );
     sendRevokedGrants(request.log, connections, ended.revokedGrants, now);
     sendCancelledRuns(connections, ended.cancelledRuns, now);
   }
@@ -223,6 +238,7 @@ export function registerPeopleRoutes(
         }
         return {
           ...result,
+          disabledAgents: await disabledAgentsOf(tx, result.disabledAgentIds),
           revokedGrants: await revokedGrantsOf(tx, result.revokedGrantIds),
         };
       });
@@ -322,6 +338,7 @@ export function registerPeopleRoutes(
         }
         return {
           ...result,
+          disabledAgents: await disabledAgentsOf(tx, result.disabledAgentIds),
           revokedGrants: await revokedGrantsOf(tx, result.revokedGrantIds),
         };
       });

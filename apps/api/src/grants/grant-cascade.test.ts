@@ -43,9 +43,10 @@ import { ConnectionRegistry } from "../gateway.ts";
 // removal of a person and a departure, a device revocation, and a sign-in
 // that replaces a device. Each event goes to the connections subscribed to
 // the grant's own workspace, so a change that spans workspaces tells each
-// workspace of its own grants only. The grant events come before the run
-// events of the same change. An agent's disable is covered with its route
-// (agent-routes.test.ts).
+// workspace of its own grants only. The grant events come after the
+// workspace.agent.disabled of the agents that the change disabled (#326;
+// agent-cascade.test.ts) and before the run events of the same change. An
+// agent's disable is covered with its route (agent-routes.test.ts).
 
 const database = useTestDatabase();
 
@@ -229,7 +230,8 @@ async function subscribed(client: Client, workspaceId: WorkspaceId) {
 
 /**
  * Every message that arrived, after pending ones settled: the events as
- * `type` and, for a grant revocation, its grant; frames as `frame:type`.
+ * `type` and, for a grant revocation, its grant, for a run, the run, and for
+ * a disabled agent, the agent; frames as `frame:type`.
  */
 async function received(client: Client): Promise<string[]> {
   await settle();
@@ -242,6 +244,8 @@ async function received(client: Client): Promise<string[]> {
       seen.push(`revoked:${decoded.event.payload.grantId}`);
     } else if (decoded.event.type === "agent.run.state_changed") {
       seen.push(`run:${decoded.event.payload.runId}`);
+    } else if (decoded.event.type === "workspace.agent.disabled") {
+      seen.push(`disabled:${decoded.event.payload.agent.id}`);
     } else {
       seen.push(decoded.event.type);
     }
@@ -276,6 +280,20 @@ async function expectRevoked(
       revokedAt: at.toISOString(),
     });
     return raw;
+  }
+}
+
+/** The next `workspace.agent.disabled`, skipping presence frames, for the agent. */
+async function expectDisabled(client: Client, agentId: string): Promise<void> {
+  for (;;) {
+    const { decoded, raw } = await nextMessage(client);
+    if (decoded.kind === "frame") {
+      assert.equal(decoded.frame.type, "presence.changed", raw);
+      continue;
+    }
+    assert.ok(decoded.event.type === "workspace.agent.disabled", raw);
+    assert.equal(decoded.event.payload.agent.id, agentId);
+    return;
   }
 }
 
@@ -441,7 +459,12 @@ test("a removal and a departure send agent.grant.revoked for the grants of the p
       (await received(client)).filter(
         (seen) => seen !== "frame:presence.changed",
       ),
-      ["workspace.member.removed", `revoked:${bobGrant.id}`, `run:${bobRun}`],
+      [
+        "workspace.member.removed",
+        `disabled:${bobAgent.id}`,
+        `revoked:${bobGrant.id}`,
+        `run:${bobRun}`,
+      ],
     );
   }
   // The removed person's subscription ended first: no grant event.
@@ -458,6 +481,7 @@ test("a removal and a departure send agent.grant.revoked for the grants of the p
   );
   assert.deepEqual(adaSeen, [
     "workspace.member.removed",
+    `disabled:${cleoAgent.id}`,
     `revoked:${cleoGrant.id}`,
     `run:${cleoRun}`,
   ]);
@@ -511,11 +535,15 @@ test("a device revocation and a sign-in that replaces a device send agent.grant.
     reason: "removed",
   });
   const at = new Date(clock.now());
+  await expectDisabled(adaClient, deskInAdas.id);
   await expectRevoked(adaClient, deskAdaGrant, adas.id, at);
   assert.deepEqual(await received(adaClient), [`run:${deskRun}`]);
   const laptopSeen = await received(laptopClient);
   assert.deepEqual(laptopSeen, [
     "frame:account.device_revoked",
+    ...[deskInAdas.id, deskInBobs.id]
+      .sort()
+      .map((agentId) => `disabled:${agentId}`),
     ...byId([deskAdaGrant, deskBobGrant]).map((grant) => `revoked:${grant.id}`),
     `run:${deskRun}`,
   ]);
@@ -524,6 +552,7 @@ test("a device revocation and a sign-in that replaces a device send agent.grant.
   clock.advance(1_000);
   await signInDevice(bob.app, newKey(), laptop.device.deviceId);
   const replacedAt = new Date(clock.now());
+  await expectDisabled(adaClient, laptopInAdas.id);
   await expectRevoked(adaClient, laptopGrant, adas.id, replacedAt);
   assert.deepEqual(await received(adaClient), [`run:${laptopRun}`]);
 });
@@ -565,7 +594,7 @@ test("a grant event that fails to send fails neither the committed change nor th
     (await received(adaClient)).filter(
       (seen) => seen !== "frame:presence.changed",
     ),
-    ["workspace.member.removed", `run:${bobRun}`],
+    ["workspace.member.removed", `disabled:${bobAgent.id}`, `run:${bobRun}`],
   );
   const [row] = await database()
     .select({ revokedAt: permissionGrants.revokedAt })

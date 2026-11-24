@@ -1,7 +1,12 @@
-import type { CancelledRun, RevokedGrant } from "@mymandev/database";
+import type {
+  CancelledRun,
+  DisabledAgent,
+  RevokedGrant,
+} from "@mymandev/database";
 import {
   type AgentGrantCreatedEvent,
   type AgentGrantRevokedEvent,
+  type AgentListItem,
   type AgentRunStateChangedEvent,
   type ApproverEventType,
   type EventId,
@@ -109,6 +114,73 @@ export function deliverApproverEvent(
     { eventType: event.type, workspaceId: event.workspaceId, sent },
     "join request event",
   );
+}
+
+/**
+ * The agent as every member reads it in the agent list and in
+ * `workspace.agent.created` and `workspace.agent.disabled` (#294), built
+ * field by field, so that a field that the database result gains later,
+ * such as the host device, is not sent to the members until it is added
+ * here (#110).
+ */
+export function workspaceAgent(agent: AgentListItem): AgentListItem {
+  return {
+    id: agent.id,
+    projectId: agent.projectId,
+    name: agent.name,
+    ownerMemberId: agent.ownerMemberId,
+    disabledAt: agent.disabledAt,
+  };
+}
+
+/** `workspace.agent.disabled`, the membership event of a disabled agent. */
+export type AgentDisabledEvent = Extract<
+  WorkspaceEvent,
+  { type: "workspace.agent.disabled" }
+>;
+
+/**
+ * `workspace.agent.disabled` for an agent that a change disabled (#294,
+ * #326): a `system` actor, `deviceId: null`, the agent's workspace, and the
+ * agent as the agent list shows it (`workspaceAgent`), never its host
+ * device. The agent route and the cascades send the same payload.
+ */
+export function agentDisabledEvent(
+  disabled: DisabledAgent,
+  now: Date,
+): AgentDisabledEvent {
+  return {
+    ...serverEventHeader(disabled.workspaceId, now),
+    type: "workspace.agent.disabled",
+    payload: { agent: workspaceAgent(disabled.agent) },
+  };
+}
+
+/**
+ * Sends each agent that a committed device revocation, a sign-in that
+ * replaced a device, a removal, or a departure disabled as
+ * `workspace.agent.disabled` through `handler`, the membership event
+ * delivery, to the connections subscribed to the agent's own workspace and
+ * to no one else (`members` in `SERVER_EVENT_AUDIENCES`; #326): one event
+ * per agent, in the order of the agent IDs. A change that spans workspaces,
+ * such as a device revocation, tells each workspace of its own agents only,
+ * as `sendRevokedGrants` does with grants. Each goes as
+ * `sendWorkspaceEvent` sends one, so a failure is logged and neither fails
+ * the committed change's answer nor keeps the events after it from being
+ * sent. The caller sends them before the grant and run events of the same
+ * change, as the agent route does; after a revocation it closes the revoked
+ * device's connection first, and after a removal the removed person's
+ * subscriptions end first.
+ */
+export function sendDisabledAgents(
+  request: FastifyRequest,
+  handler: WorkspaceEventHandler,
+  agents: readonly DisabledAgent[],
+  now: Date,
+): void {
+  for (const agent of agents) {
+    sendWorkspaceEvent(request, handler, agentDisabledEvent(agent, now));
+  }
 }
 
 /**
