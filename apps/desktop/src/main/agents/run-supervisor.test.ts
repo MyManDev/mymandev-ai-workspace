@@ -1576,6 +1576,34 @@ test("a completion refused with rate_limited is sent again later and never repor
   expect(g.violations).toEqual([]);
 });
 
+test("a completion refused with rate_limited is still sent after the backoff when another project opens meanwhile", async () => {
+  const h = await started();
+  h.claude.last.resolve({ outcome: "completed" });
+  await settle();
+  h.advance(STEP);
+  expect(h.walk().at(-1)).toBe("1 running>completed");
+  const first = h.last.id;
+  h.refuse("rate_limited");
+  // The user opens another project during the backoff.
+  h.openProject(PROJECT_2);
+  h.advance(RUN_SUPERVISOR_RETRY_DELAY_MS - 1);
+  expect(h.sent).toHaveLength(2);
+  h.advance(1);
+  // The end of the execution needs no open project: it goes from its known
+  // state, as before the refusal.
+  expect(h.walk()).toEqual([
+    "1 queued>running",
+    "1 running>completed",
+    "1 running>completed",
+  ]);
+  expect(h.last.id).not.toBe(first);
+  h.ackAndStep();
+  expect(h.runState(1)).toBe("completed");
+  h.advance(60_000);
+  expect(h.sent).toHaveLength(3);
+  expect(h.violations).toEqual([]);
+});
+
 test("a run that waits for a reload while the connection stays open asks for one, after a backoff that doubles up to its bound", async () => {
   // No acknowledgement, twice: the start owes a report.
   const h = new Harness({ runs: [run(1, "queued")] });

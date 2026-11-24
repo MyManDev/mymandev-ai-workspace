@@ -85,7 +85,9 @@
 //   transition and sends it again with a new event after a backoff
 //   (`RUN_SUPERVISOR_RETRY_DELAY_MS`, doubling up to
 //   `RUN_SUPERVISOR_RETRY_MAX_MS`), only when the run is then still in the
-//   state that it starts from in the activity; a reload meanwhile does not
+//   state that it starts from in the activity (the end of an execution, which
+//   needs no activity, is checked only while its project is open, and is
+//   otherwise sent from its known state); a reload meanwhile does not
 //   report the run as interrupted. At `conflict` or `not_found`, the
 //   supervisor drops the run and never retries it; the run and its agent
 //   wait for the next reload, which brings the truth.
@@ -1348,7 +1350,23 @@ export function createRunSupervisor(
         continue;
       }
       if (stage.purpose === "finish") {
-        // From the run's known state: it needs no activity.
+        const open =
+          live !== null &&
+          live.workspaceId === entry.workspaceId &&
+          live.projectId === entry.projectId;
+        if (stage.notBefore !== undefined && open) {
+          // Sent again after a `rate_limited`, while its project is open:
+          // only when the activity still shows the state that it starts from.
+          const run = live.state.unfinishedRuns.find(
+            (item) => item.id === entry.runId,
+          );
+          if (run === undefined || run.state !== stage.transition.from) {
+            entries.delete(entry.runId);
+            continue;
+          }
+        }
+        // Otherwise from the run's known state: it needs no activity, and the
+        // server checks the state that it starts from.
         return entry;
       }
       if (stage.purpose === "start" && signInOver()) {
@@ -1531,7 +1549,9 @@ export function createRunSupervisor(
     if (stop?.cause === "refused" && stop.code === "rate_limited") {
       // Transient: the same transition again, with a new event, after the
       // backoff, once the activity still shows the state that it starts
-      // from. The end of an execution is checked against the activity too.
+      // from. The end of an execution keeps its purpose: it is checked
+      // against the activity while its project is open, and otherwise sent
+      // from its known state, as before the refusal.
       const delay = Math.min(
         RUN_SUPERVISOR_RETRY_DELAY_MS * 2 ** retryAttempt,
         RUN_SUPERVISOR_RETRY_MAX_MS,
@@ -1543,7 +1563,7 @@ export function createRunSupervisor(
       entry.stage = {
         kind: "due",
         transition: stage.transition,
-        purpose: stage.purpose === "finish" ? "owed" : stage.purpose,
+        purpose: stage.purpose,
         start: stage.start,
         notBefore: now() + delay,
       };
