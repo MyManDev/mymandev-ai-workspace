@@ -271,6 +271,11 @@ class Harness {
   projectId: ProjectId | null;
   live: boolean;
   reloads = 1;
+  /**
+   * Finished runs that the activity's list of recently finished runs no
+   * longer holds, as beyond its limit.
+   */
+  readonly unlistedFinished = new Set<RunId>();
   revision = 1;
   readonly claude: FakeExecutor;
   readonly codex: FakeExecutor;
@@ -420,7 +425,10 @@ class Harness {
       unfinishedRuns: project
         .filter((item) => !isTerminalRunState(item.state))
         .sort(newestFirst),
-      finishedRuns: project.filter((item) => isTerminalRunState(item.state)),
+      finishedRuns: project.filter(
+        (item) =>
+          isTerminalRunState(item.state) && !this.unlistedFinished.has(item.id),
+      ),
     });
   }
 
@@ -1288,6 +1296,20 @@ test("a sent transition always starts from the run's state on the server", async
   h.changed();
   h.advance(10 * STEP);
   expect(h.sent).toHaveLength(1);
+
+  // The same, when the list of finished runs does not show it: it only
+  // left the unfinished runs.
+  const f = new Harness({
+    runs: [run(1, "running"), run(2, "running", { agent: AGENT_B })],
+    executors: {},
+  });
+  f.ack();
+  f.setRun(runId(2), "cancelled");
+  f.unlistedFinished.add(runId(2));
+  f.changed();
+  f.advance(10 * STEP);
+  expect(f.sent).toHaveLength(1);
+  expect(f.violations).toEqual([]);
 
   // A queued run that the server cancelled after the read was asked for.
   const g = new Harness({ runs: [run(1, "queued")] });
