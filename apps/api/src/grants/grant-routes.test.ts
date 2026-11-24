@@ -7,6 +7,7 @@ import {
   workspaceMembers,
 } from "@mymandev/database";
 import {
+  AgentGrantListResponseSchema,
   type AgentId,
   ApiErrorBodySchema,
   CreateAgentResponseSchema,
@@ -55,8 +56,9 @@ import { ConnectionRegistry } from "../gateway.ts";
 // answers grant_limit, and an account's grants of a day rate_limited; a
 // grant of terminal.execute expires within 30 days;
 // each change sends its events after the commit to every connection
-// subscribed to the agent's workspace; and the record list holds the
-// unrevoked grants of the calling device's agents, with their facts.
+// subscribed to the agent's workspace; the record list holds the
+// unrevoked grants of the calling device's agents, with their facts; and the
+// agent's owner reads one agent's grants from any of its devices (#345).
 
 const database = useTestDatabase();
 
@@ -942,6 +944,163 @@ test("the record list holds the unrevoked grants of the agents that the calling 
   assert.deepEqual(await records(dan), []);
 });
 
+test("the agent's owner reads the agent's grants from its host device and from another device: the grants that are not revoked, an expired one included, with no device, account, or record fact", async (t) => {
+  const { account, secondDevice, clock } = instance(t);
+  const ada = await account(7591);
+  const bob = await account(7592);
+  const { workspace, project } = await workspaceWithProject(ada);
+  await addClaimed(workspace.id, bob, ada);
+  const laptop = await secondDevice(bob);
+  const agent = await agentOn(bob, project.id);
+  const otherAgent = await agentOn(bob, project.id, "Reviewer");
+  const repositoryId = await repositoryOf(bob, project.id);
+  const deskConnection = await connectionOf(bob);
+  const expiring = await granted(bob, agent.id, {
+    capability: "repo.read",
+    repositoryId,
+    lifetimeSeconds: 60,
+  });
+  const shell = await granted(bob, agent.id, {
+    capability: "terminal.execute",
+    repositoryId,
+    lifetimeSeconds: SHELL_GRANT_MAX_LIFETIME_SECONDS,
+  });
+  const use = await granted(bob, agent.id, {
+    capability: "provider.use",
+    providerConnectionId: deskConnection,
+    lifetimeSeconds: null,
+  });
+  const gone = await granted(bob, agent.id, {
+    capability: "repo.write",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
+  await revoked(laptop, agent.id, gone.id);
+  await granted(bob, otherAgent.id, {
+    capability: "repo.read",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
+  // The repo.read grant has expired by now; it stays listed until revoked.
+  clock.advance(2 * 60_000);
+
+  const expected = [expiring, shell, use]
+    .sort((a, b) => (a.id < b.id ? -1 : 1))
+    .map((grant) => ({
+      id: grant.id,
+      granteeAgentId: grant.granteeAgentId,
+      capability: grant.capability,
+      ...("repositoryId" in grant
+        ? { repositoryId: grant.repositoryId }
+        : { providerConnectionId: grant.providerConnectionId }),
+      createdAt: grant.createdAt,
+      expiresAt: grant.expiresAt,
+    }));
+  // The host device and another device of the owner get the same answer.
+  for (const caller of [bob, laptop]) {
+    const response = await get(caller, `/agents/${agent.id}/grants`);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.deepEqual(response.json(), { grants: expected });
+    assert.deepEqual(
+      AgentGrantListResponseSchema.parse(response.json()).grants,
+      expected,
+    );
+    // The body names no device, no account, and no project, and has no
+    // field that would carry them.
+    for (const value of [
+      bob.device.deviceId,
+      laptop.device.deviceId,
+      bob.device.userId,
+      ada.device.userId,
+      project.id,
+      workspace.id,
+      "hostDeviceId",
+      "grantedByUserId",
+      "revokedAt",
+      "facts",
+      "projectId",
+    ]) {
+      assert.equal(response.body.includes(value), false, value);
+    }
+  }
+  // Once revoked from the other device, the grant leaves the list.
+  await revoked(laptop, agent.id, shell.id);
+  const after = await get(laptop, `/agents/${agent.id}/grants`);
+  assert.equal(after.statusCode, 200, after.body);
+  assert.deepEqual(
+    AgentGrantListResponseSchema.parse(after.json()).grants.map(
+      (grant) => grant.id,
+    ),
+    expected.map((grant) => grant.id).filter((id) => id !== shell.id),
+  );
+});
+
+test("only the agent's owner reads the agent's grants: another member, the workspace's owner, and an admin get 403, and a non-member, a removed member, a removed owner, and an unknown agent get the same 404", async (t) => {
+  const { account, secondDevice } = instance(t);
+  const ada = await account(7601);
+  const bob = await account(7602);
+  const dan = await account(7603);
+  const eve = await account(7604);
+  const former = await account(7605);
+  const outsider = await account(7606);
+  const { workspace, project } = await workspaceWithProject(ada);
+  const bobPerson = await addClaimed(workspace.id, bob, ada);
+  await addClaimed(workspace.id, dan, ada);
+  const evePerson = await addClaimed(workspace.id, eve, ada);
+  await database()
+    .update(workspaceMembers)
+    .set({ role: "admin" })
+    .where(eq(workspaceMembers.id, evePerson));
+  const formerPerson = await addClaimed(workspace.id, former, ada);
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: new Date(), removedByUserId: ada.device.userId })
+    .where(eq(workspaceMembers.id, formerPerson));
+  await workspaceWithProject(outsider, "Elsewhere");
+  const laptop = await secondDevice(bob);
+  const agent = await agentOn(bob, project.id);
+  const repositoryId = await repositoryOf(bob, project.id);
+  const made = await granted(bob, agent.id, {
+    capability: "repo.read",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
+  const url = `/agents/${agent.id}/grants`;
+
+  for (const caller of [dan, ada, eve]) {
+    const refused = await get(caller, url);
+    assert.equal(refused.statusCode, 403, refused.body);
+    assert.deepEqual(refused.json(), FORBIDDEN);
+    assert.equal(refused.body.includes(made.id), false);
+  }
+  const unknown = await get(bob, `/agents/${newId<AgentId>()}/grants`);
+  assert.equal(unknown.statusCode, 404, unknown.body);
+  assert.deepEqual(unknown.json(), NOT_FOUND);
+  for (const caller of [former, outsider]) {
+    const refused = await get(caller, url);
+    assert.equal(refused.statusCode, 404, refused.body);
+    assert.equal(refused.body, unknown.body);
+  }
+  const malformed = await get(bob, "/agents/not-an-id/grants");
+  assert.equal(malformed.statusCode, 400, malformed.body);
+  assert.equal(errorCode(malformed), "bad_request");
+
+  // The owner's person is removed, its grant left in place: the owner
+  // learns nothing more of the agent, on any of its devices.
+  const listed = await get(laptop, url);
+  assert.equal(listed.statusCode, 200, listed.body);
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: new Date(), removedByUserId: ada.device.userId })
+    .where(eq(workspaceMembers.id, bobPerson));
+  assert.equal((await grantRow(made.id)).revokedAt, null);
+  for (const caller of [bob, laptop]) {
+    const refused = await get(caller, url);
+    assert.equal(refused.statusCode, 404, refused.body);
+    assert.equal(refused.body, unknown.body);
+  }
+});
+
 test("a refused or rolled-back grant or revocation sends no grant event and changes nothing, and the same change sends its event once it commits", async (t) => {
   const { account, failNextCommit, failedCommits } = instance(t);
   const bob = await account(7571);
@@ -992,6 +1151,7 @@ test("the grant routes need a valid access token, and a revoked device gets 401"
   });
   const requests = [
     ["GET", "/grant-records", undefined],
+    ["GET", `/agents/${agent.id}/grants`, undefined],
     [
       "POST",
       `/agents/${agent.id}/grants`,

@@ -2,11 +2,13 @@ import {
   type Database,
   grantCapability,
   type GrantCapabilityResult,
+  listAgentGrants,
   listGrantRecords,
   revokeGrant,
   type RevokeGrantResult,
 } from "@mymandev/database";
 import {
+  type AgentGrantListResponse,
   type AgentId,
   AgentIdSchema,
   type GrantCapabilityRequest,
@@ -44,7 +46,7 @@ export type GrantRouteOptions = Readonly<{
   connections: ConnectionRegistry;
 }>;
 
-/** The path parameter of a grant. */
+/** The path parameter of a grant and of the list of an agent's grants. */
 const AgentParamsSchema = z.object({ agentId: AgentIdSchema });
 
 /** The path parameters of a revocation. */
@@ -98,9 +100,10 @@ function refusedRevocation(
 
 /**
  * The grant routes (#75; ADR 0015, P-74 to P-80; Project Manager decisions
- * of 2026-11-02, 2026-11-14, and 2026-11-19): granting a capability to an
- * agent, revoking a grant, and the grant records of the agents that the
- * calling device hosts. Every route needs an access token, and the account
+ * of 2026-11-02, 2026-11-14, 2026-11-19, and 2026-11-24): granting a
+ * capability to an agent, revoking a grant, the grant records of the agents
+ * that the calling device hosts, and the grants of one agent for its owner
+ * on any of its devices (#345). Every route needs an access token, and the account
  * limit of every authenticated route applies; beyond it, the count limits of
  * `GRANT_COUNT_LIMITS`, which the database applies, bound the grants: an
  * agent's and a host device's grants that are not revoked (`grant_limit`),
@@ -111,7 +114,7 @@ function refusedRevocation(
  * of a workspace that the account is not an active member of both answer
  * `404` with `not_found`, so that a route never tells them apart. Only the
  * agent's owner grants, only from the agent's host device; the owner
- * revokes from any of its devices.
+ * revokes, and reads the agent's grants, from any of its devices.
  *
  * Each change runs in one transaction that checks the account and the
  * device again (`lockActor`), so a device that was revoked after the request
@@ -143,6 +146,31 @@ export async function registerGrantRoutes(
           deviceId: auth.deviceId,
         });
         return { records };
+      },
+    );
+
+    // The agent's owner reads the agent's grants from any of its devices, so
+    // that it can revoke them away from the host device (#345, Project
+    // Manager decision of 2026-11-24). It decides as a revocation does, and
+    // the database checks the owner in the statement that reads the grants.
+    // The answer is the database's list as it is: each grant built field by
+    // field, with no host device, account, or record fact (#110). A read
+    // locks nothing, so it needs no `lockActor`; the authentication checked
+    // the device, and the account's request limit applies as for every read.
+    scope.get(
+      GRANT_ROUTES.listAgentGrants.path,
+      { schema: { params: AgentParamsSchema } },
+      async (request): Promise<AgentGrantListResponse> => {
+        const auth = authOf(request);
+        const { agentId } = request.params as { agentId: AgentId };
+        const result = await listAgentGrants(database, {
+          agentId,
+          userId: auth.userId,
+        });
+        if (!result.listed) {
+          throw new ApiError(result.refusal);
+        }
+        return { grants: result.grants };
       },
     );
 
