@@ -65,6 +65,8 @@ const AGENT = id(0xf1);
 const ELSEWHERE = id(0xf2);
 const THEIRS = id(0xf3);
 const DISABLED = id(0xf4);
+const DISABLED_ELSEWHERE = id(0xf5);
+const OLDER_SERVER = id(0xf6);
 const REPOSITORY = id(0x2001);
 const CONNECTION = id(0x3001);
 const GRANT = id(0x4001);
@@ -180,6 +182,9 @@ function setup() {
       agent(ELSEWHERE, ME, OTHER_DEVICE),
       agent(THEIRS, SOMEONE, null),
       agent(DISABLED, ME, DEVICE, AT),
+      agent(DISABLED_ELSEWHERE, ME, OTHER_DEVICE, AT),
+      // The account's agent from a server that does not send its host.
+      agent(OLDER_SERVER, ME, null),
     ],
     unfinishedRuns: [],
     finishedRuns: [],
@@ -963,20 +968,12 @@ test("the owner reads the grants of its agent that another device hosts, each as
   for (const value of [DEVICE, OTHER_DEVICE, USER, ME, "hostDeviceId"]) {
     expect(crossed, value).not.toContain(value);
   }
-  // An owned agent that is hosted here but disabled is not grantable here,
-  // so its grants are read the same way.
-  harness.setAgentGrants({ ok: true, value: { grants: [] } });
-  expect(await harness.service.listAgentGrants(DISABLED)).toEqual({
-    outcome: "ok",
-    agentId: DISABLED,
-    grants: [],
-  });
   // Nothing is written.
   expect(harness.sent).toEqual([]);
   expect(harness.answered()).toBe(0);
 });
 
-test("the grants of an agent are read only for an owner's agent of the open project that is not grantable here; every other request is refused without a read", async () => {
+test("the grants of an agent are read only for an owner's enabled agent of the open project that another device is known to host; every other request is refused without a read", async () => {
   const harness = setup();
   for (const [agentId, reason] of [
     ["not-an-id", "invalid"],
@@ -984,6 +981,11 @@ test("the grants of an agent are read only for an owner's agent of the open proj
     [id(0xf9), "not_open"],
     [THEIRS, "not_owner"],
     [AGENT, "hosted_here"],
+    // Disabled on this device: its grants are in this device's records.
+    [DISABLED, "hosted_here"],
+    [DISABLED_ELSEWHERE, "disabled"],
+    // Without its host, the agent may be this device's own.
+    [OLDER_SERVER, "host_unknown"],
   ] as const) {
     expect(await harness.service.listAgentGrants(agentId), agentId).toEqual({
       outcome: "refused",
@@ -1000,6 +1002,19 @@ test("the grants of an agent are read only for an owner's agent of the open proj
   expect(harness.reads).toEqual([]);
   expect((await harness.service.listAgentGrants(AGENT)).outcome).toBe("ok");
   expect(harness.readParams).toEqual([{ agentId: AGENT }]);
+  // Before this device's key is ready, this device is not known, so no
+  // agent's host is.
+  harness.setStatus({
+    ...signedIn(OTHER_DEVICE),
+    deviceKey: "loading",
+  } as unknown as AccountStatus);
+  for (const agentId of [AGENT, ELSEWHERE, OLDER_SERVER]) {
+    expect(await harness.service.listAgentGrants(agentId), agentId).toEqual({
+      outcome: "refused",
+      reason: "host_unknown",
+    });
+  }
+  harness.setStatus(signedIn(OTHER_DEVICE));
   // No project is open.
   harness.setState({ projectId: null, workspaceId: null });
   expect(await harness.service.listAgentGrants(AGENT)).toEqual({

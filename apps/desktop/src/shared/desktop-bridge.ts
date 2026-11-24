@@ -803,8 +803,9 @@ export interface AgentBridge {
  * times, never an account or a device. Whether this device may grant an
  * agent comes with the agent (`grantableHere` of the agent activity); the
  * main process checks it again before it sends a grant. The grants of the
- * account's agents that another device hosts are read one agent at a time
- * (`listAgentGrants`, #345).
+ * account's agents that another device is known to host
+ * (`hostedElsewhere`) are read one agent at a time (`listAgentGrants`,
+ * #345).
  */
 export interface GrantBridge {
   /** The current grants. */

@@ -10,18 +10,23 @@
 //   host device (ADR 0015, update of 2026-11-23). The agent list gives the
 //   host device to the agent's own account only (#342, `hostDeviceId`); it
 //   is compared here with this device's ID and never leaves the main
-//   process: the renderer gets `ownedByMe` and `grantableHere` alone
-//   (`agentAccess`). A revocation needs `ownedByMe` only, as the API
-//   lets the owner revoke from any of its devices.
+//   process: the renderer gets `ownedByMe`, `grantableHere`, and
+//   `hostedElsewhere` alone (`agentAccess`). A revocation needs
+//   `ownedByMe` only, as the API lets the owner revoke from any of its
+//   devices.
 // - The owner's agents that another device hosts (#345). This device holds
 //   no grant records for them, so `listAgentGrants` reads one such agent's
 //   grants with `GET /agents/:agentId/grants`, on demand, when the
 //   permission screen shows the agent and again after a revocation: only
-//   for an agent of the open project that the account owns and that is not
-//   grantable here, and never on its own. The answer carries no host device
-//   and no record fact; only grants of the agent that was asked for are
-//   passed on, as `GrantView`s, at most `GRANT_LIMITS.agentGrants`. Nothing
-//   is kept: each call reads again.
+//   for an agent of the open project that is `hostedElsewhere` (enabled,
+//   owned by the account, and on a known host device that is not this
+//   one), and never on its own. An agent whose host is not known, from a
+//   server without `hostDeviceId` or before this device's key is ready, is
+//   not read, because it may be this device's own (default until the
+//   Project Manager decides). The answer carries no host device and no
+//   record fact; only grants of the agent that was asked for are passed
+//   on, as `GrantView`s, at most `GRANT_LIMITS.agentGrants`. Nothing is
+//   kept: each call reads again.
 // - What is offered. Every capability. A grant names one scope, a
 //   repository or, for `provider.use`, a provider connection of this
 //   device, and an optional lifetime, checked with the protocol's
@@ -109,6 +114,28 @@ export interface AgentAccess {
    * every agent not grantable here.
    */
   readonly grantableHere: boolean;
+  /**
+   * The agent is enabled, the account owns it, and another device of the
+   * account is known to host it: its grants are read from the API to be
+   * revoked here (#345). An agent whose host is not known, because the
+   * server does not send `hostDeviceId` or this device's key is not ready,
+   * is not hosted elsewhere, since it may be this device's own.
+   */
+  readonly hostedElsewhere: boolean;
+}
+
+/**
+ * Where `agent` is hosted as `viewer` sees it: on this device, on another
+ * one, or `unknown` without the agent's host device or this device's ID.
+ */
+export function agentHost(
+  agent: AgentListItem,
+  viewer: GrantViewer,
+): "here" | "elsewhere" | "unknown" {
+  if (viewer.deviceId === null || agent.hostDeviceId === undefined) {
+    return "unknown";
+  }
+  return agent.hostDeviceId === viewer.deviceId ? "here" : "elsewhere";
 }
 
 /** What `viewer` may do with `agent`; the host device is only compared. */
@@ -118,13 +145,13 @@ export function agentAccess(
 ): AgentAccess {
   const ownedByMe =
     viewer.ownMemberId !== null && agent.ownerMemberId === viewer.ownMemberId;
-  const grantableHere =
-    ownedByMe &&
-    agent.disabledAt === null &&
-    viewer.deviceId !== null &&
-    agent.hostDeviceId !== undefined &&
-    agent.hostDeviceId === viewer.deviceId;
-  return Object.freeze({ ownedByMe, grantableHere });
+  const enabledAndOwned = ownedByMe && agent.disabledAt === null;
+  const host = agentHost(agent, viewer);
+  return Object.freeze({
+    ownedByMe,
+    grantableHere: enabledAndOwned && host === "here",
+    hostedElsewhere: enabledAndOwned && host === "elsewhere",
+  });
 }
 
 /** The viewer of the open project's agents. */
@@ -371,9 +398,11 @@ export function createGrantActions(
   }
 
   /** The agent of the open project with this ID, and what the account may do. */
-  function openAgent(
-    agentId: AgentId,
-  ): { readonly agent: AgentListItem; readonly access: AgentAccess } | null {
+  function openAgent(agentId: AgentId): {
+    readonly agent: AgentListItem;
+    readonly viewer: GrantViewer;
+    readonly access: AgentAccess;
+  } | null {
     const state = agents.state();
     if (state.projectId === null) {
       return null;
@@ -383,7 +412,7 @@ export function createGrantActions(
       return null;
     }
     const viewer = grantViewer(account.status(), state, workspaces.ownMemberId);
-    return { agent, access: agentAccess(agent, viewer) };
+    return { agent, viewer, access: agentAccess(agent, viewer) };
   }
 
   function state(): GrantsState {
@@ -473,10 +502,18 @@ export function createGrantActions(
     if (!found.access.ownedByMe) {
       return refuse("not_owner");
     }
-    // The grant records of this device hold the grants of an agent that it
-    // may grant for; only another device's agents are read here.
-    if (found.access.grantableHere) {
-      return refuse("hosted_here");
+    // Only an enabled agent that another device is known to host is read:
+    // the grant records of this device hold the grants of its own agents,
+    // and an agent whose host is not known may be one of them.
+    if (!found.access.hostedElsewhere) {
+      const host = agentHost(found.agent, found.viewer);
+      return refuse(
+        host === "unknown"
+          ? "host_unknown"
+          : host === "here"
+            ? "hosted_here"
+            : "disabled",
+      );
     }
     let result;
     try {

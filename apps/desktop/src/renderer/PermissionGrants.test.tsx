@@ -592,6 +592,7 @@ const AGENTS: AgentActivityView = {
       disabledAt: null,
       ownedByMe: true,
       grantableHere: true,
+      hostedElsewhere: false,
     },
     {
       id: SECOND,
@@ -600,6 +601,7 @@ const AGENTS: AgentActivityView = {
       disabledAt: null,
       ownedByMe: true,
       grantableHere: true,
+      hostedElsewhere: false,
     },
   ],
   unfinishedRuns: [],

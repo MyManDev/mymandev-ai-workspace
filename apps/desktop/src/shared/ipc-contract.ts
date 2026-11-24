@@ -2661,10 +2661,8 @@ export const AgentViewSchema = z.object({
   /** When the agent was disabled; null while it is enabled. */
   disabledAt: TimestampSchema.nullable(),
   /**
-   * Whether the signed-in account's own person owns the agent (#342). The
-   * permission screen offers the agents that the account owns: those
-   * grantable here with the grant form, and the others, which another
-   * device hosts, with their grants to revoke (#345).
+   * Whether the signed-in account's own person owns the agent (#342): it
+   * may revoke the agent's grants.
    */
   ownedByMe: z.boolean(),
   /**
@@ -2673,6 +2671,15 @@ export const AgentViewSchema = z.object({
    * The server still decides each grant.
    */
   grantableHere: z.boolean(),
+  /**
+   * Whether the agent is one of the account's enabled agents that another
+   * device is known to host (#345): the permission screen offers it after
+   * the agents grantable here, with its grants to revoke and without the
+   * form. An agent whose host is not known, from a server that does not
+   * send it or before this device's key is ready, is neither, because it
+   * may be this device's own.
+   */
+  hostedElsewhere: z.boolean(),
 });
 export type AgentView = z.infer<typeof AgentViewSchema>;
 
@@ -2983,8 +2990,12 @@ export type RevokeGrantResult = z.infer<typeof RevokeGrantResultSchema>;
  * - `not_open`: the agent is not one of the open project's agents. Nothing
  *   was sent.
  * - `not_owner`: the account does not own the agent. Nothing was sent.
- * - `hosted_here`: this device may grant for the agent, so its grants come
- *   with the grant state. Nothing was sent.
+ * - `hosted_here`: this device hosts the agent, so its grants come with
+ *   the grant state. Nothing was sent.
+ * - `host_unknown`: it is not known which device hosts the agent, because
+ *   the server does not send it or this device's key is not ready, so the
+ *   agent may be this device's own. Nothing was sent.
+ * - `disabled`: the agent is disabled. Nothing was sent.
  * - `not_signed_in`, `unavailable`, `rate_limited`: as for the other reads.
  * - `not_found`: the API does not know the agent, or the account is no
  *   longer a member of its workspace.
@@ -2996,6 +3007,8 @@ export const AGENT_GRANTS_READ_PROBLEMS = Object.freeze([
   "not_open",
   "not_owner",
   "hosted_here",
+  "host_unknown",
+  "disabled",
   "not_signed_in",
   "not_found",
   "rate_limited",

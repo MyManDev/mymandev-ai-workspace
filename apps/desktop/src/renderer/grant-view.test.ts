@@ -99,7 +99,9 @@ const FORMAT = agentTimeFormat({ locale: "en-US", timeZone: "UTC" });
 function agent(
   id: string,
   name: string,
-  flags: Partial<Pick<AgentView, "ownedByMe" | "grantableHere">> = {},
+  flags: Partial<
+    Pick<AgentView, "ownedByMe" | "grantableHere" | "hostedElsewhere">
+  > = {},
 ): AgentView {
   return {
     id,
@@ -108,6 +110,7 @@ function agent(
     disabledAt: null,
     ownedByMe: flags.ownedByMe ?? false,
     grantableHere: flags.grantableHere ?? false,
+    hostedElsewhere: flags.hostedElsewhere ?? false,
   };
 }
 
@@ -181,7 +184,10 @@ function input(overrides: Partial<GrantSectionInput> = {}): GrantSectionInput {
       state: agentsState([
         agent(HERE, "Builder", { ownedByMe: true, grantableHere: true }),
         agent(SECOND, "Reviewer", { ownedByMe: true, grantableHere: true }),
-        agent(ELSEWHERE, "Laptop agent", { ownedByMe: true }),
+        agent(ELSEWHERE, "Laptop agent", {
+          ownedByMe: true,
+          hostedElsewhere: true,
+        }),
         agent(THEIRS, "Their agent"),
       ]),
     },
@@ -931,7 +937,10 @@ test("the agents that this device may grant for come first, with the form, then 
             ...agent(SECOND, "Old agent", { ownedByMe: true }),
             disabledAt: AT,
           },
-          agent(ELSEWHERE, "Laptop agent", { ownedByMe: true }),
+          agent(ELSEWHERE, "Laptop agent", {
+            ownedByMe: true,
+            hostedElsewhere: true,
+          }),
           agent(THEIRS, "Their agent"),
         ]),
       },
@@ -947,10 +956,13 @@ test("the agents that this device may grant for come first, with the form, then 
   expect(onLaptop.kind === "form" && onLaptop.form).toBeNull();
   expect(onLaptop.kind === "form" && onLaptop.agentId).toBe(ELSEWHERE);
 
-  // For another member, or without agents: no agent and no form at all.
+  // For another member, a disabled agent, an agent whose host is not
+  // known, which may be this device's own (an older server, or this
+  // device's key not ready), or without agents: no agent and no form at all.
   for (const agents of [
     [agent(THEIRS, "Their agent")],
     [{ ...agent(ELSEWHERE, "Old agent", { ownedByMe: true }), disabledAt: AT }],
+    [agent(ELSEWHERE, "Older server", { ownedByMe: true })],
     [],
   ]) {
     expect(
@@ -991,7 +1003,10 @@ test("the screen reads the grants of the selected agent only while another devic
         kind: "known",
         state: agentsState([
           agent(THEIRS, "Their agent"),
-          agent(ELSEWHERE, "Laptop agent", { ownedByMe: true }),
+          agent(ELSEWHERE, "Laptop agent", {
+            ownedByMe: true,
+            hostedElsewhere: true,
+          }),
         ]),
       },
     }),
@@ -1006,7 +1021,12 @@ test("the screen reads the grants of the selected agent only while another devic
     {
       kind: "known",
       state: {
-        ...agentsState([agent(ELSEWHERE, "Laptop agent", { ownedByMe: true })]),
+        ...agentsState([
+          agent(ELSEWHERE, "Laptop agent", {
+            ownedByMe: true,
+            hostedElsewhere: true,
+          }),
+        ]),
         status: "no_project",
         projectId: null,
       },
@@ -1064,7 +1084,10 @@ test("the provider connections are needed only while an agent of the open projec
   expect(
     needsProviderConnections(
       known([
-        agent(ELSEWHERE, "Laptop agent", { ownedByMe: true }),
+        agent(ELSEWHERE, "Laptop agent", {
+          ownedByMe: true,
+          hostedElsewhere: true,
+        }),
         agent(THEIRS, "Their agent"),
       ]),
     ),

@@ -2242,6 +2242,7 @@ function agentActivity(overrides: Record<string, unknown> = {}) {
         disabledAt: null,
         ownedByMe: true,
         grantableHere: true,
+        hostedElsewhere: false,
       },
     ],
     unfinishedRuns: [agentRun()],
@@ -2785,6 +2786,7 @@ test("an agent activity drops unknown keys at every level, so no member ID or de
           disabledAt: null,
           ownedByMe: true,
           grantableHere: true,
+          hostedElsewhere: false,
         },
       ],
       unfinishedRuns: [
@@ -2806,6 +2808,7 @@ test("an agent activity over the limits or with wrong values is refused", () => 
     disabledAt: null,
     ownedByMe: false,
     grantableHere: false,
+    hostedElsewhere: false,
     ...overrides,
   });
   const many = <T>(item: T, count: number) =>
@@ -2845,6 +2848,8 @@ test("an agent activity over the limits or with wrong values is refused", () => 
     agentActivity({ agents: [agent({ disabledAt: "yesterday" })] }),
     agentActivity({ agents: [agent({ ownedByMe: undefined })] }),
     agentActivity({ agents: [agent({ grantableHere: "yes" })] }),
+    agentActivity({ agents: [agent({ hostedElsewhere: "yes" })] }),
+    agentActivity({ agents: [agent({ hostedElsewhere: undefined })] }),
     agentActivity({ agents: [agent({ id: MOUNT_ID })] }),
     agentActivity({ unfinishedRuns: [agentRun({ state: "paused" })] }),
     agentActivity({ unfinishedRuns: [agentRun({ reason: "" })] }),

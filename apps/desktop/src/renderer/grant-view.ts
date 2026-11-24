@@ -392,6 +392,9 @@ export const AGENT_GRANTS_PROBLEM_MESSAGES: Readonly<
   not_owner: "Only the agent's owner sees and revokes its permissions.",
   hosted_here:
     "This device hosts the agent, so its permissions come with this device's grants.",
+  host_unknown:
+    "It is not known which device hosts this agent, so its permissions are not read here.",
+  disabled: "This agent is disabled, so its permissions are not read here.",
   not_signed_in:
     "The permissions of this agent cannot be read: the server did not accept this device's sign-in.",
   not_found:
@@ -665,16 +668,17 @@ export function needsProviderConnections(agents: AgentPanelView): boolean {
 /**
  * The agents that the section offers: the account's own agents that this
  * device may grant for (`grantableHere`), then its enabled agents that
- * another device hosts, whose grants can only be revoked here (#345). A
- * disabled agent is not offered: disabling it revoked its grants.
+ * another device is known to host (`hostedElsewhere`), whose grants can
+ * only be revoked here (#345). A disabled agent is not offered: disabling
+ * it revoked its grants. Nor is an agent whose host is not known: it may be
+ * this device's own, and the main process sets neither flag for it.
  */
 function offeredAgents(
   agents: readonly AgentView[],
 ): readonly (AgentChoice & { readonly name: string })[] {
   const grantable = agents.filter((agent) => agent.grantableHere);
   const elsewhere = agents.filter(
-    (agent) =>
-      agent.ownedByMe && !agent.grantableHere && agent.disabledAt === null,
+    (agent) => agent.hostedElsewhere && !agent.grantableHere,
   );
   return [
     ...grantable.map((agent) => ({
