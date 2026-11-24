@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { after, before, test } from "node:test";
 import {
+  AgentGrantListResponseSchema,
   type AgentId,
   type DeviceId,
   GRANT_COUNT_LIMITS,
@@ -29,6 +30,7 @@ import { DatabaseError, withDatabaseErrors } from "./errors.ts";
 import {
   grantCapability,
   type GrantCapabilityResult,
+  listAgentGrants,
   listGrantRecords,
   revokeGrant,
 } from "./grants.ts";
@@ -1809,6 +1811,213 @@ test(
     assert.deepEqual(waitedOn, []);
     assert.deepEqual(
       result.map((record) => record.grant.id),
+      [listed],
+    );
+  },
+);
+
+function agentGrantsOf(agentId: AgentId, who: Account) {
+  return listAgentGrants(database(), { agentId, userId: who.userId });
+}
+
+test("the owner reads the agent's grants that are not revoked, an expired one included, each with its ID, agent, capability, scope, and times only, in the order of the IDs", async () => {
+  const { owner, projectId, repositoryId, agentId } = await world();
+  const otherAgent = await agentOf(projectId, owner);
+  const connectionId = await connectionOn(owner.deviceId);
+  // Expires a minute after NOW, so it has expired at LATER.
+  const expiring = await granted(
+    agentId,
+    owner,
+    readRepository(repositoryId, 60),
+  );
+  const shell = await granted(agentId, owner, {
+    capability: "terminal.execute",
+    repositoryId,
+    lifetimeSeconds: SHELL_GRANT_MAX_LIFETIME_SECONDS,
+  });
+  const use = await granted(agentId, owner, {
+    capability: "provider.use",
+    providerConnectionId: connectionId,
+    lifetimeSeconds: null,
+  });
+  const gone = await granted(agentId, owner, {
+    capability: "repo.write",
+    repositoryId,
+    lifetimeSeconds: null,
+  });
+  assert.ok(
+    (
+      await revokeGrant(database(), {
+        agentId,
+        grantId: gone,
+        userId: owner.userId,
+        now: LATER,
+      })
+    ).revoked,
+  );
+  await granted(otherAgent, owner, readRepository(repositoryId));
+
+  const result = await agentGrantsOf(agentId, owner);
+  assert.ok(result.listed, JSON.stringify(result));
+  const expected = [
+    {
+      id: expiring,
+      granteeAgentId: agentId,
+      createdAt: NOW.toISOString(),
+      expiresAt: new Date(NOW.getTime() + MINUTE_MS).toISOString(),
+      capability: "repo.read",
+      repositoryId,
+    },
+    {
+      id: shell,
+      granteeAgentId: agentId,
+      createdAt: NOW.toISOString(),
+      expiresAt: new Date(
+        NOW.getTime() + SHELL_GRANT_MAX_LIFETIME_SECONDS * 1000,
+      ).toISOString(),
+      capability: "terminal.execute",
+      repositoryId,
+    },
+    {
+      id: use,
+      granteeAgentId: agentId,
+      createdAt: NOW.toISOString(),
+      expiresAt: null,
+      capability: "provider.use",
+      providerConnectionId: connectionId,
+    },
+  ].sort((a, b) => (a.id < b.id ? -1 : 1));
+  assert.deepEqual(result.grants, expected);
+  // The protocol's answer takes the list as it is, and nothing names a
+  // device, an account, or the project.
+  assert.deepEqual(
+    AgentGrantListResponseSchema.parse({ grants: result.grants }),
+    { grants: expected },
+  );
+  const sent = JSON.stringify(result);
+  for (const id of [owner.deviceId, owner.userId, projectId]) {
+    assert.equal(sent.includes(id), false, id);
+  }
+  // An agent without a grant has an empty list.
+  const idle = await agentOf(projectId, owner);
+  assert.deepEqual(await agentGrantsOf(idle, owner), {
+    listed: true,
+    grants: [],
+  });
+});
+
+test("only the agent's owner reads its grants, from any of its devices: another member, the workspace's owner, and an admin are forbidden, and an unknown agent, an outsider, a removed member, and a removed owner are not_found", async () => {
+  const {
+    owner: workspaceOwner,
+    workspaceId,
+    projectId,
+    repositoryId,
+  } = await world();
+  const agentOwner = await account("Agent owner");
+  await join(workspaceId, agentOwner);
+  const agentId = await agentOf(projectId, agentOwner);
+  const grantId = await granted(
+    agentId,
+    agentOwner,
+    readRepository(repositoryId),
+  );
+  const member = await account("Member");
+  await join(workspaceId, member);
+  const admin = await account("Admin");
+  await database().insert(workspaceMembers).values({
+    id: newId<MemberId>(),
+    workspaceId,
+    userId: admin.userId,
+    displayName: "Admin",
+    role: "admin",
+    addedByUserId: workspaceOwner.userId,
+    claimedAt: EARLIER,
+  });
+  const former = await account("Former");
+  await join(workspaceId, former, EARLIER);
+  const outsider = await account("Outsider");
+  await workspaceOf(outsider);
+
+  // The read takes no device: the owner reads it from any of its devices.
+  const owned = await agentGrantsOf(agentId, agentOwner);
+  assert.ok(owned.listed);
+  assert.deepEqual(
+    owned.grants.map((grant) => grant.id),
+    [grantId],
+  );
+  for (const who of [member, workspaceOwner, admin]) {
+    assert.deepEqual(await agentGrantsOf(agentId, who), {
+      listed: false,
+      refusal: "forbidden",
+    });
+  }
+  for (const who of [outsider, former]) {
+    assert.deepEqual(await agentGrantsOf(agentId, who), {
+      listed: false,
+      refusal: "not_found",
+    });
+  }
+  assert.deepEqual(await agentGrantsOf(newId<AgentId>(), agentOwner), {
+    listed: false,
+    refusal: "not_found",
+  });
+  // The owner's person is removed, and the grant left in place: the owner
+  // no longer sees the agent, as for a revocation.
+  await database()
+    .update(workspaceMembers)
+    .set({ removedAt: LATER, removedByUserId: workspaceOwner.userId })
+    .where(eq(workspaceMembers.userId, agentOwner.userId));
+  assert.equal((await grantRow(grantId)).revokedAt, null);
+  assert.deepEqual(await agentGrantsOf(agentId, agentOwner), {
+    listed: false,
+    refusal: "not_found",
+  });
+});
+
+test(`the owner reads all ${PER_AGENT} grants of an agent at its count limit, and a list over it throws instead of being cut`, async () => {
+  const { owner, projectId, agentId } = await world();
+  const ids = await fill(projectId, agentId, owner, PER_AGENT);
+  const full = await agentGrantsOf(agentId, owner);
+  assert.ok(full.listed);
+  assert.deepEqual(
+    full.grants.map((grant) => grant.id),
+    [...ids].sort(),
+  );
+  assert.equal(
+    AgentGrantListResponseSchema.safeParse({ grants: full.grants }).success,
+    true,
+  );
+  // Only a broken invariant puts more there: the writer refuses the next.
+  await fill(projectId, agentId, owner, 1);
+  await assert.rejects(agentGrantsOf(agentId, owner), {
+    message: "Invariant broken: an agent has more grants than its count limit",
+  });
+});
+
+test(
+  "the list of an agent's grants does not wait for a grant that is not committed, and does not see it",
+  SERVER_ONLY,
+  async () => {
+    const { owner, repositoryId, agentId } = await world();
+    const listed = await granted(agentId, owner, {
+      capability: "repo.write",
+      repositoryId,
+      lifetimeSeconds: null,
+    });
+    const { result, waitedOn } = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        assert.ok(
+          (await grant(agentId, owner, readRepository(repositoryId), NOW, tx))
+            .granted,
+        );
+      },
+      () => agentGrantsOf(agentId, owner),
+    );
+    assert.deepEqual(waitedOn, []);
+    assert.ok(result.listed);
+    assert.deepEqual(
+      result.grants.map((grant) => grant.id),
       [listed],
     );
   },

@@ -1,4 +1,5 @@
 import {
+  type AgentGrant,
   type AgentId,
   type DeviceId,
   GRANT_COUNT_LIMITS,
@@ -16,6 +17,7 @@ import {
   and,
   count,
   eq,
+  exists,
   gt,
   isNull,
   min,
@@ -39,9 +41,10 @@ import {
   workspaces,
 } from "./schema/index.ts";
 
-// The grants of an agent: granting a capability, revoking a grant, and the
-// grant records of the agents that a device hosts (#75; ADR 0015, P-74 to
-// P-80; Project Manager decisions of 2026-11-02 and 2026-11-14). The routes
+// The grants of an agent: granting a capability, revoking a grant, the
+// grant records of the agents that a device hosts, and the grants of one
+// agent for its owner (#75, #345; ADR 0015, P-74 to P-80; Project Manager
+// decisions of 2026-11-02, 2026-11-14, and 2026-11-24). The routes
 // and their codes are the protocol's `GRANT_ROUTES` and `GRANT_ROUTE_ERRORS`.
 // Only the agent's owner grants and revokes (P-44), from any of its devices
 // (recommendation 4, Project Manager decision of 2026-11-14), and only from
@@ -709,4 +712,166 @@ export async function listGrantRecords(
             },
     },
   }));
+}
+
+export type ListAgentGrantsInput = Readonly<{
+  agentId: AgentId;
+  /** The reading account; it must be the agent's owner, on any of its devices. */
+  userId: UserId;
+}>;
+
+export type ListAgentGrantsResult =
+  | Readonly<{
+      listed: true;
+      /** The agent's grants that are not revoked, in the order of their IDs. */
+      grants: AgentGrant[];
+    }>
+  | Readonly<{
+      listed: false;
+      /**
+       * `not_found`: the agent does not exist or is in a workspace that the
+       * account is not an active member of; `forbidden`: the account is not
+       * the agent's owner.
+       */
+      refusal: "not_found" | "forbidden";
+    }>;
+
+const reader = alias(workspaceMembers, "reader");
+
+/**
+ * The grants of one agent for its owner, the answer of `GET
+ * /agents/:agentId/grants` (#345, Project Manager decision of 2026-11-24):
+ * every grant of the agent that is not revoked, an expired one included,
+ * because a revocation also takes an expired grant, in the order of the
+ * grant IDs. The owner reads it from any of its devices, so the calling
+ * device plays no part.
+ *
+ * It decides as `revokeGrant` does: `not_found` for an unknown agent or an
+ * account without an active person in the agent's workspace, then
+ * `forbidden` for an account that is not the agent's owner. The ownership
+ * and the membership are checked in SQL, in the one statement that reads the
+ * grants: the grants are joined only while the account owns the agent and
+ * has an active person in its workspace, and the same two conditions are
+ * read back for the refusal. So every grant comes from one snapshot with the
+ * check, even under READ COMMITTED, and the check cannot be left out of the
+ * rows. It locks nothing and writes nothing.
+ *
+ * It reads only the columns of `AgentGrant`: never the host device, the
+ * granting or revoking account, the project, or a fact of a record (#110).
+ * The agent's count limit (`GRANT_COUNT_LIMITS.perAgent`) bounds the list,
+ * and the list is never cut: a list over it breaks that invariant and
+ * throws, as `listGrantRecords` does.
+ */
+export async function listAgentGrants(
+  db: Database,
+  input: ListAgentGrantsInput,
+): Promise<ListAgentGrantsResult> {
+  const rows = await withDatabaseErrors(() => {
+    const activePerson = db
+      .select({ id: reader.id })
+      .from(reader)
+      .where(
+        and(
+          eq(reader.workspaceId, projects.workspaceId),
+          eq(reader.userId, input.userId),
+          isNull(reader.removedAt),
+        ),
+      );
+    const member = sql<boolean>`${exists(activePerson)}`;
+    const owns = sql<boolean>`${agents.ownerUserId} = ${input.userId}`;
+    return db
+      .select({
+        member,
+        owns,
+        grant: {
+          id: permissionGrants.id,
+          granteeAgentId: permissionGrants.granteeAgentId,
+          capability: permissionGrants.capability,
+          repositoryId: permissionGrants.repositoryId,
+          providerConnectionId: permissionGrants.providerConnectionId,
+          createdAt: permissionGrants.createdAt,
+          expiresAt: permissionGrants.expiresAt,
+        },
+      })
+      .from(agents)
+      .innerJoin(projects, eq(projects.id, agents.projectId))
+      .leftJoin(
+        permissionGrants,
+        and(
+          eq(permissionGrants.granteeAgentId, agents.id),
+          isNull(permissionGrants.revokedAt),
+          member,
+          owns,
+        ),
+      )
+      .where(eq(agents.id, input.agentId))
+      .orderBy(permissionGrants.id)
+      .limit(GRANT_COUNT_LIMITS.perAgent + 1);
+  });
+  const [first] = rows;
+  if (first === undefined || !first.member) {
+    return { listed: false, refusal: "not_found" };
+  }
+  if (!first.owns) {
+    return { listed: false, refusal: "forbidden" };
+  }
+  // Outside `withDatabaseErrors`, so that the message reaches the log; it
+  // holds no data of a row.
+  if (rows.length > GRANT_COUNT_LIMITS.perAgent) {
+    throw new Error(
+      "Invariant broken: an agent has more grants than its count limit",
+    );
+  }
+  return {
+    listed: true,
+    grants: rows.flatMap(({ grant }) =>
+      grant === null ? [] : [agentGrantOf(grant)],
+    ),
+  };
+}
+
+/**
+ * A grant as its owner reads it (`AgentGrant`), built field by field, so
+ * that no other column can reach the answer. The scope CHECK gives every
+ * row exactly the scope of its capability; a row without it breaks that
+ * invariant and throws.
+ */
+function agentGrantOf(
+  row: Pick<
+    GrantRow,
+    | "id"
+    | "granteeAgentId"
+    | "capability"
+    | "repositoryId"
+    | "providerConnectionId"
+    | "createdAt"
+    | "expiresAt"
+  >,
+): AgentGrant {
+  const header = {
+    id: row.id,
+    granteeAgentId: row.granteeAgentId,
+    createdAt: row.createdAt.toISOString(),
+    expiresAt: isoOrNull(row.expiresAt),
+  };
+  if (row.capability === "provider.use") {
+    if (row.providerConnectionId === null) {
+      throw new Error(
+        "Invariant broken: a provider.use grant names no provider connection",
+      );
+    }
+    return {
+      ...header,
+      capability: row.capability,
+      providerConnectionId: row.providerConnectionId,
+    };
+  }
+  if (row.repositoryId === null) {
+    throw new Error("Invariant broken: a repository grant names no repository");
+  }
+  return {
+    ...header,
+    capability: row.capability,
+    repositoryId: row.repositoryId,
+  };
 }
