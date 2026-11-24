@@ -489,8 +489,10 @@ const owner = alias(workspaceMembers, "owner");
  * `MAX_ANSWER_LIST_ITEMS`. Any active member of the project's workspace
  * reads them, also of an archived project; a project that does not exist and
  * a project of a workspace that the account is not an active member of,
- * removed members included, give the same `not_found`. An agent names no
- * device: the host device is device data, which only its own account sees.
+ * removed members included, give the same `not_found`. The host device is
+ * device data, which only its own account sees (#110): an agent of the
+ * reading account carries `hostDeviceId`, and every other agent leaves it
+ * out (#342), as a run leaves out its provider connection (#35).
  *
  * The table records the owning account; the protocol shows the owner's
  * person, `ownerMemberId`, as `listProjects` shows a project's creator: the
@@ -529,6 +531,7 @@ export async function listProjectAgents(
         name: agents.name,
         ownerMemberId: sql<MemberId | null>`(${ownerPerson})`,
         disabledAt: agents.disabledAt,
+        hostDeviceId: sql<DeviceId | null>`case when ${eq(agents.ownerUserId, input.actorUserId)} then ${agents.hostDeviceId} end`,
       })
       .from(agents)
       .innerJoin(projects, eq(projects.id, agents.projectId))
@@ -543,18 +546,21 @@ export async function listProjectAgents(
   // holds no data of the row.
   return {
     listed: true,
-    agents: rows.map(({ ownerMemberId, disabledAt, ...agent }) => {
-      if (ownerMemberId === null) {
-        throw new Error(
-          "Invariant broken: the owner of an agent has no person in its project's workspace",
-        );
-      }
-      return {
-        ...agent,
-        ownerMemberId,
-        disabledAt: disabledAt === null ? null : disabledAt.toISOString(),
-      };
-    }),
+    agents: rows.map(
+      ({ ownerMemberId, disabledAt, hostDeviceId, ...agent }) => {
+        if (ownerMemberId === null) {
+          throw new Error(
+            "Invariant broken: the owner of an agent has no person in its project's workspace",
+          );
+        }
+        return {
+          ...agent,
+          ownerMemberId,
+          disabledAt: disabledAt === null ? null : disabledAt.toISOString(),
+          ...(hostDeviceId === null ? {} : { hostDeviceId }),
+        };
+      },
+    ),
   };
 }
 

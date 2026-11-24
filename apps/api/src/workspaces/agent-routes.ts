@@ -115,8 +115,9 @@ export function registerAgentRoutes(
 ): void {
   const { database, connections } = options;
 
-  // Disabled agents included, without their host device; also of an
-  // archived project.
+  // Disabled agents included; also of an archived project. Only the
+  // caller's own agents carry their host device (#342), which
+  // `listProjectAgents` reads for the caller alone.
   project.get(
     AGENT_ROUTES.listAgents.path,
     { schema: { params: ProjectPathParamsSchema } },
@@ -186,12 +187,16 @@ export function registerAgentRoutes(
         }
         return result;
       });
+      // The event names no device (#110); the answer goes to the owner
+      // alone, with the calling device as the host device (#342).
       sendWorkspaceEvent(request, options.onWorkspaceEvent, {
         ...serverEventHeader(workspaceId, now),
         type: "workspace.agent.created",
         payload: { agent: workspaceAgent(agent) },
       });
-      return { agent: workspaceAgent(agent) };
+      return {
+        agent: { ...workspaceAgent(agent), hostDeviceId: auth.deviceId },
+      };
     },
   );
 

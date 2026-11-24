@@ -1224,7 +1224,7 @@ test("the largest relayed transitions of one burst fit, with the largest chat me
   );
 });
 
-test("the agent and run routes answer a member with the project's agents, disabled ones included and without a host device, and its unfinished and finished runs", async (t) => {
+test("the agent and run routes answer a member with the project's agents, disabled ones included and with the host device of its own agents only, and its unfinished and finished runs", async (t) => {
   const { account } = await instance(t);
   const ada = await account(3861);
   const bob = await account(3862);
@@ -1267,8 +1267,12 @@ test("the agent and run routes answer a member with the project's agents, disabl
       },
     ],
   );
+  // Bob reads the host device of his own agent only (#342).
+  assert.deepEqual(
+    listed.agents.map((agent) => agent.hostDeviceId),
+    [undefined, bob.device.deviceId],
+  );
   assert.ok(!agentsAnswer.body.includes(ada.device.deviceId));
-  assert.ok(!agentsAnswer.body.includes(bob.device.deviceId));
 
   const [first, second, third] = builder.runIds;
   assert.ok(first !== undefined && second !== undefined && third !== undefined);

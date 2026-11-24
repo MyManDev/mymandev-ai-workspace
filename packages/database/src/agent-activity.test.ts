@@ -816,7 +816,7 @@ test("the transition CHECK holds exactly the transitions of the protocol that a 
   assert.deepEqual(pairs.toSorted(), allowed.toSorted());
 });
 
-test("a project's agents: every agent of the project with its owner's person and no device, the oldest first", async () => {
+test("a project's agents: every agent of the project with its owner's person, the oldest first, and the host device only for the agent's own account", async () => {
   const { owner, workspaceId, projectId, agentId } = await setUp();
   const member = await account("Member");
   const memberPerson = await join(workspaceId, member);
@@ -860,6 +860,7 @@ test("a project's agents: every agent of the project with its owner's person and
       name: "Builder",
       ownerMemberId: await personOf(workspaceId, owner),
       disabledAt: null,
+      hostDeviceId: owner.deviceId,
     },
     {
       id: memberAgent,
@@ -879,13 +880,48 @@ test("a project's agents: every agent of the project with its owner's person and
   assert.ok(
     AgentListResponseSchema.safeParse({ agents: result.agents }).success,
   );
-  // Any active member reads the list.
+  // Any active member reads the list, with the host device of its own
+  // agents only (#342): the member's agent names its device, and the
+  // owner's agent names none.
+  const withoutDevices = result.agents.map((agent) => {
+    const copy = { ...agent };
+    delete copy.hostDeviceId;
+    return copy;
+  });
+  const memberResult = await listProjectAgents(database(), {
+    actorUserId: member.userId,
+    projectId,
+  });
+  assert.ok(memberResult.listed);
+  assert.deepEqual(memberResult.agents, [
+    withoutDevices[0],
+    { ...withoutDevices[1], hostDeviceId: member.deviceId },
+    withoutDevices[2],
+  ]);
+  // An agent hosted on another device of the account names that device.
+  const secondDevice = await addDevice(owner.userId);
+  const elsewhere = await agentOf(projectId, owner, {
+    deviceId: secondDevice,
+    createdAt: new Date(LATER.getTime() + 2),
+  });
+  const again = await listProjectAgents(database(), {
+    actorUserId: owner.userId,
+    projectId,
+  });
+  assert.ok(again.listed);
   assert.deepEqual(
-    await listProjectAgents(database(), {
-      actorUserId: member.userId,
-      projectId,
-    }),
-    result,
+    again.agents.map((agent) => [agent.id, agent.hostDeviceId]),
+    [
+      [agentId, owner.deviceId],
+      [memberAgent, undefined],
+      [leaverAgent, undefined],
+      [elsewhere, secondDevice],
+    ],
+  );
+  assert.equal(
+    again.agents.filter((agent) => !Object.hasOwn(agent, "hostDeviceId"))
+      .length,
+    2,
   );
   // A project without agents.
   const empty = await projectOf(workspaceId, owner, "Empty");
