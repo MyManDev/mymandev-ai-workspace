@@ -30,6 +30,7 @@ import {
   type DisableAgentInput,
   type DisableAgentResult,
 } from "./agents.ts";
+import { disabledAgentsOf } from "./cascade.ts";
 import { postChatMessage } from "./chat.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
@@ -1047,6 +1048,107 @@ test("the owner of an agent that left and joined again is shown by the new perso
   const disabled = await disable(projectId, result.agent.id, member);
   assert.ok(disabled.disabled);
   assert.equal(disabled.agent.ownerMemberId, again);
+});
+
+// The disabled agents of a cascade (#326).
+
+test("disabledAgentsOf reads the agents that a device revocation and a removal disabled, each with its workspace and as the agent list shows it, in the order of the IDs", async () => {
+  const { owner, workspaceId, projectId } = await setUp();
+  const member = await account("Member");
+  const memberPerson = await join(workspaceId, member);
+  const own = await workspaceOf(member);
+  const ownProject = await projectIn(own, member);
+  const ownPerson = await personOf(own, member);
+  const inTeam = await created(projectId, member, "Team agent");
+  const inOwn = await created(ownProject, member, "Own agent");
+  const kept = await created(projectId, owner, "Kept");
+
+  // A device revocation disables the device's agents in both workspaces.
+  const revoked = await database().transaction(async (tx) => {
+    const result = await revokeDevice(tx, {
+      deviceId: member.deviceId,
+      userId: member.userId,
+      reason: "removed",
+      now: LATER,
+      actorUserId: member.userId,
+      actorDeviceId: null,
+    });
+    assert.ok(result.revoked);
+    return disabledAgentsOf(tx, result.disabledAgentIds);
+  });
+  const expected = [
+    {
+      workspaceId,
+      agent: {
+        id: inTeam,
+        projectId,
+        name: "Team agent",
+        ownerMemberId: memberPerson,
+        disabledAt: LATER.toISOString(),
+      },
+    },
+    {
+      workspaceId: own,
+      agent: {
+        id: inOwn,
+        projectId: ownProject,
+        name: "Own agent",
+        ownerMemberId: ownPerson,
+        disabledAt: LATER.toISOString(),
+      },
+    },
+  ].sort((a, b) => (a.agent.id < b.agent.id ? -1 : 1));
+  assert.deepEqual(revoked, expected);
+  for (const { agent } of revoked) {
+    assert.ok(Object.isFrozen(agent));
+    assert.equal(AgentListItemSchema.safeParse(agent).success, true);
+  }
+  // The same items as the agent list shows them.
+  assert.deepEqual(
+    (await listed(projectId, owner)).find((agent) => agent.id === inTeam),
+    expected.find((item) => item.agent.id === inTeam)?.agent,
+  );
+
+  // A removal disables the person's agents; the owner is the removed person.
+  const removed = await account("Removed");
+  const removedPerson = await join(workspaceId, removed);
+  const removedAgent = await created(projectId, removed, "Leaving");
+  const ended = await database().transaction(async (tx) => {
+    const result = await removeMember(tx, {
+      workspaceId,
+      ...owner,
+      memberId: removedPerson,
+      now: LATER,
+    });
+    assert.ok(result.removed);
+    return disabledAgentsOf(tx, result.disabledAgentIds);
+  });
+  assert.deepEqual(ended, [
+    {
+      workspaceId,
+      agent: {
+        id: removedAgent,
+        projectId,
+        name: "Leaving",
+        ownerMemberId: removedPerson,
+        disabledAt: LATER.toISOString(),
+      },
+    },
+  ]);
+  assert.deepEqual(await disabledAgentsOf(database(), []), []);
+
+  // An ID of no agent, of an enabled agent, or twice breaks the invariant.
+  for (const asked of [
+    [inTeam, newId<AgentId>()],
+    [inTeam, kept],
+    [inTeam, inTeam],
+  ]) {
+    await assert.rejects(
+      disabledAgentsOf(database(), asked),
+      /^Error: Invariant broken/u,
+      JSON.stringify(asked),
+    );
+  }
 });
 
 // Races, on a PostgreSQL server only.
