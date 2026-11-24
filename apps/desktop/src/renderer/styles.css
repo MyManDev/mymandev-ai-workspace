@@ -958,6 +958,14 @@ code {
   margin-block-end: var(--space-2);
 }
 
+/* The agents of the section stand outside the form (#345), laid out as it. */
+.grant-agent {
+  display: grid;
+  gap: var(--space-1);
+  justify-items: start;
+  margin-block-end: var(--space-1);
+}
+
 .grant-form button {
   margin-block-start: var(--space-2);
 }

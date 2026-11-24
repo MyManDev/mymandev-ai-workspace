@@ -8,6 +8,7 @@ import {
 import { afterEach, expect, test, vi } from "vitest";
 import type {
   AgentActivityView,
+  AgentGrantsResult,
   AgentView,
   GrantCapabilityResult,
   GrantsView,
@@ -16,11 +17,14 @@ import type {
   RevokeGrantResult,
 } from "../shared/ipc-contract.ts";
 import {
+  AGENT_GRANTS_READ_PROBLEMS,
   GRANT_CAPABILITY_REFUSALS,
   REVOKE_GRANT_REFUSALS,
 } from "../shared/ipc-contract.ts";
 import { agentTimeFormat } from "./agent-view.ts";
 import {
+  AGENT_GRANTS_PROBLEM_MESSAGES,
+  agentGrantsToRead,
   askConfirmation,
   bundleableCapabilities,
   changeGrantForm,
@@ -43,7 +47,9 @@ import {
   INITIAL_CAPABILITY,
   INITIAL_GRANT_FORM,
   missingShellGitCapabilities,
+  missingShellGitCapabilitiesIn,
   needsProviderConnections,
+  NO_AGENT_GRANTS,
   NO_EXPIRY_ID,
   OFFERED_CAPABILITIES,
   preselectableCapabilities,
@@ -55,6 +61,7 @@ import {
   type GrantFormState,
   type GrantFormView,
   type GrantSectionInput,
+  type AgentGrantsPanelView,
   type GrantSectionView,
   type GrantsPanelView,
 } from "./grant-view.ts";
@@ -180,6 +187,7 @@ function input(overrides: Partial<GrantSectionInput> = {}): GrantSectionInput {
     },
     repositories: { kind: "known", state: REPOSITORIES },
     grants: { kind: "known", state: grantsState([]) },
+    agentGrants: NO_AGENT_GRANTS,
     connections: CONNECTIONS,
     form: INITIAL_GRANT_FORM,
     now: NOW,
@@ -865,21 +873,32 @@ test("the form says that repo.read with provider.use sends the repository's cont
   }
 });
 
-test("only the agents that this device may grant for are offered; the owner's other devices and other members' agents never are", () => {
-  const form = formOf(describeGrantSection(input()));
-  expect(form.agents).toEqual([
-    { id: HERE, label: "Builder" },
-    { id: SECOND, label: "Reviewer" },
+test("the agents that this device may grant for come first, with the form, then the owner's agents that another device hosts, without one; other members' and disabled agents never", () => {
+  const view = describeGrantSection(input());
+  if (view.kind !== "form") {
+    throw new Error("no form");
+  }
+  expect(view.agents).toEqual([
+    { id: HERE, label: "Builder", grantable: true },
+    { id: SECOND, label: "Reviewer", grantable: true },
+    {
+      id: ELSEWHERE,
+      label: `Laptop agent (${GRANT_MESSAGES.otherDevice})`,
+      grantable: false,
+    },
   ]);
-  expect(form.agentId).toBe(HERE);
-  // A chosen agent that is no longer grantable here falls back.
-  expect(
-    formOf(
-      describeGrantSection(
-        input({ form: { ...INITIAL_GRANT_FORM, agentId: ELSEWHERE } }),
-      ),
-    ).agentId,
-  ).toBe(HERE);
+  expect(view.agentId).toBe(HERE);
+  expect(formOf(view).agentId).toBe(HERE);
+  // An agent that is not offered falls back to the first one.
+  for (const agentId of [THEIRS, "0192f2a0-7c3e-7a1b-8c4d-5e6f708192ff"]) {
+    expect(
+      formOf(
+        describeGrantSection(
+          input({ form: { ...INITIAL_GRANT_FORM, agentId } }),
+        ),
+      ).agentId,
+    ).toBe(HERE);
+  }
   expect(
     formOf(
       describeGrantSection(
@@ -887,11 +906,51 @@ test("only the agents that this device may grant for are offered; the owner's ot
       ),
     ).agentId,
   ).toBe(SECOND);
+  // The owner's agent that another device hosts: no form, only its grants.
+  const elsewhere = describeGrantSection(
+    input({ form: { ...INITIAL_GRANT_FORM, agentId: ELSEWHERE } }),
+  );
+  expect(elsewhere).toEqual({
+    kind: "form",
+    agents: view.agents,
+    agentId: ELSEWHERE,
+    form: null,
+    notes: [GRANT_MESSAGES.hostedElsewhere],
+    grants: [],
+    grantsNote: GRANT_MESSAGES.agentGrantsPending,
+  });
 
-  // On another device of the owner, or for another member: no form at all.
+  // On another device of the owner, only the agents that it hosts elsewhere
+  // are offered, without a form; a disabled one is not.
+  const onLaptop = describeGrantSection(
+    input({
+      agents: {
+        kind: "known",
+        state: agentsState([
+          {
+            ...agent(SECOND, "Old agent", { ownedByMe: true }),
+            disabledAt: AT,
+          },
+          agent(ELSEWHERE, "Laptop agent", { ownedByMe: true }),
+          agent(THEIRS, "Their agent"),
+        ]),
+      },
+    }),
+  );
+  expect(onLaptop.kind === "form" && onLaptop.agents).toEqual([
+    {
+      id: ELSEWHERE,
+      label: `Laptop agent (${GRANT_MESSAGES.otherDevice})`,
+      grantable: false,
+    },
+  ]);
+  expect(onLaptop.kind === "form" && onLaptop.form).toBeNull();
+  expect(onLaptop.kind === "form" && onLaptop.agentId).toBe(ELSEWHERE);
+
+  // For another member, or without agents: no agent and no form at all.
   for (const agents of [
-    [agent(ELSEWHERE, "Laptop agent", { ownedByMe: true })],
     [agent(THEIRS, "Their agent")],
+    [{ ...agent(ELSEWHERE, "Old agent", { ownedByMe: true }), disabledAt: AT }],
     [],
   ]) {
     expect(
@@ -900,11 +959,69 @@ test("only the agents that this device may grant for are offered; the owner's ot
       ),
     ).toEqual({
       kind: "form",
+      agents: [],
+      agentId: null,
       form: null,
       notes: [GRANT_MESSAGES.noGrantableAgent],
       grants: [],
       grantsNote: undefined,
     });
+  }
+});
+
+test("the screen reads the grants of the selected agent only while another device hosts it, as the section selects it", () => {
+  const read = (overrides: Partial<GrantSectionInput>) => {
+    const value = input(overrides);
+    const view = describeGrantSection(value);
+    const agentId = agentGrantsToRead(value.agents, value.form);
+    // The same agent as the section shows without a form.
+    expect(agentId).toBe(
+      view.kind === "form" && view.form === null ? view.agentId : null,
+    );
+    return agentId;
+  };
+  expect(read({})).toBeNull();
+  expect(read({ form: { ...INITIAL_GRANT_FORM, agentId: SECOND } })).toBeNull();
+  expect(read({ form: { ...INITIAL_GRANT_FORM, agentId: ELSEWHERE } })).toBe(
+    ELSEWHERE,
+  );
+  expect(
+    read({
+      agents: {
+        kind: "known",
+        state: agentsState([
+          agent(THEIRS, "Their agent"),
+          agent(ELSEWHERE, "Laptop agent", { ownedByMe: true }),
+        ]),
+      },
+    }),
+  ).toBe(ELSEWHERE);
+  for (const agents of [
+    { kind: "pending" } as const,
+    { kind: "unavailable" } as const,
+    {
+      kind: "known",
+      state: { ...agentsState([]), status: "loading" },
+    } as const,
+    {
+      kind: "known",
+      state: {
+        ...agentsState([agent(ELSEWHERE, "Laptop agent", { ownedByMe: true })]),
+        status: "no_project",
+        projectId: null,
+      },
+    } as const,
+    {
+      kind: "known",
+      state: agentsState([agent(THEIRS, "Their agent")]),
+    } as const,
+  ]) {
+    expect(
+      agentGrantsToRead(agents, {
+        ...INITIAL_GRANT_FORM,
+        agentId: ELSEWHERE,
+      }),
+    ).toBeNull();
   }
 });
 
@@ -990,6 +1107,8 @@ test("when the agents could not be read, the section says that it cannot check n
     );
   const unknown = {
     kind: "form",
+    agents: [],
+    agentId: null,
     form: null,
     notes: [GRANT_MESSAGES.agentsUnknown],
     grants: [],
@@ -1195,6 +1314,191 @@ test("the list holds the selected agent's grants with their scope and expiry, an
   }
 });
 
+/** A read of the grants of `agentId`, which another device hosts. */
+function readOf(
+  agentId: string,
+  grants: readonly GrantView[],
+): AgentGrantsPanelView {
+  return {
+    kind: "known",
+    agentId,
+    result: { outcome: "ok", agentId, grants },
+  };
+}
+
+/** The section with the owner's agent that another device hosts selected. */
+function elsewhereView(agentGrants: AgentGrantsPanelView, grants = grantsOf()) {
+  const view = describeGrantSection(
+    input({
+      form: { ...INITIAL_GRANT_FORM, agentId: ELSEWHERE },
+      agentGrants,
+      grants,
+    }),
+  );
+  if (view.kind !== "form" || view.agentId !== ELSEWHERE) {
+    throw new Error("the agent is not selected");
+  }
+  expect(view.form).toBeNull();
+  expect(view.notes).toEqual([GRANT_MESSAGES.hostedElsewhere]);
+  return view;
+}
+
+test("the grants of an agent that another device hosts come from its own read, each with its scope and expiry, and the list says while they are read or why they cannot be", () => {
+  const view = elsewhereView(
+    readOf(ELSEWHERE, [
+      grant(GRANT_1, { agentId: ELSEWHERE }),
+      grant(GRANT_2, {
+        agentId: ELSEWHERE,
+        capability: "provider.use",
+        repositoryId: null,
+        providerConnectionId: CONNECTION,
+        expiresAt: "2026-11-25T12:00:00.000Z",
+      }),
+      grant(GRANT_3, {
+        agentId: ELSEWHERE,
+        repositoryId: "0192f2a0-7c3e-7a1b-8c4d-5e6f70819299",
+        expiresAt: "2026-11-24T11:00:00.000Z",
+        expired: true,
+      }),
+    ]),
+    // The grant state of this device holds no grant of that agent, and its
+    // other agents' grants are not listed.
+    grantsOf(grant("0192f2a0-7c3e-7a1b-8c4d-5e6f70819404")),
+  );
+  expect(view.grants).toEqual([
+    {
+      grantId: GRANT_1,
+      capability: "repo.read",
+      scope: "web",
+      expiry: GRANT_MESSAGES.neverExpires,
+      expired: false,
+      statements: [],
+    },
+    {
+      // A connection of the host device, which this device cannot name,
+      // also when this device has a connection with the same ID.
+      grantId: GRANT_2,
+      capability: "provider.use",
+      scope: GRANT_MESSAGES.hostConnection,
+      expiry: `Expires ${FORMAT.format(new Date("2026-11-25T12:00:00.000Z"))}`,
+      expired: false,
+      statements: [],
+    },
+    {
+      grantId: GRANT_3,
+      capability: "repo.read",
+      scope: GRANT_MESSAGES.unknownRepository,
+      expiry: `Expired ${FORMAT.format(new Date("2026-11-24T11:00:00.000Z"))}`,
+      expired: true,
+      statements: [],
+    },
+  ]);
+  expect(view.grantsNote).toBeUndefined();
+  expect(elsewhereView(readOf(ELSEWHERE, [])).grantsNote).toBe(
+    GRANT_MESSAGES.noGrants,
+  );
+
+  // While the read waits, and a read of another agent, show nothing.
+  for (const agentGrants of [
+    NO_AGENT_GRANTS,
+    { kind: "pending", agentId: ELSEWHERE } as const,
+    readOf(HERE, [grant(GRANT_1)]),
+    {
+      kind: "known",
+      agentId: ELSEWHERE,
+      result: { outcome: "ok", agentId: HERE, grants: [grant(GRANT_1)] },
+    } as const,
+  ]) {
+    const waiting = elsewhereView(agentGrants);
+    expect(waiting.grants).toEqual([]);
+    expect(waiting.grantsNote).toBe(GRANT_MESSAGES.agentGrantsPending);
+  }
+  for (const reason of AGENT_GRANTS_READ_PROBLEMS) {
+    const result: AgentGrantsResult = { outcome: "refused", reason };
+    const refused = elsewhereView({
+      kind: "known",
+      agentId: ELSEWHERE,
+      result,
+    });
+    expect(refused.grants).toEqual([]);
+    expect(refused.grantsNote, reason).toBe(
+      AGENT_GRANTS_PROBLEM_MESSAGES[reason],
+    );
+    expect(AGENT_GRANTS_PROBLEM_MESSAGES[reason], reason).toMatch(/\.$/);
+  }
+  // A selected agent without a form ends a confirmation that waits.
+  const { state } = confirming(SHELL_FORM);
+  const moved = changeGrantForm(state, { agentId: ELSEWHERE });
+  expect(moved.confirming).toBeNull();
+  expect(
+    endHiddenConfirmation(
+      state,
+      describeGrantSection(input({ form: { ...state, agentId: ELSEWHERE } })),
+    ).confirming,
+  ).toBeNull();
+});
+
+test("an active shell grant of an agent that another device hosts says that the shell can still commit and push while that agent lacks git.commit or git.push, judged from its own read", () => {
+  const shell = grant(GRANT_1, {
+    agentId: ELSEWHERE,
+    capability: "terminal.execute",
+    expiresAt: "2026-11-25T12:00:00.000Z",
+  });
+  const commit = grant(GRANT_2, {
+    agentId: ELSEWHERE,
+    capability: "git.commit",
+  });
+  const push = grant(GRANT_3, { agentId: ELSEWHERE, capability: "git.push" });
+  const statementsOf = (
+    grants: readonly GrantView[],
+    state: GrantsPanelView = grantsOf(),
+  ) =>
+    Object.fromEntries(
+      elsewhereView(readOf(ELSEWHERE, grants), state).grants.map((item) => [
+        item.grantId,
+        item.statements,
+      ]),
+    );
+
+  expect(statementsOf([shell])).toEqual({
+    [GRANT_1]: [shellGitStatement(["git.commit", "git.push"])],
+  });
+  expect(statementsOf([shell, commit])[GRANT_1]).toEqual([
+    shellGitStatement(["git.push"]),
+  ]);
+  expect(statementsOf([shell, commit, push])[GRANT_1]).toEqual([]);
+  // The grant state of this device, unusable or holding the same agent's
+  // grants, plays no part: only the agent's own read does.
+  expect(
+    statementsOf([shell], { kind: "known", state: grantsState([], false) })[
+      GRANT_1
+    ],
+  ).toEqual([shellGitStatement(["git.commit", "git.push"])]);
+  expect(statementsOf([shell], grantsOf(commit, push))[GRANT_1]).toEqual([
+    shellGitStatement(["git.commit", "git.push"]),
+  ]);
+  // An expired git grant does not count, and an expired shell grant says
+  // nothing.
+  expect(
+    statementsOf([
+      shell,
+      commit,
+      { ...push, expiresAt: "2026-11-24T11:00:00.000Z" },
+    ])[GRANT_1],
+  ).toEqual([shellGitStatement(["git.push"])]);
+  expect(
+    statementsOf([{ ...shell, expiresAt: "2026-11-24T11:00:00.000Z" }])[
+      GRANT_1
+    ],
+  ).toEqual([]);
+  expect(
+    missingShellGitCapabilitiesIn([shell, commit], ELSEWHERE, WEB, NOW),
+  ).toEqual(["git.push"]);
+  expect(missingShellGitCapabilitiesIn("unknown", ELSEWHERE, WEB, NOW)).toBe(
+    "unknown",
+  );
+});
+
 test("every refusal of a grant and a revocation has its sentence, every code of the grant routes its own, and a wait names its time", () => {
   for (const reason of GRANT_CAPABILITY_REFUSALS) {
     const text = describeGrantResult({
@@ -1312,4 +1616,45 @@ test("the actions run one at a time and say how each went, also when the bridge 
   ]);
   const revoked: RevokeGrantResult = { outcome: "ok" };
   expect(describeRevokeResult(revoked)).toBe("The permission was revoked.");
+});
+
+test("every revocation that ran, whatever its outcome, tells the screen its agent, so that the agent's grants are read again; a grant and a press while an action waits do not", async () => {
+  const revokedAgents: string[] = [];
+  const answers: (() => Promise<RevokeGrantResult>)[] = [
+    () => Promise.resolve({ outcome: "ok" }),
+    () =>
+      Promise.resolve({
+        outcome: "refused",
+        reason: "conflict",
+        retryAfterMs: null,
+      }),
+    () => Promise.resolve({ outcome: "unknown" }),
+    () => Promise.reject(new Error("refused")),
+  ];
+  let resolveGrant: (result: GrantCapabilityResult) => void = () => undefined;
+  const actions = createGrantActions(
+    {
+      grant: () =>
+        new Promise((resolve) => {
+          resolveGrant = resolve;
+        }),
+      revoke: () => answers.shift()!(),
+    },
+    () => undefined,
+    (agentId) => revokedAgents.push(agentId),
+  );
+  for (let index = 0; index < 4; index += 1) {
+    await actions.revoke(ELSEWHERE, GRANT_1);
+  }
+  expect(revokedAgents).toEqual([ELSEWHERE, ELSEWHERE, ELSEWHERE, ELSEWHERE]);
+  const granting = actions.grant(HERE, {
+    capability: "repo.read",
+    scopeId: WEB,
+    lifetimeSeconds: null,
+  });
+  // Dropped while the grant waits: nothing ran, nothing to read again.
+  await actions.revoke(ELSEWHERE, GRANT_1);
+  resolveGrant({ outcome: "ok", grantId: GRANT_1 });
+  await granting;
+  expect(revokedAgents).toHaveLength(4);
 });

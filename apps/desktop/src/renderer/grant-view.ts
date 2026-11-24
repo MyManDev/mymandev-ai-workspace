@@ -4,6 +4,8 @@ import {
 } from "@mymandev/permissions/capabilities";
 import type { GrantBridge } from "../shared/desktop-bridge.ts";
 import type {
+  AgentGrantsReadProblem,
+  AgentGrantsResult,
   GrantCapabilityRefusal,
   GrantCapabilityResult,
   GrantRequestView,
@@ -15,6 +17,7 @@ import type {
   RevokeGrantRefusal,
   RevokeGrantResult,
 } from "../shared/ipc-contract.ts";
+import type { AgentView } from "../shared/ipc-contract.ts";
 import type { AgentPanelView } from "./agent-view.ts";
 import { formatAgentTime } from "./agent-view.ts";
 import {
@@ -57,6 +60,13 @@ import { describeWait } from "./wait-text.ts";
 //   holds; with `repo.read` and `provider.use` the form says that the two
 //   together let the agent send the repository's content to the provider.
 //
+// The owner's agents that another device hosts (#345) are offered too, in
+// the same list of agents, after the ones that this device may grant for.
+// For such an agent the section shows no form, because only the host device
+// grants, but its grants, which the main process reads on demand
+// (`listAgentGrants`), each with a revoke control, and the same statement
+// on an active shell grant, judged from that agent's own grants.
+//
 // The main process checks every value again, and the server decides each
 // grant.
 
@@ -86,6 +96,25 @@ export function followGrants(
     () => onView({ kind: "unavailable" }),
   );
 }
+
+/**
+ * What the screen knows about the grants of an agent that another device
+ * hosts: read for `agentId`, or waiting for that read; `agentId` null before
+ * any read. A view of another agent than the selected one counts as
+ * waiting, so a late answer never shows under another agent.
+ */
+export type AgentGrantsPanelView =
+  | { readonly kind: "pending"; readonly agentId: string | null }
+  | {
+      readonly kind: "known";
+      readonly agentId: string;
+      readonly result: AgentGrantsResult;
+    };
+
+export const NO_AGENT_GRANTS: AgentGrantsPanelView = Object.freeze({
+  kind: "pending",
+  agentId: null,
+});
 
 /** What the screen knows about this device's provider connections. */
 export type ConnectionsPanelView =
@@ -301,6 +330,9 @@ export const GRANT_MESSAGES = Object.freeze({
     "Permissions can be granted once this device is signed in and the project is open.",
   noGrantableAgent:
     "No agent of yours in this project is hosted on this device. Only an agent's owner grants it permissions, and only from the device that hosts the agent.",
+  hostedElsewhere:
+    "This agent is hosted on another device of yours. Only that device grants it permissions; here you can revoke them.",
+  otherDevice: "on another device",
   agentsUnknown:
     "The agents of this project could not be read, so it cannot be checked now whether one of yours is hosted on this device.",
   agentLabel: "Agent",
@@ -324,11 +356,14 @@ export const GRANT_MESSAGES = Object.freeze({
   grantsTitle: "Permissions of this agent",
   grantsUnavailable:
     "The permissions of this agent cannot be shown now. They appear once this device has read its grants from the server.",
+  agentGrantsPending: "Reading the permissions of this agent from the server.",
   noGrants: "This agent has no permissions yet.",
   revoke: "Revoke",
   neverExpires: "Does not expire",
   unknownRepository: "A repository that is no longer listed",
   unknownConnection: "An AI provider connection that is no longer listed",
+  hostConnection:
+    "An AI provider connection of the device that hosts the agent",
   running: "Waiting for the server.",
 });
 
@@ -343,6 +378,29 @@ export const CONNECTION_PROBLEM_MESSAGES: Readonly<
   unavailable:
     "The AI provider connections of this device cannot be read now: the server could not be reached.",
   failed: "The AI provider connections of this device could not be read.",
+});
+
+/**
+ * Why the grants of an agent that another device hosts cannot be shown, for
+ * each problem of the main process.
+ */
+export const AGENT_GRANTS_PROBLEM_MESSAGES: Readonly<
+  Record<AgentGrantsReadProblem, string>
+> = Object.freeze({
+  invalid: "The permissions of this agent cannot be read here.",
+  not_open: "The agent is not one of this project's agents anymore.",
+  not_owner: "Only the agent's owner sees and revokes its permissions.",
+  hosted_here:
+    "This device hosts the agent, so its permissions come with this device's grants.",
+  not_signed_in:
+    "The permissions of this agent cannot be read: the server did not accept this device's sign-in.",
+  not_found:
+    "The server does not know this agent, or you are no longer a member of its workspace.",
+  rate_limited:
+    "The permissions of this agent cannot be read now: the server asked to wait.",
+  unavailable:
+    "The permissions of this agent cannot be read now: the server could not be reached.",
+  failed: "The permissions of this agent could not be read.",
 });
 
 /** The refusals whose sentence names a wait. */
@@ -464,6 +522,15 @@ export interface Choice {
   readonly label: string;
 }
 
+/**
+ * One agent of the section's list: an agent of the account's own that this
+ * device may grant for, or one that another device hosts, whose grants can
+ * only be revoked here.
+ */
+export interface AgentChoice extends Choice {
+  readonly grantable: boolean;
+}
+
 /** One grant of the selected agent, as the list shows it. */
 export interface GrantItemView {
   readonly grantId: string;
@@ -503,7 +570,7 @@ export interface GrantConfirmationView {
 
 /** The grant form, for an agent that this device may grant for. */
 export interface GrantFormView {
-  readonly agents: readonly Choice[];
+  /** The selected agent, which this device may grant for. */
   readonly agentId: string;
   readonly capabilities: readonly CapabilityChoice[];
   readonly capability: PermissionCapability;
@@ -545,7 +612,18 @@ export type GrantSectionView =
   | { readonly kind: "message"; readonly text: string }
   | {
       readonly kind: "form";
-      /** Null while this device may grant for no agent of the project. */
+      /**
+       * The account's own agents of the project: those that this device may
+       * grant for first, then those that another device hosts. Empty while
+       * there is none.
+       */
+      readonly agents: readonly AgentChoice[];
+      /** The selected agent, or null while none is offered. */
+      readonly agentId: string | null;
+      /**
+       * Null while this device may not grant for the selected agent, or no
+       * agent is offered.
+       */
       readonly form: GrantFormView | null;
       /** Shown instead of the form, or under it. */
       readonly notes: readonly string[];
@@ -558,6 +636,8 @@ export interface GrantSectionInput {
   readonly agents: AgentPanelView;
   readonly repositories: ProjectRepositoriesPanelView;
   readonly grants: GrantsPanelView;
+  /** The grants of the selected agent when another device hosts it. */
+  readonly agentGrants: AgentGrantsPanelView;
   readonly connections: ConnectionsPanelView;
   readonly form: GrantFormState;
   /** The wall clock in milliseconds, for "expired". */
@@ -583,16 +663,82 @@ export function needsProviderConnections(agents: AgentPanelView): boolean {
 }
 
 /**
+ * The agents that the section offers: the account's own agents that this
+ * device may grant for (`grantableHere`), then its enabled agents that
+ * another device hosts, whose grants can only be revoked here (#345). A
+ * disabled agent is not offered: disabling it revoked its grants.
+ */
+function offeredAgents(
+  agents: readonly AgentView[],
+): readonly (AgentChoice & { readonly name: string })[] {
+  const grantable = agents.filter((agent) => agent.grantableHere);
+  const elsewhere = agents.filter(
+    (agent) =>
+      agent.ownedByMe && !agent.grantableHere && agent.disabledAt === null,
+  );
+  return [
+    ...grantable.map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      label: agent.name,
+      grantable: true,
+    })),
+    ...elsewhere.map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      label: `${agent.name} (${GRANT_MESSAGES.otherDevice})`,
+      grantable: false,
+    })),
+  ];
+}
+
+/**
+ * The selected agent among the offered ones: the one that the form names,
+ * else the first offered, or undefined while none is offered.
+ */
+function selectedAgent<A extends AgentChoice>(
+  offered: readonly A[],
+  agentId: string | null,
+): A | undefined {
+  return offered.find((item) => item.id === agentId) ?? offered[0];
+}
+
+/**
+ * The agent whose grants the section needs from `listAgentGrants`: the
+ * selected agent while another device hosts it, else null, also while the
+ * agents are not known or no project is open. The screen reads them only
+ * then (#345). It selects as `describeGrantSection` does.
+ */
+export function agentGrantsToRead(
+  agents: AgentPanelView,
+  form: GrantFormState,
+): string | null {
+  if (
+    agents.kind !== "known" ||
+    agents.state.projectId === null ||
+    agents.state.status === "no_project" ||
+    agents.state.status === "loading"
+  ) {
+    return null;
+  }
+  const agent = selectedAgent(offeredAgents(agents.state.agents), form.agentId);
+  return agent === undefined || agent.grantable ? null : agent.id;
+}
+
+/**
  * The grant section: a message while the agents are not known, else the
- * form for the agents that this device may grant for (`grantableHere`),
- * and the selected agent's grants. When the last reload of the agents
- * failed and no agent is grantable here, it says that this cannot be
- * checked now rather than that no agent is hosted here. The selection
- * falls back to the first such agent, a scope that is no longer offered is
- * no longer chosen, and an expiry that is not chosen or not offered falls
- * back to the one proposed for the capability (`proposedExpiryId`). The
- * confirmation of a highest-risk capability shows only while the form
- * shows exactly the grant that the person asked to confirm.
+ * account's own agents (`offeredAgents`), the form for the selected agent
+ * when this device may grant for it (`grantableHere`), and the selected
+ * agent's grants: from the grant state for an agent that this device may
+ * grant for, and from `agentGrants` for one that another device hosts,
+ * which has no form (#345). When the last reload of the agents failed and
+ * no agent is offered, it says that this cannot be checked now rather than
+ * that no agent is hosted here. The selection falls back to the first
+ * offered agent, a scope that is no longer offered is no longer chosen, and
+ * an expiry that is not chosen or not offered falls back to the one
+ * proposed for the capability (`proposedExpiryId`). The confirmation of a
+ * highest-risk capability shows only while the form shows exactly the
+ * grant that the person asked to confirm.
  */
 export function describeGrantSection(
   input: GrantSectionInput,
@@ -611,10 +757,12 @@ export function describeGrantSection(
   if (state.status === "loading") {
     return { kind: "message", text: GRANT_MESSAGES.pending };
   }
-  const grantable = state.agents.filter((agent) => agent.grantableHere);
-  if (grantable.length === 0) {
+  const offered = offeredAgents(state.agents);
+  if (offered.length === 0) {
     return {
       kind: "form",
+      agents: [],
+      agentId: null,
       form: null,
       notes: [
         state.status === "unavailable"
@@ -625,8 +773,21 @@ export function describeGrantSection(
       grantsNote: undefined,
     };
   }
-  const agent =
-    grantable.find((item) => item.id === input.form.agentId) ?? grantable[0]!;
+  const agent = selectedAgent(offered, input.form.agentId)!;
+  const choices: readonly AgentChoice[] = offered.map(
+    ({ id, label, grantable }) => ({ id, label, grantable }),
+  );
+  if (!agent.grantable) {
+    return {
+      kind: "form",
+      agents: choices,
+      agentId: agent.id,
+      form: null,
+      notes: [GRANT_MESSAGES.hostedElsewhere],
+      ...elsewhereGrantList(input, agent.id),
+    };
+  }
+  const held = heldGrants(input.grants);
   const capability = OFFERED_CAPABILITIES.includes(input.form.capability)
     ? input.form.capability
     : INITIAL_CAPABILITY;
@@ -664,6 +825,7 @@ export function describeGrantSection(
           expiry: expiry.label,
           statements: shellStatements(
             input,
+            held,
             agent.id,
             capability,
             scopeKind === "repository" ? scope!.id : null,
@@ -671,7 +833,6 @@ export function describeGrantSection(
           pending: shown,
         };
   const form: GrantFormView = {
-    agents: grantable.map((item) => ({ id: item.id, label: item.name })),
     agentId: agent.id,
     capabilities: OFFERED_CAPABILITIES.map((item) => ({
       capability: item,
@@ -696,9 +857,11 @@ export function describeGrantSection(
     needsConfirmation,
     confirmation,
   };
-  const listed = grantList(input, agent.id, names);
+  const listed = grantList(input, held, agent.id, names);
   return {
     kind: "form",
+    agents: choices,
+    agentId: agent.id,
     form,
     notes: [],
     ...listed,
@@ -713,28 +876,35 @@ function isExpired(grant: GrantView, now: number): boolean {
   );
 }
 
+/** The grants that the grant state holds, or `unknown` while it holds none that are usable. */
+function heldGrants(grants: GrantsPanelView): readonly GrantView[] | "unknown" {
+  return grants.kind !== "known" ||
+    !grants.state.usable ||
+    grants.state.projectId === null
+    ? "unknown"
+    : grants.state.grants;
+}
+
 /**
  * Which of `git.commit` and `git.push` the agent lacks on `repositoryId`,
- * judged from its grants that the screen holds and that have not expired
- * (a revoked grant is not held), or `unknown` while the screen holds no
- * usable grants.
+ * judged from `held`, the agent's grants that the screen holds, those that
+ * have not expired (a revoked grant is not held), or `unknown` while the
+ * screen holds none that it can use. `held` is the grant state for an
+ * agent that this device may grant for, and the agent's own read for one
+ * that another device hosts (#345).
  */
-export function missingShellGitCapabilities(
-  grants: GrantsPanelView,
+export function missingShellGitCapabilitiesIn(
+  held: readonly GrantView[] | "unknown",
   agentId: string,
   repositoryId: string,
   now: number,
 ): readonly ShellGitCapability[] | "unknown" {
-  if (
-    grants.kind !== "known" ||
-    !grants.state.usable ||
-    grants.state.projectId === null
-  ) {
+  if (held === "unknown") {
     return "unknown";
   }
   return SHELL_GIT_CAPABILITIES.filter(
     (capability) =>
-      !grants.state.grants.some(
+      !held.some(
         (grant) =>
           grant.agentId === agentId &&
           grant.capability === capability &&
@@ -745,11 +915,31 @@ export function missingShellGitCapabilities(
 }
 
 /**
+ * Which of `git.commit` and `git.push` the agent lacks on `repositoryId`,
+ * judged from the grant state (`missingShellGitCapabilitiesIn`).
+ */
+export function missingShellGitCapabilities(
+  grants: GrantsPanelView,
+  agentId: string,
+  repositoryId: string,
+  now: number,
+): readonly ShellGitCapability[] | "unknown" {
+  return missingShellGitCapabilitiesIn(
+    heldGrants(grants),
+    agentId,
+    repositoryId,
+    now,
+  );
+}
+
+/**
  * For `terminal.execute` on a repository, that the shell can still commit
- * and push, where it applies (`shellGitStatement`); otherwise nothing.
+ * and push, where it applies (`shellGitStatement`), judged from `held`;
+ * otherwise nothing.
  */
 function shellStatements(
   input: GrantSectionInput,
+  held: readonly GrantView[] | "unknown",
   agentId: string,
   capability: PermissionCapability,
   repositoryId: string | null,
@@ -758,7 +948,7 @@ function shellStatements(
     return [];
   }
   const statement = shellGitStatement(
-    missingShellGitCapabilities(input.grants, agentId, repositoryId, input.now),
+    missingShellGitCapabilitiesIn(held, agentId, repositoryId, input.now),
   );
   return statement === undefined ? [] : [statement];
 }
@@ -818,32 +1008,91 @@ function scopeChoices(
   };
 }
 
-/** The selected agent's grants, or why they cannot be shown. */
+/** The selected agent's grants from the grant state, or why they cannot be shown. */
 function grantList(
   input: GrantSectionInput,
+  held: readonly GrantView[] | "unknown",
   agentId: string,
   names: ReadonlyMap<string, string>,
 ): {
   readonly grants: readonly GrantItemView[];
   readonly grantsNote: string | undefined;
 } {
-  const { grants } = input;
-  if (
-    grants.kind !== "known" ||
-    !grants.state.usable ||
-    grants.state.projectId === null
-  ) {
+  if (held === "unknown") {
     return { grants: [], grantsNote: GRANT_MESSAGES.grantsUnavailable };
   }
-  const items = grants.state.grants
+  return grantItems(input, held, agentId, (grant) => {
+    const scopeId = grant.repositoryId ?? grant.providerConnectionId ?? "";
+    return (
+      names.get(scopeId) ??
+      (grant.repositoryId === null
+        ? GRANT_MESSAGES.unknownConnection
+        : GRANT_MESSAGES.unknownRepository)
+    );
+  });
+}
+
+/**
+ * The grants of an agent that another device hosts, from its own read, or
+ * why they cannot be shown (#345). A read of another agent counts as
+ * waiting. A repository is named from the project's repositories; a
+ * provider connection is one of the host device, which this device cannot
+ * name.
+ */
+function elsewhereGrantList(
+  input: GrantSectionInput,
+  agentId: string,
+): {
+  readonly grants: readonly GrantItemView[];
+  readonly grantsNote: string | undefined;
+} {
+  const read = input.agentGrants;
+  if (read.kind !== "known" || read.agentId !== agentId) {
+    return { grants: [], grantsNote: GRANT_MESSAGES.agentGrantsPending };
+  }
+  if (read.result.outcome === "refused") {
+    return {
+      grants: [],
+      grantsNote: AGENT_GRANTS_PROBLEM_MESSAGES[read.result.reason],
+    };
+  }
+  if (read.result.agentId !== agentId) {
+    return { grants: [], grantsNote: GRANT_MESSAGES.agentGrantsPending };
+  }
+  const { repositories } = input;
+  const names = new Map<string, string>(
+    repositories.kind === "known"
+      ? repositories.state.repositories.map((repository) => [
+          repository.repositoryId,
+          repository.name,
+        ])
+      : [],
+  );
+  return grantItems(input, read.result.grants, agentId, (grant) =>
+    grant.repositoryId === null
+      ? GRANT_MESSAGES.hostConnection
+      : (names.get(grant.repositoryId) ?? GRANT_MESSAGES.unknownRepository),
+  );
+}
+
+/**
+ * The agent's grants of `held` as the list shows them, each with its scope
+ * named by `scopeOf`, its expiry, and, for an active shell grant, the
+ * statement that it can still commit and push, judged from `held`.
+ */
+function grantItems(
+  input: GrantSectionInput,
+  held: readonly GrantView[],
+  agentId: string,
+  scopeOf: (grant: GrantView) => string,
+): {
+  readonly grants: readonly GrantItemView[];
+  readonly grantsNote: string | undefined;
+} {
+  const items = held
     .filter((grant) => grant.agentId === agentId)
     .map((grant): GrantItemView => {
-      const scopeId = grant.repositoryId ?? grant.providerConnectionId ?? "";
-      const scope =
-        names.get(scopeId) ??
-        (grant.repositoryId === null
-          ? GRANT_MESSAGES.unknownConnection
-          : GRANT_MESSAGES.unknownRepository);
+      const scope = scopeOf(grant);
       const expired = isExpired(grant, input.now);
       const expiry =
         grant.expiresAt === null
@@ -863,6 +1112,7 @@ function grantList(
           ? []
           : shellStatements(
               input,
+              held,
               agentId,
               grant.capability,
               grant.repositoryId,
@@ -1014,12 +1264,15 @@ export interface GrantActions {
 /**
  * The grant and revoke actions of the screen: one at a time, each sent
  * once and never again on its own. The result is a fixed sentence; the
- * list changes only with the state that the main process sends, never from
- * an answer.
+ * list changes only with the state that the main process sends, or with a
+ * new read of an agent that another device hosts, never from an answer.
+ * `onRevoked` hears the agent of every revocation that ended, whatever its
+ * outcome, so that the screen reads that agent's grants again (#345).
  */
 export function createGrantActions(
   bridge: Pick<GrantBridge, "grant" | "revoke">,
   onView: (view: GrantActionsView) => void,
+  onRevoked: (agentId: string) => void = () => {},
 ): GrantActions {
   let running = false;
   async function run<T>(
@@ -1049,11 +1302,16 @@ export function createGrantActions(
         describeGrantResult,
         GRANT_RESULT_MESSAGES.notGranted,
       ),
-    revoke: (agentId: string, grantId: string) =>
-      run(
+    revoke: async (agentId: string, grantId: string) => {
+      if (running) {
+        return;
+      }
+      await run(
         () => bridge.revoke(agentId, grantId),
         describeRevokeResult,
         GRANT_RESULT_MESSAGES.notRevoked,
-      ),
+      );
+      onRevoked(agentId);
+    },
   });
 }
