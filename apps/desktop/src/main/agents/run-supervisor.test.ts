@@ -55,6 +55,10 @@ import {
 import {
   createRunSupervisor,
   HOST_RUN_REASONS,
+  RUN_SUPERVISOR_RELOAD_DELAY_MS,
+  RUN_SUPERVISOR_RELOAD_MAX_MS,
+  RUN_SUPERVISOR_RETRY_DELAY_MS,
+  RUN_SUPERVISOR_RETRY_MAX_MS,
   RUN_SUPERVISOR_SEND_INTERVAL_MS,
   type RunStartDecision,
   type RunSupervisor,
@@ -283,6 +287,8 @@ class Harness {
   readonly createdByEvent = new Set<RunId>();
   /** The unfinished runs that the last reload of the runs read. */
   snapshot: readonly AgentRunListItem[] = [];
+  /** When the supervisor asked for a reload, on the test's clock. */
+  readonly reloadRequests: number[] = [];
   revision = 1;
   readonly claude: FakeExecutor;
   readonly codex: FakeExecutor;
@@ -354,6 +360,9 @@ class Harness {
         gateLive: () => this.live && this.projectId !== null,
         runsReloaded: () => this.reloads,
         reloadedRuns: () => this.snapshot,
+        requestReload: () => {
+          this.reloadRequests.push(this.time);
+        },
       },
       grants: {
         onGrantsChanged: (listener) => {
@@ -1170,17 +1179,19 @@ test("an interrupted run is looked for only after a reload, and a run that the s
 
 // Refusals.
 
-test("a refused start is dropped, never retried, and the agent waits for the next reload", async () => {
+test("a start refused with conflict is dropped, never retried, and the agent waits for the next reload", async () => {
   const h = new Harness({
     runs: [run(1, "queued"), run(2, "queued")],
   });
   await h.answerProviders();
-  h.refuse("rate_limited");
+  h.refuse("conflict");
   h.changed();
   h.advance(60_000);
   expect(h.walk()).toEqual(["1 queued>running"]);
   expect(h.providerReads).toEqual([]);
   expect(h.claude.calls).toEqual([]);
+  // It asked for that reload.
+  expect(h.reloadRequests).toEqual([RUN_SUPERVISOR_RELOAD_DELAY_MS]);
 
   // The reload brings the truth: still queued, so it is adopted again.
   h.reload();
@@ -1188,6 +1199,183 @@ test("a refused start is dropped, never retried, and the agent waits for the nex
   expect(h.walk()).toEqual(["1 queued>running", "1 queued>running"]);
   expect(h.sent[1]?.id).not.toBe(h.sent[0]?.id);
   expect(h.violations).toEqual([]);
+});
+
+test("a start refused with rate_limited is sent again with a new event after the backoff", async () => {
+  const h = new Harness({ runs: [run(1, "queued")] });
+  await h.answerProviders();
+  h.refuse("rate_limited");
+  h.advance(RUN_SUPERVISOR_RETRY_DELAY_MS - 1);
+  expect(h.sent).toHaveLength(1);
+  h.advance(1);
+  expect(h.walk()).toEqual(["1 queued>running", "1 queued>running"]);
+  expect(h.sent[1]?.id).not.toBe(h.sent[0]?.id);
+  h.ack();
+  expect(h.claude.calls).toHaveLength(1);
+  expect(h.violations).toEqual([]);
+
+  // Each further rate_limited doubles the wait, up to its bound, until an
+  // acknowledgement.
+  const g = new Harness({ runs: [run(1, "queued")] });
+  await g.answerProviders();
+  const waits: number[] = [];
+  for (let round = 0; round < 5; round += 1) {
+    const before = g.sent.length;
+    const at = g.time;
+    g.refuse("rate_limited");
+    while (g.sent.length === before) {
+      g.advance(1_000);
+    }
+    waits.push(g.time - at);
+  }
+  expect(waits).toEqual([
+    RUN_SUPERVISOR_RETRY_DELAY_MS,
+    2 * RUN_SUPERVISOR_RETRY_DELAY_MS,
+    4 * RUN_SUPERVISOR_RETRY_DELAY_MS,
+    RUN_SUPERVISOR_RETRY_MAX_MS,
+    RUN_SUPERVISOR_RETRY_MAX_MS,
+  ]);
+  g.ack();
+  expect(g.claude.calls).toHaveLength(1);
+
+  // A run that the server moved on meanwhile is not sent again.
+  const f = new Harness({ runs: [run(1, "queued")] });
+  await f.answerProviders();
+  f.refuse("rate_limited");
+  f.setRun(runId(1), "cancelled");
+  f.changed();
+  f.advance(RUN_SUPERVISOR_RETRY_MAX_MS);
+  expect(f.sent).toHaveLength(1);
+  expect(f.violations).toEqual([]);
+});
+
+test("a completion refused with rate_limited is sent again later and never reported interrupted, and owed transitions survive it", async () => {
+  const h = await started();
+  h.claude.last.resolve({ outcome: "completed" });
+  await settle();
+  h.advance(STEP);
+  expect(h.walk().at(-1)).toBe("1 running>completed");
+  const first = h.last.id;
+  h.refuse("rate_limited");
+  // A reload during the backoff does not report the run as interrupted.
+  h.reload();
+  h.advance(RUN_SUPERVISOR_RETRY_DELAY_MS - 1);
+  expect(h.sent).toHaveLength(2);
+  h.advance(1);
+  expect(h.walk()).toEqual([
+    "1 queued>running",
+    "1 running>completed",
+    "1 running>completed",
+  ]);
+  expect(h.last.id).not.toBe(first);
+  h.ackAndStep();
+  h.reload();
+  h.advance(60_000);
+  expect(h.sent).toHaveLength(3);
+  expect(h.runState(1)).toBe("completed");
+  expect(h.violations).toEqual([]);
+
+  // Two owed reports after a lost connection: the first is limited, the
+  // second goes, and the first follows after the backoff.
+  const g = new Harness({
+    runs: [run(1, "queued"), run(2, "queued", { agent: AGENT_B })],
+  });
+  await g.answerProviders();
+  g.ackAndStep();
+  g.ack();
+  expect(g.claude.calls).toHaveLength(2);
+  g.setConnection(LOST);
+  g.reconnect();
+  g.advance(STEP);
+  expect(g.walk().at(-1)).toBe(
+    `1 running>failed ${HOST_RUN_REASONS.hostInterrupted}`,
+  );
+  g.refuse("rate_limited");
+  g.advance(STEP);
+  expect(g.walk().at(-1)).toBe(
+    `2 running>failed ${HOST_RUN_REASONS.hostInterrupted}`,
+  );
+  g.ackAndStep();
+  g.reload();
+  g.advance(RUN_SUPERVISOR_RETRY_DELAY_MS);
+  expect(g.walk().slice(2)).toEqual([
+    `1 running>failed ${HOST_RUN_REASONS.hostInterrupted}`,
+    `2 running>failed ${HOST_RUN_REASONS.hostInterrupted}`,
+    `1 running>failed ${HOST_RUN_REASONS.hostInterrupted}`,
+  ]);
+  g.ackAndStep();
+  expect(g.runState(1)).toBe("failed");
+  expect(g.runState(2)).toBe("failed");
+  expect(g.violations).toEqual([]);
+});
+
+test("a run that waits for a reload while the connection stays open asks for one, after a backoff that doubles up to its bound", async () => {
+  // No acknowledgement, twice: the start owes a report.
+  const h = new Harness({ runs: [run(1, "queued")] });
+  await h.answerProviders();
+  h.advance(2 * HOST_RUN_ACK_TIMEOUT_MS);
+  expect(h.sent).toHaveLength(2);
+  const stoppedAt = h.time;
+  h.advance(RUN_SUPERVISOR_RELOAD_DELAY_MS - 1);
+  expect(h.reloadRequests).toEqual([]);
+  h.advance(1);
+  expect(h.reloadRequests).toEqual([
+    stoppedAt + RUN_SUPERVISOR_RELOAD_DELAY_MS,
+  ]);
+  // One request, however long nothing else happens.
+  h.advance(10 * RUN_SUPERVISOR_RELOAD_MAX_MS);
+  expect(h.reloadRequests).toHaveLength(1);
+  // The reload shows the start was not applied: the run goes again.
+  h.reload();
+  await h.answerProviders();
+  expect(h.walk()).toEqual([
+    "1 queued>running",
+    "1 queued>running",
+    "1 queued>running",
+  ]);
+
+  // A dropped run: the waits double with each request, up to the bound.
+  const g = new Harness({ runs: [run(1, "queued")] });
+  await g.answerProviders();
+  const waits: number[] = [];
+  for (let round = 0; round < 6; round += 1) {
+    const at = g.time;
+    g.refuse("conflict");
+    g.advance(RUN_SUPERVISOR_RELOAD_MAX_MS);
+    waits.push((g.reloadRequests.at(-1) ?? 0) - at);
+    expect(g.reloadRequests).toHaveLength(round + 1);
+    g.reload();
+    await g.answerProviders();
+  }
+  expect(waits).toEqual([
+    RUN_SUPERVISOR_RELOAD_DELAY_MS,
+    2 * RUN_SUPERVISOR_RELOAD_DELAY_MS,
+    4 * RUN_SUPERVISOR_RELOAD_DELAY_MS,
+    8 * RUN_SUPERVISOR_RELOAD_DELAY_MS,
+    RUN_SUPERVISOR_RELOAD_MAX_MS,
+    RUN_SUPERVISOR_RELOAD_MAX_MS,
+  ]);
+  // An acknowledgement starts the backoff again.
+  g.ackAndStep();
+  g.claude.last.resolve({ outcome: "failed", reason: "provider_quota" });
+  await settle();
+  g.advance(STEP);
+  const at = g.time;
+  g.refuse("conflict");
+  g.advance(RUN_SUPERVISOR_RELOAD_MAX_MS);
+  expect(g.reloadRequests.at(-1)).toBe(at + RUN_SUPERVISOR_RELOAD_DELAY_MS);
+
+  // A reload that comes first cancels the request.
+  const f = new Harness({ runs: [run(1, "queued")] });
+  await f.answerProviders();
+  f.refuse("not_found");
+  f.advance(RUN_SUPERVISOR_RELOAD_DELAY_MS - 1);
+  f.reload();
+  f.advance(RUN_SUPERVISOR_RELOAD_MAX_MS);
+  expect(f.reloadRequests).toEqual([]);
+  expect(h.violations).toEqual([]);
+  expect(g.violations).toEqual([]);
+  expect(f.violations).toEqual([]);
 });
 
 test("a refused completion is dropped; the reload reports the run as interrupted", async () => {

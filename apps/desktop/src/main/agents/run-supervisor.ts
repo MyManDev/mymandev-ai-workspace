@@ -55,9 +55,22 @@
 //   `awaiting_input` that this process does not hold (a restart, a crash, a
 //   connection lost mid-run, a run dropped after a refusal) is reported
 //   `failed` with `host_interrupted`. There is no resume in v0.
-// - Refusals. When the server refuses a transition, the supervisor drops the
-//   run and never retries it; the run and its agent wait for the next
-//   reload, which brings the truth.
+// - Refusals. `rate_limited` is transient: the supervisor keeps the
+//   transition and sends it again with a new event after a backoff
+//   (`RUN_SUPERVISOR_RETRY_DELAY_MS`, doubling up to
+//   `RUN_SUPERVISOR_RETRY_MAX_MS`), only when the run is then still in the
+//   state that it starts from in the activity; a reload meanwhile does not
+//   report the run as interrupted. At `conflict` or `not_found`, the
+//   supervisor drops the run and never retries it; the run and its agent
+//   wait for the next reload, which brings the truth.
+// - Reload requests. While the connection stays open, nothing else reloads
+//   the runs, so a run that waits for a reload (a dropped run, a transient
+//   refusal, or a transition owed after `no_acknowledgement` or a send that
+//   went out nowhere) makes the supervisor ask the agent activity for one
+//   (`requestReload`), after `RUN_SUPERVISOR_RELOAD_DELAY_MS`, doubling up
+//   to `RUN_SUPERVISOR_RELOAD_MAX_MS` until a transition is acknowledged.
+//   At most one request waits at a time, and any reload cancels it, so the
+//   reloads stay bounded.
 // - Owed transitions. A transition that could not be sent, or whose
 //   acknowledgement did not come, because the connection closed or the
 //   device signed out, stays in memory. After the next reload of its
@@ -144,6 +157,23 @@ export type HostRunReason =
 export const RUN_SUPERVISOR_SEND_INTERVAL_MS = 500;
 
 /**
+ * How long a transition that the server refused with `rate_limited` waits
+ * before it is sent again, the first time; it doubles with every further
+ * `rate_limited` until an acknowledgement, up to
+ * `RUN_SUPERVISOR_RETRY_MAX_MS`.
+ */
+export const RUN_SUPERVISOR_RETRY_DELAY_MS = 10_000;
+export const RUN_SUPERVISOR_RETRY_MAX_MS = 60_000;
+
+/**
+ * How long the supervisor waits before it asks the agent activity for a
+ * reload, the first time; it doubles with every request until a transition
+ * is acknowledged, up to `RUN_SUPERVISOR_RELOAD_MAX_MS`.
+ */
+export const RUN_SUPERVISOR_RELOAD_DELAY_MS = 30_000;
+export const RUN_SUPERVISOR_RELOAD_MAX_MS = 300_000;
+
+/**
  * What `beforeStart` decides for a run that may start: start it, or end it
  * with `failed` or `cancelled` and a reason instead.
  */
@@ -173,7 +203,12 @@ export type RunSupervisorConnection = Pick<
 /** The part of the agent activity service that the supervisor uses. */
 export type RunSupervisorAgents = Pick<
   AgentActivityService,
-  "state" | "onChange" | "gateLive" | "runsReloaded" | "reloadedRuns"
+  | "state"
+  | "onChange"
+  | "gateLive"
+  | "runsReloaded"
+  | "reloadedRuns"
+  | "requestReload"
 >;
 /** The part of the grant store that the supervisor uses. */
 export type RunSupervisorGrants = Pick<GrantStoreService, "onGrantsChanged">;
@@ -275,10 +310,13 @@ type Stage =
       readonly transition: Transition;
       readonly purpose: Purpose;
       readonly start: StartPlan | null;
+      /** The monotonic time before which it is not sent, after `rate_limited`. */
+      readonly notBefore?: number;
     }
   | {
       readonly kind: "sending";
       readonly transition: Transition;
+      readonly purpose: Purpose;
       readonly model: HostRun;
       readonly start: StartPlan | null;
     }
@@ -437,6 +475,14 @@ export function createRunSupervisor(
   let providerReadInFlight = false;
   let cancelProviderRetry: (() => void) | null = null;
   let providerAttempt = 0;
+  /** How many `rate_limited` refusals came since the last acknowledgement. */
+  let retryAttempt = 0;
+  let cancelWake: (() => void) | null = null;
+  /** When the wake-up of `cancelWake` comes, on the monotonic clock. */
+  let wakeAt: number | null = null;
+  /** How many reloads the supervisor asked for since the last acknowledgement. */
+  let reloadAttempt = 0;
+  let cancelReloadRequest: (() => void) | null = null;
 
   // The guards.
 
@@ -775,8 +821,51 @@ export function createRunSupervisor(
 
   // The reloads and the adoption.
 
+  // The reload requests.
+
+  /**
+   * A run waits for a reload: unless a request already waits, ask the agent
+   * activity for one after the backoff. See "Reload requests".
+   */
+  function wantReload(): void {
+    if (closed || cancelReloadRequest !== null) {
+      return;
+    }
+    const delay = Math.min(
+      RUN_SUPERVISOR_RELOAD_DELAY_MS * 2 ** reloadAttempt,
+      RUN_SUPERVISOR_RELOAD_MAX_MS,
+    );
+    cancelReloadRequest = schedule(() => {
+      cancelReloadRequest = null;
+      if (closed) {
+        return;
+      }
+      reloadAttempt = Math.min(reloadAttempt + 1, 16);
+      log("The host run supervisor asks for a reload of the runs.");
+      try {
+        agents.requestReload();
+      } catch {
+        // A failing request changes nothing; the next one may go.
+      }
+    }, delay);
+  }
+
+  function stopReloadRequest(): void {
+    cancelReloadRequest?.();
+    cancelReloadRequest = null;
+  }
+
+  /** Drops `entry` until the next reload, and asks for one. */
+  function dropUntilReload(entry: Pick<Entry, "runId" | "agentId">): void {
+    entries.delete(entry.runId);
+    dropped.set(entry.runId, entry.agentId);
+    wantReload();
+  }
+
   /** After a reload of the runs: owed transitions, then interrupted runs. */
   function afterReload(live: Live): void {
+    // The reload came: a request that waits is not needed any more.
+    stopReloadRequest();
     dropped.clear();
     listedRuns = new Map(
       agents.reloadedRuns().map((item) => [item.id, item] as const),
@@ -947,7 +1036,7 @@ export function createRunSupervisor(
         decision = beforeStart(held);
       } catch {
         log("The check before a run start failed; the run waits.");
-        dropped.set(run.id, run.agentId);
+        dropUntilReload({ runId: run.id, agentId: run.agentId });
         continue;
       }
       if (decision.start === true) {
@@ -972,7 +1061,7 @@ export function createRunSupervisor(
         continue;
       }
       log("The check before a run start failed; the run waits.");
-      dropped.set(run.id, run.agentId);
+      dropUntilReload({ runId: run.id, agentId: run.agentId });
     }
   }
 
@@ -994,12 +1083,34 @@ export function createRunSupervisor(
     return false;
   }
 
+  /** Evaluates again at the monotonic time `at`, unless a wake-up comes first. */
+  function wakeUpAt(at: number): void {
+    if (wakeAt !== null && wakeAt <= at) {
+      return;
+    }
+    cancelWake?.();
+    wakeAt = at;
+    cancelWake = schedule(
+      () => {
+        cancelWake = null;
+        wakeAt = null;
+        evaluate();
+      },
+      Math.max(0, at - now()),
+    );
+  }
+
   /** The next due entry that may go now, or null. */
   function nextDue(): Entry | null {
     const live = liveActivity();
     for (const entry of [...entries.values()]) {
       const stage = entry.stage;
       if (stage.kind !== "due" || entry.deviceId !== device) {
+        continue;
+      }
+      if (stage.notBefore !== undefined && stage.notBefore > now()) {
+        // Sent again after the backoff of a `rate_limited`.
+        wakeUpAt(stage.notBefore);
         continue;
       }
       if (stage.purpose === "finish") {
@@ -1055,12 +1166,13 @@ export function createRunSupervisor(
     if (entry === null || entry.stage.kind !== "due" || !paceAllows()) {
       return;
     }
-    send(entry, entry.stage.transition, entry.stage.start);
+    send(entry, entry.stage.transition, entry.stage.purpose, entry.stage.start);
   }
 
   function send(
     entry: Entry,
     transition: Transition,
+    purpose: Purpose,
     start: StartPlan | null,
   ): void {
     const model: HostRun = createHostRun({
@@ -1076,7 +1188,7 @@ export function createRunSupervisor(
       newEventId,
       onChange: (state) => modelChanged(entry, model, state),
     });
-    entry.stage = { kind: "sending", transition, model, start };
+    entry.stage = { kind: "sending", transition, purpose, model, start };
     inFlight = entry;
     lastSend = now();
     const result = model.transition(transition.to, transition.reason);
@@ -1088,8 +1200,7 @@ export function createRunSupervisor(
     log(`A run transition was not sent (${result}); the run waits.`);
     model.close();
     inFlight = null;
-    entries.delete(entry.runId);
-    dropped.set(entry.runId, entry.agentId);
+    dropUntilReload(entry);
   }
 
   function modelChanged(
@@ -1129,14 +1240,15 @@ export function createRunSupervisor(
   ): void {
     stage.model.close();
     inFlight = null;
+    retryAttempt = 0;
+    reloadAttempt = 0;
     if (stage.start !== null && runState === "running") {
       startExecution(entry, stage.start);
     } else if (isTerminalRunState(runState)) {
       entries.delete(entry.runId);
     } else {
       // Another state than the one sent: the next reload tells.
-      entries.delete(entry.runId);
-      dropped.set(entry.runId, entry.agentId);
+      dropUntilReload(entry);
     }
     evaluate();
   }
@@ -1148,12 +1260,31 @@ export function createRunSupervisor(
   ): void {
     inFlight = null;
     const stop = state.stop;
-    if (stop === null || stop.cause === "refused") {
+    if (stop?.cause === "refused" && stop.code === "rate_limited") {
+      // Transient: the same transition again, with a new event, after the
+      // backoff, once the activity still shows the state that it starts
+      // from. The end of an execution is checked against the activity too.
+      const delay = Math.min(
+        RUN_SUPERVISOR_RETRY_DELAY_MS * 2 ** retryAttempt,
+        RUN_SUPERVISOR_RETRY_MAX_MS,
+      );
+      retryAttempt = Math.min(retryAttempt + 1, 16);
+      log(
+        "The server limited a run transition (rate_limited); it is sent again later.",
+      );
+      entry.stage = {
+        kind: "due",
+        transition: stage.transition,
+        purpose: stage.purpose === "finish" ? "owed" : stage.purpose,
+        start: stage.start,
+        notBefore: now() + delay,
+      };
+      wantReload();
+    } else if (stop === null || stop.cause === "refused") {
       log(
         `The server refused a run transition (${stop?.cause === "refused" ? stop.code : "unknown"}); the run waits for the next reload.`,
       );
-      entries.delete(entry.runId);
-      dropped.set(entry.runId, entry.agentId);
+      dropUntilReload(entry);
     } else {
       const cause =
         stop.cause === "signed_out" ? "signed_out" : "connection_lost";
@@ -1165,6 +1296,10 @@ export function createRunSupervisor(
             ? stage.transition
             : interruptedTransition(cause),
       };
+      if (stop.cause === "no_acknowledgement" || stop.cause === "not_sent") {
+        // The connection may stay open: nothing else reloads.
+        wantReload();
+      }
     }
     evaluate();
   }
@@ -1241,6 +1376,9 @@ export function createRunSupervisor(
       cancelPace = null;
       cancelProviderRetry?.();
       cancelProviderRetry = null;
+      cancelWake?.();
+      cancelWake = null;
+      stopReloadRequest();
       if (inFlight?.stage.kind === "sending") {
         inFlight.stage.model.close();
       }
