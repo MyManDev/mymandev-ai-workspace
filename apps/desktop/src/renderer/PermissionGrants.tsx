@@ -364,7 +364,7 @@ export function GrantSectionContent({
   readonly view: GrantSectionView;
   readonly actions: GrantActionsView;
   readonly handlers: GrantSectionHandlers;
-  /** Where the hook puts the focus after a confirmation; none in tests. */
+  /** Where the hook puts the focus after a confirmation; optional, the hook passes it. */
   readonly focus?: GrantSectionFocus;
 }) {
   // A subsection without a name, so that it adds no landmark region.
