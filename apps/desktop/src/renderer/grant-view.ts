@@ -1,6 +1,6 @@
 import {
-  CAPABILITY_RISK,
   CAPABILITY_SCOPE,
+  type CapabilityRisk,
 } from "@mymandev/permissions/capabilities";
 import type { GrantBridge } from "../shared/desktop-bridge.ts";
 import type {
@@ -8,6 +8,7 @@ import type {
   GrantCapabilityResult,
   GrantRequestView,
   GrantsView,
+  GrantView,
   ProviderConnectionReadProblem,
   ProviderConnectionsResult,
   ProviderConnectionView,
@@ -16,17 +17,47 @@ import type {
 } from "../shared/ipc-contract.ts";
 import type { AgentPanelView } from "./agent-view.ts";
 import { formatAgentTime } from "./agent-view.ts";
-import type { PermissionCapability } from "./permission-view.ts";
+import {
+  describeCapabilitiesInOfferOrder,
+  describeCapability,
+  grantStatements,
+  SHELL_GIT_CAPABILITIES,
+  SHELL_PROPOSED_LIFETIME_SECONDS,
+  shellGitStatement,
+  type PermissionCapability,
+  type ShellGitCapability,
+  type Statement,
+} from "./permission-view.ts";
 import type { ProjectRepositoriesPanelView } from "./project-repositories-view.ts";
 import { describeWait } from "./wait-text.ts";
 
 // The grant form and the grant list of the permission screen (#342): which
 // agents this device may grant for, one capability on one scope with an
-// optional expiry, and the selected agent's grants with a revoke control.
-// The presentation rules of ADR 0015 (a separate confirmation, a proposed
-// expiry for the shell, the conditional warnings) are #77; until then a
-// highest-risk capability, `terminal.execute`, is not offered. The main
-// process checks every value again, and the server decides each grant.
+// expiry, and the selected agent's grants with a revoke control. The
+// presentation rules of ADR 0015 (#77) apply to both:
+//
+// - The form offers every capability, each with its risk label from
+//   `CAPABILITY_RISK` (through `permission-view.ts`), and says what the
+//   chosen one allows, and for `terminal.execute` what a shell can do.
+// - It never preselects a capability whose `mayBePreselected` is false, and
+//   a bundle or a "select all", which it does not have, could only hold the
+//   capabilities whose `mayBeBundled` is set (`bundleableCapabilities`).
+// - A capability with its own confirmation, `terminal.execute`, is granted
+//   on its own, in a second step: "Grant" asks the person to confirm, and
+//   only the confirmation sends the request, with `confirmedHighestRisk`.
+//   Cancelling, or changing the agent, the capability, the scope, or the
+//   expiry, ends the confirmation, and nothing is sent.
+// - The shell is proposed an expiry of `SHELL_PROPOSED_LIFETIME_SECONDS`,
+//   which the person can change but not remove; the other capabilities
+//   keep an optional expiry and are proposed none.
+// - The confirmation, and an active shell grant in the list, say that the
+//   shell can still commit and push while the agent lacks `git.commit` or
+//   `git.push` on the repository, judged from the grants that the screen
+//   holds; with `repo.read` and `provider.use` the form says that the two
+//   together let the agent send the repository's content to the provider.
+//
+// The main process checks every value again, and the server decides each
+// grant.
 
 /** What the screen knows about the grants of the open project's agents. */
 export type GrantsPanelView =
@@ -61,22 +92,55 @@ export type ConnectionsPanelView =
   | { readonly kind: "known"; readonly result: ProviderConnectionsResult };
 
 /**
- * The capabilities that the form offers: every capability whose risk is
- * not `highest`. A highest-risk capability needs the separate confirmation
- * and the proposed expiry of ADR 0015, which #77 adds; until then the form
- * does not offer it, and the main process refuses it as well.
+ * The capabilities that the form offers: every capability of the contract,
+ * the standard ones first and a highest-risk one, `terminal.execute`, last
+ * (`describeCapabilitiesInOfferOrder`).
  */
 export const OFFERED_CAPABILITIES: readonly PermissionCapability[] =
   Object.freeze(
-    (Object.keys(CAPABILITY_RISK) as PermissionCapability[]).filter(
-      (capability) =>
-        Object.hasOwn(CAPABILITY_RISK, capability) &&
-        CAPABILITY_RISK[capability] !== "highest",
-    ),
+    describeCapabilitiesInOfferOrder().map((view) => view.capability),
   );
 
-/** The capability that the form starts with. */
-export const INITIAL_CAPABILITY: PermissionCapability = "repo.read";
+/**
+ * The capabilities of `capabilities` that a form may choose before the
+ * person does: those whose `mayBePreselected` is set, never a highest-risk
+ * one (ADR 0015).
+ */
+export function preselectableCapabilities(
+  capabilities: readonly PermissionCapability[],
+): PermissionCapability[] {
+  return capabilities.filter(
+    (capability) => describeCapability(capability).mayBePreselected,
+  );
+}
+
+/**
+ * The capabilities of `capabilities` that a bundle or a "select all" may
+ * hold: those whose `mayBeBundled` is set, never a highest-risk one, which
+ * is granted on its own (ADR 0015). The form has no bundle and no "select
+ * all" today; one that is added takes its capabilities from here.
+ */
+export function bundleableCapabilities(
+  capabilities: readonly PermissionCapability[],
+): PermissionCapability[] {
+  return capabilities.filter(
+    (capability) => describeCapability(capability).mayBeBundled,
+  );
+}
+
+function firstPreselectable(): PermissionCapability {
+  const [first] = preselectableCapabilities(OFFERED_CAPABILITIES);
+  if (first === undefined) {
+    throw new Error("The grant form has no capability that it may choose.");
+  }
+  return first;
+}
+
+/**
+ * The capability that the form starts with, and falls back to: the first
+ * offered capability that may be preselected, never `terminal.execute`.
+ */
+export const INITIAL_CAPABILITY: PermissionCapability = firstPreselectable();
 
 /** An expiry that the form offers. */
 export interface ExpiryChoice {
@@ -104,7 +168,7 @@ export const EXPIRY_CHOICES: readonly ExpiryChoice[] = Object.freeze([
 /**
  * The expiries for `capability`: a grant of `terminal.execute` always
  * expires (#75, decision of 2026-11-14), so it is offered no choice
- * without one. The form does not offer it until #77.
+ * without one; the person can change its expiry but not remove it.
  */
 export function expiryChoices(
   capability: PermissionCapability,
@@ -114,20 +178,102 @@ export function expiryChoices(
     : EXPIRY_CHOICES;
 }
 
+/** The expiry without one, which the form proposes but for the shell. */
+export const NO_EXPIRY_ID = "none";
+
+/**
+ * The expiry that the form proposes for `capability`: for
+ * `terminal.execute`, the choice of `SHELL_PROPOSED_LIFETIME_SECONDS` (24
+ * hours, #77); for every other capability, none, as before.
+ */
+export function proposedExpiryId(capability: PermissionCapability): string {
+  if (capability !== "terminal.execute") {
+    return NO_EXPIRY_ID;
+  }
+  const choices = expiryChoices(capability);
+  const proposed = choices.find(
+    (choice) => choice.seconds === SHELL_PROPOSED_LIFETIME_SECONDS,
+  );
+  return (proposed ?? choices[0]!).id;
+}
+
+/** A grant that waits for the person's confirmation, as the form showed it. */
+export interface PendingGrant {
+  readonly agentId: string;
+  readonly request: GrantRequestView;
+}
+
 /** What the person chose in the form. */
 export interface GrantFormState {
   readonly agentId: string | null;
   readonly capability: PermissionCapability;
   readonly scopeId: string | null;
-  readonly expiryId: string;
+  /** The chosen expiry, or null for the one proposed for the capability. */
+  readonly expiryId: string | null;
+  /**
+   * The grant of a capability with its own confirmation that waits for the
+   * person to confirm it, or null.
+   */
+  readonly confirming: PendingGrant | null;
 }
 
 export const INITIAL_GRANT_FORM: GrantFormState = Object.freeze({
   agentId: null,
   capability: INITIAL_CAPABILITY,
   scopeId: null,
-  expiryId: "none",
+  expiryId: null,
+  confirming: null,
 });
+
+/** A change that the person makes in the form. */
+export type GrantFormChange =
+  | { readonly agentId: string }
+  | { readonly capability: PermissionCapability }
+  | { readonly scopeId: string }
+  | { readonly expiryId: string };
+
+/**
+ * The form after the person's change. Every change ends a confirmation
+ * that waits, so nothing is sent for it; a new capability needs a new
+ * scope and is proposed its own expiry.
+ */
+export function changeGrantForm(
+  state: GrantFormState,
+  change: GrantFormChange,
+): GrantFormState {
+  if ("capability" in change) {
+    return {
+      ...state,
+      capability: change.capability,
+      scopeId: null,
+      expiryId: null,
+      confirming: null,
+    };
+  }
+  return { ...state, ...change, confirming: null };
+}
+
+/** The form with the grant that waits for the person's confirmation. */
+export function askConfirmation(
+  state: GrantFormState,
+  pending: PendingGrant,
+): GrantFormState {
+  return { ...state, confirming: pending };
+}
+
+/** The form without a confirmation: cancelled, or answered. */
+export function endConfirmation(state: GrantFormState): GrantFormState {
+  return state.confirming === null ? state : { ...state, confirming: null };
+}
+
+function samePending(a: PendingGrant, b: PendingGrant): boolean {
+  return (
+    a.agentId === b.agentId &&
+    a.request.capability === b.request.capability &&
+    a.request.scopeId === b.request.scopeId &&
+    a.request.lifetimeSeconds === b.request.lifetimeSeconds
+  );
+}
 
 /** The fixed texts of the grant section. */
 export const GRANT_MESSAGES = Object.freeze({
@@ -140,8 +286,6 @@ export const GRANT_MESSAGES = Object.freeze({
     "No agent of yours in this project is hosted on this device. Only an agent's owner grants it permissions, and only from the device that hosts the agent.",
   agentsUnknown:
     "The agents of this project could not be read, so it cannot be checked now whether one of yours is hosted on this device.",
-  shellLater:
-    "The highest-risk permission, terminal.execute, cannot be granted here yet.",
   agentLabel: "Agent",
   capabilityLabel: "Permission",
   repositoryLabel: "Repository",
@@ -153,7 +297,13 @@ export const GRANT_MESSAGES = Object.freeze({
   repositoriesUnknown: "The project's repositories are not known yet.",
   connectionsPending: "Reading the AI provider connections of this device.",
   noConnections: "This device has no AI provider connection yet.",
+  shellExpiry:
+    "A grant of terminal.execute always expires, at the latest after 30 days.",
   submit: "Grant",
+  submitConfirmation: "Grant after confirming",
+  confirmTitle: "Confirm the highest-risk permission",
+  confirm: "Confirm and grant",
+  cancel: "Cancel",
   grantsTitle: "Permissions of this agent",
   grantsUnavailable:
     "The permissions of this agent cannot be shown now. They appear once this device has read its grants from the server.",
@@ -306,14 +456,49 @@ export interface GrantItemView {
   /** When it expires or expired, or that it does not. */
   readonly expiry: string;
   readonly expired: boolean;
+  /**
+   * For an active grant of `terminal.execute`: that the shell can still
+   * commit and push while the agent lacks `git.commit` or `git.push` on the
+   * repository. Otherwise empty.
+   */
+  readonly statements: readonly Statement[];
+}
+
+/** One capability of the form's list, with its risk label. */
+export interface CapabilityChoice {
+  readonly capability: PermissionCapability;
+  /** The text of its label from `CAPABILITY_RISK`. */
+  readonly riskLabel: string;
+}
+
+/** The separate confirmation of a highest-risk capability. */
+export interface GrantConfirmationView {
+  /** The capability's confirmation, `HIGHEST_RISK_CONFIRMATIONS`. */
+  readonly text: string;
+  readonly agent: string;
+  readonly scope: string;
+  readonly expiry: string;
+  /** That the shell can still commit and push, where it applies. */
+  readonly statements: readonly Statement[];
+  /** The grant that the confirmation sends, exactly as the form shows it. */
+  readonly pending: PendingGrant;
 }
 
 /** The grant form, for an agent that this device may grant for. */
 export interface GrantFormView {
   readonly agents: readonly Choice[];
   readonly agentId: string;
-  readonly capabilities: readonly PermissionCapability[];
+  readonly capabilities: readonly CapabilityChoice[];
   readonly capability: PermissionCapability;
+  /** The chosen capability's label from `CAPABILITY_RISK`, and its text. */
+  readonly risk: CapabilityRisk;
+  readonly riskLabel: string;
+  /** What the chosen capability allows. */
+  readonly meaning: string;
+  /** What a shell can do, for `terminal.execute`; otherwise empty. */
+  readonly details: readonly Statement[];
+  /** The statements for the chosen capability (`grantStatements`). */
+  readonly statements: readonly Statement[];
   /** `repository` or `provider_connection`: the label of the scope list. */
   readonly scopeKind: "repository" | "provider_connection";
   readonly scopes: readonly Choice[];
@@ -322,8 +507,20 @@ export interface GrantFormView {
   readonly scopeNote: string | undefined;
   readonly expiries: readonly ExpiryChoice[];
   readonly expiryId: string;
+  /** Why no choice without an expiry is offered, for the shell. */
+  readonly expiryNote: string | undefined;
   /** Whether the form can be sent: a scope is chosen. */
   readonly ready: boolean;
+  /**
+   * Whether the chosen capability is granted only after its own
+   * confirmation, in a second step.
+   */
+  readonly needsConfirmation: boolean;
+  /**
+   * The confirmation that waits for the person, while the form still shows
+   * the grant that the person asked to confirm; otherwise undefined.
+   */
+  readonly confirmation: GrantConfirmationView | undefined;
 }
 
 /** The grant section of the permission screen. */
@@ -374,8 +571,11 @@ export function needsProviderConnections(agents: AgentPanelView): boolean {
  * and the selected agent's grants. When the last reload of the agents
  * failed and no agent is grantable here, it says that this cannot be
  * checked now rather than that no agent is hosted here. The selection
- * falls back to the first such agent, and a scope or an expiry that is no
- * longer offered is no longer chosen.
+ * falls back to the first such agent, a scope that is no longer offered is
+ * no longer chosen, and an expiry that is not chosen or not offered falls
+ * back to the one proposed for the capability (`proposedExpiryId`). The
+ * confirmation of a highest-risk capability shows only while the form
+ * shows exactly the grant that the person asked to confirm.
  */
 export function describeGrantSection(
   input: GrantSectionInput,
@@ -413,35 +613,137 @@ export function describeGrantSection(
   const capability = OFFERED_CAPABILITIES.includes(input.form.capability)
     ? input.form.capability
     : INITIAL_CAPABILITY;
+  const described = describeCapability(capability);
   const scopeKind = CAPABILITY_SCOPE[capability];
   const { scopes, scopeNote, names } = scopeChoices(input, scopeKind);
-  const scopeId = scopes.some((scope) => scope.id === input.form.scopeId)
-    ? input.form.scopeId
-    : null;
+  const scope = scopes.find((item) => item.id === input.form.scopeId);
   const expiries = expiryChoices(capability);
-  const expiryId = expiries.some((choice) => choice.id === input.form.expiryId)
-    ? input.form.expiryId
-    : expiries[0]!.id;
+  const expiry =
+    expiries.find((choice) => choice.id === input.form.expiryId) ??
+    expiries.find((choice) => choice.id === proposedExpiryId(capability))!;
+  const needsConfirmation = described.confirmation !== undefined;
+  const shown: PendingGrant | null =
+    scope === undefined
+      ? null
+      : {
+          agentId: agent.id,
+          request: {
+            capability,
+            scopeId: scope.id,
+            lifetimeSeconds: expiry.seconds,
+          },
+        };
+  const { confirming } = input.form;
+  const confirmation: GrantConfirmationView | undefined =
+    described.confirmation === undefined ||
+    shown === null ||
+    confirming === null ||
+    !samePending(confirming, shown)
+      ? undefined
+      : {
+          text: described.confirmation,
+          agent: agent.name,
+          scope: scope!.label,
+          expiry: expiry.label,
+          statements: shellStatements(
+            input,
+            agent.id,
+            capability,
+            scopeKind === "repository" ? scope!.id : null,
+          ),
+          pending: shown,
+        };
   const form: GrantFormView = {
     agents: grantable.map((item) => ({ id: item.id, label: item.name })),
     agentId: agent.id,
-    capabilities: OFFERED_CAPABILITIES,
+    capabilities: OFFERED_CAPABILITIES.map((item) => ({
+      capability: item,
+      riskLabel: describeCapability(item).riskLabel,
+    })),
     capability,
+    risk: described.risk,
+    riskLabel: described.riskLabel,
+    meaning: described.meaning,
+    details: described.details,
+    statements: grantStatements(capability),
     scopeKind,
     scopes,
-    scopeId,
+    scopeId: scope?.id ?? null,
     scopeNote,
     expiries,
-    expiryId,
-    ready: scopeId !== null,
+    expiryId: expiry.id,
+    expiryNote: expiries.some((choice) => choice.seconds === null)
+      ? undefined
+      : GRANT_MESSAGES.shellExpiry,
+    ready: scope !== undefined,
+    needsConfirmation,
+    confirmation,
   };
   const listed = grantList(input, agent.id, names);
   return {
     kind: "form",
     form,
-    notes: [GRANT_MESSAGES.shellLater],
+    notes: [],
     ...listed,
   };
+}
+
+/** Whether a grant of the list is expired at `now`. */
+function isExpired(grant: GrantView, now: number): boolean {
+  return (
+    grant.expired ||
+    (grant.expiresAt !== null && now >= Date.parse(grant.expiresAt))
+  );
+}
+
+/**
+ * Which of `git.commit` and `git.push` the agent lacks on `repositoryId`,
+ * judged from its grants that the screen holds and that have not expired
+ * (a revoked grant is not held), or `unknown` while the screen holds no
+ * usable grants.
+ */
+export function missingShellGitCapabilities(
+  grants: GrantsPanelView,
+  agentId: string,
+  repositoryId: string,
+  now: number,
+): readonly ShellGitCapability[] | "unknown" {
+  if (
+    grants.kind !== "known" ||
+    !grants.state.usable ||
+    grants.state.projectId === null
+  ) {
+    return "unknown";
+  }
+  return SHELL_GIT_CAPABILITIES.filter(
+    (capability) =>
+      !grants.state.grants.some(
+        (grant) =>
+          grant.agentId === agentId &&
+          grant.capability === capability &&
+          grant.repositoryId === repositoryId &&
+          !isExpired(grant, now),
+      ),
+  );
+}
+
+/**
+ * For `terminal.execute` on a repository, that the shell can still commit
+ * and push, where it applies (`shellGitStatement`); otherwise nothing.
+ */
+function shellStatements(
+  input: GrantSectionInput,
+  agentId: string,
+  capability: PermissionCapability,
+  repositoryId: string | null,
+): readonly Statement[] {
+  if (capability !== "terminal.execute" || repositoryId === null) {
+    return [];
+  }
+  const statement = shellGitStatement(
+    missingShellGitCapabilities(input.grants, agentId, repositoryId, input.now),
+  );
+  return statement === undefined ? [] : [statement];
 }
 
 /** The scope choices of a kind, and the names of every known scope. */
@@ -525,9 +827,7 @@ function grantList(
         (grant.repositoryId === null
           ? GRANT_MESSAGES.unknownConnection
           : GRANT_MESSAGES.unknownRepository);
-      const expired =
-        grant.expired ||
-        (grant.expiresAt !== null && input.now >= Date.parse(grant.expiresAt));
+      const expired = isExpired(grant, input.now);
       const expiry =
         grant.expiresAt === null
           ? GRANT_MESSAGES.neverExpires
@@ -541,6 +841,15 @@ function grantList(
         scope,
         expiry,
         expired,
+        // Only a grant that has not expired is granted.
+        statements: expired
+          ? []
+          : shellStatements(
+              input,
+              agentId,
+              grant.capability,
+              grant.repositoryId,
+            ),
       };
     });
   return {
@@ -549,12 +858,18 @@ function grantList(
   };
 }
 
-/** The request that the form sends, or null while it is not ready. */
+/**
+ * The request that the form shows, or null while it is not ready. The
+ * expiry is looked up in `expiryChoices` of the capability, never in the
+ * view's own list, so a grant of the shell never goes without one.
+ */
 export function grantRequestOf(form: GrantFormView): GrantRequestView | null {
   if (!form.ready || form.scopeId === null) {
     return null;
   }
-  const expiry = form.expiries.find((choice) => choice.id === form.expiryId);
+  const expiry = expiryChoices(form.capability).find(
+    (choice) => choice.id === form.expiryId,
+  );
   if (expiry === undefined) {
     return null;
   }
@@ -562,6 +877,64 @@ export function grantRequestOf(form: GrantFormView): GrantRequestView | null {
     capability: form.capability,
     scopeId: form.scopeId,
     lifetimeSeconds: expiry.seconds,
+  };
+}
+
+/** What "Grant" does with the form. */
+export type GrantSubmission =
+  /** A capability without its own confirmation: the request goes. */
+  | {
+      readonly kind: "send";
+      readonly agentId: string;
+      readonly request: GrantRequestView;
+    }
+  /** A capability with its own confirmation: the person is asked first. */
+  | { readonly kind: "confirm"; readonly pending: PendingGrant }
+  /** Not ready, or a confirmation already waits: nothing. */
+  | { readonly kind: "none" };
+
+/**
+ * What "Grant" does: it sends a capability that needs no confirmation of
+ * its own, and for one that does, `terminal.execute`, it only asks for the
+ * confirmation. Nothing is sent for it here.
+ */
+export function submitGrant(form: GrantFormView): GrantSubmission {
+  const request = grantRequestOf(form);
+  if (request === null || form.confirmation !== undefined) {
+    return { kind: "none" };
+  }
+  return form.needsConfirmation ||
+    describeCapability(form.capability).confirmation !== undefined
+    ? { kind: "confirm", pending: { agentId: form.agentId, request } }
+    : { kind: "send", agentId: form.agentId, request };
+}
+
+/**
+ * The request that the person's confirmation sends, with
+ * `confirmedHighestRisk`, or null. It is sent only while the form state
+ * still waits for this confirmation and the form still shows the grant
+ * that the person was asked to confirm: a change of the agent, the
+ * capability, the scope, or the expiry since ended it.
+ */
+export function confirmedGrantOf(
+  state: GrantFormState,
+  form: GrantFormView,
+): { readonly agentId: string; readonly request: GrantRequestView } | null {
+  const shown = form.confirmation;
+  const request = grantRequestOf(form);
+  if (
+    shown === undefined ||
+    request === null ||
+    state.confirming === null ||
+    describeCapability(form.capability).confirmation === undefined ||
+    !samePending(state.confirming, shown.pending) ||
+    !samePending(shown.pending, { agentId: form.agentId, request })
+  ) {
+    return null;
+  }
+  return {
+    agentId: shown.pending.agentId,
+    request: { ...shown.pending.request, confirmedHighestRisk: true },
   };
 }
 

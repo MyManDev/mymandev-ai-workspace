@@ -1,7 +1,9 @@
-// The grant section of the permission screen (#342). The components below
-// `PermissionGrants` use no hooks, so the tests render the markup and also
-// call the components as functions, walk the returned elements, and invoke
-// their event handlers.
+// The grant section of the permission screen (#342), with the presentation
+// rules of #77. The components below `PermissionGrants` use no hooks, so the
+// tests render the markup and also call the components as functions, walk
+// the returned elements, and invoke their event handlers; the hook's wiring
+// is `grantSectionHandlers`, which the tests drive with a form state of
+// their own.
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
@@ -10,21 +12,36 @@ import type {
   GrantBridge,
   ProjectRepositoriesBridge,
 } from "../shared/desktop-bridge.ts";
+import type { AgentActivityView } from "../shared/ipc-contract.ts";
+import { agentTimeFormat } from "./agent-view.ts";
 import {
   GRANT_RESULT_ID,
   GrantSectionContent,
+  grantSectionHandlers,
   type GrantSectionHandlers,
 } from "./PermissionGrants.tsx";
 import { PermissionsScreen } from "./ProjectScreens.tsx";
 import {
+  describeGrantSection,
   EXPIRY_CHOICES,
+  expiryChoices,
   GRANT_MESSAGES,
   IDLE_GRANT_ACTIONS,
+  INITIAL_GRANT_FORM,
   OFFERED_CAPABILITIES,
+  type GrantActions,
   type GrantActionsView,
+  type GrantFormState,
   type GrantFormView,
   type GrantSectionView,
 } from "./grant-view.ts";
+import {
+  describeCapability,
+  HIGHEST_RISK_CONFIRMATIONS,
+  REPOSITORY_PROVIDER_STATEMENT,
+  SHELL_STATEMENTS,
+  shellGitStatement,
+} from "./permission-view.ts";
 
 const HERE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f1";
 const SECOND = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f2";
@@ -63,21 +80,66 @@ const FORM: GrantFormView = {
     { id: SECOND, label: "<b>Reviewer</b>" },
   ],
   agentId: HERE,
-  capabilities: OFFERED_CAPABILITIES,
+  capabilities: OFFERED_CAPABILITIES.map((capability) => ({
+    capability,
+    riskLabel: describeCapability(capability).riskLabel,
+  })),
   capability: "repo.read",
+  risk: "standard",
+  riskLabel: "Standard risk",
+  meaning: "Read the files of the repository.",
+  details: [],
+  statements: [REPOSITORY_PROVIDER_STATEMENT],
   scopeKind: "repository",
   scopes: [{ id: WEB, label: "web" }],
   scopeId: WEB,
   scopeNote: undefined,
   expiries: EXPIRY_CHOICES,
   expiryId: "day",
+  expiryNote: undefined,
   ready: true,
+  needsConfirmation: false,
+  confirmation: undefined,
+};
+
+const SHELL_REQUEST = {
+  capability: "terminal.execute",
+  scopeId: WEB,
+  lifetimeSeconds: 86_400,
+} as const;
+
+/** The shell chosen on `web` for the proposed day. */
+const SHELL_FORM: GrantFormView = {
+  ...FORM,
+  capability: "terminal.execute",
+  risk: "highest",
+  riskLabel: "Highest risk",
+  meaning: "Run a shell that starts in the repository.",
+  details: SHELL_STATEMENTS,
+  statements: [],
+  expiries: expiryChoices("terminal.execute"),
+  expiryId: "day",
+  expiryNote: GRANT_MESSAGES.shellExpiry,
+  needsConfirmation: true,
+};
+
+/** The same form while its confirmation waits. */
+const CONFIRMING_FORM: GrantFormView = {
+  ...SHELL_FORM,
+  confirmation: {
+    text: HIGHEST_RISK_CONFIRMATIONS["terminal.execute"],
+    agent: "Builder",
+    scope: "web",
+    expiry: "1 day",
+    statements: [shellGitStatement(["git.push"])!],
+    pending: { agentId: HERE, request: SHELL_REQUEST },
+  },
 };
 
 const VIEW: GrantSectionView = {
   kind: "form",
   form: FORM,
-  notes: [GRANT_MESSAGES.shellLater],
+  notes: [],
   grants: [
     {
       grantId: GRANT_1,
@@ -85,6 +147,7 @@ const VIEW: GrantSectionView = {
       scope: "web",
       expiry: GRANT_MESSAGES.neverExpires,
       expired: false,
+      statements: [],
     },
   ],
   grantsNote: undefined,
@@ -98,6 +161,8 @@ function recorder() {
     onScope: (scopeId) => calls.push(["scope", scopeId]),
     onExpiry: (expiryId) => calls.push(["expiry", expiryId]),
     onGrant: (agentId, form) => calls.push(["grant", agentId, form]),
+    onConfirm: (form) => calls.push(["confirm", form]),
+    onCancel: () => calls.push(["cancel"]),
     onRevoke: (agentId, grantId) => calls.push(["revoke", agentId, grantId]),
   };
   return { calls, handlers };
@@ -116,7 +181,7 @@ function render(
   );
 }
 
-test("the form offers the grantable agents, the capabilities without the shell, the scopes, and the expiries, each with its label", () => {
+test("the form offers the grantable agents, every capability with its risk label, the scopes, and the expiries, each with its label", () => {
   const html = render(VIEW);
 
   for (const [id, label] of [
@@ -131,8 +196,18 @@ test("the form offers the grantable agents, the capabilities without the shell, 
   for (const capability of OFFERED_CAPABILITIES) {
     expect(html).toContain(`<option value="${capability}"`);
   }
-  expect(html).not.toContain('<option value="terminal.execute"');
-  expect(html).toContain(GRANT_MESSAGES.shellLater);
+  expect(html).toContain(
+    '<option value="repo.read" selected="">repo.read (Standard risk)</option>',
+  );
+  expect(html).toContain(
+    '<option value="terminal.execute">terminal.execute (Highest risk)</option>',
+  );
+  // The chosen capability: its risk, what it allows, and with repo.read
+  // that it can reach the provider together with provider.use.
+  expect(html).toContain(
+    '<div id="grant-capability-about" class="grant-capability" data-risk="standard"><p class="capability-risk">Standard risk</p><p>Read the files of the repository.</p><p>With <code>repo.read</code> on a repository and <code>provider.use</code> on an AI provider connection, the agent can send that repository&#x27;s content to that connection&#x27;s provider.</p></div>',
+  );
+  expect(html).toContain('aria-describedby="grant-capability-about"');
   // Names are text, never markup.
   expect(html).toContain("&lt;b&gt;Reviewer&lt;/b&gt;");
   expect(html).not.toContain("<b>Reviewer</b>");
@@ -159,6 +234,10 @@ test("the form cannot be sent without a scope, and every control waits while an 
   });
   expect(notReady).toContain(
     '<button type="submit" disabled="">Grant</button>',
+  );
+  const confirming = render({ ...VIEW, form: CONFIRMING_FORM });
+  expect(confirming).toContain(
+    `<button type="submit" disabled="">${GRANT_MESSAGES.submitConfirmation}</button>`,
   );
   const running = render(VIEW, { running: true, message: undefined });
   expect(running.match(/<select [^>]*disabled=""/g)).toHaveLength(4);
@@ -268,4 +347,240 @@ test("with the bridges, the screen subscribes once it is shown and first says th
   expect(html).toContain(
     `<section class="grant-section"><h3 id="grant-title">Grant a permission</h3><p class="placeholder-note">${GRANT_MESSAGES.pending}</p></section>`,
   );
+});
+
+test("the shell is shown as the highest risk with what a shell can do, an expiry that cannot be removed, and a Grant that asks for the confirmation", () => {
+  const html = render({ ...VIEW, form: SHELL_FORM });
+
+  expect(html).toContain(
+    '<option value="terminal.execute" selected="">terminal.execute (Highest risk)</option>',
+  );
+  expect(html).toContain(
+    '<div id="grant-capability-about" class="grant-capability" data-risk="highest"><p class="capability-risk">Highest risk</p><p>Run a shell that starts in the repository.</p><p>A shell runs as the user of the agent&#x27;s device. The repository is only where it starts: it is not a sandbox.</p><p>A shell can read and change files outside the repository, use the network, run <code>git commit</code> and <code>git push</code>, and read the credentials stored for that user, including local AI provider credentials.</p><p>So a shell can send files and those credentials over the network.</p></div>',
+  );
+  // No choice without an expiry, and a note that says why.
+  expect(html).not.toContain('<option value="none"');
+  expect(html).toContain(
+    '<select id="grant-expiry" aria-describedby="grant-expiry-note">',
+  );
+  expect(html).toContain(
+    `<p id="grant-expiry-note" class="grant-note">${GRANT_MESSAGES.shellExpiry}</p>`,
+  );
+  expect(html).toContain(
+    `<button type="submit">${GRANT_MESSAGES.submitConfirmation}</button>`,
+  );
+  // No confirmation before the person asks for it.
+  expect(html).not.toContain("grant-confirmation");
+  expect(html).not.toContain(GRANT_MESSAGES.confirm);
+});
+
+test("the confirmation shows its text, the grant as the form shows it, and the warning where it applies, with Cancel first and Confirm and grant", () => {
+  const html = render({ ...VIEW, form: CONFIRMING_FORM });
+
+  expect(html).toContain(
+    '<div class="grant-confirmation" role="group" aria-labelledby="grant-confirm-title" data-risk="highest"><h4 id="grant-confirm-title">Confirm the highest-risk permission</h4><p>Allow this agent to run a shell in this repository? The shell runs as the user of the agent&#x27;s device and is not limited to the repository: it can read and change files outside the repository, use the network, commit and push, and read the credentials stored for that user, including local AI provider credentials.</p><dl class="grant-confirmation-grant"><dt>Agent</dt><dd>Builder</dd><dt>Permission</dt><dd><code>terminal.execute</code></dd><dt>Repository</dt><dd>web</dd><dt>Expires</dt><dd>1 day</dd></dl><p class="grant-warning">This agent does not have <code>git.push</code> on this repository, but the shell can still commit and push.</p><button type="button" autofocus="">Cancel</button> <button type="button">Confirm and grant</button></div>',
+  );
+  // Every ID is unique, and every label names an element.
+  const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
+  expect(new Set(ids).size).toBe(ids.length);
+  for (const [, reference] of html.matchAll(
+    /\s(?:for|aria-labelledby|aria-describedby)="([^"]+)"/g,
+  )) {
+    expect(ids).toContain(reference);
+  }
+  // While an action runs, the confirmation waits too.
+  expect(
+    render(
+      { ...VIEW, form: CONFIRMING_FORM },
+      { running: true, message: undefined },
+    ),
+  ).toContain(
+    '<button type="button" autofocus="" disabled="">Cancel</button> <button type="button" disabled="">Confirm and grant</button>',
+  );
+
+  const { calls, handlers } = recorder();
+  const elements = elementsOf(
+    GrantSectionContent({
+      view: { ...VIEW, form: CONFIRMING_FORM },
+      actions: IDLE_GRANT_ACTIONS,
+      handlers,
+    }),
+  );
+  const button = (text: string) =>
+    elements.find(
+      (element) => element.type === "button" && element.props.children === text,
+    )!;
+  expect(button(GRANT_MESSAGES.cancel).props).toMatchObject({
+    autoFocus: true,
+  });
+  button(GRANT_MESSAGES.cancel).props.onClick?.();
+  button(GRANT_MESSAGES.confirm).props.onClick?.();
+  expect(calls).toEqual([["cancel"], ["confirm", CONFIRMING_FORM]]);
+});
+
+test("an active shell grant in the list says that the shell can still commit and push", () => {
+  const html = render({
+    ...VIEW,
+    grants: [
+      {
+        grantId: GRANT_1,
+        capability: "terminal.execute",
+        scope: "web",
+        expiry: "Expires soon",
+        expired: false,
+        statements: [shellGitStatement(["git.commit", "git.push"])!],
+      },
+    ],
+  });
+  expect(html).toContain(
+    '<li class="grant-item"><code>terminal.execute</code> <span>web</span> <span class="grant-expiry">Expires soon</span> <button type="button" aria-label="Revoke terminal.execute on web">Revoke</button><p class="grant-warning">This agent has neither <code>git.commit</code> nor <code>git.push</code> on this repository, but the shell can still commit and push.</p></li>',
+  );
+});
+
+/** The open project's agents for the wiring tests: one grantable here. */
+const AGENTS: AgentActivityView = {
+  status: "ready",
+  revision: 1,
+  workspaceId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192a1",
+  projectId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192e1",
+  agents: [
+    {
+      id: HERE,
+      name: "Builder",
+      ownerName: "Ada",
+      disabledAt: null,
+      ownedByMe: true,
+      grantableHere: true,
+    },
+    {
+      id: SECOND,
+      name: "Reviewer",
+      ownerName: "Ada",
+      disabledAt: null,
+      ownedByMe: true,
+      grantableHere: true,
+    },
+  ],
+  unfinishedRuns: [],
+  moreUnfinishedRuns: 0,
+  finishedRuns: [],
+};
+
+/**
+ * The hook's loop without the hook: a form state, the view that it gives,
+ * the handlers for it, and the grants that reached the actions.
+ */
+function wiring() {
+  let state: GrantFormState = INITIAL_GRANT_FORM;
+  const granted: unknown[][] = [];
+  const actions: Pick<GrantActions, "grant" | "revoke"> = {
+    grant: async (agentId, request) => {
+      granted.push([agentId, request]);
+    },
+    revoke: async () => {},
+  };
+  const form = () => {
+    const view = describeGrantSection({
+      agents: { kind: "known", state: AGENTS },
+      repositories: {
+        kind: "known",
+        state: {
+          status: "ready",
+          revision: 1,
+          workspaceId: AGENTS.workspaceId,
+          projectId: AGENTS.projectId,
+          links: "ready",
+          repositories: [
+            {
+              repositoryId: WEB,
+              name: "web",
+              linked: false,
+              mountId: null,
+              removable: true,
+            },
+          ],
+        },
+      },
+      grants: { kind: "pending" },
+      connections: { kind: "pending" },
+      form: state,
+      now: Date.parse("2026-11-24T12:00:00.000Z"),
+      timeFormat: agentTimeFormat({ locale: "en-US", timeZone: "UTC" }),
+    });
+    if (view.kind !== "form" || view.form === null) {
+      throw new Error("no form");
+    }
+    return view.form;
+  };
+  const handlers = () =>
+    grantSectionHandlers(
+      state,
+      (change) => {
+        state = change(state);
+      },
+      actions,
+    );
+  return { form, handlers, granted, state: () => state };
+}
+
+test("a standard capability is granted at once, without the confirmation flag", () => {
+  const { form, handlers, granted } = wiring();
+  handlers().onScope(WEB);
+  handlers().onGrant(HERE, form());
+  expect(granted).toEqual([
+    [HERE, { capability: "repo.read", scopeId: WEB, lifetimeSeconds: null }],
+  ]);
+});
+
+test("no grant of the shell is sent without the person's confirmation, and the confirmation sends it with confirmedHighestRisk", () => {
+  const { form, handlers, granted, state } = wiring();
+  handlers().onCapability("terminal.execute");
+  handlers().onScope(WEB);
+  expect(form().expiryId).toBe("day");
+  // "Grant" only asks.
+  handlers().onGrant(HERE, form());
+  expect(granted).toEqual([]);
+  expect(state().confirming).toEqual({ agentId: HERE, request: SHELL_REQUEST });
+  expect(form().confirmation?.text).toBe(
+    HIGHEST_RISK_CONFIRMATIONS["terminal.execute"],
+  );
+  // A second "Grant" while it waits sends nothing either.
+  handlers().onGrant(HERE, form());
+  expect(granted).toEqual([]);
+  // The confirmation sends it once, and ends.
+  handlers().onConfirm(form());
+  expect(granted).toEqual([
+    [HERE, { ...SHELL_REQUEST, confirmedHighestRisk: true }],
+  ]);
+  expect(state().confirming).toBeNull();
+  expect(form().confirmation).toBeUndefined();
+  // A confirmation of the view that is gone sends nothing again.
+  handlers().onConfirm(CONFIRMING_FORM);
+  expect(granted).toHaveLength(1);
+});
+
+test("cancelling the confirmation, or changing the agent, the capability, the scope, or the expiry during it, sends nothing", () => {
+  const changes: [string, (handlers: GrantSectionHandlers) => void][] = [
+    ["cancel", (handlers) => handlers.onCancel()],
+    ["agent", (handlers) => handlers.onAgent(SECOND)],
+    ["capability", (handlers) => handlers.onCapability("repo.write")],
+    ["scope", (handlers) => handlers.onScope(WEB)],
+    ["expiry", (handlers) => handlers.onExpiry("week")],
+  ];
+  for (const [label, change] of changes) {
+    const { form, handlers, granted, state } = wiring();
+    handlers().onCapability("terminal.execute");
+    handlers().onScope(WEB);
+    handlers().onGrant(HERE, form());
+    const asked = form();
+    expect(asked.confirmation, label).toBeDefined();
+
+    change(handlers());
+    expect(state().confirming, label).toBeNull();
+    expect(form().confirmation, label).toBeUndefined();
+    // Neither the confirmation that was shown nor the form now sends it.
+    handlers().onConfirm(asked);
+    handlers().onConfirm(form());
+    expect(granted, label).toEqual([]);
+  }
 });

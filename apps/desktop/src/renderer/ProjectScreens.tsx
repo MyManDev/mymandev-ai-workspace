@@ -7,8 +7,8 @@ import { PermissionGrants } from "./PermissionGrants.tsx";
 import {
   describePermissionScreen,
   type CapabilityView,
-  type Statement,
 } from "./permission-view.ts";
+import { StatementText } from "./StatementText.tsx";
 
 // The other screens of the open project. Tasks and decisions show
 // placeholder content only, and come in later milestones. The permission
@@ -39,19 +39,6 @@ export function DecisionsScreen() {
   );
 }
 
-/** A fixed statement, with capability names and commands as code. */
-function StatementText({ statement }: { readonly statement: Statement }) {
-  return statement.map((part, index) =>
-    typeof part === "string" ? (
-      part
-    ) : (
-      <code key={index}>
-        {"capability" in part ? part.capability : part.command}
-      </code>
-    ),
-  );
-}
-
 function CapabilityItem({ view }: { readonly view: CapabilityView }) {
   return (
     <li className="capability" data-risk={view.risk}>
@@ -72,9 +59,8 @@ function CapabilityItem({ view }: { readonly view: CapabilityView }) {
 /**
  * The permission screen after the capability and permission contract (ADR
  * 0015): the grant form and the grants of the agents that this device may
- * grant for (#342), and what each capability allows and its risk from
- * `@mymandev/permissions`. The presentation rules of #77 come later; until
- * then the form does not offer the highest-risk capability.
+ * grant for (#342), with the presentation rules of #77, and what each
+ * capability allows and its risk from `@mymandev/permissions`.
  */
 export function PermissionsScreen({
   agents,
