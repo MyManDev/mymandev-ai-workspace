@@ -75,6 +75,20 @@ export interface GrantSectionHandlers {
 export const GRANT_RESULT_ID = "grant-result";
 
 /**
+ * The ID of the sentence on the read of the grants of an agent that another
+ * device hosts, which a screen reader announces (#345).
+ */
+export const GRANT_LIST_STATUS_ID = "grant-list-status";
+
+/**
+ * The ID of the section's note at `index` while it describes the selected
+ * agent, which has no form here because another device hosts it.
+ */
+export function grantAgentNoteId(index: number): string {
+  return `grant-agent-note-${index}`;
+}
+
+/**
  * Where the hook puts the focus once a confirmation has closed
  * (`focusAfterConfirmation`): the form's "Grant" and the sentence after an
  * action.
@@ -267,11 +281,14 @@ function AgentPicker({
   agents,
   agentId,
   running,
+  describedBy,
   onAgent,
 }: {
   readonly agents: readonly AgentChoice[];
   readonly agentId: string;
   readonly running: boolean;
+  /** The IDs of the notes on the selected agent, if any. */
+  readonly describedBy: string | undefined;
   readonly onAgent: (agentId: string) => void;
 }) {
   return (
@@ -281,6 +298,7 @@ function AgentPicker({
         id="grant-agent"
         value={agentId}
         disabled={running}
+        aria-describedby={describedBy}
         onChange={(event) => onAgent(event.target.value)}
       >
         {agents.map((agent) => (
@@ -399,6 +417,13 @@ export function GrantSectionContent({
   /** Where the hook puts the focus after a confirmation; optional, the hook passes it. */
   readonly focus?: GrantSectionFocus;
 }) {
+  // The selected agent without a form is hosted on another device: the
+  // notes say so, and describe the agent list while they show.
+  const agentNotes =
+    view.kind === "form" &&
+    view.agentId !== null &&
+    view.form === null &&
+    view.notes.length > 0;
   // A subsection without a name, so that it adds no landmark region.
   return (
     <section className="grant-section">
@@ -412,6 +437,13 @@ export function GrantSectionContent({
               agents={view.agents}
               agentId={view.agentId}
               running={actions.running}
+              describedBy={
+                agentNotes
+                  ? view.notes
+                      .map((_, index) => grantAgentNoteId(index))
+                      .join(" ")
+                  : undefined
+              }
               onAgent={handlers.onAgent}
             />
           )}
@@ -431,8 +463,12 @@ export function GrantSectionContent({
               handlers={handlers}
             />
           )}
-          {view.notes.map((note) => (
-            <p key={note} className="grant-note">
+          {view.notes.map((note, index) => (
+            <p
+              key={note}
+              id={agentNotes ? grantAgentNoteId(index) : undefined}
+              className="grant-note"
+            >
               {note}
             </p>
           ))}
@@ -472,7 +508,17 @@ function GrantList({
   return (
     <>
       <h4 id="grant-list-title">{GRANT_MESSAGES.grantsTitle}</h4>
-      {view.grantsNote === undefined ? null : (
+      {view.form === null ? (
+        // The read of an agent on another device: always present, so that a
+        // screen reader announces each of its sentences as it changes.
+        <p
+          id={GRANT_LIST_STATUS_ID}
+          className={view.grantsNote === undefined ? undefined : "grant-note"}
+          role="status"
+        >
+          {view.grantsNote}
+        </p>
+      ) : view.grantsNote === undefined ? null : (
         <p className="grant-note">{view.grantsNote}</p>
       )}
       {view.grants.length === 0 ? null : (

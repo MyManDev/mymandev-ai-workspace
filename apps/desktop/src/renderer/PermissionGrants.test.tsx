@@ -24,7 +24,9 @@ import type {
 } from "../shared/ipc-contract.ts";
 import { agentTimeFormat } from "./agent-view.ts";
 import {
+  GRANT_LIST_STATUS_ID,
   GRANT_RESULT_ID,
+  grantAgentNoteId,
   GrantSectionContent,
   grantSectionHandlers,
   type GrantSectionHandlers,
@@ -36,6 +38,7 @@ import {
   describeGrantSection,
   EXPIRY_CHOICES,
   expiryChoices,
+  AGENT_GRANTS_PROBLEM_MESSAGES,
   focusAfterConfirmation,
   GRANT_MESSAGES,
   GRANT_RESULT_MESSAGES,
@@ -354,20 +357,41 @@ test("for the owner's agent that another device hosts, the section offers the ag
   expect(html).not.toMatch(/<form[\s>]/);
   expect(html).not.toContain('id="grant-capability"');
   expect(html).not.toContain('type="submit"');
+  // The note on the agent describes the agent list while it shows.
   expect(html).toContain(
-    GRANT_MESSAGES.hostedElsewhere.replaceAll("'", "&#x27;"),
+    `<p id="${grantAgentNoteId(0)}" class="grant-note">${GRANT_MESSAGES.hostedElsewhere.replaceAll("'", "&#x27;")}</p>`,
+  );
+  expect(html).toMatch(
+    new RegExp(
+      `<select id="grant-agent" [^>]*aria-describedby="${grantAgentNoteId(0)}"`,
+    ),
   );
   expect(html).toContain(
     'aria-label="Revoke terminal.execute on web">Revoke</button>',
   );
   expect(html).toContain('class="grant-warning"');
-  // Every ID is unique, and every label names an element.
+  // The sentence on the read is always there, and announced as it changes.
+  expect(html).toContain(`<p id="${GRANT_LIST_STATUS_ID}" role="status"></p>`);
+  for (const note of [
+    GRANT_MESSAGES.agentGrantsPending,
+    GRANT_MESSAGES.noGrants,
+    AGENT_GRANTS_PROBLEM_MESSAGES.not_found,
+  ]) {
+    expect(
+      render({ ...ELSEWHERE_VIEW, grants: [], grantsNote: note }),
+    ).toContain(
+      `<p id="${GRANT_LIST_STATUS_ID}" class="grant-note" role="status">${note}</p>`,
+    );
+  }
+  // Every ID is unique, and every label and description names an element.
   const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
   expect(new Set(ids).size).toBe(ids.length);
-  for (const [, reference] of html.matchAll(
-    /\s(?:for|aria-labelledby)="([^"]+)"/g,
+  for (const [, references] of html.matchAll(
+    /\s(?:for|aria-labelledby|aria-describedby)="([^"]+)"/g,
   )) {
-    expect(ids).toContain(reference);
+    for (const reference of references!.split(" ")) {
+      expect(ids).toContain(reference);
+    }
   }
 
   const { calls, handlers } = recorder();
