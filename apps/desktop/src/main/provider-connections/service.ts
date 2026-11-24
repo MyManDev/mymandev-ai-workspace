@@ -485,8 +485,10 @@ export function createProviderConnectionService(
       // A trigger came after this read was sent: only a newer answer counts.
       again = false;
       if (!result.ok && result.reason === "rate_limited") {
-        rateLimitedUntil =
-          now() + workspaceRetryDelayMs(attempt, "rate_limited");
+        // Shown as any failed read: nothing reads until its wait ended,
+        // and the read asked for goes then.
+        readFailed(result.reason);
+        return;
       }
       reload();
       return;

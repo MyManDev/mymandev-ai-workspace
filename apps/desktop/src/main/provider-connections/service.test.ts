@@ -677,6 +677,27 @@ test("a write that may have reached the API while a read is on its way drops tha
   expect(harness.reads).toHaveLength(0);
 });
 
+test("a rate_limited answer of a read that a write dropped is shown, and the next read goes once its wait ended", async () => {
+  const harness = new Harness();
+  const pending = harness.service.register("codex", "Personal");
+  harness.writes[0]?.answer(registeredAnswer("codex", "Personal"));
+  await pending;
+  await harness.answer(failure("rate_limited"));
+  expect(harness.service.state()).toMatchObject({
+    status: "unavailable",
+    problem: "rate_limited",
+  });
+  expect(harness.reads).toHaveLength(0);
+  expect(harness.openTimers().map((timer) => timer.delayMs)).toEqual([
+    RATE_LIMITED_RETRY_MS,
+  ]);
+  harness.clock = RATE_LIMITED_RETRY_MS;
+  harness.fire();
+  expect(harness.reads).toHaveLength(1);
+  await harness.ready(TWO);
+  expect(harness.service.state().problem).toBeUndefined();
+});
+
 test("a switch to another device while a write waits sends no extra read for the new device when the write answers", async () => {
   const harness = new Harness();
   await harness.ready(TWO);
