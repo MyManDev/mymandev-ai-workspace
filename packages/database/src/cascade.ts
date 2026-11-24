@@ -132,9 +132,9 @@ const owner = alias(workspaceMembers, "owner");
  * or a removal of a person, reads them with this inside its own transaction,
  * after the disabling, so that the API sends one event per agent after the
  * commit to the members of the agent's own workspace: a device revocation
- * can disable agents in several workspaces. An agent's project, owner, and
- * name never change, and its `disabled_at` is set once, so the read gives
- * what the change wrote. The owner's person is the account's active person
+ * can disable agents in several workspaces. The read runs in the
+ * transaction that disabled the agents, after the disabling, so it gives
+ * what that transaction wrote. The owner's person is the account's active person
  * in the workspace, or else its most recently removed one, as
  * `listProjectAgents` shows it, so after a removal it is the removed person.
  * It locks nothing; the change holds the agents' locks already. An ID that
