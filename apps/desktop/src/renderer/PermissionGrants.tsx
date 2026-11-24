@@ -234,10 +234,22 @@ function GrantForm({
   );
 }
 
+/** The ID of the confirmation's text. */
+export const GRANT_CONFIRM_TEXT_ID = "grant-confirm-text";
+/** The ID of the grant that the confirmation shows. */
+export const GRANT_CONFIRM_GRANT_ID = "grant-confirm-grant";
+
+/** The ID of the confirmation's warning at `index`. */
+export function grantConfirmWarningId(index: number): string {
+  return `grant-confirm-warning-${index}`;
+}
+
 /**
  * The separate step of a highest-risk capability: what the person is asked
  * to confirm, the grant as the form shows it, and "Cancel" first, which
- * takes the focus.
+ * takes the focus. The group is described by its text, the grant, and its
+ * warnings, so that a screen reader reads them when the focus enters it,
+ * not only the group's name and "Cancel".
  */
 function GrantConfirmation({
   form,
@@ -254,16 +266,22 @@ function GrantConfirmation({
     form.scopeKind === "repository"
       ? GRANT_MESSAGES.repositoryLabel
       : GRANT_MESSAGES.connectionLabel;
+  const described = [
+    GRANT_CONFIRM_TEXT_ID,
+    GRANT_CONFIRM_GRANT_ID,
+    ...confirmation.statements.map((_, index) => grantConfirmWarningId(index)),
+  ].join(" ");
   return (
     <div
       className="grant-confirmation"
       role="group"
       aria-labelledby="grant-confirm-title"
+      aria-describedby={described}
       data-risk={form.risk}
     >
       <h4 id="grant-confirm-title">{GRANT_MESSAGES.confirmTitle}</h4>
-      <p>{confirmation.text}</p>
-      <dl className="grant-confirmation-grant">
+      <p id={GRANT_CONFIRM_TEXT_ID}>{confirmation.text}</p>
+      <dl id={GRANT_CONFIRM_GRANT_ID} className="grant-confirmation-grant">
         <dt>{GRANT_MESSAGES.agentLabel}</dt>
         <dd>{confirmation.agent}</dd>
         <dt>{GRANT_MESSAGES.capabilityLabel}</dt>
@@ -276,7 +294,11 @@ function GrantConfirmation({
         <dd>{confirmation.expiry}</dd>
       </dl>
       {confirmation.statements.map((statement, index) => (
-        <p key={index} className="grant-warning">
+        <p
+          key={index}
+          id={grantConfirmWarningId(index)}
+          className="grant-warning"
+        >
           <StatementText statement={statement} />
         </p>
       ))}

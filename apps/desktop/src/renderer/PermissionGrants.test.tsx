@@ -31,6 +31,7 @@ import {
   OFFERED_CAPABILITIES,
   type GrantActions,
   type GrantActionsView,
+  type GrantConfirmationView,
   type GrantFormState,
   type GrantFormView,
   type GrantSectionView,
@@ -378,16 +379,50 @@ test("the confirmation shows its text, the grant as the form shows it, and the w
   const html = render({ ...VIEW, form: CONFIRMING_FORM });
 
   expect(html).toContain(
-    '<div class="grant-confirmation" role="group" aria-labelledby="grant-confirm-title" data-risk="highest"><h4 id="grant-confirm-title">Confirm the highest-risk permission</h4><p>Allow this agent to run a shell in this repository? The shell runs as the user of the agent&#x27;s device and is not limited to the repository: it can read and change files outside the repository, use the network, commit and push, and read the credentials stored for that user, including local AI provider credentials.</p><dl class="grant-confirmation-grant"><dt>Agent</dt><dd>Builder</dd><dt>Permission</dt><dd><code>terminal.execute</code></dd><dt>Repository</dt><dd>web</dd><dt>Expires</dt><dd>1 day</dd></dl><p class="grant-warning">This agent does not have <code>git.push</code> on this repository, but the shell can still commit and push.</p><button type="button" autofocus="">Cancel</button> <button type="button">Confirm and grant</button></div>',
+    '<div class="grant-confirmation" role="group" aria-labelledby="grant-confirm-title" aria-describedby="grant-confirm-text grant-confirm-grant grant-confirm-warning-0" data-risk="highest"><h4 id="grant-confirm-title">Confirm the highest-risk permission</h4><p id="grant-confirm-text">Allow this agent to run a shell in this repository? The shell runs as the user of the agent&#x27;s device and is not limited to the repository: it can read and change files outside the repository, use the network, commit and push, and read the credentials stored for that user, including local AI provider credentials.</p><dl id="grant-confirm-grant" class="grant-confirmation-grant"><dt>Agent</dt><dd>Builder</dd><dt>Permission</dt><dd><code>terminal.execute</code></dd><dt>Repository</dt><dd>web</dd><dt>Expires</dt><dd>1 day</dd></dl><p id="grant-confirm-warning-0" class="grant-warning">This agent does not have <code>git.push</code> on this repository, but the shell can still commit and push.</p><button type="button" autofocus="">Cancel</button> <button type="button">Confirm and grant</button></div>',
   );
-  // Every ID is unique, and every label names an element.
-  const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
-  expect(new Set(ids).size).toBe(ids.length);
-  for (const [, reference] of html.matchAll(
-    /\s(?:for|aria-labelledby|aria-describedby)="([^"]+)"/g,
-  )) {
-    expect(ids).toContain(reference);
-  }
+  // Every ID is unique, and every reference, each of a list, names an
+  // element.
+  const references = (markup: string) => {
+    const ids = [...markup.matchAll(/\sid="([^"]+)"/g)].map(
+      (match) => match[1],
+    );
+    expect(new Set(ids).size).toBe(ids.length);
+    const named = [
+      ...markup.matchAll(
+        /\s(?:for|aria-labelledby|aria-describedby)="([^"]+)"/g,
+      ),
+    ].flatMap(([, reference]) => reference!.split(" "));
+    for (const reference of named) {
+      expect(ids).toContain(reference);
+    }
+    return named;
+  };
+  references(html);
+  // A screen reader reads the text, the grant, and every warning when the
+  // focus enters the group on "Cancel", with no warning or with several.
+  const describedBy = (statements: GrantConfirmationView["statements"]) => {
+    const markup = render({
+      ...VIEW,
+      form: {
+        ...CONFIRMING_FORM,
+        confirmation: { ...CONFIRMING_FORM.confirmation!, statements },
+      },
+    });
+    references(markup);
+    return /<div class="grant-confirmation"[^>]* aria-describedby="([^"]+)"/.exec(
+      markup,
+    )?.[1];
+  };
+  expect(describedBy([])).toBe("grant-confirm-text grant-confirm-grant");
+  expect(
+    describedBy([
+      shellGitStatement(["git.push"])!,
+      shellGitStatement("unknown")!,
+    ]),
+  ).toBe(
+    "grant-confirm-text grant-confirm-grant grant-confirm-warning-0 grant-confirm-warning-1",
+  );
   // While an action runs, the confirmation waits too.
   expect(
     render(
