@@ -370,6 +370,12 @@ test("a device revocation sends workspace.agent.disabled for each agent of the d
   const deskInBobs = await agentOn(bob, bobProject.id, "Desk too");
   const laptopAgent = await agentOn(laptop, adaProject.id, "Laptop");
   const adaAgent = await agentOn(ada, adaProject.id, "Ada's");
+  // An agent of the desk that its owner disabled before: the revocation
+  // does not disable it again, so no event announces it again.
+  const retired = await agentOn(bob, adaProject.id, "Retired");
+  await done(bob, `/projects/${adaProject.id}/agents/${retired.id}/disable`);
+  const retiredAt = await disabledAt(retired.id);
+  assert.ok(retiredAt !== null);
   const repositoryId = await repositoryOf(ada, adaProject.id);
   const grant = await granted(bob, deskInAdas.id, repositoryId);
   const run = await runOf(adaProject.id, deskInAdas.id, bob);
@@ -453,6 +459,7 @@ test("a device revocation sends workspace.agent.disabled for each agent of the d
   assert.deepEqual((await received(danClient)).seen, []);
   assert.equal(await disabledAt(laptopAgent.id), null);
   assert.equal(await disabledAt(adaAgent.id), null);
+  assert.deepEqual(await disabledAt(retired.id), retiredAt);
 });
 
 test("a sign-in that replaces a device sends workspace.agent.disabled for each agent of the replaced device, before the grant and run events, never to the replaced device, and nothing when its commit fails", async (t) => {
