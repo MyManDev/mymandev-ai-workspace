@@ -141,9 +141,12 @@ export function createRunExecutorRegistry(
 
 /**
  * The executors of a production build: none, until the adapters of #30 and
- * #31 land. With an empty registry the supervisor adopts no queued run; it
- * only reports the runs that a restart, a crash, or a lost connection
- * interrupted (see `run-supervisor.ts`).
+ * #31 land. With an empty registry, the supervisor fails every queued run of
+ * this device that has a provider connection with `no_executor` or
+ * `provider_connection_missing` (default 5 of 2026-11-24 on #35; default
+ * until the Project Manager decides), leaves the runs without one (of the
+ * development seed) queued, and reports the runs that a restart, a crash,
+ * or a lost connection interrupted (see `run-supervisor.ts`).
  */
 export const PRODUCTION_RUN_EXECUTORS: RunExecutorRegistry =
   createRunExecutorRegistry({});

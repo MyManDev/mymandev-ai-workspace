@@ -276,6 +276,13 @@ class Harness {
    * longer holds, as beyond its limit.
    */
   readonly unlistedFinished = new Set<RunId>();
+  /**
+   * Runs that the activity holds as their creation event built them, without
+   * a provider connection or an input message, until the next reload.
+   */
+  readonly createdByEvent = new Set<RunId>();
+  /** The unfinished runs that the last reload of the runs read. */
+  snapshot: readonly AgentRunListItem[] = [];
   revision = 1;
   readonly claude: FakeExecutor;
   readonly codex: FakeExecutor;
@@ -306,6 +313,7 @@ class Harness {
     const executors = options.executors ?? { claude: new FakeExecutor() };
     this.claude = executors.claude ?? new FakeExecutor();
     this.codex = executors.codex ?? new FakeExecutor();
+    this.snapshot = this.unfinishedOnServer();
     const readWorkspaceData = ((name: string) => {
       if (name !== "listProviderConnections") {
         throw new Error(`Unexpected read ${name}`);
@@ -345,6 +353,7 @@ class Harness {
         },
         gateLive: () => this.live && this.projectId !== null,
         runsReloaded: () => this.reloads,
+        reloadedRuns: () => this.snapshot,
       },
       grants: {
         onGrantsChanged: (listener) => {
@@ -398,6 +407,19 @@ class Harness {
     });
   }
 
+  /** The open project's unfinished runs on the server, newest first. */
+  unfinishedOnServer(): AgentRunListItem[] {
+    if (this.projectId === null) {
+      return [];
+    }
+    return this.runs
+      .filter(
+        (item) =>
+          item.projectId === this.projectId && !isTerminalRunState(item.state),
+      )
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  }
+
   /** The agent activity of the open project, as the service gives it. */
   state(): AgentActivityState {
     if (this.projectId === null) {
@@ -411,9 +433,18 @@ class Harness {
         finishedRuns: [],
       });
     }
-    const project = this.runs.filter(
-      (item) => item.projectId === this.projectId,
-    );
+    const project = this.runs
+      .filter((item) => item.projectId === this.projectId)
+      .map((item): AgentRunListItem => {
+        if (!this.createdByEvent.has(item.id)) {
+          return item;
+        }
+        // Built from the event's payload: neither field is in it.
+        const copy: Record<string, unknown> = { ...item };
+        delete copy.providerConnectionId;
+        delete copy.inputMessageId;
+        return Object.freeze(copy) as AgentRunListItem;
+      });
     const newestFirst = (a: AgentRunListItem, b: AgentRunListItem) =>
       Date.parse(b.createdAt) - Date.parse(a.createdAt);
     return Object.freeze({
@@ -589,6 +620,19 @@ class Harness {
   reload(): void {
     this.live = true;
     this.reloads += 1;
+    this.createdByEvent.clear();
+    this.snapshot = this.unfinishedOnServer();
+    this.changed();
+  }
+
+  /**
+   * The server creates `item`, and the activity applies its creation event
+   * live: the activity holds the run without a provider connection or an
+   * input message until the next reload.
+   */
+  createByEvent(item: AgentRunListItem): void {
+    this.runs.push(item);
+    this.createdByEvent.add(item.id);
     this.changed();
   }
 
@@ -601,6 +645,7 @@ class Harness {
   openProject(projectId: ProjectId | null): void {
     this.projectId = projectId;
     this.live = false;
+    this.snapshot = [];
     this.changed();
     if (projectId !== null) {
       this.reload();
@@ -799,13 +844,28 @@ test("a queued run fails at once without an executor for its kind or without a p
   expect(h.claude.calls).toEqual([]);
   expect(h.codex.calls).toEqual([]);
 
-  // A run without a provider connection, such as a seeded one.
-  const g = new Harness({ runs: [run(1, "queued", { connection: null })] });
-  await g.answerProviders();
-  expect(g.walk()).toEqual([
-    `1 queued>failed ${HOST_RUN_REASONS.providerConnectionMissing}`,
-  ]);
-  expect(g.violations).toEqual([]);
+  expect(h.violations).toEqual([]);
+});
+
+test("a queued run that a reload lists without a provider connection is left queued, and the agent's next run goes", async () => {
+  // Only the development seed creates such runs.
+  const h = new Harness({
+    runs: [
+      run(1, "queued", { connection: null }),
+      run(2, "queued", { connection: null, agent: AGENT_B }),
+    ],
+  });
+  h.reload();
+  h.advance(60_000);
+  expect(h.providerReads).toEqual([]);
+  expect(h.sent).toEqual([]);
+
+  // A newer run of agent A with a connection goes past the seeded one.
+  h.runs.push(run(3, "queued"));
+  h.reload();
+  await h.answerProviders();
+  expect(h.walk()).toEqual(["3 queued>running"]);
+  expect(h.violations).toEqual([]);
 });
 
 test("a failed read of the provider connections sends nothing and is retried with the backoff", async () => {
@@ -821,16 +881,65 @@ test("a failed read of the provider connections sends nothing and is retried wit
   expect(h.walk()).toEqual(["1 queued>running"]);
 });
 
-test("an empty executor registry adopts no queued run and reads nothing", async () => {
+test("with an empty executor registry, every queued run with a provider connection fails at once, and the seeded ones stay queued", async () => {
   expect(PRODUCTION_RUN_EXECUTORS.kinds()).toEqual([]);
   const h = new Harness({
-    runs: [run(1, "queued"), run(2, "queued", { connection: null })],
+    runs: [
+      run(1, "queued"),
+      run(2, "queued", { connection: GONE_CONNECTION, agent: AGENT_B }),
+      run(3, "queued", { connection: null, agent: AGENT_B, createdAfter: 0 }),
+    ],
     executors: {},
   });
+  expect(h.providerReads).toHaveLength(1);
+  await h.answerProviders();
+  expect(h.walk()).toEqual([`1 queued>failed ${HOST_RUN_REASONS.noExecutor}`]);
+  h.ackAndStep();
+  expect(h.walk()).toEqual([
+    `1 queued>failed ${HOST_RUN_REASONS.noExecutor}`,
+    `2 queued>failed ${HOST_RUN_REASONS.providerConnectionMissing}`,
+  ]);
+  h.ackAndStep();
   h.reload();
   h.advance(60_000);
   expect(h.providerReads).toEqual([]);
+  expect(h.sent).toHaveLength(2);
+  expect(h.runState(3)).toBe("queued");
+  expect(h.violations).toEqual([]);
+});
+
+test("a run created live waits for the reload that lists it, and then runs with its provider connection and input message", async () => {
+  const h = new Harness();
+  // The creation event alone: the activity holds the run without its
+  // provider connection, so nothing is decided.
+  h.createByEvent(run(1, "queued"));
+  expect(h.state().unfinishedRuns[0]?.providerConnectionId).toBeUndefined();
+  h.advance(60_000);
+  expect(h.providerReads).toEqual([]);
   expect(h.sent).toEqual([]);
+
+  // The reload that the creation asked for lists it.
+  h.reload();
+  await h.answerProviders();
+  expect(h.walk()).toEqual(["1 queued>running"]);
+  h.ack();
+  const { execution } = h.claude.last;
+  expect(execution.run.providerConnectionId).toBe(CLAUDE_CONNECTION);
+  expect(execution.inputMessageId).toBe(INPUT_MESSAGE);
+
+  // A run created live behind a listed one: the listed one goes first, and
+  // the new one waits for its own reload.
+  const g = new Harness({ runs: [run(1, "queued", { agent: AGENT_B })] });
+  g.createByEvent(run(2, "queued"));
+  await g.answerProviders();
+  g.ack();
+  g.advance(60_000);
+  expect(g.walk()).toEqual(["1 queued>running"]);
+  expect(g.providerReads).toEqual([]);
+  g.reload();
+  await g.answerProviders();
+  expect(g.walk()).toEqual(["1 queued>running", "2 queued>running"]);
+  expect(g.violations).toEqual([]);
 });
 
 // The executor's outcome.

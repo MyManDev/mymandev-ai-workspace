@@ -16,12 +16,22 @@
 //   executor of one of its runs has not settled (also after an abort), while
 //   one of its runs waits for the next reload after a refusal, and while the
 //   activity shows one of its runs in `running` or `awaiting_input`.
-// - A queued run. The supervisor reads this device's provider connections
-//   (`GET /provider-connections`). A run whose provider connection is not in
-//   the list, or that has none, fails at once (`queued -> failed`,
-//   `provider_connection_missing`); so does one whose provider kind has no
-//   executor (`no_executor`), so that it does not hold one of the agent's
-//   10 unfinished places. Otherwise `beforeStart` is asked, and then
+// - A queued run is decided only once a reload of the runs listed it
+//   (`reloadedRuns`): a run that an event created carries neither its
+//   provider connection nor its input message, so its agent waits for the
+//   reload that the creation asks for. The run's provider connection and
+//   input message are taken from that reload only.
+// - A queued run that the reload lists without a provider connection is
+//   skipped and stays queued: only the development seed creates such runs
+//   (default 5 of 2026-11-24, as narrowed on the review of #348; default
+//   until the Project Manager decides). For every other queued run, the
+//   supervisor reads this device's provider connections
+//   (`GET /provider-connections`), also with an empty executor registry. A
+//   run whose provider connection is not in the list fails at once
+//   (`queued -> failed`, `provider_connection_missing`); so does one whose
+//   provider kind has no executor (`no_executor`), so that it does not hold
+//   one of the agent's 10 unfinished places. Otherwise `beforeStart` is
+//   asked, and then
 //   `queued -> running` is sent; once the server acknowledged it, the
 //   executor starts with the held run and an `AbortSignal`, and its outcome
 //   becomes `running -> completed` or `running -> failed`.
@@ -30,10 +40,6 @@
 //   makes that check waits for the Project Manager (#35, scope of
 //   2026-11-24, and #55), so it defaults to allowing every start, and the
 //   enforcement point is never called before a start.
-// - With an empty executor registry, as in production until #30 and #31,
-//   the supervisor adopts no queued run at all; it only reports the
-//   interrupted runs below. Otherwise every queued run of this device would
-//   fail with `no_executor`, also the runs of the development seed.
 // - Stops (#55, decision of 2026-11-19). An executor's action that it
 //   checked with `RunExecution.check` stays held until it ends. On every
 //   `onGrantsChanged`, each held action is checked again with the
@@ -167,7 +173,7 @@ export type RunSupervisorConnection = Pick<
 /** The part of the agent activity service that the supervisor uses. */
 export type RunSupervisorAgents = Pick<
   AgentActivityService,
-  "state" | "onChange" | "gateLive" | "runsReloaded"
+  "state" | "onChange" | "gateLive" | "runsReloaded" | "reloadedRuns"
 >;
 /** The part of the grant store that the supervisor uses. */
 export type RunSupervisorGrants = Pick<GrantStoreService, "onGrantsChanged">;
@@ -230,7 +236,16 @@ interface StartPlan {
   readonly held: HeldRun;
   readonly executor: RunExecutor;
   readonly providerKind: ProviderConnection["kind"];
-  readonly inputMessageId: AgentRunListItem["inputMessageId"] | null;
+  readonly inputMessageId: NonNullable<
+    AgentRunListItem["inputMessageId"]
+  > | null;
+}
+
+/** A queued run that may be decided, with the reload that listed it. */
+interface Candidate {
+  readonly run: AgentRunListItem;
+  /** The run as the last reload of the runs listed it. */
+  readonly listed: AgentRunListItem;
 }
 
 /** An action that an executor checked and that has not ended. */
@@ -412,6 +427,11 @@ export function createRunSupervisor(
   let cancelPace: (() => void) | null = null;
   /** The value of `runsReloaded` that the last scan saw. */
   let scannedReload: number | null = null;
+  /**
+   * The unfinished runs of the last reload of the runs that the supervisor
+   * saw, by ID: a queued run is decided only once it is here.
+   */
+  let listedRuns = new Map<RunId, AgentRunListItem>();
   /** Changes with every change of the device, so that a read for an earlier one is dropped. */
   let epoch = 0;
   let providerReadInFlight = false;
@@ -479,18 +499,33 @@ export function createRunSupervisor(
     );
   }
 
-  /** The oldest queued run of each adoptable agent that is not busy. */
-  function candidates(live: Live): AgentRunListItem[] {
-    const found: AgentRunListItem[] = [];
+  /**
+   * The oldest queued run of each adoptable agent that is not busy, once a
+   * reload listed it; see "A queued run". A run that the reload listed
+   * without a provider connection is skipped; a run that no reload listed
+   * yet makes its agent wait.
+   */
+  function candidates(live: Live): Candidate[] {
+    const found: Candidate[] = [];
     for (const agent of live.state.agents) {
       if (!adoptable(agent, live) || agentBusy(agent.id, live)) {
         continue;
       }
       const queued = live.state.unfinishedRuns
         .filter((run) => run.agentId === agent.id && run.state === "queued")
-        .sort(olderFirst)[0];
-      if (queued !== undefined) {
-        found.push(queued);
+        .sort(olderFirst);
+      for (const run of queued) {
+        const listed = listedRuns.get(run.id);
+        if (listed === undefined) {
+          // Created by an event: the reload that it asked for tells more.
+          break;
+        }
+        if (listed.providerConnectionId === undefined) {
+          // A run of the development seed: it stays queued.
+          continue;
+        }
+        found.push({ run, listed });
+        break;
       }
     }
     return found;
@@ -681,6 +716,7 @@ export function createRunSupervisor(
     if (previous !== null) {
       interruptAll(next === null ? "signed_out" : "device_changed");
     }
+    listedRuns = new Map();
     if (next !== null) {
       // Only the device that adopted a run sends for it.
       for (const entry of [...entries.values()]) {
@@ -742,6 +778,9 @@ export function createRunSupervisor(
   /** After a reload of the runs: owed transitions, then interrupted runs. */
   function afterReload(live: Live): void {
     dropped.clear();
+    listedRuns = new Map(
+      agents.reloadedRuns().map((item) => [item.id, item] as const),
+    );
     for (const entry of [...entries.values()]) {
       if (
         entry.stage.kind !== "owed" ||
@@ -847,7 +886,7 @@ export function createRunSupervisor(
     if (live === null) {
       return;
     }
-    for (const run of candidates(live)) {
+    for (const { run, listed } of candidates(live)) {
       const due = (
         transition: Transition,
         purpose: Purpose,
@@ -863,9 +902,7 @@ export function createRunSupervisor(
         });
       };
       const found = connections.find(
-        (item) =>
-          run.providerConnectionId !== undefined &&
-          item.id === run.providerConnectionId,
+        (item) => item.id === listed.providerConnectionId,
       );
       if (found === undefined) {
         log(
@@ -918,7 +955,7 @@ export function createRunSupervisor(
           held,
           executor,
           providerKind: found.kind,
-          inputMessageId: run.inputMessageId ?? null,
+          inputMessageId: listed.inputMessageId ?? null,
         });
         continue;
       }
@@ -1159,7 +1196,6 @@ export function createRunSupervisor(
             afterReload(live);
           }
           if (
-            executors.kinds().length > 0 &&
             !providerReadInFlight &&
             cancelProviderRetry === null &&
             candidates(live).length > 0
