@@ -30,16 +30,21 @@
 //   run whose provider connection is not in the list fails at once
 //   (`queued -> failed`, `provider_connection_missing`); so does one whose
 //   provider kind has no executor (`no_executor`), so that it does not hold
-//   one of the agent's 10 unfinished places. Otherwise `beforeStart` is
-//   asked, and then
-//   `queued -> running` is sent; once the server acknowledged it, the
+//   one of the agent's 10 unfinished places. Otherwise the start is due:
+//   when the pace lets it go, `beforeStart` is asked immediately before
+//   `queued -> running` is sent, every time, also after a wait behind
+//   another run or a `rate_limited`; once the server acknowledged it, the
 //   executor starts with the held run and an `AbortSignal`, and its outcome
 //   becomes `running -> completed` or `running -> failed`.
 // - `beforeStart` is the seam for a check of `provider.use` with the
 //   enforcement point before `queued -> running`. Whether the supervisor
 //   makes that check waits for the Project Manager (#35, scope of
 //   2026-11-24, and #55), so it defaults to allowing every start, and the
-//   enforcement point is never called before a start.
+//   enforcement point is never called before a start. Its answer is read
+//   defensively: an answer that is not an object, a hook that throws, or a
+//   reason that is not a code (`RUN_EXECUTOR_REASON_PATTERN`) or that only
+//   the server gives makes the run wait for the next reload, which the
+//   supervisor asks for.
 // - Stops (#55, decision of 2026-11-19). An executor's action that it
 //   checked with `RunExecution.check` stays held until it ends. On every
 //   `onGrantsChanged`, each held action is checked again with the
@@ -257,12 +262,14 @@ export interface RunSupervisorOptions {
    */
   readonly enforcement?: Pick<PermissionEnforcement, "check" | "recheck">;
   /**
-   * Asked right before `queued -> running`, for a run that has an executor
-   * and a provider connection of this device. Waits for the Project
-   * Manager's decision on a check of `provider.use` (#35, #55); defaults to
-   * `ALLOW_RUN_START`. A hook that throws, or answers outside
-   * `RunStartDecision`, sends nothing, and the run waits for the next
-   * reload.
+   * Asked immediately before each send of `queued -> running`, for a run
+   * that has an executor and a provider connection of this device. Waits
+   * for the Project Manager's decision on a check of `provider.use` (#35,
+   * #55); defaults to `ALLOW_RUN_START`. A hook that throws, or answers
+   * outside `RunStartDecision` (not an object, or a reason that is not a
+   * code of `RUN_EXECUTOR_REASON_PATTERN`, or one that only the server
+   * gives), sends nothing, and the run waits for the next reload. A host
+   * reason such as `grant_inactive` may be given.
    */
   readonly beforeStart?: (run: HeldRun) => RunStartDecision;
   /** Agents whose runs another sender moves; the supervisor leaves them alone. */
@@ -435,6 +442,32 @@ function olderFirst(a: AgentRunListItem, b: AgentRunListItem): number {
 /** The reasons that only the server gives. */
 const SERVER_REASONS: readonly string[] = RUN_CANCEL_REASONS;
 
+/** The reasons that only the supervisor gives. */
+const HOST_REASONS: readonly string[] = Object.values(HOST_RUN_REASONS);
+
+/**
+ * Whether `reason` may end a run as `beforeStart` gives it: a code of
+ * `RUN_EXECUTOR_REASON_PATTERN` that only the server does not give. A host
+ * reason is allowed, so that a check before the start can report, for
+ * example, `grant_inactive`.
+ */
+function startReasonAllowed(reason: unknown): reason is string {
+  return (
+    typeof reason === "string" &&
+    RUN_EXECUTOR_REASON_PATTERN.test(reason) &&
+    !SERVER_REASONS.includes(reason)
+  );
+}
+
+/**
+ * Whether `reason` may end a run as an executor's `failed` gives it: as
+ * `startReasonAllowed`, and none of the host's own reasons, which only the
+ * supervisor gives.
+ */
+function executorReasonAllowed(reason: unknown): reason is string {
+  return startReasonAllowed(reason) && !HOST_REASONS.includes(reason);
+}
+
 /** The terminal transition of an executor's outcome. */
 function finishOf(outcome: unknown): Transition {
   if (typeof outcome === "object" && outcome !== null) {
@@ -442,13 +475,9 @@ function finishOf(outcome: unknown): Transition {
     if (value.outcome === "completed") {
       return { from: "running", to: "completed" };
     }
-    if (
-      value.outcome === "failed" &&
-      typeof value.reason === "string" &&
-      RUN_EXECUTOR_REASON_PATTERN.test(value.reason) &&
-      !SERVER_REASONS.includes(value.reason)
-    ) {
-      return { from: "running", to: "failed", reason: value.reason };
+    const reason = value.reason;
+    if (value.outcome === "failed" && executorReasonAllowed(reason)) {
+      return { from: "running", to: "failed", reason };
     }
   }
   return {
@@ -1155,37 +1184,50 @@ export function createRunSupervisor(
         repositoryId: run.repositoryId,
         providerConnectionId: found.id,
       });
-      let decision: RunStartDecision;
-      try {
-        decision = beforeStart(held);
-      } catch {
-        log("The check before a run start failed; the run waits.");
-        dropUntilReload({ runId: run.id, agentId: run.agentId });
-        continue;
+      // `beforeStart` is asked when the start is sent; see `pump`.
+      due({ from: "queued", to: "running" }, "start", {
+        held,
+        executor,
+        providerKind: found.kind,
+        inputMessageId: listed.inputMessageId ?? null,
+      });
+    }
+  }
+
+  /**
+   * Asks `beforeStart` for `held`, immediately before its start is sent:
+   * the transition to send instead of `queued -> running`, or null when the
+   * run waits (a hook that throws, or any answer outside
+   * `RunStartDecision`, a reason that `startReasonAllowed` refuses
+   * included).
+   */
+  function askBeforeStart(held: HeldRun): Transition | null {
+    try {
+      const decision: unknown = beforeStart(held);
+      if (typeof decision !== "object" || decision === null) {
+        return null;
       }
-      if (decision.start === true) {
-        due({ from: "queued", to: "running" }, "start", {
-          held,
-          executor,
-          providerKind: found.kind,
-          inputMessageId: listed.inputMessageId ?? null,
-        });
-        continue;
+      const value = decision as {
+        start?: unknown;
+        state?: unknown;
+        reason?: unknown;
+      };
+      const start = value.start;
+      if (start === true) {
+        return { from: "queued", to: "running" };
       }
+      const state = value.state;
+      const reason = value.reason;
       if (
-        decision.start === false &&
-        (decision.state === "failed" || decision.state === "cancelled") &&
-        typeof decision.reason === "string"
+        start === false &&
+        (state === "failed" || state === "cancelled") &&
+        startReasonAllowed(reason)
       ) {
-        due(
-          { from: "queued", to: decision.state, reason: decision.reason },
-          "refuse",
-          null,
-        );
-        continue;
+        return { from: "queued", to: state, reason };
       }
-      log("The check before a run start failed; the run waits.");
-      dropUntilReload({ runId: run.id, agentId: run.agentId });
+      return null;
+    } catch {
+      return null;
     }
   }
 
@@ -1291,11 +1333,31 @@ export function createRunSupervisor(
       }
       return;
     }
-    const entry = nextDue();
-    if (entry === null || entry.stage.kind !== "due" || !paceAllows()) {
+    for (;;) {
+      const entry = nextDue();
+      if (entry === null || entry.stage.kind !== "due" || !paceAllows()) {
+        return;
+      }
+      const { transition, purpose, start } = entry.stage;
+      if (purpose !== "start" || start === null) {
+        send(entry, transition, purpose, start);
+        return;
+      }
+      // Asked immediately before each start (ADR 0015), also after a wait
+      // behind another run or a `rate_limited`.
+      const decided = askBeforeStart(start.held);
+      if (decided === null) {
+        log("The check before a run start failed; the run waits.");
+        dropUntilReload(entry);
+        continue;
+      }
+      if (decided.to === "running") {
+        send(entry, transition, purpose, start);
+      } else {
+        send(entry, decided, "refuse", null);
+      }
       return;
     }
-    send(entry, entry.stage.transition, entry.stage.purpose, entry.stage.start);
   }
 
   function send(

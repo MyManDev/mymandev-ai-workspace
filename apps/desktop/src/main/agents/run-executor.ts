@@ -25,8 +25,9 @@ import type { PermissionRequest } from "@mymandev/permissions";
  * letters, digits, and underscores, starting with a letter, at most 64
  * characters (`RUN_EXECUTOR_REASON_PATTERN`). Every member of the workspace
  * reads a run's reason, so an executor never puts a message, a path, a
- * command, or a provider's answer in it. A reason outside the pattern, or
- * one that only the server gives, is sent as `executor_failed`.
+ * command, or a provider's answer in it. A reason outside the pattern, one
+ * that only the server gives, or one of the supervisor's own
+ * `HOST_RUN_REASONS`, is sent as `executor_failed`.
  */
 export type RunExecutionOutcome =
   | { readonly outcome: "completed" }

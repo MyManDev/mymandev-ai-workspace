@@ -997,6 +997,14 @@ test("an executor's failure becomes failed with its code, or executor_failed", a
       // Fits the pattern, but only the server gives it.
       HOST_RUN_REASONS.executorFailed,
     ],
+    ...Object.values(HOST_RUN_REASONS).map(
+      (reason): [string, (call: Call) => void, string] => [
+        `the host code ${reason}`,
+        (call) => call.resolve({ outcome: "failed", reason }),
+        // Fits the pattern, but only the supervisor gives it.
+        HOST_RUN_REASONS.executorFailed,
+      ],
+    ),
     [
       "a rejection",
       (call) => call.reject(new Error("boom")),
@@ -1799,24 +1807,47 @@ test("a sent transition always starts from the run's state on the server", async
 
 // The seam before a start.
 
-test("beforeStart is asked with the held run right before the start, and may end the run instead", async () => {
-  const asked: HeldRun[] = [];
-  const h = new Harness({
+test("beforeStart is asked with the held run immediately before each start, and may end the run instead", async () => {
+  const asked: [RunId, number][] = [];
+  let h: Harness | null = null;
+  h = new Harness({
     runs: [run(1, "queued"), run(2, "queued", { agent: AGENT_B })],
     beforeStart: (held) => {
-      asked.push(held);
+      asked.push([held.runId, h?.time ?? -1]);
       return held.agentId === AGENT_A
         ? { start: true }
         : { start: false, state: "cancelled", reason: "provider_use_denied" };
     },
   });
   await h.answerProviders();
-  expect(asked.map((held) => held.runId)).toEqual([runId(1), runId(2)]);
+  // Agent B's start waits behind agent A's for the pace: its hook is asked
+  // only when it goes, not when it was decided.
+  expect(asked).toEqual([[runId(1), 0]]);
   h.ackAndStep();
+  expect(asked).toEqual([
+    [runId(1), 0],
+    [runId(2), STEP],
+  ]);
   expect(h.walk()).toEqual([
     "1 queued>running",
     "2 queued>cancelled provider_use_denied",
   ]);
+
+  // A start limited by the server asks the hook again before it goes.
+  const times: number[] = [];
+  let e: Harness | null = null;
+  e = new Harness({
+    runs: [run(1, "queued")],
+    beforeStart: () => {
+      times.push(e?.time ?? -1);
+      return { start: true };
+    },
+  });
+  await e.answerProviders();
+  e.refuse("rate_limited");
+  e.advance(RUN_SUPERVISOR_RETRY_DELAY_MS);
+  expect(times).toEqual([0, RUN_SUPERVISOR_RETRY_DELAY_MS]);
+  expect(e.walk()).toEqual(["1 queued>running", "1 queued>running"]);
 
   // A hook that throws sends nothing; the run waits for the next reload.
   const g = new Harness({
@@ -1829,6 +1860,69 @@ test("beforeStart is asked with the held run right before the start, and may end
   g.advance(60_000);
   expect(g.sent).toEqual([]);
   expect(g.providerReads).toEqual([]);
+  // It asked for the reload that the run waits for.
+  expect(g.reloadRequests).toHaveLength(1);
+});
+
+test("an answer of beforeStart that is not a decision makes the run wait, and never crashes", async () => {
+  const answers: unknown[] = [
+    null,
+    undefined,
+    "start",
+    1,
+    true,
+    { start: "true" },
+    { start: false },
+    { start: false, state: "completed", reason: "done" },
+    new Proxy(
+      {},
+      {
+        get: () => {
+          throw new Error("trap");
+        },
+      },
+    ),
+  ];
+  for (const [index, answer] of answers.entries()) {
+    const label = `answer ${String(index)}`;
+    const h = new Harness({
+      runs: [run(1, "queued")],
+      beforeStart: () => answer as RunStartDecision,
+    });
+    await h.answerProviders();
+    h.advance(60_000);
+    expect(h.sent, label).toEqual([]);
+    expect(h.claude.calls, label).toEqual([]);
+    expect(h.reloadRequests, label).toHaveLength(1);
+  }
+});
+
+test("the reason of beforeStart is sent only when it is a code that the server does not give", async () => {
+  const cases: [string, string | null][] = [
+    ["provider_use_denied", "provider_use_denied"],
+    // A host reason may be given before a start.
+    [HOST_RUN_REASONS.grantInactive, HOST_RUN_REASONS.grantInactive],
+    ["Denied for C:\\Users\\octocat", null],
+    ["", null],
+    ["x".repeat(65), null],
+    ["agent_disabled", null],
+    ["member_removed", null],
+  ];
+  for (const [reason, sent] of cases) {
+    const h = new Harness({
+      runs: [run(1, "queued")],
+      beforeStart: () => ({ start: false, state: "failed", reason }),
+    });
+    await h.answerProviders();
+    if (h.sent.length > 0) {
+      h.ack();
+    }
+    h.advance(60_000);
+    expect(h.walk(), reason).toEqual(
+      sent === null ? [] : [`1 queued>failed ${sent}`],
+    );
+    expect(h.violations, reason).toEqual([]);
+  }
 });
 
 // Close.
