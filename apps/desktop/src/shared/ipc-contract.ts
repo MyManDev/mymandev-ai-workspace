@@ -2660,7 +2660,11 @@ export const AgentViewSchema = z.object({
   ownerName: z.string().min(1).max(AGENT_LIMITS.ownerName),
   /** When the agent was disabled; null while it is enabled. */
   disabledAt: TimestampSchema.nullable(),
-  /** Whether the signed-in account's own person owns the agent (#342). */
+  /**
+   * Whether the signed-in account's own person owns the agent (#342). The
+   * renderer does not use it yet: it shows grants only for the agents
+   * grantable here. Revoking from the owner's other devices (#345) needs it.
+   */
   ownedByMe: z.boolean(),
   /**
    * Whether this device may grant the agent capabilities (#342): the agent
