@@ -19,14 +19,18 @@
 //   is the person acting on their own device, not a `provider.use` action,
 //   so it asks the permission enforcement point nothing.
 // - Reads. The list loads once a device is signed in with a ready key, and
-//   again when the device or the account changes, when a sign-in ends, when
-//   the connection reaches `connected`, and after every write that may have
-//   reached the API, whatever its answer. One read runs at a time: a read
-//   asked for while one is on its way drops that answer and reads again. A
-//   failed read is retried with the workspace service's backoff while
-//   connected; after `rate_limited` nothing reads until its wait ended. A
-//   read that the account service held back (`heldBack`) waits for
-//   `onReadsResumed`.
+//   again when the device or the account changes, when the connection
+//   reaches `connected`, and after every write that may have reached the
+//   API, whatever its answer. A read waits for a sign-in that runs; at the
+//   end of a sign-in the list is read only when a read waited for it: the
+//   device changed, or a trigger came during the sign-in. One read runs at
+//   a time: a read asked for while one is on its way drops that answer and
+//   reads again. A `connected` asks for none while one is on its way,
+//   because the status of each connection follows the connection when the
+//   state is built. A failed read is retried with the workspace service's
+//   backoff while connected; after `rate_limited`, also as the answer of a
+//   dropped read, nothing reads until its wait ended. A read that the
+//   account service held back (`heldBack`) waits for `onReadsResumed`.
 // - Writes. One at a time: a second registration or removal while the
 //   first waits is refused as `busy` and never sent. A removal is accepted
 //   only for a connection of the list held now (`not_listed`). Every write
