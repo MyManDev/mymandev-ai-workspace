@@ -50,6 +50,7 @@ import {
   missingShellGitCapabilities,
   missingShellGitCapabilitiesIn,
   needsProviderConnections,
+  nextAgentGrantExpiry,
   NO_AGENT_GRANTS,
   NO_EXPIRY_ID,
   OFFERED_CAPABILITIES,
@@ -1870,4 +1871,46 @@ test("a rejected read of an agent's grants, or a bridge that throws, is failed, 
   await settled();
   expect(gone.changes()).toBe(changes);
   expect(gone.view()).toEqual({ kind: "pending", agentId: ELSEWHERE });
+});
+
+test("the section renders again at the next expiry of a grant of an agent on another device, and not for a grant without one or already expired", () => {
+  const hour = 60 * 60 * 1000;
+  const at = (offset: number) => new Date(NOW + offset).toISOString();
+  const read = readOf(ELSEWHERE, [
+    grant(GRANT_1, { agentId: ELSEWHERE }),
+    grant(GRANT_2, { agentId: ELSEWHERE, expiresAt: at(2 * hour) }),
+    grant(GRANT_3, { agentId: ELSEWHERE, expiresAt: at(hour) }),
+    // Expired by this device's clock, or as the main process judged it.
+    grant("0192f2a0-7c3e-7a1b-8c4d-5e6f70819404", {
+      agentId: ELSEWHERE,
+      expiresAt: at(-hour),
+    }),
+    grant("0192f2a0-7c3e-7a1b-8c4d-5e6f70819405", {
+      agentId: ELSEWHERE,
+      expiresAt: at(hour / 2),
+      expired: true,
+    }),
+  ]);
+  expect(nextAgentGrantExpiry(read, NOW)).toBe(NOW + hour);
+  // At that expiry, the grant is expired, and the next one follows.
+  expect(nextAgentGrantExpiry(read, NOW + hour)).toBe(NOW + 2 * hour);
+  expect(nextAgentGrantExpiry(read, NOW + 2 * hour)).toBeUndefined();
+  expect(
+    nextAgentGrantExpiry(
+      readOf(ELSEWHERE, [grant(GRANT_1, { agentId: ELSEWHERE })]),
+      NOW,
+    ),
+  ).toBeUndefined();
+  for (const view of [
+    NO_AGENT_GRANTS,
+    { kind: "pending", agentId: ELSEWHERE } as const,
+    {
+      kind: "known",
+      agentId: ELSEWHERE,
+      refresh: 0,
+      result: { outcome: "refused", reason: "failed" },
+    } as const,
+  ]) {
+    expect(nextAgentGrantExpiry(view, NOW)).toBeUndefined();
+  }
 });

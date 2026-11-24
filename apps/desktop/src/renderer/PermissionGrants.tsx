@@ -26,6 +26,7 @@ import {
   INITIAL_GRANT_FORM,
   initialGrantsView,
   needsProviderConnections,
+  nextAgentGrantExpiry,
   NO_AGENT_GRANTS,
   submitGrant,
   type AgentChoice,
@@ -44,6 +45,7 @@ import {
   followProjectRepositories,
   initialProjectRepositoriesView,
 } from "./project-repositories-view.ts";
+import { MAX_CLOCK_WAIT_MS } from "./device-view.ts";
 import { StatementText } from "./StatementText.tsx";
 
 // The grant form and the grant list of the permission screen (#342), with
@@ -580,6 +582,26 @@ function useAgentGrants(
 }
 
 /**
+ * Renders the section again at `at`, the next expiry of a grant of an
+ * agent on another device (`nextAgentGrantExpiry`), so that its list says
+ * "Expired" without a new read. The timer ends with a change of `at` and
+ * when the section is gone; a timer that fires before `at` sets another.
+ */
+function useRenderAt(at: number | undefined): void {
+  const [renders, setRenders] = useState(0);
+  useEffect(() => {
+    if (at === undefined) {
+      return undefined;
+    }
+    const timer = setTimeout(
+      () => setRenders((count) => count + 1),
+      Math.min(Math.max(at - Date.now(), 0), MAX_CLOCK_WAIT_MS),
+    );
+    return () => clearTimeout(timer);
+  }, [at, renders]);
+}
+
+/**
  * The section's grant and revoke actions: every revocation that ended,
  * whatever its outcome, bumps the section's `refresh`, so that the grants
  * of an agent that another device hosts are read again (#345).
@@ -669,6 +691,8 @@ export function PermissionGrants({
     agentGrantsToRead(agentView, form),
     revocations,
   );
+  const now = Date.now();
+  useRenderAt(nextAgentGrantExpiry(agentGrants, now));
   const view = describeGrantSection({
     agents: agentView,
     repositories: repositoryView,
@@ -676,7 +700,7 @@ export function PermissionGrants({
     agentGrants,
     connections,
     form,
-    now: Date.now(),
+    now,
     timeFormat: agentTimeFormat(),
   });
   // Once the person ends a confirmation, the focus goes where

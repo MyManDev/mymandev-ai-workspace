@@ -934,6 +934,33 @@ function isExpired(grant: GrantView, now: number): boolean {
   );
 }
 
+/**
+ * When the next grant of the read of an agent on another device expires
+ * after `now`, in milliseconds, so that the section shows it as expired
+ * then; undefined while no grant of the read expires later. The grant
+ * state of this device needs none: the main process sends a new state at
+ * each expiry.
+ */
+export function nextAgentGrantExpiry(
+  view: AgentGrantsPanelView,
+  now: number,
+): number | undefined {
+  if (view.kind !== "known" || view.result.outcome !== "ok") {
+    return undefined;
+  }
+  let next: number | undefined;
+  for (const grant of view.result.grants) {
+    if (grant.expiresAt === null || isExpired(grant, now)) {
+      continue;
+    }
+    const at = Date.parse(grant.expiresAt);
+    if (next === undefined || at < next) {
+      next = at;
+    }
+  }
+  return next;
+}
+
 /** The grants that the grant state holds, or `unknown` while it holds none that are usable. */
 function heldGrants(grants: GrantsPanelView): readonly GrantView[] | "unknown" {
   return grants.kind !== "known" ||
