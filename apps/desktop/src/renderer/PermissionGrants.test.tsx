@@ -28,6 +28,7 @@ import {
   GrantSectionContent,
   grantSectionHandlers,
   type GrantSectionHandlers,
+  sectionGrantActions,
 } from "./PermissionGrants.tsx";
 import { PermissionsScreen } from "./ProjectScreens.tsx";
 import {
@@ -862,4 +863,31 @@ test("confirming twice with the same handlers sends the grant once", async () =>
     running: false,
     message: GRANT_RESULT_MESSAGES.granted,
   });
+});
+
+test("every revocation that ended, whatever its outcome, bumps the section's refresh, so that an agent on another device is read again; a grant does not", async () => {
+  const bumps: ((count: number) => number)[] = [];
+  let revoked: () => Promise<{ readonly outcome: "ok" }> = () =>
+    Promise.resolve({ outcome: "ok" });
+  const actions = sectionGrantActions(
+    {
+      grant: () => Promise.resolve({ outcome: "ok", grantId: GRANT_1 }),
+      revoke: () => revoked(),
+    },
+    () => {},
+    (change) => bumps.push(change),
+  );
+  await actions.grant(HERE, {
+    capability: "repo.read",
+    scopeId: WEB,
+    lifetimeSeconds: null,
+  });
+  expect(bumps).toEqual([]);
+  await actions.revoke(HERE, GRANT_1);
+  expect(bumps).toHaveLength(1);
+  revoked = () => Promise.reject(new Error("lost"));
+  await actions.revoke(HERE, GRANT_1);
+  expect(bumps).toHaveLength(2);
+  // Each bump counts one more, from whatever count the section holds.
+  expect(bumps.map((bump) => bump(3))).toEqual([4, 4]);
 });

@@ -19,6 +19,7 @@ import {
   endConfirmation,
   endHiddenConfirmation,
   focusAfterConfirmation,
+  followAgentGrants,
   followGrants,
   GRANT_MESSAGES,
   IDLE_GRANT_ACTIONS,
@@ -558,10 +559,9 @@ function useConnections(
 /**
  * Reads the grants of `agentId`, an agent that another device hosts, while
  * the section shows it (`agentGrantsToRead`), and again for each new
- * `refresh`, after a revocation (#345). Nothing is read while no such agent
- * is selected. A new agent waits for its own answer; a read again keeps the
- * list until its answer comes. An answer that comes after the section is
- * gone, or after another agent was selected, is dropped.
+ * `refresh`, after a revocation (#345), with `followAgentGrants`. An
+ * answer that comes after the section is gone, after another agent was
+ * selected, or after a later read began, is dropped.
  */
 function useAgentGrants(
   grants: GrantBridge | undefined,
@@ -569,37 +569,29 @@ function useAgentGrants(
   refresh: number,
 ): AgentGrantsPanelView {
   const [view, setView] = useState<AgentGrantsPanelView>(NO_AGENT_GRANTS);
-  useEffect(() => {
-    if (grants === undefined || agentId === null) {
-      return undefined;
-    }
-    let live = true;
-    setView((current) =>
-      current.kind === "known" && current.agentId === agentId
-        ? current
-        : { kind: "pending", agentId },
-    );
-    grants.listAgentGrants(agentId).then(
-      (result) => {
-        if (live) {
-          setView({ kind: "known", agentId, result });
-        }
-      },
-      () => {
-        if (live) {
-          setView({
-            kind: "known",
-            agentId,
-            result: { outcome: "refused", reason: "failed" },
-          });
-        }
-      },
-    );
-    return () => {
-      live = false;
-    };
-  }, [grants, agentId, refresh]);
+  useEffect(
+    () =>
+      grants === undefined
+        ? undefined
+        : followAgentGrants(grants, agentId, refresh, setView),
+    [grants, agentId, refresh],
+  );
   return view;
+}
+
+/**
+ * The section's grant and revoke actions: every revocation that ended,
+ * whatever its outcome, bumps the section's `refresh`, so that the grants
+ * of an agent that another device hosts are read again (#345).
+ */
+export function sectionGrantActions(
+  grants: Pick<GrantBridge, "grant" | "revoke">,
+  onView: (view: GrantActionsView) => void,
+  setRefresh: (change: (count: number) => number) => void,
+): GrantActions {
+  return createGrantActions(grants, onView, () =>
+    setRefresh((count) => count + 1),
+  );
 }
 
 /**
@@ -669,9 +661,7 @@ export function PermissionGrants({
     () =>
       grants === undefined
         ? undefined
-        : createGrantActions(grants, setActionsView, () =>
-            setRevocations((count) => count + 1),
-          ),
+        : sectionGrantActions(grants, setActionsView, setRevocations),
     [grants],
   );
   const agentGrants = useAgentGrants(

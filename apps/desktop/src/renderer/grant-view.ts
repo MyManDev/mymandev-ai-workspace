@@ -116,6 +116,53 @@ export const NO_AGENT_GRANTS: AgentGrantsPanelView = Object.freeze({
   agentId: null,
 });
 
+/** A change of the agent grants view, from the current one to the next. */
+export type AgentGrantsChange = (
+  current: AgentGrantsPanelView,
+) => AgentGrantsPanelView;
+
+/**
+ * Reads the grants of `agentId`, an agent that another device hosts, and
+ * reports the view through `onView` as changes of the current one (#345).
+ * Nothing is read for null. A new agent waits for its own answer; a read
+ * again of the same agent, for a new `refresh`, keeps its list until its
+ * answer comes. A rejected read, or a bridge that throws, is `failed`.
+ * Returns the function that drops the answer, for a later agent or
+ * `refresh` and when the section is gone.
+ */
+export function followAgentGrants(
+  bridge: Pick<GrantBridge, "listAgentGrants">,
+  agentId: string | null,
+  refresh: number,
+  onView: (change: AgentGrantsChange) => void,
+): () => void {
+  void refresh;
+  if (agentId === null) {
+    return () => {};
+  }
+  let live = true;
+  onView((current) =>
+    current.kind === "known" && current.agentId === agentId
+      ? current
+      : { kind: "pending", agentId },
+  );
+  const report = (result: AgentGrantsResult) => {
+    if (live) {
+      onView(() => ({ kind: "known", agentId, result }));
+    }
+  };
+  let answer: Promise<AgentGrantsResult>;
+  try {
+    answer = bridge.listAgentGrants(agentId);
+  } catch (error) {
+    answer = Promise.reject(error);
+  }
+  answer.then(report, () => report({ outcome: "refused", reason: "failed" }));
+  return () => {
+    live = false;
+  };
+}
+
 /** What the screen knows about this device's provider connections. */
 export type ConnectionsPanelView =
   | { readonly kind: "pending" }

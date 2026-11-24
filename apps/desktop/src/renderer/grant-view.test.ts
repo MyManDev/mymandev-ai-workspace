@@ -39,6 +39,7 @@ import {
   EXPIRY_CHOICES,
   expiryChoices,
   focusAfterConfirmation,
+  followAgentGrants,
   GRANT_MESSAGES,
   GRANT_REFUSAL_MESSAGES,
   GRANT_RESULT_MESSAGES,
@@ -61,6 +62,7 @@ import {
   type GrantFormState,
   type GrantFormView,
   type GrantSectionInput,
+  type AgentGrantsChange,
   type AgentGrantsPanelView,
   type GrantSectionView,
   type GrantsPanelView,
@@ -1680,4 +1682,151 @@ test("every revocation that ran, whatever its outcome, tells the screen its agen
   resolveGrant({ outcome: "ok", grantId: GRANT_1 });
   await granting;
   expect(revokedAgents).toHaveLength(4);
+});
+
+/** Lets the promises that wait settle. */
+async function settled(): Promise<void> {
+  for (let index = 0; index < 5; index += 1) {
+    await Promise.resolve();
+  }
+}
+
+/**
+ * A bridge whose reads of an agent's grants wait until the test answers
+ * them, and the view that `followAgentGrants` keeps through its changes.
+ */
+function agentGrantsHarness() {
+  const reads: {
+    readonly agentId: string;
+    readonly resolve: (result: AgentGrantsResult) => void;
+    readonly reject: (error: unknown) => void;
+  }[] = [];
+  const bridge = {
+    listAgentGrants: (agentId: string) =>
+      new Promise<AgentGrantsResult>((resolve, reject) => {
+        reads.push({ agentId, resolve, reject });
+      }),
+  };
+  let view: AgentGrantsPanelView = NO_AGENT_GRANTS;
+  let changes = 0;
+  const onView = (change: AgentGrantsChange) => {
+    changes += 1;
+    view = change(view);
+  };
+  return {
+    bridge,
+    reads,
+    onView,
+    view: () => view,
+    changes: () => changes,
+  };
+}
+
+function okRead(agentId: string, grants: readonly GrantView[]) {
+  return { outcome: "ok", agentId, grants } as const;
+}
+
+test("the grants of an agent on another device are read only for an agent, and a late answer after a switch of the agent is dropped", async () => {
+  const harness = agentGrantsHarness();
+  // No agent: nothing is read, and the view does not change.
+  const none = followAgentGrants(harness.bridge, null, 0, harness.onView);
+  expect(harness.reads).toEqual([]);
+  expect(harness.changes()).toBe(0);
+  none();
+
+  const first = followAgentGrants(harness.bridge, ELSEWHERE, 0, harness.onView);
+  expect(harness.reads.map((read) => read.agentId)).toEqual([ELSEWHERE]);
+  expect(harness.view()).toEqual({ kind: "pending", agentId: ELSEWHERE });
+  // The section selects another agent before the answer comes.
+  first();
+  followAgentGrants(harness.bridge, SECOND, 0, harness.onView);
+  expect(harness.view()).toEqual({ kind: "pending", agentId: SECOND });
+  harness.reads[0]!.resolve(
+    okRead(ELSEWHERE, [grant(GRANT_1, { agentId: ELSEWHERE })]),
+  );
+  await settled();
+  expect(harness.view()).toEqual({ kind: "pending", agentId: SECOND });
+  const answer = okRead(SECOND, [grant(GRANT_2, { agentId: SECOND })]);
+  harness.reads[1]!.resolve(answer);
+  await settled();
+  expect(harness.view()).toEqual({
+    kind: "known",
+    agentId: SECOND,
+    result: answer,
+  });
+});
+
+test("a read again of the same agent keeps its list until its own answer, and drops the answer of an older read", async () => {
+  const harness = agentGrantsHarness();
+  const listed = okRead(ELSEWHERE, [
+    grant(GRANT_1, { agentId: ELSEWHERE }),
+    grant(GRANT_2, { agentId: ELSEWHERE }),
+  ]);
+  const stop0 = followAgentGrants(harness.bridge, ELSEWHERE, 0, harness.onView);
+  harness.reads[0]!.resolve(listed);
+  await settled();
+  const known = { kind: "known", agentId: ELSEWHERE, result: listed };
+  expect(harness.view()).toEqual(known);
+  // A revocation reads again: the list stays while the read waits.
+  stop0();
+  const stop1 = followAgentGrants(harness.bridge, ELSEWHERE, 1, harness.onView);
+  expect(harness.view()).toEqual(known);
+  // Another revocation before its answer: the older read is dropped.
+  stop1();
+  followAgentGrants(harness.bridge, ELSEWHERE, 2, harness.onView);
+  harness.reads[1]!.resolve(
+    okRead(ELSEWHERE, [grant(GRANT_2, { agentId: ELSEWHERE })]),
+  );
+  await settled();
+  expect(harness.view()).toEqual(known);
+  const last = okRead(ELSEWHERE, []);
+  harness.reads[2]!.resolve(last);
+  await settled();
+  expect(harness.view()).toEqual({
+    kind: "known",
+    agentId: ELSEWHERE,
+    result: last,
+  });
+  expect(harness.reads.map((read) => read.agentId)).toEqual([
+    ELSEWHERE,
+    ELSEWHERE,
+    ELSEWHERE,
+  ]);
+});
+
+test("a rejected read of an agent's grants, or a bridge that throws, is failed, and an answer after the end is dropped", async () => {
+  const harness = agentGrantsHarness();
+  followAgentGrants(harness.bridge, ELSEWHERE, 0, harness.onView);
+  harness.reads[0]!.reject(new Error("gone"));
+  await settled();
+  const failed = {
+    kind: "known",
+    agentId: ELSEWHERE,
+    result: { outcome: "refused", reason: "failed" },
+  };
+  expect(harness.view()).toEqual(failed);
+
+  const throwing = agentGrantsHarness();
+  followAgentGrants(
+    {
+      listAgentGrants: () => {
+        throw new Error("no bridge");
+      },
+    },
+    ELSEWHERE,
+    0,
+    throwing.onView,
+  );
+  await settled();
+  expect(throwing.view()).toEqual(failed);
+
+  // The section is gone before the answer: nothing changes after it.
+  const gone = agentGrantsHarness();
+  const stop = followAgentGrants(gone.bridge, ELSEWHERE, 0, gone.onView);
+  stop();
+  const changes = gone.changes();
+  gone.reads[0]!.reject(new Error("late"));
+  await settled();
+  expect(gone.changes()).toBe(changes);
+  expect(gone.view()).toEqual({ kind: "pending", agentId: ELSEWHERE });
 });
