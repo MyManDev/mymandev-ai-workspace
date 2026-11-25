@@ -157,7 +157,7 @@ describe("callApi", () => {
     }
   });
 
-  test("a rate_limited refusal carries its Retry-After when it is a whole number of seconds, capped at the API's longest wait of 7 days", async () => {
+  test("a rate_limited or run_daily_limit refusal carries its Retry-After when it is a whole number of seconds, capped at the API's longest wait of 7 days", async () => {
     const refusal = (code: string, status: number, retryAfter?: string) =>
       new Response(
         JSON.stringify({ statusCode: status, error: "E", message: "E", code }),
@@ -236,10 +236,35 @@ describe("callApi", () => {
         refusal("rate_limited", 429),
         { kind: "error", status: 429, code: "rate_limited" },
       ],
-      // Only a rate limit carries a wait.
+      // So does the daily limit of an agent's runs (#35): the time until
+      // the oldest of them leaves the 24 hours.
+      [
+        refusal("run_daily_limit", 429, "3600"),
+        {
+          kind: "error",
+          status: 429,
+          code: "run_daily_limit",
+          retryAfterSeconds: 3_600,
+        },
+      ],
+      [
+        refusal("run_daily_limit", 429, "1.5"),
+        { kind: "error", status: 429, code: "run_daily_limit" },
+      ],
+      // Only those limits carry a wait: not the limit of unfinished runs,
+      // which no time frees, nor a device's daily limit, which the sign-in
+      // reads itself.
       [
         refusal("conflict", 409, "120"),
         { kind: "error", status: 409, code: "conflict" },
+      ],
+      [
+        refusal("run_limit", 409, "120"),
+        { kind: "error", status: 409, code: "run_limit" },
+      ],
+      [
+        refusal("device_daily_limit", 429, "120"),
+        { kind: "error", status: 429, code: "device_daily_limit" },
       ],
     ];
     for (const [answer, expected] of cases) {

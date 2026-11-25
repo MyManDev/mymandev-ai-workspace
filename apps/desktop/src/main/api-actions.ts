@@ -1,8 +1,9 @@
 // The writes of the workspace screens of #95 that the main process may send
 // to the API (the Project Manager's decision D1 of 2026-11-06), and the
 // registration and removal of a project's repositories (#286), granting
-// and revoking an agent's capabilities (#342), and registering and removing
-// a provider connection of this device (#32, #295): a frozen
+// and revoking an agent's capabilities (#342), registering and removing
+// a provider connection of this device (#32, #295), and requesting a run
+// of an agent from the project chat (#35): a frozen
 // allowlist of `POST` routes, each with its path parameters, the protocol's
 // request schema or none, and the protocol's answer schema or `empty` for a
 // `204`. The account service sends them with the device session
@@ -39,6 +40,10 @@ import {
   CreateProjectRequestSchema,
   type CreateProjectResponse,
   CreateProjectResponseSchema,
+  type CreateRunRequest,
+  CreateRunRequestSchema,
+  type CreateRunResponse,
+  CreateRunResponseSchema,
   type CreateWorkspaceRequest,
   CreateWorkspaceRequestSchema,
   type CreateWorkspaceResponse,
@@ -85,6 +90,7 @@ import {
   REPOSITORY_ROUTES,
   type RepositoryId,
   RepositoryIdSchema,
+  RUN_ROUTES,
   type WorkspaceId,
   WorkspaceIdSchema,
 } from "@mymandev/protocol";
@@ -348,6 +354,23 @@ export const WORKSPACE_ACTIONS = Object.freeze({
     null,
     "empty",
   ),
+  /**
+   * Requests a run of an agent of the project (#35; the Project Manager's
+   * decisions of 2026-11-14 and 2026-11-25): IDs only, the agent, the
+   * provider connection of this device, the caller's own chat message as
+   * the input, and an optional repository. The body's schema knows no
+   * other key, so a text, a state, or a requester sent beside them is
+   * refused here before anything is sent. The request carries no
+   * idempotency key: it is never sent again on its own. Its failures add
+   * the two limits of a run, `run_limit` and `run_daily_limit`
+   * (`RUN_CREATION_FAILURES`).
+   */
+  createRun: action(
+    RUN_ROUTES.createRun,
+    ["projectId"],
+    CreateRunRequestSchema,
+    CreateRunResponseSchema,
+  ),
 });
 export type WorkspaceActionName = keyof typeof WORKSPACE_ACTIONS;
 
@@ -399,6 +422,7 @@ export interface WorkspaceActionParams {
   readonly removeProviderConnection: {
     readonly providerConnectionId: ProviderConnectionId;
   };
+  readonly createRun: { readonly projectId: ProjectId };
 }
 
 /** The body of each write, as the caller passes it; `never` for none. */
@@ -438,6 +462,8 @@ export interface WorkspaceActionBody {
   /** The kind and the label only; never a credential (#33). */
   readonly registerProviderConnection: RegisterProviderConnectionRequest;
   readonly removeProviderConnection: never;
+  /** IDs only; never a text (#35). */
+  readonly createRun: CreateRunRequest;
 }
 
 /**
@@ -484,6 +510,7 @@ export interface WorkspaceActionAnswer {
   readonly revokeGrant: null;
   readonly registerProviderConnection: RegisterProviderConnectionResponse;
   readonly removeProviderConnection: null;
+  readonly createRun: CreateRunResponse;
 }
 
 /**
@@ -509,6 +536,15 @@ export const WORKSPACE_ACTION_BUDGET = Object.freeze({
  * the wait of the reads (`RATE_LIMITED_RETRY_MS`) is the same.
  */
 export const ACTION_RATE_LIMITED_WAIT_MS = 60_000;
+
+/**
+ * The wait after `run_daily_limit` when the answer held no valid
+ * `Retry-After` (#35): the whole 24 hours, the longest that the limit can
+ * hold an agent. The API always sends the time until the oldest of the
+ * agent's runs leaves the 24 hours; a shorter guess could only offer a try
+ * that the API refuses again.
+ */
+export const RUN_DAILY_LIMIT_WAIT_MS = 24 * 60 * 60 * 1000;
 
 /**
  * Why a write failed, a closed set that the screens can show. Only
@@ -550,6 +586,9 @@ export const ACTION_RATE_LIMITED_WAIT_MS = 60_000;
  *   The write is never sent again on its own; the screen reloads what it
  *   shows, and the person decides.
  * - `failed`: the API refused it otherwise, for example as `bad_request`.
+ *
+ * A run creation adds its two limits (`RUN_CREATION_FAILURES`); every
+ * other write answers them as `failed`, as before #35.
  */
 export const WORKSPACE_ACTION_FAILURES = Object.freeze([
   "invalid",
@@ -575,20 +614,53 @@ export const WORKSPACE_ACTION_FAILURES = Object.freeze([
 ] as const);
 export type WorkspaceActionFailure = (typeof WORKSPACE_ACTION_FAILURES)[number];
 
-/** The failures that say when the next write may go. */
-type WaitFailure = "too_soon" | "rate_limited";
+/**
+ * Why a run creation failed (#35): every failure of a write, and the API's
+ * two limits of a run (`RUN_ROUTE_ERRORS.createRun`).
+ *
+ * - `run_limit`: the agent already has as many unfinished runs as the
+ *   server allows. No wait: only a run of the agent that finishes frees a
+ *   place.
+ * - `run_daily_limit`: the agent got as many new runs within 24 hours as
+ *   the server allows; `retryAfterMs` follows the answer's `Retry-After`,
+ *   the time until the oldest of them leaves the 24 hours, or
+ *   `RUN_DAILY_LIMIT_WAIT_MS` without one.
+ *
+ * They are a set of their own, so that the other writes, whose maps cover
+ * `WORKSPACE_ACTION_FAILURES` exactly, never meet them.
+ */
+export const RUN_CREATION_FAILURES = Object.freeze([
+  ...WORKSPACE_ACTION_FAILURES,
+  "run_limit",
+  "run_daily_limit",
+] as const);
+export type RunCreationFailure = (typeof RUN_CREATION_FAILURES)[number];
 
-export type WorkspaceActionResult<T> =
+/** The failures of the write `N`: a run creation's include its limits. */
+export type WorkspaceActionFailureOf<N extends WorkspaceActionName> =
+  N extends "createRun" ? RunCreationFailure : WorkspaceActionFailure;
+
+/** The failures that say when the next write may go. */
+type WaitFailure = "too_soon" | "rate_limited" | "run_daily_limit";
+
+/**
+ * The result of a write: its answer, or a failure of `F`, the failures
+ * that the write can have (`WorkspaceActionFailureOf`).
+ */
+export type WorkspaceActionResult<
+  T,
+  F extends RunCreationFailure = WorkspaceActionFailure,
+> =
   | { readonly ok: true; readonly value: T }
   | {
       readonly ok: false;
-      readonly reason: Exclude<WorkspaceActionFailure, WaitFailure>;
+      readonly reason: Exclude<F, WaitFailure>;
       /** See `workspaceActionMayHaveSent`. */
       readonly sent?: true;
     }
   | {
       readonly ok: false;
-      readonly reason: WaitFailure;
+      readonly reason: Extract<F, WaitFailure>;
       /** How long to wait before the next try, in milliseconds. */
       readonly retryAfterMs: number;
       /** See `workspaceActionMayHaveSent`. */
@@ -598,7 +670,13 @@ export type WorkspaceActionResult<T> =
 /** `failure` as one that came after the write was handed to the session. */
 export function workspaceActionSent(
   failure: WorkspaceActionResult<never>,
-): WorkspaceActionResult<never> {
+): WorkspaceActionResult<never>;
+export function workspaceActionSent<F extends RunCreationFailure>(
+  failure: WorkspaceActionResult<never, F>,
+): WorkspaceActionResult<never, F>;
+export function workspaceActionSent(
+  failure: WorkspaceActionResult<never, RunCreationFailure>,
+): WorkspaceActionResult<never, RunCreationFailure> {
   return failure.ok ? failure : Object.freeze({ ...failure, sent: true });
 }
 
@@ -613,23 +691,31 @@ export function workspaceActionSent(
  * before the request.
  */
 export function workspaceActionMayHaveSent(
-  result: WorkspaceActionResult<unknown>,
+  result: WorkspaceActionResult<unknown, RunCreationFailure>,
 ): boolean {
   return result.ok || result.sent === true;
 }
 
-export function workspaceActionFailed(
-  reason: Exclude<WorkspaceActionFailure, WaitFailure>,
-): WorkspaceActionResult<never>;
-export function workspaceActionFailed(
-  reason: WaitFailure,
+function isWaitFailure(reason: RunCreationFailure): reason is WaitFailure {
+  return (
+    reason === "too_soon" ||
+    reason === "rate_limited" ||
+    reason === "run_daily_limit"
+  );
+}
+
+export function workspaceActionFailed<
+  R extends Exclude<RunCreationFailure, WaitFailure>,
+>(reason: R): WorkspaceActionResult<never, R>;
+export function workspaceActionFailed<R extends WaitFailure>(
+  reason: R,
   retryAfterMs: number,
-): WorkspaceActionResult<never>;
+): WorkspaceActionResult<never, R>;
 export function workspaceActionFailed(
-  reason: WorkspaceActionFailure,
+  reason: RunCreationFailure,
   retryAfterMs?: number,
-): WorkspaceActionResult<never> {
-  return reason === "too_soon" || reason === "rate_limited"
+): WorkspaceActionResult<never, RunCreationFailure> {
+  return isWaitFailure(reason)
     ? Object.freeze({
         ok: false,
         reason,
@@ -742,10 +828,32 @@ const SHOWN_CODES: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
   "provider_connection_limit",
 ]);
 
-/** The closed failure of a write for a failure of the device session. */
+/**
+ * The API's codes that only a run creation shows as they are (#35); every
+ * other write answers them as `failed`.
+ */
+const RUN_CREATION_CODES: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
+  "run_limit",
+  "run_daily_limit",
+]);
+
+/**
+ * The closed failure of a write for a failure of the device session. With
+ * `name`, the failure of that write: a run creation (`createRun`) keeps
+ * `run_limit` and `run_daily_limit`, which every other write, and a call
+ * without a name, answers as `failed`.
+ */
 export function workspaceActionFailureOf(
   failure: SessionFailure,
-): WorkspaceActionFailure {
+): WorkspaceActionFailure;
+export function workspaceActionFailureOf<N extends WorkspaceActionName>(
+  failure: SessionFailure,
+  name: N,
+): WorkspaceActionFailureOf<N>;
+export function workspaceActionFailureOf(
+  failure: SessionFailure,
+  name?: WorkspaceActionName,
+): RunCreationFailure {
   switch (failure.reason) {
     case "no_device":
     case "key_lost":
@@ -763,6 +871,9 @@ export function workspaceActionFailureOf(
       }
       if (SHOWN_CODES.has(code)) {
         return code as WorkspaceActionFailure;
+      }
+      if (RUN_CREATION_CODES.has(code)) {
+        return name === "createRun" ? (code as RunCreationFailure) : "failed";
       }
       if (NOT_SIGNED_IN_CODES.has(code)) {
         return "not_signed_in";
@@ -796,16 +907,37 @@ export function workspaceActionFailureOf(
   }
 }
 
-/** The failed result of a write for a failure of the device session. */
+/**
+ * The failed result of a write for a failure of the device session, with
+ * `name` as for `workspaceActionFailureOf`. `rate_limited` waits as long
+ * as the answer's `Retry-After`, or `ACTION_RATE_LIMITED_WAIT_MS` without
+ * one; a run creation's `run_daily_limit` as long as its `Retry-After`, or
+ * `RUN_DAILY_LIMIT_WAIT_MS` without one.
+ */
 export function workspaceActionFailedFor(
   failure: SessionFailure,
-): WorkspaceActionResult<never> {
-  const reason = workspaceActionFailureOf(failure);
-  if (reason === "rate_limited") {
+): WorkspaceActionResult<never>;
+export function workspaceActionFailedFor<N extends WorkspaceActionName>(
+  failure: SessionFailure,
+  name: N,
+): WorkspaceActionResult<never, WorkspaceActionFailureOf<N>>;
+export function workspaceActionFailedFor(
+  failure: SessionFailure,
+  name?: WorkspaceActionName,
+): WorkspaceActionResult<never, RunCreationFailure> {
+  const reason =
+    name === undefined
+      ? workspaceActionFailureOf(failure)
+      : workspaceActionFailureOf(failure, name);
+  if (reason === "rate_limited" || reason === "run_daily_limit") {
+    const fallback =
+      reason === "rate_limited"
+        ? ACTION_RATE_LIMITED_WAIT_MS
+        : RUN_DAILY_LIMIT_WAIT_MS;
     return workspaceActionFailed(
       reason,
       failure.retryAfterSeconds === undefined
-        ? ACTION_RATE_LIMITED_WAIT_MS
+        ? fallback
         : failure.retryAfterSeconds * 1000,
     );
   }

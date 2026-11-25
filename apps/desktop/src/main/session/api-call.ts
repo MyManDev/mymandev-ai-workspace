@@ -32,6 +32,17 @@ export const MAX_API_ANSWER_BYTES = 512 * 1024;
  */
 export const MAX_RETRY_AFTER_SECONDS = 604_800;
 
+/**
+ * The refusals whose `Retry-After` the session passes on: the account's
+ * request limit, and the daily limit of an agent's runs (#35), whose wait
+ * is the time until the oldest of the agent's runs leaves the 24 hours.
+ * Every other refusal carries no wait, also with the header.
+ */
+const RETRY_AFTER_CODES: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
+  "rate_limited",
+  "run_daily_limit",
+]);
+
 /** The `fetch` that the session uses; production passes Electron's `net.fetch`. */
 export type ApiFetch = (url: string, init: RequestInit) => Promise<Response>;
 
@@ -42,9 +53,10 @@ export type ApiFetch = (url: string, init: RequestInit) => Promise<Response>;
  *   (`204`).
  * - `error`: a `4xx` with the API's error body whose status fits it. Only
  *   this answer is certain: the API refused and committed nothing. With
- *   `rate_limited`, `retryAfterSeconds` holds the answer's `Retry-After`
- *   when it is a whole number of seconds from 1, capped at
- *   `MAX_RETRY_AFTER_SECONDS`.
+ *   `rate_limited` and a run creation's `run_daily_limit` (#35),
+ *   `retryAfterSeconds` holds the answer's `Retry-After` when it is a whole
+ *   number of seconds from 1, capped at `MAX_RETRY_AFTER_SECONDS`
+ *   (`RETRY_AFTER_CODES`).
  * - `server_error`: a `5xx`. The API may have committed before it failed.
  * - `unexpected_response`: any other answer, for example from a proxy, a
  *   body too large, or a body that is not JSON.
@@ -168,8 +180,9 @@ async function readAnswer(
     const parsed = ApiErrorBodySchema.safeParse(value);
     if (parsed.success && parsed.data.statusCode === status) {
       const code = parsed.data.code;
-      const retryAfterSeconds =
-        code === "rate_limited" ? retryAfterSecondsOf(response) : undefined;
+      const retryAfterSeconds = RETRY_AFTER_CODES.has(code)
+        ? retryAfterSecondsOf(response)
+        : undefined;
       return retryAfterSeconds === undefined
         ? { kind: "error", status, code }
         : { kind: "error", status, code, retryAfterSeconds };

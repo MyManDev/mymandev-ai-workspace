@@ -19,6 +19,9 @@ import {
   PROVIDER_CONNECTION_READ_PROBLEMS,
   ProviderConnectionsResultSchema,
   REVOKE_GRANT_REFUSALS,
+  RUN_REQUEST_REFUSALS,
+  RunRequestResultSchema,
+  RunRequestViewSchema,
   RevokeGrantResultSchema,
   CHAT_LIMITS,
   CHAT_LOAD_OLDER_RESULTS,
@@ -331,7 +334,7 @@ const PROJECT_REPOSITORY_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.unlinkRepository,
 ]);
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the copy of the workspace ID, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, the project repository actions, the grant actions, the provider connection actions, and the report of seen claims take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the copy of the workspace ID, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, the project repository actions, the grant actions, the provider connection actions, the run request, and the report of seen claims take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -355,9 +358,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       !PROJECT_REPOSITORY_ACTION_CHANNELS.has(channel) &&
       !GRANT_ACTION_CHANNELS.has(channel) &&
       channel !== INVOKE_CHANNELS.registerProviderConnection &&
-      channel !== INVOKE_CHANNELS.removeProviderConnection,
+      channel !== INVOKE_CHANNELS.removeProviderConnection &&
+      channel !== INVOKE_CHANNELS.requestRun,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 45);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 46);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -3115,6 +3119,87 @@ test("the grants of an agent that another device hosts cross as grant views of t
   }
 });
 
+const RUN_MESSAGE_ID = "0192f0a0-7b3c-7d4e-8f50-000000001101";
+
+test("a run request takes exactly a project ID, an agent ID, a provider connection ID, and a message ID, and refuses every other key (#35)", () => {
+  const request = {
+    projectId: AGENT_PROJECT_ID,
+    agentId: AGENT_ID,
+    providerConnectionId: GRANT_CONNECTION_ID,
+    inputMessageId: RUN_MESSAGE_ID,
+  };
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.requestRun];
+  expect(args.parse([request])).toEqual([request]);
+  expect(RunRequestViewSchema.parse(request)).toEqual(request);
+  for (const value of [
+    // An extra key is refused, not dropped: a text, a repository, a state,
+    // a retry key, or a device never crosses.
+    { ...request, body: "Fix the build" },
+    { ...request, repositoryId: AGENT_ID },
+    { ...request, state: "running" },
+    { ...request, idempotencyKey: RUN_MESSAGE_ID },
+    { ...request, hostDeviceId: AGENT_DEVICE_ID },
+    // Each ID is a lowercase UUIDv7, and none may be missing.
+    { ...request, projectId: undefined },
+    { ...request, agentId: AGENT_ID.toUpperCase() },
+    { ...request, providerConnectionId: "connection" },
+    { ...request, inputMessageId: MOUNT_ID },
+    { ...request, inputMessageId: 7 },
+    {},
+    null,
+  ]) {
+    expect(RunRequestViewSchema.safeParse(value).success).toBe(false);
+    expect(args.safeParse([value]).success).toBe(false);
+  }
+  // One argument only.
+  expect(args.safeParse([]).success).toBe(false);
+  expect(args.safeParse([request, request]).success).toBe(false);
+});
+
+test("a run request result is ok with the run's ID, refused with a fixed reason and a wait for a wait only, or unknown (#35)", () => {
+  const schema = RunRequestResultSchema;
+  const ok = { outcome: "ok", runId: RUN_ID };
+  expect(schema.parse(ok)).toEqual(ok);
+  expect(schema.parse({ outcome: "unknown", runId: RUN_ID })).toEqual({
+    outcome: "unknown",
+  });
+  for (const reason of RUN_REQUEST_REFUSALS) {
+    const wait =
+      reason === "too_soon" ||
+      reason === "rate_limited" ||
+      reason === "run_daily_limit";
+    const value = {
+      outcome: "refused",
+      reason,
+      retryAfterMs: wait ? 1_000 : null,
+    };
+    expect(schema.parse(value), reason).toEqual(value);
+    expect(
+      schema.safeParse({ ...value, retryAfterMs: wait ? null : 1_000 }).success,
+      reason,
+    ).toBe(false);
+  }
+  for (const value of [
+    { outcome: "refused", reason: "teapot", retryAfterMs: null },
+    { outcome: "ok" },
+    { outcome: "ok", runId: "run" },
+    { outcome: "queued", runId: RUN_ID },
+  ]) {
+    expect(schema.safeParse(value).success).toBe(false);
+  }
+  // Every refusal of the server's run creation is one of them.
+  for (const reason of [
+    "forbidden",
+    "not_found",
+    "conflict",
+    "run_limit",
+    "run_daily_limit",
+    "rate_limited",
+  ]) {
+    expect(RUN_REQUEST_REFUSALS).toContain(reason);
+  }
+});
+
 test("the provider connections cross with an ID, a kind, and a label only", () => {
   const connection = {
     id: GRANT_CONNECTION_ID,
@@ -3161,6 +3246,7 @@ function chatMessage(overrides: Record<string, unknown> = {}) {
     seq: 1,
     authorKind: "member",
     authorName: "Ada Lovelace",
+    writtenByMe: true,
     body: "Hello",
     createdAt: RUN_AT,
     ...overrides,
@@ -3317,6 +3403,10 @@ test("a chat view over the limits or with wrong values is refused", () => {
       ],
     }),
     chatViewValue({ messages: [chatMessage({ authorName: undefined })] }),
+    // Whether the account wrote it is a flag (#35), never left out.
+    chatViewValue({ messages: [chatMessage({ writtenByMe: undefined })] }),
+    chatViewValue({ messages: [chatMessage({ writtenByMe: "yes" })] }),
+    chatViewValue({ messages: [chatMessage({ writtenByMe: 1 })] }),
     chatViewValue({ messages: [chatMessage({ body: "" })] }),
     chatViewValue({
       messages: [
