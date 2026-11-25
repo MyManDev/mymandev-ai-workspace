@@ -46,6 +46,8 @@ import type {
   RegisterRepositoryResult,
   RemoveDeviceResult,
   RemoveProviderConnectionResult,
+  RemoveProviderKeyResult,
+  SaveProviderKeyResult,
   RemoveRepositoryResult,
   RevokeGrantResult,
   RevokeInvitationResult,
@@ -972,7 +974,8 @@ export interface DeviceListBridge {
  * This device's AI provider connections, which the main process holds
  * (#32): each connection's ID, kind, label, registration time, and status,
  * never a credential. The renderer registers one by its kind and label and
- * removes one by its ID; no secret is ever asked for or sent.
+ * removes one by its ID. It sends a connection's API key once to store it
+ * on this device (#33); no function ever returns a key.
  */
 export interface ProviderConnectionsBridge {
   /** The current state of the connections. */
@@ -1005,4 +1008,18 @@ export interface ProviderConnectionsBridge {
   readonly remove: (
     providerConnectionId: string,
   ) => Promise<RemoveProviderConnectionResult>;
+  /**
+   * Stores the API key of a connection of this device, encrypted on this
+   * device, over any key stored before. The bridge passes on a new object
+   * with only the ID and the key, each a string; the result is `ok` or a
+   * refusal, never the key.
+   */
+  readonly saveKey: (
+    providerConnectionId: string,
+    key: string,
+  ) => Promise<SaveProviderKeyResult>;
+  /** Deletes the stored API key of a connection of this device by its ID, a string. */
+  readonly removeKey: (
+    providerConnectionId: string,
+  ) => Promise<RemoveProviderKeyResult>;
 }

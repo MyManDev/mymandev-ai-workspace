@@ -433,6 +433,14 @@ export const INVOKE_CHANNELS = Object.freeze({
    * revokes its `provider.use` grants.
    */
   removeProviderConnection: "provider-connections:remove",
+  /**
+   * Stores the API key of a provider connection of this device, encrypted
+   * with the system's protection (#33). The renderer sends the key once;
+   * no channel ever sends it back.
+   */
+  saveProviderKey: "provider-connections:save-key",
+  /** Deletes the stored API key of a provider connection of this device. */
+  removeProviderKey: "provider-connections:remove-key",
 } as const);
 
 /** Channels the main process sends on with `webContents.send`. */

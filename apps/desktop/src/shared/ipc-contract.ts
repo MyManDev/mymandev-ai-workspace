@@ -3575,20 +3575,26 @@ export const PROVIDER_CONNECTION_LIMITS = Object.freeze({
 
 /**
  * The status of one connection, which the main process computes from a
- * closed list (a default until the Project Manager decides, 2026-11-24):
+ * closed list (#33, the Project Manager's decisions of 2026-11-25; it
+ * replaces the `registered` of #32):
  *
- * - `registered`: the server lists the connection, and this device checks
- *   no local credential yet (#33);
- * - `unknown`: this device is offline, or the last read of the list
- *   failed, so the connection is shown as it was last read.
+ * - `ready`: the server lists the connection, and a provider key file
+ *   exists on this device and decrypts for this device and this
+ *   connection. It does not say that the provider accepts the key: no
+ *   provider is called.
+ * - `credential_missing`: the server lists the connection, and this device
+ *   holds no usable key for it: no key file, or one that is damaged or
+ *   bound to another device or connection.
+ * - `unknown`: this device is offline, the last read of the list failed,
+ *   or the key could not be checked (not yet, or the system could not
+ *   decrypt it), so the connection is shown as it was last read.
  *
- * The local credential check of #33 adds its own statuses here, such as
- * `credential_missing`, `ready`, and `check_failed`. A status check is the
- * person acting on their own device: it is never a `provider.use` action
- * and needs no grant.
+ * A status check is the person acting on their own device: it is never a
+ * `provider.use` action and needs no grant.
  */
 export const PROVIDER_CONNECTION_STATUSES = Object.freeze([
-  "registered",
+  "credential_missing",
+  "ready",
   "unknown",
 ] as const);
 export type ProviderConnectionStatusView =
@@ -3766,6 +3772,77 @@ export const RemoveProviderConnectionResultSchema = z.discriminatedUnion(
 );
 export type RemoveProviderConnectionResult = z.infer<
   typeof RemoveProviderConnectionResultSchema
+>;
+
+/**
+ * The limits of a provider API key (#33): at most 512 characters (UTF-16
+ * code units). The main process also refuses white space and control or
+ * format characters. The renderer keeps a copy that its tests compare.
+ */
+export const PROVIDER_KEY_LIMITS = Object.freeze({ key: 512 });
+
+/**
+ * What the renderer sends, once, to store a provider key for a connection
+ * of this device: the connection's ID and the key, and no other key. No
+ * channel ever sends a key back.
+ */
+export const SaveProviderKeyViewSchema = z.strictObject({
+  providerConnectionId: ProtocolIdSchema,
+  key: z.string().min(1).max(PROVIDER_KEY_LIMITS.key),
+});
+export type SaveProviderKeyView = z.infer<typeof SaveProviderKeyViewSchema>;
+
+/**
+ * Why storing a provider key was refused:
+ *
+ * - `invalid`: the key has white space, a control or format character, or
+ *   is not well-formed text. Nothing was stored.
+ * - `not_signed_in`: no signed-in device with a ready key.
+ * - `not_listed`: the connection is not in the list that the main process
+ *   holds.
+ * - `protection_unavailable`: the system cannot protect the key, for
+ *   example Linux without a confirmed secret service. Nothing was stored.
+ * - `failed`: the key could not be stored otherwise. The previous key file,
+ *   if any, stays as it was.
+ */
+export const SAVE_PROVIDER_KEY_REFUSALS = Object.freeze([
+  "invalid",
+  "not_signed_in",
+  "not_listed",
+  "protection_unavailable",
+  "failed",
+] as const);
+export type SaveProviderKeyRefusal =
+  (typeof SAVE_PROVIDER_KEY_REFUSALS)[number];
+
+/** The result of storing a provider key: `ok` or `refused`, never the key. */
+export const SaveProviderKeyResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  createRefusedSchema(SAVE_PROVIDER_KEY_REFUSALS),
+]);
+export type SaveProviderKeyResult = z.infer<typeof SaveProviderKeyResultSchema>;
+
+/**
+ * Why removing a provider key was refused: `invalid`, `not_signed_in`, and
+ * `not_listed` as for storing one, and `failed` when the file could not be
+ * deleted.
+ */
+export const REMOVE_PROVIDER_KEY_REFUSALS = Object.freeze([
+  "invalid",
+  "not_signed_in",
+  "not_listed",
+  "failed",
+] as const);
+export type RemoveProviderKeyRefusal =
+  (typeof REMOVE_PROVIDER_KEY_REFUSALS)[number];
+
+/** The result of removing a provider key: `ok` (also without a key) or `refused`. */
+export const RemoveProviderKeyResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  createRefusedSchema(REMOVE_PROVIDER_KEY_REFUSALS),
+]);
+export type RemoveProviderKeyResult = z.infer<
+  typeof RemoveProviderKeyResultSchema
 >;
 
 /** The schemas of every invoke channel. */
@@ -4218,6 +4295,16 @@ export const INVOKE_CONTRACT = Object.freeze({
     /** The ID of a connection of the list. */
     args: z.tuple([ProtocolIdSchema]),
     result: RemoveProviderConnectionResultSchema,
+  }),
+  [INVOKE_CHANNELS.saveProviderKey]: Object.freeze({
+    /** A connection ID and a key, and no other key. */
+    args: z.tuple([SaveProviderKeyViewSchema]),
+    result: SaveProviderKeyResultSchema,
+  }),
+  [INVOKE_CHANNELS.removeProviderKey]: Object.freeze({
+    /** The ID of a connection of the list. */
+    args: z.tuple([ProtocolIdSchema]),
+    result: RemoveProviderKeyResultSchema,
   }),
 });
 

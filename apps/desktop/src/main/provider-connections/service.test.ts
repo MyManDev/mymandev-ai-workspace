@@ -33,6 +33,11 @@ import type {
   WorkspaceReadResult,
 } from "../api-reads.ts";
 import {
+  ProviderKeyError,
+  type ProviderKeyErrorCode,
+} from "../provider-keys/errors.ts";
+import type { ProviderKeyBinding } from "../provider-keys/key-file.ts";
+import {
   RATE_LIMITED_RETRY_MS,
   WORKSPACE_RETRY_BASE_MS,
 } from "../workspace/service.ts";
@@ -40,9 +45,11 @@ import {
   createProviderConnectionService,
   type ProviderConnectionAccount,
   type ProviderConnectionConnection,
+  type ProviderConnectionKeys,
   providerConnectionStatus,
   type ProviderConnectionService,
   type ProviderConnectionsState,
+  providerKeyStateAfterFailure,
 } from "./service.ts";
 
 // This device's AI provider connections in the main process (#32): the
@@ -162,6 +169,7 @@ class Harness {
   constructor(
     status: AccountStatus = accountStatus(),
     state: ConnectionStatus["state"] = "connected",
+    keys?: ProviderConnectionKeys,
   ) {
     this.accountStatus = status;
     this.connectionStatus = { state, revision: 0 } as ConnectionStatus;
@@ -201,6 +209,7 @@ class Harness {
     this.service = createProviderConnectionService({
       account,
       connection: client,
+      ...(keys === undefined ? {} : { keys }),
       grants: {
         ownGrantAnswered: () => {
           this.grantReads += 1;
@@ -283,13 +292,29 @@ test("the contract's provider connection values match the protocol's", () => {
     connections: MAX_ANSWER_LIST_ITEMS,
     label: LIMITS.providerConnectionLabel,
   });
-  // The closed list of statuses of this slice; #33 adds its own.
-  expect([...PROVIDER_CONNECTION_STATUSES]).toEqual(["registered", "unknown"]);
+  // The closed list of statuses (#33).
+  expect([...PROVIDER_CONNECTION_STATUSES]).toEqual([
+    "credential_missing",
+    "ready",
+    "unknown",
+  ]);
 });
 
-test("the status comes from a closed list: registered while the list is current, else unknown", () => {
-  expect(providerConnectionStatus({ listCurrent: true })).toBe("registered");
-  expect(providerConnectionStatus({ listCurrent: false })).toBe("unknown");
+test("the status comes from a closed list: unknown while the list is not current, else the key's state", () => {
+  expect(providerConnectionStatus({ listCurrent: true, key: "ready" })).toBe(
+    "ready",
+  );
+  expect(providerConnectionStatus({ listCurrent: true, key: "missing" })).toBe(
+    "credential_missing",
+  );
+  expect(providerConnectionStatus({ listCurrent: true, key: "unknown" })).toBe(
+    "unknown",
+  );
+  for (const key of ["ready", "missing", "unknown"] as const) {
+    expect(providerConnectionStatus({ listCurrent: false, key })).toBe(
+      "unknown",
+    );
+  }
 });
 
 test("a signed-in device reads its list at once, and each connection holds its ID, kind, label, time, and status only", async () => {
@@ -311,14 +336,14 @@ test("a signed-in device reads its list at once, and each connection holds its I
         kind: "claude",
         label: "Work laptop",
         createdAt: AT,
-        status: "registered",
+        status: "credential_missing",
       },
       {
         id: CONNECTION_2,
         kind: "codex",
         label: "Personal",
         createdAt: AT,
-        status: "registered",
+        status: "credential_missing",
       },
     ],
   });
@@ -389,7 +414,7 @@ test("offline, every connection is unknown, and the next connection reads the li
   await harness.ready(TWO);
   expect(
     harness.service.state().connections.map((entry) => entry.status),
-  ).toEqual(["registered", "registered"]);
+  ).toEqual(["credential_missing", "credential_missing"]);
 });
 
 test("a connection reached while a read is on its way sends no second read, and the first answer is shown", async () => {
@@ -402,7 +427,7 @@ test("a connection reached while a read is on its way sends no second read, and 
   expect(harness.readNames).toHaveLength(1);
   expect(
     harness.service.state().connections.map((entry) => entry.status),
-  ).toEqual(["registered", "registered"]);
+  ).toEqual(["credential_missing", "credential_missing"]);
 });
 
 test("a failed read keeps what was read, each connection unknown, and retries with the backoff until a read succeeds", async () => {
@@ -897,4 +922,378 @@ test("the logs are fixed text: no label, connection ID, device ID, or login", as
   ]) {
     expect(text).not.toContain(value);
   }
+});
+
+// ---- Provider keys (#33) ---------------------------------------------------
+
+/** An obvious fake key that no state, result, or log may hold. */
+const SENTINEL_KEY = "FAKE-PROVIDER-KEY-SENTINEL-0123456789";
+
+/**
+ * A provider key store in memory with the binding rules of the real one:
+ * each file is bound to a device and a connection, and a check of another
+ * device is refused. A test can make the next call of a kind fail, or hold
+ * it until it releases it.
+ */
+class FakeKeys implements ProviderConnectionKeys {
+  readonly files = new Map<string, { deviceId: string; key: string }>();
+  readonly calls: string[] = [];
+  readonly failures: Partial<
+    Record<"save" | "check" | "remove", ProviderKeyErrorCode>
+  > = {};
+  /** Calls of these kinds wait until `release` runs. */
+  readonly held = new Set<"save" | "check" | "remove">();
+  readonly waiting: (() => void)[] = [];
+
+  private async gate(kind: "save" | "check" | "remove"): Promise<void> {
+    if (this.held.has(kind)) {
+      await new Promise<void>((resolve) => this.waiting.push(resolve));
+    }
+    const code = this.failures[kind];
+    if (code !== undefined) {
+      throw new ProviderKeyError(code);
+    }
+  }
+
+  release(): void {
+    for (const resolve of this.waiting.splice(0)) {
+      resolve();
+    }
+  }
+
+  readonly save = async (
+    binding: ProviderKeyBinding,
+    key: string,
+  ): Promise<void> => {
+    this.calls.push(`save:${binding.providerConnectionId}`);
+    await this.gate("save");
+    this.files.set(binding.providerConnectionId, {
+      deviceId: binding.deviceId,
+      key,
+    });
+  };
+
+  readonly check = async (
+    binding: ProviderKeyBinding,
+  ): Promise<"ready" | "missing"> => {
+    this.calls.push(`check:${binding.providerConnectionId}`);
+    await this.gate("check");
+    const file = this.files.get(binding.providerConnectionId);
+    if (file === undefined) {
+      return "missing";
+    }
+    if (file.deviceId !== binding.deviceId) {
+      throw new ProviderKeyError("bound_elsewhere");
+    }
+    return "ready";
+  };
+
+  readonly remove = async (providerConnectionId: string): Promise<void> => {
+    this.calls.push(`remove:${providerConnectionId}`);
+    await this.gate("remove");
+    this.files.delete(providerConnectionId);
+  };
+}
+
+function statuses(harness: Harness): string[] {
+  return harness.service.state().connections.map((entry) => entry.status);
+}
+
+/** Everything of the service that could reach the renderer or a log. */
+function exposed(harness: Harness, ...results: unknown[]): string {
+  return JSON.stringify([
+    harness.service.state(),
+    harness.states,
+    harness.logs,
+    results,
+  ]);
+}
+
+test("the key state after a failed check: corrupt and bound elsewhere are missing, every other failure unknown", () => {
+  expect(providerKeyStateAfterFailure(new ProviderKeyError("corrupt"))).toBe(
+    "missing",
+  );
+  expect(
+    providerKeyStateAfterFailure(new ProviderKeyError("bound_elsewhere")),
+  ).toBe("missing");
+  for (const code of [
+    "unreadable",
+    "read_failed",
+    "folder_unavailable",
+    "newer_format",
+  ] as const) {
+    expect(providerKeyStateAfterFailure(new ProviderKeyError(code))).toBe(
+      "unknown",
+    );
+  }
+  expect(providerKeyStateAfterFailure(new Error("other"))).toBe("unknown");
+});
+
+test("each listed connection is unknown until its key is checked, then credential_missing or ready; offline every one is unknown", async () => {
+  const keys = new FakeKeys();
+  keys.files.set(CONNECTION_2, { deviceId: DEVICE_ID, key: SENTINEL_KEY });
+  keys.held.add("check");
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.answer(ok(TWO));
+  expect(statuses(harness)).toEqual(["unknown", "unknown"]);
+  expect(keys.calls).toEqual([
+    `check:${CONNECTION_1}`,
+    `check:${CONNECTION_2}`,
+  ]);
+  keys.held.clear();
+  keys.release();
+  await settle();
+  expect(statuses(harness)).toEqual(["credential_missing", "ready"]);
+
+  // Another list read checks no key again.
+  harness.setConnection("offline");
+  expect(statuses(harness)).toEqual(["unknown", "unknown"]);
+  harness.setConnection("connected");
+  await harness.ready(TWO);
+  expect(statuses(harness)).toEqual(["credential_missing", "ready"]);
+  expect(keys.calls).toHaveLength(2);
+  expect(exposed(harness)).not.toContain(SENTINEL_KEY);
+});
+
+test("a key that cannot be checked is unknown; a damaged one or one bound to another device is credential_missing", async () => {
+  const keys = new FakeKeys();
+  keys.failures.check = "unreadable";
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(ONE);
+  await settle();
+  expect(statuses(harness)).toEqual(["unknown"]);
+  expect(harness.logs).toContain(
+    "A provider key could not be checked (unreadable).",
+  );
+
+  const corrupt = new FakeKeys();
+  corrupt.failures.check = "corrupt";
+  const second = new Harness(accountStatus(), "connected", corrupt);
+  await second.ready(ONE);
+  await settle();
+  expect(statuses(second)).toEqual(["credential_missing"]);
+
+  const elsewhere = new FakeKeys();
+  elsewhere.files.set(CONNECTION_1, {
+    deviceId: OTHER_DEVICE_ID,
+    key: SENTINEL_KEY,
+  });
+  const third = new Harness(accountStatus(), "connected", elsewhere);
+  await third.ready(ONE);
+  await settle();
+  expect(statuses(third)).toEqual(["credential_missing"]);
+});
+
+test("a key is stored once, bound to this device and the connection, and the connection becomes ready; removing it makes it credential_missing", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(TWO);
+  await settle();
+  expect(statuses(harness)).toEqual([
+    "credential_missing",
+    "credential_missing",
+  ]);
+
+  const saved = await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+  expect(saved).toEqual({ outcome: "ok" });
+  expect(keys.files.get(CONNECTION_1)).toEqual({
+    deviceId: DEVICE_ID,
+    key: SENTINEL_KEY,
+  });
+  await settle();
+  expect(statuses(harness)).toEqual(["ready", "credential_missing"]);
+  // Nothing was sent to the server.
+  expect(harness.writes).toEqual([]);
+
+  const removed = await harness.service.removeKey(CONNECTION_1);
+  expect(removed).toEqual({ outcome: "ok" });
+  await settle();
+  expect(keys.files.has(CONNECTION_1)).toBe(false);
+  expect(statuses(harness)).toEqual([
+    "credential_missing",
+    "credential_missing",
+  ]);
+  // Removing a key that is not there is fine.
+  expect(await harness.service.removeKey(CONNECTION_2)).toEqual({
+    outcome: "ok",
+  });
+  expect(harness.writes).toEqual([]);
+  expect(exposed(harness, saved, removed)).not.toContain(SENTINEL_KEY);
+});
+
+test("a key of the wrong shape, an invalid or unlisted connection, or no signed-in device is refused before the store is asked", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(ONE);
+  await settle();
+  keys.calls.length = 0;
+  const results: unknown[] = [];
+  for (const key of [
+    "",
+    ` ${SENTINEL_KEY}`,
+    `${SENTINEL_KEY}\n`,
+    `${SENTINEL_KEY}\u200b`,
+    "k".repeat(513),
+  ]) {
+    const result = await harness.service.saveKey(CONNECTION_1, key);
+    results.push(result);
+    expect(result).toEqual({
+      outcome: "refused",
+      reason: "invalid",
+      retryAfterMs: null,
+    });
+  }
+  for (const id of ["not-an-id", CONNECTION_1.toUpperCase()]) {
+    expect(await harness.service.saveKey(id, SENTINEL_KEY)).toMatchObject({
+      reason: "invalid",
+    });
+    expect(await harness.service.removeKey(id)).toMatchObject({
+      reason: "invalid",
+    });
+  }
+  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual({
+    outcome: "refused",
+    reason: "not_listed",
+    retryAfterMs: null,
+  });
+  expect(await harness.service.removeKey(CONNECTION_2)).toMatchObject({
+    reason: "not_listed",
+  });
+  harness.setAccount(SIGNED_OUT);
+  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+    retryAfterMs: null,
+  });
+  expect(await harness.service.removeKey(CONNECTION_1)).toMatchObject({
+    reason: "not_signed_in",
+  });
+  expect(keys.calls).toEqual([]);
+
+  // Without a key store nothing can be stored.
+  const bare = new Harness();
+  await bare.ready(ONE);
+  expect(statuses(bare)).toEqual(["credential_missing"]);
+  expect(await bare.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toMatchObject({
+    reason: "failed",
+  });
+  expect(exposed(harness, results)).not.toContain(SENTINEL_KEY);
+});
+
+test("a store that cannot protect or write the key refuses it with a fixed reason, logged by its code only", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(ONE);
+  await settle();
+  const results: unknown[] = [];
+  for (const [code, reason] of [
+    ["system_protection_unavailable", "protection_unavailable"],
+    ["invalid_key", "invalid"],
+    ["write_failed", "failed"],
+    ["folder_unavailable", "failed"],
+  ] as const) {
+    keys.failures.save = code;
+    const result = await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+    results.push(result);
+    expect(result).toEqual({ outcome: "refused", reason, retryAfterMs: null });
+    expect(harness.logs.at(-1)).toBe(
+      `A provider key was not stored (${code}).`,
+    );
+  }
+  keys.failures.save = undefined;
+  keys.failures.remove = "delete_failed";
+  expect(await harness.service.removeKey(CONNECTION_1)).toEqual({
+    outcome: "refused",
+    reason: "failed",
+    retryAfterMs: null,
+  });
+  expect(harness.logs.at(-1)).toBe(
+    "A provider key could not be deleted (delete_failed).",
+  );
+  expect(keys.files.size).toBe(0);
+  expect(exposed(harness, results)).not.toContain(SENTINEL_KEY);
+});
+
+test("a key stored while the device signs out is deleted again and refused", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(ONE);
+  await settle();
+  keys.held.add("save");
+  const pending = harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+  await settle();
+  harness.setAccount(SIGNED_OUT);
+  keys.held.clear();
+  keys.release();
+  expect(await pending).toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+    retryAfterMs: null,
+  });
+  expect(keys.files.size).toBe(0);
+});
+
+test("a removal deletes the key file only after the server confirmed it; a refusal, an unknown answer, or a sign-out keeps it", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(TWO);
+  await settle();
+  await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+  await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY);
+  keys.calls.length = 0;
+
+  // Refused by the server, or not known: the key stays.
+  for (const answer of [
+    workspaceActionSent(workspaceActionFailed("not_found")),
+    workspaceActionSent(workspaceActionFailed("conflict")),
+    workspaceActionSent(workspaceActionFailed("rate_limited", 5_000)),
+    workspaceActionSent(workspaceActionFailed("unavailable")),
+    workspaceActionFailed("not_signed_in"),
+  ]) {
+    const pending = harness.service.remove(CONNECTION_1);
+    harness.writes.at(-1)?.answer(answer);
+    await pending;
+    await harness.ready(TWO).catch(() => undefined);
+    harness.reads.length = 0;
+  }
+  const threw = harness.service.remove(CONNECTION_1);
+  harness.writes.at(-1)?.fail(new Error("network"));
+  expect(await threw).toEqual({ outcome: "unknown" });
+  // Every one of them reached the account service.
+  expect(harness.writes).toHaveLength(6);
+  expect(keys.calls.filter((call) => call.startsWith("remove:"))).toEqual([]);
+  expect(keys.files.has(CONNECTION_1)).toBe(true);
+
+  // The server confirmed: the key file is deleted before the result.
+  harness.reads.length = 0;
+  const confirmed = harness.service.remove(CONNECTION_1);
+  expect(keys.calls.filter((call) => call.startsWith("remove:"))).toEqual([]);
+  harness.writes.at(-1)?.answer({ ok: true, value: null });
+  expect(await confirmed).toEqual({ outcome: "ok" });
+  expect(keys.calls.filter((call) => call.startsWith("remove:"))).toEqual([
+    `remove:${CONNECTION_1}`,
+  ]);
+  expect(keys.files.has(CONNECTION_1)).toBe(false);
+  expect(keys.files.has(CONNECTION_2)).toBe(true);
+
+  // A key file that cannot be deleted is logged, and the removal still
+  // counts.
+  await harness.ready(TWO).catch(() => undefined);
+  harness.reads.length = 0;
+  keys.failures.remove = "delete_failed";
+  const failing = harness.service.remove(CONNECTION_2);
+  harness.writes.at(-1)?.answer({ ok: true, value: null });
+  expect(await failing).toEqual({ outcome: "ok" });
+  expect(harness.logs).toContain(
+    "The provider key of a removed connection could not be deleted (delete_failed).",
+  );
+
+  // A sign-out deletes nothing.
+  keys.failures.remove = undefined;
+  keys.calls.length = 0;
+  harness.setAccount(SIGNED_OUT);
+  await settle();
+  expect(keys.calls).toEqual([]);
+  expect(keys.files.has(CONNECTION_2)).toBe(true);
+  expect(exposed(harness)).not.toContain(SENTINEL_KEY);
 });

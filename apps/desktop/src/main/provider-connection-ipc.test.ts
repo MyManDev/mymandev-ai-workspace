@@ -17,19 +17,23 @@ import type { ProviderConnectionsState } from "./provider-connections/service.ts
 // The provider connection channels of #32: the renderer reads this
 // device's connections and registers and removes one through the main
 // process, which checks the sender and every argument first. A
-// registration carries a kind and a label only.
+// registration carries a kind and a label only. A connection's API key
+// (#33) goes from the renderer to the service once, and no result, event,
+// or error ever carries it back.
 
 const DEV_URL = "http://localhost:5173/";
 const CONNECTION = "0192f0a0-7b3c-7d4e-8f50-000000000101";
 const AT = "2026-11-24T09:00:00.000Z";
+/** An obvious fake key; no result, event, or error may hold it. */
+const SENTINEL_KEY = "FAKE-PROVIDER-KEY-SENTINEL-0123456789";
 
 const ENTRY = Object.freeze({
   id: CONNECTION,
   kind: "claude",
   label: "Work laptop",
   createdAt: AT,
-  status: "registered",
-}) as ProviderConnectionsState["connections"][number];
+  status: "ready",
+}) as unknown as ProviderConnectionsState["connections"][number];
 
 interface Timer {
   readonly callback: () => void;
@@ -83,6 +87,18 @@ function fakeService() {
             outcome: "refused" as const,
             reason: "rate_limited" as const,
             retryAfterMs: 30_000,
+          });
+        },
+        saveKey: (id: string, key: string) => {
+          calls.push(["saveKey", id, key]);
+          return Promise.resolve({ outcome: "ok" as const });
+        },
+        removeKey: (id: string) => {
+          calls.push(["removeKey", id]);
+          return Promise.resolve({
+            outcome: "refused" as const,
+            reason: "not_listed" as const,
+            retryAfterMs: null,
           });
         },
       },
@@ -155,6 +171,8 @@ test("the provider connection channels are registered, and nothing else", () => 
       INVOKE_CHANNELS.subscribeProviderConnections,
       INVOKE_CHANNELS.registerProviderConnection,
       INVOKE_CHANNELS.removeProviderConnection,
+      INVOKE_CHANNELS.saveProviderKey,
+      INVOKE_CHANNELS.removeProviderKey,
     ].sort(),
   );
 });
@@ -213,16 +231,93 @@ test("every handler refuses a foreign sender, and arguments outside the strict c
     [INVOKE_CHANNELS.removeProviderConnection, [CONNECTION, CONNECTION]],
     [INVOKE_CHANNELS.removeProviderConnection, [{ id: CONNECTION }]],
   ];
-  for (const [channel, args] of refused) {
+  const keyRequest = { providerConnectionId: CONNECTION, key: SENTINEL_KEY };
+  const refusedKeys: [string, unknown[]][] = [
+    [INVOKE_CHANNELS.saveProviderKey, []],
+    [INVOKE_CHANNELS.saveProviderKey, [CONNECTION, SENTINEL_KEY]],
+    [INVOKE_CHANNELS.saveProviderKey, [keyRequest, keyRequest]],
+    [INVOKE_CHANNELS.saveProviderKey, [{ providerConnectionId: CONNECTION }]],
+    [INVOKE_CHANNELS.saveProviderKey, [{ key: SENTINEL_KEY }]],
+    [INVOKE_CHANNELS.saveProviderKey, [{ ...keyRequest, key: "" }]],
+    [INVOKE_CHANNELS.saveProviderKey, [{ ...keyRequest, key: 7 }]],
+    [
+      INVOKE_CHANNELS.saveProviderKey,
+      [{ ...keyRequest, key: `${SENTINEL_KEY}${"x".repeat(512)}` }],
+    ],
+    [
+      INVOKE_CHANNELS.saveProviderKey,
+      [{ ...keyRequest, providerConnectionId: CONNECTION.toUpperCase() }],
+    ],
+    // Nothing travels beside the ID and the key.
+    [INVOKE_CHANNELS.saveProviderKey, [{ ...keyRequest, kind: "claude" }]],
+    [
+      INVOKE_CHANNELS.saveProviderKey,
+      [{ ...keyRequest, deviceId: CONNECTION }],
+    ],
+    [INVOKE_CHANNELS.removeProviderKey, []],
+    [INVOKE_CHANNELS.removeProviderKey, ["not-an-id"]],
+    [INVOKE_CHANNELS.removeProviderKey, [CONNECTION, SENTINEL_KEY]],
+    [INVOKE_CHANNELS.removeProviderKey, [keyRequest]],
+  ];
+  for (const [channel, args] of [...refused, ...refusedKeys]) {
     const handler = handlers.get(channel)!;
-    expect(
-      () => handler(event(frame(APP_ENTRY_URL)), ...args),
-      `${channel} ${JSON.stringify(args)}`,
-    ).toThrow(
+    let thrown: unknown;
+    try {
+      handler(event(frame(APP_ENTRY_URL)), ...args);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown, `${channel} ${JSON.stringify(args)}`).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe(
       `The call on ${channel} was refused: the arguments do not match the contract.`,
     );
+    // The refusal never names the key it refused.
+    expect(String(thrown)).not.toContain(SENTINEL_KEY);
+    expect(JSON.stringify(thrown)).not.toContain(SENTINEL_KEY);
+    expect((thrown as Error).stack ?? "").not.toContain(SENTINEL_KEY);
+    expect((thrown as Error).cause).toBeUndefined();
   }
   expect(fake.calls).toEqual([]);
+});
+
+test("a key reaches the service once with the connection's ID, and no result, state, or event ever carries it back", async () => {
+  const fake = fakeService();
+  const { call } = register(fake);
+  const subscriber = receiver(DEV_URL);
+  call(INVOKE_CHANNELS.subscribeProviderConnections, [], subscriber);
+  const saved = await call(INVOKE_CHANNELS.saveProviderKey, [
+    { providerConnectionId: CONNECTION, key: SENTINEL_KEY },
+  ]);
+  expect(saved).toEqual({ outcome: "ok" });
+  expect(await call(INVOKE_CHANNELS.removeProviderKey, [CONNECTION])).toEqual({
+    outcome: "refused",
+    reason: "not_listed",
+    retryAfterMs: null,
+  });
+  expect(fake.calls).toEqual([
+    ["saveKey", CONNECTION, SENTINEL_KEY],
+    ["removeKey", CONNECTION],
+  ]);
+
+  // A service that leaked the key into its result is cut to the contract.
+  fake.options.service.saveKey = () =>
+    Promise.resolve({ outcome: "ok", key: SENTINEL_KEY } as unknown as {
+      outcome: "ok";
+    });
+  const leaked = await call(INVOKE_CHANNELS.saveProviderKey, [
+    { providerConnectionId: CONNECTION, key: SENTINEL_KEY },
+  ]);
+  expect(leaked).toEqual({ outcome: "ok" });
+
+  fake.setState({ revision: 1, status: "ready", connections: [ENTRY] });
+  fake.fire();
+  const crossed = JSON.stringify([
+    saved,
+    leaked,
+    subscriber.sent,
+    call(INVOKE_CHANNELS.getProviderConnections),
+  ]);
+  expect(crossed).not.toContain(SENTINEL_KEY);
 });
 
 test("a registration and a removal reach the service with their values only, and their results are parsed", async () => {

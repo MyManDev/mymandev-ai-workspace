@@ -48,6 +48,11 @@ import {
   type DeviceRecord,
   type DeviceRecordStore,
 } from "../device-record.ts";
+import { deletingProviderKeys } from "../provider-keys/device-removal.ts";
+import {
+  createProviderKeyStore,
+  PROVIDER_KEY_FOLDER,
+} from "../provider-keys/store.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 import {
   createSignInFlow,
@@ -620,6 +625,8 @@ interface Harness {
 function harness(
   api: FakeApi = fakeApi(),
   overrides: Partial<DeviceSessionDependencies> = {},
+  /** Wraps the key store that the session gets, as account-system.ts does. */
+  wrapKeyStore: (store: SessionKeyStore) => SessionKeyStore = (store) => store,
 ): Harness {
   const keyStore = createDeviceKeyStore({
     folder,
@@ -694,7 +701,7 @@ function harness(
   };
   const session = createDeviceSession({
     apiOrigin: { ok: true, origin: API_ORIGIN },
-    keyStore: loggedKeyStore,
+    keyStore: wrapKeyStore(loggedKeyStore),
     deviceRecords: loggedRecords,
     signOutMarkers: markers,
     sessionNotes: createSessionNotesStore({
@@ -4924,5 +4931,111 @@ describe("answers that arrive after the device was forgotten", () => {
     expect((await authenticating).ok).toBe(true);
     expect(await removing).toEqual({ ok: true, value: "removed" });
     expect(api.revokedReason).toBe("removed");
+  });
+});
+
+describe("provider keys (#33)", () => {
+  // The provider key files live in the device key's folder and are deleted
+  // with the device key (D4): by a removal that the API confirmed and by
+  // `device_revoked`, never by a sign-out or by a removal whose answer is
+  // unknown.
+  const PROVIDER_CONNECTION = "0192f0a0-7b3c-7d4e-8f50-000000000101";
+  const PROVIDER_KEY = "FAKE-PROVIDER-KEY-0123456789";
+
+  function withProviderKeys(api: FakeApi = fakeApi()) {
+    const providerKeys = createProviderKeyStore({
+      folder: () => folder,
+      platform: "win32",
+      systemProtection: fakeSafeStorage,
+      fileSystem,
+    });
+    const reports: string[] = [];
+    const h = harness(api, {}, (store) =>
+      deletingProviderKeys(store, providerKeys, (message) =>
+        reports.push(message),
+      ),
+    );
+    const binding = {
+      deviceId: DEVICE_ID,
+      providerConnectionId: PROVIDER_CONNECTION,
+    };
+    return { h, providerKeys, binding, reports };
+  }
+
+  async function providerKeyFiles(): Promise<string[]> {
+    try {
+      return await fileSystem.readdir(path.join(folder, PROVIDER_KEY_FOLDER));
+    } catch {
+      return [];
+    }
+  }
+
+  test("a sign-out keeps the provider keys with the device key", async () => {
+    const { h, providerKeys, binding } = withProviderKeys();
+    await existingDevice(h);
+    await providerKeys.save(binding, PROVIDER_KEY);
+
+    expect(await h.session.signOut()).toEqual({ ok: true, value: "reported" });
+
+    expect(h.calls).not.toContain("key.delete");
+    expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
+    expect(await providerKeyFiles()).toEqual([`${PROVIDER_CONNECTION}.json`]);
+    expect(await providerKeys.read(binding)).toBe(PROVIDER_KEY);
+  });
+
+  test("removing this device deletes every provider key file once the API confirmed it, after the device key", async () => {
+    const { h, providerKeys, binding, reports } = withProviderKeys();
+    await existingDevice(h);
+    await providerKeys.save(binding, PROVIDER_KEY);
+    await providerKeys.save(
+      {
+        ...binding,
+        providerConnectionId: "0192f0a0-7b3c-7d4e-8f50-000000000102",
+      },
+      PROVIDER_KEY,
+    );
+    expect(await providerKeyFiles()).toHaveLength(2);
+
+    expect(await h.session.removeDevice()).toEqual({
+      ok: true,
+      value: "removed",
+    });
+
+    expect(await keyFiles()).toEqual([]);
+    expect(await providerKeyFiles()).toEqual([]);
+    expect(await providerKeys.check(binding)).toBe("missing");
+    expect(reports).toEqual([]);
+  });
+
+  test("a removal whose answer is unknown keeps the device key and the provider keys", async () => {
+    const api = fakeApi();
+    const { h, providerKeys, binding } = withProviderKeys(api);
+    await existingDevice(h);
+    await providerKeys.save(binding, PROVIDER_KEY);
+    api.intercept = (request) =>
+      request.path === `/devices/${DEVICE_ID}/revoke`
+        ? Promise.resolve(new Response(null, { status: 503 }))
+        : undefined;
+
+    expect(await h.session.removeDevice()).toEqual({
+      ok: true,
+      value: "pending",
+    });
+
+    expect(h.calls).not.toContain("key.delete");
+    expect(await providerKeyFiles()).toEqual([`${PROVIDER_CONNECTION}.json`]);
+    expect(await providerKeys.read(binding)).toBe(PROVIDER_KEY);
+  });
+
+  test("device_revoked deletes the provider keys with the device key", async () => {
+    const { h, providerKeys, binding } = withProviderKeys();
+    await existingDevice(h);
+    await providerKeys.save(binding, PROVIDER_KEY);
+    h.api.deviceState = "revoked";
+
+    await h.session.listDevices();
+
+    expect(h.session.state()).toEqual({ kind: "revoked" });
+    expect(await providerKeyFiles()).toEqual([]);
   });
 });

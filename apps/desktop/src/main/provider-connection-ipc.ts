@@ -105,7 +105,7 @@ function scheduleWithSetTimeout(
 export interface ProviderConnectionIpcOptions {
   readonly service: Pick<
     ProviderConnectionService,
-    "state" | "onChange" | "register" | "remove"
+    "state" | "onChange" | "register" | "remove" | "saveKey" | "removeKey"
   >;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
@@ -126,9 +126,14 @@ export interface ProviderConnectionIpc {
  * `provider-connections:register` takes one strict object of a kind of the
  * contract and a label of 1 to 64 characters and no other key, so nothing
  * such as a credential can travel beside them; `provider-connections:remove`
- * takes one lowercase UUIDv7. The results are parsed by the contract, so
- * only fixed codes, a wait, and the connections' IDs, kinds, labels, times,
- * and statuses reach the renderer. Call it before the first window loads.
+ * takes one lowercase UUIDv7. `provider-connections:save-key` takes one
+ * strict object of a connection ID and a key of 1 to 512 characters and no
+ * other key (#33); the key goes to the service once and is never part of a
+ * result, an event, or a log. `provider-connections:remove-key` takes one
+ * lowercase UUIDv7. The results are parsed by the contract, so only fixed
+ * codes, a wait, and the connections' IDs, kinds, labels, times, and
+ * statuses reach the renderer: never a key. Call it before the first
+ * window loads.
  */
 export function registerProviderConnectionIpc(
   ipc: IpcRegistry,
@@ -212,6 +217,29 @@ export function registerProviderConnectionIpc(
       // The contract checked the ID as a lowercase UUIDv7; the service
       // accepts only a connection of its list.
       (_event, [providerConnectionId]) => service.remove(providerConnectionId),
+    ),
+  );
+  ipc.handle(
+    INVOKE_CHANNELS.saveProviderKey,
+    createInvokeHandler(
+      INVOKE_CHANNELS.saveProviderKey,
+      appUrl,
+      // The contract checked the ID and the key's length and refused any
+      // other key; the service checks the key's shape. The result is `ok`
+      // or a fixed refusal, never the key.
+      (_event, [request]) =>
+        service.saveKey(request.providerConnectionId, request.key),
+    ),
+  );
+  ipc.handle(
+    INVOKE_CHANNELS.removeProviderKey,
+    createInvokeHandler(
+      INVOKE_CHANNELS.removeProviderKey,
+      appUrl,
+      // The contract checked the ID; the service accepts only a connection
+      // of its list.
+      (_event, [providerConnectionId]) =>
+        service.removeKey(providerConnectionId),
     ),
   );
   const remove = service.onChange(changed);

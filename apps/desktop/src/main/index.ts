@@ -85,6 +85,7 @@ import { createGrantStore, signedInDevice } from "./permissions/grant-store.ts";
 import { createSystemEnforcementRecorder } from "./permissions/file-recorder-system.ts";
 import { registerProviderConnectionIpc } from "./provider-connection-ipc.ts";
 import { createProviderConnectionService } from "./provider-connections/service.ts";
+import { createSystemProviderKeyStore } from "./provider-keys/system.ts";
 import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
 import {
@@ -192,6 +193,17 @@ function start(): void {
   // is created and refreshed after the load. The sign-in, the sign-out, and
   // the removal start only on the person's action in the renderer. The
   // messages are fixed text, and the key store's errors hold no secret.
+  //
+  // The provider key store (#33) keeps each provider connection's API key
+  // encrypted with `safeStorage` in the `provider-keys` folder of the device
+  // key's local data folder, bound to this device and the connection. It
+  // touches the disk and `safeStorage` only when a key is stored, checked,
+  // read, or deleted, after the application is ready. Every deletion of the
+  // device key deletes every provider key file with it; a sign-out keeps
+  // them. Its errors are fixed text and never hold a key.
+  const providerKeys = createSystemProviderKeyStore((message, error) =>
+    console.error(message, error),
+  );
   const account = createSystemAccountService({
     focusWindow: () => focusMainWindow(),
     // "This is not me" is confirmed in a native dialog of the main process,
@@ -263,6 +275,7 @@ function start(): void {
     // back after the next sign-in. The local runtime tasks (terminal,
     // process, and agent execution) stop their work here.
     stopLocalExecution: () => undefined,
+    providerKeys,
     onError: (message, error) =>
       error === undefined
         ? console.error(message)
@@ -454,14 +467,19 @@ function start(): void {
 
   // This device's AI provider connections (#32): the list that the server
   // holds for this device, a status for each from a closed list, and
-  // registering and removing one, one write at a time. Metadata only: no
-  // credential is read, kept, or sent. A removal tells the grant store,
-  // because the server revokes the connection's `provider.use` grants. The
-  // logs are fixed text, never a label or an ID.
+  // registering and removing one, one write at a time. Only metadata
+  // reaches the server. Each connection's API key (#33) is entered on the
+  // Account screen once and stored by the provider key store above; no
+  // channel sends it back, and its status says whether it decrypts here
+  // (`ready`) or is missing. A removal that the server confirmed deletes the
+  // key file. A removal tells the grant store, because the server revokes
+  // the connection's `provider.use` grants. The logs are fixed text, never
+  // a label, an ID, or a key.
   const providerConnections = createProviderConnectionService({
     account,
     connection,
     grants: grantStore,
+    keys: providerKeys,
     log: (message) => console.info(message),
   });
   closables.add(providerConnections);

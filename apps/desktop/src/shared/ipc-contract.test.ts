@@ -355,9 +355,11 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       !PROJECT_REPOSITORY_ACTION_CHANNELS.has(channel) &&
       !GRANT_ACTION_CHANNELS.has(channel) &&
       channel !== INVOKE_CHANNELS.registerProviderConnection &&
-      channel !== INVOKE_CHANNELS.removeProviderConnection,
+      channel !== INVOKE_CHANNELS.removeProviderConnection &&
+      channel !== INVOKE_CHANNELS.saveProviderKey &&
+      channel !== INVOKE_CHANNELS.removeProviderKey,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 45);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 47);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
