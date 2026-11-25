@@ -1,4 +1,5 @@
 import {
+  type AgentId,
   API_ERROR_CODES,
   type AuthChallengeFrame,
   type AuthResponseFrame,
@@ -7,7 +8,9 @@ import {
   type JoinRequestId,
   LIMITS,
   type MemberId,
+  type MessageId,
   type ProjectId,
+  type ProviderConnectionId,
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
@@ -5196,9 +5199,10 @@ test("a run creation answered run_limit or run_daily_limit gets its own failure,
       "createRun",
       { projectId: PROJECT_ID },
       {
-        agentId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f3",
-        providerConnectionId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f4",
-        inputMessageId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f5",
+        agentId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f3" as AgentId,
+        providerConnectionId:
+          "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f4" as ProviderConnectionId,
+        inputMessageId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f5" as MessageId,
       },
     );
   const promote = () =>
