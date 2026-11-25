@@ -12,7 +12,11 @@
 // kept between calls.
 //
 // Every denial, and every allowed start of `terminal.execute`, is passed to
-// the injected recorder. A record holds IDs, a capability name, a reason
+// the injected recorder. `recheck` decides an action that is already
+// running again (a held action, after a change of the grants): it decides
+// exactly like `check` and records its denials, but it records no start,
+// because nothing starts. Default until the Project Manager decides (#55,
+// review of #348 on #35). A record holds IDs, a capability name, a reason
 // from a closed list, and a time, never a path, a command, or a value that
 // the requester sent.
 //
@@ -190,7 +194,18 @@ export interface PermissionEnforcement {
    * process start. It never throws: every failure denies.
    */
   check(run: HeldRun, request: unknown): EnforcementDecision;
+  /**
+   * Checks again a request whose action already runs, for example after a
+   * change of the grants. It decides exactly like `check` and records every
+   * denial, but an allowed `terminal.execute` records no shell start, since
+   * no shell starts, so it is never denied with `record_failed`. Never
+   * call it before an action or a process start. It never throws.
+   */
+  recheck(run: HeldRun, request: unknown): EnforcementDecision;
 }
+
+/** Why a request is decided: before an action, or again while it runs. */
+type CheckPurpose = "start" | "recheck";
 
 /** Marks a value that could not be read or is not valid. */
 const INVALID: unique symbol = Symbol("invalid");
@@ -464,7 +479,11 @@ export function createPermissionEnforcement(
     return ms === INVALID ? null : new Date(ms).toISOString();
   }
 
-  function check(heldRun: HeldRun, request: unknown): EnforcementDecision {
+  function decide(
+    heldRun: HeldRun,
+    request: unknown,
+    purpose: CheckPurpose,
+  ): EnforcementDecision {
     // Each step below names what it learned, so that the denial record holds
     // what is known and nothing that the requester sent.
     let run: HeldRun | null = null;
@@ -583,7 +602,7 @@ export function createPermissionEnforcement(
         return deny("no_grant");
       }
 
-      if (checked.capability === "terminal.execute") {
+      if (checked.capability === "terminal.execute" && purpose === "start") {
         const recorded = record({
           kind: "shell_start_allowed",
           runId: run.runId,
@@ -606,5 +625,10 @@ export function createPermissionEnforcement(
     }
   }
 
-  return Object.freeze({ check });
+  return Object.freeze({
+    check: (heldRun: HeldRun, request: unknown) =>
+      decide(heldRun, request, "start"),
+    recheck: (heldRun: HeldRun, request: unknown) =>
+      decide(heldRun, request, "recheck"),
+  });
 }
