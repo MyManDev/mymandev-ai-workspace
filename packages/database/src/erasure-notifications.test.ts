@@ -18,9 +18,10 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { eraseAccount } from "./account-erasure.ts";
 import type { Database } from "./db.ts";
+import { checkErasureNotification } from "./erasure-check.ts";
 import {
   APPROVERS_PER_NOTIFICATION,
   encodeErasureNotification,
@@ -293,10 +294,11 @@ function inOrder<T extends string>(...ids: T[]): T[] {
   return [...ids].sort();
 }
 
-const header = (kind: ErasureNotification["kind"]) => ({
+const header = (kind: ErasureNotification["kind"], userId: UserId) => ({
   v: 1,
   kind,
   at: ERASED_AT.toISOString(),
+  userId,
 });
 
 test("an erasure notifies at its commit, in the order of the routes: the account, each ended membership with its agents, grants, and runs, each revoked device's, and each withdrawn join request with its approvers; nothing about an archived workspace, and no name", async () => {
@@ -384,13 +386,12 @@ test("an erasure notifies at its commit, in the order of the routes: the account
   const at = ERASED_AT.toISOString();
   const firstMembership = [
     {
-      ...header("membership_ended"),
+      ...header("membership_ended", erin.userId),
       workspaceId: first.workspaceId,
       memberId: erinInFirst,
-      userId: erin.userId,
     },
     {
-      ...header("agent_disabled"),
+      ...header("agent_disabled", erin.userId),
       workspaceId: first.workspaceId,
       agentId: erinsAgent,
       projectId: project.projectId,
@@ -398,7 +399,7 @@ test("an erasure notifies at its commit, in the order of the routes: the account
       disabledAt: at,
     },
     {
-      ...header("grant_revoked"),
+      ...header("grant_revoked", erin.userId),
       workspaceId: first.workspaceId,
       grantId: erinsGrant,
       granteeAgentId: erinsAgent,
@@ -406,7 +407,7 @@ test("an erasure notifies at its commit, in the order of the routes: the account
     },
     ...[
       {
-        ...header("run_cancelled"),
+        ...header("run_cancelled", erin.userId),
         workspaceId: first.workspaceId,
         runId: onErinsAgent,
         agentId: erinsAgent,
@@ -417,7 +418,7 @@ test("an erasure notifies at its commit, in the order of the routes: the account
         reason: "member_removed",
       },
       {
-        ...header("run_cancelled"),
+        ...header("run_cancelled", erin.userId),
         workspaceId: first.workspaceId,
         runId: requestedByErin,
         agentId: ownersAgent,
@@ -431,10 +432,9 @@ test("an erasure notifies at its commit, in the order of the routes: the account
   ];
   const secondMembership = [
     {
-      ...header("membership_ended"),
+      ...header("membership_ended", erin.userId),
       workspaceId: second.workspaceId,
       memberId: erinInSecond,
-      userId: erin.userId,
     },
   ];
   // The people of the account in the order of their IDs.
@@ -443,11 +443,11 @@ test("an erasure notifies at its commit, in the order of the routes: the account
       ? [...firstMembership, ...secondMembership]
       : [...secondMembership, ...firstMembership];
   assert.deepEqual(notified, [
-    { ...header("account_erased"), userId: erin.userId },
+    header("account_erased", erin.userId),
     ...memberships,
     // The second device's cascade, in the former workspace.
     {
-      ...header("agent_disabled"),
+      ...header("agent_disabled", erin.userId),
       workspaceId: former.workspaceId,
       agentId: strayAgent,
       projectId: formerProject.projectId,
@@ -455,14 +455,14 @@ test("an erasure notifies at its commit, in the order of the routes: the account
       disabledAt: at,
     },
     {
-      ...header("grant_revoked"),
+      ...header("grant_revoked", erin.userId),
       workspaceId: former.workspaceId,
       grantId: strayGrant,
       granteeAgentId: strayAgent,
       revokedAt: at,
     },
     {
-      ...header("run_cancelled"),
+      ...header("run_cancelled", erin.userId),
       workspaceId: former.workspaceId,
       runId: strayRun,
       agentId: strayAgent,
@@ -473,7 +473,7 @@ test("an erasure notifies at its commit, in the order of the routes: the account
       reason: "device_revoked",
     },
     {
-      ...header("join_request_withdrawn"),
+      ...header("join_request_withdrawn", erin.userId),
       workspaceId: asked.workspaceId,
       joinRequestId: toAsked,
       approvers: inOrder(asked.ownerPerson, miaAdmin),
@@ -561,13 +561,12 @@ test("the approvers of a withdrawn request are read after the removals, so the e
     ["account_erased", "membership_ended", "join_request_withdrawn"],
   );
   assert.deepEqual(notified[1], {
-    ...header("membership_ended"),
+    ...header("membership_ended", erin.userId),
     workspaceId: team.workspaceId,
     memberId: erinAdmin,
-    userId: erin.userId,
   });
   assert.deepEqual(notified[2], {
-    ...header("join_request_withdrawn"),
+    ...header("join_request_withdrawn", erin.userId),
     workspaceId: team.workspaceId,
     joinRequestId: request,
     approvers: [team.ownerPerson],
@@ -722,12 +721,222 @@ test("the largest notification of each kind stays within the bound, and one over
         v: 1,
         kind: "join_request_withdrawn",
         at: at.toISOString(),
+        userId: newId<UserId>(),
         workspaceId: newId<WorkspaceId>(),
         joinRequestId: newId<JoinRequestId>(),
         approvers: Array.from({ length: 250 }, () => newId<MemberId>()),
       }),
     /over 7999 bytes/,
   );
+});
+
+// The API's check of a notification against the database
+// (`src/erasure-check.ts`; Project Manager decision of 2026-11-25): any role
+// that can connect can send on the channel, so only what the database
+// confirms is replayed.
+
+test("the database confirms every notification of a real erasure, with the account's revoked devices and the current approvers; it confirms none for an account that is not erased, and none whose item the erasure did not change", async () => {
+  const db = database();
+  const owner = await account("Olga");
+  const erin = await account("Erin");
+  const bob = await account("Bob");
+  const mia = await account("Mia");
+  const team = await workspaceOf(owner);
+  const other = await workspaceOf(owner);
+  const asked = await workspaceOf(owner);
+  const erinInTeam = await addPerson(team.workspaceId, owner, erin);
+  const bobInTeam = await addPerson(team.workspaceId, owner, bob);
+  const miaAdmin = await addPerson(asked.workspaceId, owner, mia, {
+    role: "admin",
+  });
+  const plainMember = await addPerson(asked.workspaceId, owner, bob);
+  const project = await projectIn(team.workspaceId, owner);
+  const erinsAgent = await agentOf(project, erin);
+  await grantTo(project, erinsAgent, erin);
+  await runOf(project, erinsAgent, "queued", owner);
+  const bobsAgent = await agentOf(project, bob);
+  await runOf(project, bobsAgent, "queued", erin);
+  await pendingRequest(erin, asked.workspaceId);
+
+  // Bob's items in the states that an erasure leaves, written directly:
+  // they belong to no erasure, as Bob is not erased.
+  const bobGone = await addPerson(other.workspaceId, owner, bob, {
+    removedAt: NOW,
+    removedByUserId: owner.userId,
+  });
+  const bobsOldAgent = await agentOf(project, bob);
+  await db
+    .update(agents)
+    .set({ disabledAt: NOW })
+    .where(eq(agents.id, bobsOldAgent));
+  const bobsOldGrant = await grantTo(project, bobsOldAgent, bob);
+  await db
+    .update(permissionGrants)
+    .set({ revokedAt: NOW, revokedByUserId: bob.userId })
+    .where(eq(permissionGrants.id, bobsOldGrant));
+  const bobsCancelledRun = await runOf(
+    project,
+    bobsOldAgent,
+    "cancelled",
+    bob,
+    {
+      finishedAt: NOW,
+    },
+  );
+  const bobsRequest = await pendingRequest(bob, asked.workspaceId);
+  await db
+    .update(workspaceJoinRequests)
+    .set({ decision: "withdrawn", decidedAt: NOW, decidedByUserId: bob.userId })
+    .where(eq(workspaceJoinRequests.id, bobsRequest));
+
+  await drained();
+  const result = await eraseAccount(db, {
+    userId: erin.userId,
+    now: ERASED_AT,
+  });
+  assert.ok(result.erased);
+  const notified = await drained();
+  assert.deepEqual(
+    notified.map((notification) => notification.kind),
+    [
+      "account_erased",
+      "membership_ended",
+      "agent_disabled",
+      "grant_revoked",
+      "run_cancelled",
+      "run_cancelled",
+      "join_request_withdrawn",
+    ],
+  );
+
+  // Every notification of the erasure is confirmed.
+  for (const notification of notified) {
+    const check = await checkErasureNotification(db, notification);
+    assert.equal(check.confirmed, true, notification.kind);
+    assert.deepEqual(
+      check.revokedDeviceIds,
+      notification.kind === "account_erased" ? [erin.deviceId] : [],
+    );
+    assert.deepEqual(
+      check.approvers,
+      notification.kind === "join_request_withdrawn"
+        ? inOrder(asked.ownerPerson, miaAdmin)
+        : [],
+    );
+  }
+
+  // The same notifications naming Bob, who is not erased, or an account
+  // that does not exist, are confirmed by none, also when Bob has a revoked
+  // device.
+  const bobsRevoked = await deviceOf(bob.userId);
+  await db
+    .update(devices)
+    .set({ revokedAt: NOW, revocationReason: "removed" })
+    .where(eq(devices.id, bobsRevoked));
+  for (const userId of [bob.userId, newId<UserId>()]) {
+    for (const notification of notified) {
+      const check = await checkErasureNotification(db, {
+        ...notification,
+        userId,
+      });
+      assert.deepEqual(
+        check,
+        { confirmed: false, revokedDeviceIds: [], approvers: [] },
+        `${notification.kind} naming another account`,
+      );
+    }
+  }
+
+  // Notifications that name Erin, whose erasure is real, but an item that
+  // her erasure did not change, are confirmed by none: Bob's items in the
+  // erasure's states, and Erin's agent with another owner's person or in
+  // another workspace.
+  const at = ERASED_AT.toISOString();
+  const forged: ErasureNotification[] = [
+    {
+      ...header("membership_ended", erin.userId),
+      workspaceId: other.workspaceId,
+      memberId: bobGone,
+    },
+    {
+      ...header("agent_disabled", erin.userId),
+      workspaceId: team.workspaceId,
+      agentId: bobsOldAgent,
+      projectId: project.projectId,
+      ownerMemberId: bobInTeam,
+      disabledAt: at,
+    },
+    {
+      ...header("agent_disabled", erin.userId),
+      workspaceId: team.workspaceId,
+      agentId: erinsAgent,
+      projectId: project.projectId,
+      ownerMemberId: bobInTeam,
+      disabledAt: at,
+    },
+    {
+      ...header("agent_disabled", erin.userId),
+      workspaceId: other.workspaceId,
+      agentId: erinsAgent,
+      projectId: project.projectId,
+      ownerMemberId: erinInTeam,
+      disabledAt: at,
+    },
+    {
+      ...header("grant_revoked", erin.userId),
+      workspaceId: team.workspaceId,
+      grantId: bobsOldGrant,
+      granteeAgentId: bobsOldAgent,
+      revokedAt: at,
+    },
+    {
+      ...header("run_cancelled", erin.userId),
+      workspaceId: team.workspaceId,
+      runId: bobsCancelledRun,
+      agentId: bobsOldAgent,
+      projectId: project.projectId,
+      repositoryId: null,
+      correlationId: null,
+      previousState: "queued",
+      reason: "member_removed",
+    },
+    {
+      ...header("join_request_withdrawn", erin.userId),
+      workspaceId: asked.workspaceId,
+      joinRequestId: bobsRequest,
+      approvers: [asked.ownerPerson],
+    },
+  ] as ErasureNotification[];
+  for (const notification of forged) {
+    assert.deepEqual(
+      await checkErasureNotification(db, notification),
+      { confirmed: false, revokedDeviceIds: [], approvers: [] },
+      notification.kind,
+    );
+  }
+
+  // A real withdrawal sends only to the named people who are an active
+  // owner or admin of its workspace now.
+  const withdrawal = notified.at(-1);
+  assert.ok(withdrawal?.kind === "join_request_withdrawn");
+  await db
+    .update(workspaceMembers)
+    .set({ removedAt: NOW, removedByUserId: owner.userId })
+    .where(eq(workspaceMembers.id, miaAdmin));
+  const narrowed = await checkErasureNotification(db, {
+    ...withdrawal,
+    approvers: [miaAdmin, plainMember, bobInTeam, asked.ownerPerson],
+  });
+  assert.equal(narrowed.confirmed, true);
+  assert.deepEqual(narrowed.approvers, [asked.ownerPerson]);
+
+  // A device of Erin's that is not revoked, which only data written outside
+  // the functions has, is never one to close.
+  await deviceOf(erin.userId);
+  const erased = notified[0];
+  assert.ok(erased !== undefined);
+  const accountCheck = await checkErasureNotification(db, erased);
+  assert.deepEqual(accountCheck.revokedDeviceIds, [erin.deviceId]);
 });
 
 // The session that listens (`src/notification-session.ts`): what it

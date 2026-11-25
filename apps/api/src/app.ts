@@ -1,6 +1,7 @@
 import rateLimit, { normalizeIP } from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
 import {
+  checkErasureNotification,
   createDatabase,
   type Database,
   type NotificationSessions,
@@ -40,7 +41,7 @@ import { registerGrantRoutes } from "./grants/grant-routes.ts";
 import { registerProviderConnectionRoutes } from "./providers/provider-connection-routes.ts";
 import { runTransitionHandler } from "./workspaces/agent-events.ts";
 import { chatSendHandler } from "./workspaces/chat-events.ts";
-import { replayErasureNotification } from "./workspaces/erasure-events.ts";
+import { ErasureReplay } from "./workspaces/erasure-events.ts";
 import {
   type AccountFrameHandler,
   type ApproverEventHandler,
@@ -547,10 +548,21 @@ export async function buildApp(
             app.log,
           ),
       });
-      // The operator's erasures, replayed to the open connections (#341).
-      // The listener starts when the app is ready, so a test that only
-      // builds the app opens no session, and stops when it closes.
+      // The operator's erasures, checked against the database and replayed
+      // to the open connections (#341). The listener starts when the app is
+      // ready, so a test that only builds the app opens no session, and
+      // stops when it closes, after the notifications that it received.
       if (erasureNotifications !== null) {
+        const checked = database;
+        const replay = new ErasureReplay({
+          connections,
+          onWorkspaceEvent,
+          onApproverEvent,
+          onAccountFrame,
+          log: app.log,
+          check: (notification) =>
+            checkErasureNotification(checked, notification),
+        });
         const listener = new ErasureListener({
           sessions: erasureNotifications,
           log: app.log,
@@ -561,16 +573,7 @@ export async function buildApp(
                 maxBackoffMs: options.erasureListenerBackoff.maxMs,
               }),
           onPayload: (payload) => {
-            replayErasureNotification(
-              {
-                connections,
-                onWorkspaceEvent,
-                onApproverEvent,
-                onAccountFrame,
-                log: app.log,
-              },
-              payload,
-            );
+            replay.push(payload);
           },
         });
         app.addHook("onReady", async () => {
@@ -578,6 +581,7 @@ export async function buildApp(
         });
         app.addHook("onClose", async () => {
           await listener.close();
+          await replay.idle();
         });
       }
     }

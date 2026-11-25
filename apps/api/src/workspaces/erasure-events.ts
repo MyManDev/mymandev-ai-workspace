@@ -1,6 +1,7 @@
 import {
   APPROVERS_PER_NOTIFICATION,
   ERASED_AGENT_NAME,
+  type ErasureCheck,
   ERASURE_NOTIFICATION_VERSION,
   type ErasureNotification,
 } from "@mymandev/database";
@@ -34,25 +35,27 @@ import {
 
 // The API's side of an operator's account erasure (#341; ADR 0014, update of
 // 2026-11-25): each notification that the erasure's transaction sent
-// (`src/erasure-notifications.ts` in `@mymandev/database`) is checked and
-// replayed through the senders of the API's own routes, so that every
-// connection gets what a removal, a device revocation, or a withdrawal
-// through the API would have sent it.
+// (`src/erasure-notifications.ts` in `@mymandev/database`) is decoded,
+// checked against the database (`checkErasureNotification`, Project Manager
+// decision of 2026-11-25), because any role that can connect to the
+// database can send one, and replayed through the senders of the API's own
+// routes, so that every connection gets what a removal, a device
+// revocation, or a withdrawal through the API would have sent it.
 
 const header = <Kind extends string>(kind: Kind) => ({
   v: z.literal(ERASURE_NOTIFICATION_VERSION),
   kind: z.literal(kind),
   at: UtcTimestampSchema,
+  userId: UserIdSchema,
 });
 
 /** Every notification of the version that this API reads, and nothing else. */
 const ErasureNotificationSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ ...header("account_erased"), userId: UserIdSchema }),
+  z.strictObject(header("account_erased")),
   z.strictObject({
     ...header("membership_ended"),
     workspaceId: WorkspaceIdSchema,
     memberId: MemberIdSchema,
-    userId: UserIdSchema,
   }),
   z.strictObject({
     ...header("agent_disabled"),
@@ -88,7 +91,7 @@ const ErasureNotificationSchema = z.discriminatedUnion("kind", [
   }),
 ]) satisfies z.ZodType<ErasureNotification>;
 
-/** Why a payload was not replayed. */
+/** Why a payload was not decoded. */
 export type IgnoredReason = "malformed" | "unknown_version" | "unknown_kind";
 
 const KINDS: ReadonlySet<unknown> = new Set<ErasureNotification["kind"]>([
@@ -142,13 +145,15 @@ export type ErasureReplayTargets = Readonly<{
 }>;
 
 /**
- * Replays one notification of an erasure, as the route that makes the same
- * change sends its events, with the erasure's time as the events' time:
+ * Replays one notification of an erasure that the database confirmed
+ * (`check`), as the route that makes the same change sends its events,
+ * with the erasure's time as the events' time:
  *
- * - `account_erased` closes every open connection of the account at once,
- *   with `device_revoked`, the reason with which the sweep would close it
- *   within 60 seconds, as every device of the account is revoked; that ends
- *   its subscriptions, and the other subscribers see its people go offline;
+ * - `account_erased` closes the open connections of the account's revoked
+ *   devices (`check.revokedDeviceIds`) at once, with `device_revoked`, the
+ *   reason with which the sweep would close them within 60 seconds; that
+ *   ends their subscriptions, and the other subscribers see its people go
+ *   offline;
  * - `membership_ended` sends `workspace.member.removed` and
  *   `account.removed_from_workspace` (`sendMemberRemoved`), as a removal;
  * - `agent_disabled` sends `workspace.agent.disabled`, with
@@ -157,35 +162,26 @@ export type ErasureReplayTargets = Readonly<{
  * - `grant_revoked` sends `agent.grant.revoked` (`sendRevokedGrants`);
  * - `run_cancelled` sends `agent.run.state_changed` (`sendCancelledRuns`);
  * - `join_request_withdrawn` sends `workspace.join_request.resolved` with
- *   the outcome `withdrawn` to the approvers that it names
- *   (`sendJoinRequestResolved`), as a withdrawal.
- *
- * A payload that `decodeErasureNotification` refuses is logged with the
- * reason only, never its content, and changes nothing. Returns whether it
- * was replayed.
+ *   the outcome `withdrawn`, as a withdrawal, to the approvers that it names
+ *   and that are still an owner or admin (`check.approvers`), if any
+ *   (`sendJoinRequestResolved`).
  */
 export function replayErasureNotification(
   targets: ErasureReplayTargets,
-  payload: string,
-): boolean {
-  const decoded = decodeErasureNotification(payload);
-  if (!decoded.ok) {
-    targets.log.warn(
-      { reason: decoded.reason },
-      "erasure notification ignored",
-    );
-    return false;
-  }
-  const { notification } = decoded;
+  notification: ErasureNotification,
+  check: ErasureCheck,
+): void {
   const at = new Date(notification.at);
   const logged = { log: targets.log };
   switch (notification.kind) {
     case "account_erased":
-      targets.connections.closeUser(
-        notification.userId,
-        "device_revoked",
-        targets.log,
-      );
+      for (const deviceId of check.revokedDeviceIds) {
+        targets.connections.closeDevice(
+          deviceId,
+          "device_revoked",
+          targets.log,
+        );
+      }
       break;
     case "membership_ended":
       sendMemberRemoved(logged, targets, notification, at);
@@ -243,14 +239,110 @@ export function replayErasureNotification(
       );
       break;
     case "join_request_withdrawn":
-      sendJoinRequestResolved(logged, targets.onApproverEvent, {
-        workspaceId: notification.workspaceId,
-        joinRequestId: notification.joinRequestId,
-        outcome: "withdrawn",
-        now: at,
-        approvers: notification.approvers,
-      });
+      if (check.approvers.length > 0) {
+        sendJoinRequestResolved(logged, targets.onApproverEvent, {
+          workspaceId: notification.workspaceId,
+          joinRequestId: notification.joinRequestId,
+          outcome: "withdrawn",
+          now: at,
+          approvers: check.approvers,
+        });
+      }
       break;
   }
-  return true;
+}
+
+/** The most notifications that wait for their check; more are dropped. */
+export const MAX_PENDING_ERASURE_NOTIFICATIONS = 10_000;
+
+export type ErasureReplayOptions = ErasureReplayTargets &
+  Readonly<{
+    /** Checks a notification against the database (`checkErasureNotification`). */
+    check: (notification: ErasureNotification) => Promise<ErasureCheck>;
+    /** Default: `MAX_PENDING_ERASURE_NOTIFICATIONS`. */
+    maxPending?: number;
+  }>;
+
+/** The error's type for a log line, never its message. */
+function errorTypeOf(error: unknown): string {
+  return error instanceof Error ? error.name : typeof error;
+}
+
+/**
+ * The API instance's replay of the erasure's notifications, one payload at
+ * a time and in the order of delivery: each payload is decoded
+ * (`decodeErasureNotification`), checked against the database (`check`,
+ * one read-only statement without a lock), and replayed
+ * (`replayErasureNotification`) only when the database confirms that its
+ * account is erased and its item is as the erasure left it. Otherwise it is
+ * dropped and logged with the reason only, never its content or an ID:
+ * `malformed`, `unknown_version`, or `unknown_kind` from the decoding,
+ * `not_confirmed` when the database does not confirm it, for example a
+ * notification that another role forged for an account that is not erased,
+ * and `backlog` when `maxPending` notifications already wait for their
+ * check. A check that fails is logged with the error's type, and its
+ * notification is dropped, as delivery is at most once anyway.
+ */
+export class ErasureReplay {
+  readonly #options: ErasureReplayOptions;
+  #tail: Promise<void> = Promise.resolve();
+  #pending = 0;
+
+  constructor(options: ErasureReplayOptions) {
+    this.#options = options;
+  }
+
+  /** Queues one payload; it never throws. */
+  push(payload: string): void {
+    const { log } = this.#options;
+    const decoded = decodeErasureNotification(payload);
+    if (!decoded.ok) {
+      log.warn({ reason: decoded.reason }, "erasure notification ignored");
+      return;
+    }
+    const max = this.#options.maxPending ?? MAX_PENDING_ERASURE_NOTIFICATIONS;
+    if (this.#pending >= max) {
+      log.warn({ reason: "backlog" }, "erasure notification ignored");
+      return;
+    }
+    this.#pending += 1;
+    this.#tail = this.#tail.then(async () => {
+      try {
+        await this.#replay(decoded.notification);
+      } finally {
+        this.#pending -= 1;
+      }
+    });
+  }
+
+  /** Resolves once every queued payload is checked and replayed or dropped. */
+  idle(): Promise<void> {
+    return this.#tail;
+  }
+
+  async #replay(notification: ErasureNotification): Promise<void> {
+    const { log } = this.#options;
+    let check: ErasureCheck;
+    try {
+      check = await this.#options.check(notification);
+    } catch (error) {
+      log.error(
+        { errorType: errorTypeOf(error) },
+        "erasure notification check failed",
+      );
+      return;
+    }
+    if (!check.confirmed) {
+      log.warn({ reason: "not_confirmed" }, "erasure notification ignored");
+      return;
+    }
+    try {
+      replayErasureNotification(this.#options, notification, check);
+    } catch (error) {
+      log.error(
+        { errorType: errorTypeOf(error) },
+        "erasure notification failed",
+      );
+    }
+  }
 }

@@ -40,6 +40,12 @@ import type { Database } from "./db.ts";
 // agent name (the API fills in `ERASED_AGENT_NAME`, which every agent of an
 // erased account has), no label, and no message body. Nothing about an
 // archived workspace is sent, as there is nobody left in it to tell.
+//
+// Every notification names the erased account. PostgreSQL lets any role
+// that can connect to the database send on the channel and listen to it,
+// so a listener trusts no payload: the API checks each one against the
+// database before it replays it (`checkErasureNotification`,
+// `src/erasure-check.ts`).
 
 /** The channel of the erasure's notifications; a fixed, lowercase SQL identifier. */
 export const ERASURE_NOTIFICATION_CHANNEL = "mymandev_account_erasure";
@@ -69,15 +75,20 @@ type Header<Kind extends string> = Readonly<{
   kind: Kind;
   /** The erasure's `now`, in UTC with milliseconds: the time of every event. */
   at: string;
+  /**
+   * The erased account, in every notification, so that the API can check
+   * against the database that the account is erased and that the item
+   * belongs to its erasure (`checkErasureNotification`).
+   */
+  userId: UserId;
 }>;
 
-/** The erased account: the API closes its open connections at once. */
-export type AccountErasedNotification = Header<"account_erased"> &
-  Readonly<{ userId: UserId }>;
+/** The erased account: the API closes the connections of its revoked devices at once. */
+export type AccountErasedNotification = Header<"account_erased">;
 
 /** An ended membership: `workspace.member.removed` and `account.removed_from_workspace`. */
 export type MembershipEndedNotification = Header<"membership_ended"> &
-  Readonly<{ workspaceId: WorkspaceId; memberId: MemberId; userId: UserId }>;
+  Readonly<{ workspaceId: WorkspaceId; memberId: MemberId }>;
 
 /** A disabled agent: `workspace.agent.disabled`, with `ERASED_AGENT_NAME` as its name. */
 export type AgentDisabledNotification = Header<"agent_disabled"> &
@@ -178,16 +189,19 @@ export function erasureNotifications(
 ): readonly ErasureNotification[] {
   const at = input.now.toISOString();
   const header = <Kind extends ErasureNotification["kind"]>(kind: Kind) =>
-    ({ v: ERASURE_NOTIFICATION_VERSION, kind, at }) as const;
+    ({
+      v: ERASURE_NOTIFICATION_VERSION,
+      kind,
+      at,
+      userId: input.userId,
+    }) as const;
   const archived: ReadonlySet<WorkspaceId> = new Set(
     input.archivedWorkspaceIds,
   );
   const live = <T extends Readonly<{ workspaceId: WorkspaceId }>>(
     items: readonly T[],
   ) => items.filter((item) => !archived.has(item.workspaceId));
-  const notifications: ErasureNotification[] = [
-    { ...header("account_erased"), userId: input.userId },
-  ];
+  const notifications: ErasureNotification[] = [header("account_erased")];
   const cascade = (change: NotifiedDevice) => {
     for (const { workspaceId, agent } of live(change.disabledAgents)) {
       notifications.push({
@@ -227,7 +241,6 @@ export function erasureNotifications(
       ...header("membership_ended"),
       workspaceId: membership.workspaceId,
       memberId: membership.memberId,
-      userId: input.userId,
     });
     cascade(membership);
   }

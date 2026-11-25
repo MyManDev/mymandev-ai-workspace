@@ -33,7 +33,7 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import type { FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance } from "fastify";
 import assert from "node:assert/strict";
 import { after, before, test, type TestContext } from "node:test";
 import {
@@ -51,6 +51,7 @@ import {
   until,
 } from "../gateway-test-support.ts";
 import { ConnectionRegistry } from "../gateway.ts";
+import { ErasureReplay, replayErasureNotification } from "./erasure-events.ts";
 import type { ApproverEvent, WorkspaceEvent } from "./events.ts";
 
 // The live events of an operator's account erasure (#341): the erasure's
@@ -438,8 +439,10 @@ test("an erasure closes the account's connections at once and sends the remainin
   );
 });
 
-test("approvers get workspace.join_request.resolved for each request that an erasure withdrew, exactly as after a withdrawal through the route; a member gets nothing", async (t) => {
-  const { observed, account } = await instance(t);
+test("approvers get workspace.join_request.resolved for each request that an erasure withdrew, exactly as after a withdrawal through the route; a member gets nothing, also when a resent notification names her", async (t) => {
+  assert.ok(testDatabase);
+  const logLines: string[] = [];
+  const { observed, account } = await instance(t, { logLines });
   const dana = await account(34201);
   const ada = await account(34202);
   const cleo = await account(34203);
@@ -449,8 +452,8 @@ test("approvers get workspace.join_request.resolved for each request that an era
     [ada.device, "admin"],
     [cleo.device, "member"],
   ]);
-  const [adaInTeam] = team.memberIds;
-  assert.ok(adaInTeam !== undefined);
+  const [adaInTeam, cleoInTeam] = team.memberIds;
+  assert.ok(adaInTeam !== undefined && cleoInTeam !== undefined);
   const faysRequest = await pendingRequest(fay.device, team.workspaceId);
   const erinsRequest = await pendingRequest(erin.device, team.workspaceId);
 
@@ -496,6 +499,32 @@ test("approvers get workspace.join_request.resolved for each request that an era
   }
   const [, approvers] = observed.approver.at(-1) ?? [];
   assert.deepEqual(approvers, [team.ownerId, adaInTeam].sort());
+
+  // The erasure's withdrawal sent again, naming Cleo, a member: the database
+  // confirms the withdrawal, but Cleo is no approver, so nobody is told. A
+  // forged notification after it shows that the replay got that far.
+  const resent = {
+    v: 1,
+    kind: "join_request_withdrawn",
+    at: new Date().toISOString(),
+    userId: erin.device.userId,
+    workspaceId: team.workspaceId,
+    joinRequestId: erinsRequest,
+    approvers: [cleoInTeam],
+  };
+  const forged = { ...resent, userId: fay.device.userId };
+  for (const notification of [resent, forged]) {
+    await testDatabase.client.query("select pg_notify($1, $2)", [
+      ERASURE_NOTIFICATION_CHANNEL,
+      JSON.stringify(notification),
+    ]);
+  }
+  await until(
+    () => logLines.some((line) => line.includes("not_confirmed")),
+    "the forged notification",
+  );
+  await quiet(danaClient, adaClient, cleoClient);
+  assert.equal(observed.approver.length, 1);
 });
 
 test("a workspace that the erasure archived gets no event, and nobody hears of its denied requests", async (t) => {
@@ -527,13 +556,14 @@ test("a workspace that the erasure archived gets no event, and nobody hears of i
   assert.deepEqual(observed.approver, []);
 });
 
-test("a malformed, unknown, or foreign notification is ignored and logged without its content, and the next one is still replayed", async (t) => {
+test("a malformed, unknown, or foreign notification is ignored and logged without its content, and the next real one is still replayed", async (t) => {
   assert.ok(testDatabase);
   const logLines: string[] = [];
   const { account } = await instance(t, { logLines });
   const erin = await account(34401);
   const erinClient = (await connected(t, erin.app, erin.device)).client;
   const at = new Date().toISOString();
+  // Well formed, but Erin is not erased: the database does not confirm it.
   const valid = encodeErasureNotification({
     v: 1,
     kind: "account_erased",
@@ -552,10 +582,12 @@ test("a malformed, unknown, or foreign notification is ignored and logged withou
       v: 1,
       kind: "join_request_withdrawn",
       at,
+      userId: erin.device.userId,
       workspaceId: newId<WorkspaceId>(),
       joinRequestId: newId<JoinRequestId>(),
       approvers: [],
     }),
+    valid,
   ];
   for (const payload of ignored) {
     await testDatabase.client.query("select pg_notify($1, $2)", [
@@ -572,10 +604,11 @@ test("a malformed, unknown, or foreign notification is ignored and logged withou
   await quiet(erinClient);
   assert.equal(erinClient.ws.readyState, erinClient.ws.OPEN);
 
-  await testDatabase.client.query("select pg_notify($1, $2)", [
-    ERASURE_NOTIFICATION_CHANNEL,
-    valid,
-  ]);
+  const erased = await eraseAccount(database(), {
+    userId: erin.device.userId,
+    now: new Date(),
+  });
+  assert.ok(erased.erased);
   assert.deepEqual(await erinClient.closed, closedWith("device_revoked"));
 
   const reasons = logLines
@@ -590,6 +623,7 @@ test("a malformed, unknown, or foreign notification is ignored and logged withou
     "malformed",
     "malformed",
     "malformed",
+    "not_confirmed",
   ]);
   for (const line of logLines) {
     assert.equal(line.includes(marker), false, line);
@@ -597,6 +631,279 @@ test("a malformed, unknown, or foreign notification is ignored and logged withou
   assert.ok(
     logLines.some((line) => line.includes("erasure listener listening")),
   );
+});
+
+test("forged notifications of every kind, for an account that is not erased or for items that an erasure did not change, replay nothing and close nothing; a real erasure afterwards still replays everything", async (t) => {
+  assert.ok(testDatabase);
+  const logLines: string[] = [];
+  const { connections, observed, account } = await instance(t, { logLines });
+  const ada = await account(34451);
+  const bob = await account(34452);
+  const cleo = await account(34453);
+  const dan = await account(34454);
+  const erin = await account(34455);
+  const team = await workspaceOf(ada.device, [
+    [bob.device, "member"],
+    [cleo.device, "member"],
+  ]);
+  const [bobInTeam] = team.memberIds;
+  assert.ok(bobInTeam !== undefined);
+  const bobsWork = await agentWithWork(team.workspaceId, bob.device);
+  const dansRequest = await pendingRequest(dan.device, team.workspaceId);
+
+  const adaClient = (await connected(t, ada.app, ada.device)).client;
+  const bobClient = (await connected(t, bob.app, bob.device)).client;
+  const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  await subscribe(adaClient, team.workspaceId);
+  await subscribe(bobClient, team.workspaceId);
+  await subscribe(cleoClient, team.workspaceId);
+  await messages(adaClient, 2);
+  await messages(bobClient, 1);
+  await quiet(adaClient, bobClient, cleoClient);
+
+  // Erin's real erasure, with nobody to tell: it makes her an erased account
+  // that a forger can name, as anyone who listens learns her ID.
+  const erinErased = await eraseAccount(database(), {
+    userId: erin.device.userId,
+    now: new Date(),
+  });
+  assert.ok(erinErased.erased);
+
+  const at = new Date().toISOString();
+  const forgedFor = (userId: UserId, requester: UserId) => [
+    { v: 1, kind: "account_erased", at, userId },
+    {
+      v: 1,
+      kind: "membership_ended",
+      at,
+      userId,
+      workspaceId: team.workspaceId,
+      memberId: bobInTeam,
+    },
+    {
+      v: 1,
+      kind: "agent_disabled",
+      at,
+      userId,
+      workspaceId: team.workspaceId,
+      agentId: bobsWork.agentId,
+      projectId: bobsWork.projectId,
+      ownerMemberId: bobInTeam,
+      disabledAt: at,
+    },
+    {
+      v: 1,
+      kind: "grant_revoked",
+      at,
+      userId,
+      workspaceId: team.workspaceId,
+      grantId: bobsWork.grantId,
+      granteeAgentId: bobsWork.agentId,
+      revokedAt: at,
+    },
+    {
+      v: 1,
+      kind: "run_cancelled",
+      at,
+      userId,
+      workspaceId: team.workspaceId,
+      runId: bobsWork.runId,
+      agentId: bobsWork.agentId,
+      projectId: bobsWork.projectId,
+      repositoryId: null,
+      correlationId: null,
+      previousState: "queued",
+      reason: "device_revoked",
+    },
+    {
+      v: 1,
+      kind: "join_request_withdrawn",
+      at,
+      userId: requester,
+      workspaceId: team.workspaceId,
+      joinRequestId: dansRequest,
+      approvers: [team.ownerId],
+    },
+  ];
+  const forged = [
+    // Naming the living owners of the items.
+    ...forgedFor(bob.device.userId, dan.device.userId),
+    // Naming Erin, who is erased, with items that her erasure never changed;
+    // her own `account_erased` is true and is replayed, closing nothing.
+    ...forgedFor(erin.device.userId, erin.device.userId).slice(1),
+  ];
+  for (const notification of forged) {
+    await testDatabase.client.query("select pg_notify($1, $2)", [
+      ERASURE_NOTIFICATION_CHANNEL,
+      JSON.stringify(notification),
+    ]);
+  }
+  const notConfirmed = () =>
+    logLines
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter(
+        (entry) =>
+          entry["msg"] === "erasure notification ignored" &&
+          entry["reason"] === "not_confirmed",
+      ).length;
+  await until(
+    () => notConfirmed() === forged.length,
+    "the forged notifications to be refused",
+  );
+  await quiet(adaClient, bobClient, cleoClient);
+  assert.equal(bobClient.ws.readyState, bobClient.ws.OPEN);
+  assert.ok(connections.connectionOf(bob.device.deviceId as DeviceId));
+  assert.deepEqual(observed.workspace, []);
+  assert.deepEqual(observed.approver, []);
+  for (const line of logLines) {
+    for (const id of [bob.device.userId, erin.device.userId, bobInTeam]) {
+      assert.equal(line.includes(id), false, line);
+    }
+  }
+
+  // Bob's real erasure: his connection closes, and Ada and Cleo get his
+  // removal, agent, grant, and run, as before.
+  const bobErased = await eraseAccount(database(), {
+    userId: bob.device.userId,
+    now: new Date(),
+  });
+  assert.ok(bobErased.erased);
+  assert.deepEqual(await bobClient.closed, closedWith("device_revoked"));
+  const replayed = await messages(cleoClient, 5);
+  assert.deepEqual(
+    replayed.map((message) => (message as { type: string }).type),
+    [
+      "presence.changed",
+      "workspace.member.removed",
+      "workspace.agent.disabled",
+      "agent.grant.revoked",
+      "agent.run.state_changed",
+    ],
+  );
+  assert.equal(notConfirmed(), forged.length);
+});
+
+test("a confirmed account_erased closes only the connections of the devices that the database shows revoked, not every connection of the account", async (t) => {
+  const { connections, account } = await instance(t);
+  const erin = await account(34471);
+  const desktop = await signInDevice(erin.app);
+  const laptopClient = (await connected(t, erin.app, erin.device)).client;
+  const desktopClient = (await connected(t, erin.app, desktop)).client;
+  await quiet(laptopClient, desktopClient);
+
+  replayErasureNotification(
+    {
+      connections,
+      onWorkspaceEvent: () => undefined,
+      onApproverEvent: () => undefined,
+      onAccountFrame: () => undefined,
+      log: erin.app.log,
+    },
+    {
+      v: 1,
+      kind: "account_erased",
+      at: new Date().toISOString(),
+      userId: erin.device.userId,
+    },
+    {
+      confirmed: true,
+      revokedDeviceIds: [erin.device.deviceId as DeviceId],
+      approvers: [],
+    },
+  );
+  assert.deepEqual(await laptopClient.closed, closedWith("device_revoked"));
+  await quiet(desktopClient);
+  assert.equal(desktopClient.ws.readyState, desktopClient.ws.OPEN);
+});
+
+/** A logger that keeps its JSON lines. */
+function replayLogger() {
+  const lines: string[] = [];
+  const app = Fastify({
+    logger: { level: "debug", stream: { write: (line) => lines.push(line) } },
+  });
+  const messages = () =>
+    lines.map((line) => {
+      const entry = JSON.parse(line) as Record<string, unknown>;
+      return [entry["msg"], entry["reason"] ?? entry["errorType"]];
+    });
+  return { log: app.log, lines, messages };
+}
+
+test("the replay checks one notification at a time and replays them in the order of delivery, also when a later check answers first; a check that fails is logged with the error's type; past the backlog bound a notification is dropped", async () => {
+  const { log, lines, messages } = replayLogger();
+  const replayed: string[] = [];
+  const workspaceId = newId<WorkspaceId>();
+  const userId = newId<UserId>();
+  const at = new Date().toISOString();
+  const removed = encodeErasureNotification({
+    v: 1,
+    kind: "membership_ended",
+    at,
+    userId,
+    workspaceId,
+    memberId: newId<MemberId>(),
+  });
+  const disabled = encodeErasureNotification({
+    v: 1,
+    kind: "agent_disabled",
+    at,
+    userId,
+    workspaceId,
+    agentId: newId<AgentId>(),
+    projectId: newId<ProjectId>(),
+    ownerMemberId: newId<MemberId>(),
+    disabledAt: at,
+  });
+  let checking = 0;
+  let mostAtOnce = 0;
+  const outcomes: (() => Promise<void>)[] = [
+    // The first check answers late, the second at once, the third fails.
+    () => new Promise((resolve) => setTimeout(resolve, 30)),
+    () => Promise.resolve(),
+    () => Promise.reject(new TypeError("connection to 10.0.0.1 lost")),
+    () => Promise.resolve(),
+  ];
+  const replay = new ErasureReplay({
+    connections: new ConnectionRegistry(),
+    onWorkspaceEvent: (event) => {
+      replayed.push(event.type);
+    },
+    onApproverEvent: () => undefined,
+    onAccountFrame: () => undefined,
+    log,
+    maxPending: 4,
+    check: async () => {
+      checking += 1;
+      mostAtOnce = Math.max(mostAtOnce, checking);
+      try {
+        await outcomes.shift()?.();
+      } finally {
+        checking -= 1;
+      }
+      return { confirmed: true, revokedDeviceIds: [], approvers: [] };
+    },
+  });
+  replay.push(removed);
+  replay.push(disabled);
+  replay.push(removed);
+  replay.push(disabled);
+  replay.push(removed);
+  await replay.idle();
+  assert.equal(mostAtOnce, 1);
+  assert.deepEqual(replayed, [
+    "workspace.member.removed",
+    "workspace.agent.disabled",
+    "workspace.agent.disabled",
+  ]);
+  assert.deepEqual(messages(), [
+    ["erasure notification ignored", "backlog"],
+    ["erasure notification check failed", "TypeError"],
+  ]);
+  for (const line of lines) {
+    assert.equal(line.includes("10.0.0.1"), false, line);
+    assert.equal(line.includes(userId), false, line);
+  }
 });
 
 test("the listener's session closes when the app closes, and an app whose listener cannot connect still starts and tries again", async (t) => {

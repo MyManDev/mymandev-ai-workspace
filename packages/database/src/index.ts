@@ -43,6 +43,10 @@ export {
   type RunCancelledNotification,
 } from "./erasure-notifications.ts";
 export {
+  checkErasureNotification,
+  type ErasureCheck,
+} from "./erasure-check.ts";
+export {
   LISTENER_APPLICATION_NAME,
   LISTENER_KEEPALIVE_INITIAL_DELAY_MS,
   type NotificationHandlers,
