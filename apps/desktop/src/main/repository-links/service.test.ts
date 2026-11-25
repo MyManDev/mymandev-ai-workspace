@@ -2413,6 +2413,73 @@ test("a folder replaced at the same path, or turned into a symbolic link, fails 
   });
 });
 
+test("two nested links that a build before #323 made resolve neither, whether the other is mounted or not, until one of them is unlinked", async () => {
+  const inner = `${FOLDER_1}/packages/lib`;
+  const harness = new Harness({
+    read: () =>
+      Promise.resolve({
+        kind: "links",
+        links: [linkOf(REPO_1, FOLDER_1), linkOf(REPO_2, inner)],
+      }),
+  });
+  harness.folders.add(inner);
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+  harness.mount(MOUNT_2, inner);
+
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "nested_link",
+  });
+  await expect(harness.service.resolveFolder(REPO_2)).resolves.toEqual({
+    ok: false,
+    reason: "nested_link",
+  });
+  // The other folder need not be mounted.
+  harness.unmount(MOUNT_2);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "nested_link",
+  });
+
+  // Once one of them is unlinked, the other resolves again.
+  await expect(harness.service.unlink(REPO_2)).resolves.toEqual({
+    outcome: "unlinked",
+  });
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: true,
+    repositoryId: REPO_1,
+    folder: FOLDER_1,
+  });
+});
+
+test("the same folder linked twice by a build before #323 resolves neither; another account's nested link is no obstacle", async () => {
+  const harness = new Harness({
+    read: () =>
+      Promise.resolve({
+        kind: "links",
+        links: [
+          linkOf(REPO_1, FOLDER_1),
+          linkOf(REPO_2, FOLDER_1),
+          linkOf(REPO_3, `${FOLDER_1}/vendor`, {
+            ownMemberId: OTHER_OWN as never,
+          }),
+        ],
+      }),
+  });
+  await harness.ready(repository(REPO_1), repository(REPO_2));
+  harness.mount(MOUNT_1, FOLDER_1);
+  harness.mount(MOUNT_2, FOLDER_2);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toEqual({
+    ok: false,
+    reason: "nested_link",
+  });
+  await harness.service.unlink(REPO_2);
+  await expect(harness.service.resolveFolder(REPO_1)).resolves.toMatchObject({
+    ok: true,
+  });
+});
+
 test("a mount whose state is unavailable does not resolve, and resolves again once it is available", async () => {
   const harness = new Harness();
   await harness.ready(repository(REPO_1));
