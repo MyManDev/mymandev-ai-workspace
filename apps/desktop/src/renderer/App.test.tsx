@@ -2160,9 +2160,13 @@ test("the account screen holds the account panel under This device and the accou
       initialView: accountView,
     }),
   ).toContain(
-    '<section aria-labelledby="account-screen-title"><h2 id="account-screen-title" tabindex="-1">Account</h2><p>Sign in this device with GitHub, manage the device and its sign-in, and see every device of the account.</p><section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">This device</h3><p>Checking the sign-in.</p></section><section class="account-panel" aria-labelledby="devices-title"><h3 id="devices-title" tabindex="-1">Devices</h3><p class="account-message" role="status">Checking the devices.</p><p class="account-message" id="device-action-message" role="status"></p></section></section>',
+    '<section aria-labelledby="account-screen-title"><h2 id="account-screen-title" tabindex="-1">Account</h2><p>Sign in this device with GitHub, manage the device and its sign-in, and see every device of the account and the AI provider connections of this device.</p><section class="account-panel" aria-labelledby="account-title"><h3 id="account-title">This device</h3><p>Checking the sign-in.</p></section><section class="account-panel" aria-labelledby="devices-title"><h3 id="devices-title" tabindex="-1">Devices</h3><p class="account-message" role="status">Checking the devices.</p><p class="account-message" id="device-action-message" role="status"></p></section><section class="account-panel" aria-labelledby="provider-connections-title"><h3 id="provider-connections-title" tabindex="-1">AI providers</h3>',
   );
   const without = render({ initialView: accountView });
+  // This device's AI provider connections (#32) follow the devices.
+  expect(without).toContain(
+    '<p class="account-message" role="status">AI provider connections are not available.</p>',
+  );
   expect(without).toContain("<p>Sign-in is not available.</p>");
   expect(without).toContain(
     '<p class="account-message" role="status">Devices are not available.</p>',

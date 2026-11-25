@@ -570,7 +570,7 @@ Provisional (#35): applied as defaults until the Project Manager decides. Each c
 - The limits and their values: 10 unfinished runs for each agent, and 100 new runs for each agent within 24 hours.
 - No idempotency key: the same request sent again creates a second run, so the desktop never sends it again on its own. No correlation ID either: linking a retry to its first run waits for the task that adds retries.
 
-An agent is created with `POST /projects/:projectId/agents` since #294 (see "Agent creation and disabling"), and the host device registers a provider connection with `POST /provider-connections` since #295 (see "Provider connections"). The desktop sends neither request yet, and the development seed's runs have neither a provider connection nor an input message.
+An agent is created with `POST /projects/:projectId/agents` since #294 (see "Agent creation and disabling"), and the host device registers a provider connection with `POST /provider-connections` since #295 (see "Provider connections"). The desktop registers, lists, and removes this device's provider connections on its Account screen since #32 but creates no agent yet. The development seed's runs have neither a provider connection nor an input message.
 
 ## Agent creation and disabling
 
@@ -666,6 +666,8 @@ A removal:
 - Revoking a device does not mark its connections removed: its grants are already revoked, and the host device fact of a grant record denies.
 
 Events: none. A connection is device data (#110), so no workspace event reports a registration or a removal, and no other account learns of a connection. Grant events of a removal: the server sends one `agent.grant.revoked` for each `provider.use` grant that the removal revoked, to the connections subscribed to the grant's workspace, as decision 5 of the grant routes asks for every change that revokes grants in its own transaction (#75). The event names the grant and its agent, never the connection.
+
+The desktop (#32) uses the three routes from the main process only, for the connections of its own device: it sends the kind and the label and never a credential, shows each connection with a status that it computes itself, and removes one after the person confirmed it ([desktop README](../../apps/desktop/README.md), "Provider connection service").
 
 Neither change writes an audit record: they are not administrative actions of ADR 0014, and its audit vocabulary has no provider connection action. This is a protocol change before protocol version 1 (#29): a new code of `API_ERROR_STATUS` and a new closed list, `PROVIDER_KINDS`, neither of which an older desktop knows.
 

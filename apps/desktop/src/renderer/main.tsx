@@ -32,6 +32,7 @@ createRoot(container).render(
       grants={window.desktop?.grants}
       chat={window.desktop?.chat}
       devices={window.desktop?.devices}
+      providerConnections={window.desktop?.providerConnections}
     />
   </StrictMode>,
 );

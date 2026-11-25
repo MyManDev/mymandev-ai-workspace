@@ -328,7 +328,7 @@ const PROJECT_REPOSITORY_ACTION_CHANNELS: ReadonlySet<string> = new Set([
   INVOKE_CHANNELS.unlinkRepository,
 ]);
 
-test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the copy of the workspace ID, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, the project repository actions, the grant actions, and the report of seen claims take no arguments and refuse any", () => {
+test("the invoke channels except unmount, unlock, the sign-in start, select, open, the creates, the copy of the workspace ID, the chat's send, retry, and discard, the dismissal of new devices, the revocation of a device, the people actions, the invitation actions, the join request actions, the own join request actions, the project repository actions, the grant actions, the provider connection actions, and the report of seen claims take no arguments and refuse any", () => {
   const channels = Object.entries(INVOKE_CONTRACT).filter(
     ([channel]) =>
       channel !== INVOKE_CHANNELS.unmountRepository &&
@@ -350,9 +350,11 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       !JOIN_REQUEST_ACTION_CHANNELS.has(channel) &&
       !OWN_JOIN_REQUEST_ACTION_CHANNELS.has(channel) &&
       !PROJECT_REPOSITORY_ACTION_CHANNELS.has(channel) &&
-      !GRANT_ACTION_CHANNELS.has(channel),
+      !GRANT_ACTION_CHANNELS.has(channel) &&
+      channel !== INVOKE_CHANNELS.registerProviderConnection &&
+      channel !== INVOKE_CHANNELS.removeProviderConnection,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 42);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 44);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [

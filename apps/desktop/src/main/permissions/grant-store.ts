@@ -191,6 +191,8 @@ export interface GrantStoreService extends GrantStore {
    * that no answer named yet, such as a new agent's first grant or one whose
    * grants all ended before the first answer (#335). The grant action of
    * `grant-actions.ts` calls it (#342), and after a revocation as well.
+   * A provider connection removal calls it too (#32), because the removal
+   * revokes the connection's `provider.use` grants.
    */
   readonly ownGrantAnswered: () => void;
   /** Stops listening and cancels the timers, for the quit. Unusable from then on. */

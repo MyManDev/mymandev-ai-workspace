@@ -47,6 +47,7 @@ const OUTCOMES = {
   project_limit: "failed",
   repository_limit: "failed",
   grant_limit: "failed",
+  provider_connection_limit: "failed",
   rate_limited: "rate_limited",
   unknown: "unknown",
   failed: "failed",
