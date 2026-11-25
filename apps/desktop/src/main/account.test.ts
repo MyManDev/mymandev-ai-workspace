@@ -54,7 +54,12 @@ import {
 import { PASSPHRASE_MAX_CHARACTERS } from "./device-key/key-file.ts";
 import type { DeviceKeyStatus } from "./device-key/store.ts";
 import type { DeviceRecord, DeviceRecordRead } from "./device-record.ts";
-import { WORKSPACE_ACTION_BUDGET, WORKSPACE_ACTIONS } from "./api-actions.ts";
+import {
+  ACTION_RATE_LIMITED_WAIT_MS,
+  RUN_DAILY_LIMIT_WAIT_MS,
+  WORKSPACE_ACTION_BUDGET,
+  WORKSPACE_ACTIONS,
+} from "./api-actions.ts";
 import { WORKSPACE_READS } from "./api-reads.ts";
 import type {
   AuthorizedRequest,
@@ -5181,6 +5186,98 @@ test("a write is not signed in without an account, and maps the session's failur
       displayName: "Grace",
     }),
   ).resolves.toEqual(SENT_UNKNOWN);
+});
+
+test("a run creation answered run_limit or run_daily_limit gets its own failure, run_daily_limit with its Retry-After, and every other write answers both as failed (#35)", async () => {
+  const h = harness();
+  await h.service.initialize();
+  const createRun = () =>
+    h.service.sendWorkspaceAction(
+      "createRun",
+      { projectId: PROJECT_ID },
+      {
+        agentId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f3",
+        providerConnectionId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f4",
+        inputMessageId: "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f5",
+      },
+    );
+  const promote = () =>
+    h.service.sendWorkspaceAction("promoteMember", {
+      workspaceId: WORKSPACE_ID,
+      memberId: MEMBER_ID,
+    });
+  const cases: [SessionResult<unknown>, unknown, unknown][] = [
+    // 409 run_limit: no wait, because only a finished run frees a place.
+    [
+      { ok: false, reason: "refused", code: "run_limit" },
+      { ok: false, reason: "run_limit", sent: true },
+      { ok: false, reason: "failed", sent: true },
+    ],
+    // 429 run_daily_limit with Retry-After: the answer's wait.
+    [
+      {
+        ok: false,
+        reason: "refused",
+        code: "run_daily_limit",
+        retryAfterSeconds: 3_600,
+      },
+      {
+        ok: false,
+        reason: "run_daily_limit",
+        retryAfterMs: 3_600_000,
+        sent: true,
+      },
+      { ok: false, reason: "failed", sent: true },
+    ],
+    // Without Retry-After: the whole 24 hours.
+    [
+      { ok: false, reason: "refused", code: "run_daily_limit" },
+      {
+        ok: false,
+        reason: "run_daily_limit",
+        retryAfterMs: RUN_DAILY_LIMIT_WAIT_MS,
+        sent: true,
+      },
+      { ok: false, reason: "failed", sent: true },
+    ],
+    // The account's limit is the same for both.
+    [
+      {
+        ok: false,
+        reason: "refused",
+        code: "rate_limited",
+        retryAfterSeconds: 30,
+      },
+      { ok: false, reason: "rate_limited", retryAfterMs: 30_000, sent: true },
+      { ok: false, reason: "rate_limited", retryAfterMs: 30_000, sent: true },
+    ],
+    [
+      { ok: false, reason: "refused", code: "rate_limited" },
+      {
+        ok: false,
+        reason: "rate_limited",
+        retryAfterMs: ACTION_RATE_LIMITED_WAIT_MS,
+        sent: true,
+      },
+      {
+        ok: false,
+        reason: "rate_limited",
+        retryAfterMs: ACTION_RATE_LIMITED_WAIT_MS,
+        sent: true,
+      },
+    ],
+  ];
+  for (const [result, ofRun, ofOther] of cases) {
+    h.request = async () => result;
+    await expect(createRun(), JSON.stringify(result)).resolves.toEqual(ofRun);
+    await expect(promote(), JSON.stringify(result)).resolves.toEqual(ofOther);
+  }
+  expect(h.requests.map((request) => request.route)).toEqual(
+    cases.flatMap(() => [
+      WORKSPACE_ACTIONS.createRun.route,
+      WORKSPACE_ACTIONS.promoteMember.route,
+    ]),
+  );
 });
 
 test("a write whose answer is uncertain is sent once and never again on its own", async () => {
