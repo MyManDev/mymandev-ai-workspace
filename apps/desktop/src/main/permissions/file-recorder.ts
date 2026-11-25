@@ -663,13 +663,17 @@ export function createFileEnforcementRecorder(
       syncFolder();
     } catch (error) {
       // The new file is empty and was created exclusively: it is deleted,
-      // so that a failure that repeats never leaves a file per record.
-      closeQuietly(fd);
+      // so that a failure that repeats never leaves a file per record. It is
+      // checked again first, while it is still open, so that a file that
+      // took its name meanwhile is not deleted.
       try {
-        fileSystem.unlinkSync(file);
+        if (inPlace(fd, file)) {
+          fileSystem.unlinkSync(file);
+        }
       } catch {
         // An empty newest file is never moved past (`reopenFile`).
       }
+      closeQuietly(fd);
       throw error;
     }
     return { fd, sequence, file, size: 0 };
@@ -695,6 +699,21 @@ export function createFileEnforcementRecorder(
     }
     try {
       if (!inPlace(fd, file)) {
+        // An empty regular file is not moved past: it may be one that
+        // `createFile` left because it was not in place, and moving past it
+        // would create a file per record. A file whose descriptor cannot be
+        // read is not moved past either. A folder is.
+        let empty = true;
+        try {
+          const stat = fileSystem.fstatSync(fd);
+          empty = stat.isFile && stat.size === 0;
+        } catch {
+          // Not moved past.
+        }
+        if (empty) {
+          // Closed by the catch below.
+          throw new EnforcementRecordError("open_failed");
+        }
         closeQuietly(fd);
         return null;
       }

@@ -1525,6 +1525,49 @@ test("an empty newest file that cannot be restricted or deleted is never moved p
   ).toHaveLength(1);
 });
 
+test("an empty newest file that is not in place is never moved past: one file at most, however many records fail", () => {
+  const create = enforcementRecordFileFlags(process.platform, true);
+  const spy = spyFileSystem({
+    lstatSync: (target) => {
+      const stat = nodeRecorderFileSystem.lstatSync(target);
+      return target.endsWith(".jsonl") ? { ...stat, ino: stat.ino + 1n } : stat;
+    },
+  });
+  const { recorder, files } = setup({ fileSystem: spy.fileSystem });
+  for (let index = 0; index < 20; index += 1) {
+    expect(failureOf(() => recorder.record(START))).toBe("open_failed");
+  }
+  expect(files()).toEqual(["enforcement-00000001.jsonl"]);
+  expect(
+    spy.named("openSync").filter((call) => call.args[1] === create),
+  ).toHaveLength(1);
+});
+
+test("a new file that fails is not deleted when its name no longer names it at the delete", () => {
+  let swapped = false;
+  const spy = spyFileSystem({
+    ...folderFlushStub(),
+    fchmodSync: () => {
+      // Another file takes the name while the new one is restricted.
+      swapped = true;
+      throw errno("EPERM");
+    },
+    lstatSync: (target) => {
+      const stat = nodeRecorderFileSystem.lstatSync(target);
+      return swapped && target.endsWith(".jsonl")
+        ? { ...stat, ino: stat.ino + 1n }
+        : stat;
+    },
+  });
+  const { recorder, files } = setup({
+    fileSystem: spy.fileSystem,
+    platform: "linux",
+  });
+  expect(failureOf(() => recorder.record(START))).toBe("open_failed");
+  expect(spy.named("unlinkSync")).toEqual([]);
+  expect(files()).toEqual(["enforcement-00000001.jsonl"]);
+});
+
 test("record file names have exactly 8 digits; other names are left alone, and no file beyond the highest number is created", () => {
   const { recorder, folder, files, read } = setup();
   mkdirSync(folder, { recursive: true });
