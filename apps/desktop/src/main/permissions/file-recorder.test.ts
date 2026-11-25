@@ -1543,6 +1543,37 @@ test("an empty newest file that is not in place is never moved past: one file at
   ).toHaveLength(1);
 });
 
+test("a newest file whose descriptor cannot be read is never moved past", () => {
+  const first = setup({ platform: "win32" });
+  first.recorder.record(DENIAL);
+  first.recorder.close();
+  const unreadable = new Set<number>();
+  const spy = spyFileSystem({
+    openSync: (file, flags, mode) => {
+      const fd = nodeRecorderFileSystem.openSync(file, flags, mode);
+      if (path.basename(file) === enforcementRecordFileName(1)) {
+        unreadable.add(fd);
+      } else {
+        unreadable.delete(fd);
+      }
+      return fd;
+    },
+    fstatSync: (fd) => {
+      if (unreadable.has(fd)) {
+        throw errno("EIO");
+      }
+      return nodeRecorderFileSystem.fstatSync(fd);
+    },
+  });
+  const second = setup({
+    root: first.root,
+    fileSystem: spy.fileSystem,
+    platform: "win32",
+  });
+  expect(failureOf(() => second.recorder.record(START))).toBe("open_failed");
+  expect(second.files()).toEqual(["enforcement-00000001.jsonl"]);
+});
+
 test("a new file that fails is not deleted when its name no longer names it at the delete", () => {
   let swapped = false;
   const spy = spyFileSystem({
