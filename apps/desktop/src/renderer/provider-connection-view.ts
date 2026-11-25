@@ -218,6 +218,8 @@ const CANNOT_SEND =
   "This device cannot send it now. Wait until the sign-in or the current change of the account is finished, then try again.";
 const BUSY =
   "Another change of the AI provider connections is still waiting for the server's answer. Wait a moment, then try again.";
+const KEY_BUSY =
+  "Another change of the AI provider connections or their API keys is still running. Wait a moment, then try again.";
 const TOO_SOON = (wait: string) =>
   `This device sent many changes in a short time. Try again in ${wait}.`;
 
@@ -278,6 +280,7 @@ export const SAVE_PROVIDER_KEY_REFUSAL_MESSAGES: Readonly<
   not_signed_in: SIGNED_OUT,
   not_listed:
     "The connection is no longer in the list. Wait until the list has loaded, then try again.",
+  busy: KEY_BUSY,
   protection_unavailable:
     "This device cannot protect it: the system's secure storage is not available. On Linux, a secret service such as GNOME Keyring or KWallet must be running.",
   failed: "This device could not store it. Try again.",
@@ -291,6 +294,7 @@ export const REMOVE_PROVIDER_KEY_REFUSAL_MESSAGES: Readonly<
   not_signed_in: SIGNED_OUT,
   not_listed:
     "The connection is no longer in the list. Wait until the list has loaded, then try again.",
+  busy: KEY_BUSY,
   failed: "This device could not delete it. Try again.",
 });
 

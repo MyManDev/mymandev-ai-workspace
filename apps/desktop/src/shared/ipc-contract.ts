@@ -3799,7 +3799,9 @@ export type SaveProviderKeyView = z.infer<typeof SaveProviderKeyViewSchema>;
  *   is not well-formed text. Nothing was stored.
  * - `not_signed_in`: no signed-in device with a ready key.
  * - `not_listed`: the connection is not in the list that the main process
- *   holds.
+ *   holds, or the server confirmed its removal.
+ * - `busy`: another key action, or a registration or removal of a
+ *   connection, is still running. Nothing was stored.
  * - `protection_unavailable`: the system cannot protect the key, for
  *   example Linux without a confirmed secret service. Nothing was stored.
  * - `failed`: the key could not be stored otherwise. The previous key file,
@@ -3809,6 +3811,7 @@ export const SAVE_PROVIDER_KEY_REFUSALS = Object.freeze([
   "invalid",
   "not_signed_in",
   "not_listed",
+  "busy",
   "protection_unavailable",
   "failed",
 ] as const);
@@ -3823,14 +3826,15 @@ export const SaveProviderKeyResultSchema = z.discriminatedUnion("outcome", [
 export type SaveProviderKeyResult = z.infer<typeof SaveProviderKeyResultSchema>;
 
 /**
- * Why removing a provider key was refused: `invalid`, `not_signed_in`, and
- * `not_listed` as for storing one, and `failed` when the file could not be
- * deleted.
+ * Why removing a provider key was refused: `invalid`, `not_signed_in`,
+ * `not_listed`, and `busy` as for storing one (nothing was deleted), and
+ * `failed` when the file could not be deleted.
  */
 export const REMOVE_PROVIDER_KEY_REFUSALS = Object.freeze([
   "invalid",
   "not_signed_in",
   "not_listed",
+  "busy",
   "failed",
 ] as const);
 export type RemoveProviderKeyRefusal =

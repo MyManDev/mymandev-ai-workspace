@@ -1214,7 +1214,7 @@ test("a store that cannot protect or write the key refuses it with a fixed reaso
   expect(exposed(harness, results)).not.toContain(SENTINEL_KEY);
 });
 
-test("a key stored while the device signs out is deleted again and refused", async () => {
+test("a key stored while the device signs out stays bound to it (D4), and is ready once the same device signs in again", async () => {
   const keys = new FakeKeys();
   const harness = new Harness(accountStatus(), "connected", keys);
   await harness.ready(ONE);
@@ -1225,12 +1225,228 @@ test("a key stored while the device signs out is deleted again and refused", asy
   harness.setAccount(SIGNED_OUT);
   keys.held.clear();
   keys.release();
-  expect(await pending).toEqual({
+  expect(await pending).toEqual({ outcome: "ok" });
+  expect(keys.files.get(CONNECTION_1)).toEqual({
+    deviceId: DEVICE_ID,
+    key: SENTINEL_KEY,
+  });
+  expect(keys.calls.filter((call) => call.startsWith("remove:"))).toEqual([]);
+  expect(harness.service.state().status).toBe("signed_out");
+
+  // The same device signs in again: the key is still there and ready.
+  harness.setAccount(accountStatus());
+  await harness.ready(ONE);
+  await settle();
+  expect(statuses(harness)).toEqual(["ready"]);
+  expect(exposed(harness)).not.toContain(SENTINEL_KEY);
+});
+
+test("a key stored while another device signs in, or while the device key is deleted, is deleted again and refused", async () => {
+  const ended = [
+    // Another device at once.
+    [accountStatus({}, OTHER_DEVICE_ID)],
+    // A sign-out, then another device.
+    [SIGNED_OUT, accountStatus({}, OTHER_DEVICE_ID)],
+    // The device key is deleted: a revocation, a confirmed removal, a lost
+    // key, and "This is not me" (no device record any more).
+    [
+      accountStatus({
+        account: Object.freeze({ kind: "hidden" }),
+        device: "revoked",
+      }),
+    ],
+    [
+      accountStatus({
+        account: Object.freeze({ kind: "hidden" }),
+        device: "removed",
+      }),
+    ],
+    [
+      accountStatus({
+        account: Object.freeze({ kind: "hidden" }),
+        device: "key_lost",
+      }),
+    ],
+    [
+      accountStatus({
+        account: Object.freeze({ kind: "signed_out" }),
+        device: "signed_out",
+      }),
+    ],
+  ] as unknown as AccountStatus[][];
+  for (const statusesMeanwhile of ended) {
+    const keys = new FakeKeys();
+    const harness = new Harness(accountStatus(), "connected", keys);
+    await harness.ready(ONE);
+    await settle();
+    keys.held.add("save");
+    const pending = harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+    await settle();
+    for (const status of statusesMeanwhile) {
+      harness.setAccount(status);
+    }
+    keys.held.clear();
+    keys.release();
+    expect(await pending).toEqual({
+      outcome: "refused",
+      reason: "not_signed_in",
+      retryAfterMs: null,
+    });
+    expect(keys.files.size).toBe(0);
+    expect(keys.calls).toContain(`remove:${CONNECTION_1}`);
+    expect(exposed(harness)).not.toContain(SENTINEL_KEY);
+  }
+});
+
+test("after the server confirmed a removal no key is stored or deleted for that connection, although the list still holds it", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(TWO);
+  await settle();
+  const removal = harness.service.remove(CONNECTION_1);
+  harness.writes.at(-1)?.answer({ ok: true, value: null });
+  expect(await removal).toEqual({ outcome: "ok" });
+  // The list read after the removal has not answered yet.
+  expect(harness.reads).toHaveLength(1);
+  expect(harness.service.state().connections.map((entry) => entry.id)).toEqual([
+    CONNECTION_1,
+    CONNECTION_2,
+  ]);
+  keys.calls.length = 0;
+  const saved = await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+  expect(saved).toEqual({
     outcome: "refused",
-    reason: "not_signed_in",
+    reason: "not_listed",
     retryAfterMs: null,
   });
+  expect(await harness.service.removeKey(CONNECTION_1)).toEqual({
+    outcome: "refused",
+    reason: "not_listed",
+    retryAfterMs: null,
+  });
+  expect(keys.calls).toEqual([]);
+  expect(keys.files.has(CONNECTION_1)).toBe(false);
+  // Another connection is not affected.
+  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual({
+    outcome: "ok",
+  });
+
+  // The list read answers without it: still refused.
+  await harness.ready(listOf(connection(CONNECTION_2, "Personal")));
+  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual({
+    outcome: "refused",
+    reason: "not_listed",
+    retryAfterMs: null,
+  });
+  expect(keys.files.has(CONNECTION_1)).toBe(false);
+  expect(exposed(harness, saved)).not.toContain(SENTINEL_KEY);
+});
+
+test("a key action that comes while a removal waits for the server or deletes its key file is refused and never reaches the store", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(TWO);
+  await settle();
+  keys.calls.length = 0;
+  keys.held.add("remove");
+  const removal = harness.service.remove(CONNECTION_1);
+  // The server has not answered: busy, for this connection and any other.
+  for (const id of [CONNECTION_1, CONNECTION_2]) {
+    expect(await harness.service.saveKey(id, SENTINEL_KEY)).toEqual({
+      outcome: "refused",
+      reason: "busy",
+      retryAfterMs: null,
+    });
+  }
+  harness.writes.at(-1)?.answer({ ok: true, value: null });
+  await settle();
+  // The removal's key deletion is held: a key for the removed connection
+  // would be queued right behind it.
+  expect(keys.calls).toEqual([`remove:${CONNECTION_1}`]);
+  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual({
+    outcome: "refused",
+    reason: "not_listed",
+    retryAfterMs: null,
+  });
+  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual({
+    outcome: "refused",
+    reason: "busy",
+    retryAfterMs: null,
+  });
+  expect(await harness.service.removeKey(CONNECTION_2)).toEqual({
+    outcome: "refused",
+    reason: "busy",
+    retryAfterMs: null,
+  });
+  keys.held.clear();
+  keys.release();
+  expect(await removal).toEqual({ outcome: "ok" });
+  expect(keys.calls).toEqual([`remove:${CONNECTION_1}`]);
   expect(keys.files.size).toBe(0);
+  // Once the removal ended, a key action for another connection goes.
+  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual({
+    outcome: "ok",
+  });
+});
+
+test("one key action at a time, and none while a registration or a removal waits: each is refused as busy and never reaches the store", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(TWO);
+  await settle();
+  keys.calls.length = 0;
+  const busy = { outcome: "refused", reason: "busy", retryAfterMs: null };
+
+  // A key action runs.
+  keys.held.add("save");
+  const first = harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+  await settle();
+  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual(
+    busy,
+  );
+  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual(
+    busy,
+  );
+  expect(await harness.service.removeKey(CONNECTION_1)).toEqual(busy);
+  expect(keys.calls).toEqual([`save:${CONNECTION_1}`]);
+  keys.held.clear();
+  keys.release();
+  expect(await first).toEqual({ outcome: "ok" });
+  await settle();
+
+  // A key deletion runs.
+  keys.calls.length = 0;
+  keys.held.add("remove");
+  const deleting = harness.service.removeKey(CONNECTION_1);
+  await settle();
+  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual(
+    busy,
+  );
+  expect(await harness.service.removeKey(CONNECTION_2)).toEqual(busy);
+  keys.held.clear();
+  keys.release();
+  expect(await deleting).toEqual({ outcome: "ok" });
+  await settle();
+  expect(keys.calls.filter((call) => !call.startsWith("check:"))).toEqual([
+    `remove:${CONNECTION_1}`,
+  ]);
+
+  // A registration waits for the server.
+  keys.calls.length = 0;
+  const registration = harness.service.register("claude", "Third");
+  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual(
+    busy,
+  );
+  expect(await harness.service.removeKey(CONNECTION_1)).toEqual(busy);
+  harness.writes.at(-1)?.answer(registeredAnswer("claude", "Third"));
+  await registration;
+  expect(keys.calls).toEqual([]);
+
+  // Once nothing runs, a key action goes.
+  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual({
+    outcome: "ok",
+  });
+  expect(keys.files.get(CONNECTION_1)?.deviceId).toBe(DEVICE_ID);
 });
 
 test("a removal deletes the key file only after the server confirmed it; a refusal, an unknown answer, or a sign-out keeps it", async () => {

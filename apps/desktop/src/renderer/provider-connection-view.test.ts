@@ -592,6 +592,13 @@ test("every answer of storing and removing a key has its own sentence, and none 
       }),
     ).toContain(REMOVE_PROVIDER_KEY_REFUSAL_MESSAGES[reason]);
   }
+  for (const describe of [describeSaveProviderKey, describeRemoveProviderKey]) {
+    expect(
+      describe({ outcome: "refused", reason: "busy", retryAfterMs: null }),
+    ).toContain(
+      "Another change of the AI provider connections or their API keys is still running.",
+    );
+  }
 });
 
 test("the key form opens empty for a listed connection, sends the trimmed key once, and is cleared as it is sent; ok closes it", async () => {

@@ -320,6 +320,35 @@ test("a key reaches the service once with the connection's ID, and no result, st
   expect(crossed).not.toContain(SENTINEL_KEY);
 });
 
+test("a key action that the service refused as busy crosses as that refusal", async () => {
+  const fake = fakeService();
+  const busy = {
+    outcome: "refused" as const,
+    reason: "busy" as const,
+    retryAfterMs: null,
+  };
+  // The fake's types name its default answers only.
+  fake.options.service.saveKey = () =>
+    Promise.resolve(busy as unknown as { outcome: "ok" });
+  fake.options.service.removeKey = () =>
+    Promise.resolve(
+      busy as unknown as {
+        outcome: "refused";
+        reason: "not_listed";
+        retryAfterMs: null;
+      },
+    );
+  const { call } = register(fake);
+  expect(
+    await call(INVOKE_CHANNELS.saveProviderKey, [
+      { providerConnectionId: CONNECTION, key: SENTINEL_KEY },
+    ]),
+  ).toEqual(busy);
+  expect(await call(INVOKE_CHANNELS.removeProviderKey, [CONNECTION])).toEqual(
+    busy,
+  );
+});
+
 test("a registration and a removal reach the service with their values only, and their results are parsed", async () => {
   const fake = fakeService();
   const { call } = register(fake);

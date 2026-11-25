@@ -297,4 +297,7 @@ test("the results of storing and removing a key are ok or a fixed refusal withou
     }
   }
   expect(SAVE_PROVIDER_KEY_REFUSALS).toContain("protection_unavailable");
+  // One key action at a time, and none while a write runs.
+  expect(SAVE_PROVIDER_KEY_REFUSALS).toContain("busy");
+  expect(REMOVE_PROVIDER_KEY_REFUSALS).toContain("busy");
 });
