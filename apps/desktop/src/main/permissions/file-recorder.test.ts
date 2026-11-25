@@ -155,7 +155,7 @@ function setup(
   const folder = path.join(root, ENFORCEMENT_RECORD_FOLDER);
   const logs: string[] = [];
   const recorder = createFileEnforcementRecorder({
-    folder,
+    folder: () => folder,
     platform: options.platform ?? process.platform,
     log: (message) => logs.push(message),
     ...(options.fileSystem === undefined
@@ -403,6 +403,60 @@ test("an old file that cannot be deleted does not fail the record; it is reporte
 
 // Failures.
 
+test("the folder is resolved when a file is opened, not when the recorder is created, and again after a failure", () => {
+  const root = dataFolder();
+  const folder = path.join(root, ENFORCEMENT_RECORD_FOLDER);
+  let resolutions = 0;
+  let missing = true;
+  const logs: string[] = [];
+  const recorder = createFileEnforcementRecorder({
+    folder: () => {
+      resolutions += 1;
+      if (missing) {
+        // As `deviceKeyFolder` throws on Windows without LOCALAPPDATA.
+        throw new Error(`LOCALAPPDATA is missing for ${root}`);
+      }
+      return folder;
+    },
+    platform: process.platform,
+    log: (message) => logs.push(message),
+  });
+  openRecorders.push(recorder);
+  expect(resolutions).toBe(0);
+  expect(failureOf(() => recorder.record(START))).toBe("folder_unavailable");
+  expect(failureOf(() => recorder.record(DENIAL))).toBe("folder_unavailable");
+  expect(resolutions).toBe(2);
+  missing = false;
+  recorder.record(DENIAL);
+  recorder.record(START);
+  // The open file keeps its folder.
+  expect(resolutions).toBe(3);
+  expect(
+    readFileSync(path.join(folder, enforcementRecordFileName(1)), "utf8"),
+  ).toBe(`${DENIAL_LINE}\n${START_LINE}\n`);
+  expect(logs).toEqual([
+    recordFailureMessage("folder_unavailable"),
+    RECORDS_WRITTEN_AGAIN_MESSAGE,
+  ]);
+  for (const message of logs) {
+    expect(message).not.toContain(root);
+  }
+});
+
+test("a folder that is not an absolute path fails the record with folder_unavailable and touches nothing", () => {
+  for (const resolved of ["", "enforcement-records", "./records", 42, null]) {
+    const spy = spyFileSystem();
+    const recorder = createFileEnforcementRecorder({
+      folder: () => resolved as string,
+      platform: process.platform,
+      log: () => undefined,
+      fileSystem: spy.fileSystem,
+    });
+    expect(failureOf(() => recorder.record(START))).toBe("folder_unavailable");
+    expect(spy.calls).toEqual([]);
+  }
+});
+
 test("a folder that cannot be created fails the record with folder_unavailable", () => {
   const root = dataFolder();
   // A file where the folder's parent should be.
@@ -628,7 +682,7 @@ test("no log names an ID, a path, or the error of the file system, whatever fail
 
 test("a log that throws changes nothing", () => {
   const recorder = createFileEnforcementRecorder({
-    folder: path.join(dataFolder(), "blocked", "x"),
+    folder: () => path.join(dataFolder(), "blocked", "x"),
     platform: process.platform,
     log: () => {
       throw new Error("log failed");

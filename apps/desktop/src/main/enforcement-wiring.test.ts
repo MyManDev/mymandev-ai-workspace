@@ -68,7 +68,7 @@ test("the entry point gives the enforcement point the wall clock, the grant stor
   expect(ENTRY).toMatch(/\bconst grantStore = createGrantStore\(\{/);
 });
 
-test("the entry point records to the append-only file recorder in the data folder, closes it at quit, and wires no recorder in memory", () => {
+test("the entry point records to the append-only file recorder in the local data folder of the device key, closes it at quit, and wires no recorder in memory", () => {
   expect(ENTRY.match(/\bcreateSystemEnforcementRecorder\(/g)).toHaveLength(1);
   expect(ENTRY).toMatch(
     /\n {2}const enforcementRecorder = createSystemEnforcementRecorder\(\(message\) =>\n {4}console\.info\(message\),\n {2}\);\n/,
@@ -79,7 +79,9 @@ test("the entry point records to the append-only file recorder in the data folde
       "./permissions/file-recorder-system.ts",
     ),
   ).toBe(true);
-  // The system module records to the record folder of the data folder.
+  // The system module records to the record folder of the local data folder
+  // that the device key and the repository links use (`deviceKeyFolder`,
+  // decision of 2026-11-25), resolved whenever a file is opened.
   const system = withoutComments(
     readFileSync(
       new URL("./permissions/file-recorder-system.ts", import.meta.url),
@@ -89,12 +91,26 @@ test("the entry point records to the append-only file recorder in the data folde
   expect(system).toContain(
     [
       "  return createFileEnforcementRecorder({",
-      '    folder: path.join(app.getPath("userData"), ENFORCEMENT_RECORD_FOLDER),',
+      "    folder: () =>",
+      "      path.join(",
+      "        deviceKeyFolder({",
+      "          platform: process.platform,",
+      "          env: process.env,",
+      '          userData: app.getPath("userData"),',
+      "        }),",
+      "        ENFORCEMENT_RECORD_FOLDER,",
+      "      ),",
       "    platform: process.platform,",
       "    log,",
       "  });",
     ].join("\n"),
   );
+  expect(system).toContain(
+    'import { deviceKeyFolder } from "../device-key/key-folder.ts";',
+  );
+  // One way of choosing the folder: no path of its own.
+  expect(system.match(/getPath\(/g)).toHaveLength(1);
+  expect(system).not.toMatch(/LOCALAPPDATA|APPDATA|appData|homedir/);
   // It closes at quit, after the services that check, which are added later.
   expect(ENTRY).toMatch(/\n {2}closables\.add\(enforcementRecorder\);\n/);
   expect(ENTRY.indexOf("closables.add(enforcementRecorder);")).toBeLessThan(

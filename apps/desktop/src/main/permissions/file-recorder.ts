@@ -1,9 +1,14 @@
 // The local append-only recorder of the permission enforcement point (#37,
 // first slice; decision of the Project Manager of 2026-11-25: local first,
 // cloud later). It keeps every record of the enforcement point on this
-// device, in JSON Lines files in a folder of its own inside the data folder
-// (Electron's `userData` path). An upload to the server comes in a later
-// slice; nothing here leaves the device.
+// device, in JSON Lines files in a folder of its own inside the local data
+// folder of the device key and the repository links (Project Manager
+// decision of 2026-11-25): `%LOCALAPPDATA%\MyManDev` on Windows, which a
+// roaming profile never copies, and the data folder (`userData`) on macOS
+// and Linux, which does not roam. The caller gives the folder as a function
+// (file-recorder-system.ts): it is resolved whenever a file is opened, and
+// a folder that cannot be resolved fails the record. An upload to the
+// server comes in a later slice; nothing here leaves the device.
 //
 // - Format. One record per line, UTF-8, ending with "\n": a JSON object
 //   whose first field is `version` (`ENFORCEMENT_RECORD_FORMAT_VERSION`),
@@ -38,7 +43,7 @@
 // - Permissions. The folder is created for its owner only (0o700) and each
 //   file is readable and writable by its owner only (0o600) on macOS and
 //   Linux. Windows ignores these modes: the files inherit the access rules
-//   of the data folder in the person's profile.
+//   of the local data folder in the person's profile.
 // - Logs. Fixed text with a failure code at most, once when the recorder
 //   starts failing and once when it writes again: never a record, an ID, or
 //   a path.
@@ -62,7 +67,7 @@ import {
   type EnforcementRecorder,
 } from "./enforcement.ts";
 
-/** The folder of the record files, inside the data folder. */
+/** The folder of the record files, inside the local data folder. */
 export const ENFORCEMENT_RECORD_FOLDER = "enforcement-records";
 
 /** The format version of a line; the first field of every line. */
@@ -112,7 +117,8 @@ export function enforcementRecordFileName(sequence: number): string {
  * - `record_invalid`: the record is not a denial or a shell start of the
  *   enforcement point, or it has another field.
  * - `record_too_large`: its line is longer than `maxRecordBytes`.
- * - `folder_unavailable`: the folder cannot be created or listed.
+ * - `folder_unavailable`: the folder cannot be resolved, created, or
+ *   listed.
  * - `open_failed`: no record file can be opened or created.
  * - `write_failed`: the write failed or was cut short.
  * - `sync_failed`: the record was written but could not be flushed to disk.
@@ -208,8 +214,13 @@ export const nodeRecorderFileSystem: RecorderFileSystem = Object.freeze({
 });
 
 export interface FileEnforcementRecorderOptions {
-  /** The folder of the record files: `ENFORCEMENT_RECORD_FOLDER` in `userData`. */
-  readonly folder: string;
+  /**
+   * The folder of the record files, resolved whenever a file is opened:
+   * `ENFORCEMENT_RECORD_FOLDER` in the local data folder. A throw, or a
+   * result that is not an absolute path, fails the record with
+   * `folder_unavailable`.
+   */
+  readonly folder: () => string;
   /** `process.platform`. */
   readonly platform: NodeJS.Platform;
   /** Fixed text only. */
@@ -335,7 +346,10 @@ const NEWLINE = 0x0a;
 export function createFileEnforcementRecorder(
   options: FileEnforcementRecorderOptions,
 ): FileEnforcementRecorder {
-  const { folder, platform, log } = options;
+  const { platform, log } = options;
+  const resolveFolder = options.folder;
+  /** The folder of the open file, resolved when it was opened. */
+  let folder = "";
   const fileSystem = options.fileSystem ?? nodeRecorderFileSystem;
   const limits = options.limits ?? ENFORCEMENT_RECORD_LIMITS;
   const posix = platform !== "win32";
@@ -493,6 +507,13 @@ export function createFileEnforcementRecorder(
     if (current !== null) {
       return current;
     }
+    folder = step("folder_unavailable", () => {
+      const resolved: unknown = resolveFolder();
+      if (typeof resolved !== "string" || !path.isAbsolute(resolved)) {
+        throw new TypeError("The record folder is not an absolute path.");
+      }
+      return resolved;
+    });
     step("folder_unavailable", () =>
       fileSystem.mkdirSync(folder, {
         recursive: true,
