@@ -1,6 +1,7 @@
 import { expect, test } from "vitest";
 import { INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import type {
+  RunRequestOutcome,
   RunRequestResult,
   RunRequestView,
 } from "../shared/ipc-contract.ts";
@@ -53,8 +54,10 @@ function register(
   answer: () => Promise<RunRequestResult> = () =>
     Promise.resolve({ outcome: "ok", runId: id(0x5001) }),
   appUrl: string = DEV_URL,
+  kept: () => Promise<RunRequestOutcome | null> = () => Promise.resolve(null),
 ) {
   const calls: RunRequestView[] = [];
+  const takes: string[] = [];
   const handlers = new Map<string, IpcInvokeListener>();
   registerRunRequestIpc(
     { handle: (channel, listener) => handlers.set(channel, listener) },
@@ -64,6 +67,10 @@ function register(
         request: (request) => {
           calls.push(request);
           return answer();
+        },
+        takeOutcome: (projectId) => {
+          takes.push(projectId);
+          return kept();
         },
       },
     },
@@ -75,13 +82,77 @@ function register(
     }
     return handler(event(frame(appUrl)), ...args);
   };
-  return { handlers, calls, call };
+  const take = (args: unknown[]) => {
+    const handler = handlers.get(INVOKE_CHANNELS.takeRunRequestOutcome);
+    if (handler === undefined) {
+      throw new Error("No handler for the kept outcome.");
+    }
+    return handler(event(frame(appUrl)), ...args);
+  };
+  return { handlers, calls, call, takes, take };
 }
 
-test("the run request channel is registered, and nothing else", () => {
+test("the run request channels are registered, and nothing else", () => {
   const { handlers } = register();
-  expect([...handlers.keys()]).toEqual([INVOKE_CHANNELS.requestRun]);
+  expect([...handlers.keys()]).toEqual([
+    INVOKE_CHANNELS.requestRun,
+    INVOKE_CHANNELS.takeRunRequestOutcome,
+  ]);
   expect(INVOKE_CHANNELS.requestRun).toBe("agents:request-run");
+  expect(INVOKE_CHANNELS.takeRunRequestOutcome).toBe(
+    "agents:take-run-request-outcome",
+  );
+});
+
+test("the kept outcome handler takes exactly one project ID from the application, and its result crosses without an ID", async () => {
+  const { handlers, takes } = register(undefined, APP_ENTRY_URL);
+  const handler = handlers.get(INVOKE_CHANNELS.takeRunRequestOutcome)!;
+  expect(() => handler(event(null), REQUEST.projectId)).toThrow(
+    `The call on ${INVOKE_CHANNELS.takeRunRequestOutcome} was refused: the sender is not the application.`,
+  );
+  for (const args of [
+    [],
+    [REQUEST.projectId, REQUEST.projectId],
+    [REQUEST.projectId.toUpperCase()],
+    ["project"],
+    [{ projectId: REQUEST.projectId }],
+    [7],
+  ] as unknown[][]) {
+    expect(
+      () => handler(event(frame(APP_ENTRY_URL)), ...args),
+      JSON.stringify(args),
+    ).toThrow(
+      `The call on ${INVOKE_CHANNELS.takeRunRequestOutcome} was refused: the arguments do not match the contract.`,
+    );
+  }
+  expect(takes).toEqual([]);
+
+  const kept: (RunRequestOutcome | null)[] = [
+    null,
+    { outcome: "unknown" },
+    { outcome: "refused", reason: "run_daily_limit", retryAfterMs: 60_000 },
+  ];
+  for (const outcome of kept) {
+    const { take, takes: asked } = register(undefined, DEV_URL, () =>
+      Promise.resolve(outcome),
+    );
+    expect(await take([REQUEST.projectId])).toEqual(outcome);
+    expect(asked).toEqual([REQUEST.projectId]);
+  }
+  // A run ID beside an `ok` is dropped by the contract, and a refusal out
+  // of the contract is refused.
+  const { take: withId } = register(undefined, DEV_URL, () =>
+    Promise.resolve({ outcome: "ok", runId: id(0x5001) } as RunRequestOutcome),
+  );
+  expect(await withId([REQUEST.projectId])).toEqual({ outcome: "ok" });
+  const { take: outOfContract } = register(undefined, DEV_URL, () =>
+    Promise.resolve({
+      outcome: "refused",
+      reason: "run_limit",
+      retryAfterMs: 1_000,
+    } as RunRequestOutcome),
+  );
+  await expect(outOfContract([REQUEST.projectId])).rejects.toThrow();
 });
 
 test("the handler refuses a foreign sender, and an argument outside the strict contract, before the service is asked", () => {

@@ -3,15 +3,19 @@
 // The person picks one of the agents that this device can run and one of
 // this device's AI provider connections, confirms, and the request goes to
 // the main process once. The new run shows through the agent activity, the
-// one list of runs; nothing here keeps it.
+// one list of runs; nothing here keeps it. The main process keeps the
+// outcome of the project's last request, which the screen takes once when
+// it opens, so that an answer that came while it was closed still shows.
 import type { AgentBridge } from "../shared/desktop-bridge.ts";
-import type {
-  AgentActivityView,
-  ChatMessageView,
-  ProviderConnectionListView,
-  RunRequestRefusal,
-  RunRequestResult,
-  RunRequestView,
+import {
+  type AgentActivityView,
+  type ChatMessageView,
+  type ProviderConnectionListView,
+  RUN_REQUEST_LOCAL_REFUSALS,
+  type RunRequestOutcome,
+  type RunRequestRefusal,
+  type RunRequestResult,
+  type RunRequestView,
 } from "../shared/ipc-contract.ts";
 import { PROVIDER_KIND_NAMES } from "./provider-connection-view.ts";
 import { describeWait } from "./wait-text.ts";
@@ -83,7 +87,7 @@ export const RUN_REFUSAL_MESSAGES: Readonly<
   forbidden:
     "The server refused: only the agent's owner requests its runs, and only from the device that hosts the agent.",
   not_found:
-    "The server does not know the agent, the AI provider connection on this device, or this message as yours.",
+    "The server did not find the project for your account, for example because you are not or no longer a member of its workspace, or it did not find the agent, the AI provider connection on this device, or this message as yours.",
   conflict:
     "The agent is disabled, the project or its workspace is archived, or the AI provider connection was removed.",
   run_limit:
@@ -93,8 +97,13 @@ export const RUN_REFUSAL_MESSAGES: Readonly<
   failed: "The server refused the request.",
 });
 
-/** The sentence after the answer of a run request. */
-export function describeRunResult(result: RunRequestResult): string {
+/**
+ * The sentence after the answer of a run request, also for the outcome
+ * that the main process kept, which has no run ID.
+ */
+export function describeRunResult(
+  result: RunRequestResult | RunRequestOutcome,
+): string {
   switch (result.outcome) {
     case "ok":
       return RUN_REQUEST_MESSAGES.requested;
@@ -349,15 +358,30 @@ export function continueRunForm(
 }
 
 /**
- * Cancel: from the confirmation back to the choice, and from the choice
- * the form closes and the focus goes back to its message's action.
+ * Cancel, decided by the step that `model` shows: from a shown
+ * confirmation back to the choice, and from the choice, also one that a
+ * confirmation fell back to, the form closes.
  */
-export function cancelRunForm(state: RunRequestState): RunRequestState {
+export function cancelRunForm(
+  state: RunRequestState,
+  model: RunFormModel | null,
+): RunRequestState {
   if (state.sending || state.messageId === null) {
     return state;
   }
-  if (state.step === "confirm") {
+  if (model?.step === "confirm") {
     return { ...state, step: "choose" };
+  }
+  return closeRunForm(state);
+}
+
+/**
+ * The message's "Run with agent" on an open form: the form closes from
+ * either step, and the focus goes back to that action.
+ */
+export function closeRunForm(state: RunRequestState): RunRequestState {
+  if (state.sending || state.messageId === null) {
+    return state;
   }
   return {
     ...IDLE_RUN_REQUEST,
@@ -394,6 +418,20 @@ export function confirmedRunRequest(
   };
 }
 
+/**
+ * The state after the main process's kept outcome arrived as the screen
+ * opened: its sentence shows, and the focus stays where it is. While a
+ * request of this screen waits, its own answer will say more.
+ */
+export function showKeptRunOutcome(
+  state: RunRequestState,
+  outcome: RunRequestOutcome,
+): RunRequestState {
+  return state.sending
+    ? state
+    : { ...state, notice: describeRunResult(outcome), focus: null };
+}
+
 /** The state after an answer: the form closes and the sentence shows. */
 export function finishRunRequest(
   state: RunRequestState,
@@ -413,35 +451,64 @@ export interface RunRequestController {
   readonly chooseAgent: (agentId: string) => void;
   readonly chooseConnection: (connectionId: string) => void;
   readonly continue: (model: RunFormModel | null) => void;
-  readonly cancel: () => void;
+  /** Cancel of the shown step (`cancelRunForm`). */
+  readonly cancel: (model: RunFormModel | null) => void;
+  /** The message's "Run with agent" on an open form (`closeRunForm`). */
+  readonly close: () => void;
   /** Sends the confirmed request once; nothing while one waits. */
-  readonly confirm: (model: RunFormModel | null, projectId: string) => void;
-  /** Ends the controller: answers that arrive later change nothing. */
-  readonly stop: () => void;
+  readonly confirm: (model: RunFormModel | null) => void;
+  /**
+   * Starts applying answers, and the first time takes the outcome that the
+   * main process kept for the project. The result stops it: answers that
+   * arrive while it is stopped change nothing. It can start again, as
+   * React's development mode does with an effect.
+   */
+  readonly start: () => () => void;
 }
 
 /**
- * The logic of the run request, which the chat screen's hook drives.
+ * The logic of the run request of the project `projectId`, which the chat
+ * screen's hook drives.
  *
  * - The request goes to the main process only from the confirmation, once:
  *   while it waits, every other action changes nothing, and nothing is
  *   ever sent again on its own, also not after `unknown` or a rejected
  *   call, which may have reached the server too.
  * - Every answer closes the form and shows one sentence; the focus goes
- *   back to the message's action.
+ *   back to the message's action. An answer that the screen showed is
+ *   then taken from the main process, so that it does not show again when
+ *   the screen opens later; an answer that came while the controller was
+ *   stopped stays there for the next screen.
+ * - The first start takes the outcome that the main process kept for the
+ *   project, and shows its sentence once.
  */
 export function createRunRequestController(
-  agents: Pick<AgentBridge, "requestRun">,
+  agents: Pick<AgentBridge, "requestRun" | "takeRunRequestOutcome">,
+  projectId: string,
   onState: (state: RunRequestState) => void,
   initial: RunRequestState = IDLE_RUN_REQUEST,
 ): RunRequestController {
   let state = initial;
-  let active = true;
+  let active = false;
+  let taken = false;
   const set = (next: RunRequestState) => {
     if (next !== state) {
       state = next;
       onState(next);
     }
+  };
+  /** Takes the kept outcome; `show` decides what becomes of it. */
+  const take = (show: (outcome: RunRequestOutcome) => void) => {
+    agents.takeRunRequestOutcome(projectId).then(
+      (outcome) => {
+        if (outcome !== null) {
+          show(outcome);
+        }
+      },
+      () => {
+        // Nothing kept can be shown; the screen stays as it is.
+      },
+    );
   };
   return Object.freeze({
     open: (messageId: string) => set(openRunForm(state, messageId)),
@@ -450,8 +517,9 @@ export function createRunRequestController(
       set(chooseRunConnection(state, connectionId)),
     continue: (model: RunFormModel | null) =>
       set(continueRunForm(state, model)),
-    cancel: () => set(cancelRunForm(state)),
-    confirm: (model: RunFormModel | null, projectId: string) => {
+    cancel: (model: RunFormModel | null) => set(cancelRunForm(state, model)),
+    close: () => set(closeRunForm(state)),
+    confirm: (model: RunFormModel | null) => {
       const request = confirmedRunRequest(state, model, projectId);
       if (request === null) {
         return;
@@ -459,8 +527,17 @@ export function createRunRequestController(
       set({ ...state, sending: true, notice: undefined, focus: null });
       agents.requestRun(request).then(
         (result) => {
-          if (active) {
-            set(finishRunRequest(state, describeRunResult(result)));
+          if (!active) {
+            return;
+          }
+          set(finishRunRequest(state, describeRunResult(result)));
+          // The main process kept what passed its checks; the screen
+          // showed it, so it is taken and dropped.
+          if (
+            result.outcome !== "refused" ||
+            !RUN_REQUEST_LOCAL_REFUSALS.has(result.reason)
+          ) {
+            take(() => undefined);
           }
         },
         () => {
@@ -472,8 +549,19 @@ export function createRunRequestController(
         },
       );
     },
-    stop: () => {
-      active = false;
+    start: () => {
+      active = true;
+      if (!taken) {
+        taken = true;
+        take((outcome) => {
+          if (active) {
+            set(showKeptRunOutcome(state, outcome));
+          }
+        });
+      }
+      return () => {
+        active = false;
+      };
     },
   });
 }

@@ -4,6 +4,7 @@ import type {
   AgentView,
   ChatMessageView,
   ProviderConnectionListView,
+  RunRequestOutcome,
   RunRequestResult,
   RunRequestView,
 } from "../shared/ipc-contract.ts";
@@ -11,6 +12,7 @@ import { RUN_REQUEST_REFUSALS } from "../shared/ipc-contract.ts";
 import {
   cancelRunForm,
   canRunWith,
+  closeRunForm,
   chooseRunAgent,
   confirmedRunRequest,
   continueRunForm,
@@ -24,6 +26,7 @@ import {
   runConnections,
   runnableAgents,
   type RunRequestState,
+  showKeptRunOutcome,
 } from "./run-request-view.ts";
 
 // The "Run with agent" action of the project chat (#35, part A), without a
@@ -276,14 +279,65 @@ test("Continue asks for a confirmation that names the agent and the connection, 
   expect(model?.agentLabel).toBe("Reviewer");
   expect(model?.connectionLabel).toBe("Work laptop (Claude)");
 
-  const back = cancelRunForm(confirming);
+  const back = cancelRunForm(confirming, model);
   expect(form(back)?.step).toBe("choose");
   expect(form(back)?.agentId).toBe(SECOND);
-  const closed = cancelRunForm(back);
+  const closed = cancelRunForm(back, form(back));
   expect(form(closed)).toBeNull();
   // The focus goes back to the message's action.
   expect(closed.returnFocusTo).toBe(MINE);
   expect(closed.focus).toBe("trigger");
+});
+
+test("Cancel decides by the shown step: a confirmation that fell back to the choice closes with one Cancel", () => {
+  const opened = chooseRunAgent(openRunForm(IDLE_RUN_REQUEST, MINE), SECOND);
+  const confirming = continueRunForm(opened, form(opened));
+  expect(confirming.step).toBe("confirm");
+  // The chosen agent is no longer offered: the choice shows.
+  const shown = form(confirming, {
+    activity: activity({ agents: [agent({})] }),
+  });
+  expect(shown?.step).toBe("choose");
+  const closed = cancelRunForm(confirming, shown);
+  expect(closed.messageId).toBeNull();
+  expect(closed.focus).toBe("trigger");
+  expect(closed.returnFocusTo).toBe(MINE);
+  // Without a shown form, Cancel closes too.
+  expect(cancelRunForm(confirming, null).messageId).toBeNull();
+  // While a request waits, it changes nothing.
+  const sending = { ...confirming, sending: true };
+  expect(cancelRunForm(sending, form(sending))).toBe(sending);
+});
+
+test("Run with agent on an open form closes it from either step, and keeps the last sentence", () => {
+  const opened = openRunForm(
+    { ...IDLE_RUN_REQUEST, notice: RUN_REQUEST_MESSAGES.requested },
+    MINE,
+  );
+  const confirming = continueRunForm(opened, form(opened));
+  for (const state of [opened, confirming]) {
+    const closed = closeRunForm(state);
+    expect(form(closed)).toBeNull();
+    expect(closed.notice).toBe(RUN_REQUEST_MESSAGES.requested);
+    expect(closed.returnFocusTo).toBe(MINE);
+    expect(closed.focus).toBe("trigger");
+  }
+  expect(closeRunForm(IDLE_RUN_REQUEST)).toBe(IDLE_RUN_REQUEST);
+  const sending = { ...confirming, sending: true };
+  expect(closeRunForm(sending)).toBe(sending);
+});
+
+test("the controller's close ends the form from the confirmation, where its Cancel steps back", () => {
+  const c = controlled();
+  c.controller.open(MINE);
+  c.controller.continue(c.form());
+  expect(c.form()?.step).toBe("confirm");
+  c.controller.cancel(c.form());
+  expect(c.form()?.step).toBe("choose");
+  c.controller.continue(c.form());
+  c.controller.close();
+  expect(c.form()).toBeNull();
+  expect(c.state().focus).toBe("trigger");
 });
 
 test("a confirmation whose agent or connection is no longer offered goes back to the choice, never to another agent", () => {
@@ -377,6 +431,16 @@ test("every answer has one sentence; the waits say how long, and an uncertain an
   ).toBe(
     `${RUN_REQUEST_MESSAGES.notRequested} The agent got as many new runs in 24 hours as it may get (100). Try again in 2 minutes.`,
   );
+  // The server's 404 also answers for the project: an unknown project, or
+  // an account that is not or no longer a member of its workspace.
+  expect(RUN_REFUSAL_MESSAGES.not_found).toContain(
+    "did not find the project for your account",
+  );
+  expect(RUN_REFUSAL_MESSAGES.not_found).toContain("not or no longer a member");
+  // A kept outcome has no run ID and says the same.
+  expect(describeRunResult({ outcome: "ok" })).toBe(
+    RUN_REQUEST_MESSAGES.requested,
+  );
 });
 
 /** A bridge whose answers the test gives. */
@@ -386,14 +450,28 @@ function fakeAgents() {
     resolve: (result: RunRequestResult) => void;
     reject: (error: unknown) => void;
   }[] = [];
+  /** The project of each take, and its answer. */
+  const takes: string[] = [];
+  const taken: {
+    resolve: (outcome: RunRequestOutcome | null) => void;
+    reject: (error: unknown) => void;
+  }[] = [];
   return {
     calls,
     answers,
+    takes,
+    taken,
     bridge: {
       requestRun: (request: RunRequestView) => {
         calls.push(request);
         return new Promise<RunRequestResult>((resolve, reject) => {
           answers.push({ resolve, reject });
+        });
+      },
+      takeRunRequestOutcome: (projectId: string) => {
+        takes.push(projectId);
+        return new Promise<RunRequestOutcome | null>((resolve, reject) => {
+          taken.push({ resolve, reject });
         });
       },
     },
@@ -406,16 +484,26 @@ async function settle(): Promise<void> {
   }
 }
 
-/** A controller whose state the test reads, with its form for the project. */
+/**
+ * A started controller whose state the test reads, with its form for the
+ * project. Nothing is kept for the project.
+ */
 function controlled() {
   const fake = fakeAgents();
   let state = IDLE_RUN_REQUEST;
-  const controller = createRunRequestController(fake.bridge, (next) => {
-    state = next;
-  });
+  const controller = createRunRequestController(
+    fake.bridge,
+    PROJECT,
+    (next) => {
+      state = next;
+    },
+  );
+  const stop = controller.start();
+  fake.taken[0]?.resolve(null);
   return {
     fake,
     controller,
+    stop,
     state: () => state,
     form: () => form(state),
   };
@@ -425,14 +513,15 @@ test("the confirmation sends the request once; while it waits, nothing else chan
   const c = controlled();
   c.controller.open(MINE);
   // Nothing is sent from the choice.
-  c.controller.confirm(c.form(), PROJECT);
+  c.controller.confirm(c.form());
   expect(c.fake.calls).toEqual([]);
   c.controller.continue(c.form());
   const shown = c.form();
-  c.controller.confirm(shown, PROJECT);
+  c.controller.confirm(shown);
   // A second press, and every other action, while it waits.
-  c.controller.confirm(shown, PROJECT);
-  c.controller.cancel();
+  c.controller.confirm(shown);
+  c.controller.cancel(shown);
+  c.controller.close();
   c.controller.open(MINE);
   c.controller.chooseAgent(SECOND);
   expect(c.fake.calls).toEqual([
@@ -464,7 +553,7 @@ test("an uncertain answer and a rejected call say that the run may have been cre
     const c = controlled();
     c.controller.open(MINE);
     c.controller.continue(c.form());
-    c.controller.confirm(c.form(), PROJECT);
+    c.controller.confirm(c.form());
     settleWith(c.fake.answers[0]!);
     await settle();
     expect(c.state().notice).toBe(RUN_REQUEST_MESSAGES.unknown);
@@ -478,7 +567,7 @@ test("a refusal closes the form with its sentence, and only a new confirmation s
   const c = controlled();
   c.controller.open(MINE);
   c.controller.continue(c.form());
-  c.controller.confirm(c.form(), PROJECT);
+  c.controller.confirm(c.form());
   c.fake.answers[0]?.resolve({
     outcome: "refused",
     reason: "run_limit",
@@ -495,18 +584,167 @@ test("a refusal closes the form with its sentence, and only a new confirmation s
     `${RUN_REQUEST_MESSAGES.notRequested} ${RUN_REFUSAL_MESSAGES.run_limit}`,
   );
   c.controller.continue(c.form());
-  c.controller.confirm(c.form(), PROJECT);
+  c.controller.confirm(c.form());
   expect(c.fake.calls).toHaveLength(2);
 });
 
-test("an answer after the screen stopped changes nothing", async () => {
+test("an answer after the screen stopped changes nothing, and stays in the main process for the next screen", async () => {
   const c = controlled();
   c.controller.open(MINE);
   c.controller.continue(c.form());
-  c.controller.confirm(c.form(), PROJECT);
+  c.controller.confirm(c.form());
   const before = c.state();
-  c.controller.stop();
+  c.stop();
   c.fake.answers[0]?.resolve({ outcome: "ok", runId: RUN });
   await settle();
   expect(c.state()).toBe(before);
+  // Not taken: the next screen of the project shows it.
+  expect(c.fake.takes).toEqual([PROJECT]);
+});
+
+test("React's development mode stops and starts the controller again, and an answer still shows (StrictMode)", async () => {
+  const fake = fakeAgents();
+  let state = IDLE_RUN_REQUEST;
+  const controller = createRunRequestController(
+    fake.bridge,
+    PROJECT,
+    (next) => {
+      state = next;
+    },
+  );
+  // The effect, its cleanup, and the effect again, with the same controller.
+  const stopFirst = controller.start();
+  stopFirst();
+  const stop = controller.start();
+  // The kept outcome is asked for once, and its answer still shows.
+  expect(fake.takes).toEqual([PROJECT]);
+  fake.taken[0]?.resolve({ outcome: "unknown" });
+  await settle();
+  expect(state.notice).toBe(RUN_REQUEST_MESSAGES.unknown);
+
+  controller.open(MINE);
+  controller.continue(form(state));
+  controller.confirm(form(state));
+  fake.answers[0]?.resolve({ outcome: "ok", runId: RUN });
+  await settle();
+  expect(state.notice).toBe(RUN_REQUEST_MESSAGES.requested);
+  expect(state.sending).toBe(false);
+  expect(form(state)).toBeNull();
+  stop();
+});
+
+test("the first start shows the outcome that the main process kept for the project once, without moving the focus", async () => {
+  const fake = fakeAgents();
+  let state = IDLE_RUN_REQUEST;
+  const controller = createRunRequestController(
+    fake.bridge,
+    PROJECT,
+    (next) => {
+      state = next;
+    },
+  );
+  // Nothing is asked before the screen shows.
+  expect(fake.takes).toEqual([]);
+  const stop = controller.start();
+  expect(fake.takes).toEqual([PROJECT]);
+  // The person opened a form and cancelled it meanwhile: the focus went
+  // back to the message's action, and the kept outcome does not move it.
+  controller.open(MINE);
+  controller.cancel(form(state));
+  expect(state.focus).toBe("trigger");
+  fake.taken[0]?.resolve({
+    outcome: "refused",
+    reason: "run_daily_limit",
+    retryAfterMs: 90_000,
+  });
+  await settle();
+  expect(state.notice).toBe(
+    `${RUN_REQUEST_MESSAGES.notRequested} ${RUN_REFUSAL_MESSAGES.run_daily_limit("2 minutes")}`,
+  );
+  expect(state.focus).toBeNull();
+  // Started again, it does not ask again.
+  stop();
+  controller.start();
+  expect(fake.takes).toEqual([PROJECT]);
+});
+
+test("a kept outcome that arrives after the screen stopped, nothing kept, or a failed take changes nothing", async () => {
+  const cases: [boolean, (fake: ReturnType<typeof fakeAgents>) => void][] = [
+    [true, (fake) => fake.taken[0]?.resolve({ outcome: "unknown" })],
+    [false, (fake) => fake.taken[0]?.resolve(null)],
+    [false, (fake) => fake.taken[0]?.reject(new Error("lost"))],
+  ];
+  for (const [stopFirst, finish] of cases) {
+    const fake = fakeAgents();
+    const states: RunRequestState[] = [];
+    const controller = createRunRequestController(
+      fake.bridge,
+      PROJECT,
+      (next) => states.push(next),
+    );
+    const stop = controller.start();
+    if (stopFirst) {
+      stop();
+    }
+    finish(fake);
+    await settle();
+    expect(states).toEqual([]);
+  }
+});
+
+test("a kept outcome never replaces the wait of a request of the screen itself", () => {
+  const sending = { ...IDLE_RUN_REQUEST, messageId: MINE, sending: true };
+  expect(showKeptRunOutcome(sending, { outcome: "unknown" })).toBe(sending);
+  const open = {
+    ...openRunForm(IDLE_RUN_REQUEST, MINE),
+    focus: "notice" as const,
+  };
+  expect(showKeptRunOutcome(open, { outcome: "ok" })).toEqual({
+    ...open,
+    notice: RUN_REQUEST_MESSAGES.requested,
+    focus: null,
+  });
+});
+
+test("an answer that the screen showed is taken from the main process, except a refusal of the main process's own checks, which it never keeps", async () => {
+  const cases: [RunRequestResult, boolean][] = [
+    [{ outcome: "ok", runId: RUN }, true],
+    [{ outcome: "unknown" }, true],
+    [{ outcome: "refused", reason: "run_limit", retryAfterMs: null }, true],
+    [{ outcome: "refused", reason: "not_signed_in", retryAfterMs: null }, true],
+    [{ outcome: "refused", reason: "busy", retryAfterMs: null }, false],
+    [
+      { outcome: "refused", reason: "message_not_found", retryAfterMs: null },
+      false,
+    ],
+  ];
+  for (const [result, takes] of cases) {
+    const c = controlled();
+    c.controller.open(MINE);
+    c.controller.continue(c.form());
+    c.controller.confirm(c.form());
+    c.fake.answers[0]?.resolve(result);
+    await settle();
+    expect(c.state().notice, JSON.stringify(result)).toBe(
+      describeRunResult(result),
+    );
+    // The first take is the start's.
+    expect(c.fake.takes, JSON.stringify(result)).toEqual(
+      takes ? [PROJECT, PROJECT] : [PROJECT],
+    );
+    // What that take answers changes nothing on the screen.
+    const shown = c.state();
+    c.fake.taken[1]?.resolve({ outcome: "unknown" });
+    await settle();
+    expect(c.state()).toBe(shown);
+  }
+  // A rejected call is not taken: what the main process kept shows on the
+  // next screen.
+  const c = controlled();
+  c.controller.open(MINE);
+  c.controller.continue(c.form());
+  c.controller.confirm(c.form());
+  c.fake.answers[0]?.reject(new Error("lost"));
+  await settle();
+  expect(c.fake.takes).toEqual([PROJECT]);
 });

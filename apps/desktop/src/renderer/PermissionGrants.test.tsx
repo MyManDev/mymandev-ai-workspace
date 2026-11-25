@@ -462,6 +462,7 @@ test("with the bridges, the screen subscribes once it is shown and first says th
           getState: unused,
           subscribeState: unused,
           requestRun: unused,
+          takeRunRequestOutcome: unused,
         } as AgentBridge
       }
       projectRepositories={

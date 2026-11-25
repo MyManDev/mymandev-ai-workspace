@@ -19,7 +19,9 @@ import {
   PROVIDER_CONNECTION_READ_PROBLEMS,
   ProviderConnectionsResultSchema,
   REVOKE_GRANT_REFUSALS,
+  RUN_REQUEST_LOCAL_REFUSALS,
   RUN_REQUEST_REFUSALS,
+  RunRequestOutcomeSchema,
   RunRequestResultSchema,
   RunRequestViewSchema,
   RevokeGrantResultSchema,
@@ -359,9 +361,10 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       !GRANT_ACTION_CHANNELS.has(channel) &&
       channel !== INVOKE_CHANNELS.registerProviderConnection &&
       channel !== INVOKE_CHANNELS.removeProviderConnection &&
-      channel !== INVOKE_CHANNELS.requestRun,
+      channel !== INVOKE_CHANNELS.requestRun &&
+      channel !== INVOKE_CHANNELS.takeRunRequestOutcome,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 46);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 47);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [
@@ -3197,6 +3200,63 @@ test("a run request result is ok with the run's ID, refused with a fixed reason 
     "rate_limited",
   ]) {
     expect(RUN_REQUEST_REFUSALS).toContain(reason);
+  }
+});
+
+test("a kept run request outcome takes one project ID, and crosses without a run ID: ok, a refusal with a wait for a wait only, or unknown (#35)", () => {
+  const { args, result } =
+    INVOKE_CONTRACT[INVOKE_CHANNELS.takeRunRequestOutcome];
+  expect(args.parse([AGENT_PROJECT_ID])).toEqual([AGENT_PROJECT_ID]);
+  for (const value of [
+    [],
+    [AGENT_PROJECT_ID, AGENT_PROJECT_ID],
+    [AGENT_PROJECT_ID.toUpperCase()],
+    [{ projectId: AGENT_PROJECT_ID }],
+    [null],
+  ]) {
+    expect(args.safeParse(value).success).toBe(false);
+  }
+  expect(result.parse(null)).toBeNull();
+  // The run's ID never crosses.
+  expect(result.parse({ outcome: "ok", runId: RUN_ID })).toEqual({
+    outcome: "ok",
+  });
+  expect(RunRequestOutcomeSchema.parse({ outcome: "unknown" })).toEqual({
+    outcome: "unknown",
+  });
+  expect(
+    RunRequestOutcomeSchema.parse({
+      outcome: "refused",
+      reason: "run_daily_limit",
+      retryAfterMs: 1,
+    }),
+  ).toEqual({ outcome: "refused", reason: "run_daily_limit", retryAfterMs: 1 });
+  for (const value of [
+    { outcome: "refused", reason: "run_limit", retryAfterMs: 1_000 },
+    { outcome: "refused", reason: "run_daily_limit", retryAfterMs: null },
+    { outcome: "refused", reason: "run_daily_limit", retryAfterMs: 0 },
+    { outcome: "queued" },
+  ]) {
+    expect(RunRequestOutcomeSchema.safeParse(value).success).toBe(false);
+  }
+  // The main process's own refusals, which it never keeps, are refusals of
+  // the contract, and none of the server's.
+  for (const reason of RUN_REQUEST_LOCAL_REFUSALS) {
+    expect(RUN_REQUEST_REFUSALS).toContain(reason);
+  }
+  for (const reason of [
+    "not_signed_in",
+    "unavailable",
+    "too_soon",
+    "rate_limited",
+    "forbidden",
+    "not_found",
+    "conflict",
+    "run_limit",
+    "run_daily_limit",
+    "failed",
+  ] as const) {
+    expect(RUN_REQUEST_LOCAL_REFUSALS.has(reason)).toBe(false);
   }
 });
 

@@ -554,10 +554,13 @@ function runRecorder() {
     chooseConnection: (connectionId) =>
       calls.push(`chooseConnection ${connectionId}`),
     continue: (model) => calls.push(`continue ${model?.messageId ?? ""}`),
-    cancel: () => calls.push("cancel"),
-    confirm: (model, projectId) =>
-      calls.push(`confirm ${model?.agentId ?? ""} ${projectId}`),
-    stop: () => calls.push("stop"),
+    cancel: (model) => calls.push(`cancel ${model?.step ?? ""}`),
+    close: () => calls.push("close"),
+    confirm: (model) => calls.push(`confirm ${model?.agentId ?? ""}`),
+    start: () => {
+      calls.push("start");
+      return () => calls.push("stop");
+    },
   };
   return { calls, actions };
 }
@@ -689,7 +692,8 @@ test("the confirmation names the agent and the connection, with Cancel first, an
   for (const button of buttons) {
     button.props.onClick?.();
   }
-  expect(calls).toEqual(["cancel", `confirm ${RUN_AGENT} ${PROJECT}`]);
+  // Each gets the shown form, so Cancel decides by the shown step.
+  expect(calls).toEqual(["cancel confirm", `confirm ${RUN_AGENT}`]);
 });
 
 test("while a request waits, its buttons are disabled and say so", () => {
@@ -713,7 +717,9 @@ test("Run with agent opens its message's form, and on an open form closes it; th
       ?.props.onClick?.();
   open(IDLE_RUN_REQUEST);
   open(OPEN);
-  expect(calls).toEqual([`open ${OWN_MESSAGE}`, "cancel"]);
+  // On a confirmation too, it closes the form rather than step back.
+  open(CONFIRMING);
+  expect(calls).toEqual([`open ${OWN_MESSAGE}`, "close", "close"]);
   const html = render({
     run: runProps({
       ...IDLE_RUN_REQUEST,

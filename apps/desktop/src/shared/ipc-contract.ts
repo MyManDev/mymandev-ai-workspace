@@ -3093,9 +3093,11 @@ export type RunRequestView = z.infer<typeof RunRequestViewSchema>;
  *   other writes; `rate_limited` is the account's limit of requests.
  * - `forbidden`: the server found that the account does not own the agent
  *   or that this device is not its host device.
- * - `not_found`: the server does not know the agent in the project, the
- *   connection on the agent's host device, or the message as the
- *   account's own and not deleted.
+ * - `not_found`: the server does not know the project for the account
+ *   (the account is not, or no longer, a member of its workspace, or the
+ *   project does not exist), the agent in the project, the connection on
+ *   the agent's host device, or the message as the account's own and not
+ *   deleted.
  * - `conflict`: the project or its workspace is archived, the agent is
  *   disabled, or the connection is removed.
  * - `run_limit`: the agent has as many unfinished runs as the server
@@ -3128,6 +3130,24 @@ export const RUN_REQUEST_REFUSALS = Object.freeze([
 ] as const);
 export type RunRequestRefusal = (typeof RUN_REQUEST_REFUSALS)[number];
 
+/**
+ * The refusals of a run request that the main process gives from its own
+ * checks, before anything is sent. The main process keeps the outcome of
+ * every other request (`RunRequestOutcomeSchema`).
+ */
+export const RUN_REQUEST_LOCAL_REFUSALS: ReadonlySet<RunRequestRefusal> =
+  new Set<RunRequestRefusal>([
+    "invalid",
+    "not_open",
+    "not_owner",
+    "not_hosted_here",
+    "disabled",
+    "message_not_found",
+    "not_own_message",
+    "connection_not_here",
+    "busy",
+  ]);
+
 /** The refusals of a run request that say when the next request may go. */
 const RUN_REQUEST_WAITS: ReadonlySet<string> = new Set([
   "too_soon",
@@ -3144,22 +3164,39 @@ const RUN_REQUEST_WAITS: ReadonlySet<string> = new Set([
  * never sent again on its own: the same request sent again would create a
  * second run.
  */
+const RunRequestRefusedSchema = z
+  .object({
+    outcome: z.literal("refused"),
+    reason: z.enum(RUN_REQUEST_REFUSALS),
+    retryAfterMs: z.int().positive().nullable(),
+  })
+  .refine(
+    (value) =>
+      RUN_REQUEST_WAITS.has(value.reason) === (value.retryAfterMs !== null),
+    { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
+  );
+
 export const RunRequestResultSchema = z.discriminatedUnion("outcome", [
   z.object({ outcome: z.literal("ok"), runId: ProtocolIdSchema }),
-  z
-    .object({
-      outcome: z.literal("refused"),
-      reason: z.enum(RUN_REQUEST_REFUSALS),
-      retryAfterMs: z.int().positive().nullable(),
-    })
-    .refine(
-      (value) =>
-        RUN_REQUEST_WAITS.has(value.reason) === (value.retryAfterMs !== null),
-      { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
-    ),
+  RunRequestRefusedSchema,
   CreateUnknownSchema,
 ]);
 export type RunRequestResult = z.infer<typeof RunRequestResultSchema>;
+
+/**
+ * The outcome of a project's last run request as the main process keeps it
+ * (#35): what the screen said after the answer, without the run's ID, so
+ * that a chat screen opened later says it once. `ok` without an ID, a
+ * refusal with its wait counted from the answer and at least 1 ms, or
+ * `unknown`. Only a request that passed the main process's own checks is
+ * kept (`RUN_REQUEST_LOCAL_REFUSALS`).
+ */
+export const RunRequestOutcomeSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  RunRequestRefusedSchema,
+  CreateUnknownSchema,
+]);
+export type RunRequestOutcome = z.infer<typeof RunRequestOutcomeSchema>;
 
 // The chat of the open project (#27).
 
@@ -4243,6 +4280,12 @@ export const INVOKE_CONTRACT = Object.freeze({
     /** The project, the agent, the connection, and the input message. */
     args: z.tuple([RunRequestViewSchema]),
     result: RunRequestResultSchema,
+  }),
+  [INVOKE_CHANNELS.takeRunRequestOutcome]: Object.freeze({
+    /** The project whose chat screen opens. */
+    args: z.tuple([ProtocolIdSchema]),
+    /** Null when nothing is kept for it. */
+    result: RunRequestOutcomeSchema.nullable(),
   }),
   [INVOKE_CHANNELS.getGrantState]: Object.freeze({
     args: NoArgumentsSchema,

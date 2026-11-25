@@ -332,6 +332,14 @@ export const INVOKE_CHANNELS = Object.freeze({
    */
   requestRun: "agents:request-run",
   /**
+   * The outcome of the last run request of a project that the main process
+   * keeps (#35), by the project ID, taken once: the chat screen shows it
+   * when it opens for that project, so that an answer that came while the
+   * screen was not shown is not lost. Waits for a request of that project
+   * that is still on its way. No ID crosses.
+   */
+  takeRunRequestOutcome: "agents:take-run-request-outcome",
+  /**
    * What the renderer may know of the grants of the open project's agents
    * (#342), from this device's grant records: never an account or a host
    * device.

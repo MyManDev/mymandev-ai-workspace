@@ -12,6 +12,7 @@ import {
 import { expect, test } from "vitest";
 import {
   RUN_REQUEST_REFUSALS,
+  RunRequestOutcomeSchema,
   RunRequestResultSchema,
   type AccountStatus,
   type RunRequestResult,
@@ -27,7 +28,7 @@ import {
 } from "../api-actions.ts";
 import type { ChatState } from "../chat/service.ts";
 import type { ProviderConnectionsState } from "../provider-connections/service.ts";
-import { createRunRequests } from "./run-request.ts";
+import { createRunRequests, KEPT_RUN_REQUEST_OUTCOMES } from "./run-request.ts";
 import type { AgentActivityState } from "./service.ts";
 
 // Requesting a run from the project chat (#35, part A) in the main process:
@@ -193,6 +194,7 @@ function setup() {
   const sent: Sent[] = [];
   const logs: string[] = [];
   let reloads = 0;
+  let clock = 1_000_000;
   const service = createRunRequests({
     account: {
       status: () => status,
@@ -214,6 +216,7 @@ function setup() {
     },
     providerConnections: { state: () => connections },
     log: (entry) => logs.push(entry),
+    now: () => clock,
   });
   return {
     service,
@@ -234,6 +237,9 @@ function setup() {
     },
     setOwnMember(next: MemberId | null) {
       ownMember = next;
+    },
+    advance(ms: number) {
+      clock += ms;
     },
   };
 }
@@ -355,11 +361,7 @@ test("each local refusal sends nothing and reloads nothing", async () => {
         h.setChat({
           messages: [
             ChatMessageSchema.parse({
-              ...message(
-                FOREIGN_MESSAGE,
-                { kind: "member", memberId: ME },
-                4,
-              ),
+              ...message(FOREIGN_MESSAGE, { kind: "member", memberId: ME }, 4),
               projectId: OTHER_PROJECT,
             }),
           ],
@@ -663,5 +665,251 @@ test("every result crosses the contract", () => {
   ];
   for (const result of results) {
     expect(RunRequestResultSchema.parse(result)).toEqual(result);
+  }
+});
+
+// ---- The kept outcome (#35) ------------------------------------------
+
+/** Opens `projectId` with the account's agent and the person's message. */
+function openProject(
+  h: ReturnType<typeof setup>,
+  projectId: ProjectId,
+  hostDeviceId: string = DEVICE,
+): void {
+  h.setActivity({
+    projectId,
+    agents: [{ ...agent(AGENT, ME, hostDeviceId), projectId }],
+  });
+  h.setChat({
+    projectId,
+    messages: [
+      ChatMessageSchema.parse({
+        ...message(MY_MESSAGE, { kind: "member", memberId: ME }, 1),
+        projectId,
+      }),
+    ],
+  });
+}
+
+/** A project ID of the test's own, `n` from 1. */
+function project(n: number): ProjectId {
+  return id(0x7000 + n) as ProjectId;
+}
+
+test("the outcome of a sent request is kept for its project without the run's ID, and taken once", async () => {
+  const h = setup();
+  const answer = h.service.request(REQUEST);
+  h.sent[0]?.resolve({ ok: true, value: created() });
+  expect(await answer).toEqual({ outcome: "ok", runId: RUN });
+  const kept = await h.service.takeOutcome(PROJECT);
+  expect(kept).toEqual({ outcome: "ok" });
+  expect(JSON.stringify(kept)).not.toContain(RUN);
+  // Once only.
+  expect(await h.service.takeOutcome(PROJECT)).toBeNull();
+  // Another project has nothing kept, and an ID that is not one is null.
+  expect(await h.service.takeOutcome(OTHER_PROJECT)).toBeNull();
+  expect(await h.service.takeOutcome("project")).toBeNull();
+});
+
+test("every outcome of a sent request is kept, also unknown after a thrown error, and a later request replaces it", async () => {
+  const h = setup();
+  let answer = h.service.request(REQUEST);
+  h.sent[0]?.reject(new Error("lost"));
+  expect(await answer).toEqual({ outcome: "unknown" });
+  answer = h.service.request(REQUEST);
+  h.sent[1]?.resolve(
+    workspaceActionSent(
+      workspaceActionFailedFor(
+        { ok: false, reason: "refused", code: "run_limit" },
+        "createRun",
+      ),
+    ),
+  );
+  await answer;
+  expect(await h.service.takeOutcome(PROJECT)).toEqual(
+    refusedWith("run_limit"),
+  );
+  answer = h.service.request(REQUEST);
+  h.sent[2]?.resolve(workspaceActionFailed("unknown"));
+  await answer;
+  expect(await h.service.takeOutcome(PROJECT)).toEqual({ outcome: "unknown" });
+  // A refusal of the account service, which sent nothing, is kept too: it
+  // is what the screen said.
+  answer = h.service.request(REQUEST);
+  h.sent[3]?.resolve(workspaceActionFailed("too_soon", 5_000));
+  await answer;
+  expect(await h.service.takeOutcome(PROJECT)).toEqual(
+    refusedWith("too_soon", 5_000),
+  );
+});
+
+test("a refusal of the service's own checks is not kept", async () => {
+  const h = setup();
+  for (const request of [
+    { ...REQUEST, inputMessageId: THEIR_MESSAGE },
+    { ...REQUEST, agentId: ELSEWHERE },
+    { ...REQUEST, providerConnectionId: OTHER_CONNECTION },
+  ]) {
+    expect((await h.service.request(request)).outcome).toBe("refused");
+    expect(await h.service.takeOutcome(PROJECT)).toBeNull();
+  }
+  // A busy refusal does not replace the outcome of the request on its way.
+  const first = h.service.request(REQUEST);
+  expect(await h.service.request(REQUEST)).toEqual(refusedWith("busy"));
+  h.sent[0]?.resolve(workspaceActionFailed("unknown"));
+  await first;
+  expect(await h.service.takeOutcome(PROJECT)).toEqual({ outcome: "unknown" });
+});
+
+test("a take while a request of that project is on its way waits for its outcome; another project's does not wait", async () => {
+  const h = setup();
+  const answer = h.service.request(REQUEST);
+  let taken: unknown = "waiting";
+  const take = h.service.takeOutcome(PROJECT).then((outcome) => {
+    taken = outcome;
+  });
+  expect(await h.service.takeOutcome(OTHER_PROJECT)).toBeNull();
+  await settle();
+  expect(taken).toBe("waiting");
+  h.sent[0]?.resolve(workspaceActionFailed("unknown"));
+  await answer;
+  await take;
+  expect(taken).toEqual({ outcome: "unknown" });
+  // Taken by the waiting screen: nothing is left.
+  expect(await h.service.takeOutcome(PROJECT)).toBeNull();
+});
+
+test("a kept wait counts from the answer, and one that passed is the shortest", async () => {
+  const h = setup();
+  const daily = () =>
+    workspaceActionSent(
+      workspaceActionFailedFor(
+        {
+          ok: false,
+          reason: "refused",
+          code: "run_daily_limit",
+          retryAfterSeconds: 3_600,
+        },
+        "createRun",
+      ),
+    );
+  let answer = h.service.request(REQUEST);
+  h.sent[0]?.resolve(daily());
+  expect(await answer).toEqual(refusedWith("run_daily_limit", 3_600_000));
+  h.advance(600_000);
+  expect(await h.service.takeOutcome(PROJECT)).toEqual(
+    refusedWith("run_daily_limit", 3_000_000),
+  );
+  answer = h.service.request(REQUEST);
+  h.sent[1]?.resolve(daily());
+  await answer;
+  h.advance(3_600_000 + 1);
+  expect(await h.service.takeOutcome(PROJECT)).toEqual(
+    refusedWith("run_daily_limit", 1),
+  );
+});
+
+test("only the latest projects are kept, the oldest dropped first", async () => {
+  const h = setup();
+  const count = KEPT_RUN_REQUEST_OUTCOMES + 1;
+  for (let n = 1; n <= count; n += 1) {
+    openProject(h, project(n));
+    const answer = h.service.request({ ...REQUEST, projectId: project(n) });
+    h.sent[n - 1]?.resolve(workspaceActionFailed("unknown"));
+    await answer;
+  }
+  // The first project, the oldest, is dropped; the others are kept.
+  expect(await h.service.takeOutcome(project(1))).toBeNull();
+  for (let n = 2; n <= count; n += 1) {
+    expect(await h.service.takeOutcome(project(n)), String(n)).toEqual({
+      outcome: "unknown",
+    });
+  }
+  // A project asked again becomes the newest: the next one over the limit
+  // drops the second project, not the first.
+  const again = setup();
+  const order = [
+    ...Array.from(
+      { length: KEPT_RUN_REQUEST_OUTCOMES },
+      (_, index) => index + 1,
+    ),
+    1,
+    count,
+  ];
+  for (const [index, which] of order.entries()) {
+    openProject(again, project(which));
+    const answer = again.service.request({
+      ...REQUEST,
+      projectId: project(which),
+    });
+    again.sent[index]?.resolve(workspaceActionFailed("unknown"));
+    await answer;
+  }
+  expect(await again.service.takeOutcome(project(2))).toBeNull();
+  expect(await again.service.takeOutcome(project(1))).toEqual({
+    outcome: "unknown",
+  });
+  expect(KEPT_RUN_REQUEST_OUTCOMES).toBe(20);
+});
+
+test("a sign-out or another device drops every kept outcome", async () => {
+  const h = setup();
+  openProject(h, project(1));
+  let answer = h.service.request({ ...REQUEST, projectId: project(1) });
+  h.sent[0]?.resolve(workspaceActionFailed("unknown"));
+  await answer;
+  openProject(h, project(2));
+  answer = h.service.request({ ...REQUEST, projectId: project(2) });
+  h.sent[1]?.resolve(workspaceActionFailed("unknown"));
+  await answer;
+  // Signed out: nothing, and nothing comes back with the next sign-in.
+  h.setStatus({ ...signedIn(), device: "signed_out" } as AccountStatus);
+  expect(await h.service.takeOutcome(project(1))).toBeNull();
+  h.setStatus(signedIn());
+  expect(await h.service.takeOutcome(project(2))).toBeNull();
+
+  // Another device's request drops this device's outcomes as it is kept.
+  const d = setup();
+  openProject(d, project(1));
+  answer = d.service.request({ ...REQUEST, projectId: project(1) });
+  d.sent[0]?.resolve(workspaceActionFailed("unknown"));
+  await answer;
+  d.setStatus(signedIn(OTHER_DEVICE));
+  openProject(d, project(2), OTHER_DEVICE);
+  answer = d.service.request({ ...REQUEST, projectId: project(2) });
+  d.sent[1]?.resolve(workspaceActionFailed("unknown"));
+  await answer;
+  d.setStatus(signedIn());
+  expect(await d.service.takeOutcome(project(1))).toBeNull();
+});
+
+test("after close, nothing kept is given", async () => {
+  const h = setup();
+  const answer = h.service.request(REQUEST);
+  h.sent[0]?.resolve(workspaceActionFailed("unknown"));
+  await answer;
+  h.service.close();
+  expect(await h.service.takeOutcome(PROJECT)).toBeNull();
+});
+
+test("every kept outcome crosses the contract", async () => {
+  const h = setup();
+  const answers: WorkspaceActionResult<unknown, RunCreationFailure>[] = [
+    { ok: true, value: created() },
+    workspaceActionFailed("unknown"),
+    workspaceActionFailed("rate_limited", 30_000),
+    workspaceActionSent(
+      workspaceActionFailedFor(
+        { ok: false, reason: "refused", code: "run_limit" },
+        "createRun",
+      ),
+    ),
+  ];
+  for (const [index, result] of answers.entries()) {
+    const answer = h.service.request(REQUEST);
+    h.sent[index]?.resolve(result);
+    await answer;
+    const kept = await h.service.takeOutcome(PROJECT);
+    expect(RunRequestOutcomeSchema.parse(kept)).toEqual(kept);
   }
 });

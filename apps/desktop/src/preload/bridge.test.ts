@@ -192,6 +192,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
     "getState",
     "requestRun",
     "subscribeState",
+    "takeRunRequestOutcome",
   ]);
   expect(Object.keys(bridge.grants).sort()).toEqual([
     "getState",
@@ -2192,6 +2193,26 @@ test("a run request refuses a value of another type without calling the main pro
     expect(String(error)).not.toContain("secret-token");
   }
   expect(fake.invoked).toEqual([]);
+});
+
+test("a kept run request outcome is asked for with the project ID string alone, and another value is refused without calling the main process (#35)", async () => {
+  const fake = fakeIpc();
+  const take = createDesktopBridge("44.9.1", fake.ipc).agents
+    .takeRunRequestOutcome as (...args: unknown[]) => Promise<unknown>;
+  const answer = take(PROJECT_ID, "extra");
+  fake.answers[0]?.resolve({ outcome: "unknown" });
+  await expect(answer).resolves.toEqual({ outcome: "unknown" });
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.takeRunRequestOutcome, args: [PROJECT_ID] },
+  ]);
+  for (const value of [undefined, null, 7, { projectId: PROJECT_ID }]) {
+    const error = await take(value).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(TypeError);
+  }
+  expect(fake.invoked).toHaveLength(1);
 });
 
 test("the agent subscription delivers the activity and every newer one, without the event object", async () => {

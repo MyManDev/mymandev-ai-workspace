@@ -369,6 +369,7 @@ test("with the bridge, the agent panel waits for the first agent activity", () =
     getState: () => Promise.reject(new Error("not called")),
     subscribeState: () => () => undefined,
     requestRun: () => Promise.reject(new Error("not called")),
+    takeRunRequestOutcome: () => Promise.resolve(null),
   };
   const html = render({
     agents,
@@ -950,6 +951,7 @@ test("the project panel's content gives the repository panel the repository brid
     getState: () => Promise.reject(new Error("not called")),
     subscribeState: () => () => undefined,
     requestRun: () => Promise.reject(new Error("not called")),
+    takeRunRequestOutcome: () => Promise.resolve(null),
   };
   const mounts: RepositoryPanelView = {
     kind: "known",

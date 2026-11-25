@@ -63,7 +63,7 @@ export function ChatScreen({
   return (
     <ChatScreenContent
       {...useChatScreen(chat)}
-      run={useRunRequest(agents, providerConnections)}
+      run={useRunRequest(agents, providerConnections, projectId)}
       projectId={projectId}
     />
   );
@@ -313,10 +313,11 @@ function MessageItem({
               : undefined
           }
           onClick={() => {
+            // On an open form, from either step, it closes the form.
             if (form === null) {
               runs.actions.open(message.id);
             } else {
-              runs.actions.cancel();
+              runs.actions.close();
             }
           }}
         >
@@ -379,14 +380,14 @@ function RunForm({
           type="button"
           autoFocus
           disabled={form.sending}
-          onClick={() => runs.actions.cancel()}
+          onClick={() => runs.actions.cancel(form)}
         >
           {RUN_REQUEST_MESSAGES.cancel}
         </button>{" "}
         <button
           type="button"
           disabled={form.sending}
-          onClick={() => runs.actions.confirm(form, runs.projectId)}
+          onClick={() => runs.actions.confirm(form)}
         >
           {RUN_REQUEST_MESSAGES.confirm}
         </button>
@@ -449,7 +450,7 @@ function RunForm({
       <button
         type="button"
         autoFocus={form.problem !== undefined}
-        onClick={() => runs.actions.cancel()}
+        onClick={() => runs.actions.cancel(form)}
       >
         {RUN_REQUEST_MESSAGES.cancel}
       </button>
@@ -579,13 +580,17 @@ function Composer({
 
 /**
  * Follows the agent activity and this device's provider connections while
- * the screen is shown, and carries out the run request (#35). The focus
- * goes back to a message's "Run with agent" after a cancel, and to the
- * sentence after an answer. Undefined without the agent bridge.
+ * the screen is shown, and carries out the run request (#35) of the
+ * project. The focus goes back to a message's "Run with agent" after a
+ * cancel, and to the sentence after an answer. The controller starts with
+ * the effect and stops with its cleanup, so that it applies answers again
+ * when React's development mode runs the effect a second time. Undefined
+ * without the agent bridge.
  */
 function useRunRequest(
   agents: AgentBridge | undefined,
   providerConnections: ProviderConnectionsBridge | undefined,
+  projectId: string,
 ): ChatRunProps | undefined {
   const [state, setState] = useState<RunRequestState>(IDLE_RUN_REQUEST);
   const [activity, setActivity] = useState<AgentActivityView | undefined>(
@@ -598,10 +603,10 @@ function useRunRequest(
     () =>
       agents === undefined
         ? undefined
-        : createRunRequestController(agents, setState),
-    [agents],
+        : createRunRequestController(agents, projectId, setState),
+    [agents, projectId],
   );
-  useEffect(() => () => controller?.stop(), [controller]);
+  useEffect(() => controller?.start(), [controller]);
   useEffect(
     () => agents?.subscribeState(setActivity, () => setActivity(undefined)),
     [agents],

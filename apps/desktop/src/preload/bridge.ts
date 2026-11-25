@@ -81,6 +81,7 @@ import type {
   RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
+  RunRequestOutcome,
   RunRequestResult,
   RunRequestView,
   RuntimeStatus,
@@ -232,8 +233,9 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * workspace ID of `claims.markSeen`, a string, with its member IDs, an array
  * of strings that it copies, and the kind and the label of
  * `providerConnections.register`, two strings in a new object of its own,
- * the ID of `providerConnections.remove`, a string, and the four IDs of
- * `agents.requestRun`, each a string, in a new object of its own.
+ * the ID of `providerConnections.remove`, a string, the four IDs of
+ * `agents.requestRun`, each a string, in a new object of its own, and the
+ * project ID of `agents.takeRunRequestOutcome`, a string.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -849,8 +851,8 @@ export function createDesktopBridge(
   });
 
   // Only a new object with the four IDs of a run request goes on, each a
-  // string; the main process checks each value. Another value is refused
-  // here without naming it.
+  // string, and a project ID string for a kept outcome; the main process
+  // checks each value. Another value is refused here without naming it.
   const agents: AgentBridge = Object.freeze({
     getState: () =>
       ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
@@ -880,6 +882,15 @@ export function createDesktopBridge(
             ),
           );
     },
+    takeRunRequestOutcome: (projectId: string) =>
+      typeof projectId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.takeRunRequestOutcome,
+            projectId,
+          ) as Promise<RunRequestOutcome | null>)
+        : Promise.reject(
+            new TypeError("takeRunRequestOutcome needs a project ID string."),
+          ),
   });
 
   // Only the IDs and a new object with the fields of a grant go on;

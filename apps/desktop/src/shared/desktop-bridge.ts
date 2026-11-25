@@ -51,6 +51,7 @@ import type {
   RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
+  RunRequestOutcome,
   RunRequestResult,
   RunRequestView,
   RuntimeStatus,
@@ -814,6 +815,17 @@ export interface AgentBridge {
    * the run may have been created: it is never sent again on its own.
    */
   readonly requestRun: (request: RunRequestView) => Promise<RunRequestResult>;
+  /**
+   * The outcome of the project's last run request that the main process
+   * keeps (#35), taken once: the chat screen shows it when it opens for
+   * that project, so that an answer that came while it was not shown is
+   * not lost, and takes it after it showed an answer itself. While a
+   * request of the project is on its way, the answer waits for its
+   * outcome. Null when nothing is kept. No ID comes with it.
+   */
+  readonly takeRunRequestOutcome: (
+    projectId: string,
+  ) => Promise<RunRequestOutcome | null>;
 }
 
 /**

@@ -35,6 +35,16 @@
 // - An answer whose run does not name the project, the agent, the
 //   connection, and the message that were sent, or that names a
 //   repository, is not this request's answer: it is `unknown`.
+// - The outcome is kept. The answer goes back to the chat screen that
+//   asked, but a switch of the project or the workspace, or leaving the
+//   chat while the request waits, closes that screen, and its answer, also
+//   "it may have been created" after `unknown`, would be lost, so that the
+//   person might ask again and create a second run. So the outcome of the
+//   last request of each project that passed the checks above is kept here
+//   (`takeOutcome`), without the run's ID, for the device that sent it, for
+//   at most `KEPT_RUN_REQUEST_OUTCOMES` projects. The chat screen of that
+//   project takes it once when it opens, and after it showed an answer
+//   itself. Another device or a sign-out drops them all.
 //
 // The host run supervisor picks a queued run up like any other. Until an
 // executor is registered for its provider kind (#30, #31), it fails on the
@@ -42,13 +52,18 @@
 //
 // The logs are fixed text, never an ID, a name, or a message body.
 import {
+  type AgentId,
   AgentIdSchema,
   type CreateRunResponse,
+  type MessageId,
   MessageIdSchema,
+  type ProjectId,
   ProjectIdSchema,
+  type ProviderConnectionId,
   ProviderConnectionIdSchema,
 } from "@mymandev/protocol";
 import type {
+  RunRequestOutcome,
   RunRequestRefusal,
   RunRequestResult,
   RunRequestView,
@@ -65,6 +80,7 @@ import {
   agentHost,
   grantViewer,
 } from "../permissions/grant-actions.ts";
+import { signedInDevice } from "../permissions/grant-store.ts";
 import type { ProviderConnectionService } from "../provider-connections/service.ts";
 import type { WorkspaceService } from "../workspace/service.ts";
 import type { AgentActivityService } from "./service.ts";
@@ -104,6 +120,13 @@ Object.freeze(RUN_OUTCOMES);
 
 const UNKNOWN: RunRequestResult = Object.freeze({ outcome: "unknown" });
 
+/**
+ * The most projects whose last run request outcome is kept; a request of
+ * another project drops the oldest. A person asks in the open project, so
+ * a few projects already cover switching back and forth.
+ */
+export const KEPT_RUN_REQUEST_OUTCOMES = 20;
+
 function refused(
   reason: RunRequestRefusal,
   retryAfterMs: number | null = null,
@@ -138,6 +161,8 @@ export interface RunRequestOptions {
    * it throws is ignored.
    */
   readonly log?: (message: string) => void;
+  /** The clock of a kept wait; `Date.now` by default. */
+  readonly now?: () => number;
 }
 
 export interface RunRequestService {
@@ -146,14 +171,38 @@ export interface RunRequestService {
    * again on its own. Never rejects.
    */
   readonly request: (request: RunRequestView) => Promise<RunRequestResult>;
-  /** Refuses every later request, for the quit. */
+  /**
+   * The outcome of the project's last request that passed the checks,
+   * once: it is dropped as it is taken. While a request of that project is
+   * on its way, it waits for its outcome. Null when nothing is kept, for
+   * an ID that is not one, when another device or none is signed in, and
+   * after close. A wait counts from the answer. Never rejects.
+   */
+  readonly takeOutcome: (
+    projectId: string,
+  ) => Promise<RunRequestOutcome | null>;
+  /** Refuses every later request, for the quit, and drops what is kept. */
   readonly close: () => void;
+}
+
+/** A kept outcome: for the device that sent it, from the time of its answer. */
+interface KeptOutcome {
+  /** Compared with the signed-in device; it never leaves this module. */
+  readonly deviceId: string;
+  readonly outcome: RunRequestOutcome;
+  readonly at: number;
+}
+
+/** What is kept of a result: never the run's ID. */
+function outcomeOf(result: RunRequestResult): RunRequestOutcome {
+  return result.outcome === "ok" ? Object.freeze({ outcome: "ok" }) : result;
 }
 
 export function createRunRequests(
   options: RunRequestOptions,
 ): RunRequestService {
   const { account, agents, chat, workspaces, providerConnections } = options;
+  const now = options.now ?? Date.now;
 
   function log(message: string): void {
     try {
@@ -166,6 +215,61 @@ export function createRunRequests(
   let closed = false;
   /** A request is waiting for its answer. */
   let requesting = false;
+  /** The request on its way, and when its outcome is kept. */
+  let onItsWay: {
+    readonly projectId: ProjectId;
+    readonly done: Promise<void>;
+  } | null = null;
+  /** The last outcome of each project, the oldest first. */
+  const kept = new Map<ProjectId, KeptOutcome>();
+
+  /** Keeps a project's outcome for `deviceId`; another device's go. */
+  function keep(
+    projectId: ProjectId,
+    deviceId: string,
+    result: RunRequestResult,
+  ): void {
+    for (const [key, entry] of kept) {
+      if (entry.deviceId !== deviceId) {
+        kept.delete(key);
+      }
+    }
+    kept.delete(projectId);
+    kept.set(projectId, { deviceId, outcome: outcomeOf(result), at: now() });
+    for (const key of kept.keys()) {
+      if (kept.size <= KEPT_RUN_REQUEST_OUTCOMES) {
+        break;
+      }
+      kept.delete(key);
+    }
+  }
+
+  async function takeOutcome(value: string): Promise<RunRequestOutcome | null> {
+    const projectId = ProjectIdSchema.safeParse(value);
+    if (!projectId.success) {
+      return null;
+    }
+    if (onItsWay !== null && onItsWay.projectId === projectId.data) {
+      await onItsWay.done;
+    }
+    const entry = kept.get(projectId.data);
+    if (closed || entry === undefined) {
+      return null;
+    }
+    kept.delete(projectId.data);
+    // Signed out, or another device: nothing kept is this one's.
+    if (entry.deviceId !== signedInDevice(account.status())) {
+      kept.clear();
+      return null;
+    }
+    const { outcome } = entry;
+    if (outcome.outcome !== "refused" || outcome.retryAfterMs === null) {
+      return outcome;
+    }
+    // The wait counts from the answer; one that passed is the shortest.
+    const left = Math.ceil(outcome.retryAfterMs - (now() - entry.at));
+    return Object.freeze({ ...outcome, retryAfterMs: Math.max(1, left) });
+  }
 
   /** Asks the agent activity to read the runs again; never throws. */
   function reloadRuns(): void {
@@ -253,16 +357,50 @@ export function createRunRequests(
       return refused("busy");
     }
     requesting = true;
-    const body = {
-      agentId: agentId.data,
-      providerConnectionId: connectionId.data,
-      inputMessageId: messageId.data,
+    // `agentHost` found this device's ID above.
+    const deviceId = viewer.deviceId ?? "";
+    let finish = (): void => undefined;
+    onItsWay = {
+      projectId: projectId.data,
+      done: new Promise<void>((resolve) => {
+        finish = resolve;
+      }),
     };
+    let result: RunRequestResult;
+    try {
+      result = await send(projectId.data, {
+        agentId: agentId.data,
+        providerConnectionId: connectionId.data,
+        inputMessageId: messageId.data,
+      });
+    } catch {
+      // Not expected: the request may have reached the API.
+      log("A run request could not be sent.");
+      result = UNKNOWN;
+    }
+    // Kept before the answer goes back, so that a screen that takes it
+    // once it has the answer finds it; only then may the next one go.
+    keep(projectId.data, deviceId, result);
+    requesting = false;
+    onItsWay = null;
+    finish();
+    return result;
+  }
+
+  /** Sends the creation once; its result, never a rejection. */
+  async function send(
+    projectId: ProjectId,
+    body: {
+      readonly agentId: AgentId;
+      readonly providerConnectionId: ProviderConnectionId;
+      readonly inputMessageId: MessageId;
+    },
+  ): Promise<RunRequestResult> {
     let answer: WorkspaceActionResult<CreateRunResponse, RunCreationFailure>;
     try {
       answer = await account.sendWorkspaceAction(
         "createRun",
-        { projectId: projectId.data },
+        { projectId },
         body,
       );
     } catch {
@@ -270,8 +408,6 @@ export function createRunRequests(
       // It may have reached the API; it is never sent again.
       reloadRuns();
       return UNKNOWN;
-    } finally {
-      requesting = false;
     }
     // Whatever the outcome of a request that may have reached the API: the
     // run may be stored although its answer was lost. Never after a refusal
@@ -286,7 +422,7 @@ export function createRunRequests(
     // A run of another project, agent, connection, or message, or with a
     // repository, is not this request's answer.
     if (
-      run.projectId !== projectId.data ||
+      run.projectId !== projectId ||
       run.agentId !== body.agentId ||
       run.providerConnectionId !== body.providerConnectionId ||
       run.inputMessageId !== body.inputMessageId ||
@@ -300,8 +436,10 @@ export function createRunRequests(
 
   return Object.freeze({
     request,
+    takeOutcome,
     close: () => {
       closed = true;
+      kept.clear();
     },
   });
 }
