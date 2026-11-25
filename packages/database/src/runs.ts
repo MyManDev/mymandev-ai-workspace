@@ -91,8 +91,8 @@ const DAY_MS = 24 * 60 * 60_000;
  * The most unfinished runs (`queued`, `running`, or `awaiting_input`) that
  * one agent has at a time (#35). A creation above it is `run_limit`, which
  * no wait frees: only a run of the agent that finishes does. The runs of
- * the development seed count too. Provisional (#35): the value, a default
- * until the Project Manager decides. 10 keeps what one host device has to
+ * the development seed count too. The value was decided by the Project
+ * Manager on 2026-11-25 (#35). 10 keeps what one host device has to
  * work through small, and keeps a project's unfinished runs, which
  * `listProjectRuns` returns whole, far below `MAX_ANSWER_LIST_ITEMS`.
  */
@@ -102,8 +102,8 @@ export const MAX_UNFINISHED_RUNS_PER_AGENT = 10;
  * The most runs that one agent gets within 24 hours (#35), whoever asked
  * and however they ended. A creation above it is `run_daily_limit`, with
  * the time until the oldest of those runs leaves the 24 hours.
- * Provisional (#35): the value, a default until the Project Manager
- * decides. 100 a day bounds what one agent adds to the run tables and what
+ * The value was decided by the Project Manager on 2026-11-25 (#35). 100 a
+ * day bounds what one agent adds to the run tables and what
  * it can spend of its owner's provider in a day.
  */
 export const MAX_NEW_RUNS_PER_AGENT_PER_DAY = 100;

@@ -22,8 +22,8 @@
 //   own words, and no other member's or agent's text becomes the
 //   instruction of the owner's run; a run has no text of its own.
 //
-// Provisional (#35), applied as defaults until the Project Manager decides:
-// the path; that the owner asks only from the agent's host device, which
+// Decided by the Project Manager on 2026-11-25 (#35), after they were
+// applied as defaults: the path; that the owner asks only from the agent's host device, which
 // follows the decision for grants (#75); that the input is only a message
 // that the caller wrote; that only the agent's owner reads the run's
 // provider connection; that the creation's event is
