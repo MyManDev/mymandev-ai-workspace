@@ -176,4 +176,10 @@ test("enabling an erased account is refused with 1; disable and enable otherwise
     disableReport({ changed: false, revokedGrantIds: [] }).exitCode,
     0,
   );
+  const disabled = disableReport({ changed: true, revokedGrantIds: [] });
+  assert.equal(disabled.exitCode, 0);
+  assert.match(
+    disabled.message,
+    /^Account disabled; 0 grants revoked\.\nAn API that listens closes the account's open connections at once/,
+  );
 });

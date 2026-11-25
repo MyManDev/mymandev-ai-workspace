@@ -4,8 +4,10 @@ import {
   type UserId,
 } from "@mymandev/protocol";
 import { and, eq, inArray, isNotNull, isNull } from "drizzle-orm";
-import { revokeGrants } from "./cascade.ts";
+import { revokedGrantsOf, revokeGrants } from "./cascade.ts";
 import type { Database } from "./db.ts";
+import { disableNotifications } from "./disable-notifications.ts";
+import { sendErasureNotifications } from "./erasure-notifications.ts";
 import { withDatabaseErrors } from "./errors.ts";
 import {
   agents,
@@ -28,7 +30,13 @@ export type DisableAccountResult = Readonly<{
  * recovery"): every authentication of the account fails from now on. In the
  * same transaction, the active grants of the agents that the account owns are
  * revoked, with the account as `revoked_by_user_id` (ADR 0015, P-77 and P-78),
- * and an `account.disabled` audit record without an actor is written.
+ * and an `account.disabled` audit record without an actor is written. Last,
+ * it sends the notifications of its live events
+ * (`src/disable-notifications.ts`, #350), which PostgreSQL delivers only at
+ * the commit: the account, then each revoked grant as its event shows it,
+ * read in the transaction with `revokedGrantsOf`, which locks nothing. A
+ * disable that changes nothing sends nothing. Inside another transaction it
+ * runs as a savepoint.
  */
 export async function disableAccount(
   db: Database,
@@ -62,6 +70,14 @@ export async function disableAccount(
         action: "account.disabled",
         subjectId: input.userId,
       });
+      await sendErasureNotifications(
+        tx,
+        disableNotifications({
+          userId: input.userId,
+          now: input.now,
+          revokedGrants: await revokedGrantsOf(tx, grants),
+        }),
+      );
       return { changed: true, revokedGrantIds: grants };
     }),
   );

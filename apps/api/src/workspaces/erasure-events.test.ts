@@ -808,6 +808,7 @@ test("a confirmed account_erased closes only the connections of the devices that
     {
       confirmed: true,
       revokedDeviceIds: [erin.device.deviceId as DeviceId],
+      disabledAccountDeviceIds: [],
       approvers: [],
     },
   );
@@ -881,7 +882,12 @@ test("the replay checks one notification at a time and replays them in the order
       } finally {
         checking -= 1;
       }
-      return { confirmed: true, revokedDeviceIds: [], approvers: [] };
+      return {
+        confirmed: true,
+        revokedDeviceIds: [],
+        disabledAccountDeviceIds: [],
+        approvers: [],
+      };
     },
   });
   replay.push(removed);

@@ -817,6 +817,7 @@ test("the database confirms every notification of a real erasure, with the accou
       check.revokedDeviceIds,
       notification.kind === "account_erased" ? [erin.deviceId] : [],
     );
+    assert.deepEqual(check.disabledAccountDeviceIds, []);
     assert.deepEqual(
       check.approvers,
       notification.kind === "join_request_withdrawn"
@@ -841,7 +842,12 @@ test("the database confirms every notification of a real erasure, with the accou
       });
       assert.deepEqual(
         check,
-        { confirmed: false, revokedDeviceIds: [], approvers: [] },
+        {
+          confirmed: false,
+          revokedDeviceIds: [],
+          disabledAccountDeviceIds: [],
+          approvers: [],
+        },
         `${notification.kind} naming another account`,
       );
     }
@@ -931,7 +937,12 @@ test("the database confirms every notification of a real erasure, with the accou
   for (const notification of forged) {
     assert.deepEqual(
       await checkErasureNotification(db, notification),
-      { confirmed: false, revokedDeviceIds: [], approvers: [] },
+      {
+        confirmed: false,
+        revokedDeviceIds: [],
+        disabledAccountDeviceIds: [],
+        approvers: [],
+      },
       notification.kind,
     );
   }
