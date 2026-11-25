@@ -384,9 +384,11 @@ function start(): void {
   // reported `failed`. An executor checks each action with the enforcement
   // point, and every change of the grants re-checks the held actions. Before
   // each `queued -> running`, the run's agent must hold `provider.use` on the
-  // run's provider connection (D13 of 2026-11-25 on #35 and #55); otherwise
-  // the run fails with `provider_use_denied`, or ends as a re-check would.
-  // It never touches the runs of the development switch's agent. The logs
+  // run's provider connection (D13 of 2026-11-25 on #35 and #55): without a
+  // grant the run fails with `provider_use_denied`, and every other denial
+  // leaves it queued to be checked again (decision of 2026-11-25). The check
+  // is made again once the start is acknowledged, before the executor
+  // starts. `enforcement-wiring.test.ts` guards this wiring. It never touches the runs of the development switch's agent. The logs
   // are fixed text with a code at most, never an ID.
   const runSupervisor = createRunSupervisor({
     account,
