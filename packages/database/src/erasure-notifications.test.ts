@@ -947,6 +947,27 @@ test("the database confirms every notification of a real erasure, with the accou
     );
   }
 
+  // Erin's real grant revocation naming another agent, which exists, is
+  // confirmed by none, so a resent notification cannot name a wrong agent.
+  const realGrant = notified.find(
+    (notification) => notification.kind === "grant_revoked",
+  );
+  assert.ok(realGrant?.kind === "grant_revoked");
+  assert.notEqual(realGrant.granteeAgentId, bobsOldAgent);
+  assert.deepEqual(
+    await checkErasureNotification(db, {
+      ...realGrant,
+      granteeAgentId: bobsOldAgent,
+    }),
+    {
+      confirmed: false,
+      revokedDeviceIds: [],
+      disabledAccountDeviceIds: [],
+      approvers: [],
+    },
+    "grant_revoked with another agent",
+  );
+
   // A real withdrawal sends only to the named people who are an active
   // owner or admin of its workspace now.
   const withdrawal = notified.at(-1);
