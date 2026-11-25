@@ -361,7 +361,12 @@ export const WORKSPACE_ACTIONS = Object.freeze({
    * the input, and an optional repository. The body's schema knows no
    * other key, so a text, a state, or a requester sent beside them is
    * refused here before anything is sent. The request carries no
-   * idempotency key: it is never sent again on its own. Its failures add
+   * idempotency key: it is never sent again on its own, except for the
+   * device session's one retry after a `401` with the API's error body,
+   * for the same device and account only (`sendAuthorized`), which is safe
+   * because the API authenticates before the handler runs, so such a `401`
+   * committed nothing; a `401` without that body is `unknown` and is not
+   * sent again. Its failures add
    * the two limits of a run, `run_limit` and `run_daily_limit`
    * (`RUN_CREATION_FAILURES`).
    */

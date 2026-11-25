@@ -45,6 +45,12 @@
 //   at most `KEPT_RUN_REQUEST_OUTCOMES` projects. The chat screen of that
 //   project takes it once when it opens, and after it showed an answer
 //   itself. Another device or a sign-out drops them all.
+// - The one retry after a `401`. The device session sends `createRun`
+//   once more after a `401` that carries the API's error body, with a new
+//   token for the same device and account only (`sendAuthorized`): the API
+//   authenticates before the route's handler runs, so such a `401` means
+//   that nothing was committed. A `401` without that body is `unknown`, and
+//   it is not sent again.
 //
 // The host run supervisor picks a queued run up like any other. Until an
 // executor is registered for its provider kind (#30, #31), it fails on the
