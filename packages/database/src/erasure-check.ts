@@ -52,17 +52,22 @@ import type { OperatorNotification } from "./erasure-notifications.ts";
 //   disable writes the account as `revoked_by_user_id` and its `now` as both
 //   `revoked_at` and `disabled_at`), so a grant that ended at another time,
 //   or by someone else, does not pass; the equality also requires that the
-//   account is disabled, as a null `disabled_at` equals nothing.
+//   account is disabled, as a null `disabled_at` equals nothing. The
+//   notification's `revokedAt`, which the event carries, must equal the
+//   grant's `revoked_at` too.
 //
 // A role that can connect can forge nothing about an account that is not
 // disabled, or about an item of another account. It can resend a real
 // disable's notifications: `account_disabled` closes only connections that
 // the sweep would close anyway, and a grant of the latest disable is sent
-// again as revoked. A disable confirms none of an erasure's kinds. An erased
-// account is disabled too, so a disable's kinds about it can pass:
-// `account_disabled` closes nothing, as every device of an erased account is
-// revoked, and a grant that the erasure revoked when it set `disabled_at`
-// is sent again as revoked, as the erasure's own notification says.
+// again as revoked, with its true `revokedAt`. Only the notification's `at`
+// is not checked: it becomes the `occurredAt` of the replayed
+// `agent.grant.revoked`, so a resent notification can carry another one.
+// A disable confirms none of an erasure's kinds. An erased account is
+// disabled too, so a disable's kinds about it can pass: `account_disabled`
+// closes nothing, as every device of an erased account is revoked, and a
+// grant that the erasure revoked when it set `disabled_at` is sent again as
+// revoked, as the erasure's own notification says.
 
 /** What the database confirms of one notification. */
 export type ErasureCheck = Readonly<{
@@ -118,7 +123,7 @@ function statementOf(notification: OperatorNotification): SQL {
     case "account_disabled":
       return sql`select ${disabled(userId)} as confirmed, array(select d.id::text from devices d where d.user_id = ${userId}::uuid and d.revoked_at is null order by d.id) as ids`;
     case "disable_grant_revoked":
-      return sql`select exists (select 1 from users u join agents a on a.owner_user_id = u.id join permission_grants g on g.grantee_agent_id = a.id join projects p on p.id = g.project_id where u.id = ${userId}::uuid and g.id = ${notification.grantId}::uuid and g.grantee_agent_id = ${notification.granteeAgentId}::uuid and p.workspace_id = ${notification.workspaceId}::uuid and g.revoked_by_user_id = u.id and g.revoked_at = u.disabled_at) as confirmed`;
+      return sql`select exists (select 1 from users u join agents a on a.owner_user_id = u.id join permission_grants g on g.grantee_agent_id = a.id join projects p on p.id = g.project_id where u.id = ${userId}::uuid and g.id = ${notification.grantId}::uuid and g.grantee_agent_id = ${notification.granteeAgentId}::uuid and p.workspace_id = ${notification.workspaceId}::uuid and g.revoked_by_user_id = u.id and g.revoked_at = u.disabled_at and g.revoked_at = ${notification.revokedAt}::timestamptz) as confirmed`;
   }
 }
 

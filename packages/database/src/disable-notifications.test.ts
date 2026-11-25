@@ -503,49 +503,71 @@ test("the database confirms every notification of a real disable, with the accou
   // Notifications that name Erin, whose disable is real, but a grant that
   // her disable did not revoke are confirmed by none: a grant of hers that
   // ended earlier or by someone else, Bob's grants, her real grant with
-  // another agent of hers or in another workspace. Nor does her disable
-  // confirm an erasure's notification about her.
+  // another agent of hers, in another workspace, or with another revocation
+  // time. Nor does her disable confirm an erasure's notification about her.
   const [, real] = notified;
   assert.ok(real?.kind === "disable_grant_revoked");
   const grant = (
     grantId: PermissionGrantId,
     granteeAgentId: AgentId,
+    revokedAt: Date = DISABLED_AT,
   ): OperatorNotification => ({
     ...header("disable_grant_revoked", erin.userId),
     workspaceId: team,
     grantId,
     granteeAgentId,
-    revokedAt: DISABLED_AT.toISOString(),
+    revokedAt: revokedAt.toISOString(),
   });
-  const forged: OperatorNotification[] = [
-    grant(erinsEarlier, tester),
-    grant(erinsByOlga, tester),
-    grant(bobsByErin, bobsAgent),
-    grant(bobsOwn, bobsAgent),
-    { ...real, granteeAgentId: tester },
-    { ...real, workspaceId: other },
-    {
-      v: 1,
-      kind: "account_erased",
-      at: DISABLED_AT.toISOString(),
-      userId: erin.userId,
-    },
-    {
-      v: 1,
-      kind: "grant_revoked",
-      at: DISABLED_AT.toISOString(),
-      userId: erin.userId,
-      workspaceId: real.workspaceId,
-      grantId: real.grantId,
-      granteeAgentId: real.granteeAgentId,
-      revokedAt: real.revokedAt,
-    },
+  const forged: readonly (readonly [string, OperatorNotification])[] = [
+    ["her grant revoked earlier", grant(erinsEarlier, tester)],
+    [
+      "her grant revoked earlier, with its true time",
+      grant(erinsEarlier, tester, NOW),
+    ],
+    ["her grant revoked by someone else", grant(erinsByOlga, tester)],
+    ["Bob's grant revoked by her", grant(bobsByErin, bobsAgent)],
+    ["Bob's grant revoked by him", grant(bobsOwn, bobsAgent)],
+    [
+      "her real grant with another agent of hers",
+      { ...real, granteeAgentId: tester },
+    ],
+    ["her real grant in another workspace", { ...real, workspaceId: other }],
+    [
+      "her real grant with a later revocation time",
+      { ...real, revokedAt: new Date(DISABLED_AT.getTime() + 1).toISOString() },
+    ],
+    [
+      "her real grant with an earlier revocation time",
+      { ...real, revokedAt: NOW.toISOString() },
+    ],
+    [
+      "an erasure's account notification",
+      {
+        v: 1,
+        kind: "account_erased",
+        at: DISABLED_AT.toISOString(),
+        userId: erin.userId,
+      },
+    ],
+    [
+      "an erasure's grant notification",
+      {
+        v: 1,
+        kind: "grant_revoked",
+        at: DISABLED_AT.toISOString(),
+        userId: erin.userId,
+        workspaceId: real.workspaceId,
+        grantId: real.grantId,
+        granteeAgentId: real.granteeAgentId,
+        revokedAt: real.revokedAt,
+      },
+    ],
   ];
-  for (const notification of forged) {
+  for (const [label, notification] of forged) {
     assert.deepEqual(
       await checkErasureNotification(db, notification),
       NOT_CONFIRMED,
-      notification.kind,
+      label,
     );
   }
 
