@@ -37,6 +37,7 @@ import {
 } from "./agents/dev-switch.ts";
 import { PRODUCTION_RUN_EXECUTORS } from "./agents/run-executor.ts";
 import { createProviderUseStartCheck } from "./agents/run-start-check.ts";
+import { createRunRequests } from "./agents/run-request.ts";
 import { createRunSupervisor } from "./agents/run-supervisor.ts";
 import { createAgentActivityService } from "./agents/service.ts";
 import {
@@ -84,6 +85,7 @@ import { createPermissionEnforcement } from "./permissions/enforcement.ts";
 import { createGrantStore, signedInDevice } from "./permissions/grant-store.ts";
 import { createSystemEnforcementRecorder } from "./permissions/file-recorder-system.ts";
 import { registerProviderConnectionIpc } from "./provider-connection-ipc.ts";
+import { registerRunRequestIpc } from "./run-request-ipc.ts";
 import { createProviderConnectionService } from "./provider-connections/service.ts";
 import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
@@ -722,6 +724,23 @@ function start(): void {
     workspaces,
   });
   closables.add(chatIpc);
+
+  // Requesting a run from the project chat (#35): one strict channel, and
+  // one write of the allowlist, sent once and never again on its own. Only
+  // the agent's owner, on the agent's host device, with one of the person's
+  // own messages and one of this device's provider connections; the main
+  // process checks each before anything is sent. The new run shows through
+  // the agent activity. The logs are fixed text, never an ID.
+  const runRequests = createRunRequests({
+    account,
+    agents,
+    chat,
+    workspaces,
+    providerConnections,
+    log: (message) => console.info(message),
+  });
+  closables.add(runRequests);
+  registerRunRequestIpc(ipcMain, rendererUrl, { service: runRequests });
 
   // A quit, for example with Cmd+Q on macOS, closes the window first. When
   // the person confirms closing it with waiting chat messages, the quit is

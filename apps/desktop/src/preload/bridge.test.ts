@@ -190,7 +190,9 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
   ]);
   expect(Object.keys(bridge.agents).sort()).toEqual([
     "getState",
+    "requestRun",
     "subscribeState",
+    "takeRunRequestOutcome",
   ]);
   expect(Object.keys(bridge.grants).sort()).toEqual([
     "getState",
@@ -2120,6 +2122,97 @@ test("the agent functions call their channels and pass no argument from the rend
   expect(fake.invoked).toEqual([
     { channel: INVOKE_CHANNELS.getAgentState, args: [] },
   ]);
+});
+
+test("a run request calls its channel once with a new object of only its four ID strings, and passes the answer through (#35)", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const requestRun = bridge.agents.requestRun as (
+    ...args: unknown[]
+  ) => Promise<unknown>;
+  const request = {
+    projectId: PROJECT_ID,
+    agentId: AGENT_ID,
+    providerConnectionId: GRANT_ID,
+    inputMessageId: REPOSITORY_ID,
+    // Never passed on: a text, a repository, or a retry key.
+    body: "Fix the build",
+    repositoryId: REPOSITORY_ID,
+    idempotencyKey: "again",
+  };
+
+  const answer = requestRun(request, "extra");
+  fake.answers[0]?.resolve({ outcome: "unknown" });
+
+  await expect(answer).resolves.toEqual({ outcome: "unknown" });
+  expect(fake.invoked).toEqual([
+    {
+      channel: INVOKE_CHANNELS.requestRun,
+      args: [
+        {
+          projectId: PROJECT_ID,
+          agentId: AGENT_ID,
+          providerConnectionId: GRANT_ID,
+          inputMessageId: REPOSITORY_ID,
+        },
+      ],
+    },
+  ]);
+  expect(fake.invoked[0]?.args[0]).not.toBe(request);
+  // An answer, also `unknown`, never makes the bridge send it again.
+  await settle();
+  expect(fake.invoked).toHaveLength(1);
+});
+
+test("a run request refuses a value of another type without calling the main process or naming it (#35)", async () => {
+  const fake = fakeIpc();
+  const requestRun = createDesktopBridge("44.9.1", fake.ipc).agents
+    .requestRun as (...args: unknown[]) => Promise<unknown>;
+  const secret = { token: "secret-token" };
+  const request = {
+    projectId: PROJECT_ID,
+    agentId: AGENT_ID,
+    providerConnectionId: GRANT_ID,
+    inputMessageId: REPOSITORY_ID,
+  };
+
+  for (const attempt of [
+    () => requestRun(),
+    () => requestRun(null),
+    () => requestRun("secret-token"),
+    () => requestRun({ ...request, projectId: secret }),
+    () => requestRun({ ...request, agentId: 7 }),
+    () => requestRun({ ...request, providerConnectionId: undefined }),
+    () => requestRun({ ...request, inputMessageId: null }),
+  ]) {
+    const error = await attempt().then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(TypeError);
+    expect(String(error)).not.toContain("secret-token");
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("a kept run request outcome is asked for with the project ID string alone, and another value is refused without calling the main process (#35)", async () => {
+  const fake = fakeIpc();
+  const take = createDesktopBridge("44.9.1", fake.ipc).agents
+    .takeRunRequestOutcome as (...args: unknown[]) => Promise<unknown>;
+  const answer = take(PROJECT_ID, "extra");
+  fake.answers[0]?.resolve({ outcome: "unknown" });
+  await expect(answer).resolves.toEqual({ outcome: "unknown" });
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.takeRunRequestOutcome, args: [PROJECT_ID] },
+  ]);
+  for (const value of [undefined, null, 7, { projectId: PROJECT_ID }]) {
+    const error = await take(value).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(TypeError);
+  }
+  expect(fake.invoked).toHaveLength(1);
 });
 
 test("the agent subscription delivers the activity and every newer one, without the event object", async () => {

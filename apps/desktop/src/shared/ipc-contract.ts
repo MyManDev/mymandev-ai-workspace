@@ -3043,6 +3043,150 @@ export const AgentGrantsResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type AgentGrantsResult = z.infer<typeof AgentGrantsResultSchema>;
 
+// Requesting a run of an agent from the project chat (#35).
+
+/**
+ * What the renderer asks for a run (#35; the Project Manager's decisions
+ * of 2026-11-14 and 2026-11-25): the project that the chat screen shows,
+ * one of its agents, a provider connection of this device, and one of the
+ * person's own messages of the project's chat as the run's input. IDs
+ * only, and no other key: a text, a repository, a state, or a retry key
+ * is refused by the contract before the main process sees it. The run has
+ * no repository yet; the main process checks every ID against what it
+ * holds before anything is sent.
+ */
+export const RunRequestViewSchema = z.strictObject({
+  projectId: ProtocolIdSchema,
+  agentId: ProtocolIdSchema,
+  providerConnectionId: ProtocolIdSchema,
+  inputMessageId: ProtocolIdSchema,
+});
+export type RunRequestView = z.infer<typeof RunRequestViewSchema>;
+
+/**
+ * Why a run request was refused. The first ones are the main process's own
+ * checks, and nothing was sent:
+ *
+ * - `invalid`: an ID is not one, or the request is outside the protocol's
+ *   format.
+ * - `not_open`: the project is not the open one, or the agent is not one of
+ *   its agents.
+ * - `not_owner`: the account does not own the agent; only its owner asks
+ *   for a run (decision of 2026-11-14).
+ * - `not_hosted_here`: this device is not the agent's host device, or it is
+ *   not known which device hosts it; only the host device asks (decision
+ *   of 2026-11-25).
+ * - `disabled`: the agent is disabled.
+ * - `message_not_found`: the chat that this device holds for the open
+ *   project has no such message.
+ * - `not_own_message`: the message is another person's or an agent's; only
+ *   the requester's own message is a run's input (decision of
+ *   2026-11-25).
+ * - `connection_not_here`: the provider connection is not one of this
+ *   device's connections as its list holds them now.
+ * - `busy`: another run request is still waiting for its answer, so that a
+ *   second press never sends a second request.
+ *
+ * Then the answers of the server, as for the other writes:
+ *
+ * - `not_signed_in`, `unavailable`, `too_soon`, `rate_limited`: as for the
+ *   other writes; `rate_limited` is the account's limit of requests.
+ * - `forbidden`: the server found that the account does not own the agent
+ *   or that this device is not its host device.
+ * - `not_found`: the server does not know the project for the account
+ *   (the account is not, or no longer, a member of its workspace, or the
+ *   project does not exist), the agent in the project, the connection on
+ *   the agent's host device, or the message as the account's own and not
+ *   deleted.
+ * - `conflict`: the project or its workspace is archived, the agent is
+ *   disabled, or the connection is removed.
+ * - `run_limit`: the agent has as many unfinished runs as the server
+ *   allows (10). No wait: only a run of the agent that finishes frees a
+ *   place.
+ * - `run_daily_limit`: the agent got as many new runs within 24 hours as
+ *   the server allows (100); `retryAfterMs` says when the next may go.
+ * - `failed`: the server refused it otherwise.
+ */
+export const RUN_REQUEST_REFUSALS = Object.freeze([
+  "invalid",
+  "not_open",
+  "not_owner",
+  "not_hosted_here",
+  "disabled",
+  "message_not_found",
+  "not_own_message",
+  "connection_not_here",
+  "busy",
+  "not_signed_in",
+  "unavailable",
+  "too_soon",
+  "rate_limited",
+  "forbidden",
+  "not_found",
+  "conflict",
+  "run_limit",
+  "run_daily_limit",
+  "failed",
+] as const);
+export type RunRequestRefusal = (typeof RUN_REQUEST_REFUSALS)[number];
+
+/**
+ * The refusals of a run request that the main process gives from its own
+ * checks, which it never keeps; in a module of its own, which imports
+ * nothing, so that the renderer may import it.
+ */
+export { RUN_REQUEST_LOCAL_REFUSALS } from "./run-request-refusals.ts";
+
+/** The refusals of a run request that say when the next request may go. */
+const RUN_REQUEST_WAITS: ReadonlySet<string> = new Set([
+  "too_soon",
+  "rate_limited",
+  "run_daily_limit",
+]);
+
+/**
+ * The result of a run request: `ok` with the new run's ID, which the agent
+ * activity shows from then on in `queued`; `refused` with a reason, and
+ * `retryAfterMs` for a wait only, null otherwise; or `unknown` when
+ * whether the server created the run is not known (no answer, a timeout,
+ * or an answer outside its schema or for another request). A request is
+ * never sent again on its own: the same request sent again would create a
+ * second run.
+ */
+const RunRequestRefusedSchema = z
+  .object({
+    outcome: z.literal("refused"),
+    reason: z.enum(RUN_REQUEST_REFUSALS),
+    retryAfterMs: z.int().positive().nullable(),
+  })
+  .refine(
+    (value) =>
+      RUN_REQUEST_WAITS.has(value.reason) === (value.retryAfterMs !== null),
+    { message: "Only a wait has a retry time", path: ["retryAfterMs"] },
+  );
+
+export const RunRequestResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok"), runId: ProtocolIdSchema }),
+  RunRequestRefusedSchema,
+  CreateUnknownSchema,
+]);
+export type RunRequestResult = z.infer<typeof RunRequestResultSchema>;
+
+/**
+ * The outcome of a project's last run request as the main process keeps it
+ * (#35): what the screen said after the answer, without the run's ID, so
+ * that a chat screen opened later says it once. `ok` without an ID, a
+ * refusal with its wait counted from the answer and at least 1 ms, or
+ * `unknown`. Only a request that passed the main process's own checks is
+ * kept (`RUN_REQUEST_LOCAL_REFUSALS`).
+ */
+export const RunRequestOutcomeSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  RunRequestRefusedSchema,
+  CreateUnknownSchema,
+]);
+export type RunRequestOutcome = z.infer<typeof RunRequestOutcomeSchema>;
+
 // The chat of the open project (#27).
 
 /**
@@ -3137,6 +3281,13 @@ export const ChatMessageViewSchema = z.object({
   seq: z.int().positive(),
   authorKind: z.enum(CHAT_AUTHOR_KINDS),
   authorName: z.string().min(1).max(CHAT_LIMITS.authorName),
+  /**
+   * Whether the signed-in account's own person wrote the message (#35):
+   * only such a message can be the input of a run that the account asks
+   * for. The main process compares the author with the account's person
+   * and sends the answer as a flag, never the member ID.
+   */
+  writtenByMe: z.boolean(),
   body: ChatBodySchema,
   createdAt: TimestampSchema,
 });
@@ -4113,6 +4264,17 @@ export const INVOKE_CONTRACT = Object.freeze({
   [INVOKE_CHANNELS.subscribeAgentState]: Object.freeze({
     args: NoArgumentsSchema,
     result: AgentActivityViewSchema,
+  }),
+  [INVOKE_CHANNELS.requestRun]: Object.freeze({
+    /** The project, the agent, the connection, and the input message. */
+    args: z.tuple([RunRequestViewSchema]),
+    result: RunRequestResultSchema,
+  }),
+  [INVOKE_CHANNELS.takeRunRequestOutcome]: Object.freeze({
+    /** The project whose chat screen opens. */
+    args: z.tuple([ProtocolIdSchema]),
+    /** Null when nothing is kept for it. */
+    result: RunRequestOutcomeSchema.nullable(),
   }),
   [INVOKE_CHANNELS.getGrantState]: Object.freeze({
     args: NoArgumentsSchema,

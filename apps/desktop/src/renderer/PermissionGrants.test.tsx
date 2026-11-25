@@ -457,7 +457,14 @@ test("with the bridges, the screen subscribes once it is shown and first says th
   };
   const html = renderToString(
     <PermissionsScreen
-      agents={{ getState: unused, subscribeState: unused } as AgentBridge}
+      agents={
+        {
+          getState: unused,
+          subscribeState: unused,
+          requestRun: unused,
+          takeRunRequestOutcome: unused,
+        } as AgentBridge
+      }
       projectRepositories={
         {
           getState: unused,

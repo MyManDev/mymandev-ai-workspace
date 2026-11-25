@@ -2,6 +2,7 @@ import {
   EventIdSchema,
   type ChatMessage,
   type ChatMessageAuthor,
+  type MemberId,
 } from "@mymandev/protocol";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import {
@@ -160,12 +161,17 @@ function olderState(state: ChatState, firstMessage: number): ChatOlderState {
 function messageView(
   message: ChatMessage,
   authorName: (author: ChatMessageAuthor) => string,
+  ownMemberId: MemberId | null,
 ): ChatMessageView {
   return Object.freeze({
     id: message.id,
     seq: message.seq,
     authorKind: message.author.kind,
     authorName: cut(authorName(message.author), CHAT_LIMITS.authorName),
+    writtenByMe:
+      ownMemberId !== null &&
+      message.author.kind === "member" &&
+      message.author.memberId === ownMemberId,
     body: message.body,
     createdAt: message.createdAt,
   });
@@ -190,7 +196,9 @@ function pendingView(copy: ChatPendingCopy): ChatPendingView {
  * The frozen copy of the chat service's state that crosses IPC, with
  * `revision` as its revision. Each author is resolved to a display name
  * with `authorName`, cut to `CHAT_LIMITS.authorName`; no member ID, agent
- * ID, user ID, or device ID crosses. The view holds the newest held
+ * ID, user ID, or device ID crosses. A message is `writtenByMe` when its
+ * author is `ownMemberId`, the account's own person in the chat's
+ * workspace (#35); without one, no message is. The view holds the newest held
  * messages and the first waiting messages, within the counts and the text
  * budget of `CHAT_LIMITS`, of which held and waiting messages each keep at
  * least half (see `fitView`), and counts what it leaves out: `moreMessages`
@@ -204,6 +212,7 @@ export function chatView(
   state: ChatState,
   revision: number,
   authorName: (author: ChatMessageAuthor) => string,
+  ownMemberId: MemberId | null,
 ): ChatView {
   const fit = fitView(state);
   const fields = {
@@ -213,7 +222,7 @@ export function chatView(
     messages: Object.freeze(
       state.messages
         .slice(fit.firstMessage)
-        .map((message) => messageView(message, authorName)),
+        .map((message) => messageView(message, authorName, ownMemberId)),
     ),
     moreMessages: fit.firstMessage,
     older: olderState(state, fit.firstMessage),
@@ -261,8 +270,11 @@ export interface ChatIpcOptions {
     | "loadOlder"
     | "authorName"
   >;
-  /** A change of the workspace service may change an author's name. */
-  readonly workspaces: Pick<WorkspaceService, "onChange">;
+  /**
+   * A change of the workspace service may change an author's name, or the
+   * account's own person, whose messages are `writtenByMe` (#35).
+   */
+  readonly workspaces: Pick<WorkspaceService, "onChange" | "ownMemberId">;
   /** Defaults to `setTimeout`. */
   readonly scheduleTimer?: ScheduleTimer;
   /** A monotonic clock in milliseconds; defaults to `performance.now`. */
@@ -332,7 +344,15 @@ export function registerChatIpc(
   let olderFailedAt = 0;
 
   function view(): ChatView {
-    return chatView(chat.state(), revision, chat.authorName);
+    const state = chat.state();
+    return chatView(
+      state,
+      revision,
+      chat.authorName,
+      state.workspaceId === null
+        ? null
+        : workspaces.ownMemberId(state.workspaceId),
+    );
   }
 
   function publish(): void {

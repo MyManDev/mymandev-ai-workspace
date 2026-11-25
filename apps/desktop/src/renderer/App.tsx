@@ -406,7 +406,7 @@ function ScreenContent({
   readonly chat: ChatBridge | undefined;
   readonly devices: DeviceListBridge | undefined;
   readonly providerConnections: ProviderConnectionsBridge | undefined;
-  /** For the permission screen (#342). */
+  /** For the permission screen (#342) and the chat's run request (#35). */
   readonly agents: AgentBridge | undefined;
   readonly projectRepositories: ProjectRepositoriesBridge | undefined;
   readonly grants: GrantBridge | undefined;
@@ -474,6 +474,8 @@ function ScreenContent({
           key={view.projectId}
           chat={chat}
           projectId={view.projectId}
+          agents={agents}
+          providerConnections={providerConnections}
         />
       );
     case "tasks":
