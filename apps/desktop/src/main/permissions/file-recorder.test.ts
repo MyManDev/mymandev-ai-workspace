@@ -1463,6 +1463,68 @@ test("moving on to the next file is bounded: at most one new file per record, an
   }
 });
 
+test("a new file that cannot be restricted or whose folder cannot be flushed is deleted, so repeated failures leave no files", () => {
+  const cases: [string, Partial<RecorderFileSystem>][] = [
+    [
+      "restrict",
+      {
+        fchmodSync: () => {
+          throw errno("EPERM");
+        },
+      },
+    ],
+    [
+      "folder flush",
+      {
+        fchmodSync: () => undefined,
+        fsyncSync: (fd) => {
+          if (fd === -1) {
+            throw errno("EIO");
+          }
+          nodeRecorderFileSystem.fsyncSync(fd);
+        },
+      },
+    ],
+  ];
+  for (const [, overrides] of cases) {
+    const spy = spyFileSystem({ ...folderFlushStub(), ...overrides });
+    const { recorder, folder } = setup({
+      fileSystem: spy.fileSystem,
+      platform: "linux",
+    });
+    for (let index = 0; index < 20; index += 1) {
+      expect(ENFORCEMENT_RECORD_FAILURES).toContain(
+        failureOf(() => recorder.record(START)),
+      );
+    }
+    expect(readdirSync(folder)).toEqual([]);
+  }
+});
+
+test("an empty newest file that cannot be restricted or deleted is never moved past: one file at most, however many records fail", () => {
+  const create = enforcementRecordFileFlags("linux", true);
+  const spy = spyFileSystem({
+    ...folderFlushStub(),
+    fchmodSync: () => {
+      throw errno("EPERM");
+    },
+    unlinkSync: () => {
+      throw errno("EPERM");
+    },
+  });
+  const { recorder, files } = setup({
+    fileSystem: spy.fileSystem,
+    platform: "linux",
+  });
+  for (let index = 0; index < 20; index += 1) {
+    expect(failureOf(() => recorder.record(START))).toBe("open_failed");
+  }
+  expect(files()).toEqual(["enforcement-00000001.jsonl"]);
+  expect(
+    spy.named("openSync").filter((call) => call.args[1] === create),
+  ).toHaveLength(1);
+});
+
 test("record file names have exactly 8 digits; other names are left alone, and no file beyond the highest number is created", () => {
   const { recorder, folder, files, read } = setup();
   mkdirSync(folder, { recursive: true });
@@ -1556,12 +1618,25 @@ test("after two failures in a row a denial waits and fails at once with the last
   ]);
 });
 
-test("a clock that throws or gives no number means no wait", () => {
+test("a clock that throws or gives NaN means no wait, at the failure or at the check", () => {
+  // Working at each failure, and failing at each check. Calls 1 and 2 are
+  // the failures of the first two denials, which are not checked; from
+  // then on, each denial reads the clock at its check (odd calls) and at
+  // its failure (even calls).
+  let calls = 0;
+  const failingAtChecks = (): number => {
+    calls += 1;
+    if (calls >= 3 && calls % 2 === 1) {
+      throw new Error("no clock");
+    }
+    return 1000;
+  };
   for (const now of [
     () => {
       throw new Error("no clock");
     },
     () => Number.NaN,
+    failingAtChecks,
   ]) {
     const spy = spyFileSystem({
       mkdirSync: () => {

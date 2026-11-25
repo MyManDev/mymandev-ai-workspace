@@ -347,8 +347,9 @@ export interface FileEnforcementRecorderOptions {
   readonly limits?: EnforcementRecordLimits;
   /**
    * A monotonic clock in milliseconds, for the wait after failures.
-   * Defaults to `performance.now`. A clock that throws or gives no number
-   * means no wait.
+   * Defaults to `performance.now`. A clock that throws or gives NaN makes no
+   * denial wait: when it does so at a failure, no denial waits until the
+   * next failure, and when it does so at a check, that denial does not wait.
    */
   readonly now?: () => number;
 }
@@ -513,14 +514,15 @@ export function createFileEnforcementRecorder(
   }
 
   /**
-   * The clock, or -Infinity (no wait) when it throws. A time that is not a
-   * finite number never makes a denial wait: no comparison with it holds.
+   * The clock, or NaN when it throws. NaN never makes a denial wait: no
+   * comparison with it holds, whether it is read at the failure or at the
+   * check.
    */
   function clock(): number {
     try {
       return now();
     } catch {
-      return Number.NEGATIVE_INFINITY;
+      return Number.NaN;
     }
   }
 
@@ -651,14 +653,23 @@ export function createFileEnforcementRecorder(
     const fd = step("open_failed", () =>
       fileSystem.openSync(file, createFlags, ENFORCEMENT_RECORD_FILE_MODE),
     );
+    if (!inPlace(fd, file)) {
+      // The path no longer names the new file: it is not deleted by path.
+      closeQuietly(fd);
+      throw new EnforcementRecordError("open_failed");
+    }
     try {
-      if (!inPlace(fd, file)) {
-        throw new EnforcementRecordError("open_failed");
-      }
       step("open_failed", () => restrict(fd));
       syncFolder();
     } catch (error) {
+      // The new file is empty and was created exclusively: it is deleted,
+      // so that a failure that repeats never leaves a file per record.
       closeQuietly(fd);
+      try {
+        fileSystem.unlinkSync(file);
+      } catch {
+        // An empty newest file is never moved past (`reopenFile`).
+      }
       throw error;
     }
     return { fd, sequence, file, size: 0 };
@@ -703,8 +714,10 @@ export function createFileEnforcementRecorder(
       try {
         restrict(fd);
       } catch (error) {
-        if (isLastingOpenError(error)) {
-          // A file of another owner.
+        // A file of another owner with records in it. An empty file is not
+        // moved past: it may be one that `createFile` could not restrict or
+        // delete, and moving past it would create a file per record.
+        if (size > 0 && isLastingOpenError(error)) {
           closeQuietly(fd);
           return null;
         }
