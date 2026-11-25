@@ -3132,21 +3132,10 @@ export type RunRequestRefusal = (typeof RUN_REQUEST_REFUSALS)[number];
 
 /**
  * The refusals of a run request that the main process gives from its own
- * checks, before anything is sent. The main process keeps the outcome of
- * every other request (`RunRequestOutcomeSchema`).
+ * checks, which it never keeps; in a module of its own, which imports
+ * nothing, so that the renderer may import it.
  */
-export const RUN_REQUEST_LOCAL_REFUSALS: ReadonlySet<RunRequestRefusal> =
-  new Set<RunRequestRefusal>([
-    "invalid",
-    "not_open",
-    "not_owner",
-    "not_hosted_here",
-    "disabled",
-    "message_not_found",
-    "not_own_message",
-    "connection_not_here",
-    "busy",
-  ]);
+export { RUN_REQUEST_LOCAL_REFUSALS } from "./run-request-refusals.ts";
 
 /** The refusals of a run request that say when the next request may go. */
 const RUN_REQUEST_WAITS: ReadonlySet<string> = new Set([

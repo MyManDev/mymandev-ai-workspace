@@ -7,16 +7,16 @@
 // outcome of the project's last request, which the screen takes once when
 // it opens, so that an answer that came while it was closed still shows.
 import type { AgentBridge } from "../shared/desktop-bridge.ts";
-import {
-  type AgentActivityView,
-  type ChatMessageView,
-  type ProviderConnectionListView,
-  RUN_REQUEST_LOCAL_REFUSALS,
-  type RunRequestOutcome,
-  type RunRequestRefusal,
-  type RunRequestResult,
-  type RunRequestView,
+import type {
+  AgentActivityView,
+  ChatMessageView,
+  ProviderConnectionListView,
+  RunRequestOutcome,
+  RunRequestRefusal,
+  RunRequestResult,
+  RunRequestView,
 } from "../shared/ipc-contract.ts";
+import { RUN_REQUEST_LOCAL_REFUSALS } from "../shared/run-request-refusals.ts";
 import { PROVIDER_KIND_NAMES } from "./provider-connection-view.ts";
 import { describeWait } from "./wait-text.ts";
 
