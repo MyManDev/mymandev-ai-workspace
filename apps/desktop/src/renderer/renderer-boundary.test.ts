@@ -65,6 +65,7 @@ const RISK_LABEL_VALUES = new Set(["CAPABILITY_RISK", "CAPABILITY_RISKS"]);
  */
 const SHARED_VALUE_MODULES = new Set([
   `${SHARED_DIRECTORY}product.ts`,
+  `${SHARED_DIRECTORY}run-request-refusals.ts`,
   `${SHARED_DIRECTORY}sign-in-timing.ts`,
 ]);
 

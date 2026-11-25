@@ -46,6 +46,7 @@ const MESSAGE = Object.freeze({
   seq: 1,
   authorKind: "member",
   authorName: "Ada",
+  writtenByMe: true,
   body: "Hello",
   createdAt: "2026-11-06T08:00:00.000Z",
 } as const);

@@ -314,7 +314,7 @@ An agent is created and disabled over HTTP (#294; the Project Manager's decision
 
 ### Run creation
 
-A run is created over HTTP (#35; the Project Manager's decision of 2026-11-14; ADR 0007, updates of 2026-11-14), and moved over the connection by its agent's host device (see "Agent activity"). The [protocol README](../../packages/protocol/README.md#run-creation) holds the contract and the choices that are still open.
+A run is created over HTTP (#35; the Project Manager's decisions of 2026-11-14 and 2026-11-25; ADR 0007, updates of 2026-11-14), and moved over the connection by its agent's host device (see "Agent activity"). The [protocol README](../../packages/protocol/README.md#run-creation) holds the contract and the decisions of 2026-11-25.
 
 - `POST /projects/:projectId/runs` (`RUN_ROUTES.createRun`, `src/workspaces/run-routes.ts`) with `agentId`, `providerConnectionId`, `inputMessageId`, and an optional `repositoryId` (`CreateRunRequestSchema`) answers `200` with the new run in `queued`, with its input message and its provider connection (`CreateRunResponseSchema`). It lies in the scope of the agent activity routes, under the same check (`requireProjectMember`): a project that does not exist, a project of a workspace that the account is not an active member of, also after a removal, and a malformed project ID get the same `404` with `not_found` before the body is validated, and the account's request limit of every authenticated route applies. A malformed body is `400`.
 - One transaction locks the account and the device again (`lockActor`), so a device that was revoked after the request was authenticated creates nothing, and then creates the run with `createRun`, which decides in this order: `not_found` for an agent that the project does not have; `forbidden` for an agent that the account does not own or that the asking device does not host, before anything about the other IDs is read; `not_found` for a repository that the project does not have, a provider connection that the agent's host device does not have, and a message that the project's chat does not have from the account or that is deleted, all with one answer; `conflict` for an archived project or workspace, a disabled agent, an archived repository, and a removed provider connection; and then the two limits below. An account that stopped being an active member after the membership check gets the check's `404`. Nothing is written when it refuses.
@@ -324,14 +324,14 @@ A run is created over HTTP (#35; the Project Manager's decision of 2026-11-14; A
 - `GET /projects/:projectId/runs` shows a run's `inputMessageId` to every member and its `providerConnectionId` only to the account that owns the run's agent (`listProjectRuns`).
 - A creation writes no audit record: it is not an administrative action of ADR 0014.
 
-The limits of a creation, each with its own code. Provisional (#35): both values, applied as defaults until the Project Manager decides:
+The limits of a creation, each with its own code. Both values were decided by the Project Manager on 2026-11-25 (#35):
 
 - An agent has at most 10 unfinished runs (`queued`, `running`, or `awaiting_input`; `MAX_UNFINISHED_RUNS_PER_AGENT`), the runs of the development seed included. A creation above it answers `409` with `run_limit` and no `Retry-After`, because no time frees a place: only a run of the agent that finishes does. 10 keeps what one host device has to work through small, and keeps a project's unfinished runs, which the run list returns whole, far below `MAX_ANSWER_LIST_ITEMS`.
 - An agent gets at most 100 runs within 24 hours (`MAX_NEW_RUNS_PER_AGENT_PER_DAY`), however they ended. A creation above it answers `429` with `run_daily_limit` and `Retry-After`, the time until the oldest of those runs leaves the 24 hours. It bounds what one agent adds to the run tables and what it can spend of its owner's provider in a day. The account's request limit on the route stays `rate_limited`.
 - An agent at both limits answers `run_limit`: the limit that no wait frees is decided first.
 - Both are counted in the database, inside the creation's transaction, after it locked the agent, so they hold across restarts and for concurrent requests.
 
-An agent is created with `POST /projects/:projectId/agents` since #294, and the host device registers a provider connection with `POST /provider-connections` since #295 (see "Provider connections"), so an account can create a run in production once its desktop sends these requests; the desktop does not send them yet.
+An agent is created with `POST /projects/:projectId/agents` since #294, and the host device registers a provider connection with `POST /provider-connections` since #295 (see "Provider connections"), and the desktop registers this device's provider connections since #32 and requests a run from the project chat since #35. The desktop creates no agent yet, so in production an account can request a run only of an agent that was created with the route itself.
 
 ### Provider connections
 

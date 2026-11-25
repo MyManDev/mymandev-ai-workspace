@@ -11,6 +11,8 @@ import {
   CreateJoinRequestResponseSchema,
   CreateProjectRequestSchema,
   CreateProjectResponseSchema,
+  CreateRunRequestSchema,
+  CreateRunResponseSchema,
   CreateWorkspaceRequestSchema,
   CreateWorkspaceResponseSchema,
   DefineMemberRequestSchema,
@@ -37,15 +39,21 @@ import {
   REPOSITORY_ROUTE_ERRORS,
   REPOSITORY_ROUTES,
   routePath,
+  RUN_ROUTE_ERRORS,
+  RUN_ROUTES,
 } from "@mymandev/protocol";
 import { expect, test } from "vitest";
 import {
   ACTION_RATE_LIMITED_WAIT_MS,
+  RUN_CREATION_FAILURES,
+  RUN_DAILY_LIMIT_WAIT_MS,
   WORKSPACE_ACTION_BUDGET,
   WORKSPACE_ACTION_FAILURES,
   WORKSPACE_ACTIONS,
+  type RunCreationFailure,
   type WorkspaceActionFailure,
   type WorkspaceActionName,
+  type WorkspaceActionResult,
   workspaceActionFailed,
   workspaceActionFailedFor,
   workspaceActionFailureOf,
@@ -67,6 +75,13 @@ const REPOSITORY_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819331";
 const AGENT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819341";
 const GRANT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819351";
 const CONNECTION_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819361";
+const MESSAGE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819371";
+/** The body of a run creation (#35). */
+const RUN = {
+  agentId: AGENT_ID,
+  providerConnectionId: CONNECTION_ID,
+  inputMessageId: MESSAGE_ID,
+};
 const OF_AGENT = { agentId: AGENT_ID };
 const OF_GRANT = { agentId: AGENT_ID, grantId: GRANT_ID };
 const IN_PROJECT = { projectId: PROJECT_ID };
@@ -305,6 +320,22 @@ const ACTIONS: [
     `/provider-connections/${CONNECTION_ID}/remove`,
     undefined,
   ],
+  [
+    "createRun",
+    IN_PROJECT,
+    // IDs only; the run of #35 names no repository yet.
+    {
+      agentId: AGENT_ID,
+      providerConnectionId: CONNECTION_ID,
+      inputMessageId: MESSAGE_ID,
+    },
+    `/projects/${PROJECT_ID}/runs`,
+    {
+      agentId: AGENT_ID,
+      providerConnectionId: CONNECTION_ID,
+      inputMessageId: MESSAGE_ID,
+    },
+  ],
 ];
 
 /** The `:name` parameters of a route path, in order. */
@@ -314,7 +345,7 @@ function pathParams(path: string): string[] {
   );
 }
 
-test("the allowlist holds exactly the 30 POST writes of the screens, the repositories, the grants, and the provider connections, frozen, each the protocol's route with its path parameters", () => {
+test("the allowlist holds exactly the 31 POST writes of the screens, the repositories, the grants, the provider connections, and the run creation, frozen, each the protocol's route with its path parameters", () => {
   expect(Object.keys(WORKSPACE_ACTIONS)).toEqual(ACTIONS.map(([name]) => name));
   expect(Object.isFrozen(WORKSPACE_ACTIONS)).toBe(true);
   for (const [name, entry] of Object.entries(WORKSPACE_ACTIONS)) {
@@ -332,7 +363,9 @@ test("the allowlist holds exactly the 30 POST writes of the screens, the reposit
             : name === "registerProviderConnection" ||
                 name === "removeProviderConnection"
               ? PROVIDER_CONNECTION_ROUTES[name]
-              : MEMBERSHIP_ROUTES[name as keyof typeof MEMBERSHIP_ROUTES];
+              : name === "createRun"
+                ? RUN_ROUTES.createRun
+                : MEMBERSHIP_ROUTES[name as keyof typeof MEMBERSHIP_ROUTES];
     expect(entry.route, name).toBe(protocol);
   }
   // Left out: the owner's limit of unclaimed people and project renames,
@@ -433,6 +466,7 @@ test("each write's request and answer schemas are the protocol's", () => {
       RegisterProviderConnectionResponseSchema,
     ],
     removeProviderConnection: [null, "empty"],
+    createRun: [CreateRunRequestSchema, CreateRunResponseSchema],
   };
   expect(Object.keys(WORKSPACE_ACTIONS).sort()).toEqual(
     Object.keys(schemas).sort(),
@@ -688,6 +722,23 @@ test("a name off the allowlist, a missing, extra, or invalid path parameter, or 
       { providerConnectionId: CONNECTION_ID, deviceId: WORKSPACE_ID },
       undefined,
     ],
+    // A run creation (#35): IDs only, each a lowercase UUIDv7, and no text,
+    // state, requester, or idempotency key beside them.
+    ["createRun", {}, RUN],
+    ["createRun", IN_WORKSPACE, RUN],
+    ["createRun", { projectId: PROJECT_ID.toUpperCase() }, RUN],
+    ["createRun", { ...IN_PROJECT, agentId: AGENT_ID }, RUN],
+    ["createRun", IN_PROJECT, undefined],
+    ["createRun", IN_PROJECT, {}],
+    ["createRun", IN_PROJECT, { ...RUN, agentId: undefined }],
+    ["createRun", IN_PROJECT, { ...RUN, providerConnectionId: undefined }],
+    ["createRun", IN_PROJECT, { ...RUN, inputMessageId: undefined }],
+    ["createRun", IN_PROJECT, { ...RUN, agentId: v4 }],
+    ["createRun", IN_PROJECT, { ...RUN, inputMessageId: upper }],
+    ["createRun", IN_PROJECT, { ...RUN, repositoryId: "repo" }],
+    ["createRun", IN_PROJECT, { ...RUN, text: "Fix the build" }],
+    ["createRun", IN_PROJECT, { ...RUN, state: "running" }],
+    ["createRun", IN_PROJECT, { ...RUN, idempotencyKey: MESSAGE_ID }],
   ];
   for (const [name, params, body] of refused) {
     expect(
@@ -822,7 +873,9 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     sign_in_code_used: "failed",
     unclaimed_limit: "unclaimed_limit",
     project_limit: "project_limit",
-    // No write of the desktop creates a run yet (#35).
+    // Only a run creation shows a run's limits (#35); every other write,
+    // and a failure mapped without a write's name, answers them as
+    // `failed`.
     run_limit: "failed",
     run_daily_limit: "failed",
     // A registration in a full project (#286, decision of 2026-11-14).
@@ -861,16 +914,124 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     grantCapability: GRANT_ROUTE_ERRORS.grantCapability,
     revokeGrant: GRANT_ROUTE_ERRORS.revokeGrant,
     ...PROVIDER_CONNECTION_ROUTE_ERRORS,
+    createRun: RUN_ROUTE_ERRORS.createRun,
   };
   for (const name of Object.keys(WORKSPACE_ACTIONS)) {
     expect(routeErrors[name], name).toBeDefined();
   }
-  for (const name of Object.keys(WORKSPACE_ACTIONS)) {
+  for (const name of Object.keys(WORKSPACE_ACTIONS) as WorkspaceActionName[]) {
     for (const code of routeErrors[name] ?? []) {
       if (code !== "bad_request" && code !== "internal_error") {
-        expect(expected[code], `${name} ${code}`).not.toBe("failed");
+        expect(
+          workspaceActionFailureOf(
+            { ok: false, reason: "refused", code },
+            name,
+          ),
+          `${name} ${code}`,
+        ).not.toBe("failed");
       }
     }
+  }
+});
+
+test("a run creation keeps the API's two run limits, and every other write answers them as failed (#35)", () => {
+  // With the name of the write, every code maps as without one, except the
+  // two limits of a run, which only `createRun` keeps.
+  for (const name of Object.keys(WORKSPACE_ACTIONS) as WorkspaceActionName[]) {
+    for (const code of API_ERROR_CODES) {
+      const failure = { ok: false as const, reason: "refused" as const, code };
+      const named = workspaceActionFailureOf(failure, name);
+      if (
+        name === "createRun" &&
+        (code === "run_limit" || code === "run_daily_limit")
+      ) {
+        expect(named, `${name} ${code}`).toBe(code);
+      } else {
+        expect(named, `${name} ${code}`).toBe(
+          workspaceActionFailureOf(failure),
+        );
+      }
+    }
+  }
+  // Every session failure maps alike with or without the name.
+  for (const reason of SESSION_FAILURE_REASONS) {
+    expect(workspaceActionFailureOf({ ok: false, reason }, "createRun")).toBe(
+      workspaceActionFailureOf({ ok: false, reason }),
+    );
+  }
+  // The run's failures are those of every write and the two limits, and
+  // only those.
+  expect([...RUN_CREATION_FAILURES].sort()).toEqual(
+    [...WORKSPACE_ACTION_FAILURES, "run_limit", "run_daily_limit"].sort(),
+  );
+  expect(Object.isFrozen(RUN_CREATION_FAILURES)).toBe(true);
+  expect(WORKSPACE_ACTION_FAILURES).not.toContain("run_limit");
+  expect(WORKSPACE_ACTION_FAILURES).not.toContain("run_daily_limit");
+});
+
+test("run_daily_limit waits as long as the API's Retry-After, or the whole 24 hours without one; run_limit carries no wait (#35)", () => {
+  expect(
+    workspaceActionFailedFor(
+      {
+        ok: false,
+        reason: "refused",
+        code: "run_daily_limit",
+        retryAfterSeconds: 3_600,
+      },
+      "createRun",
+    ),
+  ).toEqual({ ok: false, reason: "run_daily_limit", retryAfterMs: 3_600_000 });
+  expect(
+    workspaceActionFailedFor(
+      { ok: false, reason: "refused", code: "run_daily_limit" },
+      "createRun",
+    ),
+  ).toEqual({
+    ok: false,
+    reason: "run_daily_limit",
+    retryAfterMs: RUN_DAILY_LIMIT_WAIT_MS,
+  });
+  expect(RUN_DAILY_LIMIT_WAIT_MS).toBe(86_400_000);
+  // No time frees a place below the limit of unfinished runs.
+  expect(
+    workspaceActionFailedFor(
+      {
+        ok: false,
+        reason: "refused",
+        code: "run_limit",
+        retryAfterSeconds: 120,
+      },
+      "createRun",
+    ),
+  ).toEqual({ ok: false, reason: "run_limit" });
+  // The account's request limit stays `rate_limited` for a run creation.
+  expect(
+    workspaceActionFailedFor(
+      {
+        ok: false,
+        reason: "refused",
+        code: "rate_limited",
+        retryAfterSeconds: 30,
+      },
+      "createRun",
+    ),
+  ).toEqual({ ok: false, reason: "rate_limited", retryAfterMs: 30_000 });
+  // Another write answers both as `failed`, without a wait.
+  for (const code of ["run_limit", "run_daily_limit"] as const) {
+    expect(
+      workspaceActionFailedFor(
+        { ok: false, reason: "refused", code, retryAfterSeconds: 120 },
+        "grantCapability",
+      ),
+    ).toEqual({ ok: false, reason: "failed" });
+    expect(
+      workspaceActionFailedFor({
+        ok: false,
+        reason: "refused",
+        code,
+        retryAfterSeconds: 120,
+      }),
+    ).toEqual({ ok: false, reason: "failed" });
   }
 });
 
@@ -982,6 +1143,15 @@ test("a failure marked as sent may have reached the API, as every successful ans
         ? workspaceActionFailed(reason, 1_000)
         : workspaceActionFailed(reason);
     expect(workspaceActionMayHaveSent(failure), reason).toBe(false);
+  }
+  // A run creation's limits follow the same rule (#35).
+  const runFailures: WorkspaceActionResult<never, RunCreationFailure>[] = [
+    workspaceActionFailed("run_limit"),
+    workspaceActionFailed("run_daily_limit", 1_000),
+  ];
+  for (const failure of runFailures) {
+    expect(workspaceActionMayHaveSent(failure)).toBe(false);
+    expect(workspaceActionMayHaveSent(workspaceActionSent(failure))).toBe(true);
   }
 });
 

@@ -83,6 +83,9 @@ import type {
   RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
+  RunRequestOutcome,
+  RunRequestResult,
+  RunRequestView,
   RuntimeStatus,
   SignOutResult,
   StartSignInOptions,
@@ -234,7 +237,9 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * `providerConnections.register`, two strings in a new object of its own,
  * the ID of `providerConnections.remove`, a string, the ID and the API key
  * of `providerConnections.saveKey`, two strings in a new object of its own,
- * and the ID of `providerConnections.removeKey`, a string.
+ * the ID of `providerConnections.removeKey`, a string, the four IDs of
+ * `agents.requestRun`, each a string, in a new object of its own, and the
+ * project ID of `agents.takeRunRequestOutcome`, a string.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -849,6 +854,9 @@ export function createDesktopBridge(
       ),
   });
 
+  // Only a new object with the four IDs of a run request goes on, each a
+  // string, and a project ID string for a kept outcome; the main process
+  // checks each value. Another value is refused here without naming it.
   const agents: AgentBridge = Object.freeze({
     getState: () =>
       ipc.invoke(INVOKE_CHANNELS.getAgentState) as Promise<AgentActivityView>,
@@ -865,6 +873,28 @@ export function createDesktopBridge(
         listener,
         onError,
       ),
+    requestRun: (request: RunRequestView) => {
+      const copy = runRequestOf(request);
+      return copy !== null
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.requestRun,
+            copy,
+          ) as Promise<RunRequestResult>)
+        : Promise.reject(
+            new TypeError(
+              "requestRun needs a project ID, an agent ID, a provider connection ID, and a message ID string.",
+            ),
+          );
+    },
+    takeRunRequestOutcome: (projectId: string) =>
+      typeof projectId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.takeRunRequestOutcome,
+            projectId,
+          ) as Promise<RunRequestOutcome | null>)
+        : Promise.reject(
+            new TypeError("takeRunRequestOutcome needs a project ID string."),
+          ),
   });
 
   // Only the IDs and a new object with the fields of a grant go on;
@@ -1111,6 +1141,28 @@ export function createDesktopBridge(
     devices,
     providerConnections,
   });
+}
+
+/**
+ * A new object with only the four IDs of a run request (#35), or null when
+ * one is not a string. A getter is read once, so the main process gets the
+ * values that were checked, and another key never goes on.
+ */
+function runRequestOf(request: unknown): RunRequestView | null {
+  if (typeof request !== "object" || request === null) {
+    return null;
+  }
+  const { projectId, agentId, providerConnectionId, inputMessageId } =
+    request as Record<string, unknown>;
+  if (
+    typeof projectId !== "string" ||
+    typeof agentId !== "string" ||
+    typeof providerConnectionId !== "string" ||
+    typeof inputMessageId !== "string"
+  ) {
+    return null;
+  }
+  return { projectId, agentId, providerConnectionId, inputMessageId };
 }
 
 /**

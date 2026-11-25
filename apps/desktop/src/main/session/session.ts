@@ -162,9 +162,10 @@ export interface SessionFailure {
   /** With `key_store_failed`: the code of the store's `DeviceKeyError`. */
   readonly keyError?: DeviceKeyErrorCode;
   /**
-   * With `refused` and `rate_limited`: the answer's `Retry-After` in
-   * seconds, when it held a valid one (`callApi`), also when the refusal
-   * answered the token request before a request with an access token.
+   * With `refused` and `rate_limited` or a run creation's
+   * `run_daily_limit` (#35): the answer's `Retry-After` in seconds, when
+   * it held a valid one (`callApi`), also when the refusal answered the
+   * token request before a request with an access token.
    */
   readonly retryAfterSeconds?: number;
 }

@@ -195,6 +195,7 @@ function fakeServices(initial: ChatState = chatState()) {
   let loadOlderResult: ChatLoadOlderResult = "started";
   let workspaceRevision = 0;
   let clock = 0;
+  let ownMember: MemberId | null = AUTHOR;
   return {
     timers,
     errors,
@@ -217,6 +218,10 @@ function fakeServices(initial: ChatState = chatState()) {
     },
     setClock(ms: number) {
       clock = ms;
+    },
+    /** The account's own person in the chat's workspace, or null. */
+    setOwnMember(memberId: MemberId | null) {
+      ownMember = memberId;
     },
     rename(memberId: string, name: string | null) {
       if (name === null) {
@@ -280,6 +285,9 @@ function fakeServices(initial: ChatState = chatState()) {
             workspaceListeners.delete(listener);
           };
         },
+        // The account's own person is `AUTHOR` in the chat's workspace.
+        ownMemberId: (workspaceId: WorkspaceId) =>
+          workspaceId === WORKSPACE ? ownMember : null,
       },
       scheduleTimer: (callback: () => void, delayMs: number) => {
         const timer: Timer = {
@@ -544,6 +552,7 @@ test("the view holds the authors' names, an unknown person's and an agent's incl
         seq: 1,
         authorKind: "member",
         authorName: "Ada Lovelace",
+        writtenByMe: true,
         body: "Hello",
         createdAt: AT,
       },
@@ -552,6 +561,7 @@ test("the view holds the authors' names, an unknown person's and an agent's incl
         seq: 2,
         authorKind: "agent",
         authorName: UNKNOWN_AGENT_NAME,
+        writtenByMe: false,
         body: "From an agent",
         createdAt: AT,
       },
@@ -560,6 +570,7 @@ test("the view holds the authors' names, an unknown person's and an agent's incl
         seq: 3,
         authorKind: "member",
         authorName: UNKNOWN_MEMBER_NAME,
+        writtenByMe: false,
         body: "From a former member",
         createdAt: AT,
       },
@@ -611,7 +622,12 @@ test("no member ID, agent ID, user ID, device ID, or other key of the service cr
   fake.fire();
 
   const views = [
-    chatView(fake.options.chat.state(), 0, fake.options.chat.authorName),
+    chatView(
+      fake.options.chat.state(),
+      0,
+      fake.options.chat.authorName,
+      AUTHOR,
+    ),
     getState(),
     ...payloads(),
   ];
@@ -640,6 +656,7 @@ test("no member ID, agent ID, user ID, device ID, or other key of the service cr
         "createdAt",
         "id",
         "seq",
+        "writtenByMe",
       ]);
     }
     expect(Object.keys(view.pending[0] ?? {}).sort()).toEqual([
@@ -959,6 +976,7 @@ test("a worst-case chat crosses within the budget and passes the contract", () =
     chatState({ messages: held, pending, hasOlder: true }),
     0,
     () => "Ada Lovelace",
+    AUTHOR,
   );
 
   const text = [...view.messages, ...view.pending].reduce(
@@ -1008,6 +1026,7 @@ test("a view at every limit at once holds 500,000 code units of body text and le
     }),
     Number.MAX_SAFE_INTEGER,
     () => "\u{1F600}".repeat(CHAT_LIMITS.authorName),
+    AUTHOR,
   );
   expect(view.messages).toHaveLength(CHAT_LIMITS.messages);
   expect(view.messages.at(-1)?.seq).toBe(Number.MAX_SAFE_INTEGER);
@@ -1178,7 +1197,7 @@ test("author names are cut to their limit in characters", () => {
 
 test("the view is a frozen copy that shares no object with the service's state", () => {
   const state = chatState();
-  const view = chatView(state, 7, () => "Ada Lovelace");
+  const view = chatView(state, 7, () => "Ada Lovelace", AUTHOR);
 
   expect(view.revision).toBe(7);
   expect(Object.isFrozen(view)).toBe(true);
@@ -1309,6 +1328,7 @@ test("an unavailable chat crosses with its problem, and every status crosses", (
       chatState({ status, ...problem } as Partial<ChatState>),
       0,
       () => "Ada Lovelace",
+      null,
     );
     expect(crossed.status).toBe(status);
     expect(ChatViewSchema.parse(crossed)).toEqual(crossed);
@@ -1352,4 +1372,46 @@ test("the contract's limits, problems, and reasons match the service and the pro
   > &
     Record<ChatSendRefusal, true>;
   expect(Object.keys(refusals).sort()).toEqual([...CHAT_SEND_REFUSALS].sort());
+});
+
+test("a message is written by me exactly when the account's own person in the chat's workspace wrote it (#35)", () => {
+  const fake = fakeServices();
+  const { getState, subscribe } = register(fake);
+  // Message 1 is the own person's, 2 an agent's, 3 another person's.
+  expect(getState().messages.map((item) => item.writtenByMe)).toEqual([
+    true,
+    false,
+    false,
+  ]);
+  // The flag is all that crosses: never the member ID.
+  expect(JSON.stringify(getState())).not.toContain(AUTHOR);
+
+  // Without an own person in the workspace, no message is the account's.
+  fake.setOwnMember(null);
+  expect(getState().messages.map((item) => item.writtenByMe)).toEqual([
+    false,
+    false,
+    false,
+  ]);
+  // Another person of the account follows at the next view.
+  fake.setOwnMember(OTHER_AUTHOR);
+  const { payloads } = subscribe();
+  fake.rename(OTHER_AUTHOR, "Grace H.");
+  fake.fire();
+  expect(
+    payloads()
+      .at(-1)
+      ?.messages.map((item) => item.writtenByMe),
+  ).toEqual([false, false, true]);
+
+  // Without a project, nothing is anyone's.
+  expect(
+    chatView(NO_PROJECT, 0, () => "Ada Lovelace", AUTHOR).messages,
+  ).toEqual([]);
+  // A chat of no workspace asks for no own person.
+  expect(
+    chatView(chatState(), 0, () => "Ada Lovelace", null).messages.map(
+      (item) => item.writtenByMe,
+    ),
+  ).toEqual([false, false, false]);
 });

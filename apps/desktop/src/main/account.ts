@@ -55,9 +55,11 @@ import {
 } from "./account-session.ts";
 import { SIGN_IN_START_COOLDOWN_MS } from "../shared/sign-in-timing.ts";
 import {
+  type RunCreationFailure,
   WORKSPACE_ACTION_BUDGET,
   type WorkspaceActionAnswer,
   type WorkspaceActionBodyArgument,
+  type WorkspaceActionFailureOf,
   type WorkspaceActionName,
   type WorkspaceActionParams,
   type WorkspaceActionResult,
@@ -418,13 +420,16 @@ export interface AccountService {
    * refused without a request does not (`workspaceActionMayHaveSent`, #342).
    * An invitation code in the body or the answer is never kept, logged, or
    * published (D2). The body is required for a write with one and not
-   * allowed for one without. Never rejects.
+   * allowed for one without. A run creation's failures include its two
+   * limits (`WorkspaceActionFailureOf`, #35). Never rejects.
    */
   readonly sendWorkspaceAction: <N extends WorkspaceActionName>(
     name: N,
     params: WorkspaceActionParams[N],
     ...body: WorkspaceActionBodyArgument<N>
-  ) => Promise<WorkspaceActionResult<WorkspaceActionAnswer[N]>>;
+  ) => Promise<
+    WorkspaceActionResult<WorkspaceActionAnswer[N], WorkspaceActionFailureOf<N>>
+  >;
 }
 
 // The cooldown lives in a shared module, so that the renderer's delay for
@@ -2162,11 +2167,16 @@ export function createAccountService(
       : (sentWrites[0] as number) + windowMs - at;
   }
 
+  // Its failures are those of every write; `workspaceActionFailedFor`
+  // keeps a run creation's limits for `createRun` only, so the result fits
+  // `WorkspaceActionFailureOf<N>` of the interface.
   async function sendWorkspaceAction<N extends WorkspaceActionName>(
     name: N,
     params: WorkspaceActionParams[N],
     ...body: WorkspaceActionBodyArgument<N>
-  ): Promise<WorkspaceActionResult<WorkspaceActionAnswer[N]>> {
+  ): Promise<
+    WorkspaceActionResult<WorkspaceActionAnswer[N], RunCreationFailure>
+  > {
     let sent = false;
     try {
       // The types do not hold at runtime: the body is checked with the
@@ -2219,7 +2229,9 @@ export function createAccountService(
       // A failure carries no data, so it is answered as it is, marked as
       // one that may have reached the API.
       if (!result.ok) {
-        return workspaceActionSent(workspaceActionFailedFor(result));
+        return workspaceActionSent(
+          workspaceActionFailedFor<WorkspaceActionName>(result, name),
+        );
       }
       // The answer belongs to the account and the device that sent it: when
       // they changed meanwhile, or an action that may change them began, it
@@ -2295,6 +2307,7 @@ export function createAccountService(
     deviceRefused,
     readWorkspaceData,
     readDeviceList,
-    sendWorkspaceAction,
+    sendWorkspaceAction:
+      sendWorkspaceAction as AccountService["sendWorkspaceAction"],
   });
 }

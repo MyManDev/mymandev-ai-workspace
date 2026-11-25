@@ -4,12 +4,24 @@
 import { isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToString } from "react-dom/server";
 import { expect, test } from "vitest";
-import type { ChatPendingView, ChatView } from "../shared/ipc-contract.ts";
+import type {
+  AgentActivityView,
+  ChatPendingView,
+  ChatView,
+  ProviderConnectionListView,
+} from "../shared/ipc-contract.ts";
 import {
   ChatScreenContent,
+  type ChatRunProps,
   type ChatScreenActions,
   type ChatScreenContentProps,
 } from "./ChatScreen.tsx";
+import {
+  IDLE_RUN_REQUEST,
+  RUN_REQUEST_MESSAGES,
+  type RunRequestController,
+  type RunRequestState,
+} from "./run-request-view.ts";
 import {
   CHAT_MESSAGES,
   CHAT_PROBLEM_MESSAGES,
@@ -41,6 +53,7 @@ const READY: ChatView = {
       seq: 1,
       authorKind: "member",
       authorName: "Ada",
+      writtenByMe: true,
       body: "Hello",
       createdAt: CREATED_AT,
     },
@@ -49,6 +62,7 @@ const READY: ChatView = {
       seq: 2,
       authorKind: "agent",
       authorName: "Unknown agent",
+      writtenByMe: false,
       body: "Done.",
       createdAt: CREATED_AT,
     },
@@ -252,7 +266,7 @@ test("each message shows its author's name and kind, its time, and its body as t
       '<span class="message-author" dir="auto">Ada</span>' +
       '<span class="message-kind">Person</span>' +
       `<time class="message-time" dateTime="${CREATED_AT}">${formatChatTime(CREATED_AT)}</time>` +
-      '</p><p class="message-body" dir="auto">Hello</p></li>',
+      '</p><p class="message-body" id="message-body-0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1" dir="auto">Hello</p></li>',
   );
   expect(html).toContain(
     '<li class="message" data-author-kind="agent"><p class="message-meta"><span class="message-author" dir="auto">Unknown agent</span><span class="message-kind">Agent</span>',
@@ -487,5 +501,251 @@ test("every id is unique, every reference points to one, and nothing uses a styl
       expect(ids).toContain(reference);
     }
     expect(html).not.toMatch(/\sstyle=/);
+  }
+});
+
+// "Run with agent" on the person's own messages (#35, part A).
+
+const OWN_MESSAGE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1";
+const RUN_AGENT = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f1";
+const RUN_CONNECTION = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819301";
+
+const RUN_ACTIVITY: AgentActivityView = {
+  revision: 1,
+  status: "ready",
+  workspaceId: WORKSPACE,
+  projectId: PROJECT,
+  agents: [
+    {
+      id: RUN_AGENT,
+      name: "Builder",
+      ownerName: "Ada",
+      disabledAt: null,
+      ownedByMe: true,
+      grantableHere: true,
+      hostedElsewhere: false,
+    },
+  ],
+  unfinishedRuns: [],
+  moreUnfinishedRuns: 0,
+  finishedRuns: [],
+};
+
+const RUN_CONNECTIONS: ProviderConnectionListView = {
+  revision: 1,
+  status: "ready",
+  connections: [
+    {
+      id: RUN_CONNECTION,
+      kind: "claude",
+      label: "Work laptop",
+      createdAt: CREATED_AT,
+      status: "ready",
+    },
+  ],
+};
+
+/** A run request controller that records every call as "name argument". */
+function runRecorder() {
+  const calls: string[] = [];
+  const actions: RunRequestController = {
+    open: (messageId) => calls.push(`open ${messageId}`),
+    chooseAgent: (agentId) => calls.push(`chooseAgent ${agentId}`),
+    chooseConnection: (connectionId) =>
+      calls.push(`chooseConnection ${connectionId}`),
+    continue: (model) => calls.push(`continue ${model?.messageId ?? ""}`),
+    cancel: (model) => calls.push(`cancel ${model?.step ?? ""}`),
+    close: () => calls.push("close"),
+    confirm: (model) => calls.push(`confirm ${model?.agentId ?? ""}`),
+    start: () => {
+      calls.push("start");
+      return () => calls.push("stop");
+    },
+  };
+  return { calls, actions };
+}
+
+function runProps(
+  state: RunRequestState = IDLE_RUN_REQUEST,
+  actions: RunRequestController = runRecorder().actions,
+): ChatRunProps {
+  return {
+    state,
+    activity: RUN_ACTIVITY,
+    connections: RUN_CONNECTIONS,
+    actions,
+  };
+}
+
+const OPEN: RunRequestState = {
+  ...IDLE_RUN_REQUEST,
+  messageId: OWN_MESSAGE,
+};
+const CONFIRMING: RunRequestState = {
+  ...OPEN,
+  agentId: RUN_AGENT,
+  connectionId: RUN_CONNECTION,
+  step: "confirm",
+};
+
+test("only the person's own messages offer Run with agent, described by their body, and only with the agent bridge and the open project", () => {
+  const html = render({ run: runProps() });
+  expect(html).toContain(
+    `<button type="button" class="message-action" aria-describedby="message-body-${OWN_MESSAGE}" aria-expanded="false">${RUN_REQUEST_MESSAGES.open}</button>`,
+  );
+  // The agent's message offers nothing.
+  expect(html.split(RUN_REQUEST_MESSAGES.open)).toHaveLength(2);
+  // The status paragraph of the run request is always rendered.
+  expect(html).toContain(
+    '<p class="run-request-status" role="status" tabindex="-1"></p>',
+  );
+  // Without the bridge, or while the project is not open in the main
+  // process, no message offers it.
+  expect(render()).not.toContain(RUN_REQUEST_MESSAGES.open);
+  expect(
+    render({
+      run: runProps(),
+      view: known({ projectId: OTHER_PROJECT }),
+    }),
+  ).not.toContain(RUN_REQUEST_MESSAGES.open);
+  expect(
+    render({
+      run: runProps(),
+      view: known({ status: "no_project" } as Partial<ChatView>),
+    }),
+  ).not.toContain(RUN_REQUEST_MESSAGES.open);
+  // Another person's message offers nothing either.
+  expect(
+    render({
+      run: runProps(),
+      view: known({
+        messages: [{ ...READY.messages[0]!, writtenByMe: false }],
+      }),
+    }),
+  ).not.toContain(RUN_REQUEST_MESSAGES.open);
+});
+
+test("the open form labels the agent and the connection, offers the runnable agents and this device's connections, and says that a request does not start the run", () => {
+  const html = render({ run: runProps(OPEN) });
+  const form = `run-form-${OWN_MESSAGE}`;
+  expect(html).toContain(
+    `aria-expanded="true" aria-controls="${form}">${RUN_REQUEST_MESSAGES.open}</button>`,
+  );
+  expect(html).toContain(
+    `<form class="run-form" id="${form}" aria-labelledby="${form}-title" aria-describedby="${form}-note message-body-${OWN_MESSAGE}">`,
+  );
+  expect(html).toContain(
+    `<label for="${form}-agent">${RUN_REQUEST_MESSAGES.agentLabel}</label>`,
+  );
+  expect(html).toContain(
+    `<label for="${form}-connection">${RUN_REQUEST_MESSAGES.connectionLabel}</label>`,
+  );
+  expect(html).toContain(
+    `<option value="${RUN_AGENT}" selected="">Builder</option>`,
+  );
+  expect(html).toContain(
+    `<option value="${RUN_CONNECTION}" selected="">Work laptop (Claude)</option>`,
+  );
+  expect(html).toContain(
+    `<p class="run-note" id="${form}-note">${RUN_REQUEST_MESSAGES.note}</p>`,
+  );
+  expect(html).toContain(
+    `<button type="submit">${RUN_REQUEST_MESSAGES.continue}</button>`,
+  );
+});
+
+test("without a runnable agent or a connection the form says why, and Continue is disabled", () => {
+  const html = render({
+    run: {
+      ...runProps(OPEN),
+      connections: { ...RUN_CONNECTIONS, connections: [] },
+    },
+  });
+  expect(html).toContain(
+    `<p class="run-problem">${RUN_REQUEST_MESSAGES.noConnections}</p>`,
+  );
+  expect(html).not.toContain("<select");
+  expect(html).toContain(
+    `<button type="submit" disabled="">${RUN_REQUEST_MESSAGES.continue}</button>`,
+  );
+});
+
+test("the confirmation names the agent and the connection, with Cancel first, and its buttons act on the shown form", () => {
+  const { calls, actions } = runRecorder();
+  const html = render({ run: runProps(CONFIRMING, actions) });
+  const form = `run-form-${OWN_MESSAGE}`;
+  expect(html).toContain(
+    `<div class="run-form run-confirmation" id="${form}" role="group" aria-labelledby="${form}-title" aria-describedby="${form}-confirm-text ${form}-confirm-summary ${form}-note message-body-${OWN_MESSAGE}">`,
+  );
+  expect(html).toContain(`<dd dir="auto">Builder</dd>`);
+  expect(html).toContain(`<dd dir="auto">Work laptop (Claude)</dd>`);
+  expect(html.indexOf(`>${RUN_REQUEST_MESSAGES.cancel}</button>`)).toBeLessThan(
+    html.indexOf(`>${RUN_REQUEST_MESSAGES.confirm}</button>`),
+  );
+  const buttons = elements({ run: runProps(CONFIRMING, actions) }).filter(
+    (element) =>
+      element.type === "button" &&
+      (
+        [RUN_REQUEST_MESSAGES.cancel, RUN_REQUEST_MESSAGES.confirm] as string[]
+      ).includes(textOf(element.props.children)),
+  );
+  for (const button of buttons) {
+    button.props.onClick?.();
+  }
+  // Each gets the shown form, so Cancel decides by the shown step.
+  expect(calls).toEqual(["cancel confirm", `confirm ${RUN_AGENT}`]);
+});
+
+test("while a request waits, its buttons are disabled and say so", () => {
+  const html = render({ run: runProps({ ...CONFIRMING, sending: true }) });
+  expect(html).toContain(
+    `<p class="run-sending">${RUN_REQUEST_MESSAGES.sending}</p>`,
+  );
+  expect(html).toContain(
+    `<button type="button" disabled="">${RUN_REQUEST_MESSAGES.confirm}</button>`,
+  );
+  expect(html).toContain(
+    `aria-expanded="true" aria-controls="run-form-${OWN_MESSAGE}" disabled="">`,
+  );
+});
+
+test("Run with agent opens its message's form, and on an open form closes it; the answer shows in the status paragraph", () => {
+  const { calls, actions } = runRecorder();
+  const open = (state: RunRequestState) =>
+    elements({ run: runProps(state, actions) })
+      .find((element) => element.props.className === "message-action")
+      ?.props.onClick?.();
+  open(IDLE_RUN_REQUEST);
+  open(OPEN);
+  // On a confirmation too, it closes the form rather than step back.
+  open(CONFIRMING);
+  expect(calls).toEqual([`open ${OWN_MESSAGE}`, "close", "close"]);
+  const html = render({
+    run: runProps({
+      ...IDLE_RUN_REQUEST,
+      notice: RUN_REQUEST_MESSAGES.requested,
+    }),
+  });
+  expect(html).toContain(
+    `<p class="run-request-status" role="status" tabindex="-1">${RUN_REQUEST_MESSAGES.requested}</p>`,
+  );
+});
+
+test("with the run request, every id is unique and every reference points to one", () => {
+  for (const html of [
+    render({ run: runProps() }),
+    render({ run: runProps(OPEN) }),
+    render({ run: runProps(CONFIRMING) }),
+  ]) {
+    const ids = attributeValues(html, "id");
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const reference of [
+      ...attributeValues(html, "aria-labelledby"),
+      ...attributeValues(html, "aria-describedby"),
+      ...attributeValues(html, "aria-controls"),
+      ...attributeValues(html, "for"),
+    ].flatMap((value) => value.split(" "))) {
+      expect(ids).toContain(reference);
+    }
   }
 });

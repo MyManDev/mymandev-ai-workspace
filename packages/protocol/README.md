@@ -524,7 +524,7 @@ Open decisions (#75). The six recommendations and the decisions of 2026-11-14 do
 
 ## Run creation
 
-These rules follow the Project Manager's decision of 2026-11-14 on #35 ([ADR 0007](../../docs/architecture/decisions/0007-agent-run-lifecycle-v0.md), updates of 2026-11-14). Storing the run and serving the route belong to the database and API parts; the desktop does not use the route yet.
+These rules follow the Project Manager's decisions of 2026-11-14 and 2026-11-25 on #35 ([ADR 0007](../../docs/architecture/decisions/0007-agent-run-lifecycle-v0.md), updates of 2026-11-14). Storing the run and serving the route belong to the database and API parts; the desktop requests a run from the project chat since #35 (see the [desktop's README](../../apps/desktop/README.md#run-request-from-the-chat)).
 
 Decided by the Project Manager on 2026-11-14 (#35):
 
@@ -566,12 +566,12 @@ The limits, with their own codes (`API_ERROR_STATUS`); the [API's README](../../
 - `run_daily_limit` (`429`, with `Retry-After`): the agent got as many new runs within 24 hours as the server allows. `Retry-After` is the time until the oldest of them leaves the 24 hours. The account's limit of requests on the route stays `rate_limited`.
 - An agent at both limits answers `run_limit`.
 
-Provisional (#35): applied as defaults until the Project Manager decides. Each choice of who may ask, what the input is, and who reads the provider connection is the narrower option, which a later decision can widen without breaking a client:
+Decided by the Project Manager on 2026-11-25 (#35), who approved the defaults of 2026-11-14 as they were. Each choice of who may ask, what the input is, and who reads the provider connection is the narrower option, which a later decision can widen without breaking a client:
 
 - The route: `POST /projects/:projectId/runs`, beside the run list of the project (`GET /projects/:projectId/runs`), so that it starts with the project as the read routes do.
-- Who asks: the account that owns the agent, and only from the agent's host device, as only that device grants (#75, Project Manager decision of 2026-11-14). Another device of the account, for example one that a taken-over GitHub account registered, gets `forbidden`, so that it cannot start a run with the grants that the agent already holds. The alternative is any of the owner's devices. A role gives no right: the workspace's owner cannot request a run of a member's agent.
-- Which message: only a message that the caller wrote in the project's chat and that is not deleted, so that the chat shows the instruction as the requester's own words, and another member cannot place a prompt in the owner's run. The alternative is any message of the chat, also another member's or an agent's.
-- Who sees the provider connection: only the account that owns the run's agent. The alternative is every member; widening it later is an additive change, and narrowing it would not be.
+- Who asks: the account that owns the agent, and only from the agent's host device, as only that device grants (#75, Project Manager decision of 2026-11-14). Another device of the account, for example one that a taken-over GitHub account registered, gets `forbidden`, so that it cannot start a run with the grants that the agent already holds. A role gives no right: the workspace's owner cannot request a run of a member's agent.
+- Which message: only a message that the caller wrote in the project's chat and that is not deleted, so that the chat shows the instruction as the requester's own words, and another member cannot place a prompt in the owner's run.
+- Who sees the provider connection: only the account that owns the run's agent. Widening it later to every member would be an additive change; narrowing it would not be.
 - The event: the existing `agent.run.state_changed` with `run` added, not a new event type, so that ADR 0007's creation event stays and a desktop before #35 still shows the new run.
 - The limits and their values: 10 unfinished runs for each agent, and 100 new runs for each agent within 24 hours.
 - No idempotency key: the same request sent again creates a second run, so the desktop never sends it again on its own. No correlation ID either: linking a retry to its first run waits for the task that adds retries.

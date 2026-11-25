@@ -53,6 +53,9 @@ import type {
   RevokeInvitationResult,
   RevokeOtherDeviceResult,
   RepositoryList,
+  RunRequestOutcome,
+  RunRequestResult,
+  RunRequestView,
   RuntimeStatus,
   SignOutResult,
   StartSignInOptions,
@@ -111,7 +114,7 @@ export interface DesktopBridge {
   readonly claims: ClaimsBridge;
   /** Which other workspaces hold a claim that the account has not seen. */
   readonly claimMarks: ClaimMarksBridge;
-  /** The agent activity of the open project, read-only. */
+  /** The agent activity of the open project, and requesting a run. */
   readonly agents: AgentBridge;
   /** The grants of the open project's agents, granting, and revoking. */
   readonly grants: GrantBridge;
@@ -783,9 +786,11 @@ export interface ClaimMarksBridge {
 
 /**
  * The agents and runs of the open project, which the main process holds.
- * The renderer reads them and changes nothing: an agent's owner comes as a
- * display name, never as a member ID, and nothing names a device. The
- * newest runs come, with a count of the unfinished ones left out.
+ * The renderer reads them: an agent's owner comes as a display name, never
+ * as a member ID, and nothing names a device. The newest runs come, with a
+ * count of the unfinished ones left out. Its one write requests a run from
+ * the project chat (#35); the new run then shows in the agent activity,
+ * the only list of runs.
  */
 export interface AgentBridge {
   /** The current agent activity. */
@@ -801,6 +806,28 @@ export interface AgentBridge {
     listener: (state: AgentActivityView) => void,
     onError?: () => void,
   ) => () => void;
+  /**
+   * Requests a run of an agent of the open project (#35): the project that
+   * the chat screen shows, an agent that the account owns, that this
+   * device hosts, and that is enabled (`grantableHere`), a provider
+   * connection of this device, and one of the person's own messages
+   * (`writtenByMe`) as its input. The bridge passes on a new object with
+   * only the four IDs, each a string; the main process checks each one
+   * against what it holds and sends the request once. `unknown` says that
+   * the run may have been created: it is never sent again on its own.
+   */
+  readonly requestRun: (request: RunRequestView) => Promise<RunRequestResult>;
+  /**
+   * The outcome of the project's last run request that the main process
+   * keeps (#35), taken once: the chat screen shows it when it opens for
+   * that project, so that an answer that came while it was not shown is
+   * not lost, and takes it after it showed an answer itself. While a
+   * request of the project is on its way, the answer waits for its
+   * outcome. Null when nothing is kept. No ID comes with it.
+   */
+  readonly takeRunRequestOutcome: (
+    projectId: string,
+  ) => Promise<RunRequestOutcome | null>;
 }
 
 /**
