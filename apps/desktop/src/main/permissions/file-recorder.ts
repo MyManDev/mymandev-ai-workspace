@@ -21,13 +21,21 @@
 //   cut short drops the file; a file that does not end with "\n" is never
 //   appended to again, so a torn line is never followed by another line in
 //   the same file.
+// - Still in place. Before each write, the open file must still be the file
+//   at its path: linked (`nlink`), a regular file, and with the same file ID
+//   and device as the path (`lstat`). A file that was deleted, with its
+//   folder or alone, or renamed and replaced, is dropped, and the record
+//   goes to the folder and the file opened again, which are created anew.
+//   After the flush of a shell start, the file is checked again, and a file
+//   that is no longer in place fails the record (`write_failed`).
 // - Durability. The record of an allowed shell start is flushed to disk
 //   (`fsync`) before `record` returns, and so are the lines written before
 //   it. A denial reaches the operating system with its write call, which a
 //   crash of the application does not undo, and reaches the disk with the
-//   next shell start, the next rotation, or the close at quit. Default until
-//   the Project Manager decides: a denial loop of a misbehaving executor
-//   then does not flush once for every denial on the main process.
+//   next shell start, the next rotation, or when the file is dropped or
+//   closed. Default until the Project Manager decides: a denial loop of a
+//   misbehaving executor then does not flush once for every denial on the
+//   main process.
 // - Rotation. A file holds at most `maxFileBytes`. A record that does not
 //   fit starts the next numbered file, and only the newest `maxFiles` files
 //   are kept: the older ones are deleted. A closed file's content is never
@@ -36,14 +44,23 @@
 // - Failure. A record that cannot be written, a denial as well as a shell
 //   start, makes `record` throw an `EnforcementRecordError` with a code from
 //   a closed list, so that the enforcement point denies an allowed shell
-//   start (`record_failed`). The next record opens the folder again. It
-//   never throws anything else, and nothing it does can stop the main
-//   process. A file that cannot be deleted at rotation does not fail the
-//   record; it is deleted at a later rotation.
-// - Permissions. The folder is created for its owner only (0o700) and each
-//   file is readable and writable by its owner only (0o600) on macOS and
-//   Linux. Windows ignores these modes: the files inherit the access rules
-//   of the local data folder in the person's profile.
+//   start (`record_failed`). The next record opens the folder again; after
+//   two failures in a row, a denial within `ENFORCEMENT_RECORD_RETRY_MS` of
+//   the last attempt fails at once with the last code, but a shell start
+//   always tries to write. A newest file that can never be appended to (a
+//   folder, a read-only file, a link, a file of another owner) is left as it
+//   is, and the next numbered file is started. It never throws anything
+//   else, and nothing it does can stop the main process. A file that cannot
+//   be deleted at rotation does not fail the record; it is deleted at a
+//   later rotation.
+// - Permissions. The folder must be a folder, not a link, and is set to its
+//   owner only (0o700) whenever it is opened, and each file is readable and
+//   writable by its owner only (0o600) on macOS and Linux, where a file is
+//   opened with `O_NOFOLLOW`, so a link at a file's name is never followed.
+//   Windows ignores these modes, and has no `O_NOFOLLOW`: the files inherit
+//   the access rules of the local data folder in the person's profile, a
+//   folder link or junction is refused by its `lstat`, and a file link is
+//   refused by the check that the open file is the file at its path.
 // - Logs. Fixed text with a failure code at most, once when the recorder
 //   starts failing and once when it writes again: never a record, an ID, or
 //   a path.
@@ -103,12 +120,68 @@ export const ENFORCEMENT_RECORD_FILE_MODE = 0o600;
 /** The folder is for its owner only. */
 export const ENFORCEMENT_RECORD_FOLDER_MODE = 0o700;
 
-/** The name of a record file: its number, 8 digits or more. */
-const FILE_NAME = /^enforcement-(\d{8,})\.jsonl$/u;
+/**
+ * After two failures in a row, a denial within this many milliseconds of the
+ * last attempt fails at once with the last code, without touching the disk;
+ * a shell start always tries to write. Default until the Project Manager
+ * decides.
+ */
+export const ENFORCEMENT_RECORD_RETRY_MS = 1000;
 
-/** The name of record file number `sequence`. */
+/**
+ * The name of a record file: its number, exactly 8 digits, so that two names
+ * never have the same number.
+ */
+const FILE_NAME = /^enforcement-(\d{8})\.jsonl$/u;
+
+/** The highest file number; a later file fails with `open_failed`. */
+export const ENFORCEMENT_RECORD_MAX_SEQUENCE = 99_999_999;
+
+/** The name of record file number `sequence`, 1 to the highest number. */
 export function enforcementRecordFileName(sequence: number): string {
   return `enforcement-${String(sequence).padStart(8, "0")}.jsonl`;
+}
+
+/**
+ * The errors of opening the newest file that waiting does not cure: it is a
+ * folder, read-only, of another owner, a link (`O_NOFOLLOW`: `ELOOP`, or
+ * `EMLINK` on FreeBSD), or gone. The next numbered file is started instead.
+ */
+const LASTING_OPEN_ERRORS: ReadonlySet<string> = new Set([
+  "EACCES",
+  "EPERM",
+  "EISDIR",
+  "ELOOP",
+  "EMLINK",
+  "ENOENT",
+]);
+
+function isLastingOpenError(error: unknown): boolean {
+  try {
+    const code: unknown =
+      typeof error === "object" && error !== null
+        ? (error as { code?: unknown }).code
+        : undefined;
+    return typeof code === "string" && LASTING_OPEN_ERRORS.has(code);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The flags of a record file: read and append, and on macOS and Linux
+ * `O_NOFOLLOW`, so that a link at its name is never followed. Windows has no
+ * `O_NOFOLLOW`. A new file is created exclusively (`O_CREAT | O_EXCL`); an
+ * existing file is opened without `O_CREAT`, so a file that vanished is never
+ * created again by the reopen.
+ */
+export function enforcementRecordFileFlags(
+  platform: NodeJS.Platform,
+  create: boolean,
+): number {
+  const { O_APPEND, O_RDWR, O_CREAT, O_EXCL } = fs.constants;
+  const noFollow = platform === "win32" ? 0 : (fs.constants.O_NOFOLLOW ?? 0);
+  return O_APPEND | O_RDWR | noFollow | (create ? O_CREAT | O_EXCL : 0);
 }
 
 /**
@@ -161,6 +234,27 @@ export const OLD_FILE_NOT_DELETED_MESSAGE =
   "An old enforcement record file could not be deleted; it is deleted at a later rotation.";
 
 /**
+ * What the recorder reads of an open file. The file ID and the device are
+ * read as `bigint`, so that a 64-bit file ID of Windows is compared exactly.
+ */
+export interface RecorderFileStat {
+  readonly size: number;
+  readonly nlink: number;
+  readonly ino: bigint;
+  readonly dev: bigint;
+  readonly isFile: boolean;
+}
+
+/** What the recorder reads of a path, without following a link. */
+export interface RecorderPathStat {
+  readonly ino: bigint;
+  readonly dev: bigint;
+  readonly isFile: boolean;
+  readonly isDirectory: boolean;
+  readonly isSymbolicLink: boolean;
+}
+
+/**
  * The synchronous part of `node:fs` that the recorder uses. Tests pass a
  * wrapper that fails at a chosen step.
  */
@@ -170,8 +264,10 @@ export interface RecorderFileSystem {
     options: { recursive: true; mode: number },
   ): unknown;
   readdirSync(folder: string): string[];
-  openSync(file: string, flags: string, mode?: number): number;
-  fstatSync(fd: number): { size: number };
+  openSync(file: string, flags: string | number, mode?: number): number;
+  fstatSync(fd: number): RecorderFileStat;
+  lstatSync(target: string): RecorderPathStat;
+  chmodSync(target: string, mode: number): void;
   readSync(
     fd: number,
     buffer: Uint8Array,
@@ -195,9 +291,29 @@ export const nodeRecorderFileSystem: RecorderFileSystem = Object.freeze({
   mkdirSync: (folder: string, options: { recursive: true; mode: number }) =>
     fs.mkdirSync(folder, options),
   readdirSync: (folder: string) => fs.readdirSync(folder),
-  openSync: (file: string, flags: string, mode?: number) =>
+  openSync: (file: string, flags: string | number, mode?: number) =>
     fs.openSync(file, flags, mode),
-  fstatSync: (fd: number) => fs.fstatSync(fd),
+  fstatSync: (fd: number): RecorderFileStat => {
+    const stat = fs.fstatSync(fd, { bigint: true });
+    return {
+      size: Number(stat.size),
+      nlink: Number(stat.nlink),
+      ino: stat.ino,
+      dev: stat.dev,
+      isFile: stat.isFile(),
+    };
+  },
+  lstatSync: (target: string): RecorderPathStat => {
+    const stat = fs.lstatSync(target, { bigint: true });
+    return {
+      ino: stat.ino,
+      dev: stat.dev,
+      isFile: stat.isFile(),
+      isDirectory: stat.isDirectory(),
+      isSymbolicLink: stat.isSymbolicLink(),
+    };
+  },
+  chmodSync: (target: string, mode: number) => fs.chmodSync(target, mode),
   readSync: (
     fd: number,
     buffer: Uint8Array,
@@ -229,6 +345,12 @@ export interface FileEnforcementRecorderOptions {
   readonly fileSystem?: RecorderFileSystem;
   /** Defaults to `ENFORCEMENT_RECORD_LIMITS`. */
   readonly limits?: EnforcementRecordLimits;
+  /**
+   * A monotonic clock in milliseconds, for the wait after failures.
+   * Defaults to `performance.now`. A clock that throws or gives no number
+   * means no wait.
+   */
+  readonly now?: () => number;
 }
 
 export interface FileEnforcementRecorder extends EnforcementRecorder {
@@ -334,8 +456,26 @@ export function enforcementRecordLine(
 interface OpenFile {
   readonly fd: number;
   readonly sequence: number;
+  /** Its path, in the folder resolved when it was opened. */
+  readonly file: string;
   size: number;
 }
+
+/** The failures in a row of the disk, for the wait after them. */
+interface Retry {
+  readonly code: EnforcementRecordFailure;
+  readonly failures: number;
+  /** A denial before this time fails at once. */
+  readonly notBefore: number;
+}
+
+/** The failures that come from the disk, after which a denial may wait. */
+const DISK_FAILURES: ReadonlySet<EnforcementRecordFailure> = new Set([
+  "folder_unavailable",
+  "open_failed",
+  "write_failed",
+  "sync_failed",
+] as const);
 
 const NEWLINE = 0x0a;
 
@@ -352,18 +492,35 @@ export function createFileEnforcementRecorder(
   let folder = "";
   const fileSystem = options.fileSystem ?? nodeRecorderFileSystem;
   const limits = options.limits ?? ENFORCEMENT_RECORD_LIMITS;
+  const now = options.now ?? (() => performance.now());
   const posix = platform !== "win32";
+  const appendFlags = enforcementRecordFileFlags(platform, false);
+  const createFlags = enforcementRecordFileFlags(platform, true);
 
   let current: OpenFile | null = null;
   let closed = false;
   /** The code of the last failure, or null while records are written. */
   let failing: EnforcementRecordFailure | null = null;
+  /** The failures of the disk in a row, or null after a write. */
+  let retry: Retry | null = null;
 
   function report(message: string): void {
     try {
       log(message);
     } catch {
       // A failing log changes nothing.
+    }
+  }
+
+  /**
+   * The clock, or -Infinity (no wait) when it throws. A time that is not a
+   * finite number never makes a denial wait: no comparison with it holds.
+   */
+  function clock(): number {
+    try {
+      return now();
+    } catch {
+      return Number.NEGATIVE_INFINITY;
     }
   }
 
@@ -385,11 +542,43 @@ export function createFileEnforcementRecorder(
     }
   }
 
-  /** Drops the open file after a failure, without flushing it. */
+  /**
+   * Drops the open file: flushes it, ignoring an error, so that the denials
+   * written to it reach the disk when they can, and closes it.
+   */
   function dropCurrent(): void {
     if (current !== null) {
-      closeQuietly(current.fd);
+      const { fd } = current;
       current = null;
+      try {
+        fileSystem.fsyncSync(fd);
+      } catch {
+        // Dropped either way.
+      }
+      closeQuietly(fd);
+    }
+  }
+
+  /**
+   * Whether the open descriptor is still the file at `file`: linked, a
+   * regular file, and the same file ID and device as the path, which is a
+   * regular file and not a link. Never throws.
+   */
+  function inPlace(fd: number, file: string): boolean {
+    try {
+      const open = fileSystem.fstatSync(fd);
+      if (open.nlink < 1 || !open.isFile) {
+        return false;
+      }
+      const named = fileSystem.lstatSync(file);
+      return (
+        named.isFile &&
+        !named.isSymbolicLink &&
+        named.ino === open.ino &&
+        named.dev === open.dev
+      );
+    } catch {
+      return false;
     }
   }
 
@@ -407,6 +596,29 @@ export function createFileEnforcementRecorder(
       }
     }
     return found.sort((a, b) => a - b);
+  }
+
+  /**
+   * Creates the folder when it is missing, requires it to be a folder and
+   * not a link, and restricts it to its owner on macOS and Linux, also when
+   * it already existed.
+   */
+  function prepareFolder(): void {
+    step("folder_unavailable", () =>
+      fileSystem.mkdirSync(folder, {
+        recursive: true,
+        mode: ENFORCEMENT_RECORD_FOLDER_MODE,
+      }),
+    );
+    const stat = step("folder_unavailable", () => fileSystem.lstatSync(folder));
+    if (!stat.isDirectory || stat.isSymbolicLink) {
+      throw new EnforcementRecordError("folder_unavailable");
+    }
+    if (posix) {
+      step("folder_unavailable", () =>
+        fileSystem.chmodSync(folder, ENFORCEMENT_RECORD_FOLDER_MODE),
+      );
+    }
   }
 
   /** Makes a new folder entry durable; Windows cannot open a folder. */
@@ -431,31 +643,50 @@ export function createFileEnforcementRecorder(
 
   /** Creates record file number `sequence`, which must not exist. */
   function createFile(sequence: number): OpenFile {
+    if (sequence > ENFORCEMENT_RECORD_MAX_SEQUENCE) {
+      throw new EnforcementRecordError("open_failed");
+    }
     const file = path.join(folder, enforcementRecordFileName(sequence));
-    // `x`: never append to a file that this recorder did not expect.
+    // `O_EXCL`: never append to a file that this recorder did not expect.
     const fd = step("open_failed", () =>
-      fileSystem.openSync(file, "ax", ENFORCEMENT_RECORD_FILE_MODE),
+      fileSystem.openSync(file, createFlags, ENFORCEMENT_RECORD_FILE_MODE),
     );
     try {
+      if (!inPlace(fd, file)) {
+        throw new EnforcementRecordError("open_failed");
+      }
       step("open_failed", () => restrict(fd));
       syncFolder();
     } catch (error) {
       closeQuietly(fd);
       throw error;
     }
-    return { fd, sequence, size: 0 };
+    return { fd, sequence, file, size: 0 };
   }
 
   /**
    * Opens the newest record file to append to it, or null when it must not
-   * be appended to: it is full, or it does not end with "\n".
+   * be appended to: it is full, it does not end with "\n", or it can never
+   * be appended to (a folder, a read-only file, a link, a file of another
+   * owner, or gone). Another failure, which may pass, throws `open_failed`.
    */
   function reopenFile(sequence: number): OpenFile | null {
     const file = path.join(folder, enforcementRecordFileName(sequence));
-    const fd = step("open_failed", () =>
-      fileSystem.openSync(file, "a+", ENFORCEMENT_RECORD_FILE_MODE),
-    );
+    let fd: number;
     try {
+      // No `O_CREAT`: a file that vanished is created by `createFile`.
+      fd = fileSystem.openSync(file, appendFlags, ENFORCEMENT_RECORD_FILE_MODE);
+    } catch (error) {
+      if (isLastingOpenError(error)) {
+        return null;
+      }
+      throw new EnforcementRecordError("open_failed");
+    }
+    try {
+      if (!inPlace(fd, file)) {
+        closeQuietly(fd);
+        return null;
+      }
       const size = step("open_failed", () => fileSystem.fstatSync(fd).size);
       let usable = size < limits.maxFileBytes;
       if (usable && size > 0) {
@@ -469,8 +700,17 @@ export function createFileEnforcementRecorder(
         closeQuietly(fd);
         return null;
       }
-      step("open_failed", () => restrict(fd));
-      return { fd, sequence, size };
+      try {
+        restrict(fd);
+      } catch (error) {
+        if (isLastingOpenError(error)) {
+          // A file of another owner.
+          closeQuietly(fd);
+          return null;
+        }
+        throw new EnforcementRecordError("open_failed");
+      }
+      return { fd, sequence, file, size };
     } catch (error) {
       closeQuietly(fd);
       throw error;
@@ -502,10 +742,19 @@ export function createFileEnforcementRecorder(
     }
   }
 
-  /** The open file, opened or created when there is none. */
+  /**
+   * The open file, when it is still in place; otherwise the folder is
+   * resolved and prepared again, and the newest file is opened, or the next
+   * one created. At most one file is created per call.
+   */
   function openCurrent(): OpenFile {
     if (current !== null) {
-      return current;
+      if (inPlace(current.fd, current.file)) {
+        return current;
+      }
+      // Deleted, or renamed and replaced: what it holds is no longer at its
+      // path, so the record goes to the file at the path.
+      dropCurrent();
     }
     folder = step("folder_unavailable", () => {
       const resolved: unknown = resolveFolder();
@@ -514,12 +763,7 @@ export function createFileEnforcementRecorder(
       }
       return resolved;
     });
-    step("folder_unavailable", () =>
-      fileSystem.mkdirSync(folder, {
-        recursive: true,
-        mode: ENFORCEMENT_RECORD_FOLDER_MODE,
-      }),
-    );
+    prepareFolder();
     const found = sequences();
     const newest = found.at(-1);
     const opened =
@@ -556,6 +800,17 @@ export function createFileEnforcementRecorder(
     if (bytes.length > limits.maxRecordBytes) {
       throw new EnforcementRecordError("record_too_large");
     }
+    const shellStart = validated.kind === "shell_start_allowed";
+    // A shell start always tries to write; a denial after two failures in a
+    // row waits, so that a denial loop does not open the folder each time.
+    if (
+      !shellStart &&
+      retry !== null &&
+      retry.failures >= 2 &&
+      clock() < retry.notBefore
+    ) {
+      throw new EnforcementRecordError(retry.code);
+    }
     try {
       let open = openCurrent();
       if (open.size > 0 && open.size + bytes.length > limits.maxFileBytes) {
@@ -569,17 +824,32 @@ export function createFileEnforcementRecorder(
         throw new EnforcementRecordError("write_failed");
       }
       open.size += written;
-      if (validated.kind === "shell_start_allowed") {
+      if (shellStart) {
         step("sync_failed", () => fileSystem.fsyncSync(open.fd));
+        // Deleted or replaced between the check and the flush: the record
+        // is not at the path, so the start is not allowed.
+        if (!inPlace(open.fd, open.file)) {
+          throw new EnforcementRecordError("write_failed");
+        }
       }
     } catch (error) {
       // The file is dropped: the next record opens the folder again, and a
       // file with a torn line is never appended to.
       dropCurrent();
-      throw error instanceof EnforcementRecordError
-        ? error
-        : new EnforcementRecordError("write_failed");
+      const failure =
+        error instanceof EnforcementRecordError
+          ? error
+          : new EnforcementRecordError("write_failed");
+      if (DISK_FAILURES.has(failure.code)) {
+        retry = {
+          code: failure.code,
+          failures: (retry?.failures ?? 0) + 1,
+          notBefore: clock() + ENFORCEMENT_RECORD_RETRY_MS,
+        };
+      }
+      throw failure;
     }
+    retry = null;
   }
 
   return Object.freeze({
@@ -608,14 +878,8 @@ export function createFileEnforcementRecorder(
         return;
       }
       closed = true;
-      if (current !== null) {
-        try {
-          fileSystem.fsyncSync(current.fd);
-        } catch {
-          // Closed either way.
-        }
-        dropCurrent();
-      }
+      // Flushed and closed.
+      dropCurrent();
     },
   });
 }

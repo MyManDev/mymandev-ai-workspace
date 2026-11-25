@@ -1,9 +1,14 @@
 import {
+  chmodSync,
+  constants,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,9 +28,12 @@ import {
   ENFORCEMENT_RECORD_FOLDER,
   ENFORCEMENT_RECORD_FORMAT_VERSION,
   ENFORCEMENT_RECORD_LIMITS,
+  ENFORCEMENT_RECORD_MAX_SEQUENCE,
+  ENFORCEMENT_RECORD_RETRY_MS,
   type EnforcementRecordFailure,
   EnforcementRecordError,
   type EnforcementRecordLimits,
+  enforcementRecordFileFlags,
   enforcementRecordFileName,
   type FileEnforcementRecorder,
   nodeRecorderFileSystem,
@@ -149,6 +157,7 @@ function setup(
     fileSystem?: RecorderFileSystem;
     limits?: EnforcementRecordLimits;
     root?: string;
+    now?: () => number;
   } = {},
 ) {
   const root = options.root ?? dataFolder();
@@ -162,6 +171,7 @@ function setup(
       ? {}
       : { fileSystem: options.fileSystem }),
     ...(options.limits === undefined ? {} : { limits: options.limits }),
+    ...(options.now === undefined ? {} : { now: options.now }),
   });
   openRecorders.push(recorder);
   const file = (sequence: number) =>
@@ -251,7 +261,12 @@ test("the file is opened in append mode and each record is written with one writ
       .named("openSync")
       .filter((call) => String(call.args[0]).endsWith(".jsonl"))
       .map((call) => [path.basename(String(call.args[0])), call.args[1]]),
-  ).toEqual([["enforcement-00000001.jsonl", "ax"]]);
+  ).toEqual([
+    [
+      "enforcement-00000001.jsonl",
+      enforcementRecordFileFlags(process.platform, true),
+    ],
+  ]);
   expect(spy.named("writeSync")).toHaveLength(3);
   recorder.close();
 
@@ -263,7 +278,12 @@ test("the file is opened in append mode and each record is written with one writ
       .named("openSync")
       .filter((call) => String(call.args[0]).endsWith(".jsonl"))
       .map((call) => [path.basename(String(call.args[0])), call.args[1]]),
-  ).toEqual([["enforcement-00000001.jsonl", "a+"]]);
+  ).toEqual([
+    [
+      "enforcement-00000001.jsonl",
+      enforcementRecordFileFlags(process.platform, false),
+    ],
+  ]);
   expect(again.named("writeSync")).toHaveLength(1);
 });
 
@@ -427,13 +447,14 @@ test("the folder is resolved when a file is opened, not when the recorder is cre
   expect(failureOf(() => recorder.record(DENIAL))).toBe("folder_unavailable");
   expect(resolutions).toBe(2);
   missing = false;
-  recorder.record(DENIAL);
+  // A shell start always tries, also right after two failures.
   recorder.record(START);
+  recorder.record(DENIAL);
   // The open file keeps its folder.
   expect(resolutions).toBe(3);
   expect(
     readFileSync(path.join(folder, enforcementRecordFileName(1)), "utf8"),
-  ).toBe(`${DENIAL_LINE}\n${START_LINE}\n`);
+  ).toBe(`${START_LINE}\n${DENIAL_LINE}\n`);
   expect(logs).toEqual([
     recordFailureMessage("folder_unavailable"),
     RECORDS_WRITTEN_AGAIN_MESSAGE,
@@ -557,6 +578,8 @@ test("a file system that throws anything fails the record with an EnforcementRec
     "readdirSync",
     "openSync",
     "fstatSync",
+    "lstatSync",
+    "chmodSync",
     "readSync",
     "writeSync",
     "fsyncSync",
@@ -594,13 +617,17 @@ test("the recorder writes again after a failure, and logs the failure and the re
       return nodeRecorderFileSystem.writeSync(fd, buffer, offset, length);
     },
   });
+  let time = 0;
   const { recorder, logs, read, folder } = setup({
     fileSystem: spy.fileSystem,
+    now: () => time,
   });
   for (let index = 0; index < 3; index += 1) {
     expect(failureOf(() => recorder.record(START))).toBe("write_failed");
   }
   full = false;
+  // After the wait, a denial tries again.
+  time += ENFORCEMENT_RECORD_RETRY_MS;
   recorder.record(DENIAL);
   recorder.record(DENIAL);
   expect(read(1)).toBe(`${DENIAL_LINE}\n${DENIAL_LINE}\n`);
@@ -771,25 +798,47 @@ test("on macOS and Linux each opened file is restricted to its owner and a new f
         fd === -1 ? undefined : nodeRecorderFileSystem.closeSync(fd),
       fchmodSync: () => undefined,
     });
-    const { recorder, root } = setup({ fileSystem: spy.fileSystem, platform });
+    const { recorder, root, folder } = setup({
+      fileSystem: spy.fileSystem,
+      platform,
+    });
     recorder.record(START);
     expect(spy.named("fchmodSync").map((call) => call.args[1])).toEqual([
       0o600,
     ]);
+    expect(spy.named("chmodSync").map((call) => call.args)).toEqual([
+      [folder, 0o700],
+    ]);
     const opened = spy.named("openSync");
-    expect(opened.map((call) => call.args[1])).toEqual(["ax", "r"]);
+    expect(opened.map((call) => call.args[1])).toEqual([
+      enforcementRecordFileFlags(platform, true),
+      "r",
+    ]);
     expect(opened[0]?.args[2]).toBe(0o600);
     expect(spy.named("fsyncSync").map((call) => call.args[0])).toContain(-1);
     recorder.close();
 
-    // A reopened file is restricted again.
-    const again = spyFileSystem({ fchmodSync: () => undefined });
+    // A reopened file is restricted again, and so is the folder that
+    // already exists.
+    const again = spyFileSystem({
+      fchmodSync: () => undefined,
+      chmodSync: () => undefined,
+    });
     setup({ fileSystem: again.fileSystem, platform, root }).recorder.record(
       DENIAL,
     );
     expect(again.named("fchmodSync").map((call) => call.args[1])).toEqual([
       0o600,
     ]);
+    expect(again.named("chmodSync").map((call) => call.args)).toEqual([
+      [folder, 0o700],
+    ]);
+    expect(
+      again
+        .named("openSync")
+        .filter((call) => String(call.args[0]).endsWith(".jsonl"))
+        .map((call) => call.args[1]),
+    ).toEqual([enforcementRecordFileFlags(platform, false)]);
   }
 
   const windows = spyFileSystem();
@@ -797,6 +846,7 @@ test("on macOS and Linux each opened file is restricted to its owner and a new f
     START,
   );
   expect(windows.named("fchmodSync")).toEqual([]);
+  expect(windows.named("chmodSync")).toEqual([]);
   expect(
     windows.named("openSync").filter((call) => call.args[1] === "r"),
   ).toEqual([]);
@@ -1011,5 +1061,529 @@ test("through the enforcement point: a start written but not flushed leaves the 
       '{"version":1,"kind":"denied","reason":"record_failed",' +
       `"capability":"terminal.execute","runId":"${RUN_ID}","agentId":"${AGENT_ID}",` +
       `"repositoryId":"${REPOSITORY_ID}","providerConnectionId":null,"at":"${AT}"}\n`,
+  );
+});
+
+const RECORD_FAILED_LINE =
+  '{"version":1,"kind":"denied","reason":"record_failed",' +
+  `"capability":"terminal.execute","runId":"${RUN_ID}","agentId":"${AGENT_ID}",` +
+  `"repositoryId":"${REPOSITORY_ID}","providerConnectionId":null,"at":"${AT}"}`;
+
+/**
+ * Lets the platform "linux" run on any host: Windows cannot open a folder to
+ * flush it, so the folder's descriptor is a stand-in.
+ */
+function folderFlushStub(): Partial<RecorderFileSystem> {
+  return {
+    openSync: (file, flags, mode) =>
+      flags === "r" ? -1 : nodeRecorderFileSystem.openSync(file, flags, mode),
+    fsyncSync: (fd) =>
+      fd === -1 ? undefined : nodeRecorderFileSystem.fsyncSync(fd),
+    closeSync: (fd) =>
+      fd === -1 ? undefined : nodeRecorderFileSystem.closeSync(fd),
+  };
+}
+
+/** The names of the record files that were opened, with their flags. */
+function recordOpens(spy: ReturnType<typeof spyFileSystem>) {
+  return spy
+    .named("openSync")
+    .filter((call) => String(call.args[0]).endsWith(".jsonl"))
+    .map((call) => [path.basename(String(call.args[0])), call.args[1]]);
+}
+
+// Still in place.
+
+test("a record folder deleted while the application runs is created again, and the next record is on disk, never in the deleted file", () => {
+  const { recorder, folder, read, logs } = setup();
+  recorder.record(START);
+  rmSync(folder, { recursive: true, force: true });
+  expect(recorder.record(START)).toBeUndefined();
+  // Numbering starts at 1 again in the new folder.
+  expect(read(1)).toBe(`${START_LINE}\n`);
+  rmSync(folder, { recursive: true, force: true });
+  expect(recorder.record(DENIAL)).toBeUndefined();
+  expect(read(1)).toBe(`${DENIAL_LINE}\n`);
+  expect(logs).toEqual([]);
+});
+
+test("a record file renamed and replaced while the application runs is left alone, and the next record goes to the file at the path", () => {
+  const { recorder, folder, read, file, files } = setup();
+  recorder.record(START);
+  const moved = path.join(folder, "moved.jsonl");
+  renameSync(file(1), moved);
+  writeFileSync(file(1), "");
+  expect(recorder.record(START)).toBeUndefined();
+  expect(read(1)).toBe(`${START_LINE}\n`);
+  expect(readFileSync(moved, "utf8")).toBe(`${START_LINE}\n`);
+
+  // Renamed and not replaced: the file at the path is created again.
+  renameSync(file(1), path.join(folder, "moved-again.jsonl"));
+  expect(recorder.record(START)).toBeUndefined();
+  expect(read(1)).toBe(`${START_LINE}\n`);
+  expect(files()).toEqual([
+    "enforcement-00000001.jsonl",
+    "moved-again.jsonl",
+    "moved.jsonl",
+  ]);
+});
+
+test("an open file that is no longer linked is dropped and the path is opened again", () => {
+  let unlinked: number | null = null;
+  const spy = spyFileSystem({
+    fstatSync: (fd) => {
+      const stat = nodeRecorderFileSystem.fstatSync(fd);
+      return fd === unlinked ? { ...stat, nlink: 0 } : stat;
+    },
+    closeSync: (fd) => {
+      if (fd === unlinked) {
+        unlinked = null;
+      }
+      nodeRecorderFileSystem.closeSync(fd);
+    },
+  });
+  const { recorder, read } = setup({
+    fileSystem: spy.fileSystem,
+    platform: "win32",
+  });
+  recorder.record(START);
+  unlinked = spy.named("writeSync")[0]?.args[0] as number;
+  expect(recorder.record(START)).toBeUndefined();
+  expect(unlinked).toBeNull();
+  expect(recordOpens(spy)).toEqual([
+    ["enforcement-00000001.jsonl", enforcementRecordFileFlags("win32", true)],
+    ["enforcement-00000001.jsonl", enforcementRecordFileFlags("win32", false)],
+  ]);
+  expect(read(1)).toBe(`${START_LINE}\n${START_LINE}\n`);
+});
+
+test("an open file whose path names another file is dropped; a path that keeps naming another file starts the next file", () => {
+  let replaced = false;
+  const spy = spyFileSystem({
+    lstatSync: (target) => {
+      const stat = nodeRecorderFileSystem.lstatSync(target);
+      return replaced && target.endsWith(enforcementRecordFileName(1))
+        ? { ...stat, ino: stat.ino + 1n }
+        : stat;
+    },
+  });
+  const { recorder, read, files } = setup({
+    fileSystem: spy.fileSystem,
+    platform: "win32",
+  });
+  recorder.record(START);
+  replaced = true;
+  expect(recorder.record(START)).toBeUndefined();
+  expect(read(1)).toBe(`${START_LINE}\n`);
+  expect(read(2)).toBe(`${START_LINE}\n`);
+  expect(files()).toHaveLength(2);
+});
+
+test("a record folder deleted between the check and the flush of a shell start fails the record, and the shell start is denied", () => {
+  /** A recorder whose next flush deletes its folder first. */
+  function deletingOnFlush() {
+    const state = { deleteOnFlush: false, folder: "" };
+    const spy = spyFileSystem({
+      fsyncSync: (fd) => {
+        if (state.deleteOnFlush) {
+          state.deleteOnFlush = false;
+          rmSync(state.folder, { recursive: true, force: true });
+        }
+        nodeRecorderFileSystem.fsyncSync(fd);
+      },
+    });
+    const run = setup({ fileSystem: spy.fileSystem, platform: "win32" });
+    state.folder = run.folder;
+    return { run, state };
+  }
+
+  const direct = deletingOnFlush();
+  direct.run.recorder.record(DENIAL);
+  direct.state.deleteOnFlush = true;
+  expect(failureOf(() => direct.run.recorder.record(START))).toBe(
+    "write_failed",
+  );
+
+  // Through the enforcement point: denied, and the denial is on disk in the
+  // folder created again.
+  const checked = deletingOnFlush();
+  checked.state.deleteOnFlush = true;
+  expect(
+    enforcementWith(checked.run.recorder).check(HELD_RUN, SHELL_REQUEST),
+  ).toEqual({ allowed: false, reason: "record_failed" });
+  expect(checked.run.read(1)).toBe(`${RECORD_FAILED_LINE}\n`);
+});
+
+// Links, and files that cannot be appended to.
+
+test("the file flags: read and append, O_NOFOLLOW on macOS and Linux, and O_CREAT with O_EXCL for a new file only", () => {
+  const { O_APPEND, O_RDWR, O_CREAT, O_EXCL } = constants;
+  const noFollow = constants.O_NOFOLLOW ?? 0;
+  if (process.platform !== "win32") {
+    expect(noFollow).toBeGreaterThan(0);
+  }
+  expect(enforcementRecordFileFlags("win32", true)).toBe(
+    O_APPEND | O_RDWR | O_CREAT | O_EXCL,
+  );
+  expect(enforcementRecordFileFlags("win32", false)).toBe(O_APPEND | O_RDWR);
+  for (const platform of ["linux", "darwin"] as const) {
+    expect(enforcementRecordFileFlags(platform, true)).toBe(
+      O_APPEND | O_RDWR | noFollow | O_CREAT | O_EXCL,
+    );
+    expect(enforcementRecordFileFlags(platform, false)).toBe(
+      O_APPEND | O_RDWR | noFollow,
+    );
+  }
+});
+
+test("a record folder that is a link or not a folder fails the record with folder_unavailable and opens nothing", () => {
+  for (const kind of [
+    { isSymbolicLink: true, isDirectory: false },
+    { isSymbolicLink: false, isDirectory: false },
+    { isSymbolicLink: true, isDirectory: true },
+  ]) {
+    const spy = spyFileSystem({
+      lstatSync: (target) => ({
+        ...nodeRecorderFileSystem.lstatSync(target),
+        ...kind,
+      }),
+    });
+    const { recorder } = setup({ fileSystem: spy.fileSystem });
+    expect(failureOf(() => recorder.record(START))).toBe("folder_unavailable");
+    expect(spy.named("openSync")).toEqual([]);
+  }
+});
+
+test.skipIf(process.platform === "win32")(
+  "on macOS and Linux a linked record folder is refused and a linked record file is never followed",
+  () => {
+    const root = dataFolder();
+    const elsewhere = dataFolder();
+    symlinkSync(elsewhere, path.join(root, ENFORCEMENT_RECORD_FOLDER), "dir");
+    const linked = setup({ root });
+    expect(failureOf(() => linked.recorder.record(START))).toBe(
+      "folder_unavailable",
+    );
+    expect(readdirSync(elsewhere)).toEqual([]);
+
+    const first = setup();
+    first.recorder.record(DENIAL);
+    first.recorder.close();
+    const target = path.join(dataFolder(), "target.jsonl");
+    writeFileSync(target, "");
+    rmSync(first.file(1));
+    symlinkSync(target, first.file(1));
+    const second = setup({ root: first.root });
+    expect(second.recorder.record(START)).toBeUndefined();
+    expect(readFileSync(target, "utf8")).toBe("");
+    expect(second.read(2)).toBe(`${START_LINE}\n`);
+  },
+);
+
+test("a newest record file that is a folder is left alone and the next file is started", () => {
+  const { recorder, folder, read, files } = setup();
+  mkdirSync(path.join(folder, enforcementRecordFileName(1)), {
+    recursive: true,
+  });
+  expect(recorder.record(START)).toBeUndefined();
+  expect(files()).toEqual([
+    "enforcement-00000001.jsonl",
+    "enforcement-00000002.jsonl",
+  ]);
+  expect(read(2)).toBe(`${START_LINE}\n`);
+});
+
+test("a newest record file that can never be opened starts the next file; one that may open later fails with open_failed", () => {
+  const reopen = enforcementRecordFileFlags(process.platform, false);
+  for (const code of ["EACCES", "EPERM", "EISDIR", "ELOOP", "EMLINK"]) {
+    const first = setup();
+    first.recorder.record(DENIAL);
+    first.recorder.close();
+    const spy = spyFileSystem({
+      openSync: (file, flags, mode) => {
+        if (flags === reopen) {
+          throw errno(code);
+        }
+        return nodeRecorderFileSystem.openSync(file, flags, mode);
+      },
+    });
+    const second = setup({ root: first.root, fileSystem: spy.fileSystem });
+    expect(second.recorder.record(START)).toBeUndefined();
+    expect(second.read(1)).toBe(`${DENIAL_LINE}\n`);
+    expect(second.read(2)).toBe(`${START_LINE}\n`);
+  }
+  for (const code of ["EMFILE", "EBUSY", "EIO"]) {
+    const first = setup();
+    first.recorder.record(DENIAL);
+    first.recorder.close();
+    const spy = spyFileSystem({
+      openSync: (file, flags, mode) => {
+        if (flags === reopen) {
+          throw errno(code);
+        }
+        return nodeRecorderFileSystem.openSync(file, flags, mode);
+      },
+    });
+    const second = setup({ root: first.root, fileSystem: spy.fileSystem });
+    expect(failureOf(() => second.recorder.record(START))).toBe("open_failed");
+    expect(second.files()).toEqual(["enforcement-00000001.jsonl"]);
+  }
+});
+
+test("a newest record file of another owner, which cannot be restricted, starts the next file on macOS and Linux", () => {
+  const first = setup({ platform: "win32" });
+  first.recorder.record(DENIAL);
+  first.recorder.close();
+  let restricted = 0;
+  const spy = spyFileSystem({
+    ...folderFlushStub(),
+    fchmodSync: () => {
+      restricted += 1;
+      if (restricted === 1) {
+        throw errno("EPERM");
+      }
+    },
+  });
+  const second = setup({
+    root: first.root,
+    fileSystem: spy.fileSystem,
+    platform: "linux",
+  });
+  expect(second.recorder.record(START)).toBeUndefined();
+  expect(second.read(2)).toBe(`${START_LINE}\n`);
+});
+
+test("a record file that vanished after the folder was listed is created anew, and on macOS and Linux its folder entry is flushed", () => {
+  const first = setup();
+  first.recorder.record(DENIAL);
+  first.recorder.close();
+  const spy = spyFileSystem({
+    ...folderFlushStub(),
+    fchmodSync: () => undefined,
+    readdirSync: (folder) => [
+      ...nodeRecorderFileSystem.readdirSync(folder),
+      enforcementRecordFileName(3),
+    ],
+  });
+  const second = setup({
+    root: first.root,
+    fileSystem: spy.fileSystem,
+    platform: "linux",
+  });
+  expect(second.recorder.record(START)).toBeUndefined();
+  expect(recordOpens(spy)).toEqual([
+    ["enforcement-00000003.jsonl", enforcementRecordFileFlags("linux", false)],
+    ["enforcement-00000004.jsonl", enforcementRecordFileFlags("linux", true)],
+  ]);
+  const order = spy.calls.map((call) =>
+    call.name === "openSync" ? call.args[1] : call.name,
+  );
+  const created = order.indexOf(enforcementRecordFileFlags("linux", true));
+  expect(order.slice(created)).toContain("r");
+  expect(second.read(4)).toBe(`${START_LINE}\n`);
+});
+
+test("moving on to the next file is bounded: at most one new file per record, and only the newest files are kept", () => {
+  const reopen = enforcementRecordFileFlags(process.platform, false);
+  const spy = spyFileSystem({
+    openSync: (file, flags, mode) => {
+      if (flags === reopen) {
+        throw errno("EACCES");
+      }
+      return nodeRecorderFileSystem.openSync(file, flags, mode);
+    },
+    writeSync: () => {
+      throw errno("ENOSPC");
+    },
+  });
+  const { recorder, files } = setup({
+    fileSystem: spy.fileSystem,
+    limits: SMALL_LIMITS,
+  });
+  for (let index = 1; index <= 8; index += 1) {
+    expect(failureOf(() => recorder.record(START))).toBe("write_failed");
+    expect(
+      spy
+        .named("openSync")
+        .filter((call) => call.args[1] !== reopen && call.args[1] !== "r"),
+    ).toHaveLength(index);
+    expect(files().length).toBeLessThanOrEqual(SMALL_LIMITS.maxFiles);
+  }
+});
+
+test("record file names have exactly 8 digits; other names are left alone, and no file beyond the highest number is created", () => {
+  const { recorder, folder, files, read } = setup();
+  mkdirSync(folder, { recursive: true });
+  for (const name of [
+    "enforcement-000000009.jsonl",
+    "enforcement-0000009.jsonl",
+    "enforcement-00000009.jsonl.bak",
+  ]) {
+    writeFileSync(path.join(folder, name), "kept\n");
+  }
+  expect(recorder.record(START)).toBeUndefined();
+  expect(read(1)).toBe(`${START_LINE}\n`);
+  expect(files()).toEqual(
+    [
+      "enforcement-0000009.jsonl",
+      "enforcement-00000001.jsonl",
+      "enforcement-000000009.jsonl",
+      "enforcement-00000009.jsonl.bak",
+    ].sort(),
+  );
+  recorder.close();
+
+  // The highest number, torn: no next file.
+  const last = setup();
+  mkdirSync(last.folder, { recursive: true });
+  writeFileSync(
+    last.file(ENFORCEMENT_RECORD_MAX_SEQUENCE),
+    `${DENIAL_LINE}\n{"ver`,
+  );
+  expect(failureOf(() => last.recorder.record(START))).toBe("open_failed");
+  expect(last.files()).toEqual(["enforcement-99999999.jsonl"]);
+});
+
+test.skipIf(process.platform === "win32")(
+  "on macOS and Linux a record folder that already exists is set to its owner only",
+  () => {
+    const { recorder, folder } = setup();
+    mkdirSync(folder, { mode: 0o755 });
+    chmodSync(folder, 0o755);
+    recorder.record(START);
+    expect(statSync(folder).mode & 0o777).toBe(0o700);
+  },
+);
+
+// Waiting after failures.
+
+test("after two failures in a row a denial waits and fails at once with the last code, but a shell start always tries", () => {
+  let time = 1000;
+  let broken = true;
+  const spy = spyFileSystem({
+    mkdirSync: (folder, options) => {
+      if (broken) {
+        throw errno("EACCES");
+      }
+      return nodeRecorderFileSystem.mkdirSync(folder, options);
+    },
+  });
+  const { recorder, logs, read } = setup({
+    fileSystem: spy.fileSystem,
+    now: () => time,
+  });
+  const attempts = () => spy.named("mkdirSync").length;
+  expect(failureOf(() => recorder.record(DENIAL))).toBe("folder_unavailable");
+  expect(failureOf(() => recorder.record(DENIAL))).toBe("folder_unavailable");
+  expect(attempts()).toBe(2);
+  time += ENFORCEMENT_RECORD_RETRY_MS - 1;
+  expect(failureOf(() => recorder.record(DENIAL))).toBe("folder_unavailable");
+  expect(attempts()).toBe(2);
+  // A shell start tries, and starts the wait again.
+  expect(failureOf(() => recorder.record(START))).toBe("folder_unavailable");
+  expect(attempts()).toBe(3);
+  time += ENFORCEMENT_RECORD_RETRY_MS - 1;
+  expect(failureOf(() => recorder.record(DENIAL))).toBe("folder_unavailable");
+  expect(attempts()).toBe(3);
+  // An invalid record changes nothing.
+  expect(
+    failureOf(() => recorder.record({ ...DENIAL, extra: 1 } as never)),
+  ).toBe("record_invalid");
+  time += 1;
+  expect(failureOf(() => recorder.record(DENIAL))).toBe("folder_unavailable");
+  expect(attempts()).toBe(4);
+  broken = false;
+  time += ENFORCEMENT_RECORD_RETRY_MS;
+  expect(recorder.record(DENIAL)).toBeUndefined();
+  expect(read(1)).toBe(`${DENIAL_LINE}\n`);
+  expect(logs).toEqual([
+    recordFailureMessage("folder_unavailable"),
+    recordFailureMessage("record_invalid"),
+    recordFailureMessage("folder_unavailable"),
+    RECORDS_WRITTEN_AGAIN_MESSAGE,
+  ]);
+});
+
+test("a clock that throws or gives no number means no wait", () => {
+  for (const now of [
+    () => {
+      throw new Error("no clock");
+    },
+    () => Number.NaN,
+  ]) {
+    const spy = spyFileSystem({
+      mkdirSync: () => {
+        throw errno("EACCES");
+      },
+    });
+    const { recorder } = setup({ fileSystem: spy.fileSystem, now });
+    for (let index = 0; index < 4; index += 1) {
+      expect(failureOf(() => recorder.record(DENIAL))).toBe(
+        "folder_unavailable",
+      );
+    }
+    expect(spy.named("mkdirSync")).toHaveLength(4);
+  }
+});
+
+// Exact bounds.
+
+test("a line of exactly maxRecordBytes is written; one byte more is too large", () => {
+  const bytes = Buffer.byteLength(`${START_LINE}\n`, "utf8");
+  const exact = setup({
+    limits: { ...ENFORCEMENT_RECORD_LIMITS, maxRecordBytes: bytes },
+  });
+  expect(exact.recorder.record(START)).toBeUndefined();
+  expect(exact.read(1)).toBe(`${START_LINE}\n`);
+  const smaller = setup({
+    limits: { ...ENFORCEMENT_RECORD_LIMITS, maxRecordBytes: bytes - 1 },
+  });
+  expect(failureOf(() => smaller.recorder.record(START))).toBe(
+    "record_too_large",
+  );
+});
+
+test("a file may reach exactly maxFileBytes, and a file of exactly maxFileBytes is not appended to again", () => {
+  const limits: EnforcementRecordLimits = Object.freeze({
+    maxFileBytes: (DENIAL_LINE.length + 1) * 2,
+    maxFiles: 3,
+    maxRecordBytes: 1024,
+  });
+  const first = setup({ limits });
+  first.recorder.record(DENIAL);
+  first.recorder.record(DENIAL);
+  expect(first.files()).toEqual(["enforcement-00000001.jsonl"]);
+  expect(statSync(first.file(1)).size).toBe(limits.maxFileBytes);
+  first.recorder.close();
+
+  const second = setup({ root: first.root, limits });
+  second.recorder.record(DENIAL);
+  expect(second.read(1)).toBe(`${DENIAL_LINE}\n${DENIAL_LINE}\n`);
+  expect(second.read(2)).toBe(`${DENIAL_LINE}\n`);
+});
+
+// Dropping a file.
+
+test("a file dropped after a failure is flushed before it is closed, ignoring an error", () => {
+  let cut = false;
+  const spy = spyFileSystem({
+    writeSync: (fd, buffer, offset, length) =>
+      nodeRecorderFileSystem.writeSync(
+        fd,
+        buffer,
+        offset,
+        cut ? length - 5 : length,
+      ),
+  });
+  const { recorder } = setup({ fileSystem: spy.fileSystem, platform: "win32" });
+  recorder.record(DENIAL);
+  expect(spy.named("fsyncSync")).toHaveLength(0);
+  cut = true;
+  expect(failureOf(() => recorder.record(DENIAL))).toBe("write_failed");
+  const fd = spy.named("writeSync")[0]?.args[0];
+  expect(spy.named("fsyncSync").map((call) => call.args[0])).toEqual([fd]);
+  const order = spy.calls.map((call) => call.name);
+  expect(order.lastIndexOf("fsyncSync")).toBeLessThan(
+    order.lastIndexOf("closeSync"),
   );
 });
