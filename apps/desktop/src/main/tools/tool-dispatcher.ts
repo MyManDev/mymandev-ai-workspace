@@ -22,6 +22,7 @@ import { CAPABILITY_SCOPE } from "@mymandev/permissions";
 import type * as z from "zod";
 import type { RunExecution } from "../agents/run-executor.ts";
 import type { EnforcementDenialReason } from "../permissions/enforcement.ts";
+import type { FileIdentity } from "../repository-links/identity.ts";
 import type {
   RepositoryFolderFailure,
   RepositoryFolderResolution,
@@ -137,6 +138,12 @@ export interface ToolRunContext {
    * call. Never put it, or a path under it, in a result.
    */
   readonly folder: string;
+  /**
+   * The identity (device and file number) of `folder` that the link
+   * recorded and that the resolution read again. A tool checks that the
+   * folder it acts on still has it, and is not a link.
+   */
+  readonly folderIdentity: FileIdentity;
   /** The run's signal: stop at once when it aborts. */
   readonly signal: AbortSignal;
 }
@@ -420,9 +427,10 @@ export function createToolDispatcher(
       return refuse("repository_unavailable", resolution.reason);
     }
     const folder = resolution.folder;
+    const folderIdentity = resolution.identity;
 
     // The action is held until the tool settled, also after an abort.
-    const work = (async () => parsed.run({ folder, signal }))();
+    const work = (async () => parsed.run({ folder, folderIdentity, signal }))();
     void work.then(end, end);
     const outcome = await untilAborted(work, signal);
     if (outcome === ABORTED || signal.aborted) {

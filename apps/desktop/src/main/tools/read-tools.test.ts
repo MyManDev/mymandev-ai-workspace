@@ -43,6 +43,16 @@ class FakeFiles implements ReadToolFileSystem {
   /** Overrides what the open file's `fstat` gives. */
   handleStat: ((stat: ToolFileStat) => ToolFileStat) | null = null;
   readCount: ((wanted: number) => number) | null = null;
+  /** The device of a canonical path; 1 for every other. */
+  readonly devs = new Map<string, bigint>();
+  /** Runs before every call, after the hook of its n-th call. */
+  beforeEach: ((operation: Operation, target: string) => void) | null = null;
+  /**
+   * Whether an open file names its real path, as `/proc/self/fd` does on
+   * Linux; and an error code that naming it fails with.
+   */
+  namesOpenFile = false;
+  openFileNameError: string | null = null;
   private nextIno = 2n;
   private counts = new Map<Operation, number>();
 
@@ -98,6 +108,7 @@ class FakeFiles implements ReadToolFileSystem {
     this.counts.set(operation, count);
     this.calls.push([operation, target]);
     this.hooks.get(`${operation}:${count}`)?.();
+    this.beforeEach?.(operation, target);
     const code = this.failWith.get(`${operation}:${target}`);
     if (code !== undefined) {
       throw fsError(code);
@@ -130,7 +141,18 @@ class FakeFiles implements ReadToolFileSystem {
     return current;
   }
 
-  private statOf(node: Node): ToolFileStat {
+  /** The identity of a folder as a link records it, without a call. */
+  identity(target: string): { dev: string; ino: string } {
+    const real = this.resolve(target, true);
+    const node = this.nodes.get(real);
+    if (node === undefined) {
+      throw fsError("ENOENT");
+    }
+    const stat = this.statOf(node, real);
+    return { dev: String(stat.dev), ino: String(stat.ino) };
+  }
+
+  private statOf(node: Node, at: string): ToolFileStat {
     const kind: ToolFileKind =
       node.type === "dir"
         ? "directory"
@@ -141,7 +163,7 @@ class FakeFiles implements ReadToolFileSystem {
             : "other";
     return {
       kind,
-      dev: 1n,
+      dev: this.devs.get(at) ?? 1n,
       ino: node.ino,
       nlink: node.type === "file" ? node.nlink : 1n,
       size: node.type === "file" ? BigInt(node.content.length) : 0n,
@@ -160,20 +182,27 @@ class FakeFiles implements ReadToolFileSystem {
     if (node === undefined) {
       throw fsError("ENOENT");
     }
-    return this.statOf(node);
+    return this.statOf(node, real);
   }
 
   async open(target: string): Promise<ToolFileHandle> {
     this.enter("open", target);
-    const node = this.nodes.get(this.resolve(target, true));
+    const real = this.resolve(target, true);
+    const node = this.nodes.get(real);
     if (node === undefined || node.type === "dir") {
       throw fsError("EISDIR");
     }
     this.opens += 1;
     return {
       stat: async () => {
-        const stat = this.statOf(node);
+        const stat = this.statOf(node, real);
         return this.handleStat === null ? stat : this.handleStat(stat);
+      },
+      realPath: async () => {
+        if (this.openFileNameError !== null) {
+          throw fsError(this.openFileNameError);
+        }
+        return this.namesOpenFile ? real : undefined;
       },
       read: async (buffer, position) => {
         this.enter("read", target);
@@ -209,7 +238,7 @@ class FakeFiles implements ReadToolFileSystem {
       )
       .map(([key, node]) => ({
         name: key.slice(prefix.length),
-        kind: this.statOf(node).kind,
+        kind: this.statOf(node, key).kind,
       }));
     return { entries: all.slice(0, limit), more: all.length > limit };
   }
@@ -233,8 +262,17 @@ function repository(): FakeFiles {
     .file("/work/outside/index.ts", "outside index");
 }
 
-function toolsOf(files: ReadToolFileSystem) {
+/** The fake file system of each tool, which records the folder's identity. */
+const fakeOf = new WeakMap<Tool, FakeFiles>();
+
+function toolsOf(files: ReadToolFileSystem, fake?: FakeFiles) {
   const tools = createReadTools({ files, pathApi: path.posix });
+  const recorder = fake ?? (files instanceof FakeFiles ? files : undefined);
+  if (recorder !== undefined) {
+    for (const tool of tools) {
+      fakeOf.set(tool, recorder);
+    }
+  }
   const byName = new Map(tools.map((tool) => [tool.name, tool]));
   return {
     tools,
@@ -243,19 +281,50 @@ function toolsOf(files: ReadToolFileSystem) {
   };
 }
 
+type Identity = { dev: string; ino: string };
+
+/**
+ * Runs a tool as the dispatcher does. The folder's identity is the one that
+ * a link records: read when the tool is run, before any change of a test.
+ */
 async function runTool(
   tool: Tool,
   input: unknown,
-  options: { folder?: string; signal?: AbortSignal } = {},
+  options: {
+    folder?: string;
+    signal?: AbortSignal;
+    identity?: Identity;
+  } = {},
 ): Promise<ToolRunOutcome> {
   const parsed = tool.parse(input);
   if (!parsed.ok) {
     throw new Error("invalid input");
   }
+  const folder = options.folder ?? ROOT;
+  const fake = fakeOf.get(tool);
+  if (options.identity === undefined && fake === undefined) {
+    throw new Error("no identity");
+  }
   return parsed.run({
-    folder: options.folder ?? ROOT,
+    folder,
+    folderIdentity: options.identity ?? (fake as FakeFiles).identity(folder),
     signal: options.signal ?? new AbortController().signal,
   });
+}
+
+/**
+ * Makes `${ROOT}/src` itself (its node, with its file number) or a link to
+ * the folder outside, which holds an `index.ts` as `src` does.
+ */
+function srcAs(files: FakeFiles, state: "folder" | "link"): void {
+  const node = files.nodes.get(`${ROOT}/src`);
+  if (state === "link" && node?.type === "dir") {
+    files.move(`${ROOT}/src`, `${ROOT}/src-held`);
+    files.link(`${ROOT}/src`, "/work/outside");
+  } else if (state === "folder" && node?.type === "link") {
+    files.nodes.delete(`${ROOT}/src`);
+    files.move(`${ROOT}/src-held`, `${ROOT}/src`);
+  }
 }
 
 function refusal(reason: string) {
@@ -461,11 +530,17 @@ test("TOCTOU: a file swapped for a link to a file outside between the check and 
   expect(files.closes).toBe(1);
 });
 
+// The calls of `read_file` on `src/index.ts`, in order: lstat 1 of the
+// repository's folder, realpath 1 of it, lstat 2 of its real path, realpath
+// 2 of the path, lstat 3 of `src`, lstat 4 of the path, the open, then
+// realpath 3, lstat 5 and 6 of the folders, lstat 7 of the path, lstat 8 and
+// 9 of the folders, and realpath 4.
+
 test("TOCTOU: a folder swapped for a link to a folder outside between the resolution and the lstat is refused by the resolution after the open", async () => {
   const files = repository();
   const { read } = toolsOf(files);
-  // After the two resolutions (the folder and the path), before the lstat.
-  files.on("lstat", 1, () => {
+  // After the resolution and the check of the folders, before the lstat.
+  files.on("lstat", 4, () => {
     files.move(`${ROOT}/src`, `${ROOT}/src-old`);
     files.link(`${ROOT}/src`, "/work/outside");
   });
@@ -478,7 +553,7 @@ test("TOCTOU: a folder swapped for a link to a folder outside between the resolu
 test("TOCTOU: a folder swapped to a link outside for the open and back after it is refused by the lstat after the open", async () => {
   const files = repository();
   const { read } = toolsOf(files);
-  files.on("lstat", 1, () => {
+  files.on("lstat", 4, () => {
     files.move(`${ROOT}/src`, `${ROOT}/src-old`);
     files.link(`${ROOT}/src`, "/work/outside");
   });
@@ -513,6 +588,283 @@ test("TOCTOU: a folder swapped for a link while it is listed is refused", async 
   const answer = await runTool(list, { path: "src" });
   expect(answer).toEqual(refusal("changed"));
   expect(JSON.stringify(answer)).not.toContain("secret.txt");
+});
+
+test("TOCTOU (review schedule): a folder on the path that is a folder at every realpath and a link outside at every lstat and open is refused, and nothing outside is answered", async () => {
+  const files = repository().file("/work/outside/index.ts", "SECRET");
+  const { read } = toolsOf(files);
+  files.beforeEach = (operation) => {
+    if (operation === "realpath") {
+      srcAs(files, "folder");
+    } else if (operation === "lstat" || operation === "open") {
+      srcAs(files, "link");
+    }
+  };
+  const answer = await runTool(read, { path: "src/index.ts" });
+  expect(answer).toEqual(refusal("changed"));
+  expect(JSON.stringify(answer)).not.toContain("SECRET");
+  expect(files.opens).toBe(0);
+});
+
+test("TOCTOU: a folder on the path that is a link only at its check in the resolution is refused before any open", async () => {
+  const files = repository().file("/work/outside/index.ts", "SECRET");
+  const { read } = toolsOf(files);
+  let checks = 0;
+  files.beforeEach = (operation, target) => {
+    if (operation === "realpath") {
+      srcAs(files, "folder");
+    } else if (operation === "lstat" && target === `${ROOT}/src`) {
+      checks += 1;
+      srcAs(files, checks === 1 ? "link" : "folder");
+    } else if (operation === "lstat" || operation === "open") {
+      srcAs(files, "link");
+    }
+  };
+  const answer = await runTool(read, { path: "src/index.ts" });
+  expect(answer).toEqual(refusal("changed"));
+  expect(files.opens).toBe(0);
+});
+
+test("TOCTOU: a folder on the path that is a folder at its first checks and a link at every lstat and open after them is refused by a check of the folders after the open", async () => {
+  // A folder at the resolution only; then also at the first check after the
+  // open, so that only the check after the file's lstat sees the link.
+  for (const folderChecks of [1, 2]) {
+    const files = repository().file("/work/outside/index.ts", "SECRET");
+    const { read } = toolsOf(files);
+    let checks = 0;
+    files.beforeEach = (operation, target) => {
+      if (operation === "realpath") {
+        srcAs(files, "folder");
+      } else if (operation === "lstat" && target === `${ROOT}/src`) {
+        checks += 1;
+        srcAs(files, checks <= folderChecks ? "folder" : "link");
+      } else if (operation === "lstat" || operation === "open") {
+        srcAs(files, "link");
+      }
+    };
+    const answer = await runTool(read, { path: "src/index.ts" });
+    expect(answer, String(folderChecks)).toEqual(refusal("changed"));
+    expect(JSON.stringify(answer)).not.toContain("SECRET");
+    expect(files.closes).toBe(1);
+  }
+});
+
+test("TOCTOU: a folder on the path that is a link for the file's calls and for the last realpath is refused by that realpath", async () => {
+  const files = repository().file("/work/outside/index.ts", "SECRET");
+  const { read } = toolsOf(files);
+  let resolutions = 0;
+  files.beforeEach = (operation, target) => {
+    if (operation === "realpath") {
+      resolutions += 1;
+      srcAs(files, resolutions <= 3 ? "folder" : "link");
+    } else if (operation === "lstat" && target === `${ROOT}/src`) {
+      srcAs(files, "folder");
+    } else if (operation === "lstat" || operation === "open") {
+      srcAs(files, "link");
+    }
+  };
+  const answer = await runTool(read, { path: "src/index.ts" });
+  expect(answer).toEqual(refusal("changed"));
+  expect(JSON.stringify(answer)).not.toContain("SECRET");
+});
+
+/**
+ * `src` is a link outside exactly for the `lstat` calls of the file and its
+ * open, and itself for every other call: no check by path sees it.
+ */
+function linkOnlyForTheFile(files: FakeFiles): void {
+  files.beforeEach = (operation, target) => {
+    const forTheFile =
+      (operation === "lstat" && target === `${ROOT}/src/index.ts`) ||
+      operation === "open";
+    srcAs(files, forTheFile ? "link" : "folder");
+  };
+}
+
+test("TOCTOU: where the system names the open file (/proc/self/fd on Linux), a folder that is a link exactly for the file's lstat and open is refused", async () => {
+  const files = repository().file("/work/outside/index.ts", "SECRET");
+  files.namesOpenFile = true;
+  linkOnlyForTheFile(files);
+  const { read } = toolsOf(files);
+  const answer = await runTool(read, { path: "src/index.ts" });
+  expect(answer).toEqual(refusal("changed"));
+  expect(JSON.stringify(answer)).not.toContain("SECRET");
+  expect(files.closes).toBe(1);
+  // A name of the open file that cannot be read refuses as well.
+  const failing = repository();
+  failing.openFileNameError = "ENOENT";
+  expect(await runTool(toolsOf(failing).read, { path: "README.md" })).toEqual(
+    refusal("changed"),
+  );
+  // The checked path itself passes.
+  const plain = repository();
+  plain.namesOpenFile = true;
+  expect(await runTool(toolsOf(plain).read, { path: "src/index.ts" })).toEqual(
+    expect.objectContaining({ ok: true }),
+  );
+});
+
+test("known limit (README): where the system cannot name the open file, a folder that is a link exactly for the file's lstat and open is not seen", async () => {
+  // This pins the remaining window that the README describes, so that the
+  // change that closes it, before the write and shell tools, updates it.
+  const files = repository().file("/work/outside/index.ts", "SECRET");
+  linkOnlyForTheFile(files);
+  const { read } = toolsOf(files);
+  expect(await runTool(read, { path: "src/index.ts" })).toMatchObject({
+    ok: true,
+    result: { content: "SECRET" },
+  });
+});
+
+test("TOCTOU: a folder on the path replaced by another folder during the read is refused, although the file is the same", async () => {
+  const files = repository();
+  const { read } = toolsOf(files);
+  files.on("open", 1, () => {
+    // The file moves to a new folder, which takes the old folder's place.
+    files.dir(`${ROOT}/next`);
+    files.move(`${ROOT}/src/index.ts`, `${ROOT}/next/index.ts`);
+    files.move(`${ROOT}/src`, `${ROOT}/src-old`);
+    files.move(`${ROOT}/next`, `${ROOT}/src`);
+  });
+  expect(await runTool(read, { path: "src/index.ts" })).toEqual(
+    refusal("changed"),
+  );
+});
+
+test("TOCTOU: list_directory checks the folders on the path again right before the listing", async () => {
+  const files = repository().dir(`${ROOT}/src/sub`);
+  const { list } = toolsOf(files);
+  let checks = 0;
+  files.beforeEach = (operation, target) => {
+    if (operation === "lstat" && target === `${ROOT}/src`) {
+      checks += 1;
+      if (checks === 2) {
+        srcAs(files, "link");
+      }
+    }
+  };
+  expect(await runTool(list, { path: "src/sub" })).toEqual(refusal("changed"));
+  expect(files.calls.filter(([operation]) => operation === "readdir")).toEqual(
+    [],
+  );
+});
+
+test("the repository's folder must still be the folder that the link recorded, and not a link", async () => {
+  // Another folder at the same path.
+  const replaced = repository();
+  const { read } = toolsOf(replaced);
+  const recorded = replaced.identity(ROOT);
+  replaced.move(ROOT, "/work/repo-old");
+  replaced.dir(ROOT).file(`${ROOT}/README.md`, "# Other\n");
+  expect(
+    await runTool(read, { path: "README.md" }, { identity: recorded }),
+  ).toEqual(refusal("changed"));
+  expect(replaced.opens).toBe(0);
+
+  // A link to the recorded folder, which moved.
+  const moved = repository();
+  const movedTools = toolsOf(moved);
+  const movedIdentity = moved.identity(ROOT);
+  moved.move(ROOT, "/work/moved");
+  moved.link(ROOT, "/work/moved");
+  expect(
+    await runTool(
+      movedTools.read,
+      { path: "README.md" },
+      { identity: movedIdentity },
+    ),
+  ).toEqual(refusal("changed"));
+  expect(moved.opens).toBe(0);
+
+  // Swapped for a link to a folder outside after its lstat, before its
+  // realpath.
+  const swapped = repository().file("/work/outside/README.md", "SECRET");
+  const swappedTools = toolsOf(swapped);
+  swapped.on("realpath", 1, () => {
+    swapped.move(ROOT, "/work/repo-old");
+    swapped.link(ROOT, "/work/outside");
+  });
+  const answer = await runTool(swappedTools.read, { path: "README.md" });
+  expect(answer).toEqual(refusal("changed"));
+  expect(JSON.stringify(answer)).not.toContain("SECRET");
+  expect(swapped.opens).toBe(0);
+
+  // No identity, or one that is not a pair of decimal numbers.
+  const files = repository();
+  const tools = toolsOf(files);
+  for (const identity of [
+    undefined,
+    null,
+    {},
+    { dev: 1, ino: 4 },
+    { dev: "1", ino: "-4" },
+    { dev: "0x1", ino: "4" },
+  ]) {
+    const parsed = tools.list.parse({ path: "." });
+    if (!parsed.ok) {
+      throw new Error("invalid input");
+    }
+    expect(
+      await parsed.run({
+        folder: ROOT,
+        folderIdentity: identity as unknown as Identity,
+        signal: new AbortController().signal,
+      }),
+      JSON.stringify(identity),
+    ).toEqual(refusal("changed"));
+  }
+  expect(files.calls).toEqual([]);
+});
+
+test("a mounted volume or bind mount inside the repository (another device) is refused; its name is still listed", async () => {
+  const files = repository()
+    .dir(`${ROOT}/mnt`)
+    .file(`${ROOT}/mnt/file.txt`, "mounted");
+  files.devs.set(`${ROOT}/mnt`, 2n);
+  files.devs.set(`${ROOT}/mnt/file.txt`, 2n);
+  const { list, read } = toolsOf(files);
+  expect(await runTool(read, { path: "mnt/file.txt" })).toEqual(
+    refusal("other_device"),
+  );
+  expect(await runTool(list, { path: "mnt" })).toEqual(refusal("other_device"));
+  expect(files.opens).toBe(0);
+  expect(files.calls.filter(([operation]) => operation === "readdir")).toEqual(
+    [],
+  );
+  expect(await runTool(list, { path: "." })).toMatchObject({
+    ok: true,
+    result: {
+      entries: expect.arrayContaining([{ name: "mnt", kind: "directory" }]),
+    },
+  });
+});
+
+test("another device is refused at each check: a folder on the path, the file's lstat, and the open file's fstat", async () => {
+  // Only the folder reports another device.
+  const folder = repository()
+    .dir(`${ROOT}/mnt`)
+    .file(`${ROOT}/mnt/file.txt`, "mounted");
+  folder.devs.set(`${ROOT}/mnt`, 2n);
+  expect(await runTool(toolsOf(folder).read, { path: "mnt/file.txt" })).toEqual(
+    refusal("other_device"),
+  );
+  expect(folder.opens).toBe(0);
+
+  // A file bind-mounted into the repository.
+  const file = repository();
+  file.devs.set(`${ROOT}/src/index.ts`, 2n);
+  expect(await runTool(toolsOf(file).read, { path: "src/index.ts" })).toEqual(
+    refusal("other_device"),
+  );
+  expect(file.opens).toBe(0);
+
+  // The open file is on another device.
+  const opened = repository();
+  opened.handleStat = (stat) => ({ ...stat, dev: 2n });
+  expect(await runTool(toolsOf(opened).read, { path: "README.md" })).toEqual(
+    refusal("other_device"),
+  );
+  expect(opened.closes).toBe(1);
 });
 
 test("a file of exactly the bound is read whole; a longer one is truncated at the bound with a flag", async () => {
@@ -607,18 +959,21 @@ test("a folder of exactly the bound is listed whole; a larger one is truncated w
 test("a file system that gives more entries than asked is cut to the bound", async () => {
   const limit = READ_TOOL_LIMITS.maxDirectoryEntries;
   const files = repository();
-  const { list } = toolsOf({
-    realpath: (target) => files.realpath(target),
-    lstat: (target) => files.lstat(target),
-    open: (target) => files.open(target),
-    readdir: async () => ({
-      entries: Array.from({ length: limit + 3 }, (_, index) => ({
-        name: `n${index}`,
-        kind: "file" as const,
-      })),
-      more: false,
-    }),
-  });
+  const { list } = toolsOf(
+    {
+      realpath: (target) => files.realpath(target),
+      lstat: (target) => files.lstat(target),
+      open: (target) => files.open(target),
+      readdir: async () => ({
+        entries: Array.from({ length: limit + 3 }, (_, index) => ({
+          name: `n${index}`,
+          kind: "file" as const,
+        })),
+        more: false,
+      }),
+    },
+    files,
+  );
   const answer = await runTool(list, { path: "src" });
   expect(answer).toMatchObject({ ok: true, result: { truncated: true } });
   expect(

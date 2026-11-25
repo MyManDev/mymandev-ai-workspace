@@ -40,6 +40,7 @@ const PROVIDER_CONNECTION_ID = "0192f0a0-7b3c-7d4e-8f50-00000000000b";
 const NOW = Date.parse("2026-11-25T12:00:00.000Z");
 
 const FOLDER = "/home/octocat/secret-web";
+const IDENTITY = Object.freeze({ dev: "2049", ino: "131" });
 
 const RUN: HeldRun = Object.freeze({
   runId: RUN_ID,
@@ -149,7 +150,7 @@ function setup(
     resolveFolder: async (repositoryId) => {
       resolutions.push(repositoryId);
       return options.resolve === undefined
-        ? { ok: true, repositoryId, folder: FOLDER }
+        ? { ok: true, repositoryId, folder: FOLDER, identity: IDENTITY }
         : options.resolve(repositoryId);
     },
   });
@@ -199,6 +200,7 @@ test("an allowed call checks exactly the tool's capability for the run's agent a
   expect(harness.resolutions).toEqual([REPOSITORY_ID]);
   expect(probe.runs).toHaveLength(1);
   expect(probe.runs[0]?.context.folder).toBe(FOLDER);
+  expect(probe.runs[0]?.context.folderIdentity).toEqual(IDENTITY);
   expect(probe.runs[0]?.context.signal).toBe(harness.controller.signal);
   await settle();
   expect(harness.checker.ends).toBe(1);
@@ -420,6 +422,7 @@ test("an abort while the folder resolves runs nothing and ends the held action",
     ok: true,
     repositoryId: REPOSITORY_ID as RepositoryId,
     folder: FOLDER,
+    identity: IDENTITY,
   });
   expect(await answer).toEqual({ ok: false, code: "aborted" });
   expect(probe.runs).toEqual([]);
@@ -433,6 +436,7 @@ test("an abort while the folder resolution hangs answers aborted at once and end
         ok: true,
         repositoryId: REPOSITORY_ID as RepositoryId,
         folder: FOLDER,
+        identity: IDENTITY,
       }),
     (resolution: Deferred<RepositoryFolderResolution>) =>
       resolution.reject(new Error(FOLDER)),
@@ -591,6 +595,7 @@ test("an answer that holds the repository's folder is refused, in any case and w
         ok: true,
         repositoryId,
         folder: windowsFolder,
+        identity: IDENTITY,
       }),
     });
     expect(
@@ -733,7 +738,7 @@ function realSetup(
     registry: createToolRegistry(tools),
     resolveFolder: async (repositoryId) => {
       resolutions.push(repositoryId);
-      return { ok: true, repositoryId, folder: FOLDER };
+      return { ok: true, repositoryId, folder: FOLDER, identity: IDENTITY };
     },
   });
   const context: ToolCallContext = {

@@ -49,7 +49,13 @@
  *   decides: also a link that stays inside the repository).
  * - `hard_link`: the file has more than one hard link (default until the
  *   Project Manager decides), since another name of it may lie outside.
- * - `changed`: the file or folder changed between its check and its read.
+ * - `changed`: the file or folder changed between its check and its read,
+ *   or the repository's folder is no longer the folder that the link
+ *   recorded.
+ * - `other_device`: the file or a folder on its path lies on another device
+ *   than the repository's folder: a mounted volume, a bind mount, or a
+ *   mount point inside the repository (default until the Project Manager
+ *   decides).
  */
 export const REPOSITORY_PATH_REFUSALS = Object.freeze([
   "not_text",
@@ -74,6 +80,7 @@ export const REPOSITORY_PATH_REFUSALS = Object.freeze([
   "alias",
   "hard_link",
   "changed",
+  "other_device",
 ] as const);
 export type RepositoryPathRefusal = (typeof REPOSITORY_PATH_REFUSALS)[number];
 

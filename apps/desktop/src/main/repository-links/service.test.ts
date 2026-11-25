@@ -2234,6 +2234,7 @@ test("unlink drops only the account's own link: another account's link of the sa
     ok: true,
     repositoryId: REPO_1,
     folder: FOLDER_2,
+    identity: identityOf(FOLDER_2).folder,
   });
 });
 
@@ -2337,6 +2338,7 @@ test("a linked repository resolves to its folder while the folder is mounted and
     ok: true,
     repositoryId: REPO_1,
     folder: FOLDER_1,
+    identity: identityOf(FOLDER_1).folder,
   });
   // The open project does not matter: the run names the repository.
   harness.open(WS_B, null);
@@ -2450,6 +2452,7 @@ test("two nested links that a build before #323 made resolve neither, whether th
     ok: true,
     repositoryId: REPO_1,
     folder: FOLDER_1,
+    identity: identityOf(FOLDER_1).folder,
   });
 });
 

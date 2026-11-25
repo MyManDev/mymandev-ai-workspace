@@ -10,19 +10,37 @@
 // 1. The path passes the lexical rules of `repository-path.ts`: relative,
 //    POSIX form, no `..`, no `.git`, no hidden name, no device name, no
 //    stream.
-// 2. The repository's folder and the path are resolved to their real paths.
-//    The real path must lie inside the folder's real path (`outside`), and
-//    must be exactly the path under it (`alias`): a path through a symbolic
-//    link or a junction is refused, also one that stays inside, and so is a
-//    path in another case or with a short name, which the real path writes
-//    otherwise (defaults until the Project Manager decides).
-// 3. A file is opened read-only (with `O_NOFOLLOW` and `O_NONBLOCK` where
-//    the system has them), and checked after the open: the open file must
-//    be a regular file with one link, and the same file (device and file
-//    number) as the path's `lstat` before the open; after the open, the
-//    path must still resolve to itself and its `lstat` must be the open
-//    file. A swap between the check and the open is refused (`changed`). A
-//    folder is checked the same way before and after it is listed.
+// 2. The repository's folder, as the resolution named it, and its real path
+//    must each be a folder, not a link, with the identity (device and file
+//    number) that the link recorded (`changed`).
+// 3. The path is resolved to its real path, which must lie inside the
+//    folder's real path (`outside`) and be exactly the path under it
+//    (`alias`): a path through a symbolic link or a junction is refused,
+//    also one that stays inside, and so is a path in another case or with a
+//    short name, which the real path writes otherwise (defaults until the
+//    Project Manager decides).
+// 4. Every folder from the repository's folder down to the path's parent is
+//    read with `lstat` and recorded: each must be a folder, not a link
+//    (`changed`), on the repository's device (`other_device`), and so must
+//    the file or folder itself: a mounted volume or a bind mount inside the
+//    repository is refused.
+// 5. A file is opened read-only (with `O_NOFOLLOW` and `O_NONBLOCK` where
+//    the system has them), and checked after the open: its `fstat` must be
+//    on the repository's device, a regular file with one link, and the same
+//    file as the path's `lstat` before the open; on Linux, its real path
+//    through `/proc/self/fd` must be the path; and then the path must still
+//    resolve to itself, every recorded folder must still be the same folder
+//    and not a link, the path's `lstat` must be the open file, the folders
+//    are checked once more, and the path must resolve to itself again. A
+//    swap is refused (`changed`). A folder is checked the same way before
+//    and after it is listed.
+//
+// Known limit: Node.js cannot open or list relative to an open folder, so
+// every check is a separate call by path. A folder on the path that is
+// switched between itself and a link, so that it is the link for exactly
+// the `lstat` calls of the file and its open (or the listing), and itself
+// for every other call, is not seen where the system cannot name the open
+// file (Windows, macOS), nor for a listing; see the README.
 //
 // No answer holds an absolute path: an answer names the path that the tool
 // got and the names in a folder, never the folder of the repository.
@@ -83,6 +101,12 @@ export interface ToolFileStat {
 export interface ToolFileHandle {
   /** `fstat` of the open file. */
   stat(): Promise<ToolFileStat>;
+  /**
+   * The real path of the open file itself, where the system can name it
+   * (`/proc/self/fd` on Linux), or undefined where it cannot (Windows,
+   * macOS). It rejects when the system could name it but did not.
+   */
+  realPath(): Promise<string | undefined>;
   /** Reads into `buffer` from `position`; the count of bytes read, 0 at the end. */
   read(buffer: Uint8Array, position: number): Promise<number>;
   close(): Promise<void>;
@@ -148,28 +172,98 @@ function sameEntry(a: ToolFileStat, b: ToolFileStat): boolean {
   return a.kind === b.kind && a.dev === b.dev && a.ino === b.ino;
 }
 
-/** The real path of a checked path, and of the repository's folder. */
+/** A folder on a checked path, and its `lstat` when it was checked. */
+interface CheckedFolder {
+  readonly path: string;
+  readonly stat: ToolFileStat;
+}
+
+/** The real path of a checked path, and what it was checked against. */
 interface Resolved {
-  readonly root: string;
   readonly real: string;
+  /** The device of the repository's folder, as the link recorded it. */
+  readonly dev: bigint;
+  /**
+   * The folders from the repository's real folder down to the path's
+   * parent, each a folder (not a link) on `dev`; for `.`, the repository's
+   * folder alone.
+   */
+  readonly folders: readonly CheckedFolder[];
+}
+
+const DECIMAL = /^(?:0|[1-9][0-9]{0,39})$/;
+
+/** The recorded identity of the repository's folder as numbers, or null. */
+function recordedIdentity(
+  identity: unknown,
+): { readonly dev: bigint; readonly ino: bigint } | null {
+  if (typeof identity !== "object" || identity === null) {
+    return null;
+  }
+  const { dev, ino } = identity as { dev?: unknown; ino?: unknown };
+  if (
+    typeof dev !== "string" ||
+    typeof ino !== "string" ||
+    !DECIMAL.test(dev) ||
+    !DECIMAL.test(ino)
+  ) {
+    return null;
+  }
+  return { dev: BigInt(dev), ino: BigInt(ino) };
+}
+
+/** Why a folder on a checked path is refused, or null. */
+function folderRefusal(stat: ToolFileStat, dev: bigint): Failure | null {
+  if (stat.kind !== "directory") {
+    // The real path named a folder here: a link now is a swap.
+    return failed("path_refused", "changed");
+  }
+  if (stat.dev !== dev) {
+    return failed("path_refused", "other_device");
+  }
+  return null;
 }
 
 /**
  * Resolves a path that passed the lexical rules under the repository's
- * folder, and refuses a real path outside the folder's real path or not
- * exactly the path under it.
+ * folder:
+ *
+ * - The folder that the resolution named, and its real path, must each be
+ *   a folder, not a link, with the identity that the link recorded
+ *   (`changed`), so a folder swapped after the resolution moves nothing.
+ * - A real path outside the folder's real path is refused (`outside`), and
+ *   so is one that is not exactly the path under it (`alias`).
+ * - Every folder from the real folder down to the path's parent is read
+ *   with `lstat` and recorded: each must be a folder (`changed`) on the
+ *   repository's device (`other_device`).
  */
 async function resolveInside(
   files: ReadToolFileSystem,
   pathApi: PlatformPath,
-  folder: string,
+  context: ToolRunContext,
   target: RepositoryPath,
 ): Promise<Resolved | Failure> {
+  const recorded = recordedIdentity(context.folderIdentity);
+  if (recorded === null) {
+    return failed("path_refused", "changed");
+  }
+  const isRecorded = (stat: ToolFileStat) =>
+    stat.kind === "directory" &&
+    stat.dev === recorded.dev &&
+    stat.ino === recorded.ino;
   let root: string;
+  let rootStat: ToolFileStat;
   try {
-    root = await files.realpath(folder);
+    if (!isRecorded(await files.lstat(context.folder))) {
+      return failed("path_refused", "changed");
+    }
+    root = await files.realpath(context.folder);
+    rootStat = await files.lstat(root);
   } catch {
     return failed("read_failed");
+  }
+  if (!isRecorded(rootStat)) {
+    return failed("path_refused", "changed");
   }
   const lexical =
     target.segments.length === 0
@@ -187,23 +281,61 @@ async function resolveInside(
   if (real !== lexical) {
     return failed("path_refused", "alias");
   }
-  return { root, real };
+  const folders: CheckedFolder[] = [{ path: root, stat: rootStat }];
+  let current = root;
+  for (const segment of target.segments.slice(0, -1)) {
+    current = pathApi.join(current, segment);
+    let stat: ToolFileStat;
+    try {
+      stat = await files.lstat(current);
+    } catch (error) {
+      return failed(isMissing(error) ? "not_found" : "read_failed");
+    }
+    const refusal = folderRefusal(stat, recorded.dev);
+    if (refusal !== null) {
+      return refusal;
+    }
+    folders.push({ path: current, stat });
+  }
+  return { real, dev: recorded.dev, folders };
 }
 
 /**
- * Checks after a read that the path still resolves to itself and that its
- * `lstat` is still `expected`.
+ * Whether every recorded folder, in order from the repository's folder
+ * down, is still a folder, not a link, with its device and file number.
+ */
+async function foldersInPlace(
+  files: ReadToolFileSystem,
+  folders: readonly CheckedFolder[],
+): Promise<boolean> {
+  for (const folder of folders) {
+    if (!sameEntry(await files.lstat(folder.path), folder.stat)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Checks after an open or a listing, in this order: the path still
+ * resolves to itself, its folders are still in place, its `lstat` is still
+ * `expected`, its folders are still in place, and the path still resolves
+ * to itself.
  */
 async function stillInPlace(
   files: ReadToolFileSystem,
-  real: string,
+  resolved: Resolved,
   expected: ToolFileStat,
 ): Promise<boolean> {
+  const { real, folders } = resolved;
   try {
-    if ((await files.realpath(real)) !== real) {
-      return false;
-    }
-    return sameEntry(await files.lstat(real), expected);
+    return (
+      (await files.realpath(real)) === real &&
+      (await foldersInPlace(files, folders)) &&
+      sameEntry(await files.lstat(real), expected) &&
+      (await foldersInPlace(files, folders)) &&
+      (await files.realpath(real)) === real
+    );
   } catch {
     return false;
   }
@@ -254,12 +386,7 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
     if (!parsed.ok) {
       return failed("path_refused", parsed.reason);
     }
-    const resolved = await resolveInside(
-      files,
-      pathApi,
-      context.folder,
-      parsed.path,
-    );
+    const resolved = await resolveInside(files, pathApi, context, parsed.path);
     if (!("real" in resolved)) {
       return resolved;
     }
@@ -275,8 +402,20 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
     if (before.kind !== "directory") {
       return failed("not_a_directory");
     }
+    if (before.dev !== resolved.dev) {
+      return failed("path_refused", "other_device");
+    }
     if (context.signal.aborted) {
       return ABORTED;
+    }
+    // The folders on the path are checked again right before the listing,
+    // and again after it with the folder itself.
+    try {
+      if (!(await foldersInPlace(files, resolved.folders))) {
+        return failed("path_refused", "changed");
+      }
+    } catch {
+      return failed("path_refused", "changed");
     }
     let listing: Awaited<ReturnType<ReadToolFileSystem["readdir"]>>;
     try {
@@ -287,7 +426,7 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
     } catch {
       return failed("read_failed");
     }
-    if (!(await stillInPlace(files, resolved.real, before))) {
+    if (!(await stillInPlace(files, resolved, before))) {
       return failed("path_refused", "changed");
     }
     if (context.signal.aborted) {
@@ -321,12 +460,7 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
     if (!parsed.ok) {
       return failed("path_refused", parsed.reason);
     }
-    const resolved = await resolveInside(
-      files,
-      pathApi,
-      context.folder,
-      parsed.path,
-    );
+    const resolved = await resolveInside(files, pathApi, context, parsed.path);
     if (!("real" in resolved)) {
       return resolved;
     }
@@ -341,6 +475,9 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
     }
     if (before.kind !== "file") {
       return failed("not_a_file");
+    }
+    if (before.dev !== resolved.dev) {
+      return failed("path_refused", "other_device");
     }
     if (before.nlink !== 1n) {
       return failed("path_refused", "hard_link");
@@ -365,15 +502,30 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
       } catch {
         return failed("read_failed");
       }
-      // The open file must be the file that was checked, and the path must
-      // still name it after the open.
+      // The open file must lie on the repository's device and be the file
+      // that was checked, and the path must still name it after the open.
+      if (opened.dev !== resolved.dev) {
+        return failed("path_refused", "other_device");
+      }
       if (!sameEntry(opened, before)) {
         return failed("path_refused", "changed");
       }
       if (opened.nlink !== 1n) {
         return failed("path_refused", "hard_link");
       }
-      if (!(await stillInPlace(files, resolved.real, opened))) {
+      // Where the system names the open file itself (Linux), that name must
+      // be the checked path: this holds whatever a folder on the path was
+      // during the open.
+      let openedPath: string | undefined;
+      try {
+        openedPath = await handle.realPath();
+      } catch {
+        return failed("path_refused", "changed");
+      }
+      if (openedPath !== undefined && openedPath !== resolved.real) {
+        return failed("path_refused", "changed");
+      }
+      if (!(await stillInPlace(files, resolved, opened))) {
         return failed("path_refused", "changed");
       }
 
@@ -473,6 +625,29 @@ const OPEN_FLAGS =
   (fsConstants.O_NOFOLLOW ?? 0) |
   (fsConstants.O_NONBLOCK ?? 0);
 
+/**
+ * The real path of an open file through `/proc/self/fd`, on Linux only and
+ * where that folder exists; undefined elsewhere. It rejects when the folder
+ * exists but does not name the file (a deleted file, for one).
+ */
+async function realPathOfOpenFile(fd: number): Promise<string | undefined> {
+  if (process.platform !== "linux") {
+    return undefined;
+  }
+  try {
+    return await fs.promises.realpath(`/proc/self/fd/${fd}`);
+  } catch (error) {
+    const hasProc = await fs.promises
+      .stat("/proc/self/fd")
+      .then((stats) => stats.isDirectory())
+      .catch(() => false);
+    if (!hasProc) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
 /** The read tools' file system on `node:fs`. */
 export function createSystemReadToolFileSystem(): ReadToolFileSystem {
   return Object.freeze({
@@ -483,6 +658,7 @@ export function createSystemReadToolFileSystem(): ReadToolFileSystem {
       const handle = await fs.promises.open(target, OPEN_FLAGS);
       return Object.freeze({
         stat: async () => statOf(await handle.stat({ bigint: true })),
+        realPath: () => realPathOfOpenFile(handle.fd),
         read: async (buffer: Uint8Array, position: number) =>
           (await handle.read(buffer, 0, buffer.length, position)).bytesRead,
         close: () => handle.close(),

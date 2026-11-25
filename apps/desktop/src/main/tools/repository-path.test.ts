@@ -109,7 +109,13 @@ test("every refused form answers its own reason", () => {
   }
   // Every lexical reason has a case.
   const lexical = new Set(REFUSED.map(([, reason]) => reason));
-  const fileSystemReasons = ["outside", "alias", "hard_link", "changed"];
+  const fileSystemReasons = [
+    "outside",
+    "alias",
+    "hard_link",
+    "changed",
+    "other_device",
+  ];
   for (const reason of REPOSITORY_PATH_REFUSALS) {
     if (!fileSystemReasons.includes(reason)) {
       expect(lexical.has(reason), reason).toBe(true);

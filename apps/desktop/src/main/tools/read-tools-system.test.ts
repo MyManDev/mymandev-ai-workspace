@@ -5,6 +5,7 @@
 // and the fake file system of `read-tools.test.ts` covers them.
 import {
   link,
+  lstat,
   mkdir,
   mkdtemp,
   realpath,
@@ -19,6 +20,7 @@ import type { RepositoryId } from "@mymandev/protocol";
 import { afterEach, expect, test } from "vitest";
 import type { RunActionCheck } from "../agents/run-executor.ts";
 import type { HeldRun } from "../permissions/enforcement.ts";
+import type { FileIdentity } from "../repository-links/identity.ts";
 import {
   createReadTools,
   createSystemReadToolFileSystem,
@@ -100,16 +102,27 @@ function toolsOf(files: ReadToolFileSystem = createSystemReadToolFileSystem()) {
   };
 }
 
+/** The identity of a folder, as a link records it. */
+async function identityOf(folder: string): Promise<FileIdentity> {
+  const stats = await lstat(folder, { bigint: true });
+  return { dev: stats.dev.toString(), ino: stats.ino.toString() };
+}
+
 async function runTool(
   tool: Tool,
   folder: string,
   input: unknown,
+  identity?: FileIdentity,
 ): Promise<ToolRunOutcome> {
   const parsed = tool.parse(input);
   if (!parsed.ok) {
     throw new Error("invalid input");
   }
-  return parsed.run({ folder, signal: new AbortController().signal });
+  return parsed.run({
+    folder,
+    folderIdentity: identity ?? (await identityOf(folder)),
+    signal: new AbortController().signal,
+  });
 }
 
 function refusal(reason: string) {
@@ -293,6 +306,37 @@ test("TOCTOU: a folder swapped for a junction or link while it is listed is refu
   expect(answer).toEqual(refusal("changed"));
 });
 
+test("the repository's folder swapped for a junction or link to a folder outside after the resolution is refused", async () => {
+  const { base, repo, outside } = await layout();
+  await writeFile(path.join(outside, "README.md"), "outside readme\n");
+  const recorded = await identityOf(repo);
+  await rename(repo, path.join(base, "repo-old"));
+  await folderLink(outside, repo);
+  const { list, read } = toolsOf();
+  const answer = await runTool(read, repo, { path: "README.md" }, recorded);
+  expect(answer).toEqual(refusal("changed"));
+  expect(JSON.stringify(answer)).not.toContain("outside");
+  expect(await runTool(list, repo, { path: "." }, recorded)).toEqual(
+    refusal("changed"),
+  );
+});
+
+test("the open file names its real path through /proc/self/fd on Linux, and nothing elsewhere", async () => {
+  const { repo } = await layout();
+  const target = path.join(repo, "src", "a.ts");
+  const handle = await createSystemReadToolFileSystem().open(target);
+  try {
+    const named = await handle.realPath();
+    if (process.platform === "linux") {
+      expect(named).toBe(await realpath(target));
+    } else {
+      expect(named).toBeUndefined();
+    }
+  } finally {
+    await handle.close();
+  }
+});
+
 test("through the dispatcher, no answer holds the temporary folder's path, whatever the outcome", async () => {
   const { base, repo, outside } = await layout();
   await folderLink(outside, path.join(repo, "linked"));
@@ -302,6 +346,7 @@ test("through the dispatcher, no answer holds the temporary folder's path, whate
       ok: true,
       repositoryId,
       folder: repo,
+      identity: await identityOf(repo),
     }),
   });
   const context = {

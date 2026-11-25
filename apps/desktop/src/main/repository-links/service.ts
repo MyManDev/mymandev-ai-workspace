@@ -94,6 +94,7 @@ import {
 } from "../workspace/service.ts";
 import type { LinkConfirmationRequest } from "./confirmation.ts";
 import {
+  type FileIdentity,
   type FolderIdentityResult,
   type RepositoryFolders,
   sameFolderIdentity,
@@ -192,6 +193,13 @@ export type RepositoryFolderResolution =
       readonly repositoryId: RepositoryId;
       /** The repository's top-level folder, as Git reported it. */
       readonly folder: string;
+      /**
+       * The identity (`lstat`: device and file number) of the top-level
+       * folder that the link recorded and that this resolution read again,
+       * so that a caller can check that the folder it acts on is still the
+       * same folder.
+       */
+      readonly identity: FileIdentity;
     }
   | { readonly ok: false; readonly reason: RepositoryFolderFailure };
 
@@ -1838,6 +1846,7 @@ export function createProjectRepositoryService(
       ok: true,
       repositoryId: parsed.data,
       folder: second.mounted.topLevel,
+      identity: second.link.identity.folder,
     });
   }
 
