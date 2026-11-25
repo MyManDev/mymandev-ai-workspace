@@ -38,6 +38,8 @@ const REFUSED: readonly (readonly [unknown, RepositoryPathRefusal])[] = [
   [["a"], "not_text"],
   ["", "empty"],
   ["a".repeat(MAX_REPOSITORY_PATH_LENGTH + 1), "too_long"],
+  // Short segments: only the bound of the whole path refuses it.
+  [`${"a/".repeat(MAX_REPOSITORY_PATH_LENGTH / 2)}a`, "too_long"],
   [`a/${"b".repeat(MAX_REPOSITORY_PATH_SEGMENT_LENGTH + 1)}`, "too_long"],
   ["a\u0000b", "nul"],
   ["src/a\u0000", "nul"],
