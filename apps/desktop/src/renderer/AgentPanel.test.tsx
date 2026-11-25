@@ -57,6 +57,7 @@ const READY: AgentActivityView = {
       disabledAt: null,
       ownedByMe: false,
       grantableHere: false,
+      hostedElsewhere: false,
     },
     {
       id: REVIEWER,
@@ -65,6 +66,7 @@ const READY: AgentActivityView = {
       disabledAt: DISABLED_AT,
       ownedByMe: false,
       grantableHere: false,
+      hostedElsewhere: false,
     },
   ],
   unfinishedRuns: [
@@ -298,6 +300,7 @@ test("names and reasons are rendered as text, never as markup", () => {
           disabledAt: null,
           ownedByMe: false,
           grantableHere: false,
+          hostedElsewhere: false,
         },
       ],
       unfinishedRuns: [

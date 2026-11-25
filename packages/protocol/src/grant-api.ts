@@ -10,6 +10,12 @@
 // device may grant, a grant of `terminal.execute` expires within 30 days, the
 // record list leaves revoked grants out, and a record has no repository fact.
 //
+// Decided by the Project Manager on 2026-11-24 (#345): the agent's owner
+// reads the agent's grants from any of its devices, `GET
+// /agents/:agentId/grants`, so that it can revoke them away from the host
+// device. The answer holds what the permission screen needs and never the
+// host device or a record fact.
+//
 // Provisional (#75): the Project Manager's decisions leave open the paths,
 // the error codes, the count limits, the bounds of a lifetime, and the event
 // payloads. Each such choice below is the conservative one and is marked
@@ -32,8 +38,9 @@ function route(method: ApiRoute["method"], path: string): ApiRoute {
  * The grant routes. Every path parameter is an ID, and no route takes a
  * query. Provisional (#75): the paths. A write starts with the agent, as the
  * agent activity routes start with the project: an agent ID names its
- * project and its workspace. The list has no parameter, so a device can only
- * ever ask for its own records.
+ * project and its workspace. The record list has no parameter, so a device
+ * can only ever ask for its own records; the list of one agent's grants
+ * names the agent, as a write does (#345).
  */
 export const GRANT_ROUTES = Object.freeze({
   /**
@@ -46,6 +53,17 @@ export const GRANT_ROUTES = Object.freeze({
    * (`GRANT_COUNT_LIMITS`).
    */
   listGrantRecords: route("GET", "/grant-records"),
+  /**
+   * The grants of one agent that are not revoked, an expired one included,
+   * because a revocation also takes an expired grant (#345, Project Manager
+   * decision of 2026-11-24). The agent's owner only, from any of its
+   * devices, as for a revocation. Each grant carries only what the
+   * permission screen needs (`AgentGrantSchema`): no host device and no
+   * record fact, which stay with the host device's `GET /grant-records`.
+   * At most `GRANT_COUNT_LIMITS.perAgent` grants, which is every grant of
+   * the agent that is not revoked, so the server never cuts it.
+   */
+  listAgentGrants: route("GET", "/agents/:agentId/grants"),
   /**
    * Grants one capability on one scope to an agent and answers the new
    * grant. The agent's owner only (ADR 0013, P-44), and only from the agent's
@@ -84,13 +102,15 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  * `rate_limited` (with `Retry-After`), and `internal_error`. Beyond those:
  *
  * - `not_found`: an agent that does not exist or that is in a workspace that
- *   the account is not an active member of; for a grant, a repository that
+ *   the account is not an active member of, also for the list of an
+ *   agent's grants; for a grant, a repository that
  *   is not in the agent's project or a provider connection that is not on
  *   the agent's host device; for a revocation, a grant ID that the agent
  *   does not have. All answer alike, so that a route never tells which IDs
  *   exist.
  * - `forbidden`: the caller is an active member of the agent's workspace but
- *   not the agent's owner, or, for a grant, the owner on a device that is
+ *   not the agent's owner, also for the list of an agent's grants, or, for
+ *   a grant, the owner on a device that is
  *   not the agent's host. Every member already sees the project's agents,
  *   so the code tells nothing new.
  * - `conflict`: what the request names exists, but is not in the state that
@@ -109,6 +129,7 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  */
 export const GRANT_ROUTE_ERRORS = Object.freeze({
   listGrantRecords: errors(),
+  listAgentGrants: errors("not_found", "forbidden"),
   grantCapability: errors("not_found", "forbidden", "conflict", "grant_limit"),
   revokeGrant: errors("not_found", "forbidden", "conflict"),
 } satisfies Record<GrantRouteName, readonly ApiErrorCode[]>);
@@ -324,6 +345,91 @@ export const GrantRecordListResponseSchema = z
   });
 export type GrantRecordListResponse = z.infer<
   typeof GrantRecordListResponseSchema
+>;
+
+/**
+ * A grant as its agent's owner reads it on any of its devices, in the answer
+ * of `GET /agents/:agentId/grants` (#345, Project Manager decision of
+ * 2026-11-24): its ID, its agent, its capability, its scope (the repository,
+ * or for `provider.use` the provider connection on the agent's host device),
+ * and when it was created and expires. Its fields are the grant's own, under
+ * the same names.
+ *
+ * It names no account and no device: neither `grantedByUserId` nor the
+ * revocation fields, no project, and no host device or record fact (#110),
+ * which stay with the host device's `GET /grant-records`. Unknown fields are
+ * stripped, so a server that sent more would not pass them on. The
+ * provider connection ID is the caller's own data: only the agent's owner
+ * reads this answer, and the host device is the owner's.
+ */
+export const AgentGrantSchema = z
+  .discriminatedUnion("capability", [
+    RepositoryGrantSchema.pick({
+      id: true,
+      granteeAgentId: true,
+      capability: true,
+      repositoryId: true,
+      createdAt: true,
+      expiresAt: true,
+    }),
+    ProviderConnectionGrantSchema.pick({
+      id: true,
+      granteeAgentId: true,
+      capability: true,
+      providerConnectionId: true,
+      createdAt: true,
+      expiresAt: true,
+    }),
+  ])
+  .superRefine((grant, ctx) => {
+    if (
+      grant.expiresAt !== null &&
+      !(Date.parse(grant.expiresAt) > Date.parse(grant.createdAt))
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "expiresAt is after createdAt",
+        path: ["expiresAt"],
+      });
+    }
+  });
+export type AgentGrant = z.infer<typeof AgentGrantSchema>;
+
+/**
+ * The answer of `GET /agents/:agentId/grants`: the agent's grants that are
+ * not revoked, expired ones included, in the order of the grant IDs, at most
+ * `GRANT_COUNT_LIMITS.perAgent`. The schema checks what the route promises:
+ * a grant is listed once, and every grant names one agent. The schema cannot
+ * know the path, so whoever reads the answer compares that agent with the
+ * one it asked for.
+ */
+export const AgentGrantListResponseSchema = z
+  .object({
+    grants: z.array(AgentGrantSchema).max(GRANT_COUNT_LIMITS.perAgent),
+  })
+  .superRefine((list, ctx) => {
+    const agentId = list.grants[0]?.granteeAgentId;
+    const seen = new Set<string>();
+    list.grants.forEach((grant, index) => {
+      if (seen.has(grant.id)) {
+        ctx.addIssue({
+          code: "custom",
+          message: "A grant is listed once",
+          path: ["grants", index, "id"],
+        });
+      }
+      seen.add(grant.id);
+      if (grant.granteeAgentId !== agentId) {
+        ctx.addIssue({
+          code: "custom",
+          message: "Every grant belongs to one agent",
+          path: ["grants", index, "granteeAgentId"],
+        });
+      }
+    });
+  });
+export type AgentGrantListResponse = z.infer<
+  typeof AgentGrantListResponseSchema
 >;
 
 /**

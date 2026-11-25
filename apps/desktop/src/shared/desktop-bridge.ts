@@ -3,6 +3,7 @@ import type {
   AccountStatus,
   ApproveJoinRequestResult,
   AgentActivityView,
+  AgentGrantsResult,
   ChatLoadOlderResultView,
   ChatSendResultView,
   ChatView,
@@ -806,7 +807,10 @@ export interface AgentBridge {
  * agent's host device holds: each names its agent, capability, scope, and
  * times, never an account or a device. Whether this device may grant an
  * agent comes with the agent (`grantableHere` of the agent activity); the
- * main process checks it again before it sends a grant.
+ * main process checks it again before it sends a grant. The grants of the
+ * account's agents that another device is known to host
+ * (`hostedElsewhere`) are read one agent at a time (`listAgentGrants`,
+ * #345).
  */
 export interface GrantBridge {
   /** The current grants. */
@@ -837,6 +841,12 @@ export interface GrantBridge {
     agentId: string,
     grantId: string,
   ) => Promise<RevokeGrantResult>;
+  /**
+   * Reads the grants of an agent of the open project that the account owns
+   * and that another device hosts (#345), each in the form of the grant
+   * state: never an account or a device.
+   */
+  readonly listAgentGrants: (agentId: string) => Promise<AgentGrantsResult>;
 }
 
 /**

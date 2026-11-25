@@ -69,7 +69,10 @@ function agentView(
   memberName: (memberId: MemberId) => string,
   viewer: GrantViewer,
 ): AgentView {
-  const { ownedByMe, grantableHere } = agentAccess(agent, viewer);
+  const { ownedByMe, grantableHere, hostedElsewhere } = agentAccess(
+    agent,
+    viewer,
+  );
   return Object.freeze({
     id: agent.id,
     name: cut(agent.name, AGENT_LIMITS.agentName),
@@ -77,6 +80,7 @@ function agentView(
     disabledAt: agent.disabledAt,
     ownedByMe,
     grantableHere,
+    hostedElsewhere,
   });
 }
 

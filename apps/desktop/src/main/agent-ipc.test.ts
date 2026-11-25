@@ -394,6 +394,7 @@ test("the view holds the owners' names, an unknown person's included, and the mo
         // The account owns it, and the list names no host device.
         ownedByMe: true,
         grantableHere: false,
+        hostedElsewhere: false,
       },
       {
         id: AGENT_2,
@@ -402,6 +403,7 @@ test("the view holds the owners' names, an unknown person's included, and the mo
         disabledAt: AT,
         ownedByMe: false,
         grantableHere: false,
+        hostedElsewhere: false,
       },
     ],
     unfinishedRuns: [
@@ -467,6 +469,7 @@ test("no member ID, device ID, repository ID, or other key of the model crosses"
     expect(Object.keys(view.agents[0] ?? {}).sort()).toEqual([
       "disabledAt",
       "grantableHere",
+      "hostedElsewhere",
       "id",
       "name",
       "ownedByMe",
@@ -485,7 +488,7 @@ test("no member ID, device ID, repository ID, or other key of the model crosses"
   }
 });
 
-test("an agent may be granted only from its host device by its owner while it is enabled, and the host device never crosses (#342)", () => {
+test("an agent may be granted only from its host device by its owner while it is enabled, is hosted elsewhere only on another known device, and the host device never crosses (#342, #345)", () => {
   const fake = fakeServices(
     activity({
       agents: Object.freeze([
@@ -505,15 +508,22 @@ test("an agent may be granted only from its host device by its owner while it is
   const { call, subscribe } = register(fake);
   const { payloads } = subscribe();
   const flags = (view: AgentActivityView) =>
-    view.agents.map((item) => [item.name, item.ownedByMe, item.grantableHere]);
+    view.agents.map((item) => [
+      item.name,
+      item.ownedByMe,
+      item.grantableHere,
+      item.hostedElsewhere,
+    ]);
 
+  // An agent of a server without the field is neither grantable here nor
+  // hosted elsewhere: it may be this device's own.
   const view = call(INVOKE_CHANNELS.getAgentState);
   expect(flags(view)).toEqual([
-    ["Here", true, true],
-    ["Elsewhere", true, false],
-    ["Disabled", true, false],
-    ["Theirs", false, false],
-    ["Older server", true, false],
+    ["Here", true, true, false],
+    ["Elsewhere", true, false, true],
+    ["Disabled", true, false, false],
+    ["Theirs", false, false, false],
+    ["Older server", true, false, false],
   ]);
   for (const hidden of [DEVICE, OTHER_DEVICE, OWNER, OTHER_OWNER]) {
     expect(JSON.stringify(view)).not.toContain(hidden);
@@ -523,33 +533,34 @@ test("an agent may be granted only from its host device by its owner while it is
   fake.setStatus(signedIn(OTHER_DEVICE));
   fake.fire();
   expect(flags(payloads().at(-1)!)).toEqual([
-    ["Here", true, false],
-    ["Elsewhere", true, true],
-    ["Disabled", true, false],
-    ["Theirs", false, false],
-    ["Older server", true, false],
+    ["Here", true, false, true],
+    ["Elsewhere", true, true, false],
+    ["Disabled", true, false, false],
+    ["Theirs", false, false, false],
+    ["Older server", true, false, false],
   ]);
-  // Signed out, or without a person in the workspace: nothing at all.
+  // Signed out, or without a person in the workspace: nothing at all. Signed
+  // out, this device is not known, so no host is.
   fake.setStatus(SIGNED_OUT);
   fake.fire();
   expect(
     payloads()
       .at(-1)!
-      .agents.some((item) => item.grantableHere),
+      .agents.some((item) => item.grantableHere || item.hostedElsewhere),
   ).toBe(false);
   fake.setStatus(signedIn());
   fake.setOwnMember(null);
   expect(flags(call(INVOKE_CHANNELS.getAgentState))).toEqual([
-    ["Here", false, false],
-    ["Elsewhere", false, false],
-    ["Disabled", false, false],
-    ["Theirs", false, false],
-    ["Older server", false, false],
+    ["Here", false, false, false],
+    ["Elsewhere", false, false, false],
+    ["Disabled", false, false, false],
+    ["Theirs", false, false, false],
+    ["Older server", false, false, false],
   ]);
   // Without a viewer, the pure view grants nothing either.
   expect(
     agentActivityView(fake.options.agents.state(), 0, () => "x").agents.some(
-      (item) => item.ownedByMe || item.grantableHere,
+      (item) => item.ownedByMe || item.grantableHere || item.hostedElsewhere,
     ),
   ).toBe(false);
 });

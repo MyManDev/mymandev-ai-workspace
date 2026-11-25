@@ -63,6 +63,7 @@ const READY: AgentActivityView = {
       disabledAt: null,
       ownedByMe: false,
       grantableHere: false,
+      hostedElsewhere: false,
     },
     {
       id: REVIEWER,
@@ -71,6 +72,7 @@ const READY: AgentActivityView = {
       disabledAt: "2026-11-05T12:00:00.000Z",
       ownedByMe: false,
       grantableHere: false,
+      hostedElsewhere: false,
     },
   ],
   // The main process's order, which is not the order of the IDs.

@@ -1,6 +1,7 @@
 import { expect, test } from "vitest";
 import { EVENT_CHANNELS, INVOKE_CHANNELS } from "../shared/ipc-channels.ts";
 import type {
+  AgentGrantsResult,
   GrantRequestView,
   GrantsView,
   GrantView,
@@ -15,10 +16,10 @@ import type {
 } from "./ipc.ts";
 import type { GrantsState } from "./permissions/grant-actions.ts";
 
-// The grant channels of #342: the renderer reads the grants of the open
-// project's agents and this device's provider connections, and grants and
-// revokes through the main process, which checks the sender and every
-// argument first.
+// The grant channels of #342 and #345: the renderer reads the grants of the
+// open project's agents, the grants of an agent that another device hosts,
+// and this device's provider connections, and grants and revokes through
+// the main process, which checks the sender and every argument first.
 
 const DEV_URL = "http://localhost:5173/";
 
@@ -58,6 +59,12 @@ interface Timer {
 
 function fakeService() {
   let state: GrantsState = { projectId: PROJECT, usable: true, grants: [] };
+  /** What `listAgentGrants` answers next. */
+  let agentGrants: unknown = {
+    outcome: "ok",
+    agentId: AGENT,
+    grants: [A_GRANT],
+  };
   const listeners = new Set<() => void>();
   const calls: unknown[][] = [];
   const timers: Timer[] = [];
@@ -65,6 +72,9 @@ function fakeService() {
     calls,
     timers,
     listeners,
+    answerAgentGrants(next: unknown) {
+      agentGrants = next;
+    },
     setState(next: GrantsState) {
       state = next;
       for (const listener of [...listeners]) {
@@ -99,6 +109,10 @@ function fakeService() {
         revoke: (agentId: string, grantId: string) => {
           calls.push(["revoke", agentId, grantId]);
           return Promise.resolve({ outcome: "ok" as const });
+        },
+        listAgentGrants: (agentId: string) => {
+          calls.push(["listAgentGrants", agentId]);
+          return Promise.resolve(agentGrants as AgentGrantsResult);
         },
       },
       scheduleTimer: (callback: () => void, delayMs: number) => {
@@ -171,6 +185,7 @@ test("the grant channels are registered, and nothing else", () => {
       INVOKE_CHANNELS.listProviderConnections,
       INVOKE_CHANNELS.grantCapability,
       INVOKE_CHANNELS.revokeGrant,
+      INVOKE_CHANNELS.listAgentGrants,
     ].sort(),
   );
 });
@@ -217,6 +232,10 @@ test("every handler refuses a foreign sender and arguments outside the contract,
     ],
     [INVOKE_CHANNELS.revokeGrant, [AGENT]],
     [INVOKE_CHANNELS.revokeGrant, [AGENT, GRANT.toUpperCase()]],
+    [INVOKE_CHANNELS.listAgentGrants, []],
+    [INVOKE_CHANNELS.listAgentGrants, [AGENT.toUpperCase()]],
+    [INVOKE_CHANNELS.listAgentGrants, [AGENT, GRANT]],
+    [INVOKE_CHANNELS.listAgentGrants, [{ agentId: AGENT }]],
   ];
   for (const [channel, args] of refused) {
     const handler = handlers.get(channel)!;
@@ -248,6 +267,60 @@ test("a grant, a revocation, and a read of the provider connections reach the se
     ["revoke", AGENT, GRANT],
     ["listProviderConnections"],
   ]);
+});
+
+test("a read of an agent's grants reaches the service with the agent's ID, and only a result of the contract, without a device or an account, reaches the renderer", async () => {
+  const fake = fakeService();
+  const { call } = register(fake);
+  expect(await call(INVOKE_CHANNELS.listAgentGrants, [AGENT])).toEqual({
+    outcome: "ok",
+    agentId: AGENT,
+    grants: [A_GRANT],
+  });
+  fake.answerAgentGrants({ outcome: "refused", reason: "hosted_here" });
+  expect(await call(INVOKE_CHANNELS.listAgentGrants, [AGENT])).toEqual({
+    outcome: "refused",
+    reason: "hosted_here",
+  });
+  // A field beyond the contract is dropped.
+  fake.answerAgentGrants({
+    outcome: "ok",
+    agentId: AGENT,
+    hostDeviceId: id(0x5001),
+    grants: [{ ...A_GRANT, hostDeviceId: id(0x5001), grantedByUserId: id(9) }],
+  });
+  const stripped = await call(INVOKE_CHANNELS.listAgentGrants, [AGENT]);
+  expect(stripped).toEqual({
+    outcome: "ok",
+    agentId: AGENT,
+    grants: [A_GRANT],
+  });
+  expect(JSON.stringify(stripped)).not.toContain(id(0x5001));
+  // A grant of another agent, or more than an agent holds, never crosses.
+  for (const answer of [
+    {
+      outcome: "ok",
+      agentId: AGENT,
+      grants: [{ ...A_GRANT, agentId: id(0xf2) }],
+    },
+    {
+      outcome: "ok",
+      agentId: AGENT,
+      grants: Array.from({ length: 101 }, (_, index) => ({
+        ...A_GRANT,
+        id: id(0x6000 + index),
+      })),
+    },
+    { outcome: "refused", reason: "forbidden" },
+  ]) {
+    fake.answerAgentGrants(answer);
+    await expect(
+      call(INVOKE_CHANNELS.listAgentGrants, [AGENT]) as Promise<unknown>,
+    ).rejects.toThrow();
+  }
+  expect(fake.calls).toEqual(
+    Array.from({ length: 6 }, () => ["listAgentGrants", AGENT]),
+  );
 });
 
 test("a subscribed frame gets the grants after each burst of changes, with a higher revision, until the IPC closes", () => {

@@ -347,6 +347,12 @@ export const INVOKE_CHANNELS = Object.freeze({
   /** Revokes a grant of an agent of the open project (#342). */
   revokeGrant: "grants:revoke",
   /**
+   * Reads the grants of one of the account's agents of the open project
+   * that another device hosts (#345), so that the owner can revoke them
+   * here: never an account or a host device.
+   */
+  listAgentGrants: "grants:list-agent-grants",
+  /**
    * What the renderer may know of the open project's chat: the newest
    * messages that fit the view's limits, with their authors' names, and the
    * person's messages that the server has not stored yet.

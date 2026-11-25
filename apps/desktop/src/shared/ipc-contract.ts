@@ -2661,9 +2661,8 @@ export const AgentViewSchema = z.object({
   /** When the agent was disabled; null while it is enabled. */
   disabledAt: TimestampSchema.nullable(),
   /**
-   * Whether the signed-in account's own person owns the agent (#342). The
-   * renderer does not use it yet: it shows grants only for the agents
-   * grantable here. Revoking from the owner's other devices (#345) needs it.
+   * Whether the signed-in account's own person owns the agent (#342): it
+   * may revoke the agent's grants.
    */
   ownedByMe: z.boolean(),
   /**
@@ -2672,6 +2671,15 @@ export const AgentViewSchema = z.object({
    * The server still decides each grant.
    */
   grantableHere: z.boolean(),
+  /**
+   * Whether the agent is one of the account's enabled agents that another
+   * device is known to host (#345): the permission screen offers it after
+   * the agents grantable here, with its grants to revoke and without the
+   * form. An agent whose host is not known, from a server that does not
+   * send it or before this device's key is ready, is neither, because it
+   * may be this device's own.
+   */
+  hostedElsewhere: z.boolean(),
 });
 export type AgentView = z.infer<typeof AgentViewSchema>;
 
@@ -2761,14 +2769,17 @@ export const PROVIDER_KIND_VIEWS = Object.freeze(["claude", "codex"] as const);
  * Limits of the grant messages: the grants of the open project's agents
  * that one view holds, the most that the grant records hold
  * (`MAX_ANSWER_LIST_ITEMS`); this device's provider connections, the most
- * that one answer holds; and a connection's label in characters, the
- * protocol's `LIMITS.providerConnectionLabel`. The main process's tests
- * check that the values match.
+ * that one answer holds; a connection's label in characters, the
+ * protocol's `LIMITS.providerConnectionLabel`; and the grants of one agent
+ * that another device hosts, the most that an agent holds
+ * (`GRANT_COUNT_LIMITS.perAgent`). The main process's tests check that the
+ * values match.
  */
 export const GRANT_LIMITS = Object.freeze({
   grants: 1_000,
   providerConnections: 1_000,
   providerConnectionLabel: 64,
+  agentGrants: 100,
 });
 
 /**
@@ -2778,7 +2789,9 @@ export const GRANT_LIMITS = Object.freeze({
  * device), when it was created and expires, and whether it has expired by
  * this device's clock. It names no account and no host device. Only the
  * agent's host device holds such records, so an agent that another device
- * hosts has none here.
+ * hosts has none in the grant state; its owner reads its grants with
+ * `listAgentGrants` instead, in the same form (#345), where a provider
+ * connection is one of the host device.
  */
 export const GrantViewSchema = z
   .object({
@@ -2968,6 +2981,67 @@ export const RevokeGrantResultSchema = z.discriminatedUnion("outcome", [
   CreateUnknownSchema,
 ]);
 export type RevokeGrantResult = z.infer<typeof RevokeGrantResultSchema>;
+
+/**
+ * Why the grants of an agent that another device hosts could not be read
+ * (#345):
+ *
+ * - `invalid`: the agent ID is not one. Nothing was sent.
+ * - `not_open`: the agent is not one of the open project's agents. Nothing
+ *   was sent.
+ * - `not_owner`: the account does not own the agent. Nothing was sent.
+ * - `hosted_here`: this device hosts the agent, so its grants come with
+ *   the grant state. Nothing was sent.
+ * - `host_unknown`: it is not known which device hosts the agent, because
+ *   the server does not send it or this device's key is not ready, so the
+ *   agent may be this device's own. Nothing was sent.
+ * - `disabled`: the agent is disabled. Nothing was sent.
+ * - `not_signed_in`, `unavailable`, `rate_limited`: as for the other reads.
+ * - `not_found`: the API does not know the agent, or the account is no
+ *   longer a member of its workspace.
+ * - `failed`: the API refused it otherwise, for example as `forbidden` for
+ *   an account that does not own the agent, or the answer did not fit.
+ */
+export const AGENT_GRANTS_READ_PROBLEMS = Object.freeze([
+  "invalid",
+  "not_open",
+  "not_owner",
+  "hosted_here",
+  "host_unknown",
+  "disabled",
+  "not_signed_in",
+  "not_found",
+  "rate_limited",
+  "unavailable",
+  "failed",
+] as const);
+export type AgentGrantsReadProblem =
+  (typeof AGENT_GRANTS_READ_PROBLEMS)[number];
+
+/**
+ * The result of reading the grants of an agent that another device hosts:
+ * `ok` with the agent's ID and its grants that are not revoked, an expired
+ * one included, in the server's order, or `refused` with a problem. Each
+ * grant is a `GrantView` of that agent: no account and no host device.
+ */
+export const AgentGrantsResultSchema = z.discriminatedUnion("outcome", [
+  z
+    .object({
+      outcome: z.literal("ok"),
+      agentId: ProtocolIdSchema,
+      grants: z.array(GrantViewSchema).max(GRANT_LIMITS.agentGrants).readonly(),
+    })
+    .refine(
+      (result) =>
+        result.grants.every((grant) => grant.agentId === result.agentId),
+      { message: "Every grant is one of the agent" },
+    ),
+  z.object({
+    outcome: z.literal("refused"),
+    reason: z.enum(AGENT_GRANTS_READ_PROBLEMS),
+  }),
+]);
+export type AgentGrantsResult = z.infer<typeof AgentGrantsResultSchema>;
 
 // The chat of the open project (#27).
 
@@ -4061,6 +4135,11 @@ export const INVOKE_CONTRACT = Object.freeze({
     /** The agent's ID and the grant's ID. */
     args: z.tuple([ProtocolIdSchema, ProtocolIdSchema]),
     result: RevokeGrantResultSchema,
+  }),
+  [INVOKE_CHANNELS.listAgentGrants]: Object.freeze({
+    /** The agent's ID. */
+    args: z.tuple([ProtocolIdSchema]),
+    result: AgentGrantsResultSchema,
   }),
   [INVOKE_CHANNELS.getChatState]: Object.freeze({
     args: NoArgumentsSchema,

@@ -32,6 +32,7 @@ import type {
   AcceptInvitationResult,
   AccountStatus,
   AgentActivityView,
+  AgentGrantsResult,
   ApproveJoinRequestResult,
   ChatLoadOlderResultView,
   ChatSendResultView,
@@ -908,6 +909,15 @@ export function createDesktopBridge(
           ) as Promise<RevokeGrantResult>)
         : Promise.reject(
             new TypeError("revoke needs an agent ID and a grant ID string."),
+          ),
+    listAgentGrants: (agentId: string) =>
+      typeof agentId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.listAgentGrants,
+            agentId,
+          ) as Promise<AgentGrantsResult>)
+        : Promise.reject(
+            new TypeError("listAgentGrants needs an agent ID string."),
           ),
   });
 

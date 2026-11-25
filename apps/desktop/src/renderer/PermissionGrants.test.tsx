@@ -24,10 +24,13 @@ import type {
 } from "../shared/ipc-contract.ts";
 import { agentTimeFormat } from "./agent-view.ts";
 import {
+  GRANT_LIST_STATUS_ID,
   GRANT_RESULT_ID,
+  grantAgentNoteId,
   GrantSectionContent,
   grantSectionHandlers,
   type GrantSectionHandlers,
+  sectionGrantActions,
 } from "./PermissionGrants.tsx";
 import { PermissionsScreen } from "./ProjectScreens.tsx";
 import {
@@ -35,11 +38,13 @@ import {
   describeGrantSection,
   EXPIRY_CHOICES,
   expiryChoices,
+  AGENT_GRANTS_PROBLEM_MESSAGES,
   focusAfterConfirmation,
   GRANT_MESSAGES,
   GRANT_RESULT_MESSAGES,
   IDLE_GRANT_ACTIONS,
   INITIAL_GRANT_FORM,
+  NO_AGENT_GRANTS,
   OFFERED_CAPABILITIES,
   type ConfirmationEnd,
   type GrantActions,
@@ -91,10 +96,6 @@ function elementsOf(node: ReactNode): ReactElement<HostProps>[] {
 }
 
 const FORM: GrantFormView = {
-  agents: [
-    { id: HERE, label: "Builder" },
-    { id: SECOND, label: "<b>Reviewer</b>" },
-  ],
   agentId: HERE,
   capabilities: OFFERED_CAPABILITIES.map((capability) => ({
     capability,
@@ -154,6 +155,11 @@ const CONFIRMING_FORM: GrantFormView = {
 
 const VIEW: GrantSectionView = {
   kind: "form",
+  agents: [
+    { id: HERE, label: "Builder", grantable: true },
+    { id: SECOND, label: "<b>Reviewer</b>", grantable: true },
+  ],
+  agentId: HERE,
   form: FORM,
   notes: [],
   grants: [
@@ -311,10 +317,117 @@ test("each control reports its choice, the form sends its agent and its form, an
   ]);
 });
 
+const ELSEWHERE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f3";
+
+/** The owner's agent that another device hosts, selected, with its grants. */
+const ELSEWHERE_VIEW: GrantSectionView = {
+  kind: "form",
+  agents: [
+    { id: HERE, label: "Builder", grantable: true },
+    {
+      id: ELSEWHERE,
+      label: "Laptop agent (on another device)",
+      grantable: false,
+    },
+  ],
+  agentId: ELSEWHERE,
+  form: null,
+  notes: [GRANT_MESSAGES.hostedElsewhere],
+  grants: [
+    {
+      grantId: GRANT_1,
+      capability: "terminal.execute",
+      scope: "web",
+      expiry: "Expires soon",
+      expired: false,
+      statements: [shellGitStatement(["git.push"])!],
+    },
+  ],
+  grantsNote: undefined,
+};
+
+test("for the owner's agent that another device hosts, the section offers the agents and its grants with Revoke and the commit and push statement, but no form", () => {
+  const html = render(ELSEWHERE_VIEW);
+  expect(html).toContain('<label for="grant-agent">Agent</label>');
+  expect(html).toContain(
+    `<option value="${ELSEWHERE}" selected="">Laptop agent (on another device)</option>`,
+  );
+  expect(html).toContain(`<option value="${HERE}">Builder</option>`);
+  // No grant control: only the host device grants.
+  expect(html).not.toMatch(/<form[\s>]/);
+  expect(html).not.toContain('id="grant-capability"');
+  expect(html).not.toContain('type="submit"');
+  // The note on the agent describes the agent list while it shows.
+  expect(html).toContain(
+    `<p id="${grantAgentNoteId(0)}" class="grant-note">${GRANT_MESSAGES.hostedElsewhere.replaceAll("'", "&#x27;")}</p>`,
+  );
+  expect(html).toMatch(
+    new RegExp(
+      `<select id="grant-agent" [^>]*aria-describedby="${grantAgentNoteId(0)}"`,
+    ),
+  );
+  expect(html).toContain(
+    'aria-label="Revoke terminal.execute on web">Revoke</button>',
+  );
+  expect(html).toContain('class="grant-warning"');
+  // The sentence on the read is always there, and announced as it changes.
+  expect(html).toContain(`<p id="${GRANT_LIST_STATUS_ID}" role="status"></p>`);
+  for (const note of [
+    GRANT_MESSAGES.agentGrantsPending,
+    GRANT_MESSAGES.noGrants,
+    AGENT_GRANTS_PROBLEM_MESSAGES.not_found,
+  ]) {
+    expect(
+      render({ ...ELSEWHERE_VIEW, grants: [], grantsNote: note }),
+    ).toContain(
+      `<p id="${GRANT_LIST_STATUS_ID}" class="grant-note" role="status">${note}</p>`,
+    );
+  }
+  // Every ID is unique, and every label and description names an element.
+  const ids = [...html.matchAll(/\sid="([^"]+)"/g)].map((match) => match[1]);
+  expect(new Set(ids).size).toBe(ids.length);
+  for (const [, references] of html.matchAll(
+    /\s(?:for|aria-labelledby|aria-describedby)="([^"]+)"/g,
+  )) {
+    for (const reference of references!.split(" ")) {
+      expect(ids).toContain(reference);
+    }
+  }
+
+  const { calls, handlers } = recorder();
+  const elements = elementsOf(
+    GrantSectionContent({
+      view: ELSEWHERE_VIEW,
+      actions: IDLE_GRANT_ACTIONS,
+      handlers,
+    }),
+  );
+  elements
+    .find((element) => element.props.id === "grant-agent")!
+    .props.onChange?.({ target: { value: HERE } });
+  elements
+    .find(
+      (element) => element.type === "button" && element.props.type === "button",
+    )!
+    .props.onClick?.();
+  expect(calls).toEqual([
+    ["agent", HERE],
+    ["revoke", ELSEWHERE, GRANT_1],
+  ]);
+  // While an action waits, the agents and Revoke wait too.
+  const running = render(ELSEWHERE_VIEW, { running: true, message: undefined });
+  expect(running.match(/<select [^>]*disabled=""/g)).toHaveLength(1);
+  expect(running).toMatch(
+    /<button type="button" (?=[^>]*disabled="")[^>]*aria-label="Revoke terminal\.execute on web"/,
+  );
+});
+
 test("without a grantable agent, or while the agents are not known, the section shows its sentence and no control", () => {
   for (const view of [
     {
       kind: "form",
+      agents: [],
+      agentId: null,
       form: null,
       notes: [GRANT_MESSAGES.noGrantableAgent],
       grants: [],
@@ -328,6 +441,8 @@ test("without a grantable agent, or while the agents are not known, the section 
   expect(
     render({
       kind: "form",
+      agents: [],
+      agentId: null,
       form: null,
       notes: [GRANT_MESSAGES.noGrantableAgent],
       grants: [],
@@ -356,6 +471,7 @@ test("with the bridges, the screen subscribes once it is shown and first says th
           listProviderConnections: unused,
           grant: unused,
           revoke: unused,
+          listAgentGrants: unused,
         } as GrantBridge
       }
     />,
@@ -501,6 +617,7 @@ const AGENTS: AgentActivityView = {
       disabledAt: null,
       ownedByMe: true,
       grantableHere: true,
+      hostedElsewhere: false,
     },
     {
       id: SECOND,
@@ -509,6 +626,7 @@ const AGENTS: AgentActivityView = {
       disabledAt: null,
       ownedByMe: true,
       grantableHere: true,
+      hostedElsewhere: false,
     },
   ],
   unfinishedRuns: [],
@@ -555,6 +673,7 @@ function wiring(
         },
       },
       grants: { kind: "pending" },
+      agentGrants: NO_AGENT_GRANTS,
       connections: { kind: "pending" },
       form: state,
       now: Date.parse("2026-11-24T12:00:00.000Z"),
@@ -768,4 +887,31 @@ test("confirming twice with the same handlers sends the grant once", async () =>
     running: false,
     message: GRANT_RESULT_MESSAGES.granted,
   });
+});
+
+test("every revocation that ended, whatever its outcome, bumps the section's refresh, so that an agent on another device is read again; a grant does not", async () => {
+  const bumps: ((count: number) => number)[] = [];
+  let revoked: () => Promise<{ readonly outcome: "ok" }> = () =>
+    Promise.resolve({ outcome: "ok" });
+  const actions = sectionGrantActions(
+    {
+      grant: () => Promise.resolve({ outcome: "ok", grantId: GRANT_1 }),
+      revoke: () => revoked(),
+    },
+    () => {},
+    (change) => bumps.push(change),
+  );
+  await actions.grant(HERE, {
+    capability: "repo.read",
+    scopeId: WEB,
+    lifetimeSeconds: null,
+  });
+  expect(bumps).toEqual([]);
+  await actions.revoke(HERE, GRANT_1);
+  expect(bumps).toHaveLength(1);
+  revoked = () => Promise.reject(new Error("lost"));
+  await actions.revoke(HERE, GRANT_1);
+  expect(bumps).toHaveLength(2);
+  // Each bump counts one more, from whatever count the section holds.
+  expect(bumps.map((bump) => bump(3))).toEqual([4, 4]);
 });

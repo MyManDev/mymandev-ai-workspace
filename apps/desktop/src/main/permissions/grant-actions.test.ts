@@ -1,7 +1,9 @@
 import {
+  AgentGrantListResponseSchema,
   type AgentListItem,
   AgentListItemSchema,
   CAPABILITIES,
+  GRANT_COUNT_LIMITS,
   GRANT_LIFETIME_SECONDS,
   GRANT_ROUTE_ERRORS,
   GrantCapabilityResponseSchema,
@@ -16,6 +18,7 @@ import {
 import { CAPABILITY_RISK, type GrantRecord } from "@mymandev/permissions";
 import { expect, test } from "vitest";
 import {
+  AgentGrantsResultSchema,
   GRANT_CAPABILITIES,
   GRANT_CAPABILITY_REFUSALS,
   GRANT_LIMITS,
@@ -42,7 +45,8 @@ import { confirmationMatches, createGrantActions } from "./grant-actions.ts";
 
 // The grant and revoke actions of #342 in the main process: who may grant,
 // what is sent, what each answer becomes, and that the grant store reads its
-// records again after every grant request, whatever its outcome.
+// records again after every grant request, whatever its outcome; and the read
+// of the grants of an owner's agent that another device hosts (#345).
 
 /** A lowercase UUIDv7 that ends in `n`. */
 function id(n: number): string {
@@ -61,6 +65,8 @@ const AGENT = id(0xf1);
 const ELSEWHERE = id(0xf2);
 const THEIRS = id(0xf3);
 const DISABLED = id(0xf4);
+const DISABLED_ELSEWHERE = id(0xf5);
+const OLDER_SERVER = id(0xf6);
 const REPOSITORY = id(0x2001);
 const CONNECTION = id(0x3001);
 const GRANT = id(0x4001);
@@ -176,6 +182,9 @@ function setup() {
       agent(ELSEWHERE, ME, OTHER_DEVICE),
       agent(THEIRS, SOMEONE, null),
       agent(DISABLED, ME, DEVICE, AT),
+      agent(DISABLED_ELSEWHERE, ME, OTHER_DEVICE, AT),
+      // The account's agent from a server that does not send its host.
+      agent(OLDER_SERVER, ME, null),
     ],
     unfinishedRuns: [],
     finishedRuns: [],
@@ -188,8 +197,13 @@ function setup() {
     ok: true,
     value: { providerConnections: [] },
   };
+  let agentGrants: WorkspaceReadResult<unknown> | Error = {
+    ok: true,
+    value: { grants: [] },
+  };
   const sent: Sent[] = [];
   const reads: string[] = [];
+  const readParams: unknown[] = [];
   const logs: string[] = [];
   let answeredCount = 0;
   // Each listener gets no value here: the service reads the state itself.
@@ -214,9 +228,15 @@ function setup() {
         new Promise((resolve, reject) => {
           sent.push({ name, params, body, resolve, reject });
         })) as never,
-      readWorkspaceData: ((name: string) => {
+      readWorkspaceData: ((name: string, params: unknown) => {
         reads.push(name);
-        return Promise.resolve(connections);
+        readParams.push(params);
+        if (name !== "listAgentGrants") {
+          return Promise.resolve(connections);
+        }
+        return agentGrants instanceof Error
+          ? Promise.reject(agentGrants)
+          : Promise.resolve(agentGrants);
       }) as never,
     },
     agents: {
@@ -242,6 +262,7 @@ function setup() {
     service,
     sent,
     reads,
+    readParams,
     logs,
     listeners,
     answered: () => answeredCount,
@@ -256,6 +277,9 @@ function setup() {
     },
     setConnections: (next: WorkspaceReadResult<unknown>) => {
       connections = next;
+    },
+    setAgentGrants: (next: WorkspaceReadResult<unknown> | Error) => {
+      agentGrants = next;
     },
   };
 }
@@ -297,6 +321,7 @@ test("the contract's capability names, provider kinds, and limits are the protoc
     grants: MAX_ANSWER_LIST_ITEMS,
     providerConnections: MAX_ANSWER_LIST_ITEMS,
     providerConnectionLabel: LIMITS.providerConnectionLabel,
+    agentGrants: GRANT_COUNT_LIMITS.perAgent,
   });
 });
 
@@ -857,5 +882,186 @@ test("this device's provider connections cross with an ID, a kind, and a label, 
     });
   }
   // Nothing is sent for a grant read.
+  expect(harness.sent).toEqual([]);
+});
+
+/** An agent's grant as the API answers it to the agent's owner. */
+function agentGrant(
+  grantId: string,
+  fields: {
+    readonly agentId?: string;
+    readonly capability?: string;
+    readonly expiresAt?: string | null;
+  } = {},
+) {
+  const capability = fields.capability ?? "repo.read";
+  return {
+    id: grantId,
+    granteeAgentId: fields.agentId ?? ELSEWHERE,
+    capability,
+    ...(capability === "provider.use"
+      ? { providerConnectionId: CONNECTION }
+      : { repositoryId: REPOSITORY }),
+    createdAt: AT,
+    expiresAt: fields.expiresAt ?? null,
+  };
+}
+
+test("the owner reads the grants of its agent that another device hosts, each as a grant view with its expiry by this device's clock, and nothing of a device or an account", async () => {
+  const harness = setup();
+  const answer = AgentGrantListResponseSchema.parse({
+    grants: [
+      agentGrant(id(0x4011), {
+        capability: "terminal.execute",
+        // Expired before NOW_MS.
+        expiresAt: "2026-11-24T11:00:00.000Z",
+      }),
+      agentGrant(id(0x4012), {
+        capability: "terminal.execute",
+        expiresAt: "2026-11-25T10:00:00.000Z",
+      }),
+      agentGrant(id(0x4013), { capability: "provider.use" }),
+    ],
+  });
+  harness.setAgentGrants({ ok: true, value: answer });
+  const result = await harness.service.listAgentGrants(ELSEWHERE);
+  expect(AgentGrantsResultSchema.parse(result)).toEqual(result);
+  expect(result).toEqual({
+    outcome: "ok",
+    agentId: ELSEWHERE,
+    grants: [
+      {
+        id: id(0x4011),
+        agentId: ELSEWHERE,
+        capability: "terminal.execute",
+        repositoryId: REPOSITORY,
+        providerConnectionId: null,
+        createdAt: AT,
+        expiresAt: "2026-11-24T11:00:00.000Z",
+        expired: true,
+      },
+      {
+        id: id(0x4012),
+        agentId: ELSEWHERE,
+        capability: "terminal.execute",
+        repositoryId: REPOSITORY,
+        providerConnectionId: null,
+        createdAt: AT,
+        expiresAt: "2026-11-25T10:00:00.000Z",
+        expired: false,
+      },
+      {
+        id: id(0x4013),
+        agentId: ELSEWHERE,
+        capability: "provider.use",
+        repositoryId: null,
+        providerConnectionId: CONNECTION,
+        createdAt: AT,
+        expiresAt: null,
+        expired: false,
+      },
+    ],
+  });
+  expect(harness.reads).toEqual(["listAgentGrants"]);
+  expect(harness.readParams).toEqual([{ agentId: ELSEWHERE }]);
+  const crossed = JSON.stringify(result);
+  for (const value of [DEVICE, OTHER_DEVICE, USER, ME, "hostDeviceId"]) {
+    expect(crossed, value).not.toContain(value);
+  }
+  // Nothing is written.
+  expect(harness.sent).toEqual([]);
+  expect(harness.answered()).toBe(0);
+});
+
+test("the grants of an agent are read only for an owner's enabled agent of the open project that another device is known to host; every other request is refused without a read", async () => {
+  const harness = setup();
+  for (const [agentId, reason] of [
+    ["not-an-id", "invalid"],
+    [ELSEWHERE.toUpperCase(), "invalid"],
+    [id(0xf9), "not_open"],
+    [THEIRS, "not_owner"],
+    [AGENT, "hosted_here"],
+    // Disabled on this device: its grants are in this device's records.
+    [DISABLED, "hosted_here"],
+    [DISABLED_ELSEWHERE, "disabled"],
+    // Without its host, the agent may be this device's own.
+    [OLDER_SERVER, "host_unknown"],
+  ] as const) {
+    expect(await harness.service.listAgentGrants(agentId), agentId).toEqual({
+      outcome: "refused",
+      reason,
+    });
+  }
+  // On another device, the agent hosted on DEVICE is not grantable here and
+  // is read.
+  harness.setStatus(signedIn(OTHER_DEVICE));
+  expect(await harness.service.listAgentGrants(ELSEWHERE)).toEqual({
+    outcome: "refused",
+    reason: "hosted_here",
+  });
+  expect(harness.reads).toEqual([]);
+  expect((await harness.service.listAgentGrants(AGENT)).outcome).toBe("ok");
+  expect(harness.readParams).toEqual([{ agentId: AGENT }]);
+  // Before this device's key is ready, this device is not known, so no
+  // agent's host is.
+  harness.setStatus({
+    ...signedIn(OTHER_DEVICE),
+    deviceKey: "loading",
+  } as unknown as AccountStatus);
+  for (const agentId of [AGENT, ELSEWHERE, OLDER_SERVER]) {
+    expect(await harness.service.listAgentGrants(agentId), agentId).toEqual({
+      outcome: "refused",
+      reason: "host_unknown",
+    });
+  }
+  harness.setStatus(signedIn(OTHER_DEVICE));
+  // No project is open.
+  harness.setState({ projectId: null, workspaceId: null });
+  expect(await harness.service.listAgentGrants(AGENT)).toEqual({
+    outcome: "refused",
+    reason: "not_open",
+  });
+  harness.service.close();
+  expect(await harness.service.listAgentGrants(AGENT)).toEqual({
+    outcome: "refused",
+    reason: "unavailable",
+  });
+  expect(harness.reads).toEqual(["listAgentGrants"]);
+});
+
+test("a failed read of an agent's grants becomes its problem, a thrown read unavailable, and an answer that names another agent failed", async () => {
+  const harness = setup();
+  for (const [reason, problem] of [
+    ["not_signed_in", "not_signed_in"],
+    ["not_found", "not_found"],
+    ["rate_limited", "rate_limited"],
+    ["unavailable", "unavailable"],
+    ["failed", "failed"],
+  ] as const) {
+    harness.setAgentGrants({ ok: false, reason });
+    expect(await harness.service.listAgentGrants(ELSEWHERE), reason).toEqual({
+      outcome: "refused",
+      reason: problem,
+    });
+  }
+  harness.setAgentGrants(new Error(`secret ${ELSEWHERE}`));
+  expect(await harness.service.listAgentGrants(ELSEWHERE)).toEqual({
+    outcome: "refused",
+    reason: "unavailable",
+  });
+  harness.setAgentGrants({
+    ok: true,
+    value: AgentGrantListResponseSchema.parse({
+      grants: [agentGrant(id(0x4021), { agentId: AGENT })],
+    }),
+  });
+  expect(await harness.service.listAgentGrants(ELSEWHERE)).toEqual({
+    outcome: "refused",
+    reason: "failed",
+  });
+  expect(harness.logs).toEqual([
+    "The grants of an agent could not be read.",
+    "The grants of an agent named another agent.",
+  ]);
   expect(harness.sent).toEqual([]);
 });

@@ -10,6 +10,7 @@ import {
   initialAgentPanelView,
 } from "./agent-view.ts";
 import {
+  agentGrantsToRead,
   askConfirmation,
   changeGrantForm,
   confirmedGrantOf,
@@ -18,13 +19,18 @@ import {
   endConfirmation,
   endHiddenConfirmation,
   focusAfterConfirmation,
+  followAgentGrants,
   followGrants,
   GRANT_MESSAGES,
   IDLE_GRANT_ACTIONS,
   INITIAL_GRANT_FORM,
   initialGrantsView,
   needsProviderConnections,
+  nextAgentGrantExpiry,
+  NO_AGENT_GRANTS,
   submitGrant,
+  type AgentChoice,
+  type AgentGrantsPanelView,
   type ConfirmationEnd,
   type ConnectionsPanelView,
   type GrantActions,
@@ -39,14 +45,16 @@ import {
   followProjectRepositories,
   initialProjectRepositoriesView,
 } from "./project-repositories-view.ts";
+import { MAX_CLOCK_WAIT_MS } from "./device-view.ts";
 import { StatementText } from "./StatementText.tsx";
 
 // The grant form and the grant list of the permission screen (#342), with
-// the presentation rules of ADR 0015 (#77). The components below
-// `PermissionGrants` use no hooks, so the tests render the markup and also
-// call the components as functions, walk the returned elements, and invoke
-// their event handlers; `grantSectionHandlers` is the hook's wiring without
-// the hook.
+// the presentation rules of ADR 0015 (#77), and the grants of the owner's
+// agents that another device hosts, which can only be revoked here (#345).
+// The components below `PermissionGrants` use no hooks, so the tests render
+// the markup and also call the components as functions, walk the returned
+// elements, and invoke their event handlers; `grantSectionHandlers` is the
+// hook's wiring without the hook.
 
 /** What the person can do in the grant section. */
 export interface GrantSectionHandlers {
@@ -65,6 +73,20 @@ export interface GrantSectionHandlers {
 
 /** The ID of the sentence after an action, which a screen reader announces. */
 export const GRANT_RESULT_ID = "grant-result";
+
+/**
+ * The ID of the sentence on the read of the grants of an agent that another
+ * device hosts, which a screen reader announces (#345).
+ */
+export const GRANT_LIST_STATUS_ID = "grant-list-status";
+
+/**
+ * The ID of the section's note at `index` while it describes the selected
+ * agent, which has no form here because another device hosts it.
+ */
+export function grantAgentNoteId(index: number): string {
+  return `grant-agent-note-${index}`;
+}
 
 /**
  * Where the hook puts the focus once a confirmation has closed
@@ -162,19 +184,6 @@ function GrantForm({
         handlers.onGrant(form.agentId, form);
       }}
     >
-      <label htmlFor="grant-agent">{GRANT_MESSAGES.agentLabel}</label>
-      <select
-        id="grant-agent"
-        value={form.agentId}
-        disabled={running}
-        onChange={(event) => handlers.onAgent(event.target.value)}
-      >
-        {form.agents.map((agent) => (
-          <option key={agent.id} value={agent.id}>
-            {agent.label}
-          </option>
-        ))}
-      </select>
       <label htmlFor="grant-capability">{GRANT_MESSAGES.capabilityLabel}</label>
       <select
         id="grant-capability"
@@ -259,6 +268,46 @@ function GrantForm({
           : GRANT_MESSAGES.submit}
       </button>
     </form>
+  );
+}
+
+/**
+ * The account's own agents: those that this device may grant for, and
+ * those that another device hosts, whose grants can only be revoked here.
+ * It stands outside the form, so that an agent without a form can be
+ * chosen as well.
+ */
+function AgentPicker({
+  agents,
+  agentId,
+  running,
+  describedBy,
+  onAgent,
+}: {
+  readonly agents: readonly AgentChoice[];
+  readonly agentId: string;
+  readonly running: boolean;
+  /** The IDs of the notes on the selected agent, if any. */
+  readonly describedBy: string | undefined;
+  readonly onAgent: (agentId: string) => void;
+}) {
+  return (
+    <div className="grant-agent">
+      <label htmlFor="grant-agent">{GRANT_MESSAGES.agentLabel}</label>
+      <select
+        id="grant-agent"
+        value={agentId}
+        disabled={running}
+        aria-describedby={describedBy}
+        onChange={(event) => onAgent(event.target.value)}
+      >
+        {agents.map((agent) => (
+          <option key={agent.id} value={agent.id}>
+            {agent.label}
+          </option>
+        ))}
+      </select>
+    </div>
   );
 }
 
@@ -350,10 +399,11 @@ function GrantConfirmation({
 }
 
 /**
- * The grant section: the form for the agents that this device may grant
- * for, the confirmation of a highest-risk capability while it waits, the
- * selected agent's grants with a revoke control each, and the sentence
- * after the last action.
+ * The grant section: the account's own agents, the form for an agent that
+ * this device may grant for, the confirmation of a highest-risk capability
+ * while it waits, the selected agent's grants with a revoke control each,
+ * also for an agent that another device hosts, and the sentence after the
+ * last action.
  */
 export function GrantSectionContent({
   view,
@@ -367,6 +417,13 @@ export function GrantSectionContent({
   /** Where the hook puts the focus after a confirmation; optional, the hook passes it. */
   readonly focus?: GrantSectionFocus;
 }) {
+  // The selected agent without a form is hosted on another device: the
+  // notes say so, and describe the agent list while they show.
+  const agentNotes =
+    view.kind === "form" &&
+    view.agentId !== null &&
+    view.form === null &&
+    view.notes.length > 0;
   // A subsection without a name, so that it adds no landmark region.
   return (
     <section className="grant-section">
@@ -375,6 +432,21 @@ export function GrantSectionContent({
         <p className="placeholder-note">{view.text}</p>
       ) : (
         <>
+          {view.agentId === null ? null : (
+            <AgentPicker
+              agents={view.agents}
+              agentId={view.agentId}
+              running={actions.running}
+              describedBy={
+                agentNotes
+                  ? view.notes
+                      .map((_, index) => grantAgentNoteId(index))
+                      .join(" ")
+                  : undefined
+              }
+              onAgent={handlers.onAgent}
+            />
+          )}
           {view.form === null ? null : (
             <GrantForm
               form={view.form}
@@ -391,8 +463,12 @@ export function GrantSectionContent({
               handlers={handlers}
             />
           )}
-          {view.notes.map((note) => (
-            <p key={note} className="grant-note">
+          {view.notes.map((note, index) => (
+            <p
+              key={note}
+              id={agentNotes ? grantAgentNoteId(index) : undefined}
+              className="grant-note"
+            >
               {note}
             </p>
           ))}
@@ -404,9 +480,9 @@ export function GrantSectionContent({
           >
             {actions.running ? GRANT_MESSAGES.running : actions.message}
           </p>
-          {view.form === null ? null : (
+          {view.agentId === null ? null : (
             <GrantList
-              agentId={view.form.agentId}
+              agentId={view.agentId}
               view={view}
               running={actions.running}
               onRevoke={handlers.onRevoke}
@@ -432,7 +508,17 @@ function GrantList({
   return (
     <>
       <h4 id="grant-list-title">{GRANT_MESSAGES.grantsTitle}</h4>
-      {view.grantsNote === undefined ? null : (
+      {view.form === null ? (
+        // The read of an agent on another device: always present, so that a
+        // screen reader announces each of its sentences as it changes.
+        <p
+          id={GRANT_LIST_STATUS_ID}
+          className={view.grantsNote === undefined ? undefined : "grant-note"}
+          role="status"
+        >
+          {view.grantsNote}
+        </p>
+      ) : view.grantsNote === undefined ? null : (
         <p className="grant-note">{view.grantsNote}</p>
       )}
       {view.grants.length === 0 ? null : (
@@ -519,8 +605,67 @@ function useConnections(
 }
 
 /**
+ * Reads the grants of `agentId`, an agent that another device hosts, while
+ * the section shows it (`agentGrantsToRead`), and again for each new
+ * `refresh`, after a revocation (#345), with `followAgentGrants`. An
+ * answer that comes after the section is gone, after another agent was
+ * selected, or after a later read began, is dropped.
+ */
+function useAgentGrants(
+  grants: GrantBridge | undefined,
+  agentId: string | null,
+  refresh: number,
+): AgentGrantsPanelView {
+  const [view, setView] = useState<AgentGrantsPanelView>(NO_AGENT_GRANTS);
+  useEffect(
+    () =>
+      grants === undefined
+        ? undefined
+        : followAgentGrants(grants, agentId, refresh, setView),
+    [grants, agentId, refresh],
+  );
+  return view;
+}
+
+/**
+ * Renders the section again at `at`, the next expiry of a grant of an
+ * agent on another device (`nextAgentGrantExpiry`), so that its list says
+ * "Expired" without a new read. The timer ends with a change of `at` and
+ * when the section is gone; a timer that fires before `at` sets another.
+ */
+function useRenderAt(at: number | undefined): void {
+  const [renders, setRenders] = useState(0);
+  useEffect(() => {
+    if (at === undefined) {
+      return undefined;
+    }
+    const timer = setTimeout(
+      () => setRenders((count) => count + 1),
+      Math.min(Math.max(at - Date.now(), 0), MAX_CLOCK_WAIT_MS),
+    );
+    return () => clearTimeout(timer);
+  }, [at, renders]);
+}
+
+/**
+ * The section's grant and revoke actions: every revocation that ended,
+ * whatever its outcome, bumps the section's `refresh`, so that the grants
+ * of an agent that another device hosts are read again (#345).
+ */
+export function sectionGrantActions(
+  grants: Pick<GrantBridge, "grant" | "revoke">,
+  onView: (view: GrantActionsView) => void,
+  setRefresh: (change: (count: number) => number) => void,
+): GrantActions {
+  return createGrantActions(grants, onView, () =>
+    setRefresh((count) => count + 1),
+  );
+}
+
+/**
  * The grant section of the permission screen, with the open project's
- * agents, its registered repositories, the grants of its agents, and this
+ * agents, its registered repositories, the grants of its agents, the
+ * grants of the account's agents that another device hosts, and this
  * device's provider connections. Without the bridges, outside Electron, it
  * says that granting is not available.
  */
@@ -577,20 +722,31 @@ export function PermissionGrants({
   const [form, setForm] = useState<GrantFormState>(INITIAL_GRANT_FORM);
   const [actionsView, setActionsView] =
     useState<GrantActionsView>(IDLE_GRANT_ACTIONS);
+  // Each revocation reads the agent's grants again when another device
+  // hosts it; the grant state follows the main process on its own.
+  const [revocations, setRevocations] = useState(0);
   const actions = useMemo(
     () =>
       grants === undefined
         ? undefined
-        : createGrantActions(grants, setActionsView),
+        : sectionGrantActions(grants, setActionsView, setRevocations),
     [grants],
   );
+  const agentGrants = useAgentGrants(
+    grants,
+    agentGrantsToRead(agentView, form),
+    revocations,
+  );
+  const now = Date.now();
+  useRenderAt(nextAgentGrantExpiry(agentGrants, now));
   const view = describeGrantSection({
     agents: agentView,
     repositories: repositoryView,
     grants: grantView,
+    agentGrants,
     connections,
     form,
-    now: Date.now(),
+    now,
     timeFormat: agentTimeFormat(),
   });
   // Once the person ends a confirmation, the focus goes where
