@@ -293,7 +293,7 @@ test("a LISTEN that the server does not confirm in time is a failed attempt: the
   await listener.close();
 });
 
-test("a listening session is checked every minute, one check at a time; a check that fails or does not answer in time counts as a lost session, and the listener connects again", async (t) => {
+test("a listening session is checked every minute; a check that fails or does not answer in time counts as a lost session, and the listener connects again", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
   const { sessions, opened } = fakeSessions(
     ["listen", "listen", "listen"],
@@ -328,8 +328,8 @@ test("a listening session is checked every minute, one check at a time; a check 
   assert.equal(opened.length, 2);
   assert.deepEqual(waits, [100]);
 
-  // The new session's first check hangs: no second check starts while it
-  // waits, and it counts as lost once its timeout passes.
+  // The new session's first check hangs and counts as lost once its
+  // timeout passes.
   t.mock.timers.tick(ERASURE_LISTENER_CHECK_INTERVAL_MS);
   await settle();
   assert.equal(opened[1]?.checks(), 1);
@@ -367,4 +367,35 @@ test("a listening session is checked every minute, one check at a time; a check 
   for (const line of lines) {
     assert.equal(line.includes("10.0.0.1"), false, line);
   }
+});
+
+test("a check that is still waiting when the next interval comes is not run twice", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const { sessions, opened } = fakeSessions(["listen"], ["hang"]);
+  const listener = new ErasureListener({
+    sessions,
+    onPayload: () => undefined,
+    log: logger().log,
+    checkIntervalMs: 1_000,
+    checkTimeoutMs: 5_000,
+    wait: recordedWaits().wait,
+  });
+  await listener.start();
+  t.mock.timers.tick(1_000);
+  await settle();
+  assert.equal(opened[0]?.checks(), 1);
+  // Four more intervals pass while the first check waits for its answer.
+  for (let tick = 0; tick < 4; tick += 1) {
+    t.mock.timers.tick(999);
+    await settle();
+    assert.equal(opened[0]?.checks(), 1);
+    t.mock.timers.tick(1);
+    await settle();
+  }
+  assert.equal(opened[0]?.closed(), false);
+  t.mock.timers.tick(1_000);
+  await settle();
+  assert.equal(opened[0]?.closed(), true, "the check timed out");
+  assert.equal(opened[0]?.checks(), 1);
+  await listener.close();
 });
