@@ -22,6 +22,7 @@ import {
   ALLOW_RUN_START,
   denialEnd,
   HOST_RUN_REASONS,
+  type RunStartDecision,
 } from "./run-supervisor.ts";
 
 const RUN: HeldRun = Object.freeze({
@@ -47,38 +48,54 @@ function fakeEnforcement(answer: () => unknown) {
   };
 }
 
-test("every denial before a start maps to its end, and no_grant fails the run with provider_use_denied", () => {
-  const cases: [EnforcementDenialReason, "failed" | "cancelled", string][] = [
-    ["no_grant", "failed", HOST_RUN_REASONS.providerUseDenied],
-    ["signed_out", "cancelled", HOST_RUN_REASONS.signedOut],
-    ["sign_in_invalid", "cancelled", HOST_RUN_REASONS.signedOut],
-    ["device_unknown", "cancelled", HOST_RUN_REASONS.signedOut],
-    ["not_this_device", "cancelled", HOST_RUN_REASONS.signedOut],
-    ["store_unusable", "failed", HOST_RUN_REASONS.grantCheckUnavailable],
-    ["clock_invalid", "failed", HOST_RUN_REASONS.grantCheckUnavailable],
-    ["record_failed", "failed", HOST_RUN_REASONS.grantCheckUnavailable],
-    ["check_failed", "failed", HOST_RUN_REASONS.grantCheckUnavailable],
-    ["run_invalid", "failed", HOST_RUN_REASONS.grantCheckUnavailable],
-    ["request_invalid", "failed", HOST_RUN_REASONS.grantCheckUnavailable],
-    ["no_scope", "failed", HOST_RUN_REASONS.grantCheckUnavailable],
-    ["request_mismatch", "failed", HOST_RUN_REASONS.grantCheckUnavailable],
+test("before a start, only no_grant ends the run, with provider_use_denied; every other denial leaves it queued", () => {
+  const ends: [EnforcementDenialReason, RunStartDecision][] = [
+    [
+      "no_grant",
+      {
+        start: false,
+        state: "failed",
+        reason: HOST_RUN_REASONS.providerUseDenied,
+        denial: "no_grant",
+      },
+    ],
   ];
-  expect(new Set(cases.map(([reason]) => reason))).toEqual(
-    new Set(ENFORCEMENT_DENIAL_REASONS),
-  );
-  for (const [reason, state, sent] of cases) {
-    const decision = startDecisionOfDenial(reason);
-    expect(decision, reason).toEqual({ start: false, state, reason: sent });
-    expect(Object.isFrozen(decision), reason).toBe(true);
-    // The same mapping as a re-check, except for no_grant.
+  for (const reason of ENFORCEMENT_DENIAL_REASONS) {
     if (reason !== "no_grant") {
-      expect(decision, reason).toEqual({ start: false, ...denialEnd(reason) });
+      ends.push([reason, { start: "wait", denial: reason }]);
     }
   }
-  // A re-check of a held action still reports a lost grant as inactive.
+  expect(ends).toHaveLength(ENFORCEMENT_DENIAL_REASONS.length);
+  for (const [reason, expected] of ends) {
+    const decision = startDecisionOfDenial(reason);
+    expect(decision, reason).toEqual(expected);
+    expect(Object.isFrozen(decision), reason).toBe(true);
+  }
+  // The sign-in denials and the checks that cannot be made are named
+  // explicitly: none of them ends the run before it starts.
+  for (const reason of [
+    "store_unusable",
+    "clock_invalid",
+    "check_failed",
+    "signed_out",
+    "sign_in_invalid",
+    "device_unknown",
+    "not_this_device",
+  ] as const) {
+    expect(startDecisionOfDenial(reason).start, reason).toBe("wait");
+  }
+  // A running run still maps every denial with denialEnd.
   expect(denialEnd("no_grant")).toEqual({
     state: "cancelled",
     reason: HOST_RUN_REASONS.grantInactive,
+  });
+  expect(denialEnd("signed_out")).toEqual({
+    state: "cancelled",
+    reason: HOST_RUN_REASONS.signedOut,
+  });
+  expect(denialEnd("store_unusable")).toEqual({
+    state: "failed",
+    reason: HOST_RUN_REASONS.grantCheckUnavailable,
   });
 });
 
@@ -118,7 +135,7 @@ test("the check asks the enforcement point for provider.use of the run's agent o
   });
 });
 
-test("each denial of the enforcement point ends the run before it starts", () => {
+test("each denial of the enforcement point decides the start as startDecisionOfDenial says", () => {
   for (const reason of ENFORCEMENT_DENIAL_REASONS) {
     const { enforcement } = fakeEnforcement(() => ({
       allowed: false,
@@ -130,12 +147,8 @@ test("each denial of the enforcement point ends the run before it starts", () =>
   }
 });
 
-test("an enforcement point that throws or answers no decision counts as a check that failed, and the check never throws", () => {
-  const failed = {
-    start: false,
-    state: "failed",
-    reason: HOST_RUN_REASONS.grantCheckUnavailable,
-  };
+test("an enforcement point that throws or answers no decision counts as a check that failed, so the run waits, and the check never throws", () => {
+  const failed = { start: "wait", denial: "check_failed" };
   const answers: (() => unknown)[] = [
     () => {
       throw new Error("broken");
