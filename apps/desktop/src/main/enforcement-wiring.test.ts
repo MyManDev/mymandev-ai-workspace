@@ -47,12 +47,13 @@ function imports(name: string, module: string): boolean {
   );
 }
 
-test("the entry point gives the enforcement point the grant store, the account's session, the signed-in device, and the memory recorder", () => {
+test("the entry point gives the enforcement point the wall clock, the grant store, the account's session, the signed-in device, and the memory recorder", () => {
   const given = lines(
     callArguments("enforcement", "createPermissionEnforcement"),
   );
   expect(given).toEqual(
     expect.arrayContaining([
+      "now: () => new Date(),",
       "grantStore,",
       "sessionState: () => account.sessionState(),",
       "thisDevice: () => signedInDevice(account.status()) as DeviceId | null,",

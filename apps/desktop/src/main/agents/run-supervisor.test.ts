@@ -2126,6 +2126,42 @@ test("before a start, every denial but no_grant leaves the run queued, and a cha
   }
 });
 
+test("while an agent's run waits after the check before its start, another evaluation neither reads nor checks it again, and another agent's run still starts", async () => {
+  const asked: AgentId[] = [];
+  const h = new Harness({
+    runs: [run(1, "queued"), run(2, "queued", { agent: AGENT_B })],
+    beforeStart: (held) => {
+      asked.push(held.agentId);
+      return held.agentId === AGENT_A
+        ? { start: "wait", denial: "store_unusable" }
+        : { start: true };
+    },
+  });
+  await h.answerProviders();
+  // Agent A's run waits; agent B's start goes.
+  expect(h.walk()).toEqual(["2 queued>running"]);
+  h.ackAndStep();
+  expect(h.claude.calls.map((call) => call.execution.run.runId)).toEqual([
+    runId(2),
+  ]);
+  const askedOfA = () => asked.filter((agent) => agent === AGENT_A).length;
+  expect(askedOfA()).toBe(1);
+  // Unrelated evaluations: changes of the activity and of the account.
+  h.changed();
+  h.setAccount(h.accountStatus);
+  await settle();
+  h.advance(RUN_SUPERVISOR_RELOAD_DELAY_MS - STEP - 1);
+  h.changed();
+  await settle();
+  // Agent A is busy while its run waits: no read of the provider
+  // connections and no new check until a change of the grants or a reload.
+  expect(h.providerReads).toEqual([]);
+  expect(askedOfA()).toBe(1);
+  expect(h.runState(1)).toBe("queued");
+  expect(h.walk()).toEqual(["2 queued>running"]);
+  expect(h.violations).toEqual([]);
+});
+
 test("before a start, no_grant fails the run at once with provider_use_denied", async () => {
   const h = new Harness({ runs: [run(1, "queued")], providerUseCheck: true });
   h.enforcementAnswer = "no_grant";

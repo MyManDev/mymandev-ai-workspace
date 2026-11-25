@@ -388,8 +388,9 @@ function start(): void {
   // grant the run fails with `provider_use_denied`, and every other denial
   // leaves it queued to be checked again (decision of 2026-11-25). The check
   // is made again once the start is acknowledged, before the executor
-  // starts. `enforcement-wiring.test.ts` guards this wiring. It never touches the runs of the development switch's agent. The logs
-  // are fixed text with a code at most, never an ID.
+  // starts. `enforcement-wiring.test.ts` guards this wiring. It never
+  // touches the runs of the development switch's agent. The logs are fixed
+  // text with a code at most, never an ID.
   const runSupervisor = createRunSupervisor({
     account,
     connection,
