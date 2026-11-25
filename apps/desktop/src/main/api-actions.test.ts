@@ -27,6 +27,10 @@ import {
   PreviewInvitationResponseSchema,
   PROJECT_ROUTE_ERRORS,
   PROJECT_ROUTES,
+  PROVIDER_CONNECTION_ROUTE_ERRORS,
+  PROVIDER_CONNECTION_ROUTES,
+  RegisterProviderConnectionRequestSchema,
+  RegisterProviderConnectionResponseSchema,
   RegisterRepositoryRequestSchema,
   RegisterRepositoryResponseSchema,
   RenameMemberRequestSchema,
@@ -286,6 +290,21 @@ const ACTIONS: [
     `/agents/${AGENT_ID}/grants/${GRANT_ID}/revoke`,
     undefined,
   ],
+  [
+    "registerProviderConnection",
+    {},
+    // A label, sent as it is.
+    { kind: "claude", label: " Work laptop " },
+    "/provider-connections",
+    { kind: "claude", label: " Work laptop " },
+  ],
+  [
+    "removeProviderConnection",
+    { providerConnectionId: CONNECTION_ID },
+    undefined,
+    `/provider-connections/${CONNECTION_ID}/remove`,
+    undefined,
+  ],
 ];
 
 /** The `:name` parameters of a route path, in order. */
@@ -295,7 +314,7 @@ function pathParams(path: string): string[] {
   );
 }
 
-test("the allowlist holds exactly the 28 POST writes of the screens, the repositories, and the grants, frozen, each the protocol's route with its path parameters", () => {
+test("the allowlist holds exactly the 30 POST writes of the screens, the repositories, the grants, and the provider connections, frozen, each the protocol's route with its path parameters", () => {
   expect(Object.keys(WORKSPACE_ACTIONS)).toEqual(ACTIONS.map(([name]) => name));
   expect(Object.isFrozen(WORKSPACE_ACTIONS)).toBe(true);
   for (const [name, entry] of Object.entries(WORKSPACE_ACTIONS)) {
@@ -310,7 +329,10 @@ test("the allowlist holds exactly the 28 POST writes of the screens, the reposit
           ? REPOSITORY_ROUTES[name]
           : name === "grantCapability" || name === "revokeGrant"
             ? GRANT_ROUTES[name]
-            : MEMBERSHIP_ROUTES[name as keyof typeof MEMBERSHIP_ROUTES];
+            : name === "registerProviderConnection" ||
+                name === "removeProviderConnection"
+              ? PROVIDER_CONNECTION_ROUTES[name]
+              : MEMBERSHIP_ROUTES[name as keyof typeof MEMBERSHIP_ROUTES];
     expect(entry.route, name).toBe(protocol);
   }
   // Left out: the owner's limit of unclaimed people and project renames,
@@ -406,6 +428,11 @@ test("each write's request and answer schemas are the protocol's", () => {
       GrantCapabilityResponseSchema,
     ],
     revokeGrant: [null, "empty"],
+    registerProviderConnection: [
+      RegisterProviderConnectionRequestSchema,
+      RegisterProviderConnectionResponseSchema,
+    ],
+    removeProviderConnection: [null, "empty"],
   };
   expect(Object.keys(WORKSPACE_ACTIONS).sort()).toEqual(
     Object.keys(schemas).sort(),
@@ -613,6 +640,54 @@ test("a name off the allowlist, a missing, extra, or invalid path parameter, or 
     ["revokeGrant", OF_AGENT, undefined],
     ["revokeGrant", OF_GRANT, {}],
     ["revokeGrant", { agentId: AGENT_ID, grantId: upper }, undefined],
+    // A registration names no device and carries no credential (#33): an
+    // extra key is refused, not dropped, and so is a kind that is not one
+    // of the protocol's or a label outside its limits.
+    ["registerProviderConnection", {}, undefined],
+    ["registerProviderConnection", {}, { kind: "claude" }],
+    ["registerProviderConnection", {}, { label: "Work" }],
+    [
+      "registerProviderConnection",
+      {},
+      { kind: "claude", label: "Work", apiKey: "sk-ant-secret" },
+    ],
+    [
+      "registerProviderConnection",
+      {},
+      { kind: "claude", label: "Work", token: "secret" },
+    ],
+    [
+      "registerProviderConnection",
+      {},
+      { kind: "claude", label: "Work", deviceId: WORKSPACE_ID },
+    ],
+    ["registerProviderConnection", {}, { kind: "gemini", label: "Work" }],
+    ["registerProviderConnection", {}, { kind: "claude", label: "" }],
+    ["registerProviderConnection", {}, { kind: "claude", label: "   " }],
+    [
+      "registerProviderConnection",
+      {},
+      { kind: "claude", label: "x".repeat(65) },
+    ],
+    ["registerProviderConnection", {}, { kind: "claude", label: "a\nb" }],
+    ["registerProviderConnection", {}, { kind: "claude", label: "a\u202eb" }],
+    [
+      "registerProviderConnection",
+      IN_WORKSPACE,
+      { kind: "claude", label: "Work" },
+    ],
+    ["removeProviderConnection", {}, undefined],
+    ["removeProviderConnection", { providerConnectionId: CONNECTION_ID }, {}],
+    [
+      "removeProviderConnection",
+      { providerConnectionId: CONNECTION_ID.toUpperCase() },
+      undefined,
+    ],
+    [
+      "removeProviderConnection",
+      { providerConnectionId: CONNECTION_ID, deviceId: WORKSPACE_ID },
+      undefined,
+    ],
   ];
   for (const [name, params, body] of refused) {
     expect(
@@ -756,8 +831,8 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     grant_limit: "grant_limit",
     // No write of the desktop creates an agent yet (#294).
     agent_limit: "failed",
-    // No write of the desktop registers a provider connection yet (#295).
-    provider_connection_limit: "failed",
+    // A registration on a device at its limit (#32, #295), without a wait.
+    provider_connection_limit: "provider_connection_limit",
     // Only the sign-in answers it, never a write (#255).
     device_limit: "failed",
     // Nor this one: a write then fails without a wait, never as the
@@ -785,6 +860,7 @@ test("each code of the API maps to its fixed failure, and every code that a writ
     removeRepository: REPOSITORY_ROUTE_ERRORS.removeRepository,
     grantCapability: GRANT_ROUTE_ERRORS.grantCapability,
     revokeGrant: GRANT_ROUTE_ERRORS.revokeGrant,
+    ...PROVIDER_CONNECTION_ROUTE_ERRORS,
   };
   for (const name of Object.keys(WORKSPACE_ACTIONS)) {
     expect(routeErrors[name], name).toBeDefined();
@@ -863,6 +939,15 @@ test("rate_limited waits as long as the API's Retry-After, or a fixed minute wit
       retryAfterSeconds: 120,
     }),
   ).toEqual({ ok: false, reason: "grant_limit" });
+  // Nor is the limit of a device's provider connections (#295).
+  expect(
+    workspaceActionFailedFor({
+      ok: false,
+      reason: "refused",
+      code: "provider_connection_limit",
+      retryAfterSeconds: 120,
+    }),
+  ).toEqual({ ok: false, reason: "provider_connection_limit" });
   expect(workspaceActionFailedFor({ ok: false, reason: "no_answer" })).toEqual({
     ok: false,
     reason: "unknown",

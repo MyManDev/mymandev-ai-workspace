@@ -8,6 +8,7 @@ import type {
   DesktopBridge,
   DeviceListBridge,
   GrantBridge,
+  ProviderConnectionsBridge,
   InvitationActionsBridge,
   InvitationsBridge,
   JoinRequestActionsBridge,
@@ -68,10 +69,13 @@ import type {
   PersonActionResult,
   PreviewInvitationResult,
   ProjectRepositoriesView,
+  ProviderConnectionListView,
   ProviderConnectionsResult,
   ReconnectResult,
+  RegisterProviderConnectionResult,
   RegisterRepositoryResult,
   RemoveDeviceResult,
+  RemoveProviderConnectionResult,
   RemoveRepositoryResult,
   RevokeGrantResult,
   RevokeInvitationResult,
@@ -224,7 +228,9 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * workspace ID and request ID of the `ownJoinRequestActions`, each a
  * string, with the display name of `create`, a string or null, and the
  * workspace ID of `claims.markSeen`, a string, with its member IDs, an array
- * of strings that it copies.
+ * of strings that it copies, and the kind and the label of
+ * `providerConnections.register`, two strings in a new object of its own,
+ * and the ID of `providerConnections.remove`, a string.
  * `account.startSignIn` passes on a fixed option of its own when the
  * renderer asks for another browser, and `workspaces.select` and
  * `workspaces.openProject` when it asks to discard the chat messages that
@@ -1015,6 +1021,47 @@ export function createDesktopBridge(
       ipc.invoke(INVOKE_CHANNELS.dismissLostDeviceAdvice) as Promise<boolean>,
   });
 
+  // Only a new object with the kind and the label, and the ID, go on, each
+  // a string; the main process checks each value. No credential is ever
+  // passed. Another value is refused here without naming it.
+  const providerConnections: ProviderConnectionsBridge = Object.freeze({
+    getState: () =>
+      ipc.invoke(
+        INVOKE_CHANNELS.getProviderConnections,
+      ) as Promise<ProviderConnectionListView>,
+    subscribeState: (
+      listener: (state: ProviderConnectionListView) => void,
+      onError?: () => void,
+    ) =>
+      subscribeRevisions(
+        ipc,
+        INVOKE_CHANNELS.subscribeProviderConnections,
+        EVENT_CHANNELS.providerConnectionsChanged,
+        "A provider connection callback failed.",
+        reportError,
+        listener,
+        onError,
+      ),
+    register: (kind: string, label: string) =>
+      typeof kind === "string" && typeof label === "string"
+        ? (ipc.invoke(INVOKE_CHANNELS.registerProviderConnection, {
+            kind,
+            label,
+          }) as Promise<RegisterProviderConnectionResult>)
+        : Promise.reject(
+            new TypeError("register needs a kind and a label string."),
+          ),
+    remove: (providerConnectionId: string) =>
+      typeof providerConnectionId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.removeProviderConnection,
+            providerConnectionId,
+          ) as Promise<RemoveProviderConnectionResult>)
+        : Promise.reject(
+            new TypeError("remove needs a provider connection ID string."),
+          ),
+  });
+
   return Object.freeze({
     electronVersion,
     runtime,
@@ -1037,6 +1084,7 @@ export function createDesktopBridge(
     grants,
     chat,
     devices,
+    providerConnections,
   });
 }
 

@@ -566,6 +566,7 @@ const EXPECTED: Readonly<
       project_limit: refused("failed"),
       repository_limit: refused("failed"),
       grant_limit: refused("failed"),
+      provider_connection_limit: refused("failed"),
     },
     createProject: {
       ...common,
@@ -575,6 +576,7 @@ const EXPECTED: Readonly<
       project_limit: refused("project_limit"),
       repository_limit: refused("failed"),
       grant_limit: refused("failed"),
+      provider_connection_limit: refused("failed"),
     },
   };
 })();

@@ -1,9 +1,11 @@
 import type {
   AccountBridge,
   DeviceListBridge,
+  ProviderConnectionsBridge,
 } from "../shared/desktop-bridge.ts";
 import { AccountPanel } from "./AccountPanel.tsx";
 import { DevicesSection } from "./DevicesSection.tsx";
+import { ProviderConnectionsSection } from "./ProviderConnectionsSection.tsx";
 
 /**
  * The ID of the account screen's title. "Go to Account" on the home screen
@@ -16,17 +18,21 @@ export const ACCOUNT_SCREEN_TITLE_ID = "account-screen-title";
 /**
  * The account screen: the sign-in of this installation and its device,
  * with the end of the sign-in and its renewal, through the account panel,
- * and the account's devices with their actions beside it. The other
- * account screens of #95 follow here.
+ * the account's devices with their actions beside it, and this device's
+ * AI provider connections (#32). The other account screens of #95 follow
+ * here.
  */
 export function AccountScreen({
   account,
   devices,
+  providerConnections,
 }: {
   /** The account functions from the preload script; undefined outside Electron. */
   readonly account?: AccountBridge | undefined;
   /** The device list functions from the preload script; undefined outside Electron. */
   readonly devices?: DeviceListBridge | undefined;
+  /** The provider connection functions from the preload script; undefined outside Electron. */
+  readonly providerConnections?: ProviderConnectionsBridge | undefined;
 }) {
   return (
     <section aria-labelledby={ACCOUNT_SCREEN_TITLE_ID}>
@@ -35,10 +41,12 @@ export function AccountScreen({
       </h2>
       <p>
         Sign in this device with GitHub, manage the device and its sign-in, and
-        see every device of the account.
+        see every device of the account and the AI provider connections of this
+        device.
       </p>
       <AccountPanel account={account} />
       <DevicesSection devices={devices} />
+      <ProviderConnectionsSection providerConnections={providerConnections} />
     </section>
   );
 }

@@ -60,7 +60,7 @@ const status = (state: RuntimeStatus["state"], revision: number) => ({
   revision,
 });
 
-test("the bridge holds the Electron version, the runtime, the repository, the project repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the join request, the join request action, the own join request, the own join request action, the claim, the claim mark, the agent, the grant, the chat, and the device list functions only, frozen", () => {
+test("the bridge holds the Electron version, the runtime, the repository, the project repository, the account, the connection, the workspace, the people, the people action, the invitation, the invitation action, the join request, the join request action, the own join request, the own join request action, the claim, the claim mark, the agent, the grant, the chat, the device list, and the provider connection functions only, frozen", () => {
   const bridge = createDesktopBridge("44.9.1", fakeIpc().ipc);
 
   expect(Object.keys(bridge).sort()).toEqual([
@@ -82,6 +82,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
     "people",
     "peopleActions",
     "projectRepositories",
+    "providerConnections",
     "repositories",
     "runtime",
     "workspaces",
@@ -238,6 +239,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
   expect(Object.isFrozen(bridge.grants)).toBe(true);
   expect(Object.isFrozen(bridge.chat)).toBe(true);
   expect(Object.isFrozen(bridge.devices)).toBe(true);
+  expect(Object.isFrozen(bridge.providerConnections)).toBe(true);
   for (const value of [
     ...Object.values(bridge.runtime),
     ...Object.values(bridge.repositories),
@@ -259,6 +261,7 @@ test("the bridge holds the Electron version, the runtime, the repository, the pr
     ...Object.values(bridge.grants),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
+    ...Object.values(bridge.providerConnections),
   ]) {
     expect(typeof value).toBe("function");
   }
@@ -289,6 +292,7 @@ test("no part of the bridge is the ipc object or a generic invoke", () => {
     ...Object.values(bridge.grants),
     ...Object.values(bridge.chat),
     ...Object.values(bridge.devices),
+    ...Object.values(bridge.providerConnections),
   ] as unknown[];
 
   expect(values).not.toContain(ipc);
@@ -2530,4 +2534,98 @@ test("the claim mark subscription delivers the marks and every newer state, with
   fake.answers[1]?.reject(new Error("refused"));
   await settle();
   expect(refused).toBe(1);
+});
+
+test("the provider connection functions are their four, and each calls its own channel with only its strings, never a credential", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  expect(Object.keys(bridge.providerConnections).sort()).toEqual([
+    "getState",
+    "register",
+    "remove",
+    "subscribeState",
+  ]);
+  const id = "0192f0a0-7b3c-7d4e-8f50-000000000101";
+  const state = bridge.providerConnections.getState();
+  const registered = bridge.providerConnections.register("claude", " Work ");
+  // A caller cannot smuggle a credential through extra arguments.
+  const extra = (
+    bridge.providerConnections.register as unknown as (
+      ...args: unknown[]
+    ) => Promise<unknown>
+  )("codex", "Home", { apiKey: "sk-ant-secret" });
+  const removed = bridge.providerConnections.remove(id);
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.getProviderConnections, args: [] },
+    {
+      channel: INVOKE_CHANNELS.registerProviderConnection,
+      args: [{ kind: "claude", label: " Work " }],
+    },
+    {
+      channel: INVOKE_CHANNELS.registerProviderConnection,
+      args: [{ kind: "codex", label: "Home" }],
+    },
+    { channel: INVOKE_CHANNELS.removeProviderConnection, args: [id] },
+  ]);
+  expect(JSON.stringify(fake.invoked)).not.toContain("sk-ant-secret");
+  const answers = [
+    { revision: 1, status: "ready", connections: [] },
+    { outcome: "ok" },
+    { outcome: "ok" },
+    { outcome: "unknown" },
+  ];
+  answers.forEach((answer, index) => fake.answers[index]?.resolve(answer));
+  await expect(state).resolves.toEqual(answers[0]);
+  await expect(registered).resolves.toEqual(answers[1]);
+  await expect(extra).resolves.toEqual(answers[2]);
+  await expect(removed).resolves.toEqual(answers[3]);
+});
+
+test("the provider connection actions refuse a value that is not a string without calling the main process or naming it", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const register = bridge.providerConnections.register as unknown as (
+    kind: unknown,
+    label: unknown,
+  ) => Promise<unknown>;
+  const remove = bridge.providerConnections.remove as unknown as (
+    id: unknown,
+  ) => Promise<unknown>;
+  for (const [kind, label] of [
+    [{ kind: "claude" }, "Work"],
+    ["claude", { secret: "sk-ant-secret" }],
+    ["claude", undefined],
+    [7, "Work"],
+  ]) {
+    const error = await register(kind, label).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(TypeError);
+    expect(String(error)).not.toContain("sk-ant-secret");
+  }
+  for (const value of [7, null, { id: "x" }]) {
+    await expect(remove(value)).rejects.toBeInstanceOf(TypeError);
+  }
+  expect(fake.invoked).toEqual([]);
+});
+
+test("the provider connection subscription delivers the state and every newer one, without the event object", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const seen: unknown[] = [];
+  const stop = bridge.providerConnections.subscribeState((state) =>
+    seen.push(state),
+  );
+  expect(fake.invoked).toEqual([
+    { channel: INVOKE_CHANNELS.subscribeProviderConnections, args: [] },
+  ]);
+  const first = { revision: 1, status: "loading", connections: [] };
+  fake.answers[0]?.resolve(first);
+  await settle();
+  const second = { revision: 2, status: "ready", connections: [] };
+  fake.emit(EVENT_CHANNELS.providerConnectionsChanged, second);
+  fake.emit(EVENT_CHANNELS.providerConnectionsChanged, first);
+  expect(seen).toEqual([first, second]);
+  stop();
+  expect(fake.listenerCount(EVENT_CHANNELS.providerConnectionsChanged)).toBe(0);
 });

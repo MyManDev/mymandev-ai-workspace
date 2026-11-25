@@ -34,6 +34,8 @@ import {
   createDevAgentSwitch,
   devAgentSwitchSettings,
 } from "./agents/dev-switch.ts";
+import { PRODUCTION_RUN_EXECUTORS } from "./agents/run-executor.ts";
+import { createRunSupervisor } from "./agents/run-supervisor.ts";
 import { createAgentActivityService } from "./agents/service.ts";
 import {
   APP_SCHEME,
@@ -77,6 +79,8 @@ import { registerPeopleIpc } from "./people-ipc.ts";
 import { registerGrantIpc } from "./grant-ipc.ts";
 import { createGrantActions } from "./permissions/grant-actions.ts";
 import { createGrantStore } from "./permissions/grant-store.ts";
+import { registerProviderConnectionIpc } from "./provider-connection-ipc.ts";
+import { createProviderConnectionService } from "./provider-connections/service.ts";
 import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
 import { registerRepositoryIpc } from "./repository-ipc.ts";
 import {
@@ -331,9 +335,11 @@ function start(): void {
   // The grant store of the permission enforcement point (#55): the last
   // answer of `GET /grant-records`, usable only while the selected
   // workspace's connection is live and the records were read again since its
-  // last `workspace.subscribed`. Nothing checks with it yet; the runtime
-  // will re-check its running work on `onGrantsChanged`. The logs are fixed
-  // text with a failure code at most, never an ID.
+  // last `workspace.subscribed`. The host run supervisor below listens to
+  // `onGrantsChanged`, but no enforcement point is wired yet, so every check
+  // of an executor denies and nothing is ever held or re-checked until #30
+  // and #31 wire it. The logs are fixed text with a failure code at most,
+  // never an ID.
   const grantStore = createGrantStore({
     account,
     connection,
@@ -341,6 +347,41 @@ function start(): void {
     log: (message) => console.info(message),
   });
   closables.add(grantStore);
+
+  // The development agent switch's settings (#28), read here because the
+  // host run supervisor leaves that agent's runs to the switch: null in a
+  // packaged build and without MYMANDEV_DEV_AGENT_SWITCH.
+  const devAgentSettings = app.isPackaged
+    ? null
+    : devAgentSwitchSettings(app.isPackaged, process.env, (message) =>
+        console.info(message),
+      );
+
+  // The host run supervisor (#35, second part): it picks up the open
+  // project's runs whose agent this device hosts and runs them with the
+  // executor of their provider kind. Production registers no executor until
+  // the adapters of #30 and #31, so every queued run of this device with a
+  // provider connection fails with `no_executor` or
+  // `provider_connection_missing` (default 5 of 2026-11-24, default until the
+  // Project Manager decides), a seeded run without one stays queued, and
+  // the runs that a restart, a crash, or a lost connection interrupted are
+  // reported `failed`. No enforcement point is wired yet: every check of an
+  // executor denies, and nothing is re-checked, until #30 and #31 wire it.
+  // It never touches the runs of the development switch's agent. The
+  // `provider.use` check before a start waits for the Project Manager
+  // (`beforeStart` keeps its default). The logs are fixed text with a code
+  // at most, never an ID.
+  const runSupervisor = createRunSupervisor({
+    account,
+    connection,
+    agents,
+    grants: grantStore,
+    executors: PRODUCTION_RUN_EXECUTORS,
+    reservedAgentIds:
+      devAgentSettings === null ? [] : [devAgentSettings.agentId],
+    log: (message) => console.info(message),
+  });
+  closables.add(runSupervisor);
 
   // The agent activity reaches the renderer read-only, with the owners'
   // names resolved in the main process, whether the account owns each agent
@@ -373,6 +414,26 @@ function start(): void {
     service: grantActions,
   });
   closables.add(grantIpc);
+
+  // This device's AI provider connections (#32): the list that the server
+  // holds for this device, a status for each from a closed list, and
+  // registering and removing one, one write at a time. Metadata only: no
+  // credential is read, kept, or sent. A removal tells the grant store,
+  // because the server revokes the connection's `provider.use` grants. The
+  // logs are fixed text, never a label or an ID.
+  const providerConnections = createProviderConnectionService({
+    account,
+    connection,
+    grants: grantStore,
+    log: (message) => console.info(message),
+  });
+  closables.add(providerConnections);
+  const providerConnectionIpc = registerProviderConnectionIpc(
+    ipcMain,
+    rendererUrl,
+    { service: providerConnections },
+  );
+  closables.add(providerConnectionIpc);
 
   // The open project's registered repositories (#286), read over HTTP and
   // kept current with the selected workspace's repository events through
@@ -431,23 +492,17 @@ function start(): void {
   // it was given. It moves that agent's runs as the agent, from its host
   // device, and has no IPC channel, so a packaged build sends nothing. The
   // logs are fixed text with a code at most, never an ID.
-  if (!app.isPackaged) {
-    const settings = devAgentSwitchSettings(
-      app.isPackaged,
-      process.env,
-      (message) => console.info(message),
-    );
-    if (settings !== null) {
-      const devSwitch = createDevAgentSwitch({
-        settings,
-        account,
-        connection,
-        workspaces,
-        agents,
-        log: (message) => console.info(message),
-      });
-      closables.add(devSwitch);
-    }
+  // The host run supervisor above leaves this agent's runs alone.
+  if (!app.isPackaged && devAgentSettings !== null) {
+    const devSwitch = createDevAgentSwitch({
+      settings: devAgentSettings,
+      account,
+      connection,
+      workspaces,
+      agents,
+      log: (message) => console.info(message),
+    });
+    closables.add(devSwitch);
   }
 
   // The open project's chat (#27): its history, read over HTTP, its

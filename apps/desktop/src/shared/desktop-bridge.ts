@@ -39,10 +39,13 @@ import type {
   PersonActionResult,
   PreviewInvitationResult,
   ProjectRepositoriesView,
+  ProviderConnectionListView,
   ProviderConnectionsResult,
   ReconnectResult,
+  RegisterProviderConnectionResult,
   RegisterRepositoryResult,
   RemoveDeviceResult,
+  RemoveProviderConnectionResult,
   RemoveRepositoryResult,
   RevokeGrantResult,
   RevokeInvitationResult,
@@ -114,6 +117,8 @@ export interface DesktopBridge {
   readonly chat: ChatBridge;
   /** The account's devices, the registration lock, and new devices. */
   readonly devices: DeviceListBridge;
+  /** This device's AI provider connections, never a credential. */
+  readonly providerConnections: ProviderConnectionsBridge;
 }
 
 export interface RuntimeBridge {
@@ -961,4 +966,43 @@ export interface DeviceListBridge {
    * not show. It passes nothing from the renderer on.
    */
   readonly dismissLostDeviceAdvice: () => Promise<boolean>;
+}
+
+/**
+ * This device's AI provider connections, which the main process holds
+ * (#32): each connection's ID, kind, label, registration time, and status,
+ * never a credential. The renderer registers one by its kind and label and
+ * removes one by its ID; no secret is ever asked for or sent.
+ */
+export interface ProviderConnectionsBridge {
+  /** The current state of the connections. */
+  readonly getState: () => Promise<ProviderConnectionListView>;
+  /**
+   * Calls `listener` with the current state and then after changes, at
+   * most once every 50 ms with the latest one. A state older than the last
+   * one delivered is dropped. `onError` is called when the main process
+   * refuses the subscription. Returns a function that ends the
+   * subscription.
+   */
+  readonly subscribeState: (
+    listener: (state: ProviderConnectionListView) => void,
+    onError?: () => void,
+  ) => () => void;
+  /**
+   * Registers a connection of this device. The bridge passes on a new
+   * object with only the kind and the label, each a string; the main
+   * process accepts a known kind and a label of 1 to 64 characters by the
+   * protocol's text rule, one write at a time.
+   */
+  readonly register: (
+    kind: string,
+    label: string,
+  ) => Promise<RegisterProviderConnectionResult>;
+  /**
+   * Removes a connection of this device by its ID, a string; the server
+   * revokes its `provider.use` grants.
+   */
+  readonly remove: (
+    providerConnectionId: string,
+  ) => Promise<RemoveProviderConnectionResult>;
 }
