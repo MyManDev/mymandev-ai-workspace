@@ -4,12 +4,15 @@ import type {
   RevokedGrant,
 } from "@mymandev/database";
 import {
+  type AccountRemovedFromWorkspaceFrame,
   type AgentGrantCreatedEvent,
   type AgentGrantRevokedEvent,
   type AgentListItem,
   type AgentRunStateChangedEvent,
   type ApproverEventType,
   type EventId,
+  type JoinRequestId,
+  type JoinRequestOutcome,
   type MemberId,
   newId,
   type PermissionGrant,
@@ -19,8 +22,15 @@ import {
   type WorkspaceGrant,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import type { FastifyBaseLogger, FastifyRequest } from "fastify";
+import type { FastifyBaseLogger } from "fastify";
 import type { AccountFrame, ConnectionRegistry } from "../gateway.ts";
+
+/**
+ * Where an event sender logs a failure: a route's request, or the
+ * application's logger for the events that the API replays from an
+ * operator's erasure (#341).
+ */
+export type Logged = Readonly<{ log: FastifyBaseLogger }>;
 
 /**
  * An event whose audience is the workspace's owner and admins, one of
@@ -174,7 +184,7 @@ export function agentDisabledEvent(
  * subscriptions end first.
  */
 export function sendDisabledAgents(
-  request: FastifyRequest,
+  request: Logged,
   handler: WorkspaceEventHandler,
   agents: readonly DisabledAgent[],
   now: Date,
@@ -381,7 +391,7 @@ export function frozenCopy<T extends WorkspaceEvent | ApproverEvent>(
  * error's type and never its message, which may quote a display name.
  */
 export function sendWorkspaceEvent(
-  request: FastifyRequest,
+  request: Logged,
   handler: WorkspaceEventHandler,
   event: WorkspaceEvent,
 ): void {
@@ -410,7 +420,7 @@ export function sendWorkspaceEvent(
  * the workspace ID, and the error's type, never its message.
  */
 export function sendApproverEvent(
-  request: FastifyRequest,
+  request: Logged,
   handler: ApproverEventHandler,
   event: ApproverEvent,
   approvers: readonly MemberId[],
@@ -448,7 +458,7 @@ export type AccountFrameHandler = (userId: UserId, frame: AccountFrame) => void;
  * the error's message.
  */
 export function sendAccountFrame(
-  request: FastifyRequest,
+  request: Logged,
   handler: AccountFrameHandler,
   userId: UserId,
   frame: AccountFrame,
@@ -464,4 +474,77 @@ export function sendAccountFrame(
       "account frame failed",
     );
   }
+}
+
+/**
+ * Tells the open connections that a person was removed or left, after the
+ * commit and in this order: `workspace.member.removed` through
+ * `onWorkspaceEvent`, whose delivery first ends the person's subscriptions
+ * to the workspace with `membership_ended` and sends the person's `offline`
+ * to the other subscribers; then, for a claimed person,
+ * `account.removed_from_workspace` through `onAccountFrame` to every
+ * connection of the person's account. A removal, a departure, and an
+ * operator's erasure (#341) send it; each then sends its disabled agents,
+ * revoked grants, and cancelled runs.
+ */
+export function sendMemberRemoved(
+  request: Logged,
+  handlers: Readonly<{
+    onWorkspaceEvent: WorkspaceEventHandler;
+    onAccountFrame: AccountFrameHandler;
+  }>,
+  removed: Readonly<{
+    workspaceId: WorkspaceId;
+    memberId: MemberId;
+    userId: UserId | null;
+  }>,
+  now: Date,
+): void {
+  sendWorkspaceEvent(request, handlers.onWorkspaceEvent, {
+    ...serverEventHeader(removed.workspaceId, now),
+    type: "workspace.member.removed",
+    payload: { memberId: removed.memberId, removedAt: now.toISOString() },
+  });
+  if (removed.userId !== null) {
+    const frame: AccountRemovedFromWorkspaceFrame = {
+      protocolVersion: PROTOCOL_VERSION,
+      type: "account.removed_from_workspace",
+      workspaceId: removed.workspaceId,
+      removedAt: now.toISOString(),
+    };
+    sendAccountFrame(request, handlers.onAccountFrame, removed.userId, frame);
+  }
+}
+
+/**
+ * Tells the workspace's owner and admins, as the change's transaction read
+ * them, that a pending join request is no longer pending:
+ * `workspace.join_request.resolved` through `onApproverEvent`. The join
+ * request routes and an operator's erasure, which withdraws the account's
+ * requests (#341), send it.
+ */
+export function sendJoinRequestResolved(
+  request: Logged,
+  handler: ApproverEventHandler,
+  resolved: Readonly<{
+    workspaceId: WorkspaceId;
+    joinRequestId: JoinRequestId;
+    outcome: JoinRequestOutcome;
+    now: Date;
+    approvers: readonly MemberId[];
+  }>,
+): void {
+  sendApproverEvent(
+    request,
+    handler,
+    {
+      ...serverEventHeader(resolved.workspaceId, resolved.now),
+      type: "workspace.join_request.resolved",
+      payload: {
+        joinRequestId: resolved.joinRequestId,
+        outcome: resolved.outcome,
+      },
+    },
+    resolved.approvers,
+  );
 }

@@ -27,7 +27,6 @@ import {
   type JoinRequestId,
   JoinRequestIdSchema,
   type JoinRequestListResponse,
-  type JoinRequestOutcome,
   MEMBERSHIP_ROUTES,
   type MemberId,
   type OwnJoinRequestListResponse,
@@ -45,6 +44,7 @@ import {
   type ApproverEventHandler,
   sendAccountFrame,
   sendApproverEvent,
+  sendJoinRequestResolved,
   sendWorkspaceEvent,
   serverEventHeader,
   type WorkspaceEventHandler,
@@ -113,32 +113,15 @@ function sendDecision(
 
 /**
  * Tells the workspace's owner and admins, as the change's transaction read
- * them, that a pending request is no longer pending.
+ * them, that a pending request is no longer pending
+ * (`sendJoinRequestResolved`, which an operator's erasure replays too, #341).
  */
 function sendResolved(
   request: FastifyRequest,
   options: JoinRequestRouteOptions,
-  resolved: Readonly<{
-    workspaceId: WorkspaceId;
-    joinRequestId: JoinRequestId;
-    outcome: JoinRequestOutcome;
-    now: Date;
-    approvers: readonly MemberId[];
-  }>,
+  resolved: Parameters<typeof sendJoinRequestResolved>[2],
 ): void {
-  sendApproverEvent(
-    request,
-    options.onApproverEvent,
-    {
-      ...serverEventHeader(resolved.workspaceId, resolved.now),
-      type: "workspace.join_request.resolved",
-      payload: {
-        joinRequestId: resolved.joinRequestId,
-        outcome: resolved.outcome,
-      },
-    },
-    resolved.approvers,
-  );
+  sendJoinRequestResolved(request, options.onApproverEvent, resolved);
 }
 
 /**
