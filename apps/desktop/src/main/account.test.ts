@@ -602,6 +602,26 @@ test("initialize loads the key once, then reads the record, and shows only the l
   );
 });
 
+test("sessionState is starting before the session exists, and then the session's state on every call", async () => {
+  const h = harness();
+
+  expect(h.service.sessionState()).toEqual({ kind: "starting" });
+
+  await h.service.initialize();
+
+  expect(h.service.sessionState()).toBe(SESSION_SIGNED_IN);
+  const signedOut: DeviceSessionState = Object.freeze({
+    kind: "signed_out",
+    account: SESSION_ACCOUNT,
+    reportPending: false,
+  });
+  h.emit(signedOut);
+  expect(h.service.sessionState()).toBe(signedOut);
+  // Read from the session, not from the last state that it published.
+  h.sessionState = SESSION_SIGNED_IN;
+  expect(h.service.sessionState()).toBe(SESSION_SIGNED_IN);
+});
+
 test("without a record, with a corrupt one, or with one that cannot be read, the installation is signed out", async () => {
   for (const [record, errors] of [
     [{ kind: "none" }, []],

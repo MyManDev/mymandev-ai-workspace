@@ -36,23 +36,26 @@
 //   another run or a `rate_limited`; once the server acknowledged it, the
 //   executor starts with the held run and an `AbortSignal`, and its outcome
 //   becomes `running -> completed` or `running -> failed`.
-// - `beforeStart` is the seam for a check of `provider.use` with the
-//   enforcement point before `queued -> running`. Whether the supervisor
-//   makes that check waits for the Project Manager (#35, scope of
-//   2026-11-24, and #55), so it defaults to allowing every start, and the
-//   enforcement point is never called before a start. Its answer is read
-//   defensively: an answer that is not an object, a hook that throws, or a
-//   reason that is not a code (`RUN_EXECUTOR_REASON_PATTERN`) or that only
-//   the server gives makes the run wait for the next reload, which the
-//   supervisor asks for.
+// - `beforeStart` is the seam for the check of `provider.use` with the
+//   enforcement point before `queued -> running` (decision D13 of
+//   2026-11-25 on #35 and #55). The production check is
+//   `createProviderUseStartCheck` (`run-start-check.ts`), which `index.ts`
+//   passes in: a denial for a missing grant fails the run at once with
+//   `provider_use_denied`, and every other denial ends it as a re-check
+//   would (`denialEnd`). The supervisor itself keeps the hook injected and
+//   defaults to allowing every start, so that it stays testable. Its answer
+//   is read defensively: an answer that is not an object, a hook that
+//   throws, or a reason that is not a code (`RUN_EXECUTOR_REASON_PATTERN`)
+//   or that only the server gives makes the run wait for the next reload,
+//   which the supervisor asks for.
 // - Stops (#55, decision of 2026-11-19). An executor's action that it
 //   checked with `RunExecution.check` stays held until it ends. On every
 //   `onGrantsChanged`, each held action is checked again with the
 //   enforcement point's `recheck` for the run that the supervisor holds,
 //   which records denials but no shell start; at the first denial the run
 //   is aborted and reported. While connected, a denial maps as follows
-//   (default until the Project Manager decides, #55): `no_grant` is
-//   `cancelled` with `grant_inactive`; a denial of the sign-in
+//   (`denialEnd`; accepted by the Project Manager on 2026-11-25, #55):
+//   `no_grant` is `cancelled` with `grant_inactive`; a denial of the sign-in
 //   (`signed_out`, `sign_in_invalid`, `device_unknown`, `not_this_device`)
 //   is `cancelled` with `signed_out`; every other denial (`store_unusable`,
 //   `clock_invalid`, `record_failed`, `check_failed`, and the malformed
@@ -174,11 +177,17 @@ export const HOST_RUN_REASONS = Object.freeze({
   /** The device signed out, or its sign-in is no longer valid (#55). */
   signedOut: "signed_out",
   /**
-   * A held action could not be checked again: the grant store was not
-   * usable, the clock or the check failed, or an input was malformed.
-   * Default until the Project Manager decides (#55).
+   * A grant could not be checked: the grant store was not usable, the clock
+   * or the check failed, or an input was malformed (#55, accepted on
+   * 2026-11-25).
    */
   grantCheckUnavailable: "grant_check_unavailable",
+  /**
+   * The check of `provider.use` before `queued -> running` found no active
+   * grant for the run's provider connection (decision D13 of 2026-11-25 on
+   * #35 and #55).
+   */
+  providerUseDenied: "provider_use_denied",
   /** The executor failed without a reason code that may be shown. */
   executorFailed: "executor_failed",
 } as const);
@@ -277,9 +286,10 @@ export interface RunSupervisorOptions {
   readonly enforcement?: Pick<PermissionEnforcement, "check" | "recheck">;
   /**
    * Asked immediately before each send of `queued -> running`, for a run
-   * that has an executor and a provider connection of this device. Waits
-   * for the Project Manager's decision on a check of `provider.use` (#35,
-   * #55); defaults to `ALLOW_RUN_START`. A hook that throws, or answers
+   * that has an executor and a provider connection of this device. In
+   * production it is the check of `provider.use` (D13 of 2026-11-25 on #35
+   * and #55; `createProviderUseStartCheck`); it defaults to
+   * `ALLOW_RUN_START`. A hook that throws, or answers
    * outside `RunStartDecision` (not an object, or a reason that is not a
    * code of `RUN_EXECUTOR_REASON_PATTERN`, or one that only the server
    * gives), sends nothing, and the run waits for the next reload. A host
@@ -529,30 +539,36 @@ function finishOf(outcome: unknown): Transition {
   };
 }
 
+/** How a denial of the enforcement point ends a run. */
+export interface DenialEnd {
+  readonly state: "failed" | "cancelled";
+  readonly reason: HostRunReason;
+}
+
 /**
- * How a denial of a held action while connected ends its run; see "Stops".
- * Default until the Project Manager decides (#55).
+ * How a denial of the enforcement point ends a run, the one mapping of the
+ * supervisor (#55, accepted by the Project Manager on 2026-11-25): `no_grant`
+ * is `cancelled` with `grant_inactive`; a denial of the sign-in is
+ * `cancelled` with `signed_out`; every other denial, and a reason that is
+ * not one of `ENFORCEMENT_DENIAL_REASONS`, is `failed` with
+ * `grant_check_unavailable`, because the grant could not be checked. The
+ * check before a start (`run-start-check.ts`) uses it for every denial but
+ * `no_grant`.
  */
-function stopOfDenial(reason: EnforcementDenialReason): Transition {
+export function denialEnd(reason: EnforcementDenialReason): DenialEnd {
   if (reason === "no_grant") {
-    return {
-      from: "running",
-      to: "cancelled",
-      reason: HOST_RUN_REASONS.grantInactive,
-    };
+    return { state: "cancelled", reason: HOST_RUN_REASONS.grantInactive };
   }
   if (SIGN_IN_DENIALS.has(reason)) {
-    return {
-      from: "running",
-      to: "cancelled",
-      reason: HOST_RUN_REASONS.signedOut,
-    };
+    return { state: "cancelled", reason: HOST_RUN_REASONS.signedOut };
   }
-  return {
-    from: "running",
-    to: "failed",
-    reason: HOST_RUN_REASONS.grantCheckUnavailable,
-  };
+  return { state: "failed", reason: HOST_RUN_REASONS.grantCheckUnavailable };
+}
+
+/** How a denial of a held action while connected ends its run; see "Stops". */
+function stopOfDenial(reason: EnforcementDenialReason): Transition {
+  const end = denialEnd(reason);
+  return { from: "running", to: end.state, reason: end.reason };
 }
 
 /** The transition that reports a run that an interruption stopped. */

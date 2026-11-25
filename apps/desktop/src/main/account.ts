@@ -237,6 +237,13 @@ export interface AccountService {
     listener: (status: AccountStatus) => void,
   ) => () => void;
   /**
+   * The current state of the device session, read from the session on every
+   * call, or `starting` before the session exists. For the permission
+   * enforcement point of the main process only (#55): it holds the account's
+   * IDs, so it never reaches the renderer or a log.
+   */
+  readonly sessionState: () => DeviceSessionState;
+  /**
    * Opens the key store, loads the device key, reads the device record,
    * creates the device session, and refreshes it, which retries a pending
    * removal; a sign-out that the API has not learned yet is then reported.
@@ -507,6 +514,10 @@ const SIGNED_OUT: Account = Object.freeze({ kind: "signed_out" });
 const HIDDEN: Account = Object.freeze({ kind: "hidden" });
 const IDLE: SignInState = Object.freeze({ kind: "idle" });
 const STARTING: SignInState = Object.freeze({ kind: "starting" });
+/** The device session's state before the session exists. */
+const SESSION_STARTING: DeviceSessionState = Object.freeze({
+  kind: "starting",
+});
 const COMPLETING: SignInState = Object.freeze({ kind: "completing" });
 
 /** The outcome code of each error that the API's page posts. */
@@ -2246,6 +2257,7 @@ export function createAccountService(
         listeners.delete(entry);
       };
     },
+    sessionState: () => session?.state() ?? SESSION_STARTING,
     initialize: () => {
       // The whole startup counts as background work: from the key's load,
       // the key is ready before the startup refresh begins, and a sign-in or

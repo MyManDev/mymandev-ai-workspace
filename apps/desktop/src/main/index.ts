@@ -9,6 +9,7 @@ import {
 } from "electron";
 import { readFile, realpath } from "node:fs/promises";
 import path, { join } from "node:path";
+import type { DeviceId } from "@mymandev/protocol";
 import {
   FORGET_CONFIRMATION,
   forgetConfirmationDetail,
@@ -35,6 +36,7 @@ import {
   devAgentSwitchSettings,
 } from "./agents/dev-switch.ts";
 import { PRODUCTION_RUN_EXECUTORS } from "./agents/run-executor.ts";
+import { createProviderUseStartCheck } from "./agents/run-start-check.ts";
 import { createRunSupervisor } from "./agents/run-supervisor.ts";
 import { createAgentActivityService } from "./agents/service.ts";
 import {
@@ -78,7 +80,9 @@ import { registerPeopleActionsIpc } from "./people-actions-ipc.ts";
 import { registerPeopleIpc } from "./people-ipc.ts";
 import { registerGrantIpc } from "./grant-ipc.ts";
 import { createGrantActions } from "./permissions/grant-actions.ts";
-import { createGrantStore } from "./permissions/grant-store.ts";
+import { createPermissionEnforcement } from "./permissions/enforcement.ts";
+import { createGrantStore, signedInDevice } from "./permissions/grant-store.ts";
+import { createMemoryEnforcementRecorder } from "./permissions/memory-recorder.ts";
 import { registerProviderConnectionIpc } from "./provider-connection-ipc.ts";
 import { createProviderConnectionService } from "./provider-connections/service.ts";
 import { registerProjectRepositoryIpc } from "./project-repository-ipc.ts";
@@ -336,10 +340,8 @@ function start(): void {
   // answer of `GET /grant-records`, usable only while the selected
   // workspace's connection is live and the records were read again since its
   // last `workspace.subscribed`. The host run supervisor below listens to
-  // `onGrantsChanged`, but no enforcement point is wired yet, so every check
-  // of an executor denies and nothing is ever held or re-checked until #30
-  // and #31 wire it. The logs are fixed text with a failure code at most,
-  // never an ID.
+  // `onGrantsChanged` and re-checks every held action with the enforcement
+  // point. The logs are fixed text with a failure code at most, never an ID.
   const grantStore = createGrantStore({
     account,
     connection,
@@ -347,6 +349,20 @@ function start(): void {
     log: (message) => console.info(message),
   });
   closables.add(grantStore);
+
+  // The permission enforcement point (#55): every check reads the grant
+  // store once, the device session's state, this device's ID from the
+  // account status (a signed-in device with a ready key and an API origin),
+  // and the wall clock. Its denials and allowed shell starts go to a bounded
+  // recorder in memory, the default until #37 replaces it with the local
+  // append-only recorder; the recorder logs nothing.
+  const enforcement = createPermissionEnforcement({
+    now: () => new Date(),
+    grantStore,
+    sessionState: () => account.sessionState(),
+    thisDevice: () => signedInDevice(account.status()) as DeviceId | null,
+    recorder: createMemoryEnforcementRecorder(),
+  });
 
   // The development agent switch's settings (#28), read here because the
   // host run supervisor leaves that agent's runs to the switch: null in a
@@ -365,18 +381,21 @@ function start(): void {
   // `provider_connection_missing` (default 5 of 2026-11-24, default until the
   // Project Manager decides), a seeded run without one stays queued, and
   // the runs that a restart, a crash, or a lost connection interrupted are
-  // reported `failed`. No enforcement point is wired yet: every check of an
-  // executor denies, and nothing is re-checked, until #30 and #31 wire it.
-  // It never touches the runs of the development switch's agent. The
-  // `provider.use` check before a start waits for the Project Manager
-  // (`beforeStart` keeps its default). The logs are fixed text with a code
-  // at most, never an ID.
+  // reported `failed`. An executor checks each action with the enforcement
+  // point, and every change of the grants re-checks the held actions. Before
+  // each `queued -> running`, the run's agent must hold `provider.use` on the
+  // run's provider connection (D13 of 2026-11-25 on #35 and #55); otherwise
+  // the run fails with `provider_use_denied`, or ends as a re-check would.
+  // It never touches the runs of the development switch's agent. The logs
+  // are fixed text with a code at most, never an ID.
   const runSupervisor = createRunSupervisor({
     account,
     connection,
     agents,
     grants: grantStore,
     executors: PRODUCTION_RUN_EXECUTORS,
+    enforcement,
+    beforeStart: createProviderUseStartCheck(enforcement),
     reservedAgentIds:
       devAgentSettings === null ? [] : [devAgentSettings.agentId],
     log: (message) => console.info(message),
