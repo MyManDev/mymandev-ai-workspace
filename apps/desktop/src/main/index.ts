@@ -83,7 +83,7 @@ import { registerGrantIpc } from "./grant-ipc.ts";
 import { createGrantActions } from "./permissions/grant-actions.ts";
 import { createPermissionEnforcement } from "./permissions/enforcement.ts";
 import { createGrantStore, signedInDevice } from "./permissions/grant-store.ts";
-import { createMemoryEnforcementRecorder } from "./permissions/memory-recorder.ts";
+import { createSystemEnforcementRecorder } from "./permissions/file-recorder-system.ts";
 import { registerProviderConnectionIpc } from "./provider-connection-ipc.ts";
 import { registerRunRequestIpc } from "./run-request-ipc.ts";
 import { createProviderConnectionService } from "./provider-connections/service.ts";
@@ -352,18 +352,33 @@ function start(): void {
   });
   closables.add(grantStore);
 
+  // The records of the permission enforcement point (#37, first slice:
+  // local first, cloud later): every denial and every allowed shell start
+  // is appended to a JSON Lines file in the `enforcement-records` folder of
+  // the data folder, which the single-instance lock keeps to this instance.
+  // The record of a shell start is flushed to disk before the check allows
+  // it; when a record cannot be written, the check denies the start
+  // (`record_failed`). The files rotate at 2 MiB, and the newest 5 are kept
+  // (defaults until the Project Manager decides). The recorder touches the
+  // disk at the first record only, and it closes, flushing its file, after
+  // every service that checks. The logs are fixed text with a failure code
+  // at most, never a record, an ID, or a path.
+  const enforcementRecorder = createSystemEnforcementRecorder((message) =>
+    console.info(message),
+  );
+  closables.add(enforcementRecorder);
+
   // The permission enforcement point (#55): every check reads the grant
   // store once, the device session's state, this device's ID from the
   // account status (a signed-in device with a ready key and an API origin),
-  // and the wall clock. Its denials and allowed shell starts go to a bounded
-  // recorder in memory, the default until #37 replaces it with the local
-  // append-only recorder; the recorder logs nothing.
+  // and the wall clock. Its denials and allowed shell starts go to the
+  // recorder above.
   const enforcement = createPermissionEnforcement({
     now: () => new Date(),
     grantStore,
     sessionState: () => account.sessionState(),
     thisDevice: () => signedInDevice(account.status()) as DeviceId | null,
-    recorder: createMemoryEnforcementRecorder(),
+    recorder: enforcementRecorder,
   });
 
   // The development agent switch's settings (#28), read here because the
