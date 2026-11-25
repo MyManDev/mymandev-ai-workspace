@@ -875,9 +875,6 @@ export async function eraseAccount(
       const approvers = new Map<WorkspaceId, readonly MemberId[]>();
       const withdrawnJoinRequests = [];
       for (const request of pending) {
-        if (ownedWorkspaceIds.includes(request.workspaceId)) {
-          continue;
-        }
         let ofWorkspace = approvers.get(request.workspaceId);
         if (ofWorkspace === undefined) {
           ofWorkspace = await joinRequestApprovers(tx, request.workspaceId);

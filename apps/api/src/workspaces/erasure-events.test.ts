@@ -605,6 +605,8 @@ test("the listener's session closes when the app closes, and an app whose listen
   let opened = 0;
   let closed = 0;
   const counted: NotificationSessions = async () => {
+    // Slower than a ready that did not wait for it.
+    await new Promise((resolve) => setTimeout(resolve, 20));
     const session = await real();
     opened += 1;
     return {
@@ -615,10 +617,15 @@ test("the listener's session closes when the app closes, and an app whose listen
       },
     };
   };
-  const { account } = await instance(t, { sessions: counted });
-  const erin = await account(34501);
-  assert.equal(opened, 1);
-  await erin.app.close();
+  const app = await deviceApp(t, {
+    database: database(),
+    githubId: 34501,
+    erasureNotifications: counted,
+  });
+  assert.equal(opened, 0, "building the app opens no session");
+  await app.ready();
+  assert.equal(opened, 1, "ready waits for the listener's first attempt");
+  await app.close();
   assert.equal(closed, 1);
 
   // A database that cannot be reached: the app starts, logs the error's
