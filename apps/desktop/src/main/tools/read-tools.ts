@@ -22,8 +22,9 @@
 // 4. Every folder from the repository's folder down to the path's parent is
 //    read with `lstat` and recorded: each must be a folder, not a link
 //    (`changed`), on the repository's device (`other_device`), and so must
-//    the file or folder itself: a mounted volume or a bind mount inside the
-//    repository is refused.
+//    the file or folder itself: a mount of another file system (another
+//    device) inside the repository is refused. A bind mount from the same
+//    file system keeps its device and is not seen (README, "Mounts").
 // 5. A file is opened read-only (with `O_NOFOLLOW` and `O_NONBLOCK` where
 //    the system has them), and checked after the open: its `fstat` must be
 //    on the repository's device, a regular file with one link, and the same

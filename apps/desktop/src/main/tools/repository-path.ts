@@ -53,9 +53,8 @@
  *   or the repository's folder is no longer the folder that the link
  *   recorded.
  * - `other_device`: the file or a folder on its path lies on another device
- *   than the repository's folder: a mounted volume, a bind mount, or a
- *   mount point inside the repository (default until the Project Manager
- *   decides).
+ *   than the repository's folder: a mount of another file system inside
+ *   the repository (default until the Project Manager decides).
  */
 export const REPOSITORY_PATH_REFUSALS = Object.freeze([
   "not_text",
