@@ -1,8 +1,11 @@
-// The recorder of the permission enforcement point in memory (#55): the
-// default until #37 replaces it with the local append-only recorder, which
-// keeps the tool-call and audit records on the device in a file. Default
-// until the Project Manager decides otherwise; nothing here is written to
-// disk or sent anywhere.
+// A recorder of the permission enforcement point in memory (#55). Since
+// #37, production records to the local append-only file recorder
+// (`file-recorder.ts`) instead, and nothing in production uses this one: it
+// stays for tests that wire the real enforcement point and read its records
+// back, such as the wired harness of `agents/run-supervisor.test.ts`. It is
+// never a fallback for the file recorder, because it never fails, so a
+// shell start would then be allowed without a record on the device.
+// Nothing here is written to disk or sent anywhere.
 //
 // It keeps the most recent `MEMORY_RECORDER_LIMIT` records, oldest first,
 // and drops the oldest record when a new one arrives beyond the bound. It

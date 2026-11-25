@@ -2316,7 +2316,8 @@ function providerUseGrant(agentId: AgentId): GrantRecord {
  * A harness wired as `index.ts` wires the supervisor: the real enforcement
  * point with a grant store whose records the test sets, the device
  * session's state of the harness's account, the device from the account
- * status, the harness's wall clock, the memory recorder, and the check of
+ * status, the harness's wall clock, the memory recorder in place of the
+ * file recorder, so that the test reads the records back, and the check of
  * `provider.use` as `beforeStart`.
  */
 function wiredHarness(options: {
