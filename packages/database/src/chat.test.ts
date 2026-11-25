@@ -18,6 +18,8 @@ import {
 } from "@mymandev/protocol";
 import { eq, sql } from "drizzle-orm";
 import {
+  chatMessageRows,
+  getChatMessage,
   listChatMessages,
   postChatMessage,
   type PostChatMessageResult,
@@ -852,3 +854,218 @@ test(
     );
   },
 );
+
+/** One message of the project's chat, as the account reads it (#34). */
+function readMessage(who: Account, projectId: ProjectId, messageId: MessageId) {
+  return getChatMessage(database(), {
+    actorUserId: who.userId,
+    projectId,
+    messageId,
+  });
+}
+
+test("one message is the message as a page of the history shows it, for any active member, also of an archived project", async () => {
+  const owner = await account("Owner");
+  const member = await account("Member");
+  const workspaceId = await workspaceOf(owner);
+  await join(workspaceId, member);
+  const app = await projectOf(workspaceId, owner);
+  const first = await posted(workspaceId, member, app, "Hello");
+  await posted(workspaceId, owner, app, "Second");
+  const { id: agentMessageId } = await agentMessage(app, owner, "Done");
+
+  const page = await historyOf(member, app);
+  assert.equal(page.length, 3);
+  for (const listed of page) {
+    for (const who of [owner, member]) {
+      const result = await readMessage(who, app, listed.id);
+      assert.deepEqual(result, { found: true, message: listed });
+      assert.deepEqual(
+        Object.keys(result.found ? result.message : {}),
+        Object.keys(listed),
+      );
+      assert.ok(ChatMessageSchema.safeParse(listed).success);
+    }
+  }
+  assert.deepEqual(await readMessage(member, app, first.id), {
+    found: true,
+    message: first,
+  });
+  const agentAnswer = await readMessage(member, app, agentMessageId);
+  assert.ok(agentAnswer.found);
+  assert.equal(agentAnswer.message.author.kind, "agent");
+
+  // A deleted message: no writer sets `deleted_at` yet, so the history
+  // shows it unchanged, and so does one message.
+  await database()
+    .update(messages)
+    .set({ deletedAt: LATER })
+    .where(eq(messages.id, first.id));
+  const afterDeletion = await historyOf(member, app);
+  assert.deepEqual(
+    afterDeletion.find((message) => message.id === first.id),
+    first,
+  );
+  assert.deepEqual(await readMessage(member, app, first.id), {
+    found: true,
+    message: first,
+  });
+
+  // An archived project's message stays readable, as its history does, and
+  // so does one of an archived workspace.
+  await archiveProject(app);
+  await archiveWorkspace(workspaceId);
+  assert.deepEqual(await readMessage(member, app, first.id), {
+    found: true,
+    message: first,
+  });
+});
+
+test("an unknown message, a message of another project, an unknown project, a non-member, and a removed member all get the same not_found", async () => {
+  const owner = await account("Owner");
+  const member = await account("Member");
+  const outsider = await account("Outsider");
+  const workspaceId = await workspaceOf(owner);
+  const person = await join(workspaceId, member);
+  const app = await projectOf(workspaceId, owner, "App");
+  const web = await projectOf(workspaceId, owner, "Web");
+  const message = await posted(workspaceId, member, app, "Hello");
+  const elsewhere = await posted(workspaceId, owner, web, "Elsewhere");
+  // The outsider is an active member of another workspace, with a project
+  // and a message of its own.
+  const otherWorkspace = await workspaceOf(outsider);
+  const otherProject = await projectOf(otherWorkspace, outsider);
+  const foreign = await posted(otherWorkspace, outsider, otherProject, "Hi");
+  assert.ok((await readMessage(outsider, otherProject, foreign.id)).found);
+
+  const notFound = { found: false, refusal: "not_found" };
+  // A message ID that the chat does not have.
+  assert.deepEqual(
+    await readMessage(member, app, newId<MessageId>()),
+    notFound,
+  );
+  // A message of another project of the same workspace, which the reader
+  // may read under its own project.
+  assert.ok((await readMessage(member, web, elsewhere.id)).found);
+  assert.deepEqual(await readMessage(member, app, elsewhere.id), notFound);
+  assert.deepEqual(await readMessage(member, web, message.id), notFound);
+  // A message of another workspace's project, also for its own author.
+  assert.deepEqual(await readMessage(member, app, foreign.id), notFound);
+  assert.deepEqual(await readMessage(outsider, app, foreign.id), notFound);
+  // An unknown project.
+  assert.deepEqual(
+    await readMessage(member, newId<ProjectId>(), message.id),
+    notFound,
+  );
+  // An account that is not a member of the project's workspace, but is an
+  // active member of another one.
+  assert.deepEqual(await readMessage(outsider, app, message.id), notFound);
+  // A removed member, also for its own message; its message stays
+  // readable for the others, with its person.
+  await removeMember(database(), {
+    workspaceId,
+    ...owner,
+    memberId: person,
+    now: LATER,
+  });
+  assert.deepEqual(await readMessage(member, app, message.id), notFound);
+  assert.deepEqual(await readMessage(owner, app, message.id), {
+    found: true,
+    message,
+  });
+  // A person who left, too.
+  const leaver = await account("Leaver");
+  await join(workspaceId, leaver);
+  assert.ok((await readMessage(leaver, app, message.id)).found);
+  assert.ok(
+    (
+      await leaveWorkspace(database(), {
+        workspaceId,
+        ...leaver,
+        now: LATER,
+      })
+    ).left,
+  );
+  assert.deepEqual(await readMessage(leaver, app, message.id), notFound);
+});
+
+test(
+  "one message does not wait for a removal of the reader or a post that are not committed, and does not see either",
+  SERVER_ONLY,
+  async () => {
+    const owner = await account("Owner");
+    const member = await account("Member");
+    const workspaceId = await workspaceOf(owner);
+    const person = await join(workspaceId, member);
+    const app = await projectOf(workspaceId, owner);
+    const message = await posted(workspaceId, owner, app, "Hello");
+
+    const removal = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        const result = await removeMember(tx, {
+          workspaceId,
+          ...owner,
+          memberId: person,
+          now: LATER,
+        });
+        assert.ok(result.removed);
+      },
+      () => readMessage(member, app, message.id),
+    );
+    assert.deepEqual(removal.waitedOn, []);
+    assert.deepEqual(removal.result, { found: true, message });
+
+    let held: ChatMessage | undefined;
+    const post = await whileHeld(
+      testDatabase,
+      async (tx) => {
+        held = await postedIn(tx, workspaceId, owner, app, "Later");
+      },
+      () => {
+        assert.ok(held !== undefined);
+        return readMessage(owner, app, held.id);
+      },
+    );
+    assert.deepEqual(post.waitedOn, []);
+    assert.deepEqual(post.result, { found: false, refusal: "not_found" });
+    assert.ok(held !== undefined);
+    assert.ok((await readMessage(owner, app, held.id)).found);
+  },
+);
+
+test("one message is read through indexes alone: the message by its primary key, and its chat, project, and reader by theirs", async () => {
+  const owner = await account("Owner");
+  const workspaceId = await workspaceOf(owner);
+  const app = await projectOf(workspaceId, owner);
+  const message = await posted(workspaceId, owner, app, "Hello");
+  // With sequential scans priced out, a table that no index serves would
+  // still be scanned whole; on a table this small the planner otherwise
+  // prefers a scan, so the plan shows what the indexes allow.
+  const plan = await database().transaction(async (tx) => {
+    await tx.execute(sql`set local enable_seqscan = off`);
+    const result = await tx.execute(
+      sql`explain ${chatMessageRows(tx, {
+        actorUserId: owner.userId,
+        projectId: app,
+        messageId: message.id,
+      })}`,
+    );
+    return (result as unknown as { rows: Record<string, string>[] }).rows
+      .map((row) => Object.values(row)[0])
+      .join("\n");
+  });
+  assert.doesNotMatch(plan, /Seq Scan/u, plan);
+  assert.match(plan, /Index Scan using messages_pkey on messages/u, plan);
+  // A bitmap scan reads the table through an index too.
+  for (const table of ["conversations", "projects", "workspace_members"]) {
+    assert.match(
+      plan,
+      new RegExp(
+        String.raw`(Index (Only )?Scan using \w+|Bitmap Heap Scan) on ${table}\b`,
+        "u",
+      ),
+      `${table}\n${plan}`,
+    );
+  }
+});

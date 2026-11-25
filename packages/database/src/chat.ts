@@ -11,7 +11,7 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import { and, desc, eq, isNull, lt, sql } from "drizzle-orm";
+import { and, desc, eq, exists, isNull, lt, sql } from "drizzle-orm";
 import type { Database } from "./db.ts";
 import { toDatabaseError, withDatabaseErrors } from "./errors.ts";
 import {
@@ -432,4 +432,89 @@ export async function listChatMessages(
     throw new Error("Invariant broken: a project has no chat");
   }
   return { listed: true, messages: rows.map(toChatMessage) };
+}
+
+export type GetChatMessageInput = Readonly<{
+  /** The reading account; it must be an active member of the project's workspace. */
+  actorUserId: UserId;
+  projectId: ProjectId;
+  messageId: MessageId;
+}>;
+
+export type GetChatMessageResult =
+  | Readonly<{ found: true; message: ChatMessage }>
+  | Readonly<{
+      found: false;
+      /**
+       * The project does not exist, the account is not an active member of
+       * its workspace, or the project's chat has no message with this ID,
+       * also when it is a message of another project's chat: the same
+       * answer, so that neither a project ID nor a message ID can be probed.
+       */
+      refusal: "not_found";
+    }>;
+
+/**
+ * One message of a project's chat (#34; Project Manager decision of
+ * 2026-11-25): the answer of `GET /projects/:projectId/messages/:messageId`.
+ * It reveals nothing that `listChatMessages` would not: the same readers,
+ * any active member of the project's workspace, also of an archived
+ * project; the same message, read from the project's `project`
+ * conversation, as the protocol's `ChatMessage`, field for field as an item
+ * of a page; and the same `not_found` for every case that a page would not
+ * show. Like the history, it does not filter on `deleted_at`: no writer sets
+ * it yet, and the writer that does decides how both reads show a deleted
+ * message.
+ *
+ * It is one statement that locks nothing and writes nothing: the message,
+ * found by its primary key, is returned only while it is in the chat of the
+ * project of the path and while the account has an active person in that
+ * project's workspace. The membership check is in the statement, so the
+ * check and the message come from one snapshot, even under READ COMMITTED,
+ * and the check cannot be left out of the row.
+ */
+export async function getChatMessage(
+  db: Database,
+  input: GetChatMessageInput,
+): Promise<GetChatMessageResult> {
+  const [row] = await withDatabaseErrors(() => chatMessageRows(db, input));
+  if (row === undefined) {
+    return { found: false, refusal: "not_found" };
+  }
+  return { found: true, message: toChatMessage(row) };
+}
+
+/**
+ * The one statement of `getChatMessage`. Exported for its tests only, which
+ * check its plan; the package does not export it.
+ */
+export function chatMessageRows(db: Database, input: GetChatMessageInput) {
+  const activePerson = db
+    .select({ id: workspaceMembers.id })
+    .from(workspaceMembers)
+    .where(
+      and(
+        eq(workspaceMembers.workspaceId, projects.workspaceId),
+        eq(workspaceMembers.userId, input.actorUserId),
+        isNull(workspaceMembers.removedAt),
+      ),
+    );
+  return db
+    .select(messageColumns)
+    .from(messages)
+    .innerJoin(
+      conversations,
+      and(
+        eq(conversations.id, messages.conversationId),
+        eq(conversations.kind, "project"),
+      ),
+    )
+    .innerJoin(projects, eq(projects.id, conversations.projectId))
+    .where(
+      and(
+        eq(messages.id, input.messageId),
+        eq(projects.id, input.projectId),
+        exists(activePerson),
+      ),
+    );
 }

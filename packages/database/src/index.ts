@@ -209,6 +209,9 @@ export {
   revokedGrantsOf,
 } from "./cascade.ts";
 export {
+  getChatMessage,
+  type GetChatMessageInput,
+  type GetChatMessageResult,
   listChatMessages,
   type ListChatMessagesInput,
   type ListChatMessagesResult,
