@@ -44,7 +44,10 @@
 //   (`takeOutcome`), without the run's ID, for the device that sent it, for
 //   at most `KEPT_RUN_REQUEST_OUTCOMES` projects. The chat screen of that
 //   project takes it once when it opens, and after it showed an answer
-//   itself. Another device or a sign-out drops them all.
+//   itself. None is given while no device or another device is signed
+//   in, and such a take drops them all. A sign-out alone keeps them, so the
+//   same device, and so the same account, may still get one after it signs
+//   in again.
 // - The one retry after a `401`. The device session sends `createRun`
 //   once more after a `401` that carries the API's error body, with a new
 //   token for the same device and account only (`sendAuthorized`): the API

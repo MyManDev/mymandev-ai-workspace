@@ -852,7 +852,7 @@ test("only the latest projects are kept, the oldest dropped first", async () => 
   expect(KEPT_RUN_REQUEST_OUTCOMES).toBe(20);
 });
 
-test("a sign-out or another device drops every kept outcome", async () => {
+test("a take while signed out or on another device gives nothing and drops every kept outcome", async () => {
   const h = setup();
   openProject(h, project(1));
   let answer = h.service.request({ ...REQUEST, projectId: project(1) });
