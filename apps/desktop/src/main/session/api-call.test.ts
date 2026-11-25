@@ -1,5 +1,6 @@
 import { AUTH_ROUTES, INVITATION_LIFETIME_SECONDS } from "@mymandev/protocol";
 import { describe, expect, test } from "vitest";
+import { RUN_DAILY_LIMIT_WAIT_MS } from "../api-actions.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 import {
   API_REQUEST_TIMEOUT_MS,
@@ -157,7 +158,7 @@ describe("callApi", () => {
     }
   });
 
-  test("a rate_limited or run_daily_limit refusal carries its Retry-After when it is a whole number of seconds, capped at the API's longest wait of 7 days", async () => {
+  test("a rate_limited or run_daily_limit refusal carries its Retry-After when it is a whole number of seconds, capped at the API's longest wait of 7 days, and run_daily_limit's at 24 hours", async () => {
     const refusal = (code: string, status: number, retryAfter?: string) =>
       new Response(
         JSON.stringify({ statusCode: status, error: "E", message: "E", code }),
@@ -247,6 +248,44 @@ describe("callApi", () => {
           retryAfterSeconds: 3_600,
         },
       ],
+      // The daily limit never holds an agent longer than 24 hours: a longer
+      // wait is read as 24 hours, not as the API's longest wait.
+      [
+        refusal("run_daily_limit", 429, "86400"),
+        {
+          kind: "error",
+          status: 429,
+          code: "run_daily_limit",
+          retryAfterSeconds: 86_400,
+        },
+      ],
+      [
+        refusal("run_daily_limit", 429, "86401"),
+        {
+          kind: "error",
+          status: 429,
+          code: "run_daily_limit",
+          retryAfterSeconds: 86_400,
+        },
+      ],
+      [
+        refusal("run_daily_limit", 429, String(MAX_RETRY_AFTER_SECONDS)),
+        {
+          kind: "error",
+          status: 429,
+          code: "run_daily_limit",
+          retryAfterSeconds: 86_400,
+        },
+      ],
+      [
+        refusal("run_daily_limit", 429, "9999999999"),
+        {
+          kind: "error",
+          status: 429,
+          code: "run_daily_limit",
+          retryAfterSeconds: 86_400,
+        },
+      ],
       [
         refusal("run_daily_limit", 429, "1.5"),
         { kind: "error", status: 429, code: "run_daily_limit" },
@@ -279,6 +318,8 @@ describe("callApi", () => {
     expect(MAX_RETRY_AFTER_SECONDS).toBe(604_800);
     expect(MAX_RETRY_AFTER_SECONDS).toBe(INVITATION_LIFETIME_SECONDS.max);
     expect(MAX_RETRY_AFTER_SECONDS).toBe(168 * 60 * 60);
+    // The daily limit of an agent's runs: the 24 hours of the limit.
+    expect(RUN_DAILY_LIMIT_WAIT_MS).toBe(86_400 * 1000);
   });
 
   test("a body over the limit is not read, with or without Content-Length", async () => {

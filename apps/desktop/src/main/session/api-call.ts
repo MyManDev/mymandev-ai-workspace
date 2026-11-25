@@ -8,6 +8,7 @@ import {
   ApiErrorBodySchema,
   type ApiRoute,
 } from "@mymandev/protocol";
+import { RUN_DAILY_LIMIT_WAIT_MS } from "../api-actions.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 
 /** How long one request may take before the call stops waiting. */
@@ -33,14 +34,20 @@ export const MAX_API_ANSWER_BYTES = 512 * 1024;
 export const MAX_RETRY_AFTER_SECONDS = 604_800;
 
 /**
- * The refusals whose `Retry-After` the session passes on: the account's
- * request limit, and the daily limit of an agent's runs (#35), whose wait
- * is the time until the oldest of the agent's runs leaves the 24 hours.
- * Every other refusal carries no wait, also with the header.
+ * The refusals whose `Retry-After` the session passes on, each with the
+ * longest wait that it can set: the account's request limit, up to the
+ * API's longest wait (`MAX_RETRY_AFTER_SECONDS`), and the daily limit of an
+ * agent's runs (#35), whose wait is the time until the oldest of the
+ * agent's runs leaves the 24 hours, so never more than 24 hours
+ * (`RUN_DAILY_LIMIT_WAIT_MS`). Every other refusal carries no wait, also
+ * with the header.
  */
-const RETRY_AFTER_CODES: ReadonlySet<ApiErrorCode> = new Set<ApiErrorCode>([
-  "rate_limited",
-  "run_daily_limit",
+const RETRY_AFTER_CAPS: ReadonlyMap<ApiErrorCode, number> = new Map<
+  ApiErrorCode,
+  number
+>([
+  ["rate_limited", MAX_RETRY_AFTER_SECONDS],
+  ["run_daily_limit", RUN_DAILY_LIMIT_WAIT_MS / 1000],
 ]);
 
 /** The `fetch` that the session uses; production passes Electron's `net.fetch`. */
@@ -55,8 +62,8 @@ export type ApiFetch = (url: string, init: RequestInit) => Promise<Response>;
  *   this answer is certain: the API refused and committed nothing. With
  *   `rate_limited` and a run creation's `run_daily_limit` (#35),
  *   `retryAfterSeconds` holds the answer's `Retry-After` when it is a whole
- *   number of seconds from 1, capped at `MAX_RETRY_AFTER_SECONDS`
- *   (`RETRY_AFTER_CODES`).
+ *   number of seconds from 1, capped at `MAX_RETRY_AFTER_SECONDS`, and
+ *   `run_daily_limit`'s at 24 hours (`RETRY_AFTER_CAPS`).
  * - `server_error`: a `5xx`. The API may have committed before it failed.
  * - `unexpected_response`: any other answer, for example from a proxy, a
  *   body too large, or a body that is not JSON.
@@ -139,15 +146,19 @@ async function readBodyText(
 
 /**
  * The `Retry-After` of an answer in seconds, or undefined when it is not a
- * whole number of seconds from 1. The API sends seconds, never a date.
+ * whole number of seconds from 1. The API sends seconds, never a date. A
+ * longer value is read as `maxSeconds`, by default the API's longest wait.
  */
-export function retryAfterSecondsOf(response: Response): number | undefined {
+export function retryAfterSecondsOf(
+  response: Response,
+  maxSeconds: number = MAX_RETRY_AFTER_SECONDS,
+): number | undefined {
   const value = response.headers.get("retry-after");
   if (value === null || !/^[0-9]{1,10}$/u.test(value)) {
     return undefined;
   }
   const seconds = Number(value);
-  return seconds >= 1 ? Math.min(seconds, MAX_RETRY_AFTER_SECONDS) : undefined;
+  return seconds >= 1 ? Math.min(seconds, maxSeconds) : undefined;
 }
 
 async function readAnswer(
@@ -180,9 +191,9 @@ async function readAnswer(
     const parsed = ApiErrorBodySchema.safeParse(value);
     if (parsed.success && parsed.data.statusCode === status) {
       const code = parsed.data.code;
-      const retryAfterSeconds = RETRY_AFTER_CODES.has(code)
-        ? retryAfterSecondsOf(response)
-        : undefined;
+      const cap = RETRY_AFTER_CAPS.get(code);
+      const retryAfterSeconds =
+        cap === undefined ? undefined : retryAfterSecondsOf(response, cap);
       return retryAfterSeconds === undefined
         ? { kind: "error", status, code }
         : { kind: "error", status, code, retryAfterSeconds };
