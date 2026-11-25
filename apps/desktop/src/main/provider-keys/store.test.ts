@@ -1,6 +1,7 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import {
+  chmod,
   copyFile,
   mkdir,
   mkdtemp,
@@ -8,6 +9,7 @@ import {
   readFile,
   rm,
   stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,10 +17,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { PROVIDER_KEY_LIMITS } from "../../shared/ipc-contract.ts";
-import {
-  type KeyFileSystem,
-  nodeKeyFileSystem,
-} from "../device-key/atomic-file.ts";
+import { nodeKeyFileSystem } from "../device-key/atomic-file.ts";
 import { DeviceKeyError } from "../device-key/errors.ts";
 import type { SystemKeyProtection } from "../device-key/store.ts";
 import {
@@ -36,7 +35,9 @@ import {
 } from "./key-file.ts";
 import {
   createProviderKeyStore,
+  nodeProviderKeyFileSystem,
   PROVIDER_KEY_FOLDER,
+  type ProviderKeyFileSystem,
   type ProviderKeyStoreOptions,
 } from "./store.ts";
 
@@ -325,6 +326,59 @@ test("on Linux a ciphertext of Chromium's fixed key (v10) is never written, what
   expect(await store.read(BINDING_1)).toBe(OTHER_KEY);
 });
 
+/** A key file as the store writes it, around `ciphertext`. */
+function keyFileText(ciphertext: Buffer): string {
+  return `${JSON.stringify({
+    format: PROVIDER_KEY_FILE_FORMAT,
+    version: 1,
+    ciphertext: ciphertext.toString("base64url"),
+  })}\n`;
+}
+
+test("on Linux a planted file of Chromium's fixed key (v10) is refused as corrupt before it is decrypted", async () => {
+  const fake = fakeSafeStorage({ backend: "gnome_libsecret" });
+  const store = storeWith(fake, { platform: "linux" });
+  await store.save(BINDING_1, OTHER_KEY);
+  // Whoever can write the file encrypts a key of their choice, bound to
+  // this device and this connection, with the key that every Chromium
+  // shares (`v10`); the fake decrypts it, as Chromium would.
+  fake.state.prefix = "v10";
+  await writeFile(
+    keyFile(),
+    keyFileText(
+      fake.encrypt(encodeProviderKeyPayload(BINDING_1, SENTINEL_KEY)),
+    ),
+  );
+  const decrypts = () =>
+    fake.calls.filter((call) => call === "decryptStringAsync").length;
+  const before = decrypts();
+  await expectRejection(() => store.check(BINDING_1), "corrupt");
+  await expectRejection(() => store.read(BINDING_1), "corrupt");
+  // Without any prefix too.
+  await writeFile(
+    keyFile(),
+    keyFileText(
+      fake
+        .encrypt(encodeProviderKeyPayload(BINDING_1, SENTINEL_KEY))
+        .subarray(3),
+    ),
+  );
+  await expectRejection(() => store.read(BINDING_1), "corrupt");
+  expect(decrypts()).toBe(before);
+
+  // Windows and macOS always protect a key; Chromium writes `v10` there.
+  for (const platform of ["win32", "darwin"] as const) {
+    const other = storeWith(fake, { platform });
+    await other.save(BINDING_1, SENTINEL_KEY);
+    expect(await other.read(BINDING_1)).toBe(SENTINEL_KEY);
+  }
+
+  // A key entered again on Linux replaces the planted file.
+  fake.state.prefix = "v11";
+  await store.save(BINDING_1, OTHER_KEY);
+  expect(await store.read(BINDING_1)).toBe(OTHER_KEY);
+});
+
 test("a failing encryption is refused without its error, which could quote the payload", async () => {
   const fake = fakeSafeStorage();
   fake.state.failEncrypt = true;
@@ -460,8 +514,8 @@ test("a tampered, damaged, or newer file is refused with a fixed code, and never
 test("a key replaces the previous one atomically: a failed write keeps the previous file whole and leaves no temporary file", async () => {
   const fake = fakeSafeStorage();
   let failAt: "write" | "sync" | "rename" | null = null;
-  const fileSystem: KeyFileSystem = {
-    ...nodeKeyFileSystem,
+  const fileSystem: ProviderKeyFileSystem = {
+    ...nodeProviderKeyFileSystem,
     open: async (file, flags, mode) => {
       const handle = await nodeKeyFileSystem.open(file, flags, mode);
       if (flags !== "wx") {
@@ -574,6 +628,117 @@ test("an unreadable folder or file fails with a fixed code", async () => {
   await expectRejection(() => store.read(BINDING_1), "unreadable");
 });
 
+test("on Linux and macOS a symbolic link in place of the key folder is refused, and a folder with another mode is set to 0700", async () => {
+  for (const platform of ["linux", "darwin"] as const) {
+    const fake = fakeSafeStorage();
+    const calls: string[] = [];
+    const folder = { link: true, mode: 0o40755 };
+    const name = (target: string) => (target === keyFolder ? "folder" : target);
+    const fileSystem: ProviderKeyFileSystem = {
+      ...nodeProviderKeyFileSystem,
+      lstat: (target) => {
+        calls.push(`lstat:${name(target)}`);
+        return Promise.resolve({
+          mode: folder.mode,
+          isDirectory: () => !folder.link,
+          isSymbolicLink: () => folder.link,
+        });
+      },
+      chmod: (target, mode) => {
+        calls.push(`chmod:${name(target)}:${mode.toString(8)}`);
+        return Promise.resolve();
+      },
+    };
+    const store = storeWith(fake, { platform, fileSystem });
+    await expectRejection(
+      () => store.save(BINDING_1, SENTINEL_KEY),
+      "folder_unavailable",
+    );
+    await expectRejection(() => store.check(BINDING_1), "folder_unavailable");
+    await expectRejection(() => store.read(BINDING_1), "folder_unavailable");
+    await expectRejection(
+      () => store.remove(CONNECTION_1),
+      "folder_unavailable",
+    );
+    await expectRejection(() => store.removeAll(), "folder_unavailable");
+    // Nothing was written, and a link is never changed.
+    await expect(readFile(keyFile())).rejects.toThrow();
+    expect(calls).toEqual(Array.from({ length: 5 }, () => "lstat:folder"));
+
+    // A real folder with another mode is set to 0700 before it is used.
+    folder.link = false;
+    calls.length = 0;
+    expect(await store.check(BINDING_1)).toBe("missing");
+    expect(calls).toEqual(["lstat:folder", "chmod:folder:700"]);
+    folder.mode = 0o40700;
+    calls.length = 0;
+    expect(await store.check(BINDING_1)).toBe("missing");
+    expect(calls).toEqual(["lstat:folder"]);
+
+    // An lstat that fails otherwise, or a chmod that fails, is refused too.
+    fileSystem.lstat = () =>
+      Promise.reject(Object.assign(new Error("denied"), { code: "EACCES" }));
+    await expectRejection(() => store.check(BINDING_1), "folder_unavailable");
+    fileSystem.lstat = () =>
+      Promise.resolve({
+        mode: 0o40777,
+        isDirectory: () => true,
+        isSymbolicLink: () => false,
+      });
+    fileSystem.chmod = () => Promise.reject(new Error("denied"));
+    await expectRejection(() => store.check(BINDING_1), "folder_unavailable");
+    await rm(keyFolder, { recursive: true, force: true });
+  }
+
+  // Windows checks nothing of the kind.
+  const lstats: string[] = [];
+  const windows = storeWith(fakeSafeStorage(), {
+    platform: "win32",
+    fileSystem: {
+      ...nodeProviderKeyFileSystem,
+      lstat: (target) => {
+        lstats.push(target);
+        return nodeProviderKeyFileSystem.lstat(target);
+      },
+    },
+  });
+  await windows.save(BINDING_1, SENTINEL_KEY);
+  expect(await windows.read(BINDING_1)).toBe(SENTINEL_KEY);
+  expect(lstats).toEqual([]);
+});
+
+test.skipIf(process.platform === "win32")(
+  "on Linux and macOS a real symbolic link to another folder is refused and nothing goes through it; a looser real folder is set to 0700",
+  async () => {
+    const outside = path.join(root, "outside");
+    await mkdir(outside);
+    await chmod(outside, 0o755);
+    await mkdir(path.dirname(keyFolder), { recursive: true });
+    await symlink(outside, keyFolder);
+    const store = storeWith(fakeSafeStorage(), { platform: process.platform });
+    await expectRejection(
+      () => store.save(BINDING_1, SENTINEL_KEY),
+      "folder_unavailable",
+    );
+    await expectRejection(() => store.check(BINDING_1), "folder_unavailable");
+    await expectRejection(
+      () => store.remove(CONNECTION_1),
+      "folder_unavailable",
+    );
+    await expectRejection(() => store.removeAll(), "folder_unavailable");
+    expect(await readdir(outside)).toEqual([]);
+    expect((await stat(outside)).mode & 0o777).toBe(0o755);
+
+    await rm(keyFolder);
+    await mkdir(keyFolder);
+    await chmod(keyFolder, 0o755);
+    expect(await store.check(BINDING_1)).toBe("missing");
+    expect((await stat(keyFolder)).mode & 0o777).toBe(0o700);
+    await store.save(BINDING_1, SENTINEL_KEY);
+    expect(await store.read(BINDING_1)).toBe(SENTINEL_KEY);
+  },
+);
+
 test("a key of the wrong shape and an invalid ID are refused before anything is encrypted", async () => {
   const fake = fakeSafeStorage();
   const store = storeWith(fake);
@@ -650,8 +815,8 @@ test("a file that cannot be deleted fails the deletion after every other file wa
   const store0 = storeWith(fakeSafeStorage());
   await store0.save(BINDING_1, SENTINEL_KEY);
   await store0.save(BINDING_2, OTHER_KEY);
-  const fileSystem: KeyFileSystem = {
-    ...nodeKeyFileSystem,
+  const fileSystem: ProviderKeyFileSystem = {
+    ...nodeProviderKeyFileSystem,
     unlink: async (file) => {
       if (file.endsWith(`${CONNECTION_1}.json`)) {
         throw Object.assign(new Error(`EPERM: unlink '${file}'`), {

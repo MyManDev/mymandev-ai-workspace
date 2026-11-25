@@ -10,7 +10,11 @@
 //   `CONFIRMED_LINUX_BACKENDS` (never `basic_text` or `unknown`), and the
 //   ciphertext must start with `SECRET_SERVICE_CIPHERTEXT_PREFIX`. Without
 //   it no key is stored (fail closed); there is no passphrase and no
-//   unprotected file for a provider key.
+//   unprotected file for a provider key. A key file whose ciphertext lacks
+//   that prefix is refused there before it is decrypted (`corrupt`):
+//   Chromium decrypts a `v10` ciphertext with a fixed key that every
+//   installation shares, so whoever can write the file could plant a key
+//   of their choice, and this store never writes one.
 // - The key is bound to the device ID and the connection ID inside the
 //   encrypted payload (key-file.ts); a reader that asks for another device
 //   or another connection is refused (`bound_elsewhere`).
@@ -21,9 +25,13 @@
 //   file, flushed and renamed over the key file, mode 0600 on Linux and
 //   macOS, in a folder for its owner only. A failed write leaves the
 //   previous key file as it was and no temporary file.
+// - On Linux and macOS the `provider-keys` folder must be a real folder: a
+//   symbolic link in its place is refused (`folder_unavailable`), and an
+//   existing folder with a looser mode is set to 0700 before it is used.
 //
 // Nothing here logs, and nothing here is reachable from the renderer. Every
 // error is a `ProviderKeyError` with a fixed message and no `cause`.
+import * as fs from "node:fs/promises";
 import path from "node:path";
 import {
   isMissingFileError,
@@ -56,6 +64,25 @@ import {
 
 /** The folder of the key files, inside the device key's local data folder. */
 export const PROVIDER_KEY_FOLDER = "provider-keys";
+
+/**
+ * The file system of the store: the device key's, and `lstat` and `chmod`
+ * for the check of the key folder on Linux and macOS.
+ */
+export interface ProviderKeyFileSystem extends KeyFileSystem {
+  lstat(target: string): Promise<{
+    readonly mode: number;
+    isDirectory(): boolean;
+    isSymbolicLink(): boolean;
+  }>;
+  chmod(target: string, mode: number): Promise<void>;
+}
+
+export const nodeProviderKeyFileSystem: ProviderKeyFileSystem = Object.freeze({
+  ...nodeKeyFileSystem,
+  lstat: (target: string) => fs.lstat(target),
+  chmod: (target: string, mode: number) => fs.chmod(target, mode),
+});
 
 /** Whether the system can protect a new provider key. */
 export type ProviderKeyProtectionStatus =
@@ -127,7 +154,7 @@ export interface ProviderKeyStoreOptions {
   /** Electron's `safeStorage`, its asynchronous API only. */
   readonly systemProtection: SystemKeyProtection;
   /** Defaults to `node:fs/promises`. */
-  readonly fileSystem?: KeyFileSystem;
+  readonly fileSystem?: ProviderKeyFileSystem;
   /**
    * Receives an error that does not stop the operation: a failed rewrite
    * after `shouldReEncrypt`, after which the old file is kept. The error is
@@ -157,7 +184,7 @@ export function createProviderKeyStore(
   const {
     platform,
     systemProtection: safeStorage,
-    fileSystem = nodeKeyFileSystem,
+    fileSystem = nodeProviderKeyFileSystem,
     onError = () => undefined,
   } = options;
   const systemAlwaysProtects = platform === "win32" || platform === "darwin";
@@ -233,15 +260,54 @@ export function createProviderKeyStore(
     } catch {
       throw new ProviderKeyError("system_protection_unavailable");
     }
-    if (
-      !systemAlwaysProtects &&
-      !ciphertext
-        .subarray(0, secretServicePrefix.length)
-        .equals(secretServicePrefix)
-    ) {
+    if (!systemAlwaysProtects && !madeWithSecretService(ciphertext)) {
       throw new ProviderKeyError("system_protection_unavailable");
     }
     return ciphertext;
+  }
+
+  /**
+   * Whether a ciphertext was made with a secret service's key: it starts
+   * with `SECRET_SERVICE_CIPHERTEXT_PREFIX` (`v11`). Checked on Linux and
+   * elsewhere only; Windows and macOS always protect a key.
+   */
+  function madeWithSecretService(ciphertext: Buffer): boolean {
+    return ciphertext
+      .subarray(0, secretServicePrefix.length)
+      .equals(secretServicePrefix);
+  }
+
+  /**
+   * On Linux and macOS, checks that the key folder is a real folder for its
+   * owner only before it is used: a symbolic link or another kind of file
+   * in its place is refused (`folder_unavailable`), and a folder with
+   * another mode is set to 0700. False when the folder does not exist.
+   * Windows has no such mode, and nothing is checked there.
+   */
+  async function checkFolder(folder: string): Promise<boolean> {
+    if (platform === "win32") {
+      return true;
+    }
+    let stats: Awaited<ReturnType<ProviderKeyFileSystem["lstat"]>>;
+    try {
+      stats = await fileSystem.lstat(folder);
+    } catch (error) {
+      if (isMissingFileError(error)) {
+        return false;
+      }
+      throw new ProviderKeyError("folder_unavailable");
+    }
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      throw new ProviderKeyError("folder_unavailable");
+    }
+    if ((stats.mode & 0o777) !== KEY_FOLDER_MODE) {
+      try {
+        await fileSystem.chmod(folder, KEY_FOLDER_MODE);
+      } catch {
+        throw new ProviderKeyError("folder_unavailable");
+      }
+    }
+    return true;
   }
 
   async function writeKeyFile(
@@ -249,12 +315,19 @@ export function createProviderKeyStore(
     file: string,
     ciphertext: Buffer,
   ): Promise<void> {
-    const bytes = encodeProviderKeyFile(ciphertext);
     try {
       await fileSystem.mkdir(folder, {
         recursive: true,
         mode: KEY_FOLDER_MODE,
       });
+    } catch {
+      throw new ProviderKeyError("write_failed");
+    }
+    if (!(await checkFolder(folder))) {
+      throw new ProviderKeyError("write_failed");
+    }
+    const bytes = encodeProviderKeyFile(ciphertext);
+    try {
       await writeFileAtomic(fileSystem, file, bytes, platform);
     } catch {
       throw new ProviderKeyError("write_failed");
@@ -291,6 +364,9 @@ export function createProviderKeyStore(
       folder,
       providerKeyFileName(binding.providerConnectionId),
     );
+    if (!(await checkFolder(folder))) {
+      return null;
+    }
     let bytes: Uint8Array;
     try {
       bytes = await fileSystem.readFile(file);
@@ -301,6 +377,14 @@ export function createProviderKeyStore(
       throw new ProviderKeyError("read_failed");
     }
     const ciphertext = decodeProviderKeyFile(bytes);
+    // On Linux and elsewhere this store writes only a secret service's
+    // ciphertext. Anything else, above all a `v10` ciphertext of Chromium's
+    // fixed key that whoever can write the file could make, is refused
+    // before it is decrypted: `corrupt`, so the person is asked for the key
+    // again, and the new key replaces the file.
+    if (!systemAlwaysProtects && !madeWithSecretService(ciphertext)) {
+      throw new ProviderKeyError("corrupt");
+    }
     let decrypted: { shouldReEncrypt: boolean; result: string };
     try {
       decrypted = await safeStorage.decryptStringAsync(ciphertext);
@@ -348,6 +432,9 @@ export function createProviderKeyStore(
   }
 
   async function namesInFolder(folder: string): Promise<string[]> {
+    if (!(await checkFolder(folder))) {
+      return [];
+    }
     try {
       return await fileSystem.readdir(folder);
     } catch (error) {

@@ -4947,7 +4947,12 @@ describe("provider keys (#33)", () => {
       folder: () => folder,
       platform: "win32",
       systemProtection: fakeSafeStorage,
-      fileSystem,
+      fileSystem: {
+        ...fileSystem,
+        // The folder check runs on Linux and macOS only, never on Windows.
+        lstat: () => Promise.reject(new Error("Not used on Windows.")),
+        chmod: () => Promise.reject(new Error("Not used on Windows.")),
+      },
     });
     const reports: string[] = [];
     const h = harness(api, {}, (store) =>
