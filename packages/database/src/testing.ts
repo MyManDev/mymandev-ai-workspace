@@ -75,6 +75,9 @@ export function pgliteNotificationSessions(
       listen: async (channel, handlers) => {
         unlisten = await client.listen(channel, handlers.onPayload);
       },
+      check: async () => {
+        await client.query("select 1");
+      },
       close: async () => {
         const stop = unlisten;
         unlisten = null;

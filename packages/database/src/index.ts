@@ -44,6 +44,7 @@ export {
 } from "./erasure-notifications.ts";
 export {
   LISTENER_APPLICATION_NAME,
+  LISTENER_KEEPALIVE_INITIAL_DELAY_MS,
   type NotificationHandlers,
   type NotificationSession,
   type NotificationSessions,

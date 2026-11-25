@@ -12,6 +12,15 @@ export const ERASURE_LISTENER_INITIAL_BACKOFF_MS = 1_000;
 /** The longest wait between two attempts; the wait doubles up to it. */
 export const ERASURE_LISTENER_MAX_BACKOFF_MS = 30_000;
 
+/** How long an attempt waits for the server to confirm `LISTEN`; longer is a failed attempt. */
+export const ERASURE_LISTENER_LISTEN_TIMEOUT_MS = 5_000;
+
+/** How often a listening session is checked with a trivial query. */
+export const ERASURE_LISTENER_CHECK_INTERVAL_MS = 60_000;
+
+/** How long a check waits for its answer; longer is a lost session. */
+export const ERASURE_LISTENER_CHECK_TIMEOUT_MS = 5_000;
+
 export type ErasureListenerOptions = Readonly<{
   /** Opens the dedicated session (`pgNotificationSessions` in production). */
   sessions: NotificationSessions;
@@ -22,6 +31,12 @@ export type ErasureListenerOptions = Readonly<{
   initialBackoffMs?: number;
   /** Default: `ERASURE_LISTENER_MAX_BACKOFF_MS`. */
   maxBackoffMs?: number;
+  /** Default: `ERASURE_LISTENER_LISTEN_TIMEOUT_MS`. */
+  listenTimeoutMs?: number;
+  /** Default: `ERASURE_LISTENER_CHECK_INTERVAL_MS`. */
+  checkIntervalMs?: number;
+  /** Default: `ERASURE_LISTENER_CHECK_TIMEOUT_MS`. */
+  checkTimeoutMs?: number;
   /**
    * Waits `ms` or until `signal` aborts, then rejects. Default: a timer that
    * does not keep the process alive. Tests pass one that records the waits.
@@ -37,21 +52,49 @@ function errorTypeOf(error: unknown): string {
   return error instanceof Error ? error.name : typeof error;
 }
 
+/** A step of the session that took longer than its bound. */
+class TimeoutError extends Error {
+  override readonly name = "TimeoutError";
+}
+
+/**
+ * `promise`, or a `TimeoutError` after `ms`, with a timer that does not keep
+ * the process alive. A late rejection of `promise` is swallowed.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  promise.catch(() => undefined);
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new TimeoutError("timed out"));
+    }, ms);
+    timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    clearTimeout(timer);
+  });
+}
+
 /**
  * The API instance's one listener for an operator's account erasures (#341;
  * ADR 0014, update of 2026-11-25): it holds one dedicated session
  * (`NotificationSession`) that listens on `ERASURE_NOTIFICATION_CHANNEL` and
- * hands each payload to `onPayload`. A session that cannot connect or
- * listen, or that is lost later, is closed and opened again after a wait
- * that starts at `initialBackoffMs` and doubles up to `maxBackoffMs`; a
- * session that listens starts the wait again at `initialBackoffMs`.
+ * hands each payload to `onPayload`. A session that cannot connect, that
+ * does not confirm `LISTEN` within `listenTimeoutMs`, or that is lost later,
+ * is closed and opened again after a wait that starts at `initialBackoffMs`
+ * and doubles up to `maxBackoffMs`; a session that listens starts the wait
+ * again at `initialBackoffMs`. A listening session is checked every
+ * `checkIntervalMs` with a trivial query (`NotificationSession.check`); one
+ * that fails or does not answer within `checkTimeoutMs` counts as lost, so
+ * that a connection that a NAT or a load balancer dropped silently is found
+ * within about a minute, not when TCP keepalive gives up.
  * Notifications sent while no session listens are lost, which costs no more
  * than before the listener: the sweep closes the erased account's
  * connections within 60 seconds, and the other connections see the rest at
  * their next `workspace.subscribed`. A failure of `onPayload` is logged and
  * the next payload still goes to it. It logs no ID, URL, or error message:
- * only that it listens, that it lost its session or failed with an error's
- * type, and how long it waits.
+ * only that it listens, that a check failed, that it lost its session or
+ * failed with an error's type, and how long it waits.
  */
 export class ErasureListener {
   readonly #options: ErasureListenerOptions;
@@ -105,11 +148,54 @@ export class ErasureListener {
     }
   }
 
+  /**
+   * Checks `session` every `checkIntervalMs`, one check at a time, and calls
+   * `lost` once a check fails or does not answer within `checkTimeoutMs`.
+   * Returns the interval, which the caller clears when the session ends.
+   */
+  #checkPeriodically(
+    session: NotificationSession,
+    lost: () => void,
+  ): NodeJS.Timeout {
+    const interval =
+      this.#options.checkIntervalMs ?? ERASURE_LISTENER_CHECK_INTERVAL_MS;
+    const timeout =
+      this.#options.checkTimeoutMs ?? ERASURE_LISTENER_CHECK_TIMEOUT_MS;
+    let checking = false;
+    let failed = false;
+    const timer = setInterval(() => {
+      if (checking || failed || this.#closed) {
+        return;
+      }
+      checking = true;
+      withTimeout(session.check(), timeout).then(
+        () => {
+          checking = false;
+        },
+        (error: unknown) => {
+          checking = false;
+          failed = true;
+          if (!this.#closed) {
+            this.#options.log.warn(
+              { errorType: errorTypeOf(error) },
+              "erasure listener check failed",
+            );
+          }
+          lost();
+        },
+      );
+    }, interval);
+    timer.unref();
+    return timer;
+  }
+
   async #run(firstAttemptEnded: () => void): Promise<void> {
     const { log } = this.#options;
     const initial =
       this.#options.initialBackoffMs ?? ERASURE_LISTENER_INITIAL_BACKOFF_MS;
     const max = this.#options.maxBackoffMs ?? ERASURE_LISTENER_MAX_BACKOFF_MS;
+    const listenTimeout =
+      this.#options.listenTimeoutMs ?? ERASURE_LISTENER_LISTEN_TIMEOUT_MS;
     const wait = this.#options.wait ?? defaultWait;
     let backoff = initial;
     try {
@@ -121,20 +207,30 @@ export class ErasureListener {
             return;
           }
           this.#session = session;
+          let wake: () => void = () => undefined;
           const lost = new Promise<void>((resolve) => {
-            this.#wake = resolve;
+            wake = resolve;
           });
-          await session.listen(ERASURE_NOTIFICATION_CHANNEL, {
-            onPayload: (payload) => this.#deliver(payload),
-            onLost: () => this.#wake?.(),
-          });
+          this.#wake = wake;
+          await withTimeout(
+            session.listen(ERASURE_NOTIFICATION_CHANNEL, {
+              onPayload: (payload) => this.#deliver(payload),
+              onLost: wake,
+            }),
+            listenTimeout,
+          );
           if (this.#closed) {
             return;
           }
           log.info("erasure listener listening");
           backoff = initial;
           firstAttemptEnded();
-          await lost;
+          const checks = this.#checkPeriodically(session, wake);
+          try {
+            await lost;
+          } finally {
+            clearInterval(checks);
+          }
           if (this.#closed) {
             return;
           }

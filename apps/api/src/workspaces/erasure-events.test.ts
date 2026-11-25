@@ -611,6 +611,7 @@ test("the listener's session closes when the app closes, and an app whose listen
     opened += 1;
     return {
       listen: session.listen,
+      check: session.check,
       close: async () => {
         closed += 1;
         await session.close();

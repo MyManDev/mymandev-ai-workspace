@@ -2,13 +2,15 @@ import { setTimeout as delay } from "node:timers/promises";
 import pg from "pg";
 
 // One PostgreSQL session that listens for notifications (#341; ADR 0014,
-// update of 2026-11-25). It is a dedicated connection outside the pool: a
-// pooled connection goes back to the pool after each query, and a
+// update of 2026-11-25). It is a dedicated connection outside the pool,
+// because a pooled connection goes back to the pool after each query. It
+// must reach the server directly or through a session-mode pooler, which is
+// a requirement of the deployment that this code cannot check: a
 // transaction-mode pooler would hand the `LISTEN` to whichever server
-// session runs it, so the listener never connects through one. The API
-// holds one per instance (`apps/api`, `ErasureListener`), which reconnects
-// after a lost session; the tests use PGlite's `listen` in its place
-// (`src/testing.ts`).
+// session runs it, and the listener would hear nothing. The API holds one
+// per instance (`apps/api`, `ErasureListener`), which checks the session
+// periodically and reconnects after a lost one; the tests use PGlite's
+// `listen` in its place (`src/testing.ts`).
 
 /** What a listening session reports. */
 export type NotificationHandlers = Readonly<{
@@ -25,6 +27,12 @@ export type NotificationSession = Readonly<{
    * the server listens. A session that ended before rejects.
    */
   listen: (channel: string, handlers: NotificationHandlers) => Promise<void>;
+  /**
+   * Runs a trivial query (`select 1`) on the session; rejects when the
+   * session is broken. The caller bounds its wait, as a dropped connection
+   * can leave it pending.
+   */
+  check: () => Promise<void>;
   /** Ends the session; it never rejects, and `onLost` is not called. */
   close: () => Promise<void>;
 }>;
@@ -38,6 +46,13 @@ export const LISTENER_APPLICATION_NAME = "mymandev_listener";
 /** How long `close` waits for the server's goodbye before it gives up. */
 const CLOSE_TIMEOUT_MS = 5_000;
 
+/**
+ * The idle time after which the operating system starts TCP keepalive
+ * probes on a listener's connection, instead of its default of about two
+ * hours. How often it probes and how many probes it sends stay the system's.
+ */
+export const LISTENER_KEEPALIVE_INITIAL_DELAY_MS = 15_000;
+
 const CHANNEL_NAME = /^[a-z_][a-z0-9_]{0,62}$/u;
 
 /** Throws unless `channel` can stand unquoted in `LISTEN`. */
@@ -48,12 +63,15 @@ export function checkChannel(channel: string): void {
 }
 
 /**
- * Sessions to the PostgreSQL server of `connectionString` (checked with
+ * Sessions to the PostgreSQL server of `connectionString`, which the caller
+ * has checked (the API's configuration checks DATABASE_URL with
  * `checkDatabaseUrl`), each one node-postgres client of its own, outside any
- * pool, with a connection timeout of 5 seconds and TCP keepalive, so that a
- * connection that died without a close is found. A failure of the session
- * calls `onLost` once and is never thrown: the error's message, which can
- * name the host, is dropped.
+ * pool, with a connection timeout of 5 seconds and TCP keepalive that starts
+ * probing after `LISTENER_KEEPALIVE_INITIAL_DELAY_MS` of silence. Keepalive
+ * alone finds a dropped connection only after the system's probes run out,
+ * so the API also runs `check` periodically and treats a failure or a hang
+ * as a lost session. A failure of the session calls `onLost` once and is
+ * never thrown: the error's message, which can name the host, is dropped.
  */
 export function pgNotificationSessions(
   connectionString: string,
@@ -63,6 +81,7 @@ export function pgNotificationSessions(
       connectionString,
       connectionTimeoutMillis: 5_000,
       keepAlive: true,
+      keepAliveInitialDelayMillis: LISTENER_KEEPALIVE_INITIAL_DELAY_MS,
       application_name: LISTENER_APPLICATION_NAME,
     });
     let ended = false;
@@ -102,6 +121,9 @@ export function pgNotificationSessions(
         });
         handlers = given;
         await client.query(`listen ${channel}`);
+      },
+      check: async () => {
+        await client.query("select 1");
       },
       close,
     };
