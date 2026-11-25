@@ -126,7 +126,7 @@ test("an erasure that is refused, or of an account that does not exist, exits wi
   assert.equal(erased.exitCode, 0);
   assert.match(
     erased.message,
-    /^Account erased: 0 memberships ended, 0 devices revoked, 0 join requests withdrawn, 0 workspaces archived, 0 join requests denied, 0 invitations revoked, 0 grants revoked, 0 runs cancelled\.\nThe API closes/,
+    /^Account erased: 0 memberships ended, 0 devices revoked, 0 join requests withdrawn, 0 workspaces archived, 0 join requests denied, 0 invitations revoked, 0 grants revoked, 0 runs cancelled\.\nAn API that listens closes the account's open connections at once/,
   );
 });
 
@@ -137,10 +137,13 @@ test("an erasure that archives a workspace counts its denied join requests, and 
       {
         memberId: newId<MemberId>(),
         userId,
+        workspaceId: newId<WorkspaceId>(),
         revokedInvitationIds: [newId<InvitationId>()],
         disabledAgentIds: [],
         revokedGrantIds: [],
         cancelledRuns: [],
+        disabledAgents: [],
+        revokedGrants: [],
       },
     ],
     revokedDevices: [],

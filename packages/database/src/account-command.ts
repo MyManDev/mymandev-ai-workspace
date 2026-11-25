@@ -108,11 +108,12 @@ export function erasureReport(result: EraseAccountResult): CommandReport {
       `${total(ended.map((end) => end.revokedGrantIds))} grants revoked,`,
       `${total(ended.map((end) => end.cancelledRuns))} runs cancelled.`,
     ].join(" ");
-    // This command runs outside the API, which learns of the erasure only
-    // from the database.
+    // This command runs outside the API, which learns of the erasure from
+    // the database: from the erasure's notifications while it listens
+    // (#341), and otherwise at its next sweep.
     return {
       exitCode: 0,
-      message: `${summary}\nThe API closes the account's open connections at its next sweep, within 60 seconds. Its access tokens stop working at once, because every request checks the device, and leave the API's memory within 15 minutes. The other members are not sent the removals or the cancelled runs; they see them when they next load the workspace.`,
+      message: `${summary}\nAn API that listens closes the account's open connections at once and sends the other members the removals, the disabled agents, the revoked grants, the cancelled runs, and the withdrawn join requests. An API whose listener was down at the commit closes the connections at its next sweep, within 60 seconds, and its members see the rest when they next load the workspace. The account's access tokens stop working at once, because every request checks the device, and leave the API's memory within 15 minutes.`,
     };
   }
   switch (result.refusal) {

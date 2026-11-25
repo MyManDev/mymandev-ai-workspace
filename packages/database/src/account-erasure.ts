@@ -12,10 +12,22 @@ import {
   type WorkspaceId,
 } from "@mymandev/protocol";
 import { and, eq, gt, isNotNull, isNull, ne, sql } from "drizzle-orm";
-import { type CancelledRun, idIn } from "./cascade.ts";
+import {
+  type CancelledRun,
+  type DisabledAgent,
+  disabledAgentsOf,
+  idIn,
+  type RevokedGrant,
+  revokedGrantsOf,
+} from "./cascade.ts";
 import type { Database } from "./db.ts";
 import { revokeDevice } from "./device-revocation.ts";
+import {
+  erasureNotifications,
+  sendErasureNotifications,
+} from "./erasure-notifications.ts";
 import { withDatabaseErrors } from "./errors.ts";
+import { joinRequestApprovers } from "./join-requests.ts";
 import { type MembershipEnd, removePerson } from "./people.ts";
 import {
   agents,
@@ -188,7 +200,32 @@ export type ErasedDevice = Readonly<{
   revokedGrantIds: readonly PermissionGrantId[];
   /** The unfinished runs of those agents that no removal had cancelled, with the reason `device_revoked`. */
   cancelledRuns: readonly CancelledRun[];
+  /**
+   * The agents of `disabledAgentIds` as `workspace.agent.disabled` shows
+   * them, read in the erasure's transaction (`disabledAgentsOf`), in the
+   * same order.
+   */
+  disabledAgents: readonly DisabledAgent[];
+  /**
+   * The grants of `revokedGrantIds` as `agent.grant.revoked` shows them,
+   * read in the erasure's transaction (`revokedGrantsOf`), in the same
+   * order.
+   */
+  revokedGrants: readonly RevokedGrant[];
 }>;
+
+/**
+ * A membership that the erasure ended, as a removal ends one, with its
+ * workspace and the agents and grants that it disabled and revoked as their
+ * events show them, read in the erasure's transaction (`disabledAgentsOf`,
+ * `revokedGrantsOf`), in the order of their IDs.
+ */
+export type ErasedMembership = MembershipEnd &
+  Readonly<{
+    workspaceId: WorkspaceId;
+    disabledAgents: readonly DisabledAgent[];
+    revokedGrants: readonly RevokedGrant[];
+  }>;
 
 /**
  * A workspace that the erased account owned and that the erasure archived,
@@ -214,7 +251,7 @@ export type EraseAccountResult =
        * in the order of the person IDs; the owner's person of an archived
        * workspace too.
        */
-      endedMemberships: readonly MembershipEnd[];
+      endedMemberships: readonly ErasedMembership[];
       /** In the order of the device IDs. */
       revokedDevices: readonly ErasedDevice[];
       /** The pending join requests, now withdrawn, in the order of their IDs. */
@@ -335,7 +372,14 @@ function idsIn<Id extends string>(
  *   revokes the grants, and cancels the runs with `device_revoked` that no
  *   removal reached, in workspaces that the account had left before;
  * - it writes an `account.erased` audit record with the account as the
- *   subject.
+ *   subject;
+ * - last, it sends the notifications of its live events
+ *   (`src/erasure-notifications.ts`, #341), which PostgreSQL delivers only
+ *   at the commit. For them it reads, without locking anything, the
+ *   disabled agents and revoked grants of each removal and device
+ *   revocation (`disabledAgentsOf`, `revokedGrantsOf`), which the result
+ *   carries too, and the owner and admins of each workspace with a
+ *   withdrawn request (`joinRequestApprovers`), after every removal.
  *
  * Every audit record of an erasure has no actor, as an operator's has none
  * (the Project Manager's decision of 2026-11-01). Nothing is deleted:
@@ -346,7 +390,8 @@ function idsIn<Id extends string>(
  * runs as a savepoint.
  *
  * The caller runs outside the API, which learns of the erasure only from the
- * database: see "Operator commands" in the package's README.
+ * database, through those notifications or at its next sweep: see
+ * "Operator commands" in the package's README.
  */
 export async function eraseAccount(
   db: Database,
@@ -763,20 +808,26 @@ export async function eraseAccount(
         }
       }
 
-      const endedMemberships: MembershipEnd[] = [];
+      const endedMemberships: ErasedMembership[] = [];
       for (const person of active) {
+        const ended = await removePerson(
+          tx,
+          {
+            workspaceId: person.workspaceId,
+            userId,
+            now,
+            operatorReason: "account_erased",
+          },
+          person,
+          "member.removed",
+        );
         endedMemberships.push(
-          await removePerson(
-            tx,
-            {
-              workspaceId: person.workspaceId,
-              userId,
-              now,
-              operatorReason: "account_erased",
-            },
-            person,
-            "member.removed",
-          ),
+          Object.freeze({
+            ...ended,
+            workspaceId: person.workspaceId,
+            disabledAgents: await disabledAgentsOf(tx, ended.disabledAgentIds),
+            revokedGrants: await revokedGrantsOf(tx, ended.revokedGrantIds),
+          }),
         );
       }
 
@@ -800,6 +851,11 @@ export async function eraseAccount(
               disabledAgentIds: revoked.disabledAgentIds,
               revokedGrantIds: revoked.revokedGrantIds,
               cancelledRuns: revoked.cancelledRuns,
+              disabledAgents: await disabledAgentsOf(
+                tx,
+                revoked.disabledAgentIds,
+              ),
+              revokedGrants: await revokedGrantsOf(tx, revoked.revokedGrantIds),
             }),
           );
         }
@@ -811,6 +867,39 @@ export async function eraseAccount(
         action: "account.erased",
         subjectId: userId,
       });
+
+      // The live events (#341): the owners and admins of each workspace
+      // with a withdrawn request are read last, after every removal, so the
+      // account's own person is never one of them; then the notifications,
+      // which PostgreSQL delivers only at the commit.
+      const approvers = new Map<WorkspaceId, readonly MemberId[]>();
+      const withdrawnJoinRequests = [];
+      for (const request of pending) {
+        if (ownedWorkspaceIds.includes(request.workspaceId)) {
+          continue;
+        }
+        let ofWorkspace = approvers.get(request.workspaceId);
+        if (ofWorkspace === undefined) {
+          ofWorkspace = await joinRequestApprovers(tx, request.workspaceId);
+          approvers.set(request.workspaceId, ofWorkspace);
+        }
+        withdrawnJoinRequests.push({
+          workspaceId: request.workspaceId,
+          joinRequestId: request.id,
+          approvers: ofWorkspace,
+        });
+      }
+      await sendErasureNotifications(
+        tx,
+        erasureNotifications({
+          userId,
+          now,
+          endedMemberships,
+          revokedDevices,
+          withdrawnJoinRequests,
+          archivedWorkspaceIds: ownedWorkspaceIds,
+        }),
+      );
       return Object.freeze({
         erased: true,
         endedMemberships: Object.freeze(endedMemberships),
