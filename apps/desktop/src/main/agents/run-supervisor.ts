@@ -14,7 +14,8 @@
 // - Order. One run of an agent at a time, the oldest `createdAt` first. An
 //   agent is busy while the supervisor holds one of its runs, while an
 //   executor of one of its runs has not settled (also after an abort), while
-//   one of its runs waits for the next reload after a refusal, and while the
+//   one of its runs waits for the next reload after a refusal, while one of
+//   its queued runs waits after `beforeStart` (see below), and while the
 //   activity shows one of its runs in `running` or `awaiting_input`.
 // - A queued run is decided only once a reload of the runs listed it
 //   (`reloadedRuns`): a run that an event created carries neither its
@@ -36,23 +37,37 @@
 //   another run or a `rate_limited`; once the server acknowledged it, the
 //   executor starts with the held run and an `AbortSignal`, and its outcome
 //   becomes `running -> completed` or `running -> failed`.
-// - `beforeStart` is the seam for a check of `provider.use` with the
-//   enforcement point before `queued -> running`. Whether the supervisor
-//   makes that check waits for the Project Manager (#35, scope of
-//   2026-11-24, and #55), so it defaults to allowing every start, and the
-//   enforcement point is never called before a start. Its answer is read
-//   defensively: an answer that is not an object, a hook that throws, or a
-//   reason that is not a code (`RUN_EXECUTOR_REASON_PATTERN`) or that only
-//   the server gives makes the run wait for the next reload, which the
-//   supervisor asks for.
+// - `beforeStart` is the seam for the check of `provider.use` with the
+//   enforcement point before `queued -> running` (decision D13 of
+//   2026-11-25 on #35 and #55). The production check is
+//   `createProviderUseStartCheck` (`run-start-check.ts`), which `index.ts`
+//   passes in: a denial for a missing grant fails the run at once with
+//   `provider_use_denied` (D13), and every other denial leaves the run
+//   queued (decision of the Project Manager of 2026-11-25). The supervisor
+//   itself keeps the hook injected and defaults to allowing every start, so
+//   that it stays testable. Its answer is read defensively: a `wait`, an
+//   answer that is not an object, a hook that throws, or a reason that is
+//   not a code (`RUN_EXECUTOR_REASON_PATTERN`) or that only the server
+//   gives sends nothing. The run stays queued and its agent waits until the
+//   next change of the grants or the next reload of the runs, which the
+//   supervisor asks for with the backoff of "Reload requests"; then the run
+//   is decided and checked again, once per change or reload.
+// - The check once the start is acknowledged. The grants may change while
+//   `queued -> running` is on its way, and a re-check of the grants skips a
+//   run that does not execute yet. So, once the server acknowledged the
+//   start and before the executor starts, `beforeStart` is asked again. Any
+//   answer but a start ends the run, which is already `running` on the
+//   server, as a re-check would (`denialEnd` of the decision's `denial`,
+//   `check_failed` without one): no grant is `cancelled` with
+//   `grant_inactive`, and so on.
 // - Stops (#55, decision of 2026-11-19). An executor's action that it
 //   checked with `RunExecution.check` stays held until it ends. On every
 //   `onGrantsChanged`, each held action is checked again with the
 //   enforcement point's `recheck` for the run that the supervisor holds,
 //   which records denials but no shell start; at the first denial the run
 //   is aborted and reported. While connected, a denial maps as follows
-//   (default until the Project Manager decides, #55): `no_grant` is
-//   `cancelled` with `grant_inactive`; a denial of the sign-in
+//   (`denialEnd`; accepted by the Project Manager on 2026-11-25, #55):
+//   `no_grant` is `cancelled` with `grant_inactive`; a denial of the sign-in
 //   (`signed_out`, `sign_in_invalid`, `device_unknown`, `not_this_device`)
 //   is `cancelled` with `signed_out`; every other denial (`store_unusable`,
 //   `clock_invalid`, `record_failed`, `check_failed`, and the malformed
@@ -92,8 +107,9 @@
 //   supervisor drops the run and never retries it; the run and its agent
 //   wait for the next reload, which brings the truth.
 // - Reload requests. While the connection stays open, nothing else reloads
-//   the runs, so a run that waits for a reload (a dropped run, a transient
-//   refusal, or a transition owed after `no_acknowledgement` or a send that
+//   the runs, so a run that waits for a reload (a dropped run, a queued run
+//   that `beforeStart` did not let start, a transient refusal, or a
+//   transition owed after `no_acknowledgement` or a send that
 //   went out nowhere) makes the supervisor ask the agent activity for one
 //   (`requestReload`), after `RUN_SUPERVISOR_RELOAD_DELAY_MS`, doubling up
 //   to `RUN_SUPERVISOR_RELOAD_MAX_MS` until a transition is acknowledged.
@@ -133,10 +149,11 @@ import {
 import type { AccountStatus } from "../../shared/ipc-contract.ts";
 import type { AccountService } from "../account.ts";
 import type { ConnectionClient } from "../connection/client.ts";
-import type {
-  EnforcementDenialReason,
-  HeldRun,
-  PermissionEnforcement,
+import {
+  ENFORCEMENT_DENIAL_REASONS,
+  type EnforcementDenialReason,
+  type HeldRun,
+  type PermissionEnforcement,
 } from "../permissions/enforcement.ts";
 import type { GrantStoreService } from "../permissions/grant-store.ts";
 import type { ScheduleTimer } from "../runtime.ts";
@@ -174,11 +191,17 @@ export const HOST_RUN_REASONS = Object.freeze({
   /** The device signed out, or its sign-in is no longer valid (#55). */
   signedOut: "signed_out",
   /**
-   * A held action could not be checked again: the grant store was not
-   * usable, the clock or the check failed, or an input was malformed.
-   * Default until the Project Manager decides (#55).
+   * A grant could not be checked: the grant store was not usable, the clock
+   * or the check failed, or an input was malformed (#55, accepted on
+   * 2026-11-25).
    */
   grantCheckUnavailable: "grant_check_unavailable",
+  /**
+   * The check of `provider.use` before `queued -> running` found no active
+   * grant for the run's provider connection (decision D13 of 2026-11-25 on
+   * #35 and #55).
+   */
+  providerUseDenied: "provider_use_denied",
   /** The executor failed without a reason code that may be shown. */
   executorFailed: "executor_failed",
 } as const);
@@ -210,8 +233,13 @@ export const RUN_SUPERVISOR_RELOAD_DELAY_MS = 30_000;
 export const RUN_SUPERVISOR_RELOAD_MAX_MS = 300_000;
 
 /**
- * What `beforeStart` decides for a run that may start: start it, or end it
- * with `failed` or `cancelled` and a reason instead.
+ * What `beforeStart` decides for a run that may start: start it, end it
+ * with `failed` or `cancelled` and a reason instead, or leave it queued
+ * (`wait`) to be checked again after the next change of the grants or the
+ * next reload of the runs. A decision that does not start may name the
+ * enforcement point's `denial`: when the hook is asked again once the
+ * server acknowledged the start, that denial ends the running run as
+ * `denialEnd` says.
  */
 export type RunStartDecision =
   | { readonly start: true }
@@ -219,7 +247,9 @@ export type RunStartDecision =
       readonly start: false;
       readonly state: "failed" | "cancelled";
       readonly reason: string;
-    };
+      readonly denial?: EnforcementDenialReason;
+    }
+  | { readonly start: "wait"; readonly denial?: EnforcementDenialReason };
 
 /**
  * The longest wait of the timer for the end of the sign-in; a longer wait
@@ -238,6 +268,21 @@ export const RUN_SUPERVISOR_ABORT_WATCHDOG_MS = 30_000;
 /** The default of `beforeStart`: every start is allowed. */
 export const ALLOW_RUN_START: RunStartDecision = Object.freeze({
   start: true,
+});
+
+/** What the supervisor read from an answer of `beforeStart`. */
+type StartAnswer =
+  | { readonly kind: "start" }
+  | {
+      readonly kind: "end";
+      readonly transition: Transition;
+      readonly denial: EnforcementDenialReason | null;
+    }
+  | { readonly kind: "wait"; readonly denial: EnforcementDenialReason | null };
+
+const WAIT_WITHOUT_DENIAL: StartAnswer = Object.freeze({
+  kind: "wait",
+  denial: null,
 });
 
 /** The part of the account service that the supervisor uses. */
@@ -277,13 +322,18 @@ export interface RunSupervisorOptions {
   readonly enforcement?: Pick<PermissionEnforcement, "check" | "recheck">;
   /**
    * Asked immediately before each send of `queued -> running`, for a run
-   * that has an executor and a provider connection of this device. Waits
-   * for the Project Manager's decision on a check of `provider.use` (#35,
-   * #55); defaults to `ALLOW_RUN_START`. A hook that throws, or answers
-   * outside `RunStartDecision` (not an object, or a reason that is not a
-   * code of `RUN_EXECUTOR_REASON_PATTERN`, or one that only the server
-   * gives), sends nothing, and the run waits for the next reload. A host
-   * reason such as `grant_inactive` may be given.
+   * that has an executor and a provider connection of this device. In
+   * production it is the check of `provider.use` (D13 of 2026-11-25 on #35
+   * and #55; `createProviderUseStartCheck`); it defaults to
+   * `ALLOW_RUN_START`. A `wait`, a hook that throws, or an answer outside
+   * `RunStartDecision` (not an object, or a reason that is not a code of
+   * `RUN_EXECUTOR_REASON_PATTERN`, or one that only the server gives) sends
+   * nothing: the run stays queued and is checked again after the next
+   * change of the grants or the next reload. A host reason such as
+   * `grant_inactive` may be given. The hook is asked a second time once the
+   * server acknowledged `queued -> running`, before the executor starts:
+   * any answer but a start then ends the running run as `denialEnd` says
+   * for its `denial` (`check_failed` without one).
    */
   readonly beforeStart?: (run: HeldRun) => RunStartDecision;
   /** Agents whose runs another sender moves; the supervisor leaves them alone. */
@@ -529,30 +579,38 @@ function finishOf(outcome: unknown): Transition {
   };
 }
 
+/** How a denial of the enforcement point ends a run. */
+export interface DenialEnd {
+  readonly state: "failed" | "cancelled";
+  readonly reason: HostRunReason;
+}
+
 /**
- * How a denial of a held action while connected ends its run; see "Stops".
- * Default until the Project Manager decides (#55).
+ * How a denial of the enforcement point ends a run, the one mapping of the
+ * supervisor (#55, accepted by the Project Manager on 2026-11-25): `no_grant`
+ * is `cancelled` with `grant_inactive`; a denial of the sign-in is
+ * `cancelled` with `signed_out`; every other denial, and a reason that is
+ * not one of `ENFORCEMENT_DENIAL_REASONS`, is `failed` with
+ * `grant_check_unavailable`, because the grant could not be checked. It
+ * maps the denials of running runs only: before a start, `no_grant` fails
+ * the run with `provider_use_denied` and every other denial leaves it
+ * queued (`run-start-check.ts`); once a start is acknowledged, the second
+ * check before the executor starts uses it.
  */
-function stopOfDenial(reason: EnforcementDenialReason): Transition {
+export function denialEnd(reason: EnforcementDenialReason): DenialEnd {
   if (reason === "no_grant") {
-    return {
-      from: "running",
-      to: "cancelled",
-      reason: HOST_RUN_REASONS.grantInactive,
-    };
+    return { state: "cancelled", reason: HOST_RUN_REASONS.grantInactive };
   }
   if (SIGN_IN_DENIALS.has(reason)) {
-    return {
-      from: "running",
-      to: "cancelled",
-      reason: HOST_RUN_REASONS.signedOut,
-    };
+    return { state: "cancelled", reason: HOST_RUN_REASONS.signedOut };
   }
-  return {
-    from: "running",
-    to: "failed",
-    reason: HOST_RUN_REASONS.grantCheckUnavailable,
-  };
+  return { state: "failed", reason: HOST_RUN_REASONS.grantCheckUnavailable };
+}
+
+/** How a denial of a held action while connected ends its run; see "Stops". */
+function stopOfDenial(reason: EnforcementDenialReason): Transition {
+  const end = denialEnd(reason);
+  return { from: "running", to: end.state, reason: end.reason };
 }
 
 /** The transition that reports a run that an interruption stopped. */
@@ -600,6 +658,11 @@ export function createRunSupervisor(
   const executions = new Set<Execution>();
   /** Runs dropped after a refusal, with their agent, until the next reload. */
   const dropped = new Map<RunId, AgentId>();
+  /**
+   * Queued runs that `beforeStart` did not let start, with their agent,
+   * until the next change of the grants or the next reload.
+   */
+  const startWaits = new Map<RunId, AgentId>();
   /** The entry whose transition is in flight. */
   let inFlight: Entry | null = null;
   /** The monotonic time of the last send, or null before the first. */
@@ -677,7 +740,7 @@ export function createRunSupervisor(
         return true;
       }
     }
-    for (const agent of dropped.values()) {
+    for (const agent of [...dropped.values(), ...startWaits.values()]) {
       if (agent === agentId) {
         return true;
       }
@@ -921,6 +984,7 @@ export function createRunSupervisor(
     inFlight = null;
     if (cause === "device_changed") {
       dropped.clear();
+      startWaits.clear();
     }
   }
 
@@ -1010,10 +1074,15 @@ export function createRunSupervisor(
     }
   }
 
-  /** Checks every held action again; the first denial stops its run. */
+  /**
+   * Checks every held action again; the first denial stops its run. A
+   * queued run that waits after `beforeStart` is decided again by the
+   * evaluation that follows.
+   */
   function grantsChanged(): void {
     accountChanged(account.status());
     connectionChanged(connection.status().state);
+    startWaits.clear();
     for (const entry of [...entries.values()]) {
       if (entry.stage.kind !== "executing") {
         continue;
@@ -1085,11 +1154,23 @@ export function createRunSupervisor(
     wantReload();
   }
 
+  /**
+   * Leaves the queued run of `entry` queued after `beforeStart` did not let
+   * it start: it is decided again after the next change of the grants or
+   * the next reload, which the supervisor asks for.
+   */
+  function waitBeforeStart(entry: Pick<Entry, "runId" | "agentId">): void {
+    entries.delete(entry.runId);
+    startWaits.set(entry.runId, entry.agentId);
+    wantReload();
+  }
+
   /** After a reload of the runs: owed transitions, then interrupted runs. */
   function afterReload(live: Live): void {
     // The reload came: a request that waits is not needed any more.
     stopReloadRequest();
     dropped.clear();
+    startWaits.clear();
     listedRuns = new Map(
       agents.reloadedRuns().map((item) => [item.id, item] as const),
     );
@@ -1265,27 +1346,30 @@ export function createRunSupervisor(
   }
 
   /**
-   * Asks `beforeStart` for `held`, immediately before its start is sent:
-   * the transition to send instead of `queued -> running`, or null when the
-   * run waits (a hook that throws, or any answer outside
-   * `RunStartDecision`, a reason that `startReasonAllowed` refuses
-   * included).
+   * Asks `beforeStart` for `held`: a start, the transition to send instead
+   * of `queued -> running`, or a wait (a `wait`, a hook that throws, or any
+   * answer outside `RunStartDecision`, a reason that `startReasonAllowed`
+   * refuses included). The `denial` is kept only when it is one of
+   * `ENFORCEMENT_DENIAL_REASONS`.
    */
-  function askBeforeStart(held: HeldRun): Transition | null {
+  function askBeforeStart(held: HeldRun): StartAnswer {
     try {
       const decision: unknown = beforeStart(held);
       if (typeof decision !== "object" || decision === null) {
-        return null;
+        return WAIT_WITHOUT_DENIAL;
       }
       const value = decision as {
         start?: unknown;
         state?: unknown;
         reason?: unknown;
+        denial?: unknown;
       };
       const start = value.start;
       if (start === true) {
-        return { from: "queued", to: "running" };
+        return { kind: "start" };
       }
+      const given = value.denial;
+      const denial = ENFORCEMENT_DENIAL_REASONS.find((item) => item === given);
       const state = value.state;
       const reason = value.reason;
       if (
@@ -1293,11 +1377,15 @@ export function createRunSupervisor(
         (state === "failed" || state === "cancelled") &&
         startReasonAllowed(reason)
       ) {
-        return { from: "queued", to: state, reason };
+        return {
+          kind: "end",
+          transition: { from: "queued", to: state, reason },
+          denial: denial ?? null,
+        };
       }
-      return null;
+      return { kind: "wait", denial: denial ?? null };
     } catch {
-      return null;
+      return WAIT_WITHOUT_DENIAL;
     }
   }
 
@@ -1432,15 +1520,17 @@ export function createRunSupervisor(
       // Asked immediately before each start (ADR 0015), also after a wait
       // behind another run or a `rate_limited`.
       const decided = askBeforeStart(start.held);
-      if (decided === null) {
-        log("The check before a run start failed; the run waits.");
-        dropUntilReload(entry);
+      if (decided.kind === "wait") {
+        log(
+          `The check before a run start did not allow it (${decided.denial ?? "no_decision"}); the run waits.`,
+        );
+        waitBeforeStart(entry);
         continue;
       }
-      if (decided.to === "running") {
+      if (decided.kind === "start") {
         send(entry, transition, purpose, start);
       } else {
-        send(entry, decided, "refuse", null);
+        send(entry, decided.transition, "refuse", null);
       }
       return;
     }
@@ -1529,7 +1619,22 @@ export function createRunSupervisor(
         start: null,
       };
     } else if (stage.start !== null && runState === "running") {
-      startExecution(entry, stage.start);
+      // The grants may have changed while the start was on its way: asked
+      // again before the executor starts. See "The check once the start is
+      // acknowledged".
+      const decided = askBeforeStart(stage.start.held);
+      if (decided.kind === "start") {
+        startExecution(entry, stage.start);
+      } else {
+        const stop = stopOfDenial(decided.denial ?? "check_failed");
+        log(`A run was stopped on this device (${stop.reason ?? stop.to}).`);
+        entry.stage = {
+          kind: "due",
+          transition: stop,
+          purpose: "finish",
+          start: null,
+        };
+      }
     } else if (isTerminalRunState(runState)) {
       entries.delete(entry.runId);
     } else {
@@ -1685,6 +1790,7 @@ export function createRunSupervisor(
       }
       entries.clear();
       dropped.clear();
+      startWaits.clear();
     },
   });
 }

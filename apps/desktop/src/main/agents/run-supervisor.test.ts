@@ -28,7 +28,11 @@ import {
   type UserId,
   type WorkspaceId,
 } from "@mymandev/protocol";
-import type { PermissionRequest } from "@mymandev/permissions";
+import {
+  type GrantRecord,
+  GrantRecordSchema,
+  type PermissionRequest,
+} from "@mymandev/permissions";
 import { expect, test } from "vitest";
 import type {
   AccountStatus,
@@ -40,12 +44,17 @@ import type {
 } from "../api-reads.ts";
 import type { BuildClientEvent, ServerMessage } from "../connection/client.ts";
 import {
+  createPermissionEnforcement,
   ENFORCEMENT_DENIAL_REASONS,
   type EnforcementDecision,
   type EnforcementDenialReason,
   type HeldRun,
+  type PermissionEnforcement,
 } from "../permissions/enforcement.ts";
+import { createMemoryEnforcementRecorder } from "../permissions/memory-recorder.ts";
+import type { DeviceSessionState } from "../session/session.ts";
 import { HOST_RUN_ACK_TIMEOUT_MS } from "./host-run.ts";
+import { createProviderUseStartCheck } from "./run-start-check.ts";
 import {
   createRunExecutorRegistry,
   PRODUCTION_RUN_EXECUTORS,
@@ -55,6 +64,7 @@ import {
 } from "./run-executor.ts";
 import {
   createRunSupervisor,
+  denialEnd,
   HOST_RUN_REASONS,
   RUN_SUPERVISOR_ABORT_WATCHDOG_MS,
   SIGN_IN_TIMER_STEP_MS,
@@ -271,7 +281,14 @@ interface HarnessOptions {
   readonly executors?: Partial<Record<ProviderKind, FakeExecutor>>;
   readonly reserved?: readonly AgentId[];
   readonly beforeStart?: (run: HeldRun) => RunStartDecision;
+  /**
+   * Whether `beforeStart` is the production check of `provider.use` on the
+   * fake enforcement point, which answers `enforcementAnswer`.
+   */
+  readonly providerUseCheck?: boolean;
   readonly withoutEnforcement?: boolean;
+  /** An enforcement point instead of the fake one, such as the real one. */
+  readonly enforcement?: Pick<PermissionEnforcement, "check" | "recheck">;
   /** Whether the activity is ready and live at the start; true by default. */
   readonly live?: boolean;
   readonly projectId?: ProjectId | null;
@@ -391,17 +408,26 @@ class Harness {
       executors: createRunExecutorRegistry(executors),
       ...(options.withoutEnforcement === true
         ? {}
-        : {
-            enforcement: {
+        : options.enforcement !== undefined
+          ? { enforcement: options.enforcement }
+          : {
+              enforcement: {
+                check: (held: HeldRun, request: unknown) =>
+                  this.decide(held, request, "check"),
+                recheck: (held: HeldRun, request: unknown) =>
+                  this.decide(held, request, "recheck"),
+              },
+            }),
+      ...(options.providerUseCheck === true
+        ? {
+            beforeStart: createProviderUseStartCheck({
               check: (held: HeldRun, request: unknown) =>
                 this.decide(held, request, "check"),
-              recheck: (held: HeldRun, request: unknown) =>
-                this.decide(held, request, "recheck"),
-            },
-          }),
-      ...(options.beforeStart === undefined
-        ? {}
-        : { beforeStart: options.beforeStart }),
+            }),
+          }
+        : options.beforeStart === undefined
+          ? {}
+          : { beforeStart: options.beforeStart }),
       reservedAgentIds: options.reserved ?? [],
       scheduleTimer: (callback, delayMs) => {
         const timer: Timer = {
@@ -793,8 +819,9 @@ test("a queued run of an agent that this device hosts runs on its executor and c
   expect(execution.signal.aborted).toBe(false);
   expect(Object.isFrozen(execution)).toBe(true);
   expect(Object.isFrozen(execution.run)).toBe(true);
-  // No `provider.use` check before the start: the enforcement point was
-  // not called (the seam `beforeStart` waits for the Project Manager).
+  // The supervisor itself calls the enforcement point before a start only
+  // through `beforeStart`, which defaults to allowing every start; the
+  // check of `provider.use` is the `beforeStart` that `index.ts` passes in.
   expect(h.enforcementCalls).toEqual([]);
 
   h.claude.last.resolve({ outcome: "completed" });
@@ -1932,7 +1959,10 @@ test("beforeStart is asked with the held run immediately before each start, and 
   // only when it goes, not when it was decided.
   expect(asked).toEqual([[runId(1), 0]]);
   h.ackAndStep();
+  // Agent A's hook is asked again once its start is acknowledged, before
+  // its executor starts.
   expect(asked).toEqual([
+    [runId(1), 0],
     [runId(1), 0],
     [runId(2), STEP],
   ]);
@@ -1982,6 +2012,10 @@ test("an answer of beforeStart that is not a decision makes the run wait, and ne
     { start: "true" },
     { start: false },
     { start: false, state: "completed", reason: "done" },
+    // An explicit wait, with a denial or without one.
+    { start: "wait" },
+    { start: "wait", denial: "store_unusable" },
+    { start: "wait", denial: "not a reason" },
     new Proxy(
       {},
       {
@@ -2033,6 +2067,438 @@ test("the reason of beforeStart is sent only when it is a code that the server d
   }
 });
 
+// The check of provider.use before a start, on the fake enforcement point
+// (D13 and the decision of the Project Manager of 2026-11-25).
+
+/** The `check` calls of the fake enforcement point. */
+function checks(h: Harness): number {
+  return h.enforcementCalls.filter((call) => call.purpose === "check").length;
+}
+
+test("before a start, every denial but no_grant leaves the run queued, and a change of the grants checks it again", async () => {
+  const reasons = ENFORCEMENT_DENIAL_REASONS.filter(
+    (reason) => reason !== "no_grant",
+  );
+  // The checks that cannot be made and the sign-in denials are among them.
+  for (const reason of [
+    "store_unusable",
+    "clock_invalid",
+    "check_failed",
+    "signed_out",
+    "sign_in_invalid",
+    "device_unknown",
+    "not_this_device",
+  ] as const) {
+    expect(reasons).toContain(reason);
+  }
+  for (const reason of reasons) {
+    const h = new Harness({ runs: [run(1, "queued")], providerUseCheck: true });
+    h.enforcementAnswer = reason;
+    await h.answerProviders();
+    // Nothing is sent and nothing starts: the run stays queued.
+    expect(h.sent, reason).toEqual([]);
+    expect(h.claude.calls, reason).toEqual([]);
+    expect(h.runState(1), reason).toBe("queued");
+    expect(checks(h), reason).toBe(1);
+    // No busy loop: nothing is read or checked again until a change or the
+    // reload that the supervisor asks for after its backoff.
+    h.advance(RUN_SUPERVISOR_RELOAD_DELAY_MS - 1);
+    expect(h.providerReads, reason).toEqual([]);
+    expect(checks(h), reason).toBe(1);
+    expect(h.reloadRequests, reason).toEqual([]);
+    h.advance(1);
+    expect(h.reloadRequests, reason).toEqual([RUN_SUPERVISOR_RELOAD_DELAY_MS]);
+
+    // A change of the grants decides the run again; still denied, it waits.
+    h.grantsChanged();
+    await h.answerProviders();
+    expect(h.sent, reason).toEqual([]);
+    expect(checks(h), reason).toBe(2);
+
+    // Allowed at the next change: it starts.
+    h.enforcementAnswer = null;
+    h.grantsChanged();
+    await h.answerProviders();
+    expect(h.walk(), reason).toEqual(["1 queued>running"]);
+    h.ack();
+    expect(h.claude.calls, reason).toHaveLength(1);
+    expect(h.violations, reason).toEqual([]);
+  }
+});
+
+test("while an agent's run waits after the check before its start, another evaluation neither reads nor checks it again, and another agent's run still starts", async () => {
+  const asked: AgentId[] = [];
+  const h = new Harness({
+    runs: [run(1, "queued"), run(2, "queued", { agent: AGENT_B })],
+    beforeStart: (held) => {
+      asked.push(held.agentId);
+      return held.agentId === AGENT_A
+        ? { start: "wait", denial: "store_unusable" }
+        : { start: true };
+    },
+  });
+  await h.answerProviders();
+  // Agent A's run waits; agent B's start goes.
+  expect(h.walk()).toEqual(["2 queued>running"]);
+  h.ackAndStep();
+  expect(h.claude.calls.map((call) => call.execution.run.runId)).toEqual([
+    runId(2),
+  ]);
+  const askedOfA = () => asked.filter((agent) => agent === AGENT_A).length;
+  expect(askedOfA()).toBe(1);
+  // Unrelated evaluations: changes of the activity and of the account.
+  h.changed();
+  h.setAccount(h.accountStatus);
+  await settle();
+  h.advance(RUN_SUPERVISOR_RELOAD_DELAY_MS - STEP - 1);
+  h.changed();
+  await settle();
+  // Agent A is busy while its run waits: no read of the provider
+  // connections and no new check until a change of the grants or a reload.
+  expect(h.providerReads).toEqual([]);
+  expect(askedOfA()).toBe(1);
+  expect(h.runState(1)).toBe("queued");
+  expect(h.walk()).toEqual(["2 queued>running"]);
+  expect(h.violations).toEqual([]);
+});
+
+test("before a start, no_grant fails the run at once with provider_use_denied", async () => {
+  const h = new Harness({ runs: [run(1, "queued")], providerUseCheck: true });
+  h.enforcementAnswer = "no_grant";
+  await h.answerProviders();
+  expect(h.walk()).toEqual([
+    `1 queued>failed ${HOST_RUN_REASONS.providerUseDenied}`,
+  ]);
+  h.ackAndStep();
+  h.advance(RUN_SUPERVISOR_RELOAD_MAX_MS);
+  expect(h.claude.calls).toEqual([]);
+  expect(h.runState(1)).toBe("failed");
+});
+
+test("a run that waits after the check before its start is checked again after each reload, with the reload backoff", async () => {
+  const h = new Harness({ runs: [run(1, "queued")], providerUseCheck: true });
+  h.enforcementAnswer = "store_unusable";
+  await h.answerProviders();
+  h.advance(RUN_SUPERVISOR_RELOAD_DELAY_MS);
+  expect(h.reloadRequests).toEqual([RUN_SUPERVISOR_RELOAD_DELAY_MS]);
+  // The reload decides the run again; still denied, the next request waits
+  // twice as long.
+  h.reload();
+  await h.answerProviders();
+  expect(checks(h)).toBe(2);
+  expect(h.sent).toEqual([]);
+  const since = h.time;
+  h.advance(2 * RUN_SUPERVISOR_RELOAD_DELAY_MS);
+  expect(h.reloadRequests).toEqual([
+    RUN_SUPERVISOR_RELOAD_DELAY_MS,
+    since + 2 * RUN_SUPERVISOR_RELOAD_DELAY_MS,
+  ]);
+  // Allowed after the next reload: it starts.
+  h.enforcementAnswer = null;
+  h.reload();
+  await h.answerProviders();
+  expect(h.walk()).toEqual(["1 queued>running"]);
+  h.ack();
+  expect(h.claude.calls).toHaveLength(1);
+  expect(h.violations).toEqual([]);
+});
+
+test("an enforcement point that throws at a start leaves the run queued, and the run starts once it answers", async () => {
+  let broken = true;
+  const enforcement = {
+    check: (_held: HeldRun, request: unknown): EnforcementDecision => {
+      if (broken) {
+        throw new Error("broken");
+      }
+      return { allowed: true, request: request as PermissionRequest };
+    },
+    recheck: (_held: HeldRun, request: unknown): EnforcementDecision => ({
+      allowed: true,
+      request: request as PermissionRequest,
+    }),
+  };
+  const h = new Harness({
+    runs: [run(1, "queued")],
+    enforcement,
+    beforeStart: createProviderUseStartCheck(enforcement),
+  });
+  await h.answerProviders();
+  expect(h.sent).toEqual([]);
+  expect(h.runState(1)).toBe("queued");
+  broken = false;
+  h.grantsChanged();
+  await h.answerProviders();
+  expect(h.walk()).toEqual(["1 queued>running"]);
+  h.ack();
+  expect(h.claude.calls).toHaveLength(1);
+});
+
+test("once a start is acknowledged, provider.use is checked again before the executor starts, and a denial ends the running run as a re-check would", async () => {
+  for (const reason of ENFORCEMENT_DENIAL_REASONS) {
+    const h = new Harness({ runs: [run(1, "queued")], providerUseCheck: true });
+    await h.answerProviders();
+    expect(h.walk(), reason).toEqual(["1 queued>running"]);
+    expect(checks(h), reason).toBe(1);
+    // Denied while the start was on its way.
+    h.enforcementAnswer = reason;
+    h.ack();
+    expect(checks(h), reason).toBe(2);
+    expect(h.claude.calls, reason).toEqual([]);
+    h.advance(STEP);
+    const end = denialEnd(reason);
+    expect(h.walk(), reason).toEqual([
+      "1 queued>running",
+      `1 running>${end.state} ${end.reason}`,
+    ]);
+    expect(h.violations, reason).toEqual([]);
+  }
+  // A hook that throws at that point counts as a check that failed.
+  let calls = 0;
+  const g = new Harness({
+    runs: [run(1, "queued")],
+    beforeStart: () => {
+      calls += 1;
+      if (calls > 1) {
+        throw new Error("broken");
+      }
+      return { start: true };
+    },
+  });
+  await g.answerProviders();
+  g.ack();
+  g.advance(STEP);
+  expect(g.claude.calls).toEqual([]);
+  expect(g.walk()).toEqual([
+    "1 queued>running",
+    `1 running>failed ${HOST_RUN_REASONS.grantCheckUnavailable}`,
+  ]);
+});
+
+// The production wiring: the real enforcement point, the memory recorder,
+// and the check of `provider.use` before a start (D13 of 2026-11-25).
+
+const GRANT_ID = "0192f0a0-7b3c-7d4e-8f50-0000000000a9";
+
+/** An active grant of `provider.use` on the Claude connection to `agentId`. */
+function providerUseGrant(agentId: AgentId): GrantRecord {
+  return GrantRecordSchema.parse({
+    grant: {
+      id: GRANT_ID,
+      projectId: PROJECT_1,
+      granteeAgentId: agentId,
+      capability: "provider.use",
+      providerConnectionId: CLAUDE_CONNECTION,
+      grantedByUserId: USER_ID,
+      createdAt: new Date(AT).toISOString(),
+      expiresAt: null,
+      revokedAt: null,
+      revokedByUserId: null,
+    },
+    facts: {
+      agent: { id: agentId, hostDeviceId: DEVICE_ID, disabledAt: null },
+      hostDevice: { id: DEVICE_ID, revokedAt: null },
+      project: { id: PROJECT_1, workspaceId: WS_A },
+      grantorMembership: {
+        workspaceId: WS_A,
+        userId: USER_ID,
+        removedAt: null,
+      },
+      providerConnection: {
+        id: CLAUDE_CONNECTION,
+        hostDeviceId: DEVICE_ID,
+        removedAt: null,
+      },
+    },
+  });
+}
+
+/**
+ * A harness wired as `index.ts` wires the supervisor: the real enforcement
+ * point with a grant store whose records the test sets, the device
+ * session's state of the harness's account, the device from the account
+ * status, the harness's wall clock, the memory recorder, and the check of
+ * `provider.use` as `beforeStart`.
+ */
+function wiredHarness(options: {
+  readonly runs: readonly AgentRunListItem[];
+  readonly records: readonly GrantRecord[];
+  readonly signInEnd?: number;
+}) {
+  const store = { usable: true, records: options.records };
+  const recorder = createMemoryEnforcementRecorder();
+  let h: Harness | null = null;
+  const enforcement = createPermissionEnforcement({
+    now: () => new Date(WALL_START + (h?.time ?? 0)),
+    grantStore: { read: () => ({ ...store }) },
+    sessionState: (): DeviceSessionState => {
+      const account = h?.accountStatus.account;
+      if (account?.kind !== "signed_in") {
+        return { kind: "no_device" };
+      }
+      return {
+        kind: "signed_in",
+        account: {
+          deviceId: account.deviceId as DeviceId,
+          userId: USER_ID,
+          login: account.login,
+          displayName: account.displayName,
+          signInExpiresAt: account.signInExpiresAt,
+        },
+      };
+    },
+    thisDevice: () =>
+      h?.accountStatus.account.kind === "signed_in"
+        ? (h.accountStatus.account.deviceId as DeviceId)
+        : null,
+    recorder,
+  });
+  h = new Harness({
+    runs: options.runs,
+    accountStatus: accountStatus(DEVICE_ID, options.signInEnd),
+    enforcement,
+    beforeStart: createProviderUseStartCheck(enforcement),
+  });
+  return { h, store, recorder };
+}
+
+test("wired: a run whose agent lacks provider.use fails at once with provider_use_denied, and one with the grant starts", async () => {
+  const { h, recorder } = wiredHarness({
+    runs: [run(1, "queued"), run(2, "queued", { agent: AGENT_B })],
+    records: [providerUseGrant(AGENT_A)],
+  });
+  await h.answerProviders();
+  expect(h.walk()).toEqual(["1 queued>running"]);
+  h.ackAndStep();
+  expect(h.walk()).toEqual([
+    "1 queued>running",
+    `2 queued>failed ${HOST_RUN_REASONS.providerUseDenied}`,
+  ]);
+  h.ackAndStep();
+  // Only the run with the grant started; the other did not stay queued.
+  expect(h.claude.calls).toHaveLength(1);
+  expect(h.claude.last.execution.run.runId).toBe(runId(1));
+  expect(h.runState(2)).toBe("failed");
+  // The denial was recorded; the allowed provider.use was not.
+  expect(recorder.records()).toEqual([
+    {
+      kind: "denied",
+      reason: "no_grant",
+      capability: "provider.use",
+      runId: runId(2),
+      agentId: AGENT_B,
+      repositoryId: REPOSITORY,
+      providerConnectionId: CLAUDE_CONNECTION,
+      at: new Date(WALL_START + STEP).toISOString(),
+    },
+  ]);
+  expect(h.violations).toEqual([]);
+});
+
+test("wired: a grant store that cannot be read leaves the run queued, and it starts once the store is usable with the grant", async () => {
+  const { h, store, recorder } = wiredHarness({
+    runs: [run(1, "queued")],
+    records: [providerUseGrant(AGENT_A)],
+  });
+  store.usable = false;
+  await h.answerProviders();
+  expect(h.sent).toEqual([]);
+  expect(h.claude.calls).toEqual([]);
+  expect(h.runState(1)).toBe("queued");
+  expect(
+    recorder
+      .records()
+      .map((entry) => (entry.kind === "denied" ? entry.reason : entry.kind)),
+  ).toEqual(["store_unusable"]);
+  // The store becomes usable: the grant store tells of the change.
+  store.usable = true;
+  h.grantsChanged();
+  await h.answerProviders();
+  expect(h.walk()).toEqual(["1 queued>running"]);
+  h.ack();
+  expect(h.claude.calls).toHaveLength(1);
+  expect(h.violations).toEqual([]);
+});
+
+test("wired: a grant revoked while the start is on its way stops the run before its executor starts", async () => {
+  const { h, store, recorder } = wiredHarness({
+    runs: [run(1, "queued")],
+    records: [providerUseGrant(AGENT_A)],
+  });
+  await h.answerProviders();
+  expect(h.walk()).toEqual(["1 queued>running"]);
+  // Revoked before the acknowledgement: nothing executes yet to re-check.
+  store.records = [];
+  h.grantsChanged();
+  h.ack();
+  expect(h.claude.calls).toEqual([]);
+  h.advance(STEP);
+  expect(h.walk()).toEqual([
+    "1 queued>running",
+    `1 running>cancelled ${HOST_RUN_REASONS.grantInactive}`,
+  ]);
+  expect(
+    recorder
+      .records()
+      .map((entry) => (entry.kind === "denied" ? entry.reason : entry.kind)),
+  ).toEqual(["no_grant"]);
+  expect(h.violations).toEqual([]);
+});
+
+test("wired: a change of the grants re-checks a held action, and a revoked grant cancels the run", async () => {
+  const { h, store, recorder } = wiredHarness({
+    runs: [run(1, "queued")],
+    records: [providerUseGrant(AGENT_A)],
+  });
+  await h.answerProviders();
+  h.ack();
+  const { execution } = h.claude.last;
+  const use = {
+    capability: "provider.use",
+    agentId: AGENT_A,
+    providerConnectionId: CLAUDE_CONNECTION,
+  };
+  expect(execution.check(use).allowed).toBe(true);
+  // A change that keeps the grant changes nothing.
+  h.grantsChanged();
+  expect(execution.signal.aborted).toBe(false);
+
+  store.records = [];
+  h.grantsChanged();
+  expect(execution.signal.aborted).toBe(true);
+  h.advance(STEP);
+  expect(h.walk().at(-1)).toBe(
+    `1 running>cancelled ${HOST_RUN_REASONS.grantInactive}`,
+  );
+  expect(recorder.records().map((entry) => entry.kind)).toEqual(["denied"]);
+  expect(h.violations).toEqual([]);
+});
+
+test("wired: the end of the sign-in still stops the run, reported cancelled with signed_out", async () => {
+  const { h } = wiredHarness({
+    runs: [run(1, "queued")],
+    records: [providerUseGrant(AGENT_A)],
+    signInEnd: WALL_START + 60_000,
+  });
+  await h.answerProviders();
+  h.ack();
+  const { execution } = h.claude.last;
+  h.advance(60_000 - h.time - 1);
+  expect(execution.signal.aborted).toBe(false);
+  h.advance(1);
+  expect(execution.signal.aborted).toBe(true);
+  h.advance(STEP);
+  expect(h.walk().at(-1)).toBe(
+    `1 running>cancelled ${HOST_RUN_REASONS.signedOut}`,
+  );
+  h.ackAndStep();
+  // Nothing starts after the end: a queued run waits for a new sign-in.
+  h.runs.push(run(2, "queued", { createdAfter: 60 }));
+  h.reload();
+  h.advance(60_000);
+  expect(h.providerReads).toEqual([]);
+  expect(h.violations).toEqual([]);
+});
+
 // Close.
 
 test("close aborts every execution, sends nothing more, and stops listening", async () => {
@@ -2067,7 +2533,11 @@ test("no log holds an ID or a name, and the files never log with console", () =>
     expect(text).not.toContain(value);
   }
   expect(text).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-/i);
-  for (const file of ["run-supervisor.ts", "run-executor.ts"]) {
+  for (const file of [
+    "run-supervisor.ts",
+    "run-executor.ts",
+    "run-start-check.ts",
+  ]) {
     const source = readFileSync(path.join(moduleFolder, file), "utf8");
     expect(source).not.toMatch(/\bconsole\./);
   }

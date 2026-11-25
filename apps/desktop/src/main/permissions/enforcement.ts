@@ -15,8 +15,8 @@
 // the injected recorder. `recheck` decides an action that is already
 // running again (a held action, after a change of the grants): it decides
 // exactly like `check` and records its denials, but it records no start,
-// because nothing starts. Default until the Project Manager decides (#55,
-// review of #348 on #35). A record holds IDs, a capability name, a reason
+// because nothing starts (#55, review of #348 on #35; accepted by the
+// Project Manager on 2026-11-25). A record holds IDs, a capability name, a reason
 // from a closed list, and a time, never a path, a command, or a value that
 // the requester sent.
 //
