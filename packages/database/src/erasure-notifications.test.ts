@@ -735,7 +735,7 @@ test("the largest notification of each kind stays within the bound, and one over
 // that can connect can send on the channel, so only what the database
 // confirms is replayed.
 
-test("the database confirms every notification of a real erasure, with the account's revoked devices and the current approvers; it confirms none for an account that is not erased, and none whose item the erasure did not change", async () => {
+test("the database confirms every notification of a real erasure, with the account's revoked devices and the current approvers; it confirms none for an account that is not erased, none for an item of another account, and none with another workspace", async () => {
   const db = database();
   const owner = await account("Olga");
   const erin = await account("Erin");
@@ -848,9 +848,10 @@ test("the database confirms every notification of a real erasure, with the accou
   }
 
   // Notifications that name Erin, whose erasure is real, but an item that
-  // her erasure did not change, are confirmed by none: Bob's items in the
-  // erasure's states, and Erin's agent with another owner's person or in
-  // another workspace.
+  // is not hers are confirmed by none: Bob's items in the erasure's states,
+  // and Erin's agent with another owner's person or in another workspace.
+  // Each of Erin's real notifications with another workspace is confirmed
+  // by none either.
   const at = ERASED_AT.toISOString();
   const forged: ErasureNotification[] = [
     {
@@ -906,7 +907,27 @@ test("the database confirms every notification of a real erasure, with the accou
       joinRequestId: bobsRequest,
       approvers: [asked.ownerPerson],
     },
+    ...notified
+      .filter(
+        (notification) =>
+          notification.kind !== "account_erased" &&
+          notification.kind !== "agent_disabled",
+      )
+      .map((notification) => ({
+        ...notification,
+        workspaceId: other.workspaceId,
+      })),
   ] as ErasureNotification[];
+  assert.deepEqual(
+    forged.slice(-5).map((notification) => notification.kind),
+    [
+      "membership_ended",
+      "grant_revoked",
+      "run_cancelled",
+      "run_cancelled",
+      "join_request_withdrawn",
+    ],
+  );
   for (const notification of forged) {
     assert.deepEqual(
       await checkErasureNotification(db, notification),

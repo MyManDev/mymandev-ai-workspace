@@ -33,8 +33,12 @@ import type { ErasureNotification } from "./erasure-notifications.ts";
 // The times, the previous state, and the reason of a notification are not
 // checked, and nothing tells a first delivery from a repeat: a role that
 // can connect can still send a real erasure's notification again, or with
-// those fields changed, but nothing about an account that is not erased or
-// an item that its erasure did not change.
+// those fields changed. Nor does the check tell whether the erasure itself
+// ended the item: an item of the erased account that ended before the
+// erasure, such as a person removed earlier, passes too, and can be
+// replayed as a stale event about that account. A role that can connect can
+// forge nothing about an account that is not erased, or about an item of
+// another account.
 
 /** What the database confirms of one notification. */
 export type ErasureCheck = Readonly<{

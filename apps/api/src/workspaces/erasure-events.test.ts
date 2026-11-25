@@ -633,7 +633,7 @@ test("a malformed, unknown, or foreign notification is ignored and logged withou
   );
 });
 
-test("forged notifications of every kind, for an account that is not erased or for items that an erasure did not change, replay nothing and close nothing; a real erasure afterwards still replays everything", async (t) => {
+test("forged notifications of every kind, for an account that is not erased or for items of another account, replay nothing and close nothing; a real erasure afterwards still replays everything", async (t) => {
   assert.ok(testDatabase);
   const logLines: string[] = [];
   const { connections, observed, account } = await instance(t, { logLines });
