@@ -47,7 +47,7 @@ function imports(name: string, module: string): boolean {
   );
 }
 
-test("the entry point gives the enforcement point the wall clock, the grant store, the account's session, the signed-in device, and the memory recorder", () => {
+test("the entry point gives the enforcement point the wall clock, the grant store, the account's session, the signed-in device, and the file recorder", () => {
   const given = lines(
     callArguments("enforcement", "createPermissionEnforcement"),
   );
@@ -57,21 +57,67 @@ test("the entry point gives the enforcement point the wall clock, the grant stor
       "grantStore,",
       "sessionState: () => account.sessionState(),",
       "thisDevice: () => signedInDevice(account.status()) as DeviceId | null,",
-      "recorder: createMemoryEnforcementRecorder(),",
+      "recorder: enforcementRecorder,",
     ]),
   );
   expect(
     imports("createPermissionEnforcement", "./permissions/enforcement.ts"),
   ).toBe(true);
   expect(imports("signedInDevice", "./permissions/grant-store.ts")).toBe(true);
-  expect(
-    imports(
-      "createMemoryEnforcementRecorder",
-      "./permissions/memory-recorder.ts",
-    ),
-  ).toBe(true);
   // The grant store is the one that the supervisor listens to.
   expect(ENTRY).toMatch(/\bconst grantStore = createGrantStore\(\{/);
+});
+
+test("the entry point records to the append-only file recorder in the local data folder of the device key, closes it at quit, and wires no recorder in memory", () => {
+  expect(ENTRY.match(/\bcreateSystemEnforcementRecorder\(/g)).toHaveLength(1);
+  expect(ENTRY).toMatch(
+    /\n {2}const enforcementRecorder = createSystemEnforcementRecorder\(\(message\) =>\n {4}console\.info\(message\),\n {2}\);\n/,
+  );
+  expect(
+    imports(
+      "createSystemEnforcementRecorder",
+      "./permissions/file-recorder-system.ts",
+    ),
+  ).toBe(true);
+  // The system module records to the record folder of the local data folder
+  // that the device key and the repository links use (`deviceKeyFolder`,
+  // decision of 2026-11-25), resolved whenever a file is opened.
+  const system = withoutComments(
+    readFileSync(
+      new URL("./permissions/file-recorder-system.ts", import.meta.url),
+      "utf8",
+    ),
+  );
+  expect(system).toContain(
+    [
+      "  return createFileEnforcementRecorder({",
+      "    folder: () =>",
+      "      path.join(",
+      "        deviceKeyFolder({",
+      "          platform: process.platform,",
+      "          env: process.env,",
+      '          userData: app.getPath("userData"),',
+      "        }),",
+      "        ENFORCEMENT_RECORD_FOLDER,",
+      "      ),",
+      "    platform: process.platform,",
+      "    log,",
+      "  });",
+    ].join("\n"),
+  );
+  expect(system).toContain(
+    'import { deviceKeyFolder } from "../device-key/key-folder.ts";',
+  );
+  // One way of choosing the folder: no path of its own.
+  expect(system.match(/getPath\(/g)).toHaveLength(1);
+  expect(system).not.toMatch(/LOCALAPPDATA|APPDATA|appData|homedir/);
+  // It closes at quit, after the services that check, which are added later.
+  expect(ENTRY).toMatch(/\n {2}closables\.add\(enforcementRecorder\);\n/);
+  expect(ENTRY.indexOf("closables.add(enforcementRecorder);")).toBeLessThan(
+    ENTRY.indexOf("const enforcement = "),
+  );
+  // The recorder in memory never fails, so it would never deny a start.
+  expect(ENTRY).not.toMatch(/memory-recorder|MemoryEnforcementRecorder/);
 });
 
 test("the entry point gives the host run supervisor the enforcement point and the check of provider.use before a start", () => {
