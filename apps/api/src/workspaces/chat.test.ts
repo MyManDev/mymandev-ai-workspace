@@ -11,6 +11,7 @@ import {
 import {
   type ChatMessage,
   ChatHistoryResponseSchema,
+  ChatMessageResponseSchema,
   type ConnectionId,
   type DeviceId,
   decodeClientEvent,
@@ -18,6 +19,7 @@ import {
   type EventId,
   type MemberId,
   type MemberRole,
+  type MessageId,
   newId,
   type ProjectId,
   type ServerEvent,
@@ -788,4 +790,208 @@ test("an unknown project, a project of another workspace, a malformed project ID
   for (const route of ["agents", "runs"]) {
     assert.equal((await read(ada, projectId, route)).statusCode, 200);
   }
+});
+
+/** `GET /projects/:projectId/messages/:messageId` as the account (#34). */
+function oneMessage(account: Account, projectId: string, messageId: string) {
+  return account.app.inject({
+    method: "GET",
+    url: `/projects/${projectId}/messages/${messageId}`,
+    headers: { authorization: `Bearer ${account.token}` },
+  });
+}
+
+/** Stores a message of the account in the project, as a send stores it. */
+async function postedBy(
+  account: Account,
+  workspaceId: WorkspaceId,
+  projectId: ProjectId,
+  body: string,
+): Promise<ChatMessage> {
+  const result = await postChatMessage(database(), {
+    actor: {
+      workspaceId,
+      userId: account.device.userId,
+      deviceId: account.device.deviceId as DeviceId,
+    },
+    projectId,
+    eventId: newId<EventId>(),
+    body,
+    now: new Date(),
+  });
+  assert.ok(result.posted, JSON.stringify(result));
+  return result.message;
+}
+
+test("one message answers 200 with the message exactly as the history pages it, to any member, also deleted and of an archived project", async (t) => {
+  const { account } = await instance(t);
+  const ada = await account(3781);
+  const bob = await account(3782);
+  const { workspaceId } = await workspaceOf(ada.device, [bob.device]);
+  const projectId = await projectIn(workspaceId, ada.device);
+  const first = await postedBy(ada, workspaceId, projectId, "Hello");
+  await postedBy(bob, workspaceId, projectId, "Line one\nLine two");
+
+  const response = await history(bob, projectId);
+  assert.equal(response.statusCode, 200, response.body);
+  const page = ChatHistoryResponseSchema.parse(response.json()).messages;
+  assert.equal(page.length, 2);
+  for (const listed of page) {
+    for (const reader of [ada, bob]) {
+      const answer = await oneMessage(reader, projectId, listed.id);
+      assert.equal(answer.statusCode, 200, answer.body);
+      // The body is the page's item, field for field, and nothing else.
+      assert.deepEqual(answer.json(), { message: listed });
+      assert.deepEqual(ChatMessageResponseSchema.parse(answer.json()), {
+        message: listed,
+      });
+    }
+  }
+
+  // No writer sets `deleted_at` yet: a deleted message shows as the
+  // history shows it, unchanged.
+  await database()
+    .update(messages)
+    .set({ deletedAt: new Date() })
+    .where(eq(messages.id, first.id));
+  const deletedInPage = ChatHistoryResponseSchema.parse(
+    (await history(bob, projectId)).json(),
+  ).messages.find((message) => message.id === first.id);
+  assert.deepEqual(deletedInPage, first);
+  const deleted = await oneMessage(bob, projectId, first.id);
+  assert.equal(deleted.statusCode, 200, deleted.body);
+  assert.deepEqual(deleted.json(), { message: first });
+
+  await database()
+    .update(projects)
+    .set({ archivedAt: new Date() })
+    .where(eq(projects.id, projectId));
+  const archived = await oneMessage(bob, projectId, first.id);
+  assert.equal(archived.statusCode, 200, archived.body);
+  assert.deepEqual(archived.json(), { message: first });
+});
+
+test("one message refuses in the order of the history: 401 without a token, then the same 404 for a project that the account may not read, then 400 for a malformed message ID, then the same 404 for a message that the project's chat does not have", async (t) => {
+  const { account } = await instance(t);
+  const ada = await account(3791);
+  const bob = await account(3792);
+  const outsider = await account(3793);
+  const { workspaceId, memberIds } = await workspaceOf(ada.device, [
+    bob.device,
+  ]);
+  const projectId = await projectIn(workspaceId, ada.device);
+  const webId = await projectIn(workspaceId, ada.device, "Web");
+  const message = await postedBy(bob, workspaceId, projectId, "Hello");
+  const onWeb = await postedBy(ada, workspaceId, webId, "Elsewhere");
+  // The outsider is an active member of another workspace, with a project
+  // and a message.
+  const elsewhere = await workspaceOf(outsider.device);
+  const ownProject = await projectIn(elsewhere.workspaceId, outsider.device);
+  const foreign = await postedBy(
+    outsider,
+    elsewhere.workspaceId,
+    ownProject,
+    "Hi",
+  );
+  assert.equal(
+    (await oneMessage(outsider, ownProject, foreign.id)).statusCode,
+    200,
+  );
+  assert.equal((await oneMessage(bob, webId, onWeb.id)).statusCode, 200);
+
+  // 1. Authentication comes first: no token, a malformed one, and another
+  // scheme get 401, whatever the IDs.
+  for (const authorization of [
+    undefined,
+    "Bearer not-a-token",
+    `Basic ${bob.token}`,
+  ]) {
+    for (const url of [
+      `/projects/${projectId}/messages/${message.id}`,
+      "/projects/not-an-id/messages/not-an-id",
+    ]) {
+      const refused = await bob.app.inject({
+        method: "GET",
+        url,
+        headers: authorization === undefined ? {} : { authorization },
+      });
+      assert.equal(refused.statusCode, 401, `${authorization} ${url}`);
+      assert.equal((refused.json() as { code: string }).code, "unauthorized");
+    }
+  }
+
+  // The 404 of the history for a project that the account may not read.
+  const listRefused = await history(outsider, projectId);
+  assert.equal(listRefused.statusCode, 404);
+  assert.deepEqual(listRefused.json(), NOT_FOUND);
+
+  // 2. The membership check comes before the path is validated: a
+  // non-member, an unknown project, and a malformed project ID get the
+  // history's 404, whatever the message ID, also a malformed one or a
+  // message of the project.
+  const answers = [];
+  for (const messageId of [
+    message.id,
+    foreign.id,
+    newId<MessageId>(),
+    "not-an-id",
+    message.id.toUpperCase(),
+  ]) {
+    answers.push(
+      await oneMessage(outsider, projectId, messageId),
+      await oneMessage(ada, newId<ProjectId>(), messageId),
+      await oneMessage(ada, "not-an-id", messageId),
+      await oneMessage(outsider, newId<ProjectId>(), messageId),
+    );
+  }
+  // 4. A message that the project's chat does not have gets the same 404:
+  // an unknown ID, a message of another project of the workspace, which the
+  // member may read under that project, and a message of another workspace,
+  // also for its own author, who is no member here.
+  answers.push(
+    await oneMessage(bob, projectId, newId<MessageId>()),
+    await oneMessage(bob, projectId, onWeb.id),
+    await oneMessage(bob, webId, message.id),
+    await oneMessage(bob, projectId, foreign.id),
+    await oneMessage(outsider, projectId, foreign.id),
+  );
+  for (const response of answers) {
+    assert.equal(response.statusCode, 404, response.body);
+    assert.deepEqual(response.json(), NOT_FOUND);
+    assert.equal(response.body, listRefused.body);
+    assert.equal(
+      response.headers["content-type"],
+      listRefused.headers["content-type"],
+    );
+  }
+
+  // 3. A member's malformed message ID is a malformed request: not a
+  // lowercase UUIDv7.
+  for (const messageId of [
+    "not-an-id",
+    message.id.toUpperCase(),
+    "0192f2a0-7c3e-4b00-8000-000000000007",
+    `${message.id}0`,
+  ]) {
+    const refused = await oneMessage(bob, projectId, messageId);
+    assert.equal(refused.statusCode, 400, messageId);
+    assert.equal((refused.json() as { code: string }).code, "bad_request");
+  }
+
+  // A removed member gets the history's 404 for every message, its own
+  // included, also with a malformed message ID; the others still read it.
+  const bobPerson = memberIds[0];
+  assert.ok(bobPerson !== undefined);
+  await removeInDatabase(bobPerson, ada.device);
+  const removedList = await history(bob, projectId);
+  assert.equal(removedList.statusCode, 404);
+  for (const messageId of [message.id, "not-an-id"]) {
+    const removed = await oneMessage(bob, projectId, messageId);
+    assert.equal(removed.statusCode, 404, messageId);
+    assert.equal(removed.body, removedList.body);
+    assert.equal(removed.body, listRefused.body);
+  }
+  const stillRead = await oneMessage(ada, projectId, message.id);
+  assert.equal(stillRead.statusCode, 200, stillRead.body);
+  assert.deepEqual(stillRead.json(), { message });
 });

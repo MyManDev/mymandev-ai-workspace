@@ -385,10 +385,14 @@ test("on every route under /projects/:projectId, a non-member's project, an unkn
       continue;
     }
     covered.push(name);
-    const ask = (app: App, token: string, projectId: string) =>
+    // Every other path parameter is an ID; a malformed one answers 404 too,
+    // because the check comes first.
+    const ask = (app: App, token: string, projectId: string, other?: string) =>
       app.inject({
         method,
-        url: `${path.replace(":projectId", projectId)}?limit=0`,
+        url: `${path
+          .replace(/:(?!projectId\b)[A-Za-z]+/gu, () => other ?? newUuidV7())
+          .replace(":projectId", projectId)}?limit=0`,
         headers: { authorization: `Bearer ${token}` },
       });
     const nonMember = await ask(outsiderApp, outsider.token, project.id);
@@ -399,6 +403,8 @@ test("on every route under /projects/:projectId, a non-member's project, an unkn
       await ask(outsiderApp, outsider.token, "not-an-id"),
       await ask(ownerApp, owner.token, newId<ProjectId>()),
       await ask(ownerApp, owner.token, "not-an-id"),
+      await ask(outsiderApp, outsider.token, project.id, "not-an-id"),
+      await ask(ownerApp, owner.token, newId<ProjectId>(), "not-an-id"),
     ]) {
       assert.equal(other.body, nonMember.body, name);
       assert.equal(
@@ -408,7 +414,7 @@ test("on every route under /projects/:projectId, a non-member's project, an unkn
       );
     }
   }
-  assert.deepEqual(covered, ["listMessages"]);
+  assert.deepEqual(covered, ["listMessages", "getMessage"]);
 });
 
 test("former members are shown as former, and a removed member gets the same 404 as an outsider", async (t) => {
@@ -540,6 +546,7 @@ test("the workspace routes, the project routes, and the device routes share the 
   for (const url of [
     `/workspaces/${newId<WorkspaceId>()}`,
     `/projects/${newId<ProjectId>()}/messages`,
+    `/projects/${newId<ProjectId>()}/messages/${newUuidV7()}`,
     `/projects/${newId<ProjectId>()}/agents`,
     `/projects/${newId<ProjectId>()}/runs`,
   ]) {
