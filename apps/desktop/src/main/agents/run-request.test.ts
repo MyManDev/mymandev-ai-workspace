@@ -59,6 +59,7 @@ const MY_MESSAGE = id(0x1001);
 const THEIR_MESSAGE = id(0x1002);
 const AGENT_MESSAGE = id(0x1003);
 const MISSING_MESSAGE = id(0x1004);
+const FOREIGN_MESSAGE = id(0x1005);
 const RUN = id(0x5001);
 const REPOSITORY = id(0x2001);
 const AT = "2026-11-25T10:00:00.000Z";
@@ -346,6 +347,26 @@ test("each local refusal sends nothing and reloads nothing", async () => {
         return REQUEST;
       },
     ],
+    // A message of another project, although the open project's chat
+    // holds it and the person wrote it.
+    [
+      "message_not_found",
+      (h) => {
+        h.setChat({
+          messages: [
+            ChatMessageSchema.parse({
+              ...message(
+                FOREIGN_MESSAGE,
+                { kind: "member", memberId: ME },
+                4,
+              ),
+              projectId: OTHER_PROJECT,
+            }),
+          ],
+        });
+        return { ...REQUEST, inputMessageId: FOREIGN_MESSAGE };
+      },
+    ],
     // Another person's message, and an agent's.
     ["not_own_message", () => ({ ...REQUEST, inputMessageId: THEIR_MESSAGE })],
     ["not_own_message", () => ({ ...REQUEST, inputMessageId: AGENT_MESSAGE })],
@@ -365,11 +386,14 @@ test("each local refusal sends nothing and reloads nothing", async () => {
   for (const [reason, build] of cases) {
     const h = setup();
     const request = build(h);
-    const result = await h.service.request(request);
+    const pending = h.service.request(request);
+    // Checked before the answer: a request that went out would wait for
+    // an answer that never comes.
+    expect(h.sent, reason).toEqual([]);
+    const result = await pending;
     expect(result, `${reason} ${JSON.stringify(request)}`).toEqual(
       refusedWith(reason),
     );
-    expect(h.sent, reason).toEqual([]);
     expect(h.reloads(), reason).toBe(0);
   }
   // Every local refusal is one of the contract's.
