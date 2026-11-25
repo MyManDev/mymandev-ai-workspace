@@ -344,6 +344,80 @@ test("denies an allowed shell start that cannot be recorded", () => {
   });
 });
 
+test("recheck decides like check and records its denials, but never records a shell start", () => {
+  const harness = setup({ records: [grant("terminal.execute")] });
+  const decision = harness.enforcement.recheck(
+    RUN,
+    request("terminal.execute"),
+  );
+  expect(decision).toEqual({
+    allowed: true,
+    request: {
+      agentId: AGENT_ID,
+      capability: "terminal.execute",
+      repositoryId: REPOSITORY_ID,
+    },
+  });
+  expect(Object.isFrozen(decision)).toBe(true);
+  expect(harness.records).toEqual([]);
+  // A recorder that cannot record changes nothing for a recheck: no start
+  // is recorded, so none can fail.
+  harness.state.recorderThrows = true;
+  expect(
+    harness.enforcement.recheck(RUN, request("terminal.execute")).allowed,
+  ).toBe(true);
+  harness.state.recorderThrows = false;
+  expect(harness.calls.clock).toBe(2);
+  expect(harness.calls.store).toBe(2);
+
+  // Every denial is recorded, as by check.
+  const cases: [() => void, EnforcementDenialReason][] = [
+    [() => (harness.state.records = []), "no_grant"],
+    [() => (harness.state.usable = false), "store_unusable"],
+    [
+      () => {
+        harness.state.usable = true;
+        harness.state.records = [grant("terminal.execute")];
+        harness.state.session = signedIn({ signInExpiresAt: iso(NOW) });
+      },
+      "sign_in_invalid",
+    ],
+  ];
+  for (const [change, reason] of cases) {
+    change();
+    const before = harness.records.length;
+    expect(
+      harness.enforcement.recheck(RUN, request("terminal.execute")),
+    ).toEqual({ allowed: false, reason });
+    expect(harness.records.slice(before)).toEqual([
+      denial(reason, "terminal.execute"),
+    ]);
+  }
+  // A malformed request is denied and recorded without any part of it.
+  const before = harness.records.length;
+  expect(harness.enforcement.recheck(RUN, { capability: PATH })).toEqual({
+    allowed: false,
+    reason: "request_invalid",
+  });
+  expect(harness.records.slice(before)).toEqual([
+    denial("request_invalid", null),
+  ]);
+
+  // check still records the start.
+  const started = setup({ records: [grant("terminal.execute")] });
+  started.enforcement.recheck(RUN, request("terminal.execute"));
+  started.enforcement.check(RUN, request("terminal.execute"));
+  expect(started.records).toEqual([
+    {
+      kind: "shell_start_allowed",
+      runId: RUN_ID,
+      agentId: AGENT_ID,
+      repositoryId: REPOSITORY_ID,
+      at: iso(NOW),
+    },
+  ]);
+});
+
 test("denies a malformed run, without its IDs in the record", () => {
   const harness = setup({ records: [grant("repo.read")] });
   const malformed: unknown[] = [
