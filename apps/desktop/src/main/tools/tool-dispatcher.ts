@@ -401,16 +401,20 @@ export function createToolDispatcher(
       return refuse("invalid_input");
     }
 
-    let resolution: RepositoryFolderResolution;
-    try {
-      resolution = await resolveFolder(checked.repositoryId);
-    } catch {
-      resolution = Object.freeze({ ok: false, reason: "unavailable" });
-    }
-    if (signal.aborted) {
+    // An abort while the folder resolves answers at once, also when the
+    // resolution hangs. The held action ends at once as well: the resolution
+    // only reads the identity of the repository's folders, and no tool runs
+    // after an abort.
+    const resolving = (async () => resolveFolder(checked.repositoryId))();
+    const resolved = await untilAborted(resolving, signal);
+    if (resolved === ABORTED || signal.aborted) {
       end();
       return refuse("aborted");
     }
+    const resolution: RepositoryFolderResolution =
+      resolved === FAILED
+        ? Object.freeze({ ok: false, reason: "unavailable" })
+        : resolved;
     if (!resolution.ok) {
       end();
       return refuse("repository_unavailable", resolution.reason);

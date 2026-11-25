@@ -426,6 +426,41 @@ test("an abort while the folder resolves runs nothing and ends the held action",
   expect(harness.checker.ends).toBe(1);
 });
 
+test("an abort while the folder resolution hangs answers aborted at once and ends the held action; a late resolution runs nothing", async () => {
+  for (const settleLate of [
+    (resolution: Deferred<RepositoryFolderResolution>) =>
+      resolution.resolve({
+        ok: true,
+        repositoryId: REPOSITORY_ID as RepositoryId,
+        folder: FOLDER,
+      }),
+    (resolution: Deferred<RepositoryFolderResolution>) =>
+      resolution.reject(new Error(FOLDER)),
+  ]) {
+    const probe = probeTool("probe");
+    const resolution = deferred<RepositoryFolderResolution>();
+    const harness = setup([probe.tool], { resolve: () => resolution.promise });
+    let answered: unknown = "pending";
+    void harness.dispatcher
+      .call(harness.context, "probe", { value: "x" })
+      .then((answer) => {
+        answered = answer;
+      });
+    await settle();
+    expect(harness.resolutions).toEqual([REPOSITORY_ID]);
+    expect(answered).toBe("pending");
+    // The resolution never settles before the abort is answered.
+    harness.controller.abort();
+    await settle();
+    expect(answered).toEqual({ ok: false, code: "aborted" });
+    expect(harness.checker.ends).toBe(1);
+    settleLate(resolution);
+    await settle();
+    expect(probe.runs).toEqual([]);
+    expect(harness.checker.ends).toBe(1);
+  }
+});
+
 test("an abort while the tool runs answers aborted at once; the held action ends only when the tool settled, and its late answer is dropped", async () => {
   const work = deferred<ToolRunOutcome>();
   const probe = probeTool("probe", "repo.read", () => work.promise);
