@@ -309,8 +309,9 @@ function errorTypeOf(error: unknown): string {
  * `unknown_kind` from the decoding, `not_confirmed` when the database does
  * not confirm it, for example a notification that another role forged for
  * an account that is not erased or not disabled, and `backlog` when
- * `maxPending` notifications already wait for their check. A check that fails is logged with the error's type, and its
- * notification is dropped, as delivery is at most once anyway.
+ * `maxPending` notifications already wait for their check. A check that
+ * fails is logged with the error's type, and its notification is dropped,
+ * as delivery is at most once anyway.
  */
 export class ErasureReplay {
   readonly #options: ErasureReplayOptions;
