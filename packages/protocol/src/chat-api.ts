@@ -1,8 +1,9 @@
-// The chat history route of #27. A project has one chat in M2. Every route
-// needs an access token, and any active member of the project's workspace
-// may read it. A project that does not exist and a project of a workspace
-// that the account is not an active member of both answer `404` and
-// `not_found`, so that a route never tells them apart.
+// The chat history route of #27, and the route of one message of #34. A
+// project has one chat in M2. Every route needs an access token, and any
+// active member of the project's workspace may read it. A project that does
+// not exist and a project of a workspace that the account is not an active
+// member of both answer `404` and `not_found`, so that a route never tells
+// them apart.
 
 import * as z from "zod";
 import type { ApiRoute } from "./auth-api.ts";
@@ -15,7 +16,7 @@ function route(method: ApiRoute["method"], path: string): ApiRoute {
 }
 
 /**
- * The chat routes (#27). Every path parameter is an ID. The history is
+ * The chat routes (#27, #34). Every path parameter is an ID. The history is
  * read only; messages are sent over the connection with
  * `chat.message.send`.
  */
@@ -26,6 +27,12 @@ export const CHAT_ROUTES = Object.freeze({
    * number. Also the history of an archived project. Any active member.
    */
   listMessages: route("GET", "/projects/:projectId/messages"),
+  /**
+   * One message of the project's chat, as a page of the history shows it
+   * (#34; Project Manager decision of 2026-11-25). Also a message of an
+   * archived project. Any active member: whoever may read the history.
+   */
+  getMessage: route("GET", "/projects/:projectId/messages/:messageId"),
 });
 export type ChatRouteName = keyof typeof CHAT_ROUTES;
 
@@ -45,10 +52,14 @@ function errors(...codes: readonly ApiErrorCode[]): readonly ApiErrorCode[] {
  * Every error code that each chat route can answer, with its status from
  * `API_ERROR_STATUS`: the common codes of the membership routes, and
  * `not_found` for a project that does not exist or that is in a workspace
- * that the account is not an active member of.
+ * that the account is not an active member of. A message answers the same
+ * `not_found` for a message ID that the project's chat does not have, also
+ * one of another project's chat, so that a message ID tells a reader nothing
+ * that the history would not.
  */
 export const CHAT_ROUTE_ERRORS = Object.freeze({
   listMessages: errors("not_found"),
+  getMessage: errors("not_found"),
 } satisfies Record<ChatRouteName, readonly ApiErrorCode[]>);
 
 /**
@@ -123,3 +134,14 @@ export const ChatHistoryResponseSchema = z
     });
   });
 export type ChatHistoryResponse = z.infer<typeof ChatHistoryResponseSchema>;
+
+/**
+ * The answer of `GET /projects/:projectId/messages/:messageId` (#34): the
+ * one message, exactly as it is an item of a page of the history, with no
+ * other field. The schema cannot see the request, so the device checks that
+ * the message's `id` and `projectId` are the ones of the path.
+ */
+export const ChatMessageResponseSchema = z.object({
+  message: ChatMessageSchema,
+});
+export type ChatMessageResponse = z.infer<typeof ChatMessageResponseSchema>;

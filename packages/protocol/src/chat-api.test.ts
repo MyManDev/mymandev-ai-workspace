@@ -8,12 +8,14 @@ import {
   CHAT_ROUTES,
   ChatHistoryQuerySchema,
   ChatHistoryResponseSchema,
+  ChatMessageResponseSchema,
 } from "./chat-api.ts";
 import { API_ERROR_CODES, CHAT_HISTORY_PAGE } from "./model.ts";
 
 const PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b1";
 const OTHER_PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192b2";
 const MEMBER_ID = "0192f2a0-7c3e-7d2e-9f10-112233445502";
+const MESSAGE_ID = "0192f2a0-7c3e-7b00-8000-000000000007";
 const AGENT_ID = "0192f2a0-7c3e-7e00-8000-000000000005";
 const NOW = "2026-11-02T12:00:00.000Z";
 
@@ -47,13 +49,17 @@ function page(count: number) {
   };
 }
 
-test("the chat route is fixed, frozen, and reads a project's history", () => {
+test("the chat routes are fixed, frozen, and read a project's history and one of its messages", () => {
   assert.deepEqual(
     Object.values(CHAT_ROUTES).map((route) => `${route.method} ${route.path}`),
-    ["GET /projects/:projectId/messages"],
+    [
+      "GET /projects/:projectId/messages",
+      "GET /projects/:projectId/messages/:messageId",
+    ],
   );
   assert.equal(Object.isFrozen(CHAT_ROUTES), true);
   assert.equal(Object.isFrozen(CHAT_ROUTES.listMessages), true);
+  assert.equal(Object.isFrozen(CHAT_ROUTES.getMessage), true);
   assert.equal(
     routePath(CHAT_ROUTES.listMessages.path, { projectId: PROJECT_ID }),
     `/projects/${PROJECT_ID}/messages`,
@@ -65,20 +71,52 @@ test("the chat route is fixed, frozen, and reads a project's history", () => {
       projectId,
     );
   }
+  // Both path parameters of a message are lowercase UUIDv7s.
+  const ids = { projectId: PROJECT_ID, messageId: MESSAGE_ID };
+  assert.equal(
+    routePath(CHAT_ROUTES.getMessage.path, ids),
+    `/projects/${PROJECT_ID}/messages/${MESSAGE_ID}`,
+  );
+  for (const bad of [
+    "not-a-uuid",
+    MESSAGE_ID.toUpperCase(),
+    "",
+    "0192f2a0-7c3e-4b00-8000-000000000007",
+  ]) {
+    for (const name of ["projectId", "messageId"]) {
+      assert.throws(
+        () => routePath(CHAT_ROUTES.getMessage.path, { ...ids, [name]: bad }),
+        TypeError,
+        `${name}: ${bad}`,
+      );
+    }
+  }
+  assert.throws(
+    () => routePath(CHAT_ROUTES.getMessage.path, { projectId: PROJECT_ID }),
+    TypeError,
+  );
 });
 
-test("the chat route answers the common codes and not_found, frozen", () => {
+test("each chat route answers the common codes and not_found, frozen", () => {
   assert.deepEqual(Object.keys(CHAT_ROUTE_ERRORS), Object.keys(CHAT_ROUTES));
-  assert.deepEqual(CHAT_ROUTE_ERRORS.listMessages, [
-    ...COMMON_CODES,
-    "not_found",
-  ]);
   const known = new Set<string>(API_ERROR_CODES);
-  for (const code of CHAT_ROUTE_ERRORS.listMessages) {
-    assert.equal(known.has(code), true, code);
+  for (const name of ["listMessages", "getMessage"] as const) {
+    assert.deepEqual(
+      CHAT_ROUTE_ERRORS[name],
+      [...COMMON_CODES, "not_found"],
+      name,
+    );
+    for (const code of CHAT_ROUTE_ERRORS[name]) {
+      assert.equal(known.has(code), true, `${name}: ${code}`);
+    }
+    assert.equal(Object.isFrozen(CHAT_ROUTE_ERRORS[name]), true, name);
   }
+  // A message answers no code that the history does not: no forbidden.
+  assert.deepEqual(
+    CHAT_ROUTE_ERRORS.getMessage,
+    CHAT_ROUTE_ERRORS.listMessages,
+  );
   assert.equal(Object.isFrozen(CHAT_ROUTE_ERRORS), true);
-  assert.equal(Object.isFrozen(CHAT_ROUTE_ERRORS.listMessages), true);
 });
 
 test("the history query takes an optional beforeSeq and a limit from 1 to 100, 50 by default", () => {
@@ -196,14 +234,70 @@ test("a history page holds up to 100 messages of one project, each once, the new
   }
 });
 
-test("the history schemas export to JSON Schema for documentation", () => {
-  for (const schema of [ChatHistoryQuerySchema, ChatHistoryResponseSchema]) {
+test("the answer of one message is a message as a page holds it, and nothing else", () => {
+  const one = message(7, { id: MESSAGE_ID });
+  assert.deepEqual(ChatMessageResponseSchema.parse({ message: one }), {
+    message: one,
+  });
+  // The same message is an item of a page.
+  assert.deepEqual(
+    ChatHistoryResponseSchema.parse({ messages: [one] }).messages[0],
+    ChatMessageResponseSchema.parse({ message: one }).message,
+  );
+  // An agent's message, as in a page.
+  assert.equal(
+    ChatMessageResponseSchema.safeParse({
+      message: message(3, { author: { kind: "agent", agentId: AGENT_ID } }),
+    }).success,
+    true,
+  );
+  // No field beside the message reaches the device, in the answer or in
+  // the message.
+  assert.deepEqual(
+    ChatMessageResponseSchema.parse({
+      message: { ...one, deletedAt: NOW, authorUserId: MEMBER_ID },
+      messages: [one],
+    }),
+    { message: one },
+  );
+
+  const refused: [label: string, value: unknown][] = [
+    ["no message", {}],
+    ["a page instead of a message", { messages: [one] }],
+    ["a list of one message", { message: [one] }],
+    ["a message without seq", { message: message(1, { seq: undefined }) }],
+    ["a message with seq 0", { message: message(0) }],
+    ["an uppercase ID", { message: { ...one, id: MESSAGE_ID.toUpperCase() } }],
+    [
+      "the author as a person ID",
+      { message: message(1, { author: MEMBER_ID }) },
+    ],
+    [
+      "a body over the limit",
+      { message: message(1, { body: "a".repeat(16_001) }) },
+    ],
+  ];
+  for (const [label, value] of refused) {
+    assert.equal(
+      ChatMessageResponseSchema.safeParse(value).success,
+      false,
+      label,
+    );
+  }
+});
+
+test("the chat schemas export to JSON Schema for documentation", () => {
+  for (const schema of [
+    ChatHistoryQuerySchema,
+    ChatHistoryResponseSchema,
+    ChatMessageResponseSchema,
+  ]) {
     const json = z.toJSONSchema(schema, { io: "input" });
     assert.equal(typeof json, "object");
   }
 });
 
-test("the README's table lists the chat route with its codes", () => {
+test("the README's table lists each chat route with its codes", () => {
   const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
   const rows = readme
     .split("\n")

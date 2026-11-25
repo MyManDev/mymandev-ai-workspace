@@ -160,15 +160,20 @@ test("every route of the protocol has its own name and its own method and path",
   );
   assert.equal(new Set(table).size, table.length);
   // The project's chat and agent activity are read with GET, under the
-  // project, as the history is.
+  // project, as the history is; one message lies under the history.
   for (const route of [
-    ...Object.values(CHAT_ROUTES),
+    CHAT_ROUTES.listMessages,
     AGENT_ROUTES.listAgents,
     AGENT_ROUTES.listRuns,
   ]) {
     assert.match(route.path, /^\/projects\/:projectId\/[a-z]+$/u, route.path);
     assert.equal(route.method, "GET", route.path);
   }
+  assert.equal(
+    CHAT_ROUTES.getMessage.path,
+    `${CHAT_ROUTES.listMessages.path}/:messageId`,
+  );
+  assert.equal(CHAT_ROUTES.getMessage.method, "GET");
   // A change of an agent is a POST under the project.
   for (const route of [AGENT_ROUTES.createAgent, AGENT_ROUTES.disableAgent]) {
     assert.match(route.path, /^\/projects\/:projectId\/agents/u, route.path);
