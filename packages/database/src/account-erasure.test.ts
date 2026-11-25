@@ -574,6 +574,29 @@ test("an erasure ends each membership as a removal does, revokes every device wi
   assert.deepEqual(adminEnd.revokedInvitationIds, [invitedByErased]);
   assert.deepEqual(adminEnd.disabledAgentIds, [erasedAgent]);
   assert.deepEqual(adminEnd.revokedGrantIds, [erasedGrant]);
+  // With the workspace, and the agents and grants as their events show them
+  // (#341).
+  assert.equal(adminEnd.workspaceId, first.workspaceId);
+  assert.deepEqual(adminEnd.disabledAgents, [
+    {
+      workspaceId: first.workspaceId,
+      agent: {
+        id: erasedAgent,
+        projectId: project.projectId,
+        name: ERASED_AGENT_NAME,
+        ownerMemberId: adminPerson,
+        disabledAt: ERASED_AT.toISOString(),
+      },
+    },
+  ]);
+  assert.deepEqual(adminEnd.revokedGrants, [
+    {
+      grantId: erasedGrant,
+      granteeAgentId: erasedAgent,
+      workspaceId: first.workspaceId,
+      revokedAt: ERASED_AT,
+    },
+  ]);
   assert.deepEqual(
     adminEnd.cancelledRuns.map((run) => [
       run.runId,
@@ -641,6 +664,28 @@ test("an erasure ends each membership as a removal does, revokes every device wi
         correlationId: null,
         previousState: "awaiting_input",
         reason: "device_revoked",
+      },
+    ],
+    // As their events show them (#341): the stray agent's owner is the
+    // account's removed person in the former workspace.
+    disabledAgents: [
+      {
+        workspaceId: former.workspaceId,
+        agent: {
+          id: strayAgent,
+          projectId: formerProject.projectId,
+          name: ERASED_AGENT_NAME,
+          ownerMemberId: formerPerson,
+          disabledAt: ERASED_AT.toISOString(),
+        },
+      },
+    ],
+    revokedGrants: [
+      {
+        grantId: strayGrant,
+        granteeAgentId: strayAgent,
+        workspaceId: former.workspaceId,
+        revokedAt: ERASED_AT,
       },
     ],
   });
@@ -1165,6 +1210,8 @@ test("an earlier disable keeps its time, and the former GitHub ID matches nothin
         disabledAgentIds: [],
         revokedGrantIds: [],
         cancelledRuns: [],
+        disabledAgents: [],
+        revokedGrants: [],
       },
     ],
     withdrawnJoinRequestIds: [],

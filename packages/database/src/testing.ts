@@ -7,6 +7,10 @@ import pg from "pg";
 import { checkDatabaseUrl, createDatabase } from "./client.ts";
 import type { Database } from "./db.ts";
 import { migrationsFolder, runMigrations } from "./migrate.ts";
+import {
+  type NotificationSessions,
+  pgNotificationSessions,
+} from "./notification-session.ts";
 import * as schema from "./schema/index.ts";
 
 /** Runs SQL on the test database without Drizzle. */
@@ -19,6 +23,12 @@ export type TestDatabase = {
   readonly client: TestClient;
   /** The URL of the test database on a server; undefined for PGlite. */
   readonly url: string | undefined;
+  /**
+   * Sessions that listen for notifications of the test database (#341): a
+   * dedicated node-postgres client each on a server, as the API holds one
+   * (`pgNotificationSessions`), and PGlite's `listen` otherwise.
+   */
+  readonly notificationSessions: NotificationSessions;
   readonly close: () => Promise<void>;
 };
 
@@ -42,7 +52,39 @@ export async function createPgliteDatabase(): Promise<TestDatabase> {
   const client = await PGlite.create();
   const db = drizzle({ client, schema });
   await migrate(db, { migrationsFolder });
-  return { db, client, url: undefined, close: () => client.close() };
+  return {
+    db,
+    client,
+    url: undefined,
+    notificationSessions: pgliteNotificationSessions(client),
+    close: () => client.close(),
+  };
+}
+
+/**
+ * Sessions on PGlite's one connection, through its `listen`: PGlite
+ * delivers a notification at the commit of the transaction that sent it, to
+ * its own connection too, as PostgreSQL does. Such a session is never lost.
+ */
+export function pgliteNotificationSessions(
+  client: PGlite,
+): NotificationSessions {
+  return async () => {
+    let unlisten: (() => Promise<void>) | null = null;
+    return {
+      listen: async (channel, handlers) => {
+        unlisten = await client.listen(channel, handlers.onPayload);
+      },
+      check: async () => {
+        await client.query("select 1");
+      },
+      close: async () => {
+        const stop = unlisten;
+        unlisten = null;
+        await stop?.();
+      },
+    };
+  };
 }
 
 async function createServerDatabase(serverUrl: string): Promise<TestDatabase> {
@@ -83,6 +125,7 @@ async function createServerDatabase(serverUrl: string): Promise<TestDatabase> {
       }),
     },
     url: url.href,
+    notificationSessions: pgNotificationSessions(url.href),
     close: async () => {
       await Promise.all([connection.close(), raw.end()]);
       // A pool's `end` resolves before its clients' sockets are closed. A

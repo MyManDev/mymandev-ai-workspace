@@ -14,14 +14,12 @@ import {
   revokedGrantsOf,
 } from "@mymandev/database";
 import {
-  type AccountRemovedFromWorkspaceFrame,
   type DefineMemberRequest,
   DefineMemberRequestSchema,
   type DefineMemberResponse,
   type MemberId,
   MemberIdSchema,
   MEMBERSHIP_ROUTES,
-  PROTOCOL_VERSION,
   type RenameMemberRequest,
   RenameMemberRequestSchema,
   type WorkspaceId,
@@ -33,9 +31,9 @@ import type { ConnectionRegistry } from "../gateway.ts";
 import { WorkspaceParamsSchema } from "./access.ts";
 import {
   type AccountFrameHandler,
-  sendAccountFrame,
   sendCancelledRuns,
   sendDisabledAgents,
+  sendMemberRemoved,
   sendRevokedGrants,
   sendWorkspaceEvent,
   serverEventHeader,
@@ -99,7 +97,8 @@ export function registerPeopleRoutes(
    * `onWorkspaceEvent`, whose delivery first ends the person's subscriptions
    * to the workspace with `membership_ended` and sends the person's
    * `offline` to the other subscribers; `account.removed_from_workspace`
-   * through `onAccountFrame` to every connection of the person's account;
+   * through `onAccountFrame` to every connection of the person's account
+   * (`sendMemberRemoved`, which an operator's erasure replays too, #341);
    * each disabled agent as `workspace.agent.disabled` through
    * `onWorkspaceEvent` (#326); each revoked grant as `agent.grant.revoked`
    * (#75); and each cancelled run as `agent.run.state_changed`, all three to
@@ -116,20 +115,12 @@ export function registerPeopleRoutes(
       }>,
     now: Date,
   ): void {
-    send(request, {
-      ...serverEventHeader(workspaceId, now),
-      type: "workspace.member.removed",
-      payload: { memberId: ended.memberId, removedAt: now.toISOString() },
-    });
-    if (ended.userId !== null) {
-      const frame: AccountRemovedFromWorkspaceFrame = {
-        protocolVersion: PROTOCOL_VERSION,
-        type: "account.removed_from_workspace",
-        workspaceId,
-        removedAt: now.toISOString(),
-      };
-      sendAccountFrame(request, options.onAccountFrame, ended.userId, frame);
-    }
+    sendMemberRemoved(
+      request,
+      options,
+      { workspaceId, memberId: ended.memberId, userId: ended.userId },
+      now,
+    );
     sendDisabledAgents(
       request,
       options.onWorkspaceEvent,

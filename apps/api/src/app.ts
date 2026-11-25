@@ -1,6 +1,12 @@
 import rateLimit, { normalizeIP } from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
-import { createDatabase, type Database } from "@mymandev/database";
+import {
+  checkErasureNotification,
+  createDatabase,
+  type Database,
+  type NotificationSessions,
+  pgNotificationSessions,
+} from "@mymandev/database";
 import { genericApiErrorCode, MAX_FRAME_BYTES } from "@mymandev/protocol";
 import Fastify, { type FastifyInstance, type FastifyReply } from "fastify";
 import { STATUS_CODES } from "node:http";
@@ -29,12 +35,15 @@ import {
   type EventHandler,
 } from "./gateway.ts";
 import { dispatchDeviceEvents } from "./device-events.ts";
+import { ErasureListener } from "./erasure-listener.ts";
 import { serializeError, serializeRequest } from "./log.ts";
 import { registerGrantRoutes } from "./grants/grant-routes.ts";
 import { registerProviderConnectionRoutes } from "./providers/provider-connection-routes.ts";
 import { runTransitionHandler } from "./workspaces/agent-events.ts";
 import { chatSendHandler } from "./workspaces/chat-events.ts";
+import { ErasureReplay } from "./workspaces/erasure-events.ts";
 import {
+  type AccountFrameHandler,
   type ApproverEventHandler,
   deliverApproverEvent,
   deliverWorkspaceEvent,
@@ -97,6 +106,21 @@ export type BuildAppOptions = Readonly<{
    * routes that need the database answer the generic 404.
    */
   database?: Database;
+  /**
+   * Where the API listens for the notifications of an operator's account
+   * erasure, which it replays as live events (#341; ADR 0014, update of
+   * 2026-11-25). The default is a dedicated session to DATABASE_URL, outside
+   * the pool (`pgNotificationSessions`), when the API connects to the
+   * database itself; with `database` given and no sessions, nothing listens.
+   * Only an API with the gateway listens: without it, nobody is connected.
+   */
+  erasureNotifications?: NotificationSessions;
+  /**
+   * The waits of the erasure listener between two attempts. Default: 1
+   * second, doubling up to 30 seconds (`ErasureListener`); tests shorten
+   * them.
+   */
+  erasureListenerBackoff?: Readonly<{ initialMs: number; maxMs: number }>;
 }>;
 
 /** In-memory sign-in state (ADR 0014, "Lifetimes" and "Limits"). */
@@ -381,7 +405,11 @@ export async function buildApp(
   );
 
   let database: Database | null = options.database ?? null;
+  let erasureNotifications = options.erasureNotifications ?? null;
   if (database === null && config.databaseUrl !== null) {
+    erasureNotifications ??= pgNotificationSessions(
+      config.databaseUrl.reveal(),
+    );
     const connection = createDatabase(config.databaseUrl.reveal(), {
       onPoolError: () => {
         app.log.error("an idle database connection failed");
@@ -423,6 +451,10 @@ export async function buildApp(
     });
     // Registering the device needs the database too.
     if (database !== null) {
+      // Account frames go to the account's open connections at once.
+      const onAccountFrame: AccountFrameHandler = (userId, frame) => {
+        connections.sendToUser(userId, frame);
+      };
       tokens = new AccessTokens({
         max: MAX_ACCESS_TOKENS,
         lifetimeMs: ACCESS_TOKEN_LIFETIME_MS,
@@ -485,10 +517,7 @@ export async function buildApp(
         now,
         onWorkspaceEvent,
         onApproverEvent,
-        // Account frames go to the account's open connections at once.
-        onAccountFrame: (userId, frame) => {
-          connections.sendToUser(userId, frame);
-        },
+        onAccountFrame,
         connections,
       });
       // A connection authenticates with its device key (ADR 0014).
@@ -519,6 +548,42 @@ export async function buildApp(
             app.log,
           ),
       });
+      // The operator's erasures, checked against the database and replayed
+      // to the open connections (#341). The listener starts when the app is
+      // ready, so a test that only builds the app opens no session, and
+      // stops when it closes, after the notifications that it received.
+      if (erasureNotifications !== null) {
+        const checked = database;
+        const replay = new ErasureReplay({
+          connections,
+          onWorkspaceEvent,
+          onApproverEvent,
+          onAccountFrame,
+          log: app.log,
+          check: (notification) =>
+            checkErasureNotification(checked, notification),
+        });
+        const listener = new ErasureListener({
+          sessions: erasureNotifications,
+          log: app.log,
+          ...(options.erasureListenerBackoff === undefined
+            ? {}
+            : {
+                initialBackoffMs: options.erasureListenerBackoff.initialMs,
+                maxBackoffMs: options.erasureListenerBackoff.maxMs,
+              }),
+          onPayload: (payload) => {
+            replay.push(payload);
+          },
+        });
+        app.addHook("onReady", async () => {
+          await listener.start();
+        });
+        app.addHook("onClose", async () => {
+          await listener.close();
+          await replay.idle();
+        });
+      }
     }
   }
 

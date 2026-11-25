@@ -26,7 +26,34 @@ export {
   type EraseAccountInput,
   type EraseAccountResult,
   type ErasedDevice,
+  type ErasedMembership,
 } from "./account-erasure.ts";
+export {
+  type AccountErasedNotification,
+  type AgentDisabledNotification,
+  APPROVERS_PER_NOTIFICATION,
+  encodeErasureNotification,
+  ERASURE_NOTIFICATION_CHANNEL,
+  ERASURE_NOTIFICATION_VERSION,
+  type ErasureNotification,
+  type GrantRevokedNotification,
+  type JoinRequestWithdrawnNotification,
+  MAX_NOTIFICATION_PAYLOAD_BYTES,
+  type MembershipEndedNotification,
+  type RunCancelledNotification,
+} from "./erasure-notifications.ts";
+export {
+  checkErasureNotification,
+  type ErasureCheck,
+} from "./erasure-check.ts";
+export {
+  LISTENER_APPLICATION_NAME,
+  LISTENER_KEEPALIVE_INITIAL_DELAY_MS,
+  type NotificationHandlers,
+  type NotificationSession,
+  type NotificationSessions,
+  pgNotificationSessions,
+} from "./notification-session.ts";
 export {
   type GitHubRevocationInput,
   type GitHubRevocationResult,
