@@ -40,6 +40,7 @@ import {
   OLD_FILE_NOT_DELETED_MESSAGE,
   RECORDS_WRITTEN_AGAIN_MESSAGE,
   type RecorderFileSystem,
+  type RecorderPathStat,
   recordFailureMessage,
 } from "./file-recorder.ts";
 
@@ -1157,26 +1158,77 @@ test("an open file that is no longer linked is dropped and the path is opened ag
   expect(read(1)).toBe(`${START_LINE}\n${START_LINE}\n`);
 });
 
-test("an open file whose path names another file is dropped; a path that keeps naming another file starts the next file", () => {
-  let replaced = false;
+test("an open file whose path names another file, or a link, is dropped; a path that keeps doing so starts the next file", () => {
+  const changes: Partial<RecorderPathStat>[] = [
+    { ino: 1n },
+    { dev: 1n },
+    { isSymbolicLink: true },
+    { isFile: false },
+  ];
+  for (const change of changes) {
+    let replaced = false;
+    const spy = spyFileSystem({
+      lstatSync: (target) => {
+        const stat = nodeRecorderFileSystem.lstatSync(target);
+        if (!replaced || !target.endsWith(enforcementRecordFileName(1))) {
+          return stat;
+        }
+        return {
+          ...stat,
+          ...change,
+          ...(change.ino === undefined ? {} : { ino: stat.ino + 1n }),
+          ...(change.dev === undefined ? {} : { dev: stat.dev + 1n }),
+        };
+      },
+    });
+    const { recorder, read, files } = setup({
+      fileSystem: spy.fileSystem,
+      platform: "win32",
+    });
+    recorder.record(START);
+    replaced = true;
+    expect(recorder.record(START)).toBeUndefined();
+    expect(read(1)).toBe(`${START_LINE}\n`);
+    expect(read(2)).toBe(`${START_LINE}\n`);
+    expect(files()).toHaveLength(2);
+  }
+});
+
+test("a descriptor that is not a regular file is never written to: a newest one starts the next file, a new one fails with open_failed", () => {
+  let notAFile: string | null = null;
+  const descriptors = new Map<number, string>();
   const spy = spyFileSystem({
-    lstatSync: (target) => {
-      const stat = nodeRecorderFileSystem.lstatSync(target);
-      return replaced && target.endsWith(enforcementRecordFileName(1))
-        ? { ...stat, ino: stat.ino + 1n }
+    openSync: (file, flags, mode) => {
+      const fd = nodeRecorderFileSystem.openSync(file, flags, mode);
+      descriptors.set(fd, path.basename(file));
+      return fd;
+    },
+    fstatSync: (fd) => {
+      const stat = nodeRecorderFileSystem.fstatSync(fd);
+      return descriptors.get(fd) === notAFile
+        ? { ...stat, isFile: false }
         : stat;
     },
   });
-  const { recorder, read, files } = setup({
+  const first = setup({ platform: "win32" });
+  first.recorder.record(DENIAL);
+  first.recorder.close();
+  notAFile = enforcementRecordFileName(1);
+  const second = setup({
+    root: first.root,
     fileSystem: spy.fileSystem,
     platform: "win32",
   });
-  recorder.record(START);
-  replaced = true;
-  expect(recorder.record(START)).toBeUndefined();
-  expect(read(1)).toBe(`${START_LINE}\n`);
-  expect(read(2)).toBe(`${START_LINE}\n`);
-  expect(files()).toHaveLength(2);
+  expect(second.recorder.record(START)).toBeUndefined();
+  expect(second.read(1)).toBe(`${DENIAL_LINE}\n`);
+  expect(second.read(2)).toBe(`${START_LINE}\n`);
+  second.recorder.close();
+
+  // A new file that is not in place right after it was created.
+  notAFile = enforcementRecordFileName(1);
+  const fresh = setup({ fileSystem: spy.fileSystem, platform: "win32" });
+  expect(failureOf(() => fresh.recorder.record(START))).toBe("open_failed");
+  expect(fresh.read(1)).toBe("");
 });
 
 test("a record folder deleted between the check and the flush of a shell start fails the record, and the shell start is denied", () => {
@@ -1556,10 +1608,19 @@ test("a file may reach exactly maxFileBytes, and a file of exactly maxFileBytes 
   expect(statSync(first.file(1)).size).toBe(limits.maxFileBytes);
   first.recorder.close();
 
-  const second = setup({ root: first.root, limits });
+  // The full file is left at once: neither read nor flushed for a rotation.
+  const spy = spyFileSystem();
+  const second = setup({
+    root: first.root,
+    limits,
+    fileSystem: spy.fileSystem,
+    platform: "win32",
+  });
   second.recorder.record(DENIAL);
   expect(second.read(1)).toBe(`${DENIAL_LINE}\n${DENIAL_LINE}\n`);
   expect(second.read(2)).toBe(`${DENIAL_LINE}\n`);
+  expect(spy.named("readSync")).toEqual([]);
+  expect(spy.named("fsyncSync")).toEqual([]);
 });
 
 // Dropping a file.
