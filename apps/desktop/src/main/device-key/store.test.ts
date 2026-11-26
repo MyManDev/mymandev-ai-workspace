@@ -29,12 +29,14 @@ import {
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { type KeyFileSystem, nodeKeyFileSystem } from "./atomic-file.ts";
 import { type DeviceKeyErrorCode, isDeviceKeyError } from "./errors.ts";
+import type { DeviceKeyProtection } from "./key-file.ts";
 import type { DeviceKey } from "./signing-key.ts";
 import {
   createDeviceKeyStore,
   CURRENT_KEY_FILE,
   type DeviceKeyStoreOptions,
   PREVIOUS_KEY_FILE,
+  PROTECTION_RECORD_FILE,
   type SystemKeyProtection,
 } from "./store.ts";
 
@@ -976,7 +978,9 @@ test("an unprotected key is renewed as an unprotected key only with a fresh expl
     );
   }
   expect(store.keys()).toEqual({ current: first, previous: null });
-  expect(await readdir(folder)).toEqual([CURRENT_KEY_FILE]);
+  expect((await readdir(folder)).sort()).toEqual(
+    [CURRENT_KEY_FILE, PROTECTION_RECORD_FILE].sort(),
+  );
 
   await store.replace({ acceptsUnprotectedKey: true });
 
@@ -1036,7 +1040,9 @@ test("on Linux a replacement moves an unprotected key up to the system without a
   expect((await keyFileJson())["protection"]).toBe("system");
   expect(await publicKeyInFile(fake)).toBe(replaced.current.publicKey);
   await store.confirmReplacement();
-  expect(await readdir(folder)).toEqual([CURRENT_KEY_FILE]);
+  expect((await readdir(folder)).sort()).toEqual(
+    [CURRENT_KEY_FILE, PROTECTION_RECORD_FILE].sort(),
+  );
 });
 
 test("a moved-up key that is abandoned keeps its passphrase for the next replacement, also after a restart", async () => {
@@ -1127,7 +1133,9 @@ test("a system-protected key is not replaced once the system cannot protect keys
   await expectRejection(() => store.replace(), "system_protection_unavailable");
 
   expect(store.keys()).toEqual({ current: first, previous: null });
-  expect(await readdir(folder)).toEqual([CURRENT_KEY_FILE]);
+  expect((await readdir(folder)).sort()).toEqual(
+    [CURRENT_KEY_FILE, PROTECTION_RECORD_FILE].sort(),
+  );
 });
 
 test("delete removes the key files and temporary files, and the keys held sign nothing more", async () => {
@@ -1299,6 +1307,612 @@ test("operations run one after the other, in the order they were called", async 
   expect(await readdir(folder)).toEqual([CURRENT_KEY_FILE]);
 });
 
+// The protection record of #358: on Linux the protection that the person
+// last chose is kept outside the key files, and a key file below it is
+// refused as `corrupt`.
+
+const PROTECTIONS = ["system", "passphrase", "unprotected"] as const;
+const RANK: Readonly<Record<DeviceKeyProtection, number>> = {
+  unprotected: 0,
+  passphrase: 1,
+  system: 2,
+};
+
+/** The bytes of a protection record. */
+function recordOf(protection: string): string {
+  return `${JSON.stringify({
+    format: "mymandev-device-key-protection",
+    version: 1,
+    protection,
+  })}\n`;
+}
+
+async function readRecord(): Promise<string | null> {
+  try {
+    return await readFile(path.join(folder, PROTECTION_RECORD_FILE), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function newProtection(protection: DeviceKeyProtection) {
+  switch (protection) {
+    case "system":
+      return { kind: "system" } as const;
+    case "passphrase":
+      return { kind: "passphrase", passphrase: PASSPHRASE } as const;
+    case "unprotected":
+      return { kind: "unprotected", acceptsUnprotectedKey: true } as const;
+  }
+}
+
+/**
+ * One Linux key file of each protection, made by the store itself with a
+ * fake whose backend allows that protection, and the public key in it.
+ */
+async function linuxKeyFiles(fake: FakeSafeStorage) {
+  const files = {} as Record<
+    DeviceKeyProtection,
+    { content: string; publicKey: string }
+  >;
+  for (const protection of PROTECTIONS) {
+    const source = path.join(root, `source-${protection}`);
+    fake.state.backend =
+      protection === "system" ? "gnome_libsecret" : "basic_text";
+    const key = await storeWith(fake, {
+      platform: "linux",
+      folder: source,
+    }).create(newProtection(protection));
+    files[protection] = {
+      content: await readFile(path.join(source, CURRENT_KEY_FILE), "utf8"),
+      publicKey: key.publicKey,
+    };
+  }
+  fake.state.backend = "basic_text";
+  return files;
+}
+
+/** Replaces the key folder with exactly `layout`. */
+async function layOut(layout: Record<string, string>): Promise<void> {
+  await rm(folder, { recursive: true, force: true });
+  await mkdir(folder);
+  for (const [name, content] of Object.entries(layout)) {
+    await writeFile(path.join(folder, name), content);
+  }
+}
+
+async function expectFolder(layout: Record<string, string>): Promise<void> {
+  expect((await readdir(folder)).sort()).toEqual(Object.keys(layout).sort());
+  for (const [name, content] of Object.entries(layout)) {
+    expect(await readFile(path.join(folder, name), "utf8"), name).toBe(content);
+  }
+}
+
+test("on Linux a new key records the chosen protection, before its key file is written", async () => {
+  for (const protection of PROTECTIONS) {
+    await rm(folder, { recursive: true, force: true });
+    const fake = fakeSafeStorage({
+      backend: protection === "system" ? "kwallet6" : "basic_text",
+    });
+    const renames: string[] = [];
+    const fileSystem: KeyFileSystem = {
+      ...nodeKeyFileSystem,
+      rename: async (from, to) => {
+        renames.push(path.basename(to));
+        await nodeKeyFileSystem.rename(from, to);
+      },
+    };
+
+    await storeWith(fake, { platform: "linux", fileSystem }).create(
+      newProtection(protection),
+    );
+
+    expect(renames).toEqual([PROTECTION_RECORD_FILE, CURRENT_KEY_FILE]);
+    expect(await readRecord()).toBe(recordOf(protection));
+    expect((await keyFileJson())["protection"]).toBe(protection);
+  }
+});
+
+test("on Linux a key file whose protection is lower than the recorded choice is refused as corrupt, and nothing is deleted", async () => {
+  const fake = fakeSafeStorage();
+  const files = await linuxKeyFiles(fake);
+  let cases = 0;
+  for (const recorded of PROTECTIONS) {
+    for (const lower of PROTECTIONS) {
+      if (RANK[lower] >= RANK[recorded]) {
+        continue;
+      }
+      const record = recordOf(recorded);
+      const layouts: Record<string, string>[] = [
+        { [CURRENT_KEY_FILE]: files[lower].content },
+        // A replacement that stopped between its two renames.
+        { [PREVIOUS_KEY_FILE]: files[lower].content },
+        // A lower previous key next to a current key at the recorded level.
+        {
+          [CURRENT_KEY_FILE]: files[recorded].content,
+          [PREVIOUS_KEY_FILE]: files[lower].content,
+        },
+        // A lower current key next to a previous key at the recorded level.
+        {
+          [CURRENT_KEY_FILE]: files[lower].content,
+          [PREVIOUS_KEY_FILE]: files[recorded].content,
+        },
+      ];
+      for (const keyFiles of layouts) {
+        const layout = { ...keyFiles, [PROTECTION_RECORD_FILE]: record };
+        await layOut(layout);
+        fake.calls.length = 0;
+        const store = storeWith(fake, { platform: "linux" });
+
+        await expectRejection(() => store.status(), "corrupt");
+        await expectRejection(
+          () => store.load({ passphrase: PASSPHRASE }),
+          "corrupt",
+        );
+        // Refused before anything is decrypted.
+        expect(fake.calls).not.toContain("decryptStringAsync");
+        expect(store.keys()).toBeNull();
+        expect(await store.hasKey()).toBe(true);
+        await expectRejection(
+          () => store.create(newProtection(lower)),
+          "key_exists",
+        );
+        await expectRejection(() => store.replace(), "not_loaded");
+        // Nothing is replaced, moved, or deleted on its own, the record
+        // included.
+        await expectFolder(layout);
+        cases += 1;
+      }
+    }
+  }
+  // system > passphrase, system > unprotected, passphrase > unprotected.
+  expect(cases).toBe(3 * 4);
+});
+
+test("on Linux a key file at or above the recorded choice is loaded, and a higher one raises the record", async () => {
+  const fake = fakeSafeStorage();
+  const files = await linuxKeyFiles(fake);
+  let cases = 0;
+  for (const recorded of PROTECTIONS) {
+    for (const stored of PROTECTIONS) {
+      if (RANK[stored] < RANK[recorded]) {
+        continue;
+      }
+      await layOut({
+        [CURRENT_KEY_FILE]: files[stored].content,
+        [PROTECTION_RECORD_FILE]: recordOf(recorded),
+      });
+      const store = storeWith(fake, { platform: "linux" });
+
+      expect(await store.status()).toMatchObject({ protection: stored });
+      const keys = await store.load({ passphrase: PASSPHRASE });
+
+      expect(keys?.current.publicKey).toBe(files[stored].publicKey);
+      expect(await readRecord()).toBe(recordOf(stored));
+      cases += 1;
+    }
+  }
+  expect(cases).toBe(6);
+});
+
+test("on Linux a key without a record, as on an installation from before the record, makes its protection the record once", async () => {
+  const fake = fakeSafeStorage();
+  const files = await linuxKeyFiles(fake);
+  for (const protection of PROTECTIONS) {
+    await layOut({ [CURRENT_KEY_FILE]: files[protection].content });
+    const store = storeWith(fake, { platform: "linux" });
+
+    // `status` reads only; it writes no record.
+    expect(await store.status()).toMatchObject({ protection });
+    expect(await readRecord()).toBeNull();
+    const keys = await store.load({ passphrase: PASSPHRASE });
+
+    expect(keys?.current.publicKey).toBe(files[protection].publicKey);
+    expect(await readRecord()).toBe(recordOf(protection));
+  }
+
+  // From then on a lower key file is refused.
+  await layOut({ [CURRENT_KEY_FILE]: files.passphrase.content });
+  await storeWith(fake, { platform: "linux" }).load({
+    passphrase: PASSPHRASE,
+  });
+  expect(await readRecord()).toBe(recordOf("passphrase"));
+  await writeFile(
+    path.join(folder, CURRENT_KEY_FILE),
+    files.unprotected.content,
+  );
+  await expectRejection(
+    () => storeWith(fake, { platform: "linux" }).load(),
+    "corrupt",
+  );
+});
+
+test("on Linux a pending replacement without a record records the weaker of its two keys", async () => {
+  const fake = fakeSafeStorage();
+  const files = await linuxKeyFiles(fake);
+  await layOut({
+    [CURRENT_KEY_FILE]: files.system.content,
+    [PREVIOUS_KEY_FILE]: files.passphrase.content,
+  });
+
+  const store = storeWith(fake, { platform: "linux" });
+  await store.load({ passphrase: PASSPHRASE });
+
+  expect(await readRecord()).toBe(recordOf("passphrase"));
+  // So the previous key can still become the current one again.
+  await store.abandonReplacement();
+  const keys = await storeWith(fake, { platform: "linux" }).load({
+    passphrase: PASSPHRASE,
+  });
+  expect(keys?.current.publicKey).toBe(files.passphrase.publicKey);
+});
+
+test("on Linux a damaged, unknown, or newer record refuses the key, fails closed, and is not replaced on its own", async () => {
+  const fake = fakeSafeStorage();
+  const files = await linuxKeyFiles(fake);
+  const damaged: [string, DeviceKeyErrorCode][] = [
+    ["damaged", "corrupt"],
+    ["", "corrupt"],
+    ["null", "corrupt"],
+    [recordOf("none"), "corrupt"],
+    [recordOf("SYSTEM"), "corrupt"],
+    [
+      JSON.stringify({
+        format: "mymandev-device-key",
+        version: 1,
+        protection: "unprotected",
+      }),
+      "corrupt",
+    ],
+    [
+      JSON.stringify({
+        format: "mymandev-device-key-protection",
+        version: 1,
+        protection: "unprotected",
+        extra: true,
+      }),
+      "corrupt",
+    ],
+    [
+      JSON.stringify({
+        format: "mymandev-device-key-protection",
+        version: 2,
+        protection: "unprotected",
+      }),
+      "newer_format",
+    ],
+  ];
+  for (const [record, code] of damaged) {
+    // Even a system-protected key, which no record could be above.
+    for (const protection of ["system", "unprotected"] as const) {
+      const layout = {
+        [CURRENT_KEY_FILE]: files[protection].content,
+        [PROTECTION_RECORD_FILE]: record,
+      };
+      await layOut(layout);
+      const store = storeWith(fake, { platform: "linux" });
+
+      await expectRejection(() => store.status(), code);
+      await expectRejection(() => store.load(), code);
+      expect(store.keys()).toBeNull();
+      await expectFolder(layout);
+    }
+  }
+});
+
+test("on Linux a record that cannot be read rejects with the error and loads no key", async () => {
+  const fake = fakeSafeStorage();
+  const files = await linuxKeyFiles(fake);
+  await layOut({
+    [CURRENT_KEY_FILE]: files.unprotected.content,
+    [PROTECTION_RECORD_FILE]: recordOf("unprotected"),
+  });
+  const fileSystem: KeyFileSystem = {
+    ...nodeKeyFileSystem,
+    readFile: async (file) => {
+      if (path.basename(file) === PROTECTION_RECORD_FILE) {
+        throw Object.assign(new Error("permission denied"), {
+          code: "EACCES",
+        });
+      }
+      return nodeKeyFileSystem.readFile(file);
+    },
+  };
+  const store = storeWith(fake, { platform: "linux", fileSystem });
+
+  await expect(store.status()).rejects.toThrow("permission denied");
+  await expect(store.load()).rejects.toThrow("permission denied");
+  expect(store.keys()).toBeNull();
+});
+
+test("on Linux a record without a key file is ignored, and a new key replaces it", async () => {
+  const fake = fakeSafeStorage({ backend: "basic_text" });
+  for (const record of [recordOf("system"), "damaged"]) {
+    await layOut({ [PROTECTION_RECORD_FILE]: record });
+    const store = storeWith(fake, { platform: "linux" });
+
+    expect(await store.status()).toEqual({ protection: "none" });
+    expect(await store.load()).toBeNull();
+    // The person's new choice is the new record, even a lower one.
+    await store.create({ kind: "unprotected", acceptsUnprotectedKey: true });
+
+    expect(await readRecord()).toBe(recordOf("unprotected"));
+    expect(
+      (await storeWith(fake, { platform: "linux" }).load())?.current,
+    ).toBeDefined();
+  }
+});
+
+test('on Linux delete, as "This is not me" runs it, clears a refused key and its record, so that a new key of any protection can be made', async () => {
+  const fake = fakeSafeStorage();
+  const files = await linuxKeyFiles(fake);
+  await layOut({
+    [CURRENT_KEY_FILE]: files.unprotected.content,
+    [PREVIOUS_KEY_FILE]: files.system.content,
+    [PROTECTION_RECORD_FILE]: recordOf("system"),
+  });
+  const unlinks: string[] = [];
+  const fileSystem: KeyFileSystem = {
+    ...nodeKeyFileSystem,
+    unlink: async (file) => {
+      unlinks.push(path.basename(file));
+      await nodeKeyFileSystem.unlink(file);
+    },
+  };
+  const store = storeWith(fake, { platform: "linux", fileSystem });
+  await expectRejection(() => store.load(), "corrupt");
+  await writeFile(
+    path.join(folder, `${PROTECTION_RECORD_FILE}.0123456789abcdef.tmp`),
+    "partial",
+  );
+  unlinks.length = 0;
+
+  await store.delete();
+
+  // The record goes after both key files.
+  expect(unlinks).toEqual([
+    PREVIOUS_KEY_FILE,
+    CURRENT_KEY_FILE,
+    PROTECTION_RECORD_FILE,
+    `${PROTECTION_RECORD_FILE}.0123456789abcdef.tmp`,
+  ]);
+  expect(await readdir(folder)).toEqual([]);
+  expect(await store.status()).toEqual({ protection: "none" });
+  await store.create({ kind: "unprotected", acceptsUnprotectedKey: true });
+  expect(await readRecord()).toBe(recordOf("unprotected"));
+  expect(
+    (await storeWith(fake, { platform: "linux" }).load())?.current.publicKey,
+  ).toBe(store.keys()?.current.publicKey);
+});
+
+test("on Linux a delete that stops before the record leaves no key, and the next key replaces the record", async () => {
+  const fake = fakeSafeStorage({ backend: "gnome_libsecret" });
+  const fileSystem: KeyFileSystem = {
+    ...nodeKeyFileSystem,
+    unlink: async (file) => {
+      if (path.basename(file) === PROTECTION_RECORD_FILE) {
+        throw new Error("unlink failed");
+      }
+      await nodeKeyFileSystem.unlink(file);
+    },
+  };
+  const store = storeWith(fake, { platform: "linux", fileSystem });
+  await store.create({ kind: "system" });
+
+  await expect(store.delete()).rejects.toThrow("unlink failed");
+
+  expect(await readdir(folder)).toEqual([PROTECTION_RECORD_FILE]);
+  fake.state.backend = "basic_text";
+  const restarted = storeWith(fake, { platform: "linux" });
+  expect(await restarted.load()).toBeNull();
+  await restarted.create({ kind: "passphrase", passphrase: PASSPHRASE });
+  expect(await readRecord()).toBe(recordOf("passphrase"));
+  expect(
+    await storeWith(fake, { platform: "linux" }).load({
+      passphrase: PASSPHRASE,
+    }),
+  ).not.toBeNull();
+});
+
+test("on Linux a new key whose key file is not written leaves only its record, and a record that is not written leaves no key", async () => {
+  const fake = fakeSafeStorage({ backend: "basic_text" });
+  let failing: string | null = null;
+  const fileSystem: KeyFileSystem = {
+    ...nodeKeyFileSystem,
+    open: async (file, flags, mode) => {
+      if (
+        failing !== null &&
+        flags === "wx" &&
+        path.basename(file).startsWith(`${failing}.`)
+      ) {
+        throw new Error("disk full");
+      }
+      return nodeKeyFileSystem.open(file, flags, mode);
+    },
+  };
+  const store = storeWith(fake, { platform: "linux", fileSystem });
+
+  failing = PROTECTION_RECORD_FILE;
+  await expect(
+    store.create({ kind: "unprotected", acceptsUnprotectedKey: true }),
+  ).rejects.toThrow("disk full");
+  expect(await readdir(folder)).toEqual([]);
+  expect(store.keys()).toBeNull();
+
+  failing = CURRENT_KEY_FILE;
+  await expect(
+    store.create({ kind: "passphrase", passphrase: PASSPHRASE }),
+  ).rejects.toThrow("disk full");
+  // A record without a key protects nothing and blocks nothing.
+  expect(await readdir(folder)).toEqual([PROTECTION_RECORD_FILE]);
+  expect(store.keys()).toBeNull();
+  expect(await store.status()).toEqual({ protection: "none" });
+
+  failing = null;
+  await store.create({ kind: "unprotected", acceptsUnprotectedKey: true });
+  expect(await readRecord()).toBe(recordOf("unprotected"));
+});
+
+test("on Linux a key that moved up raises the record only after the previous key is deleted", async () => {
+  const fake = fakeSafeStorage({ backend: "basic_text" });
+  const events: string[] = [];
+  const fileSystem: KeyFileSystem = {
+    ...nodeKeyFileSystem,
+    rename: async (from, to) => {
+      events.push(`rename ${path.basename(to)}`);
+      await nodeKeyFileSystem.rename(from, to);
+    },
+    unlink: async (file) => {
+      events.push(`unlink ${path.basename(file)}`);
+      await nodeKeyFileSystem.unlink(file);
+    },
+  };
+  const store = storeWith(fake, { platform: "linux", fileSystem });
+  const first = await store.create({
+    kind: "passphrase",
+    passphrase: PASSPHRASE,
+  });
+  fake.state.backend = "gnome_libsecret";
+
+  const replaced = await store.replace();
+
+  // While the passphrase key is kept, the record stays with it, so that
+  // a start in between and `abandonReplacement` still accept it.
+  expect(await readRecord()).toBe(recordOf("passphrase"));
+  const between = await storeWith(fake, { platform: "linux" }).load({
+    passphrase: PASSPHRASE,
+  });
+  expect(between?.previous?.publicKey).toBe(first.publicKey);
+  expect(await readRecord()).toBe(recordOf("passphrase"));
+  events.length = 0;
+
+  await store.confirmReplacement();
+
+  expect(events).toEqual([
+    `unlink ${PREVIOUS_KEY_FILE}`,
+    `rename ${PROTECTION_RECORD_FILE}`,
+  ]);
+  expect(await readRecord()).toBe(recordOf("system"));
+  expect((await readdir(folder)).sort()).toEqual(
+    [CURRENT_KEY_FILE, PROTECTION_RECORD_FILE].sort(),
+  );
+  expect(
+    (await storeWith(fake, { platform: "linux" }).load())?.current.publicKey,
+  ).toBe(replaced.current.publicKey);
+
+  // A passphrase key file planted now is refused.
+  const planted = path.join(root, "planted");
+  await storeWith(fakeSafeStorage({ backend: "basic_text" }), {
+    platform: "linux",
+    folder: planted,
+  }).create({ kind: "passphrase", passphrase: PASSPHRASE });
+  await copyFile(
+    path.join(planted, CURRENT_KEY_FILE),
+    path.join(folder, CURRENT_KEY_FILE),
+  );
+  await expectRejection(
+    () =>
+      storeWith(fake, { platform: "linux" }).load({ passphrase: PASSPHRASE }),
+    "corrupt",
+  );
+});
+
+test("on Linux a record that confirmReplacement or load cannot write is reported, does not stop them, and is written at the next load", async () => {
+  const fake = fakeSafeStorage({ backend: "basic_text" });
+  let failRecord = false;
+  const fileSystem: KeyFileSystem = {
+    ...nodeKeyFileSystem,
+    open: async (file, flags, mode) => {
+      if (
+        failRecord &&
+        flags === "wx" &&
+        path.basename(file).startsWith(`${PROTECTION_RECORD_FILE}.`)
+      ) {
+        throw new Error("disk full");
+      }
+      return nodeKeyFileSystem.open(file, flags, mode);
+    },
+  };
+  const reported: string[] = [];
+  const options = {
+    platform: "linux",
+    fileSystem,
+    onError: (message: string) => {
+      reported.push(message);
+      throw new Error("the receiver fails too");
+    },
+  } as const;
+  const store = storeWith(fake, options);
+  await store.create({ kind: "passphrase", passphrase: PASSPHRASE });
+  fake.state.backend = "kwallet6";
+  const replaced = await store.replace();
+
+  failRecord = true;
+  await store.confirmReplacement();
+
+  expect(reported).toEqual([
+    "The protection of the device key could not be recorded.",
+  ]);
+  expect(store.keys()).toEqual({ current: replaced.current, previous: null });
+  expect(await readdir(folder)).not.toContain(PREVIOUS_KEY_FILE);
+  // The record still names the passphrase.
+  expect(await readRecord()).toBe(recordOf("passphrase"));
+
+  // A load that cannot raise it reports that and still loads.
+  const keys = await storeWith(fake, options).load();
+  expect(keys?.current.publicKey).toBe(replaced.current.publicKey);
+  expect(reported).toHaveLength(2);
+  expect(await readRecord()).toBe(recordOf("passphrase"));
+
+  // The next load that can write raises it.
+  failRecord = false;
+  await storeWith(fake, options).load();
+  expect(await readRecord()).toBe(recordOf("system"));
+});
+
+test("on Linux abandoning a moved-up key keeps the record of the passphrase key", async () => {
+  const fake = fakeSafeStorage({ backend: "basic_text" });
+  const store = storeWith(fake, { platform: "linux" });
+  const first = await store.create({
+    kind: "passphrase",
+    passphrase: PASSPHRASE,
+  });
+  fake.state.backend = "gnome_libsecret";
+  await store.replace();
+
+  await store.abandonReplacement();
+
+  expect(await readRecord()).toBe(recordOf("passphrase"));
+  const keys = await storeWith(fake, { platform: "linux" }).load({
+    passphrase: PASSPHRASE,
+  });
+  expect(keys?.current.publicKey).toBe(first.publicKey);
+});
+
+for (const platform of ["win32", "darwin"] as const) {
+  test(`on ${platform} no protection record is written or read, and delete removes one that is there`, async () => {
+    const fake = fakeSafeStorage();
+    const store = storeWith(fake, { platform });
+    await store.create({ kind: "system" });
+    const replaced = await store.replace();
+    await store.confirmReplacement();
+    expect(await readdir(folder)).toEqual([CURRENT_KEY_FILE]);
+
+    // The system's protection is the floor there already, so even a
+    // damaged record does not block the key.
+    await writeFile(path.join(folder, PROTECTION_RECORD_FILE), "damaged");
+    const restarted = storeWith(fake, { platform });
+    expect(await restarted.status()).toMatchObject({ protection: "system" });
+    expect((await restarted.load())?.current.publicKey).toBe(
+      replaced.current.publicKey,
+    );
+    expect(await readRecord()).toBe("damaged");
+
+    await restarted.delete();
+    expect(await readdir(folder)).toEqual([]);
+  });
+}
+
 const moduleFolder = path.dirname(fileURLToPath(import.meta.url));
 const sources = readdirSync(moduleFolder)
   .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts"))
@@ -1313,6 +1927,7 @@ test("the module never calls the synchronous safeStorage API and never logs", ()
     "errors.ts",
     "key-file.ts",
     "key-folder.ts",
+    "protection-record.ts",
     "signing-key.ts",
     "store.ts",
     "system.ts",
