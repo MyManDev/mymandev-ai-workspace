@@ -1,5 +1,16 @@
 import path from "node:path";
+import type {
+  MessageId,
+  ProjectId,
+  RepositoryId,
+  WorkspaceId,
+} from "@mymandev/protocol";
 import { expect, test } from "vitest";
+import {
+  createRunContextBuilder,
+  type RunContextResult,
+} from "../agents/run-context.ts";
+import type { EnforcementRecord, HeldRun } from "../permissions/enforcement.ts";
 import type {
   ReadToolFileSystem,
   ToolFileKind,
@@ -258,6 +269,8 @@ test("the walk lists every file, relative and sorted, and skips hidden names, .g
       "src/lib/a.ts",
       "src/out",
     ],
+    // The repository's folder, `Build`, `src`, and `src/lib`.
+    folders: 4,
     truncated: false,
   });
   // No skipped folder, hidden folder, or link was ever listed.
@@ -323,13 +336,18 @@ test("at most 1,000 folders are listed, and a folder left out for it says so", a
     exact.dir(`${ROOT}/d${index}`);
   }
   const whole = await walk(exact);
-  expect(whole).toEqual({ ok: true, files: [], truncated: false });
+  expect(whole).toEqual({
+    ok: true,
+    files: [],
+    folders: 1_000,
+    truncated: false,
+  });
   expect(exact.listed).toHaveLength(1_000);
 
   const over = exact.dir(`${ROOT}/one-more`).file(`${ROOT}/one-more/x.txt`);
   over.listed.length = 0;
   const cut = await walk(over);
-  expect(cut).toEqual({ ok: true, files: [], truncated: true });
+  expect(cut).toEqual({ ok: true, files: [], folders: 1_000, truncated: true });
   expect(over.listed).toHaveLength(1_000);
 });
 
@@ -346,6 +364,7 @@ test("the walk stops listing once 1,000 files are found and one more is seen", a
   const outcome = await walk(files);
   expect(outcome.ok && outcome.files.length).toBe(1_000);
   expect(outcome.ok && outcome.truncated).toBe(true);
+  expect(outcome.ok && outcome.folders).toBe(3);
   // `c` is never listed.
   expect(files.listed).toEqual([ROOT, `${ROOT}/a`, `${ROOT}/b`]);
 });
@@ -366,6 +385,7 @@ test("a folder deeper than 32 levels is not entered, and the list says so", asyn
   const whole = await walk(exact);
   expect(whole.ok && whole.files.length).toBe(maxDepth);
   expect(whole.ok && whole.truncated).toBe(false);
+  expect(whole.ok && whole.folders).toBe(maxDepth + 1);
   expect(exact.listed).toHaveLength(maxDepth + 1);
 
   const deep = chain(maxDepth + 8);
@@ -374,6 +394,7 @@ test("a folder deeper than 32 levels is not entered, and the list says so", asyn
     throw new Error("the walk failed");
   }
   expect(cut.truncated).toBe(true);
+  expect(cut.folders).toBe(maxDepth + 1);
   expect(cut.files).toHaveLength(maxDepth);
   expect(cut.files).toContain(`${"d/".repeat(maxDepth)}f${maxDepth}.txt`);
   // The repository's folder and 32 levels below it, no more.
@@ -394,6 +415,7 @@ test("an abort while a listing does not return answers the files found so far on
   expect(await walking).toEqual({
     ok: true,
     files: ["a.txt"],
+    folders: 1,
     truncated: true,
   });
 
@@ -413,7 +435,12 @@ test("a folder with more entries than one listing reads makes the list say that 
     files.file(`${ROOT}/many/.hidden${index}`);
   }
   files.file(`${ROOT}/many/visible.txt`);
-  expect(await walk(files)).toEqual({ ok: true, files: [], truncated: true });
+  expect(await walk(files)).toEqual({
+    ok: true,
+    files: [],
+    folders: 2,
+    truncated: true,
+  });
 });
 
 test("a path longer than the read tools take is left out", async () => {
@@ -461,6 +488,7 @@ test("a folder that is gone, on another device, unreadable, or changing when its
   expect(await walk(gone)).toEqual({
     ok: true,
     files: ["a.txt"],
+    folders: 1,
     truncated: false,
   });
 
@@ -469,10 +497,12 @@ test("a folder that is gone, on another device, unreadable, or changing when its
     .dir(`${ROOT}/src`)
     .file(`${ROOT}/src/b.txt`);
   failing.failReaddir.set(`${ROOT}/src`, "EACCES");
-  // An unreadable subfolder is left out, and the list says that it was cut.
+  // An unreadable subfolder is left out, not counted, and the list says
+  // that it was cut.
   expect(await walk(failing)).toEqual({
     ok: true,
     files: ["a.txt"],
+    folders: 1,
     truncated: true,
   });
   // The repository's folder itself that cannot be read fails the list.
@@ -556,6 +586,7 @@ test("a repository folder that disappears after it was listed gives the files fo
   expect(await walk(gone, { identity })).toEqual({
     ok: true,
     files: ["a/x.txt", "top.txt"],
+    folders: 2,
     truncated: true,
   });
   expect(gone.listed).toEqual([ROOT, `${ROOT}/a`]);
@@ -592,4 +623,128 @@ test("an abort stops the walk", async () => {
     ok: false,
     reason: "aborted",
   });
+});
+
+// The walk's record through the context builder (#366): the counts that the
+// walk gives, and never a name or a path.
+
+const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000000001";
+const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000002";
+const REPOSITORY_ID = "0192f0a0-7b3c-7d4e-8f50-000000000009" as RepositoryId;
+const AT = "2026-11-26T12:00:00.000Z";
+
+async function recordedWalk(
+  files: FakeFiles,
+): Promise<{ records: EnforcementRecord[]; result: RunContextResult }> {
+  const records: EnforcementRecord[] = [];
+  const builder = createRunContextBuilder({
+    account: {
+      readWorkspaceData: (async () => ({
+        ok: true,
+        value: {
+          message: {
+            id: "0192f0a0-7b3c-7d4e-8f50-00000000000c",
+            projectId: "0192f0a0-7b3c-7d4e-8f50-000000000006",
+            seq: 1,
+            author: {
+              kind: "member",
+              memberId: "0192f0a0-7b3c-7d4e-8f50-00000000000d",
+            },
+            body: "List the files.",
+            createdAt: "2026-11-26T11:00:00.000Z",
+          },
+        },
+      })) as never,
+    },
+    resolveFolder: async (repositoryId) => ({
+      ok: true,
+      repositoryId,
+      folder: ROOT,
+      identity: files.identity(ROOT),
+    }),
+    listFiles: createRepositoryWalkLister({ files, pathApi: path.posix }),
+    recorder: {
+      record: (entry) => {
+        records.push(entry);
+        return undefined;
+      },
+    },
+    now: () => new Date(AT),
+  });
+  const result = await builder.build({
+    run: {
+      runId: RUN_ID,
+      agentId: AGENT_ID,
+      hostDeviceId: "0192f0a0-7b3c-7d4e-8f50-000000000004",
+      repositoryId: REPOSITORY_ID,
+      providerConnectionId: null,
+    } as HeldRun,
+    workspaceId: "0192f0a0-7b3c-7d4e-8f50-000000000007" as WorkspaceId,
+    projectId: "0192f0a0-7b3c-7d4e-8f50-000000000006" as ProjectId,
+    inputMessageId: "0192f0a0-7b3c-7d4e-8f50-00000000000c" as MessageId,
+    check: () => ({
+      allowed: true,
+      request: {
+        agentId: AGENT_ID,
+        capability: "repo.read",
+        repositoryId: REPOSITORY_ID,
+      } as never,
+      end: () => undefined,
+    }),
+    signal: new AbortController().signal,
+  });
+  return { records, result };
+}
+
+function okWalk(files: number, folders: number, truncated: boolean) {
+  return {
+    kind: "context_walk",
+    result: "ok",
+    files,
+    folders,
+    truncated,
+    runId: RUN_ID,
+    agentId: AGENT_ID,
+    repositoryId: REPOSITORY_ID,
+    providerConnectionId: null,
+    at: AT,
+  };
+}
+
+test("the walk's record counts the files in the context and the folders listed: an unreadable folder is not counted and cuts the list", async () => {
+  const files = repository()
+    .file(`${ROOT}/a.txt`)
+    .dir(`${ROOT}/src`)
+    .file(`${ROOT}/src/b.txt`)
+    .dir(`${ROOT}/secret-plans`)
+    .file(`${ROOT}/secret-plans/c.txt`);
+  files.failReaddir.set(`${ROOT}/secret-plans`, "EACCES");
+  const { records, result } = await recordedWalk(files);
+  expect(result.ok && result.context.repository).toEqual({
+    included: true,
+    repositoryId: REPOSITORY_ID,
+    files: ["a.txt", "src/b.txt"],
+    truncated: true,
+  });
+  expect(records).toEqual([okWalk(2, 2, true)]);
+  const json = JSON.stringify(records);
+  for (const name of ["a.txt", "src", "secret-plans", "octocat", ROOT]) {
+    expect(json).not.toContain(name);
+  }
+});
+
+test("the walk's record of a tree deeper than 32 levels counts the 33 folders listed and says that the list was cut", async () => {
+  const { maxDepth } = REPOSITORY_FILE_LIST_LIMITS;
+  const files = repository();
+  let current = ROOT;
+  for (let level = 1; level <= maxDepth + 4; level += 1) {
+    current = `${current}/d`;
+    files.dir(current).file(`${current}/f${level}.txt`);
+  }
+  const { records } = await recordedWalk(files);
+  expect(records).toEqual([okWalk(maxDepth, maxDepth + 1, true)]);
+
+  // A tree within every bound is recorded as whole.
+  const whole = repository().file(`${ROOT}/a.txt`);
+  expect((await recordedWalk(whole)).records).toEqual([okWalk(1, 1, false)]);
 });

@@ -70,6 +70,13 @@ export const SKIPPED_FOLDER_NAMES: ReadonlySet<string> = Object.freeze(
  * - `files`: paths relative to the repository's top-level folder, in POSIX
  *   form, each once, sorted by UTF-16 code unit; never a folder, a link, or
  *   an absolute path.
+ * - `folders`: the number of folders whose listing was read, the
+ *   repository's folder included, from 1 to `maxFolders`; the context's walk
+ *   record holds it (#366). A lister that lists no folder one by one (the
+ *   later `git ls-files`) counts the folders that hold its files, the
+ *   repository's folder included, capped at `maxFolders`: it answers the
+ *   smaller of its count and `maxFolders`, so that 1,000 files in 1,000
+ *   folders below the repository's folder stay a valid answer.
  * - `truncated`: a bound of `REPOSITORY_FILE_LIST_LIMITS` cut the list, a
  *   folder held more entries than one listing reads, a path was too long to
  *   name, a folder below the repository's folder could not be read, or the
@@ -86,6 +93,7 @@ export type RepositoryFileListOutcome =
   | {
       readonly ok: true;
       readonly files: readonly string[];
+      readonly folders: number;
       readonly truncated: boolean;
     }
   | { readonly ok: false; readonly reason: "aborted" | "failed" };
@@ -189,6 +197,7 @@ function untilStopped<T>(
 
 function sortedList(
   files: readonly string[],
+  folders: number,
   truncated: boolean,
 ): RepositoryFileListOutcome {
   return Object.freeze({
@@ -196,6 +205,7 @@ function sortedList(
     files: Object.freeze(
       [...files].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
     ),
+    folders,
     truncated,
   });
 }
@@ -230,10 +240,12 @@ export function createRepositoryWalkLister(
     const { signal } = context;
     const files: string[] = [];
     let truncated = false;
-    let rootListed = false;
+    // The folders whose listing was read; the repository's folder first.
+    let listed = 0;
     // After an abort: the files found so far, once the repository's folder
     // was listed.
-    const stopped = () => (rootListed ? sortedList(files, true) : ABORTED);
+    const stopped = () =>
+      listed > 0 ? sortedList(files, listed, true) : ABORTED;
     // The folders to list, the repository's folder first, each with its
     // depth below it; `next` is the first one not listed yet. At most
     // `maxFolders` are ever held.
@@ -288,7 +300,7 @@ export function createRepositoryWalkLister(
       if (listing === null) {
         return FAILED;
       }
-      rootListed = true;
+      listed += 1;
       if (listing.truncated) {
         truncated = true;
       }
@@ -318,7 +330,7 @@ export function createRepositoryWalkLister(
         // A link and anything else is never followed or listed.
       }
     }
-    return sortedList(files, truncated);
+    return sortedList(files, listed, truncated);
   }
 
   return (context: ToolRunContext) => walk(context).catch(() => FAILED);

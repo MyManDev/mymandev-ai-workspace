@@ -139,11 +139,14 @@ test("the entry point gives the host run supervisor the enforcement point and th
   );
 });
 
-test("a tool dispatcher records to the enforcement point's own recorder: it is created in the entry point only, with that recorder", () => {
-  // No dispatcher is wired yet (#36: no executor calls one). Once one is,
-  // it must get the very recorder of the enforcement point: a second file
-  // recorder on the same folder would be a second writer of its files, and
-  // a recorder in memory would keep nothing on the device.
+/**
+ * Requires that `create` is called in the entry point only, outside its own
+ * module and the tests, and that every call there gives it the enforcement
+ * point's recorder: a second file recorder on the same folder would be a
+ * second writer of its files, and a recorder in memory would keep nothing on
+ * the device.
+ */
+function expectOwnRecorder(create: string, module: string): void {
   const sources = readdirSync(new URL(".", import.meta.url), {
     recursive: true,
     encoding: "utf8",
@@ -151,10 +154,10 @@ test("a tool dispatcher records to the enforcement point's own recorder: it is c
     (name) =>
       name.endsWith(".ts") &&
       !name.endsWith(".test.ts") &&
-      path.basename(name) !== "tool-dispatcher.ts",
+      path.basename(name) !== module,
   );
   const creating = sources.filter((name) =>
-    /\bcreateToolDispatcher\(/.test(
+    new RegExp(`\\b${create}\\(`).test(
       withoutComments(
         readFileSync(
           new URL(name.replaceAll("\\", "/"), import.meta.url),
@@ -165,9 +168,11 @@ test("a tool dispatcher records to the enforcement point's own recorder: it is c
   );
   expect(creating.every((name) => name === "index.ts")).toBe(true);
   const calls = [
-    ...ENTRY.matchAll(/\bcreateToolDispatcher\(\{\n([\s\S]*?)\n {2}\}\);/g),
+    ...ENTRY.matchAll(
+      new RegExp(`\\b${create}\\(\\{\\n([\\s\\S]*?)\\n {2}\\}\\);`, "g"),
+    ),
   ];
-  expect(ENTRY.match(/\bcreateToolDispatcher\(/g) ?? []).toHaveLength(
+  expect(ENTRY.match(new RegExp(`\\b${create}\\(`, "g")) ?? []).toHaveLength(
     calls.length,
   );
   for (const call of calls) {
@@ -176,4 +181,16 @@ test("a tool dispatcher records to the enforcement point's own recorder: it is c
   // The entry point has one recorder: the file recorder of the system.
   expect(ENTRY).not.toMatch(/\bcreateFileEnforcementRecorder\(/);
   expect(ENTRY.match(/\bcreateSystemEnforcementRecorder\(/g)).toHaveLength(1);
+}
+
+test("a tool dispatcher records to the enforcement point's own recorder: it is created in the entry point only, with that recorder", () => {
+  // No dispatcher is wired yet (#36: no executor calls one). Once one is,
+  // it must get the very recorder of the enforcement point.
+  expectOwnRecorder("createToolDispatcher", "tool-dispatcher.ts");
+});
+
+test("a run context builder records its walks to the enforcement point's own recorder: it is created in the entry point only, with that recorder", () => {
+  // No builder is wired yet (#34: no executor calls one). Once one is, it
+  // must get the very recorder of the enforcement point (#366).
+  expectOwnRecorder("createRunContextBuilder", "run-context.ts");
 });
