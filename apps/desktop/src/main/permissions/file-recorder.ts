@@ -15,12 +15,14 @@
 //   followed by the fields of the record in a fixed order, with U+2028 and
 //   U+2029 escaped as well (still the same JSON). A record is validated
 //   before it is written, and anything that is not exactly a `DenialRecord`,
-//   a `ShellStartRecord`, or a `ToolCallRecord` (tool-call-record.ts; IDs,
+//   a `ShellStartRecord`, a `ToolCallRecord` (tool-call-record.ts; IDs,
 //   closed vocabularies, times, and a tool call's path relative to the
-//   repository) is refused, an unexpected field included. A tool call's path
-//   with a lone surrogate or a Unicode format character (`\p{Cf}`, the bidi
-//   overrides and the BOM included) is refused too; the dispatcher records
-//   such a path as null.
+//   repository), or a `ContextWalkRecord` (context-walk-record.ts; IDs, a
+//   result code, counts within the bounds of the file list, at least one
+//   folder, a flag, and a time) is refused, an unexpected field included.
+//   A tool call's path with a lone surrogate or a Unicode format character
+//   (`\p{Cf}`, the bidi overrides and the BOM included) is refused too; the
+//   dispatcher records such a path as null.
 // - Versions (Project Manager decision of 2026-11-26). The version changes
 //   only when a field of an existing kind is added, removed, or changes its
 //   meaning. A new kind is added under the same version, and the lines of
@@ -29,14 +31,15 @@
 //   result codes of a tool call, the denial reasons, the capability names)
 //   under the same version, and a reader accepts a value that it does not
 //   know. So `tool_call_allowed` (#37, Project Manager decision of
-//   2026-11-26) is a line of version 1, and the lines written before it keep
-//   their meaning.
+//   2026-11-26) and `context_walk` (#366) are lines of version 1, and the
+//   lines written before them keep their meaning.
 // - Two series (Project Manager decision of 2026-11-26). The denials and the
 //   shell starts are written to `enforcement-<8 digits>.jsonl`, and the
-//   allowed tool calls to `enforcement-tool-calls-<8 digits>.jsonl`, in the
-//   same folder. Each series has its own open file, numbering, rotation, size
-//   tracking, wait after failures, and logs, so that tool calls never rotate
-//   a denial or a shell start away.
+//   allowed tool calls and the walks of a run's context (#366) to
+//   `enforcement-tool-calls-<8 digits>.jsonl`, in the same folder. Each
+//   series has its own open file, numbering, rotation, size tracking, wait
+//   after failures, and logs, so that tool calls never rotate a denial or a
+//   shell start away.
 // - Append only. A file is opened in append mode and never truncated, and
 //   each record is written with one write call. A write that fails or is
 //   cut short drops the file; a file that does not end with "\n" is never
@@ -52,11 +55,11 @@
 // - Durability. The record of an allowed shell start is flushed to disk
 //   (`fsync`) before `record` returns, and so are the lines written before
 //   it in its file; then the open file of the tool calls is flushed too,
-//   ignoring an error, which never fails the start. A denial, and an allowed
-//   tool call, reach the operating system with their write call, which a
-//   crash of the application does not undo, and reach the disk with the
-//   next shell start, the next rotation of their series, or when their file
-//   is dropped or closed. Default until the Project Manager decides: a
+//   ignoring an error, which never fails the start. A denial, an allowed
+//   tool call, and a walk reach the operating system with their write call,
+//   which a crash of the application does not undo, and reach the disk with
+//   the next shell start, the next rotation of their series, or when their
+//   file is dropped or closed. Default until the Project Manager decides: a
 //   denial loop of a misbehaving executor, or the many reads of an agent,
 //   then do not flush once for every record on the main process.
 // - Rotation. A file holds at most `maxFileBytes`. A record that does not
@@ -69,16 +72,17 @@
 // - Failure. A record that cannot be written, of any kind, makes `record`
 //   throw an `EnforcementRecordError` with a code from a closed list, so that
 //   the enforcement point denies an allowed shell start (`record_failed`),
-//   and the tool dispatcher refuses an allowed tool call (`record_failed`).
-//   The next record opens the folder again; after two failures of its series
-//   in a row, a denial or a tool call within `ENFORCEMENT_RECORD_RETRY_MS` of
-//   the last attempt fails at once with the last code, but a shell start
-//   always tries to write. A newest file that can never be appended to (a
-//   folder, a read-only file, a link, a file of another owner) is left as it
-//   is, and the next numbered file is started. It never throws anything
-//   else, and nothing it does can stop the main process. A file that cannot
-//   be deleted at rotation does not fail the record; it is deleted at a
-//   later rotation.
+//   the tool dispatcher refuses an allowed tool call (`record_failed`), and
+//   the context builder leaves the repository out of a run's context
+//   (`unavailable`). The next record opens the folder again; after two
+//   failures of its series in a row, a denial, a tool call, or a walk within
+//   `ENFORCEMENT_RECORD_RETRY_MS` of the last attempt fails at once with the
+//   last code, but a shell start always tries to write. A newest file that
+//   can never be appended to (a folder, a read-only file, a link, a file of
+//   another owner) is left as it is, and the next numbered file is started.
+//   It never throws anything else, and nothing it does can stop the main
+//   process. A file that cannot be deleted at rotation does not fail the
+//   record; it is deleted at a later rotation.
 // - Permissions. The folder must be a folder, not a link, and is set to its
 //   owner only (0o700) whenever it is opened, and each file is readable and
 //   writable by its owner only (0o600) on macOS and Linux, where a file is
@@ -105,7 +109,9 @@ import {
   UtcTimestampSchema,
 } from "@mymandev/protocol";
 import * as z from "zod";
+import { REPOSITORY_FILE_LIST_LIMITS } from "../tools/repository-files.ts";
 import { parseRepositoryPath } from "../tools/repository-path.ts";
+import { CONTEXT_WALK_RECORD_RESULTS } from "./context-walk-record.ts";
 import {
   ENFORCEMENT_DENIAL_REASONS,
   type EnforcementRecord,
@@ -157,10 +163,10 @@ export const ENFORCEMENT_RECORD_FILE_MODE = 0o600;
 export const ENFORCEMENT_RECORD_FOLDER_MODE = 0o700;
 
 /**
- * After two failures of its series in a row, a denial or a tool call within
- * this many milliseconds of the last attempt fails at once with the last
- * code, without touching the disk; a shell start always tries to write.
- * Default until the Project Manager decides.
+ * After two failures of its series in a row, a denial, a tool call, or a
+ * walk within this many milliseconds of the last attempt fails at once with
+ * the last code, without touching the disk; a shell start always tries to
+ * write. Default until the Project Manager decides.
  */
 export const ENFORCEMENT_RECORD_RETRY_MS = 1000;
 
@@ -171,8 +177,8 @@ export const ENFORCEMENT_RECORD_RETRY_MS = 1000;
 const FILE_NAME = /^enforcement-(\d{8})\.jsonl$/u;
 
 /**
- * The name of a record file of the allowed tool calls, a series of its own:
- * its number, exactly 8 digits.
+ * The name of a record file of the allowed tool calls and the walks of a
+ * run's context, a series of its own: its number, exactly 8 digits.
  */
 const TOOL_CALL_FILE_NAME = /^enforcement-tool-calls-(\d{8})\.jsonl$/u;
 
@@ -241,8 +247,8 @@ export function enforcementRecordFileFlags(
  * Why a record was not written, a closed list:
  *
  * - `record_invalid`: the record is not a denial or a shell start of the
- *   enforcement point, or a tool call of the dispatcher, or it has another
- *   field.
+ *   enforcement point, a tool call of the dispatcher, or a walk of the
+ *   context builder, or it has another field.
  * - `record_too_large`: its line is longer than `maxRecordBytes`.
  * - `folder_unavailable`: the folder cannot be resolved, created, or
  *   listed.
@@ -462,10 +468,46 @@ const ToolCallLineSchema = z.strictObject({
   at: UtcTimestampSchema,
 });
 
+/**
+ * A count of a walk: an integer from `min` to its bound in
+ * `REPOSITORY_FILE_LIST_LIMITS`, or null for a walk without a list.
+ */
+function walkCount(min: number, max: number) {
+  return z.number().int().min(min).max(max).nullable();
+}
+
+/**
+ * A walk of a run's context: the counts and the flag are given for the
+ * result `ok` and null for every other result. A list read at least the
+ * repository's folder, so `folders` is at least 1.
+ */
+const ContextWalkLineSchema = z
+  .strictObject({
+    kind: z.literal("context_walk"),
+    result: z.enum(CONTEXT_WALK_RECORD_RESULTS),
+    files: walkCount(0, REPOSITORY_FILE_LIST_LIMITS.maxFiles),
+    folders: walkCount(1, REPOSITORY_FILE_LIST_LIMITS.maxFolders),
+    truncated: z.boolean().nullable(),
+    runId: RunIdSchema,
+    agentId: AgentIdSchema,
+    repositoryId: RepositoryIdSchema,
+    providerConnectionId: ProviderConnectionIdSchema.nullable(),
+    at: UtcTimestampSchema,
+  })
+  .refine((walk) => {
+    const listed = walk.result === "ok";
+    return (
+      (walk.files !== null) === listed &&
+      (walk.folders !== null) === listed &&
+      (walk.truncated !== null) === listed
+    );
+  });
+
 const RecordLineSchema = z.discriminatedUnion("kind", [
   DenialLineSchema,
   ShellStartLineSchema,
   ToolCallLineSchema,
+  ContextWalkLineSchema,
 ]);
 
 /**
@@ -550,6 +592,21 @@ export function enforcementRecordLine(
         at: record.at,
       };
       break;
+    case "context_walk":
+      fields = {
+        version,
+        kind: record.kind,
+        result: record.result,
+        files: record.files,
+        folders: record.folders,
+        truncated: record.truncated,
+        runId: record.runId,
+        agentId: record.agentId,
+        repositoryId: record.repositoryId,
+        providerConnectionId: record.providerConnectionId,
+        at: record.at,
+      };
+      break;
     default: {
       // A new kind does not compile until its line is written here.
       const unknownKind: never = record;
@@ -591,8 +648,8 @@ interface Retry {
 /**
  * A series of record files, with its own names, its own rotation and size
  * tracking, and its own state of failure: one for the denials and shell
- * starts, and one for the allowed tool calls, so that tool calls never rotate
- * a denial or a shell start away.
+ * starts, and one for the allowed tool calls and the walks of a run's
+ * context, so that tool calls never rotate a denial or a shell start away.
  */
 interface Series {
   /** The name of its file number `sequence`. */
@@ -641,7 +698,7 @@ export function createFileEnforcementRecorder(
     failing: null,
     retry: null,
   };
-  /** The allowed tool calls. */
+  /** The allowed tool calls and the walks of a run's context. */
   const toolCalls: Series = {
     fileName: enforcementToolCallFileName,
     pattern: TOOL_CALL_FILE_NAME,
@@ -1005,9 +1062,9 @@ export function createFileEnforcementRecorder(
       throw new EnforcementRecordError("record_too_large");
     }
     const shellStart = validated.kind === "shell_start_allowed";
-    // A shell start always tries to write; a denial or a tool call after two
-    // failures of its series in a row waits, so that a loop does not open the
-    // folder each time.
+    // A shell start always tries to write; a denial, a tool call, or a walk
+    // after two failures of its series in a row waits, so that a loop does
+    // not open the folder each time.
     const { retry } = series;
     if (
       !shellStart &&
@@ -1072,7 +1129,11 @@ export function createFileEnforcementRecorder(
         if (validated === null) {
           throw new EnforcementRecordError("record_invalid");
         }
-        if (validated.kind === "tool_call_allowed") {
+        // A walk of a run's context goes with the tool calls (#366).
+        if (
+          validated.kind === "tool_call_allowed" ||
+          validated.kind === "context_walk"
+        ) {
           series = toolCalls;
         }
         write(series, validated);

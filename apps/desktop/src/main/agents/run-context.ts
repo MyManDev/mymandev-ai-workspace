@@ -31,6 +31,22 @@
 //   held action. A walk that listed the repository's folder answers the
 //   files found so far, marked `truncated`; before that the repository is
 //   left out (`unavailable`). The run's own abort still fails the build.
+// - The record (#366, Project Manager decision of 2026-11-26: one record per
+//   walk). Once `repo.read` was allowed, the walk is recorded exactly once,
+//   after it settled and before its list is placed in the context: one
+//   `context_walk` record (`ContextWalkRecord`, in
+//   `permissions/context-walk-record.ts` with the format of the records) to
+//   the enforcement point's own recorder, which writes it to the series of
+//   the tool calls. It holds the run, the agent, the repository, the run's
+//   provider connection, the result code, the number of files and of
+//   folders listed, whether the list was cut, and the time: never a file's
+//   or a folder's name, a path, or a file's content. The run's abort that
+//   lands before the record is recorded as `aborted`; one that lands right
+//   after it still fails the build, although the record says `ok` (the list
+//   was ready for the context). A walk that is not recorded never reaches
+//   the context (fail closed, default until the Project Manager decides):
+//   the repository is left out (`unavailable`). A denial is recorded by the
+//   enforcement point, and a run without a repository has no walk.
 // - After the build. Once the list settled, a change of the grants no longer
 //   reaches it: the executor calls `recheckRepositoryRead` right before
 //   every provider request that carries the list, also on later turns, and
@@ -51,6 +67,11 @@ import type {
 } from "@mymandev/protocol";
 import type { AccountService } from "../account.ts";
 import type { WorkspaceReadResult } from "../api-reads.ts";
+import type {
+  ContextWalkRecord,
+  ContextWalkRecordResult,
+} from "../permissions/context-walk-record.ts";
+import type { EnforcementRecorder } from "../permissions/enforcement.ts";
 import type { RepositoryFolderResolution } from "../repository-links/service.ts";
 import {
   REPOSITORY_FILE_LIST_LIMITS,
@@ -86,9 +107,10 @@ export type RunContextFailure = (typeof RUN_CONTEXT_FAILURES)[number];
  * - `no_repository`: the run has none; nothing is checked.
  * - `denied`: the enforcement point denied `repo.read` with any reason, or
  *   the check failed.
- * - `unavailable`: the repository's folder did not resolve on this device,
- *   its file list failed or broke a rule above, or the deadline came before
- *   the repository's folder was listed.
+ * - `unavailable`: the repository's folder did not resolve on this device
+ *   or its resolution could not be read, its file list failed or broke a
+ *   rule above, the deadline came before the repository's folder was
+ *   listed, or the walk's record was not taken.
  */
 export const RUN_CONTEXT_REPOSITORY_OMISSIONS = Object.freeze([
   "no_repository",
@@ -152,6 +174,16 @@ export interface RunContextBuilderOptions {
   ) => Promise<RepositoryFolderResolution>;
   /** The file list: `createRepositoryWalkLister` until the Git slice. */
   readonly listFiles: RepositoryFileLister;
+  /**
+   * The enforcement point's recorder, which takes the `ContextWalkRecord` of
+   * every walk (#366): the very instance that the enforcement point got,
+   * never a second file recorder on the same folder (a second writer) or a
+   * recorder in memory (nothing kept on the device). A walk whose record is
+   * not taken leaves the repository out (`unavailable`).
+   */
+  readonly recorder: EnforcementRecorder;
+  /** The wall clock, read once for each record. */
+  readonly now: () => Date;
 }
 
 export interface RunContextBuilder {
@@ -207,6 +239,59 @@ function untilAborted<T>(
 
 /** The repository part, or `ABORTED`. */
 type RepositoryPart = RunContextRepository | typeof ABORTED;
+
+/** What a walk gave: its result code, and its list for `ok`. */
+type Walk =
+  | {
+      readonly result: "ok";
+      readonly files: readonly string[];
+      readonly folders: number;
+      readonly truncated: boolean;
+    }
+  | { readonly result: Exclude<ContextWalkRecordResult, "ok"> };
+
+function walkWithout(result: Exclude<ContextWalkRecordResult, "ok">): Walk {
+  return Object.freeze({ result });
+}
+
+/**
+ * Where a walk is: `listing` turns true once the resolution's answer was
+ * read and the lister is called, so that an answer that throws is recorded
+ * as the resolution's failure before it and as the lister's after it.
+ */
+interface WalkPhase {
+  listing: boolean;
+}
+
+/** The ISO time of a genuine, valid Date from the clock, or null. */
+function timeOf(now: () => Date): string | null {
+  try {
+    const ms = Date.prototype.getTime.call(now());
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Handles the rejection of a thenable, so that a recorder that returned a
+ * promise leaves no unhandled rejection. It never throws.
+ */
+function settleQuietly(value: unknown): void {
+  try {
+    if (
+      (typeof value === "object" && value !== null) ||
+      typeof value === "function"
+    ) {
+      const then: unknown = (value as { then?: unknown }).then;
+      if (typeof then === "function") {
+        then.call(value, undefined, () => undefined);
+      }
+    }
+  } catch {
+    // Nothing more to do.
+  }
+}
 
 /** Settles after the current turn of the event loop. */
 function nextTurn(): Promise<void> {
@@ -310,7 +395,48 @@ export function recheckRepositoryRead(
 export function createRunContextBuilder(
   options: RunContextBuilderOptions,
 ): RunContextBuilder {
-  const { account, resolveFolder, listFiles } = options;
+  const { account, resolveFolder, listFiles, recorder, now } = options;
+
+  /**
+   * Records a walk once it settled: true only when the recorder took the
+   * record, `undefined`, as the enforcement point counts it. A clock without
+   * a valid time, a throw, and any other result are not taken.
+   */
+  function recordWalk(
+    input: RunContextInput,
+    repositoryId: RepositoryId,
+    walk: Walk,
+  ): boolean {
+    const at = timeOf(now);
+    if (at === null) {
+      return false;
+    }
+    const listed = walk.result === "ok";
+    const entry: ContextWalkRecord = Object.freeze({
+      kind: "context_walk",
+      result: walk.result,
+      // Counts and a flag only: never a name or a path of the list.
+      files: listed ? walk.files.length : null,
+      folders: listed ? walk.folders : null,
+      truncated: listed ? walk.truncated : null,
+      runId: input.run.runId,
+      agentId: input.run.agentId,
+      repositoryId,
+      providerConnectionId: input.run.providerConnectionId,
+      at,
+    });
+    let taken: unknown;
+    try {
+      taken = recorder.record(entry);
+    } catch {
+      return false;
+    }
+    if (taken !== undefined) {
+      settleQuietly(taken);
+      return false;
+    }
+    return true;
+  }
 
   /** The message of the run, or why it has none. */
   async function readMessage(
@@ -344,11 +470,18 @@ export function createRunContextBuilder(
     return message;
   }
 
-  /** Checks a lister's answer by the rules above; the list, or null. */
+  /**
+   * Checks a lister's answer by the rules above, and its count of folders,
+   * an integer from 1 to `maxFolders`; the list, or null.
+   */
   function checkedList(
     outcome: RepositoryFileListOutcome,
     folder: string,
-  ): { readonly files: readonly string[]; readonly truncated: boolean } | null {
+  ): {
+    readonly files: readonly string[];
+    readonly folders: number;
+    readonly truncated: boolean;
+  } | null {
     if (
       typeof outcome !== "object" ||
       outcome === null ||
@@ -356,8 +489,15 @@ export function createRunContextBuilder(
     ) {
       return null;
     }
-    const { files, truncated } = outcome;
-    if (!Array.isArray(files) || typeof truncated !== "boolean") {
+    const { files, folders, truncated } = outcome;
+    if (
+      !Array.isArray(files) ||
+      typeof truncated !== "boolean" ||
+      !Number.isSafeInteger(folders) ||
+      // A list read at least the repository's folder.
+      folders < 1 ||
+      folders > REPOSITORY_FILE_LIST_LIMITS.maxFolders
+    ) {
       return null;
     }
     const seen = new Set<string>();
@@ -381,6 +521,7 @@ export function createRunContextBuilder(
     }
     return {
       files: Object.freeze(kept),
+      folders,
       truncated: truncated || files.length > maxFiles,
     };
   }
@@ -420,28 +561,95 @@ export function createRunContextBuilder(
       end();
     }, REPOSITORY_FILE_LIST_LIMITS.deadlineMs);
 
+    // From here on, `repo.read` is allowed: the walk is recorded once,
+    // whatever it gives, before its list is placed in the context.
+    const phase: WalkPhase = { listing: false };
+    let walk: Walk;
+    try {
+      walk = await walkRepository(
+        input,
+        repositoryId,
+        stop,
+        deadline,
+        end,
+        phase,
+      );
+    } catch {
+      // A resolution's answer that throws while it is read, before any
+      // lister ran, or a lister's answer that throws while it is checked.
+      end();
+      walk = walkWithout(
+        signal.aborted
+          ? "aborted"
+          : phase.listing
+            ? "list_failed"
+            : "repository_unavailable",
+      );
+    }
+    // An abort that landed after the walk's last check and before its
+    // record: the build fails, so the walk is recorded as aborted.
+    if (signal.aborted) {
+      walk = walkWithout("aborted");
+    }
+    const recorded = recordWalk(input, repositoryId, walk);
+    if (walk.result === "aborted") {
+      return ABORTED;
+    }
+    if (walk.result !== "ok" || !recorded) {
+      return omitted("unavailable");
+    }
+    return Object.freeze({
+      included: true,
+      repositoryId,
+      files: walk.files,
+      truncated: walk.truncated,
+    });
+  }
+
+  /**
+   * Resolves the repository's folder and lists its files, until the run's
+   * signal or the deadline aborts `stop`; `end` ends the held action, and
+   * `phase.listing` turns true once the resolution's answer was read and the
+   * lister is called. What the walk gave, for its record and the context.
+   */
+  async function walkRepository(
+    input: RunContextInput,
+    repositoryId: RepositoryId,
+    stop: AbortSignal,
+    deadline: AbortController,
+    end: () => void,
+    phase: WalkPhase,
+  ): Promise<Walk> {
+    const { signal } = input;
     const resolving = (async () => resolveFolder(repositoryId))();
     const resolved = await untilAborted(resolving, stop);
     if (signal.aborted) {
       end();
-      return ABORTED;
+      return walkWithout("aborted");
+    }
+    if (resolved === ABORTED) {
+      // The deadline, before the folder resolved.
+      end();
+      return walkWithout("timed_out");
     }
     if (
-      resolved === ABORTED ||
       resolved === THREW ||
       typeof resolved !== "object" ||
       resolved === null ||
       resolved.ok !== true
     ) {
       end();
-      return omitted("unavailable");
+      return walkWithout("repository_unavailable");
     }
-    const folder = resolved.folder;
+    // Read once, before the lister is called: an answer that throws here is
+    // the resolution's failure.
+    const { folder, identity } = resolved;
+    phase.listing = true;
 
     // The action is held until the lister settled, also after an abort, or
     // until the deadline.
     const listing = (async () =>
-      listFiles({ folder, folderIdentity: resolved.identity, signal: stop }))();
+      listFiles({ folder, folderIdentity: identity, signal: stop }))();
     void listing.then(end, end);
     let outcome = await untilAborted(listing, stop);
     if (outcome === ABORTED && !signal.aborted) {
@@ -452,20 +660,32 @@ export function createRunContextBuilder(
         signal,
       );
     }
-    if (outcome === ABORTED || signal.aborted) {
-      return signal.aborted ? ABORTED : omitted("unavailable");
+    if (signal.aborted) {
+      return walkWithout("aborted");
     }
-    if (outcome === THREW || typeof outcome !== "object" || outcome === null) {
-      return omitted("unavailable");
+    if (outcome === ABORTED) {
+      return walkWithout("timed_out");
+    }
+    if (
+      outcome === THREW ||
+      typeof outcome !== "object" ||
+      outcome === null ||
+      outcome.ok !== true
+    ) {
+      // No list; after the deadline, it came too late.
+      return walkWithout(deadline.signal.aborted ? "timed_out" : "list_failed");
     }
     const list = checkedList(outcome, folder);
+    if (signal.aborted) {
+      return walkWithout("aborted");
+    }
     if (list === null) {
-      return omitted("unavailable");
+      return walkWithout("list_refused");
     }
     return Object.freeze({
-      included: true,
-      repositoryId,
+      result: "ok",
       files: list.files,
+      folders: list.folders,
       // A list that the deadline cut is never answered as whole.
       truncated: list.truncated || deadline.signal.aborted,
     });
