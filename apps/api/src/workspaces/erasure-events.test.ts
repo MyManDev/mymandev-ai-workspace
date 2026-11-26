@@ -2,6 +2,7 @@ import {
   agentRuns,
   agents,
   type Database,
+  disableAccount,
   encodeErasureNotification,
   ERASED_AGENT_NAME,
   eraseAccount,
@@ -50,8 +51,12 @@ import {
   settle,
   until,
 } from "../gateway-test-support.ts";
-import { ConnectionRegistry } from "../gateway.ts";
-import { ErasureReplay, replayErasureNotification } from "./erasure-events.ts";
+import { ConnectionRegistry, refusalOf } from "../gateway.ts";
+import {
+  decodeErasureNotification,
+  ErasureReplay,
+  replayErasureNotification,
+} from "./erasure-events.ts";
 import type { ApproverEvent, WorkspaceEvent } from "./events.ts";
 
 // The live events of an operator's account erasure (#341): the erasure's
@@ -808,6 +813,7 @@ test("a confirmed account_erased closes only the connections of the devices that
     {
       confirmed: true,
       revokedDeviceIds: [erin.device.deviceId as DeviceId],
+      disabledAccountDeviceIds: [],
       approvers: [],
     },
   );
@@ -881,7 +887,12 @@ test("the replay checks one notification at a time and replays them in the order
       } finally {
         checking -= 1;
       }
-      return { confirmed: true, revokedDeviceIds: [], approvers: [] };
+      return {
+        confirmed: true,
+        revokedDeviceIds: [],
+        disabledAccountDeviceIds: [],
+        approvers: [],
+      };
     },
   });
   replay.push(removed);
@@ -1032,3 +1043,280 @@ test(
     );
   },
 );
+
+// The live events of an operator's account disable (#350): the disable's
+// transaction sends its notifications on the erasure's channel, and the
+// same listener and replay handle them.
+
+test("a disable closes the account's connections at once with auth_failed, the reason of the sweep, and sends the remaining subscribers each revoked grant exactly as the grant route does", async (t) => {
+  const { connections, observed, account } = await instance(t);
+  const ada = await account(35101);
+  const bob = await account(35102);
+  const cleo = await account(35103);
+  const erin = await account(35104);
+  const erinsDesktop = await signInDevice(erin.app);
+
+  // Twin workspaces: Bob revokes his agent's grant in the first through the
+  // route, Erin is disabled with an agent in the second; Cleo watches both.
+  const route = await workspaceOf(ada.device, [
+    [bob.device, "member"],
+    [cleo.device, "member"],
+  ]);
+  const disable = await workspaceOf(ada.device, [
+    [erin.device, "member"],
+    [cleo.device, "member"],
+  ]);
+  const bobsWork = await agentWithWork(route.workspaceId, bob.device);
+  const erinsWork = await agentWithWork(disable.workspaceId, erin.device);
+
+  const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  const bobClient = (await connected(t, bob.app, bob.device)).client;
+  const erinsLaptop = (await connected(t, erin.app, erin.device)).client;
+  const erinsOther = (await connected(t, erin.app, erinsDesktop)).client;
+  await subscribe(cleoClient, route.workspaceId);
+  await subscribe(cleoClient, disable.workspaceId);
+  await subscribe(bobClient, route.workspaceId);
+  await subscribe(erinsLaptop, disable.workspaceId);
+  // Cleo sees Bob and Erin come online.
+  await messages(cleoClient, 2);
+  await quiet(cleoClient, bobClient, erinsLaptop, erinsOther);
+
+  const revoked = await post(
+    bob,
+    `/agents/${bobsWork.agentId}/grants/${bobsWork.grantId}/revoke`,
+  );
+  assert.equal(revoked.statusCode, 204, revoked.body);
+  const byRoute = await messages(cleoClient, 1);
+  await messages(bobClient, 1);
+  await quiet(cleoClient, bobClient, erinsLaptop, erinsOther);
+
+  const now = new Date();
+  const disabled = await disableAccount(database(), {
+    userId: erin.device.userId,
+    now,
+  });
+  assert.deepEqual(disabled, {
+    changed: true,
+    revokedGrantIds: [erinsWork.grantId],
+  });
+  // Every connection of Erin's closes at once with the reason with which
+  // the sweep closes a disabled account's connections within 60 seconds.
+  assert.equal(
+    refusalOf(
+      {
+        userId: erin.device.userId,
+        revokedAt: null,
+        signedOutAt: null,
+        lastSignInAt: now,
+        disabledAt: now,
+        signInRequiredAt: null,
+      },
+      now.getTime(),
+      now.getTime(),
+    ),
+    "auth_failed",
+  );
+  assert.deepEqual(await erinsLaptop.closed, closedWith("auth_failed"));
+  assert.deepEqual(await erinsOther.closed, closedWith("auth_failed"));
+  assert.equal(
+    connections
+      .live()
+      .filter(({ context }) => context.identity.userId === erin.device.userId)
+      .length,
+    0,
+  );
+  const byDisable = await messages(cleoClient, 2);
+  await quiet(cleoClient, bobClient);
+
+  // Cleo sees Erin go offline, then the revoked grant exactly as the route
+  // sends it.
+  assert.deepEqual(
+    byDisable.map((message) => (message as { type: string }).type),
+    ["presence.changed", "agent.grant.revoked"],
+  );
+  assert.deepEqual(shape(byDisable.slice(1)), shape(byRoute));
+  const [, revokedEvent] = byDisable as Record<string, unknown>[];
+  assert.deepEqual(revokedEvent?.["workspaceId"], disable.workspaceId);
+  assert.deepEqual(revokedEvent?.["actor"], { kind: "system" });
+  assert.deepEqual(revokedEvent?.["payload"], {
+    grantId: erinsWork.grantId,
+    granteeAgentId: erinsWork.agentId,
+    revokedAt: now.toISOString(),
+  });
+  // A disable disables no agent and cancels no run: no other event.
+  assert.deepEqual(observed.workspace, []);
+});
+
+test("forged disable notifications, for an account that is not disabled or for a grant of another account, replay nothing and close nothing; a real disable afterwards still replays", async (t) => {
+  assert.ok(testDatabase);
+  const logLines: string[] = [];
+  const { connections, observed, account } = await instance(t, { logLines });
+  const ada = await account(35201);
+  const bob = await account(35202);
+  const cleo = await account(35203);
+  const erin = await account(35204);
+  const team = await workspaceOf(ada.device, [
+    [bob.device, "member"],
+    [cleo.device, "member"],
+  ]);
+  const bobsWork = await agentWithWork(team.workspaceId, bob.device);
+
+  const adaClient = (await connected(t, ada.app, ada.device)).client;
+  const bobClient = (await connected(t, bob.app, bob.device)).client;
+  const cleoClient = (await connected(t, cleo.app, cleo.device)).client;
+  await subscribe(adaClient, team.workspaceId);
+  await subscribe(bobClient, team.workspaceId);
+  await subscribe(cleoClient, team.workspaceId);
+  await messages(adaClient, 2);
+  await messages(bobClient, 1);
+  await quiet(adaClient, bobClient, cleoClient);
+
+  // Erin's real disable, with nobody to tell: it makes her a disabled
+  // account that a forger can name.
+  const erinDisabled = await disableAccount(database(), {
+    userId: erin.device.userId,
+    now: new Date(),
+  });
+  assert.ok(erinDisabled.changed);
+
+  const at = new Date().toISOString();
+  const grantOf = (userId: UserId) => ({
+    v: 1,
+    kind: "disable_grant_revoked",
+    at,
+    userId,
+    workspaceId: team.workspaceId,
+    grantId: bobsWork.grantId,
+    granteeAgentId: bobsWork.agentId,
+    revokedAt: at,
+  });
+  const forged = [
+    // Naming Bob, who is living and enabled, or an account that does not
+    // exist.
+    { v: 1, kind: "account_disabled", at, userId: bob.device.userId },
+    { v: 1, kind: "account_disabled", at, userId: newId<UserId>() },
+    grantOf(bob.device.userId),
+    // Naming Erin, who is disabled, with Bob's grant.
+    grantOf(erin.device.userId),
+  ];
+  for (const notification of forged) {
+    await testDatabase.client.query("select pg_notify($1, $2)", [
+      ERASURE_NOTIFICATION_CHANNEL,
+      JSON.stringify(notification),
+    ]);
+  }
+  const notConfirmed = () =>
+    logLines
+      .map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter(
+        (entry) =>
+          entry["msg"] === "erasure notification ignored" &&
+          entry["reason"] === "not_confirmed",
+      ).length;
+  await until(
+    () => notConfirmed() === forged.length,
+    "the forged notifications to be refused",
+  );
+  await quiet(adaClient, bobClient, cleoClient);
+  assert.equal(bobClient.ws.readyState, bobClient.ws.OPEN);
+  assert.ok(connections.connectionOf(bob.device.deviceId as DeviceId));
+  assert.deepEqual(observed.workspace, []);
+  for (const line of logLines) {
+    for (const id of [bob.device.userId, erin.device.userId]) {
+      assert.equal(line.includes(id), false, line);
+    }
+  }
+
+  // Bob's real disable: his connection closes, and Ada and Cleo get his
+  // revoked grant.
+  const bobDisabled = await disableAccount(database(), {
+    userId: bob.device.userId,
+    now: new Date(),
+  });
+  assert.ok(bobDisabled.changed);
+  assert.deepEqual(await bobClient.closed, closedWith("auth_failed"));
+  const replayed = await messages(cleoClient, 2);
+  assert.deepEqual(
+    replayed.map((message) => (message as { type: string }).type),
+    ["presence.changed", "agent.grant.revoked"],
+  );
+  assert.equal(
+    (replayed[1] as { payload: { grantId: string } }).payload.grantId,
+    bobsWork.grantId,
+  );
+  assert.equal(notConfirmed(), forged.length);
+});
+
+test("a confirmed account_disabled closes with auth_failed only the connections of the devices that the database confirms", async (t) => {
+  const { connections, account } = await instance(t);
+  const erin = await account(35301);
+  const bob = await account(35302);
+  const desktop = await signInDevice(erin.app);
+  const laptopClient = (await connected(t, erin.app, erin.device)).client;
+  const desktopClient = (await connected(t, erin.app, desktop)).client;
+  const bobClient = (await connected(t, bob.app, bob.device)).client;
+  await quiet(laptopClient, desktopClient, bobClient);
+
+  replayErasureNotification(
+    {
+      connections,
+      onWorkspaceEvent: () => undefined,
+      onApproverEvent: () => undefined,
+      onAccountFrame: () => undefined,
+      log: erin.app.log,
+    },
+    {
+      v: 1,
+      kind: "account_disabled",
+      at: new Date().toISOString(),
+      userId: erin.device.userId,
+    },
+    {
+      confirmed: true,
+      revokedDeviceIds: [],
+      disabledAccountDeviceIds: [erin.device.deviceId as DeviceId],
+      approvers: [],
+    },
+  );
+  assert.deepEqual(await laptopClient.closed, closedWith("auth_failed"));
+  await quiet(desktopClient, bobClient);
+  assert.equal(desktopClient.ws.readyState, desktopClient.ws.OPEN);
+  assert.equal(bobClient.ws.readyState, bobClient.ws.OPEN);
+});
+
+test("a disable's notifications decode only in their exact shape", () => {
+  const at = new Date().toISOString();
+  const userId = newId<UserId>();
+  const accountDisabled = { v: 1, kind: "account_disabled", at, userId };
+  const grantRevoked = {
+    v: 1,
+    kind: "disable_grant_revoked",
+    at,
+    userId,
+    workspaceId: newId<WorkspaceId>(),
+    grantId: newId<PermissionGrantId>(),
+    granteeAgentId: newId<AgentId>(),
+    revokedAt: at,
+  };
+  for (const notification of [accountDisabled, grantRevoked]) {
+    assert.deepEqual(decodeErasureNotification(JSON.stringify(notification)), {
+      ok: true,
+      notification,
+    });
+  }
+  const withoutAgent: Record<string, unknown> = { ...grantRevoked };
+  delete withoutAgent["granteeAgentId"];
+  for (const [payload, reason] of [
+    [{ ...accountDisabled, workspaceId: newId<WorkspaceId>() }, "malformed"],
+    [{ ...grantRevoked, extra: true }, "malformed"],
+    [withoutAgent, "malformed"],
+    [{ ...grantRevoked, revokedAt: "yesterday" }, "malformed"],
+    [{ ...accountDisabled, userId: "Erin" }, "malformed"],
+    [{ ...accountDisabled, v: 2 }, "unknown_version"],
+  ] as const) {
+    assert.deepEqual(decodeErasureNotification(JSON.stringify(payload)), {
+      ok: false,
+      reason,
+    });
+  }
+});

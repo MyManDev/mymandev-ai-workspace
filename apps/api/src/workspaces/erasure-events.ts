@@ -3,7 +3,7 @@ import {
   ERASED_AGENT_NAME,
   type ErasureCheck,
   ERASURE_NOTIFICATION_VERSION,
-  type ErasureNotification,
+  type OperatorNotification,
 } from "@mymandev/database";
 import {
   AgentIdSchema,
@@ -41,6 +41,12 @@ import {
 // database can send one, and replayed through the senders of the API's own
 // routes, so that every connection gets what a removal, a device
 // revocation, or a withdrawal through the API would have sent it.
+//
+// An operator's account disable (#350) sends its own kinds on the same
+// channel (`src/disable-notifications.ts` in `@mymandev/database`), which
+// the same listener hands to the same replay: `account_disabled` closes the
+// connections of the disabled account's devices with `auth_failed`, as the
+// sweep would, and `disable_grant_revoked` sends `agent.grant.revoked`.
 
 const header = <Kind extends string>(kind: Kind) => ({
   v: z.literal(ERASURE_NOTIFICATION_VERSION),
@@ -50,7 +56,7 @@ const header = <Kind extends string>(kind: Kind) => ({
 });
 
 /** Every notification of the version that this API reads, and nothing else. */
-const ErasureNotificationSchema = z.discriminatedUnion("kind", [
+const OperatorNotificationSchema = z.discriminatedUnion("kind", [
   z.strictObject(header("account_erased")),
   z.strictObject({
     ...header("membership_ended"),
@@ -89,18 +95,28 @@ const ErasureNotificationSchema = z.discriminatedUnion("kind", [
     joinRequestId: JoinRequestIdSchema,
     approvers: z.array(MemberIdSchema).min(1).max(APPROVERS_PER_NOTIFICATION),
   }),
-]) satisfies z.ZodType<ErasureNotification>;
+  z.strictObject(header("account_disabled")),
+  z.strictObject({
+    ...header("disable_grant_revoked"),
+    workspaceId: WorkspaceIdSchema,
+    grantId: PermissionGrantIdSchema,
+    granteeAgentId: AgentIdSchema,
+    revokedAt: UtcTimestampSchema,
+  }),
+]) satisfies z.ZodType<OperatorNotification>;
 
 /** Why a payload was not decoded. */
 export type IgnoredReason = "malformed" | "unknown_version" | "unknown_kind";
 
-const KINDS: ReadonlySet<unknown> = new Set<ErasureNotification["kind"]>([
+const KINDS: ReadonlySet<unknown> = new Set<OperatorNotification["kind"]>([
   "account_erased",
   "membership_ended",
   "agent_disabled",
   "grant_revoked",
   "run_cancelled",
   "join_request_withdrawn",
+  "account_disabled",
+  "disable_grant_revoked",
 ]);
 
 /**
@@ -112,7 +128,7 @@ const KINDS: ReadonlySet<unknown> = new Set<ErasureNotification["kind"]>([
 export function decodeErasureNotification(
   payload: string,
 ):
-  | Readonly<{ ok: true; notification: ErasureNotification }>
+  | Readonly<{ ok: true; notification: OperatorNotification }>
   | Readonly<{ ok: false; reason: IgnoredReason }> {
   let json: unknown;
   try {
@@ -129,7 +145,7 @@ export function decodeErasureNotification(
   if (!("kind" in json) || !KINDS.has(json.kind)) {
     return { ok: false, reason: "unknown_kind" };
   }
-  const parsed = ErasureNotificationSchema.safeParse(json);
+  const parsed = OperatorNotificationSchema.safeParse(json);
   return parsed.success
     ? { ok: true, notification: parsed.data }
     : { ok: false, reason: "malformed" };
@@ -145,9 +161,9 @@ export type ErasureReplayTargets = Readonly<{
 }>;
 
 /**
- * Replays one notification of an erasure that the database confirmed
- * (`check`), as the route that makes the same change sends its events,
- * with the erasure's time as the events' time:
+ * Replays one notification of an erasure or a disable that the database
+ * confirmed (`check`), as the route that makes the same change sends its
+ * events, with the erasure's or the disable's time as the events' time:
  *
  * - `account_erased` closes the open connections of the account's revoked
  *   devices (`check.revokedDeviceIds`) at once, with `device_revoked`, the
@@ -159,16 +175,23 @@ export type ErasureReplayTargets = Readonly<{
  * - `agent_disabled` sends `workspace.agent.disabled`, with
  *   `ERASED_AGENT_NAME`, which the erasure gave every agent of the account,
  *   as a removal or a device revocation (`sendDisabledAgents`);
- * - `grant_revoked` sends `agent.grant.revoked` (`sendRevokedGrants`);
+ * - `grant_revoked` and a disable's `disable_grant_revoked` send
+ *   `agent.grant.revoked` (`sendRevokedGrants`);
  * - `run_cancelled` sends `agent.run.state_changed` (`sendCancelledRuns`);
  * - `join_request_withdrawn` sends `workspace.join_request.resolved` with
  *   the outcome `withdrawn`, as a withdrawal, to the approvers that it names
  *   and that are still an owner or admin (`check.approvers`), if any
- *   (`sendJoinRequestResolved`).
+ *   (`sendJoinRequestResolved`);
+ * - a disable's `account_disabled` closes the open connections of the
+ *   account's devices that the database confirms, those that are not
+ *   revoked (`check.disabledAccountDeviceIds`), at once, with
+ *   `auth_failed`, the reason with which the sweep would close them within
+ *   60 seconds; that ends their subscriptions, and the other subscribers
+ *   see its people go offline.
  */
 export function replayErasureNotification(
   targets: ErasureReplayTargets,
-  notification: ErasureNotification,
+  notification: OperatorNotification,
   check: ErasureCheck,
 ): void {
   const at = new Date(notification.at);
@@ -205,7 +228,13 @@ export function replayErasureNotification(
         at,
       );
       break;
+    case "account_disabled":
+      for (const deviceId of check.disabledAccountDeviceIds) {
+        targets.connections.closeDevice(deviceId, "auth_failed", targets.log);
+      }
+      break;
     case "grant_revoked":
+    case "disable_grant_revoked":
       sendRevokedGrants(
         targets.log,
         targets.connections,
@@ -258,7 +287,7 @@ export const MAX_PENDING_ERASURE_NOTIFICATIONS = 10_000;
 export type ErasureReplayOptions = ErasureReplayTargets &
   Readonly<{
     /** Checks a notification against the database (`checkErasureNotification`). */
-    check: (notification: ErasureNotification) => Promise<ErasureCheck>;
+    check: (notification: OperatorNotification) => Promise<ErasureCheck>;
     /** Default: `MAX_PENDING_ERASURE_NOTIFICATIONS`. */
     maxPending?: number;
   }>;
@@ -269,19 +298,20 @@ function errorTypeOf(error: unknown): string {
 }
 
 /**
- * The API instance's replay of the erasure's notifications, one payload at
- * a time and in the order of delivery: each payload is decoded
- * (`decodeErasureNotification`), checked against the database (`check`,
- * one read-only statement without a lock), and replayed
+ * The API instance's replay of the erasures' and the disables'
+ * notifications, one payload at a time and in the order of delivery: each
+ * payload is decoded (`decodeErasureNotification`), checked against the
+ * database (`check`, one read-only statement without a lock), and replayed
  * (`replayErasureNotification`) only when the database confirms that its
- * account is erased and its item is as the erasure left it. Otherwise it is
- * dropped and logged with the reason only, never its content or an ID:
- * `malformed`, `unknown_version`, or `unknown_kind` from the decoding,
- * `not_confirmed` when the database does not confirm it, for example a
- * notification that another role forged for an account that is not erased,
- * and `backlog` when `maxPending` notifications already wait for their
- * check. A check that fails is logged with the error's type, and its
- * notification is dropped, as delivery is at most once anyway.
+ * account is erased or disabled and its item is as the erasure or the
+ * disable left it. Otherwise it is dropped and logged with the reason
+ * only, never its content or an ID: `malformed`, `unknown_version`, or
+ * `unknown_kind` from the decoding, `not_confirmed` when the database does
+ * not confirm it, for example a notification that another role forged for
+ * an account that is not erased or not disabled, and `backlog` when
+ * `maxPending` notifications already wait for their check. A check that
+ * fails is logged with the error's type, and its notification is dropped,
+ * as delivery is at most once anyway.
  */
 export class ErasureReplay {
   readonly #options: ErasureReplayOptions;
@@ -320,7 +350,7 @@ export class ErasureReplay {
     return this.#tail;
   }
 
-  async #replay(notification: ErasureNotification): Promise<void> {
+  async #replay(notification: OperatorNotification): Promise<void> {
     const { log } = this.#options;
     let check: ErasureCheck;
     try {

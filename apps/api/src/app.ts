@@ -108,10 +108,11 @@ export type BuildAppOptions = Readonly<{
   database?: Database;
   /**
    * Where the API listens for the notifications of an operator's account
-   * erasure, which it replays as live events (#341; ADR 0014, update of
-   * 2026-11-25). The default is a dedicated session to DATABASE_URL, outside
-   * the pool (`pgNotificationSessions`), when the API connects to the
-   * database itself; with `database` given and no sessions, nothing listens.
+   * erasure or disable, which it replays as live events (#341, #350; ADR
+   * 0014, update of 2026-11-25). The default is a dedicated session to
+   * DATABASE_URL, outside the pool (`pgNotificationSessions`), when the API
+   * connects to the database itself; with `database` given and no sessions,
+   * nothing listens.
    * Only an API with the gateway listens: without it, nobody is connected.
    */
   erasureNotifications?: NotificationSessions;
@@ -548,10 +549,11 @@ export async function buildApp(
             app.log,
           ),
       });
-      // The operator's erasures, checked against the database and replayed
-      // to the open connections (#341). The listener starts when the app is
-      // ready, so a test that only builds the app opens no session, and
-      // stops when it closes, after the notifications that it received.
+      // The operator's erasures and disables, checked against the database
+      // and replayed to the open connections (#341, #350). The listener
+      // starts when the app is ready, so a test that only builds the app
+      // opens no session, and stops when it closes, after the notifications
+      // that it received.
       if (erasureNotifications !== null) {
         const checked = database;
         const replay = new ErasureReplay({
