@@ -31,6 +31,12 @@ import {
   sealWithPassphrase,
 } from "./key-file.ts";
 import {
+  decodeProtectionRecord,
+  encodeProtectionRecord,
+  isBelow,
+  weakestOf,
+} from "./protection-record.ts";
+import {
   type DeviceKey,
   generateDeviceKey,
   type HeldDeviceKey,
@@ -112,6 +118,13 @@ export const CURRENT_KEY_FILE = "device-key.json";
 export const PREVIOUS_KEY_FILE = "device-key.previous.json";
 
 /**
+ * The file of the protection record on Linux (#358): the protection that
+ * the person last chose, kept outside the key files. A stored key file
+ * whose protection is lower than the record is refused as `corrupt`.
+ */
+export const PROTECTION_RECORD_FILE = "device-key-protection.json";
+
+/**
  * What the UI may ask: how the stored key is protected (`system`,
  * `passphrase`, or `unprotected`), or `none` when no key is stored.
  */
@@ -178,7 +191,10 @@ export interface DeviceKeyStore {
    * that this version cannot read, with `corrupt` for a key file
    * protected by a passphrase or unprotected on Windows or macOS, and with
    * `corrupt` for a system-protected key file on Linux whose ciphertext does
-   * not start with `SECRET_SERVICE_CIPHERTEXT_PREFIX`.
+   * not start with `SECRET_SERVICE_CIPHERTEXT_PREFIX`. On Linux it also
+   * rejects with `corrupt` for a key file whose protection is lower than
+   * the protection record, and with `corrupt` or `newer_format` for a
+   * record that this version cannot read.
    */
   readonly status: () => Promise<DeviceKeyStatus>;
   /**
@@ -192,7 +208,12 @@ export interface DeviceKeyStore {
    * file protected by a passphrase or unprotected is `corrupt` on Windows
    * and macOS, where the store never writes one, and so is a
    * system-protected key file on Linux whose ciphertext does not start with
-   * `SECRET_SERVICE_CIPHERTEXT_PREFIX`, which is never decrypted.
+   * `SECRET_SERVICE_CIPHERTEXT_PREFIX`, which is never decrypted. On Linux
+   * a key file whose protection is lower than the protection record is
+   * `corrupt` too, before anything is decrypted, and so is a record that
+   * cannot be decoded (`newer_format` for a later version). Without a
+   * record, or with a lower one, the weakest protection of the key files
+   * that opened is recorded.
    */
   readonly load: (options?: LoadDeviceKeyOptions) => Promise<DeviceKeys | null>;
   /** The keys held, or null before `load` or `create` and after `delete`. */
@@ -205,7 +226,8 @@ export interface DeviceKeyStore {
    * that first), `system_protection_required` (a passphrase or an
    * unprotected key on Windows or macOS), `system_protection_available` (a
    * passphrase or an unprotected key on Linux while the system can protect
-   * it), `unprotected_not_accepted`, or `passphrase_invalid`.
+   * it), `unprotected_not_accepted`, or `passphrase_invalid`. On Linux the
+   * chosen protection is recorded before the key file is written.
    */
   readonly create: (protection: NewDeviceKeyProtection) => Promise<DeviceKey>;
   /**
@@ -226,7 +248,9 @@ export interface DeviceKeyStore {
   readonly replace: (options?: ReplaceDeviceKeyOptions) => Promise<DeviceKeys>;
   /**
    * One authentication with the newest key succeeded: deletes the previous
-   * key, which then signs nothing more. Rejects with `no_replacement`.
+   * key, which then signs nothing more. On Linux the protection of the
+   * newest key is then recorded, which raises the record after a key moved
+   * up to the system. Rejects with `no_replacement`.
    */
   readonly confirmReplacement: () => Promise<void>;
   /**
@@ -236,9 +260,10 @@ export interface DeviceKeyStore {
    */
   readonly abandonReplacement: () => Promise<void>;
   /**
-   * Deletes both key files, whether loaded or not, and every key held stops
-   * signing. Used after the API confirmed a removal, after
-   * `device_revoked`, and when a key is lost.
+   * Deletes both key files, whether loaded or not, then the protection
+   * record, and every key held stops signing. Used after the API confirmed
+   * a removal, after `device_revoked`, when a key is lost, and by "This is
+   * not me", the only way out of a key refused as `corrupt`.
    */
   readonly delete: () => Promise<void>;
 }
@@ -256,8 +281,10 @@ export interface DeviceKeyStoreOptions {
   readonly scryptCost?: ScryptCost;
   /**
    * Receives an error that does not stop the operation: a failed rewrite
-   * after `shouldReEncrypt`, after which the old file is kept. The error
-   * holds no secret. An error that it throws is ignored.
+   * after `shouldReEncrypt`, after which the old file is kept, or a failed
+   * write of the protection record by `load` or `confirmReplacement`, after
+   * which the record stays as it was until the next `load`. The error holds
+   * no secret. An error that it throws is ignored.
    */
   readonly onError?: (message: string, error: unknown) => void;
 }
@@ -304,11 +331,16 @@ export function createDeviceKeyStore(
   } = options;
   const currentPath = path.join(folder, CURRENT_KEY_FILE);
   const previousPath = path.join(folder, PREVIOUS_KEY_FILE);
+  const recordPath = path.join(folder, PROTECTION_RECORD_FILE);
   // Windows and macOS always protect a key with the system. Elsewhere the
   // system's protection must be confirmed, and only Linux may fall back to a
   // passphrase or an unprotected key.
   const systemAlwaysProtects = platform === "win32" || platform === "darwin";
   const fallbackAllowed = platform === "linux";
+  // The protection record matters only where a key may be protected by
+  // less than the system: everywhere else `readKeyFile` already refuses
+  // such a key file, so the floor is the system's protection.
+  const recordsProtection = fallbackAllowed;
   let loaded: LoadedKeys | null = null;
 
   // Every operation runs after the one before it has settled, so two calls
@@ -404,6 +436,64 @@ export function createDeviceKeyStore(
     return ciphertext;
   }
 
+  /**
+   * Refuses stored key files whose protection is lower than the protection
+   * record, as `corrupt` (#358), and resolves with the record: null without
+   * one, or where no record is kept. The record is read only when a key file
+   * exists. A record that cannot be decoded is `corrupt` or `newer_format`,
+   * and a read that fails rejects with its error: both fail closed.
+   */
+  async function checkProtectionFloor(
+    stored: readonly KeyFile[],
+  ): Promise<DeviceKeyProtection | null> {
+    if (!recordsProtection || stored.length === 0) {
+      return null;
+    }
+    const bytes = await readFileIfPresent(fileSystem, recordPath);
+    if (bytes === null) {
+      return null;
+    }
+    const floor = decodeProtectionRecord(bytes);
+    if (stored.some((file) => isBelow(file.protection, floor))) {
+      throw new DeviceKeyError("corrupt");
+    }
+    return floor;
+  }
+
+  /** Writes the protection record atomically. */
+  async function writeProtectionRecord(
+    protection: DeviceKeyProtection,
+  ): Promise<void> {
+    await writeFileAtomic(
+      fileSystem,
+      recordPath,
+      encodeProtectionRecord(protection),
+      platform,
+    );
+  }
+
+  /**
+   * Writes the protection record and reports a failure to `onError` instead
+   * of throwing: the keys are already in place, and the next `load` writes
+   * the record again.
+   */
+  async function recordProtectionQuietly(
+    protection: DeviceKeyProtection,
+  ): Promise<void> {
+    try {
+      await writeProtectionRecord(protection);
+    } catch (error) {
+      try {
+        onError(
+          "The protection of the device key could not be recorded.",
+          error,
+        );
+      } catch {
+        // An error of the receiver does not stop the operation either.
+      }
+    }
+  }
+
   async function keyFileExists(): Promise<boolean> {
     return (
       (await readFileIfPresent(fileSystem, currentPath)) !== null ||
@@ -425,7 +515,8 @@ export function createDeviceKeyStore(
     for (const name of names) {
       if (
         isTemporaryFileOf(name, CURRENT_KEY_FILE) ||
-        isTemporaryFileOf(name, PREVIOUS_KEY_FILE)
+        isTemporaryFileOf(name, PREVIOUS_KEY_FILE) ||
+        isTemporaryFileOf(name, PROTECTION_RECORD_FILE)
       ) {
         await removeFile(fileSystem, path.join(folder, name));
       }
@@ -557,6 +648,10 @@ export function createDeviceKeyStore(
     await removeTemporaryFiles();
     let current = await readKeyFile(currentPath);
     let previous = await readKeyFile(previousPath);
+    // Before anything is moved or decrypted.
+    const floor = await checkProtectionFloor(
+      [current, previous].filter((file) => file !== null),
+    );
     if (current === null) {
       if (previous === null) {
         return null;
@@ -619,6 +714,20 @@ export function createDeviceKeyStore(
           settled.key.fill(0);
         }
       }
+      // Without a record, for example on an installation from before
+      // #358, the weakest protection of the keys that opened becomes the
+      // record. A record below it is raised: a `confirmReplacement` after
+      // a move up may have stopped before it wrote the record. Never
+      // lowered: a lower key file was refused above.
+      if (recordsProtection) {
+        const weakest = weakestOf([
+          currentSlot.protection,
+          ...(previousSlot === null ? [] : [previousSlot.protection]),
+        ]);
+        if (floor === null || isBelow(floor, weakest)) {
+          await recordProtectionQuietly(weakest);
+        }
+      }
       loaded = { current: currentSlot, previous: previousSlot, wrapping: kept };
       return view(loaded);
     } catch (error) {
@@ -668,6 +777,19 @@ export function createDeviceKeyStore(
         recursive: true,
         mode: KEY_FOLDER_MODE,
       });
+      // The record first: if the process stops in between, a record
+      // without a key protects nothing, and the next `create` writes it
+      // again. The other order could leave the new key with a record left
+      // by an earlier key, or with none: a lower record would not protect
+      // the new key, and a higher one would refuse it.
+      if (recordsProtection) {
+        try {
+          await writeProtectionRecord(protection.kind);
+        } catch (error) {
+          bytes.fill(0);
+          throw error;
+        }
+      }
       await writeKeyFile(currentPath, bytes);
     } catch (error) {
       held.retire();
@@ -787,6 +909,18 @@ export function createDeviceKeyStore(
     previous.held.retire();
     keys.previous = null;
     dropUnusedWrapping(keys);
+    // Only now, with the previous key gone: a record raised while it was
+    // kept would refuse it, and `abandonReplacement` makes it current
+    // again. The newest key is never weaker than the previous one, which
+    // was not below the record, so this never lowers the record.
+    // Residual risk: a power loss can lose the deletion above and keep the
+    // raised record, which leaves a lower previous key below the record,
+    // so the next `load` refuses it as `corrupt` until "This is not me".
+    // The order is deliberate: accepting a previous key below the record
+    // would let a planted previous key file through again.
+    if (recordsProtection) {
+      await recordProtectionQuietly(keys.current.protection);
+    }
   }
 
   async function abandonReplacement(): Promise<void> {
@@ -813,6 +947,10 @@ export function createDeviceKeyStore(
     // current one the current key again.
     await removeFile(fileSystem, previousPath);
     await removeFile(fileSystem, currentPath);
+    // The record after the keys, so that a delete that stops halfway never
+    // leaves a key without its record. It is removed on every platform, in
+    // case one is there.
+    await removeFile(fileSystem, recordPath);
     await removeTemporaryFiles();
     await syncFolder(fileSystem, folder, platform);
     if (loaded !== null) {
@@ -834,6 +972,9 @@ export function createDeviceKeyStore(
     }
     const current = await readKeyFile(currentPath);
     const previous = await readKeyFile(previousPath);
+    await checkProtectionFloor(
+      [current, previous].filter((file) => file !== null),
+    );
     const stored = current ?? previous;
     if (stored === null) {
       return Object.freeze({ protection: "none" });
