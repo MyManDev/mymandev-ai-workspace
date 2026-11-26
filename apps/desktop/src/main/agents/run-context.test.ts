@@ -7,7 +7,7 @@ import type {
   WorkspaceId,
 } from "@mymandev/protocol";
 import { type GrantRecord, GrantRecordSchema } from "@mymandev/permissions";
-import { expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
 import type { WorkspaceReadResult } from "../api-reads.ts";
 import {
   createPermissionEnforcement,
@@ -23,9 +23,11 @@ import type {
 import type { ToolRunContext } from "../tools/tool-dispatcher.ts";
 import {
   createRunContextBuilder,
+  recheckRepositoryRead,
   RUN_CONTEXT_FAILURES,
   RUN_CONTEXT_REPOSITORY_OMISSIONS,
   type RunContextInput,
+  type RunContextRepository,
 } from "./run-context.ts";
 import type { RunActionCheck } from "./run-executor.ts";
 
@@ -95,16 +97,27 @@ function allowRepoRead(): RunActionCheck {
   };
 }
 
+afterEach(() => {
+  vi.useRealTimers();
+});
+
 function setup(
   options: {
     decide?: (request: unknown) => unknown;
-    message?: () => Promise<WorkspaceReadResult<{ message: ChatMessage }>>;
+    message?: (
+      controller: AbortController,
+    ) => Promise<WorkspaceReadResult<{ message: ChatMessage }>>;
     resolve?: () => Promise<RepositoryFolderResolution>;
-    list?: (context: ToolRunContext) => Promise<RepositoryFileListOutcome>;
+    list?: (
+      context: ToolRunContext,
+      controller: AbortController,
+    ) => Promise<RepositoryFileListOutcome>;
     run?: HeldRun;
     inputMessageId?: MessageId | null;
+    folder?: string;
   } = {},
 ) {
+  const controller = new AbortController();
   const reads: [string, unknown][] = [];
   const requests: unknown[] = [];
   const resolutions: RepositoryId[] = [];
@@ -116,18 +129,25 @@ function setup(
         reads.push([name, params]);
         return options.message === undefined
           ? { ok: true, value: { message: MESSAGE } }
-          : options.message();
+          : options.message(controller);
       }) as never,
     },
     resolveFolder: async (repositoryId) => {
       resolutions.push(repositoryId);
       return options.resolve === undefined
-        ? { ok: true, repositoryId, folder: FOLDER, identity: IDENTITY }
+        ? {
+            ok: true,
+            repositoryId,
+            folder: options.folder ?? FOLDER,
+            identity: IDENTITY,
+          }
         : options.resolve();
     },
     listFiles: (async (context: ToolRunContext) => {
       listings.push(context);
-      return options.list === undefined ? LISTED : options.list(context);
+      return options.list === undefined
+        ? LISTED
+        : options.list(context, controller);
     }) as RepositoryFileLister,
   });
   const decide = options.decide ?? (() => allowRepoRead());
@@ -144,7 +164,6 @@ function setup(
     }
     return decision;
   };
-  const controller = new AbortController();
   const input: RunContextInput = {
     run: options.run ?? RUN,
     workspaceId: WORKSPACE_ID,
@@ -220,8 +239,12 @@ test("with repo.read granted, the context holds the message, the project, and th
   expect(harness.listings).toHaveLength(1);
   expect(harness.listings[0]?.folder).toBe(FOLDER);
   expect(harness.listings[0]?.folderIdentity).toEqual(IDENTITY);
-  expect(harness.listings[0]?.signal).toBe(harness.input.signal);
   expect(harness.ends).toBe(1);
+  // The lister's signal is the run's, combined with the deadline's.
+  const listed = harness.listings[0]?.signal as AbortSignal;
+  expect(listed.aborted).toBe(false);
+  harness.controller.abort();
+  expect(listed.aborted).toBe(true);
   // Plain, frozen data without the folder.
   expect(Object.isFrozen(result)).toBe(true);
   if (!result.ok) {
@@ -264,6 +287,7 @@ test("a check that throws or answers no decision, and an allowed decision for an
     () => null,
     () => "allowed",
     () => ({ allowed: "yes" }),
+    () => ({ ...allowRepoRead(), allowed: "yes" }),
     () => ({ allowed: false, reason: "store_unusable" }),
     () => ({
       allowed: true,
@@ -355,9 +379,6 @@ test("a list with a path that is absolute, leaves the repository, names .git or 
     [""],
     ["README.md", "README.md"],
     [7],
-    // A relative path that holds the folder's text.
-    ["a/home/octocat/secret-web/b.txt"],
-    ["a/HOME/OCTOCAT/SECRET-WEB/b.txt"],
   ];
   for (const files of lists) {
     const harness = setup({
@@ -369,6 +390,56 @@ test("a list with a path that is absolute, leaves the repository, names .git or 
       result.ok && result.context.repository,
       JSON.stringify(files),
     ).toEqual({ included: false, reason: "unavailable" });
+  }
+});
+
+test("only a path that begins with the folder is left out; a path inside the repository that repeats the folder's names is kept", async () => {
+  const app = setup({
+    folder: "/app",
+    list: async () => ({
+      ok: true,
+      files: ["src/app/page.tsx", "app.ts"],
+      truncated: false,
+    }),
+  });
+  const result = await app.builder.build(app.input);
+  expect(result.ok && result.context.repository).toEqual({
+    included: true,
+    repositoryId: REPOSITORY_ID,
+    files: ["app.ts", "src/app/page.tsx"],
+    truncated: false,
+  });
+
+  const repeated = setup({
+    list: async () => ({
+      ok: true,
+      files: [
+        "a/home/octocat/secret-web/b.txt",
+        "a/HOME/OCTOCAT/SECRET-WEB/c.txt",
+      ],
+      truncated: false,
+    }),
+  });
+  const kept = await repeated.builder.build(repeated.input);
+  expect(kept.ok && kept.context.repository.included).toBe(true);
+
+  // A folder that a path of the list begins with, in any case and with
+  // either separator.
+  const lists: [string, string[]][] = [
+    ["work\\repo", ["Work/Repo/a.txt"]],
+    ["work/repo/", ["work/repo"]],
+    ["WORK/REPO", ["a.txt", "work/repo/b.txt"]],
+  ];
+  for (const [folder, files] of lists) {
+    const harness = setup({
+      folder,
+      list: async () => ({ ok: true, files, truncated: false }),
+    });
+    const left = await harness.builder.build(harness.input);
+    expect(left.ok && left.context.repository, folder).toEqual({
+      included: false,
+      reason: "unavailable",
+    });
   }
 });
 
@@ -498,13 +569,234 @@ test("an abort before the build, during the message read, the resolution, or the
   await new Promise((done) => setTimeout(done, 0));
   expect(duringList.ends).toBe(1);
 
+  // A lister that answers `aborted` while the run was not aborted.
   const lister = setup({
     list: async () => ({ ok: false, reason: "aborted" }),
   });
-  expect(await lister.builder.build(lister.input)).toEqual({
+  const notAborted = await lister.builder.build(lister.input);
+  expect(notAborted.ok && notAborted.context.repository).toEqual({
+    included: false,
+    reason: "unavailable",
+  });
+});
+
+test("an abort that lands exactly when the list, or the message of a run without a repository, resolves fails the build as aborted", async () => {
+  const list = setup({
+    list: async (_context, controller) => {
+      controller.abort();
+      return LISTED;
+    },
+  });
+  expect(await list.builder.build(list.input)).toEqual({
     ok: false,
     reason: "aborted",
   });
+  expect(list.ends).toBe(1);
+
+  const message = setup({
+    run: Object.freeze({ ...RUN, repositoryId: null }) as HeldRun,
+    message: async (controller) => {
+      controller.abort();
+      return { ok: true, value: { message: MESSAGE } };
+    },
+  });
+  expect(await message.builder.build(message.input)).toEqual({
+    ok: false,
+    reason: "aborted",
+  });
+  expect(message.requests).toEqual([]);
+
+  // The abort lands after the answer was delivered, while the builder reads
+  // it (a getter of the answer aborts the run).
+  const afterList = setup({
+    list: async (_context, controller) =>
+      ({
+        ok: true,
+        get files() {
+          controller.abort();
+          return LISTED.ok ? LISTED.files : [];
+        },
+        truncated: false,
+      }) as RepositoryFileListOutcome,
+  });
+  expect(await afterList.builder.build(afterList.input)).toEqual({
+    ok: false,
+    reason: "aborted",
+  });
+  expect(afterList.ends).toBe(1);
+
+  const afterMessage = setup({
+    run: Object.freeze({ ...RUN, repositoryId: null }) as HeldRun,
+    message: async (controller) => ({
+      ok: true,
+      get value() {
+        controller.abort();
+        return { message: MESSAGE };
+      },
+    }),
+  });
+  expect(await afterMessage.builder.build(afterMessage.input)).toEqual({
+    ok: false,
+    reason: "aborted",
+  });
+  expect(afterMessage.requests).toEqual([]);
+});
+
+test("the repository part ends after 10 seconds: a folder that does not resolve leaves it out, and the held action ends", async () => {
+  vi.useFakeTimers();
+  const harness = setup({ resolve: () => new Promise(() => undefined) });
+  let settled = false;
+  const building = harness.builder.build(harness.input).then((result) => {
+    settled = true;
+    return result;
+  });
+  await vi.advanceTimersByTimeAsync(9_999);
+  expect(settled).toBe(false);
+  expect(harness.ends).toBe(0);
+  await vi.advanceTimersByTimeAsync(1);
+  const result = await building;
+  expect(result.ok && result.context.repository).toEqual({
+    included: false,
+    reason: "unavailable",
+  });
+  expect(harness.ends).toBe(1);
+  expect(harness.listings).toEqual([]);
+  expect(harness.input.signal.aborted).toBe(false);
+});
+
+test("at the deadline, the walk is aborted: the files found so far are included and marked cut; a walk that listed nothing, or a lister that does not answer, leaves the repository out", async () => {
+  vi.useFakeTimers();
+  /** A lister that answers `answer` once its signal aborts, or never. */
+  const atAbort =
+    (answer: RepositoryFileListOutcome | null) => (context: ToolRunContext) =>
+      new Promise<RepositoryFileListOutcome>((resolve) => {
+        context.signal.addEventListener("abort", () => {
+          if (answer !== null) {
+            resolve(answer);
+          }
+        });
+      });
+
+  const partial = setup({
+    list: atAbort({ ok: true, files: ["a.txt"], truncated: false }),
+  });
+  const cut = partial.builder.build(partial.input);
+  await vi.advanceTimersByTimeAsync(9_999);
+  expect(partial.ends).toBe(0);
+  await vi.advanceTimersByTimeAsync(1);
+  const answered = await cut;
+  expect(answered.ok && answered.context.repository).toEqual({
+    included: true,
+    repositoryId: REPOSITORY_ID,
+    files: ["a.txt"],
+    truncated: true,
+  });
+  expect(partial.ends).toBe(1);
+  expect(partial.input.signal.aborted).toBe(false);
+
+  for (const answer of [
+    { ok: false, reason: "aborted" } as const,
+    { ok: false, reason: "failed" } as const,
+    null,
+  ]) {
+    const harness = setup({ list: atAbort(answer) });
+    const building = harness.builder.build(harness.input);
+    await vi.advanceTimersByTimeAsync(10_000);
+    // The builder waits one more turn (a timer of 0, run after 1 ms) for
+    // the lister's answer.
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await building;
+    expect(result.ok && result.context.repository, String(answer)).toEqual({
+      included: false,
+      reason: "unavailable",
+    });
+    expect(harness.ends).toBe(1);
+  }
+
+  // The run's own abort before the deadline still fails the build.
+  const aborted = setup({ list: atAbort(null) });
+  const stopping = aborted.builder.build(aborted.input);
+  await vi.advanceTimersByTimeAsync(5_000);
+  aborted.controller.abort();
+  expect(await stopping).toEqual({ ok: false, reason: "aborted" });
+  expect(aborted.ends).toBe(0);
+  await vi.advanceTimersByTimeAsync(5_000);
+  // The held action ends at the deadline although the lister never answered.
+  expect(aborted.ends).toBe(1);
+});
+
+test("a list that settles before the deadline leaves no timer behind", async () => {
+  vi.useFakeTimers();
+  const harness = setup();
+  const result = await harness.builder.build(harness.input);
+  expect(result.ok && result.context.repository.included).toBe(true);
+  expect(vi.getTimerCount()).toBe(0);
+  expect(harness.ends).toBe(1);
+});
+
+test("recheckRepositoryRead: the list may be sent only while repo.read is allowed for the run's agent on the run's repository; the action ends at once", () => {
+  const included: RunContextRepository = Object.freeze({
+    included: true,
+    repositoryId: REPOSITORY_ID as RepositoryId,
+    files: Object.freeze(["README.md"]),
+    truncated: false,
+  });
+  const allowed = setup();
+  expect(recheckRepositoryRead(allowed.input, included)).toBe(true);
+  expect(allowed.requests).toEqual([
+    { agentId: AGENT_ID, capability: "repo.read", repositoryId: REPOSITORY_ID },
+  ]);
+  expect(allowed.ends).toBe(1);
+
+  const decisions: (() => unknown)[] = [
+    () => ({ allowed: false, reason: "no_grant" }),
+    () => ({ allowed: false, reason: "check_failed" }),
+    () => {
+      throw new Error("check");
+    },
+    () => null,
+    () => ({ ...allowRepoRead(), allowed: "yes" }),
+    () => ({
+      allowed: true,
+      request: {
+        agentId: AGENT_ID,
+        capability: "repo.write",
+        repositoryId: REPOSITORY_ID,
+      },
+      end: () => undefined,
+    }),
+    () => ({
+      allowed: true,
+      request: {
+        agentId: AGENT_ID,
+        capability: "repo.read",
+        repositoryId: OTHER_REPOSITORY_ID,
+      },
+      end: () => undefined,
+    }),
+  ];
+  for (const [index, decide] of decisions.entries()) {
+    const harness = setup({ decide });
+    expect(recheckRepositoryRead(harness.input, included), String(index)).toBe(
+      false,
+    );
+  }
+
+  // Nothing to send, or the list of another repository: no check.
+  const omittedParts: RunContextRepository[] = [
+    { included: false, reason: "denied" },
+    { ...included, repositoryId: OTHER_REPOSITORY_ID as RepositoryId },
+  ];
+  for (const repository of omittedParts) {
+    const harness = setup();
+    expect(recheckRepositoryRead(harness.input, repository)).toBe(false);
+    expect(harness.requests).toEqual([]);
+  }
+  const noRepository = setup({
+    run: Object.freeze({ ...RUN, repositoryId: null }) as HeldRun,
+  });
+  expect(recheckRepositoryRead(noRepository.input, included)).toBe(false);
+  expect(noRepository.requests).toEqual([]);
 });
 
 // Through the real enforcement point.
@@ -541,11 +833,18 @@ function grant(
   });
 }
 
-function realSetup(records: readonly GrantRecord[]) {
+function realSetup(
+  records: readonly GrantRecord[] | (() => readonly GrantRecord[]),
+) {
   const recorded: EnforcementRecord[] = [];
   const enforcement = createPermissionEnforcement({
     now: () => new Date(NOW),
-    grantStore: { read: () => ({ usable: true, records }) },
+    grantStore: {
+      read: () => ({
+        usable: true,
+        records: typeof records === "function" ? records() : records,
+      }),
+    },
     sessionState: () =>
       ({
         kind: "signed_in",
@@ -592,6 +891,31 @@ test("through the real enforcement point: a grant of repo.read includes the list
   expect(denied.listings).toEqual([]);
   expect(denied.resolutions).toEqual([]);
   expect(denied.recorded).toEqual([
+    {
+      kind: "denied",
+      reason: "no_grant",
+      capability: "repo.read",
+      runId: RUN_ID,
+      agentId: AGENT_ID,
+      repositoryId: REPOSITORY_ID,
+      providerConnectionId: PROVIDER_CONNECTION_ID,
+      at: new Date(NOW).toISOString(),
+    },
+  ]);
+});
+
+test("through the real enforcement point: a revocation after the build denies the recheck, which is recorded, and the list may no longer be sent", async () => {
+  let records: readonly GrantRecord[] = [grant("repo.read", REPOSITORY_ID)];
+  const harness = realSetup(() => records);
+  const result = await harness.builder.build(harness.input);
+  if (!result.ok || !result.context.repository.included) {
+    throw new Error("the repository is missing");
+  }
+  const { repository } = result.context;
+  expect(recheckRepositoryRead(harness.input, repository)).toBe(true);
+  records = [];
+  expect(recheckRepositoryRead(harness.input, repository)).toBe(false);
+  expect(harness.recorded).toEqual([
     {
       kind: "denied",
       reason: "no_grant",

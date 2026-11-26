@@ -20,17 +20,28 @@
 //   folder, so that the enforcement point decides and records a denial.
 //   Only an allowed check resolves the repository of the allowed request to
 //   its folder and lists its files (`RepositoryFileLister`); the action
-//   stays held until the lister settled, so that a change of the grants
-//   re-checks it and aborts the run. A denial, a folder that does not
-//   resolve, and a list that fails leave the repository out of the context
-//   (fail closed), and the context says so with a closed reason; a partial
-//   list is never given.
+//   stays held until the lister settled or the deadline, so that a change of
+//   the grants until then re-checks it and aborts the run. A denial, a
+//   folder that does not resolve, and a list that fails leave the repository
+//   out of the context (fail closed), and the context says so with a closed
+//   reason; a failed list is never given in part.
+// - The deadline. The resolution and the list together end after
+//   `REPOSITORY_FILE_LIST_LIMITS.deadlineMs`: the builder aborts the walk
+//   through its signal (the run's combined with the deadline's) and ends the
+//   held action. A walk that listed the repository's folder answers the
+//   files found so far, marked `truncated`; before that the repository is
+//   left out (`unavailable`). The run's own abort still fails the build.
+// - After the build. Once the list settled, a change of the grants no longer
+//   reaches it: the executor calls `recheckRepositoryRead` right before
+//   every provider request that carries the list, also on later turns, and
+//   leaves the list out of that request on a denial.
 // - No absolute path. Every path of the list is relative to the
 //   repository's top-level folder, in POSIX form, and passes the lexical
 //   rules of the read tools (`parseRepositoryPath`) again, whichever lister
-//   gave it; a list that holds the folder, in any case and with either
-//   separator (`holdsFolder`), is left out as well. The context never holds
-//   the folder, and nothing of it leaves the main process.
+//   gave it; a list with a path that begins with the folder, in any case and
+//   with either separator (`startsWithFolder`), is left out as well. The
+//   context never holds the folder, and nothing of it leaves the main
+//   process.
 import type {
   ChatMessage,
   MessageId,
@@ -47,7 +58,6 @@ import {
   type RepositoryFileListOutcome,
 } from "../tools/repository-files.ts";
 import { parseRepositoryPath } from "../tools/repository-path.ts";
-import { holdsFolder } from "../tools/tool-dispatcher.ts";
 import type { RunActionCheck, RunExecution } from "./run-executor.ts";
 
 /**
@@ -77,7 +87,8 @@ export type RunContextFailure = (typeof RUN_CONTEXT_FAILURES)[number];
  * - `denied`: the enforcement point denied `repo.read` with any reason, or
  *   the check failed.
  * - `unavailable`: the repository's folder did not resolve on this device,
- *   or its file list failed or broke a rule above.
+ *   its file list failed or broke a rule above, or the deadline came before
+ *   the repository's folder was listed.
  */
 export const RUN_CONTEXT_REPOSITORY_OMISSIONS = Object.freeze([
   "no_repository",
@@ -156,6 +167,19 @@ function omitted(reason: RunContextRepositoryOmission): RunContextRepository {
   return Object.freeze({ included: false, reason });
 }
 
+/**
+ * Whether a path of the list begins with the repository's folder, in any
+ * case and with either separator. Every path passed `parseRepositoryPath`,
+ * so it is relative, in POSIX form, without a drive letter: only its start
+ * can hold the folder, and a name inside the repository that repeats the
+ * folder's last names (`src/app/page.tsx` in `/app`) is kept.
+ */
+function startsWithFolder(file: string, folder: string): boolean {
+  const path = file.toLowerCase();
+  const form = folder.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  return form !== "" && (path === form || path.startsWith(`${form}/`));
+}
+
 const ABORTED: unique symbol = Symbol("aborted");
 const THREW: unique symbol = Symbol("threw");
 
@@ -183,6 +207,105 @@ function untilAborted<T>(
 
 /** The repository part, or `ABORTED`. */
 type RepositoryPart = RunContextRepository | typeof ABORTED;
+
+/** Settles after the current turn of the event loop. */
+function nextTurn(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
+/**
+ * Checks exactly `repo.read`, for the run's agent on the run's repository;
+ * the enforcement point takes both from the run again. The allowed action,
+ * whose `end` never throws, or null when it is denied, the check fails, or
+ * the allowed request is not `repo.read` on the run's repository (its
+ * action then ends at once).
+ */
+function checkRepositoryRead(
+  input: Pick<RunExecution, "run" | "check">,
+): { readonly repositoryId: RepositoryId; readonly end: () => void } | null {
+  const { run, check } = input;
+  if (run.repositoryId === null) {
+    return null;
+  }
+  let decision: RunActionCheck;
+  try {
+    decision = check({
+      agentId: run.agentId,
+      capability: "repo.read",
+      repositoryId: run.repositoryId,
+    });
+  } catch {
+    return null;
+  }
+  if (
+    typeof decision !== "object" ||
+    decision === null ||
+    decision.allowed !== true
+  ) {
+    return null;
+  }
+  const allowed = decision;
+  let ended = false;
+  const end = () => {
+    if (!ended) {
+      ended = true;
+      try {
+        allowed.end();
+      } catch {
+        // The supervisor's `end` never throws; the build still answers.
+      }
+    }
+  };
+  // Act only on the request that was checked, and only when it is
+  // `repo.read` on the run's repository.
+  const checked = allowed.request;
+  if (
+    typeof checked !== "object" ||
+    checked === null ||
+    checked.capability !== "repo.read" ||
+    !("repositoryId" in checked) ||
+    checked.repositoryId !== run.repositoryId
+  ) {
+    end();
+    return null;
+  }
+  return { repositoryId: checked.repositoryId, end };
+}
+
+/**
+ * Whether a provider request may carry the context's file list (Project
+ * Manager decision of 2026-11-26): checks `repo.read` again, for the run's
+ * agent on the run's repository, through the executor's `check`, so that
+ * the enforcement point decides and records a denial. The executor (#30,
+ * #31) calls it right before every provider request that carries the list,
+ * also on later turns, and leaves the list out of that request when it
+ * answers false. It answers false without a check for a context without a
+ * list, or with the list of another repository. An allowed action ends at
+ * once: a sent request cannot be taken back. Never throws.
+ */
+export function recheckRepositoryRead(
+  input: Pick<RunExecution, "run" | "check">,
+  repository: RunContextRepository,
+): boolean {
+  try {
+    if (
+      repository.included !== true ||
+      repository.repositoryId !== input.run.repositoryId
+    ) {
+      return false;
+    }
+    const allowed = checkRepositoryRead(input);
+    if (allowed === null) {
+      return false;
+    }
+    allowed.end();
+    return allowed.repositoryId === repository.repositoryId;
+  } catch {
+    return false;
+  }
+}
 
 export function createRunContextBuilder(
   options: RunContextBuilderOptions,
@@ -253,7 +376,7 @@ export function createRunContextBuilder(
     const kept = [...(files as string[])]
       .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
       .slice(0, maxFiles);
-    if (holdsFolder(JSON.stringify(kept), folder)) {
+    if (kept.some((file) => startsWithFolder(file, folder))) {
       return null;
     }
     return {
@@ -266,65 +389,45 @@ export function createRunContextBuilder(
   async function readRepository(
     input: RunContextInput,
   ): Promise<RepositoryPart> {
-    const { run, check, signal } = input;
+    const { run, signal } = input;
     if (run.repositoryId === null) {
       return omitted("no_repository");
     }
     if (signal.aborted) {
       return ABORTED;
     }
-    // Exactly `repo.read`, for the run's agent on the run's repository; the
-    // enforcement point takes both from the run again.
-    let decision: RunActionCheck;
-    try {
-      decision = check({
-        agentId: run.agentId,
-        capability: "repo.read",
-        repositoryId: run.repositoryId,
-      });
-    } catch {
+    const allowed = checkRepositoryRead(input);
+    if (allowed === null) {
       return omitted("denied");
     }
-    if (
-      typeof decision !== "object" ||
-      decision === null ||
-      decision.allowed !== true
-    ) {
-      return omitted("denied");
-    }
-    const allowed = decision;
+    const { repositoryId } = allowed;
+
+    // The repository part ends at the deadline: the walk is aborted through
+    // its signal, the run's combined with the deadline's, and the held
+    // action ends.
+    const deadline = new AbortController();
+    const stop = AbortSignal.any([signal, deadline.signal]);
     let ended = false;
     const end = () => {
       if (!ended) {
         ended = true;
-        try {
-          allowed.end();
-        } catch {
-          // The supervisor's `end` never throws; the build still answers.
-        }
+        clearTimeout(timer);
+        allowed.end();
       }
     };
-    // Act only on the request that was checked, and only when it is
-    // `repo.read` on the run's repository.
-    const checked = allowed.request;
-    if (
-      typeof checked !== "object" ||
-      checked === null ||
-      checked.capability !== "repo.read" ||
-      !("repositoryId" in checked) ||
-      checked.repositoryId !== run.repositoryId
-    ) {
+    const timer = setTimeout(() => {
+      deadline.abort();
       end();
-      return omitted("denied");
-    }
+    }, REPOSITORY_FILE_LIST_LIMITS.deadlineMs);
 
-    const resolving = (async () => resolveFolder(checked.repositoryId))();
-    const resolved = await untilAborted(resolving, signal);
-    if (resolved === ABORTED || signal.aborted) {
+    const resolving = (async () => resolveFolder(repositoryId))();
+    const resolved = await untilAborted(resolving, stop);
+    if (signal.aborted) {
       end();
       return ABORTED;
     }
     if (
+      resolved === ABORTED ||
       resolved === THREW ||
       typeof resolved !== "object" ||
       resolved === null ||
@@ -335,19 +438,25 @@ export function createRunContextBuilder(
     }
     const folder = resolved.folder;
 
-    // The action is held until the lister settled, also after an abort.
+    // The action is held until the lister settled, also after an abort, or
+    // until the deadline.
     const listing = (async () =>
-      listFiles({ folder, folderIdentity: resolved.identity, signal }))();
+      listFiles({ folder, folderIdentity: resolved.identity, signal: stop }))();
     void listing.then(end, end);
-    const outcome = await untilAborted(listing, signal);
+    let outcome = await untilAborted(listing, stop);
+    if (outcome === ABORTED && !signal.aborted) {
+      // The deadline: the lister answers right away with the files found so
+      // far; one that does not is not waited for.
+      outcome = await untilAborted(
+        Promise.race([listing, nextTurn().then((): typeof ABORTED => ABORTED)]),
+        signal,
+      );
+    }
     if (outcome === ABORTED || signal.aborted) {
-      return ABORTED;
+      return signal.aborted ? ABORTED : omitted("unavailable");
     }
     if (outcome === THREW || typeof outcome !== "object" || outcome === null) {
       return omitted("unavailable");
-    }
-    if (outcome.ok === false && outcome.reason === "aborted") {
-      return ABORTED;
     }
     const list = checkedList(outcome, folder);
     if (list === null) {
@@ -355,9 +464,10 @@ export function createRunContextBuilder(
     }
     return Object.freeze({
       included: true,
-      repositoryId: checked.repositoryId,
+      repositoryId,
       files: list.files,
-      truncated: list.truncated,
+      // A list that the deadline cut is never answered as whole.
+      truncated: list.truncated || deadline.signal.aborted,
     });
   }
 
