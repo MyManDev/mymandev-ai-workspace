@@ -46,6 +46,7 @@ import {
 } from "@mymandev/permissions";
 import * as z from "zod";
 import type { DeviceSessionState } from "../session/session.ts";
+import type { ToolCallRecord } from "../tools/tool-dispatcher.ts";
 
 /**
  * Why a check denied, a closed list:
@@ -154,8 +155,14 @@ export interface ShellStartRecord {
   readonly at: string;
 }
 
-/** What the check records: IDs, closed vocabularies, and times only. */
-export type EnforcementRecord = DenialRecord | ShellStartRecord;
+/**
+ * What the recorder takes: what the check records (IDs, closed vocabularies,
+ * and times only), and the record of an allowed tool call that the tool
+ * dispatcher makes (`ToolCallRecord`, #37, Project Manager decision of
+ * 2026-11-26), which also holds a path relative to the repository.
+ */
+export type EnforcementRecord =
+  DenialRecord | ShellStartRecord | ToolCallRecord;
 
 /**
  * Receives every record. A record is frozen.

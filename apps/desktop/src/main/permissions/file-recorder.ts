@@ -14,8 +14,14 @@
 //   whose first field is `version` (`ENFORCEMENT_RECORD_FORMAT_VERSION`),
 //   followed by the fields of the record in a fixed order. A record is
 //   validated before it is written, and anything that is not exactly a
-//   `DenialRecord` or a `ShellStartRecord` (IDs, closed vocabularies, and
-//   times) is refused, an unexpected field included.
+//   `DenialRecord`, a `ShellStartRecord`, or a `ToolCallRecord` (IDs,
+//   closed vocabularies, times, and a tool call's path relative to the
+//   repository) is refused, an unexpected field included. Versions: a new
+//   kind of record is added under the same version, and the lines of the
+//   kinds before it never change; the version changes only when the line of
+//   an existing kind changes. A reader skips a kind that it does not know.
+//   So `tool_call_allowed` (#37, Project Manager decision of 2026-11-26) is
+//   a line of version 1, and the lines written before it keep their meaning.
 // - Append only. A file is opened in append mode and never truncated, and
 //   each record is written with one write call. A write that fails or is
 //   cut short drops the file; a file that does not end with "\n" is never
@@ -30,24 +36,25 @@
 //   that is no longer in place fails the record (`write_failed`).
 // - Durability. The record of an allowed shell start is flushed to disk
 //   (`fsync`) before `record` returns, and so are the lines written before
-//   it. A denial reaches the operating system with its write call, which a
-//   crash of the application does not undo, and reaches the disk with the
-//   next shell start, the next rotation, or when the file is dropped or
-//   closed. Default until the Project Manager decides: a denial loop of a
-//   misbehaving executor then does not flush once for every denial on the
-//   main process.
+//   it. A denial, and an allowed tool call, reach the operating system with
+//   their write call, which a crash of the application does not undo, and
+//   reach the disk with the next shell start, the next rotation, or when the
+//   file is dropped or closed. Default until the Project Manager decides: a
+//   denial loop of a misbehaving executor, or the many reads of an agent,
+//   then do not flush once for every record on the main process.
 // - Rotation. A file holds at most `maxFileBytes`. A record that does not
 //   fit starts the next numbered file, and only the newest `maxFiles` files
 //   are kept: the older ones are deleted. A closed file's content is never
 //   changed, and a file is never renamed. Defaults until the Project Manager
 //   decides: 2 MiB per file and 5 files, at most 10 MiB together.
-// - Failure. A record that cannot be written, a denial as well as a shell
-//   start, makes `record` throw an `EnforcementRecordError` with a code from
-//   a closed list, so that the enforcement point denies an allowed shell
-//   start (`record_failed`). The next record opens the folder again; after
-//   two failures in a row, a denial within `ENFORCEMENT_RECORD_RETRY_MS` of
-//   the last attempt fails at once with the last code, but a shell start
-//   always tries to write. A newest file that can never be appended to (a
+// - Failure. A record that cannot be written, of any kind, makes `record`
+//   throw an `EnforcementRecordError` with a code from a closed list, so that
+//   the enforcement point denies an allowed shell start (`record_failed`),
+//   and the tool dispatcher refuses an allowed tool call (`record_failed`).
+//   The next record opens the folder again; after two failures in a row, a
+//   denial or a tool call within `ENFORCEMENT_RECORD_RETRY_MS` of the last
+//   attempt fails at once with the last code, but a shell start always tries
+//   to write. A newest file that can never be appended to (a
 //   folder, a read-only file, a link, a file of another owner) is left as it
 //   is, and the next numbered file is started. It never throws anything
 //   else, and nothing it does can stop the main process. A file that cannot
@@ -78,6 +85,11 @@ import {
   UtcTimestampSchema,
 } from "@mymandev/protocol";
 import * as z from "zod";
+import { parseRepositoryPath } from "../tools/repository-path.ts";
+import {
+  TOOL_CALL_RECORD_RESULTS,
+  TOOL_NAME_PATTERN,
+} from "../tools/tool-dispatcher.ts";
 import {
   ENFORCEMENT_DENIAL_REASONS,
   type EnforcementRecord,
@@ -103,14 +115,16 @@ export interface EnforcementRecordLimits {
 /**
  * The defaults until the Project Manager decides: a file holds at most
  * 2 MiB, about 6,000 records, and the newest 5 files are kept, so the records
- * take at most 10 MiB. A line holds at most 1 KiB; a valid record is about
- * 300 bytes.
+ * take at most 10 MiB. A line holds at most 8 KiB, so that a tool call's
+ * record holds the longest path that a tool takes
+ * (`MAX_REPOSITORY_PATH_LENGTH`, 1,024 UTF-16 code units, at most 6 bytes
+ * each as JSON writes them); a denial or a shell start is about 300 bytes.
  */
 export const ENFORCEMENT_RECORD_LIMITS: EnforcementRecordLimits = Object.freeze(
   {
     maxFileBytes: 2 * 1024 * 1024,
     maxFiles: 5,
-    maxRecordBytes: 1024,
+    maxRecordBytes: 8 * 1024,
   },
 );
 
@@ -121,10 +135,10 @@ export const ENFORCEMENT_RECORD_FILE_MODE = 0o600;
 export const ENFORCEMENT_RECORD_FOLDER_MODE = 0o700;
 
 /**
- * After two failures in a row, a denial within this many milliseconds of the
- * last attempt fails at once with the last code, without touching the disk;
- * a shell start always tries to write. Default until the Project Manager
- * decides.
+ * After two failures in a row, a denial or a tool call within this many
+ * milliseconds of the last attempt fails at once with the last code, without
+ * touching the disk; a shell start always tries to write. Default until the
+ * Project Manager decides.
  */
 export const ENFORCEMENT_RECORD_RETRY_MS = 1000;
 
@@ -188,7 +202,8 @@ export function enforcementRecordFileFlags(
  * Why a record was not written, a closed list:
  *
  * - `record_invalid`: the record is not a denial or a shell start of the
- *   enforcement point, or it has another field.
+ *   enforcement point, or a tool call of the dispatcher, or it has another
+ *   field.
  * - `record_too_large`: its line is longer than `maxRecordBytes`.
  * - `folder_unavailable`: the folder cannot be resolved, created, or
  *   listed.
@@ -381,9 +396,33 @@ const ShellStartLineSchema = z.strictObject({
   at: UtcTimestampSchema,
 });
 
+/**
+ * A tool call's path: exactly a path that passes the lexical rules of
+ * `parseRepositoryPath`, so relative to the repository, in POSIX form, and
+ * never absolute, a drive, or a UNC path.
+ */
+const RecordPathSchema = z.string().refine((value) => {
+  const parsed = parseRepositoryPath(value);
+  return parsed.ok && parsed.path.text === value;
+});
+
+const ToolCallLineSchema = z.strictObject({
+  kind: z.literal("tool_call_allowed"),
+  tool: z.string().regex(TOOL_NAME_PATTERN),
+  capability: CapabilitySchema,
+  path: RecordPathSchema.nullable(),
+  result: z.enum(TOOL_CALL_RECORD_RESULTS),
+  runId: RunIdSchema,
+  agentId: AgentIdSchema,
+  repositoryId: RepositoryIdSchema,
+  providerConnectionId: ProviderConnectionIdSchema.nullable(),
+  at: UtcTimestampSchema,
+});
+
 const RecordLineSchema = z.discriminatedUnion("kind", [
   DenialLineSchema,
   ShellStartLineSchema,
+  ToolCallLineSchema,
 ]);
 
 /**
@@ -428,29 +467,53 @@ export function enforcementRecordLine(
   }
   const record = parsed.data;
   const version = ENFORCEMENT_RECORD_FORMAT_VERSION;
-  const line = JSON.stringify(
-    record.kind === "denied"
-      ? {
-          version,
-          kind: record.kind,
-          reason: record.reason,
-          capability: record.capability,
-          runId: record.runId,
-          agentId: record.agentId,
-          repositoryId: record.repositoryId,
-          providerConnectionId: record.providerConnectionId,
-          at: record.at,
-        }
-      : {
-          version,
-          kind: record.kind,
-          runId: record.runId,
-          agentId: record.agentId,
-          repositoryId: record.repositoryId,
-          at: record.at,
-        },
-  );
-  return { kind: record.kind, line };
+  let fields: Record<string, unknown>;
+  switch (record.kind) {
+    case "denied":
+      fields = {
+        version,
+        kind: record.kind,
+        reason: record.reason,
+        capability: record.capability,
+        runId: record.runId,
+        agentId: record.agentId,
+        repositoryId: record.repositoryId,
+        providerConnectionId: record.providerConnectionId,
+        at: record.at,
+      };
+      break;
+    case "shell_start_allowed":
+      fields = {
+        version,
+        kind: record.kind,
+        runId: record.runId,
+        agentId: record.agentId,
+        repositoryId: record.repositoryId,
+        at: record.at,
+      };
+      break;
+    case "tool_call_allowed":
+      fields = {
+        version,
+        kind: record.kind,
+        tool: record.tool,
+        capability: record.capability,
+        path: record.path,
+        result: record.result,
+        runId: record.runId,
+        agentId: record.agentId,
+        repositoryId: record.repositoryId,
+        providerConnectionId: record.providerConnectionId,
+        at: record.at,
+      };
+      break;
+    default: {
+      // A new kind does not compile until its line is written here.
+      const unknownKind: never = record;
+      return unknownKind;
+    }
+  }
+  return { kind: record.kind, line: JSON.stringify(fields) };
 }
 
 /** The open record file. */
@@ -833,8 +896,9 @@ export function createFileEnforcementRecorder(
       throw new EnforcementRecordError("record_too_large");
     }
     const shellStart = validated.kind === "shell_start_allowed";
-    // A shell start always tries to write; a denial after two failures in a
-    // row waits, so that a denial loop does not open the folder each time.
+    // A shell start always tries to write; a denial or a tool call after two
+    // failures in a row waits, so that a loop does not open the folder each
+    // time.
     if (
       !shellStart &&
       retry !== null &&

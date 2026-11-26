@@ -41,8 +41,14 @@ import {
   RECORDS_WRITTEN_AGAIN_MESSAGE,
   type RecorderFileSystem,
   type RecorderPathStat,
+  enforcementRecordLine,
   recordFailureMessage,
 } from "./file-recorder.ts";
+import {
+  MAX_REPOSITORY_PATH_LENGTH,
+  MAX_REPOSITORY_PATH_SEGMENT_LENGTH,
+} from "../tools/repository-path.ts";
+import type { ToolCallRecord } from "../tools/tool-dispatcher.ts";
 
 const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000000001";
 const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000002";
@@ -93,6 +99,25 @@ const START: ShellStartRecord = Object.freeze({
   repositoryId: REPOSITORY_ID,
   at: AT,
 }) as ShellStartRecord;
+
+const TOOL_CALL: ToolCallRecord = Object.freeze({
+  kind: "tool_call_allowed",
+  tool: "read_file",
+  capability: "repo.read",
+  path: "src/a.ts",
+  result: "ok",
+  runId: RUN_ID,
+  agentId: AGENT_ID,
+  repositoryId: REPOSITORY_ID,
+  providerConnectionId: PROVIDER_CONNECTION_ID,
+  at: AT,
+}) as ToolCallRecord;
+
+const TOOL_CALL_LINE =
+  '{"version":1,"kind":"tool_call_allowed","tool":"read_file",' +
+  '"capability":"repo.read","path":"src/a.ts","result":"ok",' +
+  `"runId":"${RUN_ID}","agentId":"${AGENT_ID}","repositoryId":"${REPOSITORY_ID}",` +
+  `"providerConnectionId":"${PROVIDER_CONNECTION_ID}","at":"${AT}"}`;
 
 const DENIAL_LINE =
   '{"version":1,"kind":"denied","reason":"no_grant","capability":"provider.use",' +
@@ -227,13 +252,212 @@ test("each record is one JSON line with the format version first, in the data fo
   }
 });
 
-test("the defaults are 2 MiB per file, 5 files, and 1 KiB per record", () => {
+test("the defaults are 2 MiB per file, 5 files, and 8 KiB per record", () => {
   expect(ENFORCEMENT_RECORD_LIMITS).toEqual({
     maxFileBytes: 2 * 1024 * 1024,
     maxFiles: 5,
-    maxRecordBytes: 1024,
+    maxRecordBytes: 8 * 1024,
   });
   expect(Object.isFrozen(ENFORCEMENT_RECORD_LIMITS)).toBe(true);
+});
+
+test("an allowed tool call is one line of version 1, with its fields in a fixed order", () => {
+  const { recorder, read } = setup();
+  expect(recorder.record(TOOL_CALL)).toBeUndefined();
+  const without = Object.freeze({
+    ...TOOL_CALL,
+    path: null,
+    result: "path_refused",
+    providerConnectionId: null,
+  }) as ToolCallRecord;
+  expect(recorder.record(without)).toBeUndefined();
+  expect(read(1)).toBe(
+    `${TOOL_CALL_LINE}\n` +
+      '{"version":1,"kind":"tool_call_allowed","tool":"read_file",' +
+      '"capability":"repo.read","path":null,"result":"path_refused",' +
+      `"runId":"${RUN_ID}","agentId":"${AGENT_ID}","repositoryId":"${REPOSITORY_ID}",` +
+      `"providerConnectionId":null,"at":"${AT}"}\n`,
+  );
+  // The fields are written in their fixed order, whatever the order given.
+  const reordered = Object.fromEntries(Object.entries(TOOL_CALL).reverse());
+  expect(enforcementRecordLine(reordered)?.line).toBe(TOOL_CALL_LINE);
+});
+
+test("the lines of version 1 written before tool calls are recorded stay as they are and still read", () => {
+  // A file with the earlier kinds, as an earlier build wrote them.
+  const first = setup();
+  first.recorder.record(DENIAL);
+  first.recorder.record(START);
+  first.recorder.record(MALFORMED_DENIAL);
+  first.recorder.close();
+  const before = first.read(1);
+  expect(before.startsWith(`${DENIAL_LINE}\n${START_LINE}\n`)).toBe(true);
+
+  // This build appends a tool call to the same file, and the earlier lines
+  // are unchanged.
+  const second = setup({ root: first.root });
+  second.recorder.record(TOOL_CALL);
+  second.recorder.record(DENIAL);
+  const after = second.read(1);
+  expect(after).toBe(`${before}${TOOL_CALL_LINE}\n${DENIAL_LINE}\n`);
+  expect(second.files()).toEqual(["enforcement-00000001.jsonl"]);
+
+  // Every line reads back: its version, and its record, which the record
+  // types still take and write as exactly the same line.
+  const lines = after.trimEnd().split("\n");
+  expect(
+    lines.map((line) => (JSON.parse(line) as { kind: string }).kind),
+  ).toEqual([
+    "denied",
+    "shell_start_allowed",
+    "denied",
+    "tool_call_allowed",
+    "denied",
+  ]);
+  for (const line of lines) {
+    const { version, ...entry } = JSON.parse(line) as Record<string, unknown>;
+    expect(version).toBe(ENFORCEMENT_RECORD_FORMAT_VERSION);
+    expect(enforcementRecordLine(entry)?.line).toBe(line);
+  }
+});
+
+test("a tool call's path is relative to the repository only: an absolute path, a drive, a UNC path, a backslash, or a path that leaves the repository is refused, and nothing is written", () => {
+  const spy = spyFileSystem();
+  const { recorder } = setup({ fileSystem: spy.fileSystem });
+  for (const refusedPath of [
+    "/home/person/repository/src/a.ts",
+    "/etc/passwd",
+    "C:/Users/person/repository",
+    "C:\\Users\\person\\repository",
+    "c:",
+    "\\\\server\\share\\a.ts",
+    "//server/share/a.ts",
+    "src\\a.ts",
+    "../outside.txt",
+    "src/../../outside.txt",
+    "./src",
+    ".git/config",
+    ".env",
+    "src/",
+    "",
+    "nul",
+  ]) {
+    expect(
+      failureOf(() =>
+        recorder.record({ ...TOOL_CALL, path: refusedPath } as ToolCallRecord),
+      ),
+      refusedPath,
+    ).toBe("record_invalid");
+  }
+  expect(spy.calls).toEqual([]);
+  // The repository's root and paths inside it are taken.
+  for (const taken of [
+    ".",
+    "src",
+    "src/a.ts",
+    "docs/read me.md",
+    "\u00e9t\u00e9.md",
+  ]) {
+    expect(
+      recorder.record({ ...TOOL_CALL, path: taken } as ToolCallRecord),
+      taken,
+    ).toBeUndefined();
+  }
+});
+
+test("a tool call outside its record type is refused: content, an input, an unknown result, a tool name, or a missing time", () => {
+  const spy = spyFileSystem();
+  const { recorder } = setup({ fileSystem: spy.fileSystem });
+  const refused: unknown[] = [
+    { ...TOOL_CALL, content: "export const a = 1;" },
+    { ...TOOL_CALL, input: { path: "src/a.ts" } },
+    { ...TOOL_CALL, answer: { ok: true } },
+    { ...TOOL_CALL, result: "denied" },
+    { ...TOOL_CALL, result: "unknown_tool" },
+    { ...TOOL_CALL, result: "record_failed" },
+    { ...TOOL_CALL, result: "made_up" },
+    { ...TOOL_CALL, tool: "Read File" },
+    { ...TOOL_CALL, tool: "" },
+    { ...TOOL_CALL, capability: "repo.everything" },
+    { ...TOOL_CALL, path: 7 },
+    { ...TOOL_CALL, runId: null },
+    { ...TOOL_CALL, repositoryId: null },
+    { ...TOOL_CALL, at: null },
+    { ...TOOL_CALL, kind: "tool_call" },
+    Object.fromEntries(
+      Object.entries(TOOL_CALL).filter(([key]) => key !== "path"),
+    ),
+  ];
+  for (const entry of refused) {
+    expect(
+      failureOf(() => recorder.record(entry as EnforcementRecord)),
+      JSON.stringify(entry),
+    ).toBe("record_invalid");
+  }
+  expect(spy.calls).toEqual([]);
+});
+
+test("a tool call with the longest path, in the longest form that JSON writes, fits in one line", () => {
+  // Lone surrogates, which JSON writes as six bytes each, in the longest
+  // segments, up to the longest path.
+  const unit = "\ud800";
+  const segment = unit.repeat(MAX_REPOSITORY_PATH_SEGMENT_LENGTH);
+  const segments = [segment, segment, segment, segment];
+  let longest = segments.join("/");
+  longest = `${longest.slice(0, MAX_REPOSITORY_PATH_LENGTH - 2)}/${unit}`;
+  expect(longest).toHaveLength(MAX_REPOSITORY_PATH_LENGTH);
+  const entry = { ...TOOL_CALL, path: longest } as ToolCallRecord;
+  const line = enforcementRecordLine(entry)?.line ?? "";
+  expect(Buffer.byteLength(`${line}\n`, "utf8")).toBeGreaterThan(6_000);
+  expect(Buffer.byteLength(`${line}\n`, "utf8")).toBeLessThanOrEqual(
+    ENFORCEMENT_RECORD_LIMITS.maxRecordBytes,
+  );
+  const { recorder, read } = setup();
+  expect(recorder.record(entry)).toBeUndefined();
+  expect(read(1)).toBe(`${line}\n`);
+  expect((JSON.parse(line) as { path: string }).path).toBe(longest);
+});
+
+test("an allowed tool call is not flushed on its own, as a denial; a shell start flushes it", () => {
+  const spy = spyFileSystem();
+  const { recorder, read } = setup({
+    fileSystem: spy.fileSystem,
+    platform: "win32",
+  });
+  recorder.record(TOOL_CALL);
+  recorder.record(TOOL_CALL);
+  expect(spy.named("fsyncSync")).toHaveLength(0);
+  recorder.record(START);
+  expect(spy.named("fsyncSync")).toHaveLength(1);
+  expect(read(1)).toBe(`${TOOL_CALL_LINE}\n${TOOL_CALL_LINE}\n${START_LINE}\n`);
+});
+
+test("after two failures in a row a tool call waits as a denial does, and fails at once with the last code", () => {
+  let time = 1000;
+  const spy = spyFileSystem({
+    mkdirSync: () => {
+      throw errno("EACCES");
+    },
+  });
+  const { recorder } = setup({ fileSystem: spy.fileSystem, now: () => time });
+  const attempts = () => spy.named("mkdirSync").length;
+  expect(failureOf(() => recorder.record(TOOL_CALL))).toBe(
+    "folder_unavailable",
+  );
+  expect(failureOf(() => recorder.record(TOOL_CALL))).toBe(
+    "folder_unavailable",
+  );
+  expect(attempts()).toBe(2);
+  time += ENFORCEMENT_RECORD_RETRY_MS - 1;
+  expect(failureOf(() => recorder.record(TOOL_CALL))).toBe(
+    "folder_unavailable",
+  );
+  expect(attempts()).toBe(2);
+  time += 1;
+  expect(failureOf(() => recorder.record(TOOL_CALL))).toBe(
+    "folder_unavailable",
+  );
+  expect(attempts()).toBe(3);
 });
 
 test("creating the recorder touches nothing; the first record creates the folder and the file", () => {
