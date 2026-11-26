@@ -540,7 +540,7 @@ const RUN_CONNECTIONS: ProviderConnectionListView = {
       kind: "claude",
       label: "Work laptop",
       createdAt: CREATED_AT,
-      status: "registered",
+      status: "ready",
     },
   ],
 };

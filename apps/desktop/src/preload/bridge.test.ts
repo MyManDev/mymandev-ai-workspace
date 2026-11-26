@@ -2629,13 +2629,15 @@ test("the claim mark subscription delivers the marks and every newer state, with
   expect(refused).toBe(1);
 });
 
-test("the provider connection functions are their four, and each calls its own channel with only its strings, never a credential", async () => {
+test("the provider connection functions are their six, and each calls its own channel with only its strings, never a credential beside them", async () => {
   const fake = fakeIpc();
   const bridge = createDesktopBridge("44.9.1", fake.ipc);
   expect(Object.keys(bridge.providerConnections).sort()).toEqual([
     "getState",
     "register",
     "remove",
+    "removeKey",
+    "saveKey",
     "subscribeState",
   ]);
   const id = "0192f0a0-7b3c-7d4e-8f50-000000000101";
@@ -2672,6 +2674,49 @@ test("the provider connection functions are their four, and each calls its own c
   await expect(registered).resolves.toEqual(answers[1]);
   await expect(extra).resolves.toEqual(answers[2]);
   await expect(removed).resolves.toEqual(answers[3]);
+});
+
+test("the key functions pass on a new object with only the ID and the key, and the ID, each a string, and refuse anything else without naming it", async () => {
+  const fake = fakeIpc();
+  const bridge = createDesktopBridge("44.9.1", fake.ipc);
+  const id = "0192f0a0-7b3c-7d4e-8f50-000000000101";
+  const key = "FAKE-PROVIDER-KEY-SENTINEL-0123456789";
+  const saveKey = bridge.providerConnections.saveKey as unknown as (
+    ...args: unknown[]
+  ) => Promise<unknown>;
+  const removeKey = bridge.providerConnections.removeKey as unknown as (
+    ...args: unknown[]
+  ) => Promise<unknown>;
+  const saved = saveKey(id, key, { deviceId: id });
+  const removed = removeKey(id, key);
+  expect(fake.invoked).toEqual([
+    {
+      channel: INVOKE_CHANNELS.saveProviderKey,
+      args: [{ providerConnectionId: id, key }],
+    },
+    { channel: INVOKE_CHANNELS.removeProviderKey, args: [id] },
+  ]);
+  fake.answers[0]?.resolve({ outcome: "ok" });
+  fake.answers[1]?.resolve({ outcome: "ok" });
+  await expect(saved).resolves.toEqual({ outcome: "ok" });
+  await expect(removed).resolves.toEqual({ outcome: "ok" });
+  fake.invoked.length = 0;
+  for (const [first, second] of [
+    [id, { key }],
+    [{ id }, key],
+    [id, undefined],
+    [7, key],
+  ]) {
+    const error = await saveKey(first, second).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(TypeError);
+    expect(String(error)).not.toContain(key);
+  }
+  for (const value of [7, null, { id }]) {
+    await expect(removeKey(value)).rejects.toBeInstanceOf(TypeError);
+  }
+  expect(fake.invoked).toEqual([]);
 });
 
 test("the provider connection actions refuse a value that is not a string without calling the main process or naming it", async () => {

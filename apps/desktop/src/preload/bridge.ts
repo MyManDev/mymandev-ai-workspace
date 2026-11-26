@@ -76,6 +76,8 @@ import type {
   RegisterRepositoryResult,
   RemoveDeviceResult,
   RemoveProviderConnectionResult,
+  RemoveProviderKeyResult,
+  SaveProviderKeyResult,
   RemoveRepositoryResult,
   RevokeGrantResult,
   RevokeInvitationResult,
@@ -233,7 +235,9 @@ function subscribeRevisions<T extends { readonly revision: number }>(
  * workspace ID of `claims.markSeen`, a string, with its member IDs, an array
  * of strings that it copies, and the kind and the label of
  * `providerConnections.register`, two strings in a new object of its own,
- * the ID of `providerConnections.remove`, a string, the four IDs of
+ * the ID of `providerConnections.remove`, a string, the ID and the API key
+ * of `providerConnections.saveKey`, two strings in a new object of its own,
+ * the ID of `providerConnections.removeKey`, a string, the four IDs of
  * `agents.requestRun`, each a string, in a new object of its own, and the
  * project ID of `agents.takeRunRequestOutcome`, a string.
  * `account.startSignIn` passes on a fixed option of its own when the
@@ -1051,9 +1055,10 @@ export function createDesktopBridge(
       ipc.invoke(INVOKE_CHANNELS.dismissLostDeviceAdvice) as Promise<boolean>,
   });
 
-  // Only a new object with the kind and the label, and the ID, go on, each
-  // a string; the main process checks each value. No credential is ever
-  // passed. Another value is refused here without naming it.
+  // Only a new object with the kind and the label, a new object with the ID
+  // and the API key, and the ID, go on, each a string; the main process
+  // checks each value. The key goes to the main process once, and nothing
+  // returns it. Another value is refused here without naming it.
   const providerConnections: ProviderConnectionsBridge = Object.freeze({
     getState: () =>
       ipc.invoke(
@@ -1089,6 +1094,26 @@ export function createDesktopBridge(
           ) as Promise<RemoveProviderConnectionResult>)
         : Promise.reject(
             new TypeError("remove needs a provider connection ID string."),
+          ),
+    saveKey: (providerConnectionId: string, key: string) =>
+      typeof providerConnectionId === "string" && typeof key === "string"
+        ? (ipc.invoke(INVOKE_CHANNELS.saveProviderKey, {
+            providerConnectionId,
+            key,
+          }) as Promise<SaveProviderKeyResult>)
+        : Promise.reject(
+            new TypeError(
+              "saveKey needs a provider connection ID and a key string.",
+            ),
+          ),
+    removeKey: (providerConnectionId: string) =>
+      typeof providerConnectionId === "string"
+        ? (ipc.invoke(
+            INVOKE_CHANNELS.removeProviderKey,
+            providerConnectionId,
+          ) as Promise<RemoveProviderKeyResult>)
+        : Promise.reject(
+            new TypeError("removeKey needs a provider connection ID string."),
           ),
   });
 

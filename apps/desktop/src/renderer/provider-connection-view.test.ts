@@ -14,16 +14,21 @@ import type {
 import {
   PROVIDER_CONNECTION_LIST_PROBLEMS,
   PROVIDER_CONNECTION_STATUSES,
+  PROVIDER_KEY_LIMITS,
   REGISTER_PROVIDER_CONNECTION_REFUSALS,
   REMOVE_PROVIDER_CONNECTION_REFUSALS,
+  REMOVE_PROVIDER_KEY_REFUSALS,
   RegisterProviderConnectionResultSchema,
   RemoveProviderConnectionResultSchema,
+  SAVE_PROVIDER_KEY_REFUSALS,
 } from "../shared/ipc-contract.ts";
 import {
   createProviderConnectionActions,
   describeProviderConnections,
   describeRegisterProviderConnection,
   describeRemoveProviderConnection,
+  describeRemoveProviderKey,
+  describeSaveProviderKey,
   followProviderConnections,
   IDLE_PROVIDER_CONNECTION_ACTIONS,
   initialProviderConnectionSectionView,
@@ -31,6 +36,7 @@ import {
   MAX_NEW_PROVIDER_CONNECTIONS_PER_DAY,
   MAX_PROVIDER_CONNECTION_LABEL_LENGTH,
   MAX_PROVIDER_CONNECTIONS_PER_DEVICE,
+  MAX_PROVIDER_KEY_LENGTH,
   PROVIDER_CONNECTION_MESSAGES,
   PROVIDER_CONNECTION_NOT_SENT,
   PROVIDER_CONNECTION_PROBLEM_MESSAGES,
@@ -38,6 +44,10 @@ import {
   PROVIDER_KINDS_OFFERED,
   providerConnectionLabelPrompt,
   providerConnectionLabelToSend,
+  providerKeyPrompt,
+  providerKeyToSend,
+  REMOVE_PROVIDER_KEY_REFUSAL_MESSAGES,
+  SAVE_PROVIDER_KEY_REFUSAL_MESSAGES,
   type ProviderConnectionActionsView,
   type ProviderConnectionSectionView,
 } from "./provider-connection-view.ts";
@@ -60,7 +70,7 @@ function item(
     kind: "claude",
     label,
     createdAt: AT,
-    status: "registered",
+    status: "credential_missing",
     ...overrides,
   };
 }
@@ -92,6 +102,7 @@ test("the section's values match the protocol's", () => {
   );
   expect(LABEL_SAFE_PATTERN.source).toBe(SAFE_TEXT_PATTERN.source);
   expect(LABEL_SAFE_PATTERN.flags).toBe(SAFE_TEXT_PATTERN.flags);
+  expect(MAX_PROVIDER_KEY_LENGTH).toBe(PROVIDER_KEY_LIMITS.key);
   // Every status and problem of the contract has its text.
   expect(Object.keys(PROVIDER_CONNECTION_STATUS_TEXTS).sort()).toEqual(
     [...PROVIDER_CONNECTION_STATUSES].sort(),
@@ -146,9 +157,11 @@ test("the section says what it knows, lists the connections with their status, a
       kindName: "Claude",
       label: "Work",
       createdAt: AT,
-      status: "registered",
-      statusName: "Registered",
-      statusText: PROVIDER_CONNECTION_STATUS_TEXTS.registered.text,
+      status: "credential_missing",
+      statusName: "No API key",
+      statusText: PROVIDER_CONNECTION_STATUS_TEXTS.credential_missing.text,
+      keyAction: "enter",
+      keyMayExist: false,
     },
     {
       id: ID_2,
@@ -156,9 +169,11 @@ test("the section says what it knows, lists the connections with their status, a
       kindName: "Codex",
       label: "Home",
       createdAt: AT,
-      status: "registered",
-      statusName: "Registered",
-      statusText: PROVIDER_CONNECTION_STATUS_TEXTS.registered.text,
+      status: "credential_missing",
+      statusName: "No API key",
+      statusText: PROVIDER_CONNECTION_STATUS_TEXTS.credential_missing.text,
+      keyAction: "enter",
+      keyMayExist: false,
     },
   ]);
   // A failed read shows its problem with what was read before, unknown.
@@ -174,10 +189,30 @@ test("the section says what it knows, lists the connections with their status, a
     expect(model.rows?.[0]?.statusName).toBe("Unknown");
     expect(model.signedIn).toBe(true);
   }
-  // No status claims that a provider works: no credential is checked yet.
+  // A stored key is "Ready" and is replaced, an unknown one may exist.
+  const keyed = describeProviderConnections(
+    known({
+      connections: [
+        item(ID_1, "Work", { status: "ready" }),
+        item(ID_2, "Home", { status: "unknown" }),
+      ],
+    }),
+  );
+  expect(
+    keyed.rows?.map((row) => [row.statusName, row.keyAction, row.keyMayExist]),
+  ).toEqual([
+    ["Ready", "replace", true],
+    ["Unknown", "enter", true],
+  ]);
+  // No status claims that the provider accepts the key: none is checked
+  // with it.
   for (const texts of Object.values(PROVIDER_CONNECTION_STATUS_TEXTS)) {
-    expect(texts.name).not.toMatch(/ready|working|connected/iu);
+    expect(texts.name).not.toMatch(/working|connected|valid|accepted/iu);
+    expect(texts.text).not.toMatch(/\bworks\b|is valid|was accepted/iu);
   }
+  expect(PROVIDER_CONNECTION_STATUS_TEXTS.ready.text).toContain(
+    "Whether the provider accepts it",
+  );
 });
 
 test("a label is trimmed and checked as the protocol checks it, characters counted as code points", () => {
@@ -328,6 +363,14 @@ function fakeBridge() {
         calls.push(`remove ${id}`);
         return answer();
       },
+      saveKey: (id: string, key: string) => {
+        calls.push(`saveKey ${id} ${key}`);
+        return answer();
+      },
+      removeKey: (id: string) => {
+        calls.push(`removeKey ${id}`);
+        return answer();
+      },
     },
   };
 }
@@ -415,6 +458,7 @@ test("a removal asks first, sends the listed ID once on confirm, and a cancel se
     id: ID_2,
     label: "Home",
     kindName: "Codex",
+    action: "remove",
   });
   actions.cancel();
   expect(views.at(-1)?.question).toBeUndefined();
@@ -470,4 +514,274 @@ test("the question ends when its connection leaves the list, and a sign-out drop
   await pending;
   await settle();
   expect(views.at(-1)).toMatchObject({ running: false, message: undefined });
+});
+
+// ---- API keys (#33) ---------------------------------------------------------
+
+/** An obvious fake key; once sent, no view of the section may hold it. */
+const SENTINEL_KEY = "FAKE-PROVIDER-KEY-SENTINEL-0123456789";
+
+test("a key is trimmed and checked as the main process checks it, and a problem never names the key", () => {
+  expect(providerKeyToSend(`  ${SENTINEL_KEY}\n`)).toBe(SENTINEL_KEY);
+  expect(providerKeyPrompt(SENTINEL_KEY)).toBeUndefined();
+  expect(
+    providerKeyPrompt("k".repeat(MAX_PROVIDER_KEY_LENGTH)),
+  ).toBeUndefined();
+  expect(providerKeyPrompt("")).toBe(PROVIDER_CONNECTION_MESSAGES.keyMissing);
+  expect(providerKeyPrompt("k".repeat(MAX_PROVIDER_KEY_LENGTH + 1))).toBe(
+    PROVIDER_CONNECTION_MESSAGES.keyTooLong,
+  );
+  for (const key of [
+    `${SENTINEL_KEY} x`,
+    `${SENTINEL_KEY}\tx`,
+    `${SENTINEL_KEY}\u0000`,
+    `${SENTINEL_KEY}\u00a0x`,
+    `${SENTINEL_KEY}\u200b`,
+    `${SENTINEL_KEY}\ud800`,
+  ]) {
+    expect(providerKeyPrompt(key), JSON.stringify(key)).toBe(
+      PROVIDER_CONNECTION_MESSAGES.keyUnsafe,
+    );
+  }
+  for (const message of [
+    PROVIDER_CONNECTION_MESSAGES.keyMissing,
+    PROVIDER_CONNECTION_MESSAGES.keyTooLong,
+    PROVIDER_CONNECTION_MESSAGES.keyUnsafe,
+  ]) {
+    expect(message).not.toContain(SENTINEL_KEY);
+  }
+});
+
+test("every answer of storing and removing a key has its own sentence, and none holds a key", () => {
+  expect(Object.keys(SAVE_PROVIDER_KEY_REFUSAL_MESSAGES).sort()).toEqual(
+    [...SAVE_PROVIDER_KEY_REFUSALS].sort(),
+  );
+  expect(Object.keys(REMOVE_PROVIDER_KEY_REFUSAL_MESSAGES).sort()).toEqual(
+    [...REMOVE_PROVIDER_KEY_REFUSALS].sort(),
+  );
+  expect(describeSaveProviderKey({ outcome: "ok" })).toBe(
+    "The API key was stored on this device.",
+  );
+  expect(describeRemoveProviderKey({ outcome: "ok" })).toBe(
+    "The API key was deleted from this device.",
+  );
+  for (const reason of SAVE_PROVIDER_KEY_REFUSALS) {
+    expect(
+      describeSaveProviderKey({
+        outcome: "refused",
+        reason,
+        retryAfterMs: null,
+      }),
+    ).toBe(
+      `The API key was not stored. ${SAVE_PROVIDER_KEY_REFUSAL_MESSAGES[reason]}`,
+    );
+  }
+  expect(
+    describeSaveProviderKey({
+      outcome: "refused",
+      reason: "protection_unavailable",
+      retryAfterMs: null,
+    }),
+  ).toContain("secret service");
+  for (const reason of REMOVE_PROVIDER_KEY_REFUSALS) {
+    expect(
+      describeRemoveProviderKey({
+        outcome: "refused",
+        reason,
+        retryAfterMs: null,
+      }),
+    ).toContain(REMOVE_PROVIDER_KEY_REFUSAL_MESSAGES[reason]);
+  }
+  for (const describe of [describeSaveProviderKey, describeRemoveProviderKey]) {
+    expect(
+      describe({ outcome: "refused", reason: "busy", retryAfterMs: null }),
+    ).toContain(
+      "Another change of the AI provider connections or their API keys is still running.",
+    );
+  }
+});
+
+test("the key form opens empty for a listed connection, sends the trimmed key once, and is cleared as it is sent; ok closes it", async () => {
+  const fake = fakeBridge();
+  const views: ProviderConnectionActionsView[] = [];
+  const actions = createProviderConnectionActions(fake.bridge, (view) =>
+    views.push(view),
+  );
+  const model = describeProviderConnections(known());
+  actions.follow(model);
+  const row = model.rows![0]!;
+
+  // Typing without an open form keeps nothing.
+  actions.editKey(SENTINEL_KEY);
+  expect(views).toEqual([]);
+  // A row that the model does not list opens nothing.
+  actions.askKey({ ...row, id: "0192f0a0-7b3c-7d4e-8f50-000000000999" });
+  expect(views).toEqual([]);
+
+  actions.askKey(row);
+  expect(views.at(-1)).toMatchObject({
+    keyFor: { id: ID_1, label: "Work", kindName: "Claude" },
+    draftKey: "",
+    keyProblem: undefined,
+  });
+  actions.editKey(`  ${SENTINEL_KEY}  `);
+  expect(views.at(-1)?.draftKey).toBe(`  ${SENTINEL_KEY}  `);
+  const sentAt = views.length;
+  const pending = actions.saveKey();
+  // The field is empty before the main process answers.
+  expect(views.at(-1)).toMatchObject({ draftKey: "", running: true });
+  expect(fake.calls).toEqual([`saveKey ${ID_1} ${SENTINEL_KEY}`]);
+  // While it runs, nothing else starts and nothing is sent again.
+  await actions.saveKey();
+  actions.askKey(model.rows![1]!);
+  expect(fake.calls).toHaveLength(1);
+  fake.pending[0]?.resolve({ outcome: "ok" });
+  await pending;
+  expect(views.at(-1)).toEqual({
+    ...IDLE_PROVIDER_CONNECTION_ACTIONS,
+    message: "The API key was stored on this device.",
+  });
+  // From the send on, no view holds the key.
+  expect(JSON.stringify(views.slice(sentAt))).not.toContain(SENTINEL_KEY);
+});
+
+test("a key with a problem is not sent and its field is cleared; a refusal keeps the form open and empty; cancel empties it", async () => {
+  const fake = fakeBridge();
+  const views: ProviderConnectionActionsView[] = [];
+  const actions = createProviderConnectionActions(fake.bridge, (view) =>
+    views.push(view),
+  );
+  const model = describeProviderConnections(known());
+  actions.follow(model);
+  const row = model.rows![1]!;
+  actions.askKey(row);
+  await actions.saveKey();
+  expect(views.at(-1)?.keyProblem).toBe(
+    PROVIDER_CONNECTION_MESSAGES.keyMissing,
+  );
+  actions.editKey(`${SENTINEL_KEY} more`);
+  expect(views.at(-1)?.keyProblem).toBeUndefined();
+  const before = views.length;
+  await actions.saveKey();
+  expect(views.at(-1)).toMatchObject({
+    draftKey: "",
+    keyProblem: PROVIDER_CONNECTION_MESSAGES.keyUnsafe,
+    keyFor: { id: ID_2 },
+  });
+  expect(fake.calls).toEqual([]);
+  expect(JSON.stringify(views.slice(before))).not.toContain(SENTINEL_KEY);
+
+  actions.editKey(SENTINEL_KEY);
+  const refused = actions.saveKey();
+  fake.pending[0]?.resolve({
+    outcome: "refused",
+    reason: "protection_unavailable",
+    retryAfterMs: null,
+  });
+  await refused;
+  expect(views.at(-1)).toMatchObject({
+    running: false,
+    draftKey: "",
+    keyFor: { id: ID_2 },
+  });
+  expect(views.at(-1)?.message).toContain("cannot protect it");
+
+  actions.editKey(SENTINEL_KEY);
+  const thrown = actions.saveKey();
+  fake.pending[1]?.reject(new Error("refused by the contract"));
+  await thrown;
+  expect(views.at(-1)?.message).toBe(
+    `The API key was not stored. ${PROVIDER_CONNECTION_NOT_SENT}`,
+  );
+  expect(views.at(-1)?.draftKey).toBe("");
+
+  actions.editKey(SENTINEL_KEY);
+  actions.cancelKey();
+  expect(views.at(-1)).toMatchObject({
+    keyFor: undefined,
+    draftKey: "",
+    keyProblem: undefined,
+  });
+});
+
+test("removing a key asks first and sends the listed ID once; the focus stays", async () => {
+  const fake = fakeBridge();
+  const views: ProviderConnectionActionsView[] = [];
+  const actions = createProviderConnectionActions(fake.bridge, (view) =>
+    views.push(view),
+  );
+  const model = describeProviderConnections(
+    known({ connections: [item(ID_1, "Work", { status: "ready" })] }),
+  );
+  actions.follow(model);
+  actions.askRemoveKey(model.rows![0]!);
+  expect(views.at(-1)?.question).toEqual({
+    id: ID_1,
+    label: "Work",
+    kindName: "Claude",
+    action: "removeKey",
+  });
+  actions.cancel();
+  expect(fake.calls).toEqual([]);
+  actions.askRemoveKey(model.rows![0]!);
+  const removing = actions.confirm();
+  expect(fake.calls).toEqual([`removeKey ${ID_1}`]);
+  fake.pending[0]?.resolve({ outcome: "ok" });
+  await expect(removing).resolves.toBe(false);
+  expect(views.at(-1)?.message).toBe(
+    "The API key was deleted from this device.",
+  );
+});
+
+test("a sign-out or a connection that leaves the list closes the key form and drops the typed key", () => {
+  const fake = fakeBridge();
+  const views: ProviderConnectionActionsView[] = [];
+  const actions = createProviderConnectionActions(fake.bridge, (view) =>
+    views.push(view),
+  );
+  const model = describeProviderConnections(known());
+  actions.follow(model);
+  actions.askKey(model.rows![0]!);
+  actions.editKey(SENTINEL_KEY);
+  actions.follow(
+    describeProviderConnections(
+      known({ connections: [item(ID_2, "Home", { kind: "codex" })] }),
+    ),
+  );
+  expect(views.at(-1)).toMatchObject({ keyFor: undefined, draftKey: "" });
+
+  actions.follow(model);
+  actions.askKey(model.rows![1]!);
+  actions.editKey(SENTINEL_KEY);
+  actions.follow(
+    describeProviderConnections(
+      known({ status: "signed_out", connections: [] }),
+    ),
+  );
+  expect(views.at(-1)).toMatchObject({ keyFor: undefined, draftKey: "" });
+  expect(JSON.stringify(views.at(-1))).not.toContain(SENTINEL_KEY);
+  expect(fake.calls).toEqual([]);
+});
+
+test("opening the key form of another connection never carries over what was typed", () => {
+  const fake = fakeBridge();
+  const views: ProviderConnectionActionsView[] = [];
+  const actions = createProviderConnectionActions(fake.bridge, (view) =>
+    views.push(view),
+  );
+  const model = describeProviderConnections(known());
+  actions.follow(model);
+  actions.askKey(model.rows![0]!);
+  actions.editKey(SENTINEL_KEY);
+  actions.askKey(model.rows![1]!);
+  expect(views.at(-1)).toMatchObject({
+    keyFor: { id: ID_2 },
+    draftKey: "",
+    keyProblem: undefined,
+  });
+  // Opening the same connection's form again starts empty too.
+  actions.editKey(SENTINEL_KEY);
+  actions.askKey(model.rows![1]!);
+  expect(views.at(-1)?.draftKey).toBe("");
+  expect(fake.calls).toEqual([]);
 });
