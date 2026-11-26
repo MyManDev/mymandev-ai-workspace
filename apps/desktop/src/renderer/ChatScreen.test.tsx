@@ -626,6 +626,7 @@ const CONFIRMING: RunRequestState = {
   agentId: RUN_AGENT,
   connectionId: RUN_CONNECTION,
   repositoryChoice: RUN_REPOSITORY,
+  confirmedRepositoryLabel: "web",
   step: "confirm",
 };
 
@@ -724,7 +725,11 @@ test("the repository list is labelled and described, offers No repository first 
   expect(noneHtml).not.toContain(escaped(RUN_REQUEST_MESSAGES.repositoryFiles));
   expect(noneHtml).not.toContain(`id="${form}-repository-files"`);
   const noneConfirmation = render({
-    run: runProps({ ...CONFIRMING, repositoryChoice: NO_REPOSITORY }),
+    run: runProps({
+      ...CONFIRMING,
+      repositoryChoice: NO_REPOSITORY,
+      confirmedRepositoryLabel: RUN_REQUEST_MESSAGES.noRepository,
+    }),
   });
   expect(noneConfirmation).toContain(
     `<dt>${RUN_REQUEST_MESSAGES.repositoryLabel}</dt><dd dir="auto">${RUN_REQUEST_MESSAGES.noRepository}</dd>`,

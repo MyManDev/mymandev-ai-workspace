@@ -554,6 +554,72 @@ test("names that repeat among the repositories offered get a number in the list'
   expect(JSON.stringify(model)).not.toContain("mount-1");
 });
 
+test("each repeated name is numbered on its own", () => {
+  const API_2 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819506";
+  const WEB_2 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819504";
+  expect(
+    runRepositories(
+      repositories({
+        repositories: [
+          repository({ repositoryId: API, name: "api" }),
+          repository({}),
+          repository({ repositoryId: API_2, name: "api" }),
+          repository({ repositoryId: DOCS, name: "docs" }),
+          repository({ repositoryId: WEB_2, name: "web" }),
+        ],
+      }),
+      PROJECT,
+    ),
+  ).toEqual([
+    { id: API, label: "api (1)" },
+    { id: WEB, label: "web (1)" },
+    { id: API_2, label: "api (2)" },
+    { id: DOCS, label: "docs" },
+    { id: WEB_2, label: "web (2)" },
+  ]);
+});
+
+test("a confirmation whose repository's label changed since Continue goes back to the choice, which shows the new label", () => {
+  const WEB_2 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819504";
+  const WEB_3 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819505";
+  const three = repositories({
+    repositories: [
+      repository({}),
+      repository({ repositoryId: WEB_2, name: "web" }),
+      repository({ repositoryId: WEB_3, name: "web" }),
+    ],
+  });
+  const opened = chooseRunRepository(
+    openRunForm(IDLE_RUN_REQUEST, MINE),
+    WEB_2,
+  );
+  const confirming = continueRunForm(
+    opened,
+    form(opened, { repositories: three }),
+  );
+  expect(confirming.confirmedRepositoryLabel).toBe("web (2)");
+  expect(form(confirming, { repositories: three })?.step).toBe("confirm");
+  // The oldest is unlinked: the same repository is now "web (1)".
+  const twoLeft = repositories({
+    repositories: [
+      repository({ linked: false }),
+      repository({ repositoryId: WEB_2, name: "web" }),
+      repository({ repositoryId: WEB_3, name: "web" }),
+    ],
+  });
+  const changed = form(confirming, { repositories: twoLeft });
+  expect(changed?.step).toBe("choose");
+  expect(changed?.repositoryId).toBe(WEB_2);
+  expect(changed?.repositoryLabel).toBe("web (1)");
+  expect(confirmedRunRequest(confirming, changed, PROJECT)).toBeNull();
+  // Continue again confirms the label shown now.
+  const again = continueRunForm(confirming, changed);
+  const model = form(again, { repositories: twoLeft });
+  expect(model?.step).toBe("confirm");
+  expect(model?.repositoryLabel).toBe("web (1)");
+  expect(confirmedRunRequest(again, model, PROJECT)?.repositoryId).toBe(WEB_2);
+});
+
 test("exactly one linked repository is preselected; with none or several, no repository is, and the form can still continue", () => {
   const opened = openRunForm(IDLE_RUN_REQUEST, MINE);
   // One: preselected.
@@ -804,7 +870,7 @@ test("repositories that cannot be read say so, and a run without a repository ca
   expect(stopped).toEqual(["stop"]);
 });
 
-test("while a repository is chosen, the form and the confirmation say that the names of its files are sent if the agent may read it", () => {
+test("while a repository is chosen, the form and the confirmation say that the names of its files and folders are sent if the agent may read it", () => {
   const opened = openRunForm(IDLE_RUN_REQUEST, MINE);
   expect(form(opened)?.repositoryFiles).toBe(
     RUN_REQUEST_MESSAGES.repositoryFiles,

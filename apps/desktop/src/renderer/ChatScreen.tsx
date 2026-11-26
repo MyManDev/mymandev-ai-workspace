@@ -359,10 +359,10 @@ function MessageItem({
  * offers "No repository" first, then the project's repositories that the
  * account linked on this device, by name; its hint says which ones it
  * offers, or that they cannot be read, and while a repository is chosen,
- * the list and the confirmation say that the names of its files are sent
- * to the provider if the agent may read it. Why nothing can be requested
- * shows in its place. While a request waits, nothing can change or be sent
- * again.
+ * the list and the confirmation say that the names of its files and
+ * folders are sent to the provider if the agent may read it. Why nothing
+ * can be requested shows in its place. While a request waits, nothing can
+ * change or be sent again.
  */
 function RunForm({
   form,

@@ -44,10 +44,11 @@ export const RUN_REQUEST_MESSAGES = Object.freeze({
   /**
    * Under the repository list and in the confirmation while a repository
    * is chosen: what of it the run's context carries. Only the names of its
-   * files, and only when the agent holds `repo.read` on it.
+   * files, as paths relative to the repository, so with the names of their
+   * folders, and only when the agent holds `repo.read` on it.
    */
   repositoryFiles:
-    "If the agent may read this repository, the names of its files are sent to the AI provider of the chosen connection.",
+    "If the agent may read this repository, the names of its files and folders are sent to the AI provider of the chosen connection.",
   /**
    * In place of the hint when this project's repositories could not be
    * read and none was read before, or the main process refused the
@@ -317,6 +318,13 @@ export interface RunRequestState {
    * (`describeRunForm`).
    */
   readonly repositoryChoice: string | null;
+  /**
+   * The repository's label that the confirmation showed at Continue, or
+   * null before. A confirmation whose label changed since, for example
+   * "web (2)" that became "web (1)", goes back to the choice: the person
+   * confirms exactly the text that they see.
+   */
+  readonly confirmedRepositoryLabel: string | null;
   /** The choice, then the separate confirmation. */
   readonly step: "choose" | "confirm";
   /** A request waits for its answer; nothing else can be sent. */
@@ -337,6 +345,7 @@ export const IDLE_RUN_REQUEST: RunRequestState = Object.freeze({
   agentId: null,
   connectionId: null,
   repositoryChoice: null,
+  confirmedRepositoryLabel: null,
   step: "choose",
   sending: false,
   notice: undefined,
@@ -373,8 +382,8 @@ export interface RunFormModel {
    */
   readonly repositoryHint: string;
   /**
-   * While a repository is chosen, that the names of its files are sent to
-   * the provider if the agent may read it; else undefined.
+   * While a repository is chosen, that the names of its files and folders
+   * are sent to the provider if the agent may read it; else undefined.
    */
   readonly repositoryFiles: string | undefined;
 }
@@ -459,15 +468,20 @@ export function describeRunForm(
     problem = RUN_REQUEST_MESSAGES.repositoriesPending;
   }
   const ready = problem === undefined && agent !== null && connection !== null;
+  const repositoryLabel =
+    repository?.label ?? RUN_REQUEST_MESSAGES.noRepository;
   // A confirmation shows only the agent, the connection, and the repository
   // that the person chose: when one is no longer offered, it goes back to
-  // the choice rather than confirm another one.
+  // the choice rather than confirm another one. So does a repository whose
+  // label changed since Continue, so that the text confirmed is the text
+  // that was shown.
   const confirmable =
     ready &&
     state.step === "confirm" &&
     agent.id === state.agentId &&
     connection.id === state.connectionId &&
-    (repository?.id ?? NO_REPOSITORY) === state.repositoryChoice;
+    (repository?.id ?? NO_REPOSITORY) === state.repositoryChoice &&
+    repositoryLabel === state.confirmedRepositoryLabel;
   return {
     messageId,
     step: confirmable ? "confirm" : "choose",
@@ -482,7 +496,7 @@ export function describeRunForm(
     canContinue: ready && !state.sending,
     agentLabel: agent?.label ?? "",
     connectionLabel: connection?.label ?? "",
-    repositoryLabel: repository?.label ?? RUN_REQUEST_MESSAGES.noRepository,
+    repositoryLabel,
     repositoryHint: repositoriesUnreadable(repositorySource, projectId)
       ? RUN_REQUEST_MESSAGES.repositoriesUnavailable
       : RUN_REQUEST_MESSAGES.repositoryHint,
@@ -551,6 +565,7 @@ export function continueRunForm(
     // What the form showed becomes the person's choice: also a preselected
     // repository, and none.
     repositoryChoice: model.repositoryId ?? NO_REPOSITORY,
+    confirmedRepositoryLabel: model.repositoryLabel,
     step: "confirm",
   };
 }
