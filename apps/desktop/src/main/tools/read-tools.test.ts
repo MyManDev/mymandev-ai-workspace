@@ -13,7 +13,11 @@ import type { Tool, ToolRunOutcome } from "./tool-dispatcher.ts";
 
 // A fake file system with POSIX paths: folders, files, and symbolic links.
 // `open` follows every link, as Windows does without `O_NOFOLLOW`, so the
-// checks after the open are what refuse a swap.
+// checks after the open are what refuse a swap. A folder's change time is
+// stamped with the fake clock whenever an entry in it is created, removed,
+// or renamed, and a node's own change time when it changes in place, as on
+// a real file system; the clock moves only when a test or a wait moves it,
+// so changes during a call share one step of the clock.
 
 type Node =
   | { readonly type: "dir"; readonly ino: bigint }
@@ -32,8 +36,103 @@ function fsError(code: string): Error {
   return Object.assign(new Error(`${code}: /work/repo/secret`), { code });
 }
 
+function parentOf(target: string): string | null {
+  if (target === "/") {
+    return null;
+  }
+  const index = target.lastIndexOf("/");
+  return index <= 0 ? "/" : target.slice(0, index);
+}
+
+/** The nodes by path; a change of an entry calls `onChange` unless quiet. */
+class Tree extends Map<string, Node> {
+  onChange: ((target: string) => void) | null = null;
+  quiet = false;
+
+  override set(target: string, node: Node): this {
+    super.set(target, node);
+    if (this.quiet !== true) {
+      this.onChange?.(target);
+    }
+    return this;
+  }
+
+  override delete(target: string): boolean {
+    const had = super.delete(target);
+    if (had && this.quiet !== true) {
+      this.onChange?.(target);
+    }
+    return had;
+  }
+}
+
+/** The fake clock's start, in milliseconds since 1970. */
+const CLOCK_START = 1_700_000_000_000;
+
 class FakeFiles implements ReadToolFileSystem {
-  readonly nodes = new Map<string, Node>([["/", { type: "dir", ino: 1n }]]);
+  readonly nodes = new Tree([["/", { type: "dir", ino: 1n }]]);
+  /** The fake clock, in milliseconds since 1970. */
+  now = CLOCK_START;
+  /** Stamps change times in whole seconds, as HFS+ does. */
+  coarse = false;
+  /** Reports no change times (0), as a file system without them. */
+  noChangeTimes = false;
+  /** Whether a run moves the clock 10 s first, so the setup is settled. */
+  settleBeforeRun = true;
+  /** The waits of the tools, in milliseconds. */
+  readonly sleeps: number[] = [];
+  /** Runs after each wait of the tools. */
+  onSleep: (() => void) | null = null;
+  private readonly ctimes = new Map<bigint, bigint>();
+  private readonly origin: bigint;
+
+  constructor() {
+    this.origin = this.stamp();
+    this.nodes.onChange = (target) => {
+      const parent = parentOf(target);
+      if (parent !== null) {
+        this.touch(parent);
+      }
+    };
+  }
+
+  /** The change time that a change now gets. */
+  stamp(): bigint {
+    const nanoseconds = BigInt(this.now) * 1_000_000n + 7n;
+    return this.coarse
+      ? nanoseconds - (nanoseconds % 1_000_000_000n)
+      : nanoseconds;
+  }
+
+  /** Stamps the change time of the node at `target`. */
+  touch(target: string): void {
+    const node = this.nodes.get(target);
+    if (node !== undefined) {
+      this.ctimes.set(node.ino, this.stamp());
+    }
+  }
+
+  /**
+   * Changes a folder into a link to `to` in place, or a link back into a
+   * folder (`to` null), with the same file number, as a junction set on or
+   * removed from an empty folder on Windows: only its own change time
+   * moves, not its parent's.
+   */
+  convert(target: string, to: string | null): void {
+    const node = this.nodes.get(target);
+    if (node === undefined) {
+      throw new Error("nothing to convert");
+    }
+    this.nodes.quiet = true;
+    this.nodes.set(
+      target,
+      to === null
+        ? { type: "dir", ino: node.ino }
+        : { type: "link", ino: node.ino, target: to },
+    );
+    this.nodes.quiet = false;
+    this.touch(target);
+  }
   readonly calls: [Operation, string][] = [];
   /** Runs before the n-th call (from 1) of an operation. */
   readonly hooks = new Map<string, () => void>();
@@ -58,6 +157,7 @@ class FakeFiles implements ReadToolFileSystem {
 
   dir(target: string): this {
     this.nodes.set(target, { type: "dir", ino: this.ino() });
+    this.touch(target);
     return this;
   }
 
@@ -71,25 +171,38 @@ class FakeFiles implements ReadToolFileSystem {
           : content,
       nlink,
     });
+    this.touch(target);
     return this;
   }
 
   link(target: string, to: string): this {
     this.nodes.set(target, { type: "link", ino: this.ino(), target: to });
+    this.touch(target);
     return this;
   }
 
   fifo(target: string): this {
     this.nodes.set(target, { type: "fifo", ino: this.ino() });
+    this.touch(target);
     return this;
   }
 
-  /** Moves a node and everything under it. */
+  /**
+   * Moves a node and everything under it: the change times of the two
+   * parents move, not those of the folders that move with it.
+   */
   move(from: string, to: string): void {
+    this.nodes.quiet = true;
     for (const [key, node] of [...this.nodes]) {
       if (key === from || key.startsWith(`${from}/`)) {
         this.nodes.delete(key);
         this.nodes.set(to + key.slice(from.length), node);
+      }
+    }
+    this.nodes.quiet = false;
+    for (const parent of [parentOf(from), parentOf(to)]) {
+      if (parent !== null) {
+        this.touch(parent);
       }
     }
   }
@@ -167,6 +280,9 @@ class FakeFiles implements ReadToolFileSystem {
       ino: node.ino,
       nlink: node.type === "file" ? node.nlink : 1n,
       size: node.type === "file" ? BigInt(node.content.length) : 0n,
+      ctime: this.noChangeTimes
+        ? 0n
+        : (this.ctimes.get(node.ino) ?? this.origin),
     };
   }
 
@@ -266,8 +382,21 @@ function repository(): FakeFiles {
 const fakeOf = new WeakMap<Tool, FakeFiles>();
 
 function toolsOf(files: ReadToolFileSystem, fake?: FakeFiles) {
-  const tools = createReadTools({ files, pathApi: path.posix });
   const recorder = fake ?? (files instanceof FakeFiles ? files : undefined);
+  const tools = createReadTools({
+    files,
+    pathApi: path.posix,
+    ...(recorder === undefined
+      ? {}
+      : {
+          now: () => recorder.now,
+          sleep: async (ms: number) => {
+            recorder.sleeps.push(ms);
+            recorder.now += ms;
+            recorder.onSleep?.();
+          },
+        }),
+  });
   if (recorder !== undefined) {
     for (const tool of tools) {
       fakeOf.set(tool, recorder);
@@ -304,6 +433,9 @@ async function runTool(
   const fake = fakeOf.get(tool);
   if (options.identity === undefined && fake === undefined) {
     throw new Error("no identity");
+  }
+  if (fake?.settleBeforeRun === true) {
+    fake.now += 10_000;
   }
   return parsed.run({
     folder,
@@ -666,7 +798,12 @@ test("TOCTOU: a folder on the path that is a folder at its first checks and a li
       } else if (operation === "lstat" && target === `${ROOT}/src`) {
         checks += 1;
         srcAs(files, checks <= folderChecks ? "folder" : "link");
-      } else if (operation === "lstat" || operation === "open") {
+      } else if (
+        (operation === "lstat" && target !== ROOT) ||
+        operation === "open"
+      ) {
+        // Not at the repository's folder's own `lstat`: a swap right before
+        // the first one would make the call wait for its change time first.
         srcAs(files, "link");
       }
     };
@@ -687,13 +824,18 @@ test("TOCTOU: a folder on the path that is a link for the file's calls and for t
       srcAs(files, resolutions <= 3 ? "folder" : "link");
     } else if (operation === "lstat" && target === `${ROOT}/src`) {
       srcAs(files, "folder");
-    } else if (operation === "lstat" || operation === "open") {
+    } else if (
+      (operation === "lstat" && target !== ROOT) ||
+      operation === "open"
+    ) {
+      // Not at the repository's folder's own `lstat`, as above.
       srcAs(files, "link");
     }
   };
   const answer = await runTool(read, { path: "src/index.ts" });
   expect(answer).toEqual(refusal("changed"));
   expect(JSON.stringify(answer)).not.toContain("SECRET");
+  expect(files.closes).toBe(1);
 });
 
 /**
@@ -732,16 +874,264 @@ test("TOCTOU: where the system names the open file (/proc/self/fd on Linux), a f
   );
 });
 
-test("known limit (README): where the system cannot name the open file, a folder that is a link exactly for the file's lstat and open is not seen", async () => {
-  // This pins the remaining window that the README describes, so that the
-  // change that closes it, before the write and shell tools, updates it.
+test("TOCTOU (the former known limit): where the system cannot name the open file, a folder that is a link exactly for the file's lstat and open moves its parent's change time, and the call is refused after three attempts", async () => {
   const files = repository().file("/work/outside/index.ts", "SECRET");
   linkOnlyForTheFile(files);
   const { read } = toolsOf(files);
-  expect(await runTool(read, { path: "src/index.ts" })).toMatchObject({
-    ok: true,
-    result: { content: "SECRET" },
+  const answer = await runTool(read, { path: "src/index.ts" });
+  expect(answer).toEqual(refusal("unsettled"));
+  expect(JSON.stringify(answer)).not.toContain("SECRET");
+  // The first attempt saw the change time move after the open; the second
+  // waited for it to settle, without an open; the third saw it move again.
+  expect(files.opens).toBe(2);
+  expect(files.closes).toBe(2);
+  expect(files.sleeps).toEqual([101]);
+});
+
+test("TOCTOU: a swap at each step of read_file: before the open, between the open and the checks after it, and during the read after them", async () => {
+  // Before the open: `src` is a link for the open only. The open file is
+  // not the file that the `lstat` before it saw.
+  const before = repository().file("/work/outside/index.ts", "SECRET");
+  before.beforeEach = (operation) => {
+    srcAs(before, operation === "open" ? "link" : "folder");
+  };
+  const first = await runTool(toolsOf(before).read, { path: "src/index.ts" });
+  expect(first).toEqual(refusal("changed"));
+  expect(JSON.stringify(first)).not.toContain("SECRET");
+
+  // Between the open and the checks after it: a link for the open and for
+  // the file's `lstat` calls, which then see the open file; only the
+  // change time of `src`'s parent shows the swap.
+  const between = repository().file("/work/outside/index.ts", "SECRET");
+  linkOnlyForTheFile(between);
+  const second = await runTool(toolsOf(between).read, { path: "src/index.ts" });
+  expect(second).toEqual(refusal("unsettled"));
+  expect(JSON.stringify(second)).not.toContain("SECRET");
+
+  // During the read, after the checks: the content comes from the open file,
+  // which the checks tied to the path, so nothing outside is read.
+  const during = repository().file("/work/outside/index.ts", "SECRET");
+  during.on("read", 1, () => srcAs(during, "link"));
+  expect(
+    await runTool(toolsOf(during).read, { path: "src/index.ts" }),
+  ).toMatchObject({ ok: true, result: { content: "export const a = 1;\n" } });
+});
+
+test("TOCTOU: a change in the same step of the clock as the call is not trusted: the call waits until the change time is settled", async () => {
+  // `src` was swapped and back in the step of the clock in which the call
+  // starts, so the swaps during the call give its parent the same change
+  // time. Only the wait for a settled change time shows them.
+  const files = repository().file("/work/outside/index.ts", "SECRET");
+  files.settleBeforeRun = false;
+  files.now += 10_000;
+  srcAs(files, "link");
+  srcAs(files, "folder");
+  linkOnlyForTheFile(files);
+  const { read } = toolsOf(files);
+  const answer = await runTool(read, { path: "src/index.ts" });
+  expect(answer).toEqual(refusal("unsettled"));
+  expect(JSON.stringify(answer)).not.toContain("SECRET");
+  expect(files.sleeps[0]).toBe(101);
+
+  // A folder that changed just before the call, and not since: the call
+  // waits once and answers.
+  const changed = repository();
+  changed.settleBeforeRun = false;
+  changed.now += 10_000;
+  changed.file(`${ROOT}/src/new.ts`, "new");
+  expect(
+    await runTool(toolsOf(changed).read, { path: "src/index.ts" }),
+  ).toMatchObject({ ok: true, result: { content: "export const a = 1;\n" } });
+  expect(changed.sleeps).toEqual([101]);
+});
+
+test("TOCTOU: a change time on a whole second, as HFS+ stamps them, must be two seconds old", async () => {
+  // The last change and the swaps during the call fall in the same second:
+  // with stamps of whole seconds they give the same change time.
+  const files = repository().file("/work/outside/index.ts", "SECRET");
+  files.coarse = true;
+  files.settleBeforeRun = false;
+  files.now += 10_000 + 200;
+  srcAs(files, "link");
+  srcAs(files, "folder");
+  files.now += 300;
+  linkOnlyForTheFile(files);
+  const { read } = toolsOf(files);
+  const answer = await runTool(read, { path: "src/index.ts" });
+  expect(answer).toEqual(refusal("unsettled"));
+  expect(JSON.stringify(answer)).not.toContain("SECRET");
+  // Two seconds from the stamp, 500 ms of which have passed.
+  expect(files.sleeps[0]).toBe(1_501);
+});
+
+test("a folder that keeps changing is refused after three attempts, with a bounded wait before each new one", async () => {
+  // Another process adds a file to `src` at every open.
+  const busy = repository();
+  let added = 0;
+  busy.beforeEach = (operation) => {
+    if (operation === "open") {
+      added += 1;
+      busy.file(`${ROOT}/src/tmp-${added}.txt`, "");
+    }
+  };
+  expect(await runTool(toolsOf(busy).read, { path: "src/index.ts" })).toEqual(
+    refusal("unsettled"),
+  );
+  expect(busy.sleeps).toEqual([101]);
+  expect(busy.closes).toBe(2);
+
+  // A change time ahead of the clock (a clock set back by an hour) is
+  // waited for at most 2.1 s at a time.
+  const ahead = repository();
+  ahead.settleBeforeRun = false;
+  ahead.now -= 3_600_000;
+  const { list, read } = toolsOf(ahead);
+  expect(await runTool(read, { path: "README.md" })).toEqual(
+    refusal("unsettled"),
+  );
+  expect(await runTool(list, { path: "." })).toEqual(refusal("unsettled"));
+  expect(ahead.sleeps).toEqual([2_100, 2_100, 2_100, 2_100]);
+  expect(ahead.opens).toBe(0);
+  expect(ahead.calls.filter(([operation]) => operation === "readdir")).toEqual(
+    [],
+  );
+});
+
+test("a clock set back during a call makes it start again before it answers", async () => {
+  const once = repository();
+  once.on("open", 1, () => {
+    once.now -= 1_000;
   });
+  expect(
+    await runTool(toolsOf(once).read, { path: "README.md" }),
+  ).toMatchObject({ ok: true, result: { content: "# Repo\n" } });
+  expect(once.opens).toBe(2);
+
+  const always = repository();
+  always.beforeEach = (operation) => {
+    if (operation === "readdir") {
+      always.now -= 1_000;
+    }
+  };
+  expect(await runTool(toolsOf(always).list, { path: "." })).toEqual(
+    refusal("unsettled"),
+  );
+});
+
+test("an abort during a wait for settled change times answers aborted", async () => {
+  const files = repository();
+  files.settleBeforeRun = false;
+  const controller = new AbortController();
+  files.onSleep = () => controller.abort();
+  const { read, list } = toolsOf(files);
+  expect(
+    await runTool(read, { path: "README.md" }, { signal: controller.signal }),
+  ).toEqual({ ok: false, code: "aborted" });
+  expect(files.opens).toBe(0);
+  expect(
+    await runTool(list, { path: "." }, { signal: controller.signal }),
+  ).toEqual({ ok: false, code: "aborted" });
+  expect(files.sleeps).toEqual([101]);
+});
+
+test("the wait of the system tools ends at once on an abort", async () => {
+  // Change times an hour ahead of the clock make every attempt wait 2.1 s
+  // with the default timer, unless the abort ends the wait.
+  const files = repository();
+  const tools = createReadTools({
+    files,
+    pathApi: path.posix,
+    now: () => files.now - 3_600_000,
+  });
+  const read = tools.find(
+    (tool) => tool.name === READ_TOOL_NAMES.readFile,
+  ) as Tool;
+  const parsed = read.parse({ path: "README.md" });
+  if (!parsed.ok) {
+    throw new Error("invalid input");
+  }
+  const run = (signal: AbortSignal) =>
+    parsed.run({ folder: ROOT, folderIdentity: files.identity(ROOT), signal });
+
+  // Aborted during the first attempt: the wait does not start.
+  const early = new AbortController();
+  files.on("lstat", 1, () => early.abort());
+  let started = performance.now();
+  expect(await run(early.signal)).toEqual({ ok: false, code: "aborted" });
+  expect(performance.now() - started).toBeLessThan(1_000);
+
+  // Aborted during the wait.
+  const during = new AbortController();
+  setTimeout(() => during.abort(), 20);
+  started = performance.now();
+  expect(await run(during.signal)).toEqual({ ok: false, code: "aborted" });
+  expect(performance.now() - started).toBeLessThan(1_000);
+});
+
+test("a file system without change times is refused (fail closed)", async () => {
+  const files = repository();
+  files.noChangeTimes = true;
+  const { list, read } = toolsOf(files);
+  expect(await runTool(list, { path: "." })).toEqual({
+    ok: false,
+    code: "read_failed",
+  });
+  expect(await runTool(read, { path: "src/index.ts" })).toEqual({
+    ok: false,
+    code: "read_failed",
+  });
+  expect(files.opens).toBe(0);
+  expect(files.calls.filter(([operation]) => operation === "readdir")).toEqual(
+    [],
+  );
+});
+
+test("TOCTOU (the former listing window): a folder that is a link exactly for its listing is refused, and no name outside is answered", async () => {
+  const files = repository();
+  files.beforeEach = (operation) => {
+    srcAs(files, operation === "readdir" ? "link" : "folder");
+  };
+  const { list } = toolsOf(files);
+  const answer = await runTool(list, { path: "src" });
+  expect(answer).toEqual(refusal("unsettled"));
+  expect(JSON.stringify(answer)).not.toContain("secret");
+});
+
+test("TOCTOU: an empty folder made a link in place for exactly its listing (a junction on Windows) is refused by its own change time", async () => {
+  const files = repository().dir(`${ROOT}/src/empty`);
+  const target = `${ROOT}/src/empty`;
+  files.beforeEach = (operation) => {
+    const node = files.nodes.get(target);
+    if (operation === "readdir" && node?.type === "dir") {
+      files.convert(target, "/work/outside");
+    } else if (operation !== "readdir" && node?.type === "link") {
+      files.convert(target, null);
+    }
+  };
+  const { list } = toolsOf(files);
+  const answer = await runTool(list, { path: "src/empty" });
+  expect(answer).toEqual(refusal("unsettled"));
+  expect(JSON.stringify(answer)).not.toContain("secret");
+
+  // Made a link and back in the step of the clock in which the call starts:
+  // its own change time must be settled too.
+  const recent = repository().dir(`${ROOT}/src/empty`);
+  recent.settleBeforeRun = false;
+  recent.now += 10_000;
+  recent.convert(target, "/work/outside");
+  recent.convert(target, null);
+  recent.beforeEach = (operation) => {
+    const node = recent.nodes.get(target);
+    if (operation === "readdir" && node?.type === "dir") {
+      recent.convert(target, "/work/outside");
+    } else if (operation !== "readdir" && node?.type === "link") {
+      recent.convert(target, null);
+    }
+  };
+  const again = await runTool(toolsOf(recent).list, { path: "src/empty" });
+  expect(again).toEqual(refusal("unsettled"));
+  expect(JSON.stringify(again)).not.toContain("secret");
+  expect(recent.sleeps[0]).toBe(101);
 });
 
 test("TOCTOU: a folder on the path replaced by another folder during the read is refused, although the file is the same", async () => {

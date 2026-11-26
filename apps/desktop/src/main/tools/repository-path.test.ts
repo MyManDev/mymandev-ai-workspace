@@ -115,6 +115,7 @@ test("every refused form answers its own reason", () => {
     "hard_link",
     "changed",
     "other_device",
+    "unsettled",
   ];
   for (const reason of REPOSITORY_PATH_REFUSALS) {
     if (!fileSystemReasons.includes(reason)) {
