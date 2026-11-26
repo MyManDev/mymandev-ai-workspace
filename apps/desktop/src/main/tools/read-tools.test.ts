@@ -73,8 +73,11 @@ class FakeFiles implements ReadToolFileSystem {
   readonly nodes = new Tree([["/", { type: "dir", ino: 1n }]]);
   /** The fake clock, in milliseconds since 1970. */
   now = CLOCK_START;
-  /** Stamps change times in whole seconds, as HFS+ does. */
-  coarse = false;
+  /**
+   * The step of the clock that stamps change times, in milliseconds: 1,000
+   * as HFS+, about 16 as NTFS with the default tick; 1 ns when null.
+   */
+  stepMs: number | null = null;
   /** Reports no change times (0), as a file system without them. */
   noChangeTimes = false;
   /** Whether a run moves the clock 10 s first, so the setup is settled. */
@@ -99,9 +102,11 @@ class FakeFiles implements ReadToolFileSystem {
   /** The change time that a change now gets. */
   stamp(): bigint {
     const nanoseconds = BigInt(this.now) * 1_000_000n + 7n;
-    return this.coarse
-      ? nanoseconds - (nanoseconds % 1_000_000_000n)
-      : nanoseconds;
+    if (this.stepMs === null) {
+      return nanoseconds;
+    }
+    const step = BigInt(this.stepMs) * 1_000_000n;
+    return nanoseconds - (nanoseconds % step);
   }
 
   /** Stamps the change time of the node at `target`. */
@@ -949,7 +954,7 @@ test("TOCTOU: a change time on a whole second, as HFS+ stamps them, must be two 
   // The last change and the swaps during the call fall in the same second:
   // with stamps of whole seconds they give the same change time.
   const files = repository().file("/work/outside/index.ts", "SECRET");
-  files.coarse = true;
+  files.stepMs = 1_000;
   files.settleBeforeRun = false;
   files.now += 10_000 + 200;
   srcAs(files, "link");
@@ -962,6 +967,26 @@ test("TOCTOU: a change time on a whole second, as HFS+ stamps them, must be two 
   expect(JSON.stringify(answer)).not.toContain("SECRET");
   // Two seconds from the stamp, 500 ms of which have passed.
   expect(files.sleeps[0]).toBe(1_501);
+});
+
+test("TOCTOU: a change time must be older than the margin, not only older than the call, since the clock that stamps it moves in steps", async () => {
+  // Stamps in steps of 16 ms, as NTFS with the default tick of Windows. The
+  // last change and the swaps during the call fall in the same step, 12 ms
+  // after the last change: they give the same change time.
+  const files = repository().file("/work/outside/index.ts", "SECRET");
+  files.stepMs = 16;
+  files.settleBeforeRun = false;
+  files.now += 10_000 + 50;
+  srcAs(files, "link");
+  srcAs(files, "folder");
+  files.now += 12;
+  linkOnlyForTheFile(files);
+  const answer = await runTool(toolsOf(files).read, { path: "src/index.ts" });
+  expect(answer).toEqual(refusal("unsettled"));
+  expect(JSON.stringify(answer)).not.toContain("SECRET");
+  // 100 ms from the stamp, at the start of its step 2 ms before the last
+  // change, of which 14 ms have passed.
+  expect(files.sleeps[0]).toBe(87);
 });
 
 test("a folder that keeps changing is refused after three attempts, with a bounded wait before each new one", async () => {
