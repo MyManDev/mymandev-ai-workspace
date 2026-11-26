@@ -46,6 +46,7 @@ import {
 } from "@mymandev/permissions";
 import * as z from "zod";
 import type { DeviceSessionState } from "../session/session.ts";
+import type { ContextWalkRecord } from "./context-walk-record.ts";
 import type { ToolCallRecord } from "./tool-call-record.ts";
 
 /**
@@ -157,12 +158,14 @@ export interface ShellStartRecord {
 
 /**
  * What the recorder takes: what the check records (IDs, closed vocabularies,
- * and times only), and the record of an allowed tool call that the tool
+ * and times only), the record of an allowed tool call that the tool
  * dispatcher makes (`ToolCallRecord`, #37, Project Manager decision of
- * 2026-11-26), which also holds a path relative to the repository.
+ * 2026-11-26), which also holds a path relative to the repository, and the
+ * record of the walk of a run's context that the context builder makes
+ * (`ContextWalkRecord`, #366), which also holds two counts and a flag.
  */
 export type EnforcementRecord =
-  DenialRecord | ShellStartRecord | ToolCallRecord;
+  DenialRecord | ShellStartRecord | ToolCallRecord | ContextWalkRecord;
 
 /**
  * Receives every record. A record is frozen.
