@@ -3,6 +3,8 @@ import type {
   AgentActivityView,
   AgentView,
   ChatMessageView,
+  ProjectRepositoriesView,
+  ProjectRepositoryView,
   ProviderConnectionListView,
   RunRequestOutcome,
   RunRequestResult,
@@ -14,17 +16,22 @@ import {
   canRunWith,
   closeRunForm,
   chooseRunAgent,
+  chooseRunRepository,
   confirmedRunRequest,
   continueRunForm,
   createRunRequestController,
   describeRunForm,
   describeRunResult,
+  followRunRepositories,
   IDLE_RUN_REQUEST,
+  NO_REPOSITORY,
   openRunForm,
   RUN_REFUSAL_MESSAGES,
   RUN_REQUEST_MESSAGES,
   runConnections,
   runnableAgents,
+  runRepositories,
+  type RunRepositoriesSource,
   type RunRequestState,
   showKeptRunOutcome,
 } from "./run-request-view.ts";
@@ -47,6 +54,9 @@ const OTHER_CONNECTION = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819302";
 const MINE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1";
 const THEIR_MESSAGE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d2";
 const RUN = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819401";
+const WEB = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819501";
+const API = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819502";
+const DOCS = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819503";
 const AT = "2026-11-25T08:00:00.000Z";
 
 function agent(overrides: Partial<AgentView>): AgentView {
@@ -110,6 +120,51 @@ function connections(
   } as ProviderConnectionListView;
 }
 
+function repository(
+  overrides: Partial<ProjectRepositoryView>,
+): ProjectRepositoryView {
+  return {
+    repositoryId: WEB,
+    name: "web",
+    linked: true,
+    mountId: null,
+    removable: false,
+    ...overrides,
+  };
+}
+
+/**
+ * The open project's repositories: `web` linked on this device, `api`
+ * registered but not linked here (#362).
+ */
+function repositories(
+  overrides: Partial<ProjectRepositoriesView> = {},
+): ProjectRepositoriesView {
+  return {
+    revision: 4,
+    status: "ready",
+    workspaceId: WORKSPACE,
+    projectId: PROJECT,
+    links: "ready",
+    repositories: [
+      repository({}),
+      repository({ repositoryId: API, name: "api", linked: false }),
+    ],
+    ...overrides,
+  } as ProjectRepositoriesView;
+}
+
+/** Both `web` and `docs` linked on this device, `api` not. */
+function twoLinked(): ProjectRepositoriesView {
+  return repositories({
+    repositories: [
+      repository({}),
+      repository({ repositoryId: API, name: "api", linked: false }),
+      repository({ repositoryId: DOCS, name: "docs" }),
+    ],
+  });
+}
+
 function message(overrides: Partial<ChatMessageView> = {}): ChatMessageView {
   return {
     id: MINE,
@@ -138,6 +193,7 @@ function form(
   overrides: {
     activity?: AgentActivityView | undefined;
     connections?: ProviderConnectionListView | undefined;
+    repositories?: RunRepositoriesSource;
   } = {},
 ) {
   return describeRunForm(
@@ -145,6 +201,7 @@ function form(
     MESSAGES,
     "activity" in overrides ? overrides.activity : activity(),
     "connections" in overrides ? overrides.connections : connections(),
+    "repositories" in overrides ? overrides.repositories : repositories(),
     PROJECT,
   );
 }
@@ -217,12 +274,17 @@ test("a form opens on an own message only, with the first agent and connection c
       { id: CONNECTION, label: "Work laptop (Claude)" },
       { id: OTHER_CONNECTION, label: "Home (Codex)" },
     ],
+    repositories: [{ id: WEB, label: "web" }],
     agentId: RUNNABLE,
     connectionId: CONNECTION,
+    repositoryId: WEB,
     problem: undefined,
     canContinue: true,
     agentLabel: "Builder",
     connectionLabel: "Work laptop (Claude)",
+    repositoryLabel: "web",
+    repositoryHint: RUN_REQUEST_MESSAGES.repositoryHint,
+    repositoryFiles: RUN_REQUEST_MESSAGES.repositoryFiles,
   });
   const chosen = chooseRunAgent(opened, SECOND);
   expect(form(chosen)?.agentId).toBe(SECOND);
@@ -261,6 +323,20 @@ test("each reason why nothing can be requested shows in the form, and Continue d
     [
       { connections: connections({ connections: [] }) },
       RUN_REQUEST_MESSAGES.noConnections,
+    ],
+    // The repositories or this device's links are not known yet (#362).
+    [{ repositories: undefined }, RUN_REQUEST_MESSAGES.repositoriesPending],
+    [
+      { repositories: repositories({ status: "loading" }) },
+      RUN_REQUEST_MESSAGES.repositoriesPending,
+    ],
+    [
+      { repositories: repositories({ links: "loading" }) },
+      RUN_REQUEST_MESSAGES.repositoriesPending,
+    ],
+    [
+      { repositories: repositories({ projectId: OTHER_PROJECT }) },
+      RUN_REQUEST_MESSAGES.repositoriesPending,
     ],
   ];
   for (const [overrides, problem] of cases) {
@@ -357,7 +433,7 @@ test("a confirmation whose agent or connection is no longer offered goes back to
   expect(confirmedRunRequest(confirming, noConnection, PROJECT)).toBeNull();
 });
 
-test("only a shown confirmation yields the request, with the four IDs", () => {
+test("only a shown confirmation yields the request, with the four IDs and the confirmed repository", () => {
   const opened = openRunForm(IDLE_RUN_REQUEST, MINE);
   expect(confirmedRunRequest(opened, form(opened), PROJECT)).toBeNull();
   const confirming = continueRunForm(opened, form(opened));
@@ -366,6 +442,7 @@ test("only a shown confirmation yields the request, with the four IDs", () => {
     agentId: RUNNABLE,
     providerConnectionId: CONNECTION,
     inputMessageId: MINE,
+    repositoryId: WEB,
   });
   expect(
     confirmedRunRequest(
@@ -374,6 +451,442 @@ test("only a shown confirmation yields the request, with the four IDs", () => {
       PROJECT,
     ),
   ).toBeNull();
+});
+
+// The repository of the run (#362; the Project Manager's decision of
+// 2026-11-26).
+
+test("the repositories offered are the project's that the account linked on this device, by name, in the list's order", () => {
+  expect(runRepositories(twoLinked(), PROJECT)).toEqual([
+    { id: WEB, label: "web" },
+    { id: DOCS, label: "docs" },
+  ]);
+  // Not known: no view, another project's, none open, loading, or the
+  // links not read yet.
+  expect(runRepositories(undefined, PROJECT)).toBeNull();
+  expect(
+    runRepositories(repositories({ projectId: OTHER_PROJECT }), PROJECT),
+  ).toBeNull();
+  expect(
+    runRepositories(repositories({ status: "no_project" }), PROJECT),
+  ).toBeNull();
+  expect(
+    runRepositories(repositories({ status: "loading" }), PROJECT),
+  ).toBeNull();
+  expect(
+    runRepositories(repositories({ links: "loading" }), PROJECT),
+  ).toBeNull();
+  // Links that cannot be read link nothing: none is offered.
+  expect(
+    runRepositories(
+      repositories({
+        links: "unavailable",
+        repositories: [repository({ linked: false })],
+      }),
+      PROJECT,
+    ),
+  ).toEqual([]);
+  // What was loaded stays offered while a reload fails.
+  expect(
+    runRepositories(
+      {
+        ...repositories(),
+        status: "unavailable",
+        problem: "unavailable",
+      } as ProjectRepositoriesView,
+      PROJECT,
+    ),
+  ).toEqual([{ id: WEB, label: "web" }]);
+  // A failed first load, or a refused subscription: none, and no wait.
+  const failed = {
+    ...repositories({ repositories: [] }),
+    status: "unavailable",
+    problem: "unavailable",
+  } as ProjectRepositoriesView;
+  expect(runRepositories(failed, PROJECT)).toEqual([]);
+  expect(
+    runRepositories(
+      { ...failed, links: "loading" } as ProjectRepositoriesView,
+      PROJECT,
+    ),
+  ).toEqual([]);
+  expect(runRepositories("unavailable", PROJECT)).toEqual([]);
+  // Another project's failed view is still not known.
+  expect(
+    runRepositories(
+      { ...failed, projectId: OTHER_PROJECT } as ProjectRepositoriesView,
+      PROJECT,
+    ),
+  ).toBeNull();
+});
+
+test("names that repeat among the repositories offered get a number in the list's order; other names stay as they are, and no path or mount ID shows", () => {
+  const WEB_2 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819504";
+  const WEB_3 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819505";
+  const view = repositories({
+    repositories: [
+      repository({ mountId: "mount-1" }),
+      repository({ repositoryId: API, name: "api" }),
+      // Not offered, so it does not count.
+      repository({ repositoryId: DOCS, name: "api", linked: false }),
+      repository({ repositoryId: WEB_2, name: "web" }),
+      repository({ repositoryId: WEB_3, name: "Web" }),
+    ],
+  });
+  expect(runRepositories(view, PROJECT)).toEqual([
+    { id: WEB, label: "web (1)" },
+    { id: API, label: "api" },
+    { id: WEB_2, label: "web (2)" },
+    { id: WEB_3, label: "Web" },
+  ]);
+  // The confirmation shows the same label.
+  const opened = chooseRunRepository(
+    openRunForm(IDLE_RUN_REQUEST, MINE),
+    WEB_2,
+  );
+  const confirming = continueRunForm(
+    opened,
+    form(opened, { repositories: view }),
+  );
+  const model = form(confirming, { repositories: view });
+  expect(model?.step).toBe("confirm");
+  expect(model?.repositoryLabel).toBe("web (2)");
+  expect(JSON.stringify(model)).not.toContain("mount-1");
+});
+
+test("each repeated name is numbered on its own", () => {
+  const API_2 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819506";
+  const WEB_2 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819504";
+  expect(
+    runRepositories(
+      repositories({
+        repositories: [
+          repository({ repositoryId: API, name: "api" }),
+          repository({}),
+          repository({ repositoryId: API_2, name: "api" }),
+          repository({ repositoryId: DOCS, name: "docs" }),
+          repository({ repositoryId: WEB_2, name: "web" }),
+        ],
+      }),
+      PROJECT,
+    ),
+  ).toEqual([
+    { id: API, label: "api (1)" },
+    { id: WEB, label: "web (1)" },
+    { id: API_2, label: "api (2)" },
+    { id: DOCS, label: "docs" },
+    { id: WEB_2, label: "web (2)" },
+  ]);
+});
+
+test("a confirmation whose repository's label changed since Continue goes back to the choice, which shows the new label", () => {
+  const WEB_2 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819504";
+  const WEB_3 = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819505";
+  const three = repositories({
+    repositories: [
+      repository({}),
+      repository({ repositoryId: WEB_2, name: "web" }),
+      repository({ repositoryId: WEB_3, name: "web" }),
+    ],
+  });
+  const opened = chooseRunRepository(
+    openRunForm(IDLE_RUN_REQUEST, MINE),
+    WEB_2,
+  );
+  const confirming = continueRunForm(
+    opened,
+    form(opened, { repositories: three }),
+  );
+  expect(confirming.confirmedRepositoryLabel).toBe("web (2)");
+  expect(form(confirming, { repositories: three })?.step).toBe("confirm");
+  // The oldest is unlinked: the same repository is now "web (1)".
+  const twoLeft = repositories({
+    repositories: [
+      repository({ linked: false }),
+      repository({ repositoryId: WEB_2, name: "web" }),
+      repository({ repositoryId: WEB_3, name: "web" }),
+    ],
+  });
+  const changed = form(confirming, { repositories: twoLeft });
+  expect(changed?.step).toBe("choose");
+  expect(changed?.repositoryId).toBe(WEB_2);
+  expect(changed?.repositoryLabel).toBe("web (1)");
+  expect(confirmedRunRequest(confirming, changed, PROJECT)).toBeNull();
+  // Continue again confirms the label shown now.
+  const again = continueRunForm(confirming, changed);
+  const model = form(again, { repositories: twoLeft });
+  expect(model?.step).toBe("confirm");
+  expect(model?.repositoryLabel).toBe("web (1)");
+  expect(confirmedRunRequest(again, model, PROJECT)?.repositoryId).toBe(WEB_2);
+});
+
+test("exactly one linked repository is preselected; with none or several, no repository is, and the form can still continue", () => {
+  const opened = openRunForm(IDLE_RUN_REQUEST, MINE);
+  // One: preselected.
+  expect(form(opened)?.repositoryId).toBe(WEB);
+  expect(form(opened)?.repositoryLabel).toBe("web");
+  // Several: none, until the person chooses.
+  const several = form(opened, { repositories: twoLinked() });
+  expect(several?.repositoryId).toBeNull();
+  expect(several?.repositoryLabel).toBe(RUN_REQUEST_MESSAGES.noRepository);
+  expect(several?.canContinue).toBe(true);
+  // None linked here: no repository, and nothing blocks the run.
+  const none = form(opened, {
+    repositories: repositories({
+      repositories: [repository({ linked: false })],
+    }),
+  });
+  expect(none?.repositories).toEqual([]);
+  expect(none?.repositoryId).toBeNull();
+  expect(none?.problem).toBeUndefined();
+  expect(none?.canContinue).toBe(true);
+});
+
+test("the person chooses a repository among several, or no repository although one is preselected, and the request carries that choice", () => {
+  const opened = openRunForm(IDLE_RUN_REQUEST, MINE);
+  const docs = chooseRunRepository(opened, DOCS);
+  const withDocs = continueRunForm(
+    docs,
+    form(docs, { repositories: twoLinked() }),
+  );
+  const docsModel = form(withDocs, { repositories: twoLinked() });
+  expect(docsModel?.step).toBe("confirm");
+  expect(docsModel?.repositoryLabel).toBe("docs");
+  expect(confirmedRunRequest(withDocs, docsModel, PROJECT)?.repositoryId).toBe(
+    DOCS,
+  );
+  // A repository that is not offered is never chosen, and once the person
+  // chose, the preselection no longer applies: none.
+  expect(form(chooseRunRepository(opened, API))?.repositoryId).toBeNull();
+
+  // No repository, although one is linked and preselected.
+  const none = chooseRunRepository(opened, NO_REPOSITORY);
+  expect(form(none)?.repositoryId).toBeNull();
+  const confirmingNone = continueRunForm(none, form(none));
+  expect(confirmingNone.repositoryChoice).toBe(NO_REPOSITORY);
+  const noneModel = form(confirmingNone);
+  expect(noneModel?.step).toBe("confirm");
+  expect(noneModel?.repositoryLabel).toBe(RUN_REQUEST_MESSAGES.noRepository);
+  expect(confirmedRunRequest(confirmingNone, noneModel, PROJECT)).toEqual({
+    projectId: PROJECT,
+    agentId: RUNNABLE,
+    providerConnectionId: CONNECTION,
+    inputMessageId: MINE,
+    repositoryId: null,
+  });
+  // A repository linked meanwhile does not enter a run without one.
+  const linkedMeanwhile = form(confirmingNone, { repositories: twoLinked() });
+  expect(linkedMeanwhile?.step).toBe("confirm");
+  expect(linkedMeanwhile?.repositoryId).toBeNull();
+  // While a request waits, the choice does not change.
+  const sending = { ...confirmingNone, sending: true };
+  expect(chooseRunRepository(sending, WEB)).toBe(sending);
+});
+
+test("a chosen repository that is unlinked or removed is not sent: the choice falls back to No repository, never to another repository, and a confirmation goes back to the choice", () => {
+  const opened = openRunForm(IDLE_RUN_REQUEST, MINE);
+  // Chosen among two, then unlinked before Continue: "No repository", not
+  // the one left, although one alone would be preselected.
+  const docs = chooseRunRepository(opened, DOCS);
+  expect(form(docs, { repositories: twoLinked() })?.repositoryId).toBe(DOCS);
+  const unlinkedBefore = form(docs);
+  expect(unlinkedBefore?.repositoryId).toBeNull();
+  expect(unlinkedBefore?.repositoryLabel).toBe(
+    RUN_REQUEST_MESSAGES.noRepository,
+  );
+  expect(unlinkedBefore?.repositoryFiles).toBeUndefined();
+  // The same for the one repository, chosen while it was the only one.
+  const web = chooseRunRepository(opened, WEB);
+  expect(
+    form(web, {
+      repositories: repositories({
+        repositories: [
+          repository({ linked: false }),
+          repository({ repositoryId: DOCS, name: "docs" }),
+        ],
+      }),
+    })?.repositoryId,
+  ).toBeNull();
+  // Unlinked after Continue: back to the choice, with "No repository".
+  const confirming = continueRunForm(
+    docs,
+    form(docs, { repositories: twoLinked() }),
+  );
+  expect(confirming.repositoryChoice).toBe(DOCS);
+  const gone = form(confirming);
+  expect(gone?.step).toBe("choose");
+  expect(gone?.repositoryId).toBeNull();
+  expect(confirmedRunRequest(confirming, gone, PROJECT)).toBeNull();
+  // Choosing a repository there keeps the form at the choice: the person
+  // continues to a new confirmation.
+  const again = chooseRunRepository(confirming, WEB);
+  expect(again.step).toBe("choose");
+  const againModel = form(again);
+  expect(againModel?.step).toBe("choose");
+  expect(againModel?.repositoryId).toBe(WEB);
+  expect(confirmedRunRequest(again, againModel, PROJECT)).toBeNull();
+  // The preselected repository confirmed, then unlinked: back to the
+  // choice, with no repository; none is put in its place.
+  const preselected = continueRunForm(opened, form(opened));
+  expect(preselected.repositoryChoice).toBe(WEB);
+  const unlinked = form(preselected, {
+    repositories: repositories({
+      repositories: [repository({ linked: false })],
+    }),
+  });
+  expect(unlinked?.step).toBe("choose");
+  expect(unlinked?.repositoryId).toBeNull();
+  expect(confirmedRunRequest(preselected, unlinked, PROJECT)).toBeNull();
+  // Removed from the project: the same.
+  const removed = form(preselected, {
+    repositories: repositories({ repositories: [] }),
+  });
+  expect(removed?.step).toBe("choose");
+  // The main process's refusal of a repository unlinked after the
+  // confirmation has its own sentence.
+  expect(
+    describeRunResult({
+      outcome: "refused",
+      reason: "repository_not_linked",
+      retryAfterMs: null,
+    }),
+  ).toBe(
+    `${RUN_REQUEST_MESSAGES.notRequested} ${RUN_REFUSAL_MESSAGES.repository_not_linked}`,
+  );
+});
+
+test("the controller sends the repository that the person chose", async () => {
+  const fake = fakeAgents();
+  let state = IDLE_RUN_REQUEST;
+  const controller = createRunRequestController(
+    fake.bridge,
+    PROJECT,
+    (next) => {
+      state = next;
+    },
+  );
+  controller.start();
+  const shown = () => form(state, { repositories: twoLinked() });
+  controller.open(MINE);
+  controller.chooseRepository(DOCS);
+  controller.continue(shown());
+  controller.confirm(shown());
+  expect(fake.calls.map((call) => call.repositoryId)).toEqual([DOCS]);
+  fake.answers[0]?.resolve({ outcome: "ok", runId: RUN });
+  await settle();
+  // The next form starts without a choice: the preselection again.
+  controller.open(MINE);
+  expect(state.repositoryChoice).toBeNull();
+});
+
+test("another message's form starts without the repository chosen in the open one", () => {
+  const MORE = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d3";
+  const messages = [...MESSAGES, message({ id: MORE, seq: 3 })];
+  const shown = (state: RunRequestState) =>
+    describeRunForm(
+      state,
+      messages,
+      activity(),
+      connections(),
+      repositories(),
+      PROJECT,
+    );
+  const none = chooseRunRepository(
+    openRunForm(IDLE_RUN_REQUEST, MINE),
+    NO_REPOSITORY,
+  );
+  expect(shown(none)?.repositoryId).toBeNull();
+  const other = openRunForm(none, MORE);
+  expect(other.repositoryChoice).toBeNull();
+  // The one linked repository is preselected again.
+  expect(shown(other)?.messageId).toBe(MORE);
+  expect(shown(other)?.repositoryId).toBe(WEB);
+});
+
+test("repositories that cannot be read say so, and a run without a repository can still be requested", () => {
+  const failed = {
+    ...repositories({ repositories: [] }),
+    status: "unavailable",
+    problem: "not_found",
+  } as ProjectRepositoriesView;
+  const opened = openRunForm(IDLE_RUN_REQUEST, MINE);
+  for (const source of [failed, "unavailable"] as const) {
+    const model = form(opened, { repositories: source });
+    expect(model?.problem).toBeUndefined();
+    expect(model?.repositories).toEqual([]);
+    expect(model?.repositoryId).toBeNull();
+    expect(model?.repositoryHint).toBe(
+      RUN_REQUEST_MESSAGES.repositoriesUnavailable,
+    );
+    expect(model?.canContinue).toBe(true);
+    const confirming = continueRunForm(opened, model);
+    expect(
+      confirmedRunRequest(
+        confirming,
+        form(confirming, { repositories: source }),
+        PROJECT,
+      )?.repositoryId,
+    ).toBeNull();
+  }
+  // What was read before stays offered with the usual hint.
+  expect(
+    form(opened, {
+      repositories: {
+        ...repositories(),
+        status: "unavailable",
+        problem: "unavailable",
+      } as ProjectRepositoriesView,
+    })?.repositoryHint,
+  ).toBe(RUN_REQUEST_MESSAGES.repositoryHint);
+  expect(form(opened)?.repositoryHint).toBe(
+    RUN_REQUEST_MESSAGES.repositoryHint,
+  );
+  // A project that has no repository is read, not unreadable.
+  expect(
+    form(opened, { repositories: repositories({ repositories: [] }) })
+      ?.repositoryHint,
+  ).toBe(RUN_REQUEST_MESSAGES.repositoryHint);
+
+  // A refused subscription becomes "unavailable"; a later state replaces
+  // it.
+  const seen: RunRepositoriesSource[] = [];
+  let deliver: ((state: ProjectRepositoriesView) => void) | undefined;
+  let refuse: (() => void) | undefined;
+  const stopped: string[] = [];
+  const stop = followRunRepositories(
+    {
+      subscribeState: (listener, onError) => {
+        deliver = listener;
+        refuse = onError;
+        return () => stopped.push("stop");
+      },
+    },
+    (source) => seen.push(source),
+  );
+  refuse?.();
+  deliver?.(repositories());
+  expect(seen).toEqual(["unavailable", repositories()]);
+  stop();
+  expect(stopped).toEqual(["stop"]);
+});
+
+test("while a repository is chosen, the form and the confirmation say that the names of its files and folders are sent if the agent may read it", () => {
+  const opened = openRunForm(IDLE_RUN_REQUEST, MINE);
+  expect(form(opened)?.repositoryFiles).toBe(
+    RUN_REQUEST_MESSAGES.repositoryFiles,
+  );
+  const confirming = continueRunForm(opened, form(opened));
+  expect(form(confirming)?.step).toBe("confirm");
+  expect(form(confirming)?.repositoryFiles).toBe(
+    RUN_REQUEST_MESSAGES.repositoryFiles,
+  );
+  // None chosen, or none preselected: nothing is said.
+  expect(
+    form(chooseRunRepository(opened, NO_REPOSITORY))?.repositoryFiles,
+  ).toBeUndefined();
+  expect(
+    form(opened, { repositories: twoLinked() })?.repositoryFiles,
+  ).toBeUndefined();
 });
 
 test("every answer has one sentence; the waits say how long, and an uncertain answer says that the run may have been created", () => {
@@ -530,6 +1043,7 @@ test("the confirmation sends the request once; while it waits, nothing else chan
       agentId: RUNNABLE,
       providerConnectionId: CONNECTION,
       inputMessageId: MINE,
+      repositoryId: WEB,
     },
   ]);
   expect(c.state().sending).toBe(true);

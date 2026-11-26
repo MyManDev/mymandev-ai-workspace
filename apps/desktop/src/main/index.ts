@@ -746,15 +746,18 @@ function start(): void {
   // Requesting a run from the project chat (#35): one strict channel, and
   // one write of the allowlist, sent once and never again on its own. Only
   // the agent's owner, on the agent's host device, with one of the person's
-  // own messages and one of this device's provider connections; the main
-  // process checks each before anything is sent. The new run shows through
-  // the agent activity. The logs are fixed text, never an ID.
+  // own messages and one of this device's provider connections, and the
+  // repository that the person chose, one linked on this device, or none
+  // (#362); the main process checks each before anything is sent. The new
+  // run shows through the agent activity. The logs are fixed text, never an
+  // ID.
   const runRequests = createRunRequests({
     account,
     agents,
     chat,
     workspaces,
     providerConnections,
+    repositories: projectRepositories,
     log: (message) => console.info(message),
   });
   closables.add(runRequests);

@@ -476,6 +476,7 @@ function ScreenContent({
           projectId={view.projectId}
           agents={agents}
           providerConnections={providerConnections}
+          projectRepositories={projectRepositories}
         />
       );
     case "tasks":

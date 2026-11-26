@@ -3126,21 +3126,36 @@ test("the grants of an agent that another device hosts cross as grant views of t
 
 const RUN_MESSAGE_ID = "0192f0a0-7b3c-7d4e-8f50-000000001101";
 
-test("a run request takes exactly a project ID, an agent ID, a provider connection ID, and a message ID, and refuses every other key (#35)", () => {
+test("a run request takes exactly a project ID, an agent ID, a provider connection ID, a message ID, and a repository ID or null, and refuses every other key (#35, #362)", () => {
   const request = {
     projectId: AGENT_PROJECT_ID,
     agentId: AGENT_ID,
     providerConnectionId: GRANT_CONNECTION_ID,
     inputMessageId: RUN_MESSAGE_ID,
+    repositoryId: null,
   };
   const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.requestRun];
   expect(args.parse([request])).toEqual([request]);
   expect(RunRequestViewSchema.parse(request)).toEqual(request);
+  // The repository that the person chose.
+  const withRepository = { ...request, repositoryId: REPOSITORY_ID };
+  expect(args.parse([withRepository])).toEqual([withRepository]);
   for (const value of [
-    // An extra key is refused, not dropped: a text, a repository, a state,
-    // a retry key, or a device never crosses.
+    // The choice is never left out: no repository is a null.
+    {
+      projectId: AGENT_PROJECT_ID,
+      agentId: AGENT_ID,
+      providerConnectionId: GRANT_CONNECTION_ID,
+      inputMessageId: RUN_MESSAGE_ID,
+    },
+    { ...request, repositoryId: undefined },
+    { ...request, repositoryId: "web" },
+    { ...request, repositoryId: REPOSITORY_ID.toUpperCase() },
+    { ...request, repositoryId: 7 },
+    // An extra key is refused, not dropped: a text, a state, a retry key,
+    // a path, or a device never crosses.
     { ...request, body: "Fix the build" },
-    { ...request, repositoryId: AGENT_ID },
+    { ...request, repositoryPath: "/home/ada/web" },
     { ...request, state: "running" },
     { ...request, idempotencyKey: RUN_MESSAGE_ID },
     { ...request, hostDeviceId: AGENT_DEVICE_ID },
@@ -3260,6 +3275,8 @@ test("a kept run request outcome takes one project ID, and crosses without a run
   ] as const) {
     expect(RUN_REQUEST_LOCAL_REFUSALS.has(reason)).toBe(false);
   }
+  // A repository that is no longer linked here is refused before a send.
+  expect(RUN_REQUEST_LOCAL_REFUSALS.has("repository_not_linked")).toBe(true);
 });
 
 test("the provider connections cross with an ID, a kind, and a label only", () => {

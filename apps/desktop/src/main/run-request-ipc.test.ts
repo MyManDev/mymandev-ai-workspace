@@ -31,6 +31,7 @@ const REQUEST: RunRequestView = Object.freeze({
   agentId: id(0xf1),
   providerConnectionId: id(0x3001),
   inputMessageId: id(0x1001),
+  repositoryId: null,
 });
 
 function frame(url: string, parent: IpcFrame | null = null): IpcFrame {
@@ -175,10 +176,21 @@ test("the handler refuses a foreign sender, and an argument outside the strict c
     [{ ...REQUEST, agentId: "agent" }],
     [{ ...REQUEST, providerConnectionId: REQUEST.agentId.toUpperCase() }],
     [{ ...REQUEST, inputMessageId: 7 }],
-    // An extra key is refused, not dropped: no text, repository, state,
-    // device, or retry key travels beside the four IDs.
+    // The repository is an ID or null, and never left out (#362).
+    [{ ...REQUEST, repositoryId: undefined }],
+    [{ ...REQUEST, repositoryId: "web" }],
+    [
+      {
+        projectId: REQUEST.projectId,
+        agentId: REQUEST.agentId,
+        providerConnectionId: REQUEST.providerConnectionId,
+        inputMessageId: REQUEST.inputMessageId,
+      },
+    ],
+    // An extra key is refused, not dropped: no text, path, state, device,
+    // or retry key travels beside the IDs.
     [{ ...REQUEST, body: "Fix the build" }],
-    [{ ...REQUEST, repositoryId: id(0x2001) }],
+    [{ ...REQUEST, repositoryPath: "/home/ada/web" }],
     [{ ...REQUEST, state: "running" }],
     [{ ...REQUEST, hostDeviceId: id(0xd1) }],
     [{ ...REQUEST, idempotencyKey: id(0x6001) }],
@@ -194,7 +206,7 @@ test("the handler refuses a foreign sender, and an argument outside the strict c
   expect(calls).toEqual([]);
 });
 
-test("a request reaches the service once with its four IDs, and its result is parsed", async () => {
+test("a request reaches the service once with its four IDs and its repository, and its result is parsed", async () => {
   const { call, calls } = register(() =>
     Promise.resolve({
       outcome: "refused",
@@ -208,6 +220,10 @@ test("a request reaches the service once with its four IDs, and its result is pa
     retryAfterMs: 3_600_000,
   });
   expect(calls).toEqual([REQUEST]);
+  // The chosen repository reaches the service as it was sent (#362).
+  const withRepository = { ...REQUEST, repositoryId: id(0x2001) };
+  await call([withRepository]);
+  expect(calls).toEqual([REQUEST, withRepository]);
 });
 
 test("an uncertain answer goes to the renderer as unknown and is never asked for again", async () => {

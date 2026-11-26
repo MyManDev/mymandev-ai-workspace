@@ -325,10 +325,11 @@ export const INVOKE_CHANNELS = Object.freeze({
   subscribeAgentState: "agents:subscribe-state",
   /**
    * Requests a run of an agent of the open project (#35), by the project
-   * ID, the agent ID, the ID of a provider connection of this device, and
-   * the ID of one of the person's own chat messages, its input. Only the
-   * agent's owner, on the agent's host device. Sent once; never again on
-   * its own.
+   * ID, the agent ID, the ID of a provider connection of this device, the
+   * ID of one of the person's own chat messages, its input, and the ID of
+   * the repository that the person chose, one that the account linked on
+   * this device, or null for none (#362). Only the agent's owner, on the
+   * agent's host device. Sent once; never again on its own.
    */
   requestRun: "agents:request-run",
   /**
