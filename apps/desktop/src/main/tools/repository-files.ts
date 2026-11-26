@@ -96,13 +96,13 @@ interface ListedEntry {
   readonly kind: string;
 }
 
-/** The entries and the truncation of a listing, or null for another shape. */
-function listingOf(
-  result: unknown,
-): {
+interface Listing {
   readonly entries: readonly ListedEntry[];
   readonly truncated: boolean;
-} | null {
+}
+
+/** The entries and the truncation of a listing, or null for another shape. */
+function listingOf(result: unknown): Listing | null {
   if (typeof result !== "object" || result === null) {
     return null;
   }
