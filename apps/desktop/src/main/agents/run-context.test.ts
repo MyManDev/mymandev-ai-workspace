@@ -430,6 +430,23 @@ test("only a path that begins with the folder is left out; a path inside the rep
     ["work/repo/", ["work/repo"]],
     ["WORK/REPO", ["a.txt", "work/repo/b.txt"]],
   ];
+  // Only at a segment's end: `work/repo` does not hold
+  // `work/repository.txt`.
+  const segment = setup({
+    folder: "work/repo",
+    list: async () => ({
+      ok: true,
+      files: ["work/repository.txt", "work/repo-notes.md"],
+      truncated: false,
+    }),
+  });
+  const whole = await segment.builder.build(segment.input);
+  expect(whole.ok && whole.context.repository).toEqual({
+    included: true,
+    repositoryId: REPOSITORY_ID,
+    files: ["work/repo-notes.md", "work/repository.txt"],
+    truncated: false,
+  });
   for (const [folder, files] of lists) {
     const harness = setup({
       folder,
@@ -797,6 +814,22 @@ test("recheckRepositoryRead: the list may be sent only while repo.read is allowe
   });
   expect(recheckRepositoryRead(noRepository.input, included)).toBe(false);
   expect(noRepository.requests).toEqual([]);
+
+  // A repository part that is not one, or one that throws while it is
+  // read, answers false and never throws.
+  const throwing = Object.defineProperty({}, "included", {
+    get() {
+      throw new Error("repository");
+    },
+  }) as RunContextRepository;
+  for (const repository of [null, undefined, throwing]) {
+    const harness = setup();
+    expect(
+      recheckRepositoryRead(harness.input, repository as never),
+      String(repository),
+    ).toBe(false);
+    expect(harness.requests).toEqual([]);
+  }
 });
 
 // Through the real enforcement point.

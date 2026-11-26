@@ -35,6 +35,8 @@ class FakeFiles implements ReadToolFileSystem {
   readonly listed: string[] = [];
   /** Runs before each `readdir`, with its folder. */
   beforeReaddir: ((target: string) => void) | null = null;
+  /** Runs before each `realpath`, with its path. */
+  beforeRealpath: ((target: string) => void) | null = null;
   failReaddir = new Map<string, string>();
   /** Folders whose `readdir` never returns, as on a stalled network share. */
   readonly hangReaddir = new Set<string>();
@@ -124,6 +126,7 @@ class FakeFiles implements ReadToolFileSystem {
   }
 
   async realpath(target: string): Promise<string> {
+    this.beforeRealpath?.(target);
     return this.resolve(target, true);
   }
 
@@ -500,6 +503,50 @@ test("the repository's folder itself that is gone fails the list", async () => {
   const identity = files.identity(ROOT);
   files.remove(ROOT);
   expect(await walk(files, { identity })).toEqual({
+    ok: false,
+    reason: "failed",
+  });
+});
+
+test("a repository folder that disappears after it was listed gives the files found so far, cut; one replaced by another folder fails the list", async () => {
+  // The root goes when the walk turns to `b`, after the root and `a` were
+  // listed: `b` is gone (skipped), and the listing of `c` cannot read the
+  // root (`read_failed`, skipped and marked).
+  function tree(): FakeFiles {
+    return repository()
+      .file(`${ROOT}/top.txt`)
+      .dir(`${ROOT}/a`)
+      .file(`${ROOT}/a/x.txt`)
+      .dir(`${ROOT}/b`)
+      .file(`${ROOT}/b/y.txt`)
+      .dir(`${ROOT}/c`)
+      .file(`${ROOT}/c/z.txt`);
+  }
+  const gone = tree();
+  const identity = gone.identity(ROOT);
+  gone.beforeRealpath = (target) => {
+    if (target === `${ROOT}/b`) {
+      gone.beforeRealpath = null;
+      gone.remove(ROOT);
+    }
+  };
+  expect(await walk(gone, { identity })).toEqual({
+    ok: true,
+    files: ["a/x.txt", "top.txt"],
+    truncated: true,
+  });
+  expect(gone.listed).toEqual([ROOT, `${ROOT}/a`]);
+
+  // Replaced by another folder at the same moment: a swap, which fails.
+  const replaced = tree();
+  replaced.beforeRealpath = (target) => {
+    if (target === `${ROOT}/b`) {
+      replaced.beforeRealpath = null;
+      replaced.remove(ROOT);
+      replaced.dir(ROOT).dir(`${ROOT}/c`);
+    }
+  };
+  expect(await walk(replaced, { identity: replaced.identity(ROOT) })).toEqual({
     ok: false,
     reason: "failed",
   });
