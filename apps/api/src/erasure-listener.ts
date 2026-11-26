@@ -88,13 +88,15 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
  * that fails or does not answer within `checkTimeoutMs` counts as lost, so
  * that a connection that a NAT or a load balancer dropped silently is found
  * within about a minute, not when TCP keepalive gives up.
- * Notifications sent while no session listens are lost, which costs no more
- * than before the listener: the sweep closes the erased account's
- * connections within 60 seconds, and the other connections see the rest at
- * their next `workspace.subscribed`. A failure of `onPayload` is logged and
- * the next payload still goes to it. It logs no ID, URL, or error message:
- * only that it listens, that a check failed, that it lost its session or
- * failed with an error's type, and how long it waits.
+ * The same session hears an operator's account disables (#350), which share
+ * the channel. Notifications sent while no session listens are lost, which
+ * costs no more than before the listener: the sweep closes the erased or
+ * disabled account's connections within 60 seconds, and the other
+ * connections see the rest at their next `workspace.subscribed`. A failure
+ * of `onPayload` is logged and the next payload still goes to it. It logs
+ * no ID, URL, or error message: only that it listens, that a check failed,
+ * that it lost its session or failed with an error's type, and how long it
+ * waits.
  */
 export class ErasureListener {
   readonly #options: ErasureListenerOptions;

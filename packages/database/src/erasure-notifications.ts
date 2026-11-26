@@ -19,6 +19,7 @@ import type {
   UnfinishedRunState,
 } from "./cascade.ts";
 import type { Database } from "./db.ts";
+import type { DisableNotification } from "./disable-notifications.ts";
 
 // The live events of an operator's account erasure (#341; ADR 0014, update
 // of 2026-11-25). The erasure runs in the operator command, outside the API,
@@ -46,6 +47,12 @@ import type { Database } from "./db.ts";
 // so a listener trusts no payload: the API checks each one against the
 // database before it replays it (`checkErasureNotification`,
 // `src/erasure-check.ts`).
+//
+// An operator's account disable (`disableAccount`, #350) sends its own kinds
+// on the same channel (`src/disable-notifications.ts`), with the same
+// header, version, bound, and sending, so that each API instance keeps one
+// listener and one dedicated session for both. A listener that does not
+// know a kind ignores it.
 
 /** The channel of the erasure's notifications; a fixed, lowercase SQL identifier. */
 export const ERASURE_NOTIFICATION_CHANNEL = "mymandev_account_erasure";
@@ -70,28 +77,33 @@ export const MAX_NOTIFICATION_PAYLOAD_BYTES = 7_999;
  */
 export const APPROVERS_PER_NOTIFICATION = 100;
 
-type Header<Kind extends string> = Readonly<{
+/** The fields that every notification on the channel carries. */
+export type NotificationHeader<Kind extends string> = Readonly<{
   v: typeof ERASURE_NOTIFICATION_VERSION;
   kind: Kind;
-  /** The erasure's `now`, in UTC with milliseconds: the time of every event. */
+  /**
+   * The erasure's or the disable's `now`, in UTC with milliseconds: the time
+   * of every event.
+   */
   at: string;
   /**
-   * The erased account, in every notification, so that the API can check
-   * against the database that the account is erased and that the item
-   * belongs to its erasure (`checkErasureNotification`).
+   * The erased or disabled account, in every notification, so that the API
+   * can check against the database that the account is erased or disabled
+   * and that the item belongs to it (`checkErasureNotification`).
    */
   userId: UserId;
 }>;
 
 /** The erased account: the API closes the connections of its revoked devices at once. */
-export type AccountErasedNotification = Header<"account_erased">;
+export type AccountErasedNotification = NotificationHeader<"account_erased">;
 
 /** An ended membership: `workspace.member.removed` and `account.removed_from_workspace`. */
-export type MembershipEndedNotification = Header<"membership_ended"> &
-  Readonly<{ workspaceId: WorkspaceId; memberId: MemberId }>;
+export type MembershipEndedNotification =
+  NotificationHeader<"membership_ended"> &
+    Readonly<{ workspaceId: WorkspaceId; memberId: MemberId }>;
 
 /** A disabled agent: `workspace.agent.disabled`, with `ERASED_AGENT_NAME` as its name. */
-export type AgentDisabledNotification = Header<"agent_disabled"> &
+export type AgentDisabledNotification = NotificationHeader<"agent_disabled"> &
   Readonly<{
     workspaceId: WorkspaceId;
     agentId: AgentId;
@@ -101,7 +113,7 @@ export type AgentDisabledNotification = Header<"agent_disabled"> &
   }>;
 
 /** A revoked grant: `agent.grant.revoked`. */
-export type GrantRevokedNotification = Header<"grant_revoked"> &
+export type GrantRevokedNotification = NotificationHeader<"grant_revoked"> &
   Readonly<{
     workspaceId: WorkspaceId;
     grantId: PermissionGrantId;
@@ -110,7 +122,7 @@ export type GrantRevokedNotification = Header<"grant_revoked"> &
   }>;
 
 /** A cancelled run: `agent.run.state_changed`. */
-export type RunCancelledNotification = Header<"run_cancelled"> &
+export type RunCancelledNotification = NotificationHeader<"run_cancelled"> &
   Readonly<{
     workspaceId: WorkspaceId;
     runId: RunId;
@@ -128,7 +140,7 @@ export type RunCancelledNotification = Header<"run_cancelled"> &
  * erasure's transaction read them last.
  */
 export type JoinRequestWithdrawnNotification =
-  Header<"join_request_withdrawn"> &
+  NotificationHeader<"join_request_withdrawn"> &
     Readonly<{
       workspaceId: WorkspaceId;
       joinRequestId: JoinRequestId;
@@ -142,6 +154,9 @@ export type ErasureNotification =
   | GrantRevokedNotification
   | RunCancelledNotification
   | JoinRequestWithdrawnNotification;
+
+/** Every notification on the channel: an erasure's or a disable's. */
+export type OperatorNotification = ErasureNotification | DisableNotification;
 
 /** An ended membership as the notifications need it. */
 export type NotifiedMembership = Readonly<{
@@ -279,10 +294,11 @@ function requiredTime(value: string | null): string {
  * The notification as its payload: JSON, at most
  * `MAX_NOTIFICATION_PAYLOAD_BYTES` bytes. Every notification is far below
  * the bound; one above it breaks that invariant and throws, so that the
- * erasure rolls back rather than lose its events in a refused `pg_notify`.
+ * erasure or the disable rolls back rather than lose its events in a
+ * refused `pg_notify`.
  */
 export function encodeErasureNotification(
-  notification: ErasureNotification,
+  notification: OperatorNotification,
 ): string {
   const payload = JSON.stringify(notification);
   if (Buffer.byteLength(payload, "utf8") > MAX_NOTIFICATION_PAYLOAD_BYTES) {
@@ -295,13 +311,13 @@ export function encodeErasureNotification(
 
 /**
  * Sends the notifications in one statement, in their order, on
- * `ERASURE_NOTIFICATION_CHANNEL`. Inside the erasure's transaction they are
- * delivered only at its commit. The payloads travel as one array parameter,
- * which `unnest` reads in order.
+ * `ERASURE_NOTIFICATION_CHANNEL`. Inside the erasure's or the disable's
+ * transaction they are delivered only at its commit. The payloads travel as
+ * one array parameter, which `unnest` reads in order.
  */
 export async function sendErasureNotifications(
   tx: Database,
-  notifications: readonly ErasureNotification[],
+  notifications: readonly OperatorNotification[],
 ): Promise<void> {
   if (notifications.length === 0) {
     return;

@@ -40,8 +40,15 @@ export {
   type JoinRequestWithdrawnNotification,
   MAX_NOTIFICATION_PAYLOAD_BYTES,
   type MembershipEndedNotification,
+  type NotificationHeader,
+  type OperatorNotification,
   type RunCancelledNotification,
 } from "./erasure-notifications.ts";
+export {
+  type AccountDisabledNotification,
+  type DisableGrantRevokedNotification,
+  type DisableNotification,
+} from "./disable-notifications.ts";
 export {
   checkErasureNotification,
   type ErasureCheck,

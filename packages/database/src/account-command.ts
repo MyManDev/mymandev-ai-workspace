@@ -60,11 +60,14 @@ function total(lists: readonly (readonly unknown[])[]): number {
   return lists.reduce((sum, list) => sum + list.length, 0);
 }
 
+// Like an erasure, a disable reaches the API through the database: through
+// its notifications while the API listens (#350), and otherwise at its next
+// sweep.
 export function disableReport(result: DisableAccountResult): CommandReport {
   return {
     exitCode: 0,
     message: result.changed
-      ? `Account disabled; ${result.revokedGrantIds.length} grants revoked.`
+      ? `Account disabled; ${result.revokedGrantIds.length} grants revoked.\nAn API that listens closes the account's open connections at once and sends the other members the revoked grants. An API whose listener was down at the commit closes the connections at its next sweep, within 60 seconds, and its members see the revoked grants when they next load the workspace.`
       : "No change: the account does not exist or is already disabled.",
   };
 }
