@@ -845,7 +845,7 @@ test("each tool is checked for its own capability only: a grant of repo.read all
   // allowed call, in the same recorder.
   expect(
     harness.recorded.map((entry) =>
-      entry.kind === "shell_start_allowed"
+      entry.kind === "shell_start_allowed" || entry.kind === "context_walk"
         ? entry.kind
         : `${entry.kind} ${entry.capability}`,
     ),

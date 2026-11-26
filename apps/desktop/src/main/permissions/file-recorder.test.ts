@@ -16,6 +16,10 @@ import path from "node:path";
 import { GrantRecordSchema } from "@mymandev/permissions";
 import { afterEach, expect, test } from "vitest";
 import {
+  CONTEXT_WALK_RECORD_RESULTS,
+  type ContextWalkRecord,
+} from "./context-walk-record.ts";
+import {
   createPermissionEnforcement,
   type DenialRecord,
   type EnforcementRecord,
@@ -2311,4 +2315,269 @@ test("a file dropped after a failure is flushed before it is closed, ignoring an
   expect(order.lastIndexOf("fsyncSync")).toBeLessThan(
     order.lastIndexOf("closeSync"),
   );
+});
+
+// The walk of a run's context (#366): a new kind of version 1 in the series
+// of the tool calls.
+
+const WALK: ContextWalkRecord = Object.freeze({
+  kind: "context_walk",
+  result: "ok",
+  files: 412,
+  folders: 37,
+  truncated: true,
+  runId: RUN_ID,
+  agentId: AGENT_ID,
+  repositoryId: REPOSITORY_ID,
+  providerConnectionId: PROVIDER_CONNECTION_ID,
+  at: AT,
+}) as ContextWalkRecord;
+
+const WALK_LINE =
+  '{"version":1,"kind":"context_walk","result":"ok","files":412,' +
+  '"folders":37,"truncated":true,' +
+  `"runId":"${RUN_ID}","agentId":"${AGENT_ID}","repositoryId":"${REPOSITORY_ID}",` +
+  `"providerConnectionId":"${PROVIDER_CONNECTION_ID}","at":"${AT}"}`;
+
+/** A walk without a list: no counts and no flag. */
+const UNLISTED_WALK: ContextWalkRecord = Object.freeze({
+  ...WALK,
+  result: "timed_out",
+  files: null,
+  folders: null,
+  truncated: null,
+  providerConnectionId: null,
+}) as ContextWalkRecord;
+
+const UNLISTED_WALK_LINE =
+  '{"version":1,"kind":"context_walk","result":"timed_out","files":null,' +
+  '"folders":null,"truncated":null,' +
+  `"runId":"${RUN_ID}","agentId":"${AGENT_ID}","repositoryId":"${REPOSITORY_ID}",` +
+  `"providerConnectionId":null,"at":"${AT}"}`;
+
+test("a walk of a run's context is one line of version 1, with its fields in a fixed order, in the series of the tool calls", () => {
+  const { recorder, readTools, files } = setup();
+  expect(recorder.record(WALK)).toBeUndefined();
+  expect(recorder.record(UNLISTED_WALK)).toBeUndefined();
+  expect(recorder.record(TOOL_CALL)).toBeUndefined();
+  expect(readTools(1)).toBe(
+    `${WALK_LINE}\n${UNLISTED_WALK_LINE}\n${TOOL_CALL_LINE}\n`,
+  );
+  // No file of the denials and shell starts is started.
+  expect(files()).toEqual(["enforcement-tool-calls-00000001.jsonl"]);
+  // The fields are written in their fixed order, whatever the order given.
+  const reordered = Object.fromEntries(Object.entries(WALK).reverse());
+  expect(enforcementRecordLine(reordered)?.line).toBe(WALK_LINE);
+  expect(enforcementRecordLine(WALK)?.kind).toBe("context_walk");
+  // Every result code is taken, each without a list but `ok`.
+  expect(CONTEXT_WALK_RECORD_RESULTS).toEqual([
+    "ok",
+    "aborted",
+    "repository_unavailable",
+    "timed_out",
+    "list_failed",
+    "list_refused",
+  ]);
+  for (const result of CONTEXT_WALK_RECORD_RESULTS) {
+    const entry = result === "ok" ? WALK : { ...UNLISTED_WALK, result };
+    expect(recorder.record(entry as ContextWalkRecord), result).toBeUndefined();
+  }
+});
+
+test("a walk outside its record type is refused, and nothing is written: a name, a path, content, an unknown result, a count out of its bound, or counts that do not fit the result", () => {
+  const spy = spyFileSystem();
+  const { recorder } = setup({ fileSystem: spy.fileSystem });
+  const refused: unknown[] = [
+    // A name or a path, under any field.
+    { ...WALK, path: "src" },
+    { ...WALK, folder: "/home/person/repository" },
+    { ...WALK, names: ["README.md"] },
+    { ...WALK, content: "export const a = 1;" },
+    { ...WALK, files: ["README.md", "src/a.ts"] },
+    { ...WALK, folders: ["src"] },
+    { ...WALK, repositoryId: "/home/person/repository" },
+    // Result codes outside the closed list.
+    { ...UNLISTED_WALK, result: "denied" },
+    { ...UNLISTED_WALK, result: "no_repository" },
+    { ...UNLISTED_WALK, result: "record_failed" },
+    { ...UNLISTED_WALK, result: "made_up" },
+    // Counts outside an integer from 0 to 1,000.
+    { ...WALK, files: -1 },
+    { ...WALK, files: 1_001 },
+    { ...WALK, files: 1.5 },
+    { ...WALK, files: Number.NaN },
+    { ...WALK, files: Number.POSITIVE_INFINITY },
+    { ...WALK, files: "412" },
+    { ...WALK, folders: -1 },
+    { ...WALK, folders: 1_001 },
+    { ...WALK, folders: 0.5 },
+    { ...WALK, folders: "37" },
+    { ...WALK, truncated: "yes" },
+    { ...WALK, truncated: 1 },
+    // `ok` with no list, and a result without a list with one.
+    { ...WALK, files: null },
+    { ...WALK, folders: null },
+    { ...WALK, truncated: null },
+    { ...UNLISTED_WALK, files: 0 },
+    { ...UNLISTED_WALK, folders: 1 },
+    { ...UNLISTED_WALK, truncated: false },
+    // The IDs and the time are required.
+    { ...WALK, runId: null },
+    { ...WALK, agentId: null },
+    { ...WALK, repositoryId: null },
+    { ...WALK, at: null },
+    { ...WALK, at: "yesterday" },
+    { ...WALK, kind: "walk" },
+    Object.fromEntries(Object.entries(WALK).filter(([key]) => key !== "files")),
+    Object.fromEntries(
+      Object.entries(WALK).filter(([key]) => key !== "truncated"),
+    ),
+  ];
+  for (const entry of refused) {
+    expect(
+      failureOf(() => recorder.record(entry as EnforcementRecord)),
+      JSON.stringify(entry),
+    ).toBe("record_invalid");
+  }
+  expect(spy.calls).toEqual([]);
+  // The bounds themselves are taken.
+  for (const count of [0, 1_000]) {
+    expect(
+      recorder.record({
+        ...WALK,
+        files: count,
+        folders: count,
+      } as ContextWalkRecord),
+      String(count),
+    ).toBeUndefined();
+  }
+});
+
+test("the lines of the earlier kinds stay byte for byte as they were, and still read, once walks are recorded", () => {
+  // A file of each series, as the build before walks wrote them.
+  const first = setup();
+  first.recorder.record(DENIAL);
+  first.recorder.record(START);
+  first.recorder.record(MALFORMED_DENIAL);
+  first.recorder.record(TOOL_CALL);
+  first.recorder.close();
+  const records = first.read(1);
+  const toolCalls = first.readTools(1);
+  expect(toolCalls).toBe(`${TOOL_CALL_LINE}\n`);
+
+  // This build appends a walk after the tool call and a denial after the
+  // earlier lines, which are unchanged.
+  const second = setup({ root: first.root });
+  second.recorder.record(WALK);
+  second.recorder.record(DENIAL);
+  second.recorder.record(TOOL_CALL);
+  expect(second.read(1)).toBe(`${records}${DENIAL_LINE}\n`);
+  expect(second.readTools(1)).toBe(
+    `${toolCalls}${WALK_LINE}\n${TOOL_CALL_LINE}\n`,
+  );
+  // The earlier kinds still write exactly their lines of before.
+  expect(enforcementRecordLine(DENIAL)?.line).toBe(DENIAL_LINE);
+  expect(enforcementRecordLine(START)?.line).toBe(START_LINE);
+  expect(enforcementRecordLine(TOOL_CALL)?.line).toBe(TOOL_CALL_LINE);
+
+  // Every line reads back as exactly the same line.
+  const lines = [
+    ...second.read(1).trimEnd().split("\n"),
+    ...second.readTools(1).trimEnd().split("\n"),
+  ];
+  expect(
+    lines.map((line) => (JSON.parse(line) as { kind: string }).kind),
+  ).toEqual([
+    "denied",
+    "shell_start_allowed",
+    "denied",
+    "denied",
+    "tool_call_allowed",
+    "context_walk",
+    "tool_call_allowed",
+  ]);
+  for (const line of lines) {
+    const { version, ...entry } = JSON.parse(line) as Record<string, unknown>;
+    expect(version).toBe(ENFORCEMENT_RECORD_FORMAT_VERSION);
+    expect(enforcementRecordLine(entry)?.line).toBe(line);
+  }
+});
+
+test("flooding the tool calls' series with walks never deletes or changes a file of the denials and shell starts; walks rotate with the tool calls", () => {
+  const { recorder, read, readTools, files } = setup({
+    limits: SERIES_LIMITS,
+  });
+  recorder.record(DENIAL);
+  recorder.record(START);
+  recorder.record(MALFORMED_DENIAL);
+  const first = read(1);
+  const second = read(2);
+  for (let index = 0; index < 50; index += 1) {
+    expect(recorder.record(WALK)).toBeUndefined();
+  }
+  expect(files()).toEqual([
+    "enforcement-00000001.jsonl",
+    "enforcement-00000002.jsonl",
+    "enforcement-tool-calls-00000049.jsonl",
+    "enforcement-tool-calls-00000050.jsonl",
+  ]);
+  expect(read(1)).toBe(first);
+  expect(read(2)).toBe(second);
+  expect(readTools(50)).toBe(`${WALK_LINE}\n`);
+  // A tool call goes on in the same series, after the walks.
+  recorder.record(TOOL_CALL);
+  expect(files().at(-1)).toBe("enforcement-tool-calls-00000051.jsonl");
+  expect(readTools(51)).toBe(`${TOOL_CALL_LINE}\n`);
+});
+
+test("a walk is flushed as a tool call is: at the next shell start, not on its own", () => {
+  const spy = spyFileSystem();
+  const { recorder, readTools } = setup({
+    fileSystem: spy.fileSystem,
+    platform: "win32",
+  });
+  recorder.record(WALK);
+  expect(spy.named("fsyncSync")).toHaveLength(0);
+  recorder.record(START);
+  expect(spy.named("fsyncSync")).toHaveLength(2);
+  expect(readTools(1)).toBe(`${WALK_LINE}\n`);
+});
+
+test("after two failures of the tool calls' series a walk waits as a tool call does, and failing walks never make a denial wait", () => {
+  let time = 1000;
+  let failToolCalls = true;
+  const spy = spyFileSystem({
+    openSync: (file, flags, mode) => {
+      if (
+        failToolCalls &&
+        path.basename(file).startsWith("enforcement-tool-calls-")
+      ) {
+        throw errno("EMFILE");
+      }
+      return nodeRecorderFileSystem.openSync(file, flags, mode);
+    },
+  });
+  const { recorder, read, readTools } = setup({
+    fileSystem: spy.fileSystem,
+    now: () => time,
+    platform: "win32",
+  });
+  const toolCallOpens = () =>
+    spy
+      .named("openSync")
+      .filter((call) =>
+        path.basename(String(call.args[0])).startsWith("enforcement-tool-"),
+      ).length;
+  expect(failureOf(() => recorder.record(WALK))).toBe("open_failed");
+  expect(failureOf(() => recorder.record(TOOL_CALL))).toBe("open_failed");
+  expect(toolCallOpens()).toBe(2);
+  // Within the wait, a walk fails at once, and a denial still writes.
+  expect(failureOf(() => recorder.record(WALK))).toBe("open_failed");
+  expect(toolCallOpens()).toBe(2);
+  expect(recorder.record(DENIAL)).toBeUndefined();
+  expect(read(1)).toBe(`${DENIAL_LINE}\n`);
+  failToolCalls = false;
+  time += ENFORCEMENT_RECORD_RETRY_MS;
+  expect(recorder.record(WALK)).toBeUndefined();
+  expect(readTools(1)).toBe(`${WALK_LINE}\n`);
 });
