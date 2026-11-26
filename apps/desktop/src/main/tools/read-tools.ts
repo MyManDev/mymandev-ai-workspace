@@ -581,15 +581,28 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
       name: READ_TOOL_NAMES.listDirectory,
       capability: "repo.read",
       input: PathInputSchema,
+      recordPath,
       run: listDirectory,
     }),
     defineTool({
       name: READ_TOOL_NAMES.readFile,
       capability: "repo.read",
       input: PathInputSchema,
+      recordPath,
       run: readFile,
     }),
   ]);
+}
+
+/**
+ * The path of a call's record: the path that the tool got, when it passes
+ * the lexical rules, so that it is relative to the repository and never
+ * absolute; null otherwise. A path that the lexical rules refuse is never
+ * recorded, since it may name a folder outside the repository.
+ */
+function recordPath(input: { path: string }): string | null {
+  const parsed = parseRepositoryPath(input.path);
+  return parsed.ok ? parsed.path.text : null;
 }
 
 function kindOf(entry: {

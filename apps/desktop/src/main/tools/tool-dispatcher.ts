@@ -13,6 +13,21 @@
 // allowed action stays held, so that a change of the grants re-checks it and
 // aborts the run, until the tool settled.
 //
+// Every allowed call is recorded (#37, Project Manager decision of
+// 2026-11-26): once the call has its answer, and before the answer is
+// given, one `tool_call_allowed` record goes to the enforcement point's
+// recorder, with the tool, its capability, the path that the call names
+// relative to the repository (or null), the result code (`ok`, or the
+// refusal), the run's IDs, and the time (`ToolCallRecord`, in
+// `permissions/tool-call-record.ts` with the format of the records). It never
+// holds the input, the answer, a file's content, or an absolute path; a path
+// with a lone surrogate or a Unicode format character is recorded as null.
+// A record that is not taken withholds the answer: the call is refused with
+// `record_failed` (default until the Project Manager decides: fail closed, as
+// for a shell start). The recorder must be the enforcement point's own
+// instance. A call refused before the check (`unknown_tool`, `aborted`) is not
+// recorded here, and a denial is recorded by the enforcement point.
+//
 // Every answer is plain JSON data. A refusal is a code of a closed list,
 // with a reason of a closed list for some codes, never a message, a path,
 // or an error of the file system. An answer never holds the repository's
@@ -21,20 +36,23 @@ import type { Capability, RepositoryId } from "@mymandev/protocol";
 import { CAPABILITY_SCOPE } from "@mymandev/permissions";
 import type * as z from "zod";
 import type { RunExecution } from "../agents/run-executor.ts";
-import type { EnforcementDenialReason } from "../permissions/enforcement.ts";
+import type {
+  EnforcementDenialReason,
+  EnforcementRecorder,
+} from "../permissions/enforcement.ts";
+import {
+  recordablePath,
+  TOOL_CALL_RECORD_RESULTS,
+  TOOL_NAME_PATTERN,
+  type ToolCallRecord,
+  type ToolCallRecordResult,
+} from "../permissions/tool-call-record.ts";
 import type { FileIdentity } from "../repository-links/identity.ts";
 import type {
   RepositoryFolderFailure,
   RepositoryFolderResolution,
 } from "../repository-links/service.ts";
 import type { RepositoryPathRefusal } from "./repository-path.ts";
-
-/**
- * The form of a tool's name: lowercase letters, digits, and underscores,
- * starting with a letter, at most 64 characters, which every provider's
- * tool names accept.
- */
-export const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 
 /**
  * The largest answer of one call, in bytes of its JSON text (UTF-8), the
@@ -72,6 +90,8 @@ export const MAX_TOOL_INPUT_BYTES = 64 * 1024;
  *   until the Project Manager decides: also when the folder is in a file's
  *   content).
  * - `tool_failed`: the tool failed in another way.
+ * - `record_failed`: the record of the allowed call was not taken, so its
+ *   answer is withheld.
  */
 export const TOOL_CALL_REFUSALS = Object.freeze([
   "unknown_tool",
@@ -87,8 +107,11 @@ export const TOOL_CALL_REFUSALS = Object.freeze([
   "answer_too_large",
   "answer_has_path",
   "tool_failed",
+  "record_failed",
 ] as const);
 export type ToolCallRefusal = (typeof TOOL_CALL_REFUSALS)[number];
+
+const RECORD_RESULTS: ReadonlySet<string> = new Set(TOOL_CALL_RECORD_RESULTS);
 
 /** The refusals that a tool itself may answer. */
 export type ToolRunRefusal = Extract<
@@ -158,6 +181,14 @@ export interface ToolDefinition<Input> {
   readonly capability: Capability;
   /** A strict schema: unknown fields are refused. */
   readonly input: z.ZodType<Input>;
+  /**
+   * The path that a parsed input names, for the call's record: relative to
+   * the repository's top-level folder, as it passed `parseRepositoryPath`,
+   * or null. Never an absolute path: the recorder refuses one, and the call
+   * is then refused (`record_failed`). Without it, or when it throws, the
+   * record's path is null.
+   */
+  readonly recordPath?: (input: Input) => string | null;
   readonly run: (
     input: Input,
     context: ToolRunContext,
@@ -168,17 +199,21 @@ export interface ToolDefinition<Input> {
 export interface Tool {
   readonly name: string;
   readonly capability: Capability;
-  /** Parses the input; an allowed call then runs it. Never throws. */
+  /**
+   * Parses the input; an allowed call then runs it, and records `path`.
+   * Never throws.
+   */
   readonly parse: (input: unknown) =>
     | {
         readonly ok: true;
+        readonly path: string | null;
         readonly run: (context: ToolRunContext) => Promise<ToolRunOutcome>;
       }
     | { readonly ok: false };
 }
 
 export function defineTool<Input>(definition: ToolDefinition<Input>): Tool {
-  const { name, capability, input, run } = definition;
+  const { name, capability, input, recordPath, run } = definition;
   return Object.freeze({
     name,
     capability,
@@ -193,8 +228,15 @@ export function defineTool<Input>(definition: ToolDefinition<Input>): Tool {
         return Object.freeze({ ok: false } as const);
       }
       const data = parsed.data;
+      let path: string | null;
+      try {
+        path = recordPath === undefined ? null : recordPath(data);
+      } catch {
+        path = null;
+      }
       return Object.freeze({
         ok: true,
+        path,
         run: (context: ToolRunContext) => run(data, context),
       } as const);
     },
@@ -250,6 +292,16 @@ export interface ToolDispatcherOptions {
   readonly resolveFolder: (
     repositoryId: RepositoryId,
   ) => Promise<RepositoryFolderResolution>;
+  /**
+   * The enforcement point's recorder, which takes the `ToolCallRecord` of
+   * every allowed call: the very instance that the enforcement point got,
+   * never a second file recorder on the same folder (a second writer) or a
+   * recorder in memory (nothing kept on the device). A call whose record is
+   * not taken is refused (`record_failed`).
+   */
+  readonly recorder: EnforcementRecorder;
+  /** The wall clock, read once for each record. */
+  readonly now: () => Date;
 }
 
 export interface ToolDispatcher {
@@ -338,10 +390,148 @@ export function holdsFolder(json: string, folder: string): boolean {
   return false;
 }
 
+/**
+ * Handles the rejection of a thenable, so that a recorder that returned a
+ * promise leaves no unhandled rejection. It never throws.
+ */
+function settleQuietly(value: unknown): void {
+  try {
+    if (
+      (typeof value === "object" && value !== null) ||
+      typeof value === "function"
+    ) {
+      const then: unknown = (value as { then?: unknown }).then;
+      if (typeof then === "function") {
+        then.call(value, undefined, () => undefined);
+      }
+    }
+  } catch {
+    // Nothing more to do.
+  }
+}
+
+/** The ISO time of a genuine, valid Date from the clock, or null. */
+function timeOf(now: () => Date): string | null {
+  try {
+    const ms = Date.prototype.getTime.call(now());
+    return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  } catch {
+    return null;
+  }
+}
+
 export function createToolDispatcher(
   options: ToolDispatcherOptions,
 ): ToolDispatcher {
-  const { registry, resolveFolder } = options;
+  const { registry, resolveFolder, recorder, now } = options;
+
+  /**
+   * Records the answer of an allowed call, and gives it only when the
+   * recorder took the record: `undefined`, as the enforcement point counts
+   * it. Otherwise, a clock without a valid time included, the call is
+   * refused with `record_failed`.
+   */
+  function recorded(
+    answer: ToolCallAnswer,
+    entry: Omit<ToolCallRecord, "result" | "at">,
+  ): ToolCallAnswer {
+    const at = timeOf(now);
+    if (at === null) {
+      return refuse("record_failed");
+    }
+    // `unknown_tool`, `denied`, and `record_failed` never come after the
+    // check; they are recorded as `tool_failed`, never as given.
+    const result: ToolCallRecordResult = answer.ok
+      ? "ok"
+      : RECORD_RESULTS.has(answer.code)
+        ? (answer.code as ToolCallRecordResult)
+        : "tool_failed";
+    let taken: unknown;
+    try {
+      taken = recorder.record(Object.freeze({ ...entry, result, at }));
+    } catch {
+      return refuse("record_failed");
+    }
+    if (taken !== undefined) {
+      settleQuietly(taken);
+      return refuse("record_failed");
+    }
+    return answer;
+  }
+
+  /**
+   * Runs an allowed call whose input parsed: resolves the folder, runs the
+   * tool, and checks its answer. `end` ends the held action.
+   */
+  async function act(
+    tool: Tool,
+    repositoryId: RepositoryId,
+    run: (context: ToolRunContext) => Promise<ToolRunOutcome>,
+    signal: AbortSignal,
+    end: () => void,
+  ): Promise<ToolCallAnswer> {
+    // An abort while the folder resolves answers at once, also when the
+    // resolution hangs. The held action ends at once as well: the resolution
+    // only reads the identity of the repository's folders, and no tool runs
+    // after an abort.
+    const resolving = (async () => resolveFolder(repositoryId))();
+    const resolved = await untilAborted(resolving, signal);
+    if (resolved === ABORTED || signal.aborted) {
+      end();
+      return refuse("aborted");
+    }
+    const resolution: RepositoryFolderResolution =
+      resolved === FAILED
+        ? Object.freeze({ ok: false, reason: "unavailable" })
+        : resolved;
+    if (!resolution.ok) {
+      end();
+      return refuse("repository_unavailable", resolution.reason);
+    }
+    const folder = resolution.folder;
+    const folderIdentity = resolution.identity;
+
+    // The action is held until the tool settled, also after an abort.
+    const work = (async () => run({ folder, folderIdentity, signal }))();
+    void work.then(end, end);
+    const outcome = await untilAborted(work, signal);
+    if (outcome === ABORTED || signal.aborted) {
+      return refuse("aborted");
+    }
+    if (outcome === FAILED) {
+      return refuse("tool_failed");
+    }
+    if (typeof outcome !== "object" || outcome === null) {
+      return refuse("tool_failed");
+    }
+    if (outcome.ok !== true) {
+      return TOOL_RUN_REFUSALS.has(outcome.code)
+        ? refuse(outcome.code, outcome.reason)
+        : refuse("tool_failed");
+    }
+
+    // The answer is the JSON text's data, checked as it will be sent.
+    let json: string | undefined;
+    try {
+      json = JSON.stringify(outcome.result);
+    } catch {
+      json = undefined;
+    }
+    if (json === undefined) {
+      return refuse("tool_failed");
+    }
+    if (Buffer.byteLength(json, "utf8") > MAX_TOOL_ANSWER_BYTES) {
+      return refuse("answer_too_large");
+    }
+    if (holdsFolder(json, folder)) {
+      return refuse("answer_has_path");
+    }
+    return Object.freeze({
+      ok: true,
+      tool: tool.name,
+      result: JSON.parse(json) as unknown,
+    });
+  }
 
   async function call(
     context: ToolCallContext,
@@ -402,74 +592,39 @@ export function createToolDispatcher(
       return refuse("denied", "check_failed");
     }
 
+    // From here on, the call is allowed: whatever it answers is recorded
+    // first, with the path that its input names when it parsed.
+    const entry = {
+      kind: "tool_call_allowed",
+      tool: tool.name,
+      capability: tool.capability,
+      runId: run.runId,
+      agentId: run.agentId,
+      repositoryId: checked.repositoryId,
+      providerConnectionId: run.providerConnectionId,
+    } as const;
+
     const plain = jsonInput(input);
-    const parsed = plain === undefined ? undefined : tool.parse(plain.value);
+    let parsed: ReturnType<Tool["parse"]> | undefined;
+    try {
+      parsed = plain === undefined ? undefined : tool.parse(plain.value);
+    } catch {
+      end();
+      return recorded(refuse("tool_failed"), { ...entry, path: null });
+    }
     if (parsed === undefined || !parsed.ok) {
       end();
-      return refuse("invalid_input");
+      return recorded(refuse("invalid_input"), { ...entry, path: null });
     }
-
-    // An abort while the folder resolves answers at once, also when the
-    // resolution hangs. The held action ends at once as well: the resolution
-    // only reads the identity of the repository's folders, and no tool runs
-    // after an abort.
-    const resolving = (async () => resolveFolder(checked.repositoryId))();
-    const resolved = await untilAborted(resolving, signal);
-    if (resolved === ABORTED || signal.aborted) {
-      end();
-      return refuse("aborted");
-    }
-    const resolution: RepositoryFolderResolution =
-      resolved === FAILED
-        ? Object.freeze({ ok: false, reason: "unavailable" })
-        : resolved;
-    if (!resolution.ok) {
-      end();
-      return refuse("repository_unavailable", resolution.reason);
-    }
-    const folder = resolution.folder;
-    const folderIdentity = resolution.identity;
-
-    // The action is held until the tool settled, also after an abort.
-    const work = (async () => parsed.run({ folder, folderIdentity, signal }))();
-    void work.then(end, end);
-    const outcome = await untilAborted(work, signal);
-    if (outcome === ABORTED || signal.aborted) {
-      return refuse("aborted");
-    }
-    if (outcome === FAILED) {
-      return refuse("tool_failed");
-    }
-    if (typeof outcome !== "object" || outcome === null) {
-      return refuse("tool_failed");
-    }
-    if (outcome.ok !== true) {
-      return TOOL_RUN_REFUSALS.has(outcome.code)
-        ? refuse(outcome.code, outcome.reason)
-        : refuse("tool_failed");
-    }
-
-    // The answer is the JSON text's data, checked as it will be sent.
-    let json: string | undefined;
+    // A path that a reader could misread is recorded as null.
+    const path = recordablePath(parsed.path);
+    let answer: ToolCallAnswer;
     try {
-      json = JSON.stringify(outcome.result);
+      answer = await act(tool, checked.repositoryId, parsed.run, signal, end);
     } catch {
-      json = undefined;
+      answer = refuse("tool_failed");
     }
-    if (json === undefined) {
-      return refuse("tool_failed");
-    }
-    if (Buffer.byteLength(json, "utf8") > MAX_TOOL_ANSWER_BYTES) {
-      return refuse("answer_too_large");
-    }
-    if (holdsFolder(json, folder)) {
-      return refuse("answer_has_path");
-    }
-    return Object.freeze({
-      ok: true,
-      tool: tool.name,
-      result: JSON.parse(json) as unknown,
-    });
+    return recorded(answer, { ...entry, path });
   }
 
   return Object.freeze({

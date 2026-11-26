@@ -3,7 +3,8 @@
 // entry point's source: the entry point starts Electron, so no test runs it.
 // The behaviour of the wired parts is tested in
 // `agents/run-supervisor.test.ts` ("wired:"), on a harness wired as here.
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import path from "node:path";
 import { expect, test } from "vitest";
 
 /** `source` without its block and line comments. */
@@ -136,4 +137,43 @@ test("the entry point gives the host run supervisor the enforcement point and th
   expect(ENTRY.indexOf("const enforcement = ")).toBeLessThan(
     ENTRY.indexOf("const runSupervisor = "),
   );
+});
+
+test("a tool dispatcher records to the enforcement point's own recorder: it is created in the entry point only, with that recorder", () => {
+  // No dispatcher is wired yet (#36: no executor calls one). Once one is,
+  // it must get the very recorder of the enforcement point: a second file
+  // recorder on the same folder would be a second writer of its files, and
+  // a recorder in memory would keep nothing on the device.
+  const sources = readdirSync(new URL(".", import.meta.url), {
+    recursive: true,
+    encoding: "utf8",
+  }).filter(
+    (name) =>
+      name.endsWith(".ts") &&
+      !name.endsWith(".test.ts") &&
+      path.basename(name) !== "tool-dispatcher.ts",
+  );
+  const creating = sources.filter((name) =>
+    /\bcreateToolDispatcher\(/.test(
+      withoutComments(
+        readFileSync(
+          new URL(name.replaceAll("\\", "/"), import.meta.url),
+          "utf8",
+        ),
+      ),
+    ),
+  );
+  expect(creating.every((name) => name === "index.ts")).toBe(true);
+  const calls = [
+    ...ENTRY.matchAll(/\bcreateToolDispatcher\(\{\n([\s\S]*?)\n {2}\}\);/g),
+  ];
+  expect(ENTRY.match(/\bcreateToolDispatcher\(/g) ?? []).toHaveLength(
+    calls.length,
+  );
+  for (const call of calls) {
+    expect(lines(call[1] ?? "")).toContain("recorder: enforcementRecorder,");
+  }
+  // The entry point has one recorder: the file recorder of the system.
+  expect(ENTRY).not.toMatch(/\bcreateFileEnforcementRecorder\(/);
+  expect(ENTRY.match(/\bcreateSystemEnforcementRecorder\(/g)).toHaveLength(1);
 });

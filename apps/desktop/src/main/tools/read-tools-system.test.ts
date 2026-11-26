@@ -8,6 +8,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readFile,
   realpath,
   rename,
   rm,
@@ -20,6 +21,11 @@ import type { RepositoryId } from "@mymandev/protocol";
 import { afterEach, expect, test } from "vitest";
 import type { RunActionCheck } from "../agents/run-executor.ts";
 import type { HeldRun } from "../permissions/enforcement.ts";
+import {
+  createFileEnforcementRecorder,
+  ENFORCEMENT_RECORD_FOLDER,
+  enforcementToolCallFileName,
+} from "../permissions/file-recorder.ts";
 import type { FileIdentity } from "../repository-links/identity.ts";
 import {
   createReadTools,
@@ -337,9 +343,20 @@ test("the open file names its real path through /proc/self/fd on Linux, and noth
   }
 });
 
-test("through the dispatcher, no answer holds the temporary folder's path, whatever the outcome", async () => {
+test("through the dispatcher, no answer and no record holds the temporary folder's path or a file's content, whatever the outcome", async () => {
   const { base, repo, outside } = await layout();
   await folderLink(outside, path.join(repo, "linked"));
+  // The records go to the local append-only recorder, in a folder of its own.
+  const recordRoot = await realpath(
+    await mkdtemp(path.join(tmpdir(), "mymandev-tool-records-")),
+  );
+  bases.push(recordRoot);
+  const recordFolder = path.join(recordRoot, ENFORCEMENT_RECORD_FOLDER);
+  const recorder = createFileEnforcementRecorder({
+    folder: () => recordFolder,
+    platform: process.platform,
+    log: () => undefined,
+  });
   const dispatcher = createToolDispatcher({
     registry: createToolRegistry(toolsOf().tools),
     resolveFolder: async (repositoryId: RepositoryId) => ({
@@ -348,6 +365,8 @@ test("through the dispatcher, no answer holds the temporary folder's path, whate
       folder: repo,
       identity: await identityOf(repo),
     }),
+    recorder,
+    now: () => new Date(),
   });
   const context = {
     run: RUN,
@@ -363,6 +382,7 @@ test("through the dispatcher, no answer holds the temporary folder's path, whate
     signal: new AbortController().signal,
   };
   const answers: ToolCallAnswer[] = [];
+  const calls: { tool: string; path: string }[] = [];
   for (const value of [
     ".",
     "src",
@@ -379,12 +399,54 @@ test("through the dispatcher, no answer holds the temporary folder's path, whate
       READ_TOOL_NAMES.readFile,
     ]) {
       answers.push(await dispatcher.call(context, name, { path: value }));
+      calls.push({ tool: name, path: value });
     }
   }
+  recorder.close();
   expect(answers.filter((answer) => answer.ok)).toHaveLength(3);
   const text = JSON.stringify(answers).toLowerCase();
   for (const form of [base, base.replaceAll("\\", "/"), tmpdir()]) {
     expect(text).not.toContain(JSON.stringify(form.toLowerCase()).slice(1, -1));
   }
   expect(text).not.toContain("secret");
+
+  // One record per call, in order, with its result, and the path only when
+  // it is relative to the repository: never the folder or a file's content.
+  const written = await readFile(
+    path.join(recordFolder, enforcementToolCallFileName(1)),
+    "utf8",
+  );
+  const records = written
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line) as Record<string, unknown>);
+  expect(records).toHaveLength(calls.length);
+  records.forEach((entry, index) => {
+    const call = calls[index];
+    const answer = answers[index];
+    expect(entry).toMatchObject({
+      version: 1,
+      kind: "tool_call_allowed",
+      tool: call?.tool,
+      capability: "repo.read",
+      result: answer?.ok === true ? "ok" : answer?.code,
+      runId: RUN.runId,
+      agentId: RUN.agentId,
+      repositoryId: REPOSITORY_ID,
+      providerConnectionId: null,
+    });
+    const relative =
+      call !== undefined &&
+      !path.isAbsolute(call.path) &&
+      !call.path.startsWith("..");
+    expect(entry.path).toBe(relative ? call?.path : null);
+  });
+  const recordText = written.toLowerCase();
+  for (const form of [base, base.replaceAll("\\", "/"), tmpdir()]) {
+    expect(recordText).not.toContain(
+      JSON.stringify(form.toLowerCase()).slice(1, -1),
+    );
+  }
+  expect(recordText).not.toContain("export const");
+  expect(recordText).not.toContain("# repo");
 });
