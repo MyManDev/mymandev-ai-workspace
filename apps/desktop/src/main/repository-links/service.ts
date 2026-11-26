@@ -94,6 +94,7 @@ import {
 } from "../workspace/service.ts";
 import type { LinkConfirmationRequest } from "./confirmation.ts";
 import {
+  type FileIdentity,
   type FolderIdentityResult,
   type RepositoryFolders,
   sameFolderIdentity,
@@ -165,6 +166,12 @@ export interface ProjectRepositoryState {
  *   that was linked (its device or file number changed, or it became a
  *   symbolic link or a junction); the person links it again.
  * - `changed`: the link or the mount changed while the folder was checked.
+ * - `nested_link`: the linked folder is the same as, inside, or around a
+ *   folder that the account linked to another repository on this device,
+ *   a pair that a build before #323 could make. Neither of the two
+ *   resolves until one of them is unlinked (Project Manager decision of
+ *   2026-11-25 on #36), so that a tool of one repository never reaches the
+ *   files of the other.
  */
 export const REPOSITORY_FOLDER_FAILURES = Object.freeze([
   "invalid",
@@ -175,6 +182,7 @@ export const REPOSITORY_FOLDER_FAILURES = Object.freeze([
   "folder_missing",
   "changed_folder",
   "changed",
+  "nested_link",
 ] as const);
 export type RepositoryFolderFailure =
   (typeof REPOSITORY_FOLDER_FAILURES)[number];
@@ -185,6 +193,13 @@ export type RepositoryFolderResolution =
       readonly repositoryId: RepositoryId;
       /** The repository's top-level folder, as Git reported it. */
       readonly folder: string;
+      /**
+       * The identity (`lstat`: device and file number) of the top-level
+       * folder that the link recorded and that this resolution read again,
+       * so that a caller can check that the folder it acts on is still the
+       * same folder.
+       */
+      readonly identity: FileIdentity;
     }
   | { readonly ok: false; readonly reason: RepositoryFolderFailure };
 
@@ -1761,6 +1776,23 @@ export function createProjectRepositoryService(
     if (link === undefined) {
       return "not_linked";
     }
+    // A link that nests with another of the account's links, which a build
+    // before #323 could make, resolves neither (decision of 2026-11-25 on
+    // #36), whether the other folder is mounted or not.
+    const nested = links.some(
+      (held) =>
+        held !== link &&
+        ownLink(held) &&
+        folderRelation(
+          held.folder,
+          link.folder,
+          options.pathApi,
+          options.caseInsensitivePaths,
+        ) !== "apart",
+    );
+    if (nested) {
+      return "nested_link";
+    }
     const mountId = mountOf(link.folder);
     if (mountId === null) {
       return "not_mounted";
@@ -1814,6 +1846,7 @@ export function createProjectRepositoryService(
       ok: true,
       repositoryId: parsed.data,
       folder: second.mounted.topLevel,
+      identity: second.link.identity.folder,
     });
   }
 
