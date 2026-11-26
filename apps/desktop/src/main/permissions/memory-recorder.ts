@@ -19,8 +19,10 @@ import type { EnforcementRecord, EnforcementRecorder } from "./enforcement.ts";
 
 /**
  * How many records the recorder keeps: the most recent 1,000. A record holds
- * at most five IDs, a capability, a reason, and a time, so they stay well
- * below 1 MB, also when an executor that misbehaves is denied in a loop.
+ * at most five IDs, a capability, a reason or a tool's name and result, a
+ * path of at most 1,024 characters (a tool call's), and a time, so they stay
+ * below about 3 MB, also when an executor that misbehaves is denied in a
+ * loop.
  */
 export const MEMORY_RECORDER_LIMIT = 1_000;
 

@@ -345,6 +345,34 @@ test("the read tools need repo.read and take { path } only", () => {
   }
 });
 
+test("the path of a call's record is the path when it passes the lexical rules, and null otherwise, so never absolute", () => {
+  const { tools } = toolsOf(repository());
+  for (const tool of tools) {
+    const pathOf = (value: string) => {
+      const parsed = tool.parse({ path: value });
+      return parsed.ok ? parsed.path : "invalid";
+    };
+    for (const taken of [".", "src", "src/index.ts", "docs/read me.md"]) {
+      expect(pathOf(taken), taken).toBe(taken);
+    }
+    for (const refused of [
+      ROOT,
+      `${ROOT}/src/index.ts`,
+      "/etc/passwd",
+      "C:\\Users\\person\\repository",
+      "C:/Users/person/repository",
+      "\\\\server\\share",
+      "../outside",
+      "src/../..",
+      ".git/config",
+      ".env",
+      "",
+    ]) {
+      expect(pathOf(refused), refused).toBeNull();
+    }
+  }
+});
+
 test("read_file answers a text file with its relative path, size, and content", async () => {
   const { read } = toolsOf(repository());
   expect(await runTool(read, { path: "src/index.ts" })).toEqual({

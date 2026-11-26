@@ -12,10 +12,31 @@
 //
 // - Format. One record per line, UTF-8, ending with "\n": a JSON object
 //   whose first field is `version` (`ENFORCEMENT_RECORD_FORMAT_VERSION`),
-//   followed by the fields of the record in a fixed order. A record is
-//   validated before it is written, and anything that is not exactly a
-//   `DenialRecord` or a `ShellStartRecord` (IDs, closed vocabularies, and
-//   times) is refused, an unexpected field included.
+//   followed by the fields of the record in a fixed order, with U+2028 and
+//   U+2029 escaped as well (still the same JSON). A record is validated
+//   before it is written, and anything that is not exactly a `DenialRecord`,
+//   a `ShellStartRecord`, or a `ToolCallRecord` (tool-call-record.ts; IDs,
+//   closed vocabularies, times, and a tool call's path relative to the
+//   repository) is refused, an unexpected field included. A tool call's path
+//   with a lone surrogate or a Unicode format character (`\p{Cf}`, the bidi
+//   overrides and the BOM included) is refused too; the dispatcher records
+//   such a path as null.
+// - Versions (Project Manager decision of 2026-11-26). The version changes
+//   only when a field of an existing kind is added, removed, or changes its
+//   meaning. A new kind is added under the same version, and the lines of
+//   the kinds before it never change; a reader skips a kind that it does not
+//   know. A value may be added to a closed list of an existing kind (the
+//   result codes of a tool call, the denial reasons, the capability names)
+//   under the same version, and a reader accepts a value that it does not
+//   know. So `tool_call_allowed` (#37, Project Manager decision of
+//   2026-11-26) is a line of version 1, and the lines written before it keep
+//   their meaning.
+// - Two series (Project Manager decision of 2026-11-26). The denials and the
+//   shell starts are written to `enforcement-<8 digits>.jsonl`, and the
+//   allowed tool calls to `enforcement-tool-calls-<8 digits>.jsonl`, in the
+//   same folder. Each series has its own open file, numbering, rotation, size
+//   tracking, wait after failures, and logs, so that tool calls never rotate
+//   a denial or a shell start away.
 // - Append only. A file is opened in append mode and never truncated, and
 //   each record is written with one write call. A write that fails or is
 //   cut short drops the file; a file that does not end with "\n" is never
@@ -30,22 +51,27 @@
 //   that is no longer in place fails the record (`write_failed`).
 // - Durability. The record of an allowed shell start is flushed to disk
 //   (`fsync`) before `record` returns, and so are the lines written before
-//   it. A denial reaches the operating system with its write call, which a
-//   crash of the application does not undo, and reaches the disk with the
-//   next shell start, the next rotation, or when the file is dropped or
-//   closed. Default until the Project Manager decides: a denial loop of a
-//   misbehaving executor then does not flush once for every denial on the
-//   main process.
+//   it in its file; then the open file of the tool calls is flushed too,
+//   ignoring an error, which never fails the start. A denial, and an allowed
+//   tool call, reach the operating system with their write call, which a
+//   crash of the application does not undo, and reach the disk with the
+//   next shell start, the next rotation of their series, or when their file
+//   is dropped or closed. Default until the Project Manager decides: a
+//   denial loop of a misbehaving executor, or the many reads of an agent,
+//   then do not flush once for every record on the main process.
 // - Rotation. A file holds at most `maxFileBytes`. A record that does not
-//   fit starts the next numbered file, and only the newest `maxFiles` files
-//   are kept: the older ones are deleted. A closed file's content is never
-//   changed, and a file is never renamed. Defaults until the Project Manager
-//   decides: 2 MiB per file and 5 files, at most 10 MiB together.
-// - Failure. A record that cannot be written, a denial as well as a shell
-//   start, makes `record` throw an `EnforcementRecordError` with a code from
-//   a closed list, so that the enforcement point denies an allowed shell
-//   start (`record_failed`). The next record opens the folder again; after
-//   two failures in a row, a denial within `ENFORCEMENT_RECORD_RETRY_MS` of
+//   fit starts the next numbered file of its series, and only the newest
+//   `maxFiles` files of each series are kept: the older ones of that series
+//   are deleted. A closed file's content is never changed, and a file is
+//   never renamed. Defaults until the Project Manager decides: 2 MiB per file
+//   and 5 files for each series, so at most 10 MiB for each and 20 MiB
+//   together.
+// - Failure. A record that cannot be written, of any kind, makes `record`
+//   throw an `EnforcementRecordError` with a code from a closed list, so that
+//   the enforcement point denies an allowed shell start (`record_failed`),
+//   and the tool dispatcher refuses an allowed tool call (`record_failed`).
+//   The next record opens the folder again; after two failures of its series
+//   in a row, a denial or a tool call within `ENFORCEMENT_RECORD_RETRY_MS` of
 //   the last attempt fails at once with the last code, but a shell start
 //   always tries to write. A newest file that can never be appended to (a
 //   folder, a read-only file, a link, a file of another owner) is left as it
@@ -61,9 +87,10 @@
 //   the access rules of the local data folder in the person's profile, a
 //   folder link or junction is refused by its `lstat`, and a file link is
 //   refused by the check that the open file is the file at its path.
-// - Logs. Fixed text with a failure code at most, once when the recorder
-//   starts failing and once when it writes again: never a record, an ID, or
-//   a path.
+// - Logs. Fixed text with a failure code at most, for each series once when
+//   it starts failing and once when it writes again (a record refused before
+//   its series is known counts for the denials and shell starts): never a
+//   record, an ID, or a path.
 //
 // The single-instance lock (data-folder.ts) keeps every other instance of
 // the application from writing to the same folder.
@@ -78,11 +105,17 @@ import {
   UtcTimestampSchema,
 } from "@mymandev/protocol";
 import * as z from "zod";
+import { parseRepositoryPath } from "../tools/repository-path.ts";
 import {
   ENFORCEMENT_DENIAL_REASONS,
   type EnforcementRecord,
   type EnforcementRecorder,
 } from "./enforcement.ts";
+import {
+  isRecordablePathText,
+  TOOL_CALL_RECORD_RESULTS,
+  TOOL_NAME_PATTERN,
+} from "./tool-call-record.ts";
 
 /** The folder of the record files, inside the local data folder. */
 export const ENFORCEMENT_RECORD_FOLDER = "enforcement-records";
@@ -101,16 +134,19 @@ export interface EnforcementRecordLimits {
 }
 
 /**
- * The defaults until the Project Manager decides: a file holds at most
- * 2 MiB, about 6,000 records, and the newest 5 files are kept, so the records
- * take at most 10 MiB. A line holds at most 1 KiB; a valid record is about
- * 300 bytes.
+ * The defaults until the Project Manager decides, for each of the two
+ * series: a file holds at most 2 MiB, about 6,000 records, and the newest 5
+ * files are kept, so each series takes at most 10 MiB, and both at most
+ * 20 MiB. A line holds at most 8 KiB, so that a tool call's record holds the
+ * longest path that a tool takes (`MAX_REPOSITORY_PATH_LENGTH`, 1,024 UTF-16
+ * code units, at most 6 bytes each as the line writes them); a denial or a
+ * shell start is about 300 bytes.
  */
 export const ENFORCEMENT_RECORD_LIMITS: EnforcementRecordLimits = Object.freeze(
   {
     maxFileBytes: 2 * 1024 * 1024,
     maxFiles: 5,
-    maxRecordBytes: 1024,
+    maxRecordBytes: 8 * 1024,
   },
 );
 
@@ -121,25 +157,42 @@ export const ENFORCEMENT_RECORD_FILE_MODE = 0o600;
 export const ENFORCEMENT_RECORD_FOLDER_MODE = 0o700;
 
 /**
- * After two failures in a row, a denial within this many milliseconds of the
- * last attempt fails at once with the last code, without touching the disk;
- * a shell start always tries to write. Default until the Project Manager
- * decides.
+ * After two failures of its series in a row, a denial or a tool call within
+ * this many milliseconds of the last attempt fails at once with the last
+ * code, without touching the disk; a shell start always tries to write.
+ * Default until the Project Manager decides.
  */
 export const ENFORCEMENT_RECORD_RETRY_MS = 1000;
 
 /**
- * The name of a record file: its number, exactly 8 digits, so that two names
- * never have the same number.
+ * The name of a record file of the denials and shell starts: its number,
+ * exactly 8 digits, so that two names never have the same number.
  */
 const FILE_NAME = /^enforcement-(\d{8})\.jsonl$/u;
+
+/**
+ * The name of a record file of the allowed tool calls, a series of its own:
+ * its number, exactly 8 digits.
+ */
+const TOOL_CALL_FILE_NAME = /^enforcement-tool-calls-(\d{8})\.jsonl$/u;
 
 /** The highest file number; a later file fails with `open_failed`. */
 export const ENFORCEMENT_RECORD_MAX_SEQUENCE = 99_999_999;
 
-/** The name of record file number `sequence`, 1 to the highest number. */
+/**
+ * The name of record file number `sequence` of the denials and shell starts,
+ * 1 to the highest number.
+ */
 export function enforcementRecordFileName(sequence: number): string {
   return `enforcement-${String(sequence).padStart(8, "0")}.jsonl`;
+}
+
+/**
+ * The name of record file number `sequence` of the allowed tool calls, 1 to
+ * the highest number.
+ */
+export function enforcementToolCallFileName(sequence: number): string {
+  return `enforcement-tool-calls-${String(sequence).padStart(8, "0")}.jsonl`;
 }
 
 /**
@@ -188,7 +241,8 @@ export function enforcementRecordFileFlags(
  * Why a record was not written, a closed list:
  *
  * - `record_invalid`: the record is not a denial or a shell start of the
- *   enforcement point, or it has another field.
+ *   enforcement point, or a tool call of the dispatcher, or it has another
+ *   field.
  * - `record_too_large`: its line is longer than `maxRecordBytes`.
  * - `folder_unavailable`: the folder cannot be resolved, created, or
  *   listed.
@@ -381,9 +435,37 @@ const ShellStartLineSchema = z.strictObject({
   at: UtcTimestampSchema,
 });
 
+/**
+ * A tool call's path: exactly a path that passes the lexical rules of
+ * `parseRepositoryPath`, so relative to the repository, in POSIX form, and
+ * never absolute, a drive, or a UNC path; and text that may be recorded
+ * (`isRecordablePathText`: no lone surrogate, no format character).
+ */
+const RecordPathSchema = z.string().refine((value) => {
+  if (!isRecordablePathText(value)) {
+    return false;
+  }
+  const parsed = parseRepositoryPath(value);
+  return parsed.ok && parsed.path.text === value;
+});
+
+const ToolCallLineSchema = z.strictObject({
+  kind: z.literal("tool_call_allowed"),
+  tool: z.string().regex(TOOL_NAME_PATTERN),
+  capability: CapabilitySchema,
+  path: RecordPathSchema.nullable(),
+  result: z.enum(TOOL_CALL_RECORD_RESULTS),
+  runId: RunIdSchema,
+  agentId: AgentIdSchema,
+  repositoryId: RepositoryIdSchema,
+  providerConnectionId: ProviderConnectionIdSchema.nullable(),
+  at: UtcTimestampSchema,
+});
+
 const RecordLineSchema = z.discriminatedUnion("kind", [
   DenialLineSchema,
   ShellStartLineSchema,
+  ToolCallLineSchema,
 ]);
 
 /**
@@ -428,36 +510,72 @@ export function enforcementRecordLine(
   }
   const record = parsed.data;
   const version = ENFORCEMENT_RECORD_FORMAT_VERSION;
-  const line = JSON.stringify(
-    record.kind === "denied"
-      ? {
-          version,
-          kind: record.kind,
-          reason: record.reason,
-          capability: record.capability,
-          runId: record.runId,
-          agentId: record.agentId,
-          repositoryId: record.repositoryId,
-          providerConnectionId: record.providerConnectionId,
-          at: record.at,
-        }
-      : {
-          version,
-          kind: record.kind,
-          runId: record.runId,
-          agentId: record.agentId,
-          repositoryId: record.repositoryId,
-          at: record.at,
-        },
+  let fields: Record<string, unknown>;
+  switch (record.kind) {
+    case "denied":
+      fields = {
+        version,
+        kind: record.kind,
+        reason: record.reason,
+        capability: record.capability,
+        runId: record.runId,
+        agentId: record.agentId,
+        repositoryId: record.repositoryId,
+        providerConnectionId: record.providerConnectionId,
+        at: record.at,
+      };
+      break;
+    case "shell_start_allowed":
+      fields = {
+        version,
+        kind: record.kind,
+        runId: record.runId,
+        agentId: record.agentId,
+        repositoryId: record.repositoryId,
+        at: record.at,
+      };
+      break;
+    case "tool_call_allowed":
+      fields = {
+        version,
+        kind: record.kind,
+        tool: record.tool,
+        capability: record.capability,
+        path: record.path,
+        result: record.result,
+        runId: record.runId,
+        agentId: record.agentId,
+        repositoryId: record.repositoryId,
+        providerConnectionId: record.providerConnectionId,
+        at: record.at,
+      };
+      break;
+    default: {
+      // A new kind does not compile until its line is written here.
+      const unknownKind: never = record;
+      return unknownKind;
+    }
+  }
+  return { kind: record.kind, line: lineText(fields) };
+}
+
+/**
+ * The JSON text of a line's fields, with U+2028 and U+2029 escaped as well,
+ * so that no reader splits a line at them; it is still the same JSON.
+ */
+function lineText(fields: Record<string, unknown>): string {
+  return JSON.stringify(fields).replace(/[\u2028\u2029]/gu, (separator) =>
+    separator === "\u2028" ? "\\u2028" : "\\u2029",
   );
-  return { kind: record.kind, line };
 }
 
 /** The open record file. */
 interface OpenFile {
   readonly fd: number;
   readonly sequence: number;
-  /** Its path, in the folder resolved when it was opened. */
+  /** The folder it is in, resolved when it was opened. */
+  readonly folder: string;
+  /** Its path, in that folder. */
   readonly file: string;
   size: number;
 }
@@ -468,6 +586,25 @@ interface Retry {
   readonly failures: number;
   /** A denial before this time fails at once. */
   readonly notBefore: number;
+}
+
+/**
+ * A series of record files, with its own names, its own rotation and size
+ * tracking, and its own state of failure: one for the denials and shell
+ * starts, and one for the allowed tool calls, so that tool calls never rotate
+ * a denial or a shell start away.
+ */
+interface Series {
+  /** The name of its file number `sequence`. */
+  readonly fileName: (sequence: number) => string;
+  /** The names of its files, with the number. */
+  readonly pattern: RegExp;
+  /** Its open file. */
+  current: OpenFile | null;
+  /** The code of its last failure, or null while its records are written. */
+  failing: EnforcementRecordFailure | null;
+  /** Its failures of the disk in a row, or null after a write. */
+  retry: Retry | null;
 }
 
 /** The failures that come from the disk, after which a denial may wait. */
@@ -489,8 +626,6 @@ export function createFileEnforcementRecorder(
 ): FileEnforcementRecorder {
   const { platform, log } = options;
   const resolveFolder = options.folder;
-  /** The folder of the open file, resolved when it was opened. */
-  let folder = "";
   const fileSystem = options.fileSystem ?? nodeRecorderFileSystem;
   const limits = options.limits ?? ENFORCEMENT_RECORD_LIMITS;
   const now = options.now ?? (() => performance.now());
@@ -498,12 +633,23 @@ export function createFileEnforcementRecorder(
   const appendFlags = enforcementRecordFileFlags(platform, false);
   const createFlags = enforcementRecordFileFlags(platform, true);
 
-  let current: OpenFile | null = null;
+  /** The denials and the shell starts. */
+  const records: Series = {
+    fileName: enforcementRecordFileName,
+    pattern: FILE_NAME,
+    current: null,
+    failing: null,
+    retry: null,
+  };
+  /** The allowed tool calls. */
+  const toolCalls: Series = {
+    fileName: enforcementToolCallFileName,
+    pattern: TOOL_CALL_FILE_NAME,
+    current: null,
+    failing: null,
+    retry: null,
+  };
   let closed = false;
-  /** The code of the last failure, or null while records are written. */
-  let failing: EnforcementRecordFailure | null = null;
-  /** The failures of the disk in a row, or null after a write. */
-  let retry: Retry | null = null;
 
   function report(message: string): void {
     try {
@@ -545,13 +691,13 @@ export function createFileEnforcementRecorder(
   }
 
   /**
-   * Drops the open file: flushes it, ignoring an error, so that the denials
-   * written to it reach the disk when they can, and closes it.
+   * Drops the open file of the series: flushes it, ignoring an error, so that
+   * the denials written to it reach the disk when they can, and closes it.
    */
-  function dropCurrent(): void {
-    if (current !== null) {
-      const { fd } = current;
-      current = null;
+  function dropCurrent(series: Series): void {
+    if (series.current !== null) {
+      const { fd } = series.current;
+      series.current = null;
       try {
         fileSystem.fsyncSync(fd);
       } catch {
@@ -584,14 +730,14 @@ export function createFileEnforcementRecorder(
     }
   }
 
-  /** The numbers of the record files in the folder, ascending. */
-  function sequences(): number[] {
+  /** The numbers of the series' files in the folder, ascending. */
+  function sequences(series: Series, folder: string): number[] {
     const names = step("folder_unavailable", () =>
       fileSystem.readdirSync(folder),
     );
     const found: number[] = [];
     for (const name of names) {
-      const match = FILE_NAME.exec(name);
+      const match = series.pattern.exec(name);
       const sequence = match === null ? NaN : Number(match[1]);
       if (Number.isSafeInteger(sequence)) {
         found.push(sequence);
@@ -605,7 +751,7 @@ export function createFileEnforcementRecorder(
    * not a link, and restricts it to its owner on macOS and Linux, also when
    * it already existed.
    */
-  function prepareFolder(): void {
+  function prepareFolder(folder: string): void {
     step("folder_unavailable", () =>
       fileSystem.mkdirSync(folder, {
         recursive: true,
@@ -624,7 +770,7 @@ export function createFileEnforcementRecorder(
   }
 
   /** Makes a new folder entry durable; Windows cannot open a folder. */
-  function syncFolder(): void {
+  function syncFolder(folder: string): void {
     if (!posix) {
       return;
     }
@@ -643,12 +789,16 @@ export function createFileEnforcementRecorder(
     }
   }
 
-  /** Creates record file number `sequence`, which must not exist. */
-  function createFile(sequence: number): OpenFile {
+  /** Creates the series' file number `sequence`, which must not exist. */
+  function createFile(
+    series: Series,
+    folder: string,
+    sequence: number,
+  ): OpenFile {
     if (sequence > ENFORCEMENT_RECORD_MAX_SEQUENCE) {
       throw new EnforcementRecordError("open_failed");
     }
-    const file = path.join(folder, enforcementRecordFileName(sequence));
+    const file = path.join(folder, series.fileName(sequence));
     // `O_EXCL`: never append to a file that this recorder did not expect.
     const fd = step("open_failed", () =>
       fileSystem.openSync(file, createFlags, ENFORCEMENT_RECORD_FILE_MODE),
@@ -660,7 +810,7 @@ export function createFileEnforcementRecorder(
     }
     try {
       step("open_failed", () => restrict(fd));
-      syncFolder();
+      syncFolder(folder);
     } catch (error) {
       // The new file is empty and was created exclusively: it is deleted,
       // so that a failure that repeats never leaves a file per record. It is
@@ -676,17 +826,21 @@ export function createFileEnforcementRecorder(
       closeQuietly(fd);
       throw error;
     }
-    return { fd, sequence, file, size: 0 };
+    return { fd, sequence, folder, file, size: 0 };
   }
 
   /**
-   * Opens the newest record file to append to it, or null when it must not
+   * Opens the series' newest file to append to it, or null when it must not
    * be appended to: it is full, it does not end with "\n", or it can never
    * be appended to (a folder, a read-only file, a link, a file of another
    * owner, or gone). Another failure, which may pass, throws `open_failed`.
    */
-  function reopenFile(sequence: number): OpenFile | null {
-    const file = path.join(folder, enforcementRecordFileName(sequence));
+  function reopenFile(
+    series: Series,
+    folder: string,
+    sequence: number,
+  ): OpenFile | null {
+    const file = path.join(folder, series.fileName(sequence));
     let fd: number;
     try {
       // No `O_CREAT`: a file that vanished is created by `createFile`.
@@ -742,18 +896,23 @@ export function createFileEnforcementRecorder(
         }
         throw new EnforcementRecordError("open_failed");
       }
-      return { fd, sequence, file, size };
+      return { fd, sequence, folder, file, size };
     } catch (error) {
       closeQuietly(fd);
       throw error;
     }
   }
 
-  /** Deletes the oldest record files beyond `maxFiles`. Never throws. */
-  function prune(newest: number): void {
+  /**
+   * Deletes the oldest files of the series beyond `maxFiles`; the files of
+   * the other series are never counted or deleted. Never throws.
+   */
+  function prune(series: Series, folder: string, newest: number): void {
     let found: number[];
     try {
-      found = sequences().filter((sequence) => sequence <= newest);
+      found = sequences(series, folder).filter(
+        (sequence) => sequence <= newest,
+      );
     } catch {
       report(OLD_FILE_NOT_DELETED_MESSAGE);
       return;
@@ -762,9 +921,7 @@ export function createFileEnforcementRecorder(
     let failed = false;
     for (const sequence of found.slice(0, Math.max(0, excess))) {
       try {
-        fileSystem.unlinkSync(
-          path.join(folder, enforcementRecordFileName(sequence)),
-        );
+        fileSystem.unlinkSync(path.join(folder, series.fileName(sequence)));
       } catch {
         failed = true;
       }
@@ -775,66 +932,83 @@ export function createFileEnforcementRecorder(
   }
 
   /**
-   * The open file, when it is still in place; otherwise the folder is
-   * resolved and prepared again, and the newest file is opened, or the next
-   * one created. At most one file is created per call.
+   * The series' open file, when it is still in place; otherwise the folder
+   * is resolved and prepared again, and the series' newest file is opened,
+   * or its next one created. At most one file is created per call.
    */
-  function openCurrent(): OpenFile {
+  function openCurrent(series: Series): OpenFile {
+    const { current } = series;
     if (current !== null) {
       if (inPlace(current.fd, current.file)) {
         return current;
       }
       // Deleted, or renamed and replaced: what it holds is no longer at its
       // path, so the record goes to the file at the path.
-      dropCurrent();
+      dropCurrent(series);
     }
-    folder = step("folder_unavailable", () => {
+    const folder = step("folder_unavailable", () => {
       const resolved: unknown = resolveFolder();
       if (typeof resolved !== "string" || !path.isAbsolute(resolved)) {
         throw new TypeError("The record folder is not an absolute path.");
       }
       return resolved;
     });
-    prepareFolder();
-    const found = sequences();
+    prepareFolder(folder);
+    const found = sequences(series, folder);
     const newest = found.at(-1);
     const opened =
-      (newest === undefined ? null : reopenFile(newest)) ??
-      createFile((newest ?? 0) + 1);
-    current = opened;
-    prune(opened.sequence);
+      (newest === undefined ? null : reopenFile(series, folder, newest)) ??
+      createFile(series, folder, (newest ?? 0) + 1);
+    series.current = opened;
+    prune(series, folder, opened.sequence);
     return opened;
   }
 
-  /** Flushes and closes the open file and creates the next one. */
-  function rotate(open: OpenFile): OpenFile {
-    current = null;
+  /**
+   * Flushes and closes the series' open file and creates its next one, in
+   * the same folder.
+   */
+  function rotate(series: Series, open: OpenFile): OpenFile {
+    series.current = null;
     try {
       step("sync_failed", () => fileSystem.fsyncSync(open.fd));
     } finally {
       closeQuietly(open.fd);
     }
-    const next = createFile(open.sequence + 1);
-    current = next;
-    prune(next.sequence);
+    const next = createFile(series, open.folder, open.sequence + 1);
+    series.current = next;
+    prune(series, open.folder, next.sequence);
     return next;
   }
 
-  function write(entry: EnforcementRecord): void {
-    if (closed) {
-      throw new EnforcementRecordError("recorder_closed");
+  /**
+   * Flushes the open file of the series, ignoring an error: the tool calls
+   * written before a shell start reach the disk with it.
+   */
+  function flushQuietly(series: Series): void {
+    if (series.current !== null) {
+      try {
+        fileSystem.fsyncSync(series.current.fd);
+      } catch {
+        // Flushed at its next rotation, drop, or close.
+      }
     }
-    const validated = enforcementRecordLine(entry);
-    if (validated === null) {
-      throw new EnforcementRecordError("record_invalid");
-    }
+  }
+
+  /** Writes the validated line to its series, or throws. */
+  function write(
+    series: Series,
+    validated: NonNullable<ReturnType<typeof enforcementRecordLine>>,
+  ): void {
     const bytes = Buffer.from(`${validated.line}\n`, "utf8");
     if (bytes.length > limits.maxRecordBytes) {
       throw new EnforcementRecordError("record_too_large");
     }
     const shellStart = validated.kind === "shell_start_allowed";
-    // A shell start always tries to write; a denial after two failures in a
-    // row waits, so that a denial loop does not open the folder each time.
+    // A shell start always tries to write; a denial or a tool call after two
+    // failures of its series in a row waits, so that a loop does not open the
+    // folder each time.
+    const { retry } = series;
     if (
       !shellStart &&
       retry !== null &&
@@ -844,9 +1018,9 @@ export function createFileEnforcementRecorder(
       throw new EnforcementRecordError(retry.code);
     }
     try {
-      let open = openCurrent();
+      let open = openCurrent(series);
       if (open.size > 0 && open.size + bytes.length > limits.maxFileBytes) {
-        open = rotate(open);
+        open = rotate(series, open);
       }
       // One write call for the whole line.
       const written = step("write_failed", () =>
@@ -863,17 +1037,18 @@ export function createFileEnforcementRecorder(
         if (!inPlace(open.fd, open.file)) {
           throw new EnforcementRecordError("write_failed");
         }
+        flushQuietly(toolCalls);
       }
     } catch (error) {
-      // The file is dropped: the next record opens the folder again, and a
-      // file with a torn line is never appended to.
-      dropCurrent();
+      // The file is dropped: the next record of the series opens the folder
+      // again, and a file with a torn line is never appended to.
+      dropCurrent(series);
       const failure =
         error instanceof EnforcementRecordError
           ? error
           : new EnforcementRecordError("write_failed");
       if (DISK_FAILURES.has(failure.code)) {
-        retry = {
+        series.retry = {
           code: failure.code,
           failures: (retry?.failures ?? 0) + 1,
           notBefore: clock() + ENFORCEMENT_RECORD_RETRY_MS,
@@ -881,26 +1056,39 @@ export function createFileEnforcementRecorder(
       }
       throw failure;
     }
-    retry = null;
+    series.retry = null;
   }
 
   return Object.freeze({
     record: (entry: EnforcementRecord): undefined => {
+      // A record refused before its series is known counts for the series
+      // of the denials and shell starts.
+      let series = records;
       try {
-        write(entry);
+        if (closed) {
+          throw new EnforcementRecordError("recorder_closed");
+        }
+        const validated = enforcementRecordLine(entry);
+        if (validated === null) {
+          throw new EnforcementRecordError("record_invalid");
+        }
+        if (validated.kind === "tool_call_allowed") {
+          series = toolCalls;
+        }
+        write(series, validated);
       } catch (error) {
         const failure =
           error instanceof EnforcementRecordError
             ? error
             : new EnforcementRecordError("write_failed");
-        if (failing !== failure.code) {
-          failing = failure.code;
+        if (series.failing !== failure.code) {
+          series.failing = failure.code;
           report(recordFailureMessage(failure.code));
         }
         throw failure;
       }
-      if (failing !== null) {
-        failing = null;
+      if (series.failing !== null) {
+        series.failing = null;
         report(RECORDS_WRITTEN_AGAIN_MESSAGE);
       }
       return undefined;
@@ -911,7 +1099,8 @@ export function createFileEnforcementRecorder(
       }
       closed = true;
       // Flushed and closed.
-      dropCurrent();
+      dropCurrent(records);
+      dropCurrent(toolCalls);
     },
   });
 }

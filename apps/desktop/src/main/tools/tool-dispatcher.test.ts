@@ -27,6 +27,10 @@ import {
   type ToolRunOutcome,
   TOOL_CALL_REFUSALS,
 } from "./tool-dispatcher.ts";
+import {
+  TOOL_CALL_RECORD_RESULTS,
+  type ToolCallRecord,
+} from "../permissions/tool-call-record.ts";
 
 const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000000001";
 const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000002";
@@ -89,6 +93,8 @@ function probeTool(
     name,
     capability,
     input: z.strictObject({ value: z.string() }),
+    // The probe's value is its path, for the record.
+    recordPath: (input) => input.value,
     run: (input, context) => {
       runs.push({ input, context });
       return answer(input, context);
@@ -142,9 +148,13 @@ function setup(
     resolve?: (
       repositoryId: RepositoryId,
     ) => Promise<RepositoryFolderResolution>;
+    /** The recorder's `record`; it takes every record by default. */
+    record?: (entry: EnforcementRecord) => unknown;
+    now?: () => Date;
   } = {},
 ) {
   const resolutions: RepositoryId[] = [];
+  const records: EnforcementRecord[] = [];
   const dispatcher = createToolDispatcher({
     registry: createToolRegistry(tools),
     resolveFolder: async (repositoryId) => {
@@ -153,6 +163,15 @@ function setup(
         ? { ok: true, repositoryId, folder: FOLDER, identity: IDENTITY }
         : options.resolve(repositoryId);
     },
+    recorder: {
+      record: (entry) => {
+        records.push(entry);
+        return (
+          options.record === undefined ? undefined : options.record(entry)
+        ) as undefined;
+      },
+    },
+    now: options.now ?? (() => new Date(NOW)),
   });
   const checker = fakeCheck(options.decide ?? allowRepo());
   const controller = new AbortController();
@@ -161,7 +180,24 @@ function setup(
     check: checker.check,
     signal: controller.signal,
   };
-  return { dispatcher, checker, controller, context, resolutions };
+  return { dispatcher, checker, controller, context, resolutions, records };
+}
+
+/** The record of an allowed call of the probe, with `fields` changed. */
+function callRecord(fields: Partial<ToolCallRecord> = {}): ToolCallRecord {
+  return {
+    kind: "tool_call_allowed",
+    tool: "probe",
+    capability: "repo.read",
+    path: "x",
+    result: "ok",
+    runId: RUN_ID,
+    agentId: AGENT_ID,
+    repositoryId: REPOSITORY_ID,
+    providerConnectionId: PROVIDER_CONNECTION_ID,
+    at: new Date(NOW).toISOString(),
+    ...fields,
+  } as ToolCallRecord;
 }
 
 test("the refusal codes are a closed list", () => {
@@ -179,8 +215,21 @@ test("the refusal codes are a closed list", () => {
     "answer_too_large",
     "answer_has_path",
     "tool_failed",
+    "record_failed",
   ]);
   expect(Object.isFrozen(TOOL_CALL_REFUSALS)).toBe(true);
+  // A recorded result is `ok` or a refusal after the check; never one that
+  // comes before or at it, nor the record's own failure.
+  expect(TOOL_CALL_RECORD_RESULTS).toEqual([
+    "ok",
+    ...TOOL_CALL_REFUSALS.filter(
+      (code) =>
+        code !== "unknown_tool" &&
+        code !== "denied" &&
+        code !== "record_failed",
+    ),
+  ]);
+  expect(Object.isFrozen(TOOL_CALL_RECORD_RESULTS)).toBe(true);
 });
 
 test("an allowed call checks exactly the tool's capability for the run's agent and repository, then resolves the folder and runs the tool, and ends the held action", async () => {
@@ -694,6 +743,12 @@ function grant(
 
 function realEnforcement(records: readonly GrantRecord[]) {
   const recorded: EnforcementRecord[] = [];
+  const recorder = {
+    record: (entry: EnforcementRecord): undefined => {
+      recorded.push(entry);
+      return undefined;
+    },
+  };
   const enforcement = createPermissionEnforcement({
     now: () => new Date(NOW),
     grantStore: { read: () => ({ usable: true, records }) },
@@ -709,14 +764,9 @@ function realEnforcement(records: readonly GrantRecord[]) {
         },
       }) as unknown as DeviceSessionState,
     thisDevice: () => DEVICE_ID as never,
-    recorder: {
-      record: (entry) => {
-        recorded.push(entry);
-        return undefined;
-      },
-    },
+    recorder,
   });
-  return { enforcement, recorded };
+  return { enforcement, recorded, recorder };
 }
 
 /** The executor's `check` over the enforcement point, as the supervisor gives it. */
@@ -732,7 +782,7 @@ function realSetup(
   tools: readonly Tool[],
   run = RUN,
 ) {
-  const { enforcement, recorded } = realEnforcement(records);
+  const { enforcement, recorded, recorder } = realEnforcement(records);
   const resolutions: RepositoryId[] = [];
   const dispatcher = createToolDispatcher({
     registry: createToolRegistry(tools),
@@ -740,6 +790,8 @@ function realSetup(
       resolutions.push(repositoryId);
       return { ok: true, repositoryId, folder: FOLDER, identity: IDENTITY };
     },
+    recorder,
+    now: () => new Date(NOW),
   });
   const context: ToolCallContext = {
     run,
@@ -789,11 +841,15 @@ test("each tool is checked for its own capability only: a grant of repo.read all
     await harness.dispatcher.call(harness.context, "writer", { value: "x" }),
   ).toEqual({ ok: false, code: "denied", reason: "no_grant" });
   expect(write.runs).toEqual([]);
+  // The enforcement point recorded the denial, and the dispatcher the
+  // allowed call, in the same recorder.
   expect(
-    harness.recorded.map(
-      (entry) => entry.kind === "denied" && entry.capability,
+    harness.recorded.map((entry) =>
+      entry.kind === "shell_start_allowed"
+        ? entry.kind
+        : `${entry.kind} ${entry.capability}`,
     ),
-  ).toEqual(["repo.write"]);
+  ).toEqual(["tool_call_allowed repo.read", "denied repo.write"]);
 });
 
 test("a run without a repository is denied and recorded, and runs nothing", async () => {
@@ -807,4 +863,386 @@ test("a run without a repository is denied and recorded, and runs nothing", asyn
   expect(read.runs).toEqual([]);
   expect(harness.recorded).toHaveLength(1);
   expect(harness.recorded[0]?.kind).toBe("denied");
+});
+
+// Records of allowed calls (#37, Project Manager decision of 2026-11-26).
+
+test("an allowed call writes exactly one record, with the tool, its capability, the path, the result, the run's IDs, and the time, and nothing of its input or answer", async () => {
+  const content = "export const secretContent = 1;";
+  const probe = probeTool("probe", "repo.read", async (input) => ({
+    ok: true,
+    result: { path: input.value, content },
+  }));
+  const harness = setup([probe.tool]);
+  const answer = await harness.dispatcher.call(harness.context, "probe", {
+    value: "src/a.ts",
+  });
+  expect(answer).toEqual({
+    ok: true,
+    tool: "probe",
+    result: { path: "src/a.ts", content },
+  });
+  expect(harness.records).toEqual([callRecord({ path: "src/a.ts" })]);
+  const [entry] = harness.records;
+  expect(Object.isFrozen(entry)).toBe(true);
+  expect(Object.keys(entry ?? {})).toEqual([
+    "kind",
+    "tool",
+    "capability",
+    "runId",
+    "agentId",
+    "repositoryId",
+    "providerConnectionId",
+    "path",
+    "result",
+    "at",
+  ]);
+  const text = JSON.stringify(harness.records);
+  expect(text).not.toContain("secretContent");
+  expect(text).not.toContain(FOLDER);
+  expect(text).not.toContain("secret-web");
+});
+
+test("the record is of the request that was checked, and the clock is read for it", async () => {
+  let reads = 0;
+  const probe = probeTool("probe", "repo.write");
+  const harness = setup([probe.tool], {
+    decide: allowRepo("repo.write"),
+    now: () => {
+      reads += 1;
+      return new Date(NOW + 5_000);
+    },
+  });
+  await harness.dispatcher.call(harness.context, "probe", { value: "x" });
+  expect(harness.records).toEqual([
+    callRecord({
+      capability: "repo.write",
+      at: new Date(NOW + 5_000).toISOString(),
+    }),
+  ]);
+  expect(reads).toBe(1);
+});
+
+test("every answer of an allowed call is recorded once, with its result code", async () => {
+  const cases: {
+    readonly name: string;
+    readonly answer?: (
+      input: { value: string },
+      context: ToolRunContext,
+    ) => Promise<ToolRunOutcome>;
+    readonly resolve?: () => Promise<RepositoryFolderResolution>;
+    readonly result: string;
+  }[] = [
+    {
+      name: "a tool's own refusal",
+      answer: async () => ({
+        ok: false,
+        code: "path_refused",
+        reason: "outside",
+      }),
+      result: "path_refused",
+    },
+    {
+      name: "nothing at the path",
+      answer: async () => ({ ok: false, code: "not_found" }),
+      result: "not_found",
+    },
+    {
+      name: "a tool that rejects",
+      answer: () => Promise.reject(new Error(FOLDER)),
+      result: "tool_failed",
+    },
+    {
+      name: "an answer too large",
+      answer: async () => ({
+        ok: true,
+        result: { s: "a".repeat(MAX_TOOL_ANSWER_BYTES) },
+      }),
+      result: "answer_too_large",
+    },
+    {
+      name: "an answer that holds the folder",
+      answer: async () => ({ ok: true, result: { leaked: FOLDER } }),
+      result: "answer_has_path",
+    },
+    {
+      name: "a repository that does not resolve",
+      resolve: async () => ({ ok: false, reason: "not_linked" }),
+      result: "repository_unavailable",
+    },
+  ];
+  for (const { name, answer, resolve, result } of cases) {
+    const probe = probeTool("probe", "repo.read", answer);
+    const harness = setup(
+      [probe.tool],
+      resolve === undefined ? {} : { resolve },
+    );
+    const given = await harness.dispatcher.call(harness.context, "probe", {
+      value: "src/a.ts",
+    });
+    expect(given, name).toMatchObject({ ok: false, code: result });
+    expect(harness.records, name).toEqual([
+      callRecord({ path: "src/a.ts", result } as Partial<ToolCallRecord>),
+    ]);
+    expect(JSON.stringify(harness.records), name).not.toContain(FOLDER);
+  }
+});
+
+test("an invalid input is recorded as invalid_input without a path", async () => {
+  const probe = probeTool("probe");
+  const harness = setup([probe.tool]);
+  for (const input of [
+    { value: "x", path: "/etc/passwd" },
+    { value: 7 },
+    undefined,
+  ]) {
+    expect(
+      await harness.dispatcher.call(harness.context, "probe", input),
+    ).toEqual({ ok: false, code: "invalid_input" });
+  }
+  expect(harness.records).toEqual([
+    callRecord({ path: null, result: "invalid_input" }),
+    callRecord({ path: null, result: "invalid_input" }),
+    callRecord({ path: null, result: "invalid_input" }),
+  ]);
+  expect(JSON.stringify(harness.records)).not.toContain("passwd");
+});
+
+test("an abort after the check is recorded as aborted, once, when the call answers; the tool's late answer adds nothing", async () => {
+  const work = deferred<ToolRunOutcome>();
+  const probe = probeTool("probe", "repo.read", () => work.promise);
+  const harness = setup([probe.tool]);
+  const answer = harness.dispatcher.call(harness.context, "probe", {
+    value: "src",
+  });
+  await settle();
+  expect(harness.records).toEqual([]);
+  harness.controller.abort();
+  expect(await answer).toEqual({ ok: false, code: "aborted" });
+  expect(harness.records).toEqual([
+    callRecord({ path: "src", result: "aborted" }),
+  ]);
+  work.resolve({ ok: true, result: { late: true } });
+  await settle();
+  expect(harness.records).toHaveLength(1);
+
+  // An abort while the folder resolves is recorded the same way.
+  const resolution = deferred<RepositoryFolderResolution>();
+  const resolving = setup([probe.tool], { resolve: () => resolution.promise });
+  const early = resolving.dispatcher.call(resolving.context, "probe", {
+    value: "src",
+  });
+  await settle();
+  resolving.controller.abort();
+  expect(await early).toEqual({ ok: false, code: "aborted" });
+  expect(resolving.records).toEqual([
+    callRecord({ path: "src", result: "aborted" }),
+  ]);
+});
+
+test("a call refused before or at the check is not recorded by the dispatcher", async () => {
+  const probe = probeTool("probe");
+  const unknown = setup([probe.tool]);
+  await unknown.dispatcher.call(unknown.context, "missing", { value: "x" });
+  const aborted = setup([probe.tool]);
+  aborted.controller.abort();
+  await aborted.dispatcher.call(aborted.context, "probe", { value: "x" });
+  const denied = setup([probe.tool], {
+    decide: () => ({ allowed: false, reason: "no_grant" }),
+  });
+  await denied.dispatcher.call(denied.context, "probe", { value: "x" });
+  const throwing = setup([probe.tool], {
+    decide: () => {
+      throw new Error("check failed");
+    },
+  });
+  await throwing.dispatcher.call(throwing.context, "probe", { value: "x" });
+  const elsewhere = setup([probe.tool], {
+    decide: () => ({
+      allowed: true,
+      request: {
+        agentId: AGENT_ID,
+        capability: "repo.read",
+        repositoryId: OTHER_REPOSITORY_ID,
+      },
+    }),
+  });
+  await elsewhere.dispatcher.call(elsewhere.context, "probe", { value: "x" });
+  for (const harness of [unknown, aborted, denied, throwing, elsewhere]) {
+    expect(harness.records).toEqual([]);
+  }
+  expect(probe.runs).toEqual([]);
+});
+
+test("a record that is not taken withholds the answer with record_failed; the tool ran and its held action ends", async () => {
+  const rejected = Promise.reject(new Error("not written"));
+  const records: ((entry: EnforcementRecord) => unknown)[] = [
+    () => {
+      throw new Error("write_failed");
+    },
+    () => rejected,
+    () => true,
+    () => null,
+  ];
+  for (const record of records) {
+    const probe = probeTool("probe", "repo.read", async () => ({
+      ok: true,
+      result: { content: "secret content" },
+    }));
+    const harness = setup([probe.tool], { record });
+    expect(
+      await harness.dispatcher.call(harness.context, "probe", { value: "x" }),
+    ).toEqual({ ok: false, code: "record_failed" });
+    expect(probe.runs).toHaveLength(1);
+    expect(harness.records).toHaveLength(1);
+    await settle();
+    expect(harness.checker.ends).toBe(1);
+  }
+  // A refusal is withheld the same way.
+  const probe = probeTool("probe");
+  const harness = setup([probe.tool], {
+    record: () => {
+      throw new Error("write_failed");
+    },
+  });
+  expect(
+    await harness.dispatcher.call(harness.context, "probe", { value: 7 }),
+  ).toEqual({ ok: false, code: "record_failed" });
+});
+
+test("a clock without a valid time fails the record: record_failed, and nothing is recorded", async () => {
+  for (const now of [
+    () => {
+      throw new Error("clock");
+    },
+    () => new Date(Number.NaN),
+    () => ({ getTime: () => NOW }) as unknown as Date,
+  ]) {
+    const probe = probeTool("probe");
+    const harness = setup([probe.tool], { now });
+    expect(
+      await harness.dispatcher.call(harness.context, "probe", { value: "x" }),
+    ).toEqual({ ok: false, code: "record_failed" });
+    expect(harness.records).toEqual([]);
+  }
+});
+
+test("a tool without a record path, or whose record path throws, records a null path", async () => {
+  const plain = defineTool({
+    name: "plain",
+    capability: "repo.read",
+    input: z.strictObject({ value: z.string() }),
+    run: async () => ({ ok: true, result: null }),
+  });
+  const throwing = defineTool({
+    name: "throwing",
+    capability: "repo.read",
+    input: z.strictObject({ value: z.string() }),
+    recordPath: () => {
+      throw new Error(FOLDER);
+    },
+    run: async () => ({ ok: true, result: null }),
+  });
+  const harness = setup([plain, throwing]);
+  await harness.dispatcher.call(harness.context, "plain", { value: "a" });
+  await harness.dispatcher.call(harness.context, "throwing", { value: "a" });
+  expect(harness.records).toEqual([
+    callRecord({ tool: "plain", path: null }),
+    callRecord({ tool: "throwing", path: null }),
+  ]);
+});
+
+test("a hand-built tool whose parse throws fails with tool_failed and writes exactly one tool_failed record without a path", async () => {
+  const tool: Tool = Object.freeze({
+    name: "broken",
+    capability: "repo.read",
+    parse: () => {
+      throw new Error(FOLDER);
+    },
+  });
+  const harness = setup([tool]);
+  expect(
+    await harness.dispatcher.call(harness.context, "broken", { value: "x" }),
+  ).toEqual({ ok: false, code: "tool_failed" });
+  expect(harness.records).toEqual([
+    callRecord({ tool: "broken", path: null, result: "tool_failed" }),
+  ]);
+  expect(harness.checker.ends).toBe(1);
+  expect(harness.resolutions).toEqual([]);
+});
+
+test("a run that answers an object whose ok getter throws fails with tool_failed and writes exactly one tool_failed record", async () => {
+  const probe = probeTool(
+    "probe",
+    "repo.read",
+    async () =>
+      ({
+        get ok(): boolean {
+          throw new Error(FOLDER);
+        },
+      }) as unknown as ToolRunOutcome,
+  );
+  const harness = setup([probe.tool]);
+  expect(
+    await harness.dispatcher.call(harness.context, "probe", { value: "x" }),
+  ).toEqual({ ok: false, code: "tool_failed" });
+  expect(harness.records).toEqual([callRecord({ result: "tool_failed" })]);
+  await settle();
+  expect(harness.checker.ends).toBe(1);
+});
+
+test("an abort that comes after the tool settled, before the call answers, answers aborted and records aborted", async () => {
+  const probe = probeTool("probe");
+  // The held action's end, which runs when the tool settled, aborts the run
+  // one step later: after the tool's answer arrived and before the call
+  // answers.
+  const harness = setup([probe.tool], {
+    decide: () => ({
+      allowed: true,
+      request: {
+        agentId: AGENT_ID,
+        capability: "repo.read",
+        repositoryId: REPOSITORY_ID,
+      },
+      end: () => {
+        queueMicrotask(() => harness.controller.abort());
+      },
+    }),
+  });
+  expect(
+    await harness.dispatcher.call(harness.context, "probe", { value: "x" }),
+  ).toEqual({ ok: false, code: "aborted" });
+  expect(probe.runs).toHaveLength(1);
+  expect(harness.controller.signal.aborted).toBe(true);
+  expect(harness.records).toEqual([callRecord({ result: "aborted" })]);
+});
+
+test("a path with a lone surrogate or a Unicode format character is recorded as null; the call still answers", async () => {
+  const char = (code: number) => String.fromCharCode(code);
+  const unrecordable = [
+    `src/a${char(0xd800)}.ts`,
+    `src/a${char(0xdc00)}`,
+    `src/${char(0x202e)}gpj.exe`,
+    `src/a${char(0x2066)}b`,
+    `${char(0xfeff)}src/a.ts`,
+    `src/a${char(0x200b)}b`,
+    `src/a${char(0xad)}b`,
+  ];
+  // A pair of surrogates, and the line and paragraph separators, are
+  // recorded as they are; the recorder escapes the separators.
+  const recordable = [
+    `src/${String.fromCodePoint(0x1f600)}.md`,
+    `src/a${char(0x2028)}b${char(0x2029)}`,
+  ];
+  const probe = probeTool("probe");
+  const harness = setup([probe.tool]);
+  for (const value of [...unrecordable, ...recordable]) {
+    expect(
+      await harness.dispatcher.call(harness.context, "probe", { value }),
+    ).toEqual({ ok: true, tool: "probe", result: { echo: value } });
+  }
+  expect(harness.records).toEqual([
+    ...unrecordable.map(() => callRecord({ path: null })),
+    ...recordable.map((value) => callRecord({ path: value })),
+  ]);
 });
