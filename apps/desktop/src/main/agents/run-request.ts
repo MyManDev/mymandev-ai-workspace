@@ -393,7 +393,8 @@ export function createRunRequests(
     // The repository that the person chose, if any: one of the open
     // project's that the account linked to a folder on this device, as the
     // project repository service holds them now. One unlinked or removed
-    // since the person chose it is refused, never replaced by another.
+    // since the person chose it is refused, never replaced by another; the
+    // chat's form never replaces it either, and falls back to none (#362).
     if (repositoryId !== null) {
       const held = repositories.state();
       const linkedHere =

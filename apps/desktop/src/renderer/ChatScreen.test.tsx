@@ -699,30 +699,69 @@ test("the repository list is labelled and described, offers No repository first 
   const html = render({ run: runProps(OPEN) });
   const form = `run-form-${OWN_MESSAGE}`;
   expect(html).toContain(
-    `<label for="${form}-repository">${RUN_REQUEST_MESSAGES.repositoryLabel}</label><select id="${form}-repository" aria-describedby="${form}-repository-hint">`,
+    `<label for="${form}-repository">${RUN_REQUEST_MESSAGES.repositoryLabel}</label><select id="${form}-repository" aria-describedby="${form}-repository-hint ${form}-repository-files">`,
   );
   expect(html).toContain(
     `<option value="${NO_REPOSITORY}">${RUN_REQUEST_MESSAGES.noRepository}</option><option value="${RUN_REPOSITORY}" selected="">web</option></select>`,
   );
+  // The hint, and with a repository chosen, what of it is sent.
   expect(html).toContain(
-    `<p class="run-hint" id="${form}-repository-hint">${escaped(RUN_REQUEST_MESSAGES.repositoryHint)}</p>`,
+    `<p class="run-hint" id="${form}-repository-hint">${escaped(RUN_REQUEST_MESSAGES.repositoryHint)}</p><p class="run-hint" id="${form}-repository-files">${escaped(RUN_REQUEST_MESSAGES.repositoryFiles)}</p>`,
   );
   // A repository that is not linked on this device is not offered.
   expect(html).not.toContain(UNLINKED_REPOSITORY);
   expect(html).not.toContain(">api<");
   // No repository chosen: "No repository" is selected, and the
-  // confirmation says so.
+  // confirmation says so; neither says that files are sent.
   const none = { ...OPEN, repositoryChoice: NO_REPOSITORY };
-  expect(render({ run: runProps(none) })).toContain(
+  const noneHtml = render({ run: runProps(none) });
+  expect(noneHtml).toContain(
     `<option value="${NO_REPOSITORY}" selected="">${RUN_REQUEST_MESSAGES.noRepository}</option>`,
   );
-  expect(
-    render({
-      run: runProps({ ...CONFIRMING, repositoryChoice: NO_REPOSITORY }),
-    }),
-  ).toContain(
+  expect(noneHtml).toContain(
+    `<select id="${form}-repository" aria-describedby="${form}-repository-hint">`,
+  );
+  expect(noneHtml).not.toContain(escaped(RUN_REQUEST_MESSAGES.repositoryFiles));
+  expect(noneHtml).not.toContain(`id="${form}-repository-files"`);
+  const noneConfirmation = render({
+    run: runProps({ ...CONFIRMING, repositoryChoice: NO_REPOSITORY }),
+  });
+  expect(noneConfirmation).toContain(
     `<dt>${RUN_REQUEST_MESSAGES.repositoryLabel}</dt><dd dir="auto">${RUN_REQUEST_MESSAGES.noRepository}</dd>`,
   );
+  expect(noneConfirmation).toContain(
+    `aria-describedby="${form}-confirm-text ${form}-confirm-summary ${form}-note message-body-${OWN_MESSAGE}"`,
+  );
+  expect(noneConfirmation).not.toContain(
+    escaped(RUN_REQUEST_MESSAGES.repositoryFiles),
+  );
+  expect(noneConfirmation).not.toContain(`id="${form}-confirm-files"`);
+});
+
+test("repositories that cannot be read say so in place of the hint, and Continue stays enabled for a run without a repository (#362)", () => {
+  const form = `run-form-${OWN_MESSAGE}`;
+  for (const repositories of [
+    {
+      ...RUN_REPOSITORIES,
+      status: "unavailable",
+      problem: "unavailable",
+      repositories: [],
+    } as ProjectRepositoriesView,
+    "unavailable" as const,
+  ]) {
+    const html = render({ run: { ...runProps(OPEN), repositories } });
+    expect(html).toContain(
+      `<option value="${NO_REPOSITORY}" selected="">${RUN_REQUEST_MESSAGES.noRepository}</option></select>`,
+    );
+    expect(html).toContain(
+      `<p class="run-hint" id="${form}-repository-hint">${escaped(RUN_REQUEST_MESSAGES.repositoriesUnavailable)}</p>`,
+    );
+    expect(html).not.toContain(escaped(RUN_REQUEST_MESSAGES.repositoryHint));
+    expect(html).not.toContain(RUN_REQUEST_MESSAGES.repositoriesPending);
+    expect(html).toContain(
+      `<button type="submit">${RUN_REQUEST_MESSAGES.continue}</button>`,
+    );
+  }
 });
 
 test("choosing a repository passes its value to the controller (#362)", () => {
@@ -774,12 +813,12 @@ test("the confirmation names the agent and the connection, with Cancel first, an
   const html = render({ run: runProps(CONFIRMING, actions) });
   const form = `run-form-${OWN_MESSAGE}`;
   expect(html).toContain(
-    `<div class="run-form run-confirmation" id="${form}" role="group" aria-labelledby="${form}-title" aria-describedby="${form}-confirm-text ${form}-confirm-summary ${form}-note message-body-${OWN_MESSAGE}">`,
+    `<div class="run-form run-confirmation" id="${form}" role="group" aria-labelledby="${form}-title" aria-describedby="${form}-confirm-text ${form}-confirm-summary ${form}-confirm-files ${form}-note message-body-${OWN_MESSAGE}">`,
   );
   expect(html).toContain(`<dd dir="auto">Builder</dd>`);
   expect(html).toContain(`<dd dir="auto">Work laptop (Claude)</dd>`);
   expect(html).toContain(
-    `<dt>${RUN_REQUEST_MESSAGES.repositoryLabel}</dt><dd dir="auto">web</dd>`,
+    `<dt>${RUN_REQUEST_MESSAGES.repositoryLabel}</dt><dd dir="auto">web</dd></dl><p class="run-hint" id="${form}-confirm-files">${escaped(RUN_REQUEST_MESSAGES.repositoryFiles)}</p>`,
   );
   expect(html.indexOf(`>${RUN_REQUEST_MESSAGES.cancel}</button>`)).toBeLessThan(
     html.indexOf(`>${RUN_REQUEST_MESSAGES.confirm}</button>`),

@@ -8,7 +8,6 @@ import type {
 import type {
   AgentActivityView,
   ChatMessageView,
-  ProjectRepositoriesView,
   ProviderConnectionListView,
 } from "../shared/ipc-contract.ts";
 import {
@@ -32,11 +31,13 @@ import {
   canRunWith,
   createRunRequestController,
   describeRunForm,
+  followRunRepositories,
   IDLE_RUN_REQUEST,
   NO_REPOSITORY,
   RUN_REQUEST_MESSAGES,
   type RunFormModel,
   type RunRequestController,
+  type RunRepositoriesSource,
   type RunRequestState,
 } from "./run-request-view.ts";
 
@@ -110,10 +111,10 @@ export interface ChatRunProps {
   /** This device's provider connections. */
   readonly connections: ProviderConnectionListView | undefined;
   /**
-   * The open project's repositories with this device's links, IDs and
-   * names only (#362).
+   * The open project's repositories with this device's links (#362), or
+   * `"unavailable"` when the main process refused the subscription.
    */
-  readonly repositories: ProjectRepositoriesView | undefined;
+  readonly repositories: RunRepositoriesSource;
   readonly actions: RunRequestController;
   /** Where the hook puts the focus after a cancel and after an answer. */
   readonly focus?: RunFocus;
@@ -357,8 +358,11 @@ function MessageItem({
  * three, with "Cancel" first, which takes the focus. The repository list
  * offers "No repository" first, then the project's repositories that the
  * account linked on this device, by name; its hint says which ones it
- * offers. Why nothing can be requested shows in its
- * place. While a request waits, nothing can change or be sent again.
+ * offers, or that they cannot be read, and while a repository is chosen,
+ * the list and the confirmation say that the names of its files are sent
+ * to the provider if the agent may read it. Why nothing can be requested
+ * shows in its place. While a request waits, nothing can change or be sent
+ * again.
  */
 function RunForm({
   form,
@@ -376,16 +380,25 @@ function RunForm({
   const connectionId = `${id}-connection`;
   const repositoryId = `${id}-repository`;
   const repositoryHintId = `${id}-repository-hint`;
+  const repositoryFilesId = `${id}-repository-files`;
   if (form.step === "confirm") {
     const textId = `${id}-confirm-text`;
     const summaryId = `${id}-confirm-summary`;
+    const filesId = `${id}-confirm-files`;
+    const describedBy = [
+      textId,
+      summaryId,
+      ...(form.repositoryFiles === undefined ? [] : [filesId]),
+      noteId,
+      bodyId,
+    ].join(" ");
     return (
       <div
         className="run-form run-confirmation"
         id={id}
         role="group"
         aria-labelledby={titleId}
-        aria-describedby={`${textId} ${summaryId} ${noteId} ${bodyId}`}
+        aria-describedby={describedBy}
       >
         <h3 id={titleId}>{RUN_REQUEST_MESSAGES.confirmTitle}</h3>
         <p id={textId}>{RUN_REQUEST_MESSAGES.confirmText}</p>
@@ -397,6 +410,11 @@ function RunForm({
           <dt>{RUN_REQUEST_MESSAGES.repositoryLabel}</dt>
           <dd dir="auto">{form.repositoryLabel}</dd>
         </dl>
+        {form.repositoryFiles === undefined ? null : (
+          <p className="run-hint" id={filesId}>
+            {form.repositoryFiles}
+          </p>
+        )}
         <p className="run-note" id={noteId}>
           {RUN_REQUEST_MESSAGES.note}
         </p>
@@ -469,7 +487,11 @@ function RunForm({
           </label>
           <select
             id={repositoryId}
-            aria-describedby={repositoryHintId}
+            aria-describedby={
+              form.repositoryFiles === undefined
+                ? repositoryHintId
+                : `${repositoryHintId} ${repositoryFilesId}`
+            }
             value={form.repositoryId ?? NO_REPOSITORY}
             onChange={(event) =>
               runs.actions.chooseRepository(event.target.value)
@@ -485,8 +507,13 @@ function RunForm({
             ))}
           </select>
           <p className="run-hint" id={repositoryHintId}>
-            {RUN_REQUEST_MESSAGES.repositoryHint}
+            {form.repositoryHint}
           </p>
+          {form.repositoryFiles === undefined ? null : (
+            <p className="run-hint" id={repositoryFilesId}>
+              {form.repositoryFiles}
+            </p>
+          )}
         </>
       ) : (
         <p className="run-problem">{form.problem}</p>
@@ -650,9 +677,8 @@ function useRunRequest(
   const [connections, setConnections] = useState<
     ProviderConnectionListView | undefined
   >(undefined);
-  const [repositories, setRepositories] = useState<
-    ProjectRepositoriesView | undefined
-  >(undefined);
+  const [repositories, setRepositories] =
+    useState<RunRepositoriesSource>(undefined);
   const controller = useMemo(
     () =>
       agents === undefined
@@ -674,9 +700,9 @@ function useRunRequest(
   );
   useEffect(
     () =>
-      projectRepositories?.subscribeState(setRepositories, () =>
-        setRepositories(undefined),
-      ),
+      projectRepositories === undefined
+        ? undefined
+        : followRunRepositories(projectRepositories, setRepositories),
     [projectRepositories],
   );
   const trigger = useRef<HTMLButtonElement>(null);

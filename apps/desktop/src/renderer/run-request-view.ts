@@ -7,7 +7,10 @@
 // one list of runs; nothing here keeps it. The main process keeps the
 // outcome of the project's last request, which the screen takes once when
 // it opens, so that an answer that came while it was closed still shows.
-import type { AgentBridge } from "../shared/desktop-bridge.ts";
+import type {
+  AgentBridge,
+  ProjectRepositoriesBridge,
+} from "../shared/desktop-bridge.ts";
 import type {
   AgentActivityView,
   ChatMessageView,
@@ -38,6 +41,20 @@ export const RUN_REQUEST_MESSAGES = Object.freeze({
    */
   repositoryHint:
     "Only this project's repositories that you linked to a folder on this device can be chosen. You link one in the Repositories panel.",
+  /**
+   * Under the repository list and in the confirmation while a repository
+   * is chosen: what of it the run's context carries. Only the names of its
+   * files, and only when the agent holds `repo.read` on it.
+   */
+  repositoryFiles:
+    "If the agent may read this repository, the names of its files are sent to the AI provider of the chosen connection.",
+  /**
+   * In place of the hint when this project's repositories could not be
+   * read and none was read before, or the main process refused the
+   * subscription: a run without a repository can still be requested.
+   */
+  repositoriesUnavailable:
+    "This project's repositories cannot be read now. A run without a repository can still be requested.",
   /**
    * Requesting a run does not start it, and nothing here says that it
    * will run: until this device can carry out runs of a provider (#30,
@@ -193,33 +210,92 @@ export function runConnections(
 }
 
 /**
+ * What the screen knows of the open project's repositories: the view, or
+ * `"unavailable"` when the main process refused the subscription, or
+ * undefined before the first state.
+ */
+export type RunRepositoriesSource =
+  ProjectRepositoriesView | "unavailable" | undefined;
+
+/**
+ * Follows the open project's repositories for the run form: every state as
+ * it comes, and `"unavailable"` when the main process refuses the
+ * subscription, so that a run without a repository can still be requested
+ * rather than wait for a state that may never come. A state that arrives
+ * later replaces it. Returns the function that ends the subscription.
+ */
+export function followRunRepositories(
+  bridge: Pick<ProjectRepositoriesBridge, "subscribeState">,
+  onSource: (source: RunRepositoriesSource) => void,
+): () => void {
+  return bridge.subscribeState(onSource, () => onSource("unavailable"));
+}
+
+/**
+ * Whether this project's repositories could not be read: the main process
+ * refused the subscription, or the project's view is `unavailable` with
+ * nothing read before. A run without a repository can still be requested.
+ */
+export function repositoriesUnreadable(
+  source: RunRepositoriesSource,
+  projectId: string,
+): boolean {
+  return (
+    source === "unavailable" ||
+    (source !== undefined &&
+      source.projectId === projectId &&
+      source.status === "unavailable" &&
+      source.repositories.length === 0)
+  );
+}
+
+/**
  * The repositories that a run can name (#362; the Project Manager's
- * decision of 2026-11-26): the project's registered repositories that the
+ * decisions of 2026-11-26): the project's registered repositories that the
  * account linked to a folder on this device (`linked`), in the list's
- * order, the oldest first, each by its name. A run runs on the agent's
- * host device, which is this one, so a repository without a folder here is
- * not offered. No path crosses: the view holds IDs and names only. null
- * while the repositories or the links are not known for that project.
+ * order, the oldest first, each by its name. Names that repeat in this list
+ * get a number in its order, "web (1)" and "web (2)"; a name that does not
+ * repeat stays as it is. A run runs on the agent's host device, which is
+ * this one, so a repository without a folder here is not offered. No path
+ * and no mount ID is shown. None when the repositories could not be read
+ * (`repositoriesUnreadable`); null while the repositories or the links are
+ * not known for that project.
  */
 export function runRepositories(
-  view: ProjectRepositoriesView | undefined,
+  source: RunRepositoriesSource,
   projectId: string,
 ): readonly RunChoice[] | null {
+  if (repositoriesUnreadable(source, projectId)) {
+    return [];
+  }
   if (
-    view === undefined ||
-    view.projectId !== projectId ||
-    view.status === "no_project" ||
-    view.status === "loading" ||
-    view.links === "loading"
+    source === undefined ||
+    source === "unavailable" ||
+    source.projectId !== projectId ||
+    source.status === "no_project" ||
+    source.status === "loading" ||
+    source.links === "loading"
   ) {
     return null;
   }
-  return view.repositories
-    .filter((repository) => repository.linked)
-    .map((repository) => ({
+  const linked = source.repositories.filter((repository) => repository.linked);
+  const counts = new Map<string, number>();
+  for (const repository of linked) {
+    counts.set(repository.name, (counts.get(repository.name) ?? 0) + 1);
+  }
+  const numbered = new Map<string, number>();
+  return linked.map((repository) => {
+    const { name } = repository;
+    if ((counts.get(name) ?? 0) < 2) {
+      return { id: repository.repositoryId, label: name };
+    }
+    const number = (numbered.get(name) ?? 0) + 1;
+    numbered.set(name, number);
+    return {
       id: repository.repositoryId,
-      label: repository.name,
-    }));
+      label: `${name} (${String(number)})`,
+    };
+  });
 }
 
 /**
@@ -237,7 +313,7 @@ export interface RunRequestState {
   readonly connectionId: string | null;
   /**
    * The repository chosen: a repository ID, `NO_REPOSITORY`, or null
-   * while the person has not chosen, when the preselection applies
+   * while the person has not chosen. Only null lets the preselection apply
    * (`describeRunForm`).
    */
   readonly repositoryChoice: string | null;
@@ -289,8 +365,18 @@ export interface RunFormModel {
   /** The chosen agent's and connection's texts, for the confirmation. */
   readonly agentLabel: string;
   readonly connectionLabel: string;
-  /** The chosen repository's name, or "No repository". */
+  /** The chosen repository's label, or "No repository". */
   readonly repositoryLabel: string;
+  /**
+   * The hint under the repository list: which repositories it offers, or
+   * that they could not be read.
+   */
+  readonly repositoryHint: string;
+  /**
+   * While a repository is chosen, that the names of its files are sent to
+   * the provider if the agent may read it; else undefined.
+   */
+  readonly repositoryFiles: string | undefined;
 }
 
 /** The chosen ID, if it is still offered, else the first offered one. */
@@ -305,23 +391,24 @@ function chosen(
 }
 
 /**
- * The chosen repository, or null for none. The person's choice while it is
- * still offered; before they chose, and after the one that they chose is
- * no longer offered, the preselection: the one repository when exactly one
- * is offered, else none (#362). A choice of none stays none.
+ * The chosen repository, or null for none (#362; the Project Manager's
+ * decisions of 2026-11-26). Before the person chose, the preselection: the
+ * one repository when exactly one is offered, else none. Once they chose,
+ * their choice while it is still offered, else none: a repository that they
+ * chose and that is no longer offered is never replaced by another. A
+ * choice of none stays none.
  */
 function chosenRepository(
   choices: readonly RunChoice[] | null,
   choice: string | null,
 ): RunChoice | null {
-  if (choices === null || choice === NO_REPOSITORY) {
+  if (choices === null) {
     return null;
   }
-  const kept = choices.find((item) => item.id === choice);
-  if (kept !== undefined) {
-    return kept;
+  if (choice === null) {
+    return choices.length === 1 ? (choices[0] ?? null) : null;
   }
-  return choices.length === 1 ? (choices[0] ?? null) : null;
+  return choices.find((item) => item.id === choice) ?? null;
 }
 
 /**
@@ -335,7 +422,7 @@ export function describeRunForm(
   messages: readonly ChatMessageView[],
   activity: AgentActivityView | undefined,
   connectionList: ProviderConnectionListView | undefined,
-  repositoryView: ProjectRepositoriesView | undefined,
+  repositorySource: RunRepositoriesSource,
   projectId: string,
 ): RunFormModel | null {
   const { messageId } = state;
@@ -349,7 +436,7 @@ export function describeRunForm(
   const connections = runConnections(connectionList);
   const agent = chosen(agents, state.agentId);
   const connection = chosen(connections, state.connectionId);
-  const repositories = runRepositories(repositoryView, projectId);
+  const repositories = runRepositories(repositorySource, projectId);
   const repository = chosenRepository(repositories, state.repositoryChoice);
   let problem: string | undefined;
   if (agents === null) {
@@ -396,6 +483,11 @@ export function describeRunForm(
     agentLabel: agent?.label ?? "",
     connectionLabel: connection?.label ?? "",
     repositoryLabel: repository?.label ?? RUN_REQUEST_MESSAGES.noRepository,
+    repositoryHint: repositoriesUnreadable(repositorySource, projectId)
+      ? RUN_REQUEST_MESSAGES.repositoriesUnavailable
+      : RUN_REQUEST_MESSAGES.repositoryHint,
+    repositoryFiles:
+      repository === null ? undefined : RUN_REQUEST_MESSAGES.repositoryFiles,
   };
 }
 
