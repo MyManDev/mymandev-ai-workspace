@@ -2,11 +2,13 @@ import { useEffect, useMemo, useRef, useState, type Ref } from "react";
 import type {
   AgentBridge,
   ChatBridge,
+  ProjectRepositoriesBridge,
   ProviderConnectionsBridge,
 } from "../shared/desktop-bridge.ts";
 import type {
   AgentActivityView,
   ChatMessageView,
+  ProjectRepositoriesView,
   ProviderConnectionListView,
 } from "../shared/ipc-contract.ts";
 import {
@@ -31,6 +33,7 @@ import {
   createRunRequestController,
   describeRunForm,
   IDLE_RUN_REQUEST,
+  NO_REPOSITORY,
   RUN_REQUEST_MESSAGES,
   type RunFormModel,
   type RunRequestController,
@@ -47,6 +50,7 @@ export function ChatScreen({
   projectId,
   agents,
   providerConnections,
+  projectRepositories,
 }: {
   /** The chat functions from the preload script; undefined outside Electron. */
   readonly chat: ChatBridge | undefined;
@@ -59,11 +63,21 @@ export function ChatScreen({
   readonly agents?: AgentBridge | undefined;
   /** This device's AI provider connections, the choices of a run. */
   readonly providerConnections?: ProviderConnectionsBridge | undefined;
+  /**
+   * The open project's repositories and this device's links, whose linked
+   * repositories a run can name (#362).
+   */
+  readonly projectRepositories?: ProjectRepositoriesBridge | undefined;
 }) {
   return (
     <ChatScreenContent
       {...useChatScreen(chat)}
-      run={useRunRequest(agents, providerConnections, projectId)}
+      run={useRunRequest(
+        agents,
+        providerConnections,
+        projectRepositories,
+        projectId,
+      )}
       projectId={projectId}
     />
   );
@@ -95,6 +109,11 @@ export interface ChatRunProps {
   readonly activity: AgentActivityView | undefined;
   /** This device's provider connections. */
   readonly connections: ProviderConnectionListView | undefined;
+  /**
+   * The open project's repositories with this device's links, IDs and
+   * names only (#362).
+   */
+  readonly repositories: ProjectRepositoriesView | undefined;
   readonly actions: RunRequestController;
   /** Where the hook puts the focus after a cancel and after an answer. */
   readonly focus?: RunFocus;
@@ -138,6 +157,7 @@ export function ChatScreenContent({
             lists.messages,
             run.activity,
             run.connections,
+            run.repositories,
             projectId,
           ),
         };
@@ -332,9 +352,12 @@ function MessageItem({
 }
 
 /**
- * The run form of one message: the agent and the AI provider connection,
- * labelled, then a separate confirmation that names both, with "Cancel"
- * first, which takes the focus. Why nothing can be requested shows in its
+ * The run form of one message: the agent, the AI provider connection, and
+ * the repository, labelled, then a separate confirmation that names all
+ * three, with "Cancel" first, which takes the focus. The repository list
+ * offers "No repository" first, then the project's repositories that the
+ * account linked on this device, by name; its hint says which ones it
+ * offers. Why nothing can be requested shows in its
  * place. While a request waits, nothing can change or be sent again.
  */
 function RunForm({
@@ -351,6 +374,8 @@ function RunForm({
   const noteId = `${id}-note`;
   const agentId = `${id}-agent`;
   const connectionId = `${id}-connection`;
+  const repositoryId = `${id}-repository`;
+  const repositoryHintId = `${id}-repository-hint`;
   if (form.step === "confirm") {
     const textId = `${id}-confirm-text`;
     const summaryId = `${id}-confirm-summary`;
@@ -369,6 +394,8 @@ function RunForm({
           <dd dir="auto">{form.agentLabel}</dd>
           <dt>{RUN_REQUEST_MESSAGES.connectionLabel}</dt>
           <dd dir="auto">{form.connectionLabel}</dd>
+          <dt>{RUN_REQUEST_MESSAGES.repositoryLabel}</dt>
+          <dd dir="auto">{form.repositoryLabel}</dd>
         </dl>
         <p className="run-note" id={noteId}>
           {RUN_REQUEST_MESSAGES.note}
@@ -437,6 +464,29 @@ function RunForm({
               </option>
             ))}
           </select>
+          <label htmlFor={repositoryId}>
+            {RUN_REQUEST_MESSAGES.repositoryLabel}
+          </label>
+          <select
+            id={repositoryId}
+            aria-describedby={repositoryHintId}
+            value={form.repositoryId ?? NO_REPOSITORY}
+            onChange={(event) =>
+              runs.actions.chooseRepository(event.target.value)
+            }
+          >
+            <option value={NO_REPOSITORY}>
+              {RUN_REQUEST_MESSAGES.noRepository}
+            </option>
+            {form.repositories.map((choice) => (
+              <option key={choice.id} value={choice.id}>
+                {choice.label}
+              </option>
+            ))}
+          </select>
+          <p className="run-hint" id={repositoryHintId}>
+            {RUN_REQUEST_MESSAGES.repositoryHint}
+          </p>
         </>
       ) : (
         <p className="run-problem">{form.problem}</p>
@@ -579,9 +629,9 @@ function Composer({
 }
 
 /**
- * Follows the agent activity and this device's provider connections while
- * the screen is shown, and carries out the run request (#35) of the
- * project. The focus goes back to a message's "Run with agent" after a
+ * Follows the agent activity, this device's provider connections, and the
+ * open project's repositories with this device's links (#362) while the
+ * screen is shown, and carries out the run request (#35) of the project. The focus goes back to a message's "Run with agent" after a
  * cancel, and to the sentence after an answer. The controller starts with
  * the effect and stops with its cleanup, so that it applies answers again
  * when React's development mode runs the effect a second time. Undefined
@@ -590,6 +640,7 @@ function Composer({
 function useRunRequest(
   agents: AgentBridge | undefined,
   providerConnections: ProviderConnectionsBridge | undefined,
+  projectRepositories: ProjectRepositoriesBridge | undefined,
   projectId: string,
 ): ChatRunProps | undefined {
   const [state, setState] = useState<RunRequestState>(IDLE_RUN_REQUEST);
@@ -598,6 +649,9 @@ function useRunRequest(
   );
   const [connections, setConnections] = useState<
     ProviderConnectionListView | undefined
+  >(undefined);
+  const [repositories, setRepositories] = useState<
+    ProjectRepositoriesView | undefined
   >(undefined);
   const controller = useMemo(
     () =>
@@ -618,6 +672,13 @@ function useRunRequest(
       ),
     [providerConnections],
   );
+  useEffect(
+    () =>
+      projectRepositories?.subscribeState(setRepositories, () =>
+        setRepositories(undefined),
+      ),
+    [projectRepositories],
+  );
   const trigger = useRef<HTMLButtonElement>(null);
   const notice = useRef<HTMLParagraphElement>(null);
   useEffect(() => {
@@ -633,6 +694,7 @@ function useRunRequest(
         state,
         activity,
         connections,
+        repositories,
         actions: controller,
         focus: { trigger, notice },
       };

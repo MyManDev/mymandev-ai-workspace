@@ -17,11 +17,22 @@
 //   provider connection service's list holds it now. The API checks the
 //   connection again on the agent's host device; an agent has no provider
 //   kind of its own, so any of this device's connections is accepted here.
+// - Which repository (#362; the Project Manager's decision of 2026-11-26).
+//   The one that the person chose, or none: the request names it, or null,
+//   and nothing here ever adds one. A chosen repository must be one of the
+//   open project's repositories that the signed-in account linked to a
+//   folder on this device, as the project repository service holds them
+//   now (`linked`). The run runs on this device, the agent's host, so a
+//   repository without a folder here is not offered and not accepted. The
+//   API checks again that the repository is one of the project's and not
+//   removed. The request carries the repository's ID only, never a path.
 // - Refused locally, without a request: an ID that is not one, a project
 //   that is not the open one, an agent that is not one of its agents, not
 //   the account's, not hosted here, or disabled, a message that is not the
 //   person's own in the open project, a connection that is not this
-//   device's, and a second request while one waits (`busy`).
+//   device's, a repository that is not linked here
+//   (`repository_not_linked`), and a second request while one waits
+//   (`busy`).
 // - Sent once. The request carries no idempotency key, so the same request
 //   sent again would create a second run: nothing here ever sends it again,
 //   also not after `unknown`, a timeout, or a thrown error. The person
@@ -33,8 +44,9 @@
 //   through the agent activity, the one list of runs; nothing here holds
 //   it.
 // - An answer whose run does not name the project, the agent, the
-//   connection, and the message that were sent, or that names a
-//   repository, is not this request's answer: it is `unknown`.
+//   connection, the message, and the repository that were sent, or that
+//   names a repository for a request without one, is not this request's
+//   answer: it is `unknown`.
 // - The outcome is kept. The answer goes back to the chat screen that
 //   asked, but a switch of the project or the workspace, or leaving the
 //   chat while the request waits, closes that screen, and its answer, also
@@ -70,6 +82,8 @@ import {
   ProjectIdSchema,
   type ProviderConnectionId,
   ProviderConnectionIdSchema,
+  type RepositoryId,
+  RepositoryIdSchema,
 } from "@mymandev/protocol";
 import type {
   RunRequestOutcome,
@@ -91,6 +105,7 @@ import {
 } from "../permissions/grant-actions.ts";
 import { signedInDevice } from "../permissions/grant-store.ts";
 import type { ProviderConnectionService } from "../provider-connections/service.ts";
+import type { ProjectRepositoryService } from "../repository-links/service.ts";
 import type { WorkspaceService } from "../workspace/service.ts";
 import type { AgentActivityService } from "./service.ts";
 
@@ -165,6 +180,8 @@ export interface RunRequestOptions {
   readonly chat: Pick<ChatService, "state">;
   readonly workspaces: Pick<WorkspaceService, "ownMemberId">;
   readonly providerConnections: Pick<ProviderConnectionService, "state">;
+  /** The open project's repositories and the account's links on this device. */
+  readonly repositories: Pick<ProjectRepositoryService, "state">;
   /**
    * Receives fixed messages, never an ID, a name, or a body. An error that
    * it throws is ignored.
@@ -210,7 +227,14 @@ function outcomeOf(result: RunRequestResult): RunRequestOutcome {
 export function createRunRequests(
   options: RunRequestOptions,
 ): RunRequestService {
-  const { account, agents, chat, workspaces, providerConnections } = options;
+  const {
+    account,
+    agents,
+    chat,
+    workspaces,
+    providerConnections,
+    repositories,
+  } = options;
   const now = options.now ?? Date.now;
 
   function log(message: string): void {
@@ -296,11 +320,17 @@ export function createRunRequests(
       value.providerConnectionId,
     );
     const messageId = MessageIdSchema.safeParse(value.inputMessageId);
+    // Null is a run without a repository; anything else must be an ID.
+    const repositoryId =
+      value.repositoryId === null
+        ? null
+        : RepositoryIdSchema.safeParse(value.repositoryId);
     if (
       !projectId.success ||
       !agentId.success ||
       !connectionId.success ||
-      !messageId.success
+      !messageId.success ||
+      (repositoryId !== null && !repositoryId.success)
     ) {
       return refused("invalid");
     }
@@ -360,6 +390,23 @@ export function createRunRequests(
       return refused("connection_not_here");
     }
 
+    // The repository that the person chose, if any: one of the open
+    // project's that the account linked to a folder on this device, as the
+    // project repository service holds them now. One unlinked or removed
+    // since the person chose it is refused, never replaced by another.
+    if (repositoryId !== null) {
+      const held = repositories.state();
+      const linkedHere =
+        held.projectId === projectId.data &&
+        held.workspaceId === activity.workspaceId &&
+        held.repositories.some(
+          (item) => item.repositoryId === repositoryId.data && item.linked,
+        );
+      if (!linkedHere) {
+        return refused("repository_not_linked");
+      }
+    }
+
     // One at a time: a second press while the first waits is refused, never
     // queued, because a queued one would still reach the server.
     if (requesting) {
@@ -381,6 +428,8 @@ export function createRunRequests(
         agentId: agentId.data,
         providerConnectionId: connectionId.data,
         inputMessageId: messageId.data,
+        // The protocol leaves the field out for a run without a repository.
+        ...(repositoryId === null ? {} : { repositoryId: repositoryId.data }),
       });
     } catch {
       // Not expected: the request may have reached the API.
@@ -403,6 +452,7 @@ export function createRunRequests(
       readonly agentId: AgentId;
       readonly providerConnectionId: ProviderConnectionId;
       readonly inputMessageId: MessageId;
+      readonly repositoryId?: RepositoryId;
     },
   ): Promise<RunRequestResult> {
     let answer: WorkspaceActionResult<CreateRunResponse, RunCreationFailure>;
@@ -428,14 +478,15 @@ export function createRunRequests(
       return failedResult(answer);
     }
     const { run } = answer.value;
-    // A run of another project, agent, connection, or message, or with a
-    // repository, is not this request's answer.
+    // A run of another project, agent, connection, message, or repository,
+    // or with a repository for a request without one, is not this
+    // request's answer.
     if (
       run.projectId !== projectId ||
       run.agentId !== body.agentId ||
       run.providerConnectionId !== body.providerConnectionId ||
       run.inputMessageId !== body.inputMessageId ||
-      run.repositoryId !== null
+      run.repositoryId !== (body.repositoryId ?? null)
     ) {
       log("A run request was answered with another run.");
       return UNKNOWN;

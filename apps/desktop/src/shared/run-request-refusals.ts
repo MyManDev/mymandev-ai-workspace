@@ -18,5 +18,6 @@ export const RUN_REQUEST_LOCAL_REFUSALS: ReadonlySet<string> = new Set([
   "message_not_found",
   "not_own_message",
   "connection_not_here",
+  "repository_not_linked",
   "busy",
 ]);

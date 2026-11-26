@@ -3050,16 +3050,23 @@ export type AgentGrantsResult = z.infer<typeof AgentGrantsResultSchema>;
  * of 2026-11-14 and 2026-11-25): the project that the chat screen shows,
  * one of its agents, a provider connection of this device, and one of the
  * person's own messages of the project's chat as the run's input. IDs
- * only, and no other key: a text, a repository, a state, or a retry key
- * is refused by the contract before the main process sees it. The run has
- * no repository yet; the main process checks every ID against what it
- * holds before anything is sent.
+ * only, and no other key: a text, a state, or a retry key is refused by
+ * the contract before the main process sees it. The main process checks
+ * every ID against what it holds before anything is sent.
+ *
+ * `repositoryId` is the repository that the person chose for the run
+ * (#362; the Project Manager's decision of 2026-11-26): one of the open
+ * project's repositories that the account linked to a folder on this
+ * device, or null for a run without a repository. It is never left out, so
+ * that no repository enters a run without the person's choice, and a run
+ * without one says so.
  */
 export const RunRequestViewSchema = z.strictObject({
   projectId: ProtocolIdSchema,
   agentId: ProtocolIdSchema,
   providerConnectionId: ProtocolIdSchema,
   inputMessageId: ProtocolIdSchema,
+  repositoryId: ProtocolIdSchema.nullable(),
 });
 export type RunRequestView = z.infer<typeof RunRequestViewSchema>;
 
@@ -3084,6 +3091,10 @@ export type RunRequestView = z.infer<typeof RunRequestViewSchema>;
  *   2026-11-25).
  * - `connection_not_here`: the provider connection is not one of this
  *   device's connections as its list holds them now.
+ * - `repository_not_linked`: the chosen repository is not one of the open
+ *   project's repositories that the account linked to a folder on this
+ *   device, as the project repository service holds them now, for example
+ *   because it was unlinked or removed after the person chose it (#362).
  * - `busy`: another run request is still waiting for its answer, so that a
  *   second press never sends a second request.
  *
@@ -3095,11 +3106,11 @@ export type RunRequestView = z.infer<typeof RunRequestViewSchema>;
  *   or that this device is not its host device.
  * - `not_found`: the server does not know the project for the account
  *   (the account is not, or no longer, a member of its workspace, or the
- *   project does not exist), the agent in the project, the connection on
- *   the agent's host device, or the message as the account's own and not
- *   deleted.
+ *   project does not exist), the agent in the project, the repository in
+ *   the project, the connection on the agent's host device, or the message
+ *   as the account's own and not deleted.
  * - `conflict`: the project or its workspace is archived, the agent is
- *   disabled, or the connection is removed.
+ *   disabled, the repository is removed, or the connection is removed.
  * - `run_limit`: the agent has as many unfinished runs as the server
  *   allows (10). No wait: only a run of the agent that finishes frees a
  *   place.
@@ -3116,6 +3127,7 @@ export const RUN_REQUEST_REFUSALS = Object.freeze([
   "message_not_found",
   "not_own_message",
   "connection_not_here",
+  "repository_not_linked",
   "busy",
   "not_signed_in",
   "unavailable",
@@ -4347,7 +4359,10 @@ export const INVOKE_CONTRACT = Object.freeze({
     result: AgentActivityViewSchema,
   }),
   [INVOKE_CHANNELS.requestRun]: Object.freeze({
-    /** The project, the agent, the connection, and the input message. */
+    /**
+     * The project, the agent, the connection, the input message, and the
+     * chosen repository or null.
+     */
     args: z.tuple([RunRequestViewSchema]),
     result: RunRequestResultSchema,
   }),

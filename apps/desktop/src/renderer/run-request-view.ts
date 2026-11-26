@@ -1,8 +1,9 @@
 // Requesting a run of an agent from the project chat (#35, part A): the
 // "Run with agent" action on the person's own messages, apart from React.
-// The person picks one of the agents that this device can run and one of
-// this device's AI provider connections, confirms, and the request goes to
-// the main process once. The new run shows through the agent activity, the
+// The person picks one of the agents that this device can run, one of
+// this device's AI provider connections, and one of the project's
+// repositories that they linked on this device or none (#362), confirms,
+// and the request goes to the main process once. The new run shows through the agent activity, the
 // one list of runs; nothing here keeps it. The main process keeps the
 // outcome of the project's last request, which the screen takes once when
 // it opens, so that an answer that came while it was closed still shows.
@@ -10,6 +11,7 @@ import type { AgentBridge } from "../shared/desktop-bridge.ts";
 import type {
   AgentActivityView,
   ChatMessageView,
+  ProjectRepositoriesView,
   ProviderConnectionListView,
   RunRequestOutcome,
   RunRequestRefusal,
@@ -26,6 +28,16 @@ export const RUN_REQUEST_MESSAGES = Object.freeze({
   formTitle: "Run with agent",
   agentLabel: "Agent",
   connectionLabel: "AI provider connection",
+  repositoryLabel: "Repository",
+  /** The choice of a run without a repository, always offered first. */
+  noRepository: "No repository",
+  /**
+   * Under the repository list: which repositories it offers, and where
+   * one is linked. A repository is named by its name only, never by a
+   * folder.
+   */
+  repositoryHint:
+    "Only this project's repositories that you linked to a folder on this device can be chosen. You link one in the Repositories panel.",
   /**
    * Requesting a run does not start it, and nothing here says that it
    * will run: until this device can carry out runs of a provider (#30,
@@ -48,6 +60,8 @@ export const RUN_REQUEST_MESSAGES = Object.freeze({
     "The AI provider connections of this device are known once it is signed in.",
   noConnections:
     "This device has no AI provider connection. Add one in the AI providers section of the Account screen.",
+  repositoriesPending:
+    "Reading this project's repositories and the links of this device.",
   requested:
     "The run was requested and waits in the queue. Its state shows in the agent activity.",
   notRequested: "The run was not requested.",
@@ -75,6 +89,8 @@ export const RUN_REFUSAL_MESSAGES: Readonly<
   not_own_message: "Only your own messages can be a run's instruction.",
   connection_not_here:
     "The AI provider connection is no longer one of this device's connections.",
+  repository_not_linked:
+    "The repository is no longer one of this project's repositories linked on this device. Choose again.",
   busy: "Another run request is still waiting for the server's answer.",
   not_signed_in:
     "This device is not signed in, or the server did not accept its sign-in.",
@@ -87,9 +103,9 @@ export const RUN_REFUSAL_MESSAGES: Readonly<
   forbidden:
     "The server refused: only the agent's owner requests its runs, and only from the device that hosts the agent.",
   not_found:
-    "The server did not find the project for your account, for example because you are not or no longer a member of its workspace, or it did not find the agent, the AI provider connection on this device, or this message as yours.",
+    "The server did not find the project for your account, for example because you are not or no longer a member of its workspace, or it did not find the agent, the repository in the project, the AI provider connection on this device, or this message as yours.",
   conflict:
-    "The agent is disabled, the project or its workspace is archived, or the AI provider connection was removed.",
+    "The agent is disabled, the project or its workspace is archived, the repository was removed, or the AI provider connection was removed.",
   run_limit:
     "The agent already has as many unfinished runs as it may have (10). Request another once one of them finishes.",
   run_daily_limit: (wait: string) =>
@@ -176,6 +192,42 @@ export function runConnections(
   }));
 }
 
+/**
+ * The repositories that a run can name (#362; the Project Manager's
+ * decision of 2026-11-26): the project's registered repositories that the
+ * account linked to a folder on this device (`linked`), in the list's
+ * order, the oldest first, each by its name. A run runs on the agent's
+ * host device, which is this one, so a repository without a folder here is
+ * not offered. No path crosses: the view holds IDs and names only. null
+ * while the repositories or the links are not known for that project.
+ */
+export function runRepositories(
+  view: ProjectRepositoriesView | undefined,
+  projectId: string,
+): readonly RunChoice[] | null {
+  if (
+    view === undefined ||
+    view.projectId !== projectId ||
+    view.status === "no_project" ||
+    view.status === "loading" ||
+    view.links === "loading"
+  ) {
+    return null;
+  }
+  return view.repositories
+    .filter((repository) => repository.linked)
+    .map((repository) => ({
+      id: repository.repositoryId,
+      label: repository.name,
+    }));
+}
+
+/**
+ * The value of the "No repository" choice of the list. A repository ID is
+ * a UUID, so it is never this value.
+ */
+export const NO_REPOSITORY = "none";
+
 /** What the person did so far; the screen's controller keeps it. */
 export interface RunRequestState {
   /** The message whose form is open, or null. */
@@ -183,6 +235,12 @@ export interface RunRequestState {
   /** The agent and the connection chosen; null for the first offered. */
   readonly agentId: string | null;
   readonly connectionId: string | null;
+  /**
+   * The repository chosen: a repository ID, `NO_REPOSITORY`, or null
+   * while the person has not chosen, when the preselection applies
+   * (`describeRunForm`).
+   */
+  readonly repositoryChoice: string | null;
   /** The choice, then the separate confirmation. */
   readonly step: "choose" | "confirm";
   /** A request waits for its answer; nothing else can be sent. */
@@ -202,6 +260,7 @@ export const IDLE_RUN_REQUEST: RunRequestState = Object.freeze({
   messageId: null,
   agentId: null,
   connectionId: null,
+  repositoryChoice: null,
   step: "choose",
   sending: false,
   notice: undefined,
@@ -216,9 +275,13 @@ export interface RunFormModel {
   readonly sending: boolean;
   readonly agents: readonly RunChoice[];
   readonly connections: readonly RunChoice[];
+  /** The repositories offered, without "No repository", which is always. */
+  readonly repositories: readonly RunChoice[];
   /** The chosen agent and connection, or null while there is none. */
   readonly agentId: string | null;
   readonly connectionId: string | null;
+  /** The chosen repository, or null for a run without one. */
+  readonly repositoryId: string | null;
   /** Why nothing can be requested now, or undefined. */
   readonly problem: string | undefined;
   /** Whether "Continue" goes on to the confirmation. */
@@ -226,6 +289,8 @@ export interface RunFormModel {
   /** The chosen agent's and connection's texts, for the confirmation. */
   readonly agentLabel: string;
   readonly connectionLabel: string;
+  /** The chosen repository's name, or "No repository". */
+  readonly repositoryLabel: string;
 }
 
 /** The chosen ID, if it is still offered, else the first offered one. */
@@ -240,15 +305,37 @@ function chosen(
 }
 
 /**
+ * The chosen repository, or null for none. The person's choice while it is
+ * still offered; before they chose, and after the one that they chose is
+ * no longer offered, the preselection: the one repository when exactly one
+ * is offered, else none (#362). A choice of none stays none.
+ */
+function chosenRepository(
+  choices: readonly RunChoice[] | null,
+  choice: string | null,
+): RunChoice | null {
+  if (choices === null || choice === NO_REPOSITORY) {
+    return null;
+  }
+  const kept = choices.find((item) => item.id === choice);
+  if (kept !== undefined) {
+    return kept;
+  }
+  return choices.length === 1 ? (choices[0] ?? null) : null;
+}
+
+/**
  * The open form for `state`, or null when none is open or its message is
  * no longer one of the person's own shown messages. The first agent and
- * the first connection are chosen until the person chooses another.
+ * the first connection are chosen until the person chooses another, and
+ * the repository by `chosenRepository`.
  */
 export function describeRunForm(
   state: RunRequestState,
   messages: readonly ChatMessageView[],
   activity: AgentActivityView | undefined,
   connectionList: ProviderConnectionListView | undefined,
+  repositoryView: ProjectRepositoriesView | undefined,
   projectId: string,
 ): RunFormModel | null {
   const { messageId } = state;
@@ -262,6 +349,8 @@ export function describeRunForm(
   const connections = runConnections(connectionList);
   const agent = chosen(agents, state.agentId);
   const connection = chosen(connections, state.connectionId);
+  const repositories = runRepositories(repositoryView, projectId);
+  const repository = chosenRepository(repositories, state.repositoryChoice);
   let problem: string | undefined;
   if (agents === null) {
     problem = RUN_REQUEST_MESSAGES.agentsPending;
@@ -279,28 +368,34 @@ export function describeRunForm(
         : RUN_REQUEST_MESSAGES.connectionsPending;
   } else if (connections.length === 0) {
     problem = RUN_REQUEST_MESSAGES.noConnections;
+  } else if (repositories === null) {
+    problem = RUN_REQUEST_MESSAGES.repositoriesPending;
   }
   const ready = problem === undefined && agent !== null && connection !== null;
-  // A confirmation shows only the agent and the connection that the person
-  // chose: when either is no longer offered, it goes back to the choice
-  // rather than confirm another one.
+  // A confirmation shows only the agent, the connection, and the repository
+  // that the person chose: when one is no longer offered, it goes back to
+  // the choice rather than confirm another one.
   const confirmable =
     ready &&
     state.step === "confirm" &&
     agent.id === state.agentId &&
-    connection.id === state.connectionId;
+    connection.id === state.connectionId &&
+    (repository?.id ?? NO_REPOSITORY) === state.repositoryChoice;
   return {
     messageId,
     step: confirmable ? "confirm" : "choose",
     sending: state.sending,
     agents: agents ?? [],
     connections: connections ?? [],
+    repositories: repositories ?? [],
     agentId: agent?.id ?? null,
     connectionId: connection?.id ?? null,
+    repositoryId: repository?.id ?? null,
     problem,
     canContinue: ready && !state.sending,
     agentLabel: agent?.label ?? "",
     connectionLabel: connection?.label ?? "",
+    repositoryLabel: repository?.label ?? RUN_REQUEST_MESSAGES.noRepository,
   };
 }
 
@@ -341,6 +436,14 @@ export function chooseRunConnection(
   return state.sending ? state : { ...state, connectionId, step: "choose" };
 }
 
+/** A repository ID, or `NO_REPOSITORY` for a run without one. */
+export function chooseRunRepository(
+  state: RunRequestState,
+  repositoryChoice: string,
+): RunRequestState {
+  return state.sending ? state : { ...state, repositoryChoice, step: "choose" };
+}
+
 /** Goes on to the confirmation when the form is ready. */
 export function continueRunForm(
   state: RunRequestState,
@@ -353,6 +456,9 @@ export function continueRunForm(
     ...state,
     agentId: model.agentId,
     connectionId: model.connectionId,
+    // What the form showed becomes the person's choice: also a preselected
+    // repository, and none.
+    repositoryChoice: model.repositoryId ?? NO_REPOSITORY,
     step: "confirm",
   };
 }
@@ -394,7 +500,7 @@ export function closeRunForm(state: RunRequestState): RunRequestState {
 /**
  * The request that the confirmation of `model` sends, or null when it
  * sends nothing: no confirmation shown, a request waiting, or a choice
- * missing.
+ * missing. It names the confirmed repository, or null for none.
  */
 export function confirmedRunRequest(
   state: RunRequestState,
@@ -415,6 +521,7 @@ export function confirmedRunRequest(
     agentId: model.agentId,
     providerConnectionId: model.connectionId,
     inputMessageId: model.messageId,
+    repositoryId: model.repositoryId,
   };
 }
 
@@ -450,6 +557,8 @@ export interface RunRequestController {
   readonly open: (messageId: string) => void;
   readonly chooseAgent: (agentId: string) => void;
   readonly chooseConnection: (connectionId: string) => void;
+  /** A repository ID, or `NO_REPOSITORY`. */
+  readonly chooseRepository: (repositoryChoice: string) => void;
   readonly continue: (model: RunFormModel | null) => void;
   /** Cancel of the shown step (`cancelRunForm`). */
   readonly cancel: (model: RunFormModel | null) => void;
@@ -515,6 +624,8 @@ export function createRunRequestController(
     chooseAgent: (agentId: string) => set(chooseRunAgent(state, agentId)),
     chooseConnection: (connectionId: string) =>
       set(chooseRunConnection(state, connectionId)),
+    chooseRepository: (repositoryChoice: string) =>
+      set(chooseRunRepository(state, repositoryChoice)),
     continue: (model: RunFormModel | null) =>
       set(continueRunForm(state, model)),
     cancel: (model: RunFormModel | null) => set(cancelRunForm(state, model)),
