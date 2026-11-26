@@ -4,8 +4,9 @@
 // and D8 of 2026-11-13), of a project's registered repositories (#286), and
 // of this device's grant records for the grant store (#55), of this
 // device's provider connections for the permission screen (#342), and of the
-// grants of one of the account's agents that another device hosts (#345): a
-// frozen allowlist of fourteen `GET` routes, each with the protocol's
+// grants of one of the account's agents that another device hosts (#345),
+// and of one chat message, the instruction of a run's context (#34): a
+// frozen allowlist of fifteen `GET` routes, each with the protocol's
 // response schema and a fixed cap on the size of its answer.
 // The account service sends them with the device session
 // (`readWorkspaceData`); no IPC channel and no bridge member reach them.
@@ -25,6 +26,8 @@ import {
   type ChatHistoryResponse,
   ChatHistoryQuerySchema,
   ChatHistoryResponseSchema,
+  type ChatMessageResponse,
+  ChatMessageResponseSchema,
   type ClaimListResponse,
   ClaimListResponseSchema,
   GRANT_ROUTES,
@@ -35,6 +38,7 @@ import {
   type JoinRequestListResponse,
   JoinRequestListResponseSchema,
   MEMBERSHIP_ROUTES,
+  type MessageId,
   type OwnJoinRequestListResponse,
   OwnJoinRequestListResponseSchema,
   PROJECT_ROUTES,
@@ -106,7 +110,8 @@ function read<T>(
  * connections with labels of 64 four-byte characters are about 0.4 MB; a
  * device holds 10. For #345, the 100 grants of an agent
  * (`GRANT_COUNT_LIMITS.perAgent`), each with every field set, are about
- * 25 KB.
+ * 25 KB. For #34, one message with a body of 16,000 four-byte characters
+ * (`LIMITS.messageBody`) is about 64 KB.
  */
 export const WORKSPACE_READS = Object.freeze({
   /** `GET /workspaces`: the account's workspaces. */
@@ -229,6 +234,18 @@ export const WORKSPACE_READS = Object.freeze({
     AgentGrantListResponseSchema,
     256 * KIB,
   ),
+  /**
+   * `GET /projects/:projectId/messages/:messageId`: one message of the
+   * project's chat, the instruction of a run's context (#34). The caller
+   * checks that the answer names the message and the project that it asked
+   * for, which the schema cannot see.
+   */
+  getMessage: read(
+    CHAT_ROUTES.getMessage,
+    ["projectId", "messageId"],
+    ChatMessageResponseSchema,
+    128 * KIB,
+  ),
 });
 export type WorkspaceReadName = keyof typeof WORKSPACE_READS;
 
@@ -251,6 +268,10 @@ export interface WorkspaceReadParams {
   readonly listGrantRecords: NoParams;
   readonly listProviderConnections: NoParams;
   readonly listAgentGrants: { readonly agentId: AgentId };
+  readonly getMessage: {
+    readonly projectId: ProjectId;
+    readonly messageId: MessageId;
+  };
 }
 
 /**
@@ -278,6 +299,7 @@ export interface WorkspaceReadQuery {
   readonly listGrantRecords: never;
   readonly listProviderConnections: never;
   readonly listAgentGrants: never;
+  readonly getMessage: never;
 }
 
 /** The answer of each read, as its response schema parsed it. */
@@ -296,6 +318,7 @@ export interface WorkspaceReadAnswer {
   readonly listGrantRecords: GrantRecordListResponse;
   readonly listProviderConnections: ProviderConnectionListResponse;
   readonly listAgentGrants: AgentGrantListResponse;
+  readonly getMessage: ChatMessageResponse;
 }
 
 /**

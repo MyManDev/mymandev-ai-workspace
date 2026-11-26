@@ -4,11 +4,14 @@ import {
   AgentListResponseSchema,
   AgentRunListResponseSchema,
   ChatHistoryResponseSchema,
+  ChatMessageResponseSchema,
   ClaimListResponseSchema,
   GRANT_COUNT_LIMITS,
   GrantRecordListResponseSchema,
   InvitationListResponseSchema,
   JoinRequestListResponseSchema,
+  LIMITS,
+  type MessageId,
   OwnJoinRequestListResponseSchema,
   ProjectListResponseSchema,
   ProviderConnectionListResponseSchema,
@@ -39,6 +42,8 @@ const ORIGIN = "https://api.mymandev.example";
 const WORKSPACE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192d1" as WorkspaceId;
 const PROJECT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192e1" as ProjectId;
 const AGENT_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f708192f1" as AgentId;
+const MESSAGE_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819301" as MessageId;
+const MEMBER_ID = "0192f2a0-7c3e-7a1b-8c4d-5e6f70819311";
 const KIB = 1024;
 const MIB = 1024 * KIB;
 
@@ -108,6 +113,12 @@ const READS: [WorkspaceReadName, Record<string, string>, string, number][] = [
     `/agents/${AGENT_ID}/grants`,
     256 * KIB,
   ],
+  [
+    "getMessage",
+    { projectId: PROJECT_ID, messageId: MESSAGE_ID },
+    `/projects/${PROJECT_ID}/messages/${MESSAGE_ID}`,
+    128 * KIB,
+  ],
 ];
 
 /** Sends the request as the session does, with an answer of exactly `size` bytes. */
@@ -137,7 +148,7 @@ async function answerOfSize(
   return answer.kind;
 }
 
-test("the allowlist holds exactly fourteen GET reads, frozen", () => {
+test("the allowlist holds exactly fifteen GET reads, frozen", () => {
   expect(Object.keys(WORKSPACE_READS)).toEqual(READS.map(([name]) => name));
   expect(Object.isFrozen(WORKSPACE_READS)).toBe(true);
   for (const entry of Object.values(WORKSPACE_READS)) {
@@ -165,6 +176,28 @@ test("the cap of an agent's grants holds every grant that an agent may have, wit
   expect(new TextEncoder().encode(answer).length).toBeLessThan(
     WORKSPACE_READS.listAgentGrants.maxAnswerBytes / 4,
   );
+});
+
+test("the cap of one message holds a message whose body is at its limit, with room to spare", () => {
+  const longest = (character: string) => ({
+    message: {
+      id: MESSAGE_ID,
+      projectId: PROJECT_ID,
+      seq: Number.MAX_SAFE_INTEGER,
+      author: { kind: "member", memberId: MEMBER_ID },
+      body: character.repeat(LIMITS.messageBody / character.length),
+      createdAt: "2026-11-26T10:00:00.000Z",
+    },
+  });
+  // A three-byte character is one code unit, a four-byte one two, and a
+  // quote is written with its escape: each body is at its limit.
+  for (const character of ["€", "\u{1F600}", '"']) {
+    const answer = longest(character);
+    expect(ChatMessageResponseSchema.safeParse(answer).success).toBe(true);
+    expect(
+      new TextEncoder().encode(JSON.stringify(answer)).length,
+    ).toBeLessThan(WORKSPACE_READS.getMessage.maxAnswerBytes / 2);
+  }
 });
 
 test("each read fills its path, and only listMessages has a query", () => {
@@ -239,6 +272,19 @@ test("a name off the allowlist, a wrong parameter, or a query of another read is
     ["listAgentGrants", { agentId: 7 }, undefined],
     ["listAgentGrants", { agentId: AGENT_ID, deviceId: AGENT_ID }, undefined],
     ["listAgentGrants", { agentId: AGENT_ID }, { limit: 5 }],
+    ["getMessage", { projectId: PROJECT_ID }, undefined],
+    ["getMessage", { messageId: MESSAGE_ID }, undefined],
+    ["getMessage", { projectId: PROJECT_ID, messageId: 7 }, undefined],
+    [
+      "getMessage",
+      { projectId: PROJECT_ID, messageId: MESSAGE_ID, agentId: AGENT_ID },
+      undefined,
+    ],
+    [
+      "getMessage",
+      { projectId: PROJECT_ID, messageId: MESSAGE_ID },
+      { limit: 1 },
+    ],
   ];
   for (const [name, params, query] of refused) {
     expect(
@@ -276,6 +322,7 @@ test("each read's answer is checked with its response schema", () => {
     listGrantRecords: { records: [] },
     listProviderConnections: { providerConnections: [] },
     listAgentGrants: { grants: [] },
+    getMessage: null,
   };
   for (const [name, params] of READS) {
     const request = workspaceReadRequest(name, params, undefined)!;
@@ -345,6 +392,7 @@ test("each read's answer schema is the protocol schema of its route", () => {
     listGrantRecords: GrantRecordListResponseSchema,
     listProviderConnections: ProviderConnectionListResponseSchema,
     listAgentGrants: AgentGrantListResponseSchema,
+    getMessage: ChatMessageResponseSchema,
   };
   expect(Object.keys(WORKSPACE_READS).sort()).toEqual(
     Object.keys(schemas).sort(),
