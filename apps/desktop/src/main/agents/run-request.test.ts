@@ -186,7 +186,7 @@ function setup() {
         kind: "claude",
         label: "Work laptop",
         createdAt: AT,
-        status: "registered",
+        status: "ready",
       },
     ] as unknown as ProviderConnectionsState["connections"],
   };

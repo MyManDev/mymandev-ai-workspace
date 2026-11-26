@@ -8,6 +8,10 @@ import type {
   RegisterProviderConnectionResult,
   RemoveProviderConnectionRefusal,
   RemoveProviderConnectionResult,
+  RemoveProviderKeyRefusal,
+  RemoveProviderKeyResult,
+  SaveProviderKeyRefusal,
+  SaveProviderKeyResult,
 } from "../shared/ipc-contract.ts";
 import { describeWait } from "./wait-text.ts";
 
@@ -15,8 +19,14 @@ import { describeWait } from "./wait-text.ts";
 // connection's kind, label, and status, registering one by its kind and
 // label, and removing one after a question. The main process holds the
 // list (`window.desktop.providerConnections`) and computes each status; the
-// section shows what it sends and passes the person's actions on. No
-// credential is asked for, shown, or sent: storing one waits for #33.
+// section shows what it sends and passes the person's actions on.
+//
+// A connection's API key (#33) is entered in a password field that is
+// never prefilled, sent to the main process once, and cleared as it is
+// sent; the main process stores it encrypted on this device. No answer of
+// the main process ever holds a key, so it is never shown again: the
+// status says only whether one is stored (`ready`) or not
+// (`credential_missing`).
 
 /** A provider kind, as the contract names it. */
 export type ProviderKindView = ProviderConnectionItemView["kind"];
@@ -53,6 +63,19 @@ export const MAX_NEW_PROVIDER_CONNECTIONS_PER_DAY = 20;
 export const LABEL_SAFE_PATTERN =
   /^(?:[^\p{Cc}\p{Cf}\p{Cs}\p{Co}\p{Zl}\p{Zp}\p{DI}]|\u200C|\u200D|\uFE0E|\uFE0F)*$/u;
 
+/**
+ * The longest API key in UTF-16 code units, the contract's
+ * `PROVIDER_KEY_LIMITS.key`. The tests check that the values match.
+ */
+export const MAX_PROVIDER_KEY_LENGTH = 512;
+
+/**
+ * A character that an API key never holds, as the main process checks it:
+ * white space, control characters, and format characters such as a
+ * zero-width space.
+ */
+const KEY_FORBIDDEN_CHARACTER = /[\s\p{Cc}\p{Cf}]/u;
+
 /** What the section knows about the connections. */
 export type ProviderConnectionSectionView =
   /** Outside Electron, or the main process refused the subscription. */
@@ -85,7 +108,7 @@ export function followProviderConnections(
 /** The fixed texts of the section. */
 export const PROVIDER_CONNECTION_MESSAGES = Object.freeze({
   title: "AI providers",
-  hint: "The AI provider connections of this device. Only a connection's kind and label reach the server: no API key, token, or password is asked for or sent.",
+  hint: "The AI provider connections of this device. Only a connection's kind and label reach the server. An API key that you enter stays on this device, encrypted by the system, and is never shown again.",
   unavailable: "AI provider connections are not available.",
   pending: "Checking the AI provider connections.",
   signedOut:
@@ -107,6 +130,16 @@ export const PROVIDER_CONNECTION_MESSAGES = Object.freeze({
   added: "Added",
   /** The term before a connection's status. */
   status: "Status",
+  enterKey: "Enter an API key",
+  replaceKey: "Replace the API key",
+  removeKey: "Remove the API key",
+  keyLabel: "API key",
+  keyHint: `The provider's API key for this connection, up to ${String(MAX_PROVIDER_KEY_LENGTH)} characters. It is encrypted and kept on this device only, never sent to the server, and never shown again. This device does not check it with the provider.`,
+  saveKey: "Store the key",
+  keyMissing: "Enter the key.",
+  keyTooLong: `The key is longer than ${String(MAX_PROVIDER_KEY_LENGTH)} characters.`,
+  keyUnsafe:
+    "The key holds a space, a line break, or an invisible character. Paste the key alone.",
 });
 
 /** The names of the providers. */
@@ -117,9 +150,8 @@ export const PROVIDER_KIND_NAMES: Readonly<Record<ProviderKindView, string>> =
   });
 
 /**
- * The name and the sentence of each status (a default until the Project
- * Manager decides, 2026-11-24). No status says that a provider works: this
- * device does not check a credential yet (#33).
+ * The name and the sentence of each status (#33). No status says that a
+ * provider works: `ready` says only that a key is stored here and decrypts.
  */
 export const PROVIDER_CONNECTION_STATUS_TEXTS: Readonly<
   Record<
@@ -127,13 +159,17 @@ export const PROVIDER_CONNECTION_STATUS_TEXTS: Readonly<
     { readonly name: string; readonly text: string }
   >
 > = Object.freeze({
-  registered: Object.freeze({
-    name: "Registered",
-    text: "The server knows this connection. This device does not check the provider's sign-in yet.",
+  credential_missing: Object.freeze({
+    name: "No API key",
+    text: "This device holds no usable API key for this connection. Enter one to use the connection here.",
+  }),
+  ready: Object.freeze({
+    name: "Ready",
+    text: "An API key for this connection is stored on this device. Whether the provider accepts it shows when an agent uses it.",
   }),
   unknown: Object.freeze({
     name: "Unknown",
-    text: "This device is offline, or the list could not be read, so the connection is shown as it was last read.",
+    text: "This device is offline, the list could not be read, or the stored key could not be checked, so the connection is shown as it was last read.",
   }),
 });
 
@@ -148,17 +184,21 @@ export const PROVIDER_CONNECTION_PROBLEM_MESSAGES: Readonly<
   failed: "The AI provider connections could not be read. Trying again later.",
 });
 
-/** The sentence after an action that the server confirmed. */
+/** The sentence after an action that the server or this device confirmed. */
 export const PROVIDER_CONNECTION_DONE_MESSAGES = Object.freeze({
   register: "The connection was added.",
   remove:
     "The connection was removed, and the permissions that named it were revoked.",
+  saveKey: "The API key was stored on this device.",
+  removeKey: "The API key was deleted from this device.",
 });
 
 /** The start of the sentence after an action that was refused. */
 export const PROVIDER_CONNECTION_NOT_DONE_MESSAGES = Object.freeze({
   register: "The connection was not added.",
   remove: "The connection was not removed.",
+  saveKey: "The API key was not stored.",
+  removeKey: "The API key was not deleted.",
 });
 
 /** The sentence after an action whose answer did not show what happened. */
@@ -178,6 +218,8 @@ const CANNOT_SEND =
   "This device cannot send it now. Wait until the sign-in or the current change of the account is finished, then try again.";
 const BUSY =
   "Another change of the AI provider connections is still waiting for the server's answer. Wait a moment, then try again.";
+const KEY_BUSY =
+  "Another change of the AI provider connections or their API keys is still running. Wait a moment, then try again.";
 const TOO_SOON = (wait: string) =>
   `This device sent many changes in a short time. Try again in ${wait}.`;
 
@@ -228,6 +270,75 @@ export const REMOVE_PROVIDER_CONNECTION_REFUSAL_MESSAGES: Readonly<
   conflict: "The connection was removed already. The list is read again.",
   failed: "The server refused it.",
 });
+
+/** Why storing a key was refused, one sentence for each refusal. */
+export const SAVE_PROVIDER_KEY_REFUSAL_MESSAGES: Readonly<
+  Record<SaveProviderKeyRefusal, string>
+> = Object.freeze({
+  invalid:
+    "It holds a space, a line break, or an invisible character, or it is too long.",
+  not_signed_in: SIGNED_OUT,
+  not_listed:
+    "The connection is no longer in the list. Wait until the list has loaded, then try again.",
+  busy: KEY_BUSY,
+  protection_unavailable:
+    "This device cannot protect it: the system's secure storage is not available. On Linux, a secret service such as GNOME Keyring or KWallet must be running.",
+  failed: "This device could not store it. Try again.",
+});
+
+/** Why removing a key was refused, one sentence for each refusal. */
+export const REMOVE_PROVIDER_KEY_REFUSAL_MESSAGES: Readonly<
+  Record<RemoveProviderKeyRefusal, string>
+> = Object.freeze({
+  invalid: "The request was not valid.",
+  not_signed_in: SIGNED_OUT,
+  not_listed:
+    "The connection is no longer in the list. Wait until the list has loaded, then try again.",
+  busy: KEY_BUSY,
+  failed: "This device could not delete it. Try again.",
+});
+
+/** The sentence after the answer of storing a key. */
+export function describeSaveProviderKey(result: SaveProviderKeyResult): string {
+  return result.outcome === "ok"
+    ? PROVIDER_CONNECTION_DONE_MESSAGES.saveKey
+    : `${PROVIDER_CONNECTION_NOT_DONE_MESSAGES.saveKey} ${SAVE_PROVIDER_KEY_REFUSAL_MESSAGES[result.reason]}`;
+}
+
+/** The sentence after the answer of removing a key. */
+export function describeRemoveProviderKey(
+  result: RemoveProviderKeyResult,
+): string {
+  return result.outcome === "ok"
+    ? PROVIDER_CONNECTION_DONE_MESSAGES.removeKey
+    : `${PROVIDER_CONNECTION_NOT_DONE_MESSAGES.removeKey} ${REMOVE_PROVIDER_KEY_REFUSAL_MESSAGES[result.reason]}`;
+}
+
+/**
+ * The key as the section sends it: without white space at its start and
+ * its end, which a copy often adds and which no key holds.
+ */
+export function providerKeyToSend(text: string): string {
+  return text.trim();
+}
+
+/**
+ * The problem of a key before it is sent, or undefined, as the main process
+ * checks it: none, longer than the limit, or a white space, control, or
+ * format character, or text that is not well-formed. It never names the
+ * key.
+ */
+export function providerKeyPrompt(key: string): string | undefined {
+  if (key === "") {
+    return PROVIDER_CONNECTION_MESSAGES.keyMissing;
+  }
+  if (key.length > MAX_PROVIDER_KEY_LENGTH) {
+    return PROVIDER_CONNECTION_MESSAGES.keyTooLong;
+  }
+  return key.isWellFormed() && !KEY_FORBIDDEN_CHARACTER.test(key)
+    ? undefined
+    : PROVIDER_CONNECTION_MESSAGES.keyUnsafe;
+}
 
 function refusalSentence<R extends string>(
   messages: Readonly<Record<Exclude<R, "too_soon" | "rate_limited">, string>> &
@@ -324,6 +435,10 @@ export interface ProviderConnectionRow {
   readonly status: ProviderConnectionStatusView;
   readonly statusName: string;
   readonly statusText: string;
+  /** "Replace" once a key is stored (`ready`), "Enter" otherwise. */
+  readonly keyAction: "enter" | "replace";
+  /** Whether a key may be stored, so that "Remove the API key" is offered. */
+  readonly keyMayExist: boolean;
 }
 
 export interface ProviderConnectionsModel {
@@ -346,6 +461,8 @@ function rowOf(item: ProviderConnectionItemView): ProviderConnectionRow {
     status: item.status,
     statusName: texts.name,
     statusText: texts.text,
+    keyAction: item.status === "ready" ? "replace" : "enter",
+    keyMayExist: item.status !== "credential_missing",
   };
 }
 
@@ -400,11 +517,19 @@ export function describeProviderConnections(
   return { status, rows, signedIn: true };
 }
 
-/** The question before a removal: the connection as it was shown. */
-export interface ProviderConnectionQuestion {
+/** A connection as it was shown, for a question or the key form. */
+export interface ProviderConnectionTarget {
   readonly id: string;
   readonly label: string;
   readonly kindName: string;
+}
+
+/**
+ * The question before a removal: of the connection (`remove`), or of its
+ * API key only (`removeKey`).
+ */
+export interface ProviderConnectionQuestion extends ProviderConnectionTarget {
+  readonly action: "remove" | "removeKey";
 }
 
 /** What the section shows of its actions. */
@@ -424,6 +549,16 @@ export interface ProviderConnectionActionsView {
   readonly draftLabel: string;
   /** Why the label was not sent, or undefined. */
   readonly labelProblem: string | undefined;
+  /** The connection whose key form is open, or undefined. */
+  readonly keyFor: ProviderConnectionTarget | undefined;
+  /**
+   * The text of the key field. It starts empty whenever the form opens and
+   * is emptied as the key is sent, refused before sending, or the form
+   * closes.
+   */
+  readonly draftKey: string;
+  /** Why the key was not sent, or undefined. */
+  readonly keyProblem: string | undefined;
 }
 
 export const IDLE_PROVIDER_CONNECTION_ACTIONS: ProviderConnectionActionsView =
@@ -434,6 +569,9 @@ export const IDLE_PROVIDER_CONNECTION_ACTIONS: ProviderConnectionActionsView =
     draftKind: "claude",
     draftLabel: "",
     labelProblem: undefined,
+    keyFor: undefined,
+    draftKey: "",
+    keyProblem: undefined,
   });
 
 export interface ProviderConnectionActions {
@@ -452,18 +590,36 @@ export interface ProviderConnectionActions {
   readonly register: () => Promise<void>;
   /** Opens the question before removing a connection that the model lists. */
   readonly askRemove: (row: ProviderConnectionRow) => void;
+  /** Opens the empty key form of a connection that the model lists. */
+  readonly askKey: (row: ProviderConnectionRow) => void;
+  /** Changes the key field, and ends its problem. */
+  readonly editKey: (text: string) => void;
   /**
-   * Removes the connection of the open question. Resolves to true when the
-   * main process removed it, so that the focus can leave its button.
+   * Sends the key of the form, trimmed (`providerKeyToSend`), once it passes
+   * `providerKeyPrompt`; the field is emptied first in either case, so the
+   * key is held no longer than this call. Closes the form once the main
+   * process stored it. While an action runs, nothing happens. Never
+   * rejects.
+   */
+  readonly saveKey: () => Promise<void>;
+  /** Closes the key form and empties its field. */
+  readonly cancelKey: () => void;
+  /** Opens the question before removing a listed connection's API key. */
+  readonly askRemoveKey: (row: ProviderConnectionRow) => void;
+  /**
+   * Runs the open question: removes the connection, or its key. Resolves to
+   * true when the main process removed the connection, so that the focus
+   * can leave its button.
    */
   readonly confirm: () => Promise<boolean>;
   /** Closes the open question without the removal. */
   readonly cancel: () => void;
   /**
    * Follows the section's model, which the section passes after every
-   * render: a sign-out drops the question, the field, and the last
-   * sentence, which belonged to the device that left, and the question
-   * ends once its connection is no longer listed.
+   * render: a sign-out drops the question, the fields, the key form, and
+   * the last sentence, which belonged to the device that left, and the
+   * question and the key form end once their connection is no longer
+   * listed.
    */
   readonly follow: (model: ProviderConnectionsModel) => void;
 }
@@ -475,7 +631,10 @@ export interface ProviderConnectionActions {
  * no sentence.
  */
 export function createProviderConnectionActions(
-  bridge: Pick<ProviderConnectionsBridge, "register" | "remove">,
+  bridge: Pick<
+    ProviderConnectionsBridge,
+    "register" | "remove" | "saveKey" | "removeKey"
+  >,
   onView: (view: ProviderConnectionActionsView) => void,
 ): ProviderConnectionActions {
   let view = IDLE_PROVIDER_CONNECTION_ACTIONS;
@@ -486,6 +645,15 @@ export function createProviderConnectionActions(
     view = Object.freeze({ ...view, ...change });
     onView(view);
   };
+
+  const listed = (row: ProviderConnectionRow): boolean =>
+    model?.rows?.some((shown) => shown.id === row.id) === true;
+  const targetOf = (row: ProviderConnectionRow): ProviderConnectionTarget =>
+    Object.freeze({ id: row.id, label: row.label, kindName: row.kindName });
+  const questionOf = (
+    row: ProviderConnectionRow,
+    action: ProviderConnectionQuestion["action"],
+  ): ProviderConnectionQuestion => Object.freeze({ ...targetOf(row), action });
 
   async function run<T>(
     call: () => Promise<T>,
@@ -541,24 +709,71 @@ export function createProviderConnectionActions(
       }
     },
     askRemove: (row: ProviderConnectionRow) => {
-      if (
-        view.running ||
-        model?.rows?.some((listed) => listed.id === row.id) !== true
-      ) {
+      if (!view.running && listed(row)) {
+        show({ question: questionOf(row, "remove") });
+      }
+    },
+    askKey: (row: ProviderConnectionRow) => {
+      if (!view.running && listed(row)) {
+        show({
+          keyFor: targetOf(row),
+          draftKey: "",
+          keyProblem: undefined,
+          question: undefined,
+        });
+      }
+    },
+    editKey: (text: string) => {
+      if (view.keyFor !== undefined) {
+        show({ draftKey: text, keyProblem: undefined });
+      }
+    },
+    saveKey: async () => {
+      const target = view.keyFor;
+      if (view.running || target === undefined) {
         return;
       }
-      show({
-        question: Object.freeze({
-          id: row.id,
-          label: row.label,
-          kindName: row.kindName,
-        }),
-      });
+      const key = providerKeyToSend(view.draftKey);
+      const problem = providerKeyPrompt(key);
+      // The field is emptied before anything is sent, also when the key is
+      // not sent: the person pastes it again.
+      show({ draftKey: "", keyProblem: problem });
+      if (problem !== undefined) {
+        return;
+      }
+      const done = await run(
+        () => bridge.saveKey(target.id, key),
+        describeSaveProviderKey,
+        PROVIDER_CONNECTION_NOT_DONE_MESSAGES.saveKey,
+        (result) => result.outcome === "ok",
+      );
+      if (done && view.keyFor?.id === target.id) {
+        show({ keyFor: undefined, draftKey: "", keyProblem: undefined });
+      }
     },
-    confirm: () => {
+    cancelKey: () => {
+      if (view.keyFor !== undefined || view.draftKey !== "") {
+        show({ keyFor: undefined, draftKey: "", keyProblem: undefined });
+      }
+    },
+    askRemoveKey: (row: ProviderConnectionRow) => {
+      if (!view.running && listed(row)) {
+        show({ question: questionOf(row, "removeKey") });
+      }
+    },
+    confirm: async () => {
       const question = view.question;
       if (view.running || question === undefined) {
-        return Promise.resolve(false);
+        return false;
+      }
+      if (question.action === "removeKey") {
+        await run(
+          () => bridge.removeKey(question.id),
+          describeRemoveProviderKey,
+          PROVIDER_CONNECTION_NOT_DONE_MESSAGES.removeKey,
+          (result) => result.outcome === "ok",
+        );
+        return false;
       }
       return run(
         () => bridge.remove(question.id),
@@ -582,6 +797,9 @@ export function createProviderConnectionActions(
           question: undefined,
           draftLabel: "",
           labelProblem: undefined,
+          keyFor: undefined,
+          draftKey: "",
+          keyProblem: undefined,
         });
         return;
       }
@@ -591,6 +809,13 @@ export function createProviderConnectionActions(
         next.rows?.some((row) => row.id === question.id) !== true
       ) {
         show({ question: undefined });
+      }
+      const keyFor = view.keyFor;
+      if (
+        keyFor !== undefined &&
+        next.rows?.some((row) => row.id === keyFor.id) !== true
+      ) {
+        show({ keyFor: undefined, draftKey: "", keyProblem: undefined });
       }
     },
   });
