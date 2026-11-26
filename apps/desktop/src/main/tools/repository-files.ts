@@ -1,0 +1,321 @@
+// The file list of a run's context (#34; Project Manager decision of
+// 2026-11-26): the files of the run's repository, found by walking its
+// folder under the rules of the read tools (`read-tools.ts`). It needs no
+// capability of its own: the context builder (`../agents/run-context.ts`)
+// checks `repo.read` before it calls a lister, and holds that action until
+// the lister settled or the deadline of `REPOSITORY_FILE_LIST_LIMITS`.
+//
+// The walk lists each folder with the `list_directory` tool itself, so every
+// listing passes the same lexical rules (`repository-path.ts`) and the same
+// checks on the file system: the repository's folder must still be the one
+// that the link recorded, a path through a link or a junction is refused,
+// and so is one on another device. On top of the tool's own rules (hidden
+// names and `.git` left out), the walk never follows a link (`link`), skips
+// what is neither a file nor a folder (`other`), and does not enter a folder
+// named `node_modules`, `dist`, `out`, or `build`, at any depth.
+//
+// `RepositoryFileLister` is the seam of the later swap to `git ls-files`
+// (#36, Git slice): another lister gives the same answer, and the context
+// builder checks every path of any lister again with the lexical rules.
+import type { PlatformPath } from "node:path";
+import {
+  createReadTools,
+  READ_TOOL_NAMES,
+  type ReadToolFileSystem,
+} from "./read-tools.ts";
+import { MAX_REPOSITORY_PATH_LENGTH } from "./repository-path.ts";
+import type {
+  Tool,
+  ToolRunContext,
+  ToolRunOutcome,
+} from "./tool-dispatcher.ts";
+
+/**
+ * The bounds of the file list (`maxFiles` by the Project Manager's decision
+ * of 2026-11-26; the others defaults until the Project Manager decides):
+ *
+ * - `maxFiles`: at most this many files are listed; a repository with more
+ *   is answered with the first ones and `truncated: true`.
+ * - `maxFolders`: at most this many folders are listed, the repository's
+ *   folder included, so that a tree of many folders with few files ends
+ *   too; a folder left out for it sets `truncated: true`.
+ * - `maxDepth`: a folder deeper than this many levels below the
+ *   repository's folder is not entered, and sets `truncated: true`. Each
+ *   listing checks every folder from the repository's folder down again, so
+ *   a deep chain of folders costs the square of its depth.
+ * - `deadlineMs`: the repository part of a run's context, the folder's
+ *   resolution and its list, ends after this long (`../agents/run-context.ts`
+ *   aborts the walk): with the files found so far and `truncated: true` once
+ *   the repository's folder was listed, and left out before that.
+ */
+export const REPOSITORY_FILE_LIST_LIMITS = Object.freeze({
+  maxFiles: 1_000,
+  maxFolders: 1_000,
+  maxDepth: 32,
+  deadlineMs: 10_000,
+});
+
+/**
+ * The folder names that the walk never enters, at any depth, in exactly this
+ * case (Project Manager decision of 2026-11-26). A file of such a name is
+ * listed.
+ */
+export const SKIPPED_FOLDER_NAMES: ReadonlySet<string> = Object.freeze(
+  new Set(["node_modules", "dist", "out", "build"]),
+);
+
+/**
+ * What a lister answers.
+ *
+ * - `files`: paths relative to the repository's top-level folder, in POSIX
+ *   form, each once, sorted by UTF-16 code unit; never a folder, a link, or
+ *   an absolute path.
+ * - `truncated`: a bound of `REPOSITORY_FILE_LIST_LIMITS` cut the list, a
+ *   folder held more entries than one listing reads, a path was too long to
+ *   name, a folder below the repository's folder could not be read, or the
+ *   signal aborted after the repository's folder was listed (the list then
+ *   holds the files found so far).
+ * - `aborted`: the signal aborted before the repository's folder was listed.
+ * - `failed`: a listing was refused, or the repository's folder could not
+ *   be listed; no partial list is answered.
+ *
+ * A lister answers promptly once its signal aborts, also while a listing of
+ * the file system has not returned.
+ */
+export type RepositoryFileListOutcome =
+  | {
+      readonly ok: true;
+      readonly files: readonly string[];
+      readonly truncated: boolean;
+    }
+  | { readonly ok: false; readonly reason: "aborted" | "failed" };
+
+/**
+ * Lists the files of the repository's folder that the resolution named for
+ * this build, with its recorded identity and a signal: the run's, combined
+ * with the deadline of `REPOSITORY_FILE_LIST_LIMITS`. Never rejects.
+ */
+export type RepositoryFileLister = (
+  context: ToolRunContext,
+) => Promise<RepositoryFileListOutcome>;
+
+const ABORTED: RepositoryFileListOutcome = Object.freeze({
+  ok: false,
+  reason: "aborted",
+});
+const FAILED: RepositoryFileListOutcome = Object.freeze({
+  ok: false,
+  reason: "failed",
+});
+
+interface ListedEntry {
+  readonly name: string;
+  readonly kind: string;
+}
+
+interface Listing {
+  readonly entries: readonly ListedEntry[];
+  readonly truncated: boolean;
+}
+
+/** The entries and the truncation of a listing, or null for another shape. */
+function listingOf(result: unknown): Listing | null {
+  if (typeof result !== "object" || result === null) {
+    return null;
+  }
+  const { entries, truncated } = result as {
+    entries?: unknown;
+    truncated?: unknown;
+  };
+  if (!Array.isArray(entries) || typeof truncated !== "boolean") {
+    return null;
+  }
+  for (const entry of entries as unknown[]) {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      typeof (entry as { name?: unknown }).name !== "string" ||
+      typeof (entry as { kind?: unknown }).kind !== "string"
+    ) {
+      return null;
+    }
+  }
+  return { entries: entries as ListedEntry[], truncated };
+}
+
+/**
+ * Whether a refused listing of a folder below the repository's folder skips
+ * that folder rather than failing the list: it is gone or no longer a
+ * folder since its parent was listed, or it lies on another device (a
+ * mount, which the read tools refuse as well).
+ */
+function skipsFolder(outcome: Extract<ToolRunOutcome, { ok: false }>): boolean {
+  return (
+    outcome.code === "not_found" ||
+    outcome.code === "not_a_directory" ||
+    (outcome.code === "path_refused" && outcome.reason === "other_device")
+  );
+}
+
+const STOPPED: unique symbol = Symbol("stopped");
+
+/**
+ * What `work` gives, or `STOPPED` once the signal aborts, whichever comes
+ * first, so that a listing that does not return (a stalled network share)
+ * never holds the walk after an abort. A rejection rejects.
+ */
+function untilStopped<T>(
+  work: Promise<T>,
+  signal: AbortSignal,
+): Promise<T | typeof STOPPED> {
+  if (signal.aborted) {
+    return Promise.resolve(STOPPED);
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve(STOPPED);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error as Error);
+      },
+    );
+  });
+}
+
+function sortedList(
+  files: readonly string[],
+  truncated: boolean,
+): RepositoryFileListOutcome {
+  return Object.freeze({
+    ok: true,
+    files: Object.freeze(
+      [...files].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+    ),
+    truncated,
+  });
+}
+
+export interface RepositoryWalkOptions {
+  readonly files: ReadToolFileSystem;
+  /** The system's path functions, `node:path` by default. */
+  readonly pathApi?: PlatformPath;
+}
+
+/**
+ * The lister that walks the repository's folder breadth-first, each folder's
+ * entries in the order of `list_directory` (sorted by name), so that a cut
+ * keeps the files nearest the top. The kept paths are then sorted.
+ */
+export function createRepositoryWalkLister(
+  options: RepositoryWalkOptions,
+): RepositoryFileLister {
+  const tools = createReadTools(
+    options.pathApi === undefined
+      ? { files: options.files }
+      : { files: options.files, pathApi: options.pathApi },
+  );
+  const list = tools.find(
+    (tool) => tool.name === READ_TOOL_NAMES.listDirectory,
+  ) as Tool;
+  const { maxFiles, maxFolders, maxDepth } = REPOSITORY_FILE_LIST_LIMITS;
+
+  async function walk(
+    context: ToolRunContext,
+  ): Promise<RepositoryFileListOutcome> {
+    const { signal } = context;
+    const files: string[] = [];
+    let truncated = false;
+    let rootListed = false;
+    // After an abort: the files found so far, once the repository's folder
+    // was listed.
+    const stopped = () => (rootListed ? sortedList(files, true) : ABORTED);
+    // The folders to list, the repository's folder first, each with its
+    // depth below it; `next` is the first one not listed yet. At most
+    // `maxFolders` are ever held.
+    const folders: { readonly path: string; readonly depth: number }[] = [
+      { path: ".", depth: 0 },
+    ];
+    let next = 0;
+    walking: while (next < folders.length) {
+      if (signal.aborted) {
+        return stopped();
+      }
+      const { path: folder, depth } = folders[next] as {
+        path: string;
+        depth: number;
+      };
+      next += 1;
+      const parsed = list.parse({ path: folder });
+      if (!parsed.ok) {
+        return FAILED;
+      }
+      let outcome: ToolRunOutcome | typeof STOPPED;
+      try {
+        outcome = await untilStopped(parsed.run(context), signal);
+      } catch {
+        return FAILED;
+      }
+      if (outcome === STOPPED || signal.aborted) {
+        return stopped();
+      }
+      if (!outcome.ok) {
+        if (outcome.code === "aborted") {
+          return stopped();
+        }
+        if (folder !== ".") {
+          if (skipsFolder(outcome)) {
+            continue;
+          }
+          // A folder that cannot be read (for example without permission)
+          // is left out; a swap stays fatal.
+          if (outcome.code === "read_failed") {
+            truncated = true;
+            continue;
+          }
+        }
+        return FAILED;
+      }
+      const listing = listingOf(outcome.result);
+      if (listing === null) {
+        return FAILED;
+      }
+      rootListed = true;
+      if (listing.truncated) {
+        truncated = true;
+      }
+      for (const entry of listing.entries) {
+        const child = folder === "." ? entry.name : `${folder}/${entry.name}`;
+        // A path that the read tools could not name again is left out.
+        if (child.length > MAX_REPOSITORY_PATH_LENGTH) {
+          truncated = true;
+          continue;
+        }
+        if (entry.kind === "file") {
+          if (files.length >= maxFiles) {
+            truncated = true;
+            break walking;
+          }
+          files.push(child);
+        } else if (
+          entry.kind === "directory" &&
+          !SKIPPED_FOLDER_NAMES.has(entry.name)
+        ) {
+          if (depth + 1 > maxDepth || folders.length >= maxFolders) {
+            truncated = true;
+          } else {
+            folders.push({ path: child, depth: depth + 1 });
+          }
+        }
+        // A link and anything else is never followed or listed.
+      }
+    }
+    return sortedList(files, truncated);
+  }
+
+  return (context: ToolRunContext) => walk(context).catch(() => FAILED);
+}

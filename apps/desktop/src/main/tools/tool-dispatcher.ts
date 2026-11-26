@@ -371,9 +371,10 @@ function untilAborted<T>(
 
 /**
  * Whether the JSON text holds the folder, in any case, with either
- * separator, as JSON writes it.
+ * separator, as JSON writes it. The run's context (#34) applies it to its
+ * file list as well.
  */
-function holdsFolder(json: string, folder: string): boolean {
+export function holdsFolder(json: string, folder: string): boolean {
   const text = json.toLowerCase();
   const forms = new Set([
     folder,
