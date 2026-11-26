@@ -913,6 +913,11 @@ export function createDeviceKeyStore(
     // kept would refuse it, and `abandonReplacement` makes it current
     // again. The newest key is never weaker than the previous one, which
     // was not below the record, so this never lowers the record.
+    // Residual risk: a power loss can lose the deletion above and keep the
+    // raised record, which leaves a lower previous key below the record,
+    // so the next `load` refuses it as `corrupt` until "This is not me".
+    // The order is deliberate: accepting a previous key below the record
+    // would let a planted previous key file through again.
     if (recordsProtection) {
       await recordProtectionQuietly(keys.current.protection);
     }

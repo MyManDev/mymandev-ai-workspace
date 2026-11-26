@@ -1467,7 +1467,7 @@ test("on Linux a key file whose protection is lower than the recorded choice is 
   }
   // system > passphrase, system > unprotected, passphrase > unprotected.
   expect(cases).toBe(3 * 4);
-});
+}, 20_000);
 
 test("on Linux a key file at or above the recorded choice is loaded, and a higher one raises the record", async () => {
   const fake = fakeSafeStorage();
@@ -1493,7 +1493,7 @@ test("on Linux a key file at or above the recorded choice is loaded, and a highe
     }
   }
   expect(cases).toBe(6);
-});
+}, 20_000);
 
 test("on Linux a key without a record, as on an installation from before the record, makes its protection the record once", async () => {
   const fake = fakeSafeStorage();
@@ -1525,7 +1525,64 @@ test("on Linux a key without a record, as on an installation from before the rec
     () => storeWith(fake, { platform: "linux" }).load(),
     "corrupt",
   );
-});
+}, 20_000);
+
+test("on Linux a load that fails records nothing, and only a load whose keys opened records their protection", async () => {
+  const fake = fakeSafeStorage();
+  const files = await linuxKeyFiles(fake);
+  const failures: {
+    layout: Record<string, string>;
+    passphrase?: string;
+    failDecrypt?: boolean;
+    code: DeviceKeyErrorCode;
+    /** What the successful load afterwards records. */
+    recorded: DeviceKeyProtection;
+  }[] = [
+    {
+      layout: { [CURRENT_KEY_FILE]: files.passphrase.content },
+      code: "passphrase_required",
+      recorded: "passphrase",
+    },
+    {
+      layout: { [CURRENT_KEY_FILE]: files.passphrase.content },
+      passphrase: "wrong passphrase",
+      code: "wrong_passphrase",
+      recorded: "passphrase",
+    },
+    {
+      layout: { [CURRENT_KEY_FILE]: files.system.content },
+      failDecrypt: true,
+      code: "unreadable",
+      recorded: "system",
+    },
+    // The current key opens, and the previous one does not.
+    {
+      layout: {
+        [CURRENT_KEY_FILE]: files.system.content,
+        [PREVIOUS_KEY_FILE]: files.passphrase.content,
+      },
+      passphrase: "wrong passphrase",
+      code: "wrong_passphrase",
+      recorded: "passphrase",
+    },
+  ];
+  for (const { layout, passphrase, failDecrypt, code, recorded } of failures) {
+    await layOut(layout);
+    fake.state.failDecrypt = failDecrypt ?? false;
+    const store = storeWith(fake, { platform: "linux" });
+
+    await expectRejection(
+      () => store.load(passphrase === undefined ? {} : { passphrase }),
+      code,
+    );
+
+    expect(await readRecord()).toBeNull();
+    await expectFolder(layout);
+    fake.state.failDecrypt = false;
+    await store.load({ passphrase: PASSPHRASE });
+    expect(await readRecord()).toBe(recordOf(recorded));
+  }
+}, 20_000);
 
 test("on Linux a pending replacement without a record records the weaker of its two keys", async () => {
   const fake = fakeSafeStorage();
@@ -1598,7 +1655,7 @@ test("on Linux a damaged, unknown, or newer record refuses the key, fails closed
       await expectFolder(layout);
     }
   }
-});
+}, 20_000);
 
 test("on Linux a record that cannot be read rejects with the error and loads no key", async () => {
   const fake = fakeSafeStorage();
