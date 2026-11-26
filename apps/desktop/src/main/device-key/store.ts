@@ -69,7 +69,8 @@ export const CONFIRMED_LINUX_BACKENDS: readonly string[] = Object.freeze([
  * a secret service. Chromium writes `v10` for its fixed key, which protects
  * nothing. Not yet verified with the asynchronous API on a real Linux
  * desktop (#67); any other prefix counts as no secret service, so a wrong
- * guess only leads to a passphrase.
+ * guess only leads to a passphrase. A stored system-protected key file with
+ * any other prefix is refused as `corrupt` before it is decrypted.
  */
 export const SECRET_SERVICE_CIPHERTEXT_PREFIX = "v11";
 
@@ -174,8 +175,10 @@ export interface DeviceKeyStore {
   /**
    * The protection of the stored key, read from the key file without
    * decrypting it. Rejects with `corrupt` or `newer_format` for a key file
-   * that this version cannot read, and with `corrupt` for a key file
-   * protected by a passphrase or unprotected on Windows or macOS.
+   * that this version cannot read, with `corrupt` for a key file
+   * protected by a passphrase or unprotected on Windows or macOS, and with
+   * `corrupt` for a system-protected key file on Linux whose ciphertext does
+   * not start with `SECRET_SERVICE_CIPHERTEXT_PREFIX`.
    */
   readonly status: () => Promise<DeviceKeyStatus>;
   /**
@@ -187,7 +190,9 @@ export interface DeviceKeyStore {
    * `shouldReEncrypt`. Rejects with `passphrase_required`,
    * `wrong_passphrase`, `unreadable`, `corrupt`, or `newer_format`; a key
    * file protected by a passphrase or unprotected is `corrupt` on Windows
-   * and macOS, where the store never writes one.
+   * and macOS, where the store never writes one, and so is a
+   * system-protected key file on Linux whose ciphertext does not start with
+   * `SECRET_SERVICE_CIPHERTEXT_PREFIX`, which is never decrypted.
    */
   readonly load: (options?: LoadDeviceKeyOptions) => Promise<DeviceKeys | null>;
   /** The keys held, or null before `load` or `create` and after `delete`. */
@@ -361,7 +366,11 @@ export function createDeviceKeyStore(
    * Reads and decodes a key file. On Windows and macOS a key file protected
    * by a passphrase or unprotected is `corrupt`: the store never writes one
    * there, so it was placed by someone else, and a replacement must not
-   * inherit its lower protection.
+   * inherit its lower protection. Under the same condition as
+   * `systemEncrypt`, a system-protected key file whose ciphertext was not
+   * made with a secret service's key is `corrupt` too, before it ever
+   * reaches `safeStorage`: the store never writes one, and Chromium would
+   * still decrypt a `v10` ciphertext with its fixed key.
    */
   async function readKeyFile(file: string): Promise<KeyFile | null> {
     const bytes = await readFileIfPresent(fileSystem, file);
@@ -370,6 +379,13 @@ export function createDeviceKeyStore(
     }
     const stored = decodeKeyFile(bytes);
     if (stored.protection !== "system" && !fallbackAllowed) {
+      throw new DeviceKeyError("corrupt");
+    }
+    if (
+      stored.protection === "system" &&
+      !systemAlwaysProtects &&
+      !madeWithSecretService(stored.ciphertext)
+    ) {
       throw new DeviceKeyError("corrupt");
     }
     return stored;

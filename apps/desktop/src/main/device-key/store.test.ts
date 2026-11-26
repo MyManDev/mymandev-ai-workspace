@@ -517,6 +517,98 @@ test("on Linux a rewrite after shouldReEncrypt is not written with a v10 ciphert
   );
 });
 
+/** The bytes of a system-protected key file whose ciphertext starts with `prefix`. */
+function withCiphertextPrefix(keyFile: string, prefix: string): string {
+  const stored = JSON.parse(keyFile) as Record<string, string>;
+  const ciphertext = Buffer.from(stored["ciphertext"] ?? "", "base64url");
+  ciphertext.write(prefix, 0, "ascii");
+  return JSON.stringify({
+    ...stored,
+    ciphertext: ciphertext.toString("base64url"),
+  });
+}
+
+test("on Linux a planted key file with a v10 ciphertext is refused as corrupt and never decrypted", async () => {
+  const fake = fakeSafeStorage({ backend: "gnome_libsecret" });
+  await storeWith(fake, { platform: "linux" }).create({ kind: "system" });
+  const v11 = await readFile(path.join(folder, CURRENT_KEY_FILE), "utf8");
+  // The fake decrypts whatever the prefix, as Chromium does for `v10` with
+  // its fixed key, so only the store's check refuses this file.
+  const v10 = withCiphertextPrefix(v11, "v10");
+
+  const layouts = [
+    { [CURRENT_KEY_FILE]: v10 },
+    { [PREVIOUS_KEY_FILE]: v10 },
+    { [CURRENT_KEY_FILE]: v11, [PREVIOUS_KEY_FILE]: v10 },
+  ];
+  for (const layout of layouts) {
+    await rm(folder, { recursive: true, force: true });
+    await mkdir(folder);
+    for (const [name, content] of Object.entries(layout)) {
+      await writeFile(path.join(folder, name), content);
+    }
+    fake.calls.length = 0;
+    const store = storeWith(fake, { platform: "linux" });
+
+    await expectRejection(() => store.status(), "corrupt");
+    await expectRejection(() => store.load(), "corrupt");
+    expect(fake.calls).not.toContain("decryptStringAsync");
+    expect(store.keys()).toBeNull();
+    // Nothing replaces, moves, or deletes the refused file on its own.
+    expect(await store.hasKey()).toBe(true);
+    await expectRejection(() => store.create({ kind: "system" }), "key_exists");
+    await expectRejection(() => store.replace(), "not_loaded");
+    expect((await readdir(folder)).sort()).toEqual(Object.keys(layout).sort());
+    for (const [name, content] of Object.entries(layout)) {
+      expect(await readFile(path.join(folder, name), "utf8")).toBe(content);
+    }
+  }
+});
+
+test("on Linux a key file with a v11 ciphertext is still decrypted and loaded", async () => {
+  const fake = fakeSafeStorage({ backend: "kwallet6" });
+  const created = await storeWith(fake, { platform: "linux" }).create({
+    kind: "system",
+  });
+  expect(
+    Buffer.from((await keyFileJson())["ciphertext"] ?? "", "base64url")
+      .subarray(0, 3)
+      .toString("ascii"),
+  ).toBe("v11");
+  fake.calls.length = 0;
+  const restarted = storeWith(fake, { platform: "linux" });
+
+  expect(await restarted.status()).toEqual({
+    protection: "system",
+    loaded: false,
+    replacementPending: false,
+    passphraseRequired: false,
+  });
+  const keys = await restarted.load();
+
+  expect(keys?.current.publicKey).toBe(created.publicKey);
+  expect(fake.calls).toEqual(["decryptStringAsync"]);
+});
+
+for (const platform of ["win32", "darwin"] as const) {
+  test(`on ${platform} the prefix of a key file's ciphertext is not checked`, async () => {
+    // Chromium's ciphertexts on Windows and macOS start with `v10` too.
+    const fake = fakeSafeStorage();
+    fake.state.prefix = "v10";
+    const created = await storeWith(fake, { platform }).create({
+      kind: "system",
+    });
+    fake.calls.length = 0;
+    const restarted = storeWith(fake, { platform });
+
+    expect(await restarted.status()).toMatchObject({ protection: "system" });
+    const keys = await restarted.load();
+
+    expect(keys?.current.publicKey).toBe(created.publicKey);
+    expect(fake.calls).toContain("decryptStringAsync");
+  });
+}
+
 test("on Linux without a secret service a key is protected by a passphrase, and a wrong passphrase is refused", async () => {
   const fake = fakeSafeStorage({ backend: "basic_text" });
   const store = storeWith(fake, { platform: "linux" });
