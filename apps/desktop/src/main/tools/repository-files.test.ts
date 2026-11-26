@@ -36,6 +36,8 @@ class FakeFiles implements ReadToolFileSystem {
   /** Runs before each `readdir`, with its folder. */
   beforeReaddir: ((target: string) => void) | null = null;
   failReaddir = new Map<string, string>();
+  /** Folders whose `readdir` never returns, as on a stalled network share. */
+  readonly hangReaddir = new Set<string>();
   readonly devs = new Map<string, bigint>();
   private nextIno = 2n;
 
@@ -144,6 +146,9 @@ class FakeFiles implements ReadToolFileSystem {
     if (code !== undefined) {
       throw fsError(code);
     }
+    if (this.hangReaddir.has(target)) {
+      return new Promise<never>(() => undefined);
+    }
     this.listed.push(target);
     const real = this.resolve(target, true);
     const prefix = real === "/" ? "/" : `${real}/`;
@@ -187,6 +192,8 @@ test("the bounds and the skipped folder names are those of the decision of 2026-
   expect(REPOSITORY_FILE_LIST_LIMITS).toEqual({
     maxFiles: 1_000,
     maxFolders: 1_000,
+    maxDepth: 32,
+    deadlineMs: 10_000,
   });
   expect(Object.isFrozen(REPOSITORY_FILE_LIST_LIMITS)).toBe(true);
   expect([...SKIPPED_FOLDER_NAMES].sort()).toEqual([
@@ -316,6 +323,80 @@ test("at most 1,000 folders are listed, and a folder left out for it says so", a
   expect(over.listed).toHaveLength(1_000);
 });
 
+test("the walk stops listing once 1,000 files are found and one more is seen", async () => {
+  const files = repository().dir(`${ROOT}/a`).dir(`${ROOT}/b`).dir(`${ROOT}/c`);
+  for (
+    let index = 0;
+    index < REPOSITORY_FILE_LIST_LIMITS.maxFiles;
+    index += 1
+  ) {
+    files.file(`${ROOT}/a/f${String(index).padStart(4, "0")}.txt`);
+  }
+  files.file(`${ROOT}/b/one-more.txt`).file(`${ROOT}/c/never.txt`);
+  const outcome = await walk(files);
+  expect(outcome.ok && outcome.files.length).toBe(1_000);
+  expect(outcome.ok && outcome.truncated).toBe(true);
+  // `c` is never listed.
+  expect(files.listed).toEqual([ROOT, `${ROOT}/a`, `${ROOT}/b`]);
+});
+
+test("a folder deeper than 32 levels is not entered, and the list says so", async () => {
+  const { maxDepth } = REPOSITORY_FILE_LIST_LIMITS;
+  // A chain of folders `d/d/.../d`, each with a file.
+  function chain(levels: number): FakeFiles {
+    const files = repository();
+    let current = ROOT;
+    for (let level = 1; level <= levels; level += 1) {
+      current = `${current}/d`;
+      files.dir(current).file(`${current}/f${level}.txt`);
+    }
+    return files;
+  }
+  const exact = chain(maxDepth);
+  const whole = await walk(exact);
+  expect(whole.ok && whole.files.length).toBe(maxDepth);
+  expect(whole.ok && whole.truncated).toBe(false);
+  expect(exact.listed).toHaveLength(maxDepth + 1);
+
+  const deep = chain(maxDepth + 8);
+  const cut = await walk(deep);
+  if (!cut.ok) {
+    throw new Error("the walk failed");
+  }
+  expect(cut.truncated).toBe(true);
+  expect(cut.files).toHaveLength(maxDepth);
+  expect(cut.files).toContain(`${"d/".repeat(maxDepth)}f${maxDepth}.txt`);
+  // The repository's folder and 32 levels below it, no more.
+  expect(deep.listed).toHaveLength(maxDepth + 1);
+  expect(deep.listed.at(-1)).toBe(`${ROOT}${"/d".repeat(maxDepth)}`);
+});
+
+test("an abort while a listing does not return answers the files found so far once the repository's folder was listed", async () => {
+  const files = repository()
+    .file(`${ROOT}/a.txt`)
+    .dir(`${ROOT}/share`)
+    .file(`${ROOT}/share/b.txt`);
+  files.hangReaddir.add(`${ROOT}/share`);
+  const controller = new AbortController();
+  const walking = walk(files, { signal: controller.signal });
+  await new Promise((done) => setTimeout(done, 0));
+  controller.abort();
+  expect(await walking).toEqual({
+    ok: true,
+    files: ["a.txt"],
+    truncated: true,
+  });
+
+  // Before the repository's folder was listed: aborted.
+  const root = repository().file(`${ROOT}/a.txt`);
+  root.hangReaddir.add(ROOT);
+  const stopped = new AbortController();
+  const hung = walk(root, { signal: stopped.signal });
+  await new Promise((done) => setTimeout(done, 0));
+  stopped.abort();
+  expect(await hung).toEqual({ ok: false, reason: "aborted" });
+});
+
 test("a folder with more entries than one listing reads makes the list say that it was cut", async () => {
   const files = repository().dir(`${ROOT}/many`);
   for (let index = 0; index < 1_000; index += 1) {
@@ -348,9 +429,11 @@ test("a path longer than the read tools take is left out", async () => {
     throw new Error("the walk failed");
   }
   expect(outcome.files).toEqual([`${relative}/short.txt`]);
+  // The list says that a file was left out.
+  expect(outcome.truncated).toBe(true);
 });
 
-test("a folder that is gone or on another device when its turn comes is skipped; a failed or swapped listing fails the whole list", async () => {
+test("a folder that is gone, on another device, or unreadable when its turn comes is skipped; a swapped listing fails the whole list", async () => {
   const gone = repository()
     .file(`${ROOT}/a.txt`)
     .dir(`${ROOT}/gone`)
@@ -376,7 +459,16 @@ test("a folder that is gone or on another device when its turn comes is skipped;
     .dir(`${ROOT}/src`)
     .file(`${ROOT}/src/b.txt`);
   failing.failReaddir.set(`${ROOT}/src`, "EACCES");
-  expect(await walk(failing)).toEqual({ ok: false, reason: "failed" });
+  // An unreadable subfolder is left out, and the list says that it was cut.
+  expect(await walk(failing)).toEqual({
+    ok: true,
+    files: ["a.txt"],
+    truncated: true,
+  });
+  // The repository's folder itself that cannot be read fails the list.
+  const unreadable = repository().file(`${ROOT}/a.txt`);
+  unreadable.failReaddir.set(ROOT, "EACCES");
+  expect(await walk(unreadable)).toEqual({ ok: false, reason: "failed" });
 
   // The repository's folder is no longer the one that the link recorded.
   const swapped = repository().file(`${ROOT}/a.txt`);

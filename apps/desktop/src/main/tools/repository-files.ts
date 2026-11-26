@@ -3,7 +3,7 @@
 // folder under the rules of the read tools (`read-tools.ts`). It needs no
 // capability of its own: the context builder (`../agents/run-context.ts`)
 // checks `repo.read` before it calls a lister, and holds that action until
-// the lister settled.
+// the lister settled or the deadline of `REPOSITORY_FILE_LIST_LIMITS`.
 //
 // The walk lists each folder with the `list_directory` tool itself, so every
 // listing passes the same lexical rules (`repository-path.ts`) and the same
@@ -32,17 +32,27 @@ import type {
 
 /**
  * The bounds of the file list (`maxFiles` by the Project Manager's decision
- * of 2026-11-26; `maxFolders` a default until the Project Manager decides):
+ * of 2026-11-26; the others defaults until the Project Manager decides):
  *
  * - `maxFiles`: at most this many files are listed; a repository with more
  *   is answered with the first ones and `truncated: true`.
  * - `maxFolders`: at most this many folders are listed, the repository's
  *   folder included, so that a tree of many folders with few files ends
  *   too; a folder left out for it sets `truncated: true`.
+ * - `maxDepth`: a folder deeper than this many levels below the
+ *   repository's folder is not entered, and sets `truncated: true`. Each
+ *   listing checks every folder from the repository's folder down again, so
+ *   a deep chain of folders costs the square of its depth.
+ * - `deadlineMs`: the repository part of a run's context, the folder's
+ *   resolution and its list, ends after this long (`../agents/run-context.ts`
+ *   aborts the walk): with the files found so far and `truncated: true` once
+ *   the repository's folder was listed, and left out before that.
  */
 export const REPOSITORY_FILE_LIST_LIMITS = Object.freeze({
   maxFiles: 1_000,
   maxFolders: 1_000,
+  maxDepth: 32,
+  deadlineMs: 10_000,
 });
 
 /**
@@ -60,10 +70,17 @@ export const SKIPPED_FOLDER_NAMES: ReadonlySet<string> = Object.freeze(
  * - `files`: paths relative to the repository's top-level folder, in POSIX
  *   form, each once, sorted by UTF-16 code unit; never a folder, a link, or
  *   an absolute path.
- * - `truncated`: a bound of `REPOSITORY_FILE_LIST_LIMITS` cut the list, or a
- *   folder held more entries than one listing reads.
- * - `aborted`: the run's signal aborted.
- * - `failed`: a listing was refused or failed; no partial list is answered.
+ * - `truncated`: a bound of `REPOSITORY_FILE_LIST_LIMITS` cut the list, a
+ *   folder held more entries than one listing reads, a path was too long to
+ *   name, a folder below the repository's folder could not be read, or the
+ *   signal aborted after the repository's folder was listed (the list then
+ *   holds the files found so far).
+ * - `aborted`: the signal aborted before the repository's folder was listed.
+ * - `failed`: a listing was refused, or the repository's folder could not
+ *   be listed; no partial list is answered.
+ *
+ * A lister answers promptly once its signal aborts, also while a listing of
+ * the file system has not returned.
  */
 export type RepositoryFileListOutcome =
   | {
@@ -75,8 +92,8 @@ export type RepositoryFileListOutcome =
 
 /**
  * Lists the files of the repository's folder that the resolution named for
- * this build, with its recorded identity and the run's signal. Never
- * rejects.
+ * this build, with its recorded identity and a signal: the run's, combined
+ * with the deadline of `REPOSITORY_FILE_LIST_LIMITS`. Never rejects.
  */
 export type RepositoryFileLister = (
   context: ToolRunContext,
@@ -140,6 +157,49 @@ function skipsFolder(outcome: Extract<ToolRunOutcome, { ok: false }>): boolean {
   );
 }
 
+const STOPPED: unique symbol = Symbol("stopped");
+
+/**
+ * What `work` gives, or `STOPPED` once the signal aborts, whichever comes
+ * first, so that a listing that does not return (a stalled network share)
+ * never holds the walk after an abort. A rejection rejects.
+ */
+function untilStopped<T>(
+  work: Promise<T>,
+  signal: AbortSignal,
+): Promise<T | typeof STOPPED> {
+  if (signal.aborted) {
+    return Promise.resolve(STOPPED);
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => resolve(STOPPED);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void work.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error as Error);
+      },
+    );
+  });
+}
+
+function sortedList(
+  files: readonly string[],
+  truncated: boolean,
+): RepositoryFileListOutcome {
+  return Object.freeze({
+    ok: true,
+    files: Object.freeze(
+      [...files].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+    ),
+    truncated,
+  });
+}
+
 export interface RepositoryWalkOptions {
   readonly files: ReadToolFileSystem;
   /** The system's path functions, `node:path` by default. */
@@ -162,7 +222,7 @@ export function createRepositoryWalkLister(
   const list = tools.find(
     (tool) => tool.name === READ_TOOL_NAMES.listDirectory,
   ) as Tool;
-  const { maxFiles, maxFolders } = REPOSITORY_FILE_LIST_LIMITS;
+  const { maxFiles, maxFolders, maxDepth } = REPOSITORY_FILE_LIST_LIMITS;
 
   async function walk(
     context: ToolRunContext,
@@ -170,35 +230,53 @@ export function createRepositoryWalkLister(
     const { signal } = context;
     const files: string[] = [];
     let truncated = false;
-    // The folders to list, the repository's folder first; `next` is the
-    // first one not listed yet. At most `maxFolders` are ever held.
-    const folders: string[] = ["."];
+    let rootListed = false;
+    // After an abort: the files found so far, once the repository's folder
+    // was listed.
+    const stopped = () => (rootListed ? sortedList(files, true) : ABORTED);
+    // The folders to list, the repository's folder first, each with its
+    // depth below it; `next` is the first one not listed yet. At most
+    // `maxFolders` are ever held.
+    const folders: { readonly path: string; readonly depth: number }[] = [
+      { path: ".", depth: 0 },
+    ];
     let next = 0;
     walking: while (next < folders.length) {
       if (signal.aborted) {
-        return ABORTED;
+        return stopped();
       }
-      const folder = folders[next] as string;
+      const { path: folder, depth } = folders[next] as {
+        path: string;
+        depth: number;
+      };
       next += 1;
       const parsed = list.parse({ path: folder });
       if (!parsed.ok) {
         return FAILED;
       }
-      let outcome: ToolRunOutcome;
+      let outcome: ToolRunOutcome | typeof STOPPED;
       try {
-        outcome = await parsed.run(context);
+        outcome = await untilStopped(parsed.run(context), signal);
       } catch {
         return FAILED;
       }
-      if (signal.aborted) {
-        return ABORTED;
+      if (outcome === STOPPED || signal.aborted) {
+        return stopped();
       }
       if (!outcome.ok) {
         if (outcome.code === "aborted") {
-          return ABORTED;
+          return stopped();
         }
-        if (folder !== "." && skipsFolder(outcome)) {
-          continue;
+        if (folder !== ".") {
+          if (skipsFolder(outcome)) {
+            continue;
+          }
+          // A folder that cannot be read (for example without permission)
+          // is left out; a swap stays fatal.
+          if (outcome.code === "read_failed") {
+            truncated = true;
+            continue;
+          }
         }
         return FAILED;
       }
@@ -206,6 +284,7 @@ export function createRepositoryWalkLister(
       if (listing === null) {
         return FAILED;
       }
+      rootListed = true;
       if (listing.truncated) {
         truncated = true;
       }
@@ -213,6 +292,7 @@ export function createRepositoryWalkLister(
         const child = folder === "." ? entry.name : `${folder}/${entry.name}`;
         // A path that the read tools could not name again is left out.
         if (child.length > MAX_REPOSITORY_PATH_LENGTH) {
+          truncated = true;
           continue;
         }
         if (entry.kind === "file") {
@@ -225,21 +305,16 @@ export function createRepositoryWalkLister(
           entry.kind === "directory" &&
           !SKIPPED_FOLDER_NAMES.has(entry.name)
         ) {
-          if (folders.length >= maxFolders) {
+          if (depth + 1 > maxDepth || folders.length >= maxFolders) {
             truncated = true;
           } else {
-            folders.push(child);
+            folders.push({ path: child, depth: depth + 1 });
           }
         }
         // A link and anything else is never followed or listed.
       }
     }
-    files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-    return Object.freeze({
-      ok: true,
-      files: Object.freeze(files),
-      truncated,
-    });
+    return sortedList(files, truncated);
   }
 
   return (context: ToolRunContext) => walk(context).catch(() => FAILED);
