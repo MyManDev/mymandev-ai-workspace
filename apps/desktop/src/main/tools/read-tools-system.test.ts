@@ -24,7 +24,7 @@ import type { HeldRun } from "../permissions/enforcement.ts";
 import {
   createFileEnforcementRecorder,
   ENFORCEMENT_RECORD_FOLDER,
-  enforcementRecordFileName,
+  enforcementToolCallFileName,
 } from "../permissions/file-recorder.ts";
 import type { FileIdentity } from "../repository-links/identity.ts";
 import {
@@ -413,7 +413,7 @@ test("through the dispatcher, no answer and no record holds the temporary folder
   // One record per call, in order, with its result, and the path only when
   // it is relative to the repository: never the folder or a file's content.
   const written = await readFile(
-    path.join(recordFolder, enforcementRecordFileName(1)),
+    path.join(recordFolder, enforcementToolCallFileName(1)),
     "utf8",
   );
   const records = written

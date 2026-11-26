@@ -18,24 +18,21 @@
 // given, one `tool_call_allowed` record goes to the enforcement point's
 // recorder, with the tool, its capability, the path that the call names
 // relative to the repository (or null), the result code (`ok`, or the
-// refusal), the run's IDs, and the time. It never holds the input, the
-// answer, a file's content, or the repository's folder. A record that is not
-// taken withholds the answer: the call is refused with `record_failed`
-// (default until the Project Manager decides: fail closed, as for a shell
-// start). A call refused before the check (`unknown_tool`, `aborted`) is not
+// refusal), the run's IDs, and the time (`ToolCallRecord`, in
+// `permissions/tool-call-record.ts` with the format of the records). It never
+// holds the input, the answer, a file's content, or an absolute path; a path
+// with a lone surrogate or a Unicode format character is recorded as null.
+// A record that is not taken withholds the answer: the call is refused with
+// `record_failed` (default until the Project Manager decides: fail closed, as
+// for a shell start). The recorder must be the enforcement point's own
+// instance. A call refused before the check (`unknown_tool`, `aborted`) is not
 // recorded here, and a denial is recorded by the enforcement point.
 //
 // Every answer is plain JSON data. A refusal is a code of a closed list,
 // with a reason of a closed list for some codes, never a message, a path,
 // or an error of the file system. An answer never holds the repository's
 // folder.
-import type {
-  AgentId,
-  Capability,
-  ProviderConnectionId,
-  RepositoryId,
-  RunId,
-} from "@mymandev/protocol";
+import type { Capability, RepositoryId } from "@mymandev/protocol";
 import { CAPABILITY_SCOPE } from "@mymandev/permissions";
 import type * as z from "zod";
 import type { RunExecution } from "../agents/run-executor.ts";
@@ -43,19 +40,19 @@ import type {
   EnforcementDenialReason,
   EnforcementRecorder,
 } from "../permissions/enforcement.ts";
+import {
+  recordablePath,
+  TOOL_CALL_RECORD_RESULTS,
+  TOOL_NAME_PATTERN,
+  type ToolCallRecord,
+  type ToolCallRecordResult,
+} from "../permissions/tool-call-record.ts";
 import type { FileIdentity } from "../repository-links/identity.ts";
 import type {
   RepositoryFolderFailure,
   RepositoryFolderResolution,
 } from "../repository-links/service.ts";
 import type { RepositoryPathRefusal } from "./repository-path.ts";
-
-/**
- * The form of a tool's name: lowercase letters, digits, and underscores,
- * starting with a letter, at most 64 characters, which every provider's
- * tool names accept.
- */
-export const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 
 /**
  * The largest answer of one call, in bytes of its JSON text (UTF-8), the
@@ -114,58 +111,7 @@ export const TOOL_CALL_REFUSALS = Object.freeze([
 ] as const);
 export type ToolCallRefusal = (typeof TOOL_CALL_REFUSALS)[number];
 
-/**
- * The result code of a recorded call, a closed list: `ok` for an answer with
- * a result, or the refusal of a call that the enforcement point allowed.
- * `unknown_tool` and `denied` come before or at the check, and
- * `record_failed` is the record's own failure, so none is ever recorded.
- */
-export const TOOL_CALL_RECORD_RESULTS = Object.freeze([
-  "ok",
-  "aborted",
-  "invalid_input",
-  "repository_unavailable",
-  "path_refused",
-  "not_found",
-  "not_a_file",
-  "not_a_directory",
-  "read_failed",
-  "answer_too_large",
-  "answer_has_path",
-  "tool_failed",
-] as const);
-export type ToolCallRecordResult = (typeof TOOL_CALL_RECORD_RESULTS)[number];
-
 const RECORD_RESULTS: ReadonlySet<string> = new Set(TOOL_CALL_RECORD_RESULTS);
-
-/**
- * A tool call that the enforcement point allowed, as the dispatcher records
- * it once the call has its answer (#37, Project Manager decision of
- * 2026-11-26). It holds IDs, the tool's name, a capability, a path relative
- * to the repository, a result code, and a time: never the input, the
- * answer, a file's content, or the repository's folder.
- */
-export interface ToolCallRecord {
-  readonly kind: "tool_call_allowed";
-  /** The tool's name (`TOOL_NAME_PATTERN`). */
-  readonly tool: string;
-  /** The capability that the tool needs, which the check allowed. */
-  readonly capability: Capability;
-  /**
-   * The path that the call names, relative to the repository's top-level
-   * folder in POSIX form, as it passed `parseRepositoryPath` (`.` for the
-   * folder itself), or null when the call names none, or none that passed.
-   */
-  readonly path: string | null;
-  readonly result: ToolCallRecordResult;
-  readonly runId: RunId;
-  readonly agentId: AgentId;
-  /** The repository of the allowed request. */
-  readonly repositoryId: RepositoryId;
-  readonly providerConnectionId: ProviderConnectionId | null;
-  /** The time of the answer. */
-  readonly at: string;
-}
 
 /** The refusals that a tool itself may answer. */
 export type ToolRunRefusal = Extract<
@@ -348,8 +294,10 @@ export interface ToolDispatcherOptions {
   ) => Promise<RepositoryFolderResolution>;
   /**
    * The enforcement point's recorder, which takes the `ToolCallRecord` of
-   * every allowed call. A call whose record is not taken is refused
-   * (`record_failed`).
+   * every allowed call: the very instance that the enforcement point got,
+   * never a second file recorder on the same folder (a second writer) or a
+   * recorder in memory (nothing kept on the device). A call whose record is
+   * not taken is refused (`record_failed`).
    */
   readonly recorder: EnforcementRecorder;
   /** The wall clock, read once for each record. */
@@ -667,7 +615,8 @@ export function createToolDispatcher(
       end();
       return recorded(refuse("invalid_input"), { ...entry, path: null });
     }
-    const path = parsed.path;
+    // A path that a reader could misread is recorded as null.
+    const path = recordablePath(parsed.path);
     let answer: ToolCallAnswer;
     try {
       answer = await act(tool, checked.repositoryId, parsed.run, signal, end);

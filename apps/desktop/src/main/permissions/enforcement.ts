@@ -46,7 +46,7 @@ import {
 } from "@mymandev/permissions";
 import * as z from "zod";
 import type { DeviceSessionState } from "../session/session.ts";
-import type { ToolCallRecord } from "../tools/tool-dispatcher.ts";
+import type { ToolCallRecord } from "./tool-call-record.ts";
 
 /**
  * Why a check denied, a closed list:

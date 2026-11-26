@@ -25,10 +25,12 @@ import {
   type ToolCallContext,
   type ToolRunContext,
   type ToolRunOutcome,
-  TOOL_CALL_RECORD_RESULTS,
   TOOL_CALL_REFUSALS,
-  type ToolCallRecord,
 } from "./tool-dispatcher.ts";
+import {
+  TOOL_CALL_RECORD_RESULTS,
+  type ToolCallRecord,
+} from "../permissions/tool-call-record.ts";
 
 const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000000001";
 const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000002";
@@ -1147,5 +1149,100 @@ test("a tool without a record path, or whose record path throws, records a null 
   expect(harness.records).toEqual([
     callRecord({ tool: "plain", path: null }),
     callRecord({ tool: "throwing", path: null }),
+  ]);
+});
+
+test("a hand-built tool whose parse throws fails with tool_failed and writes exactly one tool_failed record without a path", async () => {
+  const tool: Tool = Object.freeze({
+    name: "broken",
+    capability: "repo.read",
+    parse: () => {
+      throw new Error(FOLDER);
+    },
+  });
+  const harness = setup([tool]);
+  expect(
+    await harness.dispatcher.call(harness.context, "broken", { value: "x" }),
+  ).toEqual({ ok: false, code: "tool_failed" });
+  expect(harness.records).toEqual([
+    callRecord({ tool: "broken", path: null, result: "tool_failed" }),
+  ]);
+  expect(harness.checker.ends).toBe(1);
+  expect(harness.resolutions).toEqual([]);
+});
+
+test("a run that answers an object whose ok getter throws fails with tool_failed and writes exactly one tool_failed record", async () => {
+  const probe = probeTool(
+    "probe",
+    "repo.read",
+    async () =>
+      ({
+        get ok(): boolean {
+          throw new Error(FOLDER);
+        },
+      }) as unknown as ToolRunOutcome,
+  );
+  const harness = setup([probe.tool]);
+  expect(
+    await harness.dispatcher.call(harness.context, "probe", { value: "x" }),
+  ).toEqual({ ok: false, code: "tool_failed" });
+  expect(harness.records).toEqual([callRecord({ result: "tool_failed" })]);
+  await settle();
+  expect(harness.checker.ends).toBe(1);
+});
+
+test("an abort that comes after the tool settled, before the call answers, answers aborted and records aborted", async () => {
+  const probe = probeTool("probe");
+  // The held action's end, which runs when the tool settled, aborts the run
+  // one step later: after the tool's answer arrived and before the call
+  // answers.
+  const harness = setup([probe.tool], {
+    decide: () => ({
+      allowed: true,
+      request: {
+        agentId: AGENT_ID,
+        capability: "repo.read",
+        repositoryId: REPOSITORY_ID,
+      },
+      end: () => {
+        queueMicrotask(() => harness.controller.abort());
+      },
+    }),
+  });
+  expect(
+    await harness.dispatcher.call(harness.context, "probe", { value: "x" }),
+  ).toEqual({ ok: false, code: "aborted" });
+  expect(probe.runs).toHaveLength(1);
+  expect(harness.controller.signal.aborted).toBe(true);
+  expect(harness.records).toEqual([callRecord({ result: "aborted" })]);
+});
+
+test("a path with a lone surrogate or a Unicode format character is recorded as null; the call still answers", async () => {
+  const char = (code: number) => String.fromCharCode(code);
+  const unrecordable = [
+    `src/a${char(0xd800)}.ts`,
+    `src/a${char(0xdc00)}`,
+    `src/${char(0x202e)}gpj.exe`,
+    `src/a${char(0x2066)}b`,
+    `${char(0xfeff)}src/a.ts`,
+    `src/a${char(0x200b)}b`,
+    `src/a${char(0xad)}b`,
+  ];
+  // A pair of surrogates, and the line and paragraph separators, are
+  // recorded as they are; the recorder escapes the separators.
+  const recordable = [
+    `src/${String.fromCodePoint(0x1f600)}.md`,
+    `src/a${char(0x2028)}b${char(0x2029)}`,
+  ];
+  const probe = probeTool("probe");
+  const harness = setup([probe.tool]);
+  for (const value of [...unrecordable, ...recordable]) {
+    expect(
+      await harness.dispatcher.call(harness.context, "probe", { value }),
+    ).toEqual({ ok: true, tool: "probe", result: { echo: value } });
+  }
+  expect(harness.records).toEqual([
+    ...unrecordable.map(() => callRecord({ path: null })),
+    ...recordable.map((value) => callRecord({ path: value })),
   ]);
 });

@@ -35,6 +35,7 @@ import {
   type EnforcementRecordLimits,
   enforcementRecordFileFlags,
   enforcementRecordFileName,
+  enforcementToolCallFileName,
   type FileEnforcementRecorder,
   nodeRecorderFileSystem,
   OLD_FILE_NOT_DELETED_MESSAGE,
@@ -48,7 +49,7 @@ import {
   MAX_REPOSITORY_PATH_LENGTH,
   MAX_REPOSITORY_PATH_SEGMENT_LENGTH,
 } from "../tools/repository-path.ts";
-import type { ToolCallRecord } from "../tools/tool-dispatcher.ts";
+import type { ToolCallRecord } from "./tool-call-record.ts";
 
 const RUN_ID = "0192f0a0-7b3c-7d4e-8f50-000000000001";
 const AGENT_ID = "0192f0a0-7b3c-7d4e-8f50-000000000002";
@@ -203,8 +204,22 @@ function setup(
   const file = (sequence: number) =>
     path.join(folder, enforcementRecordFileName(sequence));
   const read = (sequence: number) => readFileSync(file(sequence), "utf8");
+  const toolFile = (sequence: number) =>
+    path.join(folder, enforcementToolCallFileName(sequence));
+  const readTools = (sequence: number) =>
+    readFileSync(toolFile(sequence), "utf8");
   const files = () => readdirSync(folder).sort();
-  return { root, folder, recorder, logs, file, read, files };
+  return {
+    root,
+    folder,
+    recorder,
+    logs,
+    file,
+    read,
+    toolFile,
+    readTools,
+    files,
+  };
 }
 
 /** The code of the `EnforcementRecordError` that `fn` throws. */
@@ -261,8 +276,8 @@ test("the defaults are 2 MiB per file, 5 files, and 8 KiB per record", () => {
   expect(Object.isFrozen(ENFORCEMENT_RECORD_LIMITS)).toBe(true);
 });
 
-test("an allowed tool call is one line of version 1, with its fields in a fixed order", () => {
-  const { recorder, read } = setup();
+test("an allowed tool call is one line of version 1, with its fields in a fixed order, in a file series of its own", () => {
+  const { recorder, readTools, files } = setup();
   expect(recorder.record(TOOL_CALL)).toBeUndefined();
   const without = Object.freeze({
     ...TOOL_CALL,
@@ -271,12 +286,20 @@ test("an allowed tool call is one line of version 1, with its fields in a fixed 
     providerConnectionId: null,
   }) as ToolCallRecord;
   expect(recorder.record(without)).toBeUndefined();
-  expect(read(1)).toBe(
+  expect(readTools(1)).toBe(
     `${TOOL_CALL_LINE}\n` +
       '{"version":1,"kind":"tool_call_allowed","tool":"read_file",' +
       '"capability":"repo.read","path":null,"result":"path_refused",' +
       `"runId":"${RUN_ID}","agentId":"${AGENT_ID}","repositoryId":"${REPOSITORY_ID}",` +
       `"providerConnectionId":null,"at":"${AT}"}\n`,
+  );
+  // Only the series of the tool calls has a file: no denial file is started.
+  expect(files()).toEqual(["enforcement-tool-calls-00000001.jsonl"]);
+  expect(enforcementToolCallFileName(1)).toBe(
+    "enforcement-tool-calls-00000001.jsonl",
+  );
+  expect(enforcementToolCallFileName(ENFORCEMENT_RECORD_MAX_SEQUENCE)).toBe(
+    "enforcement-tool-calls-99999999.jsonl",
   );
   // The fields are written in their fixed order, whatever the order given.
   const reordered = Object.fromEntries(Object.entries(TOOL_CALL).reverse());
@@ -293,26 +316,33 @@ test("the lines of version 1 written before tool calls are recorded stay as they
   const before = first.read(1);
   expect(before.startsWith(`${DENIAL_LINE}\n${START_LINE}\n`)).toBe(true);
 
-  // This build appends a tool call to the same file, and the earlier lines
-  // are unchanged.
+  // This build writes a tool call to its own file, and appends the denial
+  // after the earlier lines, which are unchanged.
   const second = setup({ root: first.root });
   second.recorder.record(TOOL_CALL);
   second.recorder.record(DENIAL);
   const after = second.read(1);
-  expect(after).toBe(`${before}${TOOL_CALL_LINE}\n${DENIAL_LINE}\n`);
-  expect(second.files()).toEqual(["enforcement-00000001.jsonl"]);
+  expect(after).toBe(`${before}${DENIAL_LINE}\n`);
+  expect(second.readTools(1)).toBe(`${TOOL_CALL_LINE}\n`);
+  expect(second.files()).toEqual([
+    "enforcement-00000001.jsonl",
+    "enforcement-tool-calls-00000001.jsonl",
+  ]);
 
   // Every line reads back: its version, and its record, which the record
   // types still take and write as exactly the same line.
-  const lines = after.trimEnd().split("\n");
+  const lines = [
+    ...after.trimEnd().split("\n"),
+    ...second.readTools(1).trimEnd().split("\n"),
+  ];
   expect(
     lines.map((line) => (JSON.parse(line) as { kind: string }).kind),
   ).toEqual([
     "denied",
     "shell_start_allowed",
     "denied",
-    "tool_call_allowed",
     "denied",
+    "tool_call_allowed",
   ]);
   for (const line of lines) {
     const { version, ...entry } = JSON.parse(line) as Record<string, unknown>;
@@ -398,9 +428,9 @@ test("a tool call outside its record type is refused: content, an input, an unkn
 });
 
 test("a tool call with the longest path, in the longest form that JSON writes, fits in one line", () => {
-  // Lone surrogates, which JSON writes as six bytes each, in the longest
+  // Line separators, which the line writes as six bytes each, in the longest
   // segments, up to the longest path.
-  const unit = "\ud800";
+  const unit = String.fromCharCode(0x2028);
   const segment = unit.repeat(MAX_REPOSITORY_PATH_SEGMENT_LENGTH);
   const segments = [segment, segment, segment, segment];
   let longest = segments.join("/");
@@ -412,24 +442,285 @@ test("a tool call with the longest path, in the longest form that JSON writes, f
   expect(Buffer.byteLength(`${line}\n`, "utf8")).toBeLessThanOrEqual(
     ENFORCEMENT_RECORD_LIMITS.maxRecordBytes,
   );
-  const { recorder, read } = setup();
+  const { recorder, readTools } = setup();
   expect(recorder.record(entry)).toBeUndefined();
-  expect(read(1)).toBe(`${line}\n`);
+  expect(readTools(1)).toBe(`${line}\n`);
   expect((JSON.parse(line) as { path: string }).path).toBe(longest);
 });
 
-test("an allowed tool call is not flushed on its own, as a denial; a shell start flushes it", () => {
+test("U+2028 and U+2029 are escaped in a line, which stays the same JSON and one line", () => {
+  const separators = `src/a${String.fromCharCode(0x2028)}b${String.fromCharCode(0x2029)}c`;
+  const entry = { ...TOOL_CALL, path: separators } as ToolCallRecord;
+  const line = enforcementRecordLine(entry)?.line ?? "";
+  expect(line).toContain("src/a\\u2028b\\u2029c");
+  expect(line).not.toMatch(/[\u2028\u2029]/u);
+  expect((JSON.parse(line) as { path: string }).path).toBe(separators);
+  const { recorder, readTools } = setup();
+  recorder.record(entry);
+  recorder.record(TOOL_CALL);
+  expect(readTools(1)).toBe(`${line}\n${TOOL_CALL_LINE}\n`);
+  // The lines of the other kinds have none: they are as JSON writes them.
+  expect(enforcementRecordLine(DENIAL)?.line).toBe(DENIAL_LINE);
+  expect(enforcementRecordLine(START)?.line).toBe(START_LINE);
+});
+
+test("a tool call's path with a lone surrogate or a Unicode format character is refused, and nothing is written", () => {
+  const char = (code: number) => String.fromCharCode(code);
   const spy = spyFileSystem();
-  const { recorder, read } = setup({
+  const { recorder } = setup({ fileSystem: spy.fileSystem });
+  for (const refusedPath of [
+    `src/a${char(0xd800)}.ts`,
+    `src/a${char(0xdfff)}`,
+    `${char(0xdc00)}${char(0xd800)}`,
+    `src/${char(0x202e)}gpj.exe`,
+    `src/a${char(0x2066)}b`,
+    `${char(0xfeff)}src/a.ts`,
+    `src/a${char(0x200b)}b`,
+    `src/a${char(0xad)}b`,
+  ]) {
+    expect(
+      failureOf(() =>
+        recorder.record({ ...TOOL_CALL, path: refusedPath } as ToolCallRecord),
+      ),
+      JSON.stringify(refusedPath),
+    ).toBe("record_invalid");
+  }
+  expect(spy.calls).toEqual([]);
+  // A pair of surrogates is well formed, and taken.
+  expect(
+    recorder.record({
+      ...TOOL_CALL,
+      path: `src/${String.fromCodePoint(0x1f600)}.md`,
+    } as ToolCallRecord),
+  ).toBeUndefined();
+});
+
+test("an allowed tool call is not flushed on its own, as a denial; a shell start flushes its own file and the tool calls' file", () => {
+  const spy = spyFileSystem();
+  const { recorder, read, readTools } = setup({
     fileSystem: spy.fileSystem,
     platform: "win32",
   });
   recorder.record(TOOL_CALL);
   recorder.record(TOOL_CALL);
+  recorder.record(DENIAL);
   expect(spy.named("fsyncSync")).toHaveLength(0);
   recorder.record(START);
-  expect(spy.named("fsyncSync")).toHaveLength(1);
-  expect(read(1)).toBe(`${TOOL_CALL_LINE}\n${TOOL_CALL_LINE}\n${START_LINE}\n`);
+  expect(spy.named("fsyncSync")).toHaveLength(2);
+  expect(read(1)).toBe(`${DENIAL_LINE}\n${START_LINE}\n`);
+  expect(readTools(1)).toBe(`${TOOL_CALL_LINE}\n${TOOL_CALL_LINE}\n`);
+});
+
+test("a tool calls' file that cannot be flushed at a shell start does not fail the start", () => {
+  const descriptors = new Map<number, string>();
+  let toolCallsFlushes = 0;
+  const spy = spyFileSystem({
+    openSync: (file, flags, mode) => {
+      const fd = nodeRecorderFileSystem.openSync(file, flags, mode);
+      descriptors.set(fd, path.basename(file));
+      return fd;
+    },
+    fsyncSync: (fd) => {
+      if (descriptors.get(fd)?.startsWith("enforcement-tool-calls-")) {
+        toolCallsFlushes += 1;
+        throw errno("EIO");
+      }
+      nodeRecorderFileSystem.fsyncSync(fd);
+    },
+  });
+  const { recorder, read, readTools } = setup({
+    fileSystem: spy.fileSystem,
+    platform: "win32",
+  });
+  recorder.record(TOOL_CALL);
+  expect(recorder.record(START)).toBeUndefined();
+  expect(toolCallsFlushes).toBe(1);
+  // The tool calls' file is still written to.
+  expect(recorder.record(TOOL_CALL)).toBeUndefined();
+  expect(read(1)).toBe(`${START_LINE}\n`);
+  expect(readTools(1)).toBe(`${TOOL_CALL_LINE}\n${TOOL_CALL_LINE}\n`);
+});
+
+// Two series: the tool calls never rotate a denial or a shell start away.
+
+/** Limits of two denial lines per file and two files of each series. */
+const SERIES_LIMITS: EnforcementRecordLimits = Object.freeze({
+  maxFileBytes: (DENIAL_LINE.length + 1) * 2,
+  maxFiles: 2,
+  maxRecordBytes: ENFORCEMENT_RECORD_LIMITS.maxRecordBytes,
+});
+
+test("flooding the tool calls' series never deletes or changes a file of the denials and shell starts", () => {
+  const { recorder, read, readTools, files } = setup({
+    limits: SERIES_LIMITS,
+  });
+  recorder.record(DENIAL);
+  recorder.record(START);
+  recorder.record(MALFORMED_DENIAL);
+  const first = read(1);
+  const second = read(2);
+  expect(files()).toEqual([
+    "enforcement-00000001.jsonl",
+    "enforcement-00000002.jsonl",
+  ]);
+  // Each tool call fills a file of its own at these limits: 50 rotations.
+  for (let index = 0; index < 50; index += 1) {
+    expect(recorder.record(TOOL_CALL)).toBeUndefined();
+  }
+  // The tool calls' series keeps its newest 2 files; the other series keeps
+  // both of its files, unchanged.
+  expect(files()).toEqual([
+    "enforcement-00000001.jsonl",
+    "enforcement-00000002.jsonl",
+    "enforcement-tool-calls-00000049.jsonl",
+    "enforcement-tool-calls-00000050.jsonl",
+  ]);
+  expect(read(1)).toBe(first);
+  expect(read(2)).toBe(second);
+  expect(readTools(50)).toBe(`${TOOL_CALL_LINE}\n`);
+  // A later denial goes on in its own series, after its own last file.
+  recorder.record(DENIAL);
+  expect(read(2)).toBe(`${second}${DENIAL_LINE}\n`);
+});
+
+test("each series rotates on its own size: the denials' rotation never deletes a tool calls' file", () => {
+  const { recorder, read, readTools, files } = setup({
+    limits: SERIES_LIMITS,
+  });
+  recorder.record(TOOL_CALL);
+  const toolCalls = readTools(1);
+  // Two denials fill the denials' file exactly; the tool call before them
+  // does not count toward its size.
+  recorder.record(DENIAL);
+  recorder.record(DENIAL);
+  expect(files()).toEqual([
+    "enforcement-00000001.jsonl",
+    "enforcement-tool-calls-00000001.jsonl",
+  ]);
+  expect(read(1)).toBe(`${DENIAL_LINE}\n${DENIAL_LINE}\n`);
+  for (let index = 0; index < 10; index += 1) {
+    recorder.record(DENIAL);
+  }
+  expect(files()).toEqual([
+    "enforcement-00000005.jsonl",
+    "enforcement-00000006.jsonl",
+    "enforcement-tool-calls-00000001.jsonl",
+  ]);
+  expect(readTools(1)).toBe(toolCalls);
+  // The next tool call rotates its own series only, by its own size: a
+  // second tool call line does not fit in a file at these limits.
+  recorder.record(TOOL_CALL);
+  expect(files()).toEqual([
+    "enforcement-00000005.jsonl",
+    "enforcement-00000006.jsonl",
+    "enforcement-tool-calls-00000001.jsonl",
+    "enforcement-tool-calls-00000002.jsonl",
+  ]);
+  expect(readTools(1)).toBe(toolCalls);
+  expect(readTools(2)).toBe(`${TOOL_CALL_LINE}\n`);
+});
+
+test("a later recorder appends each kind to the newest file of its own series", () => {
+  const first = setup({ limits: SERIES_LIMITS });
+  first.recorder.record(DENIAL);
+  first.recorder.record(TOOL_CALL);
+  first.recorder.close();
+  const second = setup({ root: first.root, limits: SERIES_LIMITS });
+  second.recorder.record(TOOL_CALL);
+  second.recorder.record(START);
+  expect(second.files()).toEqual([
+    "enforcement-00000001.jsonl",
+    "enforcement-tool-calls-00000001.jsonl",
+    "enforcement-tool-calls-00000002.jsonl",
+  ]);
+  expect(second.read(1)).toBe(`${DENIAL_LINE}\n${START_LINE}\n`);
+  expect(second.readTools(1)).toBe(`${TOOL_CALL_LINE}\n`);
+  expect(second.readTools(2)).toBe(`${TOOL_CALL_LINE}\n`);
+});
+
+test("the wait after failures and the logs are of each series: failing tool calls never make a denial wait", () => {
+  let time = 1000;
+  let failToolCalls = true;
+  const spy = spyFileSystem({
+    openSync: (file, flags, mode) => {
+      if (
+        failToolCalls &&
+        path.basename(file).startsWith("enforcement-tool-calls-")
+      ) {
+        throw errno("EMFILE");
+      }
+      return nodeRecorderFileSystem.openSync(file, flags, mode);
+    },
+  });
+  const { recorder, read, logs, files } = setup({
+    fileSystem: spy.fileSystem,
+    now: () => time,
+    platform: "win32",
+  });
+  const toolCallOpens = () =>
+    spy
+      .named("openSync")
+      .filter((call) =>
+        path.basename(String(call.args[0])).startsWith("enforcement-tool-"),
+      ).length;
+  expect(failureOf(() => recorder.record(TOOL_CALL))).toBe("open_failed");
+  expect(failureOf(() => recorder.record(TOOL_CALL))).toBe("open_failed");
+  expect(toolCallOpens()).toBe(2);
+  // Within the wait, a tool call fails at once, and a denial still writes.
+  expect(failureOf(() => recorder.record(TOOL_CALL))).toBe("open_failed");
+  expect(toolCallOpens()).toBe(2);
+  expect(recorder.record(DENIAL)).toBeUndefined();
+  expect(recorder.record(DENIAL)).toBeUndefined();
+  expect(read(1)).toBe(`${DENIAL_LINE}\n${DENIAL_LINE}\n`);
+  // One log for the tool calls' failure; the denials, which never failed,
+  // log nothing.
+  expect(logs).toEqual([recordFailureMessage("open_failed")]);
+  // The tool calls write again after the wait, and log it once.
+  failToolCalls = false;
+  time += ENFORCEMENT_RECORD_RETRY_MS;
+  expect(recorder.record(TOOL_CALL)).toBeUndefined();
+  expect(logs).toEqual([
+    recordFailureMessage("open_failed"),
+    RECORDS_WRITTEN_AGAIN_MESSAGE,
+  ]);
+  expect(files()).toEqual([
+    "enforcement-00000001.jsonl",
+    "enforcement-tool-calls-00000001.jsonl",
+  ]);
+
+  // And the other way: failing denials never make a tool call wait.
+  let failRecords = true;
+  const other = spyFileSystem({
+    openSync: (file, flags, mode) => {
+      if (failRecords && /^enforcement-\d/u.test(path.basename(file))) {
+        throw errno("EMFILE");
+      }
+      return nodeRecorderFileSystem.openSync(file, flags, mode);
+    },
+  });
+  const second = setup({
+    fileSystem: other.fileSystem,
+    now: () => time,
+    platform: "win32",
+  });
+  expect(failureOf(() => second.recorder.record(DENIAL))).toBe("open_failed");
+  expect(failureOf(() => second.recorder.record(DENIAL))).toBe("open_failed");
+  expect(failureOf(() => second.recorder.record(DENIAL))).toBe("open_failed");
+  expect(second.recorder.record(TOOL_CALL)).toBeUndefined();
+  expect(second.readTools(1)).toBe(`${TOOL_CALL_LINE}\n`);
+  failRecords = false;
+});
+
+test("close flushes and closes the open file of each series", () => {
+  const spy = spyFileSystem();
+  const { recorder } = setup({ fileSystem: spy.fileSystem, platform: "win32" });
+  recorder.record(DENIAL);
+  recorder.record(TOOL_CALL);
+  expect(spy.named("fsyncSync")).toHaveLength(0);
+  recorder.close();
+  expect(spy.named("fsyncSync")).toHaveLength(2);
+  expect(spy.named("closeSync")).toHaveLength(2);
+  expect(failureOf(() => recorder.record(TOOL_CALL))).toBe("recorder_closed");
 });
 
 test("after two failures in a row a tool call waits as a denial does, and fails at once with the last code", () => {
