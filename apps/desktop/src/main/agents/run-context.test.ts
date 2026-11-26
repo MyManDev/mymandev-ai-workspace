@@ -1100,13 +1100,13 @@ test("the walk record: one per build once repo.read is allowed, after the walk s
     list: async () => ({
       ok: true,
       files: [],
-      folders: 0,
+      folders: 1,
       truncated: true,
     }),
   });
   await marked.builder.build(marked.input);
   expect(marked.records).toEqual([
-    walkRecord("ok", { files: 0, folders: 0, truncated: true }),
+    walkRecord("ok", { files: 0, folders: 1, truncated: true }),
   ]);
 
   // A run without a provider connection is recorded with null.
@@ -1175,6 +1175,50 @@ test("the walk record: a walk without a list is recorded once with its result an
       "repository_unavailable",
     ],
     [{ resolve: async () => null as never }, "repository_unavailable"],
+    // A resolution's answer that throws while the builder reads it: no
+    // lister ran, and the held action ends at once.
+    [
+      {
+        resolve: async () =>
+          ({
+            get ok(): never {
+              throw new Error(FOLDER);
+            },
+            repositoryId: REPOSITORY_ID,
+            folder: FOLDER,
+            identity: IDENTITY,
+          }) as never,
+      },
+      "repository_unavailable",
+    ],
+    [
+      {
+        resolve: async () =>
+          ({
+            ok: true,
+            repositoryId: REPOSITORY_ID,
+            get folder(): never {
+              throw new Error(FOLDER);
+            },
+            identity: IDENTITY,
+          }) as never,
+      },
+      "repository_unavailable",
+    ],
+    [
+      {
+        resolve: async () =>
+          ({
+            ok: true,
+            repositoryId: REPOSITORY_ID,
+            folder: FOLDER,
+            get identity(): never {
+              throw new Error(FOLDER);
+            },
+          }) as never,
+      },
+      "repository_unavailable",
+    ],
     [{ list: async () => ({ ok: false, reason: "failed" }) }, "list_failed"],
     // A lister that answers `aborted` while the run was not aborted.
     [{ list: async () => ({ ok: false, reason: "aborted" }) }, "list_failed"],
@@ -1246,12 +1290,17 @@ test("the walk record: a walk without a list is recorded once with its result an
     });
     expect(harness.records, String(index)).toEqual([walkRecord(result)]);
     expect(JSON.stringify(harness.records)).not.toContain("octocat");
+    // Ended straight after the build, without waiting for the deadline.
     expect(harness.ends, String(index)).toBe(1);
+    expect(harness.listings.length, String(index)).toBe(
+      result === "repository_unavailable" ? 0 : 1,
+    );
   }
 });
 
-test("the walk record: a count of folders that is not an integer from 0 to 1,000 is refused with the list", async () => {
+test("the walk record: a count of folders that is not an integer from 1 to 1,000 is refused with the list", async () => {
   for (const folders of [
+    0,
     -1,
     1_001,
     1.5,
@@ -1280,7 +1329,7 @@ test("the walk record: a count of folders that is not an integer from 0 to 1,000
       walkRecord("list_refused"),
     ]);
   }
-  for (const folders of [0, 1_000]) {
+  for (const folders of [1, 1_000]) {
     const harness = setup({
       list: async () => ({
         ok: true,
@@ -1419,6 +1468,65 @@ test("the walk record: the run's abort after repo.read was allowed is recorded o
     reason: "aborted",
   });
   expect(afterList.records).toEqual([walkRecord("aborted")]);
+});
+
+test("the walk record: an abort that lands after the walk's last check and before the record is recorded as aborted; one inside the record still fails the build", async () => {
+  /** Runs `fn` after `count` turns of the microtask queue. */
+  const afterMicrotasks = (count: number, fn: () => void) => {
+    let chain = Promise.resolve();
+    for (let turn = 0; turn < count; turn += 1) {
+      chain = chain.then(() => undefined);
+    }
+    void chain.then(fn);
+  };
+  const seen = new Set<string>();
+  for (let count = 0; count <= 40; count += 1) {
+    let abortedAtRecord: boolean | null = null;
+    const harness = setup({
+      list: async (_context, controller) => {
+        afterMicrotasks(count, () => controller.abort());
+        return LISTED;
+      },
+      record: () => {
+        abortedAtRecord = harness.controller.signal.aborted;
+        return undefined;
+      },
+    });
+    const built = await harness.builder.build(harness.input);
+    const label = String(count);
+    expect(harness.records.length, label).toBe(1);
+    const [record] = harness.records as ContextWalkRecord[];
+    // A record taken while the run was aborted never says `ok`.
+    expect(record?.result, label).toBe(abortedAtRecord ? "aborted" : "ok");
+    if (record?.result === "aborted") {
+      expect(built, label).toEqual({ ok: false, reason: "aborted" });
+    }
+    if (built.ok) {
+      expect(record?.result, label).toBe("ok");
+      expect(built.context.repository.included, label).toBe(true);
+    }
+    seen.add(`${String(record?.result)}:${String(built.ok)}`);
+  }
+  // Both sides of the record are reached: the abort before it, and after.
+  expect(seen.has("aborted:false"), [...seen].join()).toBe(true);
+  expect(seen.has("ok:true"), [...seen].join()).toBe(true);
+
+  // An abort inside the recorder's call: the record says `ok` (the list was
+  // ready for the context), and the build still fails as aborted.
+  const inside = setup({
+    record: () => {
+      inside.controller.abort();
+      return undefined;
+    },
+  });
+  expect(await inside.builder.build(inside.input)).toEqual({
+    ok: false,
+    reason: "aborted",
+  });
+  expect(inside.records).toEqual([
+    walkRecord("ok", { files: 2, folders: 1, truncated: false }),
+  ]);
+  expect(inside.ends).toBe(1);
 });
 
 test("the walk record: at the deadline, a walk that listed the repository's folder is recorded as ok and cut; one that did not, or a resolution or a lister that does not answer, as timed_out; each once", async () => {

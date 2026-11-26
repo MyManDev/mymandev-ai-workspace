@@ -15,15 +15,18 @@ import type {
  * The result code of a walk, a closed list (defaults until the Project
  * Manager decides):
  *
- * - `ok`: the file list was placed in the context, whole or cut
- *   (`truncated`).
- * - `aborted`: the run's signal aborted after `repo.read` was allowed; the
- *   build fails.
+ * - `ok`: the file list was ready for the context, whole or cut
+ *   (`truncated`). A run aborted right after the record may still not use
+ *   it: the build then fails as aborted.
+ * - `aborted`: the run's signal aborted after `repo.read` was allowed and
+ *   before the record; the build fails.
  * - `repository_unavailable`: the repository's folder did not resolve on
- *   this device.
+ *   this device, or the resolution's answer threw while the builder read
+ *   it; no lister ran.
  * - `timed_out`: the deadline came before the repository's folder was
  *   listed, or the lister did not answer at it.
- * - `list_failed`: the lister failed, threw, or answered another shape.
+ * - `list_failed`: the lister failed, threw, or answered another shape, or
+ *   its answer threw while the builder read it.
  * - `list_refused`: the list broke a rule of the builder (a path that is
  *   not relative to the repository, that repeats, or that begins with the
  *   repository's folder, or a count out of its bound).
@@ -59,16 +62,17 @@ export interface ContextWalkRecord {
   readonly kind: "context_walk";
   readonly result: ContextWalkRecordResult;
   /**
-   * The number of files in the list placed in the context, at most
+   * The number of files in the list ready for the context, at most
    * `REPOSITORY_FILE_LIST_LIMITS.maxFiles`.
    */
   readonly files: number | null;
   /**
    * The number of folders whose listing the walk read, the repository's
-   * folder included, at most `REPOSITORY_FILE_LIST_LIMITS.maxFolders`.
+   * folder included: at least 1 for `ok`, and at most
+   * `REPOSITORY_FILE_LIST_LIMITS.maxFolders`.
    */
   readonly folders: number | null;
-  /** Whether the list placed in the context was cut. */
+  /** Whether the list ready for the context was cut. */
   readonly truncated: boolean | null;
   readonly runId: RunId;
   readonly agentId: AgentId;

@@ -71,10 +71,12 @@ export const SKIPPED_FOLDER_NAMES: ReadonlySet<string> = Object.freeze(
  *   form, each once, sorted by UTF-16 code unit; never a folder, a link, or
  *   an absolute path.
  * - `folders`: the number of folders whose listing was read, the
- *   repository's folder included, at most `maxFolders`; the context's walk
+ *   repository's folder included, from 1 to `maxFolders`; the context's walk
  *   record holds it (#366). A lister that lists no folder one by one (the
  *   later `git ls-files`) counts the folders that hold its files, the
- *   repository's folder included.
+ *   repository's folder included, capped at `maxFolders`: it answers the
+ *   smaller of its count and `maxFolders`, so that 1,000 files in 1,000
+ *   folders below the repository's folder stay a valid answer.
  * - `truncated`: a bound of `REPOSITORY_FILE_LIST_LIMITS` cut the list, a
  *   folder held more entries than one listing reads, a path was too long to
  *   name, a folder below the repository's folder could not be read, or the

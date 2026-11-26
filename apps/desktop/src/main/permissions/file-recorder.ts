@@ -18,11 +18,11 @@
 //   a `ShellStartRecord`, a `ToolCallRecord` (tool-call-record.ts; IDs,
 //   closed vocabularies, times, and a tool call's path relative to the
 //   repository), or a `ContextWalkRecord` (context-walk-record.ts; IDs, a
-//   result code, counts within the bounds of the file list, a flag, and a
-//   time) is refused, an unexpected field included. A tool call's path
-//   with a lone surrogate or a Unicode format character (`\p{Cf}`, the bidi
-//   overrides and the BOM included) is refused too; the dispatcher records
-//   such a path as null.
+//   result code, counts within the bounds of the file list, at least one
+//   folder, a flag, and a time) is refused, an unexpected field included.
+//   A tool call's path with a lone surrogate or a Unicode format character
+//   (`\p{Cf}`, the bidi overrides and the BOM included) is refused too; the
+//   dispatcher records such a path as null.
 // - Versions (Project Manager decision of 2026-11-26). The version changes
 //   only when a field of an existing kind is added, removed, or changes its
 //   meaning. A new kind is added under the same version, and the lines of
@@ -79,10 +79,10 @@
 //   `ENFORCEMENT_RECORD_RETRY_MS` of the last attempt fails at once with the
 //   last code, but a shell start always tries to write. A newest file that
 //   can never be appended to (a folder, a read-only file, a link, a file of
-//   another owner) is left as it is, and the next numbered file is started. It never throws anything
-//   else, and nothing it does can stop the main process. A file that cannot
-//   be deleted at rotation does not fail the record; it is deleted at a
-//   later rotation.
+//   another owner) is left as it is, and the next numbered file is started.
+//   It never throws anything else, and nothing it does can stop the main
+//   process. A file that cannot be deleted at rotation does not fail the
+//   record; it is deleted at a later rotation.
 // - Permissions. The folder must be a folder, not a link, and is set to its
 //   owner only (0o700) whenever it is opened, and each file is readable and
 //   writable by its owner only (0o600) on macOS and Linux, where a file is
@@ -469,23 +469,24 @@ const ToolCallLineSchema = z.strictObject({
 });
 
 /**
- * A count of a walk: an integer from 0 to its bound in
+ * A count of a walk: an integer from `min` to its bound in
  * `REPOSITORY_FILE_LIST_LIMITS`, or null for a walk without a list.
  */
-function walkCount(max: number) {
-  return z.number().int().min(0).max(max).nullable();
+function walkCount(min: number, max: number) {
+  return z.number().int().min(min).max(max).nullable();
 }
 
 /**
  * A walk of a run's context: the counts and the flag are given for the
- * result `ok` and null for every other result.
+ * result `ok` and null for every other result. A list read at least the
+ * repository's folder, so `folders` is at least 1.
  */
 const ContextWalkLineSchema = z
   .strictObject({
     kind: z.literal("context_walk"),
     result: z.enum(CONTEXT_WALK_RECORD_RESULTS),
-    files: walkCount(REPOSITORY_FILE_LIST_LIMITS.maxFiles),
-    folders: walkCount(REPOSITORY_FILE_LIST_LIMITS.maxFolders),
+    files: walkCount(0, REPOSITORY_FILE_LIST_LIMITS.maxFiles),
+    folders: walkCount(1, REPOSITORY_FILE_LIST_LIMITS.maxFolders),
     truncated: z.boolean().nullable(),
     runId: RunIdSchema,
     agentId: AgentIdSchema,

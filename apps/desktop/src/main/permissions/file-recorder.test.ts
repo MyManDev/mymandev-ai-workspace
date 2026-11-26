@@ -2401,13 +2401,16 @@ test("a walk outside its record type is refused, and nothing is written: a name,
     { ...UNLISTED_WALK, result: "no_repository" },
     { ...UNLISTED_WALK, result: "record_failed" },
     { ...UNLISTED_WALK, result: "made_up" },
-    // Counts outside an integer from 0 to 1,000.
+    // Files outside an integer from 0 to 1,000, folders outside one from 1
+    // to 1,000: a list read at least the repository's folder.
     { ...WALK, files: -1 },
     { ...WALK, files: 1_001 },
     { ...WALK, files: 1.5 },
     { ...WALK, files: Number.NaN },
     { ...WALK, files: Number.POSITIVE_INFINITY },
     { ...WALK, files: "412" },
+    { ...WALK, folders: 0 },
+    { ...WALK, files: 0, folders: 0 },
     { ...WALK, folders: -1 },
     { ...WALK, folders: 1_001 },
     { ...WALK, folders: 0.5 },
@@ -2441,14 +2444,13 @@ test("a walk outside its record type is refused, and nothing is written: a name,
   }
   expect(spy.calls).toEqual([]);
   // The bounds themselves are taken.
-  for (const count of [0, 1_000]) {
+  for (const [files, folders] of [
+    [0, 1],
+    [1_000, 1_000],
+  ] as const) {
     expect(
-      recorder.record({
-        ...WALK,
-        files: count,
-        folders: count,
-      } as ContextWalkRecord),
-      String(count),
+      recorder.record({ ...WALK, files, folders } as ContextWalkRecord),
+      `${String(files)}/${String(folders)}`,
     ).toBeUndefined();
   }
 });
