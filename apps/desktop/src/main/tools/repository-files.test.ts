@@ -510,8 +510,9 @@ test("a folder that is gone, on another device, unreadable, or changing when its
   unreadable.failReaddir.set(ROOT, "EACCES");
   expect(await walk(unreadable)).toEqual({ ok: false, reason: "failed" });
 
-  // A subfolder that keeps changing (`unsettled`) is left out, and the list
-  // says that it was cut; the repository's folder itself fails the list.
+  // A subfolder that keeps changing (`unsettled`) is left out, not counted,
+  // and the list says that it was cut; the repository's folder itself fails
+  // the list.
   const busy = repository()
     .file(`${ROOT}/a.txt`)
     .dir(`${ROOT}/tmp`)
@@ -520,6 +521,7 @@ test("a folder that is gone, on another device, unreadable, or changing when its
   expect(await walk(busy)).toEqual({
     ok: true,
     files: ["a.txt"],
+    folders: 1,
     truncated: true,
   });
   const busyRoot = repository().file(`${ROOT}/a.txt`);
