@@ -6,18 +6,43 @@
 // for each connection, and the two writes, registering and removing a
 // connection, sent with `sendWorkspaceAction`.
 //
-// - Metadata only. A connection is its ID, its kind, its label, and when it
-//   was registered. No credential is read, kept, or sent here: a
-//   registration sends the kind and the label only, and the local
-//   credential waits for #33 and the Project Manager's decision on how the
-//   adapters reach the providers.
-// - Status (a default until the Project Manager decides, 2026-11-24). The
-//   status of each connection is computed here from a closed list
-//   (`providerConnectionStatus`): `registered` while the server lists it
-//   and this device is online with a list read that succeeded, and
-//   `unknown` while it is offline or the last read failed. A status check
-//   is the person acting on their own device, not a `provider.use` action,
-//   so it asks the permission enforcement point nothing.
+// - Metadata to the server. A connection is its ID, its kind, its label,
+//   and when it was registered. A registration sends the kind and the label
+//   only; no key ever leaves the device.
+// - The API key of a connection (#33, the Project Manager's decisions of
+//   2026-11-25) stays on this device, in the provider key store
+//   (provider-keys/store.ts), encrypted with the system's protection and
+//   bound to this device's ID and the connection's ID. `saveKey` takes it
+//   from the renderer once and stores it; `removeKey` deletes it. No state,
+//   result, or log holds a key, and nothing here sends one anywhere.
+// - Key actions. One at a time, and none while a registration or a removal
+//   runs, including the removal's deletion of the key file: such a key
+//   action is refused as `busy` and never reaches the store. A key action
+//   is accepted only for a connection of the list held now that no
+//   confirmed removal named (`not_listed`), so that no key is stored for a
+//   connection that the server removed while the list still shows it.
+// - A key stored while the device signs out stays: it is bound to this
+//   device's ID, which the next sign-in opens again, and every enforcement
+//   check is denied while signed out (D4). A key stored while the device
+//   changes, or while its device key is deleted (the device was removed or
+//   revoked, "This is not me", a lost key), is deleted again, because no
+//   later device can open it.
+// - Status. The status of each connection is computed here from a closed
+//   list (`providerConnectionStatus`): `unknown` while this device is
+//   offline or the last list read failed; otherwise `ready` when the key
+//   file of the connection exists and decrypts for this device and this
+//   connection, `credential_missing` when there is none or it is damaged or
+//   bound elsewhere, and `unknown` while it was not checked yet or could
+//   not be checked. `ready` does not say that the provider accepts the key:
+//   no provider is called. Each listed connection is checked once after a
+//   list read lists it, and again after its key was stored or removed. A
+//   status check is the person acting on their own device, not a
+//   `provider.use` action, so it asks the permission enforcement point
+//   nothing.
+// - Removal. A connection's key file is deleted only after the server
+//   confirmed its removal (`ok`); every other answer keeps it. From that
+//   answer on, until the next reset, every key action for the connection is
+//   refused as `not_listed`, also while the list read after it waits.
 // - Reads. The list loads once a device is signed in with a ready key, and
 //   again when the device or the account changes, when the connection
 //   reaches `connected`, and after every write that may have reached the
@@ -42,10 +67,11 @@
 // - A sign-out, another account, or another device drops the list and the
 //   answers on their way.
 //
-// The state holds no device ID, user ID, or token. The logs are fixed text
-// with a failure code at most, never a label or an ID.
+// The state holds no device ID, user ID, token, or key. The logs are fixed
+// text with a failure code at most, never a label, an ID, or a key.
 import {
   type ProviderConnection,
+  type ProviderConnectionId,
   ProviderConnectionIdSchema,
   type ProviderConnectionListResponse,
   RegisterProviderConnectionRequestSchema,
@@ -58,6 +84,9 @@ import type {
   RegisterProviderConnectionResult,
   RemoveProviderConnectionRefusal,
   RemoveProviderConnectionResult,
+  RemoveProviderKeyResult,
+  SaveProviderKeyRefusal,
+  SaveProviderKeyResult,
 } from "../../shared/ipc-contract.ts";
 import type { AccountService } from "../account.ts";
 import {
@@ -74,15 +103,26 @@ import {
   type GrantStoreService,
   signedInDevice,
 } from "../permissions/grant-store.ts";
+import { isProviderKeyError } from "../provider-keys/errors.ts";
+import { isProviderKeyShape } from "../provider-keys/key-file.ts";
+import type { ProviderKeyStore } from "../provider-keys/store.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 import { workspaceRetryDelayMs } from "../workspace/service.ts";
 
 /**
  * The status of one connection; see `PROVIDER_CONNECTION_STATUSES` of the
- * contract. The local credential check of #33 adds its statuses there and
- * its facts to `ProviderConnectionFacts`.
+ * contract.
  */
 export type ProviderConnectionStatus = ProviderConnectionStatusView;
+
+/**
+ * What the last check of a connection's key on this device found: `ready`
+ * (a key file exists and decrypts for this device and this connection),
+ * `missing` (no usable key: no file, a damaged one, or one bound to another
+ * device or connection), or `unknown` (not checked yet, or the check
+ * failed otherwise, for example when the system could not decrypt it).
+ */
+export type ProviderKeyState = "ready" | "missing" | "unknown";
 
 /** What the main process knows of a connection, the input of its status. */
 export interface ProviderConnectionFacts {
@@ -91,18 +131,51 @@ export interface ProviderConnectionFacts {
    * succeeded, and this device is connected.
    */
   readonly listCurrent: boolean;
+  /** What the last check of the connection's key found. */
+  readonly key: ProviderKeyState;
 }
 
 /**
- * The status of a connection from its facts, from a closed list (a default
- * until the Project Manager decides, 2026-11-24): `registered` while the
- * list is current, else `unknown`. It reads no credential and asks no
- * permission: it is the person's own device describing itself.
+ * The status of a connection from its facts, from a closed list (#33):
+ * `unknown` while the list is not current; otherwise `ready` for a key
+ * that is `ready`, `credential_missing` for a `missing` one, and `unknown`
+ * for a key that was not checked or could not be checked. It asks no
+ * permission and calls no provider: it is the person's own device
+ * describing itself.
  */
 export function providerConnectionStatus(
   facts: ProviderConnectionFacts,
 ): ProviderConnectionStatus {
-  return facts.listCurrent ? "registered" : "unknown";
+  if (!facts.listCurrent) {
+    return "unknown";
+  }
+  switch (facts.key) {
+    case "ready":
+      return "ready";
+    case "missing":
+      return "credential_missing";
+    case "unknown":
+      return "unknown";
+  }
+}
+
+/**
+ * The key state after a check that failed: `missing` for a file that can
+ * never open here (`corrupt`, `bound_elsewhere`), so the person is asked
+ * for a key, and `unknown` for everything else, which may pass later (the
+ * system could not decrypt it, the folder or the file could not be read, or
+ * a newer version wrote it).
+ */
+export function providerKeyStateAfterFailure(error: unknown): ProviderKeyState {
+  return isProviderKeyError(error, "corrupt") ||
+    isProviderKeyError(error, "bound_elsewhere")
+    ? "missing"
+    : "unknown";
+}
+
+/** The fixed code of a key store failure for a log line, never a value. */
+function failureCode(error: unknown): string {
+  return isProviderKeyError(error) ? error.code : "unexpected";
 }
 
 /**
@@ -151,9 +224,21 @@ export type ProviderConnectionConnection = Pick<
   "status" | "onStatusChange"
 >;
 
+/** The part of the provider key store that the service uses; no way to read a key. */
+export type ProviderConnectionKeys = Pick<
+  ProviderKeyStore,
+  "save" | "check" | "remove"
+>;
+
 export interface ProviderConnectionServiceOptions {
   readonly account: ProviderConnectionAccount;
   readonly connection: ProviderConnectionConnection;
+  /**
+   * The provider key store (#33). Without it, as in tests of the list
+   * alone, every listed connection is `credential_missing`, and storing or
+   * removing a key is refused as `failed`.
+   */
+  readonly keys?: ProviderConnectionKeys;
   /**
    * The grant store, told after a removal that may have reached the API,
    * which revokes the connection's `provider.use` grants. Optional for
@@ -186,10 +271,34 @@ export interface ProviderConnectionService {
     kind: string,
     label: string,
   ) => Promise<RegisterProviderConnectionResult>;
-  /** Removes a connection of the list held now by its ID. Never rejects. */
+  /**
+   * Removes a connection of the list held now by its ID, and deletes its
+   * key file once the server confirmed the removal. Never rejects.
+   */
   readonly remove: (
     providerConnectionId: string,
   ) => Promise<RemoveProviderConnectionResult>;
+  /**
+   * Stores the API key of a connection of the list held now, bound to this
+   * device and that connection, over any key stored before. The key is
+   * checked for its shape only and never returned, kept, or logged. Refused
+   * as `busy` while another key action, a registration, or a removal runs,
+   * and as `not_listed` after the server confirmed the connection's
+   * removal. A sign-out meanwhile keeps the stored key (`ok`); another
+   * device or a deleted device key deletes it again (`not_signed_in`).
+   * Never rejects.
+   */
+  readonly saveKey: (
+    providerConnectionId: string,
+    key: string,
+  ) => Promise<SaveProviderKeyResult>;
+  /**
+   * Deletes the stored key of a connection of the list held now; `ok` also
+   * when none was stored. Refused as `saveKey` is. Never rejects.
+   */
+  readonly removeKey: (
+    providerConnectionId: string,
+  ) => Promise<RemoveProviderKeyResult>;
   /** Stops listening and cancels the retry, for the quit. */
   readonly close: () => void;
 }
@@ -243,6 +352,19 @@ const REMOVE_OUTCOMES = {
 >;
 Object.freeze(REMOVE_OUTCOMES);
 
+/**
+ * The device states in which this installation's device key is deleted or
+ * replaced (see `DEVICE_STATES` of the contract): no usable device, a lost
+ * key, a removal that the API confirmed, and a revocation. A plain sign-out
+ * (`signed_out`, `sign_out_report_pending`) keeps the key.
+ */
+const DEVICE_KEY_ENDED_STATES: ReadonlySet<AccountStatus["device"]> = new Set([
+  "no_device",
+  "key_lost",
+  "removed",
+  "revoked",
+]);
+
 const UNKNOWN = Object.freeze({ outcome: "unknown" } as const);
 const OK = Object.freeze({ outcome: "ok" } as const);
 const NO_CONNECTIONS: readonly ProviderConnectionEntry[] = Object.freeze([]);
@@ -285,7 +407,7 @@ function scheduleWithSetTimeout(
 export function createProviderConnectionService(
   options: ProviderConnectionServiceOptions,
 ): ProviderConnectionService {
-  const { account, connection, grants } = options;
+  const { account, connection, grants, keys } = options;
   const schedule = options.scheduleTimer ?? scheduleWithSetTimeout;
   const now = options.now ?? (() => performance.now());
 
@@ -322,6 +444,27 @@ export function createProviderConnectionService(
   let rateLimitedUntil: number | null = null;
   /** A write is waiting for its answer. */
   let writing = false;
+  /** A removal runs, from its write to the end of its key deletion. */
+  let removing = false;
+  /** A key action (`saveKey`, `removeKey`) runs. */
+  let keyAction = false;
+  /**
+   * The connections whose removal the server confirmed since the last
+   * reset: no key action names them, also while the list still holds them.
+   */
+  const removedConnections = new Set<string>();
+  /** The last signed-in device, kept across a sign-out; only compared. */
+  let lastDevice: string | null = null;
+  /**
+   * Grows whenever the signed-in device changes to another one, or the
+   * device key ends (`DEVICE_KEY_ENDED_STATES`); a plain sign-out keeps it.
+   */
+  let deviceGeneration = 0;
+  /** What the last check of each listed connection's key found. */
+  const keyStates = new Map<string, ProviderKeyState>();
+  /** The token of the check of each connection on its way; a newer one wins. */
+  const keyChecks = new Map<string, number>();
+  let lastKeyCheck = 0;
 
   let revision = 0;
   let dirty = false;
@@ -337,7 +480,6 @@ export function createProviderConnectionService(
       });
     }
     const listCurrent = problem === null && connected;
-    const status = providerConnectionStatus({ listCurrent });
     const connections =
       list === null
         ? NO_CONNECTIONS
@@ -348,7 +490,13 @@ export function createProviderConnectionService(
                 kind: item.kind,
                 label: item.label,
                 createdAt: item.createdAt,
-                status,
+                status: providerConnectionStatus({
+                  listCurrent,
+                  key:
+                    keys === undefined
+                      ? "missing"
+                      : (keyStates.get(item.id) ?? "unknown"),
+                }),
               }),
             ),
           );
@@ -419,6 +567,9 @@ export function createProviderConnectionService(
     problem = null;
     attempt = 0;
     rateLimitedUntil = null;
+    keyStates.clear();
+    keyChecks.clear();
+    removedConnections.clear();
     touch();
   }
 
@@ -511,6 +662,61 @@ export function createProviderConnectionService(
     attempt = 0;
     rateLimitedUntil = null;
     touch();
+    checkNewKeys();
+  }
+
+  /**
+   * Forgets the key state of connections that the list no longer holds, and
+   * checks the key of each listed connection that was not checked yet.
+   */
+  function checkNewKeys(): void {
+    const listed = new Set<string>(list?.map((item) => item.id) ?? []);
+    for (const id of [...keyStates.keys()]) {
+      if (!listed.has(id)) {
+        keyStates.delete(id);
+      }
+    }
+    for (const id of listed) {
+      if (!keyStates.has(id) && !keyChecks.has(id)) {
+        checkKey(id);
+      }
+    }
+  }
+
+  /**
+   * Checks the key of one connection for the device signed in now. The
+   * answer applies only when no newer check of that connection started and
+   * the device is the same. The plaintext never reaches the service.
+   */
+  function checkKey(id: string): void {
+    if (keys === undefined || device === null || closed) {
+      return;
+    }
+    lastKeyCheck += 1;
+    const token = lastKeyCheck;
+    const started = epoch;
+    keyChecks.set(id, token);
+    void keys
+      .check({ deviceId: device, providerConnectionId: id })
+      .then(
+        (found): ProviderKeyState => (found === "ready" ? "ready" : "missing"),
+        (error: unknown): ProviderKeyState => {
+          log(`A provider key could not be checked (${failureCode(error)}).`);
+          return providerKeyStateAfterFailure(error);
+        },
+      )
+      .then((state) =>
+        run(() => {
+          if (closed || started !== epoch || keyChecks.get(id) !== token) {
+            return;
+          }
+          keyChecks.delete(id);
+          if (list?.some((item) => item.id === id) === true) {
+            keyStates.set(id, state);
+            touch();
+          }
+        }),
+      );
   }
 
   function readFailed(reason: WorkspaceReadFailure): void {
@@ -541,6 +747,21 @@ export function createProviderConnectionService(
 
   function accountChanged(status: AccountStatus): void {
     const next = signedInDevice(status);
+    if (next !== null && lastDevice !== null && next !== lastDevice) {
+      deviceGeneration += 1;
+    }
+    if (next !== null) {
+      lastDevice = next;
+    }
+    // Without a device record (`signed_out`, as after "This is not me") or
+    // in a state that deletes the device key, a key bound to the device
+    // can no longer be opened by any later device.
+    if (
+      status.account.kind === "signed_out" ||
+      DEVICE_KEY_ENDED_STATES.has(status.device)
+    ) {
+      deviceGeneration += 1;
+    }
     if (next !== device) {
       if (device !== null) {
         reset();
@@ -673,6 +894,19 @@ export function createProviderConnectionService(
     if (writing) {
       return refused("busy");
     }
+    // No key action starts until the key file of a confirmed removal is
+    // deleted.
+    removing = true;
+    try {
+      return await removeListed(providerConnectionId);
+    } finally {
+      removing = false;
+    }
+  }
+
+  async function removeListed(
+    providerConnectionId: ProviderConnectionId,
+  ): Promise<RemoveProviderConnectionResult> {
     const answer = await write<null>(
       () =>
         account.sendWorkspaceAction("removeProviderConnection", {
@@ -691,7 +925,144 @@ export function createProviderConnectionService(
     if (answer === null) {
       return UNKNOWN;
     }
-    return answer.ok ? OK : failedResult(REMOVE_OUTCOMES, answer);
+    if (!answer.ok) {
+      return failedResult(REMOVE_OUTCOMES, answer);
+    }
+    // The connection is gone at the server: from now on no key action
+    // names it, although the list holds it until the next read answers.
+    removedConnections.add(providerConnectionId);
+    // The server confirmed the removal: only now is the key file deleted
+    // (D4). A failure is logged; the file stays bound to a connection that
+    // no longer exists, and the device's removal deletes it.
+    if (keys !== undefined) {
+      try {
+        await keys.remove(providerConnectionId);
+      } catch (error) {
+        log(
+          `The provider key of a removed connection could not be deleted (${failureCode(error)}).`,
+        );
+      }
+    }
+    return OK;
+  }
+
+  /**
+   * The ID of a connection of the list held now for a key action, with
+   * the device signed in now, or the refusal of the action: `not_listed`
+   * also for a connection whose removal the server confirmed, and `busy`
+   * while another key action, a registration, or a removal runs.
+   */
+  function keyTarget(
+    value: string,
+  ):
+    | { readonly id: ProviderConnectionId; readonly deviceId: string }
+    | Refused<"invalid" | "not_signed_in" | "not_listed" | "busy" | "failed"> {
+    const parsed = ProviderConnectionIdSchema.safeParse(value);
+    if (!parsed.success) {
+      return refused("invalid");
+    }
+    if (closed || keys === undefined) {
+      return refused("failed");
+    }
+    if (device === null) {
+      return refused("not_signed_in");
+    }
+    const id = parsed.data;
+    if (
+      list?.some((item) => item.id === id) !== true ||
+      removedConnections.has(id)
+    ) {
+      return refused("not_listed");
+    }
+    if (keyAction || writing || removing) {
+      return refused("busy");
+    }
+    return { id, deviceId: device };
+  }
+
+  /** The refusal of a key store failure while storing a key. */
+  function saveRefusal(error: unknown): SaveProviderKeyRefusal {
+    if (isProviderKeyError(error, "system_protection_unavailable")) {
+      return "protection_unavailable";
+    }
+    return isProviderKeyError(error, "invalid_key") ? "invalid" : "failed";
+  }
+
+  async function saveKey(
+    value: string,
+    key: string,
+  ): Promise<SaveProviderKeyResult> {
+    // The shape first, so that nothing else runs with a key that is not one.
+    if (!isProviderKeyShape(key)) {
+      return refused("invalid");
+    }
+    const target = keyTarget(value);
+    if ("outcome" in target) {
+      return target;
+    }
+    keyAction = true;
+    try {
+      return await storeKey(target, key);
+    } finally {
+      keyAction = false;
+    }
+  }
+
+  async function storeKey(
+    target: { readonly id: ProviderConnectionId; readonly deviceId: string },
+    key: string,
+  ): Promise<SaveProviderKeyResult> {
+    const generation = deviceGeneration;
+    try {
+      await keys?.save(
+        { deviceId: target.deviceId, providerConnectionId: target.id },
+        key,
+      );
+    } catch (error) {
+      log(`A provider key was not stored (${failureCode(error)}).`);
+      return refused(saveRefusal(error));
+    }
+    if (generation !== deviceGeneration) {
+      // Another device signed in, or the device key was deleted, while the
+      // key was written: the file is bound to a device that no later
+      // device can be, so it is deleted again.
+      try {
+        await keys?.remove(target.id);
+      } catch (error) {
+        log(
+          `A provider key of a device that left could not be deleted (${failureCode(error)}).`,
+        );
+      }
+      return refused("not_signed_in");
+    }
+    // A sign-out meanwhile keeps the key (D4): it is bound to this device,
+    // and the next sign-in of this device checks it with the list.
+    if (device === target.deviceId) {
+      run(() => checkKey(target.id));
+    }
+    return OK;
+  }
+
+  async function removeKey(value: string): Promise<RemoveProviderKeyResult> {
+    const target = keyTarget(value);
+    if ("outcome" in target) {
+      return target;
+    }
+    keyAction = true;
+    const started = epoch;
+    let result: RemoveProviderKeyResult = OK;
+    try {
+      await keys?.remove(target.id);
+    } catch (error) {
+      log(`A provider key could not be deleted (${failureCode(error)}).`);
+      result = refused("failed");
+    } finally {
+      keyAction = false;
+    }
+    if (started === epoch) {
+      run(() => checkKey(target.id));
+    }
+    return result;
   }
 
   const removers = [
@@ -718,6 +1089,8 @@ export function createProviderConnectionService(
     },
     register,
     remove,
+    saveKey,
+    removeKey,
     close: () => {
       if (closed) {
         return;

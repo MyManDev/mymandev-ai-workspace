@@ -11,10 +11,12 @@ import { deviceTimeFormat } from "./device-view.ts";
 import {
   PROVIDER_CONNECTION_MESSAGE_ID,
   PROVIDER_CONNECTIONS_TITLE_ID,
+  PROVIDER_KEY_INPUT_ID,
   ProviderConnectionQuestionContent,
   ProviderConnectionsContent,
   ProviderConnectionsSection,
   providerConnectionHandlers,
+  REMOVE_KEY_QUESTION_MESSAGES,
   REMOVE_QUESTION_MESSAGES,
   type ProviderConnectionHandlers,
 } from "./ProviderConnectionsSection.tsx";
@@ -46,7 +48,7 @@ const READY: ProviderConnectionListView = {
       kind: "claude",
       label: MARKUP_LABEL,
       createdAt: AT,
-      status: "registered",
+      status: "credential_missing",
     },
     {
       id: ID_2,
@@ -128,6 +130,12 @@ function recorder() {
     onLabel: (text) => calls.push(`label ${text}`),
     onRegister: () => calls.push("register"),
     onRemove: (row: ProviderConnectionRow) => calls.push(`remove ${row.id}`),
+    onAskKey: (row: ProviderConnectionRow) => calls.push(`askKey ${row.id}`),
+    onKey: (text) => calls.push(`key ${text}`),
+    onSaveKey: () => calls.push("saveKey"),
+    onCancelKey: () => calls.push("cancelKey"),
+    onRemoveKey: (row: ProviderConnectionRow) =>
+      calls.push(`removeKey ${row.id}`),
     onConfirm: () => calls.push("confirm"),
     onCancel: () => calls.push("cancel"),
   };
@@ -149,7 +157,7 @@ function content(
   );
 }
 
-test("the section lists each connection's label as text, its provider, when it was added, and its status, and offers no field for a secret", () => {
+test("the section lists each connection's label as text, its provider, when it was added, and its status, and shows no key field until one is asked for", () => {
   const html = renderToString(content(known()));
   expect(html).toContain(
     `<h3 id="${PROVIDER_CONNECTIONS_TITLE_ID}" tabindex="-1">AI providers</h3>`,
@@ -167,12 +175,20 @@ test("the section lists each connection's label as text, its provider, when it w
   expect(html).toContain('<span class="device-mark">Codex</span>');
   expect(html).toContain(`<time dateTime="${AT}">24 Nov 2026, 09:00</time>`);
   expect(html).toContain(
-    `Registered<!-- -->. <!-- -->${htmlText(PROVIDER_CONNECTION_STATUS_TEXTS.registered.text)}`,
+    `No API key<!-- -->. <!-- -->${htmlText(PROVIDER_CONNECTION_STATUS_TEXTS.credential_missing.text)}`,
   );
   expect(html).toContain(
     `Unknown<!-- -->. <!-- -->${htmlText(PROVIDER_CONNECTION_STATUS_TEXTS.unknown.text)}`,
   );
-  // Each "Remove" is described by its connection's label.
+  // Each button is described by its connection's label. A connection
+  // without a key offers to enter one; one whose key is unknown also offers
+  // to remove it.
+  expect(html).toContain(
+    '<button type="button" class="panel-action" aria-describedby="provider-connection-label-0">Enter an API key</button><button type="button" class="panel-action" aria-describedby="provider-connection-label-0">Remove</button>',
+  );
+  expect(html).toContain(
+    '<button type="button" class="panel-action" aria-describedby="provider-connection-label-1">Enter an API key</button><button type="button" class="panel-action" aria-describedby="provider-connection-label-1">Remove the API key</button>',
+  );
   expect(html).toContain(
     '<button type="button" class="panel-action" aria-describedby="provider-connection-label-0">Remove</button>',
   );
@@ -261,7 +277,8 @@ test("while an action runs, the buttons do nothing and the fields are read-only;
     draftLabel: "Work",
   };
   const html = renderToString(content(known(), running, handlers));
-  expect(html.match(/aria-disabled="true"/gu)).toHaveLength(3);
+  // Enter (2), Remove the API key (1), Remove (2), and the submit.
+  expect(html.match(/aria-disabled="true"/gu)).toHaveLength(6);
   expect(html).toContain('readOnly=""');
   expect(html).toContain('<select id="provider-connection-kind"');
   expect(html).toMatch(/<select [^>]*disabled=""/u);
@@ -306,7 +323,7 @@ test("the controls pass the person's input on: the kind, the label, a submit, an
       },
     });
   for (const element of elements) {
-    if (element.type === "button" && textOf(element) === "Remove") {
+    if (element.type === "button") {
       element.props.onClick?.({ currentTarget: null });
     }
   }
@@ -315,7 +332,10 @@ test("the controls pass the person's input on: the kind, the label, a submit, an
     "kind codex",
     "label  Home ",
     "register",
+    `askKey ${ID_1}`,
     `remove ${ID_1}`,
+    `askKey ${ID_2}`,
+    `removeKey ${ID_2}`,
     `remove ${ID_2}`,
   ]);
 });
@@ -332,7 +352,12 @@ test("the question names the connection as text, puts Cancel first, and confirms
   expect(closed).toBe('<dialog class="people-dialog"></dialog>');
   const question = (
     <ProviderConnectionQuestionContent
-      question={{ id: ID_1, label: MARKUP_LABEL, kindName: "Claude" }}
+      question={{
+        id: ID_1,
+        label: MARKUP_LABEL,
+        kindName: "Claude",
+        action: "remove",
+      }}
       onConfirm={handlers.onConfirm}
       onCancel={handlers.onCancel}
     />
@@ -379,6 +404,11 @@ test("a confirmed removal moves the focus to the title only once the connection 
     editLabel: () => undefined,
     register: () => Promise.resolve(),
     askRemove: () => undefined,
+    askKey: () => undefined,
+    editKey: () => undefined,
+    saveKey: () => Promise.resolve(),
+    cancelKey: () => undefined,
+    askRemoveKey: () => undefined,
     confirm: () => Promise.resolve(removed),
     cancel: () => undefined,
     follow: () => undefined,
@@ -412,9 +442,140 @@ test("the Account screen shows the section after the devices, also without the b
         subscribeState: () => () => undefined,
         register: () => new Promise(() => undefined),
         remove: () => new Promise(() => undefined),
+        saveKey: () => new Promise(() => undefined),
+        removeKey: () => new Promise(() => undefined),
       }}
     />,
   );
   expect(withBridge).toContain(PROVIDER_CONNECTION_MESSAGES.pending);
   expect(withBridge).toContain('<dialog class="people-dialog"></dialog>');
+});
+
+/** An obvious fake key that the markup may hold only while it is typed. */
+const SENTINEL_KEY = "FAKE-PROVIDER-KEY-SENTINEL-0123456789";
+
+test("the key form is one password field, never prefilled, under its connection, with its hint and alert", () => {
+  const { calls, handlers } = recorder();
+  const open: ProviderConnectionActionsView = {
+    ...IDLE_PROVIDER_CONNECTION_ACTIONS,
+    keyFor: { id: ID_1, label: MARKUP_LABEL, kindName: "Claude" },
+  };
+  const html = renderToString(content(known(), open, handlers));
+  expect(html.match(/type="password"/gu)).toHaveLength(1);
+  expect(html).toContain(
+    `<label class="account-label" for="${PROVIDER_KEY_INPUT_ID}">API key</label>`,
+  );
+  // The field opens empty and never offers a stored key.
+  expect(html).toMatch(
+    new RegExp(
+      `<input id="${PROVIDER_KEY_INPUT_ID}" class="account-input" type="password" autoComplete="off" autoCapitalize="off" autoCorrect="off" spellCheck="false" aria-describedby="provider-key-hint provider-key-problem" value=""/>`,
+      "u",
+    ),
+  );
+  expect(html).toContain(
+    'aria-describedby="provider-key-hint provider-key-problem"',
+  );
+  expect(html).toContain(htmlText(PROVIDER_CONNECTION_MESSAGES.keyHint));
+  // The label of the connection stays text in the form's title.
+  expect(html).toContain(
+    '<span dir="auto" translate="no">&lt;b&gt;Work&lt;/b&gt; account</span>',
+  );
+  // Its "Enter an API key" button gives way to the form; the other row
+  // keeps its own.
+  expect(html).not.toContain(
+    'aria-describedby="provider-connection-label-0">Enter an API key</button>',
+  );
+  expect(html).toContain(
+    'aria-describedby="provider-connection-label-1">Enter an API key</button>',
+  );
+  const elements = elementsOf(content(known(), open, handlers));
+  const input = elements.find(
+    (element) =>
+      element.type === "input" && element.props.id === PROVIDER_KEY_INPUT_ID,
+  );
+  input?.props.onChange?.({ currentTarget: { value: SENTINEL_KEY } });
+  const form = elements.find(
+    (element) =>
+      element.type === "form" &&
+      element.props["aria-labelledby"] === "provider-key-title",
+  );
+  form?.props.onSubmit?.({ preventDefault: () => undefined });
+  elements
+    .find(
+      (element) =>
+        element.type === "button" &&
+        textOf(element) === PROVIDER_CONNECTION_MESSAGES.cancel,
+    )
+    ?.props.onClick?.({ currentTarget: null });
+  expect(calls).toEqual([`key ${SENTINEL_KEY}`, "saveKey", "cancelKey"]);
+
+  // A typed key is in the field only; once sent, the field is empty again.
+  const typed = renderToString(
+    content(known(), { ...open, draftKey: SENTINEL_KEY }, handlers),
+  );
+  expect(typed.match(new RegExp(SENTINEL_KEY, "gu"))).toHaveLength(1);
+  const sent = renderToString(
+    content(
+      known(),
+      {
+        ...open,
+        draftKey: "",
+        keyProblem: PROVIDER_CONNECTION_MESSAGES.keyUnsafe,
+      },
+      handlers,
+    ),
+  );
+  expect(sent).not.toContain(SENTINEL_KEY);
+  expect(sent).toContain('aria-invalid="true"');
+  expect(sent).toContain(
+    `<p class="panel-message" id="provider-key-problem" role="alert">${PROVIDER_CONNECTION_MESSAGES.keyUnsafe}</p>`,
+  );
+  // While an action runs the field is read-only and its buttons do nothing.
+  const running = renderToString(
+    content(known(), { ...open, running: true }, handlers),
+  );
+  expect(running).toMatch(
+    new RegExp(`<input id="${PROVIDER_KEY_INPUT_ID}"[^>]*readOnly=""`, "u"),
+  );
+});
+
+test("a ready connection offers to replace and remove its key, and the key question has its own texts", () => {
+  const ready = known({
+    revision: 4,
+    status: "ready",
+    connections: [
+      {
+        id: ID_1,
+        kind: "claude",
+        label: "Work",
+        createdAt: AT,
+        status: "ready",
+      },
+    ],
+  });
+  const html = renderToString(content(ready));
+  expect(html).toContain(
+    `Ready<!-- -->. <!-- -->${htmlText(PROVIDER_CONNECTION_STATUS_TEXTS.ready.text)}`,
+  );
+  expect(html).toContain(">Replace the API key</button>");
+  expect(html).toContain(">Remove the API key</button>");
+  expect(html).not.toContain(">Enter an API key</button>");
+  expect(html).not.toContain('type="password"');
+
+  const question = renderToString(
+    <ProviderConnectionQuestionContent
+      question={{
+        id: ID_1,
+        label: "Work",
+        kindName: "Claude",
+        action: "removeKey",
+      }}
+      onConfirm={() => undefined}
+      onCancel={() => undefined}
+    />,
+  );
+  expect(question).toContain(htmlText(REMOVE_KEY_QUESTION_MESSAGES.title));
+  expect(question).toContain(htmlText(REMOVE_KEY_QUESTION_MESSAGES.text));
+  expect(question).toContain(`>${REMOVE_KEY_QUESTION_MESSAGES.confirm}<`);
+  expect(question).not.toContain(REMOVE_QUESTION_MESSAGES.title);
 });

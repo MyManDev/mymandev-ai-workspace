@@ -96,7 +96,7 @@ function connections(
         kind: "claude",
         label: "Work laptop",
         createdAt: AT,
-        status: "registered",
+        status: "ready",
       },
       {
         id: OTHER_CONNECTION,

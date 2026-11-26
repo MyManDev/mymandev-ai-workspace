@@ -20,6 +20,8 @@ import { resolveApiOrigin } from "./api-origin.ts";
 import { deviceKeyFolder } from "./device-key/key-folder.ts";
 import { createSystemDeviceKeyStore } from "./device-key/system.ts";
 import { createDeviceRecordStore } from "./device-record.ts";
+import { deletingProviderKeys } from "./provider-keys/device-removal.ts";
+import type { ProviderKeyStore } from "./provider-keys/store.ts";
 import { createSystemDeviceSession } from "./session/system.ts";
 import { createRegistrationMarkerStore } from "./sign-in/registration-marker.ts";
 import { createSystemSignInFlow } from "./sign-in/system.ts";
@@ -47,6 +49,11 @@ export interface SystemAccountOptions {
   ) => Promise<boolean>;
   /** Stops local execution after the API revoked this device. */
   readonly stopLocalExecution: () => void;
+  /**
+   * The provider key store (#33): every deletion of the device key also
+   * deletes every provider key file (`deletingProviderKeys`).
+   */
+  readonly providerKeys: Pick<ProviderKeyStore, "removeAll">;
   /** Receives fixed messages; the key store's errors hold no secret. */
   readonly onError: (message: string, error?: unknown) => void;
 }
@@ -60,7 +67,13 @@ export function createSystemAccountService(
       env: process.env,
     }),
     openSystem: () => {
-      const keyStore = createSystemDeviceKeyStore(options.onError);
+      // Removing the device deletes the provider keys with the device key
+      // (#33, D4); a sign-out deletes neither.
+      const keyStore = deletingProviderKeys(
+        createSystemDeviceKeyStore(options.onError),
+        options.providerKeys,
+        (message) => options.onError(message),
+      );
       const folder = deviceKeyFolder({
         platform: process.platform,
         env: process.env,

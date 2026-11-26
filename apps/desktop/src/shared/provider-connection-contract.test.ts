@@ -8,13 +8,20 @@ import {
   PROVIDER_CONNECTION_STATUSES,
   ProviderConnectionListViewSchema,
   REGISTER_PROVIDER_CONNECTION_REFUSALS,
+  PROVIDER_KEY_LIMITS,
   REMOVE_PROVIDER_CONNECTION_REFUSALS,
+  REMOVE_PROVIDER_KEY_REFUSALS,
   RegisterProviderConnectionResultSchema,
   RemoveProviderConnectionResultSchema,
+  RemoveProviderKeyResultSchema,
+  SAVE_PROVIDER_KEY_REFUSALS,
+  SaveProviderKeyResultSchema,
 } from "./ipc-contract.ts";
 
 // The contract of this device's AI provider connections (#32): metadata
-// and a status cross, never a credential.
+// and a status cross, never a credential. A connection's API key (#33)
+// crosses once, from the renderer to the main process, and no result or
+// event holds one.
 
 const CONNECTION = "0192f0a0-7b3c-7d4e-8f50-000000000101";
 const AT = "2026-11-24T09:00:00.000Z";
@@ -23,7 +30,7 @@ const ITEM = {
   kind: "claude",
   label: "Work laptop",
   createdAt: AT,
-  status: "registered",
+  status: "ready",
 };
 
 test("the provider connection channels have their own names and schemas", () => {
@@ -152,15 +159,16 @@ test("a list view holds the ID, kind, label, time, and status of each connection
     },
     { revision: -1, status: "ready", connections: [] },
     { revision: 1, status: "ready", connections: [{ ...ITEM, kind: "x" }] },
+    // `registered` was the status of #32, before the key of #33.
     {
       revision: 1,
       status: "ready",
-      connections: [{ ...ITEM, status: "ready" }],
+      connections: [{ ...ITEM, status: "registered" }],
     },
     {
       revision: 1,
       status: "ready",
-      connections: [{ ...ITEM, status: "credential_missing" }],
+      connections: [{ ...ITEM, status: "check_failed" }],
     },
     { revision: 1, status: "ready", connections: [{ ...ITEM, label: "" }] },
     { revision: 1, status: "ready", connections: [{ ...ITEM, id: "x" }] },
@@ -219,4 +227,77 @@ test("the results of a registration and a removal are ok, a fixed refusal with a
   );
   expect(REMOVE_PROVIDER_CONNECTION_REFUSALS).toContain("not_found");
   expect(REMOVE_PROVIDER_CONNECTION_REFUSALS).toContain("conflict");
+});
+
+/** An obvious fake key; no result of the contract may hold it. */
+const SENTINEL_KEY = "FAKE-PROVIDER-KEY-SENTINEL-0123456789";
+
+test("storing a key takes one strict object of a connection ID and a key of 1 to 512 characters, and no other key", () => {
+  expect(INVOKE_CHANNELS.saveProviderKey).toBe("provider-connections:save-key");
+  expect(INVOKE_CHANNELS.removeProviderKey).toBe(
+    "provider-connections:remove-key",
+  );
+  expect(PROVIDER_KEY_LIMITS).toEqual({ key: 512 });
+  const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.saveProviderKey];
+  const request = { providerConnectionId: CONNECTION, key: SENTINEL_KEY };
+  expect(args.parse([request])).toEqual([request]);
+  const longest = { ...request, key: "k".repeat(PROVIDER_KEY_LIMITS.key) };
+  expect(args.parse([longest])).toEqual([longest]);
+  for (const value of [
+    [],
+    [request, request],
+    [CONNECTION, SENTINEL_KEY],
+    [{ ...request, key: "" }],
+    [{ ...request, key: "k".repeat(PROVIDER_KEY_LIMITS.key + 1) }],
+    [{ ...request, key: 7 }],
+    [{ ...request, providerConnectionId: CONNECTION.toUpperCase() }],
+    [{ key: SENTINEL_KEY }],
+    [{ providerConnectionId: CONNECTION }],
+    [{ ...request, kind: "claude" }],
+    [{ ...request, deviceId: CONNECTION }],
+  ]) {
+    const parsed = args.safeParse(value);
+    expect(parsed.success, JSON.stringify(value)?.slice(0, 80)).toBe(false);
+    // The contract's error never quotes the key it refused.
+    expect(JSON.stringify(parsed.error?.issues ?? [])).not.toContain(
+      SENTINEL_KEY,
+    );
+    expect(parsed.error?.message ?? "").not.toContain(SENTINEL_KEY);
+  }
+  const remove = INVOKE_CONTRACT[INVOKE_CHANNELS.removeProviderKey].args;
+  expect(remove.parse([CONNECTION])).toEqual([CONNECTION]);
+  for (const value of [[], [CONNECTION, SENTINEL_KEY], [request]]) {
+    expect(remove.safeParse(value).success).toBe(false);
+  }
+});
+
+test("the results of storing and removing a key are ok or a fixed refusal without a wait, and never carry a key", () => {
+  for (const [schema, reasons] of [
+    [SaveProviderKeyResultSchema, SAVE_PROVIDER_KEY_REFUSALS],
+    [RemoveProviderKeyResultSchema, REMOVE_PROVIDER_KEY_REFUSALS],
+  ] as const) {
+    expect(schema.parse({ outcome: "ok", key: SENTINEL_KEY })).toEqual({
+      outcome: "ok",
+    });
+    // A key action happens on this device: its outcome is always known.
+    expect(schema.safeParse({ outcome: "unknown" }).success).toBe(false);
+    for (const reason of reasons) {
+      expect(
+        schema.parse({
+          outcome: "refused",
+          reason,
+          retryAfterMs: null,
+          key: SENTINEL_KEY,
+        }),
+      ).toEqual({ outcome: "refused", reason, retryAfterMs: null });
+      expect(
+        schema.safeParse({ outcome: "refused", reason, retryAfterMs: 1_000 })
+          .success,
+      ).toBe(false);
+    }
+  }
+  expect(SAVE_PROVIDER_KEY_REFUSALS).toContain("protection_unavailable");
+  // One key action at a time, and none while a write runs.
+  expect(SAVE_PROVIDER_KEY_REFUSALS).toContain("busy");
+  expect(REMOVE_PROVIDER_KEY_REFUSALS).toContain("busy");
 });

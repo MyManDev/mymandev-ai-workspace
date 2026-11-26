@@ -16,6 +16,7 @@ import {
   type ProviderConnectionQuestion,
   type ProviderConnectionRow,
   type ProviderConnectionsModel,
+  type ProviderConnectionTarget,
 } from "./provider-connection-view.ts";
 
 /** The ID of the section's title, which takes the focus without a tab stop. */
@@ -29,12 +30,20 @@ export function providerConnectionLabelId(index: number): string {
   return `provider-connection-label-${String(index)}`;
 }
 
+/** The ID of the key field of the open key form. */
+export const PROVIDER_KEY_INPUT_ID = "provider-key-input";
+
 /** What the section needs to offer its actions. */
 export interface ProviderConnectionHandlers {
   readonly onKind: (kind: string) => void;
   readonly onLabel: (text: string) => void;
   readonly onRegister: () => void;
   readonly onRemove: (row: ProviderConnectionRow) => void;
+  readonly onAskKey: (row: ProviderConnectionRow) => void;
+  readonly onKey: (text: string) => void;
+  readonly onSaveKey: () => void;
+  readonly onCancelKey: () => void;
+  readonly onRemoveKey: (row: ProviderConnectionRow) => void;
   readonly onConfirm: () => void;
   readonly onCancel: () => void;
 }
@@ -59,11 +68,14 @@ export interface ProviderConnectionsContentProps {
  * bridge a second one for the sentence of the last action. Each connection
  * shows its provider, its label, as text that a person entered with
  * `dir="auto"` and never translated, when it was added, and its status with
- * its sentence; its "Remove" button is described by the label. While a
- * device is signed in, a form adds a connection by its provider and label;
- * it has no field for a key or a token. While an action runs, every button
- * stays focusable and does nothing (`aria-disabled`), and the fields are
- * read-only.
+ * its sentence; its buttons are described by the label: "Enter an API
+ * key" (or "Replace the API key" once one is stored), "Remove the API key"
+ * while one may be stored, and "Remove". The key form opens under its
+ * connection with one password field that is never prefilled (#33). While
+ * a device is signed in, a form adds a connection by its provider and
+ * label; it has no field for a key or a token. While an action runs, every
+ * button stays focusable and does nothing (`aria-disabled`), and the
+ * fields are read-only.
  */
 export function ProviderConnectionsContent({
   model,
@@ -105,7 +117,7 @@ export function ProviderConnectionsContent({
               row={row}
               index={index}
               format={format}
-              running={actions.running}
+              actions={actions}
               handlers={handlers}
             />
           ))}
@@ -122,16 +134,18 @@ function ConnectionItem({
   row,
   index,
   format,
-  running,
+  actions,
   handlers,
 }: {
   readonly row: ProviderConnectionRow;
   readonly index: number;
   readonly format: Intl.DateTimeFormat;
-  readonly running: boolean;
+  readonly actions: ProviderConnectionActionsView;
   readonly handlers: ProviderConnectionHandlers | undefined;
 }) {
+  const { running } = actions;
   const labelId = providerConnectionLabelId(index);
+  const keyOpen = actions.keyFor?.id === row.id;
   return (
     <li>
       <p className="device-name">
@@ -154,6 +168,30 @@ function ConnectionItem({
       </dl>
       {handlers === undefined ? null : (
         <div className="account-actions">
+          {keyOpen ? null : (
+            <button
+              type="button"
+              className="panel-action"
+              aria-describedby={labelId}
+              aria-disabled={running ? "true" : undefined}
+              onClick={running ? undefined : () => handlers.onAskKey(row)}
+            >
+              {row.keyAction === "replace"
+                ? PROVIDER_CONNECTION_MESSAGES.replaceKey
+                : PROVIDER_CONNECTION_MESSAGES.enterKey}
+            </button>
+          )}
+          {row.keyMayExist ? (
+            <button
+              type="button"
+              className="panel-action"
+              aria-describedby={labelId}
+              aria-disabled={running ? "true" : undefined}
+              onClick={running ? undefined : () => handlers.onRemoveKey(row)}
+            >
+              {PROVIDER_CONNECTION_MESSAGES.removeKey}
+            </button>
+          ) : null}
           <button
             type="button"
             className="panel-action"
@@ -165,7 +203,96 @@ function ConnectionItem({
           </button>
         </div>
       )}
+      {handlers === undefined ||
+      !keyOpen ||
+      actions.keyFor === undefined ? null : (
+        <KeyForm
+          target={actions.keyFor}
+          actions={actions}
+          handlers={handlers}
+        />
+      )}
     </li>
+  );
+}
+
+/**
+ * The form that stores a connection's API key: one password field, never
+ * prefilled, that the actions empty as the key is sent; its hint says that
+ * the key stays on this device and is never shown again; an alert for a
+ * key that is not sent; "Store the key" and "Cancel". The field has no
+ * `maxLength` and no autocomplete, and spelling is not checked, so that no
+ * spelling service sees it.
+ */
+function KeyForm({
+  target,
+  actions,
+  handlers,
+}: {
+  readonly target: ProviderConnectionTarget;
+  readonly actions: ProviderConnectionActionsView;
+  readonly handlers: ProviderConnectionHandlers;
+}) {
+  const { running } = actions;
+  return (
+    <form
+      className="account-form"
+      aria-labelledby="provider-key-title"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!running) {
+          handlers.onSaveKey();
+        }
+      }}
+    >
+      <h4 id="provider-key-title">
+        {PROVIDER_CONNECTION_MESSAGES.keyLabel}:{" "}
+        <span dir="auto" translate="no">
+          {target.label}
+        </span>{" "}
+        ({target.kindName})
+      </h4>
+      <label className="account-label" htmlFor={PROVIDER_KEY_INPUT_ID}>
+        {PROVIDER_CONNECTION_MESSAGES.keyLabel}
+      </label>
+      <input
+        id={PROVIDER_KEY_INPUT_ID}
+        className="account-input"
+        type="password"
+        autoComplete="off"
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+        value={actions.draftKey}
+        readOnly={running}
+        aria-invalid={actions.keyProblem === undefined ? undefined : "true"}
+        aria-describedby="provider-key-hint provider-key-problem"
+        onChange={(event) => handlers.onKey(event.currentTarget.value)}
+      />
+      <p className="account-message" id="provider-key-hint">
+        {PROVIDER_CONNECTION_MESSAGES.keyHint}
+      </p>
+      <p className="panel-message" id="provider-key-problem" role="alert">
+        {actions.keyProblem ?? ""}
+      </p>
+      <div className="account-actions">
+        <button
+          type="submit"
+          className="panel-action"
+          aria-disabled={running ? "true" : undefined}
+        >
+          {PROVIDER_CONNECTION_MESSAGES.saveKey}
+        </button>
+        <button
+          type="button"
+          className="panel-action"
+          aria-disabled={running ? "true" : undefined}
+          onClick={running ? undefined : handlers.onCancelKey}
+        >
+          {PROVIDER_CONNECTION_MESSAGES.cancel}
+        </button>
+      </div>
+    </form>
   );
 }
 
@@ -256,8 +383,15 @@ function RegisterForm({
 /** The fixed texts of the question before a removal. */
 export const REMOVE_QUESTION_MESSAGES = Object.freeze({
   title: "Remove this AI provider connection?",
-  text: "The server forgets it, and every permission that lets an agent use it is revoked. Nothing on the provider's side changes.",
+  text: "The server forgets it, every permission that lets an agent use it is revoked, and its API key is deleted from this device. Nothing on the provider's side changes.",
   confirm: "Remove the connection",
+});
+
+/** The fixed texts of the question before removing an API key. */
+export const REMOVE_KEY_QUESTION_MESSAGES = Object.freeze({
+  title: "Remove this connection's API key?",
+  text: "The key is deleted from this device, and agents cannot use the connection here until you enter a key again. The connection stays, and nothing on the provider's side changes.",
+  confirm: "Remove the API key",
 });
 
 export interface ProviderConnectionQuestionProps {
@@ -299,6 +433,10 @@ export function ProviderConnectionQuestionContent({
   if (question === undefined) {
     return <dialog ref={dialogRef} className="people-dialog" />;
   }
+  const texts =
+    question.action === "removeKey"
+      ? REMOVE_KEY_QUESTION_MESSAGES
+      : REMOVE_QUESTION_MESSAGES;
   return (
     <dialog
       ref={dialogRef}
@@ -319,24 +457,20 @@ export function ProviderConnectionQuestionContent({
           onConfirm();
         }}
       >
-        <h2 id="provider-connection-dialog-title">
-          {REMOVE_QUESTION_MESSAGES.title}
-        </h2>
+        <h2 id="provider-connection-dialog-title">{texts.title}</h2>
         <p className="people-dialog-name" id="provider-connection-dialog-name">
           <span dir="auto" translate="no">
             {question.label}
           </span>{" "}
           ({question.kindName})
         </p>
-        <p id="provider-connection-dialog-text">
-          {REMOVE_QUESTION_MESSAGES.text}
-        </p>
+        <p id="provider-connection-dialog-text">{texts.text}</p>
         <div className="people-dialog-actions">
           <button type="button" className="panel-action" onClick={onCancel}>
             {PROVIDER_CONNECTION_MESSAGES.cancel}
           </button>
           <button type="submit" className="panel-action">
-            {REMOVE_QUESTION_MESSAGES.confirm}
+            {texts.confirm}
           </button>
         </div>
       </form>
@@ -368,6 +502,13 @@ export function providerConnectionHandlers(
       void controller.register();
     },
     onRemove: controller.askRemove,
+    onAskKey: controller.askKey,
+    onKey: controller.editKey,
+    onSaveKey: () => {
+      void controller.saveKey();
+    },
+    onCancelKey: controller.cancelKey,
+    onRemoveKey: controller.askRemoveKey,
     onConfirm: () => {
       void controller.confirm().then((removed) => {
         if (removed) {

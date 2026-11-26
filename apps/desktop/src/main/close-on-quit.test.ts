@@ -234,6 +234,8 @@ const ENTRY = withoutComments(mainSource("./index.ts"));
 const NOT_ADDED: Readonly<Record<string, string>> = {
   runtime: "stopRuntimeOnQuit stops it and holds back the first quit",
   account: "the account service has no close",
+  providerKeys:
+    "the provider key store holds no file, timer, or listener open and has no close",
   enforcement: "the enforcement point keeps nothing and has no close",
   guardSession: "a function that guards a session",
 };
@@ -302,6 +304,12 @@ test("the entry point registers no will-quit listener of its own and adds every 
     );
   expect(enforcementPoint?.[0]).toMatch(/\brecheck\(/);
   expect(enforcementPoint?.[0]).not.toMatch(/^\s*(?:readonly )?close\b/m);
+  const providerKeyStore =
+    /export interface ProviderKeyStore \{[\s\S]*?\n\}/.exec(
+      mainSource("./provider-keys/store.ts"),
+    );
+  expect(providerKeyStore?.[0]).toMatch(/readonly removeAll:/);
+  expect(providerKeyStore?.[0]).not.toMatch(/^\s*(?:readonly )?close\b/m);
   expect(
     declaredReturnType(
       mainSource("./guards.ts"),
