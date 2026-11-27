@@ -53,13 +53,32 @@
 // that follow it shows that no folder on the path changed in between, so
 // the path named, without any link, the folder that was listed or the file
 // that the checks after the open saw, which is the open file. An answer is
-// given only when the clock did not go back during the attempt. This holds
-// against a process that can change entries inside the repository. The one
-// case that remains where the system cannot name the open file (Windows,
-// macOS): the folders above the repository's folder are not checked this
-// way, so a process that can rename them can still switch the path above
-// the repository for exactly the open. See the README ("TOCTOU") for that
-// case and the assumptions about the file system's clock.
+// given only when the clock did not go back during the attempt, as far as
+// the clock shows it (best effort: `ReadToolOptions.now`).
+//
+// This holds against a process that can change entries inside the
+// repository only if it cannot also set a folder's change time back:
+//
+// - Linux: only root can set a change time, or the clock; and `read_file`
+//   is tied to the path by `/proc/self/fd` whatever the change times are.
+// - macOS: holds only if a user's process cannot set a folder's change time
+//   (`setattrlist` with `ATTR_CMN_CHGTIME`); whether APFS and HFS+ keep
+//   such a change time has not been verified.
+// - Windows: a process of the same user can set a folder's NTFS change time
+//   back (`SetFileInformationByHandle` with `FileBasicInfo`, which needs
+//   only `FILE_WRITE_ATTRIBUTES`) and so pass the check: `read_file` can
+//   then answer a file outside the repository, and `list_directory` the
+//   names of a folder outside. Accepted as a documented limit (Project
+//   Manager decision of 2026-11-26, evening): such a process can already
+//   read the user's files and copy them into the repository.
+//
+// Also remaining: the folders above the repository's folder are not checked
+// by change time, so a process that can rename them can switch the path
+// above the repository for exactly the open (`read_file` on Windows, macOS,
+// and Linux without `/proc`) or the listing (`list_directory` on every
+// system); and a mount placed on a folder for exactly one listing changes
+// no change time (`list_directory`). See the README ("TOCTOU") for these
+// cases and the assumptions about the file system and its clock.
 //
 // No answer holds an absolute path: an answer names the path that the tool
 // got and the names in a folder, never the folder of the repository.
@@ -435,6 +454,13 @@ const MOVED: Unsettled = Object.freeze({ unsettled: true, waitMs: 0 });
  * file system stamps with a later step of its clock, moves the change time.
  * A file system without change times cannot show a change: `read_failed`
  * (fail closed).
+ *
+ * A change time in the future (the clock went back after it was stamped:
+ * an NTP correction backwards, or a dual boot in which one system keeps
+ * the hardware clock in local time and the other in UTC) is never settled:
+ * every call under that folder is refused (`unsettled`) until real time
+ * passes it, or until an entry in that folder changes, which stamps it
+ * anew with the clock.
  */
 function settledAt(
   stats: readonly ToolFileStat[],
@@ -513,7 +539,10 @@ export interface ReadToolOptions {
   readonly pathApi?: PlatformPath;
   /**
    * The clock that the change times are compared with, in milliseconds
-   * since 1970: `Date.now` by default, the clock that stamps them.
+   * since 1970: `Date.now` by default, which follows the system clock that
+   * stamps them. The check that it did not go back during an attempt is
+   * best effort: on Windows, `Date.now` may not reflect a small step back
+   * of the system clock immediately.
    */
   readonly now?: () => number;
   /** Waits for settled change times; a timer by default. */
@@ -549,8 +578,10 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
       const started = nowNs();
       let outcome = await attempt(started);
       // A clock set back during the attempt could stamp a change with the
-      // change time of an earlier one: an answer is given only when the
-      // clock did not go back before the attempt's start.
+      // change time of an earlier one: an answer is given only when `now`
+      // did not go back before the attempt's start. Best effort: `now` may
+      // not show a small step back of the system clock at once (see
+      // `ReadToolOptions.now`).
       if ("ok" in outcome && outcome.ok && nowNs() < started) {
         outcome = MOVED;
       }
