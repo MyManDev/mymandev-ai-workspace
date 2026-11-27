@@ -989,6 +989,36 @@ test("TOCTOU: a change time must be older than the margin, not only older than t
   expect(files.sleeps[0]).toBe(87);
 });
 
+test("a change time exactly the margin older than the call is not settled; one millisecond older is", async () => {
+  // Stamps on whole milliseconds, not on a whole second, so the margin is
+  // 100 ms. `src` changes 10,050 ms after the clock's start.
+  const exact = repository();
+  exact.stepMs = 1;
+  exact.settleBeforeRun = false;
+  exact.now += 10_050;
+  exact.file(`${ROOT}/src/new.ts`, "new");
+  // The call starts exactly 100 ms after the change: not older by more than
+  // the margin, so it waits the one nanosecond left, rounded up to 1 ms.
+  exact.now += 100;
+  expect(
+    await runTool(toolsOf(exact).read, { path: "src/index.ts" }),
+  ).toMatchObject({ ok: true, result: { content: "export const a = 1;\n" } });
+  expect(exact.sleeps).toEqual([1]);
+  expect(exact.opens).toBe(1);
+
+  // One millisecond later, the change time is settled at once.
+  const later = repository();
+  later.stepMs = 1;
+  later.settleBeforeRun = false;
+  later.now += 10_050;
+  later.file(`${ROOT}/src/new.ts`, "new");
+  later.now += 101;
+  expect(
+    await runTool(toolsOf(later).read, { path: "src/index.ts" }),
+  ).toMatchObject({ ok: true, result: { content: "export const a = 1;\n" } });
+  expect(later.sleeps).toEqual([]);
+});
+
 test("a folder that keeps changing is refused after three attempts, with a bounded wait before each new one", async () => {
   // Another process adds a file to `src` at every open.
   const busy = repository();
