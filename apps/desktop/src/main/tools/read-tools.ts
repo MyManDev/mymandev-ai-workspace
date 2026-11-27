@@ -459,8 +459,9 @@ const MOVED: Unsettled = Object.freeze({ unsettled: true, waitMs: 0 });
  * an NTP correction backwards, or a dual boot in which one system keeps
  * the hardware clock in local time and the other in UTC) is never settled:
  * every call under that folder is refused (`unsettled`) until real time
- * passes it, or until an entry in that folder changes, which stamps it
- * anew with the clock.
+ * passes it by the margin; an entry in that folder that changes stamps it
+ * anew with the clock, and calls under it settle once that new change
+ * time is older than the margin.
  */
 function settledAt(
   stats: readonly ToolFileStat[],
