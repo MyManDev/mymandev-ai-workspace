@@ -32,6 +32,7 @@ import type {
   WorkspaceReadFailure,
   WorkspaceReadResult,
 } from "../api-reads.ts";
+import { createClaudeCredentialLoader } from "../provider-keys/credential.ts";
 import {
   ProviderKeyError,
   type ProviderKeyErrorCode,
@@ -1603,6 +1604,95 @@ test("a removal deletes the key file only after the server confirmed it; a refus
   expect(keys.calls).toEqual([]);
   expect(keys.files.has(CONNECTION_2)).toBe(true);
   expect(exposed(harness)).not.toContain(SENTINEL_KEY);
+});
+
+test("connectionKind names the kind of a listed connection only, and the Claude credential loader reads no key of a removed, unlisted, or other connection", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  const UNLISTED = "0192f0a0-7b3c-7d4e-8f50-000000000103";
+  // Before the list is read, nothing is listed.
+  expect(harness.service.connectionKind(CONNECTION_1)).toBeNull();
+  await harness.ready(TWO);
+  await settle();
+  expect(harness.service.connectionKind(CONNECTION_1)).toBe("claude");
+  expect(harness.service.connectionKind(CONNECTION_2)).toBe("codex");
+  expect(harness.service.connectionKind(UNLISTED)).toBeNull();
+  expect(harness.service.connectionKind(CONNECTION_1.toUpperCase())).toBeNull();
+
+  await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL);
+  await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY, null);
+  keys.files.set(UNLISTED, {
+    deviceId: DEVICE_ID,
+    key: SENTINEL_KEY,
+    model: MODEL,
+  });
+  const reads: string[] = [];
+  let device: string | null = DEVICE_ID;
+  const load = createClaudeCredentialLoader({
+    keys: {
+      read: (binding) => {
+        reads.push(binding.providerConnectionId);
+        const file = keys.files.get(binding.providerConnectionId);
+        if (file === undefined) {
+          return Promise.reject(new ProviderKeyError("missing"));
+        }
+        return Promise.resolve({ key: file.key, model: file.model ?? null });
+      },
+    },
+    deviceId: () => device,
+    connectionKind: (id) => harness.service.connectionKind(id),
+  });
+  expect(await load(CONNECTION_1)).toEqual({
+    ok: true,
+    apiKey: SENTINEL_KEY,
+    model: MODEL,
+  });
+  // A listed connection of another kind, and a key file of a connection
+  // that the list does not hold: nothing is read.
+  expect(await load(CONNECTION_2)).toEqual({ ok: false, reason: "not_claude" });
+  expect(await load(UNLISTED)).toEqual({ ok: false, reason: "not_listed" });
+  expect(reads).toEqual([CONNECTION_1]);
+
+  // The server confirmed the removal, but the key file could not be
+  // deleted: the list still holds the connection until the next read, and
+  // the file stays, yet its key is never read for a run.
+  keys.failures.remove = "delete_failed";
+  const removal = harness.service.remove(CONNECTION_1);
+  harness.writes.at(-1)?.answer({ ok: true, value: null });
+  expect(await removal).toEqual({ outcome: "ok" });
+  keys.failures.remove = undefined;
+  expect(keys.files.has(CONNECTION_1)).toBe(true);
+  expect(harness.service.state().connections.map((entry) => entry.id)).toEqual([
+    CONNECTION_1,
+    CONNECTION_2,
+  ]);
+  expect(harness.service.connectionKind(CONNECTION_1)).toBeNull();
+  expect(await load(CONNECTION_1)).toEqual({ ok: false, reason: "not_listed" });
+  // The list read answers without it: still not listed.
+  await harness.ready(listOf(connection(CONNECTION_2, "Personal", "codex")));
+  expect(harness.service.connectionKind(CONNECTION_1)).toBeNull();
+  expect(await load(CONNECTION_1)).toEqual({ ok: false, reason: "not_listed" });
+  expect(reads).toEqual([CONNECTION_1]);
+
+  // A sign-out drops the list; the loader stops at the device first.
+  harness.setAccount(SIGNED_OUT);
+  device = null;
+  await settle();
+  expect(harness.service.connectionKind(CONNECTION_2)).toBeNull();
+  expect(await load(CONNECTION_2)).toEqual({
+    ok: false,
+    reason: "not_signed_in",
+  });
+  // Another device holds no list until its own read answers.
+  harness.setAccount(accountStatus({}, OTHER_DEVICE_ID));
+  device = OTHER_DEVICE_ID;
+  await settle();
+  expect(harness.service.connectionKind(CONNECTION_2)).toBeNull();
+  await harness.ready(TWO);
+  expect(harness.service.connectionKind(CONNECTION_2)).toBe("codex");
+  harness.service.close();
+  expect(harness.service.connectionKind(CONNECTION_2)).toBeNull();
+  expect(reads).toEqual([CONNECTION_1]);
 });
 
 // ---- The model of a Claude connection (#30) ------------------------------

@@ -35,6 +35,9 @@ const DEVICE_ID = "0192f0a0-7b3c-7d4e-8f50-000000000004";
 const OTHER_DEVICE_ID = "0192f0a0-7b3c-7d4e-8f50-000000000014";
 const CONNECTION = "0192f0a0-7b3c-7d4e-8f50-000000000101";
 
+/** The provider connection service's answer for a listed Claude connection. */
+const listedClaude = () => "claude";
+
 let root: string;
 
 beforeEach(async () => {
@@ -126,6 +129,7 @@ test("loadClaudeCredential returns the key and the model of a key stored with a 
       },
     },
     deviceId: () => DEVICE_ID,
+    connectionKind: listedClaude,
   });
   await store.save(
     { deviceId: DEVICE_ID, providerConnectionId: CONNECTION },
@@ -154,6 +158,7 @@ test("there is no default model: a key without a model of the closed list is mod
   const load = createClaudeCredentialLoader({
     keys: store,
     deviceId: () => DEVICE_ID,
+    connectionKind: listedClaude,
   });
   await store.save(
     { deviceId: DEVICE_ID, providerConnectionId: CONNECTION },
@@ -173,6 +178,7 @@ test("there is no default model: a key without a model of the closed list is mod
           Promise.resolve<ProviderCredential>({ key: SENTINEL_KEY, model }),
       },
       deviceId: () => DEVICE_ID,
+      connectionKind: listedClaude,
     });
     const result = await fake(CONNECTION);
     expect(result, String(model)).toEqual({
@@ -201,6 +207,7 @@ test("loadClaudeCredential maps every failure to a fixed reason that never holds
         },
       },
       deviceId,
+      connectionKind: listedClaude,
     });
     expect(await load(CONNECTION)).toEqual({
       ok: false,
@@ -212,6 +219,7 @@ test("loadClaudeCredential maps every failure to a fixed reason that never holds
   const load = createClaudeCredentialLoader({
     keys: store,
     deviceId: () => DEVICE_ID,
+    connectionKind: listedClaude,
   });
   // No file, an ID outside the format, and a file of another device.
   expect(await load(CONNECTION)).toEqual({
@@ -239,7 +247,9 @@ test("loadClaudeCredential maps every failure to a fixed reason that never holds
     system_protection_unavailable: "unreadable",
     invalid_key: "unreadable",
     invalid_model: "unreadable",
-    invalid_binding: "invalid_connection",
+    // The connection ID was checked before the read: only the device ID
+    // can be invalid there.
+    invalid_binding: "not_signed_in",
     missing: "credential_missing",
     unreadable: "unreadable",
     corrupt: "credential_missing",
@@ -256,6 +266,7 @@ test("loadClaudeCredential maps every failure to a fixed reason that never holds
     const failing = createClaudeCredentialLoader({
       keys: { read: () => Promise.reject(new ProviderKeyError(code)) },
       deviceId: () => DEVICE_ID,
+      connectionKind: listedClaude,
     });
     const result = await failing(CONNECTION);
     expect(result, code).toEqual({ ok: false, reason: expected[code] });
@@ -266,10 +277,116 @@ test("loadClaudeCredential maps every failure to a fixed reason that never holds
       read: () => Promise.reject(new Error(`decrypted ${SENTINEL_KEY}`)),
     },
     deviceId: () => DEVICE_ID,
+    connectionKind: listedClaude,
   });
   const result = await strange(CONNECTION);
   expect(result).toEqual({ ok: false, reason: "unreadable" });
   expectNoKeyIn(result);
+});
+
+test("the loader fails closed: no key is read for an invalid ID, without a device, or for a connection that is not a listed Claude connection", async () => {
+  const store = realStore();
+  await store.save(
+    { deviceId: DEVICE_ID, providerConnectionId: CONNECTION },
+    SENTINEL_KEY,
+    "claude-opus-5-5",
+  );
+  const asked: string[] = [];
+  function loaderWith(
+    deviceId: () => string | null,
+    connectionKind: (id: string) => string | null,
+  ) {
+    return createClaudeCredentialLoader({
+      keys: {
+        read: (binding) => {
+          asked.push(`read:${binding.providerConnectionId}`);
+          return store.read(binding);
+        },
+      },
+      deviceId: () => {
+        asked.push("device");
+        return deviceId();
+      },
+      connectionKind: (id) => {
+        asked.push(`kind:${id}`);
+        return connectionKind(id);
+      },
+    });
+  }
+
+  // An ID outside the format: nothing else is asked.
+  const listed = loaderWith(() => DEVICE_ID, listedClaude);
+  for (const id of [
+    "",
+    "not-an-id",
+    CONNECTION.toUpperCase(),
+    `${CONNECTION}/`,
+  ]) {
+    expect(await listed(id), id).toEqual({
+      ok: false,
+      reason: "invalid_connection",
+    });
+  }
+  expect(asked).toEqual([]);
+
+  // Signed out: the service is not asked, and nothing is read.
+  expect(await loaderWith(() => null, listedClaude)(CONNECTION)).toEqual({
+    ok: false,
+    reason: "not_signed_in",
+  });
+  expect(asked).toEqual(["device"]);
+  asked.length = 0;
+
+  // Not listed (also after a confirmed removal, whose key file may stay),
+  // a lookup that throws, and a connection of another kind: the key file
+  // exists, but it is never read.
+  const refusals: [(id: string) => string | null, string][] = [
+    [() => null, "not_listed"],
+    [
+      () => {
+        throw new Error(`lookup failed ${SENTINEL_KEY}`);
+      },
+      "not_listed",
+    ],
+    [() => "codex", "not_claude"],
+    [() => "", "not_claude"],
+    [() => "Claude", "not_claude"],
+  ];
+  for (const [connectionKind, reason] of refusals) {
+    const result = await loaderWith(
+      () => DEVICE_ID,
+      connectionKind,
+    )(CONNECTION);
+    expect(result, reason).toEqual({ ok: false, reason });
+    expectNoKeyIn(result);
+  }
+  expect(asked.filter((entry) => entry.startsWith("read:"))).toEqual([]);
+  expect(asked.filter((entry) => entry.startsWith("kind:"))).toEqual(
+    refusals.map(() => `kind:${CONNECTION}`),
+  );
+  asked.length = 0;
+
+  // A listed Claude connection: the key is read, after the checks.
+  expect(await listed(CONNECTION)).toEqual({
+    ok: true,
+    apiKey: SENTINEL_KEY,
+    model: "claude-opus-5-5",
+  });
+  expect(asked).toEqual(["device", `kind:${CONNECTION}`, `read:${CONNECTION}`]);
+});
+
+test("a device ID that is not one is not_signed_in, never invalid_connection", async () => {
+  const store = realStore();
+  for (const deviceId of ["", "not-a-device", DEVICE_ID.toUpperCase()]) {
+    const load = createClaudeCredentialLoader({
+      keys: store,
+      deviceId: () => deviceId,
+      connectionKind: listedClaude,
+    });
+    const result = await load(CONNECTION);
+    expect(result, deviceId).toEqual({ ok: false, reason: "not_signed_in" });
+    expectNoKeyIn(result);
+  }
 });
 
 test("the loader's module never logs, and never imports Electron or anything of the renderer", async () => {

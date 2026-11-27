@@ -342,6 +342,18 @@ export interface ProviderConnectionService {
   readonly removeKey: (
     providerConnectionId: string,
   ) => Promise<RemoveProviderKeyResult>;
+  /**
+   * The kind of a connection of the list held now, or null: for an ID that
+   * the list does not hold, for a connection whose removal the server
+   * confirmed (its key file may remain when its deletion failed), while no
+   * device is signed in, and after `close`. It reads nothing and never
+   * throws. The Claude credential loader (credential.ts) asks it before it
+   * opens a key, so that a run only ever reads the key of a listed Claude
+   * connection.
+   */
+  readonly connectionKind: (
+    providerConnectionId: string,
+  ) => ProviderConnection["kind"] | null;
   /** Stops listening and cancels the retry, for the quit. */
   readonly close: () => void;
 }
@@ -1217,6 +1229,18 @@ export function createProviderConnectionService(
     return result;
   }
 
+  function connectionKind(value: string): ProviderConnection["kind"] | null {
+    if (closed) {
+      return null;
+    }
+    // Without a signed-in device the list is null: `reset` drops it.
+    const listed = list?.find((item) => item.id === value);
+    if (listed === undefined || removedConnections.has(listed.id)) {
+      return null;
+    }
+    return listed.kind;
+  }
+
   const removers = [
     account.onStatusChange((status) => run(() => accountChanged(status))),
     account.onReadsResumed(() => run(readsResumed)),
@@ -1244,6 +1268,7 @@ export function createProviderConnectionService(
     saveKey,
     setModel,
     removeKey,
+    connectionKind,
     close: () => {
       if (closed) {
         return;

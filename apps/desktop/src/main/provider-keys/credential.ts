@@ -9,17 +9,28 @@
 // There is no default model. A key without a model of the closed list
 // (models.ts), such as a key stored before models were chosen, is
 // `model_missing`: the run fails, and the Account screen asks the person to
-// choose one. The loader does not know the connection's kind; it is meant
-// for the executor of Claude connections, which reads only their keys.
+// choose one.
+//
+// The loader fails closed: it opens a key only for a connection that the
+// provider connection service lists now, whose kind is `claude`, and whose
+// removal the server did not confirm. A key file that outlived its
+// connection, such as one whose deletion failed after a confirmed removal,
+// or the key of a connection of another kind is never read for a run.
 import { isProviderKeyError } from "./errors.ts";
+import { checkConnectionId } from "./key-file.ts";
 import { type ClaudeModel, isClaudeModel } from "./models.ts";
 import type { ProviderKeyStore } from "./store.ts";
 
 /**
  * Why a Claude credential could not be loaded:
  *
- * - `not_signed_in`: no signed-in device, so no key can be opened.
  * - `invalid_connection`: the connection ID is not a lowercase UUIDv7.
+ * - `not_signed_in`: no signed-in device, or a device ID that is not one,
+ *   so no key can be opened.
+ * - `not_listed`: the provider connection service does not list the
+ *   connection now, or the server confirmed its removal; nothing is read.
+ * - `not_claude`: the connection is listed, but of another kind; nothing
+ *   is read.
  * - `credential_missing`: no usable key on this device: no key file, or one
  *   that is damaged or bound to another device or connection, as the
  *   connection's status `credential_missing` says.
@@ -30,8 +41,10 @@ import type { ProviderKeyStore } from "./store.ts";
  *   or a newer version of the application wrote it.
  */
 export const CLAUDE_CREDENTIAL_FAILURES = Object.freeze([
-  "not_signed_in",
   "invalid_connection",
+  "not_signed_in",
+  "not_listed",
+  "not_claude",
   "credential_missing",
   "model_missing",
   "unreadable",
@@ -65,16 +78,28 @@ export interface ClaudeCredentialLoaderOptions {
    * which counts as no device.
    */
   readonly deviceId: () => string | null;
+  /**
+   * The kind of a connection that the provider connection service lists
+   * now and whose removal the server did not confirm, or null; in
+   * production `connectionKind` of the provider connection service. It may
+   * throw, which counts as a connection that is not listed.
+   */
+  readonly connectionKind: (providerConnectionId: string) => string | null;
 }
 
 function failed(reason: ClaudeCredentialFailure): ClaudeCredentialResult {
   return Object.freeze({ ok: false, reason });
 }
 
-/** The reason of a key store failure while a credential is read. */
+/**
+ * The reason of a key store failure while a credential is read. The
+ * connection ID was checked before the read, so an `invalid_binding` can
+ * only come from the device ID: a device ID that is not one is no
+ * signed-in device whose key can be opened.
+ */
 function failureOf(error: unknown): ClaudeCredentialFailure {
   if (isProviderKeyError(error, "invalid_binding")) {
-    return "invalid_connection";
+    return "not_signed_in";
   }
   if (
     isProviderKeyError(error, "missing") ||
@@ -86,16 +111,30 @@ function failureOf(error: unknown): ClaudeCredentialFailure {
   return "unreadable";
 }
 
+/** Whether `providerConnectionId` is a lowercase UUIDv7. */
+function isConnectionId(providerConnectionId: string): boolean {
+  try {
+    checkConnectionId(providerConnectionId);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * The `loadClaudeCredential` of the main process: reads the connection's
- * key file for the device signed in now and returns the key and the model,
- * or a fixed reason.
+ * The `loadClaudeCredential` of the main process: checks the connection ID,
+ * the signed-in device, and that the connection is a listed Claude
+ * connection, then reads the connection's key file for that device and
+ * returns the key and the model, or a fixed reason.
  */
 export function createClaudeCredentialLoader(
   options: ClaudeCredentialLoaderOptions,
 ): LoadClaudeCredential {
   const { keys } = options;
   return async (providerConnectionId: string) => {
+    if (!isConnectionId(providerConnectionId)) {
+      return failed("invalid_connection");
+    }
     let deviceId: string | null;
     try {
       deviceId = options.deviceId();
@@ -104,6 +143,18 @@ export function createClaudeCredentialLoader(
     }
     if (deviceId === null) {
       return failed("not_signed_in");
+    }
+    let kind: string | null;
+    try {
+      kind = options.connectionKind(providerConnectionId);
+    } catch {
+      kind = null;
+    }
+    if (kind === null) {
+      return failed("not_listed");
+    }
+    if (kind !== "claude") {
+      return failed("not_claude");
     }
     let credential: Awaited<ReturnType<ProviderKeyStore["read"]>>;
     try {

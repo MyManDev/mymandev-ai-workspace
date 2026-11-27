@@ -162,7 +162,8 @@ export interface ProviderKeyStore {
    * Decrypts the connection's key and its model on demand, for the main
    * process only: the adapter that starts a run calls it at the start and
    * holds the key for that run only (#30, #31), through
-   * `createClaudeCredentialLoader` (credential.ts) for a Claude connection.
+   * `createClaudeCredentialLoader` (credential.ts) for a listed Claude
+   * connection.
    * Nothing caches it. Rejects as `check`, and with `missing` without a
    * file.
    */
