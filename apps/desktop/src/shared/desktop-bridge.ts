@@ -811,11 +811,15 @@ export interface AgentBridge {
    * Requests a run of an agent of the open project (#35): the project that
    * the chat screen shows, an agent that the account owns, that this
    * device hosts, and that is enabled (`grantableHere`), a provider
-   * connection of this device, and one of the person's own messages
-   * (`writtenByMe`) as its input. The bridge passes on a new object with
-   * only the four IDs, each a string; the main process checks each one
-   * against what it holds and sends the request once. `unknown` says that
-   * the run may have been created: it is never sent again on its own.
+   * connection of this device, one of the person's own messages
+   * (`writtenByMe`) as its input, and the repository that the person chose
+   * (#362), one of the project's repositories that the account linked on
+   * this device (`linked` of the project repositories), or null for a run
+   * without one. The bridge passes on a new object with only the four IDs,
+   * each a string, and the repository ID, a string or null; the main
+   * process checks each one against what it holds and sends the request
+   * once. `unknown` says that the run may have been created: it is never
+   * sent again on its own.
    */
   readonly requestRun: (request: RunRequestView) => Promise<RunRequestResult>;
   /**

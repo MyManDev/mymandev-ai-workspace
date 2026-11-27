@@ -14,7 +14,8 @@ export interface RunRequestIpcOptions {
  * handler checks the sender and the argument first
  * (`createInvokeHandler`): for a request, one object with exactly the
  * project ID, the agent ID, the provider connection ID, and the input
- * message ID, each a lowercase UUIDv7, and no other key; for an outcome,
+ * message ID, each a lowercase UUIDv7, and the chosen repository's ID or
+ * null (#362), and no other key; for an outcome,
  * one project ID. The results are parsed by the contract, so only fixed
  * codes, a wait, or the new run's ID reach the renderer, and a kept
  * outcome carries no ID. The service sends a request at most once; these
