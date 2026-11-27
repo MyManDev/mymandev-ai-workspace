@@ -372,7 +372,41 @@ test("the loader fails closed: no key is read for an invalid ID, without a devic
     apiKey: SENTINEL_KEY,
     model: "claude-opus-5-5",
   });
-  expect(asked).toEqual(["device", `kind:${CONNECTION}`, `read:${CONNECTION}`]);
+  expect(asked).toEqual([
+    "device",
+    `kind:${CONNECTION}`,
+    `read:${CONNECTION}`,
+    `kind:${CONNECTION}`,
+  ]);
+});
+
+test("a removal or a change of kind while the key is read withholds the key: the kind is asked again once the read answered", async () => {
+  for (const [later, reason] of [
+    [null, "not_listed"],
+    ["codex", "not_claude"],
+  ] as const) {
+    let kind: string | null = "claude";
+    let answer: (credential: ProviderCredential) => void = () => undefined;
+    const load = createClaudeCredentialLoader({
+      keys: {
+        read: () =>
+          new Promise<ProviderCredential>((resolve) => {
+            answer = resolve;
+          }),
+      },
+      deviceId: () => DEVICE_ID,
+      connectionKind: () => kind,
+    });
+    const pending = load(CONNECTION);
+    await Promise.resolve();
+    // The server confirms the removal (or the list changes) while the
+    // read waits for the store's queue and the decryption.
+    kind = later;
+    answer({ key: SENTINEL_KEY, model: "claude-opus-5-5" });
+    const result = await pending;
+    expect(result, String(later)).toEqual({ ok: false, reason });
+    expectNoKeyIn(result);
+  }
 });
 
 test("a device ID that is not one is not_signed_in, never invalid_connection", async () => {

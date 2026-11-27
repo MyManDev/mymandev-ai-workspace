@@ -1695,6 +1695,43 @@ test("connectionKind names the kind of a listed connection only, and the Claude 
   expect(reads).toEqual([CONNECTION_1]);
 });
 
+test("a removal that the server confirms while the Claude credential loader reads the key withholds the key", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(TWO);
+  await settle();
+  await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL);
+  let answerRead: () => void = () => undefined;
+  const load = createClaudeCredentialLoader({
+    keys: {
+      // The read waits, as it does behind the store's queue and the
+      // system's decryption.
+      read: (binding) =>
+        new Promise((resolve) => {
+          answerRead = () => {
+            const file = keys.files.get(binding.providerConnectionId);
+            resolve({ key: file?.key ?? "", model: file?.model ?? null });
+          };
+        }),
+    },
+    deviceId: () => DEVICE_ID,
+    connectionKind: (id) => harness.service.connectionKind(id),
+  });
+  const pending = load(CONNECTION_1);
+  await settle();
+  // The removal is confirmed between the kind check and the read's answer;
+  // the key file stays because its deletion failed.
+  keys.failures.remove = "delete_failed";
+  const removal = harness.service.remove(CONNECTION_1);
+  harness.writes.at(-1)?.answer({ ok: true, value: null });
+  expect(await removal).toEqual({ outcome: "ok" });
+  expect(keys.files.has(CONNECTION_1)).toBe(true);
+  answerRead();
+  const result = await pending;
+  expect(result).toEqual({ ok: false, reason: "not_listed" });
+  expect(JSON.stringify(result)).not.toContain(SENTINEL_KEY);
+});
+
 // ---- The model of a Claude connection (#30) ------------------------------
 
 function models(harness: Harness): (string | null)[] {

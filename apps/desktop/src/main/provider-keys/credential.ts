@@ -13,9 +13,11 @@
 //
 // The loader fails closed: it opens a key only for a connection that the
 // provider connection service lists now, whose kind is `claude`, and whose
-// removal the server did not confirm. A key file that outlived its
-// connection, such as one whose deletion failed after a confirmed removal,
-// or the key of a connection of another kind is never read for a run.
+// removal the server did not confirm, and it asks again once the read
+// answered, so that a removal confirmed while the key was read still
+// withholds the key. A key file that outlived its connection, such as one
+// whose deletion failed after a confirmed removal, or the key of a
+// connection of another kind is never read for a run.
 import { isProviderKeyError } from "./errors.ts";
 import { checkConnectionId } from "./key-file.ts";
 import { type ClaudeModel, isClaudeModel } from "./models.ts";
@@ -124,13 +126,31 @@ function isConnectionId(providerConnectionId: string): boolean {
 /**
  * The `loadClaudeCredential` of the main process: checks the connection ID,
  * the signed-in device, and that the connection is a listed Claude
- * connection, then reads the connection's key file for that device and
- * returns the key and the model, or a fixed reason.
+ * connection, then reads the connection's key file for that device, checks
+ * the connection's kind again once the read answered, and returns the key
+ * and the model, or a fixed reason.
  */
 export function createClaudeCredentialLoader(
   options: ClaudeCredentialLoaderOptions,
 ): LoadClaudeCredential {
   const { keys } = options;
+
+  /** Why the connection is not a listed Claude connection now, or null. */
+  function kindRefusal(
+    providerConnectionId: string,
+  ): "not_listed" | "not_claude" | null {
+    let kind: string | null;
+    try {
+      kind = options.connectionKind(providerConnectionId);
+    } catch {
+      kind = null;
+    }
+    if (kind === null) {
+      return "not_listed";
+    }
+    return kind === "claude" ? null : "not_claude";
+  }
+
   return async (providerConnectionId: string) => {
     if (!isConnectionId(providerConnectionId)) {
       return failed("invalid_connection");
@@ -144,23 +164,21 @@ export function createClaudeCredentialLoader(
     if (deviceId === null) {
       return failed("not_signed_in");
     }
-    let kind: string | null;
-    try {
-      kind = options.connectionKind(providerConnectionId);
-    } catch {
-      kind = null;
-    }
-    if (kind === null) {
-      return failed("not_listed");
-    }
-    if (kind !== "claude") {
-      return failed("not_claude");
+    const before = kindRefusal(providerConnectionId);
+    if (before !== null) {
+      return failed(before);
     }
     let credential: Awaited<ReturnType<ProviderKeyStore["read"]>>;
     try {
       credential = await keys.read({ deviceId, providerConnectionId });
     } catch (error) {
       return failed(failureOf(error));
+    }
+    // The read waits for the store's queue and the system's decryption: a
+    // removal that the server confirmed meanwhile must not hand out the key.
+    const after = kindRefusal(providerConnectionId);
+    if (after !== null) {
+      return failed(after);
     }
     if (!isClaudeModel(credential.model)) {
       return failed("model_missing");
