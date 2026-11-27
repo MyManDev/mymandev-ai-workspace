@@ -1059,6 +1059,59 @@ test("an abort during a wait for settled change times answers aborted", async ()
   expect(files.sleeps).toEqual([101]);
 });
 
+test("an abort during the last attempt, which then sees a change time move, answers aborted, not unsettled", async () => {
+  // Another process adds a file to `src` at every open; the abort comes
+  // with the change of the last attempt. The first attempt opens and sees
+  // the change, the second waits for it to settle, and the third opens,
+  // sees the change, and was aborted.
+  const reading = repository();
+  const readAbort = new AbortController();
+  let opens = 0;
+  reading.beforeEach = (operation) => {
+    if (operation === "open") {
+      opens += 1;
+      reading.file(`${ROOT}/src/tmp-${opens}.txt`, "");
+      if (opens === 2) {
+        readAbort.abort();
+      }
+    }
+  };
+  expect(
+    await runTool(
+      toolsOf(reading).read,
+      { path: "src/index.ts" },
+      { signal: readAbort.signal },
+    ),
+  ).toEqual({ ok: false, code: "aborted" });
+  expect(reading.opens).toBe(2);
+  expect(reading.closes).toBe(2);
+  expect(reading.sleeps).toEqual([101]);
+
+  // The same for a listing: a file is added to the listed folder at every
+  // listing.
+  const listing = repository();
+  const listAbort = new AbortController();
+  let listings = 0;
+  listing.beforeEach = (operation) => {
+    if (operation === "readdir") {
+      listings += 1;
+      listing.file(`${ROOT}/tmp-${listings}.txt`, "");
+      if (listings === 2) {
+        listAbort.abort();
+      }
+    }
+  };
+  expect(
+    await runTool(
+      toolsOf(listing).list,
+      { path: "." },
+      { signal: listAbort.signal },
+    ),
+  ).toEqual({ ok: false, code: "aborted" });
+  expect(listings).toBe(2);
+  expect(listing.sleeps).toEqual([101]);
+});
+
 test("the wait of the system tools ends at once on an abort", async () => {
   // Change times an hour ahead of the clock make every attempt wait 2.1 s
   // with the default timer, unless the abort ends the wait.

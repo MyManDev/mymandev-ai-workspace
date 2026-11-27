@@ -588,6 +588,11 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
       if (!("unsettled" in outcome)) {
         return outcome;
       }
+      // An abort during the attempt answers `aborted`, also when the
+      // attempt saw a change time move, and on the last attempt.
+      if (context.signal.aborted) {
+        return ABORTED;
+      }
       if (count >= READ_TOOL_SETTLING.attempts) {
         return failed("path_refused", "unsettled");
       }
