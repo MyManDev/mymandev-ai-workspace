@@ -2124,7 +2124,7 @@ test("the agent functions call their channels and pass no argument from the rend
   ]);
 });
 
-test("a run request calls its channel once with a new object of only its four ID strings, and passes the answer through (#35)", async () => {
+test("a run request calls its channel once with a new object of only its four ID strings and its repository ID, and passes the answer through (#35, #362)", async () => {
   const fake = fakeIpc();
   const bridge = createDesktopBridge("44.9.1", fake.ipc);
   const requestRun = bridge.agents.requestRun as (
@@ -2135,9 +2135,10 @@ test("a run request calls its channel once with a new object of only its four ID
     agentId: AGENT_ID,
     providerConnectionId: GRANT_ID,
     inputMessageId: REPOSITORY_ID,
-    // Never passed on: a text, a repository, or a retry key.
-    body: "Fix the build",
     repositoryId: REPOSITORY_ID,
+    // Never passed on: a text, a path, or a retry key.
+    body: "Fix the build",
+    repositoryPath: "/home/ada/web",
     idempotencyKey: "again",
   };
 
@@ -2154,6 +2155,7 @@ test("a run request calls its channel once with a new object of only its four ID
           agentId: AGENT_ID,
           providerConnectionId: GRANT_ID,
           inputMessageId: REPOSITORY_ID,
+          repositoryId: REPOSITORY_ID,
         },
       ],
     },
@@ -2162,6 +2164,20 @@ test("a run request calls its channel once with a new object of only its four ID
   // An answer, also `unknown`, never makes the bridge send it again.
   await settle();
   expect(fake.invoked).toHaveLength(1);
+
+  // A run without a repository passes its null on.
+  const without = requestRun({ ...request, repositoryId: null });
+  fake.answers[1]?.resolve({ outcome: "unknown" });
+  await expect(without).resolves.toEqual({ outcome: "unknown" });
+  expect(fake.invoked[1]?.args).toEqual([
+    {
+      projectId: PROJECT_ID,
+      agentId: AGENT_ID,
+      providerConnectionId: GRANT_ID,
+      inputMessageId: REPOSITORY_ID,
+      repositoryId: null,
+    },
+  ]);
 });
 
 test("a run request refuses a value of another type without calling the main process or naming it (#35)", async () => {
@@ -2174,6 +2190,7 @@ test("a run request refuses a value of another type without calling the main pro
     agentId: AGENT_ID,
     providerConnectionId: GRANT_ID,
     inputMessageId: REPOSITORY_ID,
+    repositoryId: null,
   };
 
   for (const attempt of [
@@ -2184,6 +2201,17 @@ test("a run request refuses a value of another type without calling the main pro
     () => requestRun({ ...request, agentId: 7 }),
     () => requestRun({ ...request, providerConnectionId: undefined }),
     () => requestRun({ ...request, inputMessageId: null }),
+    // The repository is a string or null, never left out.
+    () => requestRun({ ...request, repositoryId: undefined }),
+    () => requestRun({ ...request, repositoryId: 7 }),
+    () => requestRun({ ...request, repositoryId: secret }),
+    () =>
+      requestRun({
+        projectId: PROJECT_ID,
+        agentId: AGENT_ID,
+        providerConnectionId: GRANT_ID,
+        inputMessageId: REPOSITORY_ID,
+      }),
   ]) {
     const error = await attempt().then(
       () => null,

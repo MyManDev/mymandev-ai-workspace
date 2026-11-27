@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type Ref } from "react";
 import type {
   AgentBridge,
   ChatBridge,
+  ProjectRepositoriesBridge,
   ProviderConnectionsBridge,
 } from "../shared/desktop-bridge.ts";
 import type {
@@ -30,10 +31,13 @@ import {
   canRunWith,
   createRunRequestController,
   describeRunForm,
+  followRunRepositories,
   IDLE_RUN_REQUEST,
+  NO_REPOSITORY,
   RUN_REQUEST_MESSAGES,
   type RunFormModel,
   type RunRequestController,
+  type RunRepositoriesSource,
   type RunRequestState,
 } from "./run-request-view.ts";
 
@@ -47,6 +51,7 @@ export function ChatScreen({
   projectId,
   agents,
   providerConnections,
+  projectRepositories,
 }: {
   /** The chat functions from the preload script; undefined outside Electron. */
   readonly chat: ChatBridge | undefined;
@@ -59,11 +64,21 @@ export function ChatScreen({
   readonly agents?: AgentBridge | undefined;
   /** This device's AI provider connections, the choices of a run. */
   readonly providerConnections?: ProviderConnectionsBridge | undefined;
+  /**
+   * The open project's repositories and this device's links, whose linked
+   * repositories a run can name (#362).
+   */
+  readonly projectRepositories?: ProjectRepositoriesBridge | undefined;
 }) {
   return (
     <ChatScreenContent
       {...useChatScreen(chat)}
-      run={useRunRequest(agents, providerConnections, projectId)}
+      run={useRunRequest(
+        agents,
+        providerConnections,
+        projectRepositories,
+        projectId,
+      )}
       projectId={projectId}
     />
   );
@@ -95,6 +110,11 @@ export interface ChatRunProps {
   readonly activity: AgentActivityView | undefined;
   /** This device's provider connections. */
   readonly connections: ProviderConnectionListView | undefined;
+  /**
+   * The open project's repositories with this device's links (#362), or
+   * `"unavailable"` when the main process refused the subscription.
+   */
+  readonly repositories: RunRepositoriesSource;
   readonly actions: RunRequestController;
   /** Where the hook puts the focus after a cancel and after an answer. */
   readonly focus?: RunFocus;
@@ -138,6 +158,7 @@ export function ChatScreenContent({
             lists.messages,
             run.activity,
             run.connections,
+            run.repositories,
             projectId,
           ),
         };
@@ -332,10 +353,16 @@ function MessageItem({
 }
 
 /**
- * The run form of one message: the agent and the AI provider connection,
- * labelled, then a separate confirmation that names both, with "Cancel"
- * first, which takes the focus. Why nothing can be requested shows in its
- * place. While a request waits, nothing can change or be sent again.
+ * The run form of one message: the agent, the AI provider connection, and
+ * the repository, labelled, then a separate confirmation that names all
+ * three, with "Cancel" first, which takes the focus. The repository list
+ * offers "No repository" first, then the project's repositories that the
+ * account linked on this device, by name; its hint says which ones it
+ * offers, or that they cannot be read, and while a repository is chosen,
+ * the list and the confirmation say that the names of its files and
+ * folders are sent to the provider if the agent may read it. Why nothing
+ * can be requested shows in its place. While a request waits, nothing can
+ * change or be sent again.
  */
 function RunForm({
   form,
@@ -351,16 +378,27 @@ function RunForm({
   const noteId = `${id}-note`;
   const agentId = `${id}-agent`;
   const connectionId = `${id}-connection`;
+  const repositoryId = `${id}-repository`;
+  const repositoryHintId = `${id}-repository-hint`;
+  const repositoryFilesId = `${id}-repository-files`;
   if (form.step === "confirm") {
     const textId = `${id}-confirm-text`;
     const summaryId = `${id}-confirm-summary`;
+    const filesId = `${id}-confirm-files`;
+    const describedBy = [
+      textId,
+      summaryId,
+      ...(form.repositoryFiles === undefined ? [] : [filesId]),
+      noteId,
+      bodyId,
+    ].join(" ");
     return (
       <div
         className="run-form run-confirmation"
         id={id}
         role="group"
         aria-labelledby={titleId}
-        aria-describedby={`${textId} ${summaryId} ${noteId} ${bodyId}`}
+        aria-describedby={describedBy}
       >
         <h3 id={titleId}>{RUN_REQUEST_MESSAGES.confirmTitle}</h3>
         <p id={textId}>{RUN_REQUEST_MESSAGES.confirmText}</p>
@@ -369,7 +407,14 @@ function RunForm({
           <dd dir="auto">{form.agentLabel}</dd>
           <dt>{RUN_REQUEST_MESSAGES.connectionLabel}</dt>
           <dd dir="auto">{form.connectionLabel}</dd>
+          <dt>{RUN_REQUEST_MESSAGES.repositoryLabel}</dt>
+          <dd dir="auto">{form.repositoryLabel}</dd>
         </dl>
+        {form.repositoryFiles === undefined ? null : (
+          <p className="run-hint" id={filesId}>
+            {form.repositoryFiles}
+          </p>
+        )}
         <p className="run-note" id={noteId}>
           {RUN_REQUEST_MESSAGES.note}
         </p>
@@ -437,6 +482,38 @@ function RunForm({
               </option>
             ))}
           </select>
+          <label htmlFor={repositoryId}>
+            {RUN_REQUEST_MESSAGES.repositoryLabel}
+          </label>
+          <select
+            id={repositoryId}
+            aria-describedby={
+              form.repositoryFiles === undefined
+                ? repositoryHintId
+                : `${repositoryHintId} ${repositoryFilesId}`
+            }
+            value={form.repositoryId ?? NO_REPOSITORY}
+            onChange={(event) =>
+              runs.actions.chooseRepository(event.target.value)
+            }
+          >
+            <option value={NO_REPOSITORY}>
+              {RUN_REQUEST_MESSAGES.noRepository}
+            </option>
+            {form.repositories.map((choice) => (
+              <option key={choice.id} value={choice.id}>
+                {choice.label}
+              </option>
+            ))}
+          </select>
+          <p className="run-hint" id={repositoryHintId}>
+            {form.repositoryHint}
+          </p>
+          {form.repositoryFiles === undefined ? null : (
+            <p className="run-hint" id={repositoryFilesId}>
+              {form.repositoryFiles}
+            </p>
+          )}
         </>
       ) : (
         <p className="run-problem">{form.problem}</p>
@@ -579,9 +656,9 @@ function Composer({
 }
 
 /**
- * Follows the agent activity and this device's provider connections while
- * the screen is shown, and carries out the run request (#35) of the
- * project. The focus goes back to a message's "Run with agent" after a
+ * Follows the agent activity, this device's provider connections, and the
+ * open project's repositories with this device's links (#362) while the
+ * screen is shown, and carries out the run request (#35) of the project. The focus goes back to a message's "Run with agent" after a
  * cancel, and to the sentence after an answer. The controller starts with
  * the effect and stops with its cleanup, so that it applies answers again
  * when React's development mode runs the effect a second time. Undefined
@@ -590,6 +667,7 @@ function Composer({
 function useRunRequest(
   agents: AgentBridge | undefined,
   providerConnections: ProviderConnectionsBridge | undefined,
+  projectRepositories: ProjectRepositoriesBridge | undefined,
   projectId: string,
 ): ChatRunProps | undefined {
   const [state, setState] = useState<RunRequestState>(IDLE_RUN_REQUEST);
@@ -599,6 +677,8 @@ function useRunRequest(
   const [connections, setConnections] = useState<
     ProviderConnectionListView | undefined
   >(undefined);
+  const [repositories, setRepositories] =
+    useState<RunRepositoriesSource>(undefined);
   const controller = useMemo(
     () =>
       agents === undefined
@@ -618,6 +698,13 @@ function useRunRequest(
       ),
     [providerConnections],
   );
+  useEffect(
+    () =>
+      projectRepositories === undefined
+        ? undefined
+        : followRunRepositories(projectRepositories, setRepositories),
+    [projectRepositories],
+  );
   const trigger = useRef<HTMLButtonElement>(null);
   const notice = useRef<HTMLParagraphElement>(null);
   useEffect(() => {
@@ -633,6 +720,7 @@ function useRunRequest(
         state,
         activity,
         connections,
+        repositories,
         actions: controller,
         focus: { trigger, notice },
       };

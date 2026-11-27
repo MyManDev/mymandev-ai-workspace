@@ -6,6 +6,7 @@ import {
   CreateRunResponseSchema,
   type MemberId,
   type ProjectId,
+  type RepositoryId,
   RUN_ROUTE_ERRORS,
   type WorkspaceId,
 } from "@mymandev/protocol";
@@ -28,6 +29,7 @@ import {
 } from "../api-actions.ts";
 import type { ChatState } from "../chat/service.ts";
 import type { ProviderConnectionsState } from "../provider-connections/service.ts";
+import type { ProjectRepositoryState } from "../repository-links/service.ts";
 import { createRunRequests, KEPT_RUN_REQUEST_OUTCOMES } from "./run-request.ts";
 import type { AgentActivityState } from "./service.ts";
 
@@ -62,7 +64,9 @@ const AGENT_MESSAGE = id(0x1003);
 const MISSING_MESSAGE = id(0x1004);
 const FOREIGN_MESSAGE = id(0x1005);
 const RUN = id(0x5001);
-const REPOSITORY = id(0x2001);
+const REPOSITORY = id(0x2001) as RepositoryId;
+const UNLINKED_REPOSITORY = id(0x2002) as RepositoryId;
+const MISSING_REPOSITORY = id(0x2003) as RepositoryId;
 const AT = "2026-11-25T10:00:00.000Z";
 
 function agent(
@@ -129,6 +133,13 @@ const REQUEST: RunRequestView = Object.freeze({
   agentId: AGENT,
   providerConnectionId: CONNECTION,
   inputMessageId: MY_MESSAGE,
+  repositoryId: null,
+});
+
+/** The request with the repository that the person chose (#362). */
+const WITH_REPOSITORY: RunRequestView = Object.freeze({
+  ...REQUEST,
+  repositoryId: REPOSITORY,
 });
 
 interface Sent {
@@ -190,6 +201,30 @@ function setup() {
       },
     ] as unknown as ProviderConnectionsState["connections"],
   };
+  let repositories: ProjectRepositoryState = {
+    revision: 1,
+    status: "ready",
+    workspaceId: WORKSPACE,
+    projectId: PROJECT,
+    links: "ready",
+    repositories: [
+      {
+        repositoryId: REPOSITORY,
+        name: "web",
+        linked: true,
+        mountId: null,
+        removable: true,
+      },
+      // Registered in the project, but not linked on this device.
+      {
+        repositoryId: UNLINKED_REPOSITORY,
+        name: "api",
+        linked: false,
+        mountId: null,
+        removable: true,
+      },
+    ],
+  };
   let ownMember: MemberId | null = ME;
   const sent: Sent[] = [];
   const logs: string[] = [];
@@ -215,6 +250,7 @@ function setup() {
         workspaceId === WORKSPACE ? ownMember : null,
     },
     providerConnections: { state: () => connections },
+    repositories: { state: () => repositories },
     log: (entry) => logs.push(entry),
     now: () => clock,
   });
@@ -237,6 +273,9 @@ function setup() {
     },
     setOwnMember(next: MemberId | null) {
       ownMember = next;
+    },
+    setRepositories(next: Partial<ProjectRepositoryState>) {
+      repositories = { ...repositories, ...next };
     },
     advance(ms: number) {
       clock += ms;
@@ -264,7 +303,8 @@ test("the request of the owner's enabled agent hosted here, with the person's ow
   expect(h.sent).toHaveLength(1);
   expect(h.sent[0]?.name).toBe("createRun");
   expect(h.sent[0]?.params).toEqual({ projectId: PROJECT });
-  // IDs only: no text, no repository, no requester, no retry key.
+  // IDs only: no text, no requester, no retry key, and no repository,
+  // because none was chosen.
   expect(h.sent[0]?.body).toEqual({
     agentId: AGENT,
     providerConnectionId: CONNECTION,
@@ -279,6 +319,48 @@ test("the request of the owner's enabled agent hosted here, with the person's ow
   expect(h.reloads()).toBe(1);
   await settle();
   expect(h.sent).toHaveLength(1);
+});
+
+test("a request with the repository that the person chose, one linked on this device, sends its ID, and the answer must name it (#362)", async () => {
+  const h = setup();
+  const answer = h.service.request(WITH_REPOSITORY);
+  expect(h.sent).toHaveLength(1);
+  expect(h.sent[0]?.body).toEqual({
+    agentId: AGENT,
+    providerConnectionId: CONNECTION,
+    inputMessageId: MY_MESSAGE,
+    repositoryId: REPOSITORY,
+  });
+  h.sent[0]?.resolve({
+    ok: true,
+    value: created({ repositoryId: REPOSITORY }),
+  });
+  expect(await answer).toEqual({ outcome: "ok", runId: RUN });
+  // While the repositories reload after a failure, what was loaded stays,
+  // and a link there is still accepted: the server checks again.
+  h.setRepositories({ status: "unavailable", problem: "unavailable" });
+  const again = h.service.request(WITH_REPOSITORY);
+  expect(h.sent).toHaveLength(2);
+  h.sent[1]?.resolve(workspaceActionFailed("unknown"));
+  await again;
+});
+
+test("a run without a repository sends none, also when the project has one linked here: no repository enters without the person's choice (#362)", async () => {
+  const h = setup();
+  const answer = h.service.request(REQUEST);
+  expect(h.sent[0]?.body).not.toHaveProperty("repositoryId");
+  h.sent[0]?.resolve({ ok: true, value: created() });
+  expect(await answer).toEqual({ outcome: "ok", runId: RUN });
+});
+
+test("an answer for a request with a repository that names none or another one is not this request's: unknown (#362)", async () => {
+  for (const repositoryId of [null, UNLINKED_REPOSITORY]) {
+    const h = setup();
+    const answer = h.service.request(WITH_REPOSITORY);
+    h.sent[0]?.resolve({ ok: true, value: created({ repositoryId }) });
+    expect(await answer, String(repositoryId)).toEqual({ outcome: "unknown" });
+    expect(h.logs).toEqual(["A run request was answered with another run."]);
+  }
 });
 
 test("each local refusal sends nothing and reloads nothing", async () => {
@@ -382,6 +464,71 @@ test("each local refusal sends nothing and reloads nothing", async () => {
       (h) => {
         h.setConnections({ status: "signed_out", connections: [] });
         return REQUEST;
+      },
+    ],
+    // A repository ID that is not one (#362).
+    ["invalid", () => ({ ...REQUEST, repositoryId: "web" })],
+    ["invalid", () => ({ ...REQUEST, repositoryId: REPOSITORY.toUpperCase() })],
+    // A repository of the project that is not linked on this device, one
+    // that the project does not have, and one unlinked or removed after the
+    // person chose it.
+    [
+      "repository_not_linked",
+      () => ({ ...REQUEST, repositoryId: UNLINKED_REPOSITORY }),
+    ],
+    [
+      "repository_not_linked",
+      () => ({ ...REQUEST, repositoryId: MISSING_REPOSITORY }),
+    ],
+    [
+      "repository_not_linked",
+      (h) => {
+        h.setRepositories({
+          repositories: [
+            {
+              repositoryId: REPOSITORY,
+              name: "web",
+              linked: false,
+              mountId: null,
+              removable: true,
+            },
+          ],
+        });
+        return WITH_REPOSITORY;
+      },
+    ],
+    [
+      "repository_not_linked",
+      (h) => {
+        h.setRepositories({ repositories: [] });
+        return WITH_REPOSITORY;
+      },
+    ],
+    // The repositories of another project or workspace, or none loaded.
+    [
+      "repository_not_linked",
+      (h) => {
+        h.setRepositories({ projectId: OTHER_PROJECT });
+        return WITH_REPOSITORY;
+      },
+    ],
+    [
+      "repository_not_linked",
+      (h) => {
+        h.setRepositories({ workspaceId: id(0xa2) as WorkspaceId });
+        return WITH_REPOSITORY;
+      },
+    ],
+    [
+      "repository_not_linked",
+      (h) => {
+        h.setRepositories({
+          status: "no_project",
+          workspaceId: null,
+          projectId: null,
+          repositories: [],
+        });
+        return WITH_REPOSITORY;
       },
     ],
   ];
@@ -640,6 +787,14 @@ test("a reload that throws changes nothing of the answer", async () => {
           status: "ready",
           connections: [{ id: CONNECTION }],
         }) as unknown as ProviderConnectionsState,
+    },
+    repositories: {
+      state: () =>
+        ({
+          workspaceId: WORKSPACE,
+          projectId: PROJECT,
+          repositories: [],
+        }) as unknown as ProjectRepositoryState,
     },
     log: (entry) => h.logs.push(entry),
   });
