@@ -16,6 +16,9 @@ import {
   RemoveProviderKeyResultSchema,
   SAVE_PROVIDER_KEY_REFUSALS,
   SaveProviderKeyResultSchema,
+  CLAUDE_MODEL_VIEWS,
+  SET_PROVIDER_MODEL_REFUSALS,
+  SetProviderModelResultSchema,
 } from "./ipc-contract.ts";
 
 // The contract of this device's AI provider connections (#32): metadata
@@ -31,6 +34,7 @@ const ITEM = {
   label: "Work laptop",
   createdAt: AT,
   status: "ready",
+  model: "claude-sonnet-5-5",
 };
 
 test("the provider connection channels have their own names and schemas", () => {
@@ -172,6 +176,18 @@ test("a list view holds the ID, kind, label, time, and status of each connection
     },
     { revision: 1, status: "ready", connections: [{ ...ITEM, label: "" }] },
     { revision: 1, status: "ready", connections: [{ ...ITEM, id: "x" }] },
+    // The model is always present: one of the closed list, or null (#30).
+    {
+      revision: 1,
+      status: "ready",
+      connections: [{ ...ITEM, model: undefined }],
+    },
+    {
+      revision: 1,
+      status: "ready",
+      connections: [{ ...ITEM, model: "claude-opus-4-8" }],
+    },
+    { revision: 1, status: "ready", connections: [{ ...ITEM, model: "" }] },
   ]) {
     expect(
       ProviderConnectionListViewSchema.safeParse(value).success,
@@ -232,15 +248,24 @@ test("the results of a registration and a removal are ok, a fixed refusal with a
 /** An obvious fake key; no result of the contract may hold it. */
 const SENTINEL_KEY = "FAKE-PROVIDER-KEY-SENTINEL-0123456789";
 
-test("storing a key takes one strict object of a connection ID and a key of 1 to 512 characters, and no other key", () => {
+test("storing a key takes one strict object of a connection ID, a key of 1 to 512 characters, and a model of the closed list or null, and no other key", () => {
   expect(INVOKE_CHANNELS.saveProviderKey).toBe("provider-connections:save-key");
   expect(INVOKE_CHANNELS.removeProviderKey).toBe(
     "provider-connections:remove-key",
   );
   expect(PROVIDER_KEY_LIMITS).toEqual({ key: 512 });
   const { args } = INVOKE_CONTRACT[INVOKE_CHANNELS.saveProviderKey];
-  const request = { providerConnectionId: CONNECTION, key: SENTINEL_KEY };
+  const request = {
+    providerConnectionId: CONNECTION,
+    key: SENTINEL_KEY,
+    model: "claude-sonnet-5-5",
+  };
   expect(args.parse([request])).toEqual([request]);
+  for (const model of [...CLAUDE_MODEL_VIEWS, null]) {
+    expect(args.parse([{ ...request, model }])).toEqual([
+      { ...request, model },
+    ]);
+  }
   const longest = { ...request, key: "k".repeat(PROVIDER_KEY_LIMITS.key) };
   expect(args.parse([longest])).toEqual([longest]);
   for (const value of [
@@ -255,6 +280,13 @@ test("storing a key takes one strict object of a connection ID and a key of 1 to
     [{ providerConnectionId: CONNECTION }],
     [{ ...request, kind: "claude" }],
     [{ ...request, deviceId: CONNECTION }],
+    [{ providerConnectionId: CONNECTION, key: SENTINEL_KEY }],
+    [{ ...request, model: undefined }],
+    [{ ...request, model: "" }],
+    [{ ...request, model: "claude-opus-4-8" }],
+    [{ ...request, model: "claude-opus-5-5-20260401" }],
+    [{ ...request, model: "Claude Opus 5.5" }],
+    [{ ...request, model: 7 }],
   ]) {
     const parsed = args.safeParse(value);
     expect(parsed.success, JSON.stringify(value)?.slice(0, 80)).toBe(false);
@@ -271,10 +303,52 @@ test("storing a key takes one strict object of a connection ID and a key of 1 to
   }
 });
 
-test("the results of storing and removing a key are ok or a fixed refusal without a wait, and never carry a key", () => {
+test("changing the model takes one strict object of a connection ID and a model of the closed list, and no other key, never a key", () => {
+  expect(INVOKE_CHANNELS.setProviderModel).toBe(
+    "provider-connections:set-model",
+  );
+  expect([...CLAUDE_MODEL_VIEWS]).toEqual([
+    "claude-fable-5-2",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+  ]);
+  const { args, result } = INVOKE_CONTRACT[INVOKE_CHANNELS.setProviderModel];
+  expect(result).toBe(SetProviderModelResultSchema);
+  for (const model of CLAUDE_MODEL_VIEWS) {
+    const request = { providerConnectionId: CONNECTION, model };
+    expect(args.parse([request])).toEqual([request]);
+  }
+  const request = {
+    providerConnectionId: CONNECTION,
+    model: "claude-opus-5-5",
+  };
+  for (const value of [
+    [],
+    [request, request],
+    [CONNECTION, "claude-opus-5-5"],
+    [{ providerConnectionId: CONNECTION }],
+    [{ model: "claude-opus-5-5" }],
+    [{ ...request, model: null }],
+    [{ ...request, model: "" }],
+    [{ ...request, model: "claude-opus-4-8" }],
+    [{ ...request, providerConnectionId: CONNECTION.toUpperCase() }],
+    [{ ...request, key: SENTINEL_KEY }],
+    [{ ...request, kind: "claude" }],
+  ]) {
+    const parsed = args.safeParse(value);
+    expect(parsed.success, JSON.stringify(value)?.slice(0, 80)).toBe(false);
+    expect(JSON.stringify(parsed.error?.issues ?? [])).not.toContain(
+      SENTINEL_KEY,
+    );
+  }
+});
+
+test("the results of storing and removing a key, and of changing the model, are ok or a fixed refusal without a wait, and never carry a key", () => {
   for (const [schema, reasons] of [
     [SaveProviderKeyResultSchema, SAVE_PROVIDER_KEY_REFUSALS],
     [RemoveProviderKeyResultSchema, REMOVE_PROVIDER_KEY_REFUSALS],
+    [SetProviderModelResultSchema, SET_PROVIDER_MODEL_REFUSALS],
   ] as const) {
     expect(schema.parse({ outcome: "ok", key: SENTINEL_KEY })).toEqual({
       outcome: "ok",

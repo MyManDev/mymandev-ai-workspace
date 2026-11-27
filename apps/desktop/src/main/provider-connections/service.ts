@@ -15,6 +15,13 @@
 //   bound to this device's ID and the connection's ID. `saveKey` takes it
 //   from the renderer once and stores it; `removeKey` deletes it. No state,
 //   result, or log holds a key, and nothing here sends one anywhere.
+// - The model (#30, the Project Manager's decision of 2026-11-26). A Claude
+//   connection's key is stored with the model that the person chose, one
+//   of the closed list of provider-keys/models.ts, in the same encrypted
+//   payload; `saveKey` refuses a Claude key without one, and a key of
+//   another kind with one (`invalid_model`). `setModel` changes the model of
+//   a stored key without the key. There is no default model. The state
+//   holds each connection's model, which is not secret.
 // - Key actions. One at a time, and none while a registration or a removal
 //   runs, including the removal's deletion of the key file: such a key
 //   action is refused as `busy` and never reaches the store. A key action
@@ -32,8 +39,10 @@
 //   offline or the last list read failed; otherwise `ready` when the key
 //   file of the connection exists and decrypts for this device and this
 //   connection, `credential_missing` when there is none or it is damaged or
-//   bound elsewhere, and `unknown` while it was not checked yet or could
-//   not be checked. `ready` does not say that the provider accepts the key:
+//   bound elsewhere, `model_missing` for a Claude connection whose key
+//   decrypts without a model of the closed list (#30), and `unknown` while
+//   it was not checked yet or could not be checked. `ready` does not say
+//   that the provider accepts the key:
 //   no provider is called. Each listed connection is checked once after a
 //   list read lists it, and again after its key was stored or removed. A
 //   status check is the person acting on their own device, not a
@@ -87,6 +96,8 @@ import type {
   RemoveProviderKeyResult,
   SaveProviderKeyRefusal,
   SaveProviderKeyResult,
+  SetProviderModelRefusal,
+  SetProviderModelResult,
 } from "../../shared/ipc-contract.ts";
 import type { AccountService } from "../account.ts";
 import {
@@ -105,6 +116,11 @@ import {
 } from "../permissions/grant-store.ts";
 import { isProviderKeyError } from "../provider-keys/errors.ts";
 import { isProviderKeyShape } from "../provider-keys/key-file.ts";
+import {
+  type ClaudeModel,
+  isClaudeModel,
+  kindNeedsModel,
+} from "../provider-keys/models.ts";
 import type { ProviderKeyStore } from "../provider-keys/store.ts";
 import type { ScheduleTimer } from "../runtime.ts";
 import { workspaceRetryDelayMs } from "../workspace/service.ts";
@@ -133,14 +149,21 @@ export interface ProviderConnectionFacts {
   readonly listCurrent: boolean;
   /** What the last check of the connection's key found. */
   readonly key: ProviderKeyState;
+  /**
+   * The connection needs a model (a Claude connection) and the key was
+   * stored without one of the closed list (#30). Read only for a `ready`
+   * key.
+   */
+  readonly modelMissing: boolean;
 }
 
 /**
- * The status of a connection from its facts, from a closed list (#33):
- * `unknown` while the list is not current; otherwise `ready` for a key
- * that is `ready`, `credential_missing` for a `missing` one, and `unknown`
- * for a key that was not checked or could not be checked. It asks no
- * permission and calls no provider: it is the person's own device
+ * The status of a connection from its facts, from a closed list (#33,
+ * #30): `unknown` while the list is not current; otherwise `ready` for a
+ * key that is `ready` with the model it needs, `model_missing` for a
+ * `ready` key without it, `credential_missing` for a `missing` key, and
+ * `unknown` for a key that was not checked or could not be checked. It asks
+ * no permission and calls no provider: it is the person's own device
  * describing itself.
  */
 export function providerConnectionStatus(
@@ -151,7 +174,7 @@ export function providerConnectionStatus(
   }
   switch (facts.key) {
     case "ready":
-      return "ready";
+      return facts.modelMissing ? "model_missing" : "ready";
     case "missing":
       return "credential_missing";
     case "unknown":
@@ -195,6 +218,12 @@ export interface ProviderConnectionEntry {
   readonly label: string;
   readonly createdAt: string;
   readonly status: ProviderConnectionStatus;
+  /**
+   * The model stored with the key of a Claude connection, when it is one of
+   * the closed list and the key decrypted at the last check; null
+   * otherwise, and always for a connection of another kind.
+   */
+  readonly model: ClaudeModel | null;
 }
 
 /** The service's state. Every value is frozen. */
@@ -227,7 +256,7 @@ export type ProviderConnectionConnection = Pick<
 /** The part of the provider key store that the service uses; no way to read a key. */
 export type ProviderConnectionKeys = Pick<
   ProviderKeyStore,
-  "save" | "check" | "remove"
+  "save" | "setModel" | "check" | "remove"
 >;
 
 export interface ProviderConnectionServiceOptions {
@@ -286,12 +315,26 @@ export interface ProviderConnectionService {
    * and as `not_listed` after the server confirmed the connection's
    * removal. A sign-out meanwhile keeps the stored key (`ok`); another
    * device or a deleted device key deletes it again (`not_signed_in`).
-   * Never rejects.
+   * `model` is required for a Claude connection, one of the closed list,
+   * and must be null for a connection of another kind (`invalid_model`); it
+   * is stored with the key. Never rejects.
    */
   readonly saveKey: (
     providerConnectionId: string,
     key: string,
+    model: string | null,
   ) => Promise<SaveProviderKeyResult>;
+  /**
+   * Changes the model stored with the key of a Claude connection of the
+   * list held now, without the key (#30). Refused as `saveKey` is, as
+   * `invalid_model` for a model outside the closed list or a connection of
+   * another kind, and as `credential_missing` when no usable key is stored.
+   * Never rejects.
+   */
+  readonly setModel: (
+    providerConnectionId: string,
+    model: string,
+  ) => Promise<SetProviderModelResult>;
   /**
    * Deletes the stored key of a connection of the list held now; `ok` also
    * when none was stored. Refused as `saveKey` is. Never rejects.
@@ -299,6 +342,18 @@ export interface ProviderConnectionService {
   readonly removeKey: (
     providerConnectionId: string,
   ) => Promise<RemoveProviderKeyResult>;
+  /**
+   * The kind of a connection of the list held now, or null: for an ID that
+   * the list does not hold, for a connection whose removal the server
+   * confirmed (its key file may remain when its deletion failed), while no
+   * device is signed in, and after `close`. It reads nothing and never
+   * throws. The Claude credential loader (credential.ts) asks it before it
+   * opens a key, so that a run only ever reads the key of a listed Claude
+   * connection.
+   */
+  readonly connectionKind: (
+    providerConnectionId: string,
+  ) => ProviderConnection["kind"] | null;
   /** Stops listening and cancels the retry, for the quit. */
   readonly close: () => void;
 }
@@ -364,6 +419,18 @@ const DEVICE_KEY_ENDED_STATES: ReadonlySet<AccountStatus["device"]> = new Set([
   "removed",
   "revoked",
 ]);
+
+/**
+ * What the last check of a connection's key found, and the model stored
+ * with it when that is one of the closed list. Never the key.
+ */
+interface KeyFacts {
+  readonly state: ProviderKeyState;
+  readonly model: ClaudeModel | null;
+}
+
+const UNCHECKED: KeyFacts = Object.freeze({ state: "unknown", model: null });
+const NO_KEY: KeyFacts = Object.freeze({ state: "missing", model: null });
 
 const UNKNOWN = Object.freeze({ outcome: "unknown" } as const);
 const OK = Object.freeze({ outcome: "ok" } as const);
@@ -461,7 +528,7 @@ export function createProviderConnectionService(
    */
   let deviceGeneration = 0;
   /** What the last check of each listed connection's key found. */
-  const keyStates = new Map<string, ProviderKeyState>();
+  const keyStates = new Map<string, KeyFacts>();
   /** The token of the check of each connection on its way; a newer one wins. */
   const keyChecks = new Map<string, number>();
   let lastKeyCheck = 0;
@@ -484,21 +551,26 @@ export function createProviderConnectionService(
       list === null
         ? NO_CONNECTIONS
         : Object.freeze(
-            list.map((item) =>
-              Object.freeze({
+            list.map((item) => {
+              const facts =
+                keys === undefined
+                  ? NO_KEY
+                  : (keyStates.get(item.id) ?? UNCHECKED);
+              const needsModel = kindNeedsModel(item.kind);
+              const model = needsModel ? facts.model : null;
+              return Object.freeze({
                 id: item.id,
                 kind: item.kind,
                 label: item.label,
                 createdAt: item.createdAt,
                 status: providerConnectionStatus({
                   listCurrent,
-                  key:
-                    keys === undefined
-                      ? "missing"
-                      : (keyStates.get(item.id) ?? "unknown"),
+                  key: facts.state,
+                  modelMissing: needsModel && model === null,
                 }),
-              }),
-            ),
+                model,
+              });
+            }),
           );
     if (problem !== null) {
       return Object.freeze({
@@ -699,10 +771,20 @@ export function createProviderConnectionService(
     void keys
       .check({ deviceId: device, providerConnectionId: id })
       .then(
-        (found): ProviderKeyState => (found === "ready" ? "ready" : "missing"),
-        (error: unknown): ProviderKeyState => {
+        (found): KeyFacts =>
+          found.key === "ready"
+            ? Object.freeze({
+                state: "ready",
+                // A model outside the closed list counts as none.
+                model: isClaudeModel(found.model) ? found.model : null,
+              })
+            : NO_KEY,
+        (error: unknown): KeyFacts => {
           log(`A provider key could not be checked (${failureCode(error)}).`);
-          return providerKeyStateAfterFailure(error);
+          return Object.freeze({
+            state: providerKeyStateAfterFailure(error),
+            model: null,
+          });
         },
       )
       .then((state) =>
@@ -952,10 +1034,12 @@ export function createProviderConnectionService(
    * also for a connection whose removal the server confirmed, and `busy`
    * while another key action, a registration, or a removal runs.
    */
-  function keyTarget(
-    value: string,
-  ):
-    | { readonly id: ProviderConnectionId; readonly deviceId: string }
+  function keyTarget(value: string):
+    | {
+        readonly id: ProviderConnectionId;
+        readonly deviceId: string;
+        readonly kind: ProviderConnection["kind"];
+      }
     | Refused<"invalid" | "not_signed_in" | "not_listed" | "busy" | "failed"> {
     const parsed = ProviderConnectionIdSchema.safeParse(value);
     if (!parsed.success) {
@@ -968,29 +1052,45 @@ export function createProviderConnectionService(
       return refused("not_signed_in");
     }
     const id = parsed.data;
-    if (
-      list?.some((item) => item.id === id) !== true ||
-      removedConnections.has(id)
-    ) {
+    const listed = list?.find((item) => item.id === id);
+    if (listed === undefined || removedConnections.has(id)) {
       return refused("not_listed");
     }
     if (keyAction || writing || removing) {
       return refused("busy");
     }
-    return { id, deviceId: device };
+    return { id, deviceId: device, kind: listed.kind };
   }
 
-  /** The refusal of a key store failure while storing a key. */
-  function saveRefusal(error: unknown): SaveProviderKeyRefusal {
+  /** The refusal of a key store failure while storing a key or a model. */
+  function saveRefusal(
+    error: unknown,
+  ): SaveProviderKeyRefusal & SetProviderModelRefusal {
     if (isProviderKeyError(error, "system_protection_unavailable")) {
       return "protection_unavailable";
     }
+    if (isProviderKeyError(error, "invalid_model")) {
+      return "invalid_model";
+    }
     return isProviderKeyError(error, "invalid_key") ? "invalid" : "failed";
+  }
+
+  /**
+   * Whether `model` fits a connection of `kind`: a model of the closed list
+   * for a Claude connection, null for any other kind. No model is ever
+   * picked for the person.
+   */
+  function modelFits(
+    kind: string,
+    model: unknown,
+  ): model is ClaudeModel | null {
+    return kindNeedsModel(kind) ? isClaudeModel(model) : model === null;
   }
 
   async function saveKey(
     value: string,
     key: string,
+    model: string | null,
   ): Promise<SaveProviderKeyResult> {
     // The shape first, so that nothing else runs with a key that is not one.
     if (!isProviderKeyShape(key)) {
@@ -1000,9 +1100,12 @@ export function createProviderConnectionService(
     if ("outcome" in target) {
       return target;
     }
+    if (!modelFits(target.kind, model)) {
+      return refused("invalid_model");
+    }
     keyAction = true;
     try {
-      return await storeKey(target, key);
+      return await storeKey(target, key, model);
     } finally {
       keyAction = false;
     }
@@ -1011,12 +1114,14 @@ export function createProviderConnectionService(
   async function storeKey(
     target: { readonly id: ProviderConnectionId; readonly deviceId: string },
     key: string,
+    model: ClaudeModel | null,
   ): Promise<SaveProviderKeyResult> {
     const generation = deviceGeneration;
     try {
       await keys?.save(
         { deviceId: target.deviceId, providerConnectionId: target.id },
         key,
+        model,
       );
     } catch (error) {
       log(`A provider key was not stored (${failureCode(error)}).`);
@@ -1043,6 +1148,65 @@ export function createProviderConnectionService(
     return OK;
   }
 
+  async function setModel(
+    value: string,
+    model: string,
+  ): Promise<SetProviderModelResult> {
+    const target = keyTarget(value);
+    if ("outcome" in target) {
+      return target;
+    }
+    if (!kindNeedsModel(target.kind) || !isClaudeModel(model)) {
+      return refused("invalid_model");
+    }
+    keyAction = true;
+    try {
+      return await storeModel(target, model);
+    } finally {
+      keyAction = false;
+    }
+  }
+
+  async function storeModel(
+    target: { readonly id: ProviderConnectionId; readonly deviceId: string },
+    model: ClaudeModel,
+  ): Promise<SetProviderModelResult> {
+    const generation = deviceGeneration;
+    let result: SetProviderModelResult = OK;
+    try {
+      await keys?.setModel(
+        { deviceId: target.deviceId, providerConnectionId: target.id },
+        model,
+      );
+    } catch (error) {
+      log(`A provider model was not stored (${failureCode(error)}).`);
+      // A file that can never open here, or none, asks for a key first.
+      result = refused(
+        isProviderKeyError(error, "missing") ||
+          providerKeyStateAfterFailure(error) === "missing"
+          ? "credential_missing"
+          : saveRefusal(error),
+      );
+    }
+    if (result.outcome === "ok" && generation !== deviceGeneration) {
+      // As for `storeKey`: the rewritten file is bound to a device that no
+      // later device can be, so it is deleted again.
+      try {
+        await keys?.remove(target.id);
+      } catch (error) {
+        log(
+          `A provider key of a device that left could not be deleted (${failureCode(error)}).`,
+        );
+      }
+      return refused("not_signed_in");
+    }
+    // The status follows what the file holds now, also after a refusal.
+    if (device === target.deviceId) {
+      run(() => checkKey(target.id));
+    }
+    return result;
+  }
+
   async function removeKey(value: string): Promise<RemoveProviderKeyResult> {
     const target = keyTarget(value);
     if ("outcome" in target) {
@@ -1063,6 +1227,18 @@ export function createProviderConnectionService(
       run(() => checkKey(target.id));
     }
     return result;
+  }
+
+  function connectionKind(value: string): ProviderConnection["kind"] | null {
+    if (closed) {
+      return null;
+    }
+    // Without a signed-in device the list is null: `reset` drops it.
+    const listed = list?.find((item) => item.id === value);
+    if (listed === undefined || removedConnections.has(listed.id)) {
+      return null;
+    }
+    return listed.kind;
   }
 
   const removers = [
@@ -1090,7 +1266,9 @@ export function createProviderConnectionService(
     register,
     remove,
     saveKey,
+    setModel,
     removeKey,
+    connectionKind,
     close: () => {
       if (closed) {
         return;

@@ -362,11 +362,12 @@ test("the invoke channels except unmount, unlock, the sign-in start, select, ope
       channel !== INVOKE_CHANNELS.registerProviderConnection &&
       channel !== INVOKE_CHANNELS.removeProviderConnection &&
       channel !== INVOKE_CHANNELS.saveProviderKey &&
+      channel !== INVOKE_CHANNELS.setProviderModel &&
       channel !== INVOKE_CHANNELS.removeProviderKey &&
       channel !== INVOKE_CHANNELS.requestRun &&
       channel !== INVOKE_CHANNELS.takeRunRequestOutcome,
   );
-  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 49);
+  expect(channels).toHaveLength(Object.keys(INVOKE_CONTRACT).length - 50);
   for (const [, { args }] of channels) {
     expect(args.parse([])).toEqual([]);
     for (const value of [

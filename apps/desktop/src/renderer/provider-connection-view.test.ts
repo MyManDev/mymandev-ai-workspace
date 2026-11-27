@@ -21,8 +21,15 @@ import {
   RegisterProviderConnectionResultSchema,
   RemoveProviderConnectionResultSchema,
   SAVE_PROVIDER_KEY_REFUSALS,
+  CLAUDE_MODEL_VIEWS,
+  SET_PROVIDER_MODEL_REFUSALS,
 } from "../shared/ipc-contract.ts";
 import {
+  CLAUDE_MODELS_OFFERED,
+  claudeModelName,
+  describeSetProviderModel,
+  providerModelPrompt,
+  SET_PROVIDER_MODEL_REFUSAL_MESSAGES,
   createProviderConnectionActions,
   describeProviderConnections,
   describeRegisterProviderConnection,
@@ -71,6 +78,7 @@ function item(
     label,
     createdAt: AT,
     status: "credential_missing",
+    model: null,
     ...overrides,
   };
 }
@@ -103,6 +111,19 @@ test("the section's values match the protocol's", () => {
   expect(LABEL_SAFE_PATTERN.source).toBe(SAFE_TEXT_PATTERN.source);
   expect(LABEL_SAFE_PATTERN.flags).toBe(SAFE_TEXT_PATTERN.flags);
   expect(MAX_PROVIDER_KEY_LENGTH).toBe(PROVIDER_KEY_LIMITS.key);
+  // The models offered are the contract's closed list, in its order (#30).
+  expect(CLAUDE_MODELS_OFFERED.map((model) => model.id)).toEqual([
+    ...CLAUDE_MODEL_VIEWS,
+  ]);
+  expect(CLAUDE_MODELS_OFFERED.map((model) => model.name)).toEqual([
+    "Claude Fable 5.2",
+    "Claude Opus 5.5",
+    "Claude Sonnet 5.5",
+    "Claude Haiku 5.5",
+  ]);
+  expect(Object.keys(SET_PROVIDER_MODEL_REFUSAL_MESSAGES).sort()).toEqual(
+    [...SET_PROVIDER_MODEL_REFUSALS].sort(),
+  );
   // Every status and problem of the contract has its text.
   expect(Object.keys(PROVIDER_CONNECTION_STATUS_TEXTS).sort()).toEqual(
     [...PROVIDER_CONNECTION_STATUSES].sort(),
@@ -162,6 +183,10 @@ test("the section says what it knows, lists the connections with their status, a
       statusText: PROVIDER_CONNECTION_STATUS_TEXTS.credential_missing.text,
       keyAction: "enter",
       keyMayExist: false,
+      needsModel: true,
+      model: null,
+      modelName: "None chosen",
+      modelAction: null,
     },
     {
       id: ID_2,
@@ -174,6 +199,10 @@ test("the section says what it knows, lists the connections with their status, a
       statusText: PROVIDER_CONNECTION_STATUS_TEXTS.credential_missing.text,
       keyAction: "enter",
       keyMayExist: false,
+      needsModel: false,
+      model: null,
+      modelName: null,
+      modelAction: null,
     },
   ]);
   // A failed read shows its problem with what was read before, unknown.
@@ -363,8 +392,12 @@ function fakeBridge() {
         calls.push(`remove ${id}`);
         return answer();
       },
-      saveKey: (id: string, key: string) => {
-        calls.push(`saveKey ${id} ${key}`);
+      saveKey: (id: string, key: string, model: string | null) => {
+        calls.push(`saveKey ${id} ${key} ${String(model)}`);
+        return answer();
+      },
+      setModel: (id: string, model: string) => {
+        calls.push(`setModel ${id} ${model}`);
         return answer();
       },
       removeKey: (id: string) => {
@@ -458,6 +491,7 @@ test("a removal asks first, sends the listed ID once on confirm, and a cancel se
     id: ID_2,
     label: "Home",
     kindName: "Codex",
+    needsModel: false,
     action: "remove",
   });
   actions.cancel();
@@ -620,17 +654,24 @@ test("the key form opens empty for a listed connection, sends the trimmed key on
 
   actions.askKey(row);
   expect(views.at(-1)).toMatchObject({
-    keyFor: { id: ID_1, label: "Work", kindName: "Claude" },
+    keyFor: { id: ID_1, label: "Work", kindName: "Claude", needsModel: true },
     draftKey: "",
     keyProblem: undefined,
+    // No model is chosen for the person.
+    draftModel: "",
+    modelProblem: undefined,
   });
   actions.editKey(`  ${SENTINEL_KEY}  `);
   expect(views.at(-1)?.draftKey).toBe(`  ${SENTINEL_KEY}  `);
+  actions.editModel("claude-haiku-5-5");
+  expect(views.at(-1)?.draftModel).toBe("claude-haiku-5-5");
   const sentAt = views.length;
   const pending = actions.saveKey();
   // The field is empty before the main process answers.
   expect(views.at(-1)).toMatchObject({ draftKey: "", running: true });
-  expect(fake.calls).toEqual([`saveKey ${ID_1} ${SENTINEL_KEY}`]);
+  expect(fake.calls).toEqual([
+    `saveKey ${ID_1} ${SENTINEL_KEY} claude-haiku-5-5`,
+  ]);
   // While it runs, nothing else starts and nothing is sent again.
   await actions.saveKey();
   actions.askKey(model.rows![1]!);
@@ -673,6 +714,8 @@ test("a key with a problem is not sent and its field is cleared; a refusal keeps
 
   actions.editKey(SENTINEL_KEY);
   const refused = actions.saveKey();
+  // A Codex connection sends no model.
+  expect(fake.calls).toEqual([`saveKey ${ID_2} ${SENTINEL_KEY} null`]);
   fake.pending[0]?.resolve({
     outcome: "refused",
     reason: "protection_unavailable",
@@ -719,6 +762,7 @@ test("removing a key asks first and sends the listed ID once; the focus stays", 
     id: ID_1,
     label: "Work",
     kindName: "Claude",
+    needsModel: true,
     action: "removeKey",
   });
   actions.cancel();
@@ -783,5 +827,266 @@ test("opening the key form of another connection never carries over what was typ
   actions.editKey(SENTINEL_KEY);
   actions.askKey(model.rows![1]!);
   expect(views.at(-1)?.draftKey).toBe("");
+  expect(fake.calls).toEqual([]);
+});
+
+// ---- The model of a Claude connection (#30) ------------------------------
+
+test("a Claude connection shows its model, offers to change it once its key is stored, and asks for one without it; another kind has none", () => {
+  const model = describeProviderConnections(
+    known({
+      connections: [
+        item(ID_1, "Work", { status: "ready", model: "claude-opus-5-5" }),
+        item(ID_2, "Home", { status: "model_missing" }),
+        item("0192f0a0-7b3c-7d4e-8f50-000000000103", "Codex", {
+          kind: "codex",
+          status: "ready",
+        }),
+        item("0192f0a0-7b3c-7d4e-8f50-000000000104", "New", {}),
+      ],
+    }),
+  );
+  expect(
+    model.rows?.map((row) => [
+      row.statusName,
+      row.keyAction,
+      row.keyMayExist,
+      row.needsModel,
+      row.model,
+      row.modelName,
+      row.modelAction,
+    ]),
+  ).toEqual([
+    [
+      "Ready",
+      "replace",
+      true,
+      true,
+      "claude-opus-5-5",
+      "Claude Opus 5.5",
+      "change",
+    ],
+    ["No model chosen", "replace", true, true, null, "None chosen", "choose"],
+    ["Ready", "replace", true, false, null, null, null],
+    ["No API key", "enter", false, true, null, "None chosen", null],
+  ]);
+  expect(PROVIDER_CONNECTION_STATUS_TEXTS.model_missing.text).toContain(
+    "no model is chosen",
+  );
+  // A model that the renderer does not know is never shown by its ID.
+  const strange = describeProviderConnections(
+    known({
+      connections: [
+        item(ID_1, "Work", {
+          status: "ready",
+          model: "claude-unknown" as "claude-opus-5-5",
+        }),
+      ],
+    }),
+  );
+  expect(strange.rows?.[0]?.modelName).toBe("None chosen");
+});
+
+test("a model is checked against the closed list before it is sent, and every answer of changing it has its own sentence", () => {
+  expect(claudeModelName("claude-sonnet-5-5")).toBe("Claude Sonnet 5.5");
+  expect(claudeModelName("claude-opus-4-8")).toBeUndefined();
+  for (const model of CLAUDE_MODEL_VIEWS) {
+    expect(providerModelPrompt(model)).toBeUndefined();
+  }
+  for (const model of ["", "claude-opus-4-8", "Claude Opus 5.5", "x"]) {
+    expect(providerModelPrompt(model)).toBe(
+      PROVIDER_CONNECTION_MESSAGES.modelMissing,
+    );
+  }
+  expect(describeSetProviderModel({ outcome: "ok" })).toBe(
+    "The model was stored on this device.",
+  );
+  for (const reason of SET_PROVIDER_MODEL_REFUSALS) {
+    expect(
+      describeSetProviderModel({
+        outcome: "refused",
+        reason,
+        retryAfterMs: null,
+      }),
+    ).toBe(
+      `The model was not stored. ${SET_PROVIDER_MODEL_REFUSAL_MESSAGES[reason]}`,
+    );
+  }
+  expect(SAVE_PROVIDER_KEY_REFUSAL_MESSAGES.invalid_model).toContain(
+    "Choose one of the models",
+  );
+});
+
+test("a Claude key is never sent without a model: the person chooses one, nothing is chosen for them, and an earlier choice is kept", async () => {
+  const fake = fakeBridge();
+  const views: ProviderConnectionActionsView[] = [];
+  const actions = createProviderConnectionActions(fake.bridge, (view) =>
+    views.push(view),
+  );
+  const model = describeProviderConnections(
+    known({
+      connections: [
+        item(ID_1, "Work"),
+        item(ID_2, "Home", { status: "ready", model: "claude-opus-5-5" }),
+      ],
+    }),
+  );
+  actions.follow(model);
+  actions.askKey(model.rows![0]!);
+  actions.editKey(SENTINEL_KEY);
+  await actions.saveKey();
+  expect(views.at(-1)).toMatchObject({
+    draftKey: "",
+    keyProblem: undefined,
+    modelProblem: PROVIDER_CONNECTION_MESSAGES.modelMissing,
+    keyFor: { id: ID_1 },
+  });
+  // A value outside the list is not sent either.
+  actions.editModel("claude-opus-4-8");
+  expect(views.at(-1)?.modelProblem).toBeUndefined();
+  actions.editKey(SENTINEL_KEY);
+  await actions.saveKey();
+  expect(views.at(-1)?.modelProblem).toBe(
+    PROVIDER_CONNECTION_MESSAGES.modelMissing,
+  );
+  expect(fake.calls).toEqual([]);
+
+  // Replacing the key of a connection with a model keeps its model chosen.
+  actions.askKey(model.rows![1]!);
+  expect(views.at(-1)).toMatchObject({
+    keyFor: { id: ID_2 },
+    draftModel: "claude-opus-5-5",
+    draftKey: "",
+  });
+  actions.editKey(SENTINEL_KEY);
+  const pending = actions.saveKey();
+  expect(fake.calls).toEqual([
+    `saveKey ${ID_2} ${SENTINEL_KEY} claude-opus-5-5`,
+  ]);
+  fake.pending[0]?.resolve({ outcome: "ok" });
+  await pending;
+  expect(views.at(-1)).toEqual({
+    ...IDLE_PROVIDER_CONNECTION_ACTIONS,
+    message: "The API key was stored on this device.",
+  });
+});
+
+test("the model form changes the model of a stored key without the key, once, and closes on ok", async () => {
+  const fake = fakeBridge();
+  const views: ProviderConnectionActionsView[] = [];
+  const actions = createProviderConnectionActions(fake.bridge, (view) =>
+    views.push(view),
+  );
+  const model = describeProviderConnections(
+    known({
+      connections: [
+        item(ID_1, "Work", { status: "ready", model: "claude-opus-5-5" }),
+        item(ID_2, "Home", { status: "model_missing" }),
+        item("0192f0a0-7b3c-7d4e-8f50-000000000103", "Codex", {
+          kind: "codex",
+          status: "ready",
+        }),
+        item("0192f0a0-7b3c-7d4e-8f50-000000000104", "New", {}),
+      ],
+    }),
+  );
+  actions.follow(model);
+  // No model form for a row without a model action.
+  actions.askModel(model.rows![2]!);
+  actions.askModel(model.rows![3]!);
+  expect(views).toEqual([]);
+
+  // A key form open before is closed, and its key dropped.
+  actions.askKey(model.rows![0]!);
+  actions.editKey(SENTINEL_KEY);
+  actions.askModel(model.rows![1]!);
+  expect(views.at(-1)).toMatchObject({
+    keyFor: undefined,
+    draftKey: "",
+    modelFor: { id: ID_2, label: "Home", needsModel: true },
+    draftModel: "",
+    modelProblem: undefined,
+  });
+  await actions.saveModel();
+  expect(views.at(-1)?.modelProblem).toBe(
+    PROVIDER_CONNECTION_MESSAGES.modelMissing,
+  );
+  expect(fake.calls).toEqual([]);
+
+  actions.editModel("claude-sonnet-5-5");
+  const refused = actions.saveModel();
+  expect(views.at(-1)).toMatchObject({ running: true });
+  // While it runs, nothing else is sent.
+  await actions.saveModel();
+  expect(fake.calls).toEqual([`setModel ${ID_2} claude-sonnet-5-5`]);
+  fake.pending[0]?.resolve({
+    outcome: "refused",
+    reason: "credential_missing",
+    retryAfterMs: null,
+  });
+  await refused;
+  expect(views.at(-1)).toMatchObject({
+    running: false,
+    modelFor: { id: ID_2 },
+    draftModel: "claude-sonnet-5-5",
+  });
+  expect(views.at(-1)?.message).toBe(
+    `The model was not stored. ${SET_PROVIDER_MODEL_REFUSAL_MESSAGES.credential_missing}`,
+  );
+
+  const done = actions.saveModel();
+  fake.pending[1]?.resolve({ outcome: "ok" });
+  await done;
+  expect(views.at(-1)).toEqual({
+    ...IDLE_PROVIDER_CONNECTION_ACTIONS,
+    message: "The model was stored on this device.",
+  });
+
+  // The model form of a ready connection starts with its model.
+  actions.askModel(model.rows![0]!);
+  expect(views.at(-1)?.draftModel).toBe("claude-opus-5-5");
+  actions.cancelModel();
+  expect(views.at(-1)).toMatchObject({ modelFor: undefined, draftModel: "" });
+  expect(fake.calls).toHaveLength(2);
+  // No view of the model form ever held the key typed before it opened.
+  const opened = views.findIndex((view) => view.modelFor !== undefined);
+  expect(JSON.stringify(views.slice(opened))).not.toContain(SENTINEL_KEY);
+});
+
+test("the model form closes when its connection leaves the list, loses its key, or the device signs out", () => {
+  const fake = fakeBridge();
+  const views: ProviderConnectionActionsView[] = [];
+  const actions = createProviderConnectionActions(fake.bridge, (view) =>
+    views.push(view),
+  );
+  const ready = describeProviderConnections(
+    known({
+      connections: [
+        item(ID_1, "Work", { status: "ready", model: "claude-opus-5-5" }),
+      ],
+    }),
+  );
+  actions.follow(ready);
+  actions.askModel(ready.rows![0]!);
+  expect(views.at(-1)?.modelFor?.id).toBe(ID_1);
+  // The key was removed elsewhere: no model to change.
+  actions.follow(
+    describeProviderConnections(known({ connections: [item(ID_1, "Work")] })),
+  );
+  expect(views.at(-1)).toMatchObject({ modelFor: undefined, draftModel: "" });
+
+  actions.follow(ready);
+  actions.askModel(ready.rows![0]!);
+  actions.follow(describeProviderConnections(known({ connections: [] })));
+  expect(views.at(-1)?.modelFor).toBeUndefined();
+
+  actions.follow(ready);
+  actions.askModel(ready.rows![0]!);
+  actions.follow(
+    describeProviderConnections(
+      known({ status: "signed_out", connections: [] }),
+    ),
+  );
+  expect(views.at(-1)).toMatchObject({ modelFor: undefined, draftModel: "" });
   expect(fake.calls).toEqual([]);
 });

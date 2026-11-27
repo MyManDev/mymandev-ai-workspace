@@ -18,9 +18,17 @@
 // - The key is bound to the device ID and the connection ID inside the
 //   encrypted payload (key-file.ts); a reader that asks for another device
 //   or another connection is refused (`bound_elsewhere`).
-// - The plaintext is never cached. `check` decrypts and drops it; `read`
-//   decrypts and hands it to its caller, the adapter that starts a run, which
-//   holds it for that run only.
+// - The model chosen for the connection (#30, the Project Manager's
+//   decision of 2026-11-26) is kept in the same encrypted payload as the
+//   key, so that it is written atomically, bound, and deleted with it.
+//   `save` and `setModel` accept only a model of the closed list of
+//   models.ts, or null (`invalid_model`); a key stored before models were
+//   chosen (payload version 1) opens with the model null. No model is ever
+//   picked for the person.
+// - The plaintext is never cached. `check` decrypts and drops the key,
+//   returning the model only; `read` decrypts and hands the key and the
+//   model to its caller, the adapter that starts a run, which holds the key
+//   for that run only.
 // - Writes are atomic, as the device key's (atomic-file.ts): a temporary
 //   file, flushed and renamed over the key file, mode 0600 on Linux and
 //   macOS, in a folder for its owner only. A failed write leaves the
@@ -58,9 +66,11 @@ import {
   encodeProviderKeyPayload,
   isProviderKeyShape,
   openProviderKeyPayload,
+  type ProviderCredential,
   type ProviderKeyBinding,
   providerKeyFileName,
 } from "./key-file.ts";
+import { type ClaudeModel, isClaudeModel, isStorableModel } from "./models.ts";
 
 /** The folder of the key files, inside the device key's local data folder. */
 export const PROVIDER_KEY_FOLDER = "provider-keys";
@@ -101,33 +111,63 @@ export type ProviderKeyProtectionStatus =
         | "secret_service_unconfirmed";
     };
 
-/** What a check of a connection's key found. */
-export type ProviderKeyCheck = "ready" | "missing";
+/**
+ * What a check of a connection's key found: `missing` without a file, or
+ * `ready` with the model stored next to the key, null when none is (a key
+ * stored before models were chosen, or one of a connection without a model
+ * to choose). The model is only shape-checked here; models.ts says whether
+ * it is one of the closed list. Never the key.
+ */
+export type ProviderKeyCheck =
+  | { readonly key: "missing" }
+  | { readonly key: "ready"; readonly model: string | null };
 
 export interface ProviderKeyStore {
   /** Whether the system can protect a new key now. */
   readonly protection: () => Promise<ProviderKeyProtectionStatus>;
   /**
-   * Encrypts `key`, bound to the binding's device and connection, and
-   * writes it atomically over the connection's key file. Rejects with
-   * `invalid_binding`, `invalid_key`, `system_protection_unavailable`,
+   * Encrypts `key` and `model`, bound to the binding's device and
+   * connection, and writes them atomically over the connection's key file.
+   * `model` is a model of the closed list (models.ts), or null for a
+   * connection without a model to choose. Rejects with `invalid_binding`,
+   * `invalid_key`, `invalid_model`, `system_protection_unavailable`,
    * `folder_unavailable`, or `write_failed`; the previous file then stays.
    */
-  readonly save: (binding: ProviderKeyBinding, key: string) => Promise<void>;
+  readonly save: (
+    binding: ProviderKeyBinding,
+    key: string,
+    model: ClaudeModel | null,
+  ) => Promise<void>;
   /**
-   * `ready` when the connection's key file exists and decrypts for this
-   * binding, `missing` without a file. The plaintext is dropped at once.
-   * Rejects with `invalid_binding`, `folder_unavailable`, `read_failed`,
-   * `corrupt`, `newer_format`, `unreadable`, or `bound_elsewhere`.
+   * Changes the model stored next to the connection's key without the
+   * caller knowing the key: decrypts the file, checks its binding, and
+   * writes the same key with `model` atomically over it. Rejects with
+   * `invalid_model` before anything is read, as `read` when the file does
+   * not open (also `missing` without one), and as `save` when it cannot be
+   * written; the previous file then stays.
+   */
+  readonly setModel: (
+    binding: ProviderKeyBinding,
+    model: ClaudeModel,
+  ) => Promise<void>;
+  /**
+   * `ready` with the stored model when the connection's key file exists and
+   * decrypts for this binding, `missing` without a file. The plaintext key
+   * is dropped at once. Rejects with `invalid_binding`, `folder_unavailable`,
+   * `read_failed`, `corrupt`, `newer_format`, `unreadable`, or
+   * `bound_elsewhere`.
    */
   readonly check: (binding: ProviderKeyBinding) => Promise<ProviderKeyCheck>;
   /**
-   * Decrypts the connection's key on demand, for the main process only:
-   * the adapter that starts a run calls it at the start and holds the key
-   * for that run only (#30, #31). Nothing caches it. Rejects as `check`,
-   * and with `missing` without a file.
+   * Decrypts the connection's key and its model on demand, for the main
+   * process only: the adapter that starts a run calls it at the start and
+   * holds the key for that run only (#30, #31), through
+   * `createClaudeCredentialLoader` (credential.ts) for a listed Claude
+   * connection.
+   * Nothing caches it. Rejects as `check`, and with `missing` without a
+   * file.
    */
-  readonly read: (binding: ProviderKeyBinding) => Promise<string>;
+  readonly read: (binding: ProviderKeyBinding) => Promise<ProviderCredential>;
   /**
    * Deletes the connection's key file and its temporary files; a missing
    * file is not an error. Rejects with `invalid_binding`,
@@ -163,6 +203,8 @@ export interface ProviderKeyStoreOptions {
    */
   readonly onError?: (message: string, error: unknown) => void;
 }
+
+const MISSING: ProviderKeyCheck = Object.freeze({ key: "missing" });
 
 const secretServicePrefix = Buffer.from(
   SECRET_SERVICE_CIPHERTEXT_PREFIX,
@@ -339,13 +381,28 @@ export function createProviderKeyStore(
   async function save(
     requested: ProviderKeyBinding,
     key: string,
+    model: ClaudeModel | null,
   ): Promise<void> {
     const binding = checkBinding(requested);
     if (!isProviderKeyShape(key)) {
       throw new ProviderKeyError("invalid_key");
     }
+    if (!isStorableModel(model)) {
+      throw new ProviderKeyError("invalid_model");
+    }
+    await write(binding, key, model);
+  }
+
+  /** Encrypts the payload of `binding` and writes it over its key file. */
+  async function write(
+    binding: ProviderKeyBinding,
+    key: string,
+    model: ClaudeModel | null,
+  ): Promise<void> {
     const folder = keyFolder();
-    const ciphertext = await encrypt(encodeProviderKeyPayload(binding, key));
+    const ciphertext = await encrypt(
+      encodeProviderKeyPayload(binding, key, model),
+    );
     await writeKeyFile(
       folder,
       path.join(folder, providerKeyFileName(binding.providerConnectionId)),
@@ -353,11 +410,29 @@ export function createProviderKeyStore(
     );
   }
 
+  async function setModel(
+    requested: ProviderKeyBinding,
+    model: ClaudeModel,
+  ): Promise<void> {
+    const binding = checkBinding(requested);
+    // Null is not a model to set: a model is chosen, never taken away.
+    if (!isClaudeModel(model)) {
+      throw new ProviderKeyError("invalid_model");
+    }
+    const stored = await open(binding);
+    if (stored === null) {
+      throw new ProviderKeyError("missing");
+    }
+    await write(binding, stored.key, model);
+  }
+
   /**
    * Reads, decrypts, and opens a connection's key file; null without one.
    * Rewrites it when `safeStorage` reports `shouldReEncrypt`.
    */
-  async function open(requested: ProviderKeyBinding): Promise<string | null> {
+  async function open(
+    requested: ProviderKeyBinding,
+  ): Promise<ProviderCredential | null> {
     const binding = checkBinding(requested);
     const folder = keyFolder();
     const file = path.join(
@@ -391,11 +466,11 @@ export function createProviderKeyStore(
     } catch {
       throw new ProviderKeyError("unreadable");
     }
-    const key = openProviderKeyPayload(decrypted.result, binding);
+    const credential = openProviderKeyPayload(decrypted.result, binding);
     if (decrypted.shouldReEncrypt) {
       await reEncrypt(folder, file, decrypted.result);
     }
-    return key;
+    return credential;
   }
 
   /**
@@ -420,15 +495,20 @@ export function createProviderKeyStore(
   }
 
   async function check(binding: ProviderKeyBinding): Promise<ProviderKeyCheck> {
-    return (await open(binding)) === null ? "missing" : "ready";
+    const credential = await open(binding);
+    return credential === null
+      ? MISSING
+      : Object.freeze({ key: "ready", model: credential.model });
   }
 
-  async function read(binding: ProviderKeyBinding): Promise<string> {
-    const key = await open(binding);
-    if (key === null) {
+  async function read(
+    binding: ProviderKeyBinding,
+  ): Promise<ProviderCredential> {
+    const credential = await open(binding);
+    if (credential === null) {
       throw new ProviderKeyError("missing");
     }
-    return key;
+    return credential;
   }
 
   async function namesInFolder(folder: string): Promise<string[]> {
@@ -487,8 +567,13 @@ export function createProviderKeyStore(
 
   return Object.freeze({
     protection: () => exclusive(protection),
-    save: (binding: ProviderKeyBinding, key: string) =>
-      exclusive(() => save(binding, key)),
+    save: (
+      binding: ProviderKeyBinding,
+      key: string,
+      model: ClaudeModel | null,
+    ) => exclusive(() => save(binding, key, model)),
+    setModel: (binding: ProviderKeyBinding, model: ClaudeModel) =>
+      exclusive(() => setModel(binding, model)),
     check: (binding: ProviderKeyBinding) => exclusive(() => check(binding)),
     read: (binding: ProviderKeyBinding) => exclusive(() => read(binding)),
     remove: (providerConnectionId: string) =>

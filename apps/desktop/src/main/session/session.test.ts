@@ -4978,26 +4978,27 @@ describe("provider keys (#33)", () => {
   test("a sign-out keeps the provider keys with the device key", async () => {
     const { h, providerKeys, binding } = withProviderKeys();
     await existingDevice(h);
-    await providerKeys.save(binding, PROVIDER_KEY);
+    await providerKeys.save(binding, PROVIDER_KEY, null);
 
     expect(await h.session.signOut()).toEqual({ ok: true, value: "reported" });
 
     expect(h.calls).not.toContain("key.delete");
     expect(await keyFiles()).toEqual([CURRENT_KEY_FILE, DEVICE_RECORD_FILE]);
     expect(await providerKeyFiles()).toEqual([`${PROVIDER_CONNECTION}.json`]);
-    expect(await providerKeys.read(binding)).toBe(PROVIDER_KEY);
+    expect((await providerKeys.read(binding)).key).toBe(PROVIDER_KEY);
   });
 
   test("removing this device deletes every provider key file once the API confirmed it, after the device key", async () => {
     const { h, providerKeys, binding, reports } = withProviderKeys();
     await existingDevice(h);
-    await providerKeys.save(binding, PROVIDER_KEY);
+    await providerKeys.save(binding, PROVIDER_KEY, null);
     await providerKeys.save(
       {
         ...binding,
         providerConnectionId: "0192f0a0-7b3c-7d4e-8f50-000000000102",
       },
       PROVIDER_KEY,
+      "claude-sonnet-5-5",
     );
     expect(await providerKeyFiles()).toHaveLength(2);
 
@@ -5008,7 +5009,7 @@ describe("provider keys (#33)", () => {
 
     expect(await keyFiles()).toEqual([]);
     expect(await providerKeyFiles()).toEqual([]);
-    expect(await providerKeys.check(binding)).toBe("missing");
+    expect(await providerKeys.check(binding)).toEqual({ key: "missing" });
     expect(reports).toEqual([]);
   });
 
@@ -5016,7 +5017,7 @@ describe("provider keys (#33)", () => {
     const api = fakeApi();
     const { h, providerKeys, binding } = withProviderKeys(api);
     await existingDevice(h);
-    await providerKeys.save(binding, PROVIDER_KEY);
+    await providerKeys.save(binding, PROVIDER_KEY, null);
     api.intercept = (request) =>
       request.path === `/devices/${DEVICE_ID}/revoke`
         ? Promise.resolve(new Response(null, { status: 503 }))
@@ -5029,13 +5030,13 @@ describe("provider keys (#33)", () => {
 
     expect(h.calls).not.toContain("key.delete");
     expect(await providerKeyFiles()).toEqual([`${PROVIDER_CONNECTION}.json`]);
-    expect(await providerKeys.read(binding)).toBe(PROVIDER_KEY);
+    expect((await providerKeys.read(binding)).key).toBe(PROVIDER_KEY);
   });
 
   test("device_revoked deletes the provider keys with the device key", async () => {
     const { h, providerKeys, binding } = withProviderKeys();
     await existingDevice(h);
-    await providerKeys.save(binding, PROVIDER_KEY);
+    await providerKeys.save(binding, PROVIDER_KEY, null);
     h.api.deviceState = "revoked";
 
     await h.session.listDevices();

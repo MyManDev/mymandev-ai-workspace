@@ -3,6 +3,7 @@ import type { ProviderConnectionsBridge } from "../shared/desktop-bridge.ts";
 import { deviceTimeFormat, formatDeviceTime } from "./device-view.ts";
 import { syncModal } from "./JoinRequests.tsx";
 import {
+  CLAUDE_MODELS_OFFERED,
   createProviderConnectionActions,
   describeProviderConnections,
   followProviderConnections,
@@ -33,6 +34,9 @@ export function providerConnectionLabelId(index: number): string {
 /** The ID of the key field of the open key form. */
 export const PROVIDER_KEY_INPUT_ID = "provider-key-input";
 
+/** The ID of the model select of the open key form or model form. */
+export const PROVIDER_MODEL_INPUT_ID = "provider-model-input";
+
 /** What the section needs to offer its actions. */
 export interface ProviderConnectionHandlers {
   readonly onKind: (kind: string) => void;
@@ -41,8 +45,12 @@ export interface ProviderConnectionHandlers {
   readonly onRemove: (row: ProviderConnectionRow) => void;
   readonly onAskKey: (row: ProviderConnectionRow) => void;
   readonly onKey: (text: string) => void;
+  readonly onModel: (model: string) => void;
   readonly onSaveKey: () => void;
   readonly onCancelKey: () => void;
+  readonly onAskModel: (row: ProviderConnectionRow) => void;
+  readonly onSaveModel: () => void;
+  readonly onCancelModel: () => void;
   readonly onRemoveKey: (row: ProviderConnectionRow) => void;
   readonly onConfirm: () => void;
   readonly onCancel: () => void;
@@ -71,7 +79,11 @@ export interface ProviderConnectionsContentProps {
  * its sentence; its buttons are described by the label: "Enter an API
  * key" (or "Replace the API key" once one is stored), "Remove the API key"
  * while one may be stored, and "Remove". The key form opens under its
- * connection with one password field that is never prefilled (#33). While
+ * connection with one password field that is never prefilled (#33), and for
+ * a Claude connection a required model select (#30). A Claude connection
+ * also shows its model, and once its key is stored offers "Change the
+ * model" (or "Choose the model" without one), a form with the select only.
+ * While
  * a device is signed in, a form adds a connection by its provider and
  * label; it has no field for a key or a token. While an action runs, every
  * button stays focusable and does nothing (`aria-disabled`), and the
@@ -146,6 +158,7 @@ function ConnectionItem({
   const { running } = actions;
   const labelId = providerConnectionLabelId(index);
   const keyOpen = actions.keyFor?.id === row.id;
+  const modelOpen = actions.modelFor?.id === row.id;
   return (
     <li>
       <p className="device-name">
@@ -165,6 +178,12 @@ function ConnectionItem({
         <dd>
           {row.statusName}. {row.statusText}
         </dd>
+        {row.modelName === null ? null : (
+          <>
+            <dt>{PROVIDER_CONNECTION_MESSAGES.model}</dt>
+            <dd translate="no">{row.modelName}</dd>
+          </>
+        )}
       </dl>
       {handlers === undefined ? null : (
         <div className="account-actions">
@@ -179,6 +198,19 @@ function ConnectionItem({
               {row.keyAction === "replace"
                 ? PROVIDER_CONNECTION_MESSAGES.replaceKey
                 : PROVIDER_CONNECTION_MESSAGES.enterKey}
+            </button>
+          )}
+          {row.modelAction === null || modelOpen ? null : (
+            <button
+              type="button"
+              className="panel-action"
+              aria-describedby={labelId}
+              aria-disabled={running ? "true" : undefined}
+              onClick={running ? undefined : () => handlers.onAskModel(row)}
+            >
+              {row.modelAction === "choose"
+                ? PROVIDER_CONNECTION_MESSAGES.chooseModel
+                : PROVIDER_CONNECTION_MESSAGES.changeModel}
             </button>
           )}
           {row.keyMayExist ? (
@@ -212,12 +244,126 @@ function ConnectionItem({
           handlers={handlers}
         />
       )}
+      {handlers === undefined ||
+      !modelOpen ||
+      actions.modelFor === undefined ? null : (
+        <ModelForm
+          target={actions.modelFor}
+          actions={actions}
+          handlers={handlers}
+        />
+      )}
     </li>
   );
 }
 
 /**
- * The form that stores a connection's API key: one password field, never
+ * The required model select of a Claude connection (#30): labelled
+ * "Model", with a first option "Choose a model" that is no model, so that
+ * nothing is chosen for the person, then the models of
+ * `CLAUDE_MODELS_OFFERED` by their names. A native `select`, so it is
+ * reached with the keyboard and announced with its label, its hint, and
+ * its problem.
+ */
+function ModelSelect({
+  actions,
+  handlers,
+}: {
+  readonly actions: ProviderConnectionActionsView;
+  readonly handlers: ProviderConnectionHandlers;
+}) {
+  return (
+    <>
+      <label className="account-label" htmlFor={PROVIDER_MODEL_INPUT_ID}>
+        {PROVIDER_CONNECTION_MESSAGES.model}
+      </label>
+      <select
+        id={PROVIDER_MODEL_INPUT_ID}
+        className="account-input"
+        required
+        aria-required="true"
+        value={actions.draftModel}
+        disabled={actions.running}
+        aria-invalid={actions.modelProblem === undefined ? undefined : "true"}
+        aria-describedby="provider-model-hint provider-model-problem"
+        onChange={(event) => handlers.onModel(event.currentTarget.value)}
+      >
+        <option value="">{PROVIDER_CONNECTION_MESSAGES.modelChoose}</option>
+        {CLAUDE_MODELS_OFFERED.map((model) => (
+          <option key={model.id} value={model.id}>
+            {model.name}
+          </option>
+        ))}
+      </select>
+      <p className="account-message" id="provider-model-hint">
+        {PROVIDER_CONNECTION_MESSAGES.modelHint}
+      </p>
+      <p className="panel-message" id="provider-model-problem" role="alert">
+        {actions.modelProblem ?? ""}
+      </p>
+    </>
+  );
+}
+
+/**
+ * The form that changes the model of a Claude connection whose key is
+ * stored, without the key (#30): the model select, "Store the model", and
+ * "Cancel".
+ */
+function ModelForm({
+  target,
+  actions,
+  handlers,
+}: {
+  readonly target: ProviderConnectionTarget;
+  readonly actions: ProviderConnectionActionsView;
+  readonly handlers: ProviderConnectionHandlers;
+}) {
+  const { running } = actions;
+  return (
+    <form
+      className="account-form"
+      aria-labelledby="provider-model-title"
+      noValidate
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!running) {
+          handlers.onSaveModel();
+        }
+      }}
+    >
+      <h4 id="provider-model-title">
+        {PROVIDER_CONNECTION_MESSAGES.model}:{" "}
+        <span dir="auto" translate="no">
+          {target.label}
+        </span>{" "}
+        ({target.kindName})
+      </h4>
+      <ModelSelect actions={actions} handlers={handlers} />
+      <div className="account-actions">
+        <button
+          type="submit"
+          className="panel-action"
+          aria-disabled={running ? "true" : undefined}
+        >
+          {PROVIDER_CONNECTION_MESSAGES.saveModel}
+        </button>
+        <button
+          type="button"
+          className="panel-action"
+          aria-disabled={running ? "true" : undefined}
+          onClick={running ? undefined : handlers.onCancelModel}
+        >
+          {PROVIDER_CONNECTION_MESSAGES.cancel}
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/**
+ * The form that stores a connection's API key: for a Claude connection the
+ * required model select first (#30), then one password field, never
  * prefilled, that the actions empty as the key is sent; its hint says that
  * the key stays on this device and is never shown again; an alert for a
  * key that is not sent; "Store the key" and "Cancel". The field has no
@@ -238,6 +384,8 @@ function KeyForm({
     <form
       className="account-form"
       aria-labelledby="provider-key-title"
+      // The actions check the model and say what is missing in the alert.
+      noValidate
       onSubmit={(event) => {
         event.preventDefault();
         if (!running) {
@@ -252,6 +400,9 @@ function KeyForm({
         </span>{" "}
         ({target.kindName})
       </h4>
+      {target.needsModel ? (
+        <ModelSelect actions={actions} handlers={handlers} />
+      ) : null}
       <label className="account-label" htmlFor={PROVIDER_KEY_INPUT_ID}>
         {PROVIDER_CONNECTION_MESSAGES.keyLabel}
       </label>
@@ -504,10 +655,16 @@ export function providerConnectionHandlers(
     onRemove: controller.askRemove,
     onAskKey: controller.askKey,
     onKey: controller.editKey,
+    onModel: controller.editModel,
     onSaveKey: () => {
       void controller.saveKey();
     },
     onCancelKey: controller.cancelKey,
+    onAskModel: controller.askModel,
+    onSaveModel: () => {
+      void controller.saveModel();
+    },
+    onCancelModel: controller.cancelModel,
     onRemoveKey: controller.askRemoveKey,
     onConfirm: () => {
       void controller.confirm().then((removed) => {

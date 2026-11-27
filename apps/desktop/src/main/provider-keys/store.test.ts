@@ -30,9 +30,12 @@ import {
   encodeProviderKeyPayload,
   isProviderKeyShape,
   PROVIDER_KEY_FILE_FORMAT,
+  PROVIDER_KEY_FILE_VERSION,
   PROVIDER_KEY_PAYLOAD_FORMAT,
+  PROVIDER_KEY_PAYLOAD_VERSION,
   type ProviderKeyBinding,
 } from "./key-file.ts";
+import type { ClaudeModel } from "./models.ts";
 import {
   createProviderKeyStore,
   nodeProviderKeyFileSystem,
@@ -203,44 +206,64 @@ function errorText(error: unknown): string {
   ].join("\n");
 }
 
-test("a key round-trips: the file holds one ciphertext, never the key or an ID in the clear, and the payload binds the device and the connection", async () => {
+test("a key round-trips with its model: the file holds one ciphertext, never the key, the model, or an ID in the clear, and the payload binds the device and the connection", async () => {
   const fake = fakeSafeStorage();
   const store = storeWith(fake);
-  expect(await store.check(BINDING_1)).toBe("missing");
+  expect(await store.check(BINDING_1)).toEqual({ key: "missing" });
   await expectRejection(() => store.read(BINDING_1), "missing");
 
-  await store.save(BINDING_1, SENTINEL_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, "claude-sonnet-5-5");
 
   expect(await readdir(keyFolder)).toEqual([`${CONNECTION_1}.json`]);
   const text = await readFile(keyFile(), "utf8");
   expect(text).not.toContain(SENTINEL_KEY);
   expect(text).not.toContain(DEVICE_ID);
+  expect(text).not.toContain("claude");
   expect(text.endsWith("}\n")).toBe(true);
   const json = JSON.parse(text) as Record<string, unknown>;
   expect(Object.keys(json)).toEqual(["format", "version", "ciphertext"]);
   expect(json["format"]).toBe(PROVIDER_KEY_FILE_FORMAT);
-  expect(json["version"]).toBe(1);
+  // The file's own format is unchanged; only the payload has a new version.
+  expect(json["version"]).toBe(PROVIDER_KEY_FILE_VERSION);
+  expect(PROVIDER_KEY_FILE_VERSION).toBe(1);
+  expect(PROVIDER_KEY_PAYLOAD_VERSION).toBe(2);
   const payload = JSON.parse(
     fake.decrypt(Buffer.from(json["ciphertext"] as string, "base64url")),
   ) as unknown;
   expect(payload).toEqual({
     format: PROVIDER_KEY_PAYLOAD_FORMAT,
-    version: 1,
+    version: 2,
     deviceId: DEVICE_ID,
     providerConnectionId: CONNECTION_1,
     key: SENTINEL_KEY,
+    model: "claude-sonnet-5-5",
   });
+  expect(Object.keys(payload as object)).toEqual([
+    "format",
+    "version",
+    "deviceId",
+    "providerConnectionId",
+    "key",
+    "model",
+  ]);
 
-  expect(await store.check(BINDING_1)).toBe("ready");
-  expect(await store.read(BINDING_1)).toBe(SENTINEL_KEY);
+  expect(await store.check(BINDING_1)).toEqual({
+    key: "ready",
+    model: "claude-sonnet-5-5",
+  });
+  expect(await store.read(BINDING_1)).toEqual({
+    key: SENTINEL_KEY,
+    model: "claude-sonnet-5-5",
+  });
+  expect((await store.read(BINDING_1)).key).toBe(SENTINEL_KEY);
   // Each read decrypts again: nothing is cached.
   const decrypts = fake.calls.filter((call) => call === "decryptStringAsync");
-  expect(await store.read(BINDING_1)).toBe(SENTINEL_KEY);
+  expect((await store.read(BINDING_1)).key).toBe(SENTINEL_KEY);
   expect(
     fake.calls.filter((call) => call === "decryptStringAsync").length,
   ).toBe(decrypts.length + 1);
   // The other connection has no key.
-  expect(await store.check(BINDING_2)).toBe("missing");
+  expect(await store.check(BINDING_2)).toEqual({ key: "missing" });
 });
 
 test("on Linux and elsewhere the folders and the file are for their owner only", async () => {
@@ -248,7 +271,7 @@ test("on Linux and elsewhere the folders and the file are for their owner only",
     return;
   }
   const store = storeWith(fakeSafeStorage(), { platform: process.platform });
-  await store.save(BINDING_1, SENTINEL_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, null);
   expect((await stat(keyFolder)).mode & 0o777).toBe(0o700);
   expect((await stat(keyFile())).mode & 0o777).toBe(0o600);
 });
@@ -258,7 +281,7 @@ test("without the system's protection no key is stored, and nothing is encrypted
     const fake = fakeSafeStorage({ available: false });
     const store = storeWith(fake, { platform });
     await expectRejection(
-      () => store.save(BINDING_1, SENTINEL_KEY),
+      () => store.save(BINDING_1, SENTINEL_KEY, null),
       "system_protection_unavailable",
     );
     expect(await store.protection()).toEqual({
@@ -284,7 +307,7 @@ test("on Linux a key is stored only with a confirmed secret service: basic_text,
       reason,
     });
     await expectRejection(
-      () => store.save(BINDING_1, SENTINEL_KEY),
+      () => store.save(BINDING_1, SENTINEL_KEY, null),
       "system_protection_unavailable",
     );
     expect(fake.calls, backend).not.toContain("encryptStringAsync");
@@ -300,14 +323,14 @@ test("on Linux a key is stored only with a confirmed secret service: basic_text,
       platform: "linux",
     });
     expect(await store.protection(), backend).toEqual({ available: true });
-    await store.save(BINDING_1, SENTINEL_KEY);
-    expect(await store.read(BINDING_1)).toBe(SENTINEL_KEY);
+    await store.save(BINDING_1, SENTINEL_KEY, null);
+    expect((await store.read(BINDING_1)).key).toBe(SENTINEL_KEY);
   }
   // Windows and macOS never ask for a backend.
   for (const platform of ["win32", "darwin"] as const) {
     const fake = fakeSafeStorage({ backend: "basic_text" });
     const store = storeWith(fake, { platform });
-    await store.save(BINDING_1, SENTINEL_KEY);
+    await store.save(BINDING_1, SENTINEL_KEY, null);
     expect(fake.calls).not.toContain("getSelectedStorageBackend");
   }
 });
@@ -315,15 +338,15 @@ test("on Linux a key is stored only with a confirmed secret service: basic_text,
 test("on Linux a ciphertext of Chromium's fixed key (v10) is never written, whatever the backend says", async () => {
   const fake = fakeSafeStorage({ backend: "gnome_libsecret" });
   const store = storeWith(fake, { platform: "linux" });
-  await store.save(BINDING_1, OTHER_KEY);
+  await store.save(BINDING_1, OTHER_KEY, null);
   fake.state.prefix = "v10";
   await expectRejection(
-    () => store.save(BINDING_1, SENTINEL_KEY),
+    () => store.save(BINDING_1, SENTINEL_KEY, null),
     "system_protection_unavailable",
   );
   // The earlier key stays, and no temporary file is left.
   expect(await readdir(keyFolder)).toEqual([`${CONNECTION_1}.json`]);
-  expect(await store.read(BINDING_1)).toBe(OTHER_KEY);
+  expect((await store.read(BINDING_1)).key).toBe(OTHER_KEY);
 });
 
 /** A key file as the store writes it, around `ciphertext`. */
@@ -338,7 +361,7 @@ function keyFileText(ciphertext: Buffer): string {
 test("on Linux a planted file of Chromium's fixed key (v10) is refused as corrupt before it is decrypted", async () => {
   const fake = fakeSafeStorage({ backend: "gnome_libsecret" });
   const store = storeWith(fake, { platform: "linux" });
-  await store.save(BINDING_1, OTHER_KEY);
+  await store.save(BINDING_1, OTHER_KEY, null);
   // Whoever can write the file encrypts a key of their choice, bound to
   // this device and this connection, with the key that every Chromium
   // shares (`v10`); the fake decrypts it, as Chromium would.
@@ -346,7 +369,7 @@ test("on Linux a planted file of Chromium's fixed key (v10) is refused as corrup
   await writeFile(
     keyFile(),
     keyFileText(
-      fake.encrypt(encodeProviderKeyPayload(BINDING_1, SENTINEL_KEY)),
+      fake.encrypt(encodeProviderKeyPayload(BINDING_1, SENTINEL_KEY, null)),
     ),
   );
   const decrypts = () =>
@@ -359,7 +382,7 @@ test("on Linux a planted file of Chromium's fixed key (v10) is refused as corrup
     keyFile(),
     keyFileText(
       fake
-        .encrypt(encodeProviderKeyPayload(BINDING_1, SENTINEL_KEY))
+        .encrypt(encodeProviderKeyPayload(BINDING_1, SENTINEL_KEY, null))
         .subarray(3),
     ),
   );
@@ -369,21 +392,23 @@ test("on Linux a planted file of Chromium's fixed key (v10) is refused as corrup
   // Windows and macOS always protect a key; Chromium writes `v10` there.
   for (const platform of ["win32", "darwin"] as const) {
     const other = storeWith(fake, { platform });
-    await other.save(BINDING_1, SENTINEL_KEY);
-    expect(await other.read(BINDING_1)).toBe(SENTINEL_KEY);
+    await other.save(BINDING_1, SENTINEL_KEY, null);
+    expect((await other.read(BINDING_1)).key).toBe(SENTINEL_KEY);
   }
 
   // A key entered again on Linux replaces the planted file.
   fake.state.prefix = "v11";
-  await store.save(BINDING_1, OTHER_KEY);
-  expect(await store.read(BINDING_1)).toBe(OTHER_KEY);
+  await store.save(BINDING_1, OTHER_KEY, null);
+  expect((await store.read(BINDING_1)).key).toBe(OTHER_KEY);
 });
 
 test("a failing encryption is refused without its error, which could quote the payload", async () => {
   const fake = fakeSafeStorage();
   fake.state.failEncrypt = true;
   const store = storeWith(fake);
-  const error = await rejectionOf(() => store.save(BINDING_1, SENTINEL_KEY));
+  const error = await rejectionOf(() =>
+    store.save(BINDING_1, SENTINEL_KEY, null),
+  );
   expect(isProviderKeyError(error, "system_protection_unavailable")).toBe(true);
   expect(errorText(error)).not.toContain(SENTINEL_KEY);
   expect((error as Error).cause).toBeUndefined();
@@ -392,7 +417,7 @@ test("a failing encryption is refused without its error, which could quote the p
 test("a file of another device or another connection is refused", async () => {
   const fake = fakeSafeStorage();
   const store = storeWith(fake);
-  await store.save(BINDING_1, SENTINEL_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, null);
 
   // Another device asks for the same connection.
   const otherDevice = { ...BINDING_1, deviceId: OTHER_DEVICE_ID };
@@ -416,6 +441,7 @@ test("a file of another device or another connection is refused", async () => {
           encodeProviderKeyPayload(
             { deviceId: OTHER_DEVICE_ID, providerConnectionId: CONNECTION_1 },
             OTHER_KEY,
+            "claude-opus-5-5",
           ),
         )
         .toString("base64url"),
@@ -423,14 +449,14 @@ test("a file of another device or another connection is refused", async () => {
   );
   await expectRejection(() => store.read(BINDING_1), "bound_elsewhere");
   // The original binding still opens the original file.
-  await store.save(BINDING_1, SENTINEL_KEY);
-  expect(await store.read(BINDING_1)).toBe(SENTINEL_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, null);
+  expect((await store.read(BINDING_1)).key).toBe(SENTINEL_KEY);
 });
 
 test("a tampered, damaged, or newer file is refused with a fixed code, and never with its content", async () => {
   const fake = fakeSafeStorage();
   const store = storeWith(fake);
-  await store.save(BINDING_1, SENTINEL_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, null);
   const original = JSON.parse(await readFile(keyFile(), "utf8")) as Record<
     string,
     unknown
@@ -475,7 +501,7 @@ test("a tampered, damaged, or newer file is refused with a fixed code, and never
     ...original,
     ciphertext: fake
       .encrypt(
-        JSON.stringify({ format: PROVIDER_KEY_PAYLOAD_FORMAT, version: 2 }),
+        JSON.stringify({ format: PROVIDER_KEY_PAYLOAD_FORMAT, version: 3 }),
       )
       .toString("base64url"),
   });
@@ -507,8 +533,8 @@ test("a tampered, damaged, or newer file is refused with a fixed code, and never
   // A damaged file is never replaced or deleted on its own; a new key
   // replaces it.
   expect(await readdir(keyFolder)).toEqual([`${CONNECTION_1}.json`]);
-  await store.save(BINDING_1, OTHER_KEY);
-  expect(await store.read(BINDING_1)).toBe(OTHER_KEY);
+  await store.save(BINDING_1, OTHER_KEY, null);
+  expect((await store.read(BINDING_1)).key).toBe(OTHER_KEY);
 });
 
 test("a key replaces the previous one atomically: a failed write keeps the previous file whole and leaves no temporary file", async () => {
@@ -547,24 +573,26 @@ test("a key replaces the previous one atomically: a failed write keeps the previ
     },
   };
   const store = storeWith(fake, { fileSystem });
-  await store.save(BINDING_1, OTHER_KEY);
+  await store.save(BINDING_1, OTHER_KEY, null);
   const before = await readFile(keyFile());
 
   for (const step of ["write", "sync", "rename"] as const) {
     failAt = step;
-    const error = await rejectionOf(() => store.save(BINDING_1, SENTINEL_KEY));
+    const error = await rejectionOf(() =>
+      store.save(BINDING_1, SENTINEL_KEY, null),
+    );
     expect(isProviderKeyError(error, "write_failed"), step).toBe(true);
     expect(errorText(error)).not.toContain(SENTINEL_KEY);
     expect((error as Error).cause).toBeUndefined();
     expect(await readdir(keyFolder), step).toEqual([`${CONNECTION_1}.json`]);
     expect((await readFile(keyFile())).equals(before), step).toBe(true);
-    expect(await store.read(BINDING_1)).toBe(OTHER_KEY);
+    expect((await store.read(BINDING_1)).key).toBe(OTHER_KEY);
   }
 
   failAt = null;
-  await store.save(BINDING_1, SENTINEL_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, null);
   expect(await readdir(keyFolder)).toEqual([`${CONNECTION_1}.json`]);
-  expect(await store.read(BINDING_1)).toBe(SENTINEL_KEY);
+  expect((await store.read(BINDING_1)).key).toBe(SENTINEL_KEY);
 });
 
 test("a key is rewritten when decryptStringAsync reports shouldReEncrypt, and a failed rewrite keeps the old file and is reported without the key", async () => {
@@ -573,16 +601,16 @@ test("a key is rewritten when decryptStringAsync reports shouldReEncrypt, and a 
   const store = storeWith(fake, {
     onError: (message, error) => reported.push([message, error]),
   });
-  await store.save(BINDING_1, SENTINEL_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, null);
   const first = await readFile(keyFile(), "utf8");
   fake.state.reEncrypt = true;
-  expect(await store.read(BINDING_1)).toBe(SENTINEL_KEY);
+  expect((await store.read(BINDING_1)).key).toBe(SENTINEL_KEY);
   const second = await readFile(keyFile(), "utf8");
   expect(second).not.toBe(first);
   expect(reported).toEqual([]);
 
   fake.state.failEncrypt = true;
-  expect(await store.check(BINDING_1)).toBe("ready");
+  expect(await store.check(BINDING_1)).toEqual({ key: "ready", model: null });
   expect(await readFile(keyFile(), "utf8")).toBe(second);
   expect(reported).toHaveLength(1);
   expect(reported[0]?.[0]).toBe("A provider key could not be encrypted again.");
@@ -598,7 +626,7 @@ test("an unreadable folder or file fails with a fixed code", async () => {
     },
   });
   await expectRejection(
-    () => missing.save(BINDING_1, SENTINEL_KEY),
+    () => missing.save(BINDING_1, SENTINEL_KEY, null),
     "folder_unavailable",
   );
   await expectRejection(() => missing.check(BINDING_1), "folder_unavailable");
@@ -615,14 +643,14 @@ test("an unreadable folder or file fails with a fixed code", async () => {
   await mkdir(keyFile(), { recursive: true });
   await expectRejection(() => store.check(BINDING_1), "read_failed");
   await expectRejection(
-    () => store.save(BINDING_1, SENTINEL_KEY),
+    () => store.save(BINDING_1, SENTINEL_KEY, null),
     "write_failed",
   );
   await rm(keyFile(), { recursive: true });
 
   // The system cannot decrypt a file that it wrote, for example after the
   // Keychain entry was deleted.
-  await store.save(BINDING_1, SENTINEL_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, null);
   fake.state.failDecrypt = true;
   await expectRejection(() => store.check(BINDING_1), "unreadable");
   await expectRejection(() => store.read(BINDING_1), "unreadable");
@@ -651,7 +679,7 @@ test("on Linux and macOS a symbolic link in place of the key folder is refused, 
     };
     const store = storeWith(fake, { platform, fileSystem });
     await expectRejection(
-      () => store.save(BINDING_1, SENTINEL_KEY),
+      () => store.save(BINDING_1, SENTINEL_KEY, null),
       "folder_unavailable",
     );
     await expectRejection(() => store.check(BINDING_1), "folder_unavailable");
@@ -668,11 +696,11 @@ test("on Linux and macOS a symbolic link in place of the key folder is refused, 
     // A real folder with another mode is set to 0700 before it is used.
     folder.link = false;
     calls.length = 0;
-    expect(await store.check(BINDING_1)).toBe("missing");
+    expect(await store.check(BINDING_1)).toEqual({ key: "missing" });
     expect(calls).toEqual(["lstat:folder", "chmod:folder:700"]);
     folder.mode = 0o40700;
     calls.length = 0;
-    expect(await store.check(BINDING_1)).toBe("missing");
+    expect(await store.check(BINDING_1)).toEqual({ key: "missing" });
     expect(calls).toEqual(["lstat:folder"]);
 
     // An lstat that fails otherwise, or a chmod that fails, is refused too.
@@ -702,8 +730,8 @@ test("on Linux and macOS a symbolic link in place of the key folder is refused, 
       },
     },
   });
-  await windows.save(BINDING_1, SENTINEL_KEY);
-  expect(await windows.read(BINDING_1)).toBe(SENTINEL_KEY);
+  await windows.save(BINDING_1, SENTINEL_KEY, null);
+  expect((await windows.read(BINDING_1)).key).toBe(SENTINEL_KEY);
   expect(lstats).toEqual([]);
 });
 
@@ -717,7 +745,7 @@ test.skipIf(process.platform === "win32")(
     await symlink(outside, keyFolder);
     const store = storeWith(fakeSafeStorage(), { platform: process.platform });
     await expectRejection(
-      () => store.save(BINDING_1, SENTINEL_KEY),
+      () => store.save(BINDING_1, SENTINEL_KEY, null),
       "folder_unavailable",
     );
     await expectRejection(() => store.check(BINDING_1), "folder_unavailable");
@@ -732,10 +760,10 @@ test.skipIf(process.platform === "win32")(
     await rm(keyFolder);
     await mkdir(keyFolder);
     await chmod(keyFolder, 0o755);
-    expect(await store.check(BINDING_1)).toBe("missing");
+    expect(await store.check(BINDING_1)).toEqual({ key: "missing" });
     expect((await stat(keyFolder)).mode & 0o777).toBe(0o700);
-    await store.save(BINDING_1, SENTINEL_KEY);
-    expect(await store.read(BINDING_1)).toBe(SENTINEL_KEY);
+    await store.save(BINDING_1, SENTINEL_KEY, null);
+    expect((await store.read(BINDING_1)).key).toBe(SENTINEL_KEY);
   },
 );
 
@@ -763,7 +791,7 @@ test("a key of the wrong shape and an invalid ID are refused before anything is 
   ]) {
     expect(isProviderKeyShape(key), JSON.stringify(key)).toBe(false);
     await expectRejection(
-      () => store.save(BINDING_1, key as string),
+      () => store.save(BINDING_1, key as string, null),
       "invalid_key",
     );
   }
@@ -773,7 +801,7 @@ test("a key of the wrong shape and an invalid ID are refused before anything is 
     { deviceId: DEVICE_ID, providerConnectionId: "../escape" },
   ]) {
     await expectRejection(
-      () => store.save(binding, SENTINEL_KEY),
+      () => store.save(binding, SENTINEL_KEY, null),
       "invalid_binding",
     );
     await expectRejection(() => store.check(binding), "invalid_binding");
@@ -785,8 +813,8 @@ test("a key of the wrong shape and an invalid ID are refused before anything is 
 
 test("remove deletes one connection's file and its temporary files; removeAll deletes every key file and leaves other names", async () => {
   const store = storeWith(fakeSafeStorage());
-  await store.save(BINDING_1, SENTINEL_KEY);
-  await store.save(BINDING_2, OTHER_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, null);
+  await store.save(BINDING_2, OTHER_KEY, null);
   const stray1 = `${CONNECTION_1}.json.0123456789abcdef.tmp`;
   const stray2 = `${CONNECTION_2}.json.fedcba9876543210.tmp`;
   await writeFile(path.join(keyFolder, stray1), "partial");
@@ -797,12 +825,12 @@ test("remove deletes one connection's file and its temporary files; removeAll de
   expect((await readdir(keyFolder)).sort()).toEqual(
     [`${CONNECTION_2}.json`, stray2, "notes.txt"].sort(),
   );
-  expect(await store.check(BINDING_1)).toBe("missing");
-  expect(await store.read(BINDING_2)).toBe(OTHER_KEY);
+  expect(await store.check(BINDING_1)).toEqual({ key: "missing" });
+  expect((await store.read(BINDING_2)).key).toBe(OTHER_KEY);
   // A missing file is not an error.
   await store.remove(CONNECTION_1);
 
-  await store.save(BINDING_1, SENTINEL_KEY);
+  await store.save(BINDING_1, SENTINEL_KEY, null);
   await store.removeAll();
   expect(await readdir(keyFolder)).toEqual(["notes.txt"]);
   // Without a folder there is nothing to delete.
@@ -813,8 +841,8 @@ test("remove deletes one connection's file and its temporary files; removeAll de
 
 test("a file that cannot be deleted fails the deletion after every other file was tried", async () => {
   const store0 = storeWith(fakeSafeStorage());
-  await store0.save(BINDING_1, SENTINEL_KEY);
-  await store0.save(BINDING_2, OTHER_KEY);
+  await store0.save(BINDING_1, SENTINEL_KEY, null);
+  await store0.save(BINDING_2, OTHER_KEY, null);
   const fileSystem: ProviderKeyFileSystem = {
     ...nodeProviderKeyFileSystem,
     unlink: async (file) => {
@@ -837,17 +865,227 @@ test("a file that cannot be deleted fails the deletion after every other file wa
 test("operations run one after the other, so a removal never races a write", async () => {
   const store = storeWith(fakeSafeStorage());
   const order: string[] = [];
-  const saving = store.save(BINDING_1, SENTINEL_KEY).then(() => {
+  const saving = store.save(BINDING_1, SENTINEL_KEY, null).then(() => {
     order.push("save");
   });
   const removing = store.removeAll().then(() => {
     order.push("removeAll");
   });
   const checking = store.check(BINDING_1).then((found) => {
-    order.push(`check:${found}`);
+    order.push(`check:${found.key}`);
   });
   await Promise.all([saving, removing, checking]);
   expect(order).toEqual(["save", "removeAll", "check:missing"]);
+});
+
+/** A key file around a payload of `fields`, encrypted by `fake`. */
+async function writePayload(
+  fake: FakeSafeStorage,
+  fields: Record<string, unknown>,
+): Promise<void> {
+  await mkdir(keyFolder, { recursive: true });
+  await writeFile(
+    keyFile(),
+    `${JSON.stringify({
+      format: PROVIDER_KEY_FILE_FORMAT,
+      version: PROVIDER_KEY_FILE_VERSION,
+      ciphertext: fake.encrypt(JSON.stringify(fields)).toString("base64url"),
+    })}\n`,
+  );
+}
+
+/** The decrypted payload of the key file of `connection`. */
+async function payloadOf(
+  fake: FakeSafeStorage,
+  connection: string = CONNECTION_1,
+): Promise<Record<string, unknown>> {
+  const json = JSON.parse(await readFile(keyFile(connection), "utf8")) as {
+    ciphertext: string;
+  };
+  return JSON.parse(
+    fake.decrypt(Buffer.from(json.ciphertext, "base64url")),
+  ) as Record<string, unknown>;
+}
+
+const V1_PAYLOAD = Object.freeze({
+  format: PROVIDER_KEY_PAYLOAD_FORMAT,
+  version: 1,
+  deviceId: DEVICE_ID,
+  providerConnectionId: CONNECTION_1,
+  key: SENTINEL_KEY,
+});
+
+test("a key file of the format before models (payload version 1) still opens, with no model, and is never given one on its own", async () => {
+  const fake = fakeSafeStorage();
+  const store = storeWith(fake);
+  await writePayload(fake, V1_PAYLOAD);
+  const before = await readFile(keyFile(), "utf8");
+
+  expect(await store.check(BINDING_1)).toEqual({ key: "ready", model: null });
+  expect(await store.read(BINDING_1)).toEqual({
+    key: SENTINEL_KEY,
+    model: null,
+  });
+  // Reading changes nothing: the old file stays as it was.
+  expect(await readFile(keyFile(), "utf8")).toBe(before);
+
+  // A model chosen later writes the current version with the same key.
+  await store.setModel(BINDING_1, "claude-haiku-5-5");
+  expect(await payloadOf(fake)).toEqual({
+    ...V1_PAYLOAD,
+    version: 2,
+    model: "claude-haiku-5-5",
+  });
+  expect(await store.read(BINDING_1)).toEqual({
+    key: SENTINEL_KEY,
+    model: "claude-haiku-5-5",
+  });
+});
+
+test("a payload whose fields do not match its version is corrupt, and a model is only shape-checked on read", async () => {
+  const fake = fakeSafeStorage();
+  const store = storeWith(fake);
+  for (const fields of [
+    // Version 1 never holds a model, and version 2 always does.
+    { ...V1_PAYLOAD, model: "claude-opus-5-5" },
+    { ...V1_PAYLOAD, version: 2 },
+    // A model that is not a model ID's shape.
+    { ...V1_PAYLOAD, version: 2, model: "" },
+    { ...V1_PAYLOAD, version: 2, model: "Claude Opus" },
+    { ...V1_PAYLOAD, version: 2, model: "claude opus" },
+    { ...V1_PAYLOAD, version: 2, model: "-claude" },
+    { ...V1_PAYLOAD, version: 2, model: `c${"x".repeat(64)}` },
+    { ...V1_PAYLOAD, version: 2, model: 5 },
+    { ...V1_PAYLOAD, version: 2, model: ["claude-opus-5-5"] },
+  ]) {
+    await writePayload(fake, fields);
+    await expectRejection(() => store.read(BINDING_1), "corrupt");
+  }
+  await writePayload(fake, { ...V1_PAYLOAD, version: 3, model: "x" });
+  await expectRejection(() => store.check(BINDING_1), "newer_format");
+
+  // A model of the right shape outside the closed list keeps the key
+  // readable; models.ts decides whether it counts.
+  await writePayload(fake, {
+    ...V1_PAYLOAD,
+    version: 2,
+    model: "claude-opus-9-9",
+  });
+  expect(await store.check(BINDING_1)).toEqual({
+    key: "ready",
+    model: "claude-opus-9-9",
+  });
+  await writePayload(fake, { ...V1_PAYLOAD, version: 2, model: null });
+  expect(await store.read(BINDING_1)).toEqual({
+    key: SENTINEL_KEY,
+    model: null,
+  });
+});
+
+test("only a model of the closed list, or null, is stored: anything else is refused before anything is encrypted, and the previous file stays", async () => {
+  const fake = fakeSafeStorage();
+  const store = storeWith(fake);
+  await store.save(BINDING_1, OTHER_KEY, "claude-opus-5-5");
+  const before = await readFile(keyFile(), "utf8");
+  const encrypts = fake.calls.filter((call) => call === "encryptStringAsync");
+  for (const model of [
+    "claude-opus-4-8",
+    "claude-opus-5-5-20260401",
+    "Claude-Opus-5-5",
+    " claude-opus-5-5",
+    "claude-fable-5-1",
+    "gpt-5",
+    "",
+    undefined,
+    7,
+    { id: "claude-opus-5-5" },
+  ]) {
+    await expectRejection(
+      () => store.save(BINDING_1, SENTINEL_KEY, model as ClaudeModel),
+      "invalid_model",
+    );
+    await expectRejection(
+      () => store.setModel(BINDING_1, model as ClaudeModel),
+      "invalid_model",
+    );
+  }
+  // setModel never takes the model away.
+  await expectRejection(
+    () => store.setModel(BINDING_1, null as unknown as ClaudeModel),
+    "invalid_model",
+  );
+  expect(
+    fake.calls.filter((call) => call === "encryptStringAsync").length,
+  ).toBe(encrypts.length);
+  expect(await readFile(keyFile(), "utf8")).toBe(before);
+  for (const model of [
+    "claude-fable-5-2",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+    null,
+  ] as const) {
+    await store.save(BINDING_1, SENTINEL_KEY, model);
+    expect(await store.check(BINDING_1)).toEqual({ key: "ready", model });
+  }
+});
+
+test("setModel changes the model of a stored key without its caller knowing the key, atomically, and fails closed", async () => {
+  const fake = fakeSafeStorage();
+  const store = storeWith(fake);
+  await expectRejection(
+    () => store.setModel(BINDING_1, "claude-opus-5-5"),
+    "missing",
+  );
+  await expect(readdir(keyFolder)).rejects.toThrow();
+
+  await store.save(BINDING_1, SENTINEL_KEY, "claude-opus-5-5");
+  await store.save(BINDING_2, OTHER_KEY, "claude-haiku-5-5");
+  await store.setModel(BINDING_1, "claude-sonnet-5-5");
+  expect(await store.read(BINDING_1)).toEqual({
+    key: SENTINEL_KEY,
+    model: "claude-sonnet-5-5",
+  });
+  // The other connection is untouched, and no temporary file is left.
+  expect(await store.read(BINDING_2)).toEqual({
+    key: OTHER_KEY,
+    model: "claude-haiku-5-5",
+  });
+  expect((await readdir(keyFolder)).sort()).toEqual(
+    [`${CONNECTION_1}.json`, `${CONNECTION_2}.json`].sort(),
+  );
+
+  // Without the system's protection, nothing is written.
+  const before = await readFile(keyFile(), "utf8");
+  fake.state.available = false;
+  await expectRejection(
+    () => store.setModel(BINDING_1, "claude-haiku-5-5"),
+    "system_protection_unavailable",
+  );
+  fake.state.available = true;
+  expect(await readFile(keyFile(), "utf8")).toBe(before);
+
+  // A file that does not open for this binding is never rewritten.
+  const otherDevice = { ...BINDING_1, deviceId: OTHER_DEVICE_ID };
+  await expectRejection(
+    () => store.setModel(otherDevice, "claude-haiku-5-5"),
+    "bound_elsewhere",
+  );
+  fake.state.failDecrypt = true;
+  await expectRejection(
+    () => store.setModel(BINDING_1, "claude-haiku-5-5"),
+    "unreadable",
+  );
+  fake.state.failDecrypt = false;
+  expect(await readFile(keyFile(), "utf8")).toBe(before);
+
+  // Removing the key removes its model with it.
+  await store.remove(CONNECTION_1);
+  expect(await store.check(BINDING_1)).toEqual({ key: "missing" });
+  await expectRejection(
+    () => store.setModel(BINDING_1, "claude-opus-5-5"),
+    "missing",
+  );
 });
 
 test("no error of the store holds the key, a cause, or file content: every message is fixed per code", async () => {
@@ -875,9 +1113,11 @@ const sources = readdirSync(moduleFolder)
 
 test("the module never calls the synchronous safeStorage API, never logs, and never sets a cause", () => {
   expect(sources.map(({ name }) => name).sort()).toEqual([
+    "credential.ts",
     "device-removal.ts",
     "errors.ts",
     "key-file.ts",
+    "models.ts",
     "store.ts",
     "system.ts",
   ]);

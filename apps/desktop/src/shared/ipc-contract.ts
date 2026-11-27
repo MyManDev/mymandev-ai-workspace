@@ -2766,6 +2766,25 @@ export type GrantCapabilityName = (typeof GRANT_CAPABILITIES)[number];
 export const PROVIDER_KIND_VIEWS = Object.freeze(["claude", "codex"] as const);
 
 /**
+ * The models that a person may choose for a Claude connection (#30, the
+ * Project Manager's decisions of 2026-11-26 and 2026-11-27), a closed list
+ * that the main process checks: Claude Fable 5.2, then the Opus, Sonnet,
+ * and Haiku of the current Claude family, from the most capable to the
+ * fastest, by their Claude API model IDs, in the order that the Account
+ * screen offers them. There is no default; the person chooses one when
+ * they enter the connection's key, and the choice is kept on this device
+ * next to the key. No other ID is accepted, also not a custom one. The
+ * renderer keeps a copy with the models' names that its tests compare.
+ */
+export const CLAUDE_MODEL_VIEWS = Object.freeze([
+  "claude-fable-5-2",
+  "claude-opus-5-5",
+  "claude-sonnet-5-5",
+  "claude-haiku-5-5",
+] as const);
+export type ClaudeModelView = (typeof CLAUDE_MODEL_VIEWS)[number];
+
+/**
  * Limits of the grant messages: the grants of the open project's agents
  * that one view holds, the most that the grant records hold
  * (`MAX_ANSWER_LIST_ITEMS`); this device's provider connections, the most
@@ -3748,6 +3767,11 @@ export const PROVIDER_CONNECTION_LIMITS = Object.freeze({
  * - `credential_missing`: the server lists the connection, and this device
  *   holds no usable key for it: no key file, or one that is damaged or
  *   bound to another device or connection.
+ * - `model_missing` (#30, the Project Manager's decision of 2026-11-26): a
+ *   Claude connection whose key is stored and decrypts here, but without a
+ *   model of `CLAUDE_MODEL_VIEWS`: a key stored before models were chosen,
+ *   or a model that this version no longer offers. There is no default
+ *   model; the person chooses one.
  * - `unknown`: this device is offline, the last read of the list failed,
  *   or the key could not be checked (not yet, or the system could not
  *   decrypt it), so the connection is shown as it was last read.
@@ -3757,6 +3781,7 @@ export const PROVIDER_CONNECTION_LIMITS = Object.freeze({
  */
 export const PROVIDER_CONNECTION_STATUSES = Object.freeze([
   "credential_missing",
+  "model_missing",
   "ready",
   "unknown",
 ] as const);
@@ -3795,8 +3820,10 @@ const ProviderConnectionLabelSchema = z
 
 /**
  * One connection of this device as the Account screen shows it: its ID,
- * kind, label, when it was registered, and its status. Nothing else
- * crosses: no device, no account, and no credential.
+ * kind, label, when it was registered, its status, and the model chosen
+ * for it on this device (#30): a model of `CLAUDE_MODEL_VIEWS` for a Claude
+ * connection whose key is stored with one, null otherwise. The model is not
+ * secret; nothing else crosses: no device, no account, and no credential.
  */
 export const ProviderConnectionItemSchema = z.object({
   id: ProtocolIdSchema,
@@ -3804,6 +3831,7 @@ export const ProviderConnectionItemSchema = z.object({
   label: ProviderConnectionLabelSchema,
   createdAt: TimestampSchema,
   status: z.enum(PROVIDER_CONNECTION_STATUSES),
+  model: z.enum(CLAUDE_MODEL_VIEWS).nullable(),
 });
 export type ProviderConnectionItemView = z.infer<
   typeof ProviderConnectionItemSchema
@@ -3946,12 +3974,16 @@ export const PROVIDER_KEY_LIMITS = Object.freeze({ key: 512 });
 
 /**
  * What the renderer sends, once, to store a provider key for a connection
- * of this device: the connection's ID and the key, and no other key. No
- * channel ever sends a key back.
+ * of this device: the connection's ID, the key, and the model chosen for it
+ * (#30), and no other key. `model` is always present: a model of
+ * `CLAUDE_MODEL_VIEWS` for a Claude connection, which the main process
+ * requires, and null for a connection of another kind, which has no model
+ * to choose yet. No channel ever sends a key back.
  */
 export const SaveProviderKeyViewSchema = z.strictObject({
   providerConnectionId: ProtocolIdSchema,
   key: z.string().min(1).max(PROVIDER_KEY_LIMITS.key),
+  model: z.enum(CLAUDE_MODEL_VIEWS).nullable(),
 });
 export type SaveProviderKeyView = z.infer<typeof SaveProviderKeyViewSchema>;
 
@@ -3960,6 +3992,9 @@ export type SaveProviderKeyView = z.infer<typeof SaveProviderKeyViewSchema>;
  *
  * - `invalid`: the key has white space, a control or format character, or
  *   is not well-formed text. Nothing was stored.
+ * - `invalid_model`: no model of `CLAUDE_MODEL_VIEWS` for a Claude
+ *   connection, or a model for a connection of another kind. Nothing was
+ *   stored.
  * - `not_signed_in`: no signed-in device with a ready key.
  * - `not_listed`: the connection is not in the list that the main process
  *   holds, or the server confirmed its removal.
@@ -3972,6 +4007,7 @@ export type SaveProviderKeyView = z.infer<typeof SaveProviderKeyViewSchema>;
  */
 export const SAVE_PROVIDER_KEY_REFUSALS = Object.freeze([
   "invalid",
+  "invalid_model",
   "not_signed_in",
   "not_listed",
   "busy",
@@ -4010,6 +4046,49 @@ export const RemoveProviderKeyResultSchema = z.discriminatedUnion("outcome", [
 ]);
 export type RemoveProviderKeyResult = z.infer<
   typeof RemoveProviderKeyResultSchema
+>;
+
+/**
+ * What the renderer sends to change the model of a Claude connection whose
+ * key is stored on this device, without entering the key again (#30): the
+ * connection's ID and a model of `CLAUDE_MODEL_VIEWS`, and no other key.
+ */
+export const SetProviderModelViewSchema = z.strictObject({
+  providerConnectionId: ProtocolIdSchema,
+  model: z.enum(CLAUDE_MODEL_VIEWS),
+});
+export type SetProviderModelView = z.infer<typeof SetProviderModelViewSchema>;
+
+/**
+ * Why changing the model was refused: `invalid`, `not_signed_in`,
+ * `not_listed`, `busy`, `protection_unavailable`, and `failed` as for
+ * storing a key (nothing was changed), and:
+ *
+ * - `invalid_model`: the connection is not a Claude connection, so it has
+ *   no model to choose.
+ * - `credential_missing`: this device holds no usable key for the
+ *   connection; the model is chosen when a key is entered.
+ */
+export const SET_PROVIDER_MODEL_REFUSALS = Object.freeze([
+  "invalid",
+  "invalid_model",
+  "not_signed_in",
+  "not_listed",
+  "busy",
+  "credential_missing",
+  "protection_unavailable",
+  "failed",
+] as const);
+export type SetProviderModelRefusal =
+  (typeof SET_PROVIDER_MODEL_REFUSALS)[number];
+
+/** The result of changing the model: `ok` or `refused`, never the key. */
+export const SetProviderModelResultSchema = z.discriminatedUnion("outcome", [
+  z.object({ outcome: z.literal("ok") }),
+  createRefusedSchema(SET_PROVIDER_MODEL_REFUSALS),
+]);
+export type SetProviderModelResult = z.infer<
+  typeof SetProviderModelResultSchema
 >;
 
 /** The schemas of every invoke channel. */
@@ -4478,9 +4557,14 @@ export const INVOKE_CONTRACT = Object.freeze({
     result: RemoveProviderConnectionResultSchema,
   }),
   [INVOKE_CHANNELS.saveProviderKey]: Object.freeze({
-    /** A connection ID and a key, and no other key. */
+    /** A connection ID, a key, and a model or null, and no other key. */
     args: z.tuple([SaveProviderKeyViewSchema]),
     result: SaveProviderKeyResultSchema,
+  }),
+  [INVOKE_CHANNELS.setProviderModel]: Object.freeze({
+    /** A connection ID and a model of the closed list, and no other key. */
+    args: z.tuple([SetProviderModelViewSchema]),
+    result: SetProviderModelResultSchema,
   }),
   [INVOKE_CHANNELS.removeProviderKey]: Object.freeze({
     /** The ID of a connection of the list. */

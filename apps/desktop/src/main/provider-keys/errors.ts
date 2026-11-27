@@ -9,6 +9,7 @@ export const PROVIDER_KEY_ERROR_CODES = Object.freeze([
   "folder_unavailable",
   "system_protection_unavailable",
   "invalid_key",
+  "invalid_model",
   "invalid_binding",
   "missing",
   "unreadable",
@@ -27,6 +28,7 @@ const MESSAGES: Readonly<Record<ProviderKeyErrorCode, string>> = Object.freeze({
   system_protection_unavailable:
     "The system cannot protect a provider key, so none is stored.",
   invalid_key: `The provider key must be 1 to ${String(PROVIDER_KEY_LIMITS.key)} characters without white space or control characters.`,
+  invalid_model: "The model is not one of the models that can be chosen.",
   invalid_binding: "The device ID or the provider connection ID is not valid.",
   missing: "No provider key is stored for this connection.",
   unreadable: "The system could not decrypt the provider key.",
