@@ -3,6 +3,7 @@
 // privilege, and symbolic links elsewhere. A symbolic link to a file needs
 // a privilege on Windows: those cases are skipped there when it is missing,
 // and the fake file system of `read-tools.test.ts` covers them.
+import { execFile } from "node:child_process";
 import {
   link,
   lstat,
@@ -13,6 +14,7 @@ import {
   rename,
   rm,
   symlink,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -51,6 +53,11 @@ const RUN: HeldRun = Object.freeze({
 }) as HeldRun;
 
 const windows = process.platform === "win32";
+/**
+ * The tests that wait for settled change times: up to 2.1 s per wait on a
+ * file system with stamps of whole seconds, and longer on a busy machine.
+ */
+const WAITING_TEST_TIMEOUT_MS = 30_000;
 const bases: string[] = [];
 
 afterEach(async () => {
@@ -236,41 +243,143 @@ test("on Windows, a path in another case is refused as an alias", async (context
   );
 });
 
+/** The system's file system, with a hook before every call. */
+function scheduled(
+  before: (
+    operation: keyof ReadToolFileSystem,
+    target: string,
+  ) => Promise<void>,
+): ReadToolFileSystem {
+  const system = createSystemReadToolFileSystem();
+  return {
+    realpath: async (target) => {
+      await before("realpath", target);
+      return system.realpath(target);
+    },
+    lstat: async (target) => {
+      await before("lstat", target);
+      return system.lstat(target);
+    },
+    open: async (target) => {
+      await before("open", target);
+      return system.open(target);
+    },
+    readdir: async (target, limit) => {
+      await before("readdir", target);
+      return system.readdir(target, limit);
+    },
+  };
+}
+
 /** The system's file system, with a hook before the n-th call of an operation. */
 function hooked(
   operation: keyof ReadToolFileSystem,
   nth: number,
   hook: () => Promise<void>,
 ): ReadToolFileSystem {
-  const system = createSystemReadToolFileSystem();
   let count = 0;
-  const before = async (name: keyof ReadToolFileSystem) => {
+  return scheduled(async (name) => {
     if (name === operation) {
       count += 1;
       if (count === nth) {
         await hook();
       }
     }
-  };
-  return {
-    realpath: async (target) => {
-      await before("realpath");
-      return system.realpath(target);
-    },
-    lstat: async (target) => {
-      await before("lstat");
-      return system.lstat(target);
-    },
-    open: async (target) => {
-      await before("open");
-      return system.open(target);
-    },
-    readdir: async (target, limit) => {
-      await before("readdir");
-      return system.readdir(target, limit);
-    },
+  });
+}
+
+/**
+ * Switches `src/sub` of the layout between itself and a junction or link
+ * to the folder outside, by renaming it aside and back, as a process that
+ * can write in the repository can.
+ */
+function subSwitch(repo: string, outside: string) {
+  const sub = path.join(repo, "src", "sub");
+  const held = path.join(repo, "src", "sub-held");
+  let linked = false;
+  return async (state: "folder" | "link") => {
+    if (state === "link" && !linked) {
+      await rename(sub, held);
+      await folderLink(outside, sub);
+      linked = true;
+    } else if (state === "folder" && linked) {
+      await unlink(sub);
+      await rename(held, sub);
+      linked = false;
+    }
   };
 }
+
+/** Waits until a change time is older than the read tools' margin. */
+async function settle(changeTime: bigint): Promise<void> {
+  const margin = changeTime % 1_000_000_000n === 0n ? 2_100 : 120;
+  const wait = Number(changeTime / 1_000_000n) + margin - Date.now();
+  if (wait > 0) {
+    await new Promise((resolve) => setTimeout(resolve, wait));
+  }
+}
+
+async function changeTimeOf(target: string): Promise<bigint> {
+  return (await lstat(target, { bigint: true })).ctimeNs;
+}
+
+test(
+  "the file system moves a folder's change time when an entry in it is created, renamed, or removed, a junction or link included, which the read tools rely on",
+  async () => {
+    const { repo, outside } = await layout();
+    const folder = path.join(repo, "src");
+    const steps: [string, () => Promise<void>][] = [
+      ["create a file", () => writeFile(path.join(folder, "new.txt"), "")],
+      [
+        "rename a folder aside",
+        () => rename(path.join(folder, "sub"), path.join(folder, "sub-held")),
+      ],
+      ["create a link", () => folderLink(outside, path.join(folder, "sub"))],
+      ["remove a link", () => unlink(path.join(folder, "sub"))],
+      [
+        "rename a folder back",
+        () => rename(path.join(folder, "sub-held"), path.join(folder, "sub")),
+      ],
+      ["remove a file", () => rm(path.join(folder, "new.txt"))],
+    ];
+    for (const [step, change] of steps) {
+      const before = await changeTimeOf(folder);
+      expect(before, step).toBeGreaterThan(0n);
+      await settle(before);
+      await change();
+      expect(await changeTimeOf(folder), step).not.toBe(before);
+    }
+  },
+  WAITING_TEST_TIMEOUT_MS,
+);
+
+test(
+  "on Windows, a junction removed in place moves the folder's own change time, which the read tools rely on for a folder made a junction in place",
+  async (context) => {
+    if (!windows) {
+      context.skip("only Windows makes a folder a link in place");
+    }
+    const { repo, outside } = await layout();
+    const junction = path.join(repo, "src", "junction");
+    await folderLink(outside, junction);
+    const before = await lstat(junction, { bigint: true });
+    await settle(before.ctimeNs);
+    const removed = await new Promise<boolean>((resolve) => {
+      execFile("fsutil", ["reparsepoint", "delete", junction], (error) =>
+        resolve(error === null),
+      );
+    });
+    if (!removed) {
+      context.skip("fsutil cannot remove a reparse point for this user");
+    }
+    const after = await lstat(junction, { bigint: true });
+    expect(after.isDirectory()).toBe(true);
+    expect(after.isSymbolicLink()).toBe(false);
+    expect(after.ino).toBe(before.ino);
+    expect(after.ctimeNs).not.toBe(before.ctimeNs);
+  },
+  WAITING_TEST_TIMEOUT_MS,
+);
 
 test("TOCTOU: a folder swapped for a junction or link to a folder outside before the open is refused", async () => {
   const { repo, outside } = await layout();
@@ -300,6 +409,43 @@ test("TOCTOU: a file swapped for a link to a file outside before the open is ref
   expect(answer).toEqual(refusal("changed"));
   expect(JSON.stringify(answer)).not.toContain("outside");
 });
+
+test(
+  "TOCTOU (the former known limit): a folder that is a junction or link outside exactly for the file's lstat and open is refused: on Linux by the open file's path, elsewhere by its parent's change time",
+  async () => {
+    const { repo, outside } = await layout();
+    const target = path.join(repo, "src", "sub", "file.txt");
+    const switchSub = subSwitch(repo, outside);
+    const files = scheduled(async (operation, at) => {
+      const forTheFile =
+        (operation === "lstat" && at === target) || operation === "open";
+      await switchSub(forTheFile ? "link" : "folder");
+    });
+    const { read } = toolsOf(files);
+    const answer = await runTool(read, repo, { path: "src/sub/file.txt" });
+    expect(answer).toEqual(
+      refusal(process.platform === "linux" ? "changed" : "unsettled"),
+    );
+    expect(JSON.stringify(answer)).not.toContain("outside");
+  },
+  WAITING_TEST_TIMEOUT_MS,
+);
+
+test(
+  "TOCTOU (the former listing window): a folder that is a junction or link outside exactly for its listing is refused by its parent's change time",
+  async () => {
+    const { repo, outside } = await layout();
+    const switchSub = subSwitch(repo, outside);
+    const files = scheduled(async (operation) => {
+      await switchSub(operation === "readdir" ? "link" : "folder");
+    });
+    const { list } = toolsOf(files);
+    const answer = await runTool(list, repo, { path: "src/sub" });
+    expect(answer).toEqual(refusal("unsettled"));
+    expect(JSON.stringify(answer)).not.toContain("secret");
+  },
+  WAITING_TEST_TIMEOUT_MS,
+);
 
 test("TOCTOU: a folder swapped for a junction or link while it is listed is refused", async () => {
   const { repo, outside } = await layout();

@@ -20,28 +20,65 @@
 //    short name, which the real path writes otherwise (defaults until the
 //    Project Manager decides).
 // 4. Every folder from the repository's folder down to the path's parent is
-//    read with `lstat` and recorded: each must be a folder, not a link
-//    (`changed`), on the repository's device (`other_device`), and so must
-//    the file or folder itself: a mount of another file system (another
-//    device) inside the repository is refused. A bind mount from the same
-//    file system keeps its device and is not seen (README, "Mounts").
-// 5. A file is opened read-only (with `O_NOFOLLOW` and `O_NONBLOCK` where
+//    read with `lstat` and recorded with its change time: each must be a
+//    folder, not a link (`changed`), on the repository's device
+//    (`other_device`), and so must the file or folder itself: a mount of
+//    another file system (another device) inside the repository is refused.
+//    A bind mount from the same file system keeps its device and is not
+//    seen (README, "Mounts").
+// 5. The change times of these folders, and of a folder to list, must be
+//    settled: older than the start of the call by more than the steps of
+//    the file system's clock (`READ_TOOL_SETTLING`). Otherwise the call
+//    waits and starts again; after three attempts it is refused
+//    (`unsettled`).
+// 6. A file is opened read-only (with `O_NOFOLLOW` and `O_NONBLOCK` where
 //    the system has them), and checked after the open: its `fstat` must be
 //    on the repository's device, a regular file with one link, and the same
 //    file as the path's `lstat` before the open; on Linux, its real path
 //    through `/proc/self/fd` must be the path; and then the path must still
 //    resolve to itself, every recorded folder must still be the same folder
 //    and not a link, the path's `lstat` must be the open file, the folders
-//    are checked once more, and the path must resolve to itself again. A
-//    swap is refused (`changed`). A folder is checked the same way before
-//    and after it is listed.
+//    are checked once more, now also with their change times, and the path
+//    must resolve to itself again. A swap is refused (`changed`); a change
+//    time that moved starts the call again (step 5). A folder is checked
+//    the same way before and after it is listed, its own change time
+//    included.
 //
-// Known limit: Node.js cannot open or list relative to an open folder, so
-// every check is a separate call by path. A folder on the path that is
-// switched between itself and a link, so that it is the link for exactly
-// the `lstat` calls of the file and its open (or the listing), and itself
-// for every other call, is not seen where the system cannot name the open
-// file (Windows, macOS), nor for a listing; see the README.
+// Why the change times close the window that checks by path leave (Node.js
+// cannot open or list relative to an open folder, and only Linux names an
+// open file): a folder's change time moves whenever an entry in it is
+// created, removed, renamed, or replaced, and whenever the folder itself
+// becomes a link in place (a junction on Windows). A settled change time
+// that is the same before the open (or the listing) and after the checks
+// that follow it shows that no folder on the path changed in between, so
+// the path named, without any link, the folder that was listed or the file
+// that the checks after the open saw, which is the open file. An answer is
+// given only when the clock did not go back during the attempt, as far as
+// the clock shows it (best effort: `ReadToolOptions.now`).
+//
+// This holds against a process that can change entries inside the
+// repository only if it cannot also set a folder's change time back:
+//
+// - Linux: only root can set a change time, or the clock; and `read_file`
+//   is tied to the path by `/proc/self/fd` whatever the change times are.
+// - macOS: holds only if a user's process cannot set a folder's change time
+//   (`setattrlist` with `ATTR_CMN_CHGTIME`); whether APFS and HFS+ keep
+//   such a change time has not been verified.
+// - Windows: a process of the same user can set a folder's NTFS change time
+//   back (`SetFileInformationByHandle` with `FileBasicInfo`, which needs
+//   only `FILE_WRITE_ATTRIBUTES`) and so pass the check: `read_file` can
+//   then answer a file outside the repository, and `list_directory` the
+//   names of a folder outside. Accepted as a documented limit (Project
+//   Manager decision of 2026-11-26, evening): such a process can already
+//   read the user's files and copy them into the repository.
+//
+// Also remaining: the folders above the repository's folder are not checked
+// by change time, so a process that can rename them can switch the path
+// above the repository for exactly the open (`read_file` on Windows, macOS,
+// and Linux without `/proc`) or the listing (`list_directory` on every
+// system); and a mount placed on a folder for exactly one listing changes
+// no change time (`list_directory`). See the README ("TOCTOU") for these
+// cases and the assumptions about the file system and its clock.
 //
 // No answer holds an absolute path: an answer names the path that the tool
 // got and the names in a folder, never the folder of the repository.
@@ -80,6 +117,27 @@ export const READ_TOOL_LIMITS = Object.freeze({
   maxDirectoryEntries: 1_000,
 });
 
+/**
+ * How the read tools wait for settled change times (defaults until the
+ * Project Manager decides):
+ *
+ * - `marginMs`: a folder's change time must be older than the start of the
+ *   call by more than this, which is more than the steps of the clocks that
+ *   stamp change times (NTFS and ReFS: one tick of the system clock, at
+ *   most 15.625 ms; ext4: one tick of the kernel; APFS: finer).
+ * - `coarseMarginMs`: the same for a change time on a whole second, which
+ *   may come from a file system that stamps whole seconds (HFS+, ext3) or
+ *   two seconds (FAT).
+ * - `attempts`: how often a call starts, at most, before it is refused
+ *   (`unsettled`); it waits for the change times before each new attempt,
+ *   at most `coarseMarginMs + marginMs` each time.
+ */
+export const READ_TOOL_SETTLING = Object.freeze({
+  marginMs: 100,
+  coarseMarginMs: 2_000,
+  attempts: 3,
+});
+
 /** The names of the read tools (defaults until the Project Manager decides). */
 export const READ_TOOL_NAMES = Object.freeze({
   listDirectory: "list_directory",
@@ -96,6 +154,12 @@ export interface ToolFileStat {
   readonly ino: bigint;
   readonly nlink: bigint;
   readonly size: bigint;
+  /**
+   * The change time (`ctime`; on Windows the change time of NTFS, not the
+   * creation time), in nanoseconds since 1970, or 0 where the file system
+   * has none.
+   */
+  readonly ctime: bigint;
 }
 
 /** A file that the read tools opened, read-only. */
@@ -302,44 +366,150 @@ async function resolveInside(
 }
 
 /**
- * Whether every recorded folder, in order from the repository's folder
- * down, is still a folder, not a link, with its device and file number.
+ * What the checks after an open or a listing found: everything in place;
+ * everything the same entry, but a change time moved (`moved`, the call
+ * starts again); or a swap (`changed`).
+ */
+type PlaceCheck = "same" | "moved" | "changed";
+
+/**
+ * Checks every recorded folder, in order from the repository's folder down:
+ * still a folder, not a link, with its device and file number (`changed`
+ * otherwise); with `changeTimes`, also with its change time (`moved`
+ * otherwise).
  */
 async function foldersInPlace(
   files: ReadToolFileSystem,
   folders: readonly CheckedFolder[],
-): Promise<boolean> {
+  changeTimes: boolean,
+): Promise<PlaceCheck> {
+  let moved = false;
   for (const folder of folders) {
-    if (!sameEntry(await files.lstat(folder.path), folder.stat)) {
-      return false;
+    const stat = await files.lstat(folder.path);
+    if (!sameEntry(stat, folder.stat)) {
+      return "changed";
+    }
+    if (changeTimes && stat.ctime !== folder.stat.ctime) {
+      moved = true;
     }
   }
-  return true;
+  return moved ? "moved" : "same";
 }
 
 /**
  * Checks after an open or a listing, in this order: the path still
  * resolves to itself, its folders are still in place, its `lstat` is still
- * `expected`, its folders are still in place, and the path still resolves
- * to itself.
+ * `expected` (with its change time too, for a listed folder), its folders
+ * are still in place with their change times, and the path still resolves
+ * to itself. A change time never goes back, so the last check of the
+ * folders sees every change since their first `lstat`.
  */
 async function stillInPlace(
   files: ReadToolFileSystem,
   resolved: Resolved,
   expected: ToolFileStat,
-): Promise<boolean> {
+  listedFolder: boolean,
+): Promise<PlaceCheck> {
   const { real, folders } = resolved;
   try {
-    return (
-      (await files.realpath(real)) === real &&
-      (await foldersInPlace(files, folders)) &&
-      sameEntry(await files.lstat(real), expected) &&
-      (await foldersInPlace(files, folders)) &&
-      (await files.realpath(real)) === real
-    );
+    if (
+      (await files.realpath(real)) !== real ||
+      (await foldersInPlace(files, folders, false)) !== "same"
+    ) {
+      return "changed";
+    }
+    const stat = await files.lstat(real);
+    if (!sameEntry(stat, expected)) {
+      return "changed";
+    }
+    const last = await foldersInPlace(files, folders, true);
+    if (last === "changed" || (await files.realpath(real)) !== real) {
+      return "changed";
+    }
+    return last === "moved" || (listedFolder && stat.ctime !== expected.ctime)
+      ? "moved"
+      : "same";
   } catch {
-    return false;
+    return "changed";
   }
+}
+
+const NANOSECONDS_PER_MILLISECOND = 1_000_000n;
+const NANOSECONDS_PER_SECOND = 1_000_000_000n;
+
+/** A call to start again once the change times are settled. */
+interface Unsettled {
+  readonly unsettled: true;
+  /** How long to wait first, in milliseconds. */
+  readonly waitMs: number;
+}
+
+const MOVED: Unsettled = Object.freeze({ unsettled: true, waitMs: 0 });
+
+/**
+ * Whether the change times of these folders are settled at `started`, the
+ * start of the attempt in nanoseconds since 1970: each must be older by
+ * more than the margin of `READ_TOOL_SETTLING`, the coarse one for a change
+ * time on a whole second. Then any later change of an entry, which the
+ * file system stamps with a later step of its clock, moves the change time.
+ * A file system without change times cannot show a change: `read_failed`
+ * (fail closed).
+ *
+ * A change time in the future (the clock went back after it was stamped:
+ * an NTP correction backwards, or a dual boot in which one system keeps
+ * the hardware clock in local time and the other in UTC) is never settled:
+ * every call under that folder is refused (`unsettled`) until real time
+ * passes it by the margin; an entry in that folder that changes stamps it
+ * anew with the clock, and calls under it settle once that new change
+ * time is older than the margin.
+ */
+function settledAt(
+  stats: readonly ToolFileStat[],
+  started: bigint,
+): Failure | Unsettled | null {
+  let wait = 0n;
+  for (const stat of stats) {
+    if (stat.ctime <= 0n) {
+      return failed("read_failed");
+    }
+    const margin =
+      BigInt(
+        stat.ctime % NANOSECONDS_PER_SECOND === 0n
+          ? READ_TOOL_SETTLING.coarseMarginMs
+          : READ_TOOL_SETTLING.marginMs,
+      ) * NANOSECONDS_PER_MILLISECOND;
+    const left = stat.ctime + margin - started;
+    if (left >= 0n && left + 1n > wait) {
+      wait = left + 1n;
+    }
+  }
+  if (wait === 0n) {
+    return null;
+  }
+  const most = READ_TOOL_SETTLING.coarseMarginMs + READ_TOOL_SETTLING.marginMs;
+  const waitMs =
+    (wait + NANOSECONDS_PER_MILLISECOND - 1n) / NANOSECONDS_PER_MILLISECOND;
+  return Object.freeze({
+    unsettled: true,
+    waitMs: waitMs > BigInt(most) ? most : Number(waitMs),
+  });
+}
+
+/** Waits `ms`, or less once the signal aborts. */
+function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal.addEventListener("abort", done, { once: true });
+  });
 }
 
 /** Whether the name of a folder's entry may be shown (`segmentRefusal`). */
@@ -368,6 +538,16 @@ export interface ReadToolOptions {
   readonly files: ReadToolFileSystem;
   /** The system's path functions, `node:path` by default. */
   readonly pathApi?: PlatformPath;
+  /**
+   * The clock that the change times are compared with, in milliseconds
+   * since 1970: `Date.now` by default, which follows the system clock that
+   * stamps them. The check that it did not go back during an attempt is
+   * best effort: on Windows, `Date.now` may not reflect a small step back
+   * of the system clock immediately.
+   */
+  readonly now?: () => number;
+  /** Waits for settled change times; a timer by default. */
+  readonly sleep?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
 /**
@@ -378,16 +558,70 @@ export interface ReadToolOptions {
 export function createReadTools(options: ReadToolOptions): readonly Tool[] {
   const files = options.files;
   const pathApi = options.pathApi ?? path;
+  const now = options.now ?? Date.now;
+  const sleep = options.sleep ?? sleepUnlessAborted;
+  const nowNs = () => BigInt(Math.floor(now())) * NANOSECONDS_PER_MILLISECOND;
 
-  async function listDirectory(
+  /**
+   * Runs `attempt` until it settles, at most `READ_TOOL_SETTLING.attempts`
+   * times, with the start of each attempt; it waits as long as an attempt
+   * asks before the next. The last attempt that does not settle is refused
+   * (`unsettled`).
+   */
+  async function settled(
+    context: ToolRunContext,
+    attempt: (started: bigint) => Promise<ToolRunOutcome | Unsettled>,
+  ): Promise<ToolRunOutcome> {
+    for (let count = 1; ; count += 1) {
+      if (context.signal.aborted) {
+        return ABORTED;
+      }
+      const started = nowNs();
+      let outcome = await attempt(started);
+      // A clock set back during the attempt could stamp a change with the
+      // change time of an earlier one: an answer is given only when `now`
+      // did not go back before the attempt's start. Best effort: `now` may
+      // not show a small step back of the system clock at once (see
+      // `ReadToolOptions.now`).
+      if ("ok" in outcome && outcome.ok && nowNs() < started) {
+        outcome = MOVED;
+      }
+      if (!("unsettled" in outcome)) {
+        return outcome;
+      }
+      // An abort during the attempt answers `aborted`, also when the
+      // attempt saw a change time move, and on the last attempt.
+      if (context.signal.aborted) {
+        return ABORTED;
+      }
+      if (count >= READ_TOOL_SETTLING.attempts) {
+        return failed("path_refused", "unsettled");
+      }
+      if (outcome.waitMs > 0) {
+        await sleep(outcome.waitMs, context.signal);
+      }
+    }
+  }
+
+  function listDirectory(
     input: { path: string },
     context: ToolRunContext,
   ): Promise<ToolRunOutcome> {
     const parsed = parseRepositoryPath(input.path);
     if (!parsed.ok) {
-      return failed("path_refused", parsed.reason);
+      return Promise.resolve(failed("path_refused", parsed.reason));
     }
-    const resolved = await resolveInside(files, pathApi, context, parsed.path);
+    return settled(context, (started) =>
+      listOnce(parsed.path, context, started),
+    );
+  }
+
+  async function listOnce(
+    target: RepositoryPath,
+    context: ToolRunContext,
+    started: bigint,
+  ): Promise<ToolRunOutcome | Unsettled> {
+    const resolved = await resolveInside(files, pathApi, context, target);
     if (!("real" in resolved)) {
       return resolved;
     }
@@ -406,13 +640,22 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
     if (before.dev !== resolved.dev) {
       return failed("path_refused", "other_device");
     }
+    // The folder itself counts too: on Windows, an empty folder can become
+    // a junction in place, which moves only its own change time.
+    const unsettled = settledAt(
+      [...resolved.folders.map((folder) => folder.stat), before],
+      started,
+    );
+    if (unsettled !== null) {
+      return unsettled;
+    }
     if (context.signal.aborted) {
       return ABORTED;
     }
     // The folders on the path are checked again right before the listing,
     // and again after it with the folder itself.
     try {
-      if (!(await foldersInPlace(files, resolved.folders))) {
+      if ((await foldersInPlace(files, resolved.folders, false)) !== "same") {
         return failed("path_refused", "changed");
       }
     } catch {
@@ -427,8 +670,9 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
     } catch {
       return failed("read_failed");
     }
-    if (!(await stillInPlace(files, resolved, before))) {
-      return failed("path_refused", "changed");
+    const place = await stillInPlace(files, resolved, before, true);
+    if (place !== "same") {
+      return place === "moved" ? MOVED : failed("path_refused", "changed");
     }
     if (context.signal.aborted) {
       return ABORTED;
@@ -443,7 +687,7 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
     return {
       ok: true,
       result: {
-        path: parsed.path.text,
+        path: target.text,
         entries,
         omitted: read.length - entries.length,
         truncated:
@@ -453,17 +697,34 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
     };
   }
 
-  async function readFile(
+  function readFile(
     input: { path: string },
     context: ToolRunContext,
   ): Promise<ToolRunOutcome> {
     const parsed = parseRepositoryPath(input.path);
     if (!parsed.ok) {
-      return failed("path_refused", parsed.reason);
+      return Promise.resolve(failed("path_refused", parsed.reason));
     }
-    const resolved = await resolveInside(files, pathApi, context, parsed.path);
+    return settled(context, (started) =>
+      readOnce(parsed.path, context, started),
+    );
+  }
+
+  async function readOnce(
+    target: RepositoryPath,
+    context: ToolRunContext,
+    started: bigint,
+  ): Promise<ToolRunOutcome | Unsettled> {
+    const resolved = await resolveInside(files, pathApi, context, target);
     if (!("real" in resolved)) {
       return resolved;
+    }
+    const unsettled = settledAt(
+      resolved.folders.map((folder) => folder.stat),
+      started,
+    );
+    if (unsettled !== null) {
+      return unsettled;
     }
     if (context.signal.aborted) {
       return ABORTED;
@@ -526,8 +787,11 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
       if (openedPath !== undefined && openedPath !== resolved.real) {
         return failed("path_refused", "changed");
       }
-      if (!(await stillInPlace(files, resolved, opened))) {
-        return failed("path_refused", "changed");
+      // From here on the content comes from the open file, which the checks
+      // tied to the path; a later change of the path changes nothing read.
+      const place = await stillInPlace(files, resolved, opened, false);
+      if (place !== "same") {
+        return place === "moved" ? MOVED : failed("path_refused", "changed");
       }
 
       const limit = READ_TOOL_LIMITS.maxFileBytes;
@@ -562,7 +826,7 @@ export function createReadTools(options: ReadToolOptions): readonly Tool[] {
       return {
         ok: true,
         result: {
-          path: parsed.path.text,
+          path: target.text,
           size: Number(opened.size),
           truncated,
           binary: content === null,
@@ -626,6 +890,7 @@ function statOf(stats: fs.BigIntStats): ToolFileStat {
     ino: stats.ino,
     nlink: stats.nlink,
     size: stats.size,
+    ctime: stats.ctimeNs,
   });
 }
 

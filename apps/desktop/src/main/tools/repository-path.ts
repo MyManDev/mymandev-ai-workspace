@@ -14,8 +14,9 @@
 
 /**
  * Why a path is refused, a closed list. The lexical reasons come from
- * `parseRepositoryPath`; `outside`, `alias`, `hard_link`, and `changed` come
- * from the read tools, after the file system was read.
+ * `parseRepositoryPath`; `outside`, `alias`, `hard_link`, `changed`,
+ * `other_device`, and `unsettled` come from the read tools, after the file
+ * system was read.
  *
  * - `not_text`: the path is not a string.
  * - `empty`: the path is empty.
@@ -55,6 +56,10 @@
  * - `other_device`: the file or a folder on its path lies on another device
  *   than the repository's folder: a mount of another file system inside
  *   the repository (default until the Project Manager decides).
+ * - `unsettled`: a folder on the path, or the folder to list, kept changing:
+ *   its change time was too recent, or moved during the call, at every
+ *   attempt (`READ_TOOL_SETTLING`). Nothing was answered; a later call may
+ *   pass.
  */
 export const REPOSITORY_PATH_REFUSALS = Object.freeze([
   "not_text",
@@ -80,6 +85,7 @@ export const REPOSITORY_PATH_REFUSALS = Object.freeze([
   "hard_link",
   "changed",
   "other_device",
+  "unsettled",
 ] as const);
 export type RepositoryPathRefusal = (typeof REPOSITORY_PATH_REFUSALS)[number];
 

@@ -52,6 +52,12 @@ class FakeFiles implements ReadToolFileSystem {
   /** Folders whose `readdir` never returns, as on a stalled network share. */
   readonly hangReaddir = new Set<string>();
   readonly devs = new Map<string, bigint>();
+  /**
+   * Folders that keep changing: their change time moves at every `lstat`.
+   * Every other change time is old and never moves.
+   */
+  readonly busy = new Set<string>();
+  private changes = 1n;
   private nextIno = 2n;
 
   dir(target: string): this {
@@ -127,6 +133,7 @@ class FakeFiles implements ReadToolFileSystem {
       ino: node.ino,
       nlink: 1n,
       size: 0n,
+      ctime: this.busy.has(at) ? (this.changes += 1n) : 1n,
     };
   }
 
@@ -463,7 +470,7 @@ test("a path longer than the read tools take is left out", async () => {
   expect(outcome.truncated).toBe(true);
 });
 
-test("a folder that is gone, on another device, or unreadable when its turn comes is skipped; a swapped listing fails the whole list", async () => {
+test("a folder that is gone, on another device, unreadable, or changing when its turn comes is skipped; a swapped listing fails the whole list", async () => {
   const gone = repository()
     .file(`${ROOT}/a.txt`)
     .dir(`${ROOT}/gone`)
@@ -502,6 +509,24 @@ test("a folder that is gone, on another device, or unreadable when its turn come
   const unreadable = repository().file(`${ROOT}/a.txt`);
   unreadable.failReaddir.set(ROOT, "EACCES");
   expect(await walk(unreadable)).toEqual({ ok: false, reason: "failed" });
+
+  // A subfolder that keeps changing (`unsettled`) is left out, not counted,
+  // and the list says that it was cut; the repository's folder itself fails
+  // the list.
+  const busy = repository()
+    .file(`${ROOT}/a.txt`)
+    .dir(`${ROOT}/tmp`)
+    .file(`${ROOT}/tmp/c.txt`);
+  busy.busy.add(`${ROOT}/tmp`);
+  expect(await walk(busy)).toEqual({
+    ok: true,
+    files: ["a.txt"],
+    folders: 1,
+    truncated: true,
+  });
+  const busyRoot = repository().file(`${ROOT}/a.txt`);
+  busyRoot.busy.add(ROOT);
+  expect(await walk(busyRoot)).toEqual({ ok: false, reason: "failed" });
 
   // The repository's folder is no longer the one that the link recorded.
   const swapped = repository().file(`${ROOT}/a.txt`);

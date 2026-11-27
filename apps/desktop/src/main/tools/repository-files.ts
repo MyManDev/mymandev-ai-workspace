@@ -283,9 +283,13 @@ export function createRepositoryWalkLister(
           if (skipsFolder(outcome)) {
             continue;
           }
-          // A folder that cannot be read (for example without permission)
-          // is left out; a swap stays fatal.
-          if (outcome.code === "read_failed") {
+          // A folder that cannot be read (for example without permission),
+          // or that kept changing (`unsettled`), is left out; a swap stays
+          // fatal.
+          if (
+            outcome.code === "read_failed" ||
+            (outcome.code === "path_refused" && outcome.reason === "unsettled")
+          ) {
             truncated = true;
             continue;
           }
