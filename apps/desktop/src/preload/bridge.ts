@@ -78,6 +78,7 @@ import type {
   RemoveProviderConnectionResult,
   RemoveProviderKeyResult,
   SaveProviderKeyResult,
+  SetProviderModelResult,
   RemoveRepositoryResult,
   RevokeGrantResult,
   RevokeInvitationResult,
@@ -1095,15 +1096,33 @@ export function createDesktopBridge(
         : Promise.reject(
             new TypeError("remove needs a provider connection ID string."),
           ),
-    saveKey: (providerConnectionId: string, key: string) =>
-      typeof providerConnectionId === "string" && typeof key === "string"
+    saveKey: (
+      providerConnectionId: string,
+      key: string,
+      model: string | null,
+    ) =>
+      typeof providerConnectionId === "string" &&
+      typeof key === "string" &&
+      (typeof model === "string" || model === null)
         ? (ipc.invoke(INVOKE_CHANNELS.saveProviderKey, {
             providerConnectionId,
             key,
+            model,
           }) as Promise<SaveProviderKeyResult>)
         : Promise.reject(
             new TypeError(
-              "saveKey needs a provider connection ID and a key string.",
+              "saveKey needs a provider connection ID and a key string, and a model string or null.",
+            ),
+          ),
+    setModel: (providerConnectionId: string, model: string) =>
+      typeof providerConnectionId === "string" && typeof model === "string"
+        ? (ipc.invoke(INVOKE_CHANNELS.setProviderModel, {
+            providerConnectionId,
+            model,
+          }) as Promise<SetProviderModelResult>)
+        : Promise.reject(
+            new TypeError(
+              "setModel needs a provider connection ID and a model string.",
             ),
           ),
     removeKey: (providerConnectionId: string) =>

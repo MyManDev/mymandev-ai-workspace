@@ -12,6 +12,7 @@ import {
   PROVIDER_CONNECTION_MESSAGE_ID,
   PROVIDER_CONNECTIONS_TITLE_ID,
   PROVIDER_KEY_INPUT_ID,
+  PROVIDER_MODEL_INPUT_ID,
   ProviderConnectionQuestionContent,
   ProviderConnectionsContent,
   ProviderConnectionsSection,
@@ -49,6 +50,7 @@ const READY: ProviderConnectionListView = {
       label: MARKUP_LABEL,
       createdAt: AT,
       status: "credential_missing",
+      model: null,
     },
     {
       id: ID_2,
@@ -56,6 +58,7 @@ const READY: ProviderConnectionListView = {
       label: "Home",
       createdAt: AT,
       status: "unknown",
+      model: null,
     },
   ],
 };
@@ -132,8 +135,13 @@ function recorder() {
     onRemove: (row: ProviderConnectionRow) => calls.push(`remove ${row.id}`),
     onAskKey: (row: ProviderConnectionRow) => calls.push(`askKey ${row.id}`),
     onKey: (text) => calls.push(`key ${text}`),
+    onModel: (model) => calls.push(`model ${model}`),
     onSaveKey: () => calls.push("saveKey"),
     onCancelKey: () => calls.push("cancelKey"),
+    onAskModel: (row: ProviderConnectionRow) =>
+      calls.push(`askModel ${row.id}`),
+    onSaveModel: () => calls.push("saveModel"),
+    onCancelModel: () => calls.push("cancelModel"),
     onRemoveKey: (row: ProviderConnectionRow) =>
       calls.push(`removeKey ${row.id}`),
     onConfirm: () => calls.push("confirm"),
@@ -356,6 +364,7 @@ test("the question names the connection as text, puts Cancel first, and confirms
         id: ID_1,
         label: MARKUP_LABEL,
         kindName: "Claude",
+        needsModel: true,
         action: "remove",
       }}
       onConfirm={handlers.onConfirm}
@@ -406,8 +415,12 @@ test("a confirmed removal moves the focus to the title only once the connection 
     askRemove: () => undefined,
     askKey: () => undefined,
     editKey: () => undefined,
+    editModel: () => undefined,
     saveKey: () => Promise.resolve(),
     cancelKey: () => undefined,
+    askModel: () => undefined,
+    saveModel: () => Promise.resolve(),
+    cancelModel: () => undefined,
     askRemoveKey: () => undefined,
     confirm: () => Promise.resolve(removed),
     cancel: () => undefined,
@@ -443,6 +456,7 @@ test("the Account screen shows the section after the devices, also without the b
         register: () => new Promise(() => undefined),
         remove: () => new Promise(() => undefined),
         saveKey: () => new Promise(() => undefined),
+        setModel: () => new Promise(() => undefined),
         removeKey: () => new Promise(() => undefined),
       }}
     />,
@@ -458,7 +472,12 @@ test("the key form is one password field, never prefilled, under its connection,
   const { calls, handlers } = recorder();
   const open: ProviderConnectionActionsView = {
     ...IDLE_PROVIDER_CONNECTION_ACTIONS,
-    keyFor: { id: ID_1, label: MARKUP_LABEL, kindName: "Claude" },
+    keyFor: {
+      id: ID_1,
+      label: MARKUP_LABEL,
+      kindName: "Claude",
+      needsModel: true,
+    },
   };
   const html = renderToString(content(known(), open, handlers));
   expect(html.match(/type="password"/gu)).toHaveLength(1);
@@ -550,6 +569,7 @@ test("a ready connection offers to replace and remove its key, and the key quest
         label: "Work",
         createdAt: AT,
         status: "ready",
+        model: "claude-opus-5-5",
       },
     ],
   });
@@ -568,6 +588,7 @@ test("a ready connection offers to replace and remove its key, and the key quest
         id: ID_1,
         label: "Work",
         kindName: "Claude",
+        needsModel: true,
         action: "removeKey",
       }}
       onConfirm={() => undefined}
@@ -578,4 +599,224 @@ test("a ready connection offers to replace and remove its key, and the key quest
   expect(question).toContain(htmlText(REMOVE_KEY_QUESTION_MESSAGES.text));
   expect(question).toContain(`>${REMOVE_KEY_QUESTION_MESSAGES.confirm}<`);
   expect(question).not.toContain(REMOVE_QUESTION_MESSAGES.title);
+});
+
+// ---- The model of a Claude connection (#30) ------------------------------
+
+/** One Claude connection with a stored key, with a model or without one. */
+function claudeWithKey(
+  status: "ready" | "model_missing",
+  model: "claude-opus-5-5" | null,
+): ProviderConnectionSectionView {
+  return known({
+    revision: 5,
+    status: "ready",
+    connections: [
+      { id: ID_1, kind: "claude", label: "Work", createdAt: AT, status, model },
+      {
+        id: ID_2,
+        kind: "codex",
+        label: "Home",
+        createdAt: AT,
+        status: "ready",
+        model: null,
+      },
+    ],
+  });
+}
+
+const CLAUDE_TARGET = Object.freeze({
+  id: ID_1,
+  label: "Work",
+  kindName: "Claude",
+  needsModel: true,
+});
+
+test("the key form of a Claude connection asks for a model first: a required, labelled select with no model chosen in advance", () => {
+  const { calls, handlers } = recorder();
+  const open: ProviderConnectionActionsView = {
+    ...IDLE_PROVIDER_CONNECTION_ACTIONS,
+    keyFor: CLAUDE_TARGET,
+  };
+  const html = renderToString(content(known(), open, handlers));
+  expect(html).toContain(
+    `<label class="account-label" for="${PROVIDER_MODEL_INPUT_ID}">Model</label>`,
+  );
+  expect(html).toMatch(
+    new RegExp(
+      `<select id="${PROVIDER_MODEL_INPUT_ID}" class="account-input" required="" aria-required="true" aria-describedby="provider-model-hint provider-model-problem">`,
+      "u",
+    ),
+  );
+  // The first option is no model, and it is the one shown: nothing is
+  // chosen for the person.
+  expect(html).toContain(
+    '<option value="" selected="">Choose a model</option><option value="claude-opus-5-5">Claude Opus 5.5</option><option value="claude-sonnet-5-5">Claude Sonnet 5.5</option><option value="claude-haiku-5-5">Claude Haiku 5.5</option>',
+  );
+  expect(html).toContain(htmlText(PROVIDER_CONNECTION_MESSAGES.modelHint));
+  expect(html).toContain(
+    '<p class="panel-message" id="provider-model-problem" role="alert"></p>',
+  );
+  // The select comes before the key field, and the form checks it itself.
+  expect(html.indexOf(PROVIDER_MODEL_INPUT_ID)).toBeLessThan(
+    html.indexOf(PROVIDER_KEY_INPUT_ID),
+  );
+  expect(html).toMatch(
+    /<form[^>]*aria-labelledby="provider-key-title"[^>]*noValidate=""/u,
+  );
+
+  const elements = elementsOf(content(known(), open, handlers));
+  const select = elements.find(
+    (element) =>
+      element.type === "select" && element.props.id === PROVIDER_MODEL_INPUT_ID,
+  );
+  select?.props.onChange?.({ currentTarget: { value: "claude-sonnet-5-5" } });
+  expect(calls).toEqual(["model claude-sonnet-5-5"]);
+
+  // A chosen model is shown as chosen; a missing one shows its problem.
+  const chosen = renderToString(
+    content(known(), { ...open, draftModel: "claude-haiku-5-5" }, handlers),
+  );
+  expect(chosen).toContain(
+    '<option value="claude-haiku-5-5" selected="">Claude Haiku 5.5</option>',
+  );
+  const missing = renderToString(
+    content(
+      known(),
+      { ...open, modelProblem: PROVIDER_CONNECTION_MESSAGES.modelMissing },
+      handlers,
+    ),
+  );
+  expect(missing).toMatch(
+    new RegExp(
+      `<select id="${PROVIDER_MODEL_INPUT_ID}"[^>]*aria-invalid="true"`,
+      "u",
+    ),
+  );
+  expect(missing).toContain(
+    `<p class="panel-message" id="provider-model-problem" role="alert">${PROVIDER_CONNECTION_MESSAGES.modelMissing}</p>`,
+  );
+  // While an action runs the select does nothing.
+  const running = renderToString(
+    content(known(), { ...open, running: true }, handlers),
+  );
+  expect(running).toMatch(
+    new RegExp(`<select id="${PROVIDER_MODEL_INPUT_ID}"[^>]*disabled=""`, "u"),
+  );
+
+  // A Codex connection's key form has no model.
+  const codex = renderToString(
+    content(
+      known(),
+      {
+        ...IDLE_PROVIDER_CONNECTION_ACTIONS,
+        keyFor: {
+          id: ID_2,
+          label: "Home",
+          kindName: "Codex",
+          needsModel: false,
+        },
+      },
+      handlers,
+    ),
+  );
+  expect(codex).toContain('type="password"');
+  expect(codex).not.toContain(PROVIDER_MODEL_INPUT_ID);
+});
+
+test("a Claude connection shows its model, and offers to change it without the key, or to choose one when its key has none", () => {
+  const { calls, handlers } = recorder();
+  const ready = renderToString(
+    content(claudeWithKey("ready", "claude-opus-5-5"), undefined, handlers),
+  );
+  expect(ready).toContain(
+    '<dt>Model</dt><dd translate="no">Claude Opus 5.5</dd>',
+  );
+  expect(ready).toContain(
+    'aria-describedby="provider-connection-label-0">Change the model</button>',
+  );
+  // The Codex connection shows no model and offers none.
+  expect(ready.match(/<dt>Model<\/dt>/gu)).toHaveLength(1);
+  expect(ready.match(/the model<\/button>/gu)).toHaveLength(1);
+
+  const missing = renderToString(
+    content(claudeWithKey("model_missing", null), undefined, handlers),
+  );
+  expect(missing).toContain(
+    `No model chosen<!-- -->. <!-- -->${htmlText(PROVIDER_CONNECTION_STATUS_TEXTS.model_missing.text)}`,
+  );
+  expect(missing).toContain(
+    '<dt>Model</dt><dd translate="no">None chosen</dd>',
+  );
+  expect(missing).toContain(
+    'aria-describedby="provider-connection-label-0">Choose the model</button>',
+  );
+  expect(missing).toContain(">Replace the API key</button>");
+
+  // Without a key, nothing to change.
+  const none = renderToString(content(known(), undefined, handlers));
+  expect(none).toContain('<dt>Model</dt><dd translate="no">None chosen</dd>');
+  expect(none).not.toContain("the model</button>");
+
+  const elements = elementsOf(
+    content(claudeWithKey("ready", "claude-opus-5-5"), undefined, handlers),
+  );
+  elements
+    .find(
+      (element) =>
+        element.type === "button" &&
+        textOf(element) === PROVIDER_CONNECTION_MESSAGES.changeModel,
+    )
+    ?.props.onClick?.({ currentTarget: null });
+  expect(calls).toEqual([`askModel ${ID_1}`]);
+});
+
+test("the model form holds the select only, with no key field, and submits, cancels, and does nothing while an action runs", () => {
+  const { calls, handlers } = recorder();
+  const open: ProviderConnectionActionsView = {
+    ...IDLE_PROVIDER_CONNECTION_ACTIONS,
+    modelFor: CLAUDE_TARGET,
+    draftModel: "claude-opus-5-5",
+  };
+  const view = claudeWithKey("ready", "claude-opus-5-5");
+  const html = renderToString(content(view, open, handlers));
+  expect(html).not.toContain('type="password"');
+  expect(html).toContain(
+    '<h4 id="provider-model-title">Model<!-- -->:<!-- --> <span dir="auto" translate="no">Work</span> <!-- -->(<!-- -->Claude<!-- -->)</h4>',
+  );
+  expect(html).toContain(
+    '<option value="claude-opus-5-5" selected="">Claude Opus 5.5</option>',
+  );
+  expect(html).toContain(">Store the model</button>");
+  // Its "Change the model" button gives way to the form.
+  expect(html).not.toContain(">Change the model</button>");
+
+  const elements = elementsOf(content(view, open, handlers));
+  elements
+    .find(
+      (element) =>
+        element.type === "form" &&
+        element.props["aria-labelledby"] === "provider-model-title",
+    )
+    ?.props.onSubmit?.({ preventDefault: () => undefined });
+  elements
+    .find(
+      (element) =>
+        element.type === "button" &&
+        textOf(element) === PROVIDER_CONNECTION_MESSAGES.cancel,
+    )
+    ?.props.onClick?.({ currentTarget: null });
+  expect(calls).toEqual(["saveModel", "cancelModel"]);
+
+  const runningElements = elementsOf(
+    content(view, { ...open, running: true }, handlers),
+  );
+  runningElements
+    .find(
+      (element) =>
+        element.type === "form" &&
+        element.props["aria-labelledby"] === "provider-model-title",
+    )
+    ?.props.onSubmit?.({ preventDefault: () => undefined });
+  expect(calls).toEqual(["saveModel", "cancelModel"]);
 });

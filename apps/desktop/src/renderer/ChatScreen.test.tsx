@@ -541,6 +541,7 @@ const RUN_CONNECTIONS: ProviderConnectionListView = {
       label: "Work laptop",
       createdAt: CREATED_AT,
       status: "ready",
+      model: "claude-sonnet-5-5",
     },
   ],
 };

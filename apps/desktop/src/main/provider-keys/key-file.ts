@@ -1,10 +1,13 @@
 // The provider key file (#33): one small versioned JSON object that holds
 // one ciphertext of Electron's `safeStorage.encryptStringAsync` and nothing
 // else. What `safeStorage` encrypts is the payload: a versioned JSON object
-// with the device ID, the provider connection ID, and the API key. The two
-// IDs bind the key to this device and this connection; a reader compares
-// them with the ones it asks for, so a file copied from another device or
-// another connection is refused.
+// with the device ID, the provider connection ID, the API key, and, from
+// payload version 2, the model chosen for the connection (#30). The two IDs
+// bind the key and the model to this device and this connection; a reader
+// compares them with the ones it asks for, so a file copied from another
+// device or another connection is refused. The model is not secret, but it
+// lives in the same payload, so that it is written, bound, and deleted with
+// the key.
 //
 // The file names the connection (`<connection ID>.json`), so that a
 // removal finds it without decrypting anything, but holds no ID in the
@@ -20,8 +23,19 @@ export const PROVIDER_KEY_FILE_FORMAT = "mymandev-provider-key";
 /** The value of `format` of the encrypted payload. */
 export const PROVIDER_KEY_PAYLOAD_FORMAT = "mymandev-provider-key-payload";
 
-/** The format version that this code writes and reads, of the file and the payload. */
+/** The format version of the file, which this code writes and reads. */
 export const PROVIDER_KEY_FILE_VERSION = 1;
+
+/**
+ * The format version of the payload that this code writes: 2, which adds
+ * `model` (#30). It still reads version 1, a payload without a model, which
+ * opens with the model null, so that the person is asked to choose one; it
+ * never picks one. A version above 2 is `newer_format`.
+ */
+export const PROVIDER_KEY_PAYLOAD_VERSION = 2;
+
+/** The payload version before `model`, which this code reads and never writes. */
+export const PROVIDER_KEY_PAYLOAD_VERSION_WITHOUT_MODEL = 1;
 
 /** The longest key in UTF-16 code units. */
 export const PROVIDER_KEY_MAX_LENGTH = PROVIDER_KEY_LIMITS.key;
@@ -53,6 +67,25 @@ export function isProviderKeyShape(key: unknown): key is string {
     key.isWellFormed() &&
     !FORBIDDEN_KEY_CHARACTER.test(key)
   );
+}
+
+/** The longest model ID that a payload may hold. */
+export const MAX_MODEL_ID_LENGTH = 64;
+
+/**
+ * The shape of a model ID in a payload that this code reads: lowercase
+ * letters, digits, dots, and hyphens, as the Claude API's model IDs are.
+ * Reading checks this shape only, so that a model that a later version
+ * offers, or that this version no longer offers, keeps the key readable;
+ * whether it is one of the closed list is checked where it is used
+ * (models.ts). The store writes only a model of the closed list.
+ */
+const MODEL_ID_SHAPE = /^[a-z0-9][a-z0-9.-]*$/u;
+
+/** What a key file holds once it is opened: the key and the model, or null. */
+export interface ProviderCredential {
+  readonly key: string;
+  readonly model: string | null;
 }
 
 /** The device and the connection that a key belongs to. */
@@ -111,16 +144,42 @@ const FileSchema = z.strictObject({
     .regex(/^[A-Za-z0-9_-]*$/u),
 });
 
-const PayloadSchema = z.strictObject({
+const ModelIdSchema = z
+  .string()
+  .min(1)
+  .max(MAX_MODEL_ID_LENGTH)
+  .regex(MODEL_ID_SHAPE);
+
+const PayloadFields = {
   format: z.literal(PROVIDER_KEY_PAYLOAD_FORMAT),
-  version: z.literal(PROVIDER_KEY_FILE_VERSION),
   deviceId: DeviceIdSchema,
   providerConnectionId: ProviderConnectionIdSchema,
   key: z.string().refine(isProviderKeyShape),
-});
+};
 
-/** Whether `value` names this format with a later version. */
-function isNewerFormat(value: unknown, format: string): boolean {
+/**
+ * Version 2, which this code writes, and version 1, which it only reads:
+ * the same fields without `model`. Both are strict, so a version 1 payload
+ * with a model, or a version 2 payload without one, is `corrupt`.
+ */
+const PayloadSchema = z.discriminatedUnion("version", [
+  z.strictObject({
+    ...PayloadFields,
+    version: z.literal(PROVIDER_KEY_PAYLOAD_VERSION),
+    model: ModelIdSchema.nullable(),
+  }),
+  z.strictObject({
+    ...PayloadFields,
+    version: z.literal(PROVIDER_KEY_PAYLOAD_VERSION_WITHOUT_MODEL),
+  }),
+]);
+
+/** Whether `value` names `format` with a version above `version`. */
+function isNewerFormat(
+  value: unknown,
+  format: string,
+  version: number,
+): boolean {
   return (
     typeof value === "object" &&
     value !== null &&
@@ -129,7 +188,7 @@ function isNewerFormat(value: unknown, format: string): boolean {
     "version" in value &&
     typeof value.version === "number" &&
     Number.isSafeInteger(value.version) &&
-    value.version > PROVIDER_KEY_FILE_VERSION
+    value.version > version
   );
 }
 
@@ -173,7 +232,7 @@ export function decodeProviderKeyFile(bytes: Uint8Array): Buffer {
   const parsed = FileSchema.safeParse(value);
   if (!parsed.success) {
     throw new ProviderKeyError(
-      isNewerFormat(value, PROVIDER_KEY_FILE_FORMAT)
+      isNewerFormat(value, PROVIDER_KEY_FILE_FORMAT, PROVIDER_KEY_FILE_VERSION)
         ? "newer_format"
         : "corrupt",
     );
@@ -189,36 +248,46 @@ export function decodeProviderKeyFile(bytes: Uint8Array): Buffer {
   return ciphertext;
 }
 
-/** The text that `safeStorage` encrypts: the binding and the key. */
+/**
+ * The text that `safeStorage` encrypts: the binding, the key, and the
+ * model, always of the current payload version.
+ */
 export function encodeProviderKeyPayload(
   binding: ProviderKeyBinding,
   key: string,
+  model: string | null,
 ): string {
   return JSON.stringify({
     format: PROVIDER_KEY_PAYLOAD_FORMAT,
-    version: PROVIDER_KEY_FILE_VERSION,
+    version: PROVIDER_KEY_PAYLOAD_VERSION,
     deviceId: binding.deviceId,
     providerConnectionId: binding.providerConnectionId,
     key,
+    model,
   });
 }
 
 /**
- * The key of a decrypted payload, after its binding was compared with
- * `binding`. Throws `corrupt` for text that is not a payload of this
- * version (a tampered file whose ciphertext still decrypts lands here),
+ * The key and the model of a decrypted payload, after its binding was
+ * compared with `binding`; a version 1 payload has the model null. Throws
+ * `corrupt` for text that is not a payload of a version that this code
+ * reads (a tampered file whose ciphertext still decrypts lands here),
  * `newer_format` for a later version, and `bound_elsewhere` for a payload
  * of another device or another connection. No error holds the text.
  */
 export function openProviderKeyPayload(
   text: string,
   binding: ProviderKeyBinding,
-): string {
+): ProviderCredential {
   const value = parseJson(text);
   const parsed = PayloadSchema.safeParse(value);
   if (!parsed.success) {
     throw new ProviderKeyError(
-      isNewerFormat(value, PROVIDER_KEY_PAYLOAD_FORMAT)
+      isNewerFormat(
+        value,
+        PROVIDER_KEY_PAYLOAD_FORMAT,
+        PROVIDER_KEY_PAYLOAD_VERSION,
+      )
         ? "newer_format"
         : "corrupt",
     );
@@ -229,5 +298,11 @@ export function openProviderKeyPayload(
   ) {
     throw new ProviderKeyError("bound_elsewhere");
   }
-  return parsed.data.key;
+  return Object.freeze({
+    key: parsed.data.key,
+    model:
+      parsed.data.version === PROVIDER_KEY_PAYLOAD_VERSION
+        ? parsed.data.model
+        : null,
+  });
 }

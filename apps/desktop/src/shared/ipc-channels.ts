@@ -455,6 +455,11 @@ export const INVOKE_CHANNELS = Object.freeze({
    * no channel ever sends it back.
    */
   saveProviderKey: "provider-connections:save-key",
+  /**
+   * Changes the model of a Claude connection whose key is stored on this
+   * device, without the key (#30).
+   */
+  setProviderModel: "provider-connections:set-model",
   /** Deletes the stored API key of a provider connection of this device. */
   removeProviderKey: "provider-connections:remove-key",
 } as const);

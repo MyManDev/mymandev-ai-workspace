@@ -33,6 +33,7 @@ const ENTRY = Object.freeze({
   label: "Work laptop",
   createdAt: AT,
   status: "ready",
+  model: "claude-sonnet-5-5",
 }) as unknown as ProviderConnectionsState["connections"][number];
 
 interface Timer {
@@ -89,9 +90,17 @@ function fakeService() {
             retryAfterMs: 30_000,
           });
         },
-        saveKey: (id: string, key: string) => {
-          calls.push(["saveKey", id, key]);
+        saveKey: (id: string, key: string, model: string | null) => {
+          calls.push(["saveKey", id, key, model]);
           return Promise.resolve({ outcome: "ok" as const });
+        },
+        setModel: (id: string, model: string) => {
+          calls.push(["setModel", id, model]);
+          return Promise.resolve({
+            outcome: "refused" as const,
+            reason: "credential_missing" as const,
+            retryAfterMs: null,
+          });
         },
         removeKey: (id: string) => {
           calls.push(["removeKey", id]);
@@ -172,6 +181,7 @@ test("the provider connection channels are registered, and nothing else", () => 
       INVOKE_CHANNELS.registerProviderConnection,
       INVOKE_CHANNELS.removeProviderConnection,
       INVOKE_CHANNELS.saveProviderKey,
+      INVOKE_CHANNELS.setProviderModel,
       INVOKE_CHANNELS.removeProviderKey,
     ].sort(),
   );
@@ -231,13 +241,45 @@ test("every handler refuses a foreign sender, and arguments outside the strict c
     [INVOKE_CHANNELS.removeProviderConnection, [CONNECTION, CONNECTION]],
     [INVOKE_CHANNELS.removeProviderConnection, [{ id: CONNECTION }]],
   ];
-  const keyRequest = { providerConnectionId: CONNECTION, key: SENTINEL_KEY };
+  const keyRequest = {
+    providerConnectionId: CONNECTION,
+    key: SENTINEL_KEY,
+    model: "claude-sonnet-5-5",
+  };
+  const modelRequest = {
+    providerConnectionId: CONNECTION,
+    model: "claude-sonnet-5-5",
+  };
   const refusedKeys: [string, unknown[]][] = [
     [INVOKE_CHANNELS.saveProviderKey, []],
     [INVOKE_CHANNELS.saveProviderKey, [CONNECTION, SENTINEL_KEY]],
     [INVOKE_CHANNELS.saveProviderKey, [keyRequest, keyRequest]],
     [INVOKE_CHANNELS.saveProviderKey, [{ providerConnectionId: CONNECTION }]],
     [INVOKE_CHANNELS.saveProviderKey, [{ key: SENTINEL_KEY }]],
+    // The model is always present: one of the closed list, or null (#30).
+    [
+      INVOKE_CHANNELS.saveProviderKey,
+      [{ providerConnectionId: CONNECTION, key: SENTINEL_KEY }],
+    ],
+    [INVOKE_CHANNELS.saveProviderKey, [{ ...keyRequest, model: undefined }]],
+    [INVOKE_CHANNELS.saveProviderKey, [{ ...keyRequest, model: "" }]],
+    [
+      INVOKE_CHANNELS.saveProviderKey,
+      [{ ...keyRequest, model: "claude-opus-4-8" }],
+    ],
+    [
+      INVOKE_CHANNELS.saveProviderKey,
+      [{ ...keyRequest, model: "claude-opus-5-5-20260401" }],
+    ],
+    [
+      INVOKE_CHANNELS.saveProviderKey,
+      [{ ...keyRequest, model: "Claude Opus 5.5" }],
+    ],
+    [INVOKE_CHANNELS.saveProviderKey, [{ ...keyRequest, model: 7 }]],
+    [
+      INVOKE_CHANNELS.saveProviderKey,
+      [{ ...keyRequest, model: ["claude-opus-5-5"] }],
+    ],
     [INVOKE_CHANNELS.saveProviderKey, [{ ...keyRequest, key: "" }]],
     [INVOKE_CHANNELS.saveProviderKey, [{ ...keyRequest, key: 7 }]],
     [
@@ -254,6 +296,26 @@ test("every handler refuses a foreign sender, and arguments outside the strict c
       INVOKE_CHANNELS.saveProviderKey,
       [{ ...keyRequest, deviceId: CONNECTION }],
     ],
+    [INVOKE_CHANNELS.setProviderModel, []],
+    [INVOKE_CHANNELS.setProviderModel, [CONNECTION, "claude-opus-5-5"]],
+    [INVOKE_CHANNELS.setProviderModel, [modelRequest, modelRequest]],
+    [INVOKE_CHANNELS.setProviderModel, [{ providerConnectionId: CONNECTION }]],
+    [INVOKE_CHANNELS.setProviderModel, [{ model: "claude-opus-5-5" }]],
+    // A model is set, never taken away, and only one of the closed list.
+    [INVOKE_CHANNELS.setProviderModel, [{ ...modelRequest, model: null }]],
+    [INVOKE_CHANNELS.setProviderModel, [{ ...modelRequest, model: "" }]],
+    [
+      INVOKE_CHANNELS.setProviderModel,
+      [{ ...modelRequest, model: "claude-opus-4-8" }],
+    ],
+    [INVOKE_CHANNELS.setProviderModel, [{ ...modelRequest, model: "gpt-5" }]],
+    [
+      INVOKE_CHANNELS.setProviderModel,
+      [{ ...modelRequest, providerConnectionId: "not-an-id" }],
+    ],
+    // The key never travels with a model change.
+    [INVOKE_CHANNELS.setProviderModel, [keyRequest]],
+    [INVOKE_CHANNELS.setProviderModel, [{ ...modelRequest, kind: "claude" }]],
     [INVOKE_CHANNELS.removeProviderKey, []],
     [INVOKE_CHANNELS.removeProviderKey, ["not-an-id"]],
     [INVOKE_CHANNELS.removeProviderKey, [CONNECTION, SENTINEL_KEY]],
@@ -286,16 +348,34 @@ test("a key reaches the service once with the connection's ID, and no result, st
   const subscriber = receiver(DEV_URL);
   call(INVOKE_CHANNELS.subscribeProviderConnections, [], subscriber);
   const saved = await call(INVOKE_CHANNELS.saveProviderKey, [
-    { providerConnectionId: CONNECTION, key: SENTINEL_KEY },
+    {
+      providerConnectionId: CONNECTION,
+      key: SENTINEL_KEY,
+      model: "claude-sonnet-5-5",
+    },
   ]);
   expect(saved).toEqual({ outcome: "ok" });
+  const codexSaved = await call(INVOKE_CHANNELS.saveProviderKey, [
+    { providerConnectionId: CONNECTION, key: SENTINEL_KEY, model: null },
+  ]);
+  expect(codexSaved).toEqual({ outcome: "ok" });
+  const modelSet = await call(INVOKE_CHANNELS.setProviderModel, [
+    { providerConnectionId: CONNECTION, model: "claude-haiku-5-5" },
+  ]);
+  expect(modelSet).toEqual({
+    outcome: "refused",
+    reason: "credential_missing",
+    retryAfterMs: null,
+  });
   expect(await call(INVOKE_CHANNELS.removeProviderKey, [CONNECTION])).toEqual({
     outcome: "refused",
     reason: "not_listed",
     retryAfterMs: null,
   });
   expect(fake.calls).toEqual([
-    ["saveKey", CONNECTION, SENTINEL_KEY],
+    ["saveKey", CONNECTION, SENTINEL_KEY, "claude-sonnet-5-5"],
+    ["saveKey", CONNECTION, SENTINEL_KEY, null],
+    ["setModel", CONNECTION, "claude-haiku-5-5"],
     ["removeKey", CONNECTION],
   ]);
 
@@ -305,15 +385,32 @@ test("a key reaches the service once with the connection's ID, and no result, st
       outcome: "ok";
     });
   const leaked = await call(INVOKE_CHANNELS.saveProviderKey, [
-    { providerConnectionId: CONNECTION, key: SENTINEL_KEY },
+    { providerConnectionId: CONNECTION, key: SENTINEL_KEY, model: null },
   ]);
   expect(leaked).toEqual({ outcome: "ok" });
+  fake.options.service.setModel = () =>
+    Promise.resolve({ outcome: "ok", key: SENTINEL_KEY } as unknown as {
+      outcome: "refused";
+      reason: "credential_missing";
+      retryAfterMs: null;
+    });
+  const leakedModel = await call(INVOKE_CHANNELS.setProviderModel, [
+    { providerConnectionId: CONNECTION, model: "claude-opus-5-5" },
+  ]);
+  expect(leakedModel).toEqual({ outcome: "ok" });
 
   fake.setState({ revision: 1, status: "ready", connections: [ENTRY] });
   fake.fire();
+  // The model crosses with the connection; it is not secret.
+  expect(call(INVOKE_CHANNELS.getProviderConnections)).toMatchObject({
+    connections: [{ id: CONNECTION, model: "claude-sonnet-5-5" }],
+  });
   const crossed = JSON.stringify([
     saved,
+    codexSaved,
+    modelSet,
     leaked,
+    leakedModel,
     subscriber.sent,
     call(INVOKE_CHANNELS.getProviderConnections),
   ]);
@@ -341,7 +438,7 @@ test("a key action that the service refused as busy crosses as that refusal", as
   const { call } = register(fake);
   expect(
     await call(INVOKE_CHANNELS.saveProviderKey, [
-      { providerConnectionId: CONNECTION, key: SENTINEL_KEY },
+      { providerConnectionId: CONNECTION, key: SENTINEL_KEY, model: null },
     ]),
   ).toEqual(busy);
   expect(await call(INVOKE_CHANNELS.removeProviderKey, [CONNECTION])).toEqual(

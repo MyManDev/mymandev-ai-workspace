@@ -2629,7 +2629,7 @@ test("the claim mark subscription delivers the marks and every newer state, with
   expect(refused).toBe(1);
 });
 
-test("the provider connection functions are their six, and each calls its own channel with only its strings, never a credential beside them", async () => {
+test("the provider connection functions are their seven, and each calls its own channel with only its strings, never a credential beside them", async () => {
   const fake = fakeIpc();
   const bridge = createDesktopBridge("44.9.1", fake.ipc);
   expect(Object.keys(bridge.providerConnections).sort()).toEqual([
@@ -2638,6 +2638,7 @@ test("the provider connection functions are their six, and each calls its own ch
     "remove",
     "removeKey",
     "saveKey",
+    "setModel",
     "subscribeState",
   ]);
   const id = "0192f0a0-7b3c-7d4e-8f50-000000000101";
@@ -2687,31 +2688,60 @@ test("the key functions pass on a new object with only the ID and the key, and t
   const removeKey = bridge.providerConnections.removeKey as unknown as (
     ...args: unknown[]
   ) => Promise<unknown>;
-  const saved = saveKey(id, key, { deviceId: id });
+  const setModel = bridge.providerConnections.setModel as unknown as (
+    ...args: unknown[]
+  ) => Promise<unknown>;
+  const saved = saveKey(id, key, "claude-sonnet-5-5", { deviceId: id });
+  const savedWithout = saveKey(id, key, null);
+  const modelSet = setModel(id, "claude-haiku-5-5", key);
   const removed = removeKey(id, key);
   expect(fake.invoked).toEqual([
     {
       channel: INVOKE_CHANNELS.saveProviderKey,
-      args: [{ providerConnectionId: id, key }],
+      args: [{ providerConnectionId: id, key, model: "claude-sonnet-5-5" }],
+    },
+    {
+      channel: INVOKE_CHANNELS.saveProviderKey,
+      args: [{ providerConnectionId: id, key, model: null }],
+    },
+    // A model change never carries a key, even one passed beside it.
+    {
+      channel: INVOKE_CHANNELS.setProviderModel,
+      args: [{ providerConnectionId: id, model: "claude-haiku-5-5" }],
     },
     { channel: INVOKE_CHANNELS.removeProviderKey, args: [id] },
   ]);
-  fake.answers[0]?.resolve({ outcome: "ok" });
-  fake.answers[1]?.resolve({ outcome: "ok" });
+  for (const answer of fake.answers) {
+    answer.resolve({ outcome: "ok" });
+  }
   await expect(saved).resolves.toEqual({ outcome: "ok" });
+  await expect(savedWithout).resolves.toEqual({ outcome: "ok" });
+  await expect(modelSet).resolves.toEqual({ outcome: "ok" });
   await expect(removed).resolves.toEqual({ outcome: "ok" });
   fake.invoked.length = 0;
-  for (const [first, second] of [
-    [id, { key }],
-    [{ id }, key],
-    [id, undefined],
-    [7, key],
+  for (const args of [
+    [id, { key }, null],
+    [{ id }, key, null],
+    [id, undefined, null],
+    [7, key, null],
+    // The model is a string or null, never left out or of another type.
+    [id, key],
+    [id, key, undefined],
+    [id, key, 7],
+    [id, key, { model: "claude-opus-5-5" }],
   ]) {
-    const error = await saveKey(first, second).catch(
-      (caught: unknown) => caught,
-    );
-    expect(error).toBeInstanceOf(TypeError);
+    const error = await saveKey(...args).catch((caught: unknown) => caught);
+    expect(error, JSON.stringify(args.slice(2))).toBeInstanceOf(TypeError);
     expect(String(error)).not.toContain(key);
+  }
+  for (const args of [
+    [id],
+    [id, null],
+    [id, 7],
+    [7, "claude-opus-5-5"],
+    [{ id }, "claude-opus-5-5"],
+  ]) {
+    await expect(setModel(...args)).rejects.toBeInstanceOf(TypeError);
   }
   for (const value of [7, null, { id }]) {
     await expect(removeKey(value)).rejects.toBeInstanceOf(TypeError);

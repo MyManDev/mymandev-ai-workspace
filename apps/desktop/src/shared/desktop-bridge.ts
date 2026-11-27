@@ -48,6 +48,7 @@ import type {
   RemoveProviderConnectionResult,
   RemoveProviderKeyResult,
   SaveProviderKeyResult,
+  SetProviderModelResult,
   RemoveRepositoryResult,
   RevokeGrantResult,
   RevokeInvitationResult,
@@ -1037,14 +1038,26 @@ export interface ProviderConnectionsBridge {
   ) => Promise<RemoveProviderConnectionResult>;
   /**
    * Stores the API key of a connection of this device, encrypted on this
-   * device, over any key stored before. The bridge passes on a new object
-   * with only the ID and the key, each a string; the result is `ok` or a
-   * refusal, never the key.
+   * device with the model chosen for it, over any key stored before. The
+   * bridge passes on a new object with only the ID and the key, each a
+   * string, and the model, a string or null; the main process requires a
+   * model of its closed list for a Claude connection and null otherwise.
+   * The result is `ok` or a refusal, never the key.
    */
   readonly saveKey: (
     providerConnectionId: string,
     key: string,
+    model: string | null,
   ) => Promise<SaveProviderKeyResult>;
+  /**
+   * Changes the model of a Claude connection whose key is stored on this
+   * device, without the key. The bridge passes on a new object with only
+   * the ID and the model, each a string.
+   */
+  readonly setModel: (
+    providerConnectionId: string,
+    model: string,
+  ) => Promise<SetProviderModelResult>;
   /** Deletes the stored API key of a connection of this device by its ID, a string. */
   readonly removeKey: (
     providerConnectionId: string,

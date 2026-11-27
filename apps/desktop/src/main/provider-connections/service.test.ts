@@ -37,6 +37,8 @@ import {
   type ProviderKeyErrorCode,
 } from "../provider-keys/errors.ts";
 import type { ProviderKeyBinding } from "../provider-keys/key-file.ts";
+import type { ClaudeModel } from "../provider-keys/models.ts";
+import type { ProviderKeyCheck } from "../provider-keys/store.ts";
 import {
   RATE_LIMITED_RETRY_MS,
   WORKSPACE_RETRY_BASE_MS,
@@ -295,26 +297,48 @@ test("the contract's provider connection values match the protocol's", () => {
   // The closed list of statuses (#33).
   expect([...PROVIDER_CONNECTION_STATUSES]).toEqual([
     "credential_missing",
+    "model_missing",
     "ready",
     "unknown",
   ]);
 });
 
-test("the status comes from a closed list: unknown while the list is not current, else the key's state", () => {
-  expect(providerConnectionStatus({ listCurrent: true, key: "ready" })).toBe(
-    "ready",
-  );
-  expect(providerConnectionStatus({ listCurrent: true, key: "missing" })).toBe(
-    "credential_missing",
-  );
-  expect(providerConnectionStatus({ listCurrent: true, key: "unknown" })).toBe(
-    "unknown",
-  );
-  for (const key of ["ready", "missing", "unknown"] as const) {
-    expect(providerConnectionStatus({ listCurrent: false, key })).toBe(
-      "unknown",
-    );
+test("the status comes from a closed list: unknown while the list is not current, else the key's state, and model_missing for a key without its model", () => {
+  for (const modelMissing of [false, true]) {
+    expect(
+      providerConnectionStatus({
+        listCurrent: true,
+        key: "missing",
+        modelMissing,
+      }),
+    ).toBe("credential_missing");
+    expect(
+      providerConnectionStatus({
+        listCurrent: true,
+        key: "unknown",
+        modelMissing,
+      }),
+    ).toBe("unknown");
+    for (const key of ["ready", "missing", "unknown"] as const) {
+      expect(
+        providerConnectionStatus({ listCurrent: false, key, modelMissing }),
+      ).toBe("unknown");
+    }
   }
+  expect(
+    providerConnectionStatus({
+      listCurrent: true,
+      key: "ready",
+      modelMissing: false,
+    }),
+  ).toBe("ready");
+  expect(
+    providerConnectionStatus({
+      listCurrent: true,
+      key: "ready",
+      modelMissing: true,
+    }),
+  ).toBe("model_missing");
 });
 
 test("a signed-in device reads its list at once, and each connection holds its ID, kind, label, time, and status only", async () => {
@@ -337,6 +361,7 @@ test("a signed-in device reads its list at once, and each connection holds its I
         label: "Work laptop",
         createdAt: AT,
         status: "credential_missing",
+        model: null,
       },
       {
         id: CONNECTION_2,
@@ -344,6 +369,7 @@ test("a signed-in device reads its list at once, and each connection holds its I
         label: "Personal",
         createdAt: AT,
         status: "credential_missing",
+        model: null,
       },
     ],
   });
@@ -447,6 +473,7 @@ test("a failed read keeps what was read, each connection unknown, and retries wi
         label: "Work laptop",
         createdAt: AT,
         status: "unknown",
+        model: null,
       },
     ],
   });
@@ -929,6 +956,9 @@ test("the logs are fixed text: no label, connection ID, device ID, or login", as
 /** An obvious fake key that no state, result, or log may hold. */
 const SENTINEL_KEY = "FAKE-PROVIDER-KEY-SENTINEL-0123456789";
 
+/** The model chosen with a Claude connection's key in these tests (#30). */
+const MODEL: ClaudeModel = "claude-sonnet-5-5";
+
 /**
  * A provider key store in memory with the binding rules of the real one:
  * each file is bound to a device and a connection, and a check of another
@@ -936,16 +966,25 @@ const SENTINEL_KEY = "FAKE-PROVIDER-KEY-SENTINEL-0123456789";
  * it until it releases it.
  */
 class FakeKeys implements ProviderConnectionKeys {
-  readonly files = new Map<string, { deviceId: string; key: string }>();
+  /**
+   * The files, with the model stored next to the key; a file set without
+   * `model` holds none, as one of the format before models.
+   */
+  readonly files = new Map<
+    string,
+    { deviceId: string; key: string; model?: string | null }
+  >();
   readonly calls: string[] = [];
   readonly failures: Partial<
-    Record<"save" | "check" | "remove", ProviderKeyErrorCode>
+    Record<"save" | "setModel" | "check" | "remove", ProviderKeyErrorCode>
   > = {};
   /** Calls of these kinds wait until `release` runs. */
-  readonly held = new Set<"save" | "check" | "remove">();
+  readonly held = new Set<"save" | "setModel" | "check" | "remove">();
   readonly waiting: (() => void)[] = [];
 
-  private async gate(kind: "save" | "check" | "remove"): Promise<void> {
+  private async gate(
+    kind: "save" | "setModel" | "check" | "remove",
+  ): Promise<void> {
     if (this.held.has(kind)) {
       await new Promise<void>((resolve) => this.waiting.push(resolve));
     }
@@ -964,28 +1003,46 @@ class FakeKeys implements ProviderConnectionKeys {
   readonly save = async (
     binding: ProviderKeyBinding,
     key: string,
+    model: ClaudeModel | null,
   ): Promise<void> => {
-    this.calls.push(`save:${binding.providerConnectionId}`);
+    this.calls.push(`save:${binding.providerConnectionId}:${String(model)}`);
     await this.gate("save");
     this.files.set(binding.providerConnectionId, {
       deviceId: binding.deviceId,
       key,
+      model,
     });
   };
 
-  readonly check = async (
+  readonly setModel = async (
     binding: ProviderKeyBinding,
-  ): Promise<"ready" | "missing"> => {
-    this.calls.push(`check:${binding.providerConnectionId}`);
-    await this.gate("check");
+    model: ClaudeModel,
+  ): Promise<void> => {
+    this.calls.push(`setModel:${binding.providerConnectionId}:${model}`);
+    await this.gate("setModel");
     const file = this.files.get(binding.providerConnectionId);
     if (file === undefined) {
-      return "missing";
+      throw new ProviderKeyError("missing");
     }
     if (file.deviceId !== binding.deviceId) {
       throw new ProviderKeyError("bound_elsewhere");
     }
-    return "ready";
+    this.files.set(binding.providerConnectionId, { ...file, model });
+  };
+
+  readonly check = async (
+    binding: ProviderKeyBinding,
+  ): Promise<ProviderKeyCheck> => {
+    this.calls.push(`check:${binding.providerConnectionId}`);
+    await this.gate("check");
+    const file = this.files.get(binding.providerConnectionId);
+    if (file === undefined) {
+      return { key: "missing" };
+    }
+    if (file.deviceId !== binding.deviceId) {
+      throw new ProviderKeyError("bound_elsewhere");
+    }
+    return { key: "ready", model: file.model ?? null };
   };
 
   readonly remove = async (providerConnectionId: string): Promise<void> => {
@@ -1094,11 +1151,16 @@ test("a key is stored once, bound to this device and the connection, and the con
     "credential_missing",
   ]);
 
-  const saved = await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+  const saved = await harness.service.saveKey(
+    CONNECTION_1,
+    SENTINEL_KEY,
+    MODEL,
+  );
   expect(saved).toEqual({ outcome: "ok" });
   expect(keys.files.get(CONNECTION_1)).toEqual({
     deviceId: DEVICE_ID,
     key: SENTINEL_KEY,
+    model: MODEL,
   });
   await settle();
   expect(statuses(harness)).toEqual(["ready", "credential_missing"]);
@@ -1135,7 +1197,7 @@ test("a key of the wrong shape, an invalid or unlisted connection, or no signed-
     `${SENTINEL_KEY}\u200b`,
     "k".repeat(513),
   ]) {
-    const result = await harness.service.saveKey(CONNECTION_1, key);
+    const result = await harness.service.saveKey(CONNECTION_1, key, MODEL);
     results.push(result);
     expect(result).toEqual({
       outcome: "refused",
@@ -1144,14 +1206,18 @@ test("a key of the wrong shape, an invalid or unlisted connection, or no signed-
     });
   }
   for (const id of ["not-an-id", CONNECTION_1.toUpperCase()]) {
-    expect(await harness.service.saveKey(id, SENTINEL_KEY)).toMatchObject({
+    expect(
+      await harness.service.saveKey(id, SENTINEL_KEY, MODEL),
+    ).toMatchObject({
       reason: "invalid",
     });
     expect(await harness.service.removeKey(id)).toMatchObject({
       reason: "invalid",
     });
   }
-  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual({
+  expect(
+    await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY, null),
+  ).toEqual({
     outcome: "refused",
     reason: "not_listed",
     retryAfterMs: null,
@@ -1160,7 +1226,9 @@ test("a key of the wrong shape, an invalid or unlisted connection, or no signed-
     reason: "not_listed",
   });
   harness.setAccount(SIGNED_OUT);
-  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual({
+  expect(
+    await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL),
+  ).toEqual({
     outcome: "refused",
     reason: "not_signed_in",
     retryAfterMs: null,
@@ -1174,7 +1242,9 @@ test("a key of the wrong shape, an invalid or unlisted connection, or no signed-
   const bare = new Harness();
   await bare.ready(ONE);
   expect(statuses(bare)).toEqual(["credential_missing"]);
-  expect(await bare.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toMatchObject({
+  expect(
+    await bare.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL),
+  ).toMatchObject({
     reason: "failed",
   });
   expect(exposed(harness, results)).not.toContain(SENTINEL_KEY);
@@ -1193,7 +1263,11 @@ test("a store that cannot protect or write the key refuses it with a fixed reaso
     ["folder_unavailable", "failed"],
   ] as const) {
     keys.failures.save = code;
-    const result = await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+    const result = await harness.service.saveKey(
+      CONNECTION_1,
+      SENTINEL_KEY,
+      MODEL,
+    );
     results.push(result);
     expect(result).toEqual({ outcome: "refused", reason, retryAfterMs: null });
     expect(harness.logs.at(-1)).toBe(
@@ -1220,7 +1294,7 @@ test("a key stored while the device signs out stays bound to it (D4), and is rea
   await harness.ready(ONE);
   await settle();
   keys.held.add("save");
-  const pending = harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+  const pending = harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL);
   await settle();
   harness.setAccount(SIGNED_OUT);
   keys.held.clear();
@@ -1229,6 +1303,7 @@ test("a key stored while the device signs out stays bound to it (D4), and is rea
   expect(keys.files.get(CONNECTION_1)).toEqual({
     deviceId: DEVICE_ID,
     key: SENTINEL_KEY,
+    model: MODEL,
   });
   expect(keys.calls.filter((call) => call.startsWith("remove:"))).toEqual([]);
   expect(harness.service.state().status).toBe("signed_out");
@@ -1280,7 +1355,7 @@ test("a key stored while another device signs in, or while the device key is del
     await harness.ready(ONE);
     await settle();
     keys.held.add("save");
-    const pending = harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+    const pending = harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL);
     await settle();
     for (const status of statusesMeanwhile) {
       harness.setAccount(status);
@@ -1313,7 +1388,11 @@ test("after the server confirmed a removal no key is stored or deleted for that 
     CONNECTION_2,
   ]);
   keys.calls.length = 0;
-  const saved = await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+  const saved = await harness.service.saveKey(
+    CONNECTION_1,
+    SENTINEL_KEY,
+    MODEL,
+  );
   expect(saved).toEqual({
     outcome: "refused",
     reason: "not_listed",
@@ -1327,13 +1406,17 @@ test("after the server confirmed a removal no key is stored or deleted for that 
   expect(keys.calls).toEqual([]);
   expect(keys.files.has(CONNECTION_1)).toBe(false);
   // Another connection is not affected.
-  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual({
+  expect(
+    await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY, null),
+  ).toEqual({
     outcome: "ok",
   });
 
   // The list read answers without it: still refused.
   await harness.ready(listOf(connection(CONNECTION_2, "Personal")));
-  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual({
+  expect(
+    await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL),
+  ).toEqual({
     outcome: "refused",
     reason: "not_listed",
     retryAfterMs: null,
@@ -1352,7 +1435,7 @@ test("a key action that comes while a removal waits for the server or deletes it
   const removal = harness.service.remove(CONNECTION_1);
   // The server has not answered: busy, for this connection and any other.
   for (const id of [CONNECTION_1, CONNECTION_2]) {
-    expect(await harness.service.saveKey(id, SENTINEL_KEY)).toEqual({
+    expect(await harness.service.saveKey(id, SENTINEL_KEY, MODEL)).toEqual({
       outcome: "refused",
       reason: "busy",
       retryAfterMs: null,
@@ -1363,12 +1446,16 @@ test("a key action that comes while a removal waits for the server or deletes it
   // The removal's key deletion is held: a key for the removed connection
   // would be queued right behind it.
   expect(keys.calls).toEqual([`remove:${CONNECTION_1}`]);
-  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual({
+  expect(
+    await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL),
+  ).toEqual({
     outcome: "refused",
     reason: "not_listed",
     retryAfterMs: null,
   });
-  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual({
+  expect(
+    await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY, null),
+  ).toEqual({
     outcome: "refused",
     reason: "busy",
     retryAfterMs: null,
@@ -1384,7 +1471,9 @@ test("a key action that comes while a removal waits for the server or deletes it
   expect(keys.calls).toEqual([`remove:${CONNECTION_1}`]);
   expect(keys.files.size).toBe(0);
   // Once the removal ended, a key action for another connection goes.
-  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual({
+  expect(
+    await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY, null),
+  ).toEqual({
     outcome: "ok",
   });
 });
@@ -1399,16 +1488,16 @@ test("one key action at a time, and none while a registration or a removal waits
 
   // A key action runs.
   keys.held.add("save");
-  const first = harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
+  const first = harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL);
   await settle();
-  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual(
-    busy,
-  );
-  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual(
-    busy,
-  );
+  expect(
+    await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL),
+  ).toEqual(busy);
+  expect(
+    await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY, null),
+  ).toEqual(busy);
   expect(await harness.service.removeKey(CONNECTION_1)).toEqual(busy);
-  expect(keys.calls).toEqual([`save:${CONNECTION_1}`]);
+  expect(keys.calls).toEqual([`save:${CONNECTION_1}:${MODEL}`]);
   keys.held.clear();
   keys.release();
   expect(await first).toEqual({ outcome: "ok" });
@@ -1419,9 +1508,9 @@ test("one key action at a time, and none while a registration or a removal waits
   keys.held.add("remove");
   const deleting = harness.service.removeKey(CONNECTION_1);
   await settle();
-  expect(await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY)).toEqual(
-    busy,
-  );
+  expect(
+    await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY, null),
+  ).toEqual(busy);
   expect(await harness.service.removeKey(CONNECTION_2)).toEqual(busy);
   keys.held.clear();
   keys.release();
@@ -1434,16 +1523,18 @@ test("one key action at a time, and none while a registration or a removal waits
   // A registration waits for the server.
   keys.calls.length = 0;
   const registration = harness.service.register("claude", "Third");
-  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual(
-    busy,
-  );
+  expect(
+    await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL),
+  ).toEqual(busy);
   expect(await harness.service.removeKey(CONNECTION_1)).toEqual(busy);
   harness.writes.at(-1)?.answer(registeredAnswer("claude", "Third"));
   await registration;
   expect(keys.calls).toEqual([]);
 
   // Once nothing runs, a key action goes.
-  expect(await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY)).toEqual({
+  expect(
+    await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL),
+  ).toEqual({
     outcome: "ok",
   });
   expect(keys.files.get(CONNECTION_1)?.deviceId).toBe(DEVICE_ID);
@@ -1454,8 +1545,8 @@ test("a removal deletes the key file only after the server confirmed it; a refus
   const harness = new Harness(accountStatus(), "connected", keys);
   await harness.ready(TWO);
   await settle();
-  await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY);
-  await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY);
+  await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL);
+  await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY, null);
   keys.calls.length = 0;
 
   // Refused by the server, or not known: the key stays.
@@ -1512,4 +1603,253 @@ test("a removal deletes the key file only after the server confirmed it; a refus
   expect(keys.calls).toEqual([]);
   expect(keys.files.has(CONNECTION_2)).toBe(true);
   expect(exposed(harness)).not.toContain(SENTINEL_KEY);
+});
+
+// ---- The model of a Claude connection (#30) ------------------------------
+
+function models(harness: Harness): (string | null)[] {
+  return harness.service.state().connections.map((entry) => entry.model);
+}
+
+test("a Claude connection is ready only with a model of the closed list: a key without one is model_missing, and a connection of another kind needs none", async () => {
+  const keys = new FakeKeys();
+  // A Claude key of the format before models, and a Codex key.
+  keys.files.set(CONNECTION_1, { deviceId: DEVICE_ID, key: SENTINEL_KEY });
+  keys.files.set(CONNECTION_2, { deviceId: DEVICE_ID, key: SENTINEL_KEY });
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(TWO);
+  await settle();
+  expect(statuses(harness)).toEqual(["model_missing", "ready"]);
+  expect(models(harness)).toEqual([null, null]);
+
+  // A model that this version no longer offers counts as none.
+  keys.files.set(CONNECTION_1, {
+    deviceId: DEVICE_ID,
+    key: SENTINEL_KEY,
+    model: "claude-opus-4-8",
+  });
+  // A Codex key never shows a model, whatever its file holds.
+  keys.files.set(CONNECTION_2, {
+    deviceId: DEVICE_ID,
+    key: SENTINEL_KEY,
+    model: MODEL,
+  });
+  const fresh = new Harness(accountStatus(), "connected", keys);
+  await fresh.ready(TWO);
+  await settle();
+  expect(statuses(fresh)).toEqual(["model_missing", "ready"]);
+  expect(models(fresh)).toEqual([null, null]);
+
+  // Offline, the model of the last check stays and the status is unknown.
+  expect(await fresh.service.setModel(CONNECTION_1, MODEL)).toEqual({
+    outcome: "ok",
+  });
+  await settle();
+  expect(statuses(fresh)).toEqual(["ready", "ready"]);
+  expect(models(fresh)).toEqual([MODEL, null]);
+  fresh.setConnection("offline");
+  expect(statuses(fresh)).toEqual(["unknown", "unknown"]);
+  expect(models(fresh)).toEqual([MODEL, null]);
+  expect(exposed(harness)).not.toContain(SENTINEL_KEY);
+  expect(exposed(fresh)).not.toContain(SENTINEL_KEY);
+});
+
+test("saveKey stores a Claude key only with a model of the closed list, and a key of another kind only without one; nothing else reaches the store", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(TWO);
+  await settle();
+  keys.calls.length = 0;
+  const invalidModel = {
+    outcome: "refused",
+    reason: "invalid_model",
+    retryAfterMs: null,
+  };
+  const results: unknown[] = [];
+  for (const model of [
+    null,
+    "",
+    "claude-opus-4-8",
+    "claude-opus-5-5-20260401",
+    "Claude Opus 5.5",
+    "gpt-5",
+  ]) {
+    const result = await harness.service.saveKey(
+      CONNECTION_1,
+      SENTINEL_KEY,
+      model,
+    );
+    results.push(result);
+    expect(result, String(model)).toEqual(invalidModel);
+  }
+  for (const model of [MODEL, "claude-opus-5-5", ""]) {
+    const result = await harness.service.saveKey(
+      CONNECTION_2,
+      SENTINEL_KEY,
+      model,
+    );
+    results.push(result);
+    expect(result, model).toEqual(invalidModel);
+  }
+  expect(keys.calls).toEqual([]);
+  expect(keys.files.size).toBe(0);
+
+  for (const model of [
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "claude-haiku-5-5",
+  ]) {
+    expect(
+      await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, model),
+    ).toEqual({ outcome: "ok" });
+    await settle();
+    expect(models(harness)).toEqual([model, null]);
+    expect(statuses(harness)).toEqual(["ready", "credential_missing"]);
+  }
+  expect(
+    await harness.service.saveKey(CONNECTION_2, SENTINEL_KEY, null),
+  ).toEqual({ outcome: "ok" });
+  await settle();
+  expect(statuses(harness)).toEqual(["ready", "ready"]);
+  expect(keys.calls.filter((call) => call.startsWith("save:"))).toEqual([
+    `save:${CONNECTION_1}:claude-opus-5-5`,
+    `save:${CONNECTION_1}:claude-sonnet-5-5`,
+    `save:${CONNECTION_1}:claude-haiku-5-5`,
+    `save:${CONNECTION_2}:null`,
+  ]);
+  // A refusal of the store keeps its code.
+  keys.failures.save = "invalid_model";
+  expect(
+    await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL),
+  ).toEqual(invalidModel);
+  expect(exposed(harness, ...results)).not.toContain(SENTINEL_KEY);
+});
+
+test("setModel changes the model of a stored Claude key without the key, and is refused for anything else", async () => {
+  const keys = new FakeKeys();
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(TWO);
+  await settle();
+  const refusal = (reason: string) => ({
+    outcome: "refused",
+    reason,
+    retryAfterMs: null,
+  });
+  keys.calls.length = 0;
+
+  // Before the store: an invalid ID, an unlisted connection, a Codex
+  // connection, and a model outside the list.
+  expect(await harness.service.setModel("nope", MODEL)).toEqual(
+    refusal("invalid"),
+  );
+  expect(
+    await harness.service.setModel(
+      "0192f0a0-7b3c-7d4e-8f50-000000000199",
+      MODEL,
+    ),
+  ).toEqual(refusal("not_listed"));
+  expect(await harness.service.setModel(CONNECTION_2, MODEL)).toEqual(
+    refusal("invalid_model"),
+  );
+  for (const model of ["", "claude-opus-4-8", "gpt-5"]) {
+    expect(await harness.service.setModel(CONNECTION_1, model), model).toEqual(
+      refusal("invalid_model"),
+    );
+  }
+  expect(keys.calls).toEqual([]);
+
+  // No key yet: the model is chosen with a key.
+  expect(await harness.service.setModel(CONNECTION_1, MODEL)).toEqual(
+    refusal("credential_missing"),
+  );
+  await settle();
+  expect(statuses(harness)).toEqual([
+    "credential_missing",
+    "credential_missing",
+  ]);
+
+  // A key of the format before models: model_missing until one is chosen.
+  keys.files.set(CONNECTION_1, { deviceId: DEVICE_ID, key: SENTINEL_KEY });
+  expect(
+    await harness.service.setModel(CONNECTION_1, "claude-opus-5-5"),
+  ).toEqual({ outcome: "ok" });
+  expect(keys.files.get(CONNECTION_1)).toEqual({
+    deviceId: DEVICE_ID,
+    key: SENTINEL_KEY,
+    model: "claude-opus-5-5",
+  });
+  await settle();
+  expect(statuses(harness)).toEqual(["ready", "credential_missing"]);
+  expect(models(harness)).toEqual(["claude-opus-5-5", null]);
+  // Nothing was sent to the server.
+  expect(harness.writes).toEqual([]);
+
+  // The store's failures.
+  for (const [code, reason] of [
+    ["bound_elsewhere", "credential_missing"],
+    ["corrupt", "credential_missing"],
+    ["missing", "credential_missing"],
+    ["system_protection_unavailable", "protection_unavailable"],
+    ["unreadable", "failed"],
+    ["write_failed", "failed"],
+  ] as const) {
+    keys.failures.setModel = code;
+    expect(await harness.service.setModel(CONNECTION_1, MODEL), code).toEqual(
+      refusal(reason),
+    );
+    expect(harness.logs).toContain(
+      `A provider model was not stored (${code}).`,
+    );
+  }
+  keys.failures.setModel = undefined;
+  // The model stays as it was after every refusal.
+  await settle();
+  expect(models(harness)).toEqual(["claude-opus-5-5", null]);
+
+  // One key action at a time.
+  keys.held.add("setModel");
+  const first = harness.service.setModel(CONNECTION_1, MODEL);
+  await settle();
+  expect(await harness.service.setModel(CONNECTION_1, MODEL)).toEqual(
+    refusal("busy"),
+  );
+  expect(
+    await harness.service.saveKey(CONNECTION_1, SENTINEL_KEY, MODEL),
+  ).toEqual(refusal("busy"));
+  keys.held.clear();
+  keys.release();
+  expect(await first).toEqual({ outcome: "ok" });
+  await settle();
+  expect(models(harness)).toEqual([MODEL, null]);
+
+  // Signed out.
+  harness.setAccount(SIGNED_OUT);
+  expect(await harness.service.setModel(CONNECTION_1, MODEL)).toEqual(
+    refusal("not_signed_in"),
+  );
+  expect(exposed(harness)).not.toContain(SENTINEL_KEY);
+});
+
+test("a model stored while another device signs in is deleted with its key file again", async () => {
+  const keys = new FakeKeys();
+  keys.files.set(CONNECTION_1, {
+    deviceId: DEVICE_ID,
+    key: SENTINEL_KEY,
+    model: "claude-opus-5-5",
+  });
+  const harness = new Harness(accountStatus(), "connected", keys);
+  await harness.ready(ONE);
+  await settle();
+  keys.held.add("setModel");
+  const pending = harness.service.setModel(CONNECTION_1, MODEL);
+  await settle();
+  harness.setAccount(accountStatus({}, OTHER_DEVICE_ID));
+  keys.held.clear();
+  keys.release();
+  expect(await pending).toEqual({
+    outcome: "refused",
+    reason: "not_signed_in",
+    retryAfterMs: null,
+  });
+  expect(keys.files.has(CONNECTION_1)).toBe(false);
 });
