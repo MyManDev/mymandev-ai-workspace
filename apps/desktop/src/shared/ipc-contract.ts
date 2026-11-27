@@ -2767,14 +2767,17 @@ export const PROVIDER_KIND_VIEWS = Object.freeze(["claude", "codex"] as const);
 
 /**
  * The models that a person may choose for a Claude connection (#30, the
- * Project Manager's decision of 2026-11-26), a closed list that the main
- * process checks: the Opus, Sonnet, and Haiku of the current Claude family,
- * by their Claude API model IDs. There is no default; the person chooses
- * one when they enter the connection's key, and the choice is kept on this
- * device next to the key. No other ID is accepted, also not a custom one.
- * The renderer keeps a copy with the models' names that its tests compare.
+ * Project Manager's decisions of 2026-11-26 and 2026-11-27), a closed list
+ * that the main process checks: Claude Fable 5.2, then the Opus, Sonnet,
+ * and Haiku of the current Claude family, from the most capable to the
+ * fastest, by their Claude API model IDs, in the order that the Account
+ * screen offers them. There is no default; the person chooses one when
+ * they enter the connection's key, and the choice is kept on this device
+ * next to the key. No other ID is accepted, also not a custom one. The
+ * renderer keeps a copy with the models' names that its tests compare.
  */
 export const CLAUDE_MODEL_VIEWS = Object.freeze([
+  "claude-fable-5-2",
   "claude-opus-5-5",
   "claude-sonnet-5-5",
   "claude-haiku-5-5",

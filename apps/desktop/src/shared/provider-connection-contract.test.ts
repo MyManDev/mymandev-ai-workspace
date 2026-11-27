@@ -308,6 +308,7 @@ test("changing the model takes one strict object of a connection ID and a model 
     "provider-connections:set-model",
   );
   expect([...CLAUDE_MODEL_VIEWS]).toEqual([
+    "claude-fable-5-2",
     "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-haiku-5-5",

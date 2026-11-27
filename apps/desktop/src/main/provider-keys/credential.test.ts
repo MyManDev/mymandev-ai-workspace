@@ -79,8 +79,9 @@ function expectNoKeyIn(result: ClaudeCredentialResult): void {
   }
 }
 
-test("the closed list of Claude models is the contract's, the current Opus, Sonnet, and Haiku, and nothing else is a model", () => {
+test("the closed list of Claude models is the contract's, Fable 5.2 and the current Opus, Sonnet, and Haiku, and nothing else is a model", () => {
   expect(CLAUDE_MODELS).toEqual([
+    "claude-fable-5-2",
     "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-haiku-5-5",
@@ -100,7 +101,8 @@ test("the closed list of Claude models is the contract's, the current Opus, Sonn
     "CLAUDE-OPUS-5-5",
     "claude-opus-5-5-20260401",
     "claude-opus-4-8",
-    "claude-fable-5-2",
+    "claude-fable-5-1",
+    "claude-mythos-5-2",
     "claude",
     7,
     ["claude-opus-5-5"],

@@ -1,9 +1,10 @@
 // The models that a person may choose for a provider connection (#30, the
-// Project Manager's decision of 2026-11-26). There is no default model: the
-// person chooses the model of a Claude connection when they enter its API
-// key, and the choice is kept on this device next to the key, in the same
-// encrypted payload of the provider key store (key-file.ts). The list is
-// closed and checked here, in the main process: the store writes only a
+// Project Manager's decisions of 2026-11-26 and, for the list, of
+// 2026-11-27). There is no default model: the person chooses the model of
+// a Claude connection when they enter its API key, and the choice is kept
+// on this device next to the key, in the same encrypted payload of the
+// provider key store (key-file.ts). The list is closed and checked here,
+// in the main process: the store writes only a
 // model of it, and a stored model outside it (a key stored before models
 // were chosen, or a model that this version no longer offers) counts as no
 // model, so that the person is asked to choose one. No custom ID is
@@ -18,8 +19,8 @@ export type ClaudeModel = ClaudeModelView;
 
 /**
  * The models that a Claude connection may use, in the order that the
- * Account screen offers them: the Opus, Sonnet, and Haiku of the current
- * Claude family.
+ * Account screen offers them: Claude Fable 5.2, then the Opus, Sonnet, and
+ * Haiku of the current Claude family, from the most capable to the fastest.
  */
 export const CLAUDE_MODELS: readonly ClaudeModel[] = CLAUDE_MODEL_VIEWS;
 

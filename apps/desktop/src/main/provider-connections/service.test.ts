@@ -1695,6 +1695,7 @@ test("saveKey stores a Claude key only with a model of the closed list, and a ke
   expect(keys.files.size).toBe(0);
 
   for (const model of [
+    "claude-fable-5-2",
     "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-haiku-5-5",
@@ -1712,6 +1713,7 @@ test("saveKey stores a Claude key only with a model of the closed list, and a ke
   await settle();
   expect(statuses(harness)).toEqual(["ready", "ready"]);
   expect(keys.calls.filter((call) => call.startsWith("save:"))).toEqual([
+    `save:${CONNECTION_1}:claude-fable-5-2`,
     `save:${CONNECTION_1}:claude-opus-5-5`,
     `save:${CONNECTION_1}:claude-sonnet-5-5`,
     `save:${CONNECTION_1}:claude-haiku-5-5`,

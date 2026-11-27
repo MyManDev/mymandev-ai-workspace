@@ -993,7 +993,7 @@ test("only a model of the closed list, or null, is stored: anything else is refu
     "claude-opus-5-5-20260401",
     "Claude-Opus-5-5",
     " claude-opus-5-5",
-    "claude-fable-5-2",
+    "claude-fable-5-1",
     "gpt-5",
     "",
     undefined,
@@ -1019,6 +1019,7 @@ test("only a model of the closed list, or null, is stored: anything else is refu
   ).toBe(encrypts.length);
   expect(await readFile(keyFile(), "utf8")).toBe(before);
   for (const model of [
+    "claude-fable-5-2",
     "claude-opus-5-5",
     "claude-sonnet-5-5",
     "claude-haiku-5-5",

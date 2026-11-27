@@ -54,6 +54,7 @@ export const CLAUDE_MODELS_OFFERED: readonly {
   readonly id: ClaudeModelView;
   readonly name: string;
 }[] = Object.freeze([
+  Object.freeze({ id: "claude-fable-5-2", name: "Claude Fable 5.2" }),
   Object.freeze({ id: "claude-opus-5-5", name: "Claude Opus 5.5" }),
   Object.freeze({ id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" }),
   Object.freeze({ id: "claude-haiku-5-5", name: "Claude Haiku 5.5" }),

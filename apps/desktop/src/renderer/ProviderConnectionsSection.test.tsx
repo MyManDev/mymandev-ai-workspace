@@ -651,7 +651,7 @@ test("the key form of a Claude connection asks for a model first: a required, la
   // The first option is no model, and it is the one shown: nothing is
   // chosen for the person.
   expect(html).toContain(
-    '<option value="" selected="">Choose a model</option><option value="claude-opus-5-5">Claude Opus 5.5</option><option value="claude-sonnet-5-5">Claude Sonnet 5.5</option><option value="claude-haiku-5-5">Claude Haiku 5.5</option>',
+    '<option value="" selected="">Choose a model</option><option value="claude-fable-5-2">Claude Fable 5.2</option><option value="claude-opus-5-5">Claude Opus 5.5</option><option value="claude-sonnet-5-5">Claude Sonnet 5.5</option><option value="claude-haiku-5-5">Claude Haiku 5.5</option>',
   );
   expect(html).toContain(htmlText(PROVIDER_CONNECTION_MESSAGES.modelHint));
   expect(html).toContain(

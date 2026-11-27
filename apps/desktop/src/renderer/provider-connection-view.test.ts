@@ -116,6 +116,7 @@ test("the section's values match the protocol's", () => {
     ...CLAUDE_MODEL_VIEWS,
   ]);
   expect(CLAUDE_MODELS_OFFERED.map((model) => model.name)).toEqual([
+    "Claude Fable 5.2",
     "Claude Opus 5.5",
     "Claude Sonnet 5.5",
     "Claude Haiku 5.5",
